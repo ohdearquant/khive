@@ -3,7 +3,6 @@ use crate::parsers::gql;
 
 #[test]
 fn node_kind_passes_through_unchanged() {
-    // Entity kinds are pack-agnostic strings -- no normalization at the query layer.
     let mut q = gql::parse("MATCH (a:paper)-[:introduced_by]->(b:concept) RETURN a").unwrap();
     validate(&mut q).unwrap();
     let kinds: Vec<_> = q
@@ -36,14 +35,12 @@ fn rejects_unknown_relation() {
 
 #[test]
 fn unknown_kind_passes_through() {
-    // Entity kinds are pack-agnostic strings -- any string is accepted at the query layer.
     let mut q = gql::parse("MATCH (a:gizmo)-[:extends]->(b) RETURN a").unwrap();
     validate(&mut q).unwrap();
 }
 
 #[test]
 fn rejects_depth_above_max() {
-    // Exceeding MAX_DEPTH is an InvalidInput error, not a silent clamp.
     let mut q = gql::parse("MATCH (a)-[:extends*1..50]->(b) RETURN b").unwrap();
     let err = validate(&mut q).unwrap_err();
     assert!(
@@ -58,7 +55,6 @@ fn rejects_depth_above_max() {
 
 #[test]
 fn rejects_depth_above_max_warnings_path() {
-    // validate_with_warnings must also reject (not clamp + warn).
     let mut q = gql::parse("MATCH (a)-[:extends*1..50]->(b) RETURN b").unwrap();
     let err = validate_with_warnings(&mut q).unwrap_err();
     assert!(
@@ -131,9 +127,6 @@ fn where_relation_contains_is_not_exact_relation_validation() {
 
 #[test]
 fn query_edge_relation_bang_rejected() {
-    // Regression for #471: relation filters with punctuation must be
-    // rejected as Validation errors, not silently normalised into a
-    // canonical relation.
     for bad in ["supports!", "part/of", "depends.on", "competes with"] {
         let mut q = gql::parse(&format!(
             "MATCH (a)-[e:extends]->(b) WHERE e.relation = '{bad}' RETURN a"
@@ -156,7 +149,6 @@ fn first_condition_string_value(q: &GqlQuery) -> String {
 
 #[test]
 fn unknown_kind_in_where_passes_through() {
-    // Entity kinds are pack-agnostic strings -- any kind string is accepted.
     let mut q = gql::parse("MATCH (a)-[:extends]->(b) WHERE a.kind = 'gizmo' RETURN a").unwrap();
     validate(&mut q).unwrap();
     assert_eq!(first_condition_string_value(&q), "gizmo");
@@ -164,7 +156,6 @@ fn unknown_kind_in_where_passes_through() {
 
 #[test]
 fn kind_in_where_passes_through_unchanged() {
-    // Pack-agnostic: 'paper' is not normalized to 'document'; strings pass through as-is.
     let mut q = gql::parse("MATCH (a)-[:extends]->(b) WHERE a.kind = 'paper' RETURN a").unwrap();
     validate(&mut q).unwrap();
     assert_eq!(first_condition_string_value(&q), "paper");
@@ -191,9 +182,6 @@ fn rejects_zero_hop_range_gql_wide() {
 
 #[test]
 fn rejects_zero_hop_range_gql_narrow() {
-    // *0..1 has max_hops=1 so has_variable_length() is false, but the
-    // fixed-length compiler also can't produce zero-hop rows -- reject at
-    // validation regardless of compile path.
     let mut q = gql::parse("MATCH (a)-[:extends*0..1]->(b) RETURN b").unwrap();
     let err = validate(&mut q).unwrap_err();
     assert!(
@@ -256,7 +244,6 @@ fn rejects_repeated_edge_var() {
 
 #[test]
 fn rejects_inverted_range() {
-    // *3..1 is an inverted range -- must error, not silently rewrite to *1..1.
     let mut q = gql::parse("MATCH (a)-[:extends*3..1]->(b) RETURN b").unwrap();
     let err = validate(&mut q).unwrap_err();
     assert!(
@@ -267,8 +254,6 @@ fn rejects_inverted_range() {
 
 #[test]
 fn rejects_min_hops_above_depth_cap() {
-    // min=50, max=100 -- the lower bound exceeds MAX_DEPTH so the query
-    // can never produce results within our cap.
     let mut q = gql::parse("MATCH (a)-[:extends*50..100]->(b) RETURN b").unwrap();
     let err = validate(&mut q).unwrap_err();
     assert!(
@@ -279,7 +264,6 @@ fn rejects_min_hops_above_depth_cap() {
 
 #[test]
 fn rejects_max_above_depth_cap_with_satisfiable_min() {
-    // *2..50 -- min 2 is satisfiable but max 50 exceeds MAX_DEPTH; must error.
     let mut q = gql::parse("MATCH (a)-[:extends*2..50]->(b) RETURN b").unwrap();
     let err = validate(&mut q).unwrap_err();
     assert!(
@@ -288,12 +272,8 @@ fn rejects_max_above_depth_cap_with_satisfiable_min() {
     );
 }
 
-// --- Regression: observed_as_* bypass fix ---
-
 #[test]
 fn rejects_unknown_synthetic_relation() {
-    // observed_as_bogus is not in SYNTHETIC_RELATIONS -- must be rejected, not
-    // silently compiled as a graph_edges query (closed-ontology bypass fix).
     let mut q = gql::parse("MATCH (a)-[:observed_as_bogus]->(b) RETURN a").unwrap();
     let err = validate(&mut q).unwrap_err();
     assert!(
@@ -308,7 +288,6 @@ fn rejects_unknown_synthetic_relation() {
 
 #[test]
 fn accepts_known_synthetic_relation() {
-    // All four known observed_as_* relations must pass validation.
     for rel in &[
         "observed_as_candidate",
         "observed_as_selected",
@@ -322,12 +301,9 @@ fn accepts_known_synthetic_relation() {
     }
 }
 
-// --- Regression: public AST pattern shape fix ---
-
 #[test]
 fn validate_pattern_shape_rejects_even_element_count() {
     use crate::ast::{EdgeDirection, EdgePattern, PatternElement};
-    // A hand-constructed AST with only an Edge element (no surrounding nodes) is malformed.
     let elements = vec![PatternElement::Edge(EdgePattern {
         variable: None,
         relations: vec!["extends".to_string()],
@@ -346,7 +322,6 @@ fn validate_pattern_shape_rejects_even_element_count() {
 fn validate_pattern_shape_rejects_wrong_type_at_position() {
     use crate::ast::{EdgeDirection, EdgePattern, NodePattern, PatternElement};
     use std::collections::HashMap;
-    // Edge, Node, Edge -- wrong: index 0 must be Node, index 2 must be Node.
     let make_node = || {
         PatternElement::Node(NodePattern {
             variable: None,
@@ -364,29 +339,24 @@ fn validate_pattern_shape_rejects_wrong_type_at_position() {
             max_hops: 1,
         })
     };
-    // Node, Node, Node -- two nodes in a row at odd index is wrong
     let elements = vec![make_node(), make_node(), make_node()];
     let err = validate_pattern_shape(&elements).unwrap_err();
     assert!(
         matches!(err, QueryError::Validation(_)),
         "expected Validation error for Node at odd index, got {err:?}"
     );
-    // Edge, Node, Edge -- edge at even index is wrong
     let elements2 = vec![make_edge(), make_node(), make_edge()];
     let err2 = validate_pattern_shape(&elements2).unwrap_err();
     assert!(
         matches!(err2, QueryError::Validation(_)),
         "expected Validation error for Edge at even index, got {err2:?}"
     );
-    // Valid: Node, Edge, Node
     let elements3 = vec![make_node(), make_edge(), make_node()];
     validate_pattern_shape(&elements3).expect("Node, Edge, Node must be valid");
 }
 
 #[test]
 fn node_property_named_relation_allowed() {
-    // `relation` on a node variable is a free-form JSON property, not the
-    // edge relation column -- taxonomy enforcement should not apply.
     let mut q =
         gql::parse("MATCH (a)-[:extends]->(b) WHERE a.relation = 'external' RETURN a").unwrap();
     validate(&mut q).unwrap();
@@ -395,8 +365,6 @@ fn node_property_named_relation_allowed() {
 
 #[test]
 fn edge_relation_still_validated() {
-    // `relation` on an edge variable must still go through EdgeRelation
-    // taxonomy validation.
     let mut q =
         gql::parse("MATCH (a)-[e:extends]->(b) WHERE e.relation = 'not_real' RETURN a").unwrap();
     let err = validate(&mut q).unwrap_err();

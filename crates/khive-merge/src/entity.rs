@@ -1,6 +1,8 @@
 // Copyright 2026 Haiyang Li. Licensed under Apache-2.0.
 //
 //! Entity-level three-way merge and field-level conflict analysis.
+//!
+//! See `crates/khive-merge/docs/api/entity-merge.md` for the decision table.
 
 use std::collections::{HashMap, HashSet};
 
@@ -10,9 +12,10 @@ use uuid::Uuid;
 use crate::diff_local::{diff_entities, properties_equal, EntityChange};
 use crate::types::{BranchSide, MergeConflict};
 
-/// Categorize all entity UUIDs across base, ours, theirs and produce:
-/// - A set of entities to include in the merged archive (no conflict).
-/// - A list of `MergeConflict` values to report.
+/// Merges all entity UUIDs and returns a provisional set plus typed conflicts.
+///
+/// Conflicted double modifications retain ours as a provisional fallback.
+/// See `crates/khive-merge/docs/api/entity-merge.md` for field rules.
 pub fn merge_entities(
     base: &KgArchive,
     ours: &KgArchive,
@@ -41,26 +44,22 @@ pub fn merge_entities(
         let theirs_change = theirs_diff.get(id);
 
         match (ours_change, theirs_change) {
-            // Both branches unchanged → include as-is from base.
             (Some(EntityChange::Unchanged), Some(EntityChange::Unchanged)) => {
                 if let Some(&e) = base_map.get(id) {
                     merged.push(e.clone());
                 }
             }
 
-            // Added in ours only → include.
             (Some(EntityChange::Added(e)), None)
             | (Some(EntityChange::Added(e)), Some(EntityChange::Unchanged)) => {
                 merged.push(e.clone());
             }
 
-            // Added in theirs only → include.
             (None, Some(EntityChange::Added(e)))
             | (Some(EntityChange::Unchanged), Some(EntityChange::Added(e))) => {
                 merged.push(e.clone());
             }
 
-            // Added in both (duplicate UUID): conflict if content differs; auto-resolved if identical.
             (Some(EntityChange::Added(e_ours)), Some(EntityChange::Added(e_theirs))) => {
                 let diffs = detect_entity_diffs(e_ours, e_theirs);
                 if diffs.is_empty() {
@@ -74,18 +73,14 @@ pub fn merge_entities(
                 }
             }
 
-            // Deleted in both → do not include (no conflict).
             (Some(EntityChange::Deleted), Some(EntityChange::Deleted)) => {}
 
-            // Deleted in ours, unchanged in theirs → delete in merge.
             (Some(EntityChange::Deleted), Some(EntityChange::Unchanged))
             | (Some(EntityChange::Deleted), None) => {}
 
-            // Deleted in theirs, unchanged in ours → delete in merge.
             (Some(EntityChange::Unchanged), Some(EntityChange::Deleted))
             | (None, Some(EntityChange::Deleted)) => {}
 
-            // Modified in ours, unchanged in theirs → take ours.
             (
                 Some(EntityChange::Modified { branch: e_ours, .. }),
                 Some(EntityChange::Unchanged),
@@ -94,7 +89,6 @@ pub fn merge_entities(
                 merged.push(e_ours.clone());
             }
 
-            // Modified in theirs, unchanged in ours → take theirs.
             (
                 Some(EntityChange::Unchanged),
                 Some(EntityChange::Modified {
@@ -110,7 +104,6 @@ pub fn merge_entities(
                 merged.push(e_theirs.clone());
             }
 
-            // Modified in both → field-level conflict analysis.
             (
                 Some(EntityChange::Modified {
                     base: _,
@@ -126,12 +119,11 @@ pub fn merge_entities(
                     merged.push(entity_result);
                 } else {
                     conflicts.extend(field_conflicts);
-                    // Include the ours version as a fallback (agent must resolve).
+                    // Preserve a deterministic provisional value for resolution UX.
                     merged.push(e_ours.clone());
                 }
             }
 
-            // Deleted in ours, modified in theirs → conflict.
             (Some(EntityChange::Deleted), Some(EntityChange::Modified { .. })) => {
                 conflicts.push(MergeConflict::ModifyDelete {
                     entity_id: *id,
@@ -140,7 +132,6 @@ pub fn merge_entities(
                 });
             }
 
-            // Modified in ours, deleted in theirs → conflict.
             (Some(EntityChange::Modified { .. }), Some(EntityChange::Deleted)) => {
                 conflicts.push(MergeConflict::ModifyDelete {
                     entity_id: *id,
@@ -149,7 +140,6 @@ pub fn merge_entities(
                 });
             }
 
-            // All other combos (e.g. both None — impossible given the union of IDs).
             _ => {}
         }
     }
@@ -157,18 +147,15 @@ pub fn merge_entities(
     (merged, conflicts)
 }
 
-/// Perform field-level merge for an entity modified in both branches.
-///
-/// Returns the merged entity and any unresolvable conflicts.
+/// Reconciles one double-modified entity and reports unresolvable fields.
 fn field_level_merge(
     id: Uuid,
     ours: &ExportedEntity,
     theirs: &ExportedEntity,
 ) -> (ExportedEntity, Vec<MergeConflict>) {
     let mut conflicts = Vec::new();
-    let mut result = ours.clone(); // Start from ours as the base.
+    let mut result = ours.clone();
 
-    // Name: conflict if different.
     if ours.name != theirs.name {
         conflicts.push(MergeConflict::NameConflict {
             entity_id: id,
@@ -177,7 +164,6 @@ fn field_level_merge(
         });
     }
 
-    // Kind: conflict if different.
     if ours.kind != theirs.kind {
         conflicts.push(MergeConflict::KindConflict {
             entity_id: id,
@@ -186,7 +172,7 @@ fn field_level_merge(
         });
     }
 
-    // Entity type: governed subtype field; use the existing generic value conflict payload.
+    // Reuse the property conflict payload for the governed subtype.
     if ours.entity_type != theirs.entity_type {
         conflicts.push(MergeConflict::PropertyMismatch {
             entity_id: id,
@@ -196,13 +182,11 @@ fn field_level_merge(
         });
     }
 
-    // Description: ours wins (annotation, not identity).
     if ours.description != theirs.description {
-        // Auto-resolved: keep ours (no conflict).
+        // Description is annotation rather than identity, so ours wins.
         result.description = ours.description.clone();
     }
 
-    // Tags: union.
     {
         let mut tag_set: HashSet<String> = ours.tags.iter().cloned().collect();
         for t in &theirs.tags {
@@ -213,7 +197,6 @@ fn field_level_merge(
         result.tags = tags;
     }
 
-    // Properties: per-key merge (see merge_properties for rules).
     let (merged_props, prop_conflicts) = merge_properties(id, &ours.properties, &theirs.properties);
     result.properties = merged_props;
     conflicts.extend(prop_conflicts);
@@ -221,14 +204,7 @@ fn field_level_merge(
     (result, conflicts)
 }
 
-/// Merge entity properties from ours and theirs.
-///
-/// Returns the merged property map and any per-key conflicts.
-/// Merge rules:
-/// - Both set K, same value → keep.
-/// - Both set K, different values → conflict; keep ours in merged map.
-/// - Only ours sets K → take ours.
-/// - Only theirs sets K → take theirs.
+/// Merges object properties per key, retaining ours on reported collisions.
 fn merge_properties(
     id: Uuid,
     ours_props: &Option<serde_json::Value>,
@@ -247,7 +223,6 @@ fn merge_properties(
 
     match (ours_obj, theirs_obj) {
         (None, None) => (None, vec![]),
-        // One side has no props → take the side that has them, no conflict.
         (Some(o), None) => (Some(Value::Object(o.clone())), vec![]),
         (None, Some(t)) => (Some(Value::Object(t.clone())), vec![]),
         (Some(o), Some(t)) => {
@@ -260,7 +235,6 @@ fn merge_properties(
             for key in all_keys_sorted {
                 match (o.get(key), t.get(key)) {
                     (Some(ov), Some(tv)) if ov != tv => {
-                        // Conflict: keep ours in the merged map; report both values.
                         conflicts.push(MergeConflict::PropertyMismatch {
                             entity_id: id,
                             key: key.clone(),
@@ -268,11 +242,9 @@ fn merge_properties(
                             theirs: tv.clone(),
                         });
                     }
-                    // Only theirs has this key → take theirs.
                     (None, Some(tv)) => {
                         merged.insert(key.clone(), tv.clone());
                     }
-                    // Equal or only-ours: already in merged (started from ours).
                     _ => {}
                 }
             }
@@ -282,7 +254,7 @@ fn merge_properties(
     }
 }
 
-/// Detect which fields differ between two entities with the same UUID.
+/// Lists content fields that differ for a duplicate UUID addition.
 fn detect_entity_diffs(ours: &ExportedEntity, theirs: &ExportedEntity) -> Vec<String> {
     let mut diffs = Vec::new();
     if ours.name != theirs.name {
@@ -309,8 +281,6 @@ fn detect_entity_diffs(ours: &ExportedEntity, theirs: &ExportedEntity) -> Vec<St
     }
     diffs
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -387,7 +357,7 @@ mod tests {
         let base = archive_with(vec![entity(id, "Original")]);
         modified.name = "Renamed".into();
         let ours = archive_with(vec![modified]);
-        let theirs = archive_with(vec![]); // deleted theirs
+        let theirs = archive_with(vec![]);
 
         let (_, conflicts) = merge_entities(&base, &ours, &theirs);
         assert_eq!(conflicts.len(), 1);
@@ -457,7 +427,6 @@ mod tests {
         let mut e_ours = entity(id, "E");
         let mut e_theirs = entity(id, "E");
         let base = archive_with(vec![entity(id, "E")]);
-        // ours has "year"; theirs has "author" (not in ours) and "year" (same value).
         e_ours.properties = Some(serde_json::json!({"year": "2023"}));
         e_theirs.properties = Some(serde_json::json!({"year": "2023", "author": "Smith"}));
 

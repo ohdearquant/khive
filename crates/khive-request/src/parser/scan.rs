@@ -4,7 +4,7 @@ use serde_json::Value;
 
 use crate::types::{ArgValue, DslError, ParsedOp, NESTING_DEPTH_LIMIT};
 
-/// Scan forward from an opening `"` to the matching close, handling `\\` escapes.
+/// Scans a JSON string through its closing quote while honoring escapes.
 pub(crate) fn scan_string_end(src: &[u8], start: usize) -> Result<usize, DslError> {
     let mut i = start + 1;
     while i < src.len() {
@@ -20,7 +20,7 @@ pub(crate) fn scan_string_end(src: &[u8], start: usize) -> Result<usize, DslErro
     Err(DslError::UnclosedString)
 }
 
-/// Human-readable label for a delimiter character in error messages.
+/// Returns a stable delimiter label for diagnostics.
 pub(crate) fn char_label(c: char) -> &'static str {
     match c {
         '(' => "'('",
@@ -33,17 +33,12 @@ pub(crate) fn char_label(c: char) -> &'static str {
     }
 }
 
-/// Return `true` if the string value is a `$prev` reference written inside
-/// JSON quotes. Matches `$prev`, `$prev.`, and `$prev[` prefixes.
+/// Detects a quoted `$prev`, `$prev.`, or `$prev[` reference boundary.
 pub(super) fn is_prev_ref_string(s: &str) -> bool {
     s == "$prev" || s.starts_with("$prev.") || s.starts_with("$prev[")
 }
 
-/// Recursively scan a JSON value for any string that is a `$prev` reference.
-///
-/// Only ever walks trees already bounded by [`check_json_nesting_depth`], but
-/// carries its own depth counter defensively (cheap, and this is an easy
-/// second recursion site to miss if the pre-pass invariant is ever changed).
+/// Detects a `$prev` string in a depth-bounded JSON tree.
 pub(crate) fn json_value_contains_prev_ref(v: &Value) -> bool {
     json_value_contains_prev_ref_at(v, 0)
 }
@@ -64,11 +59,8 @@ fn json_value_contains_prev_ref_at(v: &Value, depth: usize) -> bool {
     }
 }
 
-/// Pre-pass O(n) scan for container-nesting depth (`[`/`{`) over raw JSON-form
-/// input, bounding `serde_json::from_str::<Value>`'s otherwise-unbounded
-/// native recursive descent (CWE-674). `serde_json` exposes no depth knob
-/// for its untyped `Value` deserializer. Honors quoted strings via
-/// [`scan_string_end`] so brackets inside string literals do not count.
+/// Bounds JSON container depth before `serde_json::Value` native recursion (CWE-674).
+/// Quoted brackets do not count.
 pub(crate) fn check_json_nesting_depth(input: &str) -> Result<(), DslError> {
     let bytes = input.as_bytes();
     let mut i = 0;
@@ -99,8 +91,7 @@ pub(crate) fn check_json_nesting_depth(input: &str) -> Result<(), DslError> {
     Ok(())
 }
 
-/// Scan an op's args for any `PrevRef` and return a representative position
-/// if found. Used to emit `PrevRefOutsideChain` for Single and Parallel modes.
+/// Finds a representative `$prev` position for non-chain diagnostics.
 pub(crate) fn find_prev_ref_pos(op: &ParsedOp) -> Option<usize> {
     for av in op.args.values() {
         if arg_value_has_prev_ref(av) {
