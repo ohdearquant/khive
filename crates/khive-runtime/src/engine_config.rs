@@ -241,7 +241,7 @@ pub struct PackConfig {
 ///
 /// ```toml
 /// [[git_write.allowed]]
-/// repo = "/Users/leo/projects/khive/khive"
+/// repo = "/abs/path/repo"
 /// branches = ["feat/*", "fix/*"]
 /// ```
 #[derive(Debug, Clone, Deserialize)]
@@ -261,7 +261,7 @@ pub struct GitWriteEntryConfig {
 ///
 /// ```toml
 /// [[git_write.allowed]]
-/// repo = "/Users/leo/projects/khive/khive"
+/// repo = "/abs/path/repo"
 /// branches = ["feat/*", "fix/*"]
 /// ```
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -1712,7 +1712,7 @@ db = "/tmp/scratch/demo.db"
             &dir,
             r#"
 [[git_write.allowed]]
-repo = "/Users/leo/projects/khive/khive"
+repo = "/abs/path/repo"
 branches = ["feat/*", "fix/*"]
 "#,
         );
@@ -1720,10 +1720,7 @@ branches = ["feat/*", "fix/*"]
             .expect("no error")
             .expect("file found");
         assert_eq!(cfg.git_write.allowed.len(), 1);
-        assert_eq!(
-            cfg.git_write.allowed[0].repo,
-            "/Users/leo/projects/khive/khive"
-        );
+        assert_eq!(cfg.git_write.allowed[0].repo, "/abs/path/repo");
         assert_eq!(
             cfg.git_write.allowed[0].branches,
             vec!["feat/*".to_string(), "fix/*".to_string()]

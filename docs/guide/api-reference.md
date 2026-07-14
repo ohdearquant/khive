@@ -1581,12 +1581,24 @@ request(ops="git.digest(source=\"https://github.com/org/repo\", max_items=500)")
 ### `git.commit` / `git.branch` / `git.push` — Commissive (ADR-108)
 
 Thin write verbs that shell to system git (`std::process::Command::args`, no shell
-interpolation). Every caller-supplied value — branch/ref names, remote, paths, message,
-author — is validated against a restrictive character set before it can enter any argv
-array; subcommands and flags come from a fixed allowlist. `force` on `git.push` is always
-rejected when `true` — no policy or argument combination authorizes a force-push through
-this surface. `repo` is an ordinary verb argument on all three; protected-branch and
-per-repo/per-actor policy is enforced at the Gate (ADR-018), not hardcoded in the pack.
+interpolation). Branch/ref names, remotes, messages, and authors are validated before they
+enter fixed argv shapes. Commit paths are bounded, repository-relative, traversal-free,
+and internally converted to Git literal pathspecs, so characters such as `*`, `?`, brackets,
+Unicode, and caller text such as `:(top)` remain literal filename text. `force` on
+`git.push` is always rejected when `true` — no policy or argument combination authorizes a
+force-push through this surface.
+
+The handler-level `[git_write]` allowlist is mandatory and independent of Gate policy
+(ADR-018). With no `[[git_write.allowed]]` entries, all three write verbs deny every request,
+including under `AllowAllGate`. Repository paths are compared after canonicalization, so an
+entry names exactly one real repository; branch patterns are exact names or a glob containing
+at most one `*` wildcard.
+
+```toml
+[[git_write.allowed]]
+repo = "/abs/path/repo"
+branches = ["main", "feat/*", "release-*"]
+```
 
 | Verb         | Param     | Type            | Required | Notes                                                                                                                                                                          |
 | ------------ | --------- | --------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |

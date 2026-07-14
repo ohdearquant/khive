@@ -10,9 +10,10 @@
 //! This module owns exactly two responsibilities, both binding conditions of
 //! ADR-108's Fork (b) resolution:
 //!
-//! 1. Restrictive character-set validation on every caller-supplied string
-//!    (branch/ref names, the remote name, commit paths, the commit message,
-//!    the author string) *before* it can reach an argv array.
+//! 1. Validation on every caller-supplied string before it can reach an argv
+//!    array. Commit paths use Git's internally-added `:(literal)` pathspec
+//!    magic so valid filesystem names are not mistaken for caller-controlled
+//!    pathspec syntax.
 //! 2. A fixed subcommand + flag allowlist — the `build_*_argv` functions
 //!    below are the only argv shapes the write handlers ever construct.
 //!
@@ -145,24 +146,13 @@ pub fn validate_remote_name(value: &str) -> Result<(), GitArgError> {
     Ok(())
 }
 
-/// Validates one entry of `git.commit`'s `paths` argument: a relative,
-/// traversal-free *literal filename*, not a pathspec. Every value here
-/// reaches git as a positional argument after a `--` separator, where git
-/// still parses it for pathspec magic regardless of the `--`. A
-/// caller-supplied value carrying that magic can therefore select files
-/// outside the declared path scope even though it looks like an ordinary
-/// relative path. This is enforced as a real literal-filename grammar, not
-/// just a blocklist of the long-form `:(...)` signature: a leading `:` is
-/// rejected outright (covering both the long form `:(top)`/`:(glob)` and
-/// every short-form magic signature -- `:!x`, `:^x`, `:/x`, `:x` --  since
-/// all of them are spelled with a leading colon), and the glob/character-class
-/// pathspec metacharacters `*`, `?`, `[`, `]` are rejected anywhere in the
-/// value so a caller cannot smuggle a wildcard pathspec (`*.rs`, `?.rs`,
-/// `[ab].rs`) that expands to files outside the literal name given. The
-/// charset is restricted to ASCII printable (0x20-0x7e) so control bytes
-/// (tab, ESC, NUL, CR, LF, …) and non-ASCII bytes (including unicode
-/// confusables) are rejected uniformly, on top of the existing dash/slash/
-/// dotdot/absolute rules.
+/// Validates one entry of `git.commit`'s `paths` argument as a bounded,
+/// repository-relative filename. Git parses path arguments as pathspecs even
+/// after `--`, so [`build_add_argv`] and [`build_commit_argv`] prepend the
+/// fixed, internally-constructed `:(literal)` signature after validation.
+/// Caller text such as `:(top)`, `*`, `?`, brackets, leading dashes, control
+/// characters, and Unicode therefore remains filename text rather than Git
+/// syntax. NUL is rejected because operating-system argv cannot represent it.
 pub fn validate_commit_path(value: &str) -> Result<(), GitArgError> {
     const FIELD: &str = "paths[]";
     if value.is_empty() {
@@ -171,31 +161,20 @@ pub fn validate_commit_path(value: &str) -> Result<(), GitArgError> {
     if value.len() > MAX_PATH_LEN {
         return Err(GitArgError::TooLong(FIELD, MAX_PATH_LEN));
     }
-    if value.starts_with('-') {
-        return Err(GitArgError::LeadingDash(FIELD, value.to_string()));
-    }
-    if value.starts_with('/') {
+    if Path::new(value).is_absolute() {
         return Err(GitArgError::InvalidCharacter(FIELD, value.to_string()));
     }
-    if value.starts_with(':') {
-        return Err(GitArgError::InvalidCharacter(FIELD, value.to_string()));
-    }
-    if value.contains(":(") {
-        return Err(GitArgError::InvalidCharacter(FIELD, value.to_string()));
-    }
-    if value
-        .bytes()
-        .any(|b| matches!(b, b'*' | b'?' | b'[' | b']'))
-    {
-        return Err(GitArgError::InvalidCharacter(FIELD, value.to_string()));
-    }
-    if !value.bytes().all(|b| (0x20..=0x7e).contains(&b)) {
+    if value.as_bytes().contains(&0) {
         return Err(GitArgError::InvalidCharacter(FIELD, value.to_string()));
     }
     if value.split('/').any(|seg| seg == "..") {
         return Err(GitArgError::PathTraversal(FIELD, value.to_string()));
     }
     Ok(())
+}
+
+fn literal_pathspec(value: &str) -> String {
+    format!(":(literal){value}")
 }
 
 /// Validates the commit message. Passed to git as a single argv element
@@ -270,13 +249,13 @@ pub fn validate_repo_path(path: &Path) -> Result<(), GitArgError> {
 }
 
 /// Builds the argv for the `git add` pre-stage step of `git.commit` when
-/// `paths` is non-empty. Fixed shape: `["add", "--", paths...]`.
+/// `paths` is non-empty. Fixed shape: `["add", "--", literal-pathspecs...]`.
 pub fn build_add_argv(paths: &[String]) -> Result<Vec<String>, GitArgError> {
     for p in paths {
         validate_commit_path(p)?;
     }
     let mut argv = vec!["add".to_string(), "--".to_string()];
-    argv.extend(paths.iter().cloned());
+    argv.extend(paths.iter().map(|path| literal_pathspec(path)));
     Ok(argv)
 }
 
@@ -313,7 +292,7 @@ pub fn build_commit_argv(
     argv.push(message.to_string());
     if !paths.is_empty() {
         argv.push("--".to_string());
-        argv.extend(paths.iter().cloned());
+        argv.extend(paths.iter().map(|path| literal_pathspec(path)));
     }
     Ok(argv)
 }
@@ -477,13 +456,21 @@ mod tests {
     }
 
     #[test]
-    fn commit_path_rejects_leading_dash() {
-        for injected in ["--upload-pack=x", "-rf", "--exec=evil"] {
-            let err = validate_commit_path(injected).unwrap_err();
-            assert!(
-                matches!(err, GitArgError::LeadingDash(..)),
-                "{injected}: {err}"
-            );
+    fn commit_path_accepts_names_that_are_literalized_before_git() {
+        for literal in [
+            "--upload-pack=x",
+            "a\nb",
+            ":(top)a.txt",
+            "src/:(top)evil",
+            "a\tb",
+            "a\u{1b}b",
+            "src/m\u{0430}in.rs",
+            ":!x",
+            "*.rs",
+            "?.rs",
+            "[ab].rs",
+        ] {
+            assert!(validate_commit_path(literal).is_ok(), "{literal:?}");
         }
     }
 
@@ -505,78 +492,9 @@ mod tests {
     }
 
     #[test]
-    fn commit_path_rejects_embedded_newline() {
-        let err = validate_commit_path("a\nb").unwrap_err();
+    fn commit_path_rejects_nul() {
+        let err = validate_commit_path("a\0b").unwrap_err();
         assert!(matches!(err, GitArgError::InvalidCharacter(..)));
-    }
-
-    #[test]
-    fn commit_path_rejects_pathspec_magic_long_form() {
-        for injected in [":(top)a.txt", ":(glob)**"] {
-            let err = validate_commit_path(injected).unwrap_err();
-            assert!(
-                matches!(err, GitArgError::InvalidCharacter(..)),
-                "{injected}: {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn commit_path_rejects_embedded_pathspec_magic() {
-        let err = validate_commit_path("src/:(top)evil").unwrap_err();
-        assert!(matches!(err, GitArgError::InvalidCharacter(..)));
-    }
-
-    #[test]
-    fn commit_path_rejects_tab() {
-        let err = validate_commit_path("a\tb").unwrap_err();
-        assert!(matches!(err, GitArgError::InvalidCharacter(..)));
-    }
-
-    #[test]
-    fn commit_path_rejects_esc() {
-        let err = validate_commit_path("a\x1bb").unwrap_err();
-        assert!(matches!(err, GitArgError::InvalidCharacter(..)));
-    }
-
-    #[test]
-    fn commit_path_rejects_unicode_confusable() {
-        // Cyrillic 'а' (U+0430), visually confusable with ASCII 'a'.
-        let err = validate_commit_path("src/m\u{0430}in.rs").unwrap_err();
-        assert!(matches!(err, GitArgError::InvalidCharacter(..)));
-    }
-
-    #[test]
-    fn commit_path_rejects_pathspec_magic_short_form() {
-        for injected in [":!x", ":^x", ":/x"] {
-            let err = validate_commit_path(injected).unwrap_err();
-            assert!(
-                matches!(err, GitArgError::InvalidCharacter(..)),
-                "{injected}: {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn commit_path_rejects_wildcard_pathspec() {
-        for injected in ["*.rs", "?.rs", "[ab].rs"] {
-            let err = validate_commit_path(injected).unwrap_err();
-            assert!(
-                matches!(err, GitArgError::InvalidCharacter(..)),
-                "{injected}: {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn commit_path_rejects_upload_pack_and_exec_shapes() {
-        for injected in ["--upload-pack=x", "--exec=evil"] {
-            let err = validate_commit_path(injected).unwrap_err();
-            assert!(
-                matches!(err, GitArgError::LeadingDash(..)),
-                "{injected}: {err}"
-            );
-        }
     }
 
     // -- validate_message ------------------------------------------------------
@@ -617,7 +535,7 @@ mod tests {
 
     #[test]
     fn author_accepts_name_and_email() {
-        assert!(validate_author("Leo <leo@khive.ai>").is_ok());
+        assert!(validate_author("Test User <test@example.com>").is_ok());
     }
 
     #[test]
@@ -628,7 +546,7 @@ mod tests {
 
     #[test]
     fn author_rejects_embedded_newline() {
-        let err = validate_author("Leo\n<leo@khive.ai>").unwrap_err();
+        let err = validate_author("Test User\n<test@example.com>").unwrap_err();
         assert!(matches!(err, GitArgError::InvalidCharacter(..)));
     }
 
@@ -672,22 +590,19 @@ mod tests {
     #[test]
     fn build_add_argv_fixed_shape() {
         let argv = build_add_argv(&["a.rs".to_string(), "b/c.rs".to_string()]).unwrap();
-        assert_eq!(argv, vec!["add", "--", "a.rs", "b/c.rs"]);
+        assert_eq!(
+            argv,
+            vec!["add", "--", ":(literal)a.rs", ":(literal)b/c.rs"]
+        );
     }
 
     #[test]
-    fn build_add_argv_rejects_bad_path() {
-        assert!(build_add_argv(&["-rf".to_string()]).is_err());
-    }
-
-    #[test]
-    fn build_add_argv_rejects_pathspec_shaped_paths() {
-        for injected in [":!x", ":^x", ":/x", "*.rs", "[ab].rs", "?.rs"] {
-            assert!(
-                build_add_argv(&[injected.to_string()]).is_err(),
-                "{injected} must be rejected by build_add_argv"
-            );
-        }
+    fn build_add_argv_literalizes_caller_paths() {
+        let argv = build_add_argv(&[":(top)".to_string(), "*.rs".to_string()]).unwrap();
+        assert_eq!(
+            argv,
+            vec!["add", "--", ":(literal):(top)", ":(literal)*.rs"]
+        );
     }
 
     // -- build_commit_argv -----------------------------------------------------
@@ -701,15 +616,24 @@ mod tests {
     #[test]
     fn build_commit_argv_with_paths_scopes_and_appends_dashdash() {
         let argv = build_commit_argv("fix: thing", &["src/lib.rs".to_string()], None).unwrap();
-        assert_eq!(argv, vec!["commit", "-m", "fix: thing", "--", "src/lib.rs"]);
+        assert_eq!(
+            argv,
+            vec!["commit", "-m", "fix: thing", "--", ":(literal)src/lib.rs"]
+        );
     }
 
     #[test]
     fn build_commit_argv_with_author() {
-        let argv = build_commit_argv("msg", &[], Some("Leo <leo@khive.ai>")).unwrap();
+        let argv = build_commit_argv("msg", &[], Some("Test User <test@example.com>")).unwrap();
         assert_eq!(
             argv,
-            vec!["commit", "-a", "--author=Leo <leo@khive.ai>", "-m", "msg"]
+            vec![
+                "commit",
+                "-a",
+                "--author=Test User <test@example.com>",
+                "-m",
+                "msg"
+            ]
         );
     }
 
@@ -719,20 +643,12 @@ mod tests {
     }
 
     #[test]
-    fn build_commit_argv_rejects_injection_shaped_path() {
-        let err = build_commit_argv("msg", &["--upload-pack=x".to_string()], None).unwrap_err();
-        assert!(matches!(err, GitArgError::LeadingDash(..)));
-    }
-
-    #[test]
-    fn build_commit_argv_rejects_pathspec_shaped_paths() {
-        for injected in [":!x", ":^x", ":/x", "*.rs", "[ab].rs", "?.rs"] {
-            let err = build_commit_argv("msg", &[injected.to_string()], None).unwrap_err();
-            assert!(
-                matches!(err, GitArgError::InvalidCharacter(..)),
-                "{injected}: {err}"
-            );
-        }
+    fn build_commit_argv_literalizes_caller_paths() {
+        let argv = build_commit_argv("msg", &[":(glob)*".to_string()], None).unwrap();
+        assert_eq!(
+            argv,
+            vec!["commit", "-m", "msg", "--", ":(literal):(glob)*"]
+        );
     }
 
     // -- build_branch_argv -----------------------------------------------------

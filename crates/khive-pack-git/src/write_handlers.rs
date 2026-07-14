@@ -165,6 +165,128 @@ fn current_branch(repo: &Path) -> Result<String, RuntimeError> {
     Ok(out.trim().to_string())
 }
 
+struct WritePreflightError {
+    error: RuntimeError,
+    branch: Option<String>,
+    outcome: EventOutcome,
+}
+
+impl WritePreflightError {
+    fn denied(error: RuntimeError, branch: Option<&str>) -> Self {
+        Self {
+            error,
+            branch: branch.map(str::to_string),
+            outcome: EventOutcome::Denied,
+        }
+    }
+
+    fn runtime(error: RuntimeError) -> Self {
+        Self {
+            error,
+            branch: None,
+            outcome: EventOutcome::Error,
+        }
+    }
+}
+
+struct CommitPreflight {
+    branch: String,
+    add_argv: Option<Vec<String>>,
+    commit_argv: Vec<String>,
+}
+
+fn prepare_commit(repo: &Path, params: &Value) -> Result<CommitPreflight, WritePreflightError> {
+    validate_repo_path(repo)
+        .map_err(to_invalid_input)
+        .map_err(|e| WritePreflightError::denied(e, None))?;
+    let branch = current_branch(repo).map_err(WritePreflightError::runtime)?;
+    let message = params
+        .get("message")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RuntimeError::InvalidInput("git.commit requires message".into()))
+        .map_err(|e| WritePreflightError::denied(e, Some(&branch)))?;
+    let paths =
+        parse_paths_param(params).map_err(|e| WritePreflightError::denied(e, Some(&branch)))?;
+    let author = params.get("author").and_then(Value::as_str);
+    let add_argv = if paths.is_empty() {
+        None
+    } else {
+        Some(
+            build_add_argv(&paths)
+                .map_err(to_invalid_input)
+                .map_err(|e| WritePreflightError::denied(e, Some(&branch)))?,
+        )
+    };
+    let commit_argv = build_commit_argv(message, &paths, author)
+        .map_err(to_invalid_input)
+        .map_err(|e| WritePreflightError::denied(e, Some(&branch)))?;
+    Ok(CommitPreflight {
+        branch,
+        add_argv,
+        commit_argv,
+    })
+}
+
+struct BranchPreflight {
+    name: String,
+    from: Option<String>,
+    argv: Vec<String>,
+}
+
+fn prepare_branch(repo: &Path, params: &Value) -> Result<BranchPreflight, WritePreflightError> {
+    validate_repo_path(repo)
+        .map_err(to_invalid_input)
+        .map_err(|e| WritePreflightError::denied(e, None))?;
+    let name = params
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RuntimeError::InvalidInput("git.branch requires name".into()))
+        .map_err(|e| WritePreflightError::denied(e, None))?;
+    let from = params.get("from").and_then(Value::as_str);
+    let argv = build_branch_argv(name, from)
+        .map_err(to_invalid_input)
+        .map_err(|e| WritePreflightError::denied(e, Some(name)))?;
+    Ok(BranchPreflight {
+        name: name.to_string(),
+        from: from.map(str::to_string),
+        argv,
+    })
+}
+
+struct PushPreflight {
+    branch: String,
+    remote: String,
+    argv: Vec<String>,
+}
+
+fn prepare_push(repo: &Path, params: &Value) -> Result<PushPreflight, WritePreflightError> {
+    validate_repo_path(repo)
+        .map_err(to_invalid_input)
+        .map_err(|e| WritePreflightError::denied(e, None))?;
+    let branch = params
+        .get("branch")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RuntimeError::InvalidInput("git.push requires branch".into()))
+        .map_err(|e| WritePreflightError::denied(e, None))?;
+    let remote = params
+        .get("remote")
+        .and_then(Value::as_str)
+        .unwrap_or("origin");
+    let force =
+        parse_force_param(params).map_err(|e| WritePreflightError::denied(e, Some(branch)))?;
+    reject_force(force)
+        .map_err(to_invalid_input)
+        .map_err(|e| WritePreflightError::denied(e, Some(branch)))?;
+    let argv = build_push_argv(remote, branch)
+        .map_err(to_invalid_input)
+        .map_err(|e| WritePreflightError::denied(e, Some(branch)))?;
+    Ok(PushPreflight {
+        branch: branch.to_string(),
+        remote: remote.to_string(),
+        argv,
+    })
+}
+
 impl GitPack {
     /// Handler-level fail-closed precondition (ADR-108 Amendment), enforced
     /// before any of the three write verbs mutate a repository: the write
@@ -189,32 +311,47 @@ impl GitPack {
         policy.check(repo, branch).map_err(to_policy_denied)
     }
 
+    async fn audit_early_failure(
+        &self,
+        token: &NamespaceToken,
+        verb: &str,
+        repo: &Path,
+        branch: Option<&str>,
+        outcome: EventOutcome,
+        error: RuntimeError,
+    ) -> RuntimeError {
+        self.emit_write_audit(token, verb, repo, branch, "deny", outcome, None)
+            .await;
+        error
+    }
+
     pub(crate) async fn handle_commit(
         &self,
         token: &NamespaceToken,
         params: Value,
     ) -> Result<Value, RuntimeError> {
         let repo = parse_repo_param(&params)?;
-        validate_repo_path(&repo).map_err(to_invalid_input)?;
-
-        let message = params
-            .get("message")
-            .and_then(Value::as_str)
-            .ok_or_else(|| RuntimeError::InvalidInput("git.commit requires message".into()))?;
-        let paths = parse_paths_param(&params)?;
-        let author = params.get("author").and_then(Value::as_str);
-
-        let add_argv = if paths.is_empty() {
-            None
-        } else {
-            Some(build_add_argv(&paths).map_err(to_invalid_input)?)
-        };
-        let commit_argv = build_commit_argv(message, &paths, author).map_err(to_invalid_input)?;
-
         let lock = repo_write_lock(&repo);
         let _guard = lock.lock().await;
-
-        let branch = current_branch(&repo)?;
+        let CommitPreflight {
+            branch,
+            add_argv,
+            commit_argv,
+        } = match prepare_commit(&repo, &params) {
+            Ok(preflight) => preflight,
+            Err(failure) => {
+                return Err(self
+                    .audit_early_failure(
+                        token,
+                        "git.commit",
+                        &repo,
+                        failure.branch.as_deref(),
+                        failure.outcome,
+                        failure.error,
+                    )
+                    .await)
+            }
+        };
 
         let canonical_repo = match self.enforce_write_policy(&repo, &branch) {
             Ok(p) => p,
@@ -286,27 +423,32 @@ impl GitPack {
         params: Value,
     ) -> Result<Value, RuntimeError> {
         let repo = parse_repo_param(&params)?;
-        validate_repo_path(&repo).map_err(to_invalid_input)?;
-
-        let name = params
-            .get("name")
-            .and_then(Value::as_str)
-            .ok_or_else(|| RuntimeError::InvalidInput("git.branch requires name".into()))?;
-        let from = params.get("from").and_then(Value::as_str);
-
-        let argv = build_branch_argv(name, from).map_err(to_invalid_input)?;
-
         let lock = repo_write_lock(&repo);
         let _guard = lock.lock().await;
+        let BranchPreflight { name, from, argv } = match prepare_branch(&repo, &params) {
+            Ok(preflight) => preflight,
+            Err(failure) => {
+                return Err(self
+                    .audit_early_failure(
+                        token,
+                        "git.branch",
+                        &repo,
+                        failure.branch.as_deref(),
+                        failure.outcome,
+                        failure.error,
+                    )
+                    .await)
+            }
+        };
 
-        let canonical_repo = match self.enforce_write_policy(&repo, name) {
+        let canonical_repo = match self.enforce_write_policy(&repo, &name) {
             Ok(p) => p,
             Err(e) => {
                 self.emit_write_audit(
                     token,
                     "git.branch",
                     &repo,
-                    Some(name),
+                    Some(&name),
                     "deny",
                     EventOutcome::Denied,
                     None,
@@ -322,7 +464,7 @@ impl GitPack {
                     token,
                     "git.branch",
                     &canonical_repo,
-                    Some(name),
+                    Some(&name),
                     "allow",
                     EventOutcome::Success,
                     None,
@@ -339,7 +481,7 @@ impl GitPack {
                     token,
                     "git.branch",
                     &canonical_repo,
-                    Some(name),
+                    Some(&name),
                     "allow",
                     EventOutcome::Error,
                     None,
@@ -356,33 +498,36 @@ impl GitPack {
         params: Value,
     ) -> Result<Value, RuntimeError> {
         let repo = parse_repo_param(&params)?;
-        validate_repo_path(&repo).map_err(to_invalid_input)?;
-
-        let branch = params
-            .get("branch")
-            .and_then(Value::as_str)
-            .ok_or_else(|| RuntimeError::InvalidInput("git.push requires branch".into()))?;
-        let remote = params
-            .get("remote")
-            .and_then(Value::as_str)
-            .unwrap_or("origin");
-
-        let force = parse_force_param(&params)?;
-        reject_force(force).map_err(to_invalid_input)?;
-
-        let argv = build_push_argv(remote, branch).map_err(to_invalid_input)?;
-
         let lock = repo_write_lock(&repo);
         let _guard = lock.lock().await;
+        let PushPreflight {
+            branch,
+            remote,
+            argv,
+        } = match prepare_push(&repo, &params) {
+            Ok(preflight) => preflight,
+            Err(failure) => {
+                return Err(self
+                    .audit_early_failure(
+                        token,
+                        "git.push",
+                        &repo,
+                        failure.branch.as_deref(),
+                        failure.outcome,
+                        failure.error,
+                    )
+                    .await)
+            }
+        };
 
-        let canonical_repo = match self.enforce_write_policy(&repo, branch) {
+        let canonical_repo = match self.enforce_write_policy(&repo, &branch) {
             Ok(p) => p,
             Err(e) => {
                 self.emit_write_audit(
                     token,
                     "git.push",
                     &repo,
-                    Some(branch),
+                    Some(&branch),
                     "deny",
                     EventOutcome::Denied,
                     None,
@@ -398,7 +543,7 @@ impl GitPack {
                     token,
                     "git.push",
                     &canonical_repo,
-                    Some(branch),
+                    Some(&branch),
                     "allow",
                     EventOutcome::Success,
                     None,
@@ -415,7 +560,7 @@ impl GitPack {
                     token,
                     "git.push",
                     &canonical_repo,
-                    Some(branch),
+                    Some(&branch),
                     "allow",
                     EventOutcome::Error,
                     None,

@@ -1939,12 +1939,7 @@ pub fn resolve_runtime_config(inputs: RuntimeConfigInputs<'_>) -> anyhow::Result
             brain_profile: cli_brain_profile,
             ..RuntimeConfig::no_embeddings()
         };
-        resolve_actor_from_config(
-            inputs.config,
-            no_embed_base,
-            inputs.namespace_explicit,
-            db_path_for_config.as_deref(),
-        )?
+        resolve_actor_from_config(inputs.config, no_embed_base, db_path_for_config.as_deref())?
     } else {
         let base_config = RuntimeConfig {
             db_path,
@@ -2120,19 +2115,17 @@ fn resolve_config(
     }
 }
 
-/// Resolve only the actor namespace from a config file (no-embed path).
+/// Resolve configuration without enabling embedding engines (no-embed path).
 ///
 /// `db_path` anchors tier-3 project-local config discovery to the database's
-/// own directory instead of the process cwd (see [`resolve_config`]).
+/// own directory instead of the process cwd (see [`resolve_config`]). The
+/// caller-owned namespace remains in `base`, while non-actor sections such as
+/// `[git_write]` are still loaded and validated.
 fn resolve_actor_from_config(
     config_path: Option<&std::path::Path>,
     base: RuntimeConfig,
-    cli_namespace_explicit: bool,
     db_path: Option<&std::path::Path>,
 ) -> anyhow::Result<RuntimeConfig> {
-    if cli_namespace_explicit {
-        return Ok(base);
-    }
     match KhiveConfig::load_with_home_fallback(config_path, db_path)
         .map_err(|e| anyhow::anyhow!("config error: {e}"))?
     {
@@ -2447,6 +2440,43 @@ brain_profile = "project-profile"
             "lambda:agent-x",
             "the flag still sets the write namespace"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn no_embed_explicit_actor_preserves_git_write_config() {
+        std::env::remove_var("KHIVE_ACTOR");
+        let repo = tempfile::tempdir().expect("repo tempdir");
+        std::fs::create_dir(repo.path().join(".git")).expect("create .git");
+        let dir = tempfile::tempdir().expect("config tempdir");
+        let path = write_config(
+            dir.path(),
+            &format!(
+                "[[git_write.allowed]]\nrepo = {:?}\nbranches = [\"feat/*\"]\n",
+                repo.path().display().to_string()
+            ),
+        );
+
+        let resolved = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(":memory:"),
+            config: Some(&path),
+            namespace: Namespace::parse("lambda:cli-actor").expect("ns"),
+            namespace_explicit: true,
+            actor_explicit: true,
+            no_embed: true,
+            packs: None,
+            brain_profile: None,
+        })
+        .expect("resolve no-embed config");
+
+        assert_eq!(resolved.default_namespace.as_str(), "lambda:cli-actor");
+        assert_eq!(resolved.actor_id.as_deref(), Some("lambda:cli-actor"));
+        assert_eq!(resolved.git_write.allowed.len(), 1);
+        assert_eq!(
+            resolved.git_write.allowed[0].repo,
+            repo.path().display().to_string()
+        );
+        assert_eq!(resolved.git_write.allowed[0].branches, vec!["feat/*"]);
     }
 
     /// The `"local"` default namespace must stay anonymous (actor_id None) even when

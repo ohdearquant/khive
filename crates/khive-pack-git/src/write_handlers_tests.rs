@@ -29,6 +29,7 @@ use serde_json::json;
 
 use khive_runtime::engine_config::{GitWriteEntryConfig, GitWriteSectionConfig};
 use khive_runtime::{KhiveRuntime, Namespace, NamespaceToken, RuntimeConfig};
+use khive_types::EventOutcome;
 
 use crate::GitPack;
 
@@ -58,6 +59,31 @@ async fn pack_and_token_with_policy(git_write: GitWriteSectionConfig) -> (GitPac
     let rt = KhiveRuntime::new(config).expect("in-memory runtime");
     let token = rt.authorize(Namespace::local()).expect("authorize");
     (GitPack::new(rt), token)
+}
+
+async fn audit_event(
+    pack: &GitPack,
+    token: &NamespaceToken,
+    verb: &str,
+) -> khive_storage::event::Event {
+    let events_store = pack.runtime().events(token).expect("events store");
+    let page = events_store
+        .query_events(
+            khive_storage::event::EventFilter {
+                verbs: vec![verb.to_string()],
+                ..Default::default()
+            },
+            khive_storage::types::PageRequest {
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .await
+        .expect("query events");
+    page.items
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("{verb} audit event present"))
 }
 
 /// Builds a `git` invocation hardened against ambient host state: a global
@@ -193,6 +219,73 @@ async fn commit_with_paths_scopes_to_those_paths() {
 }
 
 #[tokio::test]
+async fn commit_literalizes_pathspec_magic_in_caller_path() {
+    let _env_guard = crate::cache::ENV_MUTEX.lock().await;
+    let (repo, _remote) = init_repo_with_remote();
+    let (pack, token) = pack_and_token_with_policy(policy(repo.path(), &["main"])).await;
+
+    std::fs::write(repo.path().join(":(top)"), b"literal").unwrap();
+    std::fs::write(
+        repo.path().join("unrelated.txt"),
+        b"must remain uncommitted",
+    )
+    .unwrap();
+
+    pack.handle_commit(
+        &token,
+        json!({
+            "repo": repo.path().to_str().unwrap(),
+            "message": "commit literal magic name",
+            "paths": [":(top)"],
+        }),
+    )
+    .await
+    .expect("caller pathspec magic is treated as a literal filename");
+
+    let status = git_command(repo.path())
+        .args(["status", "--porcelain"])
+        .output()
+        .expect("git status");
+    let status = String::from_utf8_lossy(&status.stdout);
+    assert!(status.contains("unrelated.txt"), "{status}");
+    assert!(!status.contains(":(top)"), "{status}");
+}
+
+#[tokio::test]
+async fn commit_accepts_special_and_unicode_literal_filename() {
+    let _env_guard = crate::cache::ENV_MUTEX.lock().await;
+    let (repo, _remote) = init_repo_with_remote();
+    let (pack, token) = pack_and_token_with_policy(policy(repo.path(), &["main"])).await;
+    let path = "docs/[draft]*?café.md";
+    std::fs::create_dir_all(repo.path().join("docs")).unwrap();
+    std::fs::write(repo.path().join(path), b"literal").unwrap();
+
+    pack.handle_commit(
+        &token,
+        json!({
+            "repo": repo.path().to_str().unwrap(),
+            "message": "commit special literal name",
+            "paths": [path],
+        }),
+    )
+    .await
+    .expect("special and unicode filename commits literally");
+
+    let tree = git_command(repo.path())
+        .args([
+            "-c",
+            "core.quotepath=false",
+            "ls-tree",
+            "-r",
+            "--name-only",
+            "HEAD",
+        ])
+        .output()
+        .expect("git ls-tree");
+    assert!(String::from_utf8_lossy(&tree.stdout).contains(path));
+}
+
+#[tokio::test]
 async fn commit_rejects_empty_message() {
     let _env_guard = crate::cache::ENV_MUTEX.lock().await;
     let (repo, _remote) = init_repo_with_remote();
@@ -209,23 +302,45 @@ async fn commit_rejects_empty_message() {
 }
 
 #[tokio::test]
-async fn commit_rejects_injection_shaped_path() {
+async fn commit_treats_flag_shaped_path_as_literal() {
     let _env_guard = crate::cache::ENV_MUTEX.lock().await;
     let (repo, _remote) = init_repo_with_remote();
-    let (pack, token) = pack_and_token_with_policy(GitWriteSectionConfig::default()).await;
+    let (pack, token) = pack_and_token_with_policy(policy(repo.path(), &["main"])).await;
+    std::fs::write(repo.path().join("--upload-pack=evil"), b"literal").unwrap();
 
-    let err = pack
-        .handle_commit(
-            &token,
-            json!({
-                "repo": repo.path().to_str().unwrap(),
-                "message": "msg",
-                "paths": ["--upload-pack=evil"],
-            }),
-        )
-        .await
-        .unwrap_err();
-    assert!(err.to_string().contains("start with"), "{err}");
+    pack.handle_commit(
+        &token,
+        json!({
+            "repo": repo.path().to_str().unwrap(),
+            "message": "msg",
+            "paths": ["--upload-pack=evil"],
+        }),
+    )
+    .await
+    .expect("flag-shaped filename is a literal path after --");
+}
+
+#[tokio::test]
+async fn commit_invalid_path_emits_deny_audit() {
+    let _env_guard = crate::cache::ENV_MUTEX.lock().await;
+    let (repo, _remote) = init_repo_with_remote();
+    let (pack, token) = pack_and_token_with_policy(policy(repo.path(), &["main"])).await;
+
+    pack.handle_commit(
+        &token,
+        json!({
+            "repo": repo.path().to_str().unwrap(),
+            "message": "invalid path",
+            "paths": ["../outside"],
+        }),
+    )
+    .await
+    .unwrap_err();
+
+    let audit = audit_event(&pack, &token, "git.commit").await;
+    assert_eq!(audit.outcome, EventOutcome::Denied);
+    assert_eq!(audit.payload["decision"], "deny");
+    assert_eq!(audit.payload["branch"], "main");
 }
 
 #[tokio::test]
@@ -396,6 +511,11 @@ async fn branch_rejects_path_traversal_name() {
         .await
         .unwrap_err();
     assert!(err.to_string().contains(".."), "{err}");
+
+    let audit = audit_event(&pack, &token, "git.branch").await;
+    assert_eq!(audit.outcome, EventOutcome::Denied);
+    assert_eq!(audit.payload["decision"], "deny");
+    assert_eq!(audit.payload["branch"], "../../etc/passwd");
 }
 
 #[tokio::test]
@@ -467,6 +587,11 @@ async fn push_rejects_explicit_force_true() {
         .await
         .unwrap_err();
     assert!(err.to_string().contains("force-push"), "{err}");
+
+    let audit = audit_event(&pack, &token, "git.push").await;
+    assert_eq!(audit.outcome, EventOutcome::Denied);
+    assert_eq!(audit.payload["decision"], "deny");
+    assert_eq!(audit.payload["branch"], "main");
 }
 
 #[tokio::test]
@@ -734,4 +859,25 @@ async fn commit_denial_emits_deny_decision_audit() {
         audit.payload.get("branch").and_then(|v| v.as_str()),
         Some("main")
     );
+}
+
+#[tokio::test]
+async fn detached_head_commit_failure_emits_error_audit() {
+    let _env_guard = crate::cache::ENV_MUTEX.lock().await;
+    let (repo, _remote) = init_repo_with_remote();
+    let (pack, token) = pack_and_token_with_policy(policy(repo.path(), &["main"])).await;
+    run(repo.path(), &["checkout", "-q", "--detach", "HEAD"]);
+    std::fs::write(repo.path().join("a.txt"), b"detached change").unwrap();
+
+    pack.handle_commit(
+        &token,
+        json!({ "repo": repo.path().to_str().unwrap(), "message": "detached" }),
+    )
+    .await
+    .unwrap_err();
+
+    let audit = audit_event(&pack, &token, "git.commit").await;
+    assert_eq!(audit.outcome, EventOutcome::Error);
+    assert_eq!(audit.payload["decision"], "deny");
+    assert!(audit.payload.get("branch").is_none());
 }

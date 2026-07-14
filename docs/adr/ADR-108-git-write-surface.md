@@ -420,7 +420,7 @@ would execute as a side effect of an otherwise-successful, policy-permitted writ
 
    ```toml
    [[git_write.allowed]]
-   repo = "/Users/leo/projects/khive/khive"
+   repo = "/abs/path/repo"
    branches = ["feat/*", "fix/*"]
    ```
 
