@@ -1193,17 +1193,8 @@ pub fn build_registry_for_multi_backend(
     khive_cfg: &KhiveConfig,
     cli_db_override: Option<&str>,
 ) -> anyhow::Result<MultiBackendRegistry> {
-    let db_anchor = if cli_db_override == Some(":memory:") {
-        None
-    } else {
-        base_config.db_path.clone()
-    };
-    build_registry_for_multi_backend_with_db_anchor(
-        base_config,
-        khive_cfg,
-        cli_db_override,
-        db_anchor.as_deref(),
-    )
+    khive_runtime::assert_db_anchor_consistent(base_config.db_path.as_deref(), cli_db_override)?;
+    build_registry_for_multi_backend_inner(base_config, khive_cfg, cli_db_override)
 }
 
 pub fn build_registry_for_multi_backend_with_db_anchor(
@@ -1220,6 +1211,14 @@ pub fn build_registry_for_multi_backend_with_db_anchor(
     // once instead of at each caller.
     khive_runtime::assert_captured_db_anchor_consistent(base_config.db_path.as_deref(), db_anchor)?;
 
+    build_registry_for_multi_backend_inner(base_config, khive_cfg, cli_db_override)
+}
+
+fn build_registry_for_multi_backend_inner(
+    base_config: RuntimeConfig,
+    khive_cfg: &KhiveConfig,
+    cli_db_override: Option<&str>,
+) -> anyhow::Result<MultiBackendRegistry> {
     let backend_count = khive_cfg.backends.len();
     let force_memory = match cli_db_override {
         Some(":memory:") => {
@@ -1694,17 +1693,11 @@ pub fn build_server_multi_backend(
     khive_cfg: &KhiveConfig,
     cli_db_override: Option<&str>,
 ) -> anyhow::Result<KhiveMcpServer> {
-    let db_anchor = if cli_db_override == Some(":memory:") {
-        None
-    } else {
-        base_config.db_path.clone()
-    };
-    build_server_multi_backend_with_db_anchor(
-        base_config,
-        khive_cfg,
-        cli_db_override,
-        db_anchor.as_deref(),
-    )
+    khive_runtime::assert_db_anchor_consistent(base_config.db_path.as_deref(), cli_db_override)?;
+    let multi = build_registry_for_multi_backend_inner(base_config, khive_cfg, cli_db_override)?;
+    Ok(build_server_from_multi_backend_registry(
+        multi, khive_cfg, None,
+    ))
 }
 
 pub fn build_server_multi_backend_with_db_anchor(
@@ -3907,6 +3900,90 @@ id = "lambda:project-actor"
             },
             ..KhiveConfig::default()
         }
+    }
+
+    fn memory_main_backend_config() -> KhiveConfig {
+        KhiveConfig {
+            backends: vec![BackendConfig {
+                name: "main".to_string(),
+                kind: BackendKind::Memory,
+                path: None,
+                cache_mb: None,
+                journal_mode: None,
+                read_only: false,
+            }],
+            ..KhiveConfig::default()
+        }
+    }
+
+    fn assert_db_anchor_drift<T>(result: anyhow::Result<T>) {
+        match result {
+            Err(error) => assert!(
+                error.to_string().contains("db-path resolution drift"),
+                "legacy builder must reject raw db input that disagrees with the resolved config: {error}"
+            ),
+            Ok(_) => panic!("legacy builder accepted raw db input that disagrees with the resolved config"),
+        }
+    }
+
+    #[test]
+    fn legacy_registry_rejects_mismatched_explicit_db_override() {
+        let base_cfg = RuntimeConfig {
+            db_path: Some(PathBuf::from("/tmp/khive-resolved.db")),
+            ..base_runtime_config_for_multi_backend()
+        };
+
+        assert_db_anchor_drift(build_registry_for_multi_backend(
+            base_cfg,
+            &memory_main_backend_config(),
+            Some("/tmp/khive-raw.db"),
+        ));
+    }
+
+    #[test]
+    fn legacy_server_rejects_mismatched_explicit_db_override() {
+        let base_cfg = RuntimeConfig {
+            db_path: Some(PathBuf::from("/tmp/khive-resolved.db")),
+            ..base_runtime_config_for_multi_backend()
+        };
+
+        assert_db_anchor_drift(build_server_multi_backend(
+            base_cfg,
+            &memory_main_backend_config(),
+            Some("/tmp/khive-raw.db"),
+        ));
+    }
+
+    #[test]
+    #[serial]
+    fn legacy_registry_rejects_unset_db_after_home_changes() {
+        let first_home = tempfile::tempdir().unwrap();
+        let _home_guard = HomeGuard::redirect_to(first_home.path());
+        let base_cfg = base_runtime_config_for_multi_backend();
+        let second_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", second_home.path());
+
+        assert_db_anchor_drift(build_registry_for_multi_backend(
+            base_cfg,
+            &memory_main_backend_config(),
+            None,
+        ));
+    }
+
+    #[test]
+    #[serial]
+    fn legacy_server_rejects_unset_db_after_home_changes() {
+        let first_home = tempfile::tempdir().unwrap();
+        let _home_guard = HomeGuard::redirect_to(first_home.path());
+        let base_cfg = base_runtime_config_for_multi_backend();
+        let second_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", second_home.path());
+
+        assert_db_anchor_drift(build_server_multi_backend(
+            base_cfg,
+            &memory_main_backend_config(),
+            None,
+        ));
     }
 
     /// B-SHOULD-FIX-2 (data safety): Two [[backends]] entries whose sqlite paths
