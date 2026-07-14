@@ -5,8 +5,9 @@ Technical reference for the generic snapshot envelope and `InMemoryCheckpointSto
 
 ## Ordering
 
-`InMemoryCheckpointStore::load_latest` breaks `created_at` ties by `uuid` (lexicographic
-ascending). Callers should not rely on ordering when `created_at` values are equal.
+`InMemoryCheckpointStore::load_latest` breaks `created_at` ties deterministically by `uuid`:
+`max_by_key(|c| (c.created_at, c.uuid))` selects the lexicographically greatest UUID among
+equal timestamps. Callers can rely on this deterministic winner.
 
 `sort_checkpoint_keys` is extracted as a standalone helper so it can be unit-tested with
 intentionally unsorted input, giving fail-before/pass-after coverage independent of `HashMap`

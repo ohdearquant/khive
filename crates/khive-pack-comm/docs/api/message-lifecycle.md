@@ -287,8 +287,7 @@ from the struct.
   parent's Message-ID lives in `wire_message_id` instead, since an inbound
   note's `external_id` is the IMAP UIDVALIDITY/UID dedup key, never a
   Message-ID. Returns `None` when the parent carries no wire Message-ID at
-  all (e.g. a khive-internal parent, or an email parent the channel never
-  captured one for).
+  all.
 - `parent_references_chain`: direction-aware — an inbound parent's chain (as
   received over the wire) lives in `wire_references`; an outbound parent's
   chain is whatever was persisted on it as `references_chain` when *it* was
