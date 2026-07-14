@@ -644,7 +644,7 @@ impl VamanaIndex {
     /// (v1 format) or [`VamanaIndex::save_atomic`] (v2 segmented format); the format is
     /// auto-detected from `metadata.bin`'s magic. Never rebuilds — a corrupt, torn, or
     /// absent index returns an error, leaving the recovery decision to the caller (see
-    /// [`Self::load_or_build`] and crates/khive-vamana/docs/persistence.md#v2-crash-safe-save-load).
+    /// [`Self::load_or_build`] and crates/khive-vamana/docs/api/persistence.md#v2-crash-safe-save-load).
     #[cfg(feature = "mmap")]
     pub fn load(path: &Path) -> Result<Self> {
         let metadata_path = path.join("metadata.bin");
@@ -711,7 +711,7 @@ impl VamanaIndex {
     /// atomically renames `metadata.bin.tmp` → `metadata.bin` as the commit record. A
     /// crash at any point before that rename leaves the previous `metadata.bin` (v1 or
     /// v2) valid and untouched — [`Self::load_or_build`] never observes a torn v2
-    /// commit. See crates/khive-vamana/docs/persistence.md#v2-crash-safe-save-load for
+    /// commit. See crates/khive-vamana/docs/api/persistence.md#v2-crash-safe-save-load for
     /// the staging/fsync sequence.
     #[cfg(feature = "mmap")]
     pub fn save_atomic(&self, path: &Path) -> Result<()> {
@@ -808,7 +808,7 @@ impl VamanaIndex {
     /// or a missing/corrupt v2 commit, rebuilds from `corpus_vectors` (the caller's raw
     /// flat f32 slice) using `fallback_config` or the commit's saved config, then
     /// persists via `save_atomic`. Full decision tree:
-    /// crates/khive-vamana/docs/persistence.md#v2-crash-safe-save-load.
+    /// crates/khive-vamana/docs/api/persistence.md#v2-crash-safe-save-load.
     #[cfg(feature = "mmap")]
     pub fn load_or_build(
         path: &Path,
@@ -995,7 +995,7 @@ impl VamanaIndex {
 
     /// Load a committed v2 index from `path` without a corpus and without rebuilding;
     /// errors (never rebuilds) if no valid v2 commit is present. See
-    /// crates/khive-vamana/docs/persistence.md#v2-crash-safe-save-load for the full
+    /// crates/khive-vamana/docs/api/persistence.md#v2-crash-safe-save-load for the full
     /// decision tree shared with `load_or_build`.
     #[cfg(feature = "mmap")]
     fn load_v2_raw(path: &Path) -> Result<Self> {
@@ -1739,7 +1739,7 @@ impl VamanaIndex {
     }
 
     /// Soft-delete the node at `node_id` with eager Wolverine 2-hop repair (ADR-052 §2;
-    /// see crates/khive-vamana/docs/algorithm.md#wolverine-2-hop-repair for the rewire
+    /// see crates/khive-vamana/docs/api/algorithm.md#wolverine-2-hop-repair for the rewire
     /// mechanism). If `node_id` was the medoid, a new medoid is elected (centroid-nearest
     /// live node). Returns an error without mutating any state if the op would leave zero
     /// live nodes.
@@ -1988,7 +1988,7 @@ fn set_tombstone_bit(tombstones: &mut Vec<u64>, idx: usize) {
 
 /// Core Wolverine repair: rewire each live in-neighbor of `deleted` to bypass it,
 /// updating `reverse_adj` in lockstep. See
-/// crates/khive-vamana/docs/algorithm.md#wolverine-2-hop-repair for the RobustPrune
+/// crates/khive-vamana/docs/api/algorithm.md#wolverine-2-hop-repair for the RobustPrune
 /// derivation and paper references.
 fn wolverine_repair(
     vectors: &[f32],
@@ -2661,7 +2661,7 @@ fn parse_v2_commit(data: &[u8]) -> Result<V2Commit> {
     })
 }
 
-/// Write lifecycle.bin. See crates/khive-vamana/docs/persistence.md#lifecyclebin-format
+/// Write lifecycle.bin. See crates/khive-vamana/docs/api/persistence.md#lifecyclebin-format
 /// for the full byte layout.
 #[cfg(feature = "mmap")]
 fn write_lifecycle(

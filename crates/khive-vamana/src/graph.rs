@@ -128,7 +128,7 @@ impl VamanaGraph {
         })
     }
 
-    /// Rebuild `reverse_adj` from `adjacency`. See crates/khive-vamana/docs/algorithm.md#reverse-adjacency-rebuild for cost and call-site rationale.
+    /// Rebuild `reverse_adj` from `adjacency`. See crates/khive-vamana/docs/api/algorithm.md#reverse-adjacency-rebuild for cost and call-site rationale.
     pub(crate) fn rebuild_reverse_adj_from_adjacency(&mut self) {
         let n = self.adjacency.len();
         let mut rev: Vec<Vec<u32>> = vec![Vec::new(); n];
@@ -273,7 +273,7 @@ impl VamanaGraph {
 
     /// Build a Vamana graph using SQ8 acquisition-tier distances (ADR-052 §1, Step 2).
     /// Produces a topology equivalent to `build`; caller must train `codec` and encode
-    /// `vectors` into `encoded` first (see crates/khive-vamana/docs/algorithm.md#sq8-acquisition-tier).
+    /// `vectors` into `encoded` first (see crates/khive-vamana/docs/api/algorithm.md#sq8-acquisition-tier).
     pub fn build_sq8(
         vectors: &[f32],
         encoded: &[GsEncodedVector],
@@ -447,7 +447,7 @@ impl VamanaGraph {
         &mut self.adjacency
     }
 
-    /// Install a pre-validated in-neighbor list as `reverse_adj`. See crates/khive-vamana/docs/persistence.md#v2-fast-load-path for the validation this relies on.
+    /// Install a pre-validated in-neighbor list as `reverse_adj`. See crates/khive-vamana/docs/api/persistence.md#v2-fast-load-path for the validation this relies on.
     pub(crate) fn restore_reverse_adj(&mut self, reverse_adj: Vec<Vec<u32>>) {
         self.reverse_adj = reverse_adj;
     }
@@ -525,7 +525,7 @@ impl VamanaGraph {
     ///
     /// `tombstones` is an optional bit-packed slice produced by `VamanaIndex`; when
     /// present, tombstoned nodes are skipped during beam expansion and excluded from
-    /// results (see crates/khive-vamana/docs/algorithm.md#tombstone-defense-in-depth).
+    /// results (see crates/khive-vamana/docs/api/algorithm.md#tombstone-defense-in-depth).
     // REASON: `tombstones` was added to the existing 7-parameter signature (PR2);
     // bundling params into a struct would add allocation overhead on the hot path.
     #[allow(clippy::too_many_arguments)]
@@ -793,7 +793,7 @@ pub(crate) fn robust_prune_inner(
 }
 
 /// SQ8 acquisition-tier greedy search: two-tier candidate acquisition + exact re-score.
-/// See crates/khive-vamana/docs/algorithm.md#sq8-acquisition-tier. Caller must do
+/// See crates/khive-vamana/docs/api/algorithm.md#sq8-acquisition-tier. Caller must do
 /// tombstone filtering, dimension checks, and k > 0 check.
 // REASON: nine parameters mirror `greedy_search_inner`; the SQ8 codec + encoded slice
 // are the only additions. Bundling into a struct would add allocation overhead on the hot path.
@@ -915,7 +915,7 @@ pub(crate) fn greedy_search_inner_sq8(
 }
 
 /// SQ8 acquisition-tier robust prune: SQ8-scored candidates, exact-f32 alpha predicate.
-/// See crates/khive-vamana/docs/algorithm.md#sq8-acquisition-tier for why the predicate
+/// See crates/khive-vamana/docs/api/algorithm.md#sq8-acquisition-tier for why the predicate
 /// stays exact-f32 (SQ8 code collisions would otherwise vacuously prune).
 // REASON: mirrors robust_prune_inner signature with two additional SQ8 params (encoded, codec).
 #[allow(clippy::too_many_arguments)]
