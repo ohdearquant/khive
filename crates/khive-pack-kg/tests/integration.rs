@@ -3836,9 +3836,9 @@ async fn neighbors_still_excludes_soft_deleted_entity_after_note_fix() {
 
 /// #803: `get(edge_id)` must include an `annotations` array with the full
 /// note bodies of every note that `annotates` the edge. Before this fix,
-/// `get()` returned the bare edge with no way to reach "what annotated this
-/// edge and why" — the only read path (`neighbors()`) does not accept edge
-/// ids as a node, and there is no `annotations()` verb.
+/// `get(edge_id)` did not hydrate annotating-note bodies in its response —
+/// `neighbors()` on the edge id yields only name/kind summaries, and there
+/// is no `annotations()` verb.
 #[tokio::test]
 async fn get_edge_includes_annotating_notes() {
     let pack = pack();

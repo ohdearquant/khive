@@ -116,9 +116,9 @@ impl KgPack {
     }
 
     /// Annotating notes for an edge (#803): the `annotates` convention only
-    /// writes a note→edge graph edge — nothing walked it back from the edge
-    /// side, so `get(edge_id)` returned the bare edge with no way to reach
-    /// "what annotated this and why". Discovery follows the namespace-agnostic
+    /// writes a note→edge graph edge — `get(edge_id)` previously returned the
+    /// bare edge without hydrating the annotating notes' bodies in its
+    /// response. Discovery follows the namespace-agnostic
     /// by-ID contract rather than the visible-set neighbor contract, then
     /// hydrates the full note bodies, since a neighbor hit alone carries only
     /// a name/kind summary, not the annotation content.
