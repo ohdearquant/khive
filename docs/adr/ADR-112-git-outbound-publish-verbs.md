@@ -810,13 +810,16 @@ the marker scan produced (zero, one, or more than one):
   equals the ledger's normalized `body`; for `git.publish_comment`, the candidate is already
   scoped to the exact parent issue/PR by the query path above, so the marker-stripped candidate
   `body` equals the ledger's normalized `body` - a candidate failing its verb's reduction,
-  before or after stripping, is discarded, not counted as a match; and (c) server-assigned,
-  non-caller-controllable metadata on the candidate node - GraphQL `id` (GitHub's `node_id`)
-  and the candidate's immutable author node id (`author.id`) equal to the `author_node_id`
-  value persisted in this operation's ledger row at claim time - a candidate failing any of
-  (a)-(c) is discarded, not counted as a match. The candidate's `createdAt` is deliberately not
+  before or after stripping, is discarded, not counted as a match; and (c) the candidate's
+  immutable author node id (`author.id`) equals the `author_node_id` value persisted in this
+  operation's ledger row at claim time - a candidate failing any of (a)-(c) is discarded, not
+  counted as a match. The candidate's own GraphQL `id` (GitHub's `node_id`) is server-assigned
+  and non-caller-controllable, but it is not an equality predicate here: the ledger holds no
+  remote object id at recovery time - discovering that object id is the purpose of recovery - so
+  the candidate `id` serves only to deduplicate traversal nodes and, once a candidate binds, to
+  persist the remote receipt and audit reference. The candidate's `createdAt` is deliberately not
   used as a discard filter: repository scope (a), per-verb content reduction (b), and the
-  immutable GraphQL object id and author node id in (c) already bind the candidate to this
+  immutable author node id in (c) already bind the candidate to this
   operation, and a local-clock lower bound would be redundant on top of that binding while
   remaining vulnerable to skew between the daemon's local ledger clock and GitHub's
   server-assigned timestamp. `createdAt` is still fetched on every candidate node, but only for
@@ -1294,10 +1297,13 @@ and no handler or remote work occurs.
    embedded inside the body rather than at its trailing edge, and asserts that text is
    preserved unchanged in both the published object and the ledger's normalized request, is
    never stripped, and does not cause a false content-reduction mismatch. A seventh set of
-   cases proves immutable-identity binding: publish a genuine object, then change the ambient
+   cases proves immutable-identity binding: publish a genuine object whose own GraphQL node `id`
+   is distinct from its `author.id` (as every real object is), then change the ambient
    `gh` identity's login (simulating a credential rotation or GitHub login rename) before
-   running recovery, and assert the operation still binds via the `author_node_id` persisted
-   in the ledger at claim time rather than the current ambient login. A companion clock-skew
+   running recovery, and assert the operation still binds through the `author.id`-to-
+   `author_node_id` equality using the value persisted in the ledger at claim time rather than the
+   current ambient login, and that the candidate's differing object `id` does not block the bind.
+   A companion clock-skew
    case sets the candidate's server-assigned `createdAt` earlier than the ledger's
    `created_at` and asserts recovery still binds the candidate, proving that the removed
    lower-bound filter is not required for correct binding.
