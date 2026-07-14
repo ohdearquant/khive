@@ -6,13 +6,15 @@ migration: given an already-prepared sequence of write plans, it applies them as
 whole unit. This document covers the suspend-free safety argument, the three-phase shape the
 module is one piece of, and its current wiring status.
 
-## Wiring status (ADR-099 migration step 3, sub-slice B2)
+## Wiring status (ADR-099 — B3 shipped)
 
-This module is the **mechanism only**. It has no production caller in B2 — no verb dispatch, no
-CLI `--atomic` surface, no daemon wiring. Tests in this file are the only consumer. Wiring a real
-per-verb `prepare` step (ops → `AtomicOpPlan`) and the `exec --ops-file --atomic` CLI surface is
-ADR-099 migration steps 1 (cont'd) and 4 — referred to throughout the source as the **B3 wiring
-point**.
+This module is the synchronous commit-pass piece of the shipped ADR-099 B3 flow. The production
+caller is `kkernel exec --ops-file --atomic` (see `kkernel`'s `atomic_apply` module): it runs the
+parse-time admissibility check (B1), drives the async prepare pass (ops → `AtomicOpPlan`), calls
+`run_atomic_unit` here for the one synchronous commit pass (B2), then applies the async
+post-commit effects (reindex). Only the v1 admissible verb set (`update`, `delete`, `link`,
+`merge`, `gtd.transition`, `gtd.complete`) may appear in an atomic ops-file; embedding-bearing,
+read, or unlisted verbs are rejected before any write.
 
 ## Suspend-free invariant
 
