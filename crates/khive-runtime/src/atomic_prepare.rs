@@ -13,7 +13,7 @@
 //! module (`prepare_governance_unimplemented` fails loudly rather than
 //! silently no-opping; `prepare_merge` is unreachable through `--atomic` and
 //! kept only for its own tests and as defense in depth). See
-//! `docs/atomic_prepare.md#module-scope` for why each of these is excluded
+//! `docs/api/atomic_prepare.md#scope-what-is-excluded-and-why` for why each of these is excluded
 //! and what would be required to admit them.
 
 use serde_json::Value;
@@ -299,7 +299,7 @@ async fn push_index_purge_statements(
 /// `EntityUpdated`, `delete_entity` -> `EntityDeleted`, `delete_note` ->
 /// `NoteDeleted`, `update_edge` -> `EdgeUpdated`, `delete_edge` ->
 /// `EdgeDeleted`. `update_note` and `link` append no event and must never
-/// call this. See `docs/atomic_prepare.md#event_append_statements` for why
+/// call this. See `docs/api/atomic_prepare.md#event_append_statements` for why
 /// this is a `PlanStatement` rather than a `PostCommitEffect`.
 ///
 /// Invariant: returned statements are unguarded — appended after the plan's
@@ -803,7 +803,7 @@ pub async fn prepare_update_entity_plan(
 /// patch semantics: `relation`/`weight`/`properties` are the only applicable
 /// fields, a changed `relation` is endpoint-validated first, `weight` is
 /// range-checked, and `properties` REPLACES `metadata` wholesale (no merge).
-/// See `docs/atomic_prepare.md#prepare_update_edge` for the DML-shape parity
+/// See `docs/api/atomic_prepare.md#prepare_update_edge` for the DML-shape parity
 /// detail with `update_edge`.
 ///
 /// Invariant (symmetric relations `competes_with`/`composed_with`): this
