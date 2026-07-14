@@ -1,6 +1,6 @@
 # Scoring and Reranking
 
-The scoring subsystem turns fused retrieval evidence, memory salience, age, profile state, and entity evidence into a deterministic score in `[0, 1]`. This reference covers normalization, conditional adjustments, entity extraction, and weighted reranking.
+The scoring subsystem turns fused retrieval evidence, memory salience, age, profile state, and entity evidence into a deterministic score. The response `score` field is clamped to `[0, 1]`; the ordering `rank_score` is multiplied by the entity posterior term without a final clamp and may exceed `1.0`. This reference covers normalization, conditional adjustments, entity extraction, and weighted reranking.
 
 ## `calculate_score`
 

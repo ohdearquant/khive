@@ -44,7 +44,7 @@ When too few visible candidates survive, the loop may double the window for a co
 
 A cold or stale graph enters `ensure_ann_for_model` under a bounded `ann_ready_timeout_ms` (default 8 seconds). A snapshot restore normally fits inside that window; a from-scratch production rebuild has exceeded 300 seconds. If another caller holds the model warm lock, or this recall begins the build itself and misses the bound, the model contributes zero vector hits, sets `ann_degraded`, and lets FTS continue. The build remains tracked and may finish for later requests. An ANN error likewise degrades rather than panicking.
 
-When no installed graph is available after the readiness attempt, sqlite-vec performs an exact query with namespace predicates in SQL. ANN post-filtering is repeated after hydration as defense in depth.
+When no installed graph is available after the readiness attempt — except when `ann_ready_timeout_ms` expired, where the model deliberately contributes no vector hits rather than paying an O(corpus) exact scan — sqlite-vec performs an exact query with namespace predicates in SQL. ANN post-filtering is repeated after hydration as defense in depth.
 
 ## Fusion
 

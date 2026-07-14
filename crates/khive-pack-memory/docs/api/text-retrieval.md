@@ -10,7 +10,7 @@ The text-retrieval subsystem converts recall queries into bounded FTS5 requests 
 
 The optimization is disabled by default, preserving ranked all-term behavior. When enabled, configuration controls maximum selected terms, selection rule, database gather mode, row cap or multiplier, and whether CJK bypasses term selection.
 
-The effective gather limit is either the explicit value or `candidate_limit * gather_cap_multiplier`, with checked arithmetic and positive-value validation. `to_search_options` converts pack configuration into the storage-layer `TextSearchOptions` used by the database.
+The effective gather limit is either the explicit value or `candidate_limit * gather_cap_multiplier`, with saturating multiplication and positive-value validation. `to_search_options` converts pack configuration into the storage-layer `TextSearchOptions` used by the database.
 
 ## `select_terms_by_stats`
 
