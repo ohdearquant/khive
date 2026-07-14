@@ -695,35 +695,51 @@ randomness fails the invocation before a ledger row or remote write and is audit
 content-free `remote_publish` error stage. The nonce and marker are immutable for the
 operation, including a `not_published` retry.
 
-The persisted nonce and full marker are local recovery credentials until the marker becomes
-visible on a successfully created remote object. Neither appears in receipts, error
-responses, audit payloads, graph properties, or logs. The marker is applied uniformly to
-issue and PR bodies, comment bodies, and release notes. Graph self-ingest strips exactly the
-persisted generated trailing marker from `content`; it does not remove arbitrary HTML
-comments supplied by the caller. Caller content may therefore contain operation UUIDs,
-legacy operation-id-only marker text, or marker-shaped HTML comments with caller-chosen
-nonce text without being rewritten. Such text is not a recovery match for a pending
-operation because it does not contain that operation's unpredictable persisted nonce.
+The persisted nonce and full marker are a local, unforgeable pre-plant deterrent only before
+the marker becomes visible on a successfully created remote object; once an object carrying
+the marker is public, any actor able to create content in an allowed repository can copy that
+exact marker byte-for-byte into another object. From that point on, the marker is a
+non-authoritative locator **hint**, never a security credential: recovery correctness MUST NOT
+depend on the visible marker being unforgeable or unique after disclosure. The nonce's proven
+property is narrower and still holds - it prevents a marker from being _pre-planted_ before the
+operation exists, because no one can predict it in advance - but it cannot and does not prevent
+a post-disclosure copy of the genuine marker. The binding rule below exists precisely to keep
+recovery correct under that copy. Neither the nonce nor the marker appears in receipts, error
+responses, audit payloads, graph properties, or logs. The marker is applied uniformly to issue
+and PR bodies, comment bodies, and release notes. Graph self-ingest strips exactly the
+persisted generated trailing marker from `content`; it does not remove arbitrary HTML comments
+supplied by the caller. Caller content may therefore contain operation UUIDs, legacy
+operation-id-only marker text, or marker-shaped HTML comments with caller-chosen nonce text
+without being rewritten. Such text is not a candidate hit for a pending operation because it
+does not contain that operation's unpredictable persisted nonce; a byte-for-byte copy of a
+_different_ operation's genuine, already-disclosed marker is a candidate hit and is resolved by
+the binding rule below, never treated as a match on its own.
 
-On a retry from `unconfirmed_publish`, the handler performs an authoritative, read-only,
-repo- and object-kind-scoped enumeration for the exact full persisted marker, including both
-the operation UUID and nonce. A GitHub search endpoint, search index, cached digest result,
-or first-page-only lookup is not authoritative for this purpose. The per-kind collection is
-fixed:
+On a retry from `unconfirmed_publish`, the handler performs a read-only, repo- and
+object-kind-scoped scan for the exact full persisted marker, including both the operation
+UUID and nonce, over the _single_ repository named on the ledger row for this operation -
+never any other allowed repository. This scan is a candidate-locating filter, not by itself
+the authoritative recovery decision; the binding rule below makes that decision. A GitHub search
+endpoint, search index, cached digest result, or first-page-only lookup is not acceptable for
+this purpose, since it can silently omit a genuine candidate. The per-kind collection is
+fixed and requests, for every node, the server-assigned fields the binding rule needs in
+addition to the marker text itself:
 
 - issues: the repository's `issues` connection, with `states: [OPEN, CLOSED]`,
-  `orderBy: {field: CREATED_AT, direction: ASC}`, and the issue `id`, `url`, `number`, and
-  `body`;
+  `orderBy: {field: CREATED_AT, direction: ASC}`, and the issue `id`, `url`, `number`,
+  `body`, `createdAt`, and `author { login }`;
 - pull requests: the repository's `pullRequests` connection, with
   `states: [OPEN, CLOSED, MERGED]`, `orderBy: {field: CREATED_AT, direction: ASC}`, and the
-  pull request `id`, `url`, `number`, and `body`;
+  pull request `id`, `url`, `number`, `body`, `baseRefName`, `headRefName`, `createdAt`, and
+  `author { login }`;
 - comments: the already-validated target returned by the repository's
   `issueOrPullRequest(number:)` field, followed by the concrete `Issue.comments` or
   `PullRequest.comments` connection with
-  `orderBy: {field: UPDATED_AT, direction: ASC}`, and the comment `id`, `url`, and `body`;
+  `orderBy: {field: UPDATED_AT, direction: ASC}`, and the comment `id`, `url`, `body`,
+  `createdAt`, and `author { login }`;
 - releases: the repository's `releases` connection, with
-  `orderBy: {field: CREATED_AT, direction: ASC}`, and the release `id`, `url`, and
-  `description`.
+  `orderBy: {field: CREATED_AT, direction: ASC}`, and the release `id`, `url`, `description`,
+  `tagName`, `createdAt`, and `author { login }`.
 
 These are fixed GraphQL object connections, not the GraphQL `search` connection. The handler
 invokes them through the code-selected literal `gh api graphql` command shape. The literal
@@ -735,22 +751,66 @@ The query document and selected response fields are likewise code constants.
 
 Every connection requests `first: 100` and `pageInfo { hasNextPage endCursor }`. The handler
 follows `endCursor` while `hasNextPage` is true, rejects a true `hasNextPage` with a missing
-or repeated cursor, deduplicates nodes by immutable GraphQL `id`, and sorts any matching
-identities by that id before deciding the result. A no-match conclusion is valid only after
-`hasNextPage` is false. Each recovery invocation is bounded by both 1,000 pages and 120
-seconds. The traversal returns a content-free unresolved reconciliation error if the
-120-second deadline is reached, another page remains after page 1,000, cursor progress is
-malformed, or any page read fails. The operation remains `unconfirmed_publish`; the bounded
-failure must not be treated as no match and must never enable another create.
+or repeated cursor, and deduplicates nodes by immutable GraphQL `id` into the candidate set. A
+"no candidate" conclusion is valid only after `hasNextPage` is false across every page. Each
+recovery invocation is bounded by both 1,000 pages and 120 seconds. The traversal returns a
+content-free unresolved reconciliation error if the 120-second deadline is reached, another
+page remains after page 1,000, cursor progress is malformed, or any page read fails. The
+operation remains `unconfirmed_publish` in every one of these bounded-failure cases; a bounded
+failure must not be treated as "no candidate" and must never enable another create. This is
+the one path recovery cannot resolve automatically: an operator may resolve a persistently
+unconfirmed operation stuck on a bounded traversal failure only after independently
+establishing whether the remote object exists; silently changing the idempotency key is not a
+recovery action.
 
-This rule applies identically to issue, pull-request, comment, and release reconciliation;
-an operation-id-only or nonce-mismatched marker is never accepted on any path. One match
-supplies the remote identity and advances to `published_pending_ingest`; multiple matches
-are an integrity error; no match after the complete traversal leaves the operation
-unconfirmed and returns an error carrying `operation_id` and `state`, but no publish
-content. It never calls a GitHub create command. An operator may resolve a persistently
-unconfirmed operation only after independently establishing whether the remote object
-exists; silently changing the idempotency key is not a recovery action.
+This rule applies identically to issue, pull-request, comment, and release reconciliation; an
+operation-id-only or nonce-mismatched marker is never a candidate on any path. Once the scan
+above completes without a bounded failure, an exact-marker candidate hit is never by itself an
+integrity error and never by itself a match - **the recovery marker is a locator hint, not a
+credential**, and it is not disclosure-safe once the object carrying it is public. The
+following binding rule is authoritative and applies uniformly regardless of how many candidates
+the marker scan produced (zero, one, or more than one):
+
+- Scope every candidate to (a) the single repository named on this operation's ledger row -
+  already guaranteed by the repo-scoped scan above, so a marker copied into a _different_
+  allowed repository is out of scope by construction and never enters the candidate set;
+  (b) a per-verb content reduction of the ledger's stored normalized request - for
+  `git.publish_release`, candidate `tagName` equals the ledger's normalized `tag`; for
+  `git.publish_issue`, candidate `title` and `body` equal the ledger's normalized `title` and
+  `body`; for `git.publish_pr`, candidate `title`, `body`, `baseRefName`, and `headRefName`
+  equal the ledger's normalized `title`, `body`, `base`, and `head`; for `git.publish_comment`,
+  the candidate is already scoped to the exact parent issue/PR by the query path above, so
+  candidate `body` equals the ledger's normalized `body` - a candidate failing its verb's
+  reduction is discarded, not counted as a match; and (c) server-assigned,
+  non-caller-controllable metadata on the candidate node - GraphQL `id` (GitHub's `node_id`),
+  `createdAt` falling within the recorded crash window `[ledger.created_at, now]`, and
+  `author.login` equal to the `gh` identity the daemon publishes under - a candidate failing
+  any of (a)-(c) is discarded, not counted as a match.
+- **Zero candidates survive (a)-(c):** treat every exact-marker hit as a foreign copy out of
+  scope for this operation and proceed exactly as if no marker existed - the operation is not
+  bound to any remote object, and a same-identity retry may attempt the create. This is safe
+  because a genuine create for this operation always writes the marker into the object it
+  creates, so a genuinely-published object for this operation is always a candidate that
+  satisfies (a)-(c); zero surviving candidates therefore proves no such object exists yet, and
+  the retry cannot create a marker-confusable duplicate of an object that was never actually
+  published. This case never returns an integrity error and never leaves the operation stuck.
+- **Exactly one candidate survives (a)-(c):** it supplies the remote identity and the operation
+  advances to `published_pending_ingest`. This is the ordinary case.
+- **More than one candidate survives (a)-(c):** this can only mean the genuine object was
+  created and a content-reduction-colliding duplicate was also created by the daemon identity
+  inside the crash window - never a forged binding, because (b) and (c) already restrict
+  survivors to this operation's own content and its own publishing identity. Bind to the
+  survivor with the _earliest_ `createdAt`: it is the genuine first create for this operation's
+  idempotency key. Every later survivor is recorded as a benign idempotent-replay audit note
+  referencing its own `id` and `createdAt` - never a fatal integrity error, and never a reason
+  to leave the operation unconfirmed.
+
+Recovery therefore always terminates in either a confirmed binding (`published_pending_ingest`
+or later) or a safe same-identity republish; the marker scan by itself never blocks either
+outcome, and no path leaves a genuinely-published operation permanently unrecoverable solely
+because its marker became visible and was copied. Only the bounded-traversal-failure case
+above requires operator judgment, and only because the scan itself did not complete - never
+because of what the scan found.
 
 The crash and failure windows are therefore explicit:
 
@@ -1152,7 +1212,27 @@ and no handler or remote work occurs.
    number, and cursor values cannot add or alter positional operands. Release cases also
    inject failures immediately after the reference-note upsert and immediately after its
    project-edge ensure; each recovery must finish with exactly one reference note and
-   exactly one `annotates` edge to the resolved repo-anchor project.
+   exactly one `annotates` edge to the resolved repo-anchor project. Two further cases per
+   publish verb prove the marker-replay binding rule is safe against a genuine, disclosed
+   marker being copied, not just a caller-forged one: (iii) publish a genuine object, then
+   copy its exact full marker byte-for-byte into a new object in a _different_ allowed
+   repository, then run recovery for the original operation - assert recovery binds the
+   original repository's genuine object, ignores the cross-repo copy without inspecting it
+   further, and never returns an integrity error; (iv) copy the exact full marker
+   byte-for-byte into a second object in the _same_ target repository whose per-verb content
+   reduction differs from the recovering operation's own ledger row, with a later `createdAt`
+   than the genuine object, then run recovery - assert recovery discards
+   the second object because it fails the per-verb content reduction in (b), binds the
+   earliest matching candidate, and reaches `published_pending_ingest`. A fifth case covers
+   the same-content-reduction duplicate: publish a genuine object, inject a store error that
+   leaves the operation `unconfirmed_publish` after the remote create actually succeeded, then
+   have a second, independent create for the same repository, verb, and per-verb content
+   reduction (but a
+   different `idempotency_key`) succeed with a later `createdAt` before the first operation's
+   retry runs - assert the first operation's recovery binds the earliest `createdAt` candidate,
+   records the later one as a benign idempotent-replay audit note carrying its own `id` and
+   `createdAt`, issues no second create, and reaches a terminal confirmed state rather than an
+   integrity error.
 6. **Idempotency scope and request conflict.** Reusing a key with identical normalized
    arguments returns or resumes the original operation within the same namespace and verb;
    reusing it with different arguments in that same scope fails before transport. Reuse the
@@ -1332,14 +1412,15 @@ Four forks were presented for this design; each is resolved in place.
 
 ## Alternatives Considered
 
-| Alternative                                                      | Why not adopted                                                                                                                                                                                                                                                                                              |
-| ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Enforce hygiene only at the client-side hook, no server verb     | Does not compose with the eventual "raw `gh` denied for content writes" endpoint: any caller not running a current hook has no enforcement at all. A server-side verb is the one chokepoint every caller must pass through regardless of local hook state.                                                   |
-| Semantic or LLM-based content classification instead of patterns | Rejected for v0. Patterns are deterministic, auditable as a file diff, and portable across two independent implementations by construction; a classifier's decisions are neither deterministic nor reviewable in the same way, and out-of-scope per this ADR's scope decision.                               |
-| A `force=true` per-call escape parameter                         | Rejected. Defeats the review property the allowlist file provides: a legitimate exception must be a versioned, reviewable config edit, never a call-site flag any caller can set for itself.                                                                                                                 |
-| A single merged pattern file, no in-repo/overlay split           | Rejected. The in-repo file must never carry concrete internal-identifier tokens (F2); a single file would either leak internal terms into a public repository or force every installation to maintain a full private copy instead of layering a small overlay onto a shared generic base.                    |
-| Fold outbound publish into `git.digest` with a write mode        | Rejected, matching ADR-108's identical rejection of overloading `git.digest`: it is read/ingest-shaped, and conflating it with a write-and-scan operation mixes two operations with entirely different audit and failure-mode needs.                                                                         |
-| Derive the recovery marker from `operation_id` alone             | Rejected. The id is caller supplied and predictable before the operation is claimed, so another publication could pre-plant that marker and be mistaken for the pending operation. A persisted daemon-generated nonce preserves caller content while making a pending operation's full marker unpredictable. |
+| Alternative                                                                                                        | Why not adopted                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| ------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Enforce hygiene only at the client-side hook, no server verb                                                       | Does not compose with the eventual "raw `gh` denied for content writes" endpoint: any caller not running a current hook has no enforcement at all. A server-side verb is the one chokepoint every caller must pass through regardless of local hook state.                                                                                                                                                                                                                                                           |
+| Semantic or LLM-based content classification instead of patterns                                                   | Rejected for v0. Patterns are deterministic, auditable as a file diff, and portable across two independent implementations by construction; a classifier's decisions are neither deterministic nor reviewable in the same way, and out-of-scope per this ADR's scope decision.                                                                                                                                                                                                                                       |
+| A `force=true` per-call escape parameter                                                                           | Rejected. Defeats the review property the allowlist file provides: a legitimate exception must be a versioned, reviewable config edit, never a call-site flag any caller can set for itself.                                                                                                                                                                                                                                                                                                                         |
+| A single merged pattern file, no in-repo/overlay split                                                             | Rejected. The in-repo file must never carry concrete internal-identifier tokens (F2); a single file would either leak internal terms into a public repository or force every installation to maintain a full private copy instead of layering a small overlay onto a shared generic base.                                                                                                                                                                                                                            |
+| Fold outbound publish into `git.digest` with a write mode                                                          | Rejected, matching ADR-108's identical rejection of overloading `git.digest`: it is read/ingest-shaped, and conflating it with a write-and-scan operation mixes two operations with entirely different audit and failure-mode needs.                                                                                                                                                                                                                                                                                 |
+| Derive the recovery marker from `operation_id` alone                                                               | Rejected. The id is caller supplied and predictable before the operation is claimed, so another publication could pre-plant that marker and be mistaken for the pending operation. A persisted daemon-generated nonce preserves caller content while making a pending operation's full marker unpredictable.                                                                                                                                                                                                         |
+| Treat the visible marker as the sole recovery credential and any exact-marker duplicate as a fatal integrity error | Rejected. The marker is necessarily disclosed once its object is public, so any actor able to create content in an allowed repository can copy it after the fact; treating a copy as fatal turns a genuinely-published operation into a permanent, actor-inducible unrecoverable state. The nonce blocks pre-planting, not post-disclosure replay, so recovery instead binds on the repo-scoped ledger row, the per-verb content reduction, and server-assigned metadata, with the marker demoted to a locator hint. |
 
 ## References
 
