@@ -161,16 +161,28 @@ deletes a tag or any other ref.
 The `gh` process boundary has a fixed interpretation. Code selects the executable,
 subcommand, and complete option-name set for each verb; no caller string can select or add
 a command, subcommand, option, environment-variable name, API field name, or output parser.
-Every caller-controlled value emitted in the `gh` argument vector is a separate value bound
-to a code-selected, fixed value-taking option. The builder must not use a command form that
-requires an unbound caller-controlled positional operand: it must instead choose an
-equivalent fixed-option form, encode the value through structured stdin under fixed field
-names, or reject before spawn. It never concatenates a value into an option name or shell
-string. Typed booleans may select only their one documented fixed flag, and arrays expand
-only into repetitions of their documented fixed value-taking option. Thus an accepted
-free-text value such as a title beginning `--` remains data, while an option-looking
-identifier such as a `repo`, `target`, `head`, `base`, or `tag` beginning `-` fails its
-grammar before transport.
+Except for the sole release-tag exception below, every caller-controlled value emitted in
+the `gh` argument vector is a separate value bound to a code-selected, fixed value-taking
+option. The builder must not otherwise use a command form that requires an unbound
+caller-controlled positional operand: it must instead choose an equivalent fixed-option
+form, encode the value through structured stdin under fixed field names, or reject before
+spawn. It never concatenates a value into an option name or shell string. Typed booleans may
+select only their one documented fixed flag, and arrays expand only into repetitions of
+their documented fixed value-taking option. Thus an accepted free-text value such as a
+title beginning `--` remains data, while an option-looking identifier such as a `repo`,
+`target`, `head`, `base`, or `tag` beginning `-` fails its grammar before transport.
+
+The **sole positional exception** is the tag operand required by `gh release create`. It is
+not free caller input at argv-construction time: before the operation is claimed, it must
+pass the closed ASCII ref grammar above and the read-only preflight must prove that the exact
+`refs/tags/<tag>` already exists in `repo`. Failure of either check rejects the operation
+without publishing. The builder then emits the fixed, closed shape
+`gh release create --verify-tag <fixed options> -- <validated-tag>`, with the validated tag
+as the only operand after the mandatory `--` end-of-options separator. Release assets and
+all other positional operands are forbidden. The separator remains mandatory even though
+the grammar already rejects a leading `-`, whitespace, and shell or option
+metacharacters. Every other caller-controlled value on every verb remains bound to a fixed
+value-taking option as specified above.
 
 ### Canonical request and optional-argument contract
 
@@ -190,20 +202,26 @@ the sorted forms above are the only forms stored, hashed, or sent to `gh`. "Norm
 `tag`" in the release-title rule means the exact required `tag` string after validation;
 v0 does not trim, case-fold, or otherwise rewrite it.
 
-`idempotency_key` is required on all four verbs. It is a caller-generated UUID in
-canonical lowercase hyphenated form and identifies one logical publication across retries.
+`idempotency_key` is required on all four verbs. It is a caller-generated UUID in canonical
+lowercase hyphenated form. One logical publication across retries is identified by the
+three-part operation identity `(namespace, verb, idempotency_key)`, where `namespace` is the
+write namespace from the handler's `NamespaceToken` and `verb` is the exact dispatched
+publish verb. Every ledger lookup and mutation must constrain all three components.
+
 The handler validates all arguments, applies the defaults and array normalization above,
 and constructs a canonical object containing every verb argument other than
 `idempotency_key`, including the explicit default values. It sorts object keys
 lexicographically by unsigned UTF-8 bytes, serializes the object as compact UTF-8 JSON, and
 stores the BLAKE3 hash of those bytes. The generated reconciliation nonce and marker are not
 part of the hash. Consequently, omitted and explicit defaults hash identically, as do
-permutations of the same labels or assignees. The same key with the same hash resumes that
-operation; reusing it with a different hash is rejected before any network call. The
-implementation stores the key as `operation_id` in the recovery ledger described below. A
-successful retry returns the cached remote result. This explicit key is necessary because
-neither `gh` nor a GitHub create operation supplies a transactional boundary shared with
-khive's graph store.
+permutations of the same labels or assignees. The same three-part operation identity with
+the same hash resumes that operation; reusing it with a different hash is rejected before
+any network call. Reusing the UUID in a different namespace or for a different verb is a
+distinct operation and must never return or mutate the first operation's cached receipt.
+The implementation stores the UUID component as `operation_id` in the recovery ledger
+described below. A successful same-identity retry returns the cached remote result. This
+explicit identity is necessary because neither `gh` nor a GitHub create operation supplies
+a transactional boundary shared with khive's graph store.
 
 ### Comment target grammar
 
@@ -288,9 +306,10 @@ authorization, and hygiene scanning have completed:
    the same reason ADR-088 §5 gave: it already handles auth and pagination correctly for
    this environment. The operation-bound marker described in "Publish recovery state
    machine" is appended after user content has passed the scan. A release create always
-   includes the code-selected fixed `--verify-tag` flag and never includes `--target`, so a
-   tag removed after the read-only check still causes the create to abort rather than create
-   a replacement tag or any other ref.
+   uses the sole positional exception's fixed argv shape, including the code-selected
+   `--verify-tag` flag and mandatory `--` separator, and never includes `--target` or a
+   release asset, so a tag removed after the read-only check still causes the create to
+   abort rather than create a replacement tag or any other ref.
 7. **Persist the remote receipt.** Once GitHub returns, the handler durably stores the
    remote URL and number or id and moves the operation to `published_pending_ingest`
    before attempting any graph write.
@@ -561,13 +580,15 @@ Self-ingest does not substitute a publication URL for any of these common proper
   new pack-owned note kinds for this ADR's own purposes, both use the existing base
   `reference` note kind (ADR-013), with `content` set to the release notes or comment body
   with the khive reconciliation marker removed, `properties.url` set to the published URL,
-  and `properties.publish_operation_id` set to the operation UUID.
+  `properties.publish_operation_id` set to the operation UUID, and
+  `properties.publish_verb` set to the exact publish verb.
 - A release reconciliation is an upsert with exactly one live `reference` note under
-  `(kind=reference, namespace, properties.publish_operation_id)`. It creates or updates
-  that note and ensures exactly one `annotates` edge from the note to the resolved
-  repo-anchor `project`. Replaying the initial self-ingest or recovering after either the
-  note upsert or edge ensure must leave one note and one such edge; a release reference
-  without that edge is not ingested and cannot advance to `ingested_pending_audit`.
+  `(kind=reference, namespace, properties.publish_verb,
+  properties.publish_operation_id)`. It creates or updates that note and ensures exactly
+  one `annotates` edge from the note to the resolved repo-anchor `project`. Replaying the
+  initial self-ingest or recovering after either the note upsert or edge ensure must leave
+  one note and one such edge; a release reference without that edge is not ingested and
+  cannot advance to `ingested_pending_audit`.
 - A comment uses the same reference-note upsert key. A comment targeting an already-ingested
   issue or pull request `annotates` that note; if the target was never ingested, it
   `annotates` the repo-anchor `project` entity instead. This mirrors ADR-088 Amendment 1's
@@ -584,10 +605,12 @@ exactly one `annotates` edge from it to the repo project.
 
 GitHub and the graph store cannot share a transaction. The git pack therefore owns a
 durable `git_publish_operation` ledger. Its minimum persisted fields are `operation_id`
-(the idempotency UUID, primary key), `namespace`, `verb`, `repo`, a canonical request hash,
-the normalized request needed for local replay, `reconciliation_nonce`, `marker`, `state`,
-`remote_url`, `remote_number`, `remote_id`, `note_id`, `audit_event_id`, `last_error`,
-`created_at`, and `updated_at`. The stored request has already passed the hygiene and secret
+(the idempotency UUID), `namespace`, `verb`, `repo`, a canonical request hash, the normalized
+request needed for local replay, `reconciliation_nonce`, `marker`, `state`, `remote_url`,
+`remote_number`, `remote_id`, `note_id`, `audit_event_id`, `last_error`, `created_at`, and
+`updated_at`. The composite `(namespace, verb, operation_id)` is the ledger's primary key
+and unique operation identity; no global uniqueness constraint on `operation_id` may collapse
+two supported dispatch scopes. The stored request has already passed the hygiene and secret
 scans, is local daemon state, and must never be copied into an Event payload or error
 response.
 Because the scan and nonce generation precede the ledger claim, a validation failure,
@@ -612,8 +635,9 @@ ingested_pending_audit -> complete
   its response becoming durable. A retry in this state never issues another create.
 - **`not_published`** is reachable only when `std::process::Command::spawn` itself returns
   an error, proving that no child process and therefore no remote request started. A retry
-  with the same key may move back to `unconfirmed_publish` and make the first remote
-  attempt. No child exit status or output-parse failure is strong enough for this state.
+  with the same operation identity may move back to `unconfirmed_publish` and make the first
+  remote attempt. No child exit status or output-parse failure is strong enough for this
+  state.
 - **`published_pending_ingest`** requires a durably stored remote URL and the applicable
   remote number or id. It means GitHub accepted the object but graph reconciliation is not
   yet complete. Retries perform only the local upsert and edge reconciliation.
@@ -650,23 +674,59 @@ legacy operation-id-only marker text, or marker-shaped HTML comments with caller
 nonce text without being rewritten. Such text is not a recovery match for a pending
 operation because it does not contain that operation's unpredictable persisted nonce.
 
-On a retry from `unconfirmed_publish`, the handler performs a read-only, repo- and
-object-kind-scoped search for the exact full persisted marker, including both the operation
-UUID and nonce. This rule applies identically to issue, pull-request, comment, and release
-reconciliation; an operation-id-only or nonce-mismatched marker is never accepted on any
-path. One match supplies the remote identity and advances to `published_pending_ingest`;
-multiple matches are an integrity error; no match leaves the operation unconfirmed and
-returns an error carrying `operation_id` and `state`, but no publish content. It never calls
-a GitHub create command. An operator may resolve a persistently unconfirmed operation only
-after independently establishing whether the remote object exists; silently changing the
-idempotency key is not a recovery action.
+On a retry from `unconfirmed_publish`, the handler performs an authoritative, read-only,
+repo- and object-kind-scoped enumeration for the exact full persisted marker, including both
+the operation UUID and nonce. A GitHub search endpoint, search index, cached digest result,
+or first-page-only lookup is not authoritative for this purpose. The per-kind collection is
+fixed:
+
+- issues: the repository's `issues` connection, with `states: [OPEN, CLOSED]`,
+  `orderBy: {field: CREATED_AT, direction: ASC}`, and the issue `id`, `url`, `number`, and
+  `body`;
+- pull requests: the repository's `pullRequests` connection, with
+  `states: [OPEN, CLOSED, MERGED]`, `orderBy: {field: CREATED_AT, direction: ASC}`, and the
+  pull request `id`, `url`, `number`, and `body`;
+- comments: the already-validated target returned by the repository's
+  `issueOrPullRequest(number:)` field, followed by the concrete `Issue.comments` or
+  `PullRequest.comments` connection with
+  `orderBy: {field: UPDATED_AT, direction: ASC}`, and the comment `id`, `url`, and `body`;
+- releases: the repository's `releases` connection, with
+  `orderBy: {field: CREATED_AT, direction: ASC}`, and the release `id`, `url`, and
+  `description`.
+
+These are fixed GraphQL object connections, not the GraphQL `search` connection. The handler
+invokes them through the code-selected literal `gh api graphql` command shape. The literal
+`graphql` endpoint operand contains no caller data and does not add a caller-controlled
+positional exception. Canonical owner/name components and subsequent cursors are values of
+code-selected `--raw-field` options, and the validated decimal comment target number is the
+value of a code-selected `--field` option; every GraphQL variable name is a code constant.
+The query document and selected response fields are likewise code constants.
+
+Every connection requests `first: 100` and `pageInfo { hasNextPage endCursor }`. The handler
+follows `endCursor` while `hasNextPage` is true, rejects a true `hasNextPage` with a missing
+or repeated cursor, deduplicates nodes by immutable GraphQL `id`, and sorts any matching
+identities by that id before deciding the result. A no-match conclusion is valid only after
+`hasNextPage` is false. Each recovery invocation is bounded by both 1,000 pages and 120
+seconds. The traversal returns a content-free unresolved reconciliation error if the
+120-second deadline is reached, another page remains after page 1,000, cursor progress is
+malformed, or any page read fails. The operation remains `unconfirmed_publish`; the bounded
+failure must not be treated as no match and must never enable another create.
+
+This rule applies identically to issue, pull-request, comment, and release reconciliation;
+an operation-id-only or nonce-mismatched marker is never accepted on any path. One match
+supplies the remote identity and advances to `published_pending_ingest`; multiple matches
+are an integrity error; no match after the complete traversal leaves the operation
+unconfirmed and returns an error carrying `operation_id` and `state`, but no publish
+content. It never calls a GitHub create command. An operator may resolve a persistently
+unconfirmed operation only after independently establishing whether the remote object
+exists; silently changing the idempotency key is not a recovery action.
 
 The crash and failure windows are therefore explicit:
 
 | Window                                                   | Durable state              | Retry behavior                                                                    |
 | -------------------------------------------------------- | -------------------------- | --------------------------------------------------------------------------------- |
 | Before the operation insert commits                      | No operation               | The request may claim its key; no remote write has occurred                       |
-| Spawn fails before a child exists                        | `not_published`            | A same-key retry may safely attempt the first create                              |
+| Spawn fails before a child exists                        | `not_published`            | A same-identity retry may safely attempt the first create                         |
 | After spawn, during `gh`, before receipt commit          | `unconfirmed_publish`      | Read-only marker reconciliation; never create                                     |
 | After receipt commit, before/during note or edge write   | `published_pending_ingest` | Upsert note and ensure edge; never create                                         |
 | After graph reconciliation, before/during audit append   | `ingested_pending_audit`   | Append idempotently with the persisted UUIDv7 Event id; never create or re-ingest |
@@ -691,7 +751,7 @@ failure to spawn `gh` is a confirmed no-publish hard error. Once the child proce
 an error or missing parseable response is conservatively `unconfirmed_publish`, because
 GitHub may have accepted the request before the local failure became visible. The caller
 receives `{ok:false, error: "publication state unresolved", operation_id, state}` and must
-retry with the same idempotency key; recovery follows the read-only marker path above.
+retry with the same operation identity; recovery follows the read-only marker path above.
 This asymmetry is deliberate: skipped ingest work is recoverable on the next digest pass,
 whereas a retried create could duplicate public content.
 
@@ -853,10 +913,11 @@ nonzero_digit = "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" ;
 
 The lexical and semantic rules are closed:
 
-- Pattern source must contain only printable ASCII bytes `0x20` through `0x7e`. A literal
-  is any such byte except `\`, `.`, `^`, `$`, `|`, `(`, `)`, `[`, `]`, `{`, `}`, `*`,
-  `+`, or `?`. A metacharacter is literal only when escaped with `\`; `\b` alone denotes
-  the boundary atom. A bare `.` wildcard and every other escape are rejected.
+- Pattern source must be 1-4,096 bytes long and contain only printable ASCII bytes `0x20`
+  through `0x7e`. A literal is any such byte except `\`,
+  `.`, `^`, `$`, `|`, `(`, `)`, `[`, `]`, `{`, `}`, `*`, `+`, or `?`. A
+  metacharacter is literal only when escaped with `\`; `\b` alone denotes the boundary
+  atom. A bare `.` wildcard and every other escape are rejected.
 - A class is positive, ASCII-only, and non-empty. `]` and `\` must be escaped; `-` is
   literal only when escaped or first or last, and `^` as the first class byte is rejected.
   Inside a class, the only accepted escapes are `\]`, `\\`, and `\-`; every other
@@ -879,11 +940,16 @@ The lexical and semantic rules are closed:
 
 Each loader must consume the entire pattern into this grammar and reject any other syntax
 before scan service becomes available. A host engine accepting a pattern does not make it
-valid. An implementation may translate the parsed form to a host regex only if it selects
-byte mode and preserves these exact anchor, boundary, and ASCII-case rules; otherwise it
-must evaluate the parsed form directly. This grammar and byte semantics, rather than the
-behavior of either host regex engine or a finite fixture set, define cross-client
-equivalence.
+valid. Both the server publish path and the paired hook **must** evaluate the parsed grammar
+with a bounded, worst-case linear-time byte matcher, such as a Thompson-automaton or
+RE2-style engine, with no backtracking execution path. Translation to a host regex engine is
+permitted only when that engine guarantees linear-time evaluation for every accepted
+pattern while preserving these exact anchor, boundary, byte-mode, and ASCII-case rules; a
+backtracking engine is prohibited even when a particular pattern appears benign. Matcher
+work must be bounded linearly in candidate byte length for the already bounded pattern
+source, and exhaustion of an implementation resource bound fails closed rather than falling
+back to a backtracking matcher. This grammar and byte semantics, rather than the behavior of
+either host regex engine or a finite fixture set, define cross-client equivalence.
 
 ### Match semantics
 
@@ -945,6 +1011,12 @@ files; an absent overlay; and malformed or revision-mismatched overlays. Passing
 in both the Rust handler suite and the hook suite is a regression gate for any pattern-format,
 loader, or matcher change; it is not the definition of cross-client equivalence.
 
+The shared corpus must also include an ambiguous-repetition near-miss evaluated against a
+maximum-length 65,536-scalar candidate. Both consumers must prove the linear bound with an
+instrumented matcher-step or automaton-transition budget proportional to candidate byte
+length; a wall-clock-only assertion is insufficient. The case must complete with the same
+no-match result in both suites and must not permit a backtracking fallback.
+
 ## Implementation requirements and verification
 
 The implementation ships the verbs, operation ledger, pattern loader, scan, audit rows,
@@ -992,11 +1064,11 @@ pattern file, it must include these contract tests:
    and prove it is canonicalized in place, pre-seed two aliases and prove resolution fails
    without choosing either, prove an unrelated same-basename project is ignored, and prove
    a mismatched explicit `git.digest project` id is rejected. An initial release publish
-   also asserts exactly one reference note under its operation-id upsert key and exactly one
-   `annotates` edge to this canonical project.
+   also asserts exactly one reference note under its verb-qualified operation-identity upsert
+   key and exactly one `annotates` edge to this canonical project.
 5. **Recovery failure injection.** Inject a crash or store error after each boundary in
    the recovery table: operation insert, remote response, note upsert, edge ensure, audit
-   append, and completion update. Resume with the same idempotency key and assert that the
+   append, and completion update. Resume with the same operation identity and assert that the
    remote create spy observed exactly one create, unfinished local work completed, and the
    final success Event exists exactly once. Assert that `audit_event_id` is a UUIDv7 in the
    initial claim and that every recovery attempt and the final Event reuse that exact id. The
@@ -1007,14 +1079,26 @@ pattern file, it must include these contract tests:
    in both legacy operation-id-only marker text and a full marker-shaped comment with a
    nonmatching nonce; A still receives its own generated trailing marker. B's child then
    starts, its response is lost without creating B's remote object, and B remains
-   `unconfirmed_publish`. A same-key retry of B must not bind A's remote identity, must find
-   no exact full-marker match, must issue no second create, and must return the unresolved
-   error. Release cases also inject failures immediately after the reference-note upsert and
-   immediately after its project-edge ensure; each recovery must finish with exactly one
-   reference note and exactly one `annotates` edge to the resolved repo-anchor project.
-6. **Idempotency-key conflict.** Reusing a key with identical normalized arguments returns
-   or resumes the original operation; reusing it with different arguments fails before
-   transport.
+   `unconfirmed_publish`. A same-identity retry of B must not bind A's remote identity, must
+   find no exact full-marker match, must issue no second create, and must return the
+   unresolved error. For each of issue, pull-request, comment, and release recovery, place
+   the exact marker on an object beyond the first 100-item page and prove that the
+   authoritative per-kind traversal follows pagination, finds it, and issues no second
+   create. Bound, malformed-pagination, and mid-pagination failure cases must leave the
+   operation `unconfirmed_publish` rather than reporting no match. The recovery transport
+   spy also proves that `graphql` is the only endpoint operand and that owner, name, target
+   number, and cursor values cannot add or alter positional operands. Release cases also
+   inject failures immediately after the reference-note upsert and immediately after its
+   project-edge ensure; each recovery must finish with exactly one reference note and
+   exactly one `annotates` edge to the resolved repo-anchor project.
+6. **Idempotency scope and request conflict.** Reusing a key with identical normalized
+   arguments returns or resumes the original operation within the same namespace and verb;
+   reusing it with different arguments in that same scope fails before transport. Reuse the
+   same UUID in two explicit namespaces and prove that two ledger identities and
+   namespace-specific graph records are created and neither invocation returns the other's
+   cached receipt. Reuse the same UUID across two publish verbs and prove that their ledger
+   identities remain distinct; a comment/release pair must also produce distinct reference
+   notes under `properties.publish_verb` rather than collide on the UUID.
 7. **External identifier hygiene.** Table-driven fake-transport tests put a token-denylist
    match and a `secret_gate` match in each of `tag`, `head`, and `base`. Every case returns
    a hygiene denial before an operation-ledger claim or any `gh` invocation, the transport
@@ -1032,15 +1116,19 @@ pattern file, it must include these contract tests:
    span, offset, or length.
 8. **Release-tag boundary.** A missing-tag case is rejected by the read-only preflight before
    an operation-ledger claim or remote write. An existing-tag case reaches release creation,
-   and the transport spy proves the fixed argv includes `--verify-tag`, excludes `--target`,
-   and performs no tag/ref write. A race case removes the tag after preflight and proves the
-   release create fails without recreating it.
+   and the transport spy proves the fixed argv includes `--verify-tag`, excludes `--target`
+   and release assets, contains the mandatory `--` separator immediately before the sole
+   validated-tag positional, and performs no tag/ref write. A tag beginning `-` or containing
+   whitespace or a shell/option metacharacter is rejected before argv construction and cannot
+   alter option parsing. A race case removes the tag after preflight and proves the release
+   create fails without recreating it.
 9. **Optional-argument normalization.** For labels and assignees, compare omission with
    `[]`, compare at least two permutations of the same non-empty array, and retry each form
    with one idempotency key. For draft, compare omission with `false`. For release title,
    compare omission, `""`, and the normalized tag. Each equivalence case must produce the
    same canonical JSON and request hash and must resume or return the same operation on a
-   same-key retry; each genuinely different normalized value must conflict on that key.
+   same-identity retry; each genuinely different normalized value must conflict on that
+   identity.
    Limit, element-shape, duplicate, and JSON-`null` failures occur before transport.
 10. **Hook/server scan conformance.** The Rust handler suite and the hook implementation's
     suite both execute every case in
@@ -1049,7 +1137,9 @@ pattern file, it must include these contract tests:
     allow/deny result, field or rule-id mismatch, byte-grammar loader mismatch, allowlist
     mismatch, or revision mismatch. Separate loader tests prove that both implementations
     reject every source outside the closed grammar even when their host regex engine would
-    accept it.
+    accept it. Both suites also run the shared ambiguous-repetition near-miss against a
+    65,536-scalar field under the deterministic linear matcher-work bound; neither may invoke
+    or fall back to a backtracking engine.
 
 `tests/smoke_test.py` must cover one allowed publish against a controlled fake `gh`, one
 hygiene deny, one comment-target validation failure, and one resumed
