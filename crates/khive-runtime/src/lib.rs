@@ -10,7 +10,6 @@ pub mod config;
 pub mod config_ledger;
 pub mod cost_unit;
 pub mod curation;
-#[cfg(unix)]
 pub mod daemon;
 pub mod embedder_registry;
 pub mod engine_config;
@@ -47,11 +46,10 @@ pub use curation::{
     EntityDedupMergePolicy, EntityPatch, MergeSummary, NotePatch,
 };
 #[cfg(unix)]
-pub use daemon::acquire_recovery_lock;
+pub use daemon::{acquire_recovery_lock, pid_path, run_daemon, socket_path, DaemonDispatch};
 pub use daemon::{
-    active_phase_names, background_task_count, pid_path, register_active_phase, run_daemon,
-    socket_path, track_background_task, DaemonDispatch, DaemonRequestFrame, DaemonResponseFrame,
-    PhaseGuard, PROTOCOL_VERSION,
+    active_phase_names, background_task_count, register_active_phase, track_background_task,
+    DaemonRequestFrame, DaemonResponseFrame, PhaseGuard, PROTOCOL_VERSION,
 };
 pub use embedder_registry::{EmbedderProvider, EmbedderRegistry, LatticeEmbedderProvider};
 pub use engine_config::{
