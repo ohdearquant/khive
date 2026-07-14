@@ -1301,6 +1301,64 @@ mod tests {
         assert_eq!(candidates.len(), 2);
     }
 
+    /// Stage 4 searches deeper than the caller-facing candidate limit so its
+    /// decisiveness check sees enough alternatives, but the serialized
+    /// ambiguity payload must still honor the requested (or default) limit.
+    #[tokio::test]
+    async fn resolve_stage4_ambiguous_candidates_respect_wire_limit() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        for i in 0..8 {
+            rt.create_entity(
+                &token,
+                "concept",
+                None,
+                &format!("Limit Candidate {i}"),
+                Some("stage four bounded ambiguity"),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create candidate entity");
+        }
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.with_default_namespace("local");
+        builder.register(KgPack::new(rt));
+        let registry = builder.build().expect("registry build");
+
+        for (limit, expected) in [(Some(1_u32), 1_usize), (None, 5_usize)] {
+            let mut params = json!({"refs": ["stage four bounded ambiguity"]});
+            if let Some(limit) = limit {
+                params["limit"] = json!(limit);
+            }
+
+            let result = registry
+                .dispatch("resolve", params)
+                .await
+                .expect("resolve must succeed");
+            let resolution = &result
+                .get("results")
+                .and_then(Value::as_array)
+                .expect("resolve must return results")[0];
+            assert_eq!(
+                resolution.get("status").and_then(Value::as_str),
+                Some("ambiguous"),
+                "the deeper search pool must keep a tied result ambiguous"
+            );
+            let candidates = resolution
+                .get("candidates")
+                .and_then(Value::as_array)
+                .expect("ambiguous result must carry candidates");
+            assert_eq!(
+                candidates.len(),
+                expected,
+                "the serialized candidate count must honor limit={limit:?}"
+            );
+        }
+    }
+
     /// A ref that matches nothing in the ring or hybrid search is `NotFound`.
     #[tokio::test]
     async fn resolve_not_found_when_nothing_matches() {

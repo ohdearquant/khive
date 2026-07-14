@@ -105,17 +105,15 @@ const SEARCH_RESOLVED_CONFIDENCE: f64 = 0.6;
 /// the same query against a wider `limit` (e.g. the `search` verb's own
 /// default of 10) surfaces it as the top hit (#908). Retrieving at this
 /// floor decouples "how deep to search" from "how many candidates the caller
-/// asked for" — the caller's own `limit` still governs the id-string/ring
-/// stages above and is clamped to a max of 20
-/// (`khive_pack_kg::handlers::resolve::MAX_LIMIT`) by the handler, so this
-/// floor never returns more candidates than a caller could have asked for
-/// outright.
+/// asked for". The full pool is retained for the decisiveness check, while an
+/// `Ambiguous` payload is truncated back to the caller's `limit` before it is
+/// returned.
 const STAGE4_MIN_SEARCH_LIMIT: u32 = 20;
 
 /// Resolve one natural-language reference for `token`'s actor.
 ///
 /// `limit` bounds the hybrid-search fallback candidate count (Layer-0 stage
-/// 3); it has no effect on the id-string or ring stages, which are always
+/// 4); it has no effect on the id-string or ring stages, which are always
 /// exact-or-nothing / small in-memory scans. `entity_kind`, if set, restricts
 /// stage 3 to that entity kind (e.g. `"concept"`); the id-string and ring
 /// stages are kind-agnostic by construction (a ring entry or an explicit id
@@ -248,7 +246,8 @@ pub async fn resolve_reference(
     // genuine match ranked just outside a small `limit` isn't truncated out
     // of the pool before it's even ranked against the alternatives; the
     // caller's `limit` still bounds how many candidates get rendered below.
-    let search_limit = limit.max(STAGE4_MIN_SEARCH_LIMIT);
+    let candidate_limit = limit.max(1);
+    let search_limit = candidate_limit.max(STAGE4_MIN_SEARCH_LIMIT);
     let hits = runtime
         .hybrid_search(
             token,
@@ -291,6 +290,8 @@ pub async fn resolve_reference(
                     confidence: SEARCH_RESOLVED_CONFIDENCE,
                 })
             } else {
+                let mut candidates = candidates;
+                candidates.truncate(candidate_limit as usize);
                 Ok(ReferenceResolution::Ambiguous { candidates })
             }
         }
@@ -642,20 +643,12 @@ mod tests {
         }
     }
 
-    // Regression for #908: a canonical-name entity ranked outside the
-    // caller's small default `limit` (resolve's default is 5) used to be
-    // dropped entirely, because the old code called `hybrid_search` with
-    // that same small `limit` and `hybrid_search`'s own final step is
-    // `fused.truncate(limit as usize)` — so a genuine match ranked, say,
-    // 8th, never survived to reach `resolve_reference`'s own candidate list
-    // at all. Twelve decoy entities that also satisfy the (trigram, plain
-    // AND-mode) FTS query out-rank the target via heavier term repetition,
-    // pushing the target below position 5 but keeping it within
-    // `STAGE4_MIN_SEARCH_LIMIT` (20). The target must still surface in the
-    // stage-4 result — as the `Ambiguous` listing's tail if not decisively
-    // first — rather than vanish outright.
+    // Regression for #908 and the public candidate-limit contract: stage 4
+    // retains a deeper decision pool even when the caller requests five
+    // candidates, but below-limit hits from that pool must not leak into the
+    // ambiguity payload.
     #[tokio::test]
-    async fn fallback_stage_recovers_canonical_name_ranked_below_default_limit() {
+    async fn fallback_stage_bounds_payload_after_deep_search() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let token = actor_token("resolver-test");
         let ring = ReferenceRing::new();
@@ -691,22 +684,42 @@ mod tests {
             .expect("create decoy entity");
         }
 
+        let deep_hits = rt
+            .hybrid_search(
+                &token,
+                "khive ADR-040",
+                None,
+                STAGE4_MIN_SEARCH_LIMIT,
+                None,
+                None,
+                &[],
+                None,
+            )
+            .await
+            .expect("deep hybrid search");
+        let target_rank = deep_hits
+            .iter()
+            .position(|hit| hit.entity_id == target.id)
+            .expect("the widened decision pool must include the target");
+        assert!(
+            target_rank >= 5,
+            "fixture target must rank below the caller-facing limit"
+        );
+
         let resolution = resolve_reference(&rt, &ring, &token, "khive ADR-040", 5, None)
             .await
             .expect("resolve_reference");
 
-        let found_target = match resolution {
-            ReferenceResolution::Resolved { id, .. } => id == target.id,
+        match resolution {
             ReferenceResolution::Ambiguous { candidates } => {
-                candidates.iter().any(|c| c.id == target.id)
+                assert_eq!(candidates.len(), 5);
+                assert!(
+                    candidates.iter().all(|candidate| candidate.id != target.id),
+                    "a rank-below-limit hit must remain outside the public payload"
+                );
             }
-            ReferenceResolution::NotFound => false,
-        };
-        assert!(
-            found_target,
-            "stage 4 must surface a canonical-name match ranked below the \
-             caller's default `limit` instead of dropping it (#908)"
-        );
+            other => panic!("expected bounded Ambiguous result, got {other:?}"),
+        }
     }
 
     // Regression for #908: genuine ambiguity — two entities with the exact
