@@ -1,6 +1,6 @@
 # ADR-078: Output Format and Shape-Aware Rendering
 
-**Status**: proposed
+**Status**: Accepted
 **Date**: 2026-06-27
 **Authors**: khive maintainers
 **Depends on**:
