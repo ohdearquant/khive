@@ -1,9 +1,8 @@
-# khive-brain-core — regression test rationale
+# khive-brain-core — regression test strategy
 
-Long-form rationale relocated from `#[cfg(test)]` doc-comments (non-public,
-does not render on docs.rs) per the rustdoc condense pass. Each heading names
-the test function and its source file; the `.rs` doc-comment now carries only
-a 1–3 line summary that links here.
+Why each of this crate's non-obvious regression tests exists and what invariant it
+guards. Each heading names the test function and its source file; the `.rs`
+doc-comment on the test itself carries only a 1–3 line summary that points here.
 
 ## `posterior.rs::snapshot_restore_eviction_equivalence` (BRAINCORE-AUD-001)
 
