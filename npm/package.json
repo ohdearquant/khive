@@ -1,6 +1,6 @@
 {
   "name": "khive",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Research knowledge graph runtime over MCP stdio, with typed entities, closed ontology, and hybrid search for AI research agents.",
   "license": "Apache-2.0",
   "repository": {
@@ -35,11 +35,11 @@
     "node": ">=18"
   },
   "optionalDependencies": {
-    "@khive-ai/kernel-darwin-arm64": "0.4.0",
-    "@khive-ai/kernel-darwin-x64": "0.4.0",
-    "@khive-ai/kernel-linux-x64-gnu": "0.4.0",
-    "@khive-ai/kernel-linux-x64-musl": "0.4.0",
-    "@khive-ai/kernel-linux-arm64": "0.4.0",
-    "@khive-ai/kernel-win32-x64": "0.4.0"
+    "@khive-ai/kernel-darwin-arm64": "0.5.0",
+    "@khive-ai/kernel-darwin-x64": "0.5.0",
+    "@khive-ai/kernel-linux-x64-gnu": "0.5.0",
+    "@khive-ai/kernel-linux-x64-musl": "0.5.0",
+    "@khive-ai/kernel-linux-arm64": "0.5.0",
+    "@khive-ai/kernel-win32-x64": "0.5.0"
   }
 }

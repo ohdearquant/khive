@@ -15,9 +15,9 @@ description = "Communication pack — inter-agent messaging (send, inbox, read, 
 bench = false
 
 [dependencies]
-khive-types = { version = "0.4.0", path = "../khive-types", features = ["serde"] }
-khive-runtime = { version = "0.4.0", path = "../khive-runtime" }
-khive-storage = { version = "0.4.0", path = "../khive-storage" }
+khive-types = { version = "0.5.0", path = "../khive-types", features = ["serde"] }
+khive-runtime = { version = "0.5.0", path = "../khive-runtime" }
+khive-storage = { version = "0.5.0", path = "../khive-storage" }
 inventory = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
@@ -28,11 +28,11 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
-khive-pack-kg = { version = "0.4.0", path = "../khive-pack-kg" }
-khive-db = { version = "0.4.0", path = "../khive-db" }
+khive-pack-kg = { version = "0.5.0", path = "../khive-pack-kg" }
+khive-db = { version = "0.5.0", path = "../khive-db" }
 criterion = { workspace = true }
 toml = { workspace = true }
-khive-runtime = { version = "0.4.0", path = "../khive-runtime", features = ["fault-injection"] }
+khive-runtime = { version = "0.5.0", path = "../khive-runtime", features = ["fault-injection"] }
 lattice-embed = { workspace = true }
 rusqlite = { workspace = true, features = ["bundled", "column_decltype"] }
 tempfile = { workspace = true }
