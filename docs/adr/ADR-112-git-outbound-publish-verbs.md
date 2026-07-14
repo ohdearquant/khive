@@ -153,6 +153,11 @@ supported in v0 and are rejected because `:` is outside the grammar. `base` is l
 branch name, and `tag` is a tag name; the caller never supplies `refs/heads/` or
 `refs/tags/`.
 
+In v0, `tag` must name a pre-existing remote tag in `repo`. The handler verifies existence
+with the read-only check in the pipeline below, and the release-create command independently
+enforces that boundary with its fixed `--verify-tag` flag. This verb never creates, moves, or
+deletes a tag or any other ref.
+
 The `gh` process boundary has a fixed interpretation. Code selects the executable,
 subcommand, and complete option-name set for each verb; no caller string can select or add
 a command, subcommand, option, environment-variable name, API field name, or output parser.
@@ -246,7 +251,7 @@ authorization, and hygiene scanning have completed:
    visible - `title`, `body`, `notes`, `tag`, `head`, `base`, and every string inside
    `labels`/`assignees` - is scanned by both the token denylist and the secret scan described
    in "Scan module" below, followed by the token allowlist layer. This includes the release
-   tag because `gh release create` can create a missing tag, and includes PR head/base names
+   tag because GitHub exposes it as the release identifier, and includes PR head/base names
    because GitHub exposes them as pull-request identifiers. The scan runs before the
    operation is claimed or `gh` is invoked. It is origin-agnostic: it does not distinguish
    an agent's own prose from relayed or pasted text. There is no trusted-source bypass and
@@ -262,15 +267,18 @@ authorization, and hygiene scanning have completed:
    the caller (see "Deny semantics") and an additional typed audit record (see "Audit and
    the event plane"). No GitHub API call is made, and no operation-ledger row is claimed;
    the rejected normalized request therefore has no recovery-ledger representation.
-4. **Comment-target read check.** For `git.publish_comment`, the handler performs the
-   repository-scoped, kind-aware read described in "Comment target grammar". This is a
-   read-only validation call, not a content write.
+4. **Remote-target read checks.** For `git.publish_comment`, the handler performs the
+   repository-scoped, kind-aware read described in "Comment target grammar". For
+   `git.publish_release`, it performs a repository-scoped, read-only lookup of the exact
+   `refs/tags/<tag>` reference and rejects the request if that tag does not exist. These are
+   validation calls, not content writes, and both finish before an operation is claimed.
 5. **Claim the durable operation.** For a new operation, the handler obtains a
-   cryptographically random reconciliation nonce and atomically inserts the pending-operation
-   row in state `unconfirmed_publish`, including the normalized request, nonce, and full
-   generated reconciliation marker. This commit happens before `gh` is spawned. An existing
-   row reuses its persisted nonce and marker and follows the recovery state machine; only a
-   proven `not_published` row may enter the create path.
+   cryptographically random reconciliation nonce, generates a standard UUIDv7 for the eventual
+   success-domain Event, and atomically inserts the pending-operation row in state
+   `unconfirmed_publish`, including the normalized request, nonce, full generated
+   reconciliation marker, and `audit_event_id`. This commit happens before `gh` is spawned.
+   An existing row reuses its persisted nonce, marker, and audit Event id and follows the
+   recovery state machine; only a proven `not_published` row may enter the create path.
 6. **GitHub API call.** For a newly claimed or proven `not_published` operation only, the
    verb shells the configured GitHub CLI (`gh`) under the daemon's identity - the same
    transport ADR-088's ingester and Amendment 1's `git.digest` already use, with the fixed
@@ -279,7 +287,10 @@ authorization, and hygiene scanning have completed:
    ADR-108 Fork (b) required for `git`. `gh` is reused rather than a direct REST client for
    the same reason ADR-088 §5 gave: it already handles auth and pagination correctly for
    this environment. The operation-bound marker described in "Publish recovery state
-   machine" is appended after user content has passed the scan.
+   machine" is appended after user content has passed the scan. A release create always
+   includes the code-selected fixed `--verify-tag` flag and never includes `--target`, so a
+   tag removed after the read-only check still causes the create to abort rather than create
+   a replacement tag or any other ref.
 7. **Persist the remote receipt.** Once GitHub returns, the handler durably stores the
    remote URL and number or id and moves the operation to `published_pending_ingest`
    before attempting any graph write.
@@ -453,10 +464,12 @@ row because the handler never runs. Retries create their own dispatch history. E
 use `list(kind="event", verb="git.publish_issue", ...)` (or another precise verb) and
 inspect `payload.audit_type`; ADR-022 still excludes `query()` / GQL / SPARQL for events.
 
-The success-domain row uses UUIDv5 over the operation UUID's canonical string under a fixed,
-code-defined git-publish audit namespace UUID. This makes its Event id deterministic
-without accepting a caller-selected Event id. A duplicate-key result for the same operation
-and payload is treated as already recorded. The operation cannot advance from
+The success-domain row uses the standard UUIDv7 generated once when the operation is first
+claimed and persisted in the ledger's `audit_event_id` field. It is neither caller-selected
+nor derived from the operation UUID. Recovery reuses that persisted id for the idempotent
+append; a duplicate-key result for the same operation and payload is treated as already
+recorded. The Event's `created_at` is assigned normally when it is appended, preserving
+ADR-004's `(created_at, event_id)` replay order. The operation cannot advance from
 `ingested_pending_audit` to `complete` until this row is durable. This makes the
 handler-owned success audit recoverable even though the registry's generic dispatch audit
 remains best-effort.
@@ -479,8 +492,8 @@ A successful publish reconciles a graph record through the existing generic `cre
 `update`, and `link` verbs - no new graph verb, no new edge relation, `annotates` only,
 matching ADR-088's own usage.
 
-For GitHub repositories, this ADR narrows ADR-088 Amendment 1's project-anchor fallback to
-one shared identity mapping. `GitHubRepoIdentity` is the validated lowercase
+For the GitHub-specific identity path defined below, publish self-ingest and `git.digest`
+use one shared project mapping. `GitHubRepoIdentity` is the validated lowercase
 `owner/name` slug, and its only stored URL is
 `https://github.com/<owner>/<name>`. An accepted remote `git.digest` source using
 `www.github.com`, an optional trailing slash or `.git` suffix, or ASCII case differences
@@ -491,11 +504,10 @@ not a GitHub identity alias. After alias removal and ASCII lowercasing, the slug
 satisfy this ADR's canonical `repo` grammar.
 
 `git.digest` and publish self-ingest must call the same project-identity resolver in the
-handler namespace whenever the digest source identifies a GitHub repository. A remote
-source gets that identity from its accepted URL alias. A local source that ingests GitHub
-issues or pull requests must first derive the same identity from its configured GitHub
-origin; if it cannot derive one unambiguously, that GitHub-object ingest fails rather than
-falling back to the local directory name. The resolver considers only live `project`
+handler namespace on the GitHub-specific identity path. For `git.digest`, that path applies
+only when `source` is an accepted remote GitHub URL; the identity comes from its accepted URL
+alias. Publish self-ingest gets the same identity from its canonical `repo` slug. The resolver
+considers only live `project`
 entities whose string `properties.repo_url` parses to the same `GitHubRepoIdentity`; it
 never matches `project.name`, a path basename, or an unscoped repository name. If no anchor
 matches, it creates one with the canonical URL. If exactly one alias-form anchor matches,
@@ -506,9 +518,13 @@ rather than the resolver selecting an arbitrary row. This enumeration-and-rewrit
 required alias migration for existing data and runs before either digest or publish can
 ingest a GitHub object. A caller-supplied `git.digest project` id is accepted for a GitHub
 source only when that project's `properties.repo_url` parses to the same identity; it is
-otherwise rejected. For commits-only local paths and non-GitHub URLs, ADR-088's exact
-canonical path/URL remains the identity, but its basename fallback is removed; those
-identities cannot be selected by a publish slug.
+otherwise rejected. Outside this GitHub-specific identity path - including every local path,
+whether or not it has a GitHub origin, and every non-GitHub URL - `git.digest` retains
+ADR-088 Amendment 1's accepted resolution contract unchanged: an omitted `project` matches
+either the exact canonical path/URL in `properties.repo_url` or the name derived from the
+source basename, and creates an anchor only when neither matches. This ADR neither reselects
+nor migrates those anchors; their project ids, cursors, and issue/PR natural keys remain
+unchanged. Such identities cannot be selected by a publish slug.
 
 Issue and PR self-ingest uses the same natural key as the current digest implementation:
 
@@ -647,18 +663,18 @@ idempotency key is not a recovery action.
 
 The crash and failure windows are therefore explicit:
 
-| Window                                                   | Durable state              | Retry behavior                                                                 |
-| -------------------------------------------------------- | -------------------------- | ------------------------------------------------------------------------------ |
-| Before the operation insert commits                      | No operation               | The request may claim its key; no remote write has occurred                    |
-| Spawn fails before a child exists                        | `not_published`            | A same-key retry may safely attempt the first create                           |
-| After spawn, during `gh`, before receipt commit          | `unconfirmed_publish`      | Read-only marker reconciliation; never create                                  |
-| After receipt commit, before/during note or edge write   | `published_pending_ingest` | Upsert note and ensure edge; never create                                      |
-| After graph reconciliation, before/during audit append   | `ingested_pending_audit`   | Append the deterministic success audit idempotently; never create or re-ingest |
-| After audit append, before the ledger reaches `complete` | `ingested_pending_audit`   | Duplicate Event id proves audit durability, then mark complete                 |
+| Window                                                   | Durable state              | Retry behavior                                                                    |
+| -------------------------------------------------------- | -------------------------- | --------------------------------------------------------------------------------- |
+| Before the operation insert commits                      | No operation               | The request may claim its key; no remote write has occurred                       |
+| Spawn fails before a child exists                        | `not_published`            | A same-key retry may safely attempt the first create                              |
+| After spawn, during `gh`, before receipt commit          | `unconfirmed_publish`      | Read-only marker reconciliation; never create                                     |
+| After receipt commit, before/during note or edge write   | `published_pending_ingest` | Upsert note and ensure edge; never create                                         |
+| After graph reconciliation, before/during audit append   | `ingested_pending_audit`   | Append idempotently with the persisted UUIDv7 Event id; never create or re-ingest |
+| After audit append, before the ledger reaches `complete` | `ingested_pending_audit`   | Duplicate Event id proves audit durability, then mark complete                    |
 
 The ledger update that records remote identity is committed before the first graph write.
 The graph upsert and edge ensure are independently idempotent because a crash can occur
-between them. The domain-separated deterministic success Event id closes the final
+between them. The persisted claim-time UUIDv7 success Event id closes the final
 append-versus-ledger window. No retry with a possible or confirmed prior remote attempt
 blindly reissues a GitHub create; only the proven pre-spawn `not_published` state permits
 another attempt.
@@ -982,7 +998,9 @@ pattern file, it must include these contract tests:
    the recovery table: operation insert, remote response, note upsert, edge ensure, audit
    append, and completion update. Resume with the same idempotency key and assert that the
    remote create spy observed exactly one create, unfinished local work completed, and the
-   final success Event exists exactly once. The unconfirmed case must exercise exact
+   final success Event exists exactly once. Assert that `audit_event_id` is a UUIDv7 in the
+   initial claim and that every recovery attempt and the final Event reuse that exact id. The
+   unconfirmed case must exercise exact
    nonce-bearing marker recovery and the no-match error path. A parameterized forgery
    regression covers issue, pull-request, comment, and release reconciliation: operation A
    publishes a same-repo, same-kind object whose caller content contains operation B's UUID
@@ -1002,8 +1020,9 @@ pattern file, it must include these contract tests:
    a hygiene denial before an operation-ledger claim or any `gh` invocation, the transport
    spy observes zero GitHub writes, and the deny response plus audit identify the exact
    field. The release cases must include both a denied generic-pattern tag and a
-   credential-shaped secret-pattern tag, proving that automatic tag creation cannot bypass
-   either scan layer. For each release-tag denial, the stored Event has `target = "release"`;
+   credential-shaped secret-pattern tag, proving that a tag cannot reach reference lookup or
+   release creation without passing both scan layers. For each release-tag denial, the
+   stored Event has `target = "release"`;
    a serialized-Event assertion proves the raw tag is absent from the complete payload, and
    the operation ledger remains empty for that idempotency key. Secret-scan regressions put
    at least two detector classes in one field and distribute multiple detector classes
@@ -1011,21 +1030,26 @@ pattern file, it must include these contract tests:
    `(field, pattern_id)` pairs, including overlapping detector-class matches, and assert
    that the response, audit Event, error, and logs contain no source text, masked excerpt,
    span, offset, or length.
-8. **Optional-argument normalization.** For labels and assignees, compare omission with
+8. **Release-tag boundary.** A missing-tag case is rejected by the read-only preflight before
+   an operation-ledger claim or remote write. An existing-tag case reaches release creation,
+   and the transport spy proves the fixed argv includes `--verify-tag`, excludes `--target`,
+   and performs no tag/ref write. A race case removes the tag after preflight and proves the
+   release create fails without recreating it.
+9. **Optional-argument normalization.** For labels and assignees, compare omission with
    `[]`, compare at least two permutations of the same non-empty array, and retry each form
    with one idempotency key. For draft, compare omission with `false`. For release title,
    compare omission, `""`, and the normalized tag. Each equivalence case must produce the
    same canonical JSON and request hash and must resume or return the same operation on a
    same-key retry; each genuinely different normalized value must conflict on that key.
    Limit, element-shape, duplicate, and JSON-`null` failures occur before transport.
-9. **Hook/server scan conformance.** The Rust handler suite and the hook implementation's
-   suite both execute every case in
-   `crates/khive-pack-git/tests/fixtures/publication-hygiene-conformance.toml` against the
-   authoritative generic file and test overlay. CI fails on a skipped case, divergent
-   allow/deny result, field or rule-id mismatch, byte-grammar loader mismatch, allowlist
-   mismatch, or revision mismatch. Separate loader tests prove that both implementations
-   reject every source outside the closed grammar even when their host regex engine would
-   accept it.
+10. **Hook/server scan conformance.** The Rust handler suite and the hook implementation's
+    suite both execute every case in
+    `crates/khive-pack-git/tests/fixtures/publication-hygiene-conformance.toml` against the
+    authoritative generic file and test overlay. CI fails on a skipped case, divergent
+    allow/deny result, field or rule-id mismatch, byte-grammar loader mismatch, allowlist
+    mismatch, or revision mismatch. Separate loader tests prove that both implementations
+    reject every source outside the closed grammar even when their host regex engine would
+    accept it.
 
 `tests/smoke_test.py` must cover one allowed publish against a controlled fake `gh`, one
 hygiene deny, one comment-target validation failure, and one resumed
@@ -1040,6 +1064,10 @@ test suite must not create real GitHub content.
   addresses; they stay on direct `gh`/platform mechanisms.
 - **Repository-level git writes** (commit, branch, push) - ADR-108's surface, not
   duplicated or amended here.
+- **Tag/ref creation.** `git.publish_release` requires a pre-existing remote tag and creates
+  only the release. Automatic tag creation, if ever added, is a separate explicit Git-write
+  capability requiring an ADR-108 amendment that defines the target ref and commit,
+  authorization, audit, and recovery contracts; it is outside this ADR and v0.
 - **Edit and delete of already-published content.** Named in Migration as second-wave
   work; the scan applies unchanged when these verbs are added.
 - **Semantic scanning.** The scan is pattern matching plus evidence-tuned additions, not
