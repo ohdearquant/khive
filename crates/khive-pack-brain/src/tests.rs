@@ -6305,6 +6305,62 @@ mod event_counts_tests {
         }
     }
 
+    /// A date-only `since` (no time-of-day component) is coerced to midnight
+    /// UTC rather than silently resolving to a null result — the bug reported
+    /// in #984, where the RFC-3339 parser rejected the value but the failure
+    /// never surfaced to the caller.
+    #[tokio::test]
+    async fn date_only_since_is_coerced_to_midnight_utc() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        let result = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({"since": "2026-07-07"}),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("date-only `since` must be accepted, not silently nulled");
+
+        let since = result["since"].as_str().expect("since must be a string");
+        assert!(
+            since.starts_with("2026-07-07T00:00:00"),
+            "date-only `since` must coerce to midnight UTC: {result}"
+        );
+    }
+
+    /// A value that is neither a valid date nor a valid RFC-3339 datetime
+    /// still gets a named validation error, never a null result.
+    #[tokio::test]
+    async fn garbage_since_is_rejected_not_silently_nulled() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        let result = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({"since": "2026-13-99"}),
+                &registry,
+                &token,
+            )
+            .await;
+
+        match result {
+            Ok(v) => panic!("invalid `since` must not silently succeed with a value: {v}"),
+            Err(RuntimeError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains("since") && msg.contains("2026-13-99"),
+                    "error must name the field and offending value: {msg}"
+                );
+            }
+            Err(other) => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn missing_since_is_rejected() {
         let (pack, rt) = make_pack();

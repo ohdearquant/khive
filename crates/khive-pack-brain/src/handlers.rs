@@ -2309,8 +2309,21 @@ impl BrainPack {
 /// Parse an ISO-8601/RFC-3339 datetime string into a microsecond epoch,
 /// naming the offending field/value in the error rather than a bare parse
 /// failure (`brain.event_counts`, ADR-103 Stage 1).
+///
+/// A bare `YYYY-MM-DD` date (no time-of-day component) is coerced to
+/// midnight UTC rather than rejected — RFC-3339 requires a time component,
+/// but a date-only value is unambiguous and a common caller shorthand; the
+/// alternative is silently returning nothing until the caller happens to
+/// probe the full timestamp form (#984).
 fn parse_rfc3339_micros(field: &'static str, value: &str) -> Result<i64, RuntimeError> {
-    chrono::DateTime::parse_from_rfc3339(value.trim())
+    let trimmed = value.trim();
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
+        let midnight = date
+            .and_hms_opt(0, 0, 0)
+            .expect("00:00:00 is always a valid time");
+        return Ok(midnight.and_utc().timestamp_micros());
+    }
+    chrono::DateTime::parse_from_rfc3339(trimmed)
         .map(|dt| dt.with_timezone(&Utc).timestamp_micros())
         .map_err(|e| {
             RuntimeError::InvalidInput(format!(
