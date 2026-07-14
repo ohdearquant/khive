@@ -1326,41 +1326,35 @@ fn ambiguous_forward_error() -> McpError {
 // the legitimate ADR-049 no-daemon case and never silently swallowed, in
 // either strict or non-strict mode.
 
-/// Best-effort tail of `khived.log` for the local respawn-failure diagnostic.
-/// Returns `None` on any read failure or if the tail is empty — logging is
-/// best-effort and must never turn a diagnostic path into a second failure.
-fn tail_daemon_log(max_bytes: usize) -> Option<String> {
-    let path = daemon_log_path()?;
-    let bytes = std::fs::read(&path).ok()?;
-    let start = bytes.len().saturating_sub(max_bytes);
-    let tail = String::from_utf8_lossy(&bytes[start..]).trim().to_string();
-    if tail.is_empty() {
-        None
-    } else {
-        Some(tail)
-    }
+#[derive(Clone, Copy)]
+enum RespawnFailure {
+    SpawnError { os_error_code: Option<i32> },
+    ExitedBeforeBind { exit_code: Option<i32> },
 }
 
 /// Build the caller-visible error for a respawn attempt this process made and
-/// can now positively confirm failed. The detailed observation, resolved
-/// executable path, and shared daemon-log tail stay in local error-level
-/// tracing; callers receive only a stable code and safe remediation. The error
-/// is returned regardless of
+/// can now positively confirm failed. Both the caller error and bridge tracing
+/// expose only stable classifications and non-sensitive numeric status codes.
+/// The error is returned regardless of
 /// `KHIVE_DAEMON_STRICT`: unlike the ordinary "no daemon reachable" fallback
 /// (which may be the legitimate ADR-049 no-daemon deployment), a respawn WE
 /// attempted and can prove failed is never a case for quietly completing the
 /// request via local dispatch. See #898.
-fn respawn_failed_error(detail: &str) -> McpError {
-    let exe = std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "<current_exe unresolved>".to_string());
-    let log_tail = tail_daemon_log(2048);
-    tracing::error!(
-        exe = %exe,
-        detail,
-        daemon_log_tail = log_tail.as_deref().unwrap_or("<unavailable>"),
-        "daemon respawn failed loudly (#898): respawn attempt confirmed dead"
-    );
+fn respawn_failed_error(failure: RespawnFailure) -> McpError {
+    match failure {
+        RespawnFailure::SpawnError { os_error_code } => tracing::error!(
+            reason = "respawn_failed",
+            failure_category = "spawn_error",
+            ?os_error_code,
+            "daemon respawn attempt confirmed failed"
+        ),
+        RespawnFailure::ExitedBeforeBind { exit_code } => tracing::error!(
+            reason = "respawn_failed",
+            failure_category = "exited_before_bind",
+            ?exit_code,
+            "daemon respawn attempt confirmed failed"
+        ),
+    }
     // Under strict mode this is also a pre-dispatch rejection, so preserve
     // #947's request-envelope contract by tagging it for `server::request`.
     // Non-strict callers still receive the raw, loud MCP error introduced by
@@ -1909,9 +1903,9 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
             // #898: `Command::spawn` itself failed to start the child at all —
             // an unambiguous, already-fully-diagnosed respawn failure. Loud in
             // both strict and non-strict mode; never a silent local fallback.
-            return Some(Err(respawn_failed_error(&format!(
-                "failed to start the replacement process: {e}"
-            ))));
+            return Some(Err(respawn_failed_error(RespawnFailure::SpawnError {
+                os_error_code: e.raw_os_error(),
+            })));
         }
         Ok(RecoveryOutcome::Skipped) => {
             // A concurrent client already has a live matching daemon ready.
@@ -1960,10 +1954,11 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
                     // legitimate ADR-049 no-daemon case.
                     if let Some(child) = spawned_child.as_mut() {
                         if let Ok(Some(status)) = child.try_wait() {
-                            return Some(Err(respawn_failed_error(&format!(
-                                "the spawned process exited with {status} instead \
-                                 of binding the daemon socket"
-                            ))));
+                            return Some(Err(respawn_failed_error(
+                                RespawnFailure::ExitedBeforeBind {
+                                    exit_code: status.code(),
+                                },
+                            )));
                         }
                     }
                     return fallback_or_reject(
@@ -2408,12 +2403,9 @@ mod tests {
     #[test]
     #[serial]
     fn record_fallback_config_id_daemon_defaults_to_none_literal_when_absent() {
-        // The log field itself isn't asserted (no tracing-capture harness in this
-        // crate — see the crate's Cargo.toml dev-dependencies), but the counter
-        // side effect proves the call completes and increments exactly once even
-        // when `config_id_daemon` is `None` (the common case at every
-        // forward_or_spawn fallback site, since no decodable daemon response was
-        // available to read a served config id from).
+        // The counter side effect proves the call completes and increments
+        // exactly once when `config_id_daemon` is `None` (the common case when
+        // no decodable daemon response supplied a served config id).
         reset_fallback_counters();
         record_fallback(FallbackReason::NoSocket, CFG, None, NS);
         assert_eq!(fallback_total(), 1);
@@ -2449,12 +2441,9 @@ mod tests {
 
     // ── KHIVE_DAEMON_STRICT graduated fail-loud policy (D2) ───────────────────
     //
-    // No tracing-capture harness exists in this crate (see the comment on
-    // `record_fallback_config_id_daemon_defaults_to_none_literal_when_absent`
-    // above), so these tests prove the graduated behavior via
-    // `FALLBACK_STRICT_VIOLATIONS` rather than asserting the log level
-    // directly: an `Illegitimate` reason bumps it if and only if strict mode
-    // is on; every other reason/mode combination must never bump it.
+    // These tests prove the graduated behavior via `FALLBACK_STRICT_VIOLATIONS`:
+    // an `Illegitimate` reason bumps it if and only if strict mode is on; every
+    // other reason/mode combination must never bump it.
 
     fn with_daemon_strict<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
         let prev = std::env::var("KHIVE_DAEMON_STRICT").ok();
@@ -2738,6 +2727,38 @@ mod tests {
         sentinel: &'static str,
     }
 
+    #[derive(Clone, Default)]
+    struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("captured log mutex poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = CapturedLog;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl CapturedLog {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().expect("captured log mutex poisoned").clone())
+                .expect("tracing output is UTF-8")
+        }
+    }
+
     impl RespawnDisclosureFixture {
         fn new(sentinel: &'static str) -> Self {
             let original_home = std::env::var_os("HOME");
@@ -2754,20 +2775,24 @@ mod tests {
             }
         }
 
-        fn assert_caller_output_is_sanitized(&self, error: &McpError) {
-            let caller_output = serde_json::to_string(error).expect("serialize caller MCP error");
+        fn assert_output_is_sanitized(&self, output_name: &str, output: &str) {
             let executable = std::env::current_exe()
                 .expect("resolve current test executable")
                 .display()
                 .to_string();
             assert!(
-                !caller_output.contains(self.sentinel),
-                "shared daemon log content must not reach the caller: {caller_output}"
+                !output.contains(self.sentinel),
+                "shared daemon log content must not reach {output_name}: {output}"
             );
             assert!(
-                !caller_output.contains(&executable),
-                "absolute daemon executable path must not reach the caller: {caller_output}"
+                !output.contains(&executable),
+                "absolute daemon executable path must not reach {output_name}: {output}"
             );
+        }
+
+        fn assert_caller_output_is_sanitized(&self, error: &McpError) {
+            let caller_output = serde_json::to_string(error).expect("serialize caller MCP error");
+            self.assert_output_is_sanitized("the caller", &caller_output);
             assert!(
                 caller_output.contains("respawn_failed"),
                 "caller must receive the stable respawn_failed code: {caller_output}"
@@ -2777,6 +2802,22 @@ mod tests {
                 "caller must receive safe remediation text: {caller_output}"
             );
         }
+    }
+
+    async fn forward_with_captured_events(
+        frame: &DaemonRequestFrame,
+    ) -> (Option<Result<String, McpError>>, String) {
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let subscriber_guard = tracing::subscriber::set_default(subscriber);
+        let output = forward_or_spawn(frame).await;
+        drop(subscriber_guard);
+        let events = captured.contents();
+        (output, events)
     }
 
     impl Drop for RespawnDisclosureFixture {
@@ -2803,7 +2844,16 @@ mod tests {
             RespawnDisclosureFixture::new("KHIVE_RESPAWN_LOG_SENTINEL_NON_STRICT_4d9813b72e");
 
         let frame = unreachable_daemon_frame(CFG);
-        let out = forward_or_spawn(&frame).await;
+        let (out, events) = forward_with_captured_events(&frame).await;
+        disclosure.assert_output_is_sanitized("bridge tracing events", &events);
+        assert!(
+            events.contains("reason=\"respawn_failed\""),
+            "trace must retain the stable reason code: {events}"
+        );
+        assert!(
+            events.contains("failure_category=\"exited_before_bind\""),
+            "trace must classify the confirmed failure without raw detail: {events}"
+        );
 
         match out {
             Some(Err(error)) => {
@@ -2851,7 +2901,16 @@ mod tests {
             RespawnDisclosureFixture::new("KHIVE_RESPAWN_LOG_SENTINEL_STRICT_7ac60d5391");
 
         let frame = unreachable_daemon_frame(CFG);
-        let out = forward_or_spawn(&frame).await;
+        let (out, events) = forward_with_captured_events(&frame).await;
+        disclosure.assert_output_is_sanitized("strict-mode bridge tracing events", &events);
+        assert!(
+            events.contains("reason=\"respawn_failed\""),
+            "strict-mode trace must retain the stable reason code: {events}"
+        );
+        assert!(
+            events.contains("failure_category=\"exited_before_bind\""),
+            "strict-mode trace must classify the failure without raw detail: {events}"
+        );
 
         match out {
             Some(Err(error)) => {
