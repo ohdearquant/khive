@@ -18,6 +18,12 @@
 //! (real threads + the real lock primitive, not a mocked scheduler), but
 //! here the "critical section" is a real cold-boot migration run plus real
 //! writes instead of a synthetic counter.
+//!
+//! Unix-only: drives `khive_runtime::daemon::acquire_recovery_lock`, gated
+//! `#[cfg(unix)]` (advisory `flock`-based boot/recovery locking has no
+//! non-Unix equivalent in this crate).
+
+#![cfg(unix)]
 
 use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig};
 use khive_storage::types::SqlStatement;

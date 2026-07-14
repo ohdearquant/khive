@@ -94,7 +94,7 @@ DELAY=10  # seconds to wait for crates.io index between publishes
 # (which is why it is NOT a per-PR CI gate). Runs in preflight and live alike so
 # `make publish-dry` validates SemVer before any real publish. Crates with no
 # crates.io baseline yet (never published) have nothing to diff against and are
-# excluded until their first publish. As of the 0.4.0 cycle that is exactly the
+# excluded until their first publish. As of the 0.5.0 cycle that is exactly the
 # four crates added since 0.3.0: khive-changeset, khive-pack-code, khive-pack-git,
 # khive-pack-workspace. Every other workspace crate, including khive-quant and the
 # crates first shipped in 0.3.0, has a published 0.3.0 baseline and MUST be

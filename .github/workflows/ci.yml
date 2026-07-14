@@ -392,6 +392,28 @@ jobs:
       - name: Native sequential and owned-storage tests
         run: cargo test -p khive-quant -p khive-vamana --no-default-features
 
+  check-windows:
+    name: Windows compile check
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: crates
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+          cache-on-failure: true
+      # 0.5.0 release blocker: khive-runtime/khive-mcp's daemon subsystem must
+      # compile on x86_64-pc-windows-msvc (the npm package's Windows target).
+      # Not (yet) a required check in branch protection — plain `cargo check`
+      # (no --all-targets) keeps this fast while the Windows lane is new;
+      # widen once it has proven stable.
+      - name: cargo check --workspace (Windows)
+        run: cargo check --workspace
+
   coverage-ratchet:
     name: Coverage ratchet
     runs-on: ubuntu-latest
