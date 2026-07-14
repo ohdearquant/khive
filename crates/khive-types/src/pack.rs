@@ -136,12 +136,6 @@ impl HandlerDef {
     /// New verbs that need this override must be added here; omission from the
     /// list means `Standard` applies.
     pub fn presentation_policy(&self) -> VerbPresentationPolicy {
-        // AlwaysVerbose verbs bypass agent-mode transforms entirely.
-        //
-        // `link` is AlwaysVerbose because the edge ID returned is the only handle
-        // for follow-up `neighbors`/`traverse` calls. At scale, two edges can share
-        // the same 8-char prefix (birthday collision ~65K edges), so shortening the
-        // edge ID in agent mode breaks downstream chaining.
         match self.name {
             "get" | "link" | "query" | "traverse" | "neighbors" | "brain.feedback" => {
                 VerbPresentationPolicy::AlwaysVerbose
@@ -385,36 +379,12 @@ const ATOMIC_EMBEDDING_BEARING_VERBS: &[&str] = &[
     "comm.ingest",
 ];
 
-/// Verbs that ADR-099 D3 lists as conceptually admissible (they remain on
-/// [`ATOMIC_ADMISSIBLE_VERBS`] — the ADR intends each to eventually gain a
-/// prepare/apply seam) but for which no *full-parity* seam exists yet in this
-/// slice, so they are rejected up front rather than admitted with a gap:
-///
-/// - `propose` / `review` / `withdraw` (ADR-046's event-sourced change-proposal
-///   lifecycle): their apply path is a changeset-interpreter over a dedicated
-///   `proposals_open` table, not a small number of guarded DML statements —
-///   no prepare implementation exists at all.
-/// - `merge`: a full-parity atomic prepare (field folding, survivor FTS/vector
-///   reindex, loser index purge, merge provenance, same-kind rejection,
-///   graceful edge-conflict resolution — see `curation::merge_entity_sql`) was
-///   drafted and unit-tested for B3, but deferred rather than
-///   shipped: `curation.rs`'s edge-rewire conflict handling does per-row
-///   procedural branching (read, canonicalize, probe for a conflicting
-///   triple, delete-and-refresh vs. update-in-place) that cannot be expressed
-///   as ADR-099 D1's static predicate/guard plan shape, so full parity is not
-///   achievable without either accepting a documented behavioral gap or a
-///   design change to the plan model; bias toward deferral over shipping a
-///   partially scoped atomic merge.
-///   `merge` stays admissible under the *non-atomic* verb.
-///
-/// ADR-099 B3 (governance verbs): this set
-/// previously passed the static pre-runtime admissibility check (since it's a
-/// subset of `ATOMIC_ADMISSIBLE_VERBS`) and only failed later, inside
-/// `atomic_prepare::prepare_op`, AFTER `KhiveRuntime::new` had already run.
-/// `atomic_admissibility` now checks this set FIRST so the CLI boundary
-/// (`khive_request::atomic::check_atomic_admissible`) rejects these verbs
-/// before any runtime is built or any write attempted — the same
-/// before-any-write guarantee every other rejection class gets.
+/// Verbs on [`ATOMIC_ADMISSIBLE_VERBS`] (ADR-099 D3 conceptually admissible)
+/// that have no *full-parity* prepare/apply seam yet, so they are rejected up
+/// front (checked BEFORE the general admissible-list check) rather than
+/// admitted with a silent gap. See
+/// crates/khive-types/docs/pack-error-internals.md#adr-099-d3-atomic-admissibility-rejection-classes
+/// for why each verb is deferred and the ADR-099 B3 ordering rationale.
 pub const ATOMIC_KNOWN_UNIMPLEMENTED_VERBS: &[&str] = &["propose", "review", "withdraw", "merge"];
 
 /// Read verbs rejected under `--atomic` — they produce no write plan to apply
@@ -433,17 +403,10 @@ const ATOMIC_READ_VERBS: &[&str] = &[
 ];
 
 /// Conservative default maximum op count for one `--atomic` unit (ADR-099
-/// migration step 7 / B3). The ADR does not pin an exact number — D2 defers
-/// the precise threshold to harness measurement ("a recommended default on
-/// the order of a few thousand ops ... configurable with a conservative
-/// default", Open Question 2) — so this constant is an explicit interim
-/// choice, not a value read out of the ADR text. Rationale for 2000: it is
-/// inside D2's "a few thousand" band, comfortably bounds the duration of the
-/// single cross-process `BEGIN IMMEDIATE` hold an atomic unit takes on the
-/// daemon's writer lock (ADR-099 D5 daemon-coexistence), and is cheap to
-/// override per invocation (`kkernel exec --atomic --atomic-max-ops N`)
-/// without touching this default. Revisit once the load-harness (ADR-067
-/// Component A) has real per-op-count latency data under contention.
+/// migration step 7 / B3). Override per invocation with
+/// `kkernel exec --atomic --atomic-max-ops N`. See
+/// crates/khive-types/docs/pack-error-internals.md#atomic_max_ops_default--2000--rationale
+/// for why 2000 specifically was chosen and when to revisit it.
 pub const ATOMIC_MAX_OPS_DEFAULT: usize = 2000;
 
 /// Why a verb was rejected from an `--atomic` op list (ADR-099 D3, migration
