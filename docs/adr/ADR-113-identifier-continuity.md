@@ -64,6 +64,12 @@ out of scope here.
    entity may itself be merged later (`C → D → E`).
 3. Return the first live (`deleted_at IS NULL`, `merged_into IS NULL`) entity reached.
 
+The chase is the default read behavior, and `get(C, include_deleted=true)` is its one deliberate
+exception: that flag exists to inspect deletion and merge provenance, so it returns the tombstoned
+`C` itself — carrying its `merged_into` pointer — without following the redirect. Only default
+`get(C)` and `resolve(C)` chase to `K`; the explicit `include_deleted=true` opt-out always sees the
+tombstone. Implementations must preserve this precedence.
+
 **Cycle guard (required).** The chase carries a visited-set and a bounded hop limit. On a
 revisited id or an exceeded limit, it fails loud with a distinct error (`redirect cycle detected`
 / `redirect chain too long`) rather than looping. A cycle is a data-integrity fault; the resolver
@@ -78,13 +84,30 @@ named after `D`, with no indication the id moved, cannot distinguish "my id was 
 substrate is confused." The explicit marker is a small additive response field and keeps identity
 changes caller-visible. Recommend explicit; final call is the reviewer's.
 
+**Authorization (required).** The authorization Gate (ADR-018) evaluates the raw request arguments
+at the dispatch seam, before the pack handler runs — so a `get(C)` / `resolve(C)` that resolves
+`C → K` inside the handler would return `K` on the strength of a policy decision made about `C`. An
+id-aware policy that permits reading `C` but denies `K` would be bypassed, and the audit record
+would name the wrong effective target. Redirect resolution must therefore canonicalize the id to
+the effective target `K` and authorize on `K` before returning: either canonicalize at the dispatch
+seam ahead of the Gate check while retaining the original `C` for the audit record, or perform an
+explicit effective-target authorization check inside resolution. If that effective-target check
+denies, the read is denied — never silently downgraded to `C`. This is a dependency of this
+decision, not a follow-up: it requires an ADR-018 amendment if the Gate's public input contract
+must carry both the requested and the effective id. A regression test must cover a Gate that allows
+`C` and denies `K`.
+
 **Scope.** This decision covers the by-id READ entry points (`get`, `resolve`) — the exact surface
-the dangling class touches, since a holder of an old id re-enters through them. Multi-record reads
-(`list`, `neighbors`, `traverse`) already exclude tombstoned rows and see only the rewired-to-`D`
-edges, so they carry no dangling reference. By-id WRITE paths that target a merged id (`link`,
-`update`, `delete` on `C`) are deliberately left to a follow-up: redirecting a mutation interacts
-with caller intent and is not required to close the read-dangling class. No schema migration is
-needed — the pointer and provenance columns already exist.
+the dangling class touches, since a holder of an old id re-enters through them. `list` excludes
+tombstoned rows, so it surfaces no dangling `C`. Graph reads rooted at a stale id (`neighbors` /
+`traverse` with root `C`) return an **empty** result once `C` is tombstoned — the rewired edges
+live on `K`, not `C` — so a caller holding `C` must resolve `C → K` through `get` / `resolve` first
+and traverse from `K`; this ADR does not change graph-root behavior, and extending redirect
+resolution to graph-operation roots is left to a follow-up alongside the write-path redirect. By-id
+WRITE paths that target a merged id (`link`, `update`, `delete` on `C`) are likewise left to a
+follow-up: redirecting a mutation interacts with caller intent and is not required to close the
+read-dangling class. No schema migration is needed — the pointer and provenance columns already
+exist.
 
 ### (b) An id-preserving edge endpoint-move primitive
 
@@ -95,8 +118,15 @@ Expose the id-preserving endpoint move that merge already performs, as a scoped 
 
 - Updates `source_id` and/or `target_id` in place, **preserving `edge_id`**, so any `annotates`
   note targeting the edge remains valid.
-- Applies the same symmetric-relation canonicalization (`source_uuid < target_uuid`) and
-  natural-key conflict handling that the merge transaction uses.
+- Applies the same symmetric-relation canonicalization (`source_uuid < target_uuid`) that the merge
+  transaction uses.
+- **Rejects a natural-key collision (fail-loud) rather than dropping the edge.** If the move would
+  land the edge on an already-existing `(source_id, target_id, relation)` triple — the unique
+  natural key — the primitive returns an error and mutates nothing. This is the deliberate departure
+  from merge's internal handling, which _drops_ the colliding edge: dropping would delete the very
+  edge whose id (and whose `annotates` note) this primitive exists to preserve, silently
+  re-introducing the dangling-annotation regression. A split that hits such a collision is a
+  caller-resolvable modeling conflict, surfaced, not silently absorbed.
 - **Re-validates the resulting `(source_kind, relation, target_kind)` against the ADR-002 base
   contract plus pack endpoint rules.** This is the safety addition over the raw internal `UPDATE`:
   merge preserves kind, so it never re-validates, but a split moves an endpoint onto a
@@ -142,6 +172,11 @@ exposing the primitive; final call is the reviewer's.
 - The response shape of `get`/`resolve` grows an optional `redirected_from` field (additive;
   recommended fork).
 - A new curation primitive expands the write surface and its endpoint-validation obligations.
+- Redirect resolution must authorize on the effective target `K`, coupling this decision to the
+  Gate dispatch seam and requiring an ADR-018 amendment if the Gate's public input must distinguish
+  the requested id from the effective id.
+- A split fails loud on a natural-key collision, so the caller must resolve the collision by
+  re-modeling rather than the primitive silently absorbing it.
 
 ### Neutral
 
@@ -156,6 +191,9 @@ exposing the primitive; final call is the reviewer's.
 - Redirect of by-id WRITE operations (`link` / `update` / `delete`) that target a merged id —
   named as a follow-up; it interacts with caller intent and is not needed to close the
   read-dangling class.
+- Redirect resolution for graph-operation roots (`neighbors` / `traverse` rooted at a merged id) —
+  named as a follow-up alongside the write-path redirect; a stale root returns empty today, and the
+  caller resolves `C → K` through `get` / `resolve` first.
 - The public verb composition of a split operation — this ADR specifies the substrate primitives;
   how a split verb sequences them is a consumer concern.
 
@@ -164,4 +202,5 @@ exposing the primitive; final call is the reviewer's.
 - ADR-002 — edge ontology and the endpoint contract the move re-validates.
 - ADR-007 — namespace and identifier resolution (full-UUID passthrough).
 - ADR-014 — curation operations (merge) and the data-vs-view currency rule.
+- ADR-018 — the authorization Gate; redirect resolution must authorize on the effective target `K`.
 - ADR-055 — epistemic edges and edge annotation, the practice a re-minted edge id would orphan.
