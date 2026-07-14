@@ -2,14 +2,16 @@
 
 The memory pack keeps durable context that should be useful beyond the current
 session. A memory is a note with an importance (`salience`) and an age-based
-decay rate. Recall searches memories by meaning and keywords, then weighs the
-match against their decayed importance and recency.
+decay rate. When an embedding model and ANN are available, recall searches by
+meaning and keywords; otherwise, including its bounded ANN warm-up fallback,
+it uses full-text retrieval only. It then weighs matches against their decayed
+importance and recency.
 
 Use it for session conclusions, handoffs, corrections, preferences, and
 reusable operational knowledge. Use the knowledge graph for durable things and
-their relationships: entities, documents, projects, and explicit edges. A
-memory can point back to a graph record with `source_id` when the context needs
-both kinds of persistence.
+their relationships: entities, documents, projects, and explicit edges.
+Supplying `source_id` creates an `annotates` edge from the new memory to the
+source entity or note; omitting it creates no provenance edge.
 
 Complete verb signatures and the current parameter contract live in the
 [memory pack handler declarations](../../crates/khive-pack-memory/src/pack.rs)
@@ -35,6 +37,10 @@ request(ops="memory.remember(content=\"The release checklist requires a migratio
 `working` type. Choose `episodic` for time-bound session context and `semantic`
 for knowledge expected to remain useful across many sessions.
 
+Namespace defaults depend on type: semantic writes use the shared `local` pool,
+while episodic writes use the caller's actor namespace. An explicit `namespace`
+overrides either default.
+
 When omitted, the defaults are type-specific:
 
 | Type       | Salience | Decay factor | Intended lifetime             |
@@ -52,7 +58,7 @@ important, it stops distinguishing what matters.
 request(ops="memory.recall(query=\"release documentation decisions\", memory_type=\"semantic\", tags=[\"release\", \"docs\"], tag_mode=\"all\", min_score=0.35, min_salience=0.6, limit=5)")
 ```
 
-Recall combines full-text search and vector search. Its hybrid fusion supports
+When hybrid retrieval is available, its full-text/vector fusion supports
 reciprocal-rank fusion (RRF), as well as configured weighted fusion, before
 decay-weighted ranking. It is therefore not merely a chronological list: a
 strong, recent, relevant memory can outrank an older one with similar text.
@@ -71,18 +77,22 @@ request(ops="memory.recall(query=\"release documentation decisions\", limit=1) |
 
 This chains the first returned memory into automatic positive feedback. For an
 explicit rating or correction, use `memory.feedback` with the recalled memory
-ID and the appropriate signal. Feedback updates the recall posteriors; it is a
-ranking signal, not a rewrite of the memory's content.
+ID and the appropriate signal. `memory.feedback.target_id` must be the recalled
+memory's full UUID, not its short display ID. Feedback updates the recall
+posteriors; it is a ranking signal, not a rewrite of the memory's content.
 
 ## Maintenance
 
 `memory.prune` soft-deletes memories selected by low salience and/or expiry.
-Run it with `dry_run=true` first, inspect `would_prune`, then repeat without the
-flag only when the selection is correct. `memory.vacuum` reclaims database space
-after soft deletion; it does not choose memories to remove.
+When omitted, `before` defaults to now (so expired memories are selected) and
+`namespace` defaults to `local`; use `before=0` to prune by salience only. With
+`dry_run=true`, `would_prune` is a count, not the candidate identities. Make the
+cutoff and namespace explicit before repeating without the flag.
+`memory.vacuum` reclaims database space after soft deletion; it does not choose
+memories to remove.
 
 ```text
-request(ops="memory.prune(min_salience=0.2, dry_run=true)")
+request(ops="memory.prune(min_salience=0.2, before=0, namespace=\"local\", dry_run=true)")
 ```
 
 ## Gotchas
