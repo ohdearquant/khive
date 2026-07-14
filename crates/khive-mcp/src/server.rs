@@ -1502,8 +1502,12 @@ several independent ops can run together; use chain when each op needs the prior
 result (e.g. create then link with the new entity's id)."#)]
     async fn request(&self, Parameters(p): Parameters<RequestParams>) -> Result<String, McpError> {
         // Forward to the warm daemon when reachable, auto-spawning it
-        // on first use. Any failure (no socket, spawn failure, namespace
-        // mismatch, KHIVE_NO_DAEMON) falls through to local dispatch.
+        // on first use. An ordinary no-socket condition, a namespace
+        // mismatch, or KHIVE_NO_DAEMON falls through to local dispatch.
+        // A confirmed respawn failure (spawn error, or the child exits
+        // before binding the socket) instead returns a caller-visible
+        // `respawn_failed` error without local dispatch, per ADR-049
+        // Amendment 2.
         //
         // MCP-AUD-002: the daemon wire frame has no `save_to` field, so
         // daemon-forwarded requests silently drop the sink and return the
