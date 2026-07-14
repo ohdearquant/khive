@@ -133,6 +133,7 @@ For historical context, see [v0 archive](../_archive/adr_v0/README.md). v0 ADRs 
 | [ADR-110](ADR-110-vamana-wasm.md)                            | WebAssembly Support for khive-vamana                                                                  |
 | [ADR-111](ADR-111-blob-store.md)                             | BlobStore — Content-Addressed Binary Object Storage                                                   |
 | [ADR-112](ADR-112-git-outbound-publish-verbs.md)             | Outbound GitHub Publish Verbs with a Publication-Hygiene Scan                                         |
+| [ADR-113](ADR-113-identifier-continuity.md)                  | Identifier Continuity — Merged-Entity Redirect Resolution and Split Endpoint-Move                     |
 
 ## Closed Taxonomies — Quick Reference
 

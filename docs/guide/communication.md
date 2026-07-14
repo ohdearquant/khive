@@ -29,12 +29,17 @@ hidden by the newer filter.
 
 ### Send
 
-| Param       | Type   | Required | Notes                                       |
-| ----------- | ------ | -------- | ------------------------------------------- |
-| `to`        | string | yes      | Actor label, e.g. `"lambda:leo"`.           |
-| `content`   | string | yes      | Message body. Must not be empty.            |
-| `subject`   | string | no       | Optional subject line.                      |
-| `thread_id` | uuid   | no       | Groups the message into an existing thread. |
+| Param       | Type   | Required | Notes                                                                                                                                                                                           |
+| ----------- | ------ | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `to`        | string | yes      | Actor label, e.g. `"lambda:leo"`.                                                                                                                                                               |
+| `content`   | string | yes      | Message body. Must not be empty.                                                                                                                                                                |
+| `subject`   | string | no       | Optional subject line.                                                                                                                                                                          |
+| `thread_id` | uuid   | no       | Groups the message into an existing thread.                                                                                                                                                     |
+| `self_send` | bool   | no       | Default false. Required when `to` matches the configured sender actor; otherwise the send is rejected. The anonymous `local` fallback is exempt. Use true only for an intentional note to self. |
+
+A configured actor that addresses itself must opt in with `self_send=true`. If the
+target was meant to be a distinct parent or sub-agent, configure distinct actor identities
+instead of opting in; the rejection is intended to expose that identity collapse.
 
 ### Inbox
 

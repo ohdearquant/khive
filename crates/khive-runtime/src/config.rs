@@ -381,22 +381,38 @@ pub fn resolve_db_anchor(db: Option<&str>) -> Option<std::path::PathBuf> {
 
 /// Assert that a resolved `db_path`: which `compute_config_id` folds into a
 /// process's `config_id`: agrees with what [`resolve_db_anchor`] derives from
-/// the same `--db`/`KHIVE_DB` input. Call this right after `db_path` is
-/// resolved at each construction boundary.
+/// the same raw `--db`/`KHIVE_DB` input.
 ///
-/// Guards against a construction path recomputing `db_path` independently of
-/// `resolve_db_anchor`: left unchecked, that would silently desync
-/// `config_id` from a daemon or peer sharing the same database instead of
-/// failing loud. Inert (`Ok(())`) when the anchor itself is `None` (the
-/// `:memory:` sentinel) since there is nothing to compare against.
+/// This compatibility entry point preserves the raw-string API. Construction
+/// paths that already captured the anchor should call
+/// [`assert_captured_db_anchor_consistent`] so they do not re-read mutable
+/// process environment.
 pub fn assert_db_anchor_consistent(
     resolved_db_path: Option<&std::path::Path>,
     args_db: Option<&str>,
 ) -> anyhow::Result<()> {
-    let Some(anchor) = resolve_db_anchor(args_db) else {
+    let db_anchor = resolve_db_anchor(args_db);
+    assert_captured_db_anchor_consistent(resolved_db_path, db_anchor.as_deref())
+}
+
+/// Assert that a resolved `db_path`: which `compute_config_id` folds into a
+/// process's `config_id`: agrees with the database anchor captured from the
+/// same `--db`/`KHIVE_DB` input at the construction boundary.
+///
+/// Guards against a construction path recomputing `db_path` independently of
+/// `resolve_db_anchor`: left unchecked, that would silently desync `config_id`
+/// from a daemon or peer sharing the same database instead of failing loud.
+/// The caller passes the captured anchor so validation never re-reads mutable
+/// process environment. Inert (`Ok(())`) when the anchor itself is `None` (the
+/// `:memory:` sentinel) since there is nothing to compare against.
+pub fn assert_captured_db_anchor_consistent(
+    resolved_db_path: Option<&std::path::Path>,
+    db_anchor: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    let Some(anchor) = db_anchor else {
         return Ok(());
     };
-    if resolved_db_path != Some(anchor.as_path()) {
+    if resolved_db_path != Some(anchor) {
         anyhow::bail!(
             "db-path resolution drift at server construction: resolved db_path {:?} \
              does not match the canonical anchor {:?} computed by resolve_db_anchor \
@@ -690,7 +706,8 @@ mod resolve_db_anchor_tests {
 
 #[cfg(test)]
 mod assert_db_anchor_consistent_tests {
-    use super::{assert_db_anchor_consistent, resolve_db_anchor};
+    use super::{assert_captured_db_anchor_consistent, resolve_db_anchor};
+    use crate::assert_db_anchor_consistent;
 
     #[test]
     fn diverging_db_path_is_rejected_naming_both_paths() {
@@ -698,8 +715,9 @@ mod assert_db_anchor_consistent_tests {
         let anchor = resolve_db_anchor(Some(args_db)).expect("explicit path always anchors");
         let wrong = std::path::PathBuf::from("/tmp/khive-anchor-guard-wrong.db");
 
-        let err = assert_db_anchor_consistent(Some(wrong.as_path()), Some(args_db))
-            .expect_err("a resolved db_path diverging from the anchor must be rejected");
+        let err =
+            assert_captured_db_anchor_consistent(Some(wrong.as_path()), Some(anchor.as_path()))
+                .expect_err("a resolved db_path diverging from the anchor must be rejected");
 
         let msg = err.to_string();
         assert!(
@@ -716,7 +734,11 @@ mod assert_db_anchor_consistent_tests {
     fn matching_explicit_db_path_passes() {
         let args_db = "/tmp/khive-anchor-guard-consistent.db";
         let anchor = resolve_db_anchor(Some(args_db)).expect("explicit path always anchors");
-        assert!(assert_db_anchor_consistent(Some(anchor.as_path()), Some(args_db)).is_ok());
+        assert!(assert_captured_db_anchor_consistent(
+            Some(anchor.as_path()),
+            Some(anchor.as_path())
+        )
+        .is_ok());
     }
 
     #[test]
@@ -725,8 +747,8 @@ mod assert_db_anchor_consistent_tests {
         // path to assert against, so the guard passes regardless of what
         // `resolved_db_path` happens to carry.
         let bogus = std::path::PathBuf::from("/tmp/should-not-matter.db");
-        assert!(assert_db_anchor_consistent(Some(bogus.as_path()), Some(":memory:")).is_ok());
-        assert!(assert_db_anchor_consistent(None, Some(":memory:")).is_ok());
+        assert!(assert_captured_db_anchor_consistent(Some(bogus.as_path()), None).is_ok());
+        assert!(assert_captured_db_anchor_consistent(None, None).is_ok());
     }
 
     #[test]
@@ -736,7 +758,17 @@ mod assert_db_anchor_consistent_tests {
         // concrete anchor), so a runtime whose resolved `db_path` matches
         // passes silently.
         let anchor = resolve_db_anchor(None);
-        assert!(assert_db_anchor_consistent(anchor.as_deref(), None).is_ok());
+        assert!(assert_captured_db_anchor_consistent(anchor.as_deref(), anchor.as_deref()).is_ok());
+    }
+
+    #[test]
+    fn public_compatibility_wrapper_accepts_path_and_memory_sentinel() {
+        let args_db = "/tmp/khive-anchor-guard-public-api.db";
+        let anchor = resolve_db_anchor(Some(args_db)).expect("explicit path always anchors");
+        assert!(assert_db_anchor_consistent(Some(anchor.as_path()), Some(args_db)).is_ok());
+
+        let unrelated = std::path::Path::new("/tmp/khive-anchor-guard-unrelated.db");
+        assert!(assert_db_anchor_consistent(Some(unrelated), Some(":memory:")).is_ok());
     }
 }
 
