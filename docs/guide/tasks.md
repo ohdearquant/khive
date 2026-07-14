@@ -5,9 +5,7 @@ and an optional assignee; it can also be connected to the rest of the knowledge
 graph. Use it to capture work, decide what is ready, record work in progress,
 and retain the outcome.
 
-Calls go through `request` using the function-call DSL. The
-[GTD pack rustdoc](../../crates/khive-pack-gtd/src/vocab.rs) is the reference
-for verb signatures, parameters, and response shapes. For the enclosing call
+Calls go through `request` using the function-call DSL. For the enclosing call
 format and batching rules, see the [request tool rustdoc](../../crates/khive-mcp/src/tools/request.rs).
 
 ## Lifecycle
@@ -40,14 +38,16 @@ request(ops="gtd.assign(title=\"Triage documentation feedback\", assignee=\"docs
 ```
 
 The response includes the task identifier needed by later operations. A task
-can also have a context entity, due date, tags, and dependencies; their
-parameter details belong in the [GTD pack rustdoc](../../crates/khive-pack-gtd/src/vocab.rs).
+can also have a description, context entity, due/start/end dates, tags, and
+dependencies.
 
 ## Choose the next task
 
 Use `gtd.next` to read the actionable queue. It considers only `next` and
 `active` tasks, sorts them by priority (`p0` first), and can filter by exact
-assignee.
+assignee. It defaults to `limit=10` and silently clamps `limit` to 1–200. If
+more than 20,000 actionable tasks match, it returns an error; narrow the query
+(for example with the exact `assignee` filter) and retry.
 
 ```text
 request(ops="gtd.next(assignee=\"docs-maintainer\", limit=10)")
@@ -56,7 +56,8 @@ request(ops="gtd.next(assignee=\"docs-maintainer\", limit=10)")
 Use `gtd.tasks` when reviewing work by status, assignee, or priority. Both
 `gtd.tasks` and `gtd.next` accept an assignee filter. Without a status filter,
 `gtd.tasks` shows non-terminal work; pass a terminal status when reviewing
-completed or cancelled tasks.
+completed or cancelled tasks. It defaults to `limit=50, offset=0`, and
+silently clamps `limit` to 1–200.
 
 ## Start and finish work
 
@@ -72,6 +73,9 @@ request(ops="gtd.assign(title=\"Review the task guide\", assignee=\"docs-maintai
 A repeated transition to the current status is a no-op. Use `gtd.complete` to
 finish an actionable task (`next` or `active`); it records `completed_at`, and
 can mark the task `done` (the default) or `cancelled`.
+
+When `gtd.transition` is a no-op, branch on `transitioned`: when it is `false`,
+only `transitioned`, `id`, `full_id`, `from`, `to`, and `note` are present.
 
 ## Dependencies
 
