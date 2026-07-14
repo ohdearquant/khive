@@ -2795,6 +2795,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn captured_log_flush_is_a_noop() {
+        use std::io::Write;
+
+        let mut captured = CapturedLog::default();
+        captured
+            .write_all(b"respawn-event")
+            .expect("write captured event");
+        captured.flush().expect("flush captured event");
+        assert_eq!(captured.contents(), "respawn-event");
+    }
+
     impl RespawnDisclosureFixture {
         fn new(sentinel: &'static str) -> Self {
             let original_home = std::env::var_os("HOME");
@@ -2865,6 +2877,20 @@ mod tests {
         }
     }
 
+    #[test]
+    #[serial]
+    fn respawn_disclosure_fixture_restores_absent_home() {
+        let home = std::env::var_os("HOME").expect("test process has HOME");
+        std::env::remove_var("HOME");
+        {
+            let _fixture =
+                RespawnDisclosureFixture::new("KHIVE_RESPAWN_LOG_SENTINEL_ABSENT_HOME_62cc1aeb13");
+            assert!(std::env::var_os("HOME").is_some());
+        }
+        assert!(std::env::var_os("HOME").is_none());
+        std::env::set_var("HOME", home);
+    }
+
     #[tokio::test]
     #[serial]
     async fn forward_or_spawn_surfaces_loud_error_when_respawn_confirmed_dead_non_strict() {
@@ -2894,6 +2920,9 @@ mod tests {
         match out {
             Some(Err(error)) => {
                 disclosure.assert_caller_output_is_sanitized(&error);
+                let data = error.data.as_ref().expect("respawn error data");
+                assert_eq!(data["reason"], "respawn_failed");
+                assert!(data.get(STRICT_FALLBACK_MARKER).is_none());
                 let message = &error.message;
                 assert!(
                     message.contains("respawn failed"),
@@ -2951,6 +2980,9 @@ mod tests {
         match out {
             Some(Err(error)) => {
                 disclosure.assert_caller_output_is_sanitized(&error);
+                let data = error.data.as_ref().expect("strict respawn error data");
+                assert_eq!(data["reason"], "respawn_failed");
+                assert_eq!(data[STRICT_FALLBACK_MARKER], true);
                 let message = &error.message;
                 assert!(
                     message.contains("respawn failed"),
@@ -3030,6 +3062,65 @@ mod tests {
         assert_eq!(fallback_total(), 0);
 
         reset_fallback_counters();
+        clear_daemon_env();
+        std::env::remove_var("KHIVE_LOCK");
+    }
+
+    #[cfg(unix)]
+    struct SleepingExecutableGuard {
+        path: std::path::PathBuf,
+        backup: std::path::PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl SleepingExecutableGuard {
+        fn replace_current_exe() -> Self {
+            use std::os::unix::fs::PermissionsExt;
+
+            let path = std::env::current_exe().expect("resolve current test executable");
+            let backup =
+                path.with_extension(format!("khive-respawn-backup-{}", std::process::id()));
+            std::fs::rename(&path, &backup).expect("back up current test executable");
+            std::fs::write(&path, b"#!/bin/sh\nsleep 10\n")
+                .expect("install sleeping executable wrapper");
+            let mut permissions = std::fs::metadata(&path)
+                .expect("read sleeping wrapper metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&path, permissions).expect("make sleeping wrapper executable");
+            Self { path, backup }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for SleepingExecutableGuard {
+        fn drop(&mut self) {
+            std::fs::remove_file(&self.path).expect("remove sleeping executable wrapper");
+            std::fs::rename(&self.backup, &self.path).expect("restore current test executable");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn forward_or_spawn_falls_back_when_spawned_child_is_still_alive() {
+        clear_daemon_env();
+        reset_fallback_counters();
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("KHIVE_SOCKET", dir.path().join("khived.sock"));
+        std::env::set_var("KHIVE_PID", dir.path().join("khived.pid"));
+        std::env::set_var("KHIVE_LOCK", dir.path().join("khived.recovery.lock"));
+        std::env::remove_var("KHIVE_NO_DAEMON");
+        std::env::remove_var("KHIVE_DAEMON_STRICT");
+        let _executable = SleepingExecutableGuard::replace_current_exe();
+
+        let out = forward_or_spawn(&unreachable_daemon_frame(CFG)).await;
+
+        assert!(
+            out.is_none(),
+            "a live spawned child with no socket remains eligible for non-strict local fallback: {out:?}"
+        );
+        assert_eq!(fallback_count(FallbackReason::NoSocket), 1);
         clear_daemon_env();
         std::env::remove_var("KHIVE_LOCK");
     }
