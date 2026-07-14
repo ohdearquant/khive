@@ -2,12 +2,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::GateValidationError;
 
-// ---------- Actor ----------
-
-/// Caller identity. `kind` distinguishes user vs agent vs lambda etc.
+/// Caller identity with non-empty `kind` and `id`, validated on construction and deserialization.
 ///
-/// Invariant: both `kind` and `id` must be non-empty. Enforced at construction
-/// and deserialization via `serde(try_from)`.
+/// See `crates/khive-gate/docs/api/policy-types.md`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
 pub struct ActorRef {
     pub kind: String,
@@ -74,14 +71,10 @@ impl ActorRef {
         self.kind == "anonymous"
     }
 
-    /// The identity to use for actor-binding resolution: `None` for the
-    /// anonymous caller, `Some(&self.id)` otherwise.
+    /// Return the explicit binding ID, or `None` for the anonymous caller.
     ///
-    /// Invariant: anonymous identity never participates in actor-binding
-    /// resolution. `anonymous()` carries `id: "local"`, which is a valid
-    /// explicit-binding value (e.g. `actor="local"`); resolving on it
-    /// would let an unauthenticated caller match a binding that a
-    /// pre-actor-aware `None` could never match.
+    /// Anonymous identity must never participate in binding resolution. See
+    /// `crates/khive-gate/docs/api/policy-types.md`.
     pub fn binding_id(&self) -> Option<&str> {
         if self.is_anonymous() {
             None

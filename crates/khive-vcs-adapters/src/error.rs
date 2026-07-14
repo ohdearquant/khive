@@ -6,10 +6,8 @@ use thiserror::Error;
 
 /// An error produced by a format adapter.
 ///
-/// Fatal errors (missing required fields, structural failures) are non-recoverable:
-/// the adapter aborts and the caller must handle the error atomically. Non-fatal
-/// issues (unknown but non-required fields) are warnings reported in the import
-/// summary.
+/// Variants are fatal to the containing record/source and require atomic caller handling;
+/// optional issues use warnings. See `crates/khive-vcs-adapters/docs/api/wire-records.md`.
 #[derive(Debug, Error)]
 pub enum AdapterError {
     /// A required field is missing from a record.

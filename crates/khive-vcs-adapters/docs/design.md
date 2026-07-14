@@ -47,6 +47,6 @@
 
 - ADR-036 §7 specifies streaming JSON parse (requiring an `impl Read` pipeline). The current
   `JsonFormatAdapter` uses eager `serde_json::from_str` — the full source is loaded before
-  iteration. Streaming is deferred to P1. This is documented in `docs/protocol.md`.
+  iteration. Streaming is deferred to P1. This is documented in `docs/api/adapter-protocol.md`.
 - The `PHASE0_FORMATS` constant in `lib.rs` includes `csv` and `tsv`, but no CSV/TSV adapters
   are implemented yet. These are P0 aspirational entries.

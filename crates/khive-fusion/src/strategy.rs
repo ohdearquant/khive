@@ -68,9 +68,9 @@ impl TryFrom<RawFusionStrategy> for FusionStrategy {
     }
 }
 
-/// Fusion strategy for combining ranked result lists.
+/// Validated selection for combining ranked result lists.
 ///
-/// Validated at construction and deserialization boundaries.
+/// See `crates/khive-fusion/docs/api/strategy-validation.md`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 #[serde(try_from = "RawFusionStrategy")]
@@ -128,7 +128,7 @@ impl FusionStrategy {
         Self::Rrf { k: DEFAULT_RRF_K }
     }
 
-    /// Create an RRF strategy with custom k value. Returns error if k == 0.
+    /// Create an RRF strategy, returning [`FusionStrategyError::RrfKZero`] for zero.
     #[inline]
     pub fn try_rrf(k: usize) -> Result<Self, FusionStrategyError> {
         if k == 0 {
@@ -145,7 +145,7 @@ impl FusionStrategy {
         Self::Rrf { k: k.max(1) }
     }
 
-    /// Create a weighted strategy after validating weights are finite.
+    /// Create weighted fusion, returning an error for NaN or infinite weights.
     pub fn try_weighted(weights: Vec<f64>) -> Result<Self, FusionStrategyError> {
         for w in &weights {
             if w.is_nan() {
@@ -172,7 +172,7 @@ impl FusionStrategy {
         Self::Union
     }
 
-    /// Create a custom strategy with name validation.
+    /// Create a runtime-dispatched custom strategy, rejecting an empty name.
     pub fn try_custom(
         name: String,
         params: serde_json::Value,
