@@ -72,16 +72,37 @@ verbs are `git`-pack verbs, `pack.verb` namespaced per ADR-023, dispatched throu
 existing `VerbRegistry` / `Gate` seam every other khive verb uses - no new dispatch
 mechanism.
 
+### Canonical request and optional-argument contract
+
+The optional arguments have one wire shape and one normalized representation:
+
+| Argument                      | Wire type       | Default and normalization                                                                                                                                                   | Validation limit                                                                                                                              |
+| ----------------------------- | --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `git.publish_issue.labels`    | `array<string>` | Omitted and `[]` both normalize to `[]`. Otherwise, reject exact duplicates and sort strings by unsigned UTF-8 byte order before hashing and transport.                     | At most 100 entries; each entry is 1-50 Unicode scalar values and contains no NUL, carriage return, or line feed.                             |
+| `git.publish_issue.assignees` | `array<string>` | Omitted and `[]` both normalize to `[]`. Normalize each login to ASCII lowercase, reject duplicates after lowercasing, and sort by unsigned UTF-8 byte order.               | At most 10 entries; each entry is 1-39 ASCII alphanumeric-or-hyphen characters, starts and ends alphanumeric, and has no consecutive hyphens. |
+| `git.publish_pr.draft`        | `boolean`       | Omitted and `false` both normalize to `false`; `true` remains `true`.                                                                                                       | Boolean only.                                                                                                                                 |
+| `git.publish_release.title`   | `string`        | Omitted, `""`, and a value exactly equal to the normalized `tag` all normalize to the normalized `tag`. The handler always passes the resulting non-empty title explicitly. | The resulting title is 1-256 Unicode scalar values and contains no NUL, carriage return, or line feed.                                        |
+
+For these four optional arguments, JSON `null` is invalid rather than another spelling of
+omission. String content is otherwise preserved byte-for-byte: the handler does not trim
+whitespace, case-fold labels, or apply Unicode normalization. Array order is not semantic;
+the sorted forms above are the only forms stored, hashed, or sent to `gh`. "Normalized
+`tag`" in the release-title rule means the exact required `tag` string after validation;
+v0 does not trim, case-fold, or otherwise rewrite it.
+
 `idempotency_key` is required on all four verbs. It is a caller-generated UUID in
 canonical lowercase hyphenated form and identifies one logical publication across retries.
-The handler applies defaults, preserves array order, sorts object keys lexicographically,
-serializes the normalized arguments other than `idempotency_key` as compact UTF-8 JSON,
-and stores the BLAKE3 hash of those bytes. The generated reconciliation marker is not part
-of the hash. The same key with the same hash resumes that operation; reusing it with a
-different hash is rejected before any network call. The implementation stores the key as
-`operation_id` in the recovery ledger described below. A successful retry returns the
-cached remote result. This explicit key is necessary because neither `gh` nor a GitHub
-create operation supplies a transactional boundary shared with khive's graph store.
+The handler validates all arguments, applies the defaults and array normalization above,
+and constructs a canonical object containing every verb argument other than
+`idempotency_key`, including the explicit default values. It sorts object keys
+lexicographically by unsigned UTF-8 bytes, serializes the object as compact UTF-8 JSON, and
+stores the BLAKE3 hash of those bytes. The generated reconciliation marker is not part of
+the hash. Consequently, omitted and explicit defaults hash identically, as do permutations
+of the same labels or assignees. The same key with the same hash resumes that operation;
+reusing it with a different hash is rejected before any network call. The implementation
+stores the key as `operation_id` in the recovery ledger described below. A successful retry
+returns the cached remote result. This explicit key is necessary because neither `gh` nor a
+GitHub create operation supplies a transactional boundary shared with khive's graph store.
 
 ### Comment target grammar
 
@@ -125,11 +146,21 @@ authorization, and hygiene scanning have completed:
    `[git] publish_repos` (daemon config; see "Repo allowlist" below). An unregistered repo
    fails fast, independent of content - there is no reason to scan text for a repository
    this daemon can never publish into.
-2. **Publication-hygiene scan.** Every free-text field submitted to the verb - `title`,
-   `body`, `notes`, and every string inside `labels`/`assignees` - is scanned by the three
-   layers described in "Scan module" below. The scan is origin-agnostic: it does not
-   distinguish an agent's own prose from relayed or pasted text. There is no trusted-source
-   bypass and no `force=true` parameter on any verb.
+2. **Publication-hygiene scan.** Every caller-controlled string that can become externally
+   visible - `title`, `body`, `notes`, `tag`, `head`, `base`, and every string inside
+   `labels`/`assignees` - is scanned by both the token denylist and the secret scan described
+   in "Scan module" below, followed by the token allowlist layer. This includes the release
+   tag because `gh release create` can create a missing tag, and includes PR head/base names
+   because GitHub exposes them as pull-request identifiers. The scan runs before the
+   operation is claimed or `gh` is invoked. It is origin-agnostic: it does not distinguish
+   an agent's own prose from relayed or pasted text. There is no trusted-source bypass and
+   no `force=true` parameter on any verb.
+
+   The remaining caller-controlled identifiers have narrower validation that prevents this
+   content channel: `repo` must be an exact configured allowlist entry; comment `target`
+   must match the closed grammar and an existing object in that repo; and
+   `idempotency_key` must be a canonical UUID before the handler derives the externally
+   visible reconciliation marker. They are therefore validated, not pattern-scanned.
 3. **Deny path.** Any hit not covered by an allowlist escape produces a synchronous deny to
    the caller (see "Deny semantics") and an additional typed audit record (see "Audit and
    the event plane"). No GitHub API call is made.
@@ -198,7 +229,9 @@ matching every other khive verb's error contract) with scan-specific fields:
 
 ### Scan module
 
-Three layers, evaluated in order, all inside the verb handler:
+Three layers, evaluated in order, all inside the verb handler. The candidate field set is
+the normalized outward-facing strings from Handler pipeline step 2, including `tag`,
+`head`, and `base`; the deny response and audit identify a hit by that exact field name:
 
 1. **Token denylist.** Pattern matching (regex, fail-closed) against categories described
    in the Pattern File Format section below: actor and deployment identifier tokens, internal
@@ -211,7 +244,8 @@ Three layers, evaluated in order, all inside the verb handler:
    documentation. An ADR that listed the actual internal tokens would itself be exactly the
    kind of publication-hygiene violation this system exists to prevent.
 2. **Secret scan.** Reuses the existing `secret_gate` module's compiled patterns (the same
-   ones ADR-088 §5 applies at ingest) against the same fields. Unlike the ingest path,
+   ones ADR-088 §5 applies at ingest) against the same candidate fields, including `tag`,
+   `head`, and `base`. Unlike the ingest path,
    which masks a detected secret and keeps the record, outbound publish **denies** on a
    secret-scan hit and masks nothing silently. The directionality is deliberate: inbound
    content is sanitized and kept because the record has independent value once the secret
@@ -220,10 +254,11 @@ Three layers, evaluated in order, all inside the verb handler:
    remove the credential rather than merely lose it from a git message.
 3. **Allowlist escapes.** Certain tokens are legitimate in certain repos - a product name
    that also matches an actor-token pattern, for example. Escapes are declared per
-   `(repo, pattern_id)` pair in the same config file the patterns live in (see Pattern File
+   `(repo, pattern_id)` pair in the same pattern file the token rule lives in (see Pattern File
    Format), never as a per-call parameter. There is no `force=true` escape on any verb; an
-   operator who needs an exception edits the versioned allowlist file, and that edit is
-   itself reviewable through the same process as any other configuration change.
+   operator who needs an exception edits the applicable generic or private pattern file,
+   updates the configured revision, and subjects that change to the installation's config
+   review process.
 
 ### Repo allowlist
 
@@ -271,15 +306,16 @@ Every additional row carries these required payload keys:
 | `operation_id`  | Canonical idempotency UUID supplied by the call, or `null` if key validation failed                                                           |
 | `state`         | Recovery state after this invocation, or `not_claimed` if the operation ledger was not reached                                                |
 | `rule_ids`      | Sorted, unique pattern ids on deny; empty array otherwise                                                                                     |
+| `denied_fields` | Sorted, unique outward field names on deny (including `tag`, `head`, or `base` when applicable); empty array otherwise                        |
 | `field_count`   | Number of distinct denied fields on deny; zero otherwise                                                                                      |
 | `remote_url`    | Published URL on success and whenever already known during recovery; `null` otherwise                                                         |
 | `remote_number` | Positive issue/PR number on issue or PR success; `null` for comments, releases, denies, and errors before that identity is known              |
 | `remote_id`     | Comment id on comment success; `null` for issues, pull requests, releases, denies, and errors before that identity is known                   |
 | `stage`         | `validation`, `scan`, `remote_publish`, `remote_reconcile`, `graph_ingest`, or `audit_append` on denied/error outcomes; `complete` on success |
 
-No title, body, notes, labels, assignee, matched span, or excerpt is stored in this
-payload. In particular, `rule_ids` identifies every hygiene rule hit without persisting
-the rejected content.
+No title, body, notes, tag, head, base, label, assignee, matched span, or excerpt is stored
+in this payload. `rule_ids` and `denied_fields` identify the rules and field names that
+caused a hygiene denial without persisting the rejected content.
 
 These rows are **additional to**, not replacements for, the dispatch-audit row that
 `VerbRegistry` already attempts for every call. The automatic row also has
@@ -462,9 +498,10 @@ whereas a retried create could duplicate public content.
 
 The token-denylist (scan layer 1) and allowlist-escape (scan layer 3) patterns are defined
 in TOML files, loaded by both the server-side verb handler and the client-side pre-tool-use
-hook described in the Context section. Both layers must reach the same allow/deny decision
-on the same content - the sections below are the contract that makes that possible across
-two independent implementations.
+hook described in the Context section. Both implementations must reach the same allow/deny
+decision on the same content. The authoritative paths, overlay selection, content revision,
+reload behavior, and shared conformance corpus below are the executable contract for that
+property.
 
 This normative contract covers only scan layers 1 and 3. Scan layer 2 (the secret scan)
 reuses the existing, already-deployed `secret_gate` module and its own pattern set; it is
@@ -476,37 +513,60 @@ not required by this ADR.
 
 ### Two files, one merged pattern set
 
-1. **In-repo generic pattern file** - versioned in the khive repository, public-visible.
-   Contains only generic pattern _classes_: a pattern that matches the _shape_ of an
-   actor-namespace token, an internal-path prefix, or org-mechanics phrasing, never a
-   concrete internal identifier, alias, or literal internal term. This file must never contain
-   concrete internal-identifier tokens; if a pattern would only make sense with a concrete literal
-   internal term hardcoded into it, that pattern does not belong in this file - it belongs
-   in the overlay.
-2. **Local overlay file** - not versioned in the repository, resolved from a
-   daemon-configured path (for example, an environment variable or a `[git]` config key
-   pointing outside the repository tree, matching the operational shape the git-digest
-   scratch cache already uses for daemon-owned paths outside version control). Contains the
-   concrete internal tokens: internal identifiers, aliases, literal internal-process phrasing. This
-   file is a private, per-installation overlay - it is never committed, never published,
-   and is out of scope for this ADR's public-repo artifact.
+1. **In-repo generic pattern file** - exactly
+   `crates/khive-pack-git/patterns/publication-hygiene.toml`, versioned in the khive
+   repository and public-visible. This path is the sole source of generic pattern bytes.
+   The Rust pack may embed those bytes at build time, and hook packaging may copy them, but
+   generated or installed copies must be byte-identical to this file. It contains only
+   generic pattern _classes_: a pattern that matches the _shape_ of an actor-namespace
+   token, an internal-path prefix, or org-mechanics phrasing, never a concrete internal
+   identifier, alias, or literal internal term. If a pattern would only make sense with a
+   concrete literal internal term hardcoded into it, that pattern does not belong in this
+   file - it belongs in the overlay.
+2. **Local overlay file** - not versioned in the repository. Its only selection mechanism
+   is the optional absolute path at `[git] publication_hygiene_overlay` in the resolved
+   khive config file. There is no second environment variable or alternate config key for
+   the overlay. The server uses its normal `--config` / `KHIVE_CONFIG` resolution; a paired
+   hook must receive that same resolved absolute config path through `KHIVE_CONFIG` and
+   must not perform an independent current-directory search. The overlay contains concrete
+   internal tokens: internal identifiers, aliases, and literal internal-process phrasing.
+   It is private per installation, never committed, and never published.
+
+`[git] publication_hygiene_revision` is required whenever `publish_repos` is non-empty. It
+is the lowercase 64-hex-character BLAKE3 digest of this unambiguous byte sequence:
+
+```text
+"khive-publication-hygiene-v1\0"
+|| u64be(generic_byte_length) || generic_bytes
+|| u64be(overlay_byte_length) || overlay_bytes
+```
+
+For an absent overlay key, `overlay_byte_length` is zero and `overlay_bytes` is empty. Both
+consumers compare their computed digest with the configured revision and fail closed on a
+mismatch. Thus an old embedded generic file, a stale installed hook copy, or a different
+overlay cannot silently produce a second effective rule set.
 
 ### Merge semantics
 
-At load time (daemon startup for the verb handler; hook startup or first-invocation for
-the client-side scanner), the two files are merged into one pattern set:
+Before each scan, both consumers validate the configured revision and merge the two files
+into one pattern set. The generic bytes may remain embedded or cached, but the overlay is
+read and the combined revision is recomputed for every scan; v0 does not cache overlay
+contents across scans. This makes an in-place overlay change fail closed until the
+configured revision is updated, and makes the new revision effective without one consumer
+continuing to use stale overlay bytes.
 
 - The in-repo file loads first, the overlay file loads second and its patterns are
   appended.
 - Every pattern's `id` field must be unique across the merged set. If the overlay defines
-  an `id` that already exists in the in-repo file, the loader fails closed at startup - an
+  an `id` that already exists in the in-repo file, that scan fails closed - an
   overlay is additive only; it cannot redefine or silently shadow a pattern the in-repo
   file ships. This prevents a misconfigured local overlay from quietly weakening the
   generic pattern set.
-- A missing overlay file is not an error - the merged set is simply the in-repo file's
-  patterns alone. A malformed overlay file (fails to parse as valid TOML matching the
-  schema below) is an error and fails closed: the daemon does not start with a partially
-  loaded pattern set, and the hook does not run with a partially loaded pattern set either.
+- An absent overlay config key selects the generic file alone. If the key is present, its
+  value must be an absolute UTF-8 path. A relative path, missing or unreadable file, malformed
+  TOML, schema violation, or revision mismatch fails closed before any external write. The
+  server returns a configuration error and the hook denies the raw content-write command;
+  neither continues with a partially loaded pattern set.
 
 ### Pattern entry schema
 
@@ -583,20 +643,59 @@ the two layers could disagree about the same content, which this format exists t
 ### Match semantics
 
 - Each pattern is applied independently to each candidate string field of a publish
-  request (`title`, `body`, `notes`, and each string within `labels`/`assignees`) - never
-  to a concatenation of fields, so that a reported hit's `field` value is accurate.
-  Whether a candidate scans every field or only free-text fields is a verb-level decision
-  (see Handler pipeline step 2); the file format itself does not vary by field.
+  request (`title`, `body`, `notes`, `tag`, `head`, `base`, and each string within
+  `labels`/`assignees`) - never to a concatenation of fields, so that a reported hit's
+  `field` value is accurate. The candidate set is fixed by Handler pipeline step 2; neither
+  scanner may silently omit an identifier field.
 - A pattern matching anywhere within a field's string is a hit for that field. An
   implementation is not required to find every possible match within a single field for a
   single pattern - one is sufficient to deny - but the reference verb implementation
   reports the first match per `(field, pattern_id)` pair in `hits[]` for completeness of
   the audit record.
-- File location, load order relative to other daemon startup steps, and caching/reload
-  behavior are implementation and configuration detail, not part of this normative
-  section. What is normative - and must not diverge between the two consuming
-  implementations - is: the TOML shape above, the cross-file `id`-uniqueness rule, the
-  regex-portability subset, and the per-field, per-pattern hit semantics.
+- A repo-specific `[[allow]]` entry is applied only after the implementation has collected
+  the token-pattern hit. The shared corpus therefore observes the same hit before the same
+  `(repo, pattern_id)` suppression in both implementations.
+
+### Shared conformance corpus
+
+The authoritative cross-implementation corpus is exactly
+`crates/khive-pack-git/tests/fixtures/publication-hygiene-conformance.toml`. A companion
+test overlay, when needed by a case, is
+`crates/khive-pack-git/tests/fixtures/publication-hygiene-overlay.toml`. These are generic
+test fixtures and contain no deployment-specific terms.
+
+The corpus has two closed case tables:
+
+```toml
+[[scan_case]]
+id = "word-boundary-deny"
+repo = "org/repo"
+field = "body"
+text = "generic fixture text"
+expected_rule_ids = ["fixture-word-boundary"]
+
+[[load_case]]
+id = "reject-lookbehind"
+regex = '(?<=x)y'
+expected = "reject"
+```
+
+For `scan_case`, `id`, `repo`, `field`, `text`, and the sorted unique
+`expected_rule_ids` are required; an empty expected list means allow. For `load_case`,
+`id`, `regex`, and `expected = "accept" | "reject"` are required. Unknown keys or duplicate
+case ids fail the corpus loader. Both implementations execute every case and must produce
+the exact expected result; neither maintains a private copy or language-specific expected
+file.
+
+The committed corpus must cover at least: allow and deny for every pattern category;
+matches and near-misses for anchors, `\b`, alternation, quantifiers, character classes, and
+`(?i)`; non-ASCII adjacent text that can expose word-boundary differences; rejection of
+lookaround, backreferences, possessive quantifiers, and atomic groups; multiple rule hits;
+all outward field names including `tag`, `head`, and `base`; a repo-specific allowlist hit
+that is allowed in exactly one repo and denied in another; duplicate ids across generic and
+overlay files; an absent overlay; and malformed or revision-mismatched overlays. Passing
+this corpus in both the Rust handler suite and the hook suite is a release gate for any
+pattern-format, loader, or regex-engine change.
 
 ## Implementation requirements and verification
 
@@ -628,6 +727,26 @@ pattern file, it must include these contract tests:
 5. **Idempotency-key conflict.** Reusing a key with identical normalized arguments returns
    or resumes the original operation; reusing it with different arguments fails before
    transport.
+6. **External identifier hygiene.** Table-driven fake-transport tests put a token-denylist
+   match and a `secret_gate` match in each of `tag`, `head`, and `base`. Every case returns
+   a hygiene denial before an operation-ledger claim or any `gh` invocation, the transport
+   spy observes zero GitHub writes, and the deny response plus audit identify the exact
+   field. The release cases must include both a denied generic-pattern tag and a
+   credential-shaped secret-pattern tag, proving that automatic tag creation cannot bypass
+   either scan layer.
+7. **Optional-argument normalization.** For labels and assignees, compare omission with
+   `[]`, compare at least two permutations of the same non-empty array, and retry each form
+   with one idempotency key. For draft, compare omission with `false`. For release title,
+   compare omission, `""`, and the normalized tag. Each equivalence case must produce the
+   same canonical JSON and request hash and must resume or return the same operation on a
+   same-key retry; each genuinely different normalized value must conflict on that key.
+   Limit, element-shape, duplicate, and JSON-`null` failures occur before transport.
+8. **Hook/server scan conformance.** The Rust handler suite and the hook implementation's
+   suite both execute every case in
+   `crates/khive-pack-git/tests/fixtures/publication-hygiene-conformance.toml` against the
+   authoritative generic file and test overlay. CI fails on a skipped case, divergent
+   allow/deny result, field or rule-id mismatch, regex-portability mismatch, allowlist
+   mismatch, or revision mismatch.
 
 `tests/smoke_test.py` must cover one allowed publish against a controlled fake `gh`, one
 hygiene deny, one comment-target validation failure, and one resumed
@@ -659,11 +778,12 @@ test suite must not create real GitHub content.
    idempotent self-ingest, and the repo allowlist ship together, with coverage added to
    `tests/smoke_test.py`.
 3. **Deployment notice and hook convergence**: outbound GitHub content publication moves
-   to the verb surface. The existing client-side hook converges onto the same pattern file
-   this ADR defines (rather than an independently maintained rule set) and narrows its role
-   to denying raw `gh` content writes outright, pointing the caller at the equivalent verb
-   - it no longer needs to make its own allow/deny judgment once the verb enforces the
-     identical scan server-side.
+   to the verb surface only after the Rust handler and hook both pass the shared conformance
+   corpus, consume the authoritative generic file, resolve the same absolute config path,
+   and validate the same configured pattern-set revision. The hook then narrows its role to
+   denying raw `gh` content writes outright and pointing the caller at the equivalent verb;
+   it no longer makes an independent content allow/deny judgment once the verb enforces the
+   scan server-side.
 4. **Second wave** (a follow-on ADR or amendment, not specified by this document): the
    review-verdict comment path adopts the verb surface, and edit verbs are added, reusing
    the same scan module.
@@ -682,9 +802,11 @@ Four forks were presented for this design; each is resolved in place.
    `git.digest`'s read direction and from ADR-108's repo-mutation verbs.
 2. **Pattern file location and shape (F2)**: whether the denylist lives entirely in-repo,
    entirely in a private overlay, or split. **Resolved**: split. Generic pattern classes
-   ship in-repo, versioned and public-visible; the concrete internal-token list is a
-   private local overlay file, merged at load per the rules in "Pattern File Format"
-   above. The in-repo file must never contain concrete internal-identifier tokens.
+   ship at the single authoritative in-repo path, versioned and public-visible; the
+   concrete internal-token list is selected only by the resolved config's absolute overlay
+   path. A required merged-content revision and the shared hook/server conformance corpus
+   prevent file-version and scanner-semantic drift. The in-repo file must never contain
+   concrete internal-identifier tokens.
 3. **Deny-event notification (F3)**: whether a scan deny also notifies the calling actor's
    own inbox or messaging channel, in addition to the synchronous deny response.
    **Resolved**: no per-deny notification in v0. The synchronous deny to the caller plus
@@ -709,8 +831,9 @@ Four forks were presented for this design; each is resolved in place.
 - Same-call KG visibility of caller-authored GitHub content via recoverable self-ingest,
   without waiting on the next digest sweep.
 - Pattern data is versioned and reviewable as an ordinary file diff, rather than scattered
-  across independently maintained hook and verb implementations that could silently drift
-  apart.
+  across independently maintained hook and verb implementations. The shared corpus and
+  configured merged-content revision make semantic or file-version drift a failing check
+  instead of a silent behavior change.
 
 ### Negative
 
@@ -724,11 +847,11 @@ Four forks were presented for this design; each is resolved in place.
   preferring a blocked operation over duplicate public content.
 - The recovery ledger stores outbound content that has passed the scan so local graph work
   can be replayed. It is daemon-local state and expands the data-retention surface.
-- The overlay-file split (F2) is an operational dependency, not a solved problem: a missing
-  or stale overlay changes what the scan catches, and if the verb handler and the hook load
-  overlays from different paths or versions, the two layers can still drift despite sharing
-  one file format. The format in this ADR makes convergence possible; it does not enforce
-  that both deployed copies are kept in sync.
+- The overlay-file split (F2) remains an operational dependency. Updating generic or
+  private patterns now also requires updating the configured merged-content revision and
+  keeping the paired hook on the same resolved config path. A bad rollout fails closed and
+  can temporarily block publication until both consumers receive the matching bytes and
+  revision.
 - Pattern matching has an inherent false-negative and false-positive profile. It is not
   semantic, so a paraphrased violation is not necessarily caught, and a generic pattern can
   over-match a legitimate use (mitigated, not eliminated, by the allowlist-escape
