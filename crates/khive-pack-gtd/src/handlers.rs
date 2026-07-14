@@ -32,23 +32,13 @@ use crate::GtdPack;
 
 /// Ensure `gtd_lifecycle_audit` and its index exist on the given runtime.
 ///
-/// Idempotent (`CREATE TABLE IF NOT EXISTS`).  Applied lazily on the first
-/// `transition` or `complete` call.  Logs a warning and continues if the DDL
-/// fails (e.g. read-only replica) — the audit is best-effort, not load-bearing.
-///
-/// We intentionally apply the DDL on each call rather than using a global
-/// `OnceLock`, because each `KhiveRuntime::memory()` in tests creates a fresh
-/// in-memory database that needs its own schema bootstrap.  In production the
-/// DDL is idempotent and cheap (SQLite skips `IF NOT EXISTS` tables instantly).
-/// `pub` (rather than the module-private visibility every other helper in
-/// this file uses): the ADR-099 `--atomic` CLI surface's `gtd.transition`/
-/// `gtd.complete` prepare functions live in `kkernel` (a crate that already
-/// depends on both `khive-runtime` and `khive-pack-gtd` — see that crate's
-/// `atomic_apply` module doc for the crate-direction rationale), and the B3
-/// GAP-5 applies this exact function as a deferred post-commit
-/// effect so atomic transitions/completes write the same best-effort
-/// lifecycle audit row the canonical handlers do, rather than re-deriving
-/// the DDL/INSERT here a second time.
+/// Idempotent (`CREATE TABLE IF NOT EXISTS`). Applied lazily on the first
+/// `transition` or `complete` call, on every call rather than gated by a
+/// `OnceLock` (fresh in-memory test runtimes each need their own bootstrap).
+/// Logs a warning and continues if the DDL fails (e.g. read-only replica) —
+/// the audit is best-effort, not load-bearing. `pub`: also called from
+/// `kkernel`'s ADR-099 `--atomic` seam. See
+/// `docs/handlers-internals.md#ensure_audit_schema--why-per-call-not-oncelock`.
 pub async fn ensure_audit_schema(runtime: &KhiveRuntime) {
     let Ok(mut w) = runtime.sql().writer().await else {
         tracing::warn!("gtd: failed to acquire SQL writer for audit schema (non-fatal)");
@@ -98,12 +88,9 @@ pub async fn ensure_audit_schema(runtime: &KhiveRuntime) {
 
 /// Append one row to `gtd_lifecycle_audit`.
 ///
-/// Best-effort: failures are logged and swallowed.  The note's successful
-/// write has already happened; a missing audit row is degraded, not a failure.
-///
-/// `pub` for the same reason as `ensure_audit_schema` above — the ADR-099
-/// `--atomic` surface's `kkernel`-side post-commit pass calls this directly
-/// (ADR-099 B3, GAP-5) rather than re-deriving the INSERT.
+/// Best-effort: failures are logged and swallowed. The note's successful
+/// write has already happened; a missing audit row is degraded, not a
+/// failure. `pub` for the same reason as `ensure_audit_schema` above.
 pub async fn write_audit_record(
     runtime: &KhiveRuntime,
     note_id: Uuid,
@@ -192,12 +179,10 @@ struct NextParams {
     assignee: Option<String>,
 }
 
-/// ADR-099 B3: `pub` (not module-private) SPECIFICALLY so `kkernel`'s
-/// `--atomic` validation seam (`atomic_apply::validate_atomic_args`) can
-/// deserialize an op's args through the SAME canonical struct
-/// `handle_complete` uses, reproducing `deny_unknown_fields` rejection with
-/// zero duplicated field lists. Fields stay private — the atomic seam only
-/// needs the `Result<_, _>` outcome, never field access.
+/// `handle_complete`'s deserialization target. `pub` with private fields:
+/// `kkernel`'s ADR-099 `--atomic` validation seam reuses this exact struct to
+/// validate `gtd.complete` args, needing only the `Result<_, _>` outcome. See
+/// `docs/handlers-internals.md#completeparams--transitionparams--why-pub-with-private-fields`.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompleteParams {
@@ -451,25 +436,11 @@ fn ts_to_rfc(micros: i64) -> String {
 /// task that fell outside the scan window.
 const TASK_SCAN_MAX_ROWS: u32 = 20_000;
 
-/// Fetch every `task` note matching `property_filters` in a single bounded
-/// snapshot query, instead of pre-fetching a fixed-size unfiltered window.
-/// The predicate is pushed into SQL via `query_notes_filtered_bounded`, so
-/// the candidate set this returns is bounded by how many tasks actually
-/// match — not by how many task notes of any status exist (the #772 bug: a
-/// fixed unfiltered window could be entirely filled by newer non-matching
-/// churn, hiding older matching tasks regardless of priority).
-///
-/// `query_notes_filtered_bounded` fetches at most `TASK_SCAN_MAX_ROWS + 1`
-/// rows in one SQL statement with deterministic ordering — one consistent
-/// snapshot, not a `COUNT(*)` followed by independent paged reads that a
-/// concurrent insert could split across (issue #825: the prior
-/// page-loop version re-queried the store per page with no transaction
-/// spanning them, so a row inserted between pages could appear duplicated
-/// across a page boundary, or the scan could hit its cap and still return
-/// `Ok` with an incomplete set). If `TASK_SCAN_MAX_ROWS + 1` rows come back,
-/// this returns `Err(InvalidInput)` instead of ever returning a possibly
-/// truncated result — callers must narrow the filters (e.g. add `assignee`)
-/// so the result stays complete.
+/// Fetches every `task` note matching `property_filters` in one bounded
+/// snapshot query (not a fixed-size unfiltered window — issue #772/#825).
+/// Returns `Err(InvalidInput)` rather than a possibly-truncated result if
+/// more than `TASK_SCAN_MAX_ROWS` rows match. See
+/// `docs/handlers-internals.md#fetch_all_matching_tasks--bounded-single-snapshot-scan-issue-772-825`.
 async fn fetch_all_matching_tasks(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
