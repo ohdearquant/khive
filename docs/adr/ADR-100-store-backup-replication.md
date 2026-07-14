@@ -1,6 +1,6 @@
 # ADR-100: Store backup and replication
 
-**Status**: Proposed
+**Status**: Accepted
 **Date**: 2026-07-06
 **Depends on**: ADR-067 (single-writer WriterTask), ADR-079 (ANN index persistence), ADR-091 (WAL checkpoint lifecycle)
 
