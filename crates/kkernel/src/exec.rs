@@ -31,9 +31,11 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::Parser;
 
+#[cfg(test)]
+use khive_mcp::serve::resolve_runtime_config;
 use khive_mcp::serve::{
     apply_env_output_format, build_server_multi_backend, config_discovery_db_anchor,
-    enforce_strict_actor_mode, resolve_runtime_config, RuntimeConfigInputs,
+    enforce_strict_actor_mode, RuntimeConfigInputs,
 };
 #[cfg(unix)]
 use khive_mcp::server::compute_config_id;
@@ -434,37 +436,38 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
     // forwarded frame as a `ConfigMismatch` and `exec` silently fell back to an
     // in-process, TOML-blind, effectively-anonymous dispatch (issue #581).
     let namespace = Namespace::parse(&args.namespace).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let cfg = resolve_runtime_config(RuntimeConfigInputs {
-        db: args.db.as_deref(),
-        config: None, // `kkernel exec` has no `--config` flag today
-        namespace,
-        // `--namespace` has a clap `default_value = "local"`, so it is always
-        // present — there is no way to distinguish "operator typed --namespace
-        // local" from "operator didn't pass --namespace at all". `true` is the
-        // conservative, behavior-preserving choice: it keeps exec's pre-existing
-        // semantics (the CLI/default value always becomes `default_namespace`,
-        // matching what `resolve_runtime_config`'s embed path already did
-        // unconditionally). It is also empirically inert for config_id parity:
-        // in the embed path (`no_embed: false`, exec's only mode), this flag
-        // gates only the actor_id fill-when-None guard in `resolve_runtime_config`
-        // — and `compute_config_id` never reads identity fields (`actor_id` or
-        // `visible_namespaces`; namespace is carried separately per its own doc
-        // comment). See the
-        // `namespace_explicit_changes_actor_id_fill_but_not_config_id` and
-        // `exec_config_id_matches_serve_config_id_for_project_toml_actor` tests
-        // below, which construct both arms and assert this directly rather than
-        // assuming it.
-        namespace_explicit: true,
-        actor_explicit: false,
-        no_embed: false,
-        packs: None,
-        brain_profile: None,
-    })?;
+    let (cfg, db_anchor) =
+        khive_mcp::serve::resolve_runtime_config_with_db_anchor(RuntimeConfigInputs {
+            db: args.db.as_deref(),
+            config: None, // `kkernel exec` has no `--config` flag today
+            namespace,
+            // `--namespace` has a clap `default_value = "local"`, so it is always
+            // present — there is no way to distinguish "operator typed --namespace
+            // local" from "operator didn't pass --namespace at all". `true` is the
+            // conservative, behavior-preserving choice: it keeps exec's pre-existing
+            // semantics (the CLI/default value always becomes `default_namespace`,
+            // matching what `resolve_runtime_config`'s embed path already did
+            // unconditionally). It is also empirically inert for config_id parity:
+            // in the embed path (`no_embed: false`, exec's only mode), this flag
+            // gates only the actor_id fill-when-None guard in `resolve_runtime_config`
+            // — and `compute_config_id` never reads identity fields (`actor_id` or
+            // `visible_namespaces`; namespace is carried separately per its own doc
+            // comment). See the
+            // `namespace_explicit_changes_actor_id_fill_but_not_config_id` and
+            // `exec_config_id_matches_serve_config_id_for_project_toml_actor` tests
+            // below, which construct both arms and assert this directly rather than
+            // assuming it.
+            namespace_explicit: true,
+            actor_explicit: false,
+            no_embed: false,
+            packs: None,
+            brain_profile: None,
+        })?;
 
     // Regression fence: `cfg.db_path` must agree with the canonical anchor for
     // this same `--db`/`KHIVE_DB` input, or `compute_config_id` would silently
     // desynchronize `kkernel exec` from the daemon it is trying to reach.
-    khive_runtime::assert_db_anchor_consistent(cfg.db_path.as_deref(), args.db.as_deref())?;
+    khive_runtime::assert_db_anchor_consistent(cfg.db_path.as_deref(), db_anchor.as_deref())?;
 
     match mode {
         ExecMode::Inline(ops) => {

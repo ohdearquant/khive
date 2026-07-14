@@ -299,22 +299,23 @@ async fn main() -> Result<()> {
                 let (cli_ns_explicit, cli_ns) = khive_mcp::args::resolve_cli_namespace(&a)
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-                let base_cfg = khive_mcp::serve::resolve_runtime_config(
-                    khive_mcp::serve::RuntimeConfigInputs {
-                        db: a.db.as_deref(),
-                        config: a.config.as_deref(),
-                        namespace: cli_ns,
-                        namespace_explicit: cli_ns_explicit,
-                        actor_explicit: cli_ns_explicit,
-                        no_embed: a.no_embed,
-                        packs: if a.pack.is_empty() {
-                            None
-                        } else {
-                            Some(a.pack.clone())
+                let (base_cfg, db_anchor) =
+                    khive_mcp::serve::resolve_runtime_config_with_db_anchor(
+                        khive_mcp::serve::RuntimeConfigInputs {
+                            db: a.db.as_deref(),
+                            config: a.config.as_deref(),
+                            namespace: cli_ns,
+                            namespace_explicit: cli_ns_explicit,
+                            actor_explicit: cli_ns_explicit,
+                            no_embed: a.no_embed,
+                            packs: if a.pack.is_empty() {
+                                None
+                            } else {
+                                Some(a.pack.clone())
+                            },
+                            brain_profile: a.brain_profile.clone(),
                         },
-                        brain_profile: a.brain_profile.clone(),
-                    },
-                )?;
+                    )?;
 
                 // #667: acquire the boot/recovery lock before building the
                 // coordinator server — that construction runs migrations and
@@ -334,11 +335,13 @@ async fn main() -> Result<()> {
                 #[cfg(not(unix))]
                 let boot_guard: Option<std::fs::File> = None;
 
-                let (server, schedule_rt) = build_multi_backend_server_with_coordinator(
-                    base_cfg,
-                    &khive_cfg,
-                    a.db.as_deref(),
-                )?;
+                let (server, schedule_rt) =
+                    build_multi_backend_server_with_coordinator_and_db_anchor(
+                        base_cfg,
+                        &khive_cfg,
+                        a.db.as_deref(),
+                        db_anchor.as_deref(),
+                    )?;
 
                 khive_mcp::serve::serve_server(
                     server,
@@ -439,13 +442,37 @@ fn resolve_command(exec: Option<String>, command: Option<Command>) -> Command {
 /// (`spawn_schedule_tick_loop_if_daemon`) drains the exact backend this
 /// coordinator-attached boot resolved, never a re-derived config (PR
 /// #782).
+#[cfg(test)]
 fn build_multi_backend_server_with_coordinator(
     base_cfg: RuntimeConfig,
     khive_cfg: &KhiveConfig,
     cli_db_override: Option<&str>,
 ) -> Result<(khive_mcp::server::KhiveMcpServer, Option<KhiveRuntime>)> {
-    let multi =
-        khive_mcp::serve::build_registry_for_multi_backend(base_cfg, khive_cfg, cli_db_override)?;
+    let db_anchor = if cli_db_override == Some(":memory:") {
+        None
+    } else {
+        base_cfg.db_path.clone()
+    };
+    build_multi_backend_server_with_coordinator_and_db_anchor(
+        base_cfg,
+        khive_cfg,
+        cli_db_override,
+        db_anchor.as_deref(),
+    )
+}
+
+fn build_multi_backend_server_with_coordinator_and_db_anchor(
+    base_cfg: RuntimeConfig,
+    khive_cfg: &KhiveConfig,
+    cli_db_override: Option<&str>,
+    db_anchor: Option<&std::path::Path>,
+) -> Result<(khive_mcp::server::KhiveMcpServer, Option<KhiveRuntime>)> {
+    let multi = khive_mcp::serve::build_registry_for_multi_backend_with_db_anchor(
+        base_cfg,
+        khive_cfg,
+        cli_db_override,
+        db_anchor,
+    )?;
 
     let schedule_rt = multi
         .per_pack_runtimes
@@ -1150,8 +1177,13 @@ mod tests {
         };
         let khive_cfg = KhiveConfig::default();
 
-        let result =
-            build_multi_backend_server_with_coordinator(base_cfg, &khive_cfg, Some(args_db));
+        let db_anchor = khive_runtime::resolve_db_anchor(Some(args_db));
+        let result = build_multi_backend_server_with_coordinator_and_db_anchor(
+            base_cfg,
+            &khive_cfg,
+            Some(args_db),
+            db_anchor.as_deref(),
+        );
 
         let err = match result {
             Ok(_) => panic!(
@@ -1171,6 +1203,70 @@ mod tests {
             msg.contains(&anchor.display().to_string()),
             "error must name the canonical anchor path: {msg}"
         );
+    }
+
+    /// Regression for #720: the coordinator-attached `kkernel mcp` path must
+    /// retain the HOME-derived anchor captured during runtime-config resolution
+    /// when HOME changes before registry construction.
+    #[test]
+    #[serial]
+    fn coordinator_boot_uses_anchor_captured_by_runtime_config() {
+        struct HomeGuard(Option<std::ffi::OsString>);
+
+        impl Drop for HomeGuard {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(home) => std::env::set_var("HOME", home),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+
+        let original_home = std::env::var_os("HOME");
+        let _home_guard = HomeGuard(original_home);
+        let first_home = TempDir::new().expect("first HOME");
+        std::env::set_var("HOME", first_home.path());
+        let config_path = first_home.path().join("config.toml");
+        std::fs::write(&config_path, "").expect("write empty config");
+
+        let (base_cfg, db_anchor) = khive_mcp::serve::resolve_runtime_config_with_db_anchor(
+            khive_mcp::serve::RuntimeConfigInputs {
+                db: None,
+                config: Some(&config_path),
+                namespace: khive_runtime::Namespace::parse("local").expect("namespace"),
+                namespace_explicit: false,
+                actor_explicit: false,
+                no_embed: true,
+                packs: Some(vec!["kg".to_string()]),
+                brain_profile: None,
+            },
+        )
+        .expect("resolve runtime config before HOME changes");
+
+        let mut khive_cfg = single_main_backend_config(khive_runtime::BackendKind::Memory, None);
+        khive_cfg.backends.push(khive_runtime::BackendConfig {
+            name: "secondary".to_string(),
+            kind: khive_runtime::BackendKind::Memory,
+            path: None,
+            cache_mb: None,
+            journal_mode: None,
+            read_only: false,
+        });
+
+        let second_home = TempDir::new().expect("second HOME");
+        std::env::set_var("HOME", second_home.path());
+        let result = build_multi_backend_server_with_coordinator_and_db_anchor(
+            base_cfg,
+            &khive_cfg,
+            None,
+            db_anchor.as_deref(),
+        );
+        if let Err(error) = result {
+            panic!(
+                "coordinator-attached construction must retain the anchor captured by \
+                 resolve_runtime_config instead of re-reading HOME: {error}"
+            );
+        }
     }
 
     // --- #674: coordinator link-target resolution parity with `get` ---

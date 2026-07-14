@@ -1,15 +1,18 @@
-# PR #972 implementation notes
+# PR #972 round 3 implementation notes
 
-- Updated `crates/khive-mcp/src/serve.rs` so multi-backend construction resolves the database anchor once, then validates the runtime configuration against that captured value. This removes the `HOME` time-of-check/time-of-use window while preserving the existing mismatch error and `:memory:` behavior.
-- Replaced the ambient-`HOME` and guard-characterization tests with a deterministic regression that changes `HOME` immediately after anchor capture and exercises the duplicate-SQLite-path server construction. Reintroducing an internal anchor re-read makes this test fail.
-- Kept the change internal to the MCP bootstrap; no MCP wire, storage schema, or public function signature changed.
+- Captured the HOME-derived database anchor once alongside `RuntimeConfig` resolution and threaded it through normal MCP boot, coordinator-attached `kkernel mcp` boot, and multi-backend registry validation.
+- Changed `assert_db_anchor_consistent` to compare against the caller-provided captured path, eliminating its process-environment re-read. Existing programmatic construction helpers retain their signatures and derive the anchor from the already-resolved `RuntimeConfig`, never from HOME.
+- Added deterministic regressions for both boot paths. Each resolves the runtime config under one HOME, changes HOME before registry construction, and verifies boot succeeds with the original anchor. Both tests failed against the pre-fix implementation and pass after the change.
+- Updated `kkernel exec` to use the same captured-anchor validator contract, so no retained validator call re-resolves HOME.
 
-Verification:
+Verification from `crates/`:
 
-- `cargo test -p khive-mcp duplicate_sqlite_paths_use_anchor_captured_before_home_changes -- --nocapture` — passed.
-- Removal check with the old anchor re-read restored temporarily — failed on the two deliberately different `HOME` anchors, as intended.
+- `cargo fmt --all` and `cargo fmt --all -- --check` — passed.
 - `cargo test -p khive-mcp` — 329 tests passed.
+- `cargo test -p kkernel coordinator_boot_uses_anchor_captured_by_runtime_config -- --nocapture` — passed.
+- `cargo test -p khive-runtime assert_db_anchor_consistent_tests` — 4 tests passed.
 - `cargo clippy -p khive-mcp --all-targets -- -D warnings` — passed.
-- `cargo fmt --all` — completed; check-mode verification passed before commit.
+- `cargo clippy -p kkernel --all-targets -- -D warnings` — passed.
+- `git diff --check` — passed.
 
-Domain utility: medium. The state-isolation briefing reinforced treating process environment as mutable shared state and passing the resolved dependency through the construction boundary.
+Domain utility: medium. The composed Rust testing/runtime briefing reinforced isolating mutable process state in deterministic fixtures; repository source and the review trace supplied the concrete API design.
