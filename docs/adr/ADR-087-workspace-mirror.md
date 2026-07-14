@@ -1,6 +1,6 @@
 # ADR-087: Workspace Mirror — Folding `.khive/` Into the Graph Substrate
 
-**Status**: Proposed\
+**Status**: Accepted\
 **Date**: 2026-07-03\
 **Authors**: khive maintainers
 **Depends on**: ADR-086 (Document/File Modeling — the `document`-entity shape this mirror

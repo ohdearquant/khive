@@ -1,6 +1,6 @@
 # ADR-101: KG Change-Set Model — Producer-Agnostic Op-List with Stage-Time Stable IDs
 
-**Status**: Proposed
+**Status**: Accepted
 **Date**: 2026-07-08
 **Depends on**: ADR-002 (edge ontology), ADR-016 (request DSL — the op shape this format serializes), ADR-017 (pack standard), ADR-020 (git-native KG implementation — `KgArchive` as the import/export envelope this ADR does not replace)
 **Related**: ADR-088 (git-lifecycle pack — the future-work loop below), ADR-100 (store backup and replication — whole-graph snapshots, a different artifact from the change-set this ADR defines)
