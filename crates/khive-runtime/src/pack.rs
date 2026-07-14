@@ -959,6 +959,59 @@ fn extract_table_names(stmt: &str) -> Vec<String> {
     }
 }
 
+/// Render an [`EndpointKind`] as the `"<substrate>:<kind>"` label used in
+/// `link(help=true)`'s `endpoint_rules` table.
+fn endpoint_kind_label(kind: &EndpointKind) -> String {
+    match kind {
+        EndpointKind::EntityOfKind(k) => format!("entity:{k}"),
+        EndpointKind::NoteOfKind(k) => format!("note:{k}"),
+        EndpointKind::EntityOfType { kind, entity_type } => {
+            format!("entity:{kind}({entity_type})")
+        }
+    }
+}
+
+/// Compose the full per-relation endpoint allowlist surfaced by
+/// `link(help=true)` (issue #964).
+///
+/// Combines the base entity-to-entity endpoint contract
+/// (`operations::base_entity_endpoint_rules`) with every loaded pack's
+/// additive `EDGE_RULES`, plus the `annotates` note-to-any special case —
+/// the exact same sources `valid_relations_for_entity_pair`
+/// (`khive-pack-kg`) consults when enriching a rejected `link` call, so a
+/// caller reading this table cannot diverge from what the validator itself
+/// accepts.
+fn edge_endpoint_table(packs: &[Box<dyn PackRuntime>]) -> Vec<Value> {
+    let mut rows: Vec<Value> = crate::operations::base_entity_endpoint_rules()
+        .iter()
+        .map(|(src, rel, tgt)| {
+            serde_json::json!({
+                "relation": rel.as_str(),
+                "source": format!("entity:{src}"),
+                "target": format!("entity:{tgt}"),
+            })
+        })
+        .collect();
+
+    for pack in packs.iter() {
+        for rule in pack.edge_rules().iter() {
+            rows.push(serde_json::json!({
+                "relation": rule.relation.as_str(),
+                "source": endpoint_kind_label(&rule.source),
+                "target": endpoint_kind_label(&rule.target),
+            }));
+        }
+    }
+
+    rows.push(serde_json::json!({
+        "relation": "annotates",
+        "source": "note:*",
+        "target": "any (entity, note, edge, or event)",
+    }));
+
+    rows
+}
+
 impl VerbRegistry {
     /// This registry's construction-baked default namespace.
     ///
@@ -999,6 +1052,9 @@ impl VerbRegistry {
     ///
     /// Walks registered packs for the first matching `HandlerDef` and returns a
     /// structured JSON envelope. Subhandlers carry `callable_via_mcp: false`.
+    /// `link`'s envelope additionally carries `endpoint_rules` — the composed
+    /// per-relation source/target allowlist (issue #964) — so batch callers can
+    /// defer to the kernel's own table instead of re-implementing it locally.
     /// Unknown verbs return `RuntimeError::InvalidInput`. Full shape documented
     /// in `docs/protocol.md` §Request Schema.
     pub fn describe_verb(&self, verb: &str) -> Result<Value, RuntimeError> {
@@ -1036,13 +1092,17 @@ impl VerbRegistry {
                                      invoked by internal runtime callers.",
                         }));
                     }
-                    return Ok(serde_json::json!({
+                    let mut envelope = serde_json::json!({
                         "verb": verb,
                         "pack": pack.name(),
                         "description": handler.description,
                         "category": category,
                         "params": params_arr,
-                    }));
+                    });
+                    if verb == "link" {
+                        envelope["endpoint_rules"] = Value::Array(edge_endpoint_table(&self.packs));
+                    }
+                    return Ok(envelope);
                 }
             }
         }
@@ -6243,8 +6303,24 @@ mod help_tests {
                 category: VerbCategory::Assertive,
                 params: &EMBED_PARAMS,
             },
+            HandlerDef {
+                name: "link",
+                description: "Create a typed directed edge",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Commissive,
+                params: &[],
+            },
         ];
     }
+
+    // A pack-declared additive edge rule (mirrors the GTD pack's real
+    // task-to-task `depends_on` rule), used to verify `link(help=true)`
+    // surfaces pack-composed rules alongside the base entity table.
+    static HELP_EDGE_RULES: [EdgeEndpointRule; 1] = [EdgeEndpointRule {
+        relation: khive_types::EdgeRelation::DependsOn,
+        source: EndpointKind::NoteOfKind("task"),
+        target: EndpointKind::NoteOfKind("task"),
+    }];
 
     #[async_trait]
     impl PackRuntime for HelpPack {
@@ -6259,6 +6335,9 @@ mod help_tests {
         }
         fn handlers(&self) -> &'static [HandlerDef] {
             HelpPack::HANDLERS
+        }
+        fn edge_rules(&self) -> &'static [EdgeEndpointRule] {
+            &HELP_EDGE_RULES
         }
         async fn dispatch(
             &self,
@@ -6358,6 +6437,59 @@ mod help_tests {
             limit_param["required"],
             serde_json::json!(false),
             "'limit' must be optional"
+        );
+    }
+
+    /// `link(help=true)` (issue #964) surfaces the composed per-relation
+    /// endpoint allowlist: the base entity-to-entity table, every loaded
+    /// pack's additive `EDGE_RULES`, and the `annotates` note-to-any rule —
+    /// so a batch caller can defer to the kernel's own table instead of
+    /// re-implementing it.
+    #[tokio::test]
+    async fn test_link_help_true_exposes_endpoint_rules() {
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let reg = build_help_registry(invocations.clone());
+
+        let result = reg
+            .dispatch("link", serde_json::json!({ "help": true }))
+            .await
+            .expect("help=true must succeed for link");
+
+        assert_eq!(result["verb"], "link");
+        let rules = result["endpoint_rules"]
+            .as_array()
+            .expect("link help must include an endpoint_rules array");
+        assert!(!rules.is_empty(), "endpoint_rules must not be empty");
+
+        // A base entity-to-entity rule (khive-runtime's own table) must appear.
+        assert!(
+            rules.iter().any(|r| r["relation"] == "contains"
+                && r["source"] == "entity:concept"
+                && r["target"] == "entity:concept"),
+            "endpoint_rules must include the base 'contains' entity rule; got {rules:#?}"
+        );
+
+        // The pack-declared additive rule (HelpPack's task->task depends_on) must appear.
+        assert!(
+            rules.iter().any(|r| r["relation"] == "depends_on"
+                && r["source"] == "note:task"
+                && r["target"] == "note:task"),
+            "endpoint_rules must include the pack-declared depends_on rule; got {rules:#?}"
+        );
+
+        // The annotates note-to-any special case must appear.
+        assert!(
+            rules
+                .iter()
+                .any(|r| r["relation"] == "annotates" && r["source"] == "note:*"),
+            "endpoint_rules must document the annotates note-to-any rule; got {rules:#?}"
+        );
+
+        // help=true must remain side-effect-free.
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            0,
+            "link(help=true) must not invoke pack dispatch"
         );
     }
 
