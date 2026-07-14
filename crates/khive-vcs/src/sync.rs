@@ -459,18 +459,10 @@ fn fsync_dir_best_effort(dir: &Path) {
     }
 }
 
-/// Redact URLs and embedded credentials from git stderr before surfacing in errors.
-///
-/// git on auth failure can include the full remote URL in stderr, which may carry
-/// a `user:token@host` credential form.  ADR-037 §157 prohibits leaking remote
-/// URLs in errors.  This function replaces any `scheme://[…@]host/path` token or
-/// scp-style `user@host:path` remote with `<url-redacted>` so the sanitised text
-/// is still useful for diagnostics while credentials and remote addresses stay out
-/// of logs.
-///
-/// Handled forms:
-/// - `scheme://[user:pass@]host/path` (HTTPS, SSH scheme URLs)
-/// - `user@host:path` (scp-style SSH remotes, e.g. `git@github.com:org/repo.git`)
+/// Redact URLs and embedded credentials (`user:token@host` HTTPS forms, and
+/// scp-style `user@host:path` remotes) from git stderr before it reaches a
+/// caller-visible error — ADR-037 §157 prohibits leaking remote URLs. See
+/// `docs/api/sync.md` for the exact matched forms.
 fn redact_git_stderr(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let bytes = raw.as_bytes();
@@ -522,13 +514,9 @@ fn redact_git_stderr(raw: &str) -> String {
     out
 }
 
-/// Returns `true` when position `i` in `bytes` is the `@` of an scp-style remote.
-///
-/// An scp remote looks like `word@host:path` where the colon is followed by a
-/// non-whitespace character (to distinguish `user@host:path` from
-/// `user@host: message text`).  We require that the character after `:` is
-/// neither a space, a tab, nor another `:` (which would indicate an IPv6 address
-/// or a port in a scheme URL already handled by the `://` branch).
+/// `true` when position `i` is the `@` of an scp-style remote (`word@host:path`,
+/// distinguished from `word@host: message text` by requiring a non-whitespace,
+/// non-`:` character right after the colon). See `docs/api/sync.md`.
 fn is_scp_remote_start(bytes: &[u8], i: usize) -> bool {
     if bytes[i] != b'@' {
         return false;
