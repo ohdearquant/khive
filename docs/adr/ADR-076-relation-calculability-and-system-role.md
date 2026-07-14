@@ -1,6 +1,6 @@
 # ADR-076: Relation-Set Calculability — System Role and the Non-Redundancy Certificate
 
-**Status**: proposed\
+**Status**: Accepted\
 **Date**: 2026-06-26\
 **Authors**: khive maintainers
 **Amends**: [ADR-002](ADR-002-edge-ontology.md) — corrects the `contains`/`part_of` "inverse"

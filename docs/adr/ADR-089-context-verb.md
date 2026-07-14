@@ -1,6 +1,6 @@
 # ADR-089: `context` verb — entity-anchored graph context in one call
 
-**Status**: Proposed
+**Status**: Accepted
 **Date**: 2026-07-04
 **Depends on**: ADR-002 (edge ontology), ADR-016 (request DSL), ADR-017 (pack standard), ADR-049 (daemon warm state), ADR-081 (recall retune driver)
 

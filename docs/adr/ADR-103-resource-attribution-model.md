@@ -1,6 +1,6 @@
 # ADR-103: Resource Attribution Model
 
-**Status**: Proposed
+**Status**: Accepted
 **Date**: 2026-07-08
 **Depends on**: ADR-018 (Authorization Gate), ADR-094 (Sequencing-Assertable Lifecycle
 Telemetry Events), ADR-091 (WAL Snapshot Lifetime)
