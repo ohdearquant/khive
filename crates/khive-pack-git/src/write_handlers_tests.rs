@@ -26,7 +26,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::process::Command;
 
-use serde_json::json;
+use serde_json::{json, Value};
 
 use khive_runtime::engine_config::{GitWriteEntryConfig, GitWriteSectionConfig};
 use khive_runtime::{KhiveRuntime, Namespace, NamespaceToken, RuntimeConfig};
@@ -105,10 +105,12 @@ async fn audit_event(
         )
         .await
         .expect("query events");
-    page.items
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| panic!("{verb} audit event present"))
+    assert_eq!(
+        page.items.len(),
+        1,
+        "exactly one supplementary {verb} audit event must be emitted"
+    );
+    page.items.into_iter().next().expect("length checked above")
 }
 
 /// Builds a `git` invocation hardened against ambient host state: a global
@@ -417,6 +419,41 @@ async fn commit_rejects_non_repo_path() {
 }
 
 #[tokio::test]
+async fn commit_rejects_non_string_author_without_committing() {
+    let _env_guard = crate::cache::ENV_MUTEX.lock().await;
+    let (repo, _remote) = init_repo_with_remote();
+    let (pack, token) = pack_and_token_with_policy(policy(repo.path(), &["main"])).await;
+    std::fs::write(repo.path().join("a.txt"), b"changed").unwrap();
+    let head_before = git_command(repo.path())
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .expect("git rev-parse before malformed commit")
+        .stdout;
+
+    let err = pack
+        .handle_commit(
+            &token,
+            json!({
+                "repo": repo.path().to_str().unwrap(),
+                "message": "must not commit",
+                "author": 42,
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("author must be a string"), "{err}");
+
+    let head_after = git_command(repo.path())
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .expect("git rev-parse after malformed commit")
+        .stdout;
+    assert_eq!(head_after, head_before, "malformed author must not commit");
+    let audit = audit_event(&pack, &token, "git.commit").await;
+    assert_eq!(audit.outcome, EventOutcome::Denied);
+}
+
+#[tokio::test]
 async fn commit_denied_when_no_policy_configured() {
     let _env_guard = crate::cache::ENV_MUTEX.lock().await;
     let (repo, _remote) = init_repo_with_remote();
@@ -576,6 +613,37 @@ async fn branch_rejects_path_traversal_name() {
 }
 
 #[tokio::test]
+async fn branch_rejects_non_string_from_without_creating_branch() {
+    let _env_guard = crate::cache::ENV_MUTEX.lock().await;
+    let (repo, _remote) = init_repo_with_remote();
+    let (pack, token) = pack_and_token_with_policy(policy(repo.path(), &["feat/*"])).await;
+
+    let err = pack
+        .handle_branch(
+            &token,
+            json!({
+                "repo": repo.path().to_str().unwrap(),
+                "name": "feat/malformed-from",
+                "from": 42,
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("from must be a string"), "{err}");
+
+    let branches = git_command(repo.path())
+        .args(["branch", "--list", "feat/malformed-from"])
+        .output()
+        .expect("git branch --list");
+    assert!(
+        branches.stdout.is_empty(),
+        "malformed from must not create a branch"
+    );
+    let audit = audit_event(&pack, &token, "git.branch").await;
+    assert_eq!(audit.outcome, EventOutcome::Denied);
+}
+
+#[tokio::test]
 async fn branch_denied_when_no_policy_configured() {
     let _env_guard = crate::cache::ENV_MUTEX.lock().await;
     let (repo, _remote) = init_repo_with_remote();
@@ -708,6 +776,101 @@ async fn push_rejects_injection_shaped_remote() {
         .await
         .unwrap_err();
     assert!(err.to_string().contains("start with"), "{err}");
+}
+
+#[tokio::test]
+async fn push_rejects_non_string_remote_without_pushing() {
+    let _env_guard = crate::cache::ENV_MUTEX.lock().await;
+    let (repo, remote) = init_repo_with_remote();
+    let (pack, token) = pack_and_token_with_policy(policy(repo.path(), &["feat/*"])).await;
+    run(
+        repo.path(),
+        &["checkout", "-q", "-b", "feat/malformed-remote"],
+    );
+    std::fs::write(repo.path().join("new.txt"), b"new").unwrap();
+    run(repo.path(), &["add", "new.txt"]);
+    run(repo.path(), &["commit", "-q", "-m", "new commit"]);
+
+    let err = pack
+        .handle_push(
+            &token,
+            json!({
+                "repo": repo.path().to_str().unwrap(),
+                "branch": "feat/malformed-remote",
+                "remote": 42,
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("remote must be a string"), "{err}");
+
+    let branches = git_command(remote.path())
+        .args(["branch", "--list", "feat/malformed-remote"])
+        .output()
+        .expect("git branch --list on remote");
+    assert!(
+        branches.stdout.is_empty(),
+        "malformed remote must not push to origin"
+    );
+    let audit = audit_event(&pack, &token, "git.push").await;
+    assert_eq!(audit.outcome, EventOutcome::Denied);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn invalid_repo_values_emit_denied_audits_without_invoking_git() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _env_guard = crate::cache::ENV_MUTEX.lock().await;
+    let fake_bin = tempfile::tempdir().expect("fake git bin");
+    let sentinel = fake_bin.path().join("git-invoked");
+    let fake_git = fake_bin.path().join("git");
+    std::fs::write(
+        &fake_git,
+        format!("#!/bin/sh\ntouch \"{}\"\nexit 99\n", sentinel.display()),
+    )
+    .expect("write fake git");
+    std::fs::set_permissions(&fake_git, std::fs::Permissions::from_mode(0o755))
+        .expect("make fake git executable");
+    let _path = EnvVarGuard::set("PATH", fake_bin.path());
+
+    let cases: [(&str, Value, &str); 6] = [
+        ("git.commit", json!({ "message": "msg" }), "required"),
+        (
+            "git.commit",
+            json!({ "repo": 42, "message": "msg" }),
+            "string",
+        ),
+        ("git.branch", json!({ "name": "feat/x" }), "required"),
+        (
+            "git.branch",
+            json!({ "repo": 42, "name": "feat/x" }),
+            "string",
+        ),
+        ("git.push", json!({ "branch": "main" }), "required"),
+        (
+            "git.push",
+            json!({ "repo": 42, "branch": "main" }),
+            "string",
+        ),
+    ];
+
+    for (verb, params, expected_error) in cases {
+        let (pack, token) = pack_and_token_with_policy(GitWriteSectionConfig::default()).await;
+        let result = match verb {
+            "git.commit" => pack.handle_commit(&token, params).await,
+            "git.branch" => pack.handle_branch(&token, params).await,
+            "git.push" => pack.handle_push(&token, params).await,
+            _ => unreachable!("fixed test case verb"),
+        };
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains(expected_error), "{verb}: {err}");
+        let audit = audit_event(&pack, &token, verb).await;
+        assert_eq!(audit.outcome, EventOutcome::Denied, "{verb}");
+        assert_eq!(audit.payload["decision"], "deny", "{verb}");
+        assert_eq!(audit.payload["repo"], "<invalid-repo>", "{verb}");
+        assert!(!sentinel.exists(), "{verb} must not invoke git");
+    }
 }
 
 #[tokio::test]

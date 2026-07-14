@@ -74,11 +74,26 @@ fn repo_write_lock(repo: &Path) -> Arc<AsyncMutex<()>> {
 }
 
 fn parse_repo_param(params: &Value) -> Result<PathBuf, RuntimeError> {
-    let raw = params
-        .get("repo")
-        .and_then(Value::as_str)
-        .ok_or_else(|| RuntimeError::InvalidInput("repo is required".into()))?;
-    Ok(PathBuf::from(raw))
+    match params.get("repo") {
+        Some(Value::String(raw)) => Ok(PathBuf::from(raw)),
+        None | Some(Value::Null) => Err(RuntimeError::InvalidInput("repo is required".into())),
+        Some(other) => Err(RuntimeError::InvalidInput(format!(
+            "repo must be a string, got {other:?}"
+        ))),
+    }
+}
+
+fn parse_optional_string<'a>(
+    params: &'a Value,
+    name: &str,
+) -> Result<Option<&'a str>, RuntimeError> {
+    match params.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value)),
+        Some(other) => Err(RuntimeError::InvalidInput(format!(
+            "{name} must be a string, got {other:?}"
+        ))),
+    }
 }
 
 fn parse_paths_param(params: &Value) -> Result<Vec<String>, RuntimeError> {
@@ -215,7 +230,8 @@ fn prepare_commit(repo: &Path, params: &Value) -> Result<CommitPreflight, WriteP
         .map_err(|e| WritePreflightError::denied(e, Some(&branch)))?;
     let paths =
         parse_paths_param(params).map_err(|e| WritePreflightError::denied(e, Some(&branch)))?;
-    let author = params.get("author").and_then(Value::as_str);
+    let author = parse_optional_string(params, "author")
+        .map_err(|e| WritePreflightError::denied(e, Some(&branch)))?;
     let add_argv = if paths.is_empty() {
         None
     } else {
@@ -250,7 +266,8 @@ fn prepare_branch(repo: &Path, params: &Value) -> Result<BranchPreflight, WriteP
         .and_then(Value::as_str)
         .ok_or_else(|| RuntimeError::InvalidInput("git.branch requires name".into()))
         .map_err(|e| WritePreflightError::denied(e, None))?;
-    let from = params.get("from").and_then(Value::as_str);
+    let from = parse_optional_string(params, "from")
+        .map_err(|e| WritePreflightError::denied(e, Some(name)))?;
     let argv = build_branch_argv(name, from)
         .map_err(to_invalid_input)
         .map_err(|e| WritePreflightError::denied(e, Some(name)))?;
@@ -276,9 +293,8 @@ fn prepare_push(repo: &Path, params: &Value) -> Result<PushPreflight, WritePrefl
         .and_then(Value::as_str)
         .ok_or_else(|| RuntimeError::InvalidInput("git.push requires branch".into()))
         .map_err(|e| WritePreflightError::denied(e, None))?;
-    let remote = params
-        .get("remote")
-        .and_then(Value::as_str)
+    let remote = parse_optional_string(params, "remote")
+        .map_err(|e| WritePreflightError::denied(e, Some(branch)))?
         .unwrap_or("origin");
     let force =
         parse_force_param(params).map_err(|e| WritePreflightError::denied(e, Some(branch)))?;
@@ -333,12 +349,35 @@ impl GitPack {
         error
     }
 
+    async fn parse_audited_repo(
+        &self,
+        token: &NamespaceToken,
+        verb: &str,
+        params: &Value,
+    ) -> Result<PathBuf, RuntimeError> {
+        match parse_repo_param(params) {
+            Ok(repo) => Ok(repo),
+            Err(error) => Err(self
+                .audit_early_failure(
+                    token,
+                    verb,
+                    Path::new("<invalid-repo>"),
+                    None,
+                    EventOutcome::Denied,
+                    error,
+                )
+                .await),
+        }
+    }
+
     pub(crate) async fn handle_commit(
         &self,
         token: &NamespaceToken,
         params: Value,
     ) -> Result<Value, RuntimeError> {
-        let repo = parse_repo_param(&params)?;
+        let repo = self
+            .parse_audited_repo(token, "git.commit", &params)
+            .await?;
         let lock = repo_write_lock(&repo);
         let _guard = lock.lock().await;
         let CommitPreflight {
@@ -430,7 +469,9 @@ impl GitPack {
         token: &NamespaceToken,
         params: Value,
     ) -> Result<Value, RuntimeError> {
-        let repo = parse_repo_param(&params)?;
+        let repo = self
+            .parse_audited_repo(token, "git.branch", &params)
+            .await?;
         let lock = repo_write_lock(&repo);
         let _guard = lock.lock().await;
         let BranchPreflight { name, from, argv } = match prepare_branch(&repo, &params) {
@@ -505,7 +546,7 @@ impl GitPack {
         token: &NamespaceToken,
         params: Value,
     ) -> Result<Value, RuntimeError> {
-        let repo = parse_repo_param(&params)?;
+        let repo = self.parse_audited_repo(token, "git.push", &params).await?;
         let lock = repo_write_lock(&repo);
         let _guard = lock.lock().await;
         let PushPreflight {

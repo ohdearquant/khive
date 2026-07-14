@@ -1,16 +1,23 @@
-# PR #860 round-5 implementation notes
+# Implementation notes
 
-- `crates/khive-pack-git/src/write_handlers.rs` now records supplementary write audits for all validation and detached-HEAD failures after the repository argument is parseable.
-- `crates/khive-pack-git/src/write_argv.rs` internally prefixes commit paths with Git's `:(literal)` pathspec magic while retaining relative-path, traversal, NUL, and size checks.
-- `crates/khive-mcp/src/serve.rs` now loads and validates non-embedding config for explicit namespaces, preserving `[git_write]` while CLI actor/namespace precedence remains authoritative.
-- Handler, argv, and bootstrap regressions cover force denial, malformed paths, invalid refs, detached HEAD, literal magic/special/Unicode filenames, and no-embed explicit-actor policy propagation.
-- Public docs describe the mandatory fail-closed handler allowlist and use neutral example identities and paths.
+- Added strict optional-string parsing for `git.commit.author`, `git.branch.from`, and
+  `git.push.remote`. Explicit non-string values now return `RuntimeError::InvalidInput`
+  naming the argument and expected string type instead of changing the requested Git
+  operation through omission/default behavior.
+- Routed missing and wrong-typed `repo` parameters through a shared audited parse path.
+  Each rejected request emits one denied supplementary write audit with the safe
+  `<invalid-repo>` marker before returning, without invoking Git.
+- Added handler regressions proving malformed optionals cannot create commits, branches,
+  or remote refs, and proving missing/non-string repo values are audited exactly once for
+  all three write verbs without a Git process invocation.
 
-Verification completed from `crates/`:
+## Verification
 
-- `cargo fmt --all`
-- `cargo test -p khive-pack-git -p khive-runtime -p khive-mcp`
-- `cargo clippy -p khive-pack-git -p khive-runtime -p khive-mcp --all-targets -- -D warnings`
-- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p khive-pack-git`
+- `cargo fmt --all` — passed
+- `cargo fmt --all -- --check` — passed
+- `cargo test -p khive-pack-git` — passed (169 unit tests, 52 acceptance tests)
+- `cargo clippy -p khive-pack-git --all-targets -- -D warnings` — passed
+- `git diff --check` — passed
 
-Domain utility: low. The composed GitOps audit domain reinforced complete audit trails, but the ADR and repository contracts determined the concrete implementation.
+Domain utility: low — this fix was governed by repository-local ADR contracts, handler
+implementation, and regression behavior; no external domain composition was needed.
