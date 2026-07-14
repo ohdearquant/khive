@@ -5,7 +5,7 @@ work: the things that exist, the claims and decisions made about them, and the
 relationships between them. Use it when a fact should remain useful after the
 session that produced it.
 
-The graph has two record substrates:
+You work with two kinds of record directly:
 
 - **Entities** are independently identifiable things: a paper, method,
   repository, person, or dataset. They give the graph its stable structure.
@@ -13,7 +13,10 @@ The graph has two record substrates:
   conclusion, a question, a decision, or a reference. Notes can be linked back
   to their subject.
 
-An edge is a typed relationship between records. The entity, note, and edge
+An edge is a typed relationship within the entity graph layer, not a record you
+create on its own. Entities and notes are two of khive's three storage
+substrates; the third, events, is an immutable audit log the system writes and
+you query, not something you author directly. The entity, note, and edge
 vocabularies are all closed sets. Model distinctions that do not belong in a
 kind or relation as properties instead of inventing a new label.
 
@@ -116,8 +119,8 @@ provide a reviewed change workflow when direct mutation is not appropriate.
   `entity` or `note`, or a granular kind such as `concept` or `decision`.
 - `get`, `update`, and `delete` are by-ID operations. Use a UUID rather than a
   natural-language name; use `resolve` when you have a human reference.
-- `neighbors` is outgoing-only by default. Pass `direction="both"` when the
-  relationship may have been recorded in either direction.
+- `neighbors` returns edges in both directions by default. Pass
+  `direction="outgoing"` or `direction="incoming"` to restrict to one direction.
 - `merge` returns `kept_id`, not `id`; a following chain step must use
   `$prev.kept_id`.
 - `query` is read-only. Use `create`, `link`, `update`, `merge`, or `delete` to
