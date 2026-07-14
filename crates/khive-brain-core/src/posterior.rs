@@ -488,10 +488,8 @@ mod tests {
         assert!(ep.get(&id3).is_some());
     }
 
-    /// BRAINCORE-AUD-001 regression: snapshot/restore must be eviction-equivalent
-    /// to uninterrupted execution. Capacity 2, observe A then B, snapshot, restore,
-    /// then observe C — the restored path must evict A (the oldest), not B, exactly
-    /// like the live in-memory path would.
+    /// BRAINCORE-AUD-001: eviction equivalence across snapshot/restore.
+    /// See crates/khive-brain-core/docs/testing-notes.md#posteriorrssnapshot_restore_eviction_equivalence-braincore-aud-001
     #[test]
     fn snapshot_restore_eviction_equivalence() {
         let capacity = 2;
@@ -521,8 +519,8 @@ mod tests {
         );
     }
 
-    /// BRAINCORE-AUD-001 regression: a snapshot with more entries than the
-    /// configured capacity must restore bounded, not exceed it.
+    /// BRAINCORE-AUD-001: oversized snapshot restore is bounded by capacity.
+    /// See crates/khive-brain-core/docs/testing-notes.md#posteriorrsoversized_snapshot_restore_is_bounded_by_capacity-braincore-aud-001
     #[test]
     fn oversized_snapshot_restore_is_bounded_by_capacity() {
         let capacity = 2;

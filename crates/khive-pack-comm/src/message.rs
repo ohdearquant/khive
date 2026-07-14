@@ -10,10 +10,7 @@ pub(crate) fn short_id(uuid: Uuid) -> String {
     uuid.as_hyphenated().to_string().chars().take(8).collect()
 }
 
-/// Resolve a raw id string to a full UUID.
-///
-/// Accepts a 36-char hyphenated UUID or an 8+ hex-char short prefix.
-/// The prefix is resolved via `runtime.resolve_prefix` (namespace-scoped).
+/// Resolve a raw id string (full UUID or 8+ hex-char short prefix) to a UUID.
 pub(crate) async fn resolve_id(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -36,13 +33,8 @@ pub(crate) async fn resolve_id(
     )))
 }
 
-/// Roll back a partially-written outbound note after a later `dual_write_message`
-/// step fails (issue #460). Uses a row-first compensating delete so that a
-/// cleanup failure cannot leave the outbound row (and thus the failed send's
-/// live message) behind. Returns `original` unchanged when rollback fully
-/// succeeds; returns a composite `RuntimeError::Internal` naming both the
-/// original failure and the rollback cleanup failure when the row was removed
-/// but cleanup did not complete.
+/// Rolls back a partially-written outbound note after a dual-write failure.
+/// See crates/khive-pack-comm/docs/handlers.md#messagersrollback_outbound
 async fn rollback_outbound(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -121,38 +113,17 @@ fn build_preview(content: &str) -> String {
     }
 }
 
-/// Write an outbound copy (caller namespace) and an inbound copy (recipient namespace),
-/// rolling back the outbound note if the inbound write fails (atomicity guarantee).
+/// Writes an outbound copy (caller namespace) and an inbound copy (recipient
+/// namespace), rolling back the outbound note if the inbound write fails
+/// (atomicity guarantee). Returns the outbound `Note` on success.
 ///
-/// `subject`, `thread_id` are optional. `sent_at` is the RFC3339 timestamp for both copies.
-/// `from_actor` and `to_actor` are optional actor labels (ADR-057) stored in properties.
+/// Invariant: when `thread_id` is `None` (root send), both copies are patched
+/// to share the sender's outbound UUID as their canonical `thread_id`, so
+/// `comm.thread` finds replies regardless of which copy they replied to. When
+/// `thread_id` is already supplied (reply path), it is forwarded unchanged.
 ///
-/// Cross-namespace thread root invariant: when a root message is sent (i.e., `thread_id`
-/// is `None`), both the outbound and inbound copies must share the same canonical
-/// `thread_id` — the sender's outbound UUID.  This ensures that
-/// `comm.thread(id=outbound_id)` can find replies written in any namespace, because all
-/// replies carry the same canonical thread_id regardless of which copy they were replying to.
-///
-/// When `thread_id` is already supplied (reply path), it is forwarded unchanged to both copies.
-///
-/// Returns the outbound `Note` on success.
-///
-/// `in_reply_to_message_id` is the parent's wire Message-ID (angle-bracketed),
-/// when this write is a reply to a message with a known one (issue #403). It is
-/// stored verbatim on both copies as `in_reply_to_message_id`; the outbox
-/// delivery loop reads it back to set the RFC 822 `In-Reply-To` header for
-/// native MUA conversation grouping. `None` when there is no known parent
-/// Message-ID (a plain send, or a reply whose parent has none).
-///
-/// `references_chain` is the full RFC 5322 `References` value for this reply:
-/// the parent's existing chain (if any) followed by the parent's Message-ID,
-/// space-separated angle-bracketed ids (issue #403 finding: References must
-/// preserve ancestry, not truncate to the immediate parent). Stored verbatim
-/// on both copies as `references_chain`; the outbox delivery loop reads it
-/// back to set the `References` header, and a further reply reads it back
-/// (direction-aware, via `parent_references_chain`) to extend the chain again.
-/// `None` when there is no known parent Message-ID (mirrors
-/// `in_reply_to_message_id`).
+/// See crates/khive-pack-comm/docs/handlers.md#messagersdual_write_message for
+/// the `in_reply_to_message_id`/`references_chain` header-threading contract.
 // REASON: dual_write_message mirrors the send wire shape exactly (from, to, subject,
 // content, thread_id, sent_at) plus the two context args (runtime, token). Grouping them into
 // a struct would not reduce overall complexity and would require an extra allocation on the

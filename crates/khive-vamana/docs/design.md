@@ -105,6 +105,15 @@ Key design decisions and constraints:
 
 ---
 
+## Lifecycle fields
+
+`VamanaIndex`'s PR2 lifecycle fields (ADR-052 §2): `tombstones` is a `Vec<u64>`
+bit-packed bitvec with manual manipulation rather than a `bitvec` crate dependency
+(OQ3 resolution). `consolidation_tau` lives on `VamanaIndex`, not `VamanaConfig`,
+because it is operational policy (when to compact), not graph topology (OQ5).
+
+---
+
 ## Consistency Notes
 
 - The `Vec<Vec<u32>>` adjacency layout is intentional for build-phase pruning

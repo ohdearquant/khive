@@ -15,21 +15,9 @@ use super::common::{
 };
 use crate::KgPack;
 
-// ---------------------------------------------------------------------------
-// Field applicability guard (authoritative field sets per substrate)
-//
-// Valid fields per substrate (source of truth: handler_defs.rs:241-243 +
-// EntityPatch / NotePatch / EdgePatch in crates/khive-runtime/src/curation.rs):
-//
-//   Entity: name, description, tags, properties
-//   Note:   name, content, salience, decay_factor, properties
-//           (notes have NO top-level tags column; tags live in properties["tags"])
-//   Edge:   relation, weight, properties
-//
-// Any present-but-inapplicable field is rejected with a fail-loud error naming
-// the offending field and listing the substrate's valid set.  This function
-// MUST be updated whenever UpdateParams or a patch struct changes.
-// ---------------------------------------------------------------------------
+// Field applicability guard, authoritative field sets per substrate — see
+// docs/handlers-common.md#reject_inapplicable_fields-handlersupdaters. MUST be updated
+// whenever UpdateParams or a patch struct changes.
 fn reject_inapplicable_fields(spec: &KindSpec, p: &UpdateParams) -> Result<(), RuntimeError> {
     let (bad_field, valid): (Option<&str>, &str) = match spec {
         KindSpec::Entity { .. } => {

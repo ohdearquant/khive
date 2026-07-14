@@ -94,3 +94,62 @@ provides a well-connected starting node for search.
 - No duplicate neighbors. Enforced by `sort_dedup_u32` after pruning and in `from_snapshot`.
 - Degree bound: `adjacency[i].len() <= max_degree` after build and after loading.
 - Deterministic output: seeded RNG (`BUILD_SEED`) + deterministic sort order ensures identical graphs for identical inputs.
+
+---
+
+## Reverse-adjacency rebuild
+
+`VamanaGraph::rebuild_reverse_adj_from_adjacency` (`graph.rs`) rebuilds `reverse_adj`
+from scratch by scanning the current `adjacency`: O(N × R) where N is node count and
+R is average out-degree. Called after `build()` completes, and after `load` /
+`from_snapshot` restores adjacency from disk — the v1 on-disk format does not persist
+`reverse_adj`, so it must be reconstructed rather than loaded.
+
+## Tombstone defense-in-depth
+
+`greedy_search_inner` and `greedy_search_inner_sq8` (`graph.rs`) both take an optional
+`tombstones` bitvec. Under a correct Wolverine repair, no live forward edge should ever
+point at a tombstoned node — but this guard exists to catch crash-truncated repairs in
+the window before PR4 makes the invariant crash-safe:
+
+- If the medoid seed itself is tombstoned, the search returns an empty result rather
+  than surfacing a deleted node.
+- Neighbors are skipped during beam expansion if tombstoned.
+- The final result set is filtered against tombstones before `take(k)`.
+
+## SQ8 acquisition tier
+
+`VamanaGraph::build_sq8`, `greedy_search_inner_sq8`, and `robust_prune_inner_sq8`
+(ADR-052 §1, Step 2 — two-tier principle) route graph construction and search through
+`GsSq8Codec::l2_sq` (integer L2²) on pre-encoded corpus vectors instead of the f32
+kernel, for the frontier priority queue / candidate acquisition stage only:
+
+- `build_sq8` produces a graph topology equivalent to `build`; the caller trains the
+  codec and encodes the corpus before calling it.
+- `greedy_search_inner_sq8` re-scores every frontier candidate with exact f32 L2²
+  before final top-k selection (SQ8 for acquisition, exact f32 for final ranking).
+  Frontier ties on equal SQ8 codes are broken with exact f32 distance, since distinct
+  f32 vectors can map to the same u8 code (clamped or low-resolution dimensions).
+- `robust_prune_inner_sq8` scores and orders candidates with SQ8, tiebreaking equal
+  codes with exact f32 to match the search ordering — but the alpha diversity predicate
+  itself always uses exact f32 distances on both sides (node→candidate and
+  selected→candidate). This is deliberate: if node and candidate collide in code space
+  (e.g. both map to code 0), the SQ8 distance is 0, which would make
+  `alpha² * dist(selected, candidate) <= 0` vacuously true and incorrectly prune
+  candidates that exact f32 would keep. Selected neighbor IDs match the f32 variant on
+  the collision cases covered by tests; callers that need exact distances re-score
+  after prune.
+
+## Wolverine 2-hop repair
+
+`wolverine_repair` (`index.rs`, ADR-052 §2 steps 3-8) is the core soft-delete repair
+step, called from `VamanaIndex::tombstone` and `tombstone_batch`. For each live
+in-neighbor `p` of the deleted node, it rewires `p`'s adjacency by running RobustPrune
+over the union of the deleted node's out-neighbors and `p`'s current neighbors (minus
+the deleted node), with all tombstoned candidates excluded — this preserves
+monotonic-path reachability through `p`. `reverse_adj` is updated in lockstep on every
+rewire (the PR1 invariant).
+
+References:
+- Wolverine: PVLDB 18(7):2268-2280, VLDB 2025 (Liu/Zheng/Yue/Ruan/Zhou/Jensen)
+- FreshDiskANN: SIGMOD 2022 (>95% recall at 20% deletion with eager repair)

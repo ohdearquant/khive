@@ -91,6 +91,66 @@ a single `VamanaGraph` refactor suffices.
 
 ---
 
+## v2 crash-safe save/load
+
+`VamanaIndex::save_atomic` writes `vectors.bin` and `graph.bin` (same formats as v1),
+then `lifecycle.bin` (tombstones, free_slots, reverse_adj, ops_since_consolidation),
+then atomically renames `metadata.bin.tmp` → `metadata.bin` as the commit record. If a
+crash interrupts before the rename, the previous `metadata.bin` (v1 or v2) is still
+valid — `load_or_build` never observes a torn v2 commit. Segments are staged under
+`.v2new` suffixes so a crash between segment write and metadata rename never corrupts
+a live v1-format segment set. The directory entry is fsynced after both the metadata
+rename (commit gate) and the final segment-promotion renames.
+
+`VamanaIndex::load_or_build` is the fingerprint-gated restore used by callers holding a
+live corpus. Decision tree:
+- `metadata.bin` with `KHVVAMG2` magic AND checksums valid AND fingerprint matches →
+  fast path (`load_v2_fast`, O(N) — no reverse_adj rebuild)
+- `KHVVAMG2` but checksum or fingerprint mismatch → rebuild from commit config, then
+  `save_atomic`
+- `metadata.bin` with `KHVVAMM1` (v1) → v1 `load`, then `save_atomic` upgrade
+- `metadata.bin` missing or corrupt → rebuild from `fallback_config`, then `save_atomic`
+
+`VamanaIndex::load_v2_raw` (private) is the non-rebuilding half of that fast path: it
+verifies the v2 commit magic, parses the commit record, checksum-verifies all three
+segments against the commit fingerprint, then restores via `load_v2_fast`. It returns
+`InvalidFormat` if `path` holds no valid v2 commit (absent, v1-format, torn, checksum
+mismatch, or an inconsistent lifecycle segment) rather than rebuilding — `load_or_build`
+is the entry point that decides whether to fall back to a rebuild; `VamanaIndex::load`
+surfaces the error directly to callers that don't hold a corpus to rebuild from.
+
+## lifecycle.bin format
+
+Written by `write_lifecycle` (`index.rs`) as part of the v2 segmented save. All
+fields little-endian:
+
+| Field              | Size                    | Type            |
+| ------------------ | ----------------------- | --------------- |
+| magic               | 8 B                     | bytes `KHVVLIF1` |
+| tombstone_words     | 8 B                     | u64 (count of u64 words) |
+| tombstone data      | N × 8 B                 | u64 words        |
+| free_slots_count    | 8 B                     | u64              |
+| free_slots data     | M × 4 B                 | u32 each         |
+| ops                 | 8 B                     | u64              |
+| rev_num_nodes       | 8 B                     | u64              |
+| reverse_adj records | varies, one per node    | degree (u32) + neighbors (degree × u32) |
+
+`reverse_adj` uses the same per-node record format as `graph.bin`'s adjacency
+(degree followed by that many neighbor IDs). `num_nodes` for the tombstone bitvec is
+derived from `tombstone_words`; the caller already knows `num_vectors` from
+`metadata.bin`.
+
+## v2 fast-load path
+
+`VamanaGraph::restore_reverse_adj` installs a previously serialized in-neighbor list
+as `reverse_adj` in O(1) (a move). This is safe to call without redoing the O(N×R)
+rebuild because the v2 fast-load path (`load_v2_fast` in `index.rs`) has already paid
+that cost validating bidirectional consistency between the loaded `reverse_adj` and
+the forward `adjacency` before calling it — the O(N×R) work isn't skipped, it just
+happens in the validation step rather than in `restore_reverse_adj` itself.
+
+---
+
 ## Safety note (mmap)
 
 The single `unsafe` block in `mmap_vectors` maps `vectors.bin` read-only.
