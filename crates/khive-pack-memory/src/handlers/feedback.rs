@@ -16,12 +16,8 @@ struct FeedbackParams {
 }
 
 impl MemoryPack {
-    /// Handle `memory.feedback` with 3-tier profile resolution (ADR-035).
-    ///
-    /// Resolution order:
-    /// 1. Explicit brain profile in pack config (`self.brain_profile`) → route via `brain.feedback`
-    /// 2. Namespace-bound profile resolved via `brain.resolve` → route via `brain.feedback`
-    /// 3. Global tuning prior → update `self.recall_state` directly (original behavior)
+    /// Route validated feedback through explicit profile, bound profile, then global state.
+    /// See `crates/khive-pack-memory/docs/api/memory-lifecycle.md`.
     pub(crate) async fn handle_feedback(
         &self,
         token: &NamespaceToken,
@@ -58,9 +54,7 @@ impl MemoryPack {
     }
 }
 
-/// Validate that `signal` is a known feedback vocabulary entry before it is routed
-/// to any tier. Tier-3 (`on_explicit_feedback`) silently no-ops on unknown strings,
-/// which would otherwise let an invalid signal return `ok=true`.
+/// Reject unknown feedback before the low-level tier-three no-op can report success.
 fn validate_feedback_signal(signal: &str) -> Result<(), RuntimeError> {
     let semantic = khive_brain_core::FeedbackEventKind::from_signal_str(signal).is_some();
     let legacy = serde_json::from_value::<khive_brain_core::FeedbackSignal>(json!(signal)).is_ok();
@@ -74,11 +68,7 @@ fn validate_feedback_signal(signal: &str) -> Result<(), RuntimeError> {
     }
 }
 
-/// Route feedback to `brain.feedback` for a known profile ID.
-///
-/// Returns the brain.feedback result on success, or an error if the brain pack
-/// rejects the call (e.g. unknown profile). Callers that want graceful fallback
-/// should handle the error themselves.
+/// Route feedback to a known profile, returning any brain-pack error unchanged.
 async fn route_to_brain(
     registry: &VerbRegistry,
     token: &NamespaceToken,
