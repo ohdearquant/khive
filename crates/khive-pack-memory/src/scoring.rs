@@ -9,10 +9,6 @@
 //!   6. `is_meaningful_query` — noise gate before embedding compute.
 //!   7. `contains_cjk` — CJK routing decision.
 //!   8. `needs_multilingual` — broad multilingual routing gate (non-ASCII alphabetic script).
-// FILE SIZE JUSTIFICATION: scoring.rs bundles ScoringConfig, all normalization helpers,
-// CJK routing, and the full test suite for the scoring pipeline. The tests require access
-// to module-private helpers; splitting would require pub(crate) promotion of private fns.
-
 use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
@@ -279,38 +275,19 @@ fn strip_token_punctuation(token: &str) -> &str {
 }
 
 /// Auto-extract entity-name candidates from a recall query when the caller
-/// does not supply `entity_names` explicitly.
+/// does not supply `entity_names` explicitly, for the `EntityMatch` boost in
+/// `default_adjustments`.
 ///
-/// Context (khive #dead-parameter defect): `entity_names` was a
-/// caller-supplied request field that fed `EntityMatch` — but no caller ever
-/// populated it, so the ×1.3 boost in `default_adjustments` never fired in
-/// practice. This function derives candidates server-side from the query
-/// text so the boost has something to match against.
+/// A token qualifies iff, after stripping surrounding punctuation
+/// (`strip_token_punctuation`), it is not an `ENTITY_STOPWORDS` entry and
+/// starts with an uppercase letter. Queries with no capitalized tokens
+/// return an empty list — this never falls back to lowercase content words.
+/// Returned names are lowercased (matching `EntityMatch`'s own
+/// lowercase-both-sides contract), deduplicated preserving first-seen
+/// order, and capped at `MAX_AUTO_ENTITY_NAMES`.
 ///
-/// **Capitalized tokens only.** A query token qualifies iff, after stripping
-/// surrounding punctuation, it is not a stopword and starts with an
-/// uppercase letter. Capitalization is the only signal used here because it
-/// is the sole low-noise proper-noun indicator available without an NER
-/// model or a lookup against known entity records — `EntityMatch::matches`
-/// (above) does a free-text boundary-anchored match against raw memory
-/// content, not something anchored to actual KG entity references, so
-/// admitting ordinary lowercase content words as candidates degenerates the
-/// boost into a second, redundant lexical-overlap signal on top of
-/// retrieval-stage relevance (confirmed by review: realistic score inputs
-/// clamp at the `[0, 1]` ceiling and flatten top-rank ordering when generic
-/// query words are treated as entity candidates).
-///
-/// **Queries with no capitalization extract nothing.** Many recall callers —
-/// agents in particular — pass fully lowercase queries, and this function
-/// deliberately returns an empty list for them rather than guessing at
-/// content words. Covering that case precisely requires anchoring candidates
-/// against known entity records (e.g. resolving query tokens against the KG)
-/// rather than lexical heuristics over the query string; that is out of
-/// scope here.
-///
-/// Returned names are lowercased (matching `EntityMatch`'s own lowercasing
-/// of both sides before the boundary-anchored match), deduplicated
-/// preserving first-seen order, and capped at `MAX_AUTO_ENTITY_NAMES`.
+/// See crates/khive-pack-memory/docs/scoring.md#entity-candidate-extraction
+/// for why capitalization-only was chosen over an NER model or KG lookup.
 pub fn extract_entity_candidates(query: &str) -> Vec<String> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut out: Vec<String> = Vec::new();
@@ -359,20 +336,21 @@ fn entity_lookup_case_variants(candidate: String) -> [Option<String>; 2] {
 
 /// Build the candidate strings a recall query offers to the entity-anchored
 /// lookup (ADR-104 §5 / Stage C). Alphabetic-script queries contribute
-/// ASCII-lowercased non-stopword unigrams and reserve one quarter of the cap
-/// for adjacent-token bigrams. Candidates containing non-ASCII characters also
-/// retain their raw form for exact matching. CJK substrings reserve a fair quota
-/// for every supported length from 2 through 8, redistributing unused quota from
-/// short runs. Within each length, available start positions are sampled evenly.
-/// Quotas greater than one guarantee both the first and final valid starts;
-/// a quota of one selects the first endpoint. The result is both length-fair
-/// and position-fair under the 64-candidate cap. All candidates are deduplicated.
+/// ASCII-lowercased non-stopword unigrams plus adjacent-token bigrams
+/// (reserved to one quarter of `MAX_ENTITY_LOOKUP_CANDIDATES`); non-ASCII
+/// candidates also retain their raw form for exact matching. CJK substrings
+/// of length `MIN_CJK_LOOKUP_CHARS..=MAX_CJK_LOOKUP_CHARS` are sampled under
+/// a fair per-length quota. Output is deduplicated and capped at
+/// `MAX_ENTITY_LOOKUP_CANDIDATES`.
 ///
 /// Unlike `extract_entity_candidates` above, this does **not** filter on
-/// capitalization, lowercase queries are the whole point of this extension.
-/// The precision-safety property instead comes from the caller (the
-/// `memory.recall` handler) only keeping a candidate that matches the *name*
-/// of a real KG entity, via one batched `EntityFilter::names_ci` lookup.
+/// capitalization — lowercase queries are the whole point of this path.
+/// Precision instead comes from the caller (`memory.recall`) only keeping a
+/// candidate that matches the *name* of a real KG entity, via one batched
+/// `EntityFilter::names_ci` lookup.
+///
+/// See crates/khive-pack-memory/docs/scoring.md#entity-lookup-candidate-sampling
+/// for the quota-redistribution and position-fairness sampling algorithm.
 pub fn entity_lookup_candidates(query: &str) -> Vec<String> {
     let tokens: Vec<String> = query
         .split_whitespace()
