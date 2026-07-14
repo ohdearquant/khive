@@ -20,6 +20,15 @@ pub(crate) struct SendParams {
     /// Mirrors the shipped `memory.remember` `tags` precedent (issue #495).
     #[serde(default)]
     pub tags: Option<Vec<String>>,
+    /// Explicit acknowledgment that `to` intentionally names the sender's own
+    /// resolved actor identity (khive #820). Required whenever the resolved
+    /// `to_actor` equals `from_actor`; without it such a send is rejected rather
+    /// than silently delivered, since a sub-agent session addressing a distinct
+    /// parent/orchestrator actor that happens to collapse onto its own identity
+    /// (both resolve `[actor] id` from the same project-scoped
+    /// `.khive/config.toml`, ADR-096 Fork 2) is a mis-resolution, not intent.
+    #[serde(default)]
+    pub self_send: bool,
 }
 
 #[derive(Deserialize)]

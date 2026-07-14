@@ -95,6 +95,12 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 11] = [
                 required: false,
                 description: "Structured provenance tags (e.g. run id, job id, traffic class), persisted verbatim to `properties[\"tags\"]` on both the outbound and inbound copies.",
             },
+            ParamDef {
+                name: "self_send",
+                param_type: "boolean",
+                required: false,
+                description: "Explicitly allow delivery when `to` matches the configured sender actor. Defaults to false: such self-addressed sends are rejected unless this is true. The anonymous `local` fallback is exempt.",
+            },
         ],
     },
     HandlerDef {

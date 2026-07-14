@@ -1033,6 +1033,7 @@ fn reminder_delivery_action(actor: &str, content: &str) -> String {
             "to": actor,
             "subject": reminder_subject(content),
             "content": content,
+            "self_send": true,
         }
     }]);
     serde_json::to_string(&action).expect("reminder delivery action is JSON-serializable")
