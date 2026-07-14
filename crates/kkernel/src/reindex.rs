@@ -874,33 +874,12 @@ async fn purge_stale_memory_vamana_snapshots(rt: &KhiveRuntime) {
     }
 }
 
-/// Durably mark the reindex-in-progress epoch, before ANY vector mutation in
-/// this pass (#812). The previous
-/// design bumped the durable epoch only as a best-effort step AFTER every
-/// vector mutation had already committed (see
-/// `invalidate_active_memory_vamana_snapshot`'s completion bump below); a
-/// crash between the last commit and that bump, or a silently swallowed
-/// bump error, left an already-warm daemon with no durable signal at all and
-/// serving pre-reindex vectors indefinitely.
-///
-/// Bumping first instead closes that gap: a daemon that observes this epoch
-/// mid-reindex (via `khive_pack_memory::ann::maybe_check_durable_epoch`,
-/// sampled from the recall path) rebuilds conservatively against whatever
-/// partial corpus is on disk at that moment — never worse than the old
-/// behavior of trusting a stale index forever — and the completion bump at
-/// the end of this pass forces one more rebuild once the corpus reaches its
-/// final, fully re-embedded state. Together these two durable bumps form an
-/// in-progress/completed epoch protocol: any observer landing anywhere
-/// between them still converges.
-///
-/// `kkernel reindex` runs directly against a raw `KhiveRuntime`, without a
-/// pack registry boot to apply `MemoryPack::SCHEMA_PLAN`, so this also
-/// ensures the `memory_ann_epoch` table exists before its first bump.
-///
-/// Fail-closed: an error here — schema creation OR the epoch write itself —
-/// aborts the whole reindex before any mutation runs, via `?` on this
-/// function's `Result`. Never warn-and-continue: a swallowed failure here is
-/// exactly the bug ADR-107 §4 was written to close.
+/// Durably marks the reindex-in-progress epoch, BEFORE any vector mutation in
+/// this pass (#812, ADR-107 §4). Fail-closed: an error here (schema creation OR
+/// the epoch write) aborts the whole reindex before any mutation runs — never
+/// warn-and-continue. See
+/// `crates/kkernel/docs/design.md#reindex-memory-vamana-epoch-protocol-812-adr-107-4`
+/// for the in-progress/completed epoch protocol this is half of.
 async fn begin_reindex_epoch(rt: &KhiveRuntime) -> Result<()> {
     khive_pack_memory::ensure_ann_epoch_schema(rt)
         .await
