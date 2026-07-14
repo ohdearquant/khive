@@ -6,15 +6,12 @@ configuration is read from at runtime.
 
 ## ADR Links
 
-- [ADR-034](../../../docs/adr/ADR-034-kg-validation-pipelines.md) — KG validation pipelines specification
+- [ADR-034](../../../../docs/adr/ADR-034-kg-validation-pipelines.md) — KG validation pipelines specification
 
 ## Rule Configuration File
 
 Rules are configured at `.khive/kg/rules.toml` (TOML format, per ADR-034).
 The `ValidationContext::config` map is populated from that file at runtime.
-
-Note: source comments in `validation.rs` that reference `rules.yaml` are a documentation
-error; the canonical format is `.toml` per ADR-034.
 
 ## Rule Declaration
 
