@@ -94,7 +94,8 @@ before hashing, claiming an operation, or invoking `gh`.
 Required strings are otherwise preserved byte-for-byte. The handler does not trim them,
 apply Unicode normalization, change line endings, or case-fold them. An accepted empty
 `body` or `notes` value therefore remains an empty string in the canonical request; the
-generated reconciliation marker is transport metadata and is not part of that value.
+generated nonce-bearing reconciliation marker is transport metadata and is not part of that
+value.
 The `Cc`/`Cf` rejection is performed on decoded Unicode scalars before preservation or
 scanning. Only the multiline `body` and `notes` fields permit any `Cc` scalar, and their
 closed exception set is HT, LF, and CR. Single-line titles, the optional release title,
@@ -190,13 +191,14 @@ The handler validates all arguments, applies the defaults and array normalizatio
 and constructs a canonical object containing every verb argument other than
 `idempotency_key`, including the explicit default values. It sorts object keys
 lexicographically by unsigned UTF-8 bytes, serializes the object as compact UTF-8 JSON, and
-stores the BLAKE3 hash of those bytes. The generated reconciliation marker is not part of
-the hash. Consequently, omitted and explicit defaults hash identically, as do permutations
-of the same labels or assignees. The same key with the same hash resumes that operation;
-reusing it with a different hash is rejected before any network call. The implementation
-stores the key as `operation_id` in the recovery ledger described below. A successful retry
-returns the cached remote result. This explicit key is necessary because neither `gh` nor a
-GitHub create operation supplies a transactional boundary shared with khive's graph store.
+stores the BLAKE3 hash of those bytes. The generated reconciliation nonce and marker are not
+part of the hash. Consequently, omitted and explicit defaults hash identically, as do
+permutations of the same labels or assignees. The same key with the same hash resumes that
+operation; reusing it with a different hash is rejected before any network call. The
+implementation stores the key as `operation_id` in the recovery ledger described below. A
+successful retry returns the cached remote result. This explicit key is necessary because
+neither `gh` nor a GitHub create operation supplies a transactional boundary shared with
+khive's graph store.
 
 ### Comment target grammar
 
@@ -253,8 +255,9 @@ authorization, and hygiene scanning have completed:
    The remaining caller-controlled identifiers have narrower validation that prevents this
    content channel: `repo` must be an exact configured allowlist entry; comment `target`
    must match the closed grammar and an existing object in that repo; and
-   `idempotency_key` must be a canonical UUID before the handler derives the externally
-   visible reconciliation marker. They are therefore validated, not pattern-scanned.
+   `idempotency_key` must be a canonical UUID before the handler combines it with the
+   daemon-generated reconciliation nonce described below. They are therefore validated, not
+   pattern-scanned.
 3. **Deny path.** Any hit not covered by an allowlist escape produces a synchronous deny to
    the caller (see "Deny semantics") and an additional typed audit record (see "Audit and
    the event plane"). No GitHub API call is made, and no operation-ledger row is claimed;
@@ -262,10 +265,12 @@ authorization, and hygiene scanning have completed:
 4. **Comment-target read check.** For `git.publish_comment`, the handler performs the
    repository-scoped, kind-aware read described in "Comment target grammar". This is a
    read-only validation call, not a content write.
-5. **Claim the durable operation.** The handler inserts the pending-operation row in state
-   `unconfirmed_publish`, including the normalized request and its generated reconciliation
-   marker. This commit happens before `gh` is spawned. An existing row follows the recovery
-   state machine; only a proven `not_published` row may enter the create path.
+5. **Claim the durable operation.** For a new operation, the handler obtains a
+   cryptographically random reconciliation nonce and atomically inserts the pending-operation
+   row in state `unconfirmed_publish`, including the normalized request, nonce, and full
+   generated reconciliation marker. This commit happens before `gh` is spawned. An existing
+   row reuses its persisted nonce and marker and follows the recovery state machine; only a
+   proven `not_published` row may enter the create path.
 6. **GitHub API call.** For a newly claimed or proven `not_published` operation only, the
    verb shells the configured GitHub CLI (`gh`) under the daemon's identity - the same
    transport ADR-088's ingester and Amendment 1's `git.digest` already use, with the fixed
@@ -273,8 +278,8 @@ authorization, and hygiene scanning have completed:
    matching the discipline
    ADR-108 Fork (b) required for `git`. `gh` is reused rather than a direct REST client for
    the same reason ADR-088 §5 gave: it already handles auth and pagination correctly for
-   this environment. The fixed marker described in "Publish recovery state machine" is
-   appended after user content has passed the scan.
+   this environment. The operation-bound marker described in "Publish recovery state
+   machine" is appended after user content has passed the scan.
 7. **Persist the remote receipt.** Once GitHub returns, the handler durably stores the
    remote URL and number or id and moves the operation to `published_pending_ingest`
    before attempting any graph write.
@@ -564,14 +569,16 @@ exactly one `annotates` edge from it to the repo project.
 GitHub and the graph store cannot share a transaction. The git pack therefore owns a
 durable `git_publish_operation` ledger. Its minimum persisted fields are `operation_id`
 (the idempotency UUID, primary key), `namespace`, `verb`, `repo`, a canonical request hash,
-the normalized request needed for local replay, `marker`, `state`, `remote_url`,
-`remote_number`, `remote_id`, `note_id`, `audit_event_id`, `last_error`, `created_at`, and
-`updated_at`. The stored request has already passed the hygiene and secret scans, is local
-daemon state, and must never be copied into an Event payload or error response.
-Because the scan precedes the ledger claim, a validation failure or hygiene denial creates
-no ledger row. `last_error` is a code-selected, content-free error class and stage; it never
-contains transport stdout or stderr, a command or argv rendering, or any caller-supplied
-field value. The same restriction applies to tracing and all other log output.
+the normalized request needed for local replay, `reconciliation_nonce`, `marker`, `state`,
+`remote_url`, `remote_number`, `remote_id`, `note_id`, `audit_event_id`, `last_error`,
+`created_at`, and `updated_at`. The stored request has already passed the hygiene and secret
+scans, is local daemon state, and must never be copied into an Event payload or error
+response.
+Because the scan and nonce generation precede the ledger claim, a validation failure,
+hygiene denial, or secure-random-source failure creates no ledger row. `last_error` is a
+code-selected, content-free error class and stage; it never contains transport stdout or
+stderr, a command or argv rendering, or any caller-supplied field value. The same restriction
+applies to tracing and all other log output.
 
 The closed v0 state set and transitions are:
 
@@ -600,25 +607,43 @@ ingested_pending_audit -> complete
 - **`complete`** requires remote identity, graph reconciliation, and the success-domain
   audit. Retries return the stored result without network or graph mutation.
 
-For remote reconciliation, every create appends this fixed, inert marker after the scanned
-user content:
+For remote reconciliation, every create appends this inert, operation-bound marker after the
+scanned user content:
 
 ```html
-<!-- khive-publish:<operation_id> -->
+<!-- khive-publish:<operation_id>:<reconciliation_nonce> -->
 ```
 
-The marker contains only the opaque publication UUID and is generated by the handler after
-the caller content passes the scan. It is applied to issue and PR bodies, comment bodies,
-and release notes. Graph self-ingest strips exactly this generated trailing marker from
-`content`; it does not remove arbitrary HTML comments supplied by the caller.
+`reconciliation_nonce` is exactly 32 bytes obtained from the operating system's
+cryptographically secure random source and encoded as 64 lowercase hexadecimal characters.
+It is generated by the daemon after the caller content passes the scan; it is never accepted
+from the caller or derived from the operation UUID, request bytes, time, process state, or
+another predictable value. The new-operation claim atomically persists the nonce and full
+marker with `unconfirmed_publish` before the child is spawned. Failure to obtain secure
+randomness fails the invocation before a ledger row or remote write and is audited as the
+content-free `remote_publish` error stage. The nonce and marker are immutable for the
+operation, including a `not_published` retry.
+
+The persisted nonce and full marker are local recovery credentials until the marker becomes
+visible on a successfully created remote object. Neither appears in receipts, error
+responses, audit payloads, graph properties, or logs. The marker is applied uniformly to
+issue and PR bodies, comment bodies, and release notes. Graph self-ingest strips exactly the
+persisted generated trailing marker from `content`; it does not remove arbitrary HTML
+comments supplied by the caller. Caller content may therefore contain operation UUIDs,
+legacy operation-id-only marker text, or marker-shaped HTML comments with caller-chosen
+nonce text without being rewritten. Such text is not a recovery match for a pending
+operation because it does not contain that operation's unpredictable persisted nonce.
 
 On a retry from `unconfirmed_publish`, the handler performs a read-only, repo- and
-object-kind-scoped search for the exact marker. One match supplies the remote identity and
-advances to `published_pending_ingest`; multiple matches are an integrity error; no match
-leaves the operation unconfirmed and returns an error carrying `operation_id` and
-`state`, but no publish content. It never calls a GitHub create command. An operator may
-resolve a persistently unconfirmed operation only after independently establishing whether
-the remote object exists; silently changing the idempotency key is not a recovery action.
+object-kind-scoped search for the exact full persisted marker, including both the operation
+UUID and nonce. This rule applies identically to issue, pull-request, comment, and release
+reconciliation; an operation-id-only or nonce-mismatched marker is never accepted on any
+path. One match supplies the remote identity and advances to `published_pending_ingest`;
+multiple matches are an integrity error; no match leaves the operation unconfirmed and
+returns an error carrying `operation_id` and `state`, but no publish content. It never calls
+a GitHub create command. An operator may resolve a persistently unconfirmed operation only
+after independently establishing whether the remote object exists; silently changing the
+idempotency key is not a recovery action.
 
 The crash and failure windows are therefore explicit:
 
@@ -957,11 +982,18 @@ pattern file, it must include these contract tests:
    the recovery table: operation insert, remote response, note upsert, edge ensure, audit
    append, and completion update. Resume with the same idempotency key and assert that the
    remote create spy observed exactly one create, unfinished local work completed, and the
-   final success Event exists exactly once. The unconfirmed case must exercise marker
-   recovery and the no-match error path. Release cases inject failures immediately after
-   the reference-note upsert and immediately after its project-edge ensure; each recovery
-   must finish with exactly one reference note and exactly one `annotates` edge to the
-   resolved repo-anchor project.
+   final success Event exists exactly once. The unconfirmed case must exercise exact
+   nonce-bearing marker recovery and the no-match error path. A parameterized forgery
+   regression covers issue, pull-request, comment, and release reconciliation: operation A
+   publishes a same-repo, same-kind object whose caller content contains operation B's UUID
+   in both legacy operation-id-only marker text and a full marker-shaped comment with a
+   nonmatching nonce; A still receives its own generated trailing marker. B's child then
+   starts, its response is lost without creating B's remote object, and B remains
+   `unconfirmed_publish`. A same-key retry of B must not bind A's remote identity, must find
+   no exact full-marker match, must issue no second create, and must return the unresolved
+   error. Release cases also inject failures immediately after the reference-note upsert and
+   immediately after its project-edge ensure; each recovery must finish with exactly one
+   reference note and exactly one `annotates` edge to the resolved repo-anchor project.
 6. **Idempotency-key conflict.** Reusing a key with identical normalized arguments returns
    or resumes the original operation; reusing it with different arguments fails before
    transport.
@@ -1078,6 +1110,8 @@ Four forks were presented for this design; each is resolved in place.
   pattern-tuning work an evidence base instead of anecdote.
 - Same-call KG visibility of caller-authored GitHub content via recoverable self-ingest,
   without waiting on the next digest sweep.
+- A daemon-generated nonce binds reconciliation to the operation's actual remote object
+  without reserving or rewriting legitimate caller-authored HTML comments.
 - Pattern data is versioned and reviewable as an ordinary file diff, rather than scattered
   across independently maintained hook and verb implementations. The byte-pattern grammar
   defines common semantics; the shared corpus and configured merged-content revision make
@@ -1109,13 +1143,14 @@ Four forks were presented for this design; each is resolved in place.
 
 ## Alternatives Considered
 
-| Alternative                                                      | Why not adopted                                                                                                                                                                                                                                                                           |
-| ---------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Enforce hygiene only at the client-side hook, no server verb     | Does not compose with the eventual "raw `gh` denied for content writes" endpoint: any caller not running a current hook has no enforcement at all. A server-side verb is the one chokepoint every caller must pass through regardless of local hook state.                                |
-| Semantic or LLM-based content classification instead of patterns | Rejected for v0. Patterns are deterministic, auditable as a file diff, and portable across two independent implementations by construction; a classifier's decisions are neither deterministic nor reviewable in the same way, and out-of-scope per this ADR's scope decision.            |
-| A `force=true` per-call escape parameter                         | Rejected. Defeats the review property the allowlist file provides: a legitimate exception must be a versioned, reviewable config edit, never a call-site flag any caller can set for itself.                                                                                              |
-| A single merged pattern file, no in-repo/overlay split           | Rejected. The in-repo file must never carry concrete internal-identifier tokens (F2); a single file would either leak internal terms into a public repository or force every installation to maintain a full private copy instead of layering a small overlay onto a shared generic base. |
-| Fold outbound publish into `git.digest` with a write mode        | Rejected, matching ADR-108's identical rejection of overloading `git.digest`: it is read/ingest-shaped, and conflating it with a write-and-scan operation mixes two operations with entirely different audit and failure-mode needs.                                                      |
+| Alternative                                                      | Why not adopted                                                                                                                                                                                                                                                                                              |
+| ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Enforce hygiene only at the client-side hook, no server verb     | Does not compose with the eventual "raw `gh` denied for content writes" endpoint: any caller not running a current hook has no enforcement at all. A server-side verb is the one chokepoint every caller must pass through regardless of local hook state.                                                   |
+| Semantic or LLM-based content classification instead of patterns | Rejected for v0. Patterns are deterministic, auditable as a file diff, and portable across two independent implementations by construction; a classifier's decisions are neither deterministic nor reviewable in the same way, and out-of-scope per this ADR's scope decision.                               |
+| A `force=true` per-call escape parameter                         | Rejected. Defeats the review property the allowlist file provides: a legitimate exception must be a versioned, reviewable config edit, never a call-site flag any caller can set for itself.                                                                                                                 |
+| A single merged pattern file, no in-repo/overlay split           | Rejected. The in-repo file must never carry concrete internal-identifier tokens (F2); a single file would either leak internal terms into a public repository or force every installation to maintain a full private copy instead of layering a small overlay onto a shared generic base.                    |
+| Fold outbound publish into `git.digest` with a write mode        | Rejected, matching ADR-108's identical rejection of overloading `git.digest`: it is read/ingest-shaped, and conflating it with a write-and-scan operation mixes two operations with entirely different audit and failure-mode needs.                                                                         |
+| Derive the recovery marker from `operation_id` alone             | Rejected. The id is caller supplied and predictable before the operation is claimed, so another publication could pre-plant that marker and be mistaken for the pending operation. A persisted daemon-generated nonce preserves caller content while making a pending operation's full marker unpredictable. |
 
 ## References
 
