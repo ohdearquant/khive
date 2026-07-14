@@ -5685,6 +5685,67 @@ async fn health_scoped_to_injected_namespace_sees_only_its_own_rows() {
     );
 }
 
+/// khive #917: an authorized per-tenant writer — an embedding host that
+/// authenticates a tenant principal out-of-band and dispatches via
+/// `VerbRegistry::dispatch_as` with a `VerifiedActor`, passing the tenant's
+/// own namespace as the explicit `namespace` dispatch param (ADR-007 Rev 6
+/// Rule 3's explicit escape, the same mechanism the local poll loop already
+/// uses to pin its own writes to `"local"`) — persists its `comm.heartbeat`
+/// row under that tenant's own namespace rather than the fixed
+/// `khive_pack_comm::CHANNEL_HEALTH_NAMESPACE` constant. A tenant-scoped
+/// `comm.health` read now sees that row (closing the "reads an empty set by
+/// construction" gap #917 reports), while the default (local-scoped)
+/// `comm.health` read is unaffected — heartbeat rows for different
+/// namespaces do not bleed into each other.
+#[tokio::test]
+async fn authorized_writer_persists_heartbeat_under_its_own_tenant_namespace() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    registry
+        .dispatch_as(
+            "comm.heartbeat",
+            serde_json::json!({
+                "namespace": "tenant-a",
+                "channel_kind": "email",
+                "channel_slug": "tenant-a-inbox@example.com",
+                "outcome": "success",
+            }),
+            khive_runtime::VerifiedActor::new("tenant-a-writer").expect("non-blank actor id"),
+        )
+        .await
+        .expect("authorized tenant heartbeat succeeds");
+
+    let scoped_health = registry
+        .dispatch(
+            "comm.health",
+            serde_json::json!({ "namespace": "tenant-a" }),
+        )
+        .await
+        .expect("tenant-scoped health succeeds");
+    let scoped_channels = scoped_health["channels"].as_array().expect("array");
+    assert_eq!(
+        scoped_channels.len(),
+        1,
+        "tenant-scoped comm.health must see the row the authorized writer produced: \
+         {scoped_channels:?}"
+    );
+    assert_eq!(
+        scoped_channels[0]["channel_slug"].as_str(),
+        Some("tenant-a-inbox@example.com")
+    );
+    assert_eq!(scoped_health["role"].as_str(), Some("daemon"));
+
+    let default_health = registry
+        .dispatch("comm.health", serde_json::json!({}))
+        .await
+        .expect("unscoped health succeeds");
+    let default_channels = default_health["channels"].as_array().expect("array");
+    assert!(
+        default_channels.is_empty(),
+        "the local-scoped read must not see the tenant's heartbeat row: {default_channels:?}"
+    );
+}
+
 // ── #493: comm.inbox from_actor / from_prefix sender filter ─────────────────
 
 /// A single actor namespace receives messages from two distinct senders;

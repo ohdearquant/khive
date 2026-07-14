@@ -1168,22 +1168,30 @@ pub(crate) async fn handle_heartbeat(
         ));
     }
 
-    // Issue #606: heartbeat rows are an
-    // OPERATIONAL surface, not message data. Persist to
-    // `crate::CHANNEL_HEALTH_NAMESPACE` ALWAYS — never `token.namespace()` —
-    // so a poll loop configured with a non-local `KHIVE_EMAIL_INGEST_NAMESPACE`
-    // cannot cause heartbeat rows to land anywhere but this one fixed
-    // namespace. This is enforced here (not just at the serve.rs call site)
-    // so the guarantee holds even if a future caller passes a different
-    // `namespace` dispatch param.
+    // Issue #917: heartbeat rows persist under `token.namespace()` — the
+    // dispatch-authorized namespace every other comm verb already uses —
+    // rather than the fixed `crate::CHANNEL_HEALTH_NAMESPACE` constant #606
+    // pinned this to. `comm.heartbeat` is `Visibility::Subhandler` (never
+    // reachable from the MCP wire); the only callers able to dispatch it are
+    // trusted internal Rust code holding a `&VerbRegistry` handle, so the
+    // gate check `VerbRegistry::dispatch_with_identity` already runs for
+    // every dispatch (subhandlers included) is the sole authorization
+    // boundary here (ADR-018) — this handler must not layer a second,
+    // handler-local namespace check on top of it.
     //
-    // `handle_health` (khive #877) no longer mirrors this fixed pin: it reads
-    // from `token.namespace()`, which only resolves to this same constant
-    // for an unscoped (default-namespace) caller. An explicitly-scoped
-    // `comm.health` caller reads its own namespace, not wherever this
-    // handler wrote — do not reintroduce a `handle_health` read of this
-    // constant to "fix" that; it is the cross-namespace leak #877 closed.
-    let ns = crate::CHANNEL_HEALTH_NAMESPACE;
+    // The local single-tenant poll loop (`khive-mcp`'s
+    // `record_channel_heartbeat`) is unaffected: it always passes
+    // `"namespace": crate::CHANNEL_HEALTH_NAMESPACE` explicitly in its own
+    // dispatch params, so it keeps writing under `"local"` exactly as
+    // before. An authorized per-tenant writer (#917) instead dispatches via
+    // `VerbRegistry::dispatch_as` with a `VerifiedActor` (an out-of-band
+    // authenticated tenant principal, never derived from a wire-supplied
+    // field — this verb has no wire path at all) and passes that tenant's
+    // own namespace as this same explicit `namespace` dispatch param. Those
+    // heartbeat rows land under that tenant's namespace, so a tenant-scoped
+    // `comm.health` (#877) now observes real writer state
+    // instead of an empty set by construction.
+    let ns = token.namespace().as_str();
     let store = runtime.notes(token)?;
     let id = heartbeat_note_id(ns, &p.channel_kind, &p.channel_slug);
 
@@ -1309,16 +1317,17 @@ fn channel_health_to_json(note: &Note) -> Value {
 /// `namespace` in the response (khive #877) is the namespace actually read —
 /// `token.namespace().as_str()`, echoed back so the shape is self-describing
 /// for both the unscoped and the explicitly-scoped case. This exists because
-/// `role: "client"` / empty `channels` is now ambiguous on its own: it is the
-/// correct, expected shape for a `namespace=`-scoped call in the shipped OSS
-/// build, since `comm.heartbeat` only ever persists under
-/// `crate::CHANNEL_HEALTH_NAMESPACE` (`"local"`) — there is no OSS producer
-/// for tenant-scoped heartbeat rows yet (that is cloud-side follow-up, not
-/// this handler's job). A caller reading `namespace: "tenant-a"` alongside
-/// `role: "client"` can tell "no daemon anywhere" (unscoped call, `namespace:
-/// "local"`) apart from "no rows written under my scope yet" (scoped call,
-/// `namespace: "tenant-a"`) without khive silently falling back to `"local"`
-/// to paper over the difference.
+/// `role: "client"` / empty `channels` is otherwise ambiguous: a caller
+/// reading `namespace: "tenant-a"` alongside `role: "client"` can tell "no
+/// daemon anywhere" (unscoped call, `namespace: "local"`) apart from "no rows
+/// written under my scope yet" (scoped call, `namespace: "tenant-a"`)
+/// without khive silently falling back to `"local"` to paper over the
+/// difference. `comm.heartbeat` (khive #917) persists under
+/// `token.namespace()` rather than a fixed constant, so an authorized
+/// per-tenant writer's rows are what a `namespace=`-scoped read now
+/// observes — an empty `channels` array for a scoped read means no writer
+/// has been authorized for that namespace yet, not that the feature is
+/// unreachable.
 ///
 /// Never returns a computed `healthy: bool` (design review amendment: "report
 /// timestamps only") — staleness/alerting judgment belongs to the caller.

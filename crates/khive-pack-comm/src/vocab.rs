@@ -294,12 +294,19 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 11] = [
     HandlerDef {
         name: "comm.heartbeat",
         description: "Persist a per-channel-credential heartbeat row after a poll attempt. \
-                       Subhandler — not callable on the MCP wire; only the daemon's channel \
-                       poll loop calls this (khive #606). The row is ALWAYS pinned to \
-                       `khive_pack_comm::CHANNEL_HEALTH_NAMESPACE` (\"local\") regardless of \
-                       the caller's dispatch namespace — heartbeat rows are an operational \
-                       surface, not message data, so they never follow \
-                       `KHIVE_EMAIL_INGEST_NAMESPACE` or any other caller-chosen namespace.",
+                       Subhandler — not callable on the MCP wire; only trusted internal Rust \
+                       callers holding a `VerbRegistry` handle can dispatch this (khive #606). \
+                       The row persists under the caller's dispatch-authorized namespace \
+                       (`token.namespace()`, khive #917) — the same explicit `namespace=` \
+                       escape / `\"local\"` default every other comm verb resolves. The local \
+                       single-tenant channel poll loop always dispatches with \
+                       `khive_pack_comm::CHANNEL_HEALTH_NAMESPACE` (\"local\") as its explicit \
+                       `namespace`, so its heartbeat rows are unaffected and never follow \
+                       `KHIVE_EMAIL_INGEST_NAMESPACE`. An authorized per-tenant writer instead \
+                       dispatches via `VerbRegistry::dispatch_as` with a `VerifiedActor` (an \
+                       out-of-band authenticated tenant principal) and passes its own tenant \
+                       namespace in this same `namespace` field, producing heartbeat rows under \
+                       that tenant's own namespace.",
         visibility: Visibility::Subhandler,
         category: khive_types::VerbCategory::Declaration,
         params: &[
@@ -308,12 +315,13 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 11] = [
                 param_type: "string",
                 required: true,
                 description: "Dispatch routing key (ADR-007 Rule 3 explicit escape) consumed \
-                              by `VerbRegistry::dispatch` to mint the call's `NamespaceToken`. \
-                              Callers should always pass \
-                              `khive_pack_comm::CHANNEL_HEALTH_NAMESPACE`: the persisted row's \
-                              actual namespace is hardcoded to that constant inside the \
-                              handler regardless of this value, so a different value here \
-                              does not redirect where the row lands.",
+                              by `VerbRegistry::dispatch` to mint the call's `NamespaceToken` \
+                              — the namespace the persisted row lands under. The local \
+                              single-tenant poll loop always passes \
+                              `khive_pack_comm::CHANNEL_HEALTH_NAMESPACE`. An authorized \
+                              per-tenant writer passes its own tenant namespace here via \
+                              `VerbRegistry::dispatch_as` with a `VerifiedActor`, since this \
+                              verb has no wire path for an untrusted caller to reach.",
             },
             ParamDef {
                 name: "channel_kind",
@@ -367,10 +375,12 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 11] = [
                        \"local\"'s. The response carries a `namespace` field naming the \
                        namespace actually read, so `role: \"client\"` with empty `channels` is \
                        unambiguous: it means no heartbeat rows exist under THAT namespace, not \
-                       necessarily that no daemon exists anywhere. In the shipped OSS build \
-                       `comm.heartbeat` only ever persists under \"local\", so a non-local \
-                       `namespace=` scope returns empty channels even while a daemon is \
-                       actively heartbeating under \"local\" — that is expected, not a fault.",
+                       necessarily that no daemon exists anywhere. `comm.heartbeat` (khive #917) \
+                       persists under the caller's dispatch-authorized namespace, so a \
+                       non-local `namespace=` scope returns that namespace's rows once an \
+                       authorized per-tenant writer has run; it returns empty channels only \
+                       when no such writer has been authorized for that namespace yet, even \
+                       while the local poll loop is actively heartbeating under \"local\".",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[],
