@@ -115,8 +115,10 @@ provide a reviewed change workflow when direct mutation is not appropriate.
 
 ## Behavior worth knowing
 
-- `create`, `list`, and `search` need a `kind`. Supply a substrate such as
-  `entity` or `note`, or a granular kind such as `concept` or `decision`.
+- `list`, `search`, and a singleton `create` need a `kind`. Supply a substrate
+  such as `entity` or `note`, or a granular kind such as `concept` or
+  `decision`. A bulk `create(items=[...])` carries a `kind` on each item, so it
+  needs no top-level `kind`.
 - `get`, `update`, and `delete` are by-ID operations. Use a UUID rather than a
   natural-language name; use `resolve` when you have a human reference.
 - `neighbors` returns edges in both directions by default. Pass
@@ -144,5 +146,6 @@ provide a reviewed change workflow when direct mutation is not appropriate.
   separate requests if a later step needs an earlier result that the intervening
   step did not return.
 
-For the complete domain vocabulary, see the [core type rustdoc](https://docs.rs/khive-types/latest/khive_types/). For full request
-examples and every verb parameter, use the [API reference](api-reference.md).
+For the complete domain vocabulary, see the [core type rustdoc](https://docs.rs/khive-types/latest/khive_types/). For more request
+examples, use the [API reference](api-reference.md); the [KG pack rustdoc](https://docs.rs/khive-pack-kg/latest/khive_pack_kg/) is the
+authoritative list of every verb parameter.
