@@ -1,6 +1,6 @@
 # ADR-094: Sequencing-Assertable Lifecycle Telemetry Events
 
-**Status**: Proposed
+**Status**: Accepted
 **Date**: 2026-07-04
 **Depends on**: ADR-002 (edge ontology, unrelated substrate but same repo conventions),
 ADR-041 (event provenance projection), ADR-091 (WAL snapshot lifetime, severity ladder

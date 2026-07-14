@@ -1,6 +1,6 @@
 # ADR-058: Brain Posterior Read Path — Wiring Profile Posteriors into Recall Ranking
 
-**Status**: Proposed\
+**Status**: Accepted\
 **Date**: 2026-06-15 (updated 2026-06-23)\
 **Authors**: khive maintainers
 **Depends on**:
