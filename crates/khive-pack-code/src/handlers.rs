@@ -60,7 +60,9 @@ impl CodePack {
         };
 
         let db_param = params.get("db").and_then(Value::as_str);
-        let db_path = resolve_target_db(db_param, &path).map_err(RuntimeError::InvalidInput)?;
+        let runtime_db_path = self.runtime.config().db_path.clone();
+        let db_path = resolve_target_db(db_param, &path, runtime_db_path.as_deref())
+            .map_err(RuntimeError::InvalidInput)?;
 
         let config = RuntimeConfig {
             db_path: Some(db_path.clone()),

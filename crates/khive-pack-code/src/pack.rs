@@ -20,8 +20,7 @@ use crate::vocab::{CODE_EDGE_RULES, CODE_HANDLERS, CODE_NOTE_KIND_SPECS};
 ///
 /// See `crates/khive-pack-code/docs/code-ontology.md`.
 pub struct CodePack {
-    #[allow(dead_code)]
-    runtime: KhiveRuntime,
+    pub(crate) runtime: KhiveRuntime,
 }
 
 impl Pack for CodePack {
