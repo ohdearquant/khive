@@ -175,3 +175,118 @@ config, defaulting to the high-value subpaths, avoids both.
 - ADR-010 — NDJSON snapshot scope (why `.khive/kg/*` is excluded)
 - `docs/adr/feedback-data-vs-view-not-mutation` principle (khive `docs/adr/README.md`
   "Data vs view" cross-cutting principle) — governs the supersedes-not-overwrite behavior
+
+## Amendment 1 (2026-07-15): self-standing content convention, blob-backed binaries, durability separation
+
+**Status**: Proposed (amendment). The base decision (Accepted 2026-07-03) is unchanged in
+shape; this amendment unblocks implementation, which never started because the base text
+depended on ADR-086 for the `document`-entity content shape and ADR-086 remains Proposed.
+Priority context: workspace durability is the operator's most urgent standing concern —
+`.khive/` trees across the fleet exist only as gitignored local files with no history of
+ever being backed up, and this mirror is the mechanism that folds them into the substrate.
+
+### A1: Inline content convention (decoupled from ADR-086's lifecycle)
+
+For the mirror's writes, the minimal `document`-entity convention is normative HERE,
+whatever becomes of ADR-086 as a whole: textual file content goes in `description`
+verbatim (post-masking); `properties` carries `source_uri` (absolute path at mirror
+time), `source_type` (MIME-ish string), `checksum` (BLAKE3-256 lowercase hex of the
+content bytes), and `size_bytes`. If ADR-086 is later accepted with a richer shape, the
+mirror migrates to it; if it is rejected, this subsection stands alone. This removes the
+dependency deadlock without deciding ADR-086's fate.
+
+### A2: Binary and oversized files go to the BlobStore (ADR-111, shipped)
+
+The base text's scope was markdown/text only. Real `.khive/` trees also hold binary and
+oversized artifacts (PDFs and rendered reports, images, archived exports). For any file
+that is binary (content fails UTF-8 validation or matches a configured binary-extension
+list) or whose size exceeds `KHIVE_MIRROR_INLINE_MAX_BYTES` (default 256 KiB):
+
+- the mirror stores the bytes through the shipped `BlobStore` capability
+  (`khive-storage::blob`, `FsBlobStore` implementation) and records the returned
+  BLAKE3-256 hash;
+- the `document` entity is still created, with `description` holding nothing but a
+  one-line summary (filename + size + type), and `properties.blob_hash` carrying the
+  content address; `checksum` equals `blob_hash` in this case;
+- content addressing makes re-mirroring identical bytes free (same hash, no new blob),
+  and version history stays `supersedes`-based at the entity layer exactly as in the
+  base text — blobs themselves are immutable and never superseded, only referenced.
+
+Secret masking applies to inline text content only; blob-routed binaries are stored
+as-is (masking inside arbitrary binary formats is not meaningful) but their entities
+carry `properties.masked=false` so a future export policy can treat them conservatively.
+
+### A3: Durability separation (operator constraint, binding)
+
+Substrate durability is the FEATURE this mirror delivers, but it must not become the only
+safety net while the substrate's own backup lane (ADR-100) is still being implemented and
+proven. The independent, dumb, file-level snapshot of `.khive/` trees and the home
+databases (operator-managed, outside khive) REMAINS in force until substrate backup and
+restore have been exercised end-to-end. This ADR explicitly must not be cited to retire
+that snapshot; retiring it is a separate operator decision gated on a demonstrated
+substrate restore. The system under development is never its own sole backup.
+
+### A4: Workspace-entity anchoring
+
+Since the base text was accepted, the `workspace` pack (zero verbs) added a `workspace`
+entity kind with `contains` endpoint rules. The mirror creates or reuses one `workspace`
+entity per mirrored `.khive/` root (identity: uuid5 over the canonicalized root path,
+fixed namespace seed) and links `workspace contains document` for every mirrored entity
+under that root. This gives every mirrored file a graph anchor — "everything in seat X's
+workspace" is one `neighbors()` call — and gives the previously vocabulary-only workspace
+pack its first real population. Verb-shaped intake (an explicit `workspace.ingest(path)`
+for one-shot ingestion of a tree, complementing the background poller) is deferred to a
+follow-up amendment once the mirror itself has usage evidence; the poller is the primary
+mechanism because durability must not depend on anyone remembering to call a verb.
+
+### A5: Default include set (supersedes base text item 4's recommendation)
+
+Validated against real `.khive/` contents across the fleet's seats (32 trees surveyed
+2026-07-15): include `notes/**`, `reports/**`, `codex_reviews/**`, `workspaces/**`
+(markdown and text artifacts, plus blob-routed binaries per A2), `audits/**`, and
+`loop/**` (loop cursors are exactly the operational history the operator fears losing).
+Exclusions unchanged from the base text (`kg/*`, `scripts/`, caches), plus `*.db*`
+(databases have their own backup lane and must never be double-ingested as blobs).
+
+### A6: BlobStore backend contract — S3 compatibility is a requirement
+
+The blob capability this mirror consumes MUST remain backend-portable across two named
+targets:
+
+1. **Filesystem CAS** (shipped: `FsBlobStore`) — the local default; ships in the first
+   implementation slice.
+2. **S3-compatible object store** (S3 / R2 / MinIO semantics) — the off-machine
+   durability path. Does not ship in the first slice, but the interface contract is
+   fixed NOW so the second backend never requires a trait change: callers hold only the
+   opaque content address (BLAKE3-256 hex digest) plus size; how a backend maps that
+   digest to physical storage (sharded directories, object keys, bucket layout) is
+   backend-internal and never appears in entity properties, verb results, or exported
+   metadata. Nothing in this ADR — including A2's `blob_hash` property convention — may
+   assume filesystem paths.
+
+### A7: Single-file export — `workspace.snapshot`
+
+Blobs live in a content-addressed store beside the database, not inside it — correct
+for size, dedup, and backend portability, but it means the database file alone is not
+a complete copy of a workspace. Portability is therefore a named verb behavior, not an
+implicit property: `workspace.snapshot(out_path, workspace_id?)` emits ONE bundle file
+containing a consistent database backup plus every blob referenced by the included
+entities (the git model: loose objects live, a bundle when you want one file). A
+matching restore path ingests the bundle into a fresh or existing store, dedup-safe by
+content address. The bundle format carries a version discriminator and per-blob digests
+so a partial or corrupted bundle fails loudly at restore, never silently. This is the
+answer to "one file contains everything" — the export provides the single-file
+property; the live layout stays CAS-outside-db.
+
+### Acceptance
+
+1. A fixture `.khive/` tree containing text, an oversized text file, and a binary file
+   mirrors into: N `document` entities (text inline, oversized + binary blob-routed),
+   one `workspace` entity, N `contains` edges — verified via `neighbors()`.
+2. Editing a mirrored file and re-polling produces a new entity version + `supersedes`
+   edge; re-polling with no changes produces zero writes (cursor + checksum short-circuit).
+3. Killing the daemon mid-pass and restarting completes the pass idempotently (cursor
+   discipline), with no duplicate entities.
+4. `workspace.snapshot` on the fixture workspace produces one bundle file; restoring it
+   into an empty store reproduces every entity and blob (digest-verified); restoring it
+   twice is idempotent.
