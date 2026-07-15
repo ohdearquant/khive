@@ -234,10 +234,17 @@ entity per mirrored `.khive/` root (identity: uuid5 over the canonicalized root 
 fixed namespace seed) and links `workspace contains document` for every mirrored entity
 under that root. This gives every mirrored file a graph anchor — "everything in seat X's
 workspace" is one `neighbors()` call — and gives the previously vocabulary-only workspace
-pack its first real population. Verb-shaped intake (an explicit `workspace.ingest(path)`
-for one-shot ingestion of a tree, complementing the background poller) is deferred to a
-follow-up amendment once the mirror itself has usage evidence; the poller is the primary
-mechanism because durability must not depend on anyone remembering to call a verb.
+pack its first real population.
+
+**`workspace.ingest(path)` is accepted by this amendment** (not deferred): a one-shot
+sweep verb on the workspace pack applying exactly the mirror's include/exclude set (A5),
+content routing (A1/A2), masking, and checksum short-circuit to an existing tree — same
+code path as one poller pass, invoked on demand. It is idempotent (re-running over an
+unchanged tree produces zero writes), reports per-file errors without aborting the
+sweep, and returns counts (files seen / ingested / skipped-unchanged / blob-routed /
+failed). The background poller remains the primary mechanism because durability must
+not depend on anyone remembering to call a verb; the verb exists for initial backfill
+of existing trees and for A11's completion hooks.
 
 ### A5: Default include set (supersedes base text item 4's recommendation)
 
@@ -289,7 +296,11 @@ a working tree and destroyed with it. The routing rule:
   linked via `annotates` to the corresponding git-pack `pull_request`/`issue` note.
   They are never written as files first and never routed through the blob store. This
   requires zero new verbs; it is a convention over the existing note surface.
-- **Blob CAS is for true binaries only**: bench profiles, PDFs, images, archives.
+- **Blob CAS handles true binaries** (bench profiles, PDFs, images, archives) **and
+  inline-ineligible oversized files under A2's size ceiling** — A2's
+  `KHIVE_MIRROR_INLINE_MAX_BYTES` rule remains the single authority for oversized text.
+  This subsection changes the routing of verdict/decision _prose_ (note-first, never a
+  file), not the size rule.
 - The mirror (and the one-shot `workspace.ingest(path)` sweep for existing trees)
   handles the residual genuinely file-shaped content — history that already exists on
   disk, and artifact types that are legitimately files.
@@ -302,16 +313,27 @@ skeletal `pull_request`/`issue` note it annotates if ingestion has not reached i
 with the batch ingester later enriching rather than duplicating it (identity by
 repo + number).
 
+This imposes a concrete change on the git-pack batch ingester: today it dedups by
+natural key and _skips_ an existing record. It must instead **enrich** a record marked
+skeletal — merge the full metadata into the existing note's properties, preserving the
+note's identity, tags, and incident `annotates` edges. The same rule applies to commit
+records found by SHA (A9). Acceptance for the git-pack lane must include the
+skeleton-first, ingest-later case for both PR and commit records.
+
 ### A9: Review-round chains and snapshot anchoring
 
 Review notes are not isolated: rounds on the same pull request form an explicit chain,
 and every review is a review OF a specific snapshot.
 
-- **Round chain**: review round N links `supersedes` (note→note, already legal under the
-  base contract) to round N-1's note. This is semantically exact — the newer verdict
-  supersedes the older for currency, the older round is preserved and queryable, and
-  the view layer filters superseded rounds by default. No new endpoint rule is needed;
-  `precedes` (which lacks a note→note endpoint) is deliberately not used.
+- **Round chain**: review round N-1 links `precedes` to round N. Each round is a review
+  OF a distinct snapshot and remains the authoritative review of its own commit, so
+  `supersedes` — whose ADR-002 semantics are "replaces entirely; old stops being
+  authoritative", and which the default search view filters out globally — is the wrong
+  relation here and is deliberately not used. `precedes` has no note→note endpoint in
+  the base contract; the pack owning this convention declares the additive
+  `EDGE_RULES` endpoint `decision precedes decision` (ADR-017 pack-extensible
+  endpoints, additive only). "Latest round for this PR" is a **view** keyed by PR
+  number and round — a query-layer concern, never a global data relation.
 - **Snapshot anchor**: each review note links `annotates` to the git-pack `commit` note
   for the head SHA the review examined. Same upsert-on-reference rule as A8: creating
   the review note may create a skeletal `commit` note (identity by repo + SHA) that
@@ -359,8 +381,19 @@ repositories) are backfilled by ONE canonical, idempotent ingest script:
 - parse each file → decision note with provenance properties: `source_path`, original
   date where derivable, PR number and round parsed from the filename;
 - link `annotates` to the PR/commit notes, upserting skeletal records as needed (A8/A9);
-- idempotent by construction (stable identity from repo + PR + round + content hash) so
-  re-runs never duplicate;
+- **convergent idempotency** (the honest contract for a script over non-transactional
+  verbs): identity is a deterministic `backfill_key` from repo + PR + round + content
+  hash, stored in note properties and preflight-checked before every create. Because
+  preflight-then-create is not atomic, the guarantee is convergence, not
+  single-pass atomicity: on finding an existing key, the script verifies the note's
+  required edges and creates any that are missing, so a crashed or interrupted run is
+  repaired by re-running. Runs are single-process and serial per repository;
+  concurrent runs over the same directory are out of scope. Files are processed in
+  `(repo, PR, numeric round)` ascending order so a round's predecessor exists before
+  its chain edge; files whose round is unparseable default to round 1 and are reported;
+- a true atomic get-or-create ingestion primitive (caller-supplied natural key,
+  returns existing-or-created, binds edges in one transaction) is named future work for
+  the runtime — the backfill does not wait for it;
 - the script ships ahead of this amendment's implementation — backfill notes use only
   existing verbs.
 
@@ -376,9 +409,20 @@ repositories) are backfilled by ONE canonical, idempotent ingest script:
 4. `workspace.snapshot` on the fixture workspace produces one bundle file; restoring it
    into an empty store reproduces every entity and blob (digest-verified); restoring it
    twice is idempotent.
-5. Round-trip fidelity (A10): a fixture set containing CRLF line endings, tab
-   characters, trailing whitespace, and multi-byte Unicode ingests and exports
-   byte-identical (checksum equality against the original files).
+5. Round-trip fidelity (A10), two branches: (a) an unmasked fixture containing CRLF
+   line endings, tabs, trailing whitespace, and multi-byte Unicode ingests and exports
+   byte-identical to the original (checksum equality with the source file); (b) a
+   fixture containing a maskable secret records `masked=true`, its checksum equals the
+   hash of the exported _stored_ content, and equality with the original file is
+   explicitly NOT required.
 6. Review chain (A9): two review rounds on the same fixture PR produce two decision
-   notes, a `supersedes` note→note edge round-2→round-1, and `annotates` edges to the
-   two commit notes; default views return only round 2.
+   notes, a `precedes` edge round-1→round-2, and `annotates` edges to the two commit
+   notes; both rounds remain visible in default search; a round-scoped view query
+   returns only round 2 as latest.
+7. Skeleton enrichment (A8/A9): a skeletal `pull_request` note created by
+   upsert-on-reference is enriched in place by a subsequent batch ingest — same note
+   id, full metadata merged, pre-existing `annotates` edges intact. Same for a
+   skeletal `commit` note found by SHA.
+8. Backfill convergence (A12): interrupting the backfill after note creation but
+   before edge creation, then re-running, yields exactly one note per artifact with
+   all required edges present.
