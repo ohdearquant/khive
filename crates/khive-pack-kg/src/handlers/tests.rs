@@ -1476,3 +1476,163 @@ async fn create_bulk_items_rejects_top_level_embedding_content() {
         "error must name the offending field: {err}"
     );
 }
+
+// ADR-087 Amendment 1 §A9: review-round chains are `decision precedes
+// decision` note-to-note edges (round N-1 precedes round N). KG_EDGE_RULES
+// additively extends the base entity-only `precedes` contract to
+// `decision`->`decision` note pairs, mirroring the GTD pack's `task`->`task`
+// `depends_on` rule.
+#[tokio::test]
+async fn link_accepts_decision_precedes_decision() {
+    use crate::KgPack;
+    use khive_runtime::{KhiveRuntime, VerbRegistryBuilder};
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    let registry = builder.build().expect("kg registry builds");
+    rt.install_edge_rules(registry.all_edge_rules());
+    let token = rt.authorize(khive_runtime::Namespace::local()).unwrap();
+
+    let round1 = rt
+        .create_note(
+            &token,
+            "decision",
+            None,
+            "round 1 decision",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create round-1 decision note");
+    let round2 = rt
+        .create_note(
+            &token,
+            "decision",
+            None,
+            "round 2 decision",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create round-2 decision note");
+
+    let pack = KgPack::new(rt.clone());
+    let params = serde_json::json!({
+        "source_id": round1.id.to_string(),
+        "target_id": round2.id.to_string(),
+        "relation": "precedes",
+    });
+    assert!(
+        pack.handle_link(&token, params).await.is_ok(),
+        "decision->decision precedes must be accepted"
+    );
+}
+
+#[tokio::test]
+async fn link_rejects_decision_precedes_observation() {
+    use crate::KgPack;
+    use khive_runtime::KhiveRuntime;
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let token = rt.authorize(khive_runtime::Namespace::local()).unwrap();
+
+    let decision = rt
+        .create_note(&token, "decision", None, "a decision", None, None, vec![])
+        .await
+        .expect("create decision note");
+    let observation = rt
+        .create_note(
+            &token,
+            "observation",
+            None,
+            "an observation",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create observation note");
+
+    let pack = KgPack::new(rt.clone());
+    let params = serde_json::json!({
+        "source_id": decision.id.to_string(),
+        "target_id": observation.id.to_string(),
+        "relation": "precedes",
+    });
+    assert!(
+        pack.handle_link(&token, params).await.is_err(),
+        "decision->observation precedes must be rejected"
+    );
+}
+
+#[tokio::test]
+async fn link_rejects_observation_precedes_decision() {
+    use crate::KgPack;
+    use khive_runtime::KhiveRuntime;
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let token = rt.authorize(khive_runtime::Namespace::local()).unwrap();
+
+    let observation = rt
+        .create_note(
+            &token,
+            "observation",
+            None,
+            "an observation",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create observation note");
+    let decision = rt
+        .create_note(&token, "decision", None, "a decision", None, None, vec![])
+        .await
+        .expect("create decision note");
+
+    let pack = KgPack::new(rt.clone());
+    let params = serde_json::json!({
+        "source_id": observation.id.to_string(),
+        "target_id": decision.id.to_string(),
+        "relation": "precedes",
+    });
+    assert!(
+        pack.handle_link(&token, params).await.is_err(),
+        "observation->decision precedes must be rejected"
+    );
+}
+
+#[tokio::test]
+async fn link_entity_precedes_entity_unaffected_by_decision_note_rule() {
+    use khive_runtime::KhiveRuntime;
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let token = rt.authorize(khive_runtime::Namespace::local()).unwrap();
+
+    let src = rt
+        .create_entity(&token, "project", None, "step 1", None, None, vec![])
+        .await
+        .expect("create source entity");
+    let tgt = rt
+        .create_entity(&token, "project", None, "step 2", None, None, vec![])
+        .await
+        .expect("create target entity");
+
+    let result = rt
+        .link(
+            &token,
+            src.id,
+            tgt.id,
+            khive_storage::EdgeRelation::Precedes,
+            1.0,
+            None,
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "entity->entity precedes must remain accepted (base ADR-002 contract)"
+    );
+}
