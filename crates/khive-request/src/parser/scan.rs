@@ -20,6 +20,42 @@ pub(crate) fn scan_string_end(src: &[u8], start: usize) -> Result<usize, DslErro
     Err(DslError::UnclosedString)
 }
 
+/// Rewrite raw literal newline, carriage return, and tab bytes inside a
+/// double-quoted string literal into their JSON escape form, so a value
+/// containing one of those three bytes verbatim (as opposed to a
+/// `\n`/`\r`/`\t` escape sequence) still parses as valid JSON. Existing
+/// backslash-escape pairs are copied through untouched: this walks the same
+/// `\` + next-byte pairing [`scan_string_end`] uses, so an already-escaped
+/// sequence is never reinterpreted.
+///
+/// Per ADR-016, this exception is limited to exactly those three
+/// characters. Every other raw U+0000-U+001F control byte is left as-is and
+/// falls through to `serde_json`, which rejects it as invalid JSON — the
+/// same behavior as before this exception existed.
+pub(crate) fn escape_literal_control_chars(s: &str) -> String {
+    if !s.contains(['\n', '\r', '\t']) {
+        return s.to_owned();
+    }
+    let mut out = String::with_capacity(s.len() + 8);
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            out.push(c);
+            if let Some(next) = chars.next() {
+                out.push(next);
+            }
+            continue;
+        }
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Returns a stable delimiter label for diagnostics.
 pub(crate) fn char_label(c: char) -> &'static str {
     match c {

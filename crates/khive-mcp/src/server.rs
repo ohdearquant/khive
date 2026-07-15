@@ -2339,6 +2339,60 @@ mod tests {
         }
     }
 
+    // ── request-boundary regression: raw controls survive wire decoding ─────
+
+    #[tokio::test]
+    async fn request_boundary_raw_control_bytes_reach_handler() {
+        // Simulates the actual MCP wire: a JSON-RPC client sends the tool's
+        // `ops` argument as a JSON string using the standard JSON `\n`
+        // escape. Deserializing `RequestParams` decodes that escape into an
+        // actual raw LF byte inside the DSL source — the exact shape
+        // `escape_literal_control_chars` (crates/khive-request/src/parser/scan.rs)
+        // exists to accept. This confirms the decoded raw newline survives
+        // parsing and dispatch all the way to the pack handler's result.
+        let wire = "{\"ops\":\"create(kind=\\\"entity\\\", entity_kind=\\\"concept\\\", name=\\\"line1\\nline2\\\")\"}";
+        let params: RequestParams = serde_json::from_str(wire).expect("wire JSON deserializes");
+        assert!(
+            params.ops.contains('\n'),
+            "deserialized ops must carry a raw LF, not the two-char escape: {:?}",
+            params.ops
+        );
+
+        let config = RuntimeConfig {
+            db_path: None,
+            default_namespace: Namespace::local(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        };
+        let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
+        let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
+
+        let parsed = parse_request(&params.ops).expect("literal newline inside quotes must parse");
+        let response = server
+            .run_parsed(
+                parsed.ops,
+                parsed.mode,
+                PresentationMode::Verbose,
+                None,
+                false,
+                None,
+            )
+            .await;
+
+        let results = response["results"]
+            .as_array()
+            .expect("results must be an array");
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0]["ok"],
+            json!(true),
+            "unexpected result: {response:?}"
+        );
+        assert_eq!(results[0]["result"]["name"], json!("line1\nline2"));
+    }
+
     // ── MCP-AUD-002 regression: save_to must bypass daemon forwarding ────────
 
     fn make_daemon_save_to_test_server() -> KhiveMcpServer {
