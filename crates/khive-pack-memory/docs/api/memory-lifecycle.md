@@ -49,6 +49,6 @@ Deletion is soft, performed directly through `NoteStore`. That raw path bypasses
 
 ## `memory.vacuum`
 
-Vacuum reclaims database pages after soft deletion. It accepts no parameters and rejects unexpected fields.
+Vacuum reclaims database pages after soft deletion. It accepts no meaningful parameters; unknown fields are ignored rather than rejected.
 
 SQLite `VACUUM` must run outside an open transaction. The handler issues `VACUUM;` through the writer's top-level script path (`execute_script_top_level`), which skips the usual transaction wrapper while still serializing on the single writer. Failures are returned as runtime storage errors; success reports completion without claiming how many bytes SQLite reclaimed.
