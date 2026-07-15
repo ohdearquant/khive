@@ -175,3 +175,271 @@ config, defaulting to the high-value subpaths, avoids both.
 - ADR-010 — NDJSON snapshot scope (why `.khive/kg/*` is excluded)
 - `docs/adr/feedback-data-vs-view-not-mutation` principle (khive `docs/adr/README.md`
   "Data vs view" cross-cutting principle) — governs the supersedes-not-overwrite behavior
+
+## Amendment 1 (2026-07-15): self-standing content convention, blob-backed binaries, durability separation
+
+**Status**: Proposed (amendment). The base decision (Accepted 2026-07-03) is unchanged in
+shape; this amendment unblocks implementation, which never started because the base text
+depended on ADR-086 for the `document`-entity content shape and ADR-086 remains Proposed.
+Priority context: workspace durability is the operator's most urgent standing concern —
+`.khive/` trees across the fleet exist only as gitignored local files with no history of
+ever being backed up, and this mirror is the mechanism that folds them into the substrate.
+
+### A1: Inline content convention (decoupled from ADR-086's lifecycle)
+
+For the mirror's writes, the minimal `document`-entity convention is normative HERE,
+whatever becomes of ADR-086 as a whole: textual file content goes in `description`
+verbatim (post-masking); `properties` carries `source_uri` (absolute path at mirror
+time), `source_type` (MIME-ish string), `checksum` (BLAKE3-256 lowercase hex of the
+content bytes), and `size_bytes`. If ADR-086 is later accepted with a richer shape, the
+mirror migrates to it; if it is rejected, this subsection stands alone. This removes the
+dependency deadlock without deciding ADR-086's fate.
+
+### A2: Binary and oversized files go to the BlobStore (ADR-111, shipped)
+
+The base text's scope was markdown/text only. Real `.khive/` trees also hold binary and
+oversized artifacts (PDFs and rendered reports, images, archived exports). For any file
+that is binary (content fails UTF-8 validation or matches a configured binary-extension
+list) or whose size exceeds `KHIVE_MIRROR_INLINE_MAX_BYTES` (default 256 KiB):
+
+- the mirror stores the bytes through the shipped `BlobStore` capability
+  (`khive-storage::blob`, `FsBlobStore` implementation) and records the returned
+  BLAKE3-256 hash;
+- the `document` entity is still created, with `description` holding nothing but a
+  one-line summary (filename + size + type), and `properties.blob_hash` carrying the
+  content address; `checksum` equals `blob_hash` in this case;
+- content addressing makes re-mirroring identical bytes free (same hash, no new blob),
+  and version history stays `supersedes`-based at the entity layer exactly as in the
+  base text — blobs themselves are immutable and never superseded, only referenced.
+
+Secret masking applies to inline text content only; blob-routed binaries are stored
+as-is (masking inside arbitrary binary formats is not meaningful) but their entities
+carry `properties.masked=false` so a future export policy can treat them conservatively.
+
+### A3: Durability separation (operator constraint, binding)
+
+Substrate durability is the FEATURE this mirror delivers, but it must not become the only
+safety net while the substrate's own backup lane (ADR-100) is still being implemented and
+proven. The independent, dumb, file-level snapshot of `.khive/` trees and the home
+databases (operator-managed, outside khive) REMAINS in force until substrate backup and
+restore have been exercised end-to-end. This ADR explicitly must not be cited to retire
+that snapshot; retiring it is a separate operator decision gated on a demonstrated
+substrate restore. The system under development is never its own sole backup.
+
+### A4: Workspace-entity anchoring
+
+Since the base text was accepted, the `workspace` pack (zero verbs) added a `workspace`
+entity kind with `contains` endpoint rules. The mirror creates or reuses one `workspace`
+entity per mirrored `.khive/` root (identity: uuid5 over the canonicalized root path,
+fixed namespace seed) and links `workspace contains document` for every mirrored entity
+under that root. This gives every mirrored file a graph anchor — "everything in seat X's
+workspace" is one `neighbors()` call — and gives the previously vocabulary-only workspace
+pack its first real population.
+
+**`workspace.ingest(path)` is accepted by this amendment** (not deferred): a one-shot
+sweep verb on the workspace pack applying exactly the mirror's include/exclude set (A5),
+content routing (A1/A2), masking, and checksum short-circuit to an existing tree — same
+code path as one poller pass, invoked on demand. It is idempotent (re-running over an
+unchanged tree produces zero writes), reports per-file errors without aborting the
+sweep, and returns counts (files seen / ingested / skipped-unchanged / blob-routed /
+failed). The background poller remains the primary mechanism because durability must
+not depend on anyone remembering to call a verb; the verb exists for initial backfill
+of existing trees and for A11's completion hooks.
+
+### A5: Default include set (supersedes base text item 4's recommendation)
+
+Validated against real `.khive/` contents across the fleet's seats (32 trees surveyed
+2026-07-15): include `notes/**`, `reports/**`, `codex_reviews/**`, `workspaces/**`
+(markdown and text artifacts, plus blob-routed binaries per A2), `audits/**`, and
+`loop/**` (loop cursors are exactly the operational history the operator fears losing).
+Exclusions unchanged from the base text (`kg/*`, `scripts/`, caches), plus `*.db*`
+(databases have their own backup lane and must never be double-ingested as blobs).
+
+### A6: BlobStore backend contract — S3 compatibility is a requirement
+
+The blob capability this mirror consumes MUST remain backend-portable across two named
+targets:
+
+1. **Filesystem CAS** (shipped: `FsBlobStore`) — the local default; ships in the first
+   implementation slice.
+2. **S3-compatible object store** (S3 / R2 / MinIO semantics) — the off-machine
+   durability path. Does not ship in the first slice, but the interface contract is
+   fixed NOW so the second backend never requires a trait change: callers hold only the
+   opaque content address (BLAKE3-256 hex digest) plus size; how a backend maps that
+   digest to physical storage (sharded directories, object keys, bucket layout) is
+   backend-internal and never appears in entity properties, verb results, or exported
+   metadata. Nothing in this ADR — including A2's `blob_hash` property convention — may
+   assume filesystem paths.
+
+### A7: Single-file export — `workspace.snapshot`
+
+Blobs live in a content-addressed store beside the database, not inside it — correct
+for size, dedup, and backend portability, but it means the database file alone is not
+a complete copy of a workspace. Portability is therefore a named verb behavior, not an
+implicit property: `workspace.snapshot(out_path, workspace_id?)` emits ONE bundle file
+containing a consistent database backup plus every blob referenced by the included
+entities (the git model: loose objects live, a bundle when you want one file). A
+matching restore path ingests the bundle into a fresh or existing store, dedup-safe by
+content address. The bundle format carries a version discriminator and per-blob digests
+so a partial or corrupted bundle fails loudly at restore, never silently. This is the
+answer to "one file contains everything" — the export provides the single-file
+property; the live layout stays CAS-outside-db.
+
+### A8: Note-first routing for prose artifacts — blobs are for true binaries only
+
+The most common information loss in practice is not arbitrary files: it is prose
+verdicts (review conclusions, gate decisions, issue analyses) written as loose files in
+a working tree and destroyed with it. The routing rule:
+
+- **Text verdicts and decisions are notes, born in the substrate directly** —
+  `kind=decision`, tagged with the repository and the pull-request or issue number, and
+  linked via `annotates` to the corresponding git-pack `pull_request`/`issue` note.
+  They are never written as files first and never routed through the blob store. This
+  requires zero new verbs; it is a convention over the existing note surface.
+- **Blob CAS handles true binaries** (bench profiles, PDFs, images, archives) **and
+  inline-ineligible oversized files under A2's size ceiling** — A2's
+  `KHIVE_MIRROR_INLINE_MAX_BYTES` rule remains the single authority for oversized text.
+  This subsection changes the routing of verdict/decision _prose_ (note-first, never a
+  file), not the size rule.
+- The mirror (and the one-shot `workspace.ingest(path)` sweep for existing trees)
+  handles the residual genuinely file-shaped content — history that already exists on
+  disk, and artifact types that are legitimately files.
+
+Dependency this creates on the git pack: the `annotates` target must exist. Today
+git-pack ingestion is a batch admin path, so most PR/issue notes do not exist at the
+moment a verdict is written. The git-pack lane (ingest cadence and/or outbound verbs)
+must guarantee an upsert-on-reference path — creating the verdict note may create the
+skeletal `pull_request`/`issue` note it annotates if ingestion has not reached it yet,
+with the batch ingester later enriching rather than duplicating it (identity by
+repo + number).
+
+This imposes a concrete change on the git-pack batch ingester: today it dedups by
+natural key and _skips_ an existing record. It must instead **enrich** a record marked
+skeletal — merge the full metadata into the existing note's properties, preserving the
+note's identity, tags, and incident `annotates` edges. The same rule applies to commit
+records found by SHA (A9). Acceptance for the git-pack lane must include the
+skeleton-first, ingest-later case for both PR and commit records.
+
+### A9: Review-round chains and snapshot anchoring
+
+Review notes are not isolated: rounds on the same pull request form an explicit chain,
+and every review is a review OF a specific snapshot.
+
+- **Round chain**: review round N-1 links `precedes` to round N. Each round is a review
+  OF a distinct snapshot and remains the authoritative review of its own commit, so
+  `supersedes` — whose ADR-002 semantics are "replaces entirely; old stops being
+  authoritative", and which the default search view filters out globally — is the wrong
+  relation here and is deliberately not used. `precedes` has no note→note endpoint in
+  the base contract; the pack owning this convention declares the additive
+  `EDGE_RULES` endpoint `decision precedes decision` (ADR-017 pack-extensible
+  endpoints, additive only). "Latest round for this PR" is a **view** keyed by PR
+  number and round — a query-layer concern, never a global data relation.
+- **Snapshot anchor**: each review note links `annotates` to the git-pack `commit` note
+  for the head SHA the review examined. Same upsert-on-reference rule as A8: creating
+  the review note may create a skeletal `commit` note (identity by repo + SHA) that
+  batch ingestion later enriches.
+- **Merge-commit anchor (required)**: because pull requests squash-merge, the reviewed
+  head SHAs are never ancestors of the main branch — without a recorded merge commit,
+  nothing connects the review history to mainline history. Every `pull_request` note
+  therefore records `properties.merge_commit_sha` once the PR merges, and a `commit`
+  note for that merge SHA is upserted with an `annotates` edge from the PR note. The
+  reviewed-head anchors answer "what exactly did round N examine"; the merge-commit
+  anchor answers "where did this PR land in main". Both are required; neither
+  substitutes for the other.
+
+### A10: Byte-exact content contract for stored documents
+
+The note-first treatment generalizes beyond verdicts: ADRs, design documents, research
+notes, and ordinary source/markdown files small enough for inline storage all live in
+the database directly as notes or document entities. The storage contract:
+
+- `properties.filename` preserves the original filename WITH extension;
+  `properties.media_type` carries the MIME type (or extension-derived equivalent).
+- Content is stored **verbatim, byte-exact**: whitespace, tab characters, CRLF vs LF
+  line endings, trailing newlines, and all Unicode content must round-trip perfectly.
+  No normalization, trimming, or re-encoding at any layer between ingest and export.
+- Secret masking (A1) is the single sanctioned transformation; when applied, the entity
+  records `properties.masked=true` so consumers know the content is not the original
+  bytes, and the checksum is computed over the stored (masked) content.
+- Acceptance includes a round-trip fidelity test covering CRLF, tabs, trailing
+  whitespace, and multi-byte Unicode.
+
+PDFs and true binaries remain blob-routed per A2/A8.
+
+### A11: Institutionalized capture — completion hooks, not habits
+
+Capture must not depend on anyone remembering a convention. The completion path of
+each producing workflow stores the artifact automatically:
+
+- Review-leg wrappers end with an auto-store step: the verdict text becomes the
+  decision note (A8) with its round chain and snapshot anchor (A9) before the wrapper
+  exits.
+- Merging an ADR or design document triggers its ingestion as a document record (A10).
+- The background mirror and the one-shot `workspace.ingest` sweep everything the hooks
+  miss — the safety net, not the primary path.
+
+Wrapper scripts are an acceptable mechanism; the contract is the trigger point
+(completion), not the implementation.
+
+### A12: Ordered backfill of surviving artifacts
+
+Historical verdict-shaped artifacts surviving on disk (thousands across the fleet's
+repositories) are backfilled by ONE canonical, idempotent ingest script:
+
+- parse each file → decision note with provenance properties: `source_path`, original
+  date where derivable, PR number and round parsed from the filename;
+- link `annotates` to the PR/commit notes, upserting skeletal records as needed (A8/A9);
+- **convergent idempotency** (the honest contract for a script over non-transactional
+  verbs): identity is a deterministic `backfill_key` from repo + PR + round + content
+  hash, stored in note properties and preflight-checked before every create. Because
+  preflight-then-create is not atomic, the guarantee is convergence, not
+  single-pass atomicity: on finding an existing key, the script verifies the note's
+  required edges and creates any that are missing, so a crashed or interrupted run is
+  repaired by re-running. Runs are single-process and serial per repository;
+  concurrent runs over the same directory are out of scope. Files are processed in
+  `(repo, PR, numeric round)` ascending order so a round's predecessor exists before
+  its chain edge; files whose round is unparseable default to round 1 and are reported;
+- a true atomic get-or-create ingestion primitive (caller-supplied natural key,
+  returns existing-or-created, binds edges in one transaction) is named future work for
+  the runtime — the backfill does not wait for it;
+- **delivery sequencing**: the script ships ahead of this amendment's implementation
+  and its FIRST pass creates only what existing verbs support — decision notes and
+  their `annotates` anchors. The A9 round-chain edge requires the
+  `decision precedes decision` endpoint rule, which does not exist yet; that
+  `EDGE_RULES` addition is the amendment's prerequisite first implementation slice,
+  and the round-chain edges are added by re-running the script's convergent repair
+  pass after the endpoint lands. The first pass must not claim chain completeness.
+
+### Acceptance
+
+1. A fixture `.khive/` tree containing text, an oversized text file, and a binary file
+   mirrors into: N `document` entities (text inline, oversized + binary blob-routed),
+   one `workspace` entity, N `contains` edges — verified via `neighbors()`.
+2. Editing a mirrored file and re-polling produces a new entity version + `supersedes`
+   edge; re-polling with no changes produces zero writes (cursor + checksum short-circuit).
+3. Killing the daemon mid-pass and restarting completes the pass idempotently (cursor
+   discipline), with no duplicate entities.
+4. `workspace.snapshot` on the fixture workspace produces one bundle file; restoring it
+   into an empty store reproduces every entity and blob (digest-verified); restoring it
+   twice is idempotent.
+5. Round-trip fidelity (A10), two branches: (a) an unmasked fixture containing CRLF
+   line endings, tabs, trailing whitespace, and multi-byte Unicode ingests and exports
+   byte-identical to the original (checksum equality with the source file); (b) a
+   fixture containing a maskable secret records `masked=true`, its checksum equals the
+   hash of the exported _stored_ content, and equality with the original file is
+   explicitly NOT required.
+6. Review chain (A9): two review rounds on the same fixture PR produce two decision
+   notes, a `precedes` edge round-1→round-2, and `annotates` edges to the two commit
+   notes; both rounds remain visible in default search; a round-scoped view query
+   returns only round 2 as latest.
+7. Skeleton enrichment (A8/A9): a skeletal `pull_request` note created by
+   upsert-on-reference is enriched in place by a subsequent batch ingest — same note
+   id, full metadata merged, pre-existing `annotates` edges intact. Same for a
+   skeletal `commit` note found by SHA.
+8. Backfill convergence (A12): interrupting the backfill after note creation but
+   before edge creation, then re-running, yields exactly one note per artifact with
+   all edges the current verb surface supports; after the `decision precedes decision`
+   endpoint lands, one further repair pass completes the round chains.
+9. Merge anchor (A9): merging a fixture PR stamps `properties.merge_commit_sha` on its
+   `pull_request` note and produces an `annotates` edge to the merge commit's note; a
+   query from the merge commit reaches every review round of the PR in two hops.
