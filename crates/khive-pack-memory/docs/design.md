@@ -75,19 +75,30 @@
 - These have `Visibility::Subhandler` and are not listed in public verb catalogs,
   per ADR-023 (Pack Verb Surface, Visibility, and Composition) §"Handlers vs. verbs".
 
-## Consistency Notes
+## Architecture Boundaries
 
-- `handlers.rs` is intentionally large (~3100 LOC). The full recall pipeline
-  (parameter parsing, FTS/ANN retrieval, fusion, reranking, scoring) is kept as a single
-  coherent unit because the intermediate types (`NoteCandidate`, `RerankFeatures`,
-  `ScoreBreakdown`) are deeply coupled and private. Splitting would require exporting
-  dozens of internal types. Refactoring is tracked as a longer-term work item.
-- `config.rs` is intentionally large (~1080 LOC). All recall configuration types
-  (`RecallConfig`, `DecayModel`, `RecallFtsGatherConfig`, `BrainProfileHint`) are kept
-  together because their validation logic is mutually dependent.
-- `brain_profile` integration in `RecallConfig` is partially implemented: the configuration
-  field is live but the runtime lookup (cross-pack call to `brain.profile`) is not yet wired
-  at the handler level. See TODO(#484).
-- `scoring.rs` bundles `ScoringConfig`, all normalization helpers, CJK routing, and the full
-  test suite for the scoring pipeline. The tests require access to module-private helpers;
-  splitting would require `pub(crate)` promotion of private fns.
+The implementation separates verb concerns into remember, recall, feedback, prune, and dotted
+subhandler modules. Shared request types and retrieval coordination remain in `handlers/common.rs`
+because both the main recall path and the subhandlers must use identical namespace, fusion, and ANN
+fallback rules.
+
+Configuration types stay together in `config.rs`: nested validation must reject an inconsistent
+request before retrieval starts. Archive scoring types remain in `scoring.rs`, while the primary
+recall pipeline also uses `khive_runtime::MemoryRecallPipeline`; the two models are composed rather
+than silently treated as interchangeable.
+
+Serving-profile lookup is live. Recall resolves an explicit profile or actor/namespace binding,
+projects its posterior means into request-local weights, applies the bounded per-entity term, and
+stamps the same profile ID on results and serve telemetry. A failed optional bound-profile read
+degrades to configured defaults; an explicitly named unknown profile is a caller error.
+
+## Technical References
+
+- ANN freshness, snapshots, and rebuild races: `docs/api/ann-lifecycle.md`
+- Full request and retrieval flow: `docs/api/recall-pipeline.md`
+- Configuration and environment fallbacks: `docs/api/configuration.md`
+- Score normalization, entity boosts, and reranking: `docs/api/scoring.md`
+- FTS candidate gathering: `docs/api/text-retrieval.md`
+- Remember, feedback, prune, and vacuum: `docs/api/memory-lifecycle.md`
+- Runtime registration and brain tuning: `docs/api/pack-integration.md`
+- Incident-derived guarantees: `docs/recall-reliability.md`
