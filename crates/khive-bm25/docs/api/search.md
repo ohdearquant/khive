@@ -15,8 +15,8 @@ storage. The context is cleared at the beginning of each search without releasin
 
 ## Route selection
 
-Queries with fewer than 16,384 total postings use exhaustive scoring. Larger queries use
-Block-Max WAND: cursors are ordered by current document ID, suffix bounds identify a pivot, block
+Queries with fewer than 16,384 total postings use exhaustive scoring; queries with 16,384 or
+more use Block-Max WAND: cursors are ordered by current document ID, suffix bounds identify a pivot, block
 bounds skip noncompetitive regions, and surviving candidates receive exact scores. Equality with
 the current threshold remains competitive so exact ties are retained for deterministic ordering.
 

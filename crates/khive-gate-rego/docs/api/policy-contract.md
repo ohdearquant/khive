@@ -7,7 +7,7 @@ This document describes the Rego policy interface for `khive-gate-rego`.
 Policies receive `GateRequest` as JSON on `input`:
 
 ```text
-input.actor.kind        # "user" | "agent" | "lambda" | "anonymous" | ...
+input.actor.kind        # deployment-defined, non-empty actor kind
 input.actor.id          # caller id
 input.namespace         # khive namespace as a string
 input.verb              # verb being dispatched

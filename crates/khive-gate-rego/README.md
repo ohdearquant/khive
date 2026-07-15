@@ -101,15 +101,14 @@ Per [ADR-018](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-018-au
   policy directory) is returned as `Err(GateError::Policy)` from
   `RegoGate::from_policy_str` / `from_dir` — i.e. when you *install* the gate, not at
   dispatch. Handle it at boot.
-- **Dispatch-time gate errors fail open.** When `check` cannot produce a decision — the
-  `decision` rule is undefined (no match and no `default`), evaluates to conflicting
-  values, or returns a shape that isn't a `GateDecision` — it returns `Err(GateError)`.
-  The runtime treats this as an *infrastructure* failure (ADR-018 §"Fail-open on gate
-  Err"), logs a warning, and proceeds — a misconfigured policy must not take the server
-  down. Always declare a `default decision := {deny ...}` so unmatched requests deny
-  explicitly rather than relying on the fail-open path.
-- Deployments that want strict mode (block on gate error) wrap any `Gate` in an
-  adapter that maps `Err` to `Deny`.
+- **Policy evaluation uncertainty fails closed.** When `check` cannot produce a usable
+  decision — the `decision` rule is undefined (no match and no `default`), the value
+  fails to serialize, or the result is not a `GateDecision` shape — the gate converts
+  it to an explicit `Ok(GateDecision::Deny)` with a diagnostic reason. Only failures
+  before evaluation (e.g. request serialization, `GateError::Internal`) surface as
+  `Err(GateError)`, which the runtime treats as an infrastructure failure per ADR-018.
+  Declaring a `default decision := {deny ...}` is still good practice so unmatched
+  requests deny with a policy-authored reason instead of the generic fail-closed one.
 
 ## Where this sits
 
