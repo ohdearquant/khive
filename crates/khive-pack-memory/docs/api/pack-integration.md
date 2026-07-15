@@ -44,4 +44,4 @@ The three posterior domains correspond directly to the three recall weights. Ser
 
 ## Configuration concurrency
 
-Active configuration is shared behind a read/write lock. Callers take a clone, preventing a request from observing a partially applied update. Validation happens before the write lock replaces the stored configuration.
+Active configuration is protected by a mutex. Readers lock and clone the complete configuration, preventing a request from observing a partially applied update. Validated replacements swap the stored configuration atomically under the same mutex.

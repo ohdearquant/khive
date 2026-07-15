@@ -40,7 +40,7 @@ Every selected model is embedded concurrently. The vector leg prefers the global
 
 On a current warm graph, search begins with an over-fetch window. ANN results cover all namespaces, so IDs are hydrated and post-filtered to the token's visible set before returning. The initial window is `max(candidate_limit * 4, candidate_limit + 32)` and is capped by corpus size.
 
-When too few visible candidates survive, the loop may quadruple the window (capped by the server-wide candidate limit) for a configured number of rounds. Widening only runs when the installed graph contains namespaces outside the caller's visible set; otherwise a larger search cannot recover namespace-filtered candidates. The loop also stops at corpus exhaustion. `ann_overfetch_max_rounds = 1` disables widening.
+When too few visible candidates survive, the loop doubles the fetch window per retry for a configured number of rounds, bounded by corpus exhaustion rather than a candidate cap. Widening only runs when the installed graph contains namespaces outside the caller's visible set; otherwise a larger search cannot recover namespace-filtered candidates. The loop also stops at corpus exhaustion. `ann_overfetch_max_rounds = 1` disables widening.
 
 A cold or stale graph enters `ensure_ann_for_model` under a bounded `ann_ready_timeout_ms` (default 8 seconds). A snapshot restore normally fits inside that window; a from-scratch production rebuild has exceeded 300 seconds. If another caller holds the model warm lock, or this recall begins the build itself and misses the bound, the model contributes zero vector hits, sets `ann_degraded`, and lets FTS continue. The build remains tracked and may finish for later requests. An ANN error likewise degrades rather than panicking.
 
