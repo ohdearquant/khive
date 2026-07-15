@@ -28,8 +28,9 @@
 
 ### ADR-001: Entity Kind Taxonomy
 
-- `EntityRecord.kind` must be one of the 9 canonical entity kinds: `concept`, `document`,
-  `dataset`, `project`, `person`, `org`, `artifact`, `service`, `resource`.
+- `EntityRecord.kind` must pass the default 8-base-kind validation: `concept`, `document`,
+  `dataset`, `project`, `person`, `org`, `artifact`, `service`. Pack-defined kinds such as
+  `resource` (ADR-048) require the caller-supplied kind registry (`new_with_valid_kinds`).
 - Validation uses `khive_types::EntityKind::from_str` at parse time, which also handles
   recognized aliases (e.g. `paper` → `document`).
 - Unknown kinds produce `AdapterError::UnknownKind` — never silently defaulted.

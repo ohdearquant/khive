@@ -27,8 +27,10 @@ The current modules divide responsibilities as follows: `adapter` defines the tr
 
 ## Taxonomy invariants
 
-- `EntityRecord.kind` — must be one of the 9 canonical kinds (ADR-001 base plus the ADR-048 `resource` kind); validated via
-  `khive_types::EntityKind::from_str` at parse time. Unknown kinds return `AdapterError::UnknownKind`.
+- `EntityRecord.kind` — the default adapter validates the 8 base `EntityKind` values (and their
+  aliases) via `khive_types::EntityKind::from_str` at parse time. Pack-defined kinds, including
+  the ADR-048 `resource` kind, are accepted only when the caller supplies the installed kind
+  registry through `new_with_valid_kinds`. Unknown kinds return `AdapterError::UnknownKind`.
 - `EdgeRecord.relation` — must be one of the 17 canonical relations (ADR-002 base 15 plus the ADR-055 epistemic pair `supports`/`refutes`); validated via
   `khive_types::EdgeRelation::from_str` at parse time. Unknown relations return `AdapterError::UnknownRelation`.
 - `EdgeRecord.weight` — must be finite and in `[0.0, 1.0]`. Out-of-range values return
@@ -50,9 +52,10 @@ requires `impl Read` pipeline wiring.
 ## Error boundary
 
 Missing fields, invalid values, structural parse failures, unknown entity kinds, and unknown edge
-relations are fatal. Deferred formats return `AdapterError::NotYetImplemented`. Optional omissions
-and unknown non-reserved columns are warnings, allowing callers to inspect recoverable data-quality
-issues after draining the streams.
+relations are fatal. Deferred formats return `AdapterError::NotYetImplemented`. Malformed optional
+reserved fields (e.g. a non-string `created_at`) produce warnings; absent optional fields are
+accepted silently, and unknown non-reserved keys are folded into `properties` without a warning.
+Callers inspect `warnings()` after draining the streams.
 
 ## Deferred formats
 
