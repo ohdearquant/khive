@@ -302,8 +302,11 @@ def run_vec_bench(base: Path, query: Path, n: int, dataset_name: str, out_json: 
         str(out_json.parent / "bank-run"),
     ]
     proc = run(cmd, cwd=CRATES_DIR, env=env)
+    rendered_cmd = " ".join(str(c) for c in cmd)
     if not out_json.exists():
-        raise RuntimeError(f"vec_bench did not write its output JSON (exit={proc.returncode}); see stderr above")
+        raise RuntimeError(
+            f"vec_bench did not write its output JSON (exit={proc.returncode}); command: {rendered_cmd}"
+        )
     with out_json.open() as f:
         data = json.load(f)
     if not data.get("rows"):
@@ -313,7 +316,7 @@ def run_vec_bench(base: Path, query: Path, n: int, dataset_name: str, out_json: 
         if overall != "SKIPPED":
             raise RuntimeError(
                 f"vec_bench exited nonzero (exit={proc.returncode}, assertions.overall={overall!r}); "
-                f"command: {' '.join(str(c) for c in cmd)}"
+                f"command: {rendered_cmd}"
             )
         log(
             f"vec_bench exited nonzero (exit={proc.returncode}) but assertions.overall=SKIPPED "
