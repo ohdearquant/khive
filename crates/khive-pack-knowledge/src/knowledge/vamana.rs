@@ -65,9 +65,12 @@ pub(crate) struct AnnState {
     /// `install_if_fresher` uses it to reject stale builds. See
     /// crates/khive-pack-knowledge/docs/api/vamana.md#annstategenerations-per-namespace-write-generation-counter-issue-770.
     generations: std::sync::Mutex<HashMap<String, u64>>,
-    /// Keys whose most recent warm attempt found the corpus unbuildable
-    /// (empty corpus or a build error), mapped to the namespace
-    /// write-generation captured at scan start (issue #1026). A marker is
+    /// Keys whose most recent corpus scan completed and found nothing
+    /// buildable (empty corpus), mapped to the namespace write-generation
+    /// captured at scan start (issue #1026). Only `Ok(None)` scans mark:
+    /// a rebuild error is operational (store open, SQL reader, corpus
+    /// query) and says nothing about the corpus, so error paths keep the
+    /// bounded-wait retry behavior instead of a marker. A marker is
     /// terminal — `wait_for_ann` returns immediately rather than polling out
     /// `ANN_WARM_WAIT_TIMEOUT_MS` — exactly when its stored generation is
     /// still >= the namespace's CURRENT generation: nothing can have changed
@@ -174,9 +177,10 @@ fn unavailable_guard(
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Record that `key`'s corpus scan at `generation` found nothing buildable
-/// (empty corpus or a build error). See the `unavailable` field doc on
-/// `AnnState` for the generation-fencing invariant `wait_for_ann` relies on.
+/// Record that `key`'s corpus scan at `generation` completed and found an
+/// empty corpus. Callers must not pass error outcomes here — see the
+/// `unavailable` field doc on `AnnState` for the generation-fencing
+/// invariant `wait_for_ann` relies on and why errors never mark.
 fn mark_unavailable(ann: &SharedAnn, key: &AnnKey, generation: u64) {
     unavailable_guard(&ann.unavailable).insert(key.clone(), generation);
 }
@@ -1169,8 +1173,13 @@ pub(crate) async fn ensure_ann_for_model(
             mark_unavailable(ann, &key, target_generation);
         }
         Err(e) => {
+            // Operational failure (store open, SQL reader, corpus query) —
+            // not proof the corpus is unbuildable. Do NOT mark unavailable:
+            // the warming key is removed by the caller so the next request
+            // retries at the same generation, and a marker here would make
+            // wait_for_ann short-circuit false while that retry is in
+            // flight (codex review on #1026, PR #1027).
             tracing::warn!(error = %e, "failed to rebuild Vamana ANN index");
-            mark_unavailable(ann, &key, target_generation);
         }
     }
 }
@@ -2425,6 +2434,73 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_millis(200),
             "the terminal unavailable outcome must short-circuit the 5s warm-wait: {elapsed:?}"
+        );
+    }
+
+    /// A rebuild error is operational, not proof of an unbuildable corpus:
+    /// it must NOT leave an unavailable marker, so the retry the background
+    /// path arranges (by removing the warming key) still gets a bounded wait
+    /// instead of an instant `false` (codex review on #1026, PR #1027).
+    #[tokio::test]
+    async fn ensure_ann_for_model_rebuild_error_does_not_mark_unavailable() {
+        let dir = TempDir::new().expect("tempdir");
+        let rt = file_rt_with_embedder(dir.path().join("test.db"));
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        seed_warm_corpus(&rt, &token, 3).await;
+
+        // Swap the corpus table for a view over a missing table so any scan
+        // query fails operationally (SQLite validates views at query time).
+        let model_key = sanitize_model_key(WARM_TEST_MODEL);
+        let table = format!("vec_{model_key}");
+        let sql = rt.sql();
+        let mut w = sql.writer().await.expect("writer");
+        w.execute(SqlStatement {
+            sql: format!("DROP TABLE {table}"),
+            params: vec![],
+            label: None,
+        })
+        .await
+        .expect("drop corpus table");
+        w.execute(SqlStatement {
+            sql: format!("CREATE VIEW {table} AS SELECT * FROM missing_corpus_table"),
+            params: vec![],
+            label: None,
+        })
+        .await
+        .expect("create broken view");
+        drop(w);
+
+        let ann = new_shared();
+        ensure_ann_for_model(&rt, &token, &ann, WARM_TEST_MODEL).await;
+        let key = AnnKey::new("local", WARM_TEST_MODEL);
+
+        assert!(
+            !ann.indexes.read().await.contains_key(&key),
+            "a failed rebuild must not install an index"
+        );
+        assert!(
+            !unavailable_guard(&ann.unavailable).contains_key(&key),
+            "a rebuild ERROR must not mark the key unavailable — only a completed \
+             empty-corpus scan may; a marker here would short-circuit wait_for_ann \
+             while the same-generation retry is in flight"
+        );
+
+        // The next request's wait must still observe an index installed
+        // mid-poll by the same-generation retry.
+        let ann2 = ann.clone();
+        let key2 = key.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            let bridge = AnnBridge::build(vec![1.0f32, 0.0, 0.0, 0.0], 4, vec![Uuid::new_v4()])
+                .expect("build")
+                .with_generation(0);
+            install_if_fresher(&ann2, &key2, bridge).await;
+        });
+        let ready = wait_for_ann(&ann, &key, 500, 10).await;
+        assert!(
+            ready,
+            "after a rebuild error the wait must keep polling and observe the \
+             retry's install, not short-circuit false"
         );
     }
 }
