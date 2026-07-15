@@ -12,22 +12,22 @@ use khive_runtime::{
 use khive_types::{EdgeEndpointRule, HandlerDef, Pack};
 
 use crate::hook::FindingHook;
-use crate::vocab::{CODE_EDGE_RULES, CODE_NOTE_KIND_SPECS};
+use crate::vocab::{CODE_EDGE_RULES, CODE_HANDLERS, CODE_NOTE_KIND_SPECS};
 
-/// Code ontology pack — additive edge rules over four concept subtypes plus
-/// the `finding` audit-observation note kind. No verbs (ADR-085 D1).
+/// Code ontology pack — additive edge rules over four concept subtypes, the
+/// `finding` audit-observation note kind, and the `code.ingest` verb
+/// (ADR-085 Amendment 2).
 ///
 /// See `crates/khive-pack-code/docs/code-ontology.md`.
 pub struct CodePack {
-    #[allow(dead_code)]
-    runtime: KhiveRuntime,
+    pub(crate) runtime: KhiveRuntime,
 }
 
 impl Pack for CodePack {
     const NAME: &'static str = "code";
     const NOTE_KINDS: &'static [&'static str] = &["finding"];
     const ENTITY_KINDS: &'static [&'static str] = &[];
-    const HANDLERS: &'static [HandlerDef] = &[];
+    const HANDLERS: &'static [HandlerDef] = &CODE_HANDLERS;
     const EDGE_RULES: &'static [EdgeEndpointRule] = &CODE_EDGE_RULES;
     const REQUIRES: &'static [&'static str] = &["kg"];
     const NOTE_KIND_SPECS: &'static [NoteKindSpec] = &CODE_NOTE_KIND_SPECS;
@@ -106,13 +106,16 @@ impl PackRuntime for CodePack {
     async fn dispatch(
         &self,
         verb: &str,
-        _params: Value,
+        params: Value,
         _registry: &VerbRegistry,
         _token: &NamespaceToken,
     ) -> Result<Value, RuntimeError> {
-        Err(RuntimeError::InvalidInput(format!(
-            "code pack does not handle verb {verb:?}"
-        )))
+        match verb {
+            "code.ingest" => self.handle_ingest(params).await,
+            _ => Err(RuntimeError::InvalidInput(format!(
+                "code pack does not handle verb {verb:?}"
+            ))),
+        }
     }
 }
 
@@ -127,7 +130,8 @@ mod tests {
         assert_eq!(<CodePack as Pack>::NAME, "code");
         assert_eq!(<CodePack as Pack>::NOTE_KINDS, &["finding"]);
         assert!(<CodePack as Pack>::ENTITY_KINDS.is_empty());
-        assert!(<CodePack as Pack>::HANDLERS.is_empty());
+        assert_eq!(<CodePack as Pack>::HANDLERS.len(), 1);
+        assert_eq!(<CodePack as Pack>::HANDLERS[0].name, "code.ingest");
         assert_eq!(<CodePack as Pack>::REQUIRES, &["kg"]);
         assert!(<CodePack as Pack>::SCHEMA_PLAN.is_none());
     }

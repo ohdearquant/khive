@@ -1,6 +1,6 @@
 # khive
 
-A research knowledge graph runtime: 78 verbs, 11 packs, one MCP tool.
+A research knowledge graph runtime: 79 verbs, 11 packs, one MCP tool.
 
 [![GitHub](https://img.shields.io/github/stars/ohdearquant/khive?style=flat)](https://github.com/ohdearquant/khive)
 [![crates.io](https://img.shields.io/crates/v/khive-mcp.svg)](https://crates.io/crates/khive-mcp)
@@ -34,7 +34,7 @@ All 11 packs load by default. A background daemon auto-spawns to keep the runtim
 | **knowledge** | 19    | Atom-based KB with embedding rerank search                                           |
 | **session**   | 4     | Session record persistence (store/list/resume/export)                                |
 | **git**       | 1     | Git-lifecycle note kinds (commit/issue/pull_request) + batch ingester + `git.digest` |
-| **code**      | 0     | Finding note kind; ingest is admin-CLI-only (`kkernel code-ingest`), no MCP verb     |
+| **code**      | 1     | `code.ingest` L1/L1.5 source ingest; `findings.json` stays admin-CLI (`kkernel code-ingest`) |
 
 ## Usage
 

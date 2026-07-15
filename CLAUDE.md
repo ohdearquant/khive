@@ -168,10 +168,11 @@ request(ops="[{\"tool\":\"v1\",\"args\":{...}}, ...]")
 
 Verbs come from whichever packs are loaded via `KHIVE_PACKS` (env) or `--pack` (CLI). Default
 loads all 11 production packs: kg, gtd, memory, brain, comm, schedule, knowledge, session, git,
-code, workspace (verbs unchanged at 78: the `code` pack currently contributes zero verbs (ADR-085 D1;
-Amendment 2's `code.ingest` verb is accepted but unimplemented); its `finding` note kind and
-`findings.json` ingest are reached only through the `kkernel code-ingest` admin CLI path
-(ADR-085 Amendment 3), never the MCP verb surface; git contributes
+code, workspace (verbs now at 79: the `code` pack contributes one verb, `code.ingest`
+(ADR-085 Amendment 2, PR #1039 — L1 manifest + L1.5 import-scan source ingest into a
+dedicated map database); its `finding` note kind and `findings.json` batch ingest are
+still reached only through the `kkernel code-ingest` admin CLI path (ADR-085 Amendment
+3), never the MCP verb surface; git contributes
 commit/issue/pull_request note kinds, a batch ingester, and the git.digest verb (ADR-088
 Amendment 1); comm.probe (#644) added 2026-07-07; brain.event_counts (ADR-103 Stage 1, #724
 Ask A) added 2026-07-08; kg.resolve added 2026-07-09; workspace (#873) contributes zero verbs,
