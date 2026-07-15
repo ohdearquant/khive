@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use crate::imports::{self, Resolved};
 use crate::ingest::CODE_INGEST_NAMESPACE;
-use crate::manifest::{self, ManifestProject};
+use crate::manifest;
 
 /// Outcome counters for one `code.ingest` call, mirroring `git.digest`'s
 /// `IngestReport` shape (ADR-088 Amendment 1 precedent).
@@ -331,10 +331,48 @@ async fn record_unresolved(
     upsert_entity(rt, token, entity).await
 }
 
-fn target_id_for(source_project: &str, spec: &UnresolvedSpec) -> Uuid {
+/// The path separator a module path uses in each language's native form
+/// (`imports::module_path_for_file`'s output shape).
+fn module_path_separator(language: &str) -> &'static str {
+    match language {
+        "python" => ".",
+        "typescript" => "/",
+        _ => "::",
+    }
+}
+
+/// Candidate module-path prefixes for `specifier`, longest first, then each
+/// shorter prefix down to the single leading segment.
+///
+/// A `use crate::foo::Thing` item import classifies to the intra-module
+/// target `foo::Thing`, but module identity is the *declaring file's* module
+/// path (`foo`, not `foo::Thing` — `Thing` names an item inside that module,
+/// not a nested module). Trying progressively shorter prefixes against the
+/// known module set picks the longest one that actually exists, so an item
+/// import resolves to its containing module instead of staying unresolved
+/// forever.
+fn module_candidate_specifiers(language: &str, specifier: &str) -> Vec<String> {
+    let sep = module_path_separator(language);
+    let segments: Vec<&str> = specifier.split(sep).filter(|s| !s.is_empty()).collect();
+    if segments.is_empty() {
+        return vec![specifier.to_string()];
+    }
+    (1..=segments.len())
+        .rev()
+        .map(|n| segments[..n].join(sep))
+        .collect()
+}
+
+/// Candidate target ids for `spec`, in resolution-priority order — the
+/// caller tries each in turn and takes the first that resolves to an
+/// existing entity (see `module_candidate_specifiers`).
+fn target_ids_for(source_project: &str, spec: &UnresolvedSpec) -> Vec<Uuid> {
     match spec.target_kind.as_str() {
-        "module" => module_uuid(source_project, &spec.language, &spec.specifier),
-        _ => project_uuid(&spec.specifier),
+        "module" => module_candidate_specifiers(&spec.language, &spec.specifier)
+            .into_iter()
+            .map(|path| module_uuid(source_project, &spec.language, &path))
+            .collect(),
+        _ => vec![project_uuid(&spec.specifier)],
     }
 }
 
@@ -477,10 +515,15 @@ async fn reresolve_pass(
         let mut still_unresolved = Vec::new();
         let mut changed = false;
         for spec in list.drain(..) {
-            let target_id = target_id_for(&source_project, &spec);
-            let found = get_entity_opt(rt, token, target_id).await?;
-            match found {
-                Some(_) => {
+            let mut resolved_target = None;
+            for target_id in target_ids_for(&source_project, &spec) {
+                if get_entity_opt(rt, token, target_id).await?.is_some() {
+                    resolved_target = Some(target_id);
+                    break;
+                }
+            }
+            match resolved_target {
+                Some(target_id) => {
                     upsert_dependency_edge(
                         rt,
                         token,
@@ -600,12 +643,17 @@ pub async fn run_code_ingest(
         }
     }
 
-    // L1.5: regex import scan (module + project depends_on edges).
-    for m in &manifests {
+    // L1.5: regex import scan (module + project depends_on edges). Driven by
+    // per-language file discovery across the whole ingest root — independent
+    // of manifest discovery — so a manifestless source folder still yields
+    // module/project entities and import edges under the basename-fallback
+    // identity rule (ADR-085 Amendment 2 B4), rather than being silently
+    // skipped for lack of a governing manifest.
+    for language in opts.languages.iter().copied() {
         run_import_scan(
             rt,
             token,
-            m,
+            language,
             opts.path,
             opts.sweep_time,
             &mut project_ids,
@@ -619,24 +667,33 @@ pub async fn run_code_ingest(
     Ok(report)
 }
 
+/// The `source_project` for a file with no governing manifest anywhere above
+/// it: the basename of the ingested folder (ADR-085 Amendment 2 B4).
+fn basename_project_name(ingest_root: &Path) -> String {
+    ingest_root
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| ingest_root.display().to_string())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_import_scan(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
-    m: &ManifestProject,
+    language: &'static str,
     ingest_root: &Path,
     sweep_time: DateTime<Utc>,
     project_ids: &mut HashMap<String, Uuid>,
     report: &mut CodeSourceIngestReport,
 ) -> Result<(), CodeSourceIngestError> {
-    let Some(ext) = imports::extension_for_language(m.language) else {
+    let Some(ext) = imports::extension_for_language(language) else {
         return Ok(());
     };
     let mut files = Vec::new();
-    if let Err(e) = collect_source_files(&m.root, ext, &mut files) {
+    if let Err(e) = collect_source_files(ingest_root, ext, &mut files) {
         report
             .warnings
-            .push(format!("walking {}: {e}", m.root.display()));
+            .push(format!("walking {}: {e}", ingest_root.display()));
         return Ok(());
     }
 
@@ -644,16 +701,16 @@ async fn run_import_scan(
         let Some(file_dir) = file.parent() else {
             continue;
         };
-        let Some((proj_root, proj_name)) =
-            manifest::find_governing_manifest(file_dir, ingest_root, m.language)
-        else {
-            report.warnings.push(format!(
-                "{}: no governing manifest found, skipped",
-                file.display()
-            ));
-            continue;
-        };
-        let Some(module_path) = imports::module_path_for_file(&file, &proj_root, m.language) else {
+        let (proj_root, proj_name) =
+            manifest::find_governing_manifest(file_dir, ingest_root, language).unwrap_or_else(
+                || {
+                    (
+                        ingest_root.to_path_buf(),
+                        basename_project_name(ingest_root),
+                    )
+                },
+            );
+        let Some(module_path) = imports::module_path_for_file(&file, &proj_root, language) else {
             continue;
         };
 
@@ -661,7 +718,7 @@ async fn run_import_scan(
             Some(id) => *id,
             None => {
                 let id =
-                    upsert_project(rt, token, &proj_name, m.language, sweep_time, report).await?;
+                    upsert_project(rt, token, &proj_name, language, sweep_time, report).await?;
                 project_ids.insert(proj_name.clone(), id);
                 id
             }
@@ -681,7 +738,7 @@ async fn run_import_scan(
             rt,
             token,
             &proj_name,
-            m.language,
+            language,
             &module_path,
             &hash,
             sweep_time,
@@ -707,12 +764,12 @@ async fn run_import_scan(
             report.edges_updated += 1;
         }
 
-        for raw in imports::extract_raw_imports(m.language, &content) {
-            let resolved = if m.language == "typescript" && raw.starts_with('.') {
+        for raw in imports::extract_raw_imports(language, &content) {
+            let resolved = if language == "typescript" && raw.starts_with('.') {
                 let rel_dir = file_dir.strip_prefix(&proj_root).unwrap_or(Path::new(""));
                 Resolved::IntraModule(imports::resolve_relative_ts_module(rel_dir, &raw))
             } else {
-                imports::classify_import(m.language, &raw, &module_path, &proj_name)
+                imports::classify_import(language, &raw, &module_path, &proj_name)
             };
             match resolved {
                 Resolved::Skip => {}
@@ -721,7 +778,7 @@ async fn run_import_scan(
                         specifier: target_module_path,
                         target_kind: "module".to_string(),
                         dependency_kind: "import".to_string(),
-                        language: m.language.to_string(),
+                        language: language.to_string(),
                     };
                     record_unresolved(rt, token, module_id, spec, report).await?;
                 }
@@ -730,7 +787,7 @@ async fn run_import_scan(
                         specifier: target_name,
                         target_kind: "project".to_string(),
                         dependency_kind: "import".to_string(),
-                        language: m.language.to_string(),
+                        language: language.to_string(),
                     };
                     record_unresolved(rt, token, proj_id, spec, report).await?;
                 }
