@@ -258,7 +258,12 @@ pub fn builtin_pack_names() -> Vec<&'static str> {
 }
 
 /// Which MCP handshake mode [`KhiveMcpServer::serve_stdio`] should use for
-/// this process instance (#714).
+/// this process instance (#714). Unix-only: the resumed-generation self-heal
+/// re-exec this decides between requires `crate::daemon`'s Unix-only
+/// mismatch-recovery machinery (in turn only ever armed by a Unix-domain-socket
+/// daemon-forwarding protocol mismatch); non-Unix `serve_stdio` always takes
+/// the plain handshake path (see its `#[cfg(not(unix))]` variant below).
+#[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StdioServeMode {
     /// Normal MCP `initialize` handshake — the overwhelmingly common case.
@@ -271,6 +276,7 @@ enum StdioServeMode {
 /// Pure decision behind [`StdioServeMode`], factored out so it is
 /// unit-testable without driving real stdio I/O. `resumed_generation` is
 /// [`crate::daemon::resumed_generation`]'s return value.
+#[cfg(unix)]
 fn stdio_serve_mode_for(resumed_generation: Option<u32>) -> StdioServeMode {
     match resumed_generation {
         Some(_) => StdioServeMode::Resumed,
@@ -547,6 +553,7 @@ impl KhiveMcpServer {
     /// edge that fires an armed self-heal re-exec (or drain-and-exit) only
     /// once a message has genuinely finished flushing to the client, never
     /// on a fixed timer that could race a slow or backpressured stdout.
+    #[cfg(unix)]
     pub async fn serve_stdio(self) -> anyhow::Result<()> {
         use rmcp::transport::{async_rw::AsyncRwTransport, stdio};
 
@@ -565,6 +572,23 @@ impl KhiveMcpServer {
                 service.waiting().await?;
             }
         }
+        Ok(())
+    }
+
+    /// Non-Unix stdio serving. The #714 self-heal re-exec mechanism
+    /// (`crate::daemon`'s `SelfHealOnFlushTransport`/resumed-generation
+    /// machinery) requires `exec()` (POSIX-only) and is only ever armed by a
+    /// Unix-domain-socket daemon-forwarding protocol mismatch — there is
+    /// nothing to self-heal from on this target (`--daemon` mode itself is
+    /// Unix-only, see `serve.rs::serve_server`), so this path always runs the
+    /// normal MCP `initialize` handshake directly over the raw stdio
+    /// transport, with no resumed-generation skip and no flush-triggered hook.
+    #[cfg(not(unix))]
+    pub async fn serve_stdio(self) -> anyhow::Result<()> {
+        use rmcp::transport::stdio;
+
+        let service = self.serve(stdio()).await?;
+        service.waiting().await?;
         Ok(())
     }
 
@@ -1029,24 +1053,13 @@ impl KhiveMcpServer {
 }
 
 /// Route a `link` or `search` verb through `coord` when in multi-backend mode.
-///
-/// This is the shared logic behind both dispatch sites (`dispatch_op` chain mode
-/// and the parallel/single closure in `run_parsed`). Extracted as a free async
-/// function so closures that don't have access to `&self` can call it.
-///
-/// Returns `Some(Ok(Value))` when the coordinator handled the op successfully.
-/// Returns `Some(Err((tool, error_value)))` when the coordinator returned an error,
-/// including when a caller-supplied `namespace` argument fails fail-closed
-/// validation (see below).
-/// Returns `None` to indicate fall-through (caller should dispatch through the registry).
-///
-/// RUNTIME-AUD-002 (#433, PR #549 blocker): this coordinator intercept runs
-/// *before* `VerbRegistry::dispatch`, so it must apply the exact same
-/// fail-closed namespace rule `dispatch` applies — a present-but-non-string
-/// `namespace` (null/number/bool/array/object) must be rejected, never
-/// silently substituted with the server default. Both call sites route
-/// through `resolve_explicit_namespace` (the same chokepoint `dispatch` uses)
-/// so this can't drift out of sync again.
+/// Shared logic behind both dispatch sites (`dispatch_op` chain mode and the
+/// parallel/single closure in `run_parsed`). Returns `Some(Ok(Value))` when
+/// the coordinator handled the op, `Some(Err((tool, error_value)))` on a
+/// coordinator error (including fail-closed namespace rejection), `None` to
+/// fall through to the registry. Must apply the exact same fail-closed
+/// namespace rule as `VerbRegistry::dispatch` (RUNTIME-AUD-002, #433) — see
+/// `crates/khive-mcp/docs/api/coordinator.md`.
 async fn dispatch_via_coordinator_inner(
     coord: &dyn CoordinatorService,
     tool: &str,
@@ -1267,18 +1280,10 @@ async fn dispatch_via_coordinator_inner(
 }
 
 /// Returns `true` when a raw handler `result` value's container nesting is
-/// within [`khive_request::NESTING_DEPTH_LIMIT`].
-///
-/// Handler results (e.g. `traverse`/`context`) are not bounded by the DSL
-/// parser's syntax-tree guard, so a pathologically deep result could
-/// overflow the stack via recursive `Value::clone`, `json!`/
-/// `serde_json::to_value` serialization, or the agent-mode presentation
-/// transform — all of which recurse natively over `Value`. Callers MUST
-/// call this on the raw value coming straight out of coordinator/registry
-/// dispatch, before any of those operations touch it. Delegates to
-/// [`khive_request::value_nesting_within_limit`], which walks an explicit
-/// worklist instead of native recursion, so the check itself cannot
-/// overflow the stack on the same input it is screening.
+/// within [`khive_request::NESTING_DEPTH_LIMIT`]. Callers MUST call this on
+/// the raw value straight out of coordinator/registry dispatch, before any
+/// recursive `Value` operation (clone, serialize, presentation transform)
+/// touches it — see `crates/khive-mcp/docs/design.md` (Result depth guard).
 fn result_within_depth_limit(result: &Value) -> bool {
     khive_request::value_nesting_within_limit(result, khive_request::NESTING_DEPTH_LIMIT)
 }
@@ -1378,16 +1383,12 @@ fn result_exceeds_depth_limit(result_obj: &Value) -> bool {
         .is_some_and(|v| !result_within_depth_limit(v))
 }
 
-/// Chain-mode aggregation-loop seam in [`KhiveMcpServer::run_parsed`]: the
-/// second, defense-in-depth check applied to a dispatched op's full
-/// `result_obj` envelope. By the time this runs, `dispatch_op`'s own
-/// `chain_ok_envelope_or_depth_error` has already screened the same
-/// `result` field, so this should never trip in practice — but if a future
-/// refactor bypasses that earlier guard, the rejected envelope must still be
-/// discarded iteratively rather than dropped natively, or the recursive
-/// `Drop` this branch exists to prevent happens anyway on the way out of
-/// scope. Returns the unchanged envelope on success, or an already-built
-/// error entry (with the oversized value already drained) on rejection.
+/// Chain-mode aggregation-loop seam in [`KhiveMcpServer::run_parsed`]:
+/// defense-in-depth depth check on a dispatched op's full `result_obj`
+/// envelope (should never trip — `dispatch_op` already screened `result`).
+/// Returns the unchanged envelope on success, or an already-built error
+/// entry on rejection. See `crates/khive-mcp/docs/design.md` (Result depth
+/// guard) for why the rejected envelope is drained iteratively.
 fn chain_aggregation_depth_reject(result_obj: Value) -> Result<Value, Value> {
     if result_exceeds_depth_limit(&result_obj) {
         let tool_name = result_obj
@@ -1478,8 +1479,12 @@ several independent ops can run together; use chain when each op needs the prior
 result (e.g. create then link with the new entity's id)."#)]
     async fn request(&self, Parameters(p): Parameters<RequestParams>) -> Result<String, McpError> {
         // Forward to the warm daemon when reachable, auto-spawning it
-        // on first use. Any failure (no socket, spawn failure, namespace
-        // mismatch, KHIVE_NO_DAEMON) falls through to local dispatch.
+        // on first use. An ordinary no-socket condition, a namespace
+        // mismatch, or KHIVE_NO_DAEMON falls through to local dispatch.
+        // A confirmed respawn failure (spawn error, or the child exits
+        // before binding the socket) instead returns a caller-visible
+        // `respawn_failed` error without local dispatch, per ADR-049
+        // Amendment 2.
         //
         // MCP-AUD-002: the daemon wire frame has no `save_to` field, so
         // daemon-forwarded requests silently drop the sink and return the
@@ -1492,13 +1497,14 @@ result (e.g. create then link with the new entity's id)."#)]
             if let Some(res) = crate::daemon::forward_or_spawn(&frame).await {
                 return match res {
                     Ok(s) => Ok(s),
-                    // #947: a strict-mode fallback rejection is tagged with
+                    // #947/#898: a strict-mode pre-dispatch rejection is
+                    // tagged with
                     // `daemon::STRICT_FALLBACK_MARKER` so it can be reshaped
                     // into the normal per-op envelope instead of surfacing as
                     // an RPC-level error. Every other daemon-forward error
-                    // (protocol mismatch, oversized frame, ambiguous
-                    // post-write outcome) is untagged and passes through
-                    // unchanged.
+                    // (non-strict respawn failure, protocol mismatch,
+                    // oversized frame, ambiguous post-write outcome) is
+                    // untagged and passes through unchanged.
                     Err(e) => match strict_fallback_reason(&e) {
                         Some(reason) => strict_fallback_envelope_response(&p, reason),
                         None => Err(e),
@@ -1514,6 +1520,7 @@ result (e.g. create then link with the new entity's id)."#)]
 /// [`McpError`] (#947), or `None` if `e` is not tagged with
 /// [`crate::daemon::STRICT_FALLBACK_MARKER`] — i.e. some other daemon-forward
 /// error that must stay an RPC-level error.
+#[cfg(unix)]
 fn strict_fallback_reason(e: &McpError) -> Option<String> {
     let data = e.data.as_ref()?;
     if data.get(crate::daemon::STRICT_FALLBACK_MARKER)?.as_bool() != Some(true) {
@@ -1533,6 +1540,7 @@ fn strict_fallback_reason(e: &McpError) -> Option<String> {
 /// each op's `error`, not an RPC-level `McpError`. Chain mode aborts after the
 /// first op, matching `run_parsed`'s `Chain` arm and the wire contract's
 /// documented abort-on-failure behavior for `|`-chained ops.
+#[cfg(unix)]
 fn strict_fallback_envelope_response(
     p: &RequestParams,
     reason: String,
@@ -1541,7 +1549,8 @@ fn strict_fallback_envelope_response(
     let total = parsed.ops.len();
     let error_msg = format!(
         "daemon fallback rejected under KHIVE_DAEMON_STRICT=1: reason={reason}; \
-         refusing to complete the request via local dispatch"
+         refusing to complete the request via local dispatch; \
+         rebuild with `make local` and retry"
     );
 
     let results: Vec<Value> = match parsed.mode {
@@ -1970,11 +1979,13 @@ mod tests {
 
     // ── serve_stdio handshake-mode decision (#714) ────────────────────────────
 
+    #[cfg(unix)]
     #[test]
     fn stdio_serve_mode_cold_start_uses_handshake() {
         assert_eq!(stdio_serve_mode_for(None), StdioServeMode::Handshake);
     }
 
+    #[cfg(unix)]
     #[test]
     fn stdio_serve_mode_resumed_generation_skips_handshake() {
         assert_eq!(stdio_serve_mode_for(Some(1)), StdioServeMode::Resumed);
@@ -2407,6 +2418,7 @@ mod tests {
     /// khive#948: `wire_daemon_frame` forwards `RequestParams::request_id`
     /// onto the `DaemonRequestFrame` unchanged, and defaults to `None` when
     /// the caller supplied none.
+    #[cfg(unix)]
     #[test]
     fn wire_daemon_frame_forwards_request_id() {
         let server = make_daemon_save_to_test_server();
@@ -2524,6 +2536,7 @@ mod tests {
         std::env::remove_var("KHIVE_SAVE_TO_ROOT");
     }
 
+    #[cfg(unix)]
     async fn connect_when_daemon_ready(sock: &std::path::Path) {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
@@ -2545,6 +2558,7 @@ mod tests {
     /// `save_to` request must still take the local path and return the
     /// manifest with the file actually written — proving the daemon was
     /// bypassed rather than silently dropping the sink.
+    #[cfg(unix)]
     #[tokio::test]
     #[serial]
     async fn request_save_to_bypasses_daemon_forwarding_and_writes_manifest() {
@@ -2616,6 +2630,7 @@ mod tests {
     // mid-dispatch would) and proves both that the caller sees the
     // ambiguous-forward error verbatim AND that the mutating op never actually
     // ran locally.
+    #[cfg(unix)]
     #[tokio::test]
     #[serial]
     async fn request_returns_ambiguous_forward_error_without_local_double_dispatch() {
@@ -2726,14 +2741,16 @@ mod tests {
     // counts match `results`; and (4) none of the ops ever ran locally (a
     // `stats()` snapshot taken via the trusted `dispatch_request_local` path
     // is unchanged after all three calls).
+    #[cfg(unix)]
     #[tokio::test]
     #[serial]
     async fn request_strict_fallback_lands_as_failed_op_envelope_not_rpc_error() {
         clear_daemon_env();
         crate::daemon::reset_fallback_counters();
         let dir = tempfile::tempdir().expect("tempdir");
-        // Never bound by anything in this test — the daemon is genuinely
-        // unreachable, exactly like `daemon::forward_or_spawn_strict_mode_errors_when_daemon_unreachable`.
+        // Never bound by anything in this test. The spawned test harness exits
+        // immediately on `mcp --daemon`, so #898 classifies this as a confirmed
+        // respawn failure rather than the older generic `no_socket` fallback.
         std::env::set_var("KHIVE_SOCKET", dir.path().join("khived.sock"));
         std::env::set_var("KHIVE_PID", dir.path().join("khived.pid"));
         std::env::set_var("KHIVE_LOCK", dir.path().join("khived.recovery.lock"));
@@ -2773,8 +2790,12 @@ mod tests {
                 "error must name the strict mode that rejected the fallback: {msg}"
             );
             assert!(
-                msg.contains("no_socket"),
-                "error must name the fallback reason: {msg}"
+                msg.contains("respawn_failed"),
+                "error must name the confirmed respawn failure: {msg}"
+            );
+            assert!(
+                msg.contains("make local"),
+                "error must include the safe respawn remediation: {msg}"
             );
         }
 

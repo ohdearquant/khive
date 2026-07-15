@@ -10,14 +10,12 @@ use super::scan::{char_label, escape_literal_control_chars, scan_string_end};
 pub(crate) struct Parser<'a> {
     pub(crate) src: &'a [u8],
     pub(crate) pos: usize,
-    /// Current container-nesting depth (`[`/`{` inside arg values). Guards
-    /// `parse_array_arg`/`parse_object_arg` recursion against CWE-674, see
-    /// [`NESTING_DEPTH_LIMIT`].
+    /// Current array/object depth, bounded by [`NESTING_DEPTH_LIMIT`].
     depth: usize,
 }
 
 impl<'a> Parser<'a> {
-    /// Create a new parser over the given source string.
+    /// Creates a cursor over `src`.
     pub(crate) fn new(src: &'a str) -> Self {
         Self {
             src: src.as_bytes(),
@@ -26,10 +24,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Enter one level of container nesting, rejecting once the depth limit
-    /// is exceeded. Always pair with a `self.depth -= 1` after the nested
-    /// parse completes (on both `Ok` and `Err`, so depth never leaks across
-    /// sibling containers).
+    /// Enters a container; callers must decrement after success or failure.
     fn enter_container(&mut self) -> Result<(), DslError> {
         self.depth += 1;
         if self.depth > NESTING_DEPTH_LIMIT {
@@ -44,22 +39,22 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    /// Return true if the cursor is at the end of input.
+    /// Returns whether the cursor is at end of input.
     pub(crate) fn eof(&self) -> bool {
         self.pos >= self.src.len()
     }
 
-    /// Peek at the current byte as a char without advancing.
+    /// Peeks at the current ASCII syntax byte.
     pub(crate) fn peek(&self) -> Option<char> {
         self.src.get(self.pos).map(|b| *b as char)
     }
 
-    /// Advance the cursor by `n` bytes.
+    /// Advances by at most `n` bytes.
     pub(crate) fn advance(&mut self, n: usize) {
         self.pos = (self.pos + n).min(self.src.len());
     }
 
-    /// Skip ASCII whitespace.
+    /// Skips ASCII whitespace.
     pub(crate) fn skip_ws(&mut self) {
         while let Some(c) = self.peek() {
             if c.is_ascii_whitespace() {
@@ -70,7 +65,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Expect a specific character, returning an error if not found.
+    /// Consumes `want` or returns a positioned delimiter error.
     pub(crate) fn expect_char(&mut self, want: char) -> Result<(), DslError> {
         self.skip_ws();
         match self.peek() {
@@ -108,7 +103,7 @@ impl<'a> Parser<'a> {
             .to_owned())
     }
 
-    /// Parse a complete verb call: `verb(arg=val, ...)` or `pack.verb(...)`.
+    /// Parses one `verb(...)` or `pack.verb(...)` call.
     pub(crate) fn parse_op(&mut self) -> Result<ParsedOp, DslError> {
         let mut tool = self.parse_identifier()?;
         if self.peek() == Some('.') {
@@ -506,12 +501,8 @@ impl<'a> Parser<'a> {
     }
 }
 
-/// Validate a quoted `$prev` path tail (everything after `$prev.` or after the
-/// first `[N]` of a root `$prev[N]...` form) using the same bracket grammar as
-/// unquoted refs: every `[...]` segment must be non-empty digits followed by
-/// `]`, and a bare `]` outside a bracket is invalid. Malformed segments
-/// anywhere in the path must keep the whole string a literal `ArgValue::Value`
-/// rather than being promoted to `ArgValue::PrevRef`.
+/// Validates quoted-reference brackets before promoting a string to `PrevRef`.
+/// A malformed segment keeps the entire value literal.
 fn quoted_prev_path_is_valid(path: &str) -> bool {
     let bytes = path.as_bytes();
     let mut i = 0;

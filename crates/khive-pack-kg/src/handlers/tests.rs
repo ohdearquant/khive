@@ -17,14 +17,9 @@ fn parse_relation_error_lists_all_relations() {
     );
 }
 
-// Wire-level tri-state nullable f64 for `update`:
-//   absent  → outer None (preserve existing value)
-//   null    → Some(None) (clear the value)
-//   number  → Some(Some(v)) (set to v)
-//
-// Regression: the previous `Option<Value>` representation
-// collapsed absent and null into the same `None`, so JSON null could not
-// distinguish "clear" from "preserve" through the MCP wire surface.
+// Wire-level tri-state nullable f64 for `update`: absent→None (preserve), null→Some(None)
+// (clear), number→Some(Some(v)) (set). Regression: `Option<Value>` used to collapse
+// absent and null into the same None, so JSON null couldn't distinguish clear/preserve.
 #[test]
 fn update_params_tri_state_salience() {
     let absent: UpdateParams = serde_json::from_value(json!({"id": "x", "kind": "note"})).unwrap();
@@ -561,22 +556,7 @@ fn valid_relations_unsupported_pair_returns_empty() {
     );
 }
 
-// ---- Issue #543: hints must equal the validator's own acceptance set, not a
-// separate hand-authored table (the person->project gap, issue #60, was
-// exactly this divergence class) ----
-
-// Generative cross-check: for EVERY (source_kind, target_kind) entity pair in
-// the 9x9 closed entity-kind taxonomy, the hint set returned by
-// `valid_relations_for_entity_pair` must equal the set of relations the REAL
-// production validator (`KhiveRuntime::link` -> `validate_edge_relation_endpoints`)
-// actually accepts for that pair. This calls production code on both sides —
-// it never re-implements the rule check inline.
-//
-// #621 flagged that a five-pair spot check missed an
-// `EntityOfType`-scoped divergence (see
-// `valid_relations_hint_covers_formal_pack_entity_of_type_rules` below); this
-// sweeps the full closed kind space so a future divergence at any pair fails
-// loudly rather than only at hand-picked pairs.
+// Issue #543/#621: generative hint/validator divergence sweep. See docs/api/entity-kind-validation.md#test-coverage-hintvalidator-divergence-sweep-issue-543.
 #[tokio::test]
 async fn valid_relations_hint_matches_real_validator_acceptance_across_all_entity_kind_pairs() {
     use crate::vocab::EntityKind as KgEntityKind;
@@ -592,12 +572,7 @@ async fn valid_relations_hint_matches_real_validator_acceptance_across_all_entit
         let token = rt.authorize(Namespace::local()).unwrap();
         let mut accepted = Vec::new();
         for relation in EdgeRelation::ALL {
-            // `annotates` requires a note source (never an entity), so it can
-            // never be accepted for an entity->entity pair regardless of
-            // kind; skip it (matches the hint function's own scope, which
-            // never emits "annotates"). supersedes/supports/refutes DO
-            // validate entity->entity pairs against the same base allowlist
-            // the hint function reads, so they stay in scope here.
+            // annotates is entity-invalid; see docs/api/entity-kind-validation.md.
             if relation == EdgeRelation::Annotates {
                 continue;
             }
@@ -1499,5 +1474,161 @@ async fn create_bulk_items_rejects_top_level_embedding_content() {
     assert!(
         format!("{err}").contains("embedding_content"),
         "error must name the offending field: {err}"
+    );
+}
+
+// Shared by the `decision precedes decision` tests below: builds the KG
+// registry and installs its composed edge rules (the same rule set the
+// production MCP server runs under), so negative cases prove the
+// `decision`->`decision` exception stays kind-specific rather than merely
+// exercising the base entity-only rule against an unconfigured runtime.
+async fn configured_kg_pack() -> (
+    khive_runtime::KhiveRuntime,
+    khive_runtime::NamespaceToken,
+    crate::KgPack,
+) {
+    use crate::KgPack;
+    use khive_runtime::VerbRegistryBuilder;
+
+    let rt = khive_runtime::KhiveRuntime::memory().expect("in-memory runtime");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    let registry = builder.build().expect("kg registry builds");
+    rt.install_edge_rules(registry.all_edge_rules());
+    let token = rt.authorize(khive_runtime::Namespace::local()).unwrap();
+    let pack = KgPack::new(rt.clone());
+    (rt, token, pack)
+}
+
+// ADR-087 Amendment 1 §A9: review-round chains are `decision precedes
+// decision` note-to-note edges (round N-1 precedes round N). KG_EDGE_RULES
+// additively extends the base entity-only `precedes` contract to
+// `decision`->`decision` note pairs, mirroring the GTD pack's `task`->`task`
+// `depends_on` rule.
+#[tokio::test]
+async fn link_accepts_decision_precedes_decision() {
+    let (rt, token, pack) = configured_kg_pack().await;
+
+    let round1 = rt
+        .create_note(
+            &token,
+            "decision",
+            None,
+            "round 1 decision",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create round-1 decision note");
+    let round2 = rt
+        .create_note(
+            &token,
+            "decision",
+            None,
+            "round 2 decision",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create round-2 decision note");
+
+    let params = serde_json::json!({
+        "source_id": round1.id.to_string(),
+        "target_id": round2.id.to_string(),
+        "relation": "precedes",
+    });
+    assert!(
+        pack.handle_link(&token, params).await.is_ok(),
+        "decision->decision precedes must be accepted"
+    );
+}
+
+#[tokio::test]
+async fn link_rejects_decision_precedes_observation() {
+    let (rt, token, pack) = configured_kg_pack().await;
+
+    let decision = rt
+        .create_note(&token, "decision", None, "a decision", None, None, vec![])
+        .await
+        .expect("create decision note");
+    let observation = rt
+        .create_note(
+            &token,
+            "observation",
+            None,
+            "an observation",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create observation note");
+
+    let params = serde_json::json!({
+        "source_id": decision.id.to_string(),
+        "target_id": observation.id.to_string(),
+        "relation": "precedes",
+    });
+    assert!(
+        pack.handle_link(&token, params).await.is_err(),
+        "decision->observation precedes must be rejected"
+    );
+}
+
+#[tokio::test]
+async fn link_rejects_observation_precedes_decision() {
+    let (rt, token, pack) = configured_kg_pack().await;
+
+    let observation = rt
+        .create_note(
+            &token,
+            "observation",
+            None,
+            "an observation",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create observation note");
+    let decision = rt
+        .create_note(&token, "decision", None, "a decision", None, None, vec![])
+        .await
+        .expect("create decision note");
+
+    let params = serde_json::json!({
+        "source_id": observation.id.to_string(),
+        "target_id": decision.id.to_string(),
+        "relation": "precedes",
+    });
+    assert!(
+        pack.handle_link(&token, params).await.is_err(),
+        "observation->decision precedes must be rejected"
+    );
+}
+
+#[tokio::test]
+async fn link_entity_precedes_entity_unaffected_by_decision_note_rule() {
+    let (rt, token, pack) = configured_kg_pack().await;
+
+    let src = rt
+        .create_entity(&token, "project", None, "step 1", None, None, vec![])
+        .await
+        .expect("create source entity");
+    let tgt = rt
+        .create_entity(&token, "project", None, "step 2", None, None, vec![])
+        .await
+        .expect("create target entity");
+
+    let params = serde_json::json!({
+        "source_id": src.id.to_string(),
+        "target_id": tgt.id.to_string(),
+        "relation": "precedes",
+    });
+    assert!(
+        pack.handle_link(&token, params).await.is_ok(),
+        "entity->entity precedes must remain accepted under the composed rule set (base ADR-002 contract)"
     );
 }

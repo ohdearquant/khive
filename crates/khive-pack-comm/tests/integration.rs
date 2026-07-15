@@ -557,7 +557,7 @@ async fn test_inbox_returns_inbound_for_recipient() {
     registry
         .dispatch(
             "comm.send",
-            serde_json::json!({ "to": "lambda:khive", "content": "you have mail" }),
+            serde_json::json!({ "to": "lambda:khive", "content": "you have mail", "self_send": true }),
         )
         .await
         .expect("self-send with actor identity succeeds");
@@ -710,7 +710,7 @@ async fn test_reply_from_recipient_routes_to_sender() {
     registry
         .dispatch(
             "comm.send",
-            serde_json::json!({ "to": "lambda:khive", "content": "meeting at 3pm" }),
+            serde_json::json!({ "to": "lambda:khive", "content": "meeting at 3pm", "self_send": true }),
         )
         .await
         .expect("self-send with actor identity succeeds");
@@ -1218,7 +1218,7 @@ async fn test_reply_delivers_inbound_to_recipient() {
     registry
         .dispatch(
             "comm.send",
-            serde_json::json!({ "to": "lambda:khive", "content": "original message" }),
+            serde_json::json!({ "to": "lambda:khive", "content": "original message", "self_send": true }),
         )
         .await
         .expect("self-send with actor identity succeeds");
@@ -2737,7 +2737,11 @@ async fn t5b_reply_always_writes_same_namespace() {
     let send_val = registry_local
         .dispatch(
             "comm.send",
-            serde_json::json!({ "to": "lambda:khive", "content": "hello for reply" }),
+            serde_json::json!({
+                "to": "lambda:khive",
+                "content": "hello for reply",
+                "self_send": true,
+            }),
         )
         .await
         .expect("T5b: initial send must succeed");
@@ -3904,7 +3908,11 @@ async fn i199_anonymous_inbox_cannot_read_messages_addressed_to_other_actor() {
     registry_b
         .dispatch(
             "comm.send",
-            serde_json::json!({ "to": "lambda:b", "content": "secret for B only" }),
+            serde_json::json!({
+                "to": "lambda:b",
+                "content": "secret for B only",
+                "self_send": true,
+            }),
         )
         .await
         .expect("B sends to itself");
@@ -6369,6 +6377,7 @@ async fn t495_send_tags_present_on_outbound_copy() {
                 "to": "lambda:a",
                 "content": "self-tagged",
                 "tags": ["job:42"],
+                "self_send": true,
             }),
         )
         .await
@@ -6772,4 +6781,154 @@ async fn cursor_schema_lazy_bootstraps_fresh_memory_runtime() {
         .await
         .expect("cursor_commit on a never-written table must lazily create the schema and succeed");
     assert_eq!(committed["generation"], 1);
+}
+
+// ── Issue #820: sub-agent self-address must be loud, not silent ─────────────
+//
+// A sub-agent session spawned in the same project scope resolves its actor
+// identity from the same worktree-scoped `.khive/config.toml` as its parent
+// orchestrator (ADR-096 Fork 2: `[actor] id` is a per-project, not per-session,
+// injection tier). When the sub-agent addresses that shared label thinking it
+// reaches a distinct parent principal, `from_actor` and `to_actor` collapse
+// onto the identical string with no error and no distinct inbox.
+
+/// Child and parent configured with genuinely distinct actor identities: a
+/// send from the child to the parent's label must succeed and land in the
+/// parent's inbox only, exactly as ordinary actor-addressed delivery already
+/// works (ADR-057). This is the "no bug" baseline the fix must not regress.
+#[tokio::test]
+async fn i820_child_to_parent_delivery_with_distinct_identities_succeeds() {
+    let backend = shared_backend();
+    let (registry_child, _rt_child) = build_actor_registry(backend.clone(), "lambda:child");
+    let (registry_parent, _rt_parent) = build_actor_registry(backend, "lambda:parent");
+
+    let sent = registry_child
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:parent", "content": "status update from child" }),
+        )
+        .await
+        .expect("child->parent send with distinct actor identities must succeed");
+    assert_eq!(sent["to"], serde_json::json!("lambda:parent"));
+    assert_eq!(sent["from"], serde_json::json!("lambda:child"));
+
+    let parent_inbox = registry_parent
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "all", "limit": 50 }),
+        )
+        .await
+        .expect("parent inbox succeeds");
+    assert_eq!(
+        parent_inbox["count"], 1,
+        "parent must see exactly 1 message addressed to lambda:parent; got {parent_inbox}"
+    );
+
+    let child_inbox = registry_child
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "all", "limit": 50 }),
+        )
+        .await
+        .expect("child inbox succeeds");
+    assert_eq!(
+        child_inbox["count"], 0,
+        "child must not see the message it addressed to a distinct parent; got {child_inbox}"
+    );
+}
+
+/// A caller whose named target genuinely IS its own resolved actor identity
+/// (a deliberate note-to-self) must still be allowed to send when it says so
+/// explicitly via `self_send=true`.
+#[tokio::test]
+async fn i820_explicit_self_send_allowed_when_flagged() {
+    let (registry, _rt) = build_actor_registry(shared_backend(), "lambda:leo");
+
+    let sent = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({
+                "to": "lambda:leo",
+                "content": "reminder to self",
+                "self_send": true,
+            }),
+        )
+        .await
+        .expect("explicit self-send must be allowed when self_send=true");
+    assert_eq!(sent["to"], serde_json::json!("lambda:leo"));
+    assert_eq!(sent["from"], serde_json::json!("lambda:leo"));
+
+    let inbox = registry
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "all", "limit": 50 }),
+        )
+        .await
+        .expect("inbox succeeds");
+    assert_eq!(
+        inbox["count"], 1,
+        "self-sent note must be visible in the inbox"
+    );
+}
+
+/// The silent-collapse case: a session addresses a label that happens to equal
+/// its own resolved actor identity (e.g. a sub-agent naming what it believes is
+/// its parent's distinct label, but which resolves to the same `[actor] id` as
+/// its own token per ADR-096 Fork 2) WITHOUT declaring `self_send=true`. This
+/// must now be a loud error, never a silent delivery into the sender's own
+/// inbox.
+#[tokio::test]
+async fn i820_unflagged_self_address_is_a_loud_error() {
+    let (registry, _rt) = build_actor_registry(shared_backend(), "lambda:leo");
+
+    let result = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:leo", "content": "meant for my parent" }),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "an unflagged send whose resolved target equals the sender's own actor identity \
+         must error, not silently self-address; got {result:?}"
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("self-address") || err.contains("self_send"),
+        "error must explain the self-address collapse and the self_send escape hatch; got: {err}"
+    );
+
+    let inbox = registry
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "all", "limit": 50 }),
+        )
+        .await
+        .expect("inbox succeeds");
+    assert_eq!(
+        inbox["count"], 0,
+        "a rejected send must not leave a message behind in any inbox"
+    );
+}
+
+/// The anonymous single-tenant party-line default (`to="local"` from an
+/// unattributed caller) must remain unaffected: `to_actor == "local"` is
+/// exempted from the self-address rejection since it is the pervasive
+/// unconfigured single-actor pattern, not a collapsed distinct-principal
+/// address.
+#[tokio::test]
+async fn i820_anonymous_local_party_line_send_still_succeeds() {
+    let (registry, _rt) = build_registry();
+
+    let result = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "party line message" }),
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "unattributed to=local send must not be rejected by the #820 self-address guard; \
+         got {result:?}"
+    );
 }

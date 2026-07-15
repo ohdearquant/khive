@@ -7,13 +7,15 @@ use crate::error::{Result, RetrievalError};
 use crate::metrics::{self, MetricEvent, MetricValue};
 
 impl Bm25Index {
-    /// Index a document. Re-indexes if already present; budget check skipped for re-index.
+    /// Index or replace a document; empty replacements preserve existing content.
+    ///
+    /// New IDs may return [`RetrievalError::BudgetExceeded`]; existing IDs bypass admission.
+    /// See `crates/khive-bm25/docs/api/index-lifecycle.md`.
     pub fn index_document(&mut self, doc_id: impl Into<DocumentId>, text: &str) -> Result<()> {
         let start = std::time::Instant::now();
 
         let result = self.index_document_inner(doc_id, text);
 
-        // Emit metrics
         let elapsed = start.elapsed().as_secs_f64() * 1000.0;
         metrics::emit(
             &self.metrics,
@@ -43,29 +45,24 @@ impl Bm25Index {
         result
     }
 
-    /// Inner `index_document` logic: tokenize first, mutate second (prevents half-mutated state).
+    /// Tokenize and validate before applying a replacement.
     fn index_document_inner(&mut self, doc_id: impl Into<DocumentId>, text: &str) -> Result<()> {
         let doc_id: DocumentId = doc_id.into();
-        // Check if this is a re-index (bypass budget for existing docs)
         let is_reindex = self.contains_document(&doc_id);
 
-        // Phase 1: tokenize and compute term frequencies BEFORE any mutation.
+        // Prepare all fallible replacement state before mutating the index.
         let tokens = self.tokenizer.tokenize(text);
         let doc_length = tokens.len();
 
         if doc_length == 0 {
-            // Don't index empty documents; preserve existing document if re-indexing.
             return Ok(());
         }
 
-        // Count term frequencies (collected before any mutation).
         let mut term_freqs: BTreeMap<String, u32> = BTreeMap::new();
         for token in &tokens {
             *term_freqs.entry(token.clone()).or_insert(0) += 1;
         }
 
-        // Budget check for new documents only (re-index bypasses).
-        // Performed after tokenization but before any mutation.
         if !is_reindex {
             if let Some(limit) = self.config.memory_budget {
                 let current = self.memory_usage();
@@ -76,58 +73,43 @@ impl Bm25Index {
             }
         }
 
-        // Phase 2: all replacement state is ready — now mutate.
-        // Remove the old document only after we know the replacement is non-empty.
+        // Remove old content only after the replacement is known to be usable.
         if is_reindex {
             self.remove_document(&doc_id);
         }
 
-        // Get or assign internal u32 ID
         let internal_id = self.get_or_assign_internal_id(&doc_id)?;
 
-        // Update inverted index with sorted insertion to maintain doc_id order.
         // WAND requires posting lists sorted by doc_id for binary-search seeks.
         for (term, freq) in &term_freqs {
             let postings = self.inverted_index.entry(term.clone()).or_default();
             let insert_at = postings.partition_point_by_doc_id(internal_id);
-            // Clamp to u8::MAX (255) for compact posting storage.
-            // BM25's TF saturation means tf>10 is already ~85% of max
-            // contribution at k1=1.2, so clamping at 255 has negligible
-            // scoring impact. For very long documents (>255 occurrences of
-            // a single term), the score will plateau slightly early.
+            // Compact `u8` TF storage is acceptable because BM25 saturates contribution.
             postings.insert(insert_at, internal_id, (*freq).min(255) as u8);
         }
 
-        // Populate forward index: doc -> list of its terms (for O(terms) removal).
         self.forward_index
             .insert(internal_id, term_freqs.keys().cloned().collect());
 
-        // Update document metadata
         self.doc_lengths.insert(internal_id, doc_length);
         self.set_doc_length_fast(internal_id, doc_length);
-        // Saturating add: total_tokens is used only for avgdl; saturating at
-        // usize::MAX means avgdl will be imprecise at extreme scale but will
-        // not panic or overflow.
+        // Prefer imprecise average length at extreme scale over overflow.
         self.total_tokens = self.total_tokens.saturating_add(doc_length);
 
-        // IDF cache auto-invalidates on the next search when it detects
-        // that doc_count() has changed. No per-term eviction needed.
-
-        // Block-max metadata is epoch-invalidated (lazy rebuild on next WAND search).
         self.invalidate_block_max_after_mutation();
 
         Ok(())
     }
 
-    /// Remove a document; returns `true` if found and removed.
+    /// Remove a document, returning whether it existed; internal IDs are not reused.
+    ///
+    /// See `crates/khive-bm25/docs/api/index-lifecycle.md`.
     pub fn remove_document(&mut self, doc_id: &str) -> bool {
-        // Look up internal ID
         let internal_id = match self.id_to_internal.get(doc_id).copied() {
             Some(id) => id,
             None => return false,
         };
 
-        // Get and remove document length
         let doc_length = match self.doc_lengths.remove(&internal_id) {
             Some(len) => len,
             None => return false,
@@ -142,14 +124,11 @@ impl Bm25Index {
             self.doc_lengths_f32[idx] = 0.0;
         }
 
-        // Update total tokens
         self.total_tokens = self.total_tokens.saturating_sub(doc_length);
 
-        // Ensure the forward index is populated (rebuilds lazily from the inverted
-        // index after deserialization so that removes are always O(|terms_in_doc|)).
+        // Rebuild deserialized state before the O(terms-in-document) removal.
         self.ensure_forward_index();
 
-        // Remove from posting lists using the forward index (O(terms_in_doc) not O(|V|)).
         if let Some(terms) = self.forward_index.remove(&internal_id) {
             for term in &terms {
                 if let Some(postings) = self.inverted_index.get_mut(term) {
@@ -164,14 +143,8 @@ impl Bm25Index {
             }
         }
 
-        // Remove from ID maps
         self.id_to_internal.remove(doc_id);
         // Note: don't remove from internal_to_id Vec (leaves hole, but u32 IDs are never reused)
-
-        // IDF cache auto-invalidates on the next search when it detects
-        // that doc_count() has changed. No per-term eviction needed.
-
-        // Block-max metadata is epoch-invalidated.
         self.invalidate_block_max_after_mutation();
 
         true

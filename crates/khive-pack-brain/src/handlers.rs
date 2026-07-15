@@ -74,9 +74,13 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
             plane (ADR-103 Stage 1, #724 Ask A); feedback_explicit events additionally split by \
             served_by_profile_id; events carrying a work_class (today: phase_started / \
             phase_completed / phase_cancelled payloads, checked before any future \
-            payload.resource.work_class) split by counts_by_work_class. cost_unit is not \
-            surfaced: it does not exist on any event payload yet (ADR-103 Stage 0 design-only) \
-            and will be added once a resource payload carries it.",
+            payload.resource.work_class) split by counts_by_work_class. Events carrying \
+            payload.resource.cost_unit (ADR-103 Amendment 1; stamped on every successful verb \
+            dispatch since PR #927) sum into total_cost_unit and cost_unit_by_verb; events with \
+            no resource.cost_unit (pre-Amendment-1 events, or errored/denied dispatches) simply \
+            do not contribute. Both fields are omitted, not zero-filled, when no event in the \
+            window carries cost_unit. When truncated=true, both sums are over the fetched page \
+            only, same as the other counts_by_* fields.",
         visibility: khive_types::Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[
@@ -680,14 +684,16 @@ impl BrainPack {
     // where a generic audit row carries a `resource` sub-object (ADR-103
     // Stage 1's "resource payload enrichment", still open). Events with
     // neither path present are simply not counted in the split.
-    // `cost_unit` is NOT surfaced: as of this PR no event payload carries it
-    // anywhere in the codebase (ADR-103 Stage 0 defines it; Stage 1's
-    // resource-payload work has not landed a `cost_unit` field on any
-    // producer yet). Surfacing a field that no event can ever populate today
-    // would be a documentation lie dressed as a response key; once a
-    // producer emits `cost_unit` (under `payload.resource.cost_unit`, by the
-    // same convention as `work_class`), this verb should sum it the same way
-    // `counts_by_work_class` groups `work_class`.
+    // `cost_unit` (ADR-103 Amendment 1, `payload.resource.cost_unit`,
+    // stamped on every successful verb dispatch since PR #927 via
+    // `khive_runtime::cost_unit::resource_payload`) sums into
+    // `total_cost_unit` and `cost_unit_by_verb`, both omitted rather than
+    // zero-filled when no event in the window carries it. Amendment 1's
+    // "absence has exactly two meanings" rule means a missing
+    // `resource.cost_unit` is either a pre-Amendment-1 event or an
+    // errored/denied dispatch — this verb does not distinguish the two, it
+    // simply excludes the event from the sum, matching the `work_class`
+    // split's existing exclusion convention.
     //
     // Named `brain.event_counts` rather than the literal
     // `brain.events(...)` shape sketched on the issue — that name is already
@@ -798,6 +804,9 @@ impl BrainPack {
             std::collections::BTreeMap::new();
         let mut counts_by_work_class: std::collections::BTreeMap<String, u64> =
             std::collections::BTreeMap::new();
+        let mut total_cost_unit: i64 = 0;
+        let mut cost_unit_by_verb: std::collections::BTreeMap<String, i64> =
+            std::collections::BTreeMap::new();
 
         for event in &page.items {
             *counts_by_kind
@@ -819,6 +828,11 @@ impl BrainPack {
                     .entry(work_class.to_string())
                     .or_insert(0) += 1;
             }
+            if let Some(cost_unit) = event_cost_unit(&event.payload) {
+                total_cost_unit = total_cost_unit.saturating_add(cost_unit);
+                let entry = cost_unit_by_verb.entry(event.verb.clone()).or_insert(0);
+                *entry = entry.saturating_add(cost_unit);
+            }
         }
 
         let mut result = json!({
@@ -838,6 +852,10 @@ impl BrainPack {
         }
         if !counts_by_work_class.is_empty() {
             result["counts_by_work_class"] = json!(counts_by_work_class);
+        }
+        if !cost_unit_by_verb.is_empty() {
+            result["total_cost_unit"] = json!(total_cost_unit);
+            result["cost_unit_by_verb"] = json!(cost_unit_by_verb);
         }
         Ok(result)
     }
@@ -1209,20 +1227,23 @@ impl BrainPack {
     /// which resolves its own tier and passes an explicit profile) always
     /// originates from the recall serve loop, so it must resolve against the
     /// same binding bucket the serve path used.
+    /// Returns the profile id plus a resolution marker (`explicit` |
+    /// `binding` | `default`) so event payloads can record call-site
+    /// discipline separately from attribution (#1016).
     fn resolve_effective_feedback_profile(
         &self,
         token: &NamespaceToken,
         explicit: Option<&str>,
-    ) -> String {
+    ) -> (String, &'static str) {
         if let Some(profile_id) = explicit {
-            return profile_id.to_string();
+            return (profile_id.to_string(), "explicit");
         }
         let actor = token.actor().binding_id();
         let namespace = token.namespace().as_str();
         let state = self.state.lock().unwrap();
         match state.resolve_with_match(actor, Some(namespace), ConsumerKind::Recall.as_str()) {
-            Some((record, _matched_kind, true)) => record.id.clone(),
-            _ => "balanced-recall-v1".to_string(),
+            Some((record, _matched_kind, true)) => (record.id.clone(), "binding"),
+            _ => ("balanced-recall-v1".to_string(), "default"),
         }
     }
 
@@ -1310,7 +1331,7 @@ impl BrainPack {
         // Compute the effective serving profile (explicit, else a matching
         // actor+namespace binding, else the system default — #697), then
         // validate that it exists in the registry and is not Archived.
-        let effective_profile =
+        let (effective_profile, profile_resolution) =
             self.resolve_effective_feedback_profile(token, p.served_by_profile_id.as_deref());
         let effective_profile = effective_profile.as_str();
         {
@@ -1397,10 +1418,15 @@ impl BrainPack {
         // Base feedback payload, shared by every signal kind. The gated
         // (implicit) path below adds a "gate" key inside the atomic unit;
         // the ungated path (explicit/correction) adds nothing further.
-        let mut base_data = json!({"signal": signal});
-        if let Some(ref profile_id) = p.served_by_profile_id {
-            base_data["served_by_profile_id"] = json!(profile_id);
-        }
+        // #1016: always stamp the resolved profile (not just the
+        // caller-explicit value) so event_counts attribution and ADR-032
+        // replay match what the posterior fold actually credited; the
+        // marker records how it was resolved.
+        let mut base_data = json!({
+            "signal": signal,
+            "served_by_profile_id": effective_profile,
+            "profile_resolution": profile_resolution,
+        });
         if let Some(ref ss) = p.section_signals {
             base_data["section_signals"] = ss.clone();
         }
@@ -1437,6 +1463,14 @@ impl BrainPack {
             };
 
             let namespace = token.namespace().as_str().to_string();
+            // ADR-096 per-request identity: stamp the resolved caller actor,
+            // not a hardcoded pack name — matches the `kind:id` convention
+            // the generic Audit event already uses (khive-runtime pack.rs
+            // `build_audit_storage_event`). `ActorRef::anonymous()` resolves
+            // to the explicit `"anonymous:local"` string rather than
+            // silently mislabeling the event, so unresolved-actor calls are
+            // still distinguishable from configured caller attribution.
+            let actor_label = format!("{}:{}", token.actor().kind, token.actor().id);
             // `apply_fold_gate_and_append_event`'s `build_event` closure is
             // now required to be `'static` (ADR-067 Component A, Fork C
             // slice 2 — it is boxed into an `AtomicUnitOp` and may run
@@ -1445,6 +1479,7 @@ impl BrainPack {
             // separate `namespace_for_event` clone avoids conflicting with
             // the `&namespace` borrow passed as this call's own argument.
             let namespace_for_event = namespace.clone();
+            let actor_label_for_event = actor_label.clone();
             let base_data_for_event = base_data.clone();
             let outcome = crate::fold_gate::apply_fold_gate_and_append_event(
                 sql.as_ref(),
@@ -1472,7 +1507,7 @@ impl BrainPack {
                         "brain.feedback",
                         khive_types::EventKind::FeedbackExplicit,
                         target_substrate,
-                        "brain",
+                        actor_label_for_event,
                     )
                     .with_target(target)
                     .with_payload(data)
@@ -1514,7 +1549,7 @@ impl BrainPack {
                 "brain.feedback",
                 khive_types::EventKind::FeedbackExplicit,
                 target_substrate,
-                "brain",
+                format!("{}:{}", token.actor().kind, token.actor().id),
             )
             .with_target(target)
             .with_payload(base_data)
@@ -2299,10 +2334,10 @@ fn parse_rfc3339_micros(field: &'static str, value: &str) -> Result<i64, Runtime
 /// Checks two paths, phase-payload first:
 /// 1. `payload.work_class` — the shape `PhaseStarted`/`PhaseCompleted`/`PhaseCancelled`
 ///    events use today (`khive_storage::telemetry::{PhaseStartedPayload, ...}`).
-/// 2. `payload.resource.work_class` — the not-yet-emitted shape a generic audit row would
-///    use once ADR-103 Stage 1's "resource payload enrichment" lands `work_class` on
-///    non-phase events too. No producer writes this today; the fallback exists so this
-///    verb does not need a second change when one starts.
+/// 2. `payload.resource.work_class` — the shape successful-dispatch audit rows write:
+///    `khive_runtime::cost_unit` constructs the resource object with `work_class` and the
+///    runtime persists it on successful audit rows. Phase payloads keep precedence when
+///    both paths are present.
 ///
 /// Returns `None` (silently excluded from the split, not an error) when neither path is
 /// present — the overwhelming majority of event kinds today.
@@ -2316,6 +2351,25 @@ fn event_work_class(payload: &Value) -> Option<&str> {
                 .and_then(|resource| resource.get("work_class"))
                 .and_then(Value::as_str)
         })
+}
+
+/// Extract `cost_unit` from an event payload for `brain.event_counts`'
+/// `total_cost_unit` / `cost_unit_by_verb` aggregation (ADR-103 Amendment 1).
+///
+/// Reads `payload.resource.cost_unit` only — unlike `work_class`, `cost_unit`
+/// has no top-level payload shape: it is emitted exclusively by
+/// `khive_runtime::cost_unit::resource_payload` on the per-dispatch audit
+/// row's `resource` sub-object, never by the Phase* background-work events.
+///
+/// Returns `None` (silently excluded from the sum, not an error or a zero)
+/// when the field is absent, which per Amendment 1's "absence has exactly
+/// two meanings" rule is either a pre-Amendment-1 event or an
+/// errored/denied dispatch.
+fn event_cost_unit(payload: &Value) -> Option<i64> {
+    payload
+        .get("resource")
+        .and_then(|resource| resource.get("cost_unit"))
+        .and_then(Value::as_i64)
 }
 
 // ── lattice-router seam (#345 M1 / #352 M2) ──────────────────────────────────

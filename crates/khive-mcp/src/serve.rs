@@ -130,45 +130,16 @@ fn spawn_email_channel_loops_if_daemon(server: &KhiveMcpServer, args: &Args) {
     }
 }
 
-/// Spawn the daemon-resident schedule-event tick loop (ADR-106) if — and
-/// only if — `args` indicates this process is the daemon. Mirrors
-/// [`spawn_email_channel_loops_if_daemon`]'s `args.daemon` role gate (#602):
-/// a short-lived `kkernel exec`/stdio client process never spawns this, only
-/// the daemon does, exactly once per live process. Unlike the email loops,
-/// this is not behind a Cargo feature — the schedule pack is always linked,
-/// so the tick loop is always available.
-///
-/// `schedule_rt` is the daemon's own resolved `"schedule"`-pack runtime
-/// handle, as returned by [`build_server`] (or threaded through
-/// [`serve_server`] by `kkernel`'s coordinator-attached multi-backend boot
-/// path). Passing the ALREADY-RESOLVED runtime, rather than deriving a fresh
-/// `RuntimeConfig` from raw `args.db`/an inferred namespace inside the tick,
-/// is the fix for PR #782: the daemon resolves
-/// `--config`/`[[backends]]`/actor identity/`--pack` selection once at boot,
-/// and a second independent resolution inside the tick could silently target
-/// a different database, actor identity, or pack set. `None` means either
-/// this isn't the daemon role, or the resolved pack set does not include
-/// `"schedule"` (nothing to drain) — either way the tick loop is skipped.
-///
-/// `server` is the daemon's own live, fully-wired `KhiveMcpServer` — the
-/// SAME one [`build_server`] returned alongside `schedule_rt` and that this
-/// process is about to serve. It is cloned (cheap — `Arc`-wrapped
-/// internally) and handed to the tick loop for action-dispatch only (a
-/// continuation of PR #782, following the
-/// `schedule_rt`-only fix above): `schedule_rt` alone is correct for
-/// *scanning* `scheduled_event` rows (they live on the schedule pack's own
-/// backend), but building a throwaway `KhiveMcpServer` from `schedule_rt`
-/// alone for *dispatch* would register every pack against the schedule
-/// backend, so a replayed action belonging to another pack (e.g.
-/// `comm.send`) would route to the wrong backend in a multi-backend
-/// deployment. Passing the daemon's real `server` keeps replay routing
-/// identical to a live request.
-///
-/// If no daemon is running, scheduled events are simply not drained by this
-/// mechanism — the documented external-cron invocation
-/// (`kkernel exec --pending-events`) still works independently and safely
-/// races the tick loop when both are present (see the module docs on
-/// [`crate::pending_events`]).
+/// Spawn the daemon-resident schedule-event tick loop (ADR-106) iff `args`
+/// indicates this process is the daemon (mirrors
+/// [`spawn_email_channel_loops_if_daemon`]'s role gate, #602). `schedule_rt`
+/// MUST be the daemon's own already-resolved `"schedule"`-pack runtime
+/// (never a fresh `RuntimeConfig`, PR #782); `None` means either this isn't
+/// the daemon role or the pack set has no `"schedule"`. `server` MUST be the
+/// daemon's own live `KhiveMcpServer`, cloned for action-dispatch only — a
+/// throwaway server built from `schedule_rt` alone would misroute replayed
+/// actions in a multi-backend deployment. See
+/// `crates/khive-mcp/docs/api/pending-events.md`.
 fn spawn_schedule_tick_loop_if_daemon(
     args: &Args,
     server: &KhiveMcpServer,
@@ -718,22 +689,12 @@ fn channel_error_class(err: &khive_channel::ChannelError) -> &'static str {
 }
 
 /// Persist one poll attempt's outcome via the `comm.heartbeat` subhandler
-/// (#606). Best-effort: a failed heartbeat write is logged and does not
-/// interrupt the poll loop — the heartbeat row is an observability surface,
-/// not a correctness dependency for message delivery.
-///
-/// Takes NO `namespace` parameter (2026-07-04): heartbeat rows are an
-/// operational surface, not message data,
-/// so they are ALWAYS dispatched against
-/// `khive_pack_comm::CHANNEL_HEALTH_NAMESPACE` regardless of what
-/// `KHIVE_EMAIL_INGEST_NAMESPACE` this daemon is configured with for message
-/// ingestion. `handle_heartbeat` additionally hardcodes the persisted row's
-/// namespace to this same constant, so the guarantee holds even if a future
-/// caller changes what this dispatch call passes. `comm.health` no longer
-/// mirrors this fixed pin (khive #877): it reads from the caller's dispatch
-/// token, which resolves to this constant only for an unscoped (default)
-/// read — an explicitly-scoped `comm.health` call reads its own namespace,
-/// not necessarily where this function wrote.
+/// (#606). Best-effort: a failed write is logged, never interrupts the poll
+/// loop. Takes NO `namespace` param — heartbeat rows are always dispatched
+/// against `khive_pack_comm::CHANNEL_HEALTH_NAMESPACE` regardless of the
+/// daemon's configured `KHIVE_EMAIL_INGEST_NAMESPACE` (2026-07-04); an
+/// explicitly-scoped `comm.health` read may see a different namespace
+/// (khive #877).
 #[cfg(feature = "channel-email")]
 async fn record_channel_heartbeat(
     registry: &khive_runtime::VerbRegistry,
@@ -1193,14 +1154,32 @@ pub fn build_registry_for_multi_backend(
     khive_cfg: &KhiveConfig,
     cli_db_override: Option<&str>,
 ) -> anyhow::Result<MultiBackendRegistry> {
+    khive_runtime::assert_db_anchor_consistent(base_config.db_path.as_deref(), cli_db_override)?;
+    build_registry_for_multi_backend_inner(base_config, khive_cfg, cli_db_override)
+}
+
+pub fn build_registry_for_multi_backend_with_db_anchor(
+    base_config: RuntimeConfig,
+    khive_cfg: &KhiveConfig,
+    cli_db_override: Option<&str>,
+    db_anchor: Option<&std::path::Path>,
+) -> anyhow::Result<MultiBackendRegistry> {
     // Regression fence: `base_config.db_path` feeds `compute_config_id` below,
     // so it must agree with the canonical anchor for this same `--db` input.
     // This is the shared choke point both multi-backend boot paths funnel
     // through — `build_server_multi_backend` in this file and `kkernel`'s
     // `Command::Mcp` coordinator-attached branch — so the guard lives here
     // once instead of at each caller.
-    khive_runtime::assert_db_anchor_consistent(base_config.db_path.as_deref(), cli_db_override)?;
+    khive_runtime::assert_captured_db_anchor_consistent(base_config.db_path.as_deref(), db_anchor)?;
 
+    build_registry_for_multi_backend_inner(base_config, khive_cfg, cli_db_override)
+}
+
+fn build_registry_for_multi_backend_inner(
+    base_config: RuntimeConfig,
+    khive_cfg: &KhiveConfig,
+    cli_db_override: Option<&str>,
+) -> anyhow::Result<MultiBackendRegistry> {
     let backend_count = khive_cfg.backends.len();
     let force_memory = match cli_db_override {
         Some(":memory:") => {
@@ -1446,14 +1425,11 @@ pub(crate) fn is_strict_actor_mode() -> bool {
 /// - `khive_mcp::pending_events::run_pending_events` — drains and dispatches
 ///   scheduled events
 ///
-/// **Pure-introspection registry construction is intentionally EXEMPT** because it
-/// never dispatches verbs or reads comm/tenant data, so it carries no
-/// tenant-isolation risk. Requiring an actor identity there would make
-/// `kkernel pack list` and `kkernel kg validate` fail under strict mode without
-/// any security benefit — an operator must be able to introspect a strict-mode
-/// deployment. Exempt paths: `build_registry` in `crates/kkernel/src/pack_introspect.rs`
-/// and `build_taxonomy` in `crates/kkernel/src/kg/validate.rs`. Each of those
-/// functions carries an inline comment explaining why.
+/// **Pure-introspection registry construction is intentionally EXEMPT**
+/// (`build_registry` in `crates/kkernel/src/pack_introspect.rs`,
+/// `build_taxonomy` in `crates/kkernel/src/kg/validate.rs`) because it never
+/// dispatches verbs or reads comm/tenant data — an operator must still be
+/// able to introspect a strict-mode deployment.
 pub fn enforce_strict_actor_mode(
     actor_id: Option<&str>,
     loaded_packs: &[String],
@@ -1472,25 +1448,16 @@ pub fn enforce_strict_actor_mode(
 /// Build a fully-configured server from parsed args (without serving).
 ///
 /// Returns, alongside the server, the resolved [`KhiveRuntime`] handle the
-/// `"schedule"` pack is bound to — `None` when the resolved pack set does not
-/// include `"schedule"` — for `spawn_schedule_tick_loop_if_daemon` to drain
-/// against (ADR-106). This is the SAME runtime the server itself dispatches
-/// through: a single-backend boot shares one `KhiveRuntime` across every
-/// pack, and a multi-backend boot (ADR-028 `[[backends]]`) returns the
-/// specific per-pack runtime `"schedule"` was wired to. Threading this
-/// through — rather than having the tick loop re-resolve its own
-/// `RuntimeConfig` from raw `--db`/namespace args is the fix for PR #782: a
-/// second, independently-resolved config could
-/// silently target a different database, actor identity, or pack set than
-/// the daemon it claims to serve.
+/// `"schedule"` pack is bound to — `None` when the resolved pack set does
+/// not include `"schedule"` — for `spawn_schedule_tick_loop_if_daemon` to
+/// drain against (ADR-106). This is the SAME runtime the server itself
+/// dispatches through, never an independently re-resolved one (PR #782 —
+/// see `crates/khive-mcp/docs/api/pending-events.md`).
 ///
 /// Thin wrapper over [`build_server_with_explicit_namespace`]: derives the
-/// `(namespace, namespace_explicit)` pair from a real CLI parse via
-/// [`resolve_cli_namespace`], and — because this is the genuine `--actor`
-/// / `--namespace` CLI flag path — also treats that explicitness as a real
-/// actor override (`actor_explicit` mirrors `namespace_explicit` here; see
-/// `RuntimeConfigInputs::actor_explicit`'s field doc for why only this call
-/// site is allowed to do that).
+/// `(namespace, namespace_explicit)` pair from a real CLI parse and, because
+/// this is the genuine `--actor`/`--namespace` CLI flag path, also treats
+/// that explicitness as a real actor override.
 pub fn build_server(args: &Args) -> anyhow::Result<(KhiveMcpServer, Option<KhiveRuntime>)> {
     let (cli_namespace_explicit, cli_namespace) =
         resolve_cli_namespace(args).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1505,30 +1472,23 @@ pub fn build_server(args: &Args) -> anyhow::Result<(KhiveMcpServer, Option<Khive
 /// Build a fully-configured server from parsed args plus an independently
 /// resolved `(namespace, namespace_explicit, actor_explicit)` triple.
 ///
-/// Extracted from [`build_server`] (PR #782) so
-/// that non-interactive-CLI callers — e.g. the `--pending-events` one-shot
-/// drain wrapper in `pending_events.rs` — can supply a namespace default
-/// without it being misread as a genuine `--actor` override. `build_server`
-/// derives its namespace from a real CLI parse (`resolve_cli_namespace`),
-/// where "a namespace value is present" and "the operator explicitly
-/// overrode the actor identity" are the same fact by construction — there is
-/// no way to type `--namespace foo` without meaning it. A caller that
-/// synthesizes an `Args` value programmatically (no real flag parse behind
-/// it) does not get to make that same inference: passing a default
-/// namespace through `namespace_explicit: true` while asserting the actor
-/// identity was never touched (`actor_explicit: false`) is exactly the
-/// `kkernel exec` / `kkernel reindex` shape (see their own
-/// `resolve_runtime_config` call sites and the field doc on
-/// `RuntimeConfigInputs::actor_explicit`), and this function is the seam
-/// that lets any caller opt into that same, narrower semantic instead of
-/// `build_server`'s CLI-only one.
+/// Extracted from [`build_server`] (PR #782) so non-interactive-CLI callers
+/// (e.g. the `--pending-events` one-shot drain wrapper) can supply a
+/// namespace default without it being misread as a genuine `--actor`
+/// override. `build_server` derives `namespace_explicit` from a real CLI
+/// parse, where "a namespace value is present" and "the operator explicitly
+/// overrode the actor identity" are the same fact by construction. A caller
+/// that synthesizes an `Args` value programmatically does not get to make
+/// that inference — pass `actor_explicit: false` while `namespace_explicit`
+/// is still `true` (the `kkernel exec` / `kkernel reindex` shape; see
+/// `RuntimeConfigInputs::actor_explicit`'s field doc).
 pub fn build_server_with_explicit_namespace(
     args: &Args,
     namespace: khive_runtime::Namespace,
     namespace_explicit: bool,
     actor_explicit: bool,
 ) -> anyhow::Result<(KhiveMcpServer, Option<KhiveRuntime>)> {
-    let config = resolve_runtime_config(RuntimeConfigInputs {
+    let (config, db_anchor) = resolve_runtime_config_with_db_anchor(RuntimeConfigInputs {
         db: args.db.as_deref(),
         config: args.config.as_deref(),
         namespace,
@@ -1547,7 +1507,10 @@ pub fn build_server_with_explicit_namespace(
     // resolver derives from this same `--db` input, or `config_id` (computed
     // from `config.db_path` below) would silently desynchronize this process
     // from any daemon/peer anchored on the same database.
-    khive_runtime::assert_db_anchor_consistent(config.db_path.as_deref(), args.db.as_deref())?;
+    khive_runtime::assert_captured_db_anchor_consistent(
+        config.db_path.as_deref(),
+        db_anchor.as_deref(),
+    )?;
 
     // Load the KhiveConfig to check for multi-backend declarations (ADR-028).
     // When no [[backends]] are declared, fall through to the existing single-backend path
@@ -1603,7 +1566,12 @@ pub fn build_server_with_explicit_namespace(
     }
 
     // Multi-backend path (ADR-028).
-    let multi = build_registry_for_multi_backend(config, &khive_cfg, args.db.as_deref())?;
+    let multi = build_registry_for_multi_backend_with_db_anchor(
+        config,
+        &khive_cfg,
+        args.db.as_deref(),
+        db_anchor.as_deref(),
+    )?;
     let schedule_rt = multi
         .per_pack_runtimes
         .get("schedule")
@@ -1667,10 +1635,28 @@ pub fn build_server_multi_backend(
     khive_cfg: &KhiveConfig,
     cli_db_override: Option<&str>,
 ) -> anyhow::Result<KhiveMcpServer> {
+    khive_runtime::assert_db_anchor_consistent(base_config.db_path.as_deref(), cli_db_override)?;
+    let multi = build_registry_for_multi_backend_inner(base_config, khive_cfg, cli_db_override)?;
+    Ok(build_server_from_multi_backend_registry(
+        multi, khive_cfg, None,
+    ))
+}
+
+pub fn build_server_multi_backend_with_db_anchor(
+    base_config: RuntimeConfig,
+    khive_cfg: &KhiveConfig,
+    cli_db_override: Option<&str>,
+    db_anchor: Option<&std::path::Path>,
+) -> anyhow::Result<KhiveMcpServer> {
     // The db-anchor consistency guard runs inside `build_registry_for_multi_backend`
     // (the shared choke point every multi-backend boot path funnels through),
     // so it is not duplicated here.
-    let multi = build_registry_for_multi_backend(base_config, khive_cfg, cli_db_override)?;
+    let multi = build_registry_for_multi_backend_with_db_anchor(
+        base_config,
+        khive_cfg,
+        cli_db_override,
+        db_anchor,
+    )?;
     Ok(build_server_from_multi_backend_registry(
         multi, khive_cfg, None,
     ))
@@ -1903,7 +1889,18 @@ pub struct RuntimeConfigInputs<'a> {
 /// default/env model set while the MCP server serves recall from the
 /// config-file `[[engines]]` set.
 pub fn resolve_runtime_config(inputs: RuntimeConfigInputs<'_>) -> anyhow::Result<RuntimeConfig> {
-    let db_path = khive_runtime::resolve_db_anchor(inputs.db);
+    let (config, _) = resolve_runtime_config_with_db_anchor(inputs)?;
+    Ok(config)
+}
+
+/// Resolve a [`RuntimeConfig`] and return the database anchor captured at the
+/// same construction boundary. Server boot paths thread this value through
+/// consistency validation and registry construction without re-reading HOME.
+pub fn resolve_runtime_config_with_db_anchor(
+    inputs: RuntimeConfigInputs<'_>,
+) -> anyhow::Result<(RuntimeConfig, Option<PathBuf>)> {
+    let db_anchor = khive_runtime::resolve_db_anchor(inputs.db);
+    let db_path = db_anchor.clone();
 
     let packs = inputs
         .packs
@@ -2026,7 +2023,7 @@ pub fn resolve_runtime_config(inputs: RuntimeConfigInputs<'_>) -> anyhow::Result
 
     // Tier-3 env fallback: KHIVE_BRAIN_PROFILE is applied AFTER CLI (tier-1) and
     // config-file (tier-2) so that a project or global TOML always wins over the env var.
-    Ok(apply_env_brain_profile(resolved))
+    Ok((apply_env_brain_profile(resolved), db_anchor))
 }
 
 /// Apply `KHIVE_BRAIN_PROFILE` env var as the tier-3 fallback for `brain_profile`.
@@ -3584,10 +3581,12 @@ id = "lambda:project-actor"
             }
         };
 
-        // One message to a different actor, one to ourselves.
+        // One message to a different actor, one explicit message to ourselves.
         let to_a = dispatch(r#"comm.send(to="actor-a", content="for-a")"#.to_string()).await;
         assert_eq!(to_a["results"][0]["ok"].as_bool(), Some(true), "{to_a}");
-        let to_b = dispatch(r#"comm.send(to="actor-b", content="for-b")"#.to_string()).await;
+        let to_b =
+            dispatch(r#"comm.send(to="actor-b", content="for-b", self_send=true)"#.to_string())
+                .await;
         assert_eq!(to_b["results"][0]["ok"].as_bool(), Some(true), "{to_b}");
 
         // Inbox for the configured actor (actor-b) must be filtered by to_actor.
@@ -3789,26 +3788,37 @@ id = "lambda:project-actor"
         );
     }
 
-    /// B-SHOULD-FIX-2 (data safety): Two [[backends]] entries whose sqlite paths
-    /// canonicalize to the same file must share a single Arc<StorageBackend> and
-    /// run migrations only once. Verified by using two names that differ only by
-    /// `./` prefix while pointing at the same absolute path.
-    #[test]
-    #[serial]
-    fn duplicate_sqlite_paths_deduplicated_to_single_backend() {
+    /// RAII guard: redirects `HOME` and restores the prior value on drop.
+    struct HomeGuard {
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl HomeGuard {
+        fn redirect_to(dir: &std::path::Path) -> Self {
+            let original = std::env::var_os("HOME");
+            std::env::set_var("HOME", dir);
+            Self { original }
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    fn duplicate_sqlite_path_config(db_path: &std::path::Path) -> KhiveConfig {
         use khive_runtime::PackConfig;
 
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("shared.db");
-        let db_path_str = db_path.to_str().unwrap();
-
-        // Two backend names pointing to the same file (one with ./ prefix).
-        let khive_cfg = KhiveConfig {
+        KhiveConfig {
             backends: vec![
                 BackendConfig {
                     name: "main".to_string(),
                     kind: BackendKind::Sqlite,
-                    path: Some(db_path.clone()),
+                    path: Some(db_path.to_path_buf()),
                     cache_mb: None,
                     journal_mode: None,
                     read_only: false,
@@ -3816,25 +3826,120 @@ id = "lambda:project-actor"
                 BackendConfig {
                     name: "alias".to_string(),
                     kind: BackendKind::Sqlite,
-                    path: Some(db_path.clone()),
+                    path: Some(db_path.to_path_buf()),
                     cache_mb: None,
                     journal_mode: None,
                     read_only: false,
                 },
             ],
             packs: {
-                let mut m = std::collections::HashMap::new();
-                m.insert(
+                let mut packs = std::collections::HashMap::new();
+                packs.insert(
                     "comm".to_string(),
                     PackConfig {
                         backend: "alias".to_string(),
                     },
                 );
-                m
+                packs
             },
             ..KhiveConfig::default()
+        }
+    }
+
+    fn memory_main_backend_config() -> KhiveConfig {
+        KhiveConfig {
+            backends: vec![BackendConfig {
+                name: "main".to_string(),
+                kind: BackendKind::Memory,
+                path: None,
+                cache_mb: None,
+                journal_mode: None,
+                read_only: false,
+            }],
+            ..KhiveConfig::default()
+        }
+    }
+
+    fn assert_db_anchor_drift<T>(result: anyhow::Result<T>) {
+        match result {
+            Err(error) => assert!(
+                error.to_string().contains("db-path resolution drift"),
+                "legacy builder must reject raw db input that disagrees with the resolved config: {error}"
+            ),
+            Ok(_) => panic!("legacy builder accepted raw db input that disagrees with the resolved config"),
+        }
+    }
+
+    #[test]
+    fn legacy_registry_rejects_mismatched_explicit_db_override() {
+        let base_cfg = RuntimeConfig {
+            db_path: Some(PathBuf::from("/tmp/khive-resolved.db")),
+            ..base_runtime_config_for_multi_backend()
         };
-        let _ = db_path_str; // used above to show intent
+
+        assert_db_anchor_drift(build_registry_for_multi_backend(
+            base_cfg,
+            &memory_main_backend_config(),
+            Some("/tmp/khive-raw.db"),
+        ));
+    }
+
+    #[test]
+    fn legacy_server_rejects_mismatched_explicit_db_override() {
+        let base_cfg = RuntimeConfig {
+            db_path: Some(PathBuf::from("/tmp/khive-resolved.db")),
+            ..base_runtime_config_for_multi_backend()
+        };
+
+        assert_db_anchor_drift(build_server_multi_backend(
+            base_cfg,
+            &memory_main_backend_config(),
+            Some("/tmp/khive-raw.db"),
+        ));
+    }
+
+    #[test]
+    #[serial]
+    fn legacy_registry_rejects_unset_db_after_home_changes() {
+        let first_home = tempfile::tempdir().unwrap();
+        let _home_guard = HomeGuard::redirect_to(first_home.path());
+        let base_cfg = base_runtime_config_for_multi_backend();
+        let second_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", second_home.path());
+
+        assert_db_anchor_drift(build_registry_for_multi_backend(
+            base_cfg,
+            &memory_main_backend_config(),
+            None,
+        ));
+    }
+
+    #[test]
+    #[serial]
+    fn legacy_server_rejects_unset_db_after_home_changes() {
+        let first_home = tempfile::tempdir().unwrap();
+        let _home_guard = HomeGuard::redirect_to(first_home.path());
+        let base_cfg = base_runtime_config_for_multi_backend();
+        let second_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", second_home.path());
+
+        assert_db_anchor_drift(build_server_multi_backend(
+            base_cfg,
+            &memory_main_backend_config(),
+            None,
+        ));
+    }
+
+    /// B-SHOULD-FIX-2 (data safety): Two [[backends]] entries whose sqlite paths
+    /// canonicalize to the same file must share a single Arc<StorageBackend> and
+    /// run migrations only once. Verified by using two names that differ only by
+    /// `./` prefix while pointing at the same absolute path.
+    #[test]
+    #[serial]
+    fn duplicate_sqlite_paths_deduplicated_to_single_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("shared.db");
+        let khive_cfg = duplicate_sqlite_path_config(&db_path);
 
         let base_cfg = base_runtime_config_for_multi_backend();
 
@@ -3843,6 +3948,48 @@ id = "lambda:project-actor"
         if let Err(ref e) = result {
             panic!(
                 "two backends with the same canonical path must share one Arc and boot ok; got: {e}"
+            );
+        }
+    }
+
+    /// Regression for #720: changing `HOME` after runtime-config resolution but
+    /// before multi-backend registry construction must not change the database
+    /// anchor used by the consistency guard.
+    #[test]
+    #[serial]
+    fn multi_backend_boot_uses_anchor_captured_by_runtime_config() {
+        let first_home = tempfile::tempdir().unwrap();
+        let _home_guard = HomeGuard::redirect_to(first_home.path());
+        let config_path = first_home.path().join("config.toml");
+        std::fs::write(&config_path, "").expect("write empty config");
+        let (base_cfg, db_anchor) = resolve_runtime_config_with_db_anchor(RuntimeConfigInputs {
+            db: None,
+            config: Some(&config_path),
+            namespace: Namespace::parse("local").expect("namespace"),
+            namespace_explicit: false,
+            actor_explicit: false,
+            no_embed: true,
+            packs: Some(vec!["kg".to_string()]),
+            brain_profile: None,
+        })
+        .expect("resolve runtime config before HOME changes");
+
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("shared.db");
+        let khive_cfg = duplicate_sqlite_path_config(&db_path);
+
+        let second_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", second_home.path());
+        let result = build_server_multi_backend_with_db_anchor(
+            base_cfg,
+            &khive_cfg,
+            None,
+            db_anchor.as_deref(),
+        );
+        if let Err(error) = result {
+            panic!(
+                "multi-backend construction must retain the anchor captured by \
+                 resolve_runtime_config instead of re-reading HOME: {error}"
             );
         }
     }

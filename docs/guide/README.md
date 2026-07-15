@@ -5,6 +5,7 @@ Documentation for using khive as a research knowledge graph runtime.
 | Guide                                               | What it covers                                  |
 | --------------------------------------------------- | ----------------------------------------------- |
 | [Getting Started](getting-started.md)               | Install, connect, first session                 |
+| [Request and DSL](request-and-dsl.md)               | Single tool, syntax, batches, chains, errors    |
 | [Knowledge Graph Modeling](knowledge-graph.md)      | Entity kinds, edge relations, modeling patterns |
 | [Prompt Cookbook](prompt-cookbook.md)               | 20+ real-world verb patterns with examples      |
 | [Search and Retrieval](search.md)                   | FTS, vector, hybrid fusion, reranking           |

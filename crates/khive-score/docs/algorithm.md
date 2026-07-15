@@ -38,7 +38,7 @@ The Lean proof in `proofs/` guarantees that arithmetic operations never produce 
 
 ## Distance conversion
 
-See [`docs/distance-conversion.md`](distance-conversion.md) for formulas, invariants, and the
+See [`docs/api/distance-conversion.md`](api/distance-conversion.md) for formulas, invariants, and the
 deprecation note on `score_from_distance`.
 
 ## Aggregation

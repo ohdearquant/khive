@@ -1,87 +1,27 @@
-//! Periodic WAL checkpoint task for the connection pool.
+//! Periodic WAL checkpoint task for the connection pool (ADR-091).
 //!
-//! Issues `PRAGMA wal_checkpoint(PASSIVE)` on every tick — including when the
-//! WAL page count exceeds the high-water mark. Ordinary ticks stay
-//! PASSIVE-only and non-blocking; a rare, separately-gated escalation may
-//! additionally run `PRAGMA wal_checkpoint(TRUNCATE)` under the same writer
-//! guard with a shortened busy timeout — see the ADR-091 Plank 2 doc below
-//! for the escalation's own gating.
+//! Issues `PRAGMA wal_checkpoint(PASSIVE)` on every tick — non-blocking, never
+//! waits for readers. A rare, separately-gated escalation may additionally run
+//! `PRAGMA wal_checkpoint(TRUNCATE)` once WAL pressure crosses
+//! `truncate_high_water_pages` and `truncate_min_interval` has elapsed since
+//! the last attempt (Plank 2); both run under the single writer checkout
+//! `checkpoint_once` holds for that tick. `checkpoint_once` uses
+//! `try_writer_nowait` (zero-wait `try_lock`) so a tick is skipped immediately
+//! when the writer mutex is held, rather than blocking — a skipped tick is
+//! always preferable to stalling write traffic.
 //!
-//! Non-contending design: `checkpoint_once` uses `try_writer_nowait` (zero-wait
-//! `try_lock`) so a tick is skipped immediately when any writer holds the mutex,
-//! rather than blocking for up to `checkout_timeout`. The checkpoint task must
-//! never stall active write traffic — a skipped tick is always preferable.
+//! `warn_pages` / `high_water_pages` WARNs fire at most once per below→above
+//! crossing; a skipped tick leaves crossing state unchanged. An age-based
+//! background sweep (Plank 1) additionally checks the oldest span in
+//! `khive_storage::tx_registry` against `tx_warn_secs`/`tx_max_age_secs` on
+//! every tick (Skipped or Observed) and escalates to `warn!`/`error!` on each
+//! below→above crossing — visibility only, nothing here force-closes a stale
+//! span.
 //!
-//! Why TRUNCATE is excluded from *every ordinary* tick: TRUNCATE inherits
-//! RESTART semantics — it waits for active readers to release their WAL
-//! snapshots and invokes the busy handler before acquiring the exclusive lock
-//! needed to reset the WAL file. With PoolConfig's 30 s busy_timeout, blindly
-//! running it every tick could sit inside SQLite holding the sole writer
-//! connection for up to 30 s, stalling all normal write traffic. PASSIVE never
-//! waits for readers; it checkpoints as many frames as currently possible and
-//! returns promptly. When WAL pressure is sustained (high_water_pages
-//! exceeded), the task emits a WARNING; once WAL pressure reaches the much
-//! higher `truncate_high_water_pages` mark, the rare Plank 2 escalation below
-//! may additionally attempt a bounded, rate-limited TRUNCATE under a
-//! deliberately shortened busy timeout — replacing what used to be a purely
-//! operator-scheduled manual step.
-//!
-//! Threshold-crossing WARN semantics: both the `warn_pages` and `high_water_pages`
-//! warnings fire at most once per below→above crossing. Skipped ticks (writer
-//! busy) leave the crossing state unchanged so that a skip cannot spuriously
-//! re-arm the rate limit while WAL pressure is still elevated. The ADR-091
-//! Plank 0 open-transaction-registry WARNs (oldest-entry escalation and the
-//! high-water snapshot enumeration) ride the SAME crossing gates — they are
-//! not independently rate-limited, so they never repeat on consecutive ticks
-//! that remain above a threshold. Only the per-tick `debug!` trace of the
-//! oldest open entry, and the ADR-091 Plank 1 age sweep below, run
-//! unconditionally on every tick — including a Skipped one; the sweep's own
-//! emissions stay edge-triggered per rung via `TxAgeSweepState`.
-//!
-//! ADR-091 Plank 2: rare TRUNCATE escalation. The periodic tick above stays
-//! PASSIVE-only and non-blocking; on top of it, `checkpoint_once` also
-//! evaluates a much rarer escalation to `PRAGMA wal_checkpoint(TRUNCATE)`
-//! once the WAL has grown past `truncate_high_water_pages` and at least
-//! `truncate_min_interval` has elapsed since the last TRUNCATE *attempt*
-//! (not the last successful reclaim). This is a **single writer checkout per
-//! tick**: PASSIVE and any due TRUNCATE both run under the one guard
-//! `checkpoint_once` already holds — there is never a second concurrent
-//! checkout for TRUNCATE. If the writer mutex is busy, both PASSIVE and any
-//! due TRUNCATE are skipped for that tick, and `last_truncate_attempt` is
-//! left untouched so the next tick where the writer is free is immediately
-//! eligible rather than waiting out the full interval again.
-//! `last_truncate_attempt` only advances on a tick that actually attempted
-//! TRUNCATE (writer held, threshold crossed, interval elapsed) — never on a
-//! skip for any reason (writer busy, below threshold, interval not yet up).
-//! TRUNCATE runs under a temporarily shortened `busy_timeout`
-//! (`truncate_busy_timeout`), restored on the writer connection immediately
-//! after the attempt, win or lose. No transaction is ever killed or aborted
-//! here — the tx_registry is only read for diagnostics; Plank 1 (below) owns
-//! the registry's own bound.
-//!
-//! ADR-091 Plank 1: age-based background sweep, not per-statement rejection.
-//! The ADR's original text describes a "cooperative stale-op guard" that
-//! rejects further statements and rolls back a late `commit()` on a
-//! `SqliteTransaction`/`begin_tx` span past `KHIVE_TX_MAX_AGE_SECS`. That API
-//! no longer exists in this codebase: ADR-067's `atomic_unit` replaced every
-//! production write-transaction path with a closure that structurally cannot
-//! outlive its own call (single-poll-enforced on the write-queue path), which
-//! is the ADR's own named follow-up ("closure-scoped transaction API"),
-//! already delivered for writes by a later ADR. What ships here instead is
-//! the part of Plank 1 that still applies to every registered span
-//! regardless of which mechanism created it: on EVERY tick — Skipped as well
-//! as Observed, since a registered `WriterGuard::transaction` span holds the
-//! writer mutex for its whole lifetime and would otherwise make the busiest,
-//! most relevant tick invisible to this sweep — `TxAgeSweepState` checks
-//! `khive_storage::tx_registry::oldest()`'s age against
-//! `tx_warn_secs`/`tx_max_age_secs` and escalates to `warn!`/`error!` on each
-//! below→above crossing (same debounce idiom as the WAL-pressure ladder — a
-//! sustained stale span logs once per rung, not once per tick), also
-//! re-arming both rungs if the oldest entry's identity changes between ticks
-//! so a departed span's latched state cannot suppress its replacement. This
-//! is visibility, not reclamation: nothing here force-closes a stale span,
-//! matching the ADR's own accepted gap for a transaction "held idle across
-//! an await with no further calls."
+//! See crates/khive-db/docs/api/checkpoint.md#module-overview-adr-091-planks-012
+//! for full ADR-091 Plank 0/1/2 design rationale (why TRUNCATE is excluded
+//! from ordinary ticks, the single-writer-checkout invariant, and why Plank 1
+//! is a sweep rather than the ADR's originally-described per-statement guard).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -90,18 +30,8 @@ use std::time::{Duration, Instant};
 use crate::pool::{ConnectionPool, WriterGuard};
 
 // ── metrics read-surface (load/perf harness) ─────────────────────────────
-//
-// Process-wide gauges mirroring the fallback-counter pattern in
-// `khive-mcp/src/daemon.rs` (`FALLBACK_*` statics + their `pub(crate)`
-// accessors): the checkpoint task is a single fire-and-forget
-// `tokio::spawn` with no handle retained anywhere the daemon's
-// connection-accept loop can reach, so these are plain module-scoped
-// atomics rather than a struct threaded through every `checkpoint_once`/
-// `maybe_truncate`/`note_truncate_outcome` call site (and, transitively,
-// every existing test call site). Read-only surface: nothing here is ever
-// reset outside `#[cfg(test)]`, and nothing reachable over the daemon wire
-// can reset them either (see `khive_runtime::daemon::DaemonRequestFrame::
-// metrics_only`).
+// Read-only process-wide gauges (never reset outside #[cfg(test)]). See
+// crates/khive-db/docs/api/checkpoint.md#metrics-read-surface-loadperf-harness
 
 /// Last-observed WAL page count (`query_wal_pages`'s return value on its
 /// most recent call, from either `checkpoint_once` or `maybe_truncate`).
@@ -289,30 +219,18 @@ pub struct CheckpointConfig {
     pub truncate_busy_timeout: Duration,
 
     /// ADR-091 Plank 1 soft cap: age past which the oldest entry in the
-    /// shared open-transaction registry (`khive_storage::tx_registry`,
-    /// covering every registered span regardless of which call site created
-    /// it) is surfaced at `tracing::warn!` on the background sweep this
-    /// module runs on EVERY tick — Skipped as well as Observed — independent
-    /// of WAL page pressure: a registered span can go stale while
-    /// `wal_pages` sits well under `warn_pages`, or while the writer is busy
-    /// and no WAL page count is sampled at all this tick.
+    /// shared open-transaction registry is surfaced at `tracing::warn!` on
+    /// every tick (Skipped or Observed), independent of WAL page pressure.
+    /// See `crates/khive-db/docs/api/checkpoint.md` for the Plank 1 rationale.
     ///
     /// Overridable via `KHIVE_TX_WARN_SECS`.
     /// Default: 30 seconds.
     pub tx_warn_secs: Duration,
 
-    /// ADR-091 Plank 1 cooperative-stale-op-guard threshold: age past which
-    /// the same sweep escalates the oldest registry entry to
-    /// `tracing::error!`. This module has no per-statement hook back into a
-    /// registered span's own caller to reject further statements or force a
-    /// rollback the way the ADR's original text describes — that mechanism
-    /// targeted `SqliteTransaction`/`begin_tx`, which ADR-067's `atomic_unit`
-    /// closure API has since replaced for every production write path (a
-    /// closure that structurally cannot outlive its own call is the ADR's
-    /// own named follow-up, already delivered for writes by a later ADR).
-    /// So past this age the sweep can only make a stale span maximally
-    /// visible — not force-close it — exactly the accepted gap the ADR
-    /// itself documents under Failure modes.
+    /// ADR-091 Plank 1 hard cap: age past which the same sweep escalates the
+    /// oldest registry entry to `tracing::error!`. This is visibility only —
+    /// nothing here can force-close a stale span; see
+    /// `crates/khive-db/docs/design.md` for why.
     ///
     /// Overridable via `KHIVE_TX_MAX_AGE_SECS`.
     /// Default: 120 seconds.
@@ -592,15 +510,10 @@ pub struct TxAgeEmission {
 /// into `tracing` calls, mirroring [`CheckpointSeverityState`]'s shape.
 ///
 /// Keyed off `khive_storage::tx_registry::oldest()` — the single oldest
-/// entry across every registered span, regardless of which call site
-/// (`atomic_unit`, `WriterGuard::transaction`, a store's own batch-upsert
-/// helper, or `graph.rs`'s chunked-traversal read snapshot) created it. This
-/// is deliberately a different signal from the WAL-pressure ladder: a
-/// registered span can go stale while `wal_pages` sits well under
-/// `warn_pages` (nothing has pinned the checkpoint boundary yet), and
-/// conversely `wal_pages` can be elevated with an empty registry (the pin,
-/// if any, is outside this process — see the ADR's own "route reads through
-/// the daemon" alternative, out of scope here).
+/// entry across every registered span, regardless of which call site created
+/// it. Deliberately a different signal from the WAL-pressure ladder: a span
+/// can go stale under low WAL pressure, or vice versa. See
+/// `crates/khive-db/docs/api/checkpoint.md` for the full rationale.
 #[derive(Debug, Default, Clone)]
 pub struct TxAgeSweepState {
     /// Whether the previous observed tick's oldest entry was at/above
@@ -618,26 +531,16 @@ pub struct TxAgeSweepState {
 
 impl TxAgeSweepState {
     /// Advance by one observed tick given the registry's current oldest
-    /// entry (identity, age, label), or `None` if the registry is empty.
-    /// Returns zero, one, or two emissions: an entry can cross both rungs on
-    /// the same tick if it was already stale the first time this sweep
-    /// observed it in that identity — e.g. right after process start, or
-    /// right after it became the new oldest entry by replacing a
-    /// since-closed span.
+    /// entry (identity, age, label), or `None` if empty. Returns zero, one,
+    /// or two emissions — an entry already stale the first time it's seen
+    /// under a given identity crosses both rungs on the same tick.
     ///
-    /// A below-threshold oldest entry (or no entry at all) resets both
-    /// latches, so a future stale span re-arms both rungs. Identity is also
-    /// tracked explicitly: if the oldest entry's [`TxId`](khive_storage::tx_registry::TxId)
-    /// differs from the previous tick's, both latches are force-reset before
-    /// re-evaluating the new entry's age, even though this happens on the
-    /// SAME tick as the age check (not a separate below-threshold tick in
-    /// between). Without this, an already-latched-`true` state from the
-    /// *departed* entry would silently suppress the crossing for a
-    /// *different* span that replaced it while already stale — naming
-    /// nobody at exactly the moment a new long-lived span starts pinning the
-    /// database, which is the scenario this sweep exists to catch. A merely
-    /// fresher replacement still reads as below-threshold either way, so the
-    /// identity check changes behavior only for an already-stale successor.
+    /// A below-threshold (or absent) oldest entry resets both latches. A
+    /// change in the oldest entry's [`TxId`](khive_storage::tx_registry::TxId)
+    /// also force-resets both latches before re-evaluating age, so a
+    /// departed span's latched state cannot suppress the crossing for an
+    /// already-stale successor. See `crates/khive-db/docs/api/checkpoint.md`
+    /// for why identity tracking is required here, not just the age check.
     pub fn observe(
         &mut self,
         oldest: Option<(khive_storage::tx_registry::TxId, Duration, Option<String>)>,
@@ -710,45 +613,23 @@ fn log_tx_age_emission(emission: &TxAgeEmission) {
 
 /// Run the WAL checkpoint background task.
 ///
-/// This is a long-running async task that should be spawned with
-/// `tokio::spawn`. It loops until `shutdown_rx` observes a change (or its
-/// sender is dropped), at which point it exits on its next `select!` wakeup.
-/// Callers should hold the paired `tokio::sync::watch::Sender` for the
-/// daemon's run scope and send on it as part of the shutdown sequence.
+/// Long-running async task — spawn with `tokio::spawn`. Loops until
+/// `shutdown_rx` observes a change (or its sender is dropped). Callers MUST
+/// hold the paired `tokio::sync::watch::Sender` for the daemon's run scope
+/// and send on it to shut down — do NOT rely on `pool`'s `Arc` refcount
+/// reaching zero; a sibling owner (e.g. `event_store`) holding its own clone
+/// makes that check unreachable (issue #774).
 ///
-/// An earlier version of this task used `Arc::strong_count(&pool) <= 1` as
-/// its exit condition instead of an explicit signal. That check is
-/// unreachable whenever a sibling owner holds its own clone of `pool` for
-/// the task's lifetime — which the production boot path does: `event_store`
-/// (`Option<Arc<dyn EventStore>>`), when `Some`, is a `SqlEventStore` that
-/// retains its own `Arc::clone` of the same pool, so the task always
-/// observed `strong_count == 2` and never exited via that mechanism
-/// (issue #774). The explicit watch channel does not depend on how many
-/// other owners exist.
+/// Issues `PRAGMA wal_checkpoint(PASSIVE)` every tick via `try_writer_nowait`
+/// (zero-wait try-lock): a busy writer skips the tick rather than stalling
+/// write traffic. A WARNING fires once per below→above threshold crossing,
+/// not every tick.
 ///
-/// The task issues `PRAGMA wal_checkpoint(PASSIVE)` on every tick — ordinary
-/// ticks stay PASSIVE-only and non-blocking; see the module-level doc for the
-/// rare Plank 2 TRUNCATE escalation `checkpoint_once` may additionally run
-/// under the same writer guard when WAL pressure is sustained past
-/// `truncate_high_water_pages`. A WARNING is emitted once on threshold
-/// crossing (wal_pages transitions from below a threshold to at/above) rather
-/// than on every tick, preventing log spam when a long-lived reader pins a
-/// WAL snapshot.
-///
-/// Skipped ticks (writer mutex busy) leave both crossing-state flags unchanged
-/// so that a skip cannot spuriously re-arm the rate limit while WAL pressure is
-/// still elevated.
-///
-/// Uses `try_writer_nowait` (zero-wait try-lock) so a busy writer causes the
-/// current tick to be skipped rather than stalling write traffic.
-///
-/// `event_store` (ADR-094): when `Some`, this task appends a best-effort
-/// `CheckpointOutcomeRecorded` lifecycle event on every tick where WAL
-/// pressure is at/above `warn_pages`, plus exactly one drain row on the tick
-/// that observes pressure fall back below `warn_pages` after an elevated
-/// episode — never on every ordinary below-warn tick. `namespace` is
-/// stamped on those rows. `None` makes event emission a pure no-op, exactly
-/// like an unconfigured audit sink elsewhere in the runtime.
+/// `event_store` (ADR-094): when `Some`, appends a best-effort
+/// `CheckpointOutcomeRecorded` event on every at/above-`warn_pages` tick,
+/// plus one drain row when pressure falls back below `warn_pages`. `None` is
+/// a no-op. See `crates/khive-db/docs/api/checkpoint.md` for the full
+/// shutdown-mechanism and event-emission design history.
 pub async fn run_checkpoint_task(
     pool: Arc<ConnectionPool>,
     config: CheckpointConfig,
@@ -936,10 +817,8 @@ async fn append_checkpoint_lifecycle_event<P: serde::Serialize>(
 /// the WAL frame count at `debug!`, on EVERY tick regardless of threshold
 /// state. This is the low-volume per-tick trace; the WARN-level escalations
 /// live in [`log_tx_registry_oldest_warn`] and
-/// [`log_tx_registry_snapshot_warn`], both of which are gated on threshold
-/// *crossing* by the caller (`run_checkpoint_task`) so they fire once per
-/// crossing rather than once per tick. Observe only: this never enforces or
-/// force-closes anything.
+/// debug-level, unconditional per-tick trace. See
+/// crates/khive-db/docs/api/checkpoint.md#private-tx-registry-logging-helpers-plank-0
 fn log_tx_registry_oldest_debug(wal_pages: u64) {
     if let Some((_id, age, label)) = khive_storage::tx_registry::oldest() {
         tracing::debug!(
@@ -951,11 +830,9 @@ fn log_tx_registry_oldest_debug(wal_pages: u64) {
     }
 }
 
-/// ADR-091 Plank 0: escalate the oldest open registry entry to `warn!`.
-///
-/// Callers MUST gate this on a below→above `warn_pages` crossing (via
-/// `crossing_warn`) — it is not rate-limited internally, so calling it every
-/// tick would reproduce the log-spam bug this rewrite fixes.
+/// Escalates the oldest open registry entry to `warn!`. NOT internally
+/// rate-limited — caller MUST gate on a below→above `warn_pages` crossing
+/// (`crossing_warn`) or every tick reproduces the log-spam bug this fixes.
 fn log_tx_registry_oldest_warn(wal_pages: u64) {
     if let Some((_id, age, label)) = khive_storage::tx_registry::oldest() {
         tracing::warn!(
@@ -967,14 +844,9 @@ fn log_tx_registry_oldest_warn(wal_pages: u64) {
     }
 }
 
-/// ADR-091 Plank 0: enumerate every open registry entry at `warn!` — the
-/// "which caller is holding the pin" answer this ADR's static reading could
-/// not produce.
-///
-/// Callers MUST gate this on a below→above `high_water_pages` crossing (via
-/// `crossing_warn`) — it is not rate-limited internally, so calling it every
-/// tick would repeat the full snapshot enumeration every tick under
-/// sustained pressure.
+/// Enumerates every open registry entry at `warn!`. NOT internally
+/// rate-limited — caller MUST gate on a below→above `high_water_pages`
+/// crossing (`crossing_warn`) or every tick repeats the full enumeration.
 fn log_tx_registry_snapshot_warn(wal_pages: u64) {
     for (age, label) in khive_storage::tx_registry::snapshot() {
         tracing::warn!(
@@ -1031,29 +903,10 @@ pub fn checkpoint_once(
     CheckpointTick::Observed(wal_pages)
 }
 
-/// ADR-091 Plank 2: evaluate and, if due, attempt a TRUNCATE escalation.
-///
-/// Runs under the writer guard the caller already holds — never performs its
-/// own checkout. Returns immediately (a no-op) unless BOTH:
-/// - `wal_pages >= config.truncate_high_water_pages`, and
-/// - no prior attempt (`truncate_state.last_attempt.is_none()`) OR at least
-///   `config.truncate_min_interval` has elapsed since the last attempt.
-///
-/// `truncate_state.last_attempt` is stamped ONLY immediately before the
-/// TRUNCATE pragma itself runs (writer held, threshold crossed, interval
-/// elapsed, AND the temporary busy_timeout override successfully applied) —
-/// every earlier return (below threshold, interval not elapsed, or the
-/// busy_timeout override failing to apply) is a skip, not an attempt, and
-/// never touches it, matching the ADR's "skip must not stamp" requirement.
-///
-/// The oldest-pinning-transaction snapshot is logged (reusing Plank 0's
-/// `tx_registry`) before the attempt, so an operator can see what is
-/// (potentially) pinning the WAL even if the attempt goes on to succeed.
-/// `busy_timeout` is temporarily lowered to `config.truncate_busy_timeout` for
-/// the PRAGMA call and restored to the pool's configured value immediately
-/// after, regardless of outcome. No transaction is ever killed here — this is
-/// read-only diagnostics plus the TRUNCATE pragma itself; enforcement is
-/// Plank 1's job, not this one's.
+/// Evaluate and, if due, attempt a TRUNCATE escalation under the writer
+/// guard the caller already holds (never its own checkout). `last_attempt`
+/// is stamped ONLY on an actual attempt, never on a skip. See
+/// crates/khive-db/docs/api/checkpoint.md#maybe_truncate--truncate-attempt-gating-plank-2
 fn maybe_truncate(
     pool: &ConnectionPool,
     writer: &WriterGuard<'_>,
@@ -1273,26 +1126,8 @@ mod tests {
         fn exit(&self, _: &tracing::span::Id) {}
     }
 
-    /// ADR-091 Plank 0: `log_tx_registry_oldest_debug` emits a debug-level log
-    /// naming the oldest open registry entry's label, on every call.
-    ///
-    /// `#[serial(tx_registry)]`: the registry is a process-wide singleton
-    /// shared across every test in this binary — see `pool.rs`'s and
-    /// `sql_bridge.rs`'s registry tests, which share this same serial group
-    /// (these three were previously unserialized and could
-    /// race, corrupting each other's `oldest()`/`snapshot()` reads).
-    ///
-    /// This test does NOT hardcode "checkpoint_tick_test" as the expected
-    /// label: production write paths elsewhere in this same test binary
-    /// (vectors/graph/text stores) also register short-lived registry
-    /// entries while their own tests run, and `serial(tx_registry)` only
-    /// serializes against the OTHER tests in that same group, not against
-    /// every write path in the crate. Instead it samples `oldest()` itself
-    /// immediately before invoking the function under test and asserts the
-    /// logged label matches whatever the registry considers oldest at that
-    /// instant — deterministic regardless of unrelated concurrent registry
-    /// churn, while still verifying `log_tx_registry_oldest_debug` correctly
-    /// surfaces the registry's own `oldest()` answer.
+    /// `log_tx_registry_oldest_debug` names the oldest open registry entry.
+    /// See crates/khive-db/docs/api/checkpoint.md#log_tx_registry_oldest_debug_reports_oldest_open_entry
     #[test]
     #[serial(tx_registry)]
     fn log_tx_registry_oldest_debug_reports_oldest_open_entry() {
@@ -1527,16 +1362,9 @@ mod tests {
             .expect("checkpoint task panicked");
     }
 
-    /// Regression for issue #774: on the production boot path, the daemon
-    /// passes `run_checkpoint_task` both `pool` directly and an
-    /// `event_store` that internally retains its own `Arc::clone` of the
-    /// same pool (`SqlEventStore::new_scoped`). A strong-count-based exit
-    /// condition can never fire in that shape, because the task always
-    /// observes at least two live clones — its own `pool` argument plus the
-    /// one buried in `event_store`. This test reproduces that exact
-    /// ownership shape (a real `SqlEventStore` holding a sibling clone) and
-    /// asserts the task still exits promptly via the watch-channel signal,
-    /// proving the fix does not depend on `Arc::strong_count` at all.
+    /// Regression #774: exits via watch-signal even with a live event_store
+    /// pool clone (rules out a strong-count-based exit condition). See
+    /// crates/khive-db/docs/api/checkpoint.md#checkpoint_task_exits_via_shutdown_signal_with_live_event_store_pool_clone
     #[tokio::test]
     #[serial(checkpoint_skip_metrics)]
     async fn checkpoint_task_exits_via_shutdown_signal_with_live_event_store_pool_clone() {
@@ -1661,21 +1489,10 @@ mod tests {
         assert_eq!(cfg.tx_max_age_secs, default.tx_max_age_secs);
     }
 
-    /// Regression: a high-water tick must NOT block behind an active read transaction.
-    ///
-    /// Isomorphism guarantee: this test FAILS if `checkpoint_once` regresses to
-    /// `PRAGMA wal_checkpoint(TRUNCATE)`. Confirmed by reasoning: TRUNCATE inherits
-    /// RESTART semantics and will invoke the busy handler (sleeping up to
-    /// `busy_timeout`) while waiting for the open reader snapshot to release.
-    /// With `busy_timeout = 2000ms` a TRUNCATE regression causes the call to take
-    /// ~2000ms, blowing the <500ms assertion. PASSIVE returns in <1ms even with an
-    /// open reader, because PASSIVE never waits for readers.
-    ///
-    /// Why `busy_timeout = 2000ms` and threshold `< 500ms`: the original 200ms
-    /// busy_timeout / 50ms threshold was too tight for contended CI runners where
-    /// PASSIVE legitimately takes 50-200ms under parallel-test load. Raising the
-    /// busy_timeout to 2000ms keeps the PASSIVE path well below 500ms while a
-    /// TRUNCATE regression blocks for ~2000ms — a 4x safety margin on both sides.
+    /// Regression: a high-water tick must NOT block behind an active read
+    /// transaction (isomorphism guarantee — fails if `checkpoint_once`
+    /// regresses to TRUNCATE). See
+    /// crates/khive-db/docs/api/checkpoint.md#checkpoint_high_water_does_not_block_behind_reader
     #[test]
     #[serial(checkpoint_skip_metrics)]
     fn checkpoint_high_water_does_not_block_behind_reader() {
@@ -1806,13 +1623,8 @@ mod tests {
         );
     }
 
-    /// Fix: a reversed pair — `KHIVE_TX_WARN_SECS`
-    /// >= `KHIVE_TX_MAX_AGE_SECS` — must not be honored independently. Before
-    /// this fix, WARN_SECS=120 / MAX_AGE_SECS=30 parsed both values
-    /// successfully (each is independently positive) and produced a sweep
-    /// that emits `Stale` at 30s while never reaching the `Warn` crossing
-    /// until 120s — inverting the intended severity ladder. Both thresholds
-    /// must instead fall back to their defaults together.
+    /// Fix: a reversed threshold pair must not be honored independently. See
+    /// crates/khive-db/docs/api/checkpoint.md#checkpoint_config_rejects_reversed_tx_thresholds
     #[test]
     #[serial]
     fn checkpoint_config_rejects_reversed_tx_thresholds() {
@@ -1837,10 +1649,8 @@ mod tests {
         );
     }
 
-    /// Same invariant, the degenerate equal case: WARN_SECS == MAX_AGE_SECS
-    /// would make an entry cross both rungs on the exact same tick every
-    /// time, collapsing the two-rung severity ladder into one. Must also
-    /// fall back to defaults, not merely reject a strictly-reversed pair.
+    /// Degenerate equal-thresholds case; see
+    /// crates/khive-db/docs/api/checkpoint.md#checkpoint_config_rejects_equal_tx_thresholds
     #[test]
     #[serial]
     fn checkpoint_config_rejects_equal_tx_thresholds() {
@@ -1865,17 +1675,8 @@ mod tests {
         );
     }
 
-    /// Regression: a Skipped tick must NOT reset was_above_high_water.
-    ///
-    /// Before the fix, `checkpoint_once` returned `0` on both a genuinely-empty
-    /// WAL and a writer-busy skip. The task treated `0` as an observed page count
-    /// and reset `was_above_high_water`, re-arming the rate limit on every busy
-    /// tick. With the fix, `CheckpointTick::Skipped` leaves crossing state
-    /// unchanged.
-    ///
-    /// This test drives `crossing_warn` directly (the pure function that owns the
-    /// decision) rather than going through the async task, which would require a
-    /// logging harness.
+    /// Regression: a Skipped tick must NOT reset `was_above_high_water`. See
+    /// crates/khive-db/docs/api/checkpoint.md#skipped_tick_does_not_reset_high_water_crossing_state
     #[test]
     fn skipped_tick_does_not_reset_high_water_crossing_state() {
         let mut was_above = false;
@@ -2626,14 +2427,9 @@ mod tests {
         );
     }
 
-    /// Fix: a stale entry (A) that closes and is
-    /// immediately replaced by an ALREADY-stale entry (B) on the very next
-    /// observed tick — no intervening below-threshold or empty tick, unlike
-    /// `tx_age_sweep_rearms_after_entry_clears` above — must still emit both
-    /// rungs for B. Before the identity-tracking fix, `was_above_warn` and
-    /// `was_above_max_age` were already `true` from A, so B's crossing was
-    /// silently swallowed: the alert stayed latched to a departed caller
-    /// while a different long-lived span was now pinning the database.
+    /// Fix: an already-stale entry replacing a stale one on the next tick,
+    /// with no intervening clear, must still emit both rungs. See
+    /// crates/khive-db/docs/api/checkpoint.md#tx_age_sweep_stale_replacement_without_intervening_clear_still_names_new_entry
     #[test]
     fn tx_age_sweep_stale_replacement_without_intervening_clear_still_names_new_entry() {
         let config = tx_age_test_config();
@@ -2682,11 +2478,8 @@ mod tests {
         );
     }
 
-    /// `KHIVE_TX_WARN_SECS` / `KHIVE_TX_MAX_AGE_SECS` are read into the
-    /// config `from_env` reads at `run_checkpoint_task` construction time,
-    /// so this closes the loop from env var to the actual emitted rung
-    /// (the earlier `checkpoint_config_env_override` test only asserts the
-    /// config fields themselves).
+    /// Closes the loop from env var to actual emitted rung. See
+    /// crates/khive-db/docs/api/checkpoint.md#tx_age_sweep_uses_configured_thresholds_not_hardcoded_defaults
     #[test]
     fn tx_age_sweep_uses_configured_thresholds_not_hardcoded_defaults() {
         let config = CheckpointConfig {
@@ -2711,19 +2504,8 @@ mod tests {
         );
     }
 
-    /// Integration-level regression for the incident this ADR fixes: a real
-    /// `BEGIN DEFERRED` reader pins a WAL snapshot (exactly like
-    /// `checkpoint_high_water_does_not_block_behind_reader` above) while also
-    /// being registered in the shared `tx_registry` (simulating an
-    /// instrumented long-lived-reader call site such as
-    /// `graph.rs`'s `graph_traverse_read`), writes drive `wal_pages` past
-    /// `high_water_pages`, and — with a millisecond-scale `tx_max_age_secs`
-    /// so the test does not sleep for real minutes — the Plank 1 sweep
-    /// escalates to `Stale` naming that exact reader, alongside the existing
-    /// Plank 0 high-water WARN. This is the "detection works, mitigation
-    /// missing" gap from the incident: the sweep now gives the operator the
-    /// specific, escalating, un-silenced signal that a single one-shot
-    /// high-water WARN does not.
+    /// Integration-level regression for the incident this ADR fixes. See
+    /// crates/khive-db/docs/api/checkpoint.md#tx_age_sweep_names_long_lived_reader_pinning_wal_past_high_water
     #[test]
     #[serial(tx_registry, checkpoint_skip_metrics)]
     fn tx_age_sweep_names_long_lived_reader_pinning_wal_past_high_water() {
@@ -2789,8 +2571,22 @@ mod tests {
         // warm page cache, so sleep past the cap instead of assuming
         // the elapsed work already crossed it.
         std::thread::sleep(Duration::from_millis(5));
+        // `tx_registry` is a process-wide singleton shared by every test in
+        // this binary (cargo runs `#[test]`s in parallel threads of the same
+        // process): `#[serial(tx_registry)]` only excludes other tests that
+        // carry the same key, not every production write path elsewhere in
+        // the crate (e.g. `graph_upsert_edges`) that also calls `register()`
+        // as ordinary telemetry. If one of those happens to still be open and
+        // was registered before this test's own handle, raw `oldest()` would
+        // return THAT entry instead of the fixture's reader — see #926. Look
+        // up this test's own entry by its known label instead of trusting
+        // global `oldest()`, so the assertion is immune to that noise.
+        let our_entry = khive_storage::tx_registry::snapshot()
+            .into_iter()
+            .find(|(_, label)| label.as_deref() == Some("tx_age_sweep_reader_pin_test"))
+            .expect("this test's own tx_registry entry must still be open");
         let mut tx_age_state = TxAgeSweepState::default();
-        let emissions = tx_age_state.observe(khive_storage::tx_registry::oldest(), &config);
+        let emissions = tx_age_state.observe(Some((tx_id(1), our_entry.0, our_entry.1)), &config);
         assert!(
             emissions.iter().any(|e| e.rung == TxAgeRung::Stale
                 && e.label.as_deref() == Some("tx_age_sweep_reader_pin_test")),
@@ -2800,6 +2596,51 @@ mod tests {
         reader.execute_batch("COMMIT;").ok();
         drop(reader);
         drop(_tx_handle);
+    }
+
+    /// Regression #926: reproduces the exact tx_registry race directly. See
+    /// crates/khive-db/docs/api/checkpoint.md#tx_age_sweep_own_entry_survives_concurrent_older_registration
+    #[test]
+    #[serial(tx_registry, checkpoint_skip_metrics)]
+    fn tx_age_sweep_own_entry_survives_concurrent_older_registration() {
+        let _decoy = khive_storage::tx_registry::register(Some("decoy_unrelated_span".to_string()));
+        std::thread::sleep(Duration::from_millis(2));
+        let _own = khive_storage::tx_registry::register(Some("this_test_own_span".to_string()));
+        std::thread::sleep(Duration::from_millis(5));
+
+        // Confirm the race condition is actually reproduced: an entry older
+        // than this test's own span must currently lead the process-wide
+        // registry. Another concurrently running test may have registered an
+        // entry before the decoy, so do not assume the decoy is globally
+        // oldest; the required invariant is only that our span is not.
+        let global_oldest = khive_storage::tx_registry::oldest().expect("registry not empty");
+        assert_ne!(
+            global_oldest.2.as_deref(),
+            Some("this_test_own_span"),
+            "test setup must reproduce the race: an older, unrelated entry must be \
+             the current global oldest, got: {global_oldest:?}"
+        );
+
+        let our_entry = khive_storage::tx_registry::snapshot()
+            .into_iter()
+            .find(|(_, label)| label.as_deref() == Some("this_test_own_span"))
+            .expect("this test's own tx_registry entry must still be open");
+
+        let config = CheckpointConfig {
+            tx_warn_secs: Duration::from_millis(1),
+            tx_max_age_secs: Duration::from_millis(1),
+            ..CheckpointConfig::default()
+        };
+        let mut state = TxAgeSweepState::default();
+        let emissions = state.observe(Some((tx_id(2), our_entry.0, our_entry.1)), &config);
+        assert!(
+            emissions
+                .iter()
+                .any(|e| e.rung == TxAgeRung::Stale
+                    && e.label.as_deref() == Some("this_test_own_span")),
+            "expected a Stale emission naming this test's own span despite an older, \
+             unrelated concurrent registration, got: {emissions:?}"
+        );
     }
 
     /// `KHIVE_WAL_WARN_SUSTAINED_CYCLES` overrides the default and rejects 0.

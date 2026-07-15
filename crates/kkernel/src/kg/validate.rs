@@ -15,34 +15,19 @@ use super::types::{
     OutputFormat, RuleResult, ValidateArgs, ValidationReport, ValidationSummary, Violation,
 };
 
-/// Taxonomy sets derived from the loaded pack registry.
-///
-/// `pub(super)`: also consumed by `kg::commit` (`kkernel kg commit`, ADR-102)
-/// to reuse the same entity-kind/note-kind vocabulary this module builds for
-/// `kg validate`, rather than re-deriving it.
+/// Taxonomy sets derived from the loaded pack registry; `pub(super)` so
+/// `kg::commit` (ADR-102) can reuse them. See
+/// `crates/kkernel/docs/kg-rules.md#build_taxonomy--strict-actor-mode-exemption`.
 pub(super) struct KgTaxonomy {
     pub(super) entity_kinds: HashSet<String>,
     pub(super) note_kinds: HashSet<String>,
 }
 
-/// Build the merged entity-kind and note-kind sets from all registered packs.
-///
-/// Mirrors the `build_registry()` pattern in `pack_introspect`. No DB is
-/// opened — only pack metadata is needed.
-///
-/// # Strict-actor-mode exemption
-///
-/// This function does NOT call `enforce_strict_actor_mode`. That enforcement
-/// seam protects the **comm dispatch boundary** — it prevents a server from
-/// accepting comm operations without a configured actor identity. `build_taxonomy`
-/// is metadata/introspection-only: it collects the entity-kind and note-kind
-/// sets declared by the loaded packs and never dispatches a verb or reads
-/// comm/tenant data. There is no tenant-isolation risk here, so requiring an
-/// actor identity would make `kkernel kg validate` fail under
-/// `KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1` without any security benefit — an
-/// operator must be able to run taxonomy validation against a strict-mode
-/// deployment. See `enforce_strict_actor_mode` in
-/// `crates/khive-mcp/src/serve.rs` for the authoritative boundary definition.
+/// Build the merged entity-kind and note-kind sets from all registered packs;
+/// no DB is opened, only pack metadata. Deliberately does NOT call
+/// `enforce_strict_actor_mode` — see
+/// `crates/kkernel/docs/kg-rules.md#build_taxonomy--strict-actor-mode-exemption`
+/// for why this metadata-only path is exempt from that comm-boundary guard.
 pub(super) fn build_taxonomy() -> Result<KgTaxonomy> {
     let config = RuntimeConfig {
         db_path: None,

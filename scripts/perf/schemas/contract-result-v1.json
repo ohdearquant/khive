@@ -1,0 +1,262 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://khive.dev/schemas/contract-result-v1.json",
+  "title": "ContractResult",
+  "description": "Checked result contract for the local-engine contract benchmark suite: one JSON document per full suite run, covering the five contract dimensions (ingest, ANN query latency, recall@k, FTS+ANN fusion, index-inclusive storage). Every numeric result in this document is observational: the suite records measurements and cites the same-SHA calibration artifact (scripts/perf/bench_calibrate.py output) that characterizes run-to-run noise at the measured commit. No field in this schema encodes a pass/fail judgment; thresholds, if ever placed, live outside the result document and must cite a calibration artifact. Runners emitting this document also append rows to perf/ledger.csv (one row per banked headline number); this document is the full-fidelity record behind those rows.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "suite",
+    "sha",
+    "branch",
+    "started_at",
+    "finished_at",
+    "host",
+    "isolation",
+    "calibration",
+    "dimensions",
+    "ledger_rows_appended"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "suite": {
+      "const": "local-engine-contract"
+    },
+    "sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "branch": {
+      "type": "string",
+      "minLength": 1
+    },
+    "started_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "finished_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "host": {
+      "type": "object",
+      "required": ["machine", "os", "cpu_count", "mem_bytes"],
+      "additionalProperties": false,
+      "properties": {
+        "machine": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Hardware model identifier (e.g. platform.machine + sysctl hw.model). Cross-hardware comparisons against published numbers require explicit normalization caveats; this field is what makes the caveat checkable."
+        },
+        "os": { "type": "string", "minLength": 1 },
+        "cpu_count": { "type": "integer", "minimum": 1 },
+        "mem_bytes": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "isolation": {
+      "type": "object",
+      "description": "Run-isolation evidence. Results produced without the exclusive bench window are still valid documents but must say so here; consumers decide whether to bank them.",
+      "required": ["bench_window", "loadavg_before", "loadavg_after"],
+      "additionalProperties": false,
+      "properties": {
+        "bench_window": {
+          "type": "boolean",
+          "description": "True when the run executed under the exclusive bench-window lock."
+        },
+        "loadavg_before": {
+          "type": "array",
+          "items": { "type": "number", "minimum": 0 },
+          "minItems": 3,
+          "maxItems": 3
+        },
+        "loadavg_after": {
+          "type": "array",
+          "items": { "type": "number", "minimum": 0 },
+          "minItems": 3,
+          "maxItems": 3
+        },
+        "cargo_target_dir_isolated": {
+          "type": "boolean",
+          "description": "True when the build used a dedicated CARGO_TARGET_DIR (no shared-cache fingerprint mixing)."
+        }
+      }
+    },
+    "calibration": {
+      "description": "Link to the same-SHA null-distribution measurement backing interpretation of this run's numbers. The two states are mutually exclusive: 'calibrated' must cite a variance profile with at least 10 same-SHA runs (the blocking-promotion floor documented in scripts/perf/README.md); 'uncalibrated' must carry no calibration evidence at all.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["status", "artifact_path", "runs"],
+          "additionalProperties": false,
+          "properties": {
+            "status": { "const": "calibrated" },
+            "artifact_path": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Repo-relative path to the bench_calibrate.py variance profile for this SHA and suite configuration."
+            },
+            "runs": {
+              "type": "integer",
+              "minimum": 10,
+              "description": "Number of same-SHA runs in the cited calibration artifact (K>=10 per the calibration convention)."
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["status"],
+          "additionalProperties": false,
+          "properties": {
+            "status": { "const": "uncalibrated" }
+          }
+        }
+      ]
+    },
+    "dimensions": {
+      "type": "object",
+      "description": "One entry per contract dimension. A full-contract run carries all five; a partial run carries the subset it measured and omits the rest (absence means not-measured, never implied-zero).",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "ingest": {
+          "type": "object",
+          "required": ["dataset", "corpus_docs", "docs_per_s_embed_excluded", "index_build_wall_s"],
+          "additionalProperties": false,
+          "properties": {
+            "dataset": { "type": "string", "minLength": 1 },
+            "corpus_docs": { "type": "integer", "minimum": 1 },
+            "docs_per_s_embed_excluded": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "description": "Primary ingest metric: end-to-end docs/s with embedding time excluded from the measured window."
+            },
+            "docs_per_s_embed_included": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "description": "Advisory companion row: docs/s with embedding included. Embedder-dependent; never the headline number."
+            },
+            "index_build_wall_s": { "type": "number", "exclusiveMinimum": 0 }
+          }
+        },
+        "ann_query": {
+          "type": "object",
+          "required": ["dataset", "n_vectors", "arms"],
+          "additionalProperties": false,
+          "properties": {
+            "dataset": { "type": "string", "minLength": 1 },
+            "n_vectors": { "type": "integer", "minimum": 1 },
+            "arms": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "required": ["workers", "measured_recall_at_10", "p50_us", "p95_us", "p99_us", "queries"],
+                "additionalProperties": false,
+                "properties": {
+                  "workers": { "type": "integer", "minimum": 1 },
+                  "measured_recall_at_10": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1,
+                    "description": "Observed recall@10 against exact ground truth for this arm's tuning. The iso-recall operating point the suite tunes toward is external runner configuration, not a field of this result document; consumers judge an arm by this measured value."
+                  },
+                  "p50_us": { "type": "number", "exclusiveMinimum": 0 },
+                  "p95_us": { "type": "number", "exclusiveMinimum": 0 },
+                  "p99_us": { "type": "number", "exclusiveMinimum": 0 },
+                  "queries": { "type": "integer", "minimum": 1 },
+                  "beam": { "type": "integer", "minimum": 1 }
+                }
+              }
+            }
+          }
+        },
+        "recall_at_k": {
+          "type": "object",
+          "required": ["dataset", "baseline", "rows"],
+          "additionalProperties": false,
+          "properties": {
+            "dataset": { "type": "string", "minLength": 1 },
+            "baseline": {
+              "type": "object",
+              "required": ["kind", "query_us_p50"],
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "type": "string",
+                  "enum": ["faiss-flat", "vectorized-brute-force"],
+                  "description": "Exact-search baseline used for both ground truth and the speedup denominator. Speedup claims against a naive scalar scan are not representable in this schema."
+                },
+                "query_us_p50": { "type": "number", "exclusiveMinimum": 0 }
+              }
+            },
+            "rows": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "required": ["k", "recall", "speedup_vs_baseline"],
+                "additionalProperties": false,
+                "properties": {
+                  "k": { "type": "integer", "enum": [1, 10, 100] },
+                  "recall": { "type": "number", "minimum": 0, "maximum": 1 },
+                  "speedup_vs_baseline": { "type": "number", "exclusiveMinimum": 0 }
+                }
+              }
+            }
+          }
+        },
+        "fusion": {
+          "type": "object",
+          "required": ["dataset", "ndcg_at_10", "p_at_10", "latency_overhead_vs_ann_p50_us"],
+          "additionalProperties": false,
+          "properties": {
+            "dataset": { "type": "string", "minLength": 1 },
+            "ndcg_at_10": { "type": "number", "minimum": 0, "maximum": 1 },
+            "p_at_10": { "type": "number", "minimum": 0, "maximum": 1 },
+            "latency_overhead_vs_ann_p50_us": {
+              "type": "number",
+              "description": "Fused-query p50 minus pure-ANN p50 on the same corpus, microseconds. May be negative when fusion short-circuits."
+            },
+            "queries": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "storage": {
+          "type": "object",
+          "required": ["dataset", "n_vectors", "bytes_per_vector_total", "components"],
+          "additionalProperties": false,
+          "properties": {
+            "dataset": { "type": "string", "minLength": 1 },
+            "n_vectors": { "type": "integer", "minimum": 1 },
+            "bytes_per_vector_total": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "description": "Total on-disk bytes divided by vector count, measured post-VACUUM with the WAL checkpointed."
+            },
+            "components": {
+              "type": "object",
+              "required": ["db_bytes", "wal_bytes_post_checkpoint", "ann_segment_bytes", "fts_bytes"],
+              "additionalProperties": false,
+              "properties": {
+                "db_bytes": { "type": "integer", "minimum": 0 },
+                "wal_bytes_post_checkpoint": { "type": "integer", "minimum": 0 },
+                "ann_segment_bytes": { "type": "integer", "minimum": 0 },
+                "fts_bytes": { "type": "integer", "minimum": 0 }
+              }
+            }
+          }
+        }
+      }
+    },
+    "ledger_rows_appended": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of rows the runner appended to perf/ledger.csv from this document. Required: 0 states explicitly that no headline row was banked (e.g. a partial or uncalibrated run); rows are derived from this record by the runner and the ledger is never hand-edited."
+    },
+    "notes": {
+      "type": "string"
+    }
+  }
+}

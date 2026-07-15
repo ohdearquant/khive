@@ -1,13 +1,13 @@
 # API Reference
 
-khive exposes exactly one MCP tool, `request`. Everything else, 78 verbs across 11
+khive exposes exactly one MCP tool, `request`. Everything else, 79 verbs across 11
 production packs, is dispatched through that single tool via a small request DSL.
 This page documents the DSL grammar, the response envelope, and every verb's full
 parameter contract, so an agent can call khive correctly without reading Rust source.
 
 This page is verified against the live registry (`request(ops="verbs()")`, run
-2026-07-10) and the pack source (`crates/khive-pack-*/src/*.rs` `HandlerDef`/`ParamDef`
-struct literals). Verb count: **78**, matching both the live registry `total` field and
+2026-07-15) and the pack source (`crates/khive-pack-*/src/*.rs` `HandlerDef`/`ParamDef`
+struct literals). Verb count: **79**, matching both the live registry `total` field and
 the sum of the 11 pack counts below. If your server reports a different total, your
 `KHIVE_PACKS` configuration loads a different pack set than the default, run
 `request(ops="verbs()")` against your own server to get the authoritative list.
@@ -30,7 +30,7 @@ An always-machine-readable copy of this page is at
 | `knowledge` | 19    | `KHIVE_PACKS=kg,knowledge`                 | Yes                 |
 | `session`   | 4     | `KHIVE_PACKS=kg,session`                   | Yes                 |
 | `git`       | 1     | `KHIVE_PACKS=kg,git`                       | Yes                 |
-| `code`      | 0     | `KHIVE_PACKS=kg,code`                      | Yes                 |
+| `code`      | 1     | `KHIVE_PACKS=kg,code`                      | Yes                 |
 | `workspace` | 0     | `KHIVE_PACKS=kg,git,gtd,session,workspace` | Yes                 |
 
 `git` also registers the `commit` / `issue` / `pull_request` note kinds and the shared
@@ -43,13 +43,13 @@ An always-machine-readable copy of this page is at
 creation time and persists nothing when that delivery capability is absent; the other
 three schedule verbs remain available without `comm`.
 
-`code` registers the `finding` note kind and edge rules only; its `code.ingest` verb is
-accepted but unimplemented (ADR-085), and `findings.json` ingest runs through the
-`kkernel code-ingest` admin CLI path, not the MCP verb surface — so it contributes 0
-verbs to the total below.
+`code` registers the `finding` note kind and edge rules, plus the `code.ingest` verb (L1
+manifest + L1.5 import-scan source ingest, ADR-085 Amendment 2 — see below); its
+`findings.json` batch ingest still runs only through the `kkernel code-ingest` admin CLI
+path, not the MCP verb surface.
 
 The default binary (no `KHIVE_PACKS`/`--pack` override) loads all 11 packs: 18 + 5 + 5 +
-15 + 7 + 4 + 19 + 4 + 1 + 0 + 0 = **78 verbs**.
+15 + 7 + 4 + 19 + 4 + 1 + 1 + 0 = **79 verbs**.
 
 Verb names in the `kg` pack are bare (`create`, `search`, `link`, …). Every other pack
 namespaces its verbs with a `pack.` prefix (`gtd.assign`, `memory.recall`,
@@ -189,6 +189,12 @@ Fetch any record by UUID (auto-detects entity/note/edge/event/proposal).
 ```
 request(ops="get(id=\"3f2a9c1e\")")
 ```
+
+The returned object has the full substrate shape documented under `list` below. For an edge,
+`get` additionally returns `annotations: Note[]`. The array is always present (empty when no live
+notes annotate the edge), and each full note object includes `annotation_edge_id`, the UUID of the
+`annotates` edge connecting that note to the fetched edge. Because `get` is a by-ID operation,
+annotation discovery is namespace-agnostic under ADR-007, matching the fetched edge itself.
 
 ### `list` — Assertive
 
@@ -817,10 +823,14 @@ caller. Optional; load with `KHIVE_PACKS=kg,brain`.
 Windowed event counts grouped by kind, actor, and verb over the event plane (ADR-103
 Stage 1, #724 Ask A). `feedback_explicit` events are additionally split by
 `served_by_profile_id`. Events carrying a `work_class` (today:
-`phase_started`/`phase_completed`/`phase_cancelled` payloads) split by
-`counts_by_work_class`. `cost_unit` is not surfaced: it does not exist on any event
-payload yet (ADR-103 Stage 0 is design-only) and will be added once a resource payload
-carries it.
+`phase_started`/`phase_completed`/`phase_cancelled` payloads, or `payload.resource.work_class`
+on a dispatch audit row) split by `counts_by_work_class`. Events carrying
+`payload.resource.cost_unit` (ADR-103 Amendment 1, stamped on every successful verb dispatch
+since PR #927) sum into `total_cost_unit` and `cost_unit_by_verb`; both are omitted, not
+zero-filled, when no event in the window carries `cost_unit`. Events without a `cost_unit`
+(pre-Amendment-1 events, or errored/denied dispatches) simply do not contribute. When
+`truncated` is `true`, these sums are computed over the fetched page only, same as the other
+`counts_by_*` fields.
 
 | Param   | Type   | Required | Notes                                                                                                                                                       |
 | ------- | ------ | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -1041,12 +1051,13 @@ Actor-to-actor messaging with threading. Optional; load with `KHIVE_PACKS=kg,com
 
 Send a message, optionally threaded.
 
-| Param       | Type   | Required | Notes                                                                                                          |
-| ----------- | ------ | -------- | -------------------------------------------------------------------------------------------------------------- |
-| `to`        | string | yes      | Actor label, e.g. `"lambda:leo"`. Both copies land in the caller's namespace; no cross-namespace write occurs. |
-| `content`   | string | yes      | Non-empty message body.                                                                                        |
-| `subject`   | string | no       | Optional subject line.                                                                                         |
-| `thread_id` | uuid   | no       | Groups the message into an existing thread.                                                                    |
+| Param       | Type   | Required | Notes                                                                                                                                                                                           |
+| ----------- | ------ | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `to`        | string | yes      | Actor label, e.g. `"lambda:leo"`. Both copies land in the caller's namespace; no cross-namespace write occurs.                                                                                  |
+| `content`   | string | yes      | Non-empty message body.                                                                                                                                                                         |
+| `subject`   | string | no       | Optional subject line.                                                                                                                                                                          |
+| `thread_id` | uuid   | no       | Groups the message into an existing thread.                                                                                                                                                     |
+| `self_send` | bool   | no       | Default false. Required when `to` matches the configured sender actor; otherwise the send is rejected. The anonymous `local` fallback is exempt. Use true only for an intentional note to self. |
 
 ```
 request(ops="comm.send(to=\"lambda:leo\", subject=\"PR ready\", content=\"#600 is open for review\")")
@@ -1573,6 +1584,37 @@ response's `done` field is `false`.
 
 ```
 request(ops="git.digest(source=\"https://github.com/org/repo\", max_items=500)")
+```
+
+---
+
+## `code` pack — 1 verb
+
+Deterministic source-code map ingest (ADR-085 Amendment 2, PR #1039). Optional; load
+with `KHIVE_PACKS=kg,code`. Also registers the `finding` note kind used by the
+`kkernel code-ingest` admin CLI's `findings.json` batch ingest (not reachable via this
+MCP verb surface).
+
+### `code.ingest` — Commissive
+
+Walk a source folder and ingest L1 manifest-declared dependency edges
+(`Cargo.toml` / `pyproject.toml` / `package.json`) plus L1.5 regex-based import-scan
+module and project edges, into a dedicated map database — never the shared production
+graph. A folder with no governing manifest anywhere above its source files still
+ingests, using the basename of the ingested folder as its `source_project` identity.
+Idempotent: entity and edge ids are `uuid5`-derived from identity, so re-ingesting the
+same path upserts rather than duplicates, and a synchronous re-resolve pass
+materializes edges for any import that only resolves once a later-scanned file's module
+becomes known.
+
+| Param       | Type            | Required | Notes                                                                                                                                                                                                                                        |
+| ----------- | --------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `path`      | string          | yes      | Folder to ingest — a monorepo subtree (a single crate/package) is first-class, not a special case of whole-repo ingest.                                                                                                                      |
+| `db`        | string          | no       | Target map database path. Defaults to `<path>/.khive/code-map.db`. The shared production database — its default `$HOME/.khive/khive.db` location and the calling server's actual configured database — is always rejected, with no override. |
+| `languages` | array\<string\> | no       | Restrict ingest to a subset of `rust` \| `python` \| `typescript`. Defaults to all three (auto-detected from manifests found under `path`).                                                                                                  |
+
+```
+request(ops="code.ingest(path=\"/repo/crates/my-crate\")")
 ```
 
 ---

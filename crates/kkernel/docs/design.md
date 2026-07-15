@@ -99,6 +99,139 @@
 - The kg pack exposes `propose`, `review`, and `withdraw` verbs as part of the
   17 kg-substrate bare verbs. These are validated by the contract test.
 
+### Atomic `exec --ops-file --atomic` execution path (ADR-099 Slice B3)
+
+`atomic_apply.rs` is the CLI-boundary orchestrator for `kkernel exec --ops-file --atomic`.
+It runs, in order:
+
+1. Parse-time admissibility (`khive_request::atomic::check_atomic_admissible`, B1) plus the
+   op-count guard — both run BEFORE building any runtime or touching the database.
+2. The async prepare pass: KG-substrate verbs via `khive_runtime::atomic_prepare::prepare_op`;
+   `gtd.transition`/`gtd.complete` via two `prepare_gtd_*` adapters in this module that wrap
+   the SAME decide functions (`khive_pack_gtd::handlers::prepare_transition`/
+   `prepare_complete`) the canonical non-atomic `handle_transition`/`handle_complete` call —
+   the decide logic is not duplicated, only adapted into an `AtomicOpPlan`. The adapters live
+   in `kkernel` (not `khive-pack-gtd`) because `AtomicOpPlan`/`PlanStatement` are
+   `khive-runtime` atomic-plan vocabulary this CLI orchestrator owns.
+3. The synchronous commit pass (`khive_runtime::atomic_runner::run_atomic_unit`, B2).
+4. The async post-commit reindex pass (`khive_runtime::atomic_prepare::apply_post_commit_effects`).
+
+**Verbs without a prepare implementation.** `propose`/`review`/`withdraw` are listed in
+`khive_types::pack::ATOMIC_ADMISSIBLE_VERBS` (ADR-099 D3 intends them to eventually gain a
+seam) but have none yet; the B3 fix rejects them at the same pre-runtime
+`check_atomic_admissible` guard, as `AtomicRejectionReason::KnownUnimplemented`, before they
+ever reach `KhiveRuntime::new`/`prepare_one`. `prepare_op`'s own
+`prepare_governance_unimplemented` fallback is unreachable through this CLI path and remains
+only as defense-in-depth for other `prepare_op` callers.
+
+`merge` joined this deferred bucket in the B3 fix too: a full-parity atomic merge prepare was
+drafted and unit-tested against `atomic_prepare` directly, but its edge-conflict resolution
+cannot be expressed in ADR-099's static predicate/guard plan shape, so it is rejected here
+rather than shipped partially-scoped (`merge is not yet supported under --atomic; use the
+non-atomic merge verb`).
+
+The returned envelope is additive-only and lives entirely outside `dispatch_request_local`'s
+response shape — non-atomic `--ops-file` runs (and every other exec path) are untouched.
+
+**`apply_gtd_audit_post_commit_effects`** applies every `PostCommitEffect::GtdAudit` by
+calling the SAME `ensure_audit_schema`/`write_audit_record` functions the canonical
+`handle_transition`/`handle_complete` handlers call (GAP-5). It lives in `kkernel` rather
+than `khive-runtime::atomic_prepare` because those two functions are owned by
+`khive-pack-gtd`, which depends on `khive-runtime` — not the other way around; `kkernel` is
+the first crate in the dependency graph that can see both. Non-`GtdAudit` effects are
+ignored here (they are `atomic_prepare::apply_post_commit_effects`'s job, called
+separately). Best-effort by construction: both callee functions log-and-swallow their own
+errors, so this function itself cannot fail.
+
+**`validate_atomic_args`** closes an ADR-099 B3 parity gap: the canonical (non-atomic)
+handlers deserialize their args through a `#[serde(deny_unknown_fields)]` param struct, so a
+typo like `conten` (for `content`) is rejected rather than silently ignored. The pre-fix
+`--atomic` path had no equivalent gate — each `prepare_*` fn only read the keys it knew
+about, so a typo'd key was dropped on the floor and the op reported `ok:true` with every
+OTHER field reset to its current value, silently losing the caller's intended change. The
+fix reuses (rather than reimplements) the canonical param structs: `kkernel` already depends
+on `khive-pack-kg`/`khive-pack-gtd` directly, and their param structs
+(`UpdateParams`/`DeleteParams`/`LinkParams`/`TransitionParams`/`CompleteParams`) are
+re-exported `pub` specifically for this seam. Deserializing an op's args through the same
+struct the canonical handler uses reproduces its `deny_unknown_fields` rejection and exact
+error message for free, with no duplicated key list to drift out of sync — the deserialized
+value itself is discarded; `prepare_*` still reads the raw `Value` map. `merge`, `create`,
+and the read/governance verbs are out of scope: they are already rejected earlier at
+`check_atomic_admissible`, or are not part of the v1 admissible set at all.
+
+**`delete_expected_kind`/`update_expected_kind`** resolve a caller-supplied `kind=...`
+string into the `AtomicDeleteKind`/`AtomicUpdateKind` enum `prepare_delete`/`prepare_update`
+enforce, via the SAME canonical `resolve_kind_spec` the non-atomic `handle_delete`/
+`handle_update` call. The two functions are exact mirrors of each other (same reasoning,
+same shape, differing only in which `AtomicOpPlan`-adjacent enum they target). `kind` absent
+resolves to `Ok(None)` (no check, parity with the canonical handlers' own optional
+discriminator); `Event`/`Proposal` are a fail-loud rejection before `prepare_delete`/
+`prepare_update` ever runs — those substrates are not v1-admissible for atomic
+delete/update at all.
+
+### `exec` local-dispatch fallback server (ADR-067, ADR-028 §8)
+
+`build_local_fallback_server` (`src/exec.rs`) is the server constructor for both of
+`kkernel exec`'s non-daemon dispatch paths: the daemon-unreachable/mismatch fallback inside
+`run_exec_inline_with_forward`, and the `--ops-file` bulk-apply path (which deliberately
+never attempts the daemon fast path at all — bulk apply needs cross-op atomicity the daemon
+doesn't provide). `KhiveMcpServer::new` alone only ever builds a single-backend runtime, with
+no visibility into a `khive.toml` `[[backends]]` declaration; before this fix, both
+local-dispatch paths always used that single-backend constructor, so a config declaring a
+separate backend for e.g. the `session` pack was invisible to them — the in-process fallback
+silently wrote that pack's data into the `main` backend instead of its declared one. The fix
+makes both paths agree with the daemon's own boot logic (`khive_mcp::serve::build_server`):
+an empty `khive_cfg.backends` still takes the plain single-backend constructor (byte-identical
+`config_id`, since `compute_config_id` skips the topology fold for an empty list); otherwise
+both delegate to `build_server_multi_backend_with_db_anchor`, the same captured-anchor
+constructor the production MCP boot path uses. `cli_db_override` is the raw, pre-resolution
+`--db`/`KHIVE_DB` value, required for `--db :memory:` multi-backend override handling; passing
+the wrong value would silently ignore an operator's in-memory isolation request. `db_anchor` is
+the canonical anchor captured alongside `cfg`, threaded through so fallback construction never
+re-reads a changed `HOME`.
+
+### `exec.rs` regression test notes
+
+- `strict_mode_rejects_before_daemon_forward_when_comm_and_no_actor`: `run_exec_inline` must
+  enforce the strict-actor gate (`KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1`) BEFORE forwarding to the
+  daemon. Prior to this fix, `enforce_strict_actor_mode` was only called in the in-process
+  fallback path (after the daemon fast-path returned), so an attacker or misconfigured
+  operator could start a no-actor daemon, then run strict-mode `kkernel exec`, which would
+  forward through it and exit 0 — bypassing the gate. The fix moves the check before the
+  daemon block.
+- `atomic_update_null_and_type_semantics_match_canonical_no_op_behavior`: atomic `update`
+  null/type semantics must match canonical's actually-reachable behavior. Empirically
+  verified against live `handle_update` that `name=null`/`description=null` are canonical
+  no-ops, not rejections — canonical's field type is `Option<Value>`, and serde's derived
+  `Deserialize` for `Option<T>` intercepts a literal JSON `null` at the outer `Option`
+  boundary and maps it straight to `None` regardless of the inner type, so canonical's own
+  "reject null" arms in `string_value`/`optional_string_patch` are unreachable through normal
+  struct deserialization. This test deliberately does NOT implement the naive expectation
+  ("`update(name=null)` REJECTED") since that doesn't match the live system. What canonical
+  DOES still reject is a non-null, non-string `name` (e.g. `name: 123`) — pre-fix, atomic
+  silently treated that as absent too, reporting success for an invalid update.
+
+### `reindex` memory Vamana epoch protocol (#812, ADR-107 §4)
+
+`begin_reindex_epoch` (`src/reindex.rs`) durably marks the reindex-in-progress epoch
+BEFORE any vector mutation in the pass. The previous design bumped the durable epoch only
+as a best-effort step AFTER every vector mutation had already committed; a crash between the
+last commit and that bump — or a silently swallowed bump error — left an already-warm daemon
+with no durable signal at all, serving pre-reindex vectors indefinitely. Bumping first closes
+that gap: a daemon that observes this epoch mid-reindex (via
+`khive_pack_memory::ann::maybe_check_durable_epoch`, sampled from the recall path) rebuilds
+conservatively against whatever partial corpus is on disk at that moment — never worse than
+trusting a stale index forever — and the completion bump at the end of the pass forces one
+more rebuild once the corpus reaches its final, fully re-embedded state. Together the two
+durable bumps form an in-progress/completed epoch protocol: any observer landing anywhere
+between them still converges. `kkernel reindex` runs directly against a raw `KhiveRuntime`
+without a pack-registry boot applying `MemoryPack::SCHEMA_PLAN`, so this function also
+ensures the `memory_ann_epoch` table exists before its first bump.
+
+**Fail-closed, not warn-and-continue**: an error here (schema creation OR the epoch write
+itself) aborts the whole reindex before any mutation runs. A swallowed failure here is
+exactly the bug ADR-107 §4 was written to close.
+
 ## Consistency Notes
 
 - `kkernel db migrate --dry-run` delegates to `cmd_db_check` rather than implementing

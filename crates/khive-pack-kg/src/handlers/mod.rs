@@ -17,19 +17,15 @@ mod update;
 
 pub(crate) use common::{canonical_entity_kind, canonical_note_kind, parse_relation};
 
-/// ADR-099 B3: re-exported as a real `pub` path (not `pub(crate)`) so
-/// `kkernel`'s `--atomic` validation seam can reach the SAME canonical
-/// param structs `handle_update`/`handle_delete`/`handle_link` deserialize
-/// through, reproducing their `#[serde(deny_unknown_fields)]` rejection
-/// without a duplicated per-verb key list. `kkernel` already depends on
-/// this crate directly (no crate-graph inversion); see
-/// `kkernel::atomic_apply::validate_atomic_args`.
+/// ADR-099 B3: real `pub` re-export so kkernel's `--atomic` seam validates through the
+/// SAME canonical param structs the handlers deserialize, reproducing
+/// `#[serde(deny_unknown_fields)]` rejection with no duplicated key list. See
+/// `docs/api/entity-kind-validation.md` for the full ADR-099 B3 rationale.
 pub use params::{DeleteParams, LinkParams, UpdateParams};
 
-/// ADR-099 B3 (findings 1, 3, 4): re-exported as real `pub`
-/// paths so `kkernel`'s `--atomic` seam can resolve kinds/ids and render
-/// result payloads through the exact canonical logic `handle_update`/
-/// `handle_delete`/`handle_link` use, rather than reimplementing it.
+/// ADR-099 B3 (findings 1, 3, 4): real `pub` re-export so kkernel's `--atomic` seam
+/// resolves kinds/ids and renders results through the exact canonical logic the
+/// handlers use, rather than reimplementing it.
 pub use common::{
     normalize_entity_timestamps, resolve_kind_spec, resolve_uuid_unfiltered,
     resolve_uuid_unfiltered_including_deleted, KindSpec,

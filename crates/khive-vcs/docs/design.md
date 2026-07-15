@@ -1,5 +1,9 @@
 # khive-vcs Design
 
+ADR-compliance rationale for this crate. For the function-by-function
+technical reference, see `api/sync.md` (NDJSON ⇄ SQLite sync, remote fetch)
+and `api/snapshot-hash.md` (content-addressed `SnapshotId` hashing).
+
 ## ADR Compliance
 
 ### KG Versioning (git-native v1) (ADR-010)

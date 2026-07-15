@@ -186,6 +186,20 @@ caller's namespace:
    compatibility. `from` is the namespace string (as before). `to` is the `to` argument (as
    before, now interpreted as an actor label rather than a namespace string).
 
+#### Amendment: explicit configured-actor self-send opt-in (2026-07-14)
+
+When the resolved `to_actor` equals the configured sender actor, `comm.send` rejects the call
+unless the caller passes `self_send=true`. The optional boolean defaults to false. The anonymous
+`local` party-line fallback is exempt because it does not identify two distinct configured
+principals.
+
+This is an intentional compatibility change: configured callers that previously sent to their
+own actor label must add `self_send=true` when the message is genuinely a note to self. Callers
+trying to address a distinct parent, orchestrator, or sub-agent must instead configure distinct
+actor identities. Under ADR-096 Fork 2, project-scoped actor discovery can otherwise make two
+sessions resolve the same actor label; failing loudly prevents that identity collapse from being
+mistaken for successful inter-agent delivery.
+
 The `dual_write_message` function does not need to be rewritten: the case where both copies
 land in the caller's namespace already works today (same-namespace send path). The only
 changes are that `from` and `to` in properties no longer need to be valid namespace strings,

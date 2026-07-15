@@ -3,6 +3,7 @@
 //! Separates term-selection and gather-mode logic from the recall handler so
 //! each concern has a direct test seam. The handler calls into this module;
 //! the module calls into the khive-storage TextSearch trait.
+//! See `crates/khive-pack-memory/docs/api/text-retrieval.md`.
 // FILE SIZE JUSTIFICATION: text_gather.rs includes both select_terms_by_stats and
 // collect_text_hits plus their inline tests; the inline tests use private test fixtures
 // (MockTextSearch) that require access to module-private types and would be duplicated
@@ -16,16 +17,10 @@ use khive_types::SubstrateKind;
 use crate::config::{RecallFtsGatherConfig, RecallFtsGatherMode, RecallFtsSelectionRule};
 use crate::handlers::TextSnippetPolicy;
 
-/// Select up to `k` query terms from `terms` according to `rule`.
+/// Select at most `k` terms by original order, lowest DF, or highest IDF.
 ///
-/// When rule is `Original`, returns the first `k` terms in the original order.
-/// When rule is `LowestDf` or `HighestIdf`, sorts by the corresponding stat
-/// and returns the top `k` most selective terms, preserving original-order
-/// tie-breaking so the Latin synthetic fixture is deterministic.
-///
-/// Returns the original terms if `stats` is empty or shorter than `terms`
-/// (falls back gracefully rather than crashing — the harness can detect this
-/// via the diagnostic output which records the selection rule used).
+/// Ties retain input order; incomplete statistics fall back gracefully.
+/// See `crates/khive-pack-memory/docs/api/text-retrieval.md`.
 pub fn select_terms_by_stats(
     terms: &[String],
     stats: &[khive_storage::types::TextTermStats],
@@ -72,12 +67,10 @@ pub fn select_terms_by_stats(
     }
 }
 
-/// Collect FTS text hits for a recall query, applying the gather config.
+/// Collect bounded FTS hits using configured term selection, CJK bypass, and gather mode.
 ///
-/// Handles:
-/// - CJK bypass: uses existing ranked all-term path without term selection.
-/// - Term selection by DF/IDF when stats are available.
-/// - gather_mode (Ranked / Unranked / RankWithinCap) via `search_with_options`.
+/// Returns storage/runtime errors from statistics or search. See
+/// `crates/khive-pack-memory/docs/api/text-retrieval.md`.
 // REASON: all parameters are independent scalar or slice inputs with distinct types;
 // extracting a struct would require callers to construct a temporary just to call this fn.
 #[allow(clippy::too_many_arguments)]
@@ -272,11 +265,7 @@ mod tests {
     }
 }
 
-/// Integration tests for `collect_text_hits` using an in-memory FTS5 backend.
-///
-/// These lock in the correctness of the candidate-gather path (baseline, CJK,
-/// gather modes, edge cases) against real FTS5 behaviour without requiring a
-/// file-backed database.
+/// Exercises gather modes and CJK routing against an in-memory FTS5 backend.
 #[cfg(test)]
 mod collect_text_hits_tests {
     use std::sync::Arc;

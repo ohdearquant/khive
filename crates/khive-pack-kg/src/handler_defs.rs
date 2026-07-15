@@ -917,12 +917,8 @@ mod tests {
             .unwrap_or_else(|| panic!("handler {name:?} not found in KG_HANDLERS"))
     }
 
-    /// Regression for #899: `create.entity_kind` and `list.entity_kind` hand-write
-    /// the enumerated entity-kind list in their `help=true` description text. This
-    /// asserts every canonical name in `EntityKind::NAMES` (the actual vocabulary,
-    /// ADR-001 + ADR-048's 9-kind set) appears in both descriptions, so adding or
-    /// renaming an entity kind without updating the doc text fails loudly here
-    /// instead of shipping a stale `help=true` schema.
+    /// Regression for #899: `create.entity_kind`/`list.entity_kind` help text must list
+    /// every canonical `EntityKind::NAMES` entry, so a stale hand-written list fails loudly.
     #[test]
     fn entity_kind_param_descriptions_list_all_canonical_kinds() {
         for handler_name in ["create", "list"] {

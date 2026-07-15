@@ -2,7 +2,9 @@
 
 use std::collections::HashMap;
 
-/// Returns true if `c` falls within standard CJK Unicode blocks (Unified, Extension A/B, Compatibility, Hiragana, Katakana, Hangul).
+/// Return whether `c` is in a supported CJK, Hiragana, Katakana, or Hangul block.
+///
+/// See `crates/khive-text/docs/api/identifier-and-script.md`.
 #[inline]
 pub fn is_cjk_char(c: char) -> bool {
     matches!(c,
@@ -16,7 +18,7 @@ pub fn is_cjk_char(c: char) -> bool {
     )
 }
 
-/// Returns true when more than 15% of the characters in `text` are CJK.
+/// Return whether strictly more than 15% of `text` characters are CJK.
 pub fn contains_cjk(text: &str) -> bool {
     let chars: Vec<char> = text.chars().collect();
     if chars.is_empty() {
@@ -26,7 +28,9 @@ pub fn contains_cjk(text: &str) -> bool {
     (cjk_count as f64 / chars.len() as f64) > 0.15
 }
 
-/// Lightweight script profile computed over a single string.
+/// Character-count profile containing CJK and ASCII-letter fractions.
+///
+/// See `crates/khive-text/docs/api/identifier-and-script.md`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScriptProfile {
     /// Fraction of characters that are CJK (0.0-1.0).
@@ -66,6 +70,8 @@ impl ScriptProfile {
 
 /// Returns true when `query` is worth sending to a retrieval backend.
 /// Rejects empty, symbol-only, single ASCII letter, and repeated-char (>80%) gibberish.
+///
+/// See `crates/khive-text/docs/api/identifier-and-script.md`.
 pub fn is_meaningful_query(query: &str) -> bool {
     let trimmed = query.trim();
     if trimmed.is_empty() {
@@ -179,8 +185,6 @@ mod tests {
         assert!(!is_cjk_char('\u{D7B0}')); // just after
     }
 
-    // --- contains_cjk ---
-
     #[test]
     fn empty_string_no_cjk() {
         assert!(!contains_cjk(""));
@@ -215,8 +219,6 @@ mod tests {
         assert_eq!(text.chars().count(), 20);
         assert!(!contains_cjk(text));
     }
-
-    // --- ScriptProfile ---
 
     #[test]
     fn profile_pure_latin() {
@@ -253,8 +255,6 @@ mod tests {
         assert!((p.latin_fraction - 2.0 / 3.0).abs() < 1e-9);
         assert!(p.is_cjk_dominant());
     }
-
-    // --- is_meaningful_query ---
 
     #[test]
     fn empty_not_meaningful() {
