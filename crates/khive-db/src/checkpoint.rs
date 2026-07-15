@@ -1947,6 +1947,79 @@ mod tests {
         );
     }
 
+    /// Regression guard for #845 (a recurrence of the #828 shared-statics
+    /// race): every test in this module that calls `checkpoint_once` or
+    /// `run_checkpoint_task` — both funnel through `query_wal_pages`, which
+    /// writes the process-wide `LAST_WAL_PAGES` / `CHECKPOINT_*` atomics —
+    /// must be tagged with a `#[serial(...)]` group that includes
+    /// `checkpoint_skip_metrics`. Before #828, six such call sites carried no
+    /// serial tag at all: cargo's default test thread pool ran them
+    /// concurrently with `busy_writer_skips_both_passive_and_truncate`, and an
+    /// untagged tick's `query_wal_pages` call clobbered the gauges between
+    /// this test's warmup tick and its skip assertion (`left: Some(0), right:
+    /// Some(3)` on CI — the two ticks never actually raced against each
+    /// other, a third test's tick did). This scans the module's own source so
+    /// a future test that calls either function without the tag fails this
+    /// assertion instead of flaking on a loaded CI runner.
+    #[test]
+    fn all_checkpoint_metrics_callers_are_serial_tagged() {
+        const SELF_SRC: &str = include_str!("checkpoint.rs");
+        let lines: Vec<&str> = SELF_SRC.lines().collect();
+
+        let attr_starts: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| {
+                let t = l.trim();
+                t == "#[test]" || t.starts_with("#[tokio::test")
+            })
+            .map(|(i, _)| i)
+            .collect();
+
+        let mut offenders = Vec::new();
+
+        for (idx, &start) in attr_starts.iter().enumerate() {
+            let end = attr_starts.get(idx + 1).copied().unwrap_or(lines.len());
+            let span = &lines[start..end];
+
+            let touches_shared_metrics = span
+                .iter()
+                .any(|l| l.contains("checkpoint_once(") || l.contains("run_checkpoint_task("));
+            if !touches_shared_metrics {
+                continue;
+            }
+
+            let has_group_tag = span
+                .iter()
+                .any(|l| l.contains("#[serial") && l.contains("checkpoint_skip_metrics"));
+
+            if !has_group_tag {
+                let name = span
+                    .iter()
+                    .find_map(|l| {
+                        let t = l.trim_start();
+                        let t = t.strip_prefix("pub(crate) ").unwrap_or(t);
+                        let t = t.strip_prefix("pub ").unwrap_or(t);
+                        let t = t.strip_prefix("async ").unwrap_or(t);
+                        t.strip_prefix("fn ")
+                            .map(|rest| rest.split(['(', '<']).next().unwrap_or("").trim())
+                    })
+                    .unwrap_or("<unknown test>");
+                offenders.push(name.to_string());
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "these tests call checkpoint_once/run_checkpoint_task (which write the \
+             process-wide LAST_WAL_PAGES/CHECKPOINT_* atomics via query_wal_pages) but \
+             are not tagged #[serial(checkpoint_skip_metrics)] (or a group including it); \
+             an untagged caller running concurrently on cargo's default test thread pool \
+             can clobber those atomics mid-assertion in another test (the #828/#845 race): \
+             {offenders:?}"
+        );
+    }
+
     /// Observation branch: a checkpoint tick that is actually observed (writer
     /// free) must close out a prior skip streak, resetting the
     /// consecutive-skip counter to 0 without touching the lifetime total.
