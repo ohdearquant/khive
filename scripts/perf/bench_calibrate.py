@@ -550,6 +550,9 @@ def _bench1m_extract(run_dir: pathlib.Path, proc: subprocess.CompletedProcess) -
 # n-keyed rows).
 
 _CONTRACT_RESULT_FILENAME = "contract-result.json"
+# Root discriminators pinned by scripts/perf/schemas/contract-result-v1.json
+_CONTRACT_EXPECTED_SCHEMA_VERSION = 1
+_CONTRACT_EXPECTED_SUITE = "local-engine-contract"
 _CONTRACT_INGEST_REQUIRED_FIELDS = (
     "corpus_docs",
     "docs_per_s_embed_excluded",
@@ -570,6 +573,19 @@ def _contract_extract(run_dir: pathlib.Path, proc: subprocess.CompletedProcess) 
             f"contract suite did not write {_CONTRACT_RESULT_FILENAME}; see {run_dir}/stdout.log"
         )
     result = json.loads(result_path.read_text())
+
+    schema_version = result.get("schema_version")
+    if schema_version != _CONTRACT_EXPECTED_SCHEMA_VERSION:
+        raise SchemaError(
+            f"contract result schema_version={schema_version!r}, expected "
+            f"{_CONTRACT_EXPECTED_SCHEMA_VERSION!r}; see {result_path}"
+        )
+    suite = result.get("suite")
+    if suite != _CONTRACT_EXPECTED_SUITE:
+        raise SchemaError(
+            f"contract result suite={suite!r}, expected {_CONTRACT_EXPECTED_SUITE!r}; "
+            f"see {result_path}"
+        )
 
     dimensions = result.get("dimensions")
     if not isinstance(dimensions, dict) or not dimensions:
@@ -720,6 +736,18 @@ class ContractExtractSelfCheck(unittest.TestCase):
             proc = subprocess.CompletedProcess([], 0, "", "")
             with self.assertRaises(SchemaError):
                 _contract_extract(pathlib.Path(td), proc)
+
+    def test_schema_version_drift_rejected(self) -> None:
+        payload = json.loads(_CONTRACT_FIXTURE_PATH.read_text())
+        payload["schema_version"] = 2
+        with tempfile.TemporaryDirectory() as td, self.assertRaises(SchemaError):
+            self._extract(pathlib.Path(td), payload)
+
+    def test_wrong_suite_discriminator_rejected(self) -> None:
+        payload = json.loads(_CONTRACT_FIXTURE_PATH.read_text())
+        payload["suite"] = "different-suite"
+        with tempfile.TemporaryDirectory() as td, self.assertRaises(SchemaError):
+            self._extract(pathlib.Path(td), payload)
 
     def test_arm_missing_field_rejected(self) -> None:
         payload = json.loads(_CONTRACT_FIXTURE_PATH.read_text())
