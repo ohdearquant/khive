@@ -246,6 +246,133 @@ async fn reingesting_same_fixture_is_idempotent() {
     );
 }
 
+/// `src/lib.rs` importing `crate::foo::Thing`, an item declared in
+/// `src/foo.rs`, must resolve to a `crate -> foo` `depends_on` edge with
+/// `dependency_kinds=["import"]` — not stay unresolved because the raw
+/// import target (`foo::Thing`) names an item inside `foo`, not a nested
+/// module `foo::Thing` (codex PR #1039 review, finding 3).
+fn write_item_import_fixture(root: &Path) {
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"itemimport\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "mod foo;\n\nuse crate::foo::Thing;\n\npub fn use_it() -> Thing {\n    Thing\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/foo.rs"),
+        "pub struct Thing;\n\nimpl Thing {}\n",
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn rust_item_import_resolves_to_containing_module_after_reingest() {
+    let root = TempDir::new().expect("tempdir");
+    write_item_import_fixture(root.path());
+    let db = root.path().join("item_import.db");
+    let rt = rt_at(&db);
+    let token = rt.authorize(Namespace::local()).expect("token");
+
+    let opts = || CodeSourceIngestOptions {
+        path: root.path(),
+        languages: all_languages(),
+        sweep_time: Utc::now(),
+    };
+
+    // First pass records the item import as unresolved (module `foo` did
+    // not exist yet when `lib.rs` was scanned, depending on file-walk
+    // order); the synchronous re-resolve pass inside the same call already
+    // covers this, but re-ingesting once more is the documented idempotency
+    // contract (B4/B6) and removes any file-walk-order sensitivity.
+    run_code_ingest(&rt, &token, opts())
+        .await
+        .expect("first ingest succeeds");
+    run_code_ingest(&rt, &token, opts())
+        .await
+        .expect("second ingest succeeds");
+
+    let edges = edge_fingerprints(&rt).await;
+    assert!(
+        edges.iter().any(|(rel, src, tgt, kinds)| rel == "depends_on"
+            && src == "crate"
+            && tgt == "foo"
+            && kinds == "import"),
+        "expected one crate -> foo depends_on edge with dependency_kinds=[\"import\"], got: {edges:?}"
+    );
+}
+
+/// A manifestless folder (no `Cargo.toml`/`pyproject.toml`/`package.json`
+/// anywhere above its source files) must still produce project/module
+/// entities and import edges under the basename-fallback identity rule
+/// (ADR-085 Amendment 2 B4), not be silently skipped for lack of a manifest
+/// (codex PR #1039 review, finding 4).
+#[tokio::test]
+async fn manifestless_rust_folder_uses_basename_fallback() {
+    let root = TempDir::new().expect("tempdir");
+    let proj = root.path().join("bare_rust_project");
+    std::fs::create_dir_all(proj.join("src")).unwrap();
+    std::fs::write(
+        proj.join("src/lib.rs"),
+        "mod util;\n\nuse crate::util::helper;\n\npub fn call() {\n    helper();\n}\n",
+    )
+    .unwrap();
+    std::fs::write(proj.join("src/util.rs"), "pub fn helper() {}\n").unwrap();
+
+    let db = root.path().join("manifestless.db");
+    let rt = rt_at(&db);
+    let token = rt.authorize(Namespace::local()).expect("token");
+
+    let report = run_code_ingest(
+        &rt,
+        &token,
+        CodeSourceIngestOptions {
+            path: &proj,
+            languages: all_languages(),
+            sweep_time: Utc::now(),
+        },
+    )
+    .await
+    .expect("manifestless ingest succeeds");
+    // Re-ingest so the synchronous re-resolve pass materializes the
+    // module -> module edge regardless of file-walk order.
+    run_code_ingest(
+        &rt,
+        &token,
+        CodeSourceIngestOptions {
+            path: &proj,
+            languages: all_languages(),
+            sweep_time: Utc::now(),
+        },
+    )
+    .await
+    .expect("manifestless re-ingest succeeds");
+
+    assert!(
+        report.modules_created > 0 || report.projects_created > 0,
+        "a manifestless folder with source files must still create project/module entities"
+    );
+
+    let edges = edge_fingerprints(&rt).await;
+    assert!(
+        edges
+            .iter()
+            .any(|(rel, src, _tgt, _kinds)| rel == "contains" && src == "bare_rust_project"),
+        "expected the basename-fallback project 'bare_rust_project' to contain its module, got: {edges:?}"
+    );
+    assert!(
+        edges.iter().any(|(rel, src, tgt, kinds)| rel == "depends_on"
+            && src == "crate"
+            && tgt == "util"
+            && kinds == "import"),
+        "expected one crate -> util depends_on edge with dependency_kinds=[\"import\"], got: {edges:?}"
+    );
+}
+
 #[tokio::test]
 async fn rejects_nonexistent_path() {
     let root = TempDir::new().expect("tempdir");
