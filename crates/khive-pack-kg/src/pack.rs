@@ -6,7 +6,14 @@ use crate::handler_defs::KG_HANDLERS;
 
 /// Pack-extensible edge endpoint rules (person↔org, person↔project, org↔org).
 /// See `docs/api/edge-rules-pack-kg.md`.
-pub(crate) static KG_EDGE_RULES: [EdgeEndpointRule; 9] = [
+///
+/// ADR-087 Amendment 1 §A9: decision review rounds chain via
+/// `decision precedes decision` note-to-note edges. Round N-1 precedes round
+/// N; this is NOT `supersedes` — earlier rounds stay authoritative for their
+/// own commit. The base `precedes` contract (ADR-002) is entity-to-entity
+/// only; this rule additively extends it to `decision` note pairs, mirroring
+/// the GTD pack's `task`->`task` `depends_on` rule.
+pub(crate) static KG_EDGE_RULES: [EdgeEndpointRule; 10] = [
     EdgeEndpointRule {
         relation: EdgeRelation::PartOf,
         source: EndpointKind::EntityOfKind("person"),
@@ -51,6 +58,11 @@ pub(crate) static KG_EDGE_RULES: [EdgeEndpointRule; 9] = [
         relation: EdgeRelation::Precedes,
         source: EndpointKind::EntityOfKind("org"),
         target: EndpointKind::EntityOfKind("org"),
+    },
+    EdgeEndpointRule {
+        relation: EdgeRelation::Precedes,
+        source: EndpointKind::NoteOfKind("decision"),
+        target: EndpointKind::NoteOfKind("decision"),
     },
 ];
 

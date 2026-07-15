@@ -1476,3 +1476,159 @@ async fn create_bulk_items_rejects_top_level_embedding_content() {
         "error must name the offending field: {err}"
     );
 }
+
+// Shared by the `decision precedes decision` tests below: builds the KG
+// registry and installs its composed edge rules (the same rule set the
+// production MCP server runs under), so negative cases prove the
+// `decision`->`decision` exception stays kind-specific rather than merely
+// exercising the base entity-only rule against an unconfigured runtime.
+async fn configured_kg_pack() -> (
+    khive_runtime::KhiveRuntime,
+    khive_runtime::NamespaceToken,
+    crate::KgPack,
+) {
+    use crate::KgPack;
+    use khive_runtime::VerbRegistryBuilder;
+
+    let rt = khive_runtime::KhiveRuntime::memory().expect("in-memory runtime");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    let registry = builder.build().expect("kg registry builds");
+    rt.install_edge_rules(registry.all_edge_rules());
+    let token = rt.authorize(khive_runtime::Namespace::local()).unwrap();
+    let pack = KgPack::new(rt.clone());
+    (rt, token, pack)
+}
+
+// ADR-087 Amendment 1 §A9: review-round chains are `decision precedes
+// decision` note-to-note edges (round N-1 precedes round N). KG_EDGE_RULES
+// additively extends the base entity-only `precedes` contract to
+// `decision`->`decision` note pairs, mirroring the GTD pack's `task`->`task`
+// `depends_on` rule.
+#[tokio::test]
+async fn link_accepts_decision_precedes_decision() {
+    let (rt, token, pack) = configured_kg_pack().await;
+
+    let round1 = rt
+        .create_note(
+            &token,
+            "decision",
+            None,
+            "round 1 decision",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create round-1 decision note");
+    let round2 = rt
+        .create_note(
+            &token,
+            "decision",
+            None,
+            "round 2 decision",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create round-2 decision note");
+
+    let params = serde_json::json!({
+        "source_id": round1.id.to_string(),
+        "target_id": round2.id.to_string(),
+        "relation": "precedes",
+    });
+    assert!(
+        pack.handle_link(&token, params).await.is_ok(),
+        "decision->decision precedes must be accepted"
+    );
+}
+
+#[tokio::test]
+async fn link_rejects_decision_precedes_observation() {
+    let (rt, token, pack) = configured_kg_pack().await;
+
+    let decision = rt
+        .create_note(&token, "decision", None, "a decision", None, None, vec![])
+        .await
+        .expect("create decision note");
+    let observation = rt
+        .create_note(
+            &token,
+            "observation",
+            None,
+            "an observation",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create observation note");
+
+    let params = serde_json::json!({
+        "source_id": decision.id.to_string(),
+        "target_id": observation.id.to_string(),
+        "relation": "precedes",
+    });
+    assert!(
+        pack.handle_link(&token, params).await.is_err(),
+        "decision->observation precedes must be rejected"
+    );
+}
+
+#[tokio::test]
+async fn link_rejects_observation_precedes_decision() {
+    let (rt, token, pack) = configured_kg_pack().await;
+
+    let observation = rt
+        .create_note(
+            &token,
+            "observation",
+            None,
+            "an observation",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create observation note");
+    let decision = rt
+        .create_note(&token, "decision", None, "a decision", None, None, vec![])
+        .await
+        .expect("create decision note");
+
+    let params = serde_json::json!({
+        "source_id": observation.id.to_string(),
+        "target_id": decision.id.to_string(),
+        "relation": "precedes",
+    });
+    assert!(
+        pack.handle_link(&token, params).await.is_err(),
+        "observation->decision precedes must be rejected"
+    );
+}
+
+#[tokio::test]
+async fn link_entity_precedes_entity_unaffected_by_decision_note_rule() {
+    let (rt, token, pack) = configured_kg_pack().await;
+
+    let src = rt
+        .create_entity(&token, "project", None, "step 1", None, None, vec![])
+        .await
+        .expect("create source entity");
+    let tgt = rt
+        .create_entity(&token, "project", None, "step 2", None, None, vec![])
+        .await
+        .expect("create target entity");
+
+    let params = serde_json::json!({
+        "source_id": src.id.to_string(),
+        "target_id": tgt.id.to_string(),
+        "relation": "precedes",
+    });
+    assert!(
+        pack.handle_link(&token, params).await.is_ok(),
+        "entity->entity precedes must remain accepted under the composed rule set (base ADR-002 contract)"
+    );
+}
