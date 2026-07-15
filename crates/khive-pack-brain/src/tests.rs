@@ -2221,12 +2221,12 @@ fn make_pack_with_actor(actor_id: &str) -> (BrainPack, KhiveRuntime) {
 /// balanced-recall-v1 — and must leave the default profile's posteriors untouched.
 #[tokio::test]
 async fn feedback_697_unattributed_resolves_via_actor_binding() {
-    let (pack, rt) = make_pack_with_actor("leo");
+    let (pack, rt) = make_pack_with_actor("test-actor");
     let registry = empty_registry();
     let token = rt.authorize(Namespace::local()).unwrap();
     assert_eq!(
         token.actor().id,
-        "leo",
+        "test-actor",
         "test setup: token must carry the configured actor"
     );
 
@@ -2234,7 +2234,7 @@ async fn feedback_697_unattributed_resolves_via_actor_binding() {
 
     pack.dispatch(
         "brain.create_profile",
-        json!({"name": "leo-bound-v1", "consumer_kind": "recall"}),
+        json!({"name": "test-bound-v1", "consumer_kind": "recall"}),
         &registry,
         &token,
     )
@@ -2242,7 +2242,7 @@ async fn feedback_697_unattributed_resolves_via_actor_binding() {
     .unwrap();
     pack.dispatch(
         "brain.activate",
-        json!({"profile_id": "leo-bound-v1"}),
+        json!({"profile_id": "test-bound-v1"}),
         &registry,
         &token,
     )
@@ -2252,7 +2252,7 @@ async fn feedback_697_unattributed_resolves_via_actor_binding() {
     // namespace-only resolution (pre-#697) can never reach this binding.
     pack.dispatch(
         "brain.bind",
-        json!({"actor": "leo", "profile_id": "leo-bound-v1", "consumer_kind": "recall"}),
+        json!({"actor": "test-actor", "profile_id": "test-bound-v1", "consumer_kind": "recall"}),
         &registry,
         &token,
     )
@@ -2284,7 +2284,7 @@ async fn feedback_697_unattributed_resolves_via_actor_binding() {
     let bound_after = pack
         .dispatch(
             "brain.profile",
-            json!({"profile_id": "leo-bound-v1"}),
+            json!({"profile_id": "test-bound-v1"}),
             &registry,
             &token,
         )
@@ -2590,7 +2590,7 @@ async fn feedback_697_unattributed_no_binding_falls_back_to_default() {
 /// actor binding.
 #[tokio::test]
 async fn feedback_697_explicit_profile_overrides_actor_binding() {
-    let (pack, rt) = make_pack_with_actor("leo");
+    let (pack, rt) = make_pack_with_actor("test-actor");
     let registry = empty_registry();
     let token = rt.authorize(Namespace::local()).unwrap();
 
@@ -2598,7 +2598,7 @@ async fn feedback_697_explicit_profile_overrides_actor_binding() {
 
     pack.dispatch(
         "brain.create_profile",
-        json!({"name": "leo-bound-v2", "consumer_kind": "recall"}),
+        json!({"name": "test-bound-v2", "consumer_kind": "recall"}),
         &registry,
         &token,
     )
@@ -2606,7 +2606,7 @@ async fn feedback_697_explicit_profile_overrides_actor_binding() {
     .unwrap();
     pack.dispatch(
         "brain.activate",
-        json!({"profile_id": "leo-bound-v2"}),
+        json!({"profile_id": "test-bound-v2"}),
         &registry,
         &token,
     )
@@ -2614,14 +2614,14 @@ async fn feedback_697_explicit_profile_overrides_actor_binding() {
     .unwrap();
     pack.dispatch(
         "brain.bind",
-        json!({"actor": "leo", "profile_id": "leo-bound-v2", "consumer_kind": "recall"}),
+        json!({"actor": "test-actor", "profile_id": "test-bound-v2", "consumer_kind": "recall"}),
         &registry,
         &token,
     )
     .await
     .unwrap();
 
-    // Explicit param names balanced-recall-v1 even though "leo" has a binding.
+    // Explicit param names balanced-recall-v1 even though "test-actor" has a binding.
     pack.dispatch(
         "brain.feedback",
         json!({
@@ -2638,7 +2638,7 @@ async fn feedback_697_explicit_profile_overrides_actor_binding() {
     let bound_events = pack
         .dispatch(
             "brain.profile",
-            json!({"profile_id": "leo-bound-v2"}),
+            json!({"profile_id": "test-bound-v2"}),
             &registry,
             &token,
         )
