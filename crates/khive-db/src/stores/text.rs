@@ -177,7 +177,7 @@ impl Fts5TextSearch {
         F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
         R: Send + 'static,
     {
-        if self.is_file_backed {
+        let result = if self.is_file_backed {
             let conn = self.open_standalone_writer()?;
             tokio::task::spawn_blocking(move || f(&conn).map_err(|e| map_err(e, op)))
                 .await
@@ -190,7 +190,31 @@ impl Fts5TextSearch {
             })
             .await
             .map_err(|e| StorageError::driver(StorageCapability::Text, op, e))?
+        };
+        if let Err(err) = &result {
+            let msg = err.to_string();
+            if msg.contains("locked") || msg.contains("busy") {
+                let open: Vec<String> = khive_storage::tx_registry::snapshot()
+                    .into_iter()
+                    .map(|(age, label)| {
+                        format!(
+                            "{}@{}ms",
+                            label.as_deref().unwrap_or("unlabeled"),
+                            age.as_millis()
+                        )
+                    })
+                    .collect();
+                tracing::warn!(
+                    op,
+                    open_tx_count = open.len(),
+                    open_txs = %open.join(","),
+                    "text write starved on the SQLite write lock; open registered \
+                     transactions listed (empty means the holder issued no \
+                     registered BEGIN IMMEDIATE in this process)"
+                );
+            }
         }
+        result
     }
 
     async fn with_reader<F, R>(&self, op: &'static str, f: F) -> Result<R, StorageError>
