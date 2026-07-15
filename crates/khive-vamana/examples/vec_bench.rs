@@ -55,6 +55,8 @@ struct Args {
     normalization: String,
     source_url: Option<String>,
     bank_run_dir: Option<PathBuf>,
+    workers: Vec<usize>,
+    dump_topk: Option<PathBuf>,
 }
 
 fn parse_args() -> Args {
@@ -71,6 +73,8 @@ fn parse_args() -> Args {
     let mut normalization = String::from("l2");
     let mut source_url: Option<String> = None;
     let mut bank_run_dir: Option<PathBuf> = None;
+    let mut workers: Vec<usize> = Vec::new();
+    let mut dump_topk: Option<PathBuf> = None;
 
     while let Some(key) = args_iter.next() {
         match key.as_str() {
@@ -141,8 +145,25 @@ fn parse_args() -> Args {
                     bank_run_dir = Some(PathBuf::from(val));
                 }
             }
+            "--workers" => {
+                if let Some(val) = args_iter.next() {
+                    workers.extend(
+                        val.split(',')
+                            .filter_map(|s| s.trim().parse::<usize>().ok()),
+                    );
+                }
+            }
+            "--dump-topk" => {
+                if let Some(val) = args_iter.next() {
+                    dump_topk = Some(PathBuf::from(val));
+                }
+            }
             _ => {}
         }
+    }
+
+    if workers.is_empty() {
+        workers.push(1);
     }
 
     Args {
@@ -158,6 +179,8 @@ fn parse_args() -> Args {
         normalization,
         source_url,
         bank_run_dir,
+        workers,
+        dump_topk,
     }
 }
 
@@ -405,6 +428,131 @@ fn measure_bruteforce_latency_us(
     }
     samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
     samples[samples.len() / 2]
+}
+
+// ─── concurrent query arms ───────────────────────────────────────────────────
+
+fn percentiles_us(samples: &mut [f64]) -> (f64, f64, f64) {
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let n = samples.len();
+    let last = *samples.last().unwrap();
+    let p50 = samples[n / 2];
+    let p95 = samples[(n as f64 * 0.95) as usize].min(last);
+    let p99 = samples[(n as f64 * 0.99) as usize].min(last);
+    (p50, p95, p99)
+}
+
+/// Partition `[0, n_queries)` across `workers` OS threads, each with its own
+/// `VisitedSet` (the only per-search mutable state — `VamanaGraph::greedy_search`
+/// takes `&self` and touches no interior-mutable state, so concurrent readers
+/// over the same graph/corpus are safe). Each thread times its own queries with
+/// its own clock; percentiles are computed over the pooled per-query samples.
+#[allow(clippy::too_many_arguments)]
+fn measure_concurrent_warm_latency(
+    graph: &VamanaGraph,
+    corpus: &[f32],
+    dim: usize,
+    queries: &[f32],
+    gt: &[Vec<u32>],
+    n_queries: usize,
+    beam: usize,
+    workers: usize,
+) -> (f64, f64, f64, f64) {
+    let n = corpus.len() / dim;
+    let workers = workers.max(1);
+    let chunk = n_queries.div_ceil(workers);
+
+    let per_thread: Vec<(Vec<f64>, f64, usize)> = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers);
+        for w in 0..workers {
+            let start = w * chunk;
+            if start >= n_queries {
+                continue;
+            }
+            let end = (start + chunk).min(n_queries);
+            handles.push(scope.spawn(move || {
+                let mut visited = VisitedSet::new(n);
+                // Untimed warm-up pass so the timed pass below measures a hot cache.
+                for qi in start..end {
+                    let q = row_slice(queries, dim, qi);
+                    let _ = search_with_beam(graph, corpus, dim, q, K, beam, &mut visited);
+                }
+                let mut samples = Vec::with_capacity(end - start);
+                let mut recall_sum = 0.0f64;
+                for (i, gt_row) in gt[start..end].iter().enumerate() {
+                    let qi = start + i;
+                    let q = row_slice(queries, dim, qi);
+                    let t0 = Instant::now();
+                    let res = search_with_beam(graph, corpus, dim, q, K, beam, &mut visited);
+                    samples.push(t0.elapsed().as_secs_f64() * 1e6);
+                    recall_sum += recall_at_k(&res, gt_row, K);
+                }
+                (samples, recall_sum, end - start)
+            }));
+        }
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    let mut all_samples: Vec<f64> = Vec::with_capacity(n_queries);
+    let mut recall_sum = 0.0f64;
+    let mut counted = 0usize;
+    for (samples, recall, count) in per_thread {
+        all_samples.extend(samples);
+        recall_sum += recall;
+        counted += count;
+    }
+    let (p50, p95, p99) = percentiles_us(&mut all_samples);
+    (recall_sum / counted as f64, p50, p95, p99)
+}
+
+// ─── per-query top-k dump ────────────────────────────────────────────────────
+
+fn dump_path_for_n(base: &Path, n: usize) -> PathBuf {
+    let stem = base.file_stem().and_then(|s| s.to_str()).unwrap_or("topk");
+    let filename = match base.extension().and_then(|s| s.to_str()) {
+        Some(ext) => format!("{stem}-n{n}.{ext}"),
+        None => format!("{stem}-n{n}"),
+    };
+    base.with_file_name(filename)
+}
+
+/// Untimed pass at `dump_k` (separate from the K=10 timed phase so the dump
+/// pass never pollutes latency numbers). Writes one JSON line per query
+/// (`{"query_idx": ..., "ids": [...]}`, ids sorted by ascending distance) and
+/// returns the per-query result lists so the caller can derive recall@1/@100.
+#[allow(clippy::too_many_arguments)]
+fn dump_topk(
+    graph: &VamanaGraph,
+    corpus: &[f32],
+    dim: usize,
+    queries: &[f32],
+    n_queries: usize,
+    dump_k: usize,
+    beam: usize,
+    path: &Path,
+) -> Vec<Vec<(u32, f32)>> {
+    use std::io::Write;
+
+    let n = corpus.len() / dim;
+    let mut visited = VisitedSet::new(n);
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).ok();
+        }
+    }
+    let mut file = File::create(path)
+        .unwrap_or_else(|e| panic!("cannot create dump-topk file {}: {e}", path.display()));
+
+    let mut all_results = Vec::with_capacity(n_queries);
+    for qi in 0..n_queries {
+        let q = row_slice(queries, dim, qi);
+        let res = search_with_beam(graph, corpus, dim, q, dump_k, beam, &mut visited);
+        let ids: Vec<u32> = res.iter().map(|&(id, _)| id).collect();
+        writeln!(file, "{}", json!({"query_idx": qi, "ids": ids}))
+            .expect("failed to write dump-topk line");
+        all_results.push(res);
+    }
+    all_results
 }
 
 // ─── log-log OLS ─────────────────────────────────────────────────────────────
@@ -817,6 +965,10 @@ struct RowResult {
     bruteforce_p50_us: f64,
     speedup_vs_brute_force: f64,
     per_query_resident_exceeds_llc: bool,
+    concurrency_arms: Vec<Value>,
+    recall_at_1: Option<f64>,
+    recall_at_100: Option<f64>,
+    topk_dump_path: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -972,6 +1124,72 @@ fn main() {
         );
         println!();
 
+        // Concurrent query arms (Change: --workers). workers=1 always runs so the
+        // additive `concurrency_arms` field is present even with no CLI flag; the
+        // existing top-level query_warm_* fields above are untouched.
+        let mut concurrency_arms: Vec<Value> = Vec::new();
+        for &w in &args.workers {
+            let (c_recall, c_p50, c_p95, c_p99) = measure_concurrent_warm_latency(
+                &graph, &corpus, dim, &query_all, &gt, n_lat, iso_beam, w,
+            );
+            println!(
+                "  Concurrency arm workers={w}: recall@{K}={c_recall:.4} p50={c_p50:.1}us p95={c_p95:.1}us p99={c_p99:.1}us"
+            );
+            concurrency_arms.push(json!({
+                "workers": w,
+                "recall_at_10": c_recall,
+                "query_warm_p50_us": c_p50,
+                "query_warm_p95_us": c_p95,
+                "query_warm_p99_us": c_p99,
+                "queries": n_lat,
+            }));
+        }
+        println!();
+
+        // Per-query top-k dump (Change: --dump-topk). Untimed K=100 pass so
+        // recall@1/@10/@100 are all derivable without polluting the K=10 timed
+        // latency numbers above.
+        let (recall_at_1, recall_at_100, topk_dump_path) = if let Some(base_path) = &args.dump_topk
+        {
+            let dump_path = if args.ns.len() > 1 {
+                dump_path_for_n(base_path, n)
+            } else {
+                base_path.clone()
+            };
+            let dump_k = 100usize.max(K);
+            print!("  Computing brute-force GT@{dump_k} + dumping top-k for {n_gt_queries} queries... ");
+            let t0 = Instant::now();
+            let gt_dump = compute_subset_gt(&corpus, &query_all, dim, n_gt_queries, dump_k);
+            let dump_beam = MAX_ISO_BEAM.max(iso_beam);
+            let dumped = dump_topk(
+                &graph,
+                &corpus,
+                dim,
+                &query_all,
+                n_gt_queries,
+                dump_k,
+                dump_beam,
+                &dump_path,
+            );
+            let mut r1_sum = 0.0f64;
+            let mut r100_sum = 0.0f64;
+            for (qi, res) in dumped.iter().enumerate() {
+                r1_sum += recall_at_k(res, &gt_dump[qi], 1);
+                r100_sum += recall_at_k(res, &gt_dump[qi], dump_k);
+            }
+            let r1 = r1_sum / n_gt_queries as f64;
+            let r100 = r100_sum / n_gt_queries as f64;
+            println!(
+                "{:.1}ms  recall@1={r1:.4} recall@100={r100:.4} -> {}",
+                t0.elapsed().as_secs_f64() * 1000.0,
+                dump_path.display()
+            );
+            (Some(r1), Some(r100), Some(dump_path.display().to_string()))
+        } else {
+            (None, None, None)
+        };
+        println!();
+
         rows.push(RowResult {
             n,
             build_ms,
@@ -985,6 +1203,10 @@ fn main() {
             bruteforce_p50_us: bf_p50,
             speedup_vs_brute_force: speedup,
             per_query_resident_exceeds_llc: exceeds_llc,
+            concurrency_arms,
+            recall_at_1,
+            recall_at_100,
+            topk_dump_path,
         });
     }
 
@@ -1162,6 +1384,10 @@ fn main() {
                 "per_query_resident_bytes": null,
                 "per_query_resident_exceeds_llc": r.per_query_resident_exceeds_llc,
                 "gt_source": "brute-force recomputed on subset",
+                "concurrency_arms": r.concurrency_arms,
+                "recall_at_1": r.recall_at_1,
+                "recall_at_100": r.recall_at_100,
+                "topk_dump_path": r.topk_dump_path,
             })
         })
         .collect();
