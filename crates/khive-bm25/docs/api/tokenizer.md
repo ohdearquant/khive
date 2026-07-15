@@ -9,10 +9,10 @@ an `Arc<dyn Tokenizer>`, allowing an index and its clones to share tokenizer sta
 
 ## `SimpleTokenizer`
 
-`SimpleTokenizer` splits on whitespace, strips leading and trailing non-alphanumeric characters,
-optionally lowercases, filters by minimum character length, and optionally removes the built-in
-English stop-word set. Defaults enable lowercasing and stop-word removal with a minimum length of
-one.
+`SimpleTokenizer` splits on whitespace, strips leading and trailing ASCII punctuation (non-ASCII
+punctuation is retained), optionally lowercases, filters by minimum UTF-8 byte length, and
+optionally removes the built-in English stop-word set. Defaults enable lowercasing and stop-word
+removal with a minimum length of one.
 
 ASCII tokens use an ASCII-only lowercase fast path; non-ASCII input falls back to Unicode-aware
 lowercasing. Capacity is estimated from typical English word length to reduce reallocations without
