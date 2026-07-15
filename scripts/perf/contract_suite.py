@@ -151,7 +151,7 @@ def parse_workers(spec: str) -> list[int]:
     for part in spec.split(","):
         part = part.strip()
         if not part:
-            continue
+            raise ValueError(f"--workers contains an empty segment: {spec!r}")
         w = int(part)
         if w < 1:
             raise ValueError(f"--workers value must be >= 1, got {w!r}")
