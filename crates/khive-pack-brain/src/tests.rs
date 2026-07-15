@@ -2314,6 +2314,141 @@ async fn feedback_697_unattributed_resolves_via_actor_binding() {
     );
 }
 
+/// #1016: every persisted feedback event payload must carry the RESOLVED
+/// `served_by_profile_id` plus the `profile_resolution` marker — across all
+/// three resolution tiers AND the gated implicit append path (which builds
+/// its event inside the fold-gate atomic unit from a cloned `base_data`).
+#[tokio::test]
+async fn feedback_1016_event_payload_stamps_resolved_profile_all_tiers() {
+    use khive_storage::event::EventFilter;
+    use khive_storage::types::PageRequest;
+
+    let (pack, rt) = make_pack_with_actor("leo");
+    let registry = empty_registry();
+    let token = rt.authorize(Namespace::local()).unwrap();
+    let target = create_test_entity(&rt, &token).await;
+
+    // Tier 3 (default): no explicit value, no binding — ordinary append path.
+    pack.dispatch(
+        "brain.feedback",
+        json!({"target_id": target, "signal": "useful"}),
+        &registry,
+        &token,
+    )
+    .await
+    .unwrap();
+
+    // Tier 3, gated implicit: same resolution, fold-gate append closure.
+    pack.dispatch(
+        "brain.feedback",
+        json!({"target_id": target, "signal": "implicit_positive"}),
+        &registry,
+        &token,
+    )
+    .await
+    .unwrap();
+
+    // Tier 2 (binding): bound profile resolves when the caller omits the id.
+    for (verb, params) in [
+        (
+            "brain.create_profile",
+            json!({"name": "leo-bound-v1", "consumer_kind": "recall"}),
+        ),
+        ("brain.activate", json!({"profile_id": "leo-bound-v1"})),
+        (
+            "brain.bind",
+            json!({"actor": "leo", "profile_id": "leo-bound-v1", "consumer_kind": "recall"}),
+        ),
+    ] {
+        pack.dispatch(verb, params, &registry, &token)
+            .await
+            .unwrap();
+    }
+    pack.dispatch(
+        "brain.feedback",
+        json!({"target_id": target, "signal": "useful"}),
+        &registry,
+        &token,
+    )
+    .await
+    .unwrap();
+
+    // Tier 1 (explicit): caller-supplied id wins over the binding.
+    pack.dispatch(
+        "brain.feedback",
+        json!({
+            "target_id": target,
+            "signal": "useful",
+            "served_by_profile_id": "balanced-recall-v1"
+        }),
+        &registry,
+        &token,
+    )
+    .await
+    .unwrap();
+
+    let events = rt
+        .events(&token)
+        .expect("event store")
+        .query_events(
+            EventFilter::default(),
+            PageRequest {
+                offset: 0,
+                limit: 1000,
+            },
+        )
+        .await
+        .expect("query_events");
+    let mut stamps: Vec<(String, String, String)> = events
+        .items
+        .iter()
+        .filter(|e| e.verb == "brain.feedback")
+        .map(|e| {
+            (
+                e.payload["signal"].as_str().unwrap_or("").to_string(),
+                e.payload["served_by_profile_id"]
+                    .as_str()
+                    .unwrap_or("<missing>")
+                    .to_string(),
+                e.payload["profile_resolution"]
+                    .as_str()
+                    .unwrap_or("<missing>")
+                    .to_string(),
+            )
+        })
+        .collect();
+    stamps.sort();
+
+    let mut expected = vec![
+        (
+            "useful".to_string(),
+            "balanced-recall-v1".to_string(),
+            "default".to_string(),
+        ),
+        (
+            "implicit_positive".to_string(),
+            "balanced-recall-v1".to_string(),
+            "default".to_string(),
+        ),
+        (
+            "useful".to_string(),
+            "leo-bound-v1".to_string(),
+            "binding".to_string(),
+        ),
+        (
+            "useful".to_string(),
+            "balanced-recall-v1".to_string(),
+            "explicit".to_string(),
+        ),
+    ];
+    expected.sort();
+
+    assert_eq!(
+        stamps, expected,
+        "#1016: all four feedback events must persist the resolved profile and its resolution marker"
+    );
+}
+
 /// Systemic-fix regression: an ANONYMOUS caller must not match an explicit
 /// `actor="local"` binding. `ActorRef::anonymous()` carries `id: "local"`
 /// (`khive-gate/src/actor.rs`); before the `binding_id()` fix,

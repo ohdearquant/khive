@@ -182,7 +182,7 @@ field — they were never "served" by a profile, just observed by brain.
 // Minimum payload shape for profile-served events.
 #[derive(Serialize, Deserialize)]
 pub struct ServedEventPayload {
-    pub served_by_profile_id: Option<String>,  // None ⇒ default/no-binding path
+    pub served_by_profile_id: Option<String>,  // None ⇒ legacy event (see Amendment 1)
     #[serde(flatten)]
     pub kind_specific: serde_json::Value,
 }
@@ -1272,6 +1272,28 @@ deployment.
    threshold? Success rate drop over a rolling window? Fixed epoch schedule? Needs empirical
    calibration on real usage data. `BalancedRecallProfile` ships with variance-threshold
    default; operators can override.
+
+---
+
+## Amendment 1 — Always-stamped feedback attribution (2026-07-14, #1016)
+
+The original payload shape above allowed `served_by_profile_id: None` to mean the
+default/no-binding resolution path. That made per-profile event accounting ambiguous: the
+posterior fold credited the resolved profile (explicit value, else the actor+namespace
+binding, else the system default) while the persisted event carried no attribution unless
+the caller passed the id explicitly.
+
+As of #1016, newly emitted `FeedbackExplicit` events always persist the effective profile:
+
+- `served_by_profile_id` is stamped with the RESOLVED profile id on every feedback event,
+  matching what the posterior fold credits — never omitted for the binding or default path.
+- A `profile_resolution` marker records how the id was resolved: `explicit` (caller
+  supplied it), `binding` (actor+namespace resolution table), or `default` (system default
+  profile). This keeps call-site discipline measurable separately from attribution.
+- A missing `served_by_profile_id` on a stored event now means exactly one thing: the event
+  predates this amendment (legacy semantics). Historical events are not retro-stamped —
+  the resolution table may have changed since they were written — and decoders remain
+  tolerant of both missing fields.
 
 ---
 
