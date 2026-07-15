@@ -65,6 +65,18 @@ pub(crate) struct AnnState {
     /// `install_if_fresher` uses it to reject stale builds. See
     /// crates/khive-pack-knowledge/docs/api/vamana.md#annstategenerations-per-namespace-write-generation-counter-issue-770.
     generations: std::sync::Mutex<HashMap<String, u64>>,
+    /// Keys whose most recent warm attempt found the corpus unbuildable
+    /// (empty corpus or a build error), mapped to the namespace
+    /// write-generation captured at scan start (issue #1026). A marker is
+    /// terminal — `wait_for_ann` returns immediately rather than polling out
+    /// `ANN_WARM_WAIT_TIMEOUT_MS` — exactly when its stored generation is
+    /// still >= the namespace's CURRENT generation: nothing can have changed
+    /// the outcome since the scan that produced it. A marker whose stored
+    /// generation has fallen behind means the corpus mutated after the scan,
+    /// so it no longer predicts anything and is discarded on next check.
+    /// `install_if_fresher` clears a key's marker whenever it actually
+    /// installs a fresh index for that key.
+    unavailable: std::sync::Mutex<HashMap<AnnKey, u64>>,
 }
 
 pub(crate) type SharedAnn = Arc<AnnState>;
@@ -74,6 +86,7 @@ pub(crate) fn new_shared() -> SharedAnn {
         indexes: RwLock::new(HashMap::new()),
         warming: std::sync::Mutex::new(HashSet::new()),
         generations: std::sync::Mutex::new(HashMap::new()),
+        unavailable: std::sync::Mutex::new(HashMap::new()),
     })
 }
 
@@ -138,6 +151,7 @@ pub(crate) async fn install_if_fresher(ann: &SharedAnn, key: &AnnKey, candidate:
         }
         _ => {
             idxs.insert(key.clone(), candidate);
+            unavailable_guard(&ann.unavailable).remove(key);
         }
     }
 }
@@ -148,6 +162,42 @@ fn warming_guard(
     m: &std::sync::Mutex<HashSet<AnnKey>>,
 ) -> std::sync::MutexGuard<'_, HashSet<AnnKey>> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+// Recover a poisoned unavailable Mutex rather than aborting: the guarded
+// HashMap<AnnKey, u64> stays logically valid through a poison (worst case a
+// stale reader misses one mark/clear, which only costs an extra wait or an
+// extra rebuild attempt — never a wrong terminal result).
+fn unavailable_guard(
+    m: &std::sync::Mutex<HashMap<AnnKey, u64>>,
+) -> std::sync::MutexGuard<'_, HashMap<AnnKey, u64>> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Record that `key`'s corpus scan at `generation` found nothing buildable
+/// (empty corpus or a build error). See the `unavailable` field doc on
+/// `AnnState` for the generation-fencing invariant `wait_for_ann` relies on.
+fn mark_unavailable(ann: &SharedAnn, key: &AnnKey, generation: u64) {
+    unavailable_guard(&ann.unavailable).insert(key.clone(), generation);
+}
+
+/// Returns `true` when `key` has an unavailable marker whose generation is
+/// still current, i.e. no corpus mutation has happened since the scan that
+/// produced it — nothing will ever populate `indexes` for it, so waiting out
+/// the full poll timeout is pointless. A marker that has fallen behind the
+/// namespace's current generation is stale and is discarded here so a fresh
+/// warm attempt (triggered by the mutation) gets a chance to run.
+fn is_terminally_unavailable(ann: &SharedAnn, key: &AnnKey) -> bool {
+    let current = current_generation(ann, &key.namespace);
+    let mut guard = unavailable_guard(&ann.unavailable);
+    match guard.get(key) {
+        Some(&marked_generation) if marked_generation >= current => true,
+        Some(_) => {
+            guard.remove(key);
+            false
+        }
+        None => false,
+    }
 }
 
 /// Insert `bridge` under `key` only if the slot is empty. Returns `true` when
@@ -217,7 +267,10 @@ pub(crate) fn is_warming_not_loaded(ann: &SharedAnn, key: &AnnKey) -> bool {
     }
 }
 
-/// Poll `ann` until `key` appears in the loaded index set or `timeout_ms` elapses.
+/// Poll `ann` until `key` appears in the loaded index set, `timeout_ms`
+/// elapses, or the warm outcome is discovered to be terminal (issue #1026:
+/// an empty or unbuildable corpus can never populate the index, so polling
+/// out the full timeout on every query wastes `timeout_ms` for nothing).
 ///
 /// Returns `true` if the index became available within the timeout.
 pub(crate) async fn wait_for_ann(
@@ -230,6 +283,9 @@ pub(crate) async fn wait_for_ann(
     loop {
         if ann.indexes.read().await.contains_key(key) {
             return true;
+        }
+        if is_terminally_unavailable(ann, key) {
+            return false;
         }
         if std::time::Instant::now() >= deadline {
             return false;
@@ -1106,9 +1162,15 @@ pub(crate) async fn ensure_ann_for_model(
             }
             install_if_fresher(ann, &key, bridge.with_generation(target_generation)).await;
         }
-        Ok(None) => {}
+        Ok(None) => {
+            // Empty corpus: this scan (at target_generation) proves nothing is
+            // buildable right now. Mark it so wait_for_ann can short-circuit
+            // instead of polling out the full warm-wait timeout (issue #1026).
+            mark_unavailable(ann, &key, target_generation);
+        }
         Err(e) => {
             tracing::warn!(error = %e, "failed to rebuild Vamana ANN index");
+            mark_unavailable(ann, &key, target_generation);
         }
     }
 }
@@ -1628,6 +1690,101 @@ mod tests {
         // Poll with a 500ms timeout; the insert happens at ~40ms so it should succeed.
         let ready = wait_for_ann(&ann, &key, 500, 10).await;
         assert!(ready, "must return true when index appears before timeout");
+    }
+
+    // ── unavailable marker: terminal warm outcome (issue #1026) ──────────────
+
+    #[tokio::test]
+    async fn wait_for_ann_returns_false_immediately_when_marked_unavailable() {
+        let ann = new_shared();
+        let key = AnnKey::new("local", "test-model");
+        mark_unavailable(&ann, &key, current_generation(&ann, "local"));
+
+        let start = std::time::Instant::now();
+        // Timeout is generous (5s, matching production ANN_WARM_WAIT_TIMEOUT_MS)
+        // to prove the short-circuit fires rather than the deadline.
+        let ready = wait_for_ann(&ann, &key, 5_000, 50).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            !ready,
+            "must return false for a key marked unavailable at the current generation"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "terminal unavailable outcome must short-circuit, not poll out the timeout: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_ann_resumes_polling_when_unavailable_marker_is_stale() {
+        let ann = new_shared();
+        let key = AnnKey::new("local", "test-model");
+
+        // Mark unavailable at generation 0, then bump the namespace's
+        // generation past it so the marker is stale on the next check.
+        mark_unavailable(&ann, &key, 0);
+        clear_namespace(&ann, "local").await;
+        assert_eq!(current_generation(&ann, "local"), 1);
+
+        let ann2 = ann.clone();
+        let key2 = key.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            let bridge = AnnBridge::build(vec![1.0f32, 0.0, 0.0, 0.0], 4, vec![Uuid::new_v4()])
+                .expect("build")
+                .with_generation(1);
+            install_if_fresher(&ann2, &key2, bridge).await;
+        });
+
+        let ready = wait_for_ann(&ann, &key, 500, 10).await;
+        assert!(
+            ready,
+            "a stale unavailable marker must not block polling; the index installed \
+             mid-poll must still be observed"
+        );
+    }
+
+    #[tokio::test]
+    async fn install_if_fresher_clears_unavailable_marker_on_successful_install() {
+        let ann = new_shared();
+        let key = AnnKey::new("local", "test-model");
+        mark_unavailable(&ann, &key, 0);
+
+        let bridge = AnnBridge::build(vec![1.0f32, 0.0, 0.0, 0.0], 4, vec![Uuid::new_v4()])
+            .expect("build")
+            .with_generation(0);
+        install_if_fresher(&ann, &key, bridge).await;
+
+        assert!(
+            !unavailable_guard(&ann.unavailable).contains_key(&key),
+            "a successful install must clear the unavailable marker for its key"
+        );
+    }
+
+    #[tokio::test]
+    async fn install_if_fresher_stale_reject_does_not_clear_unavailable_marker() {
+        let ann = new_shared();
+        let key = AnnKey::new("local", "test-model");
+
+        // Bump the namespace generation past the marker AND past the candidate,
+        // so install_if_fresher rejects the candidate outright.
+        clear_namespace(&ann, "local").await;
+        mark_unavailable(&ann, &key, current_generation(&ann, "local"));
+
+        let stale = AnnBridge::build(vec![1.0f32, 0.0, 0.0, 0.0], 4, vec![Uuid::new_v4()])
+            .expect("build")
+            .with_generation(0);
+        install_if_fresher(&ann, &key, stale).await;
+
+        assert!(
+            !ann.indexes.read().await.contains_key(&key),
+            "stale candidate must not install"
+        );
+        assert!(
+            unavailable_guard(&ann.unavailable).contains_key(&key),
+            "a rejected (non-installed) candidate must not clear the unavailable marker"
+        );
     }
 
     // ── poison recovery ───────────────────────────────────────────────────────
@@ -2239,6 +2396,35 @@ mod tests {
             ann_fresh.indexes.read().await.contains_key(&key),
             "warm_known_snapshots must warm v2 segments when retrieval_snapshots is absent \
              (regression: a v1 query error must not abort the v2 filesystem pass)"
+        );
+    }
+
+    /// End-to-end reproduction of issue #1026: an empty corpus must leave the
+    /// key marked unavailable so `wait_for_ann` short-circuits instead of
+    /// polling out the full warm-wait timeout on every query.
+    #[tokio::test]
+    async fn ensure_ann_for_model_empty_corpus_marks_unavailable_and_wait_short_circuits() {
+        let dir = TempDir::new().expect("tempdir");
+        let rt = file_rt_with_embedder(dir.path().join("test.db"));
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        // No seed_warm_corpus call — the corpus stays empty for this model.
+
+        let ann = new_shared();
+        ensure_ann_for_model(&rt, &token, &ann, WARM_TEST_MODEL).await;
+        let key = AnnKey::new("local", WARM_TEST_MODEL);
+        assert!(
+            !ann.indexes.read().await.contains_key(&key),
+            "empty corpus must not install an index"
+        );
+
+        let start = std::time::Instant::now();
+        let ready = wait_for_ann(&ann, &key, 5_000, 50).await;
+        let elapsed = start.elapsed();
+
+        assert!(!ready, "empty corpus must never become ready");
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "the terminal unavailable outcome must short-circuit the 5s warm-wait: {elapsed:?}"
         );
     }
 }
