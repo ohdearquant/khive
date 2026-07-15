@@ -2323,7 +2323,7 @@ async fn feedback_1016_event_payload_stamps_resolved_profile_all_tiers() {
     use khive_storage::event::EventFilter;
     use khive_storage::types::PageRequest;
 
-    let (pack, rt) = make_pack_with_actor("leo");
+    let (pack, rt) = make_pack_with_actor("test-actor");
     let registry = empty_registry();
     let token = rt.authorize(Namespace::local()).unwrap();
     let target = create_test_entity(&rt, &token).await;
@@ -2352,12 +2352,12 @@ async fn feedback_1016_event_payload_stamps_resolved_profile_all_tiers() {
     for (verb, params) in [
         (
             "brain.create_profile",
-            json!({"name": "leo-bound-v1", "consumer_kind": "recall"}),
+            json!({"name": "test-bound-v1", "consumer_kind": "recall"}),
         ),
-        ("brain.activate", json!({"profile_id": "leo-bound-v1"})),
+        ("brain.activate", json!({"profile_id": "test-bound-v1"})),
         (
             "brain.bind",
-            json!({"actor": "leo", "profile_id": "leo-bound-v1", "consumer_kind": "recall"}),
+            json!({"actor": "test-actor", "profile_id": "test-bound-v1", "consumer_kind": "recall"}),
         ),
     ] {
         pack.dispatch(verb, params, &registry, &token)
@@ -2432,7 +2432,7 @@ async fn feedback_1016_event_payload_stamps_resolved_profile_all_tiers() {
         ),
         (
             "useful".to_string(),
-            "leo-bound-v1".to_string(),
+            "test-bound-v1".to_string(),
             "binding".to_string(),
         ),
         (
