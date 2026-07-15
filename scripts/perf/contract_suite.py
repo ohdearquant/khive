@@ -23,6 +23,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fcntl
 import json
 import os
@@ -39,10 +40,17 @@ CRATES_DIR = REPO_ROOT / "crates"
 SCHEMA_PATH = REPO_ROOT / "scripts/perf/schemas/contract-result-v1.json"
 GEN_SYNTHETIC = REPO_ROOT / "scripts/perf/gen_synthetic_fvecs.py"
 TARGETS_TOML = REPO_ROOT / "perf/targets.toml"
-BENCH_WINDOW_LOCK = Path("/tmp/lion-bench-window.lock")
+BENCH_WINDOW_LOCK = Path(os.environ.get("KHIVE_BENCH_LOCK", "/tmp/khive-bench-window.lock"))
 
 ALL_DIMS = ("ingest", "ann_query", "recall_at_k")
 VEC_BENCH_DEPENDENT = {"ingest", "ann_query", "recall_at_k"}
+
+# vec_bench measures ANN search fixed at K=10 (no per-query top-k lists exposed
+# for other k). Each emitted recall_at_k row MUST be timed against an exact
+# baseline run at that SAME k -- a mismatched baseline k invalidates the
+# speedup number. Extending to k=1/k=100 requires a vec_bench extension AND an
+# additional independently-timed baseline entry here, one per emitted k.
+RECALL_ROW_KS = (10,)
 
 BASELINE_WORKER = textwrap.dedent(
     r"""
@@ -130,10 +138,9 @@ def loadavg() -> list[float]:
 
 
 class BenchWindow:
-    """Best-effort EXCLUSIVE, non-blocking acquisition of the sandbox-wide
-    /tmp/lion-bench-window.lock convention (observed empirically: concurrent
-    cargo invocations in this environment take a SHARED flock on this path;
-    no exclusive-holder convention exists in-repo). A failed acquisition is
+    """Best-effort EXCLUSIVE, non-blocking acquisition of an optional exclusive
+    advisory lock recording whether the measurement ran in an isolated bench
+    window (path configurable via KHIVE_BENCH_LOCK). A failed acquisition is
     not an error -- it means concurrent build/bench activity was present and
     is recorded honestly as bench_window=False.
     """
@@ -226,10 +233,14 @@ def prepare_dataset(scale: int, sift_dir: str | None, work_dir: Path) -> tuple[P
     if sift_dir:
         base = Path(sift_dir) / "sift_base.fvecs"
         query = Path(sift_dir) / "sift_query.fvecs"
-        if base.exists() and query.exists():
-            log(f"using real SIFT-1M data at {sift_dir}")
-            return base, query, "SIFT-1M", True
-        log(f"--sift-dir given but sift_base.fvecs/sift_query.fvecs missing under {sift_dir} -- falling back to synthetic")
+        missing = [str(p) for p in (base, query) if not p.exists()]
+        if missing:
+            raise FileNotFoundError(
+                f"--sift-dir {sift_dir} was given but the following required file(s) are missing: "
+                + ", ".join(missing)
+            )
+        log(f"using real SIFT-1M data at {sift_dir}")
+        return base, query, "SIFT-1M", True
 
     synth_dir = work_dir / "synthetic-fvecs"
     synth_dir.mkdir(parents=True, exist_ok=True)
@@ -284,23 +295,30 @@ def run_vec_bench(base: Path, query: Path, n: int, dataset_name: str, out_json: 
         "--targets",
         str(TARGETS_TOML),
         "--target-key",
-        "khive-bench-s2/contract-suite/unassessed",
+        "contract-suite/unassessed",
         "--out",
         str(out_json),
         "--bank-run",
         str(out_json.parent / "bank-run"),
     ]
     proc = run(cmd, cwd=CRATES_DIR, env=env)
-    # vec_bench's exit code reflects ITS OWN internal assertion evaluation
-    # against perf/targets.toml (SKIPPED/FAIL both exit nonzero); this suite
-    # carries no pass/fail concept, so exit code is ignored -- only the
-    # presence and shape of the output JSON is checked.
     if not out_json.exists():
         raise RuntimeError(f"vec_bench did not write its output JSON (exit={proc.returncode}); see stderr above")
     with out_json.open() as f:
         data = json.load(f)
     if not data.get("rows"):
         raise RuntimeError("vec_bench output JSON has no rows")
+    if proc.returncode != 0:
+        overall = data.get("assertions", {}).get("overall")
+        if overall != "SKIPPED":
+            raise RuntimeError(
+                f"vec_bench exited nonzero (exit={proc.returncode}, assertions.overall={overall!r}); "
+                f"command: {' '.join(str(c) for c in cmd)}"
+            )
+        log(
+            f"vec_bench exited nonzero (exit={proc.returncode}) but assertions.overall=SKIPPED "
+            "(no matching --target-key in targets.toml) -- accepting as unassessed, not a failure."
+        )
     return data
 
 
@@ -362,28 +380,48 @@ def build_ann_query_dim(vb_row: dict, vb_data: dict, dataset_name: str) -> dict:
     return {"dataset": dataset_name, "n_vectors": n, "arms": [arm]}
 
 
-def build_recall_at_k_dim(vb_row: dict, baseline: dict, dataset_name: str) -> dict:
-    speedup = baseline["query_us_p50"] / vb_row["query_warm_p50_us"]
+def build_recall_at_k_dim(vb_row: dict, baselines_by_k: dict[int, dict], dataset_name: str) -> dict:
     log(
         "recall_at_k: vec_bench measures recall@10 only (K=10 constant, no per-query "
         "result lists exposed) -- emitting the k=10 row ONLY. k=1/k=100 rows require "
         "a vec_bench extension to expose per-query top-k lists, not implemented in "
         "this slice."
     )
+    rows = []
+    for k in RECALL_ROW_KS:
+        baseline = baselines_by_k[k]
+        rows.append(
+            {
+                "k": k,
+                "recall": vb_row["recall_at_10"],
+                "speedup_vs_baseline": baseline["query_us_p50"] / vb_row["query_warm_p50_us"],
+            }
+        )
+    primary = baselines_by_k[RECALL_ROW_KS[0]]
     return {
         "dataset": dataset_name,
-        "baseline": {"kind": baseline["kind"], "query_us_p50": baseline["query_us_p50"]},
-        "rows": [
-            {
-                "k": 10,
-                "recall": vb_row["recall_at_10"],
-                "speedup_vs_baseline": speedup,
-            }
-        ],
+        "baseline": {"kind": primary["kind"], "query_us_p50": primary["query_us_p50"]},
+        "rows": rows,
     }
 
 
 # ─── main ──────────────────────────────────────────────────────────────────
+
+
+@contextlib.contextmanager
+def work_dir_context(out_dir: Path, keep_work: bool):
+    """Work material (baseline worker script, vec_bench raw JSON, bank-run
+    dir, synthetic corpus) is scratch, not the contract-result document.
+    Default: an actual temp directory, removed on exit. --keep-work opts
+    into retaining it as out_dir/_work for debugging.
+    """
+    if keep_work:
+        d = out_dir / "_work"
+        d.mkdir(parents=True, exist_ok=True)
+        yield d
+    else:
+        with tempfile.TemporaryDirectory(prefix="khive-bench-s2-work-") as td:
+            yield Path(td)
 
 
 def parse_args() -> argparse.Namespace:
@@ -394,6 +432,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out", default=None, help="output run directory (contract-result.json written inside)")
     p.add_argument("--faiss-venv", default=None, help="path to an isolated venv with faiss-cpu installed")
     p.add_argument("--selftest", action="store_true", help="synthetic 10K smoke run of all dims + schema validation")
+    p.add_argument(
+        "--keep-work",
+        action="store_true",
+        help="retain work artifacts (raw vec_bench JSON, bank-run dir, synthetic corpus) under --out/_work",
+    )
     return p.parse_args()
 
 
@@ -419,45 +462,47 @@ def main() -> int:
         out_dir = Path(args.out)
         out_dir.mkdir(parents=True, exist_ok=True)
 
-    work_dir = out_dir / "_work"
-    work_dir.mkdir(parents=True, exist_ok=True)
     cargo_target_dir = Path(os.environ.get("CARGO_TARGET_DIR", "/private/tmp/khive-bench-s2-target"))
 
     started_at = now_iso()
     lv_before = loadavg()
 
-    base, query, dataset_name, is_real_sift = prepare_dataset(scale, sift_dir, work_dir)
-
     dimensions: dict = {}
     bench_window_held = False
 
-    with BenchWindow() as bw:
-        bench_window_held = bw.held
+    with work_dir_context(out_dir, args.keep_work) as work_dir:
+        base, query, dataset_name, is_real_sift = prepare_dataset(scale, sift_dir, work_dir)
 
-        vb_data = None
-        vb_row = None
-        if VEC_BENCH_DEPENDENT & set(dims):
-            vb_json_path = work_dir / "vec_bench_out.json"
-            vb_data = run_vec_bench(base, query, scale, dataset_name, vb_json_path, cargo_target_dir)
-            vb_row = next(r for r in vb_data["rows"] if r["n"] == scale)
+        with BenchWindow() as bw:
+            bench_window_held = bw.held
 
-        if "ingest" in dims:
-            dimensions["ingest"] = build_ingest_dim(vb_row, dataset_name)
+            vb_data = None
+            vb_row = None
+            if VEC_BENCH_DEPENDENT & set(dims):
+                vb_json_path = work_dir / "vec_bench_out.json"
+                vb_data = run_vec_bench(base, query, scale, dataset_name, vb_json_path, cargo_target_dir)
+                vb_row = next(r for r in vb_data["rows"] if r["n"] == scale)
 
-        if "ann_query" in dims:
-            dimensions["ann_query"] = build_ann_query_dim(vb_row, vb_data, dataset_name)
+            if "ingest" in dims:
+                dimensions["ingest"] = build_ingest_dim(vb_row, dataset_name)
 
-        if "recall_at_k" in dims:
-            n_queries = vb_data.get("config", {}).get("n_gt_queries", min(1000, scale))
-            baseline = run_baseline(base, query, scale, n_queries, 100, args.faiss_venv, work_dir)
-            dimensions["recall_at_k"] = build_recall_at_k_dim(vb_row, baseline, dataset_name)
+            if "ann_query" in dims:
+                dimensions["ann_query"] = build_ann_query_dim(vb_row, vb_data, dataset_name)
+
+            if "recall_at_k" in dims:
+                n_queries = vb_data.get("config", {}).get("n_gt_queries", min(1000, scale))
+                baselines_by_k = {
+                    k: run_baseline(base, query, scale, n_queries, k, args.faiss_venv, work_dir)
+                    for k in RECALL_ROW_KS
+                }
+                dimensions["recall_at_k"] = build_recall_at_k_dim(vb_row, baselines_by_k, dataset_name)
 
     lv_after = loadavg()
     finished_at = now_iso()
 
     if not bench_window_held:
         log(
-            "isolation: did NOT hold the exclusive /tmp/lion-bench-window.lock during "
+            f"isolation: did NOT hold the exclusive {BENCH_WINDOW_LOCK} lock during "
             "measurement (concurrent build/bench activity was present or the lock was "
             "unavailable) -- recording bench_window=False honestly."
         )
