@@ -14,7 +14,8 @@
     "host",
     "isolation",
     "calibration",
-    "dimensions"
+    "dimensions",
+    "ledger_rows_appended"
   ],
   "additionalProperties": false,
   "properties": {
@@ -84,33 +85,35 @@
       }
     },
     "calibration": {
-      "type": "object",
-      "description": "Link to the same-SHA null-distribution measurement backing interpretation of this run's numbers.",
-      "required": ["status"],
-      "additionalProperties": false,
-      "properties": {
-        "status": {
-          "type": "string",
-          "enum": ["calibrated", "uncalibrated"],
-          "description": "'calibrated' requires artifact_path; 'uncalibrated' marks numbers whose run-to-run noise at this SHA has not been measured."
+      "description": "Link to the same-SHA null-distribution measurement backing interpretation of this run's numbers. The two states are mutually exclusive: 'calibrated' must cite a variance profile with at least 10 same-SHA runs (the blocking-promotion floor documented in scripts/perf/README.md); 'uncalibrated' must carry no calibration evidence at all.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["status", "artifact_path", "runs"],
+          "additionalProperties": false,
+          "properties": {
+            "status": { "const": "calibrated" },
+            "artifact_path": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Repo-relative path to the bench_calibrate.py variance profile for this SHA and suite configuration."
+            },
+            "runs": {
+              "type": "integer",
+              "minimum": 10,
+              "description": "Number of same-SHA runs in the cited calibration artifact (K>=10 per the calibration convention)."
+            }
+          }
         },
-        "artifact_path": {
-          "type": "string",
-          "minLength": 1,
-          "description": "Repo-relative path to the bench_calibrate.py variance profile for this SHA and suite configuration."
-        },
-        "runs": {
-          "type": "integer",
-          "minimum": 1,
-          "description": "Number of same-SHA runs in the cited calibration artifact."
+        {
+          "type": "object",
+          "required": ["status"],
+          "additionalProperties": false,
+          "properties": {
+            "status": { "const": "uncalibrated" }
+          }
         }
-      },
-      "if": {
-        "properties": { "status": { "const": "calibrated" } }
-      },
-      "then": {
-        "required": ["status", "artifact_path", "runs"]
-      }
+      ]
     },
     "dimensions": {
       "type": "object",
@@ -140,17 +143,11 @@
         },
         "ann_query": {
           "type": "object",
-          "required": ["dataset", "n_vectors", "recall_floor", "arms"],
+          "required": ["dataset", "n_vectors", "arms"],
           "additionalProperties": false,
           "properties": {
             "dataset": { "type": "string", "minLength": 1 },
             "n_vectors": { "type": "integer", "minimum": 1 },
-            "recall_floor": {
-              "type": "number",
-              "exclusiveMinimum": 0,
-              "maximum": 1,
-              "description": "Iso-recall operating point: every latency arm below was tuned to meet at least this recall@10 against exact ground truth."
-            },
             "arms": {
               "type": "array",
               "minItems": 1,
@@ -160,7 +157,12 @@
                 "additionalProperties": false,
                 "properties": {
                   "workers": { "type": "integer", "minimum": 1 },
-                  "measured_recall_at_10": { "type": "number", "minimum": 0, "maximum": 1 },
+                  "measured_recall_at_10": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1,
+                    "description": "Observed recall@10 against exact ground truth for this arm's tuning. The iso-recall operating point the suite tunes toward is external runner configuration, not a field of this result document; consumers judge an arm by this measured value."
+                  },
                   "p50_us": { "type": "number", "exclusiveMinimum": 0 },
                   "p95_us": { "type": "number", "exclusiveMinimum": 0 },
                   "p99_us": { "type": "number", "exclusiveMinimum": 0 },
@@ -251,7 +253,7 @@
     "ledger_rows_appended": {
       "type": "integer",
       "minimum": 0,
-      "description": "Number of rows the runner appended to perf/ledger.csv from this document. Rows are derived from this record by the runner; the ledger is never hand-edited."
+      "description": "Number of rows the runner appended to perf/ledger.csv from this document. Required: 0 states explicitly that no headline row was banked (e.g. a partial or uncalibrated run); rows are derived from this record by the runner and the ledger is never hand-edited."
     },
     "notes": {
       "type": "string"

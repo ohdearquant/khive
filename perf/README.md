@@ -101,11 +101,15 @@ iso-recall, recall@k vs an exact baseline, FTS+ANN fusion quality, and
 index-inclusive storage). Key rules the schema encodes:
 
 - **Calibration first.** Every result document carries a `calibration` block
-  that either cites a same-SHA variance profile produced by
-  `scripts/perf/bench_calibrate.py` (`status: "calibrated"`, with the artifact
-  path and run count) or explicitly marks the numbers `"uncalibrated"`. A
-  blocking threshold may only be proposed with a calibrated null distribution
-  behind it; the result document itself never carries a pass/fail judgment.
+  in one of two mutually exclusive states: `"calibrated"` cites a same-SHA
+  variance profile produced by `scripts/perf/bench_calibrate.py` (artifact path
+  plus run count, K >= 10 per the calibration convention in
+  `scripts/perf/README.md`); `"uncalibrated"` carries no calibration evidence
+  at all. A blocking threshold may only be proposed with a calibrated null
+  distribution behind it; the result document never carries a pass/fail
+  judgment or an operating-point target (the iso-recall point the ANN arms are
+  tuned toward is external runner configuration — the document records only
+  each arm's measured recall).
 - **Isolation evidence is data.** `isolation` records whether the run held the
   exclusive bench window, load averages before and after, and whether the build
   used a dedicated target directory. Uncontrolled runs are valid documents that
@@ -115,8 +119,8 @@ index-inclusive storage). Key rules the schema encodes:
   vectorized brute-force scan); a naive scalar-scan denominator is not
   representable.
 - **Ledger derivation.** Headline numbers banked into `ledger.csv` are derived
-  from these documents by the runner (`ledger_rows_appended` records how many);
-  the ledger is never hand-edited.
+  from these documents by the runner. `ledger_rows_appended` is required — `0`
+  states explicitly that nothing was banked; the ledger is never hand-edited.
 
 Absent dimensions mean not-measured. No runner emits this document yet; the
 schema lands first so the suite implementation and its reviews have a fixed
