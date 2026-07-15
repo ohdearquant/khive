@@ -9,6 +9,15 @@ brute-force fallback) for the `recall_at_k` dimension. Emits exactly one
 contract-result-v1 JSON document, validated in-process against
 scripts/perf/schemas/contract-result-v1.json before it is written.
 
+`ann_query` arms come from vec_bench's `--workers` concurrency arms (default
+1,4,16 -- override with `--workers`); each arm is barrier-synchronized so its
+p50/p95/p99 reflect that worker count actually querying concurrently.
+`recall_at_k` also drives vec_bench's `--dump-topk` to get recall@1/@100, but
+only emits the k=10 row in the schema (see `RECALL_ROW_KS` docstring for why:
+no measured ANN latency exists at k=1/k=100 to pair with a required
+speedup_vs_baseline); recall@1/@100 are still recorded in the document's
+`notes` field.
+
 This runner never computes a pass/fail verdict: it measures and records.
 `calibration` is always `{"status": "uncalibrated"}` here -- calibrated runs
 are produced separately by scripts/perf/bench_calibrate.py (K>=10, same SHA).
@@ -17,7 +26,7 @@ Usage:
     uv run python scripts/perf/contract_suite.py --selftest
     uv run python scripts/perf/contract_suite.py --dims ingest,ann_query,recall_at_k \\
         --scale 1000000 --sift-dir /path/to/sift1m --out /tmp/bench-s2-run \\
-        --faiss-venv /private/tmp/khive-bench-s2-faiss
+        --faiss-venv /private/tmp/khive-bench-s2-faiss --workers 1,4,16
 """
 
 from __future__ import annotations
@@ -45,11 +54,18 @@ BENCH_WINDOW_LOCK = Path(os.environ.get("KHIVE_BENCH_LOCK", "/tmp/khive-bench-wi
 ALL_DIMS = ("ingest", "ann_query", "recall_at_k")
 VEC_BENCH_DEPENDENT = {"ingest", "ann_query", "recall_at_k"}
 
-# vec_bench measures ANN search fixed at K=10 (no per-query top-k lists exposed
-# for other k). Each emitted recall_at_k row MUST be timed against an exact
-# baseline run at that SAME k -- a mismatched baseline k invalidates the
-# speedup number. Extending to k=1/k=100 requires a vec_bench extension AND an
-# additional independently-timed baseline entry here, one per emitted k.
+DEFAULT_WORKERS = "1,4,16"
+
+# vec_bench's --dump-topk pass computes recall_at_1/recall_at_100 from an
+# UNTIMED K=100 search at a larger beam (MAX_ISO_BEAM) than the TIMED K=10
+# query arms (iso_recall_beam) -- it is a different search configuration, not
+# a truncation of the timed arm's results. There is therefore no measured ANN
+# latency at k=1 or k=100 to pair with those recall values, and
+# contract-result-v1's recall_at_k row schema requires a numeric
+# speedup_vs_baseline on every row (no recall-only row variant exists). This
+# runner will not fabricate a k=1/k=100 latency by reusing the k=10 timing, so
+# it emits the k=10 row only; recall@1/@100 are still measured (via
+# --dump-topk) and reported in the document's `notes` field for visibility.
 RECALL_ROW_KS = (10,)
 
 BASELINE_WORKER = textwrap.dedent(
@@ -128,6 +144,21 @@ def log(msg: str) -> None:
 def run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
     log("+ " + " ".join(str(c) for c in cmd))
     return subprocess.run(cmd, **kwargs)
+
+
+def parse_workers(spec: str) -> list[int]:
+    out = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        w = int(part)
+        if w < 1:
+            raise ValueError(f"--workers value must be >= 1, got {w!r}")
+        out.append(w)
+    if not out:
+        raise ValueError("--workers must specify at least one worker count")
+    return out
 
 
 # ─── isolation evidence ───────────────────────────────────────────────────
@@ -272,7 +303,16 @@ def prepare_dataset(scale: int, sift_dir: str | None, work_dir: Path) -> tuple[P
 # ─── vec_bench invocation ─────────────────────────────────────────────────
 
 
-def run_vec_bench(base: Path, query: Path, n: int, dataset_name: str, out_json: Path, cargo_target_dir: Path) -> dict:
+def run_vec_bench(
+    base: Path,
+    query: Path,
+    n: int,
+    dataset_name: str,
+    out_json: Path,
+    cargo_target_dir: Path,
+    workers: list[int],
+    dump_topk_path: Path | None,
+) -> dict:
     out_json.parent.mkdir(parents=True, exist_ok=True)
     env = {**os.environ, "CARGO_TARGET_DIR": str(cargo_target_dir), "KHIVE_N_CAP": str(n)}
     cmd = [
@@ -300,7 +340,11 @@ def run_vec_bench(base: Path, query: Path, n: int, dataset_name: str, out_json: 
         str(out_json),
         "--bank-run",
         str(out_json.parent / "bank-run"),
+        "--workers",
+        ",".join(str(w) for w in workers),
     ]
+    if dump_topk_path is not None:
+        cmd += ["--dump-topk", str(dump_topk_path)]
     proc = run(cmd, cwd=CRATES_DIR, env=env)
     rendered_cmd = " ".join(str(c) for c in cmd)
     if not out_json.exists():
@@ -363,32 +407,39 @@ def build_ingest_dim(vb_row: dict, dataset_name: str) -> dict:
     }
 
 
-def build_ann_query_dim(vb_row: dict, vb_data: dict, dataset_name: str) -> dict:
+def build_ann_query_dim(vb_row: dict, dataset_name: str) -> dict:
     n = vb_row["n"]
-    n_lat = vb_data.get("config", {}).get("n_latency_queries", 1000)
-    arm = {
-        "workers": 1,
-        "measured_recall_at_10": vb_row["recall_at_10"],
-        "p50_us": vb_row["query_warm_p50_us"],
-        "p95_us": vb_row["query_warm_p95_us"],
-        "p99_us": vb_row["query_warm_p99_us"],
-        "queries": n_lat,
-        "beam": vb_row["iso_recall_beam"],
-    }
-    log(
-        "ann_query: vec_bench only measures single-threaded query latency -- "
-        "emitting the workers=1 arm ONLY. Concurrent arms (4/16 workers) require "
-        "a vec_bench extension, not implemented in this slice."
-    )
-    return {"dataset": dataset_name, "n_vectors": n, "arms": [arm]}
+    beam = vb_row["iso_recall_beam"]
+    concurrency_arms = vb_row.get("concurrency_arms") or []
+    if not concurrency_arms:
+        raise RuntimeError(
+            "vec_bench row has no concurrency_arms -- expected at least the workers=1 "
+            "arm (vec_bench always defaults --workers to [1] when unset)"
+        )
+    arms = [
+        {
+            "workers": arm["workers"],
+            "measured_recall_at_10": arm["recall_at_10"],
+            "p50_us": arm["query_warm_p50_us"],
+            "p95_us": arm["query_warm_p95_us"],
+            "p99_us": arm["query_warm_p99_us"],
+            "queries": arm["queries"],
+            "beam": beam,
+        }
+        for arm in concurrency_arms
+    ]
+    log(f"ann_query: emitting {len(arms)} concurrency arm(s): workers={[a['workers'] for a in arms]}")
+    return {"dataset": dataset_name, "n_vectors": n, "arms": arms}
 
 
 def build_recall_at_k_dim(vb_row: dict, baselines_by_k: dict[int, dict], dataset_name: str) -> dict:
     log(
-        "recall_at_k: vec_bench measures recall@10 only (K=10 constant, no per-query "
-        "result lists exposed) -- emitting the k=10 row ONLY. k=1/k=100 rows require "
-        "a vec_bench extension to expose per-query top-k lists, not implemented in "
-        "this slice."
+        "recall_at_k: emitting the k=10 row only. vec_bench also measures recall@1/@100 "
+        "via --dump-topk, but that is an UNTIMED separate K=100 search at a larger beam "
+        "than the timed K=10 arms -- there is no matching ANN latency for k=1/k=100, and "
+        "contract-result-v1 requires a numeric speedup_vs_baseline on every row (no "
+        "recall-only row variant). Those two recall values are recorded in the top-level "
+        "`notes` field instead of being paired with a fabricated latency."
     )
     rows = []
     for k in RECALL_ROW_KS:
@@ -406,6 +457,21 @@ def build_recall_at_k_dim(vb_row: dict, baselines_by_k: dict[int, dict], dataset
         "baseline": {"kind": primary["kind"], "query_us_p50": primary["query_us_p50"]},
         "rows": rows,
     }
+
+
+def recall_dump_note(vb_row: dict) -> str | None:
+    r1 = vb_row.get("recall_at_1")
+    r100 = vb_row.get("recall_at_100")
+    if r1 is None and r100 is None:
+        return None
+    dump_path = vb_row.get("topk_dump_path")
+    return (
+        f"diagnostic (not a contract-result row): recall_at_1={r1!r}, recall_at_100={r100!r} "
+        f"measured by vec_bench --dump-topk (untimed K=100 pass, dump written to "
+        f"{dump_path!r}); no matching ANN latency exists for these k, so no "
+        "speedup_vs_baseline could be computed -- see recall_at_k dimension for the k=10 "
+        "row, which is the only one with a measured ANN latency."
+    )
 
 
 # ─── main ──────────────────────────────────────────────────────────────────
@@ -434,6 +500,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sift-dir", default=None, help="directory containing sift_base.fvecs + sift_query.fvecs")
     p.add_argument("--out", default=None, help="output run directory (contract-result.json written inside)")
     p.add_argument("--faiss-venv", default=None, help="path to an isolated venv with faiss-cpu installed")
+    p.add_argument(
+        "--workers",
+        default=DEFAULT_WORKERS,
+        help=f"comma-separated concurrency arms passed to vec_bench --workers (default: {DEFAULT_WORKERS})",
+    )
     p.add_argument("--selftest", action="store_true", help="synthetic 10K smoke run of all dims + schema validation")
     p.add_argument(
         "--keep-work",
@@ -451,6 +522,7 @@ def main() -> int:
         scale = 10000
         sift_dir = None
         out_dir = Path(tempfile.mkdtemp(prefix="khive-bench-s2-selftest-"))
+        workers = [1, 2]
     else:
         dims = [d.strip() for d in args.dims.split(",") if d.strip()]
         unknown = set(dims) - set(ALL_DIMS)
@@ -464,6 +536,11 @@ def main() -> int:
             return 3
         out_dir = Path(args.out)
         out_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            workers = parse_workers(args.workers)
+        except ValueError as e:
+            log(f"ERROR: {e}")
+            return 3
 
     cargo_target_dir = Path(os.environ.get("CARGO_TARGET_DIR", "/private/tmp/khive-bench-s2-target"))
 
@@ -483,14 +560,17 @@ def main() -> int:
             vb_row = None
             if VEC_BENCH_DEPENDENT & set(dims):
                 vb_json_path = work_dir / "vec_bench_out.json"
-                vb_data = run_vec_bench(base, query, scale, dataset_name, vb_json_path, cargo_target_dir)
+                dump_topk_path = work_dir / "topk-dump.jsonl" if "recall_at_k" in dims else None
+                vb_data = run_vec_bench(
+                    base, query, scale, dataset_name, vb_json_path, cargo_target_dir, workers, dump_topk_path
+                )
                 vb_row = next(r for r in vb_data["rows"] if r["n"] == scale)
 
             if "ingest" in dims:
                 dimensions["ingest"] = build_ingest_dim(vb_row, dataset_name)
 
             if "ann_query" in dims:
-                dimensions["ann_query"] = build_ann_query_dim(vb_row, vb_data, dataset_name)
+                dimensions["ann_query"] = build_ann_query_dim(vb_row, dataset_name)
 
             if "recall_at_k" in dims:
                 n_queries = vb_data.get("config", {}).get("n_gt_queries", min(1000, scale))
@@ -510,6 +590,16 @@ def main() -> int:
             "unavailable) -- recording bench_window=False honestly."
         )
 
+    notes = [
+        "ledger_rows_appended=0: this runner does not append perf/ledger.csv rows "
+        "in this slice (that ledger's schema is scale-proof-specific and unrelated "
+        "to contract-result-v1; banking is a separate follow-up)."
+    ]
+    if vb_row is not None:
+        dump_note = recall_dump_note(vb_row)
+        if dump_note:
+            notes.append(dump_note)
+
     document = {
         "schema_version": 1,
         "suite": "local-engine-contract",
@@ -527,11 +617,7 @@ def main() -> int:
         "calibration": {"status": "uncalibrated"},
         "dimensions": dimensions,
         "ledger_rows_appended": 0,
-        "notes": (
-            "ledger_rows_appended=0: this runner does not append perf/ledger.csv rows "
-            "in this slice (that ledger's schema is scale-proof-specific and unrelated "
-            "to contract-result-v1; banking is a separate follow-up)."
-        ),
+        "notes": " ".join(notes),
     }
 
     import jsonschema
