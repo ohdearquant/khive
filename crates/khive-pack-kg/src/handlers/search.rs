@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 /// Maximum candidate window used when property/tag filters are active.
-/// See `docs/handlers-common.md#filtered_scan_cap-and-the-scan-cliff-widening-handlerssearchrs`.
+/// See `docs/api/scan-cliff.md`.
 const FILTERED_SCAN_CAP: u32 = 500;
 
 use serde_json::Value;
@@ -56,7 +56,7 @@ impl KgPack {
                 });
                 let tag_filter = p.tags.as_ref().filter(|tags| !tags.is_empty());
                 let search_limit = if props_filter.is_some() || tag_filter.is_some() {
-                    // See docs/handlers-common.md#filtered_scan_cap-and-the-scan-cliff-widening-handlerssearchrs.
+                    // See docs/api/scan-cliff.md.
                     (limit * 50).min(FILTERED_SCAN_CAP)
                 } else {
                     limit
@@ -159,7 +159,7 @@ impl KgPack {
                 });
                 let tag_filter = p.tags.as_ref().filter(|tags| !tags.is_empty());
                 let search_limit = if props_filter.is_some() || tag_filter.is_some() {
-                    // See docs/handlers-common.md#filtered_scan_cap-and-the-scan-cliff-widening-handlerssearchrs.
+                    // See docs/api/scan-cliff.md.
                     (limit * 50).min(FILTERED_SCAN_CAP)
                 } else {
                     limit

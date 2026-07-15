@@ -6,7 +6,7 @@
 //! mirror tables per call — callers poll repeatedly to drain large deltas.
 //! `INSERT OR IGNORE` keyed by the event UUID makes replays idempotent.
 //!
-//! See `crates/khive-pack-session/docs/mirror-ingest.md` for the full bounded
+//! See `crates/khive-pack-session/docs/api/mirror-ingest.md` for the full bounded
 //! tail-read algorithm, the oversized/unterminated-line handling
 //! (PACKSESSION-AUD-003), and the write-path (ADR-099 D5) rationale.
 
@@ -86,7 +86,7 @@ pub struct MirrorStats {
 
 /// Ceiling on bytes read per `mirror_file` call in production (8 MiB); bounds
 /// worst-case memory on a very large accumulated delta. See
-/// `crates/khive-pack-session/docs/mirror-ingest.md#mirrorlimits--per-pass-caps`.
+/// `crates/khive-pack-session/docs/api/mirror-ingest.md#mirrorlimits--per-pass-caps`.
 const MIRROR_MAX_BYTES_PER_PASS: usize = 8 * 1024 * 1024;
 
 /// Ceiling on parsed events collected per `mirror_file` call in production.
@@ -160,7 +160,7 @@ struct MirrorChunk {
 }
 
 /// Outcome of `read_line_bounded` for one line. See
-/// `crates/khive-pack-session/docs/mirror-ingest.md#lineread--read_line_bounded--the-packsession-aud-003-bound`
+/// `crates/khive-pack-session/docs/api/mirror-ingest.md#lineread--read_line_bounded--the-packsession-aud-003-bound`
 /// for the full PACKSESSION-AUD-003 rationale.
 #[derive(Debug)]
 enum LineRead {
@@ -407,7 +407,7 @@ async fn mirror_file_with_limits(
 /// file, not a per-pass delta (unlike the JSONL line-tail sources). An export
 /// over this size is skipped (warn-logged) and the cursor is left untouched
 /// so it is retried on every later tick rather than dropped (PACKSESSION-AUD-003).
-/// See `crates/khive-pack-session/docs/mirror-ingest.md#chatgpt-export-whole-file-re-parse-mirror_chatgpt_export_file`.
+/// See `crates/khive-pack-session/docs/api/mirror-ingest.md#chatgpt-export-whole-file-re-parse-mirror_chatgpt_export_file`.
 const DEFAULT_CHATGPT_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Resolve the ChatGPT export size ceiling from `KHIVE_MIRROR_CHATGPT_MAX_BYTES`,
@@ -511,7 +511,7 @@ async fn mirror_chatgpt_export_file_with_max_bytes(
 /// Upsert `events` and the mirror cursor for `path` in one transaction.
 /// Shared by `mirror_file`'s line-tail path and `mirror_chatgpt_export_file`'s
 /// whole-file path. See
-/// `crates/khive-pack-session/docs/mirror-ingest.md#write-path-write_events_and_cursor-and-friends-adr-099-d5`
+/// `crates/khive-pack-session/docs/api/mirror-ingest.md#write-path-write_events_and_cursor-and-friends-adr-099-d5`
 /// for the ADR-099 D5 suspension-free rationale.
 async fn write_events_and_cursor(
     runtime: &KhiveRuntime,
@@ -797,7 +797,7 @@ async fn upsert_cursor_on_writer(
 /// Write only the cursor row (no events); used when a pass consumed bytes
 /// but produced no parseable events, so the offset still advances past
 /// blank/unparseable content. A failure here must propagate — see
-/// `crates/khive-pack-session/docs/mirror-ingest.md#write-path-write_events_and_cursor-and-friends-adr-099-d5`.
+/// `crates/khive-pack-session/docs/api/mirror-ingest.md#write-path-write_events_and_cursor-and-friends-adr-099-d5`.
 async fn write_cursor_only(
     runtime: &KhiveRuntime,
     path: &Path,
@@ -2326,7 +2326,7 @@ mod tests {
 
     /// SS6 invariants #4/#5 (error never advances cursor; one transaction per
     /// pass) — see
-    /// `crates/khive-pack-session/docs/mirror-ingest.md#test_mid_transaction_db_error_leaves_no_partial_state_and_cursor_unadvanced`
+    /// `crates/khive-pack-session/docs/api/mirror-ingest.md#test_mid_transaction_db_error_leaves_no_partial_state_and_cursor_unadvanced`
     /// for why this drives `atomic_unit` directly instead of through crafted event data.
     #[tokio::test]
     async fn test_mid_transaction_db_error_leaves_no_partial_state_and_cursor_unadvanced() {

@@ -20,7 +20,7 @@ pub(crate) use common::{canonical_entity_kind, canonical_note_kind, parse_relati
 /// ADR-099 B3: real `pub` re-export so kkernel's `--atomic` seam validates through the
 /// SAME canonical param structs the handlers deserialize, reproducing
 /// `#[serde(deny_unknown_fields)]` rejection with no duplicated key list. See
-/// `docs/handlers-common.md` for the full ADR-099 B3 rationale.
+/// `docs/api/entity-kind-validation.md` for the full ADR-099 B3 rationale.
 pub use params::{DeleteParams, LinkParams, UpdateParams};
 
 /// ADR-099 B3 (findings 1, 3, 4): real `pub` re-export so kkernel's `--atomic` seam

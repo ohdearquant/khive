@@ -1,16 +1,8 @@
-# khive-brain-core — design rationale
+# Snapshot validation
 
-Long-form "why this exists" background relocated from doc-comments per the
-rustdoc condense pass. Public item contracts stay complete in the `.rs`
-source; this file holds the extended rationale a caller doesn't need in
-order to call the function correctly.
-
-## `sort_fallback_candidates` — why it's a standalone helper
-
-Extracted into a standalone helper (rather than inlined into
-`BrainState::resolve_with_match`) so it can be unit-tested with intentionally
-unsorted input, providing fail-before/pass-after coverage that does not rely
-on `HashMap` randomization to expose non-determinism.
+Technical reference for how `khive-brain-core` validates a persisted `BrainState` /
+`EntityPosteriors` snapshot on load, and the exact corruption shapes each guard rejects
+rather than silently repairs.
 
 ## `validate_brain_state_snapshot_with_capacity` — `entity_posterior_order` version gating rationale
 
