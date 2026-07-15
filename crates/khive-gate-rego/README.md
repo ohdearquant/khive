@@ -54,9 +54,10 @@ decision := {"decision": "allow", "obligations": []} if {
 ```
 
 Keep the `decision` rules **mutually exclusive**. Two complete-rule bodies that both
-match one request but produce *different* objects are a Rego conflict, which becomes a
-gate evaluation error — and gate errors fail open (see below). Branch on disjoint
-conditions (here, `actor.kind`) or use an ordered `else` chain.
+match one request but produce *different* objects are a Rego conflict. The backend
+treats that conflict as policy-evaluation uncertainty and returns an explicit deny
+(see Semantics below). Branch on disjoint conditions (here, `actor.kind`) or use an
+ordered `else` chain.
 
 `obligations` map to `khive_gate::Obligation`:
 `{"kind": "audit", "tag": "..."}`,
