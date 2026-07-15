@@ -1,18 +1,14 @@
-//! Workspace pack vocabulary: the `workspace` entity kind and its five
-//! additive `contains` endpoint rules.
+//! Workspace entity kind and additive membership endpoint rules.
 
 use khive_types::{EdgeEndpointRule, EdgeRelation, EndpointKind};
 
 /// Entity kinds this pack contributes to the runtime vocabulary.
 pub(crate) const ENTITY_KINDS: &[&str] = &["workspace"];
 
-/// v0 membership edges: `workspace -[contains]-> member`, one rule per
-/// already-shipped member note kind (git's `issue`/`pull_request`/`commit`,
-/// GTD's `task`, session's `session`). All additive  -  the base contract
-/// treats `contains` as entity-to-entity only; these rules broaden it to
-/// entity-to-note for the five kinds a workspace can hold in v0. Document
-/// membership (pack-doc #872) is deliberately absent until that pack settles
-/// its substrate contract.
+/// `workspace -[contains]->` git, task, and session note endpoints.
+///
+/// Document membership remains deferred. See
+/// `crates/khive-pack-workspace/docs/api/workspace-registration.md`.
 pub(crate) static WORKSPACE_EDGE_RULES: [EdgeEndpointRule; 5] = [
     EdgeEndpointRule {
         relation: EdgeRelation::Contains,

@@ -7,7 +7,10 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::ops::{Add, Div, Mul, Sub};
 
-/// Fixed-point score wrapping an `i64` scaled by `2^32`.
+/// Fixed-point `i64` score scaled by `2^32`, with saturating deterministic arithmetic.
+///
+/// The raw `i64::MIN` value is reserved. See
+/// `crates/khive-score/docs/api/deterministic-score.md`.
 #[derive(Copy, Clone, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize))]
 #[repr(transparent)]
@@ -421,8 +424,6 @@ mod tests {
         assert_ne!(result, DeterministicScore::MIN);
     }
 
-    // ── from_raw_saturating / from_raw_checked ────────────────────────────────
-
     #[test]
     fn from_raw_saturating_min_maps_to_neg_inf() {
         let s = DeterministicScore::from_raw_saturating(i64::MIN);
@@ -464,8 +465,6 @@ mod tests {
         let s = DeterministicScore::from_raw_checked(0).unwrap();
         assert_eq!(s, DeterministicScore::ZERO);
     }
-
-    // ── serde: custom Deserialize rejects i64::MIN ────────────────────────────
 
     #[cfg(feature = "serde")]
     #[test]

@@ -1,6 +1,8 @@
 //! Script/identifier detection and splitting for code-aware tokenization.
 
-/// Returns true if `text` looks like a code identifier (no whitespace, ≥1 ASCII letter, structural boundary present).
+/// Return whether text has an ASCII letter and an identifier boundary but no whitespace.
+///
+/// See `crates/khive-text/docs/api/identifier-and-script.md`.
 pub fn is_identifier(text: &str) -> bool {
     if text.chars().any(|c| c.is_whitespace()) {
         return false;
@@ -41,6 +43,8 @@ pub fn is_identifier(text: &str) -> bool {
 
 /// Split `text` on separators (`_`, `-`, `.`, `/`, `::`) and camelCase/digit boundaries,
 /// returning lowercase parts of at least `min_part_len` characters.
+///
+/// See `crates/khive-text/docs/api/identifier-and-script.md`.
 pub fn split_identifier(text: &str, min_part_len: usize) -> Vec<String> {
     // Collect chars, then split on separators / boundaries
     let chars: Vec<char> = text.chars().collect();
@@ -127,8 +131,6 @@ pub fn split_identifier(text: &str, min_part_len: usize) -> Vec<String> {
 mod tests {
     use super::*;
 
-    // --- is_identifier ---
-
     #[test]
     fn camel_case_is_identifier() {
         assert!(is_identifier("camelCase"));
@@ -170,8 +172,6 @@ mod tests {
         assert!(!is_identifier("123"));
         assert!(!is_identifier("_"));
     }
-
-    // --- split_identifier ---
 
     #[test]
     fn camel_case_split() {

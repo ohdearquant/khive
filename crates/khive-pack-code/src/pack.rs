@@ -16,6 +16,8 @@ use crate::vocab::{CODE_EDGE_RULES, CODE_NOTE_KIND_SPECS};
 
 /// Code ontology pack — additive edge rules over four concept subtypes plus
 /// the `finding` audit-observation note kind. No verbs (ADR-085 D1).
+///
+/// See `crates/khive-pack-code/docs/code-ontology.md`.
 pub struct CodePack {
     #[allow(dead_code)]
     runtime: KhiveRuntime,
@@ -33,12 +35,11 @@ impl Pack for CodePack {
 }
 
 impl CodePack {
+    /// Bind the code vocabulary pack to `runtime`; the pack registers no verbs.
     pub fn new(runtime: KhiveRuntime) -> Self {
         Self { runtime }
     }
 }
-
-// ── inventory self-registration ───────────────────────────────────────────────
 
 struct CodePackFactory;
 

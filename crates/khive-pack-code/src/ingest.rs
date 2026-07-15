@@ -1,23 +1,4 @@
-//! Pure `findings.json -> Vec<Entity>, Vec<Note>, Vec<Edge>` mapper.
-//!
-//! `ingest_findings_json` validates the entire input before constructing any
-//! output record, so a malformed file never yields a partial batch. Record
-//! identity is a content-derived UUIDv5 hash of the validated finding record
-//! (`observed_at` excluded), so re-ingesting the same `findings.json` under
-//! the same [`CodeIngestOptions`] reproduces the same entity, note, and edge
-//! IDs, while a content change (severity, evidence, impact, ...) produces a
-//! new finding id rather than colliding with the prior record.
-//!
-//! Only `severity` and `confidence` values, the evidence shape, and
-//! `failure_scenario` presence are governed at ingest time — they reject
-//! unknown/malformed values by design (ADR-085 D4 "fail closed; no silent
-//! coercion"). Every other field (`categories`, `standard`, `refs`,
-//! `priority`, raw audit `status`, `impact`, `recommendation`,
-//! `verification`) is tolerated per ADR-085 Amendment 1 A1: ingest neither
-//! rejects nor coerces them, it preserves whatever JSON value was provided
-//! and omits the key when the field is absent. Raw `status` is preserved
-//! verbatim under `properties.audit_status` — it has no agreed mapping to
-//! the finding lifecycle (`kind_status`) yet.
+//! Pure, fail-closed `findings.json` to deterministic KG-record mapping.
 
 use std::collections::BTreeMap;
 
@@ -34,21 +15,22 @@ use crate::vocab::{is_valid_confidence, is_valid_severity};
 /// `Uuid::new_v5(Uuid::NAMESPACE_URL, b"https://github.com/ohdearquant/khive/adr/085/code-pack/v1")`.
 pub const CODE_INGEST_NAMESPACE: Uuid = Uuid::from_u128(0x288fe3dc_ac69_5aef_ab1e_9b170fb07376);
 
-/// Options controlling one `ingest_findings_json` call.
+/// Namespace, observation time, and optional stable run identity for one ingest.
+///
+/// See `crates/khive-pack-code/docs/api/findings-ingest.md`.
 #[derive(Clone, Debug)]
 pub struct CodeIngestOptions<'a> {
     /// KG namespace the produced records belong to.
     pub namespace: &'a str,
-    /// Wall-clock timestamp stamped on produced records. Excluded from every
-    /// identity tuple so re-ingesting the same sweep at a later time still
-    /// reproduces the same IDs.
+    /// Record timestamp, excluded from identity so later retries reproduce IDs.
     pub observed_at: DateTime<Utc>,
     /// Stable sweep identity. When absent, derived as `audit.date:audit.commit`.
     pub source_run: Option<&'a str>,
 }
 
-/// Output of a successful ingest: deterministic entity/note/edge records
-/// ready for the caller to persist through existing storage/runtime paths.
+/// Deterministic entity, finding-note, and annotation-edge records ready for persistence.
+///
+/// See `crates/khive-pack-code/docs/api/findings-ingest.md`.
 #[derive(Clone, Debug)]
 pub struct CodeIngestBatch {
     pub entities: Vec<Entity>,
@@ -61,9 +43,7 @@ fn uuid5_tuple<T: serde::Serialize>(parts: &T) -> Result<Uuid, CodeIngestError> 
     Ok(Uuid::new_v5(&CODE_INGEST_NAMESPACE, &bytes))
 }
 
-/// Recursively sort object keys so two JSON values that differ only in key
-/// order serialize identically. Array element order is content and is left
-/// untouched.
+/// Recursively sort object keys while preserving content-significant array order.
 fn sort_json_keys(value: &Value) -> Value {
     match value {
         Value::Object(map) => {
@@ -82,9 +62,7 @@ fn sort_json_keys(value: &Value) -> Value {
     }
 }
 
-/// Render a tolerated (ungoverned) field for inclusion in note content text.
-/// Strings pass through verbatim; any other JSON shape renders as its
-/// canonical JSON text; absence renders as empty.
+/// Render strings verbatim, other JSON canonically, and absent values as empty text.
 fn value_to_display(value: Option<&Value>) -> String {
     match value {
         None | Some(Value::Null) => String::new(),
@@ -93,8 +71,7 @@ fn value_to_display(value: Option<&Value>) -> String {
     }
 }
 
-/// A tolerated field is present when the key exists and its value is not
-/// JSON `null` — an explicit `null` is treated the same as absence.
+/// Clone a tolerated field, treating explicit JSON null as absence.
 fn tolerated_field(obj: &Map<String, Value>, key: &str) -> Option<Value> {
     match obj.get(key) {
         None | Some(Value::Null) => None,
@@ -102,10 +79,7 @@ fn tolerated_field(obj: &Map<String, Value>, key: &str) -> Option<Value> {
     }
 }
 
-/// Amendment 1 A2 governed mapping: `fixed -> resolved`, `false_positive ->
-/// invalid`, everything else (including absent/non-string status) stays
-/// `open`. The raw producer value is preserved verbatim under
-/// `properties.audit_status` regardless of how it maps here.
+/// Map fixed/false-positive producer states to lifecycle states; default to open.
 fn map_producer_status_to_kind_status(audit_status: Option<&Value>) -> &'static str {
     match audit_status.and_then(Value::as_str) {
         Some("fixed") => "resolved",
@@ -159,9 +133,7 @@ fn normalize_title(title: &str) -> Result<String, CodeIngestError> {
     Ok(normalized)
 }
 
-/// Canonicalize the tolerated `evidence` shapes (null, string, object, array
-/// of strings/objects) into an array of `{description}`-or-richer objects.
-/// Any other shape is rejected with the finding/evidence index named.
+/// Canonicalize supported evidence shapes or report the finding/evidence index.
 fn canonicalize_evidence(
     value: Option<&Value>,
     finding_index: usize,
@@ -309,12 +281,7 @@ impl ValidatedFinding {
             });
         }
 
-        // `categories`, `standard`, `refs`, `priority`, `status`, `impact`,
-        // `recommendation`, and `verification` are tolerated (ADR-085
-        // Amendment 1 A1): ingest neither rejects nor coerces their shape,
-        // it preserves whatever JSON value was provided or omits the key
-        // when absent. Only `evidence` shape and `severity`/`confidence`/
-        // `failure_scenario` presence remain fail-closed.
+        // Preserve ungoverned JSON verbatim; only governed fields fail closed.
         let categories = tolerated_field(obj, "categories");
         let standard = tolerated_field(obj, "standard");
         let evidence = canonicalize_evidence(obj.get("evidence"), finding_index)?;
@@ -369,10 +336,8 @@ impl ValidatedFinding {
 
 /// Map a `findings.json` document into deterministic KG records.
 ///
-/// Validates the entire document before constructing any output record —
-/// malformed input never produces a partial batch. Output identity is
-/// content-derived (see module docs), so calling this twice with the same
-/// bytes and options reproduces identical entity/note/edge IDs.
+/// Validation completes before construction, so errors yield no partial batch. Equal content and
+/// identity options reproduce IDs. See `crates/khive-pack-code/docs/api/findings-ingest.md`.
 pub fn ingest_findings_json(
     input: &[u8],
     options: CodeIngestOptions<'_>,
@@ -453,11 +418,7 @@ pub fn ingest_findings_json(
     let mut edges = Vec::with_capacity(validated_findings.len());
 
     for finding in &validated_findings {
-        // Identity is a canonical content hash of the validated finding,
-        // `observed_at` excluded: same content re-ingested at a different
-        // time reproduces the same id, and any content change (severity,
-        // evidence, impact, ...) produces a different id rather than
-        // silently overwriting the prior record under the old one.
+        // Excluding observation time makes retries stable while content changes create new IDs.
         let identity_value = sort_json_keys(&json!({
             "kind": "code-finding",
             "schema_version": 1,
