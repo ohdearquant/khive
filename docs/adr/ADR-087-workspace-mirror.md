@@ -338,6 +338,14 @@ and every review is a review OF a specific snapshot.
   for the head SHA the review examined. Same upsert-on-reference rule as A8: creating
   the review note may create a skeletal `commit` note (identity by repo + SHA) that
   batch ingestion later enriches.
+- **Merge-commit anchor (required)**: because pull requests squash-merge, the reviewed
+  head SHAs are never ancestors of the main branch — without a recorded merge commit,
+  nothing connects the review history to mainline history. Every `pull_request` note
+  therefore records `properties.merge_commit_sha` once the PR merges, and a `commit`
+  note for that merge SHA is upserted with an `annotates` edge from the PR note. The
+  reviewed-head anchors answer "what exactly did round N examine"; the merge-commit
+  anchor answers "where did this PR land in main". Both are required; neither
+  substitutes for the other.
 
 ### A10: Byte-exact content contract for stored documents
 
@@ -394,8 +402,13 @@ repositories) are backfilled by ONE canonical, idempotent ingest script:
 - a true atomic get-or-create ingestion primitive (caller-supplied natural key,
   returns existing-or-created, binds edges in one transaction) is named future work for
   the runtime — the backfill does not wait for it;
-- the script ships ahead of this amendment's implementation — backfill notes use only
-  existing verbs.
+- **delivery sequencing**: the script ships ahead of this amendment's implementation
+  and its FIRST pass creates only what existing verbs support — decision notes and
+  their `annotates` anchors. The A9 round-chain edge requires the
+  `decision precedes decision` endpoint rule, which does not exist yet; that
+  `EDGE_RULES` addition is the amendment's prerequisite first implementation slice,
+  and the round-chain edges are added by re-running the script's convergent repair
+  pass after the endpoint lands. The first pass must not claim chain completeness.
 
 ### Acceptance
 
@@ -425,4 +438,8 @@ repositories) are backfilled by ONE canonical, idempotent ingest script:
    skeletal `commit` note found by SHA.
 8. Backfill convergence (A12): interrupting the backfill after note creation but
    before edge creation, then re-running, yields exactly one note per artifact with
-   all required edges present.
+   all edges the current verb surface supports; after the `decision precedes decision`
+   endpoint lands, one further repair pass completes the round chains.
+9. Merge anchor (A9): merging a fixture PR stamps `properties.merge_commit_sha` on its
+   `pull_request` note and produces an `annotates` edge to the merge commit's note; a
+   query from the merge commit reaches every review round of the PR in two hops.
