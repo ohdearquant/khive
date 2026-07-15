@@ -302,6 +302,68 @@ skeletal `pull_request`/`issue` note it annotates if ingestion has not reached i
 with the batch ingester later enriching rather than duplicating it (identity by
 repo + number).
 
+### A9: Review-round chains and snapshot anchoring
+
+Review notes are not isolated: rounds on the same pull request form an explicit chain,
+and every review is a review OF a specific snapshot.
+
+- **Round chain**: review round N links `supersedes` (note→note, already legal under the
+  base contract) to round N-1's note. This is semantically exact — the newer verdict
+  supersedes the older for currency, the older round is preserved and queryable, and
+  the view layer filters superseded rounds by default. No new endpoint rule is needed;
+  `precedes` (which lacks a note→note endpoint) is deliberately not used.
+- **Snapshot anchor**: each review note links `annotates` to the git-pack `commit` note
+  for the head SHA the review examined. Same upsert-on-reference rule as A8: creating
+  the review note may create a skeletal `commit` note (identity by repo + SHA) that
+  batch ingestion later enriches.
+
+### A10: Byte-exact content contract for stored documents
+
+The note-first treatment generalizes beyond verdicts: ADRs, design documents, research
+notes, and ordinary source/markdown files small enough for inline storage all live in
+the database directly as notes or document entities. The storage contract:
+
+- `properties.filename` preserves the original filename WITH extension;
+  `properties.media_type` carries the MIME type (or extension-derived equivalent).
+- Content is stored **verbatim, byte-exact**: whitespace, tab characters, CRLF vs LF
+  line endings, trailing newlines, and all Unicode content must round-trip perfectly.
+  No normalization, trimming, or re-encoding at any layer between ingest and export.
+- Secret masking (A1) is the single sanctioned transformation; when applied, the entity
+  records `properties.masked=true` so consumers know the content is not the original
+  bytes, and the checksum is computed over the stored (masked) content.
+- Acceptance includes a round-trip fidelity test covering CRLF, tabs, trailing
+  whitespace, and multi-byte Unicode.
+
+PDFs and true binaries remain blob-routed per A2/A8.
+
+### A11: Institutionalized capture — completion hooks, not habits
+
+Capture must not depend on anyone remembering a convention. The completion path of
+each producing workflow stores the artifact automatically:
+
+- Review-leg wrappers end with an auto-store step: the verdict text becomes the
+  decision note (A8) with its round chain and snapshot anchor (A9) before the wrapper
+  exits.
+- Merging an ADR or design document triggers its ingestion as a document record (A10).
+- The background mirror and the one-shot `workspace.ingest` sweep everything the hooks
+  miss — the safety net, not the primary path.
+
+Wrapper scripts are an acceptable mechanism; the contract is the trigger point
+(completion), not the implementation.
+
+### A12: Ordered backfill of surviving artifacts
+
+Historical verdict-shaped artifacts surviving on disk (thousands across the fleet's
+repositories) are backfilled by ONE canonical, idempotent ingest script:
+
+- parse each file → decision note with provenance properties: `source_path`, original
+  date where derivable, PR number and round parsed from the filename;
+- link `annotates` to the PR/commit notes, upserting skeletal records as needed (A8/A9);
+- idempotent by construction (stable identity from repo + PR + round + content hash) so
+  re-runs never duplicate;
+- the script ships ahead of this amendment's implementation — backfill notes use only
+  existing verbs.
+
 ### Acceptance
 
 1. A fixture `.khive/` tree containing text, an oversized text file, and a binary file
@@ -314,3 +376,9 @@ repo + number).
 4. `workspace.snapshot` on the fixture workspace produces one bundle file; restoring it
    into an empty store reproduces every entity and blob (digest-verified); restoring it
    twice is idempotent.
+5. Round-trip fidelity (A10): a fixture set containing CRLF line endings, tab
+   characters, trailing whitespace, and multi-byte Unicode ingests and exports
+   byte-identical (checksum equality against the original files).
+6. Review chain (A9): two review rounds on the same fixture PR produce two decision
+   notes, a `supersedes` note→note edge round-2→round-1, and `annotates` edges to the
+   two commit notes; default views return only round 2.
