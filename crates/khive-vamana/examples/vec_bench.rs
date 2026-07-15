@@ -147,10 +147,18 @@ fn parse_args() -> Args {
             }
             "--workers" => {
                 if let Some(val) = args_iter.next() {
-                    workers.extend(
-                        val.split(',')
-                            .filter_map(|s| s.trim().parse::<usize>().ok()),
-                    );
+                    for part in val.split(',') {
+                        let part = part.trim();
+                        match part.parse::<usize>() {
+                            Ok(w) if w >= 1 => workers.push(w),
+                            _ => {
+                                eprintln!(
+                                    "--workers: invalid value {part:?} (expected a comma-separated list of integers >= 1, e.g. 1,4,16)"
+                                );
+                                std::process::exit(2);
+                            }
+                        }
+                    }
                 }
             }
             "--dump-topk" => {
@@ -457,19 +465,23 @@ fn measure_concurrent_warm_latency(
     n_queries: usize,
     beam: usize,
     workers: usize,
-) -> (f64, f64, f64, f64) {
+) -> (usize, f64, f64, f64, f64) {
     let n = corpus.len() / dim;
     let workers = workers.max(1);
     let chunk = n_queries.div_ceil(workers);
+    let ranges: Vec<(usize, usize)> = (0..workers)
+        .map(|w| (w * chunk, ((w + 1) * chunk).min(n_queries)))
+        .filter(|(start, _)| *start < n_queries)
+        .collect();
+    let spawned = ranges.len();
+    // All workers rendezvous here after warm-up so every timed sample is taken
+    // with the full worker count actually issuing queries concurrently.
+    let barrier = std::sync::Barrier::new(spawned);
 
     let per_thread: Vec<(Vec<f64>, f64, usize)> = std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(workers);
-        for w in 0..workers {
-            let start = w * chunk;
-            if start >= n_queries {
-                continue;
-            }
-            let end = (start + chunk).min(n_queries);
+        let mut handles = Vec::with_capacity(spawned);
+        for &(start, end) in &ranges {
+            let barrier = &barrier;
             handles.push(scope.spawn(move || {
                 let mut visited = VisitedSet::new(n);
                 // Untimed warm-up pass so the timed pass below measures a hot cache.
@@ -477,6 +489,7 @@ fn measure_concurrent_warm_latency(
                     let q = row_slice(queries, dim, qi);
                     let _ = search_with_beam(graph, corpus, dim, q, K, beam, &mut visited);
                 }
+                barrier.wait();
                 let mut samples = Vec::with_capacity(end - start);
                 let mut recall_sum = 0.0f64;
                 for (i, gt_row) in gt[start..end].iter().enumerate() {
@@ -502,7 +515,7 @@ fn measure_concurrent_warm_latency(
         counted += count;
     }
     let (p50, p95, p99) = percentiles_us(&mut all_samples);
-    (recall_sum / counted as f64, p50, p95, p99)
+    (spawned, recall_sum / counted as f64, p50, p95, p99)
 }
 
 // ─── per-query top-k dump ────────────────────────────────────────────────────
@@ -1129,14 +1142,19 @@ fn main() {
         // existing top-level query_warm_* fields above are untouched.
         let mut concurrency_arms: Vec<Value> = Vec::new();
         for &w in &args.workers {
-            let (c_recall, c_p50, c_p95, c_p99) = measure_concurrent_warm_latency(
+            let (c_spawned, c_recall, c_p50, c_p95, c_p99) = measure_concurrent_warm_latency(
                 &graph, &corpus, dim, &query_all, &gt, n_lat, iso_beam, w,
             );
+            if c_spawned != w {
+                println!(
+                    "  Concurrency arm: requested workers={w} but only {c_spawned} spawned (query sample smaller than worker count); recording actual"
+                );
+            }
             println!(
-                "  Concurrency arm workers={w}: recall@{K}={c_recall:.4} p50={c_p50:.1}us p95={c_p95:.1}us p99={c_p99:.1}us"
+                "  Concurrency arm workers={c_spawned}: recall@{K}={c_recall:.4} p50={c_p50:.1}us p95={c_p95:.1}us p99={c_p99:.1}us"
             );
             concurrency_arms.push(json!({
-                "workers": w,
+                "workers": c_spawned,
                 "recall_at_10": c_recall,
                 "query_warm_p50_us": c_p50,
                 "query_warm_p95_us": c_p95,
