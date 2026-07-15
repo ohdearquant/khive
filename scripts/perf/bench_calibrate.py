@@ -37,6 +37,19 @@ Suites (pluggable via SUITES registry):
             Extracts assertion checks (recall_at_10, beam_growth_exponent,
             speedup_vs_brute_force), per-N row metrics, and growth-exponent
             fits from the schema-versioned result JSON it writes.
+  contract  drives scripts/perf/contract_suite.py (the local-engine
+            contract-result-v1 suite: ingest, ANN query concurrency arms,
+            recall@k). Cheap synthetic defaults (no SIFT-1M, no faiss
+            venv) - pass the real dataset/venv/worker-arm configuration
+            via repeated --suite-arg for a citable profile run. Extracts
+            every numeric leaf worth statting from the emitted
+            contract-result.json: per-arm p50_us/p95_us/p99_us/
+            measured_recall_at_10 (keyed by workers), recall_at_k rows'
+            recall/speedup_vs_baseline (keyed by k), the recall_at_k
+            baseline query_us_p50, and the ingest dimension's metrics.
+            Non-numeric leaves (dataset names, baseline kind) are skipped;
+            they remain visible in the per-run contract-result.json
+            artifacts kept under --out/runs/.
 
 Safety:
   - Refuses to run against a dirty git worktree (the whole point is
@@ -68,8 +81,10 @@ import unittest
 REPO_ROOT = pathlib.Path(__file__).parent.parent.parent
 PERF_SCRIPTS_DIR = pathlib.Path(__file__).parent
 _BENCH1M_FIXTURE_PATH = PERF_SCRIPTS_DIR / "testdata" / "bench1m_result_fixture.json"
+_CONTRACT_FIXTURE_PATH = PERF_SCRIPTS_DIR / "testdata" / "contract_result_fixture.json"
 PIPELINE_SCRIPT = PERF_SCRIPTS_DIR / "bench_pipeline_daemon.py"
 LOAD_SCRIPT = PERF_SCRIPTS_DIR / "bench_load_harness.py"
+CONTRACT_SCRIPT = PERF_SCRIPTS_DIR / "contract_suite.py"
 
 DEFAULT_OUT_DIR = PERF_SCRIPTS_DIR / "calibration"
 
@@ -524,6 +539,220 @@ def _bench1m_extract(run_dir: pathlib.Path, proc: subprocess.CompletedProcess) -
     return metrics
 
 
+# ── suite: contract ───────────────────────────────────────────────────────────
+#
+# Wraps scripts/perf/contract_suite.py, which writes a single schema-valid
+# contract-result-v1 document (contract-result.json) per invocation. The
+# document's `dimensions` tree nests ann_query/recall_at_k metrics inside
+# arrays keyed by a discriminant (`workers`, `k`) rather than plain nested
+# dicts, so - unlike the `load` suite's generic _flatten_numeric walk - each
+# dimension is extracted explicitly here (same shape as _bench1m_extract's
+# n-keyed rows).
+
+_CONTRACT_RESULT_FILENAME = "contract-result.json"
+_CONTRACT_INGEST_REQUIRED_FIELDS = (
+    "corpus_docs",
+    "docs_per_s_embed_excluded",
+    "index_build_wall_s",
+)
+_CONTRACT_ARM_REQUIRED_FIELDS = ("measured_recall_at_10", "p50_us", "p95_us", "p99_us")
+_CONTRACT_RECALL_ROW_REQUIRED_FIELDS = ("recall", "speedup_vs_baseline")
+
+
+def _contract_build_cmd(run_dir: pathlib.Path, extra_args: list[str]) -> list[str]:
+    return [sys.executable, str(CONTRACT_SCRIPT), *extra_args, "--out", str(run_dir)]
+
+
+def _contract_extract(run_dir: pathlib.Path, proc: subprocess.CompletedProcess) -> dict[str, float]:
+    result_path = run_dir / _CONTRACT_RESULT_FILENAME
+    if not result_path.exists():
+        raise SchemaError(
+            f"contract suite did not write {_CONTRACT_RESULT_FILENAME}; see {run_dir}/stdout.log"
+        )
+    result = json.loads(result_path.read_text())
+
+    dimensions = result.get("dimensions")
+    if not isinstance(dimensions, dict) or not dimensions:
+        raise SchemaError(f"contract result missing non-empty 'dimensions'; see {result_path}")
+
+    metrics: dict[str, float] = {}
+
+    ingest = dimensions.get("ingest")
+    if ingest is not None:
+        for field in _CONTRACT_INGEST_REQUIRED_FIELDS:
+            if field not in ingest:
+                raise SchemaError(
+                    f"contract ingest dimension missing field {field!r}; see {result_path}"
+                )
+            metrics[f"ingest.{field}"] = float(ingest[field])
+        # docs_per_s_embed_included is an optional advisory companion row
+        # (embedder-dependent, never the headline number) - stat it when
+        # present, but its absence is not schema drift.
+        if "docs_per_s_embed_included" in ingest:
+            metrics["ingest.docs_per_s_embed_included"] = float(ingest["docs_per_s_embed_included"])
+
+    ann_query = dimensions.get("ann_query")
+    if ann_query is not None:
+        arms = ann_query.get("arms")
+        if not isinstance(arms, list) or not arms:
+            raise SchemaError(
+                f"contract ann_query dimension missing non-empty 'arms'; see {result_path}"
+            )
+        seen_workers: set[int] = set()
+        for arm in arms:
+            workers = arm.get("workers")
+            if workers is None or workers in seen_workers:
+                raise SchemaError(
+                    f"contract ann_query arm missing or duplicate 'workers' key: {arm!r}; "
+                    f"see {result_path}"
+                )
+            seen_workers.add(workers)
+            for field in _CONTRACT_ARM_REQUIRED_FIELDS:
+                if field not in arm:
+                    raise SchemaError(
+                        f"contract ann_query arm workers={workers} missing field {field!r}; "
+                        f"see {result_path}"
+                    )
+                metrics[f"ann_query.workers{workers}.{field}"] = float(arm[field])
+
+    recall_at_k = dimensions.get("recall_at_k")
+    if recall_at_k is not None:
+        baseline = recall_at_k.get("baseline")
+        if not isinstance(baseline, dict) or "query_us_p50" not in baseline:
+            raise SchemaError(
+                f"contract recall_at_k dimension missing 'baseline.query_us_p50'; see {result_path}"
+            )
+        metrics["recall_at_k.baseline.query_us_p50"] = float(baseline["query_us_p50"])
+
+        rows = recall_at_k.get("rows")
+        if not isinstance(rows, list) or not rows:
+            raise SchemaError(
+                f"contract recall_at_k dimension missing non-empty 'rows'; see {result_path}"
+            )
+        seen_ks: set[int] = set()
+        for row in rows:
+            k = row.get("k")
+            if k is None or k in seen_ks:
+                raise SchemaError(
+                    f"contract recall_at_k row missing or duplicate 'k' key: {row!r}; "
+                    f"see {result_path}"
+                )
+            seen_ks.add(k)
+            for field in _CONTRACT_RECALL_ROW_REQUIRED_FIELDS:
+                if field not in row:
+                    raise SchemaError(
+                        f"contract recall_at_k row k={k} missing field {field!r}; see {result_path}"
+                    )
+                metrics[f"recall_at_k.k{k}.{field}"] = float(row[field])
+
+    return metrics
+
+
+class ContractExtractSelfCheck(unittest.TestCase):
+    """Self-check for _contract_extract against a captured contract-result-v1
+    document (ingest + a 3-arm ann_query + a k=10 recall_at_k row).
+
+    Run via: python3 -m unittest scripts.perf.bench_calibrate
+    """
+
+    def _run_dir_with(self, tmp_path: pathlib.Path, payload: dict) -> pathlib.Path:
+        (tmp_path / _CONTRACT_RESULT_FILENAME).write_text(json.dumps(payload))
+        return tmp_path
+
+    def _extract(self, tmp_path: pathlib.Path, payload: dict) -> dict[str, float]:
+        run_dir = self._run_dir_with(tmp_path, payload)
+        proc = subprocess.CompletedProcess([], 0, "", "")
+        return _contract_extract(run_dir, proc)
+
+    def test_real_result_shape_extracts_without_crashing(self) -> None:
+        payload = json.loads(_CONTRACT_FIXTURE_PATH.read_text())
+        with tempfile.TemporaryDirectory() as td:
+            metrics = self._extract(pathlib.Path(td), payload)
+
+        arms = payload["dimensions"]["ann_query"]["arms"]
+        self.assertEqual(len(arms), 3, "fixture must exercise multiple concurrency arms")
+        for arm in arms:
+            self.assertEqual(
+                metrics[f"ann_query.workers{arm['workers']}.p50_us"], arm["p50_us"]
+            )
+            self.assertEqual(
+                metrics[f"ann_query.workers{arm['workers']}.measured_recall_at_10"],
+                arm["measured_recall_at_10"],
+            )
+
+        recall_row = payload["dimensions"]["recall_at_k"]["rows"][0]
+        self.assertEqual(
+            metrics[f"recall_at_k.k{recall_row['k']}.speedup_vs_baseline"],
+            recall_row["speedup_vs_baseline"],
+        )
+        self.assertEqual(
+            metrics["recall_at_k.baseline.query_us_p50"],
+            payload["dimensions"]["recall_at_k"]["baseline"]["query_us_p50"],
+        )
+        self.assertEqual(
+            metrics["ingest.docs_per_s_embed_excluded"],
+            payload["dimensions"]["ingest"]["docs_per_s_embed_excluded"],
+        )
+        # dataset/baseline.kind (strings) must not appear as stray numeric keys.
+        self.assertNotIn("ingest.dataset", metrics)
+        self.assertNotIn("recall_at_k.baseline.kind", metrics)
+
+    def test_optional_docs_per_s_embed_included_stated_when_present(self) -> None:
+        payload = json.loads(_CONTRACT_FIXTURE_PATH.read_text())
+        payload["dimensions"]["ingest"]["docs_per_s_embed_included"] = 4321.0
+        with tempfile.TemporaryDirectory() as td:
+            metrics = self._extract(pathlib.Path(td), payload)
+        self.assertEqual(metrics["ingest.docs_per_s_embed_included"], 4321.0)
+
+    def test_partial_run_with_only_ingest_dimension_extracts(self) -> None:
+        payload = json.loads(_CONTRACT_FIXTURE_PATH.read_text())
+        del payload["dimensions"]["ann_query"]
+        del payload["dimensions"]["recall_at_k"]
+        with tempfile.TemporaryDirectory() as td:
+            metrics = self._extract(pathlib.Path(td), payload)
+        self.assertEqual(
+            set(metrics),
+            {f"ingest.{f}" for f in _CONTRACT_INGEST_REQUIRED_FIELDS},
+        )
+
+    def test_missing_result_file_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            proc = subprocess.CompletedProcess([], 0, "", "")
+            with self.assertRaises(SchemaError):
+                _contract_extract(pathlib.Path(td), proc)
+
+    def test_arm_missing_field_rejected(self) -> None:
+        payload = json.loads(_CONTRACT_FIXTURE_PATH.read_text())
+        del payload["dimensions"]["ann_query"]["arms"][0]["p99_us"]
+        with tempfile.TemporaryDirectory() as td, self.assertRaises(SchemaError):
+            self._extract(pathlib.Path(td), payload)
+
+    def test_duplicate_arm_workers_rejected(self) -> None:
+        payload = json.loads(_CONTRACT_FIXTURE_PATH.read_text())
+        dup = dict(payload["dimensions"]["ann_query"]["arms"][0])
+        payload["dimensions"]["ann_query"]["arms"].append(dup)
+        with tempfile.TemporaryDirectory() as td, self.assertRaises(SchemaError):
+            self._extract(pathlib.Path(td), payload)
+
+    def test_recall_row_missing_field_rejected(self) -> None:
+        payload = json.loads(_CONTRACT_FIXTURE_PATH.read_text())
+        del payload["dimensions"]["recall_at_k"]["rows"][0]["speedup_vs_baseline"]
+        with tempfile.TemporaryDirectory() as td, self.assertRaises(SchemaError):
+            self._extract(pathlib.Path(td), payload)
+
+    def test_recall_baseline_missing_query_us_p50_rejected(self) -> None:
+        payload = json.loads(_CONTRACT_FIXTURE_PATH.read_text())
+        del payload["dimensions"]["recall_at_k"]["baseline"]["query_us_p50"]
+        with tempfile.TemporaryDirectory() as td, self.assertRaises(SchemaError):
+            self._extract(pathlib.Path(td), payload)
+
+    def test_empty_dimensions_rejected(self) -> None:
+        payload = json.loads(_CONTRACT_FIXTURE_PATH.read_text())
+        payload["dimensions"] = {}
+        with tempfile.TemporaryDirectory() as td, self.assertRaises(SchemaError):
+            self._extract(pathlib.Path(td), payload)
+
+
 # ── suite registry ────────────────────────────────────────────────────────────
 #
 # Each entry: {command argv builder, metric extractor, cheap CLI defaults,
@@ -566,6 +795,30 @@ SUITES = {
         # cargo run --release builds+runs khive-vamana's vec_bench example
         # against synthetic 10K/50K-vector fixtures; a cold release build
         # can take several minutes on top of the bench itself.
+        "timeout_s": 1800,
+    },
+    "contract": {
+        "build_cmd": _contract_build_cmd,
+        "extract": _contract_extract,
+        # Cheap synthetic default (no --sift-dir, no --faiss-venv): scale
+        # matches contract_suite.py's own default and the run stays hermetic
+        # (numpy brute-force baseline, synthetic clustered fixtures). For a
+        # citable profile run against real SIFT-1M, override entirely via
+        # --suite-arg (each token is appended after these), e.g.:
+        #   --suite-arg=--sift-dir --suite-arg=/path/to/sift1m \
+        #   --suite-arg=--faiss-venv --suite-arg=/path/to/faiss-venv \
+        #   --suite-arg=--scale --suite-arg=100000 \
+        #   --suite-arg=--workers --suite-arg=1,4,16
+        "default_args": [
+            "--dims", "ingest,ann_query,recall_at_k",
+            "--scale", "10000",
+        ],
+        # cargo run --release builds+runs the same khive-vamana vec_bench
+        # binary as the bench-1m suite, plus a baseline pass per run. Measured
+        # wall time for the citable real-SIFT-100K profile config (--scale
+        # 100000 --sift-dir ... --faiss-venv ... --workers 1,4,16) against a
+        # warm CARGO_TARGET_DIR was ~71s; 1800s matches bench-1m's timeout for
+        # the same underlying binary and covers a cold release build too.
         "timeout_s": 1800,
     },
 }
