@@ -2,11 +2,12 @@
 
 khive's default install loads eleven production packs
 (`kg, gtd, memory, brain, comm, schedule, knowledge, session, git, code, workspace`, per
-`RuntimeConfig::default()` in `crates/khive-runtime/src/config.rs`). Two of these
-contribute zero verbs of their own: `code` registers the `finding` note kind and
-edge rules only, with its `code.ingest` verb accepted but unimplemented (see
-[ADR-085](../adr/ADR-085-code-pack.md)); `workspace` registers the `workspace`
-entity kind and five `contains` endpoint rules only, with no verbs. Beyond the
+`RuntimeConfig::default()` in `crates/khive-runtime/src/config.rs`). The `code` pack contributes one verb, `code.ingest` (L1 manifest + L1.5
+import-scan source ingestion into a dedicated map database, see
+[ADR-085](../adr/ADR-085-code-pack.md)), alongside its `finding` note kind and
+edge rules; `findings.json` ingestion remains an admin CLI path. `workspace`
+registers the `workspace` entity kind and five `contains` endpoint rules only,
+with no verbs. Beyond the
 default set, khive also ships niche packs that extend the graph for a
 specific domain without adding verbs of their own. This guide covers the
 formal-math pack, the first of these, and how pack loading works in general.
