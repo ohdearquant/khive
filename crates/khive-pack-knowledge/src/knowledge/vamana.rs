@@ -721,18 +721,20 @@ pub(crate) async fn compute_fingerprint(
 /// vectors alongside the ordered UUID id-map.
 ///
 /// Rows are fetched `ORDER BY subject_id` so the mapping is deterministic.
-/// Returns `Ok(None)` when the model is not configured, the table is empty, or
-/// no rows pass the byte-length validity check.  The caller derives `dims` as
+/// Returns `Ok(None)` only when a scan COMPLETED and found nothing: the table
+/// is empty or no rows pass the byte-length validity check. Store-opening
+/// failures propagate as `Err` — `Ok(None)` feeds the terminal unavailable
+/// marker (issue #1026), so an operational error must never masquerade as a
+/// verified empty corpus. The caller derives `dims` as
 /// `flat.len() / id_map.len()`.
 async fn scan_corpus_raw(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
     model: &str,
 ) -> Result<Option<(Vec<f32>, Vec<Uuid>)>, RuntimeError> {
-    let store = match rt.vectors_for_model(token, model) {
-        Ok(s) => s,
-        Err(_) => return Ok(None),
-    };
+    let store = rt
+        .vectors_for_model(token, model)
+        .map_err(|e| RuntimeError::Internal(e.to_string()))?;
 
     let info = store
         .info()
@@ -1178,7 +1180,7 @@ pub(crate) async fn ensure_ann_for_model(
             // the warming key is removed by the caller so the next request
             // retries at the same generation, and a marker here would make
             // wait_for_ann short-circuit false while that retry is in
-            // flight (codex review on #1026, PR #1027).
+            // flight.
             tracing::warn!(error = %e, "failed to rebuild Vamana ANN index");
         }
     }
@@ -2440,7 +2442,7 @@ mod tests {
     /// A rebuild error is operational, not proof of an unbuildable corpus:
     /// it must NOT leave an unavailable marker, so the retry the background
     /// path arranges (by removing the warming key) still gets a bounded wait
-    /// instead of an instant `false` (codex review on #1026, PR #1027).
+    /// instead of an instant `false` (issue #1026).
     #[tokio::test]
     async fn ensure_ann_for_model_rebuild_error_does_not_mark_unavailable() {
         let dir = TempDir::new().expect("tempdir");
@@ -2501,6 +2503,49 @@ mod tests {
             ready,
             "after a rebuild error the wait must keep polling and observe the \
              retry's install, not short-circuit false"
+        );
+    }
+
+    /// A store-opening failure (here: a model with no registered embedder)
+    /// must propagate as an error, not collapse into `Ok(None)` — otherwise
+    /// it would be indistinguishable from a verified empty corpus and leave
+    /// a terminal unavailable marker that blocks the same-generation retry.
+    #[tokio::test]
+    async fn ensure_ann_for_model_store_open_failure_does_not_mark_unavailable() {
+        let dir = TempDir::new().expect("tempdir");
+        let rt = file_rt_with_embedder(dir.path().join("test.db"));
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+
+        let model = "model-with-no-registered-embedder";
+        assert!(
+            rt.vectors_for_model(&token, model).is_err(),
+            "precondition: opening the vector store for an unregistered model must fail"
+        );
+
+        let ann = new_shared();
+        ensure_ann_for_model(&rt, &token, &ann, model).await;
+        let key = AnnKey::new("local", model);
+
+        assert!(
+            !unavailable_guard(&ann.unavailable).contains_key(&key),
+            "a store-opening failure must not mark the key unavailable"
+        );
+
+        // The next request's wait must still observe a same-generation install.
+        let ann2 = ann.clone();
+        let key2 = key.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            let bridge = AnnBridge::build(vec![1.0f32, 0.0, 0.0, 0.0], 4, vec![Uuid::new_v4()])
+                .expect("build")
+                .with_generation(0);
+            install_if_fresher(&ann2, &key2, bridge).await;
+        });
+        let ready = wait_for_ann(&ann, &key, 500, 10).await;
+        assert!(
+            ready,
+            "after a store-opening failure the wait must keep polling and observe \
+             the retry's install, not short-circuit false"
         );
     }
 }
