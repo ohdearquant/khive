@@ -1,37 +1,31 @@
 // Copyright 2026 Haiyang Li. Licensed under Apache-2.0.
 //
 //! Last-write-wins shortcut strategies.
+//!
+//! See `crates/khive-merge/docs/api/three-way-merge.md` for composition rules.
 
 use khive_runtime::portability::KgArchive;
 
-/// Apply "ours wins on all fields" to produce a merged archive with no conflicts.
+/// Selects ours, plus additions unique to theirs, for entities and edges.
 ///
-/// For every entity UUID:
-/// - If present in ours → use ours version.
-/// - If absent in ours but present in theirs → include theirs.
-/// - If absent in both → exclude.
-///
-/// For every edge composite key:
-/// - Same logic as entities with weight → prefer ours weight.
+/// This helper does not validate or sort; [`crate::merge::three_way_merge`]
+/// performs those steps and dangling-edge checks around it.
 pub fn apply_ours(base: &KgArchive, ours: &KgArchive, theirs: &KgArchive) -> KgArchive {
     use crate::diff_local::EdgeKey;
     use khive_runtime::portability::{ExportedEdge, ExportedEntity};
     use std::collections::HashSet;
     use uuid::Uuid;
 
-    // Entity set: include ours entities; add theirs-only additions.
     let ours_ids: HashSet<Uuid> = ours.entities.iter().map(|e| e.id).collect();
     let base_ids: HashSet<Uuid> = base.entities.iter().map(|e| e.id).collect();
 
     let mut entities: Vec<ExportedEntity> = ours.entities.clone();
     for e in &theirs.entities {
         if !base_ids.contains(&e.id) && !ours_ids.contains(&e.id) {
-            // Added in theirs but not in base or ours → include.
             entities.push(e.clone());
         }
     }
 
-    // Edge set.
     let ours_keys: HashSet<EdgeKey> = ours.edges.iter().map(EdgeKey::from_edge).collect();
     let base_keys: HashSet<EdgeKey> = base.edges.iter().map(EdgeKey::from_edge).collect();
 
@@ -53,15 +47,10 @@ pub fn apply_ours(base: &KgArchive, ours: &KgArchive, theirs: &KgArchive) -> KgA
     }
 }
 
-/// Apply "theirs wins on all fields" to produce a merged archive with no conflicts.
-///
-/// Mirror of `apply_ours` with ours and theirs swapped.
+/// Selects theirs, plus additions unique to ours, by swapping [`apply_ours`].
 pub fn apply_theirs(base: &KgArchive, ours: &KgArchive, theirs: &KgArchive) -> KgArchive {
-    // Swap ours and theirs then call apply_ours.
     apply_ours(base, theirs, ours)
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

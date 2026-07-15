@@ -1,6 +1,8 @@
 // Copyright 2026 Haiyang Li. Licensed under Apache-2.0.
 //
-//! Top-level `three_way_merge()` and `ThreeWayMergeEngine`.
+//! Top-level merge orchestration and the concrete engine adapter.
+//!
+//! See `crates/khive-merge/docs/api/three-way-merge.md`.
 
 use std::collections::HashSet;
 
@@ -13,13 +15,7 @@ use crate::entity::merge_entities;
 use crate::strategy::{apply_ours, apply_theirs};
 use crate::types::{MergeConflict, MergeEngine, MergeError, MergeResult, SnapshotMergeStrategy};
 
-/// Validate archive invariants before merge.
-///
-/// Checks:
-/// - All three archives share the same namespace.
-/// - No edge has a non-finite weight (NaN / Inf).
-/// - No duplicate entity IDs within a single archive.
-/// - No duplicate edge natural keys `(source, target, relation)` within a single archive.
+/// Validates namespace, finite-weight, and entity/edge uniqueness invariants.
 fn validate_inputs(
     base: &KgArchive,
     ours: &KgArchive,
@@ -41,7 +37,6 @@ fn validate_inputs(
 }
 
 fn validate_archive(archive: &KgArchive) -> Result<(), MergeError> {
-    // Reject non-finite edge weights.
     for edge in &archive.edges {
         if !edge.weight.is_finite() {
             return Err(MergeError::InvalidEdgeWeight(format!(
@@ -51,7 +46,6 @@ fn validate_archive(archive: &KgArchive) -> Result<(), MergeError> {
         }
     }
 
-    // Reject duplicate entity IDs.
     let mut entity_ids: HashSet<Uuid> = HashSet::with_capacity(archive.entities.len());
     for entity in &archive.entities {
         if !entity_ids.insert(entity.id) {
@@ -61,7 +55,6 @@ fn validate_archive(archive: &KgArchive) -> Result<(), MergeError> {
         }
     }
 
-    // Reject duplicate edge IDs.
     let mut edge_ids: HashSet<Uuid> = HashSet::with_capacity(archive.edges.len());
     for edge in &archive.edges {
         if !edge_ids.insert(edge.edge_id) {
@@ -72,7 +65,6 @@ fn validate_archive(archive: &KgArchive) -> Result<(), MergeError> {
         }
     }
 
-    // Reject duplicate edge semantic keys.
     let mut edge_keys: HashSet<EdgeKey> = HashSet::with_capacity(archive.edges.len());
     for edge in &archive.edges {
         let key = EdgeKey::from_edge(edge);
@@ -88,12 +80,12 @@ fn validate_archive(archive: &KgArchive) -> Result<(), MergeError> {
     Ok(())
 }
 
-/// Sort entities by UUID for deterministic output.
+/// Sorts entities by UUID for deterministic output.
 fn sort_entities(archive: &mut KgArchive) {
-    archive.entities.sort_by(|a, b| a.id.cmp(&b.id));
+    archive.entities.sort_by_key(|entity| entity.id);
 }
 
-/// Sort edges by `(source, target, relation)` for deterministic output.
+/// Sorts edges by semantic key and then edge UUID.
 fn sort_edges(edges: &mut [ExportedEdge]) {
     edges.sort_by(|a, b| {
         a.source
@@ -104,17 +96,22 @@ fn sort_edges(edges: &mut [ExportedEdge]) {
     });
 }
 
-/// Produce a deterministic `exported_at` timestamp: latest of `ours` and `theirs`.
+/// Selects the later branch timestamp without reading the wall clock.
 fn deterministic_timestamp(ours: &KgArchive, theirs: &KgArchive) -> chrono::DateTime<chrono::Utc> {
     std::cmp::max(ours.exported_at, theirs.exported_at)
 }
 
-/// Perform a three-way merge.
+/// Merges `ours` and `theirs` against their common `base` under `strategy`.
 ///
-/// - `Auto`: validate → entity pass → edge pass → dangling validation → deterministic sort → `Conflicts` or `Clean`.
-/// - `Ours`/`Theirs`: validate → last-write-wins shortcut (skips field conflict detection) →
-///   deterministic sort → dangling-edge validation against the shortcut-composed entity set,
-///   returning `Conflicts` if the shortcut output would reference a missing endpoint, else `Clean`.
+/// `Auto` performs entity and edge conflict detection; `Ours` and `Theirs`
+/// apply last-write-wins but still validate dangling endpoints. Clean output is
+/// deterministically sorted and stamped with the later branch timestamp.
+///
+/// # Errors
+///
+/// Returns [`MergeError`] for namespace mismatch, non-finite edge weights,
+/// duplicate entity IDs, duplicate edge IDs or keys, or relation reconstruction.
+/// See `crates/khive-merge/docs/api/three-way-merge.md` for the full pipeline.
 pub fn three_way_merge(
     base: &KgArchive,
     ours: &KgArchive,
@@ -136,9 +133,7 @@ pub fn three_way_merge(
     }
 }
 
-/// Finish a last-write-wins shortcut merge: sort, stamp, then check that the
-/// shortcut-composed archive has no dangling edge endpoints before labeling
-/// the result `Clean`.
+/// Sorts, stamps, and dangling-checks a last-write-wins result.
 fn finish_shortcut_merge(
     mut merged: KgArchive,
     ours: &KgArchive,
@@ -195,9 +190,9 @@ fn three_way_merge_auto(
     }
 }
 
-/// Implementation of `MergeEngine` using the three-way merge algorithm.
+/// Stateless [`MergeEngine`] adapter over [`three_way_merge`].
 ///
-/// Register this in `khive-vcs` at startup to replace `NoOpMergeEngine`.
+/// See `crates/khive-merge/docs/api/three-way-merge.md` for registration context.
 pub struct ThreeWayMergeEngine;
 
 impl MergeEngine for ThreeWayMergeEngine {

@@ -165,7 +165,7 @@ impl SparqlParser {
     fn parse_predicate(&mut self) -> Result<Predicate, QueryError> {
         self.skip_whitespace();
 
-        // 'a' is shorthand for rdf:type
+        // SPARQL defines `a` as shorthand for rdf:type.
         if self.peek() == Some('a') {
             let start = self.pos;
             self.advance();
@@ -183,7 +183,6 @@ impl SparqlParser {
         self.expect_char(':')?;
         let name = self.parse_ident()?;
 
-        // Path modifiers
         self.skip_whitespace();
         let (min_hops, max_hops) = match self.peek() {
             Some('+') => {
@@ -191,11 +190,7 @@ impl SparqlParser {
                 (1, 5)
             }
             Some('*') => {
-                // SPARQL `*` means zero-or-more, but our recursive CTE seed
-                // starts at depth 1 and cannot emit a depth-0 row that maps
-                // the start node to itself. Reject explicitly until depth-0
-                // is implemented — silently treating `*` as `+` would drop
-                // valid matches.
+                // The CTE cannot emit depth zero; treating `*` as `+` would lose matches.
                 return Err(QueryError::Unsupported(
                     "SPARQL '*' (zero-or-more hops) not yet supported; use '+' or '{min,max}'"
                         .into(),
@@ -288,7 +283,6 @@ impl SparqlParser {
                 break;
             }
             if !triples.is_empty() {
-                // Dot separator (optional before closing brace)
                 self.skip_whitespace();
                 if self.peek() == Some('.') {
                     self.advance();
@@ -316,12 +310,11 @@ impl SparqlParser {
             )));
         }
 
-        // Reconstruct graph pattern from triples.
         triples_to_ast(triples, return_items, limit)
     }
 }
 
-/// Reconstruct GQL-style AST from SPARQL triples, chaining edges into a path pattern.
+/// Reconstructs the single-path AST representable by the compiler.
 fn triples_to_ast(
     triples: Vec<Triple>,
     return_items: Vec<String>,
@@ -379,7 +372,7 @@ fn triples_to_ast(
         }
     }
 
-    // Fold the flat condition list into a left-associative AND tree.
+    // SPARQL triples are conjunctive, so fold conditions with AND.
     let where_conditions = where_cond_list
         .into_iter()
         .fold(WhereExpr::True, |acc, cond| {
@@ -398,8 +391,7 @@ fn triples_to_ast(
         });
     }
 
-    // Chain edges into a path. Find the start node (appears as source but
-    // not as target of any other edge).
+    // A path starts at a source that is not another edge's target.
     let targets: std::collections::HashSet<&str> =
         edges.iter().map(|(_, t, _, _, _)| t.as_str()).collect();
     let sources: std::collections::HashSet<&str> =
@@ -422,11 +414,10 @@ fn triples_to_ast(
     let start = if start_candidates.len() == 1 {
         start_candidates[0].to_string()
     } else {
-        // Cycle — pick first source
+        // Cycles have no unique source; validation later rejects repeated bindings.
         edges[0].0.clone()
     };
 
-    // Walk the chain
     let mut ordered_edges: Vec<(String, String, String, usize, usize)> = Vec::new();
     let mut current = start.clone();
     let mut used: Vec<bool> = vec![false; edges.len()];
@@ -447,10 +438,7 @@ fn triples_to_ast(
         }
     }
 
-    // SPARQL triples are conjunctive — every edge must be reachable from the
-    // single start through the path walk. If any edge wasn't consumed, the
-    // pattern is branched or disconnected and we cannot represent it in the
-    // current single-path AST.
+    // Reject unconsumed conjuncts rather than silently dropping a branch or component.
     if used.iter().any(|consumed| !consumed) {
         return Err(QueryError::Unsupported(
             "SPARQL WHERE block is branched or disconnected; \
@@ -466,9 +454,7 @@ fn triples_to_ast(
         });
     }
 
-    // Collect all variables that appear in the path. Node-only constraints
-    // on variables outside the path (kind filters, property filters) would be
-    // silently dropped — reject instead.
+    // Reject constraints outside the path rather than silently dropping them.
     let mut path_vars: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for (src, tgt, _, _, _) in &ordered_edges {
         path_vars.insert(src.as_str());
@@ -493,7 +479,6 @@ fn triples_to_ast(
         }
     }
 
-    // Build AST pattern: alternating Node-Edge-Node
     let mut elements: Vec<PatternElement> = Vec::new();
 
     let first_var = &ordered_edges[0].0;
@@ -532,8 +517,7 @@ fn triples_to_ast(
     })
 }
 
-/// Lift `entity_type` out of a node's property map, requiring a string literal —
-/// the same constraint the GQL inline-map parser enforces.
+/// Lifts string-valued `entity_type` into its governed node field.
 fn extract_entity_type(
     props: &mut HashMap<String, ConditionValue>,
 ) -> Result<Option<String>, QueryError> {
@@ -547,23 +531,19 @@ fn extract_entity_type(
     }
 }
 
-/// Parse a SPARQL query string into a [`GqlQuery`] AST. Errors on invalid or unsupported syntax.
+/// Parses the supported read-only SPARQL subset into a [`GqlQuery`].
+///
+/// # Errors
+///
+/// Returns [`QueryError`] for invalid, write-shaped, disconnected, or unsupported syntax.
+/// See `crates/khive-query/docs/api/parsing.md` for the supported subset.
 pub fn parse(input: &str) -> Result<GqlQuery, QueryError> {
     reject_sparql_write(input.trim())?;
     let mut parser = SparqlParser::new(input.trim());
     parser.parse_query()
 }
 
-/// Reject SPARQL update operations with an explicit, actionable error.
-///
-/// SPARQL 1.1 Update defines several write operations that must never reach
-/// the compiler. Check for them before parsing so the rejection is deliberate
-/// ("the query verb is read-only") rather than a generic "expected SELECT".
-///
-/// We skip the optional prologue (PREFIX / BASE declarations) and line comments
-/// before inspecting the leading keyword so that `WITH <g> DELETE …` and
-/// prologue-prefixed updates (`PREFIX ex: <…> INSERT DATA { … }`) are also
-/// caught. Read-only forms (SELECT / ASK / CONSTRUCT / DESCRIBE) are untouched.
+/// Rejects SPARQL Update after skipping comments and an optional prologue.
 fn reject_sparql_write(input: &str) -> Result<(), QueryError> {
     let keyword = leading_keyword(input);
     match keyword.as_str() {
@@ -577,17 +557,12 @@ fn reject_sparql_write(input: &str) -> Result<(), QueryError> {
     }
 }
 
-/// Return the first meaningful query keyword, skipping SPARQL/GQL line comments
-/// and the optional SPARQL prologue (zero or more PREFIX / BASE declarations).
-/// Used by both the per-parser write guard and the public-path guard in
-/// `language::parse_auto`.
+/// Returns the operative keyword after comments and repeated PREFIX/BASE declarations.
 pub(crate) fn leading_keyword(input: &str) -> String {
     let mut rest = input;
     loop {
-        // Skip leading ASCII whitespace.
         rest = rest.trim_start();
 
-        // Skip a line comment: # … \n
         if rest.starts_with('#') {
             rest = match rest.find('\n') {
                 Some(pos) => &rest[pos + 1..],
@@ -596,24 +571,20 @@ pub(crate) fn leading_keyword(input: &str) -> String {
             continue;
         }
 
-        // Peel off one PREFIX or BASE declaration and loop.
         let upper: String = rest
             .chars()
             .take(6)
             .flat_map(|c| c.to_uppercase())
             .collect();
         if upper.starts_with("PREFIX") || upper.starts_with("BASE") {
-            // Advance past the keyword.
             let skip = if upper.starts_with("PREFIX") { 6 } else { 4 };
             rest = &rest[skip..];
-            // Skip to end of the IRI in angle brackets, if present.
             if let Some(close) = rest.find('>') {
                 rest = &rest[close + 1..];
             }
             continue;
         }
 
-        // The next whitespace-delimited token is the operative keyword.
         return rest.split_whitespace().next().unwrap_or("").to_uppercase();
     }
 }
@@ -686,8 +657,6 @@ mod tests {
 
     #[test]
     fn disconnected_triples_rejected() {
-        // Two separate edges with no shared variable — silently dropping the
-        // second triple would change query semantics, so reject.
         let err = parse("SELECT ?a ?d WHERE { ?a :extends ?b . ?c :implements ?d . }").unwrap_err();
         assert!(
             matches!(err, QueryError::Unsupported(_)),
@@ -697,7 +666,6 @@ mod tests {
 
     #[test]
     fn branched_triples_rejected() {
-        // `?a` has two outbound edges — branching, not a single path.
         let err =
             parse("SELECT ?a ?b ?c WHERE { ?a :extends ?b . ?a :implements ?c . }").unwrap_err();
         assert!(
@@ -708,8 +676,6 @@ mod tests {
 
     #[test]
     fn disconnected_kind_constraint_rejected() {
-        // `?c a :concept` constrains a variable not on the edge path — must
-        // not be silently dropped.
         let err = parse("SELECT ?a WHERE { ?a :extends ?b . ?c a :concept . }").unwrap_err();
         assert!(
             matches!(err, QueryError::Unsupported(_)),
@@ -719,7 +685,6 @@ mod tests {
 
     #[test]
     fn disconnected_property_constraint_rejected() {
-        // `?c :name "LoRA"` constrains a variable not on the edge path.
         let err = parse("SELECT ?a WHERE { ?a :extends ?b . ?c :name 'LoRA' . }").unwrap_err();
         assert!(
             matches!(err, QueryError::Unsupported(_)),
@@ -746,8 +711,6 @@ mod tests {
             "expected trailing-input parse error, got {err}"
         );
     }
-
-    // --- Read-only invariant regression tests (#16) ---
 
     #[test]
     fn sparql_insert_data_rejected_with_readonly_message() {
@@ -798,15 +761,12 @@ mod tests {
 
     #[test]
     fn sparql_select_still_compiles_after_write_guard() {
-        // Positive control: a valid SELECT must still parse correctly.
         let q = parse("SELECT ?a WHERE { ?a :extends ?b . }").unwrap();
         assert!(!q.pattern.elements.is_empty(), "valid SELECT must parse");
     }
 
     #[test]
     fn sparql_with_delete_where_rejected() {
-        // WITH starts a SPARQL Update graph-management operation; the write
-        // guard rejects it via the WITH keyword in its write set.
         let err = parse("WITH <http://g> DELETE { ?s ?p ?o } WHERE { ?s ?p ?o }").unwrap_err();
         assert!(
             matches!(err, QueryError::Unsupported(_)),
@@ -825,7 +785,6 @@ mod tests {
 
     #[test]
     fn sparql_prefixed_insert_data_rejected() {
-        // A prologue-prefixed INSERT DATA must also be caught.
         let err =
             parse("PREFIX ex: <http://example.org/> INSERT DATA { ex:a ex:b ex:c }").unwrap_err();
         assert!(
@@ -849,9 +808,6 @@ mod tests {
 
     #[test]
     fn sparql_prefixed_select_write_guard_passes_through() {
-        // Positive control: the write guard must NOT trip on a prefixed SELECT.
-        // The underlying parser does not support PREFIX prologues, so this
-        // returns a Parse error — but it must NOT return Unsupported.
         let err =
             parse("PREFIX ex: <http://example.org/> SELECT ?s WHERE { ?s ?p ?o }").unwrap_err();
         assert!(

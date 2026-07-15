@@ -1,4 +1,6 @@
-//! KG change-set op-list model and NDJSON-delta codec. See `README.md`.
+//! KG change-set op-list model and NDJSON-delta codec.
+//!
+//! See `crates/khive-changeset/docs/api/ndjson-codec.md` for the wire format.
 
 mod changeset;
 mod envelope;
