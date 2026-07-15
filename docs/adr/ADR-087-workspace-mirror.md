@@ -278,6 +278,30 @@ so a partial or corrupted bundle fails loudly at restore, never silently. This i
 answer to "one file contains everything" — the export provides the single-file
 property; the live layout stays CAS-outside-db.
 
+### A8: Note-first routing for prose artifacts — blobs are for true binaries only
+
+The most common information loss in practice is not arbitrary files: it is prose
+verdicts (review conclusions, gate decisions, issue analyses) written as loose files in
+a working tree and destroyed with it. The routing rule:
+
+- **Text verdicts and decisions are notes, born in the substrate directly** —
+  `kind=decision`, tagged with the repository and the pull-request or issue number, and
+  linked via `annotates` to the corresponding git-pack `pull_request`/`issue` note.
+  They are never written as files first and never routed through the blob store. This
+  requires zero new verbs; it is a convention over the existing note surface.
+- **Blob CAS is for true binaries only**: bench profiles, PDFs, images, archives.
+- The mirror (and the one-shot `workspace.ingest(path)` sweep for existing trees)
+  handles the residual genuinely file-shaped content — history that already exists on
+  disk, and artifact types that are legitimately files.
+
+Dependency this creates on the git pack: the `annotates` target must exist. Today
+git-pack ingestion is a batch admin path, so most PR/issue notes do not exist at the
+moment a verdict is written. The git-pack lane (ingest cadence and/or outbound verbs)
+must guarantee an upsert-on-reference path — creating the verdict note may create the
+skeletal `pull_request`/`issue` note it annotates if ingestion has not reached it yet,
+with the batch ingester later enriching rather than duplicating it (identity by
+repo + number).
+
 ### Acceptance
 
 1. A fixture `.khive/` tree containing text, an oversized text file, and a binary file
