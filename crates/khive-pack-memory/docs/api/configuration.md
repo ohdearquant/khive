@@ -16,7 +16,7 @@ A tuning sweep of 116 configurations on the synthetic contract corpus produced t
 
 `candidate_limit`, when set, caps each retrieval path before fusion. Otherwise `limit * candidate_multiplier`, with a floor of 40, preserves legacy behavior.
 
-`ann_overfetch_max_rounds` controls namespace-aware ANN widening. Round one is the initial fetch and later rounds double the window until enough visible candidates survive or the corpus is exhausted. `Some(1)` disables widening. When absent, `ANN_OVERFETCH_MAX_ROUNDS` supplies a process-wide value, defaulting to three.
+`ann_overfetch_max_rounds` controls namespace-aware ANN widening. Round one is the initial fetch and each later round quadruples the window, capped by the server-wide candidate limit, until enough visible candidates survive or the corpus is exhausted. `Some(1)` disables widening. When absent, `ANN_OVERFETCH_MAX_ROUNDS` supplies a process-wide value, defaulting to three.
 
 `ann_ready_timeout_ms` bounds a cold-miss call to `ensure_ann_for_model` before that model degrades to FTS-only. It falls back to `KHIVE_MEMORY_ANN_READY_TIMEOUT_MS`, default 8,000 ms. The bound exists because recall and boot warming share the same model single-flight lock; without a timeout, a recall arriving during a from-scratch warm could wait for the full build, observed above 300 seconds in issue #836.
 

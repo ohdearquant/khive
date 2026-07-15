@@ -89,7 +89,7 @@ pub struct RecallConfig {
 
     // --- ANN over-fetch retry ---
     /// Maximum rounds for the ANN namespace over-fetch retry loop. Round 1 is
-    /// the initial over-fetch; rounds 2–N double the fetch window until enough
+    /// the initial over-fetch; rounds 2–N quadruple the fetch window until enough
     /// visible-namespace candidates are found or the corpus is exhausted. When
     /// `None`, falls back to the `ANN_OVERFETCH_MAX_ROUNDS` env var (default 3).
     /// Pass `Some(1)` to disable widening entirely.
