@@ -50,12 +50,13 @@ Once installed, invoke them as `khive:digester`, `khive:polisher`, and so on.
 ## Requirements
 
 The `kg` pack is the base (entities, edges, notes); every other pack builds on it. The default
-server config loads all ten (`kg`, `gtd`, `memory`, `brain`, `comm`, `schedule`, `knowledge`,
-`session`, `git`, `code` — `git` contributes note kinds, a batch ingester, and the `git.digest`
-verb; `code` contributes a `finding` note kind, with ingestion reached only through the
-`kkernel code-ingest` admin CLI, no MCP-callable verb) — this plugin currently ships pattern
-skills for the first seven; `session`, `git`, and `code` have no skill yet (see the Pattern
-skills table above).
+server config loads all eleven (`kg`, `gtd`, `memory`, `brain`, `comm`, `schedule`, `knowledge`,
+`session`, `git`, `code`, `workspace` — `git` contributes note kinds, a batch ingester, and the
+`git.digest` verb; `code` contributes the `code.ingest` L1/L1.5 source-ingest verb plus a
+`finding` note kind whose `findings.json` ingestion is reached only through the
+`kkernel code-ingest` admin CLI; `workspace` contributes entity/endpoint vocabulary, no verbs) —
+this plugin currently ships pattern skills for the first seven; `session`, `git`, `code`, and
+`workspace` have no skill yet (see the Pattern skills table above).
 See [INSTALL.md](../INSTALL.md) for setup, the actor config, and per-pack smoke tests.
 
 ## Links

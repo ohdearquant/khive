@@ -34,7 +34,7 @@ All 11 packs load by default. A background daemon auto-spawns to keep the runtim
 | **knowledge** | 19    | Atom-based KB with embedding rerank search                                           |
 | **session**   | 4     | Session record persistence (store/list/resume/export)                                |
 | **git**       | 1     | Git-lifecycle note kinds (commit/issue/pull_request) + batch ingester + `git.digest` |
-| **code**      | 0     | Finding note kind; ingest is admin-CLI-only (`kkernel code-ingest`), no MCP verb     |
+| **code**      | 1     | `code.ingest` L1/L1.5 source ingest; `findings.json` stays admin-CLI (`kkernel code-ingest`) |
 
 ## Usage
 
