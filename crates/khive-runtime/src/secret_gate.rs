@@ -683,6 +683,37 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
             return Some((token, "hex-credential-token"));
         }
 
+        // A genuine credential can be diluted below the WHOLE-TOKEN-AVERAGE
+        // entropy/hex checks above by low-entropy filler segments sharing the
+        // same whitespace token (issue #1044) — e.g. a 40-char hex payload or
+        // a random run as one `/`-delimited path segment among several short
+        // filler segments (`vault/<payload>/rotate.md`,
+        // `a/b/c/d/<payload>/e/f.rs`). Decomposing on every non-alphanumeric
+        // separator — the same run split `is_structured_identifier` uses —
+        // and re-running the hex-credential-length and entropy checks against
+        // each individual run independently of its surrounding filler closes
+        // that gap. Only `MIN_ENTROPY_LEN`+ runs are considered, so short
+        // natural-language path segments (the common case, verified against
+        // the #1040 measurement corpus: none of its real path false positives
+        // contain a single run this long) never trip it. This does NOT touch
+        // the `is_structured_identifier` exemption itself, which stays scoped
+        // to `!near_trigger` per the module doc's soundness argument — a run
+        // this long clearing its own entropy/hex check is evidence independent
+        // of that exemption's word-shape rule.
+        if near_trigger {
+            for run in token.split(|c: char| !c.is_ascii_alphanumeric()) {
+                if run.len() < MIN_ENTROPY_LEN {
+                    continue;
+                }
+                if is_pure_hex(run) && HEX_CREDENTIAL_LENGTHS.contains(&run.len()) {
+                    return Some((token, "hex-credential-token"));
+                }
+                if shannon_entropy(run.as_bytes()) >= ENTROPY_THRESHOLD {
+                    return Some((token, "high-entropy-token"));
+                }
+            }
+        }
+
         // Structured identifiers (file paths, branch names, ADR/doc slugs,
         // snake_case identifiers) are exempted from the entropy check — see
         // the module doc and `is_structured_identifier`. Must come after the
@@ -3465,6 +3496,58 @@ mod tests {
 mod corpus_replay {
     use super::*;
     use rusqlite::{Connection, OpenFlags};
+
+    // ── Whole-token-average entropy dilution (issue #1044, false-negative) ──
+
+    #[test]
+    fn blocks_hex_credential_diluted_by_filler_path_segments() {
+        // A real 40-char hex credential as one path segment among low-entropy
+        // filler segments. Whole-token-average entropy is diluted below
+        // ENTROPY_THRESHOLD, and the whole token is not pure hex (it has `/`
+        // and `.` in it), so neither the whole-token entropy check nor the
+        // whole-token hex-credential-token check catches it — only a per-run
+        // check does.
+        let line = "api key vault/9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c/rotate.md";
+        let m = scan(line);
+        assert!(
+            m.is_some(),
+            "hex credential diluted by filler path segments must be blocked; got None"
+        );
+        assert_eq!(m.unwrap().detector, "hex-credential-token");
+    }
+
+    #[test]
+    fn blocks_chopped_secret_padded_by_filler_runs() {
+        // A random high-entropy run planted among short filler runs. Whole-
+        // token-average entropy is diluted below threshold by the filler.
+        let line = "secret path a/b/c/d/Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvM/e/f.rs"; // gitleaks:allow
+        let m = scan(line);
+        assert!(
+            m.is_some(),
+            "chopped/padded secret among filler runs must be blocked; got None"
+        );
+        assert_eq!(m.unwrap().detector, "high-entropy-token");
+    }
+
+    #[test]
+    fn allows_real_paths_with_no_run_reaching_min_entropy_len() {
+        // Regression guard: the #1040 measurement corpus's real path false
+        // positives never contain a single run >= MIN_ENTROPY_LEN, so the new
+        // per-run check introduced for #1044 must not newly block them.
+        let contents = [
+            "branch feat-session-mirror pushed, see review_pr335_round2.md for the key findings",
+            "password reset doc: docs/adr/ADR-055-epistemic-edge-relations.md",
+            "credential handling code crates/khive-pack-session/src/mirror/ingest.rs",
+            "api key handling lives in check_entropy_heuristic_impl",
+        ];
+        for content in contents {
+            assert!(
+                check(content).is_ok(),
+                "real path with no long run must still pass; fired: {:?}",
+                scan(content)
+            );
+        }
+    }
 
     #[test]
     #[ignore]
