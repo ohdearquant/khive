@@ -428,9 +428,12 @@ async fn generate_report(request: &AuditRequest) -> Result<AuditReport> {
     }
 
     // Base edge signals (`module_fan_in`, `zero_in_edge_module`) only read
-    // `source_id`/`target_id`/`relation`/`deleted_at` — never `metadata` —
-    // so they must stay available on a map missing only the metadata column
-    // (codex round-2 Medium, `.khive/codex_reviews/codex_review_pr1052_round2.md`).
+    // `source_id`/`target_id`/`relation`/`deleted_at` — never `id` or
+    // `metadata` — so they must stay available on a map missing only the
+    // metadata column (codex round-2 Medium,
+    // `.khive/codex_reviews/codex_review_pr1052_round2.md`) or only the `id`
+    // column (codex round-3 Medium,
+    // `.khive/codex_reviews/codex_review_pr1052_round3.md`).
     if caps.entities_ok && caps.edges_base_ok {
         fan_in_signals(reader.as_mut(), &mut signals).await?;
         zero_in_edge_signals(
@@ -452,9 +455,9 @@ async fn generate_report(request: &AuditRequest) -> Result<AuditReport> {
     }
 
     // `layering_violation`, `manifest_import_mismatch`, and
-    // `dependency_cycle_summary` all read `graph_edges.metadata`
-    // (dependency-kind classification), so they additionally require the
-    // metadata column on top of the base edge columns.
+    // `dependency_cycle_summary` all read `graph_edges.id` and/or
+    // `graph_edges.metadata` (dependency-kind classification), so they
+    // additionally require both columns on top of the base edge columns.
     if caps.entities_ok && caps.edges_base_ok && caps.edges_metadata_ok {
         layering_signals(
             reader.as_mut(),
@@ -521,11 +524,15 @@ fn map_storage_busy(e: khive_storage::StorageError) -> anyhow::Error {
 /// missing only that column (round-2 Medium,
 /// `.khive/codex_reviews/codex_review_pr1052_round2.md`). Edge capability is
 /// therefore split per the columns each signal group actually reads:
-/// `edges_base_ok` covers `id`/`source_id`/`target_id`/`relation`/
-/// `deleted_at` (read by every edge-derived signal), `edges_metadata_ok`
-/// additionally covers `metadata` (read only by the dependency-kind
-/// classification used in layering, manifest/import mismatch, and the
-/// project-level dependency-cycle graphs).
+/// `edges_base_ok` covers exactly `source_id`/`target_id`/`relation`/
+/// `deleted_at` — the columns `SQL_FAN_IN` and `SQL_ZERO_IN_EDGE` read, and
+/// nothing more. `edges_metadata_ok` additionally covers `id` and
+/// `metadata`, read only by the dependency-kind classification used in
+/// layering, manifest/import mismatch, and the project-level dependency-
+/// cycle graphs; `id` moved out of the base tier here because neither
+/// `SQL_FAN_IN` nor `SQL_ZERO_IN_EDGE` reads `graph_edges.id`, so a map
+/// missing only that column must not suppress them (round-3 Medium,
+/// `.khive/codex_reviews/codex_review_pr1052_round3.md`).
 struct SchemaCaps {
     entities_ok: bool,
     edges_base_ok: bool,
@@ -541,9 +548,8 @@ const ENTITIES_REQUIRED_COLUMNS: &[&str] = &[
     "properties",
     "deleted_at",
 ];
-const EDGES_BASE_REQUIRED_COLUMNS: &[&str] =
-    &["id", "source_id", "target_id", "relation", "deleted_at"];
-const EDGES_METADATA_REQUIRED_COLUMNS: &[&str] = &["metadata"];
+const EDGES_BASE_REQUIRED_COLUMNS: &[&str] = &["source_id", "target_id", "relation", "deleted_at"];
+const EDGES_METADATA_REQUIRED_COLUMNS: &[&str] = &["id", "metadata"];
 
 async fn inspect_schema(reader: &mut dyn SqlReader) -> Result<SchemaCaps> {
     let table_rows = reader
@@ -2033,6 +2039,88 @@ crate-b = 1
                     .iter()
                     .any(|s| s.id == id && s.status == SignalStatus::Unavailable),
                 "expected {id} to degrade to unavailable when graph_edges.metadata is missing"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_edge_id_column_degrades_only_id_dependent_signals() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = tmp.path().join("map.db");
+        build_fixture(&db, [0, 1]).await;
+        {
+            let backend = StorageBackend::sqlite(&db).expect("open fixture backend");
+            let mut writer = backend.pool().writer().expect("writer guard");
+            // `id` is part of `graph_edges`'s composite PRIMARY KEY
+            // (namespace, id), so SQLite's `ALTER TABLE ... DROP COLUMN`
+            // refuses it ("cannot drop PRIMARY KEY column"); rebuild the
+            // table without the column instead to simulate a map missing
+            // ONLY `graph_edges.id`.
+            writer
+                .conn_mut()
+                .execute_batch(
+                    "CREATE TABLE graph_edges_no_id (
+                         namespace      TEXT NOT NULL,
+                         source_id      TEXT NOT NULL,
+                         target_id      TEXT NOT NULL,
+                         relation       TEXT NOT NULL,
+                         weight         REAL NOT NULL DEFAULT 1.0,
+                         created_at     INTEGER NOT NULL,
+                         updated_at     INTEGER NOT NULL,
+                         deleted_at     INTEGER,
+                         metadata       TEXT,
+                         target_backend TEXT
+                     );
+                     INSERT INTO graph_edges_no_id (
+                         namespace, source_id, target_id, relation, weight,
+                         created_at, updated_at, deleted_at, metadata, target_backend
+                     )
+                     SELECT namespace, source_id, target_id, relation, weight,
+                            created_at, updated_at, deleted_at, metadata, target_backend
+                     FROM graph_edges;
+                     DROP TABLE graph_edges;
+                     ALTER TABLE graph_edges_no_id RENAME TO graph_edges;",
+                )
+                .expect(
+                    "rebuild graph_edges without id to simulate a map missing only that column",
+                );
+        }
+        let policy = test_policy(tmp.path());
+
+        // Round-3 Medium: `module_fan_in` and `zero_in_edge_module` never
+        // read `graph_edges.id` (`SQL_FAN_IN`/`SQL_ZERO_IN_EDGE` select only
+        // `source_id`/`target_id`/`relation`/`deleted_at`), so a map missing
+        // ONLY that column must not suppress them — only the signals that
+        // read `id` (layering, manifest/import mismatch, dependency cycles)
+        // may degrade.
+        let report = generate_report(&base_request(db, policy)).await.unwrap();
+        assert!(report
+            .errors
+            .iter()
+            .any(|e| matches!(e.code, AuditErrorCode::SchemaUnsupported)
+                && e.message.contains("graph_edges")
+                && e.message.contains("id")));
+
+        for id in ["module_fan_in", "zero_in_edge_module"] {
+            assert!(
+                report
+                    .signals
+                    .iter()
+                    .any(|s| s.id == id && s.status != SignalStatus::Unavailable),
+                "expected {id} to remain available when only graph_edges.id is missing"
+            );
+        }
+        for id in [
+            "layering_violation",
+            "manifest_import_mismatch",
+            "dependency_cycle_summary",
+        ] {
+            assert!(
+                report
+                    .signals
+                    .iter()
+                    .any(|s| s.id == id && s.status == SignalStatus::Unavailable),
+                "expected {id} to degrade to unavailable when graph_edges.id is missing"
             );
         }
     }
