@@ -17,15 +17,15 @@ question is genuinely structural — a typed relation pattern, a property
 filter, or a bounded multi-hop path with a known relation. For everything
 else, a different verb is a better fit:
 
-| You want to...                                                                              | Use                                                        |
-| ------------------------------------------------------------------------------------------- | ---------------------------------------------------------- |
-| Find records by topic or keyword, fuzzy or full-text                                        | `search(kind="entity"\|"note", query="...")`               |
-| Look up a known record by id                                                                | `get(id="...")`                                            |
-| See immediate connections of a known node                                                   | `neighbors(node_id="...", direction="both")`               |
-| Explore unbounded or loosely-bounded multi-hop paths                                        | `traverse(roots=["..."], max_depth=N)`                     |
-| Pull a budgeted, entity-anchored context bundle                                             | `context(query="..."\|entity_ids=[...], hops=N, budget=N)` |
-| Match a typed relation pattern, filter by property, or walk a _fixed-relation_ bounded path | `query(query="MATCH ...")` or `query(query="SELECT ...")`  |
-| Create, update, link, merge, or delete anything                                             | The corresponding KG verb — never `query`                  |
+| You want to...                                                                              | Use                                                                                             |
+| ------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| Find records by topic or keyword, fuzzy or full-text                                        | `search(kind="entity", query="...")` — `kind="note"` works the same way                         |
+| Look up a known record by id                                                                | `get(id="...")`                                                                                 |
+| See immediate connections of a known node                                                   | `neighbors(node_id="...", direction="both")`                                                    |
+| Explore unbounded or loosely-bounded multi-hop paths                                        | `traverse(roots=["..."], max_depth=N)`                                                          |
+| Pull a budgeted, entity-anchored context bundle                                             | `context(query="...", hops=N, budget=N)` — or anchor with `entity_ids=[...]` instead of `query` |
+| Match a typed relation pattern, filter by property, or walk a _fixed-relation_ bounded path | `query(query="MATCH ...")` or `query(query="SELECT ...")`                                       |
+| Create, update, link, merge, or delete anything                                             | The corresponding KG verb — never `query`                                                       |
 
 Rule of thumb: if the answer depends on _relevance ranking_ or you don't know
 the exact relation name, use `search`. If you already hold an id and want its
@@ -46,7 +46,7 @@ live read-only checks against a production knowledge graph.
 | Targeted relation join    | Which concepts were introduced by which documents?                  | YES via query                | `MATCH (c:concept)-[e:introduced_by]->(d:document) RETURN c.name, d.name, e.weight LIMIT 50`                                                                     |
 | Provenance path           | What is the derivation path from an artifact to its source?         | PARTIAL                      | Fixed `derived_from` chains, or a single variable-length edge, both work. A chain that mixes fixed and variable-length hops must be split into separate queries. |
 | Supersession view         | What replaces this concept?                                         | YES via query                | `MATCH (old)-[e:supersedes]->(new) RETURN old.name, new.name, e.weight LIMIT 100`                                                                                |
-| Relation alternatives     | Show records that extend or implement another record.               | YES via query                | `MATCH (a)-[e:extends\|implements]->(b) RETURN a.name, e.relation, b.name LIMIT 100`                                                                             |
+| Relation alternatives     | Show records that extend or implement another record.               | YES via query                | Pipe-separated relation alternation inside one edge pattern — see the fenced example below the table (a literal pipe cannot be shown inside this table cell).    |
 | Bounded lineage           | What is reachable by one to three `extends` hops?                   | YES via query                | `MATCH (a)-[:extends*1..3]->(b) RETURN a.name, b.name LIMIT 100`                                                                                                 |
 | General expansion         | Expand this known entity two hops with context.                     | YES via `traverse`/`context` | `traverse(roots=["<uuid>"], max_depth=2)`, or `context(entity_ids=["<uuid>"], hops=2, budget=N)`.                                                                |
 | Cross-substrate join      | Which notes annotate concepts, documents, or other notes?           | YES via query                | `MATCH (note:note)-[e:annotates]->(target) RETURN note.name, target.kind, target.name LIMIT 100`                                                                 |
@@ -61,6 +61,13 @@ live read-only checks against a production knowledge graph.
 | Branching join            | Which parent has both an `extends` child and an `implements` child? | NO                           | GQL supports one alternating path; SPARQL rejects branched or disconnected `WHERE` blocks.                                                                       |
 | Cross-namespace audit     | What belongs to another namespace?                                  | NO (caller-controlled scope) | Namespace is a runtime `CompileOptions` input, not query text — a query that references `namespace` in its body is rejected.                                     |
 | Mutation via query        | Create, update, link, merge, or delete through GQL/SPARQL.          | NO (by design)               | Write-shaped input is rejected outright. Use the corresponding KG verb.                                                                                          |
+
+The relation-alternatives idiom, copy-paste form (alternation is a bare pipe
+between relation identifiers inside one edge pattern):
+
+```
+MATCH (a)-[e:extends|implements]->(b) RETURN a.name, e.relation, b.name LIMIT 100
+```
 
 ## Operational limits
 
@@ -93,7 +100,7 @@ counts only — no graph content is reproduced here.
 | -- | ------------------------------------- | ---------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 1  | Sample concept records                | `MATCH (n:concept) RETURN n LIMIT 2`                                                     | 2 rows; columns `n_created_at, n_entity_type, n_id, n_kind, n_name, n_namespace, n_properties, n_updated_at`. A whole-node variable expands to every supported column. |
 | 2  | Provenance endpoints                  | `MATCH (a)-[e:introduced_by]->(b) RETURN a.name, e.relation, b.name LIMIT 2`             | 2 rows; `a_name, b_name, e_relation`.                                                                                                                                  |
-| 3  | Either `extends` or `implements` edge | `MATCH (a)-[e:extends\|implements]->(b) RETURN a.name, e.relation, b.name LIMIT 2`       | 2 rows; `a_name, b_name, e_relation`. Alternation uses a pipe inside one edge pattern.                                                                                 |
+| 3  | Either `extends` or `implements` edge | The alternation idiom in the fenced block above, with `LIMIT 2`                          | 2 rows; `a_name, b_name, e_relation`. Alternation uses a pipe inside one edge pattern.                                                                                 |
 | 4  | Incoming `extends` edge               | `MATCH (a)<-[e:extends]-(b) RETURN a.name, e.weight, b.name LIMIT 2`                     | 2 rows; `a_name, b_name, e_weight`.                                                                                                                                    |
 | 5  | Undirected `extends` adjacency        | `MATCH (a)-[e:extends]-(b) RETURN a.name, e.relation, b.name LIMIT 2`                    | 2 rows; `a_name, b_name, e_relation`. May expose both orientations.                                                                                                    |
 | 6  | One- to two-hop lineage               | `MATCH (a)-[e:extends*1..2]->(b) RETURN a.name, b.name LIMIT 2`                          | 2 rows; `_depth, _total_weight, a_name, b_name`. Bounds are inclusive; maximum depth is 10.                                                                            |
