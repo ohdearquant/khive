@@ -64,6 +64,8 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
 
     #[cfg(feature = "channel-email")]
     spawn_email_channel_loops_if_daemon(&server, &args);
+    #[cfg(feature = "channel-telegram")]
+    spawn_telegram_channel_loops_if_daemon(&server, &args);
     spawn_schedule_tick_loop_if_daemon(&args, &server, schedule_rt);
 
     #[cfg(unix)]
@@ -285,7 +287,7 @@ fn allowed_recipients_from_env() -> Vec<String> {
 /// Returns `true` when the closure was called (preflight passed), `false`
 /// otherwise.  Tests can inject a counting closure to verify the loop is not
 /// started when preflight fails (ADR-056 §6 fail-closed contract).
-#[cfg(feature = "channel-email")]
+#[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
 fn run_if_authorized(
     ns_str: &str,
     registry: &khive_runtime::VerbRegistry,
@@ -305,7 +307,7 @@ fn run_if_authorized(
 /// gate permits it.  Returns `false` on any parse failure or authorization
 /// denial, after logging the reason.  The caller must not spawn the poll loop
 /// when this returns `false` (fail-closed, ADR-056 §6).
-#[cfg(feature = "channel-email")]
+#[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
 fn preflight_ingest_namespace(ns_str: &str, registry: &khive_runtime::VerbRegistry) -> bool {
     match khive_runtime::Namespace::parse(ns_str) {
         Ok(ns) => match registry.authorize_namespace(ns) {
@@ -842,7 +844,7 @@ fn log_eligible_poll_failure(
 /// present-but-null `delivered_at` is undelivered, not delivered. Checking
 /// `.is_some()` alone would treat an explicit null (e.g. left by a curation
 /// `update`) as delivered and strand the note in the outbox forever.
-#[cfg(feature = "channel-email")]
+#[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
 fn note_already_delivered(props: &serde_json::Map<String, serde_json::Value>) -> bool {
     props
         .get("delivered_at")
@@ -1069,6 +1071,280 @@ async fn channel_outbox_loop(
     }
 }
 
+/// Whether this process owns the Telegram channel loops. Mirrors
+/// [`is_daemon_role`]'s email-channel role gate (#602): channel loops are a
+/// daemon-role responsibility, never spawned per client process.
+#[cfg(feature = "channel-telegram")]
+fn is_telegram_daemon_role(args: &Args) -> bool {
+    args.daemon
+}
+
+/// Spawn the Telegram channel loops if — and only if — `args` indicates this
+/// process is the daemon. Mirrors
+/// [`spawn_email_channel_loops_if_daemon`]. If no daemon is running, Telegram
+/// is simply not polled until one starts.
+#[cfg(feature = "channel-telegram")]
+fn spawn_telegram_channel_loops_if_daemon(server: &KhiveMcpServer, args: &Args) {
+    if is_telegram_daemon_role(args) {
+        tracing::info!("telegram channel loops: spawning (daemon role)");
+        spawn_telegram_channel_loops(server);
+    } else {
+        tracing::info!("telegram channel loops: skipped (client role; daemon owns channel loops)");
+    }
+}
+
+/// Spawn the Telegram channel polling + outbox loops if the `channel-telegram`
+/// feature is enabled and `KHIVE_TELEGRAM_*` config resolves. Non-fatal: logs
+/// a warning and returns on incomplete config. Only call this when
+/// [`is_telegram_daemon_role`] is true — use
+/// [`spawn_telegram_channel_loops_if_daemon`].
+///
+/// Unlike the email adapter, Telegram's poll offset is held in memory inside
+/// `TelegramChannel` itself (ADR-056 Amendment 2026-07-05, "Poll offset and
+/// restart durability") — there is no per-channel checkpoint/cursor
+/// persistence, backoff escalation, or ADR-094 lifecycle-event surface for
+/// this adapter; those are email-specific hardening (#605/#606/ADR-094)
+/// this ADR explicitly does not require for Telegram's simpler getUpdates
+/// durability model.
+#[cfg(feature = "channel-telegram")]
+fn spawn_telegram_channel_loops(server: &KhiveMcpServer) {
+    use khive_channel_telegram::TelegramChannel;
+    use std::sync::Arc;
+
+    match TelegramChannel::from_env() {
+        Ok(tg_ch) => {
+            let tg_ch = Arc::new(tg_ch);
+            let verb_reg = server.verb_registry_clone();
+            let ingest_ns = telegram_ingest_namespace_from_env();
+
+            let verb_reg_poll = verb_reg.clone();
+            let verb_reg_outbox = verb_reg.clone();
+            let ingest_ns_poll = ingest_ns.clone();
+            let ingest_ns_outbox = ingest_ns.clone();
+            let tg_ch_poll = Arc::clone(&tg_ch);
+            let tg_ch_outbox = Arc::clone(&tg_ch);
+
+            let spawned = run_if_authorized(&ingest_ns, &verb_reg, || {
+                tokio::task::spawn(telegram_poll_loop(
+                    tg_ch_poll,
+                    verb_reg_poll,
+                    ingest_ns_poll,
+                ));
+                tokio::task::spawn(telegram_outbox_loop(
+                    tg_ch_outbox,
+                    verb_reg_outbox,
+                    ingest_ns_outbox,
+                ));
+                tracing::info!("telegram channel polling and outbox loops started");
+            });
+            if !spawned {
+                tracing::error!(
+                    namespace = %ingest_ns,
+                    "telegram channel loops NOT started: ingest namespace authorization failed (fail-closed)"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                "channel-telegram feature is enabled but configuration is incomplete: {e}; \
+                 telegram polling is disabled"
+            );
+        }
+    }
+}
+
+/// Resolve the target namespace for ingested Telegram messages.
+///
+/// Reads `KHIVE_TELEGRAM_INGEST_NAMESPACE`; falls back to `"local"` when the
+/// variable is unset or blank. Called once at server startup before the poll
+/// loop is spawned.
+#[cfg(feature = "channel-telegram")]
+fn telegram_ingest_namespace_from_env() -> String {
+    std::env::var("KHIVE_TELEGRAM_INGEST_NAMESPACE")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "local".to_string())
+}
+
+/// Background task that polls the Telegram channel via `getUpdates` long
+/// polling and ingests new inbound messages via `comm.ingest`. No
+/// backoff/heartbeat/lifecycle-event surface — see
+/// [`spawn_telegram_channel_loops`]'s doc comment for why this is a
+/// deliberately smaller loop than `channel_poll_loop`.
+///
+/// The Bot API `getUpdates` call itself blocks server-side for the
+/// connector's long-poll timeout awaiting new updates (ADR-056 Amendment
+/// 2026-07-05 requires long polling, not short polling), so the success path
+/// adds no extra sleep between requests — the long poll paces the loop.
+/// Only the error path sleeps, so a failing Bot API does not hot-loop.
+///
+/// A fetched batch's offset is committed (acknowledged to Telegram) only
+/// after every authorized envelope in it durably ingests via `comm.ingest`
+/// — mirrors the IMAP cursor-commit discipline at `channel_poll_loop`
+/// without importing its IMAP-specific machinery (issue #113).
+#[cfg(feature = "channel-telegram")]
+async fn telegram_poll_loop(
+    telegram_channel: std::sync::Arc<khive_channel_telegram::TelegramChannel>,
+    registry: khive_runtime::VerbRegistry,
+    ingest_namespace: String,
+) {
+    use chrono::Utc;
+    use khive_channel::Channel;
+    use serde_json::json;
+
+    const ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
+
+    loop {
+        match telegram_channel.poll(Utc::now()).await {
+            Ok(envelopes) => {
+                let kind = telegram_channel.kind();
+                let mut all_ingested = true;
+                for env in envelopes {
+                    let params = json!({
+                        "namespace": ingest_namespace,
+                        "from": env.from,
+                        "to": env.to,
+                        "content": env.content,
+                        "channel_kind": kind,
+                        "external_id": env.external_id,
+                        "sent_at": env.sent_at.map(|ts| ts.to_rfc3339()),
+                    });
+                    if let Err(e) = registry.dispatch("comm.ingest", params).await {
+                        tracing::warn!(
+                            channel = kind,
+                            "comm.ingest failed for inbound telegram message: {e}"
+                        );
+                        all_ingested = false;
+                    }
+                }
+
+                if all_ingested {
+                    telegram_channel.commit_offset();
+                } else {
+                    tracing::warn!(
+                        channel = kind,
+                        "not committing telegram offset: at least one message in this batch \
+                         failed comm.ingest; the whole batch will be retried next poll"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    channel = telegram_channel.kind(),
+                    "telegram channel poll failed: {e}"
+                );
+                tokio::time::sleep(ERROR_BACKOFF).await;
+            }
+        }
+    }
+}
+
+/// Background task that delivers undelivered outbound notes addressed to a
+/// `telegram:` recipient every 5 seconds. Mirrors `channel_outbox_loop`'s
+/// note-scan/send/mark-delivered shape without the Message-ID minting logic
+/// (Telegram has no RFC 822 Message-ID concept).
+#[cfg(feature = "channel-telegram")]
+async fn telegram_outbox_loop(
+    telegram_channel: std::sync::Arc<khive_channel_telegram::TelegramChannel>,
+    registry: khive_runtime::VerbRegistry,
+    ingest_namespace: String,
+) {
+    use chrono::Utc;
+    use khive_channel::{Channel, ChannelEnvelope};
+    use serde_json::json;
+
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+        let list_params = json!({
+            "namespace": ingest_namespace,
+            "kind": "message",
+            "direction": "outbound",
+            "delivered": false,
+            "limit": 200,
+        });
+        let list_result = match registry.dispatch("list", list_params).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "telegram outbox loop: list failed");
+                continue;
+            }
+        };
+
+        let notes = match list_result.as_array() {
+            Some(arr) => arr.clone(),
+            None => continue,
+        };
+
+        for note_val in notes {
+            let props = match note_val.get("properties") {
+                Some(serde_json::Value::Object(m)) => m.clone(),
+                _ => continue,
+            };
+
+            if props.get("direction").and_then(|v| v.as_str()) != Some("outbound") {
+                continue;
+            }
+
+            let to_actor = match props.get("to_actor").and_then(|v| v.as_str()) {
+                Some(a) if a.starts_with("telegram:") => a.to_string(),
+                _ => continue,
+            };
+
+            if note_already_delivered(&props) {
+                continue;
+            }
+
+            let note_id = match note_val.get("id").and_then(|v| v.as_str()) {
+                Some(id) => id.to_string(),
+                None => continue,
+            };
+
+            let content = match note_val.get("content").and_then(|v| v.as_str()) {
+                Some(c) => c.to_string(),
+                None => continue,
+            };
+
+            let env = ChannelEnvelope::new("telegram:bot", to_actor, content);
+
+            match telegram_channel.send(env).await {
+                Ok(()) => {
+                    let delivered_at = Utc::now().to_rfc3339();
+                    let mark_result = registry
+                        .dispatch(
+                            "update",
+                            json!({
+                                "namespace": ingest_namespace,
+                                "id": note_id,
+                                "properties": { "delivered_at": delivered_at },
+                            }),
+                        )
+                        .await;
+                    match mark_result {
+                        Ok(_) => {
+                            tracing::info!(note_id = %note_id, "telegram outbox loop: delivered");
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                note_id = %note_id,
+                                error = %e,
+                                "telegram outbox loop: failed to set delivered_at (AT-LEAST-ONCE: will retry)"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        note_id = %note_id,
+                        error = %e,
+                        "telegram outbox loop: send failed; will retry next cycle"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Serve a pre-built server (ADR-029 Phase 2 boot path).
 ///
 /// Extracted from `run()` so that `kkernel`'s `Command::Mcp` arm can build a
@@ -1104,6 +1380,8 @@ pub async fn serve_server(
     }
     #[cfg(feature = "channel-email")]
     spawn_email_channel_loops_if_daemon(&server, args);
+    #[cfg(feature = "channel-telegram")]
+    spawn_telegram_channel_loops_if_daemon(&server, args);
     spawn_schedule_tick_loop_if_daemon(args, &server, schedule_rt);
 
     #[cfg(unix)]
