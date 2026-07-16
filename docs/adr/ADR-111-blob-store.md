@@ -486,9 +486,16 @@ versions already present in the workspace dependency graph while excluding its f
 other cloud backends. This provides a Tokio-native client, signing, retries,
 conditional PUT support, custom endpoints, and streaming LIST pagination without importing its
 other provider implementations. The implementation gate must record the normal dependency-tree and
-stripped release-binary delta against khive's established 18 MB single-binary goal; this draft does
+stripped release-binary delta against a freshly measured `main` baseline; this draft does
 not claim an unmeasured byte cost. Updating the pinned dependency is allowed only with the same
 feature, compatibility, and size evidence.
+
+**Baseline note (2026-07-16, #1055):** the "18 MB single-binary goal" cited in earlier drafts and
+in other khive docs is stale — a stripped release `kkernel` at `main` (pre-#1054) measured
+21,654,816 bytes (20.65 MiB); #1054 itself adds only +67,312 bytes (+0.3%), so the growth predates
+and is unrelated to this ADR's S3 backend. There is no re-derived hard budget yet; until one is set,
+size-delta reviews for this and future backends must compare against a freshly measured `main`
+binary, not the old 18 MB figure.
 
 The existing whole-buffer trait is accepted for S3 v1 up to 64 MiB per object. `put` rejects a
 larger buffer with `InvalidInput`; `get` checks returned object metadata before collecting a larger
