@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand};
 
 use khive_runtime::{BackendId, KhiveConfig, KhiveRuntime, RuntimeConfig};
 use kkernel::{
-    code_ingest,
+    code_audit, code_ingest,
     coordinator::{BackendRegistry, SubstrateCoordinator, SubstrateCoordinatorService},
     engine, exec, git_ingest, kg, pack_introspect, reindex, sync, vector,
 };
@@ -91,6 +91,10 @@ enum Command {
     /// Validate and ingest a `findings.json` audit sweep into the graph as
     /// `finding` notes (ADR-085 Amendment 3).
     CodeIngest(code_ingest::CodeIngestArgs),
+
+    /// Read-only derived-report pass over a dedicated code-map database
+    /// (ADR-Q1/Q2 phase 1). Never writes to any graph.
+    CodeAudit(code_audit::CodeAuditArgs),
 }
 
 /// Database schema lifecycle subcommands.
@@ -336,6 +340,7 @@ async fn main() -> Result<()> {
         Command::Backend(b) => cmd_backend(b),
         Command::GitIngest(a) => git_ingest::run_git_ingest(a).await,
         Command::CodeIngest(a) => code_ingest::run_code_ingest(a).await,
+        Command::CodeAudit(a) => code_audit::run_code_audit(a).await,
     }
 }
 

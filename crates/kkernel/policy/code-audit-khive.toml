@@ -1,0 +1,44 @@
+# Default `kkernel code-audit` policy for the khive workspace itself
+# (ADR-Q1/Q2 phase 1 — see docs/adr/ADR-114-code-audit-derived-report.md).
+#
+# `crate_ranks` is the versioned, total layer mapping the audit's layering
+# signal evaluates `depends_on` project edges against: a source crate may only
+# depend on a target crate at the same or a lower rank. Crates absent from
+# this table degrade their layering signal to `unavailable`
+# (`POLICY_INCOMPLETE`) rather than being silently treated as rank 0.
+policy_version = 1
+coverage_floor = 0.0
+
+# Same-band pairs that are structurally allowed to depend on each other even
+# though `rank(target) == rank(source)` (e.g. sibling packs). Empty by
+# default: the khive workspace's pack layer has no approved lateral edges
+# today; add pairs here only with a recorded rationale. Must be declared
+# before the `[crate_ranks]` table below — TOML would otherwise fold it into
+# that table instead of the document root.
+denied_pairs = []
+
+[crate_ranks]
+khive-types = 0
+khive-score = 1
+khive-storage = 2
+khive-db = 3
+khive-query = 4
+khive-runtime = 5
+khive-request = 6
+khive-vcs = 6
+khive-vcs-adapters = 6
+khive-merge = 6
+khive-changeset = 6
+khive-pack-kg = 7
+khive-pack-gtd = 7
+khive-pack-memory = 7
+khive-pack-brain = 7
+khive-pack-comm = 7
+khive-pack-schedule = 7
+khive-pack-formal = 7
+khive-pack-code = 7
+khive-pack-knowledge = 7
+khive-pack-session = 7
+khive-pack-git = 7
+khive-mcp = 8
+kkernel = 8
