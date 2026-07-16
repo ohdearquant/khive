@@ -264,6 +264,7 @@ fn retry_backoff(base: Duration, attempt: u32) -> Duration {
 /// dependency this amendment pins -- out of scope for v1. `S3BlobStore::new`
 /// does **not** verify bucket versioning state; the operator provisioning
 /// the bucket must ensure it is unversioned.
+#[derive(Debug)]
 pub struct S3BlobStore {
     client: Arc<dyn ObjectStore>,
     prefix: String,
