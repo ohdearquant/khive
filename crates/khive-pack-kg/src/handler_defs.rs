@@ -1095,7 +1095,13 @@ mod tests {
             "link.relation help must document the annotates note->* endpoint"
         );
 
-        // kg pack's additive EDGE_RULES — every row must appear in the pack clause.
+        // kg pack's additive EDGE_RULES — every (relation, source, target)
+        // TRIPLE must appear in the pack clause, not merely the endpoint pair.
+        // The clause groups relations that share an endpoint pair
+        // ("part_of/instance_of person->org"), so a row is verified by finding a
+        // comma-delimited segment that carries BOTH the relation token AND the
+        // "src->tgt" endpoint — deleting a relation from a grouped run (e.g.
+        // dropping instance_of but keeping part_of) then fails the test.
         let kg_clause = desc
             .split(". ")
             .find(|c| c.contains("kg` pack additionally allows"))
@@ -1104,10 +1110,13 @@ mod tests {
             let src = endpoint_kind_label(&rule.source);
             let tgt = endpoint_kind_label(&rule.target);
             let row = format!("{src}->{tgt}");
+            let rel = rule.relation.as_str();
+            let matched = kg_clause
+                .split(", ")
+                .any(|seg| seg.contains(&row) && seg.contains(rel));
             assert!(
-                kg_clause.contains(&row),
-                "kg pack EDGE_RULES row missing from help: {:?} {row}",
-                rule.relation
+                matched,
+                "kg pack EDGE_RULES triple missing from help: {rel} {row}\nclause: {kg_clause}"
             );
         }
     }
