@@ -441,7 +441,7 @@ impl KhiveMcpServer {
     ///
     /// `VerbRegistry` is internally `Arc`-wrapped so this clone is cheap. The returned
     /// registry shares the same packs and dispatch state as the server.
-    #[cfg(feature = "channel-email")]
+    #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
     pub(crate) fn verb_registry_clone(&self) -> VerbRegistry {
         self.registry.clone()
     }
