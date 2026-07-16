@@ -1,0 +1,68 @@
+# Default `kkernel code-audit` policy for the khive workspace itself
+# (ADR-Q1/Q2 phase 1 — see docs/adr/ADR-114-code-audit-derived-report.md).
+#
+# `crate_ranks` is the versioned, total layer mapping the audit's layering
+# signal evaluates `depends_on` project edges against: a source crate may only
+# depend on a target crate at the same or a lower rank. Crates absent from
+# this table degrade their layering signal to `unavailable`
+# (`POLICY_INCOMPLETE`) rather than being silently treated as rank 0 — this
+# now applies to every in-scope crate regardless of whether it appears in any
+# evaluated edge (2026-07-16 fix round 1, H4).
+#
+# Ranks below are the longest-path depth of each crate's PRODUCTION
+# `[dependencies]` graph (dev-dependencies excluded — several packs carry
+# deliberate cyclic dev-only test deps, e.g. khive-pack-kg/khive-pack-gtd and
+# khive-pack-brain/khive-pack-memory; production dependencies among them do
+# not cycle). Every directory under `crates/` must appear here.
+policy_version = 1
+coverage_floor = 0.0
+
+# Same-band pairs that are structurally allowed to depend on each other even
+# though `rank(target) == rank(source)` (e.g. sibling packs). Empty by
+# default: the khive workspace's pack layer has no approved lateral edges
+# today; add pairs here only with a recorded rationale. Must be declared
+# before the `[crate_ranks]` table below — TOML would otherwise fold it into
+# that table instead of the document root.
+denied_pairs = []
+
+[crate_ranks]
+khive-channel = 0
+khive-quant = 0
+khive-text = 0
+khive-types = 0
+khive-changeset = 1
+khive-channel-email = 1
+khive-channel-telegram = 1
+khive-gate = 1
+khive-query = 1
+khive-request = 1
+khive-score = 1
+khive-vamana = 1
+khive-vcs-adapters = 1
+khive-bm25 = 2
+khive-fold = 2
+khive-fusion = 2
+khive-gate-rego = 2
+khive-storage = 2
+khive-db = 3
+khive-hnsw = 3
+khive-retrieval = 4
+khive-runtime = 4
+khive-brain-core = 5
+khive-merge = 5
+khive-pack-code = 5
+khive-pack-comm = 5
+khive-pack-formal = 5
+khive-pack-git = 5
+khive-pack-gtd = 5
+khive-pack-kg = 5
+khive-pack-schedule = 5
+khive-pack-session = 5
+khive-pack-template = 5
+khive-pack-workspace = 5
+khive-vcs = 5
+khive-pack-brain = 6
+khive-pack-knowledge = 6
+khive-pack-memory = 6
+khive-mcp = 7
+kkernel = 8
