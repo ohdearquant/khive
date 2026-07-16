@@ -7,15 +7,17 @@
 
 use std::path::{Path, PathBuf};
 
-/// The shared production database's default location
-/// (`khive_runtime::config::resolve_db_anchor(None)`'s value), duplicated
-/// here rather than depending on that function directly so this guard has no
-/// dependency on process environment beyond `HOME` — matching the anchor
-/// resolution `kkernel`/`khive-mcp` already use.
+/// The shared production database's default location. Delegates to
+/// `khive_runtime::config::resolve_db_anchor(None)` — the SAME resolver
+/// `kkernel`/`khive-mcp` use to anchor the production database — rather than
+/// re-deriving the fallback here. A prior hand-rolled version of this
+/// function only handled `HOME` being SET, returning `None` (no forbidden
+/// path at all) when `HOME` was absent, while the canonical resolver falls
+/// back to `./.khive/khive.db`; that divergence is exactly what let the
+/// fence fail open (#1062 H2). `resolve_db_anchor(None)` always resolves to
+/// `Some(_)` (see its own doc comment).
 fn default_production_db_path() -> Option<PathBuf> {
-    std::env::var("HOME")
-        .ok()
-        .map(|h| PathBuf::from(h).join(".khive/khive.db"))
+    khive_runtime::config::resolve_db_anchor(None)
 }
 
 /// Normalize `path` to its deepest *existing* canonical ancestor plus the
@@ -116,6 +118,11 @@ mod tests {
 
     #[test]
     fn explicit_production_path_is_rejected() {
+        // Reads HOME (does not mutate it), but still takes the shared lock:
+        // an unguarded read here can race a concurrently-running test that
+        // mutates HOME via `HomeGuard` (cargo test runs tests in the same
+        // binary in parallel by default).
+        let _guard = KHIVE_DB_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = std::env::var("HOME").expect("HOME set in test env");
         let prod = format!("{home}/.khive/khive.db");
         let err = resolve_target_db(Some(&prod), Path::new("/tmp/some-repo"), None)
@@ -213,5 +220,91 @@ mod tests {
         )
         .expect("dedicated path accepted with no env override");
         assert_eq!(db, PathBuf::from("/tmp/code-ingest-map-2.db"));
+    }
+
+    /// RAII guard: clears `HOME` for the test body and restores the prior
+    /// value on drop (including on panic/unwind) — mirrors the `HomeGuard`
+    /// pattern in `khive-mcp/src/serve.rs`. Callers must hold
+    /// `KHIVE_DB_ENV_LOCK` for the guard's whole lifetime; this type does not
+    /// take the lock itself.
+    struct HomeGuard {
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl HomeGuard {
+        fn clear() -> Self {
+            let original = std::env::var_os("HOME");
+            // SAFETY: caller holds KHIVE_DB_ENV_LOCK for this guard's lifetime.
+            unsafe {
+                std::env::remove_var("HOME");
+            }
+            Self { original }
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            // SAFETY: caller holds KHIVE_DB_ENV_LOCK for this guard's lifetime.
+            unsafe {
+                match &self.original {
+                    Some(h) => std::env::set_var("HOME", h),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+    }
+
+    /// #1062 H2 regression: with `HOME` unset AND no `KHIVE_DB` override, the
+    /// canonical resolver (`khive_runtime::config::resolve_db_anchor(None)`)
+    /// still falls back to `./.khive/khive.db` — the fence's default
+    /// forbidden path must be derived the SAME way, or this exact
+    /// unresolved-config branch resolves the production db and lets it
+    /// through (the prior HOME-only `default_production_db_path` returned
+    /// `None` here, disarming the fence entirely).
+    #[test]
+    fn production_default_is_fenced_when_home_unset_and_khive_db_absent() {
+        let _guard = KHIVE_DB_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home_guard = HomeGuard::clear();
+        // SAFETY: serialized by KHIVE_DB_ENV_LOCK above.
+        unsafe {
+            std::env::remove_var("KHIVE_DB");
+        }
+        let prod = khive_runtime::config::resolve_db_anchor(None)
+            .expect("resolve_db_anchor(None) always resolves to Some(_)");
+        let err = resolve_target_db(
+            Some(prod.to_str().unwrap()),
+            Path::new("/tmp/some-repo"),
+            None, // config().db_path unresolved — the #1042/#1062 gap
+        )
+        .expect_err("must reject the canonical production db even with HOME unset");
+        assert!(err.contains("shared production database"));
+    }
+
+    /// Same #1062 H2 gap, with `KHIVE_DB` present but empty rather than
+    /// absent — the empty-string guard on the `KHIVE_DB` fallback (added for
+    /// #1042) must not be mistaken for "no override, so allow it through";
+    /// the canonical-default fence below it still has to fire.
+    #[test]
+    fn production_default_is_fenced_when_home_unset_and_khive_db_empty() {
+        let _guard = KHIVE_DB_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home_guard = HomeGuard::clear();
+        // SAFETY: serialized by KHIVE_DB_ENV_LOCK above.
+        unsafe {
+            std::env::set_var("KHIVE_DB", "");
+        }
+        let prod = khive_runtime::config::resolve_db_anchor(None)
+            .expect("resolve_db_anchor(None) always resolves to Some(_)");
+        let result = resolve_target_db(
+            Some(prod.to_str().unwrap()),
+            Path::new("/tmp/some-repo"),
+            None,
+        );
+        // SAFETY: serialized by KHIVE_DB_ENV_LOCK above.
+        unsafe {
+            std::env::remove_var("KHIVE_DB");
+        }
+        let err = result
+            .expect_err("must reject the canonical production db with HOME unset + empty KHIVE_DB");
+        assert!(err.contains("shared production database"));
     }
 }
