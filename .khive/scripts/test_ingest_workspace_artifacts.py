@@ -367,10 +367,6 @@ class ReconcileExistingNoteTests(unittest.TestCase):
         self.assertEqual(stats.edges_backfilled, 0)
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
-
 class NulByteTests(unittest.TestCase):
     def test_nul_bytes_replaced_with_ufffd(self):
         # Live tranche-2 abort 2026-07-16: NUL is valid UTF-8, survived
@@ -402,3 +398,7 @@ class C0ControlCharTests(unittest.TestCase):
 
     def test_newline_and_cr_still_use_short_escapes(self):
         self.assertEqual(dsl_escape("a\r\nb"), "a\\r\\nb")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
