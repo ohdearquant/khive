@@ -528,7 +528,26 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 18] = [
                 name: "relation",
                 param_type: "string",
                 required: true,
-                description: "Edge relation (contains | part_of | instance_of | extends | variant_of | introduced_by | supersedes | derived_from | precedes | depends_on | enables | implements | competes_with | composed_with | annotates | supports | refutes).",
+                description: "Edge relation (contains | part_of | instance_of | extends | variant_of | introduced_by | supersedes | derived_from | precedes | depends_on | enables | implements | competes_with | composed_with | annotates | supports | refutes). \
+                    Each relation only accepts specific (source_kind -> target_kind) endpoint pairs; an out-of-allowlist pair is rejected with PermissionDenied, not silently accepted. \
+                    Base ADR-002 entity->entity allowlist (issue #964 — this table mirrors `base_entity_endpoint_rules()`, the exact source the validator consults, so it cannot drift out of sync): \
+                    contains: concept->concept, project->project, project->artifact, org->project, org->service. \
+                    part_of: concept->concept, project->project, project->org. \
+                    instance_of: *->concept (any source kind), service->project. \
+                    extends: concept->concept. variant_of: concept->concept, artifact->artifact. \
+                    introduced_by: concept->document, concept->person, concept->org, artifact->document, document->person, document->org. \
+                    derived_from: artifact->dataset, artifact->document, artifact->project, artifact->artifact. \
+                    precedes: document->document, dataset->dataset, artifact->artifact, service->service, project->project. \
+                    depends_on: project->project, service->project, service->service, service->artifact, service->dataset, artifact->project, artifact->service, document->document. \
+                    enables: concept->concept, service->concept, dataset->concept. \
+                    implements: project->concept, service->concept. \
+                    competes_with (symmetric): concept<->concept, project<->project, service<->service. \
+                    composed_with (symmetric): concept<->concept, project<->project. \
+                    supersedes: concept->concept, document->document, artifact->artifact, service->service, dataset->dataset. \
+                    supports / refutes: concept->concept, document->concept, dataset->concept, artifact->concept (evidence -> claim). \
+                    annotates: note -> {entity, note, edge, event} (the only relation whose source is a note, not an entity). \
+                    The `kg` pack additionally allows (pack-extensible, additive-only per ADR-017): part_of/instance_of person->org, part_of/instance_of person->project, depends_on/enables/contains/part_of/precedes org->org, precedes decision-note->decision-note. \
+                    Other loaded packs may add further pairs (e.g. `gtd` allows depends_on task-note->task-note; `formal` allows typed depends_on between theorem/definition/axiom/structure/instance/goal entity_types) — pack rules only ever add allowed pairs, never remove one listed here. Full pack-rule source: `docs/api/edge-rules-pack-kg.md`.",
             },
             ParamDef {
                 name: "weight",
@@ -994,6 +1013,35 @@ mod tests {
         assert!(
             h.params.iter().any(|p| p.name == "comment" && !p.required),
             "review must document optional comment param"
+        );
+    }
+
+    /// Regression for #964: `link(help=true)` must surface the per-relation
+    /// edge-endpoint allowlist so batch appliers can defer to the kernel's own
+    /// table instead of reimplementing (and drifting from) it.
+    #[test]
+    fn link_relation_param_documents_edge_endpoint_allowlist() {
+        let h = find_handler("link");
+        let relation_param = h
+            .params
+            .iter()
+            .find(|p| p.name == "relation")
+            .expect("link must document a relation param");
+        assert!(
+            relation_param
+                .description
+                .contains("contains: concept->concept"),
+            "link.relation help must enumerate the base ADR-002 endpoint allowlist"
+        );
+        assert!(
+            relation_param
+                .description
+                .contains("part_of/instance_of person->org"),
+            "link.relation help must enumerate the kg pack's additive EDGE_RULES"
+        );
+        assert!(
+            relation_param.description.contains("annotates: note ->"),
+            "link.relation help must document the annotates note->* endpoint"
         );
     }
 
