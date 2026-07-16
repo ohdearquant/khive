@@ -301,6 +301,11 @@ async fn ingest_links_commits_to_document_and_pr_by_provenance_query() {
         report.commits_ingested, 3,
         "all three commits ingest: {report:?}"
     );
+    assert_eq!(
+        report.commits_total_in_db, 3,
+        "commits_total_in_db is a DB-derived row count, independent of the \
+         in-memory ingested delta: {report:?}"
+    );
 
     // Provenance query genre: incoming `annotates` from the document.
     let doc_neighbors = registry
@@ -3009,6 +3014,7 @@ async fn digest_verb_auto_creates_project_and_enriches_references() {
     assert_eq!(first["done"], true, "{first}");
     assert_eq!(first["project_created"], true, "{first}");
     assert_eq!(first["commits_ingested"], 1, "{first}");
+    assert_eq!(first["commits_total_in_db"], 1, "{first}");
     let project_id = first["project_id"]
         .as_str()
         .expect("project_id present")
@@ -3028,6 +3034,15 @@ async fn digest_verb_auto_creates_project_and_enriches_references() {
     assert_eq!(
         second["commits_ingested"], 0,
         "no new commits since pass 1: {second}"
+    );
+    // Issue #1045: `commits_ingested` is the this-pass in-memory delta (0
+    // here, since the one commit was already durably written in pass 1) —
+    // but `commits_total_in_db` is derived fresh from the database each
+    // pass, so it still truthfully reports the one commit that exists,
+    // regardless of which pass's response a caller happened to receive.
+    assert_eq!(
+        second["commits_total_in_db"], 1,
+        "DB-derived total survives even when this pass ingests nothing new: {second}"
     );
 
     // Pre-create an issue #42 the project already tracks (as if ingested by
@@ -3055,6 +3070,10 @@ async fn digest_verb_auto_creates_project_and_enriches_references() {
         .await
         .expect("digest ok (pass 3)");
     assert_eq!(third["commits_ingested"], 1, "{third}");
+    assert_eq!(
+        third["commits_total_in_db"], 2,
+        "two commits now durably present across all three passes: {third}"
+    );
     assert_eq!(
         third["reference_edges_created"], 1,
         "the Closes #42 reference resolves: {third}"
