@@ -561,7 +561,7 @@ def _acquire_live_lock() -> "object":
     return fd
 
 
-def process(dry_run: bool) -> tuple[Stats, list[Artifact]]:
+def process(dry_run: bool, only_classes: set[str] | None = None) -> tuple[Stats, list[Artifact]]:
     live = not dry_run
     kk = KKernel(live=live)
     stats = Stats()
@@ -569,6 +569,8 @@ def process(dry_run: bool) -> tuple[Stats, list[Artifact]]:
 
     try:
         artifacts = discover()
+        if only_classes:
+            artifacts = [a for a in artifacts if a.artifact_class in only_classes]
         for a in artifacts:
             stats.by_class[a.artifact_class] += 1
 
@@ -750,10 +752,19 @@ def main() -> int:
         default=None,
         help="Path to write the dry-run markdown report (dry-run mode only)",
     )
+    parser.add_argument(
+        "--only-class",
+        action="append",
+        choices=sorted(NOTE_KIND.keys()),
+        default=None,
+        help="Restrict this run to the given artifact class(es) — the tranche knob "
+        "(repeatable). Cursor idempotency makes later full runs skip these.",
+    )
     args = parser.parse_args()
 
     dry_run = not args.live
-    stats, artifacts = process(dry_run=dry_run)
+    only_classes = set(args.only_class) if args.only_class else None
+    stats, artifacts = process(dry_run=dry_run, only_classes=only_classes)
 
     if dry_run:
         report_path = args.report or (
