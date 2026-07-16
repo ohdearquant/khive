@@ -5,9 +5,10 @@ the bottom (no subprocess either). Covers PR #1049 fix-round-1 findings:
 
   M1 - DSL $prev-literal escaping (dsl_escape)
   M2 - CRLF round-trip (dsl_escape)
-  M3 - content cap on the FINAL replacement-decoded text (now 32,768 CHARS,
-       matching the daemon embedder's char-count limit), incl. invalid-UTF-8
-       expansion and multibyte counting (cap_content)
+  M3 - 32,768-byte cap on the FINAL encoded payload (the daemon embedder's
+       actual limit — byte-counted despite its "chars" error wording), incl.
+       invalid-UTF-8 expansion and a multibyte char split at the boundary
+       (cap_content)
   H3 - PR annotation scoped to this checkout's project entity, never a
        number-only cross-repository fallback (select_exact_project,
        filter_pr_by_number)
@@ -32,7 +33,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from ingest_workspace_artifacts import (  # noqa: E402
-    MAX_CONTENT_CHARS,
+    MAX_CONTENT_BYTES,
     Artifact,
     Stats,
     cap_content,
@@ -104,68 +105,78 @@ class DslEscapeCrlfTests(unittest.TestCase):
 
 class CapContentTests(unittest.TestCase):
     def test_under_cap_not_truncated(self):
-        raw = ("a" * (MAX_CONTENT_CHARS - 1)).encode("utf-8")
+        raw = ("a" * (MAX_CONTENT_BYTES - 1)).encode("utf-8")
         text = cap_content(raw)
-        self.assertEqual(len(text), MAX_CONTENT_CHARS - 1)
+        self.assertEqual(len(text.encode("utf-8")), len(raw))
         self.assertNotIn("truncated", text)
 
     def test_exactly_at_cap_not_truncated(self):
-        raw = ("a" * MAX_CONTENT_CHARS).encode("utf-8")
+        raw = ("a" * MAX_CONTENT_BYTES).encode("utf-8")
         text = cap_content(raw)
-        self.assertEqual(len(text), MAX_CONTENT_CHARS)
+        self.assertEqual(len(text.encode("utf-8")), MAX_CONTENT_BYTES)
         self.assertNotIn("truncated", text)
 
     def test_over_cap_valid_utf8_is_truncated_and_capped(self):
-        raw = ("a" * (MAX_CONTENT_CHARS + 10)).encode("utf-8")
+        raw = ("a" * (MAX_CONTENT_BYTES + 10)).encode("utf-8")
         text = cap_content(raw)
-        self.assertLessEqual(len(text), MAX_CONTENT_CHARS)
+        self.assertLessEqual(len(text.encode("utf-8")), MAX_CONTENT_BYTES)
         self.assertIn("truncated", text)
 
-    def test_live_repro_ascii_char_count_is_capped(self):
-        # Live tranche-2 abort 2026-07-16: a 36,556-char ASCII doc passed the
-        # OLD 48KiB byte cap untouched, then the daemon embedder rejected the
-        # whole create ("text too long: 36556 chars exceeds maximum 32768
-        # chars"). The cap must count chars, matching the daemon check.
+    def test_live_repro_ascii_doc_over_embed_limit_is_capped(self):
+        # Live tranche-2 abort 2026-07-16: a 36,556-byte ASCII doc passed the
+        # OLD 48KiB cap untouched, then the daemon embedder rejected the whole
+        # create ("text too long: 36556 chars exceeds maximum 32768 chars" —
+        # byte-counted despite the wording). The cap must sit at the
+        # embedder's actual limit.
         raw = ("a" * 36_556).encode("utf-8")
         text = cap_content(raw)
-        self.assertLessEqual(len(text), MAX_CONTENT_CHARS)
+        self.assertLessEqual(len(text.encode("utf-8")), MAX_CONTENT_BYTES)
         self.assertIn("truncated", text)
 
-    def test_invalid_utf8_at_exactly_cap_length_is_still_within_cap(self):
-        # H3/M3 regression lineage: the cap must apply AFTER replacement
-        # decoding. Each invalid byte decodes to one U+FFFD char, so
-        # MAX_CONTENT_CHARS invalid bytes land exactly at the char cap.
-        raw = b"\xff" * MAX_CONTENT_CHARS
+    def test_live_repro_multibyte_expansion_is_capped_in_bytes(self):
+        # Second live abort same day: a 32,768-CHAR cap still failed at
+        # 32,846 (bytes) once multibyte chars expanded. The cap must bound
+        # the ENCODED byte length, not the char count.
+        raw = ("€" * 26 + "a" * 32_742).encode("utf-8")  # 32,768 chars, 32,820 bytes
         text = cap_content(raw)
-        self.assertLessEqual(len(text), MAX_CONTENT_CHARS)
+        self.assertLessEqual(len(text.encode("utf-8")), MAX_CONTENT_BYTES)
+        self.assertIn("truncated", text)
+
+    def test_invalid_utf8_at_exactly_cap_length_is_still_capped(self):
+        # H3/M3 regression: MAX_CONTENT_BYTES of 0xFF is invalid UTF-8; the
+        # OLD code compared len(raw) > MAX_CONTENT_BYTES BEFORE replacement
+        # decoding, so an exactly-at-cap invalid file skipped truncation
+        # entirely and ballooned to 3x size (each byte -> U+FFFD, 3 bytes).
+        raw = b"\xff" * MAX_CONTENT_BYTES
+        text = cap_content(raw)
+        encoded_len = len(text.encode("utf-8"))
+        self.assertLessEqual(
+            encoded_len,
+            MAX_CONTENT_BYTES,
+            f"final encoded payload {encoded_len} bytes exceeds the {MAX_CONTENT_BYTES} cap",
+        )
 
     def test_invalid_utf8_well_over_cap_is_capped(self):
-        raw = b"\xff" * (MAX_CONTENT_CHARS + 1024)
+        raw = b"\xff" * (MAX_CONTENT_BYTES + 1024)
         text = cap_content(raw)
-        self.assertLessEqual(len(text), MAX_CONTENT_CHARS)
+        self.assertLessEqual(len(text.encode("utf-8")), MAX_CONTENT_BYTES)
 
-    def test_multibyte_chars_counted_as_chars_not_bytes(self):
-        # 3-bytes-per-char content: a byte cap would truncate this at a third
-        # of the budget; the char cap must keep all MAX_CONTENT_CHARS chars.
-        raw = ("€" * MAX_CONTENT_CHARS).encode("utf-8")
+    def test_multibyte_char_split_at_boundary_stays_valid_utf8(self):
+        # A 3-byte char (€) straddling the truncation boundary must not
+        # produce a malformed/half UTF-8 sequence in the output.
+        head = "a" * (MAX_CONTENT_BYTES - 1)
+        raw = (head + "€" + "tail-sentinel").encode("utf-8")
         text = cap_content(raw)
-        self.assertEqual(len(text), MAX_CONTENT_CHARS)
-        self.assertNotIn("truncated", text)
-
-    def test_truncation_slices_chars_cleanly(self):
-        # Truncating by char index can never split a UTF-8 sequence; the
-        # output must round-trip and drop the tail sentinel.
-        head = "€" * (MAX_CONTENT_CHARS - 1)
-        raw = (head + "tail-sentinel").encode("utf-8")
-        text = cap_content(raw)
-        self.assertLessEqual(len(text), MAX_CONTENT_CHARS)
-        text.encode("utf-8").decode("utf-8")
+        encoded = text.encode("utf-8")
+        self.assertLessEqual(len(encoded), MAX_CONTENT_BYTES)
+        # round-trips cleanly (no stray surrogate / partial sequence)
+        encoded.decode("utf-8")
         self.assertNotIn("tail-sentinel", text)
 
     def test_sha_key_computed_over_original_bytes_not_capped_text(self):
         # Sanity: cap_content itself does not touch hashing; verify the
         # truncation marker records the ORIGINAL raw length.
-        raw = ("a" * (MAX_CONTENT_CHARS + 500)).encode("utf-8")
+        raw = ("a" * (MAX_CONTENT_BYTES + 500)).encode("utf-8")
         text = cap_content(raw)
         self.assertIn(str(len(raw)), text)
 

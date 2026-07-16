@@ -33,8 +33,9 @@ Design notes:
   covers a note left incomplete by a pre-fix run, or by a create-time link
   failure whose runtime-side compensation was itself best-effort and did not
   run to completion (crates/khive-runtime/src/operations.rs).
-- Content is truncated at 32,768 characters (of the FINAL replacement-decoded
-  text, marker space reserved — the daemon embedder's char-count limit) with
+- Content is truncated at 32,768 bytes (of the FINAL UTF-8-encoded,
+  replacement-decoded payload, marker space reserved — the daemon embedder's
+  actual limit, which is byte-counted despite its "chars" error wording) with
   a trailing marker; the sha256 is always computed over the ORIGINAL
   (untruncated) bytes so the dedup key is stable.
 - Note + its `annotates` edges (workspace lane, and PR for codex verdicts)
@@ -86,11 +87,14 @@ CURSOR_PATH = SCRIPT_DIR / ".ws_ingest_cursor"
 LOCK_PATH = Path("/tmp/lion-khive-wsingest.lock")
 KKERNEL = os.path.expanduser("~/.cargo/bin/kkernel")
 
-# The daemon's embedder rejects create() content over 32,768 CHARS (observed
-# live 2026-07-16: "embedding: text too long: 36556 chars exceeds maximum
-# 32768 chars"), so the cap counts characters, not bytes — a byte cap lets
-# ASCII-heavy docs through with more chars than the embedder accepts.
-MAX_CONTENT_CHARS = 32_768
+# The daemon's embedder rejects create() content whose UTF-8 BYTE length
+# exceeds 32,768: lattice-embed 0.6.1 (service/cached.rs, native.rs) checks
+# `text.len()` — Rust String BYTES — even though its error message says
+# "chars". Observed live 2026-07-16: a 36,556-byte ASCII doc was rejected,
+# and a char-capped 32,768-char doc still failed at 32,846 (bytes, from
+# multibyte expansion). The cap therefore applies to the final encoded
+# byte length, at the embedder's actual limit.
+MAX_CONTENT_BYTES = 32_768
 TRUNCATION_MARKER = "\n\n...[truncated by ws-ingest, original length {orig} bytes]...\n"
 
 INGEST_TAG = "ws-ingest"
@@ -494,18 +498,18 @@ def reconcile_existing_note(
 
 
 def cap_content(raw: bytes) -> str:
-    """Decode `raw` (replacing invalid UTF-8) and cap the FINAL decoded text
-    at MAX_CONTENT_CHARS, marker space reserved. The cap counts CHARACTERS
-    after replacement decoding (matching the daemon embedder's char-count
-    check), not raw bytes: `errors="replace"` can change the char count
-    (invalid byte -> one U+FFFD), and byte length overstates ASCII char
-    budgets while understating multibyte ones."""
+    """Decode `raw` (replacing invalid UTF-8) and cap the FINAL encoded
+    payload at MAX_CONTENT_BYTES, marker space reserved. Capping on the
+    original raw byte length is not sufficient: `errors="replace"` can
+    expand invalid bytes (each -> U+FFFD, 3 bytes), so the cap must apply
+    after replacement decoding, not before."""
     text = raw.decode("utf-8", errors="replace")
-    if len(text) <= MAX_CONTENT_CHARS:
+    encoded = text.encode("utf-8")
+    if len(encoded) <= MAX_CONTENT_BYTES:
         return text
     marker = TRUNCATION_MARKER.format(orig=len(raw))
-    budget = max(MAX_CONTENT_CHARS - len(marker), 0)
-    return text[:budget] + marker
+    budget = max(MAX_CONTENT_BYTES - len(marker.encode("utf-8")), 0)
+    return encoded[:budget].decode("utf-8", errors="ignore") + marker
 
 
 def build_note_content(artifact: Artifact) -> str:
