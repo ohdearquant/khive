@@ -1,7 +1,7 @@
 # ADR-111: BlobStore — Content-Addressed Binary Object Storage
 
 **Status**: accepted
-**Date**: 2026-07-12 (amended 2026-07-13, PR #922)
+**Date**: 2026-07-12 (amended 2026-07-13, PR #922; Amendment 2 proposed 2026-07-16)
 **Authors**: khive maintainers
 **Depends on**:
 
@@ -346,6 +346,206 @@ misses.
 
 ---
 
+## Amendment 2 (2026-07-16): S3-compatible backend
+
+**Status:** proposed amendment. The accepted filesystem decision and the existing `BlobStore`
+trait remain unchanged while this amendment passes the implementation specification gate.
+
+### Context and decision
+
+ADR-111 originally deferred an object-store dependency until a real consumer needed remote blob
+storage. That consumer now exists: deployments must be able to keep blob bytes in S3-compatible
+object storage instead of on the database host's filesystem. Under the last-in-time rule, this
+requirement ends the earlier deferral without reversing the trait boundary that made the backend
+replaceable.
+
+This amendment supersedes the earlier “`object_store` crate as the backend” alternative for the
+new S3 implementation only. It does not move `FsBlobStore` onto `object_store` or change the
+filesystem behavior accepted above.
+
+`khive-db` gains `S3BlobStore`, a second implementation of the existing `BlobStore` trait.
+`ContentRef`, `BlobOrphanSweepConfig`, `BlobOrphanSweepResult`, and all five trait method
+signatures remain unchanged. Callers continue to receive `Arc<dyn BlobStore>` and cannot observe
+provider-specific types.
+
+Blob backend selection is a process-level storage-capability setting, separate from ADR-028's
+pack-to-SQLite `[[backends]]` assignment:
+
+```toml
+# Existing behavior remains the default when [storage.blob] is absent.
+[storage.blob]
+backend = "fs"
+root = "/var/lib/khive/blobs"
+floor_bytes = 100000000000
+```
+
+```toml
+[storage.blob]
+backend = "s3"
+bucket = "khive-blobs"
+endpoint = "https://objects.example.invalid"
+region = "us-east-1"
+prefix = "blobs"
+```
+
+`backend` is a closed `fs | s3` enum. For `s3`, `bucket` and `region` are required,
+`endpoint` is optional, and `prefix` defaults to `blobs`. Omitting `endpoint` uses the normal AWS
+S3 regional endpoint; setting it is the compatibility knob for Cloudflare R2, MinIO, Tigris, and
+other S3-compatible services. V1 uses virtual-hosted-style requests when `endpoint` is omitted
+(real AWS, which has deprecated path-style for new buckets) and path-style requests when
+`endpoint` is set (the S3-compatible services above). A separately typed `allow_http = true`
+escape hatch may be used for a trusted local test endpoint; it defaults to `false`, and an
+`http://` endpoint without it is rejected.
+
+The nested blob config is strict even though `KhiveConfig` is forward-compatible at its top level:
+unknown fields, fields for the other backend, and attempted credential fields are startup errors.
+For `fs`, existing root precedence is unchanged: `KHIVE_BLOB_ROOT` environment variable,
+configured `root`, then `<db_dir>/blobs`. `KHIVE_BLOB_ROOT` has no effect when `backend = "s3"`.
+
+S3 credentials are never accepted in TOML. V1 reads `AWS_ACCESS_KEY_ID` and
+`AWS_SECRET_ACCESS_KEY` as an all-or-nothing pair, plus optional `AWS_SESSION_TOKEN`, from the
+process environment. Startup errors may name a missing variable but must never include a value.
+Bucket, endpoint, and region come from the explicit non-secret config above and are not silently
+replaced by process-global AWS endpoint variables.
+
+`prefix` must be non-empty and canonical: no leading or trailing slash, empty segment, `.` segment,
+or `..` segment. For a content hash `h`, the object key is:
+
+```text
+{prefix}/{h[0..2]}/{h[2..4]}/{h}
+```
+
+The shard shape preserves the deterministic CAS mapping used by `FsBlobStore`; it remains a backend
+detail and is never stored in entity properties. The bucket used for this prefix must be
+unversioned in v1. Versioning-enabled and versioning-suspended buckets are unsupported: a simple
+`DELETE Object` can create a delete marker while retaining prior bytes, which does not meet this
+ADR's physical-deletion and orphan-reclamation contract.
+
+### Trait method mapping
+
+| `BlobStore` method     | S3-compatible operation                                   | Required behavior                                                                                                                                                                                                                 |
+| ---------------------- | --------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `put(bytes)`           | Client-side BLAKE3, `HEAD`, then conditional `PUT Object` | Compute `ContentRef` before network I/O. An existing key is the dedup no-op. A missing key is created with `If-None-Match: *`; a concurrent precondition failure means an identical writer won and is returned as success.        |
+| `get(content_ref)`     | `GET Object`                                              | Return exact bytes. A missing key maps to `StorageError::NotFound` with capability `Blob`, resource `blob`, and the content ref as key.                                                                                           |
+| `exists(content_ref)`  | `HEAD Object`                                             | Success is `true`; not-found is `false`. Authorization, timeout, and transport failures remain errors and must not masquerade as absence.                                                                                         |
+| `delete(content_ref)`  | `HEAD Object`, then `DELETE Object`                       | Under the required quiescence, an absent HEAD returns `false`; a present HEAD followed by successful deletion returns `true`. The HEAD is necessary because S3 DELETE is idempotent and does not reliably report prior existence. |
+| `orphan_sweep(config)` | Paginated `ListObjectsV2`, diff, bounded deletes          | List only the configured prefix, process no more than 1,000 keys per page, validate the exact shard/key form, compare to `live_refs`, and retain only page-sized remote state. Dry-run never deletes.                             |
+
+`orphan_sweep` continues until the provider returns no continuation token. Delete request size and
+concurrency are bounded; the implementation does not materialize the full remote listing. A normal
+result means the complete prefix was visited. On a page or delete failure the method returns an
+error rather than reporting a partial scan as complete. Keys under the prefix that do not parse as
+the exact CAS shard shape are ignored, matching `FsBlobStore`'s refusal to sweep temporary or
+foreign filenames.
+
+### Concurrency and the §8 deletion hazard
+
+`S3BlobStore` has no equivalent of `FsBlobStore`'s canonical-root write mutex. That mutex exists to
+serialize a local free-space sample with a filesystem publish. S3 provides no portable
+available-space gauge, and individual object PUTs are atomically published by the service.
+Content-addressed keys plus conditional create replace the filesystem publish critical section for
+concurrent `put` calls.
+
+No object-store mutex replaces the §8 safety requirement because an in-process lock would not solve
+it. The hazardous race is between a database snapshot of live `content_ref`s and a later entity
+write, potentially across processes and storage systems. `delete` and `orphan_sweep` therefore
+remain offline-maintenance-only for S3 and require deployment-wide quiescence of every writer that
+can create a new entity reference for the full snapshot-plus-sweep interval. The transactional,
+DB-coordinated design remains khive#924.
+
+Out-of-band lifecycle policies have the same limitation and must not delete objects from the live
+BlobStore prefix.
+
+### Capacity guard and failure mapping
+
+The filesystem free-space floor is not applicable remotely. There is no portable S3 API for a
+race-free “capacity remaining after this write” check, so `S3BlobStore` performs no capacity probe.
+A provider quota or capacity refusal is surfaced from the failed PUT and is never mapped to
+`StorageError::CapacityFloor`.
+
+| HTTP/client failure                                                                                                                              | `StorageError` mapping                                              |
+| ------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------- |
+| GET or HEAD not-found                                                                                                                            | `NotFound` for `get`; `false` for `exists` and the pre-delete check |
+| Expected conditional-create already-exists/precondition failure                                                                                  | Successful dedup for `put`                                          |
+| Request deadline or transport timeout                                                                                                            | `Timeout { operation }`                                             |
+| Invalid bucket, endpoint, region, prefix, or incomplete credential environment                                                                   | Startup/config error; `InvalidInput` if discovered at method scope  |
+| Unexpected provider conflict                                                                                                                     | `Conflict { capability: Blob, operation, message }`                 |
+| Authorization/signature rejection, TLS/DNS/connect failure, exhausted transient response, quota/capacity refusal, or malformed protocol response | `Driver { capability: Blob, operation, source }`                    |
+
+The S3 client applies bounded exponential backoff with jitter to replay-safe requests and the
+idempotent content-addressed PUT. Transient `429` and `5xx` responses are retried within that budget;
+credential and authorization failures are not. After the budget, the original source remains in
+`Driver` unless the overall operation deadline elapsed, which maps to `Timeout`.
+
+### Dependency, buffering, and test decisions
+
+The implementation uses Apache Arrow's `object_store` crate rather than `aws-sdk-s3` or a local
+SigV4 client. The dependency baseline is `object_store = 0.13.2` with default features disabled and
+only its `aws` feature enabled. That release's `aws` feature uses reqwest 0.12 and ring, matching
+versions already present in the workspace dependency graph while excluding its filesystem and
+other cloud backends. This provides a Tokio-native client, signing, retries,
+conditional PUT support, custom endpoints, and streaming LIST pagination without importing its
+other provider implementations. The implementation gate must record the normal dependency-tree and
+stripped release-binary delta against khive's established 18 MB single-binary goal; this draft does
+not claim an unmeasured byte cost. Updating the pinned dependency is allowed only with the same
+feature, compatibility, and size evidence.
+
+The existing whole-buffer trait is accepted for S3 v1 up to 64 MiB per object. `put` rejects a
+larger buffer with `InvalidInput`; `get` checks returned object metadata before collecting a larger
+response. Consumers must enforce the same ceiling before reading a source into memory. A streaming
+amendment covering both upload and download, hash finalization, replay, multipart abort, and retry
+semantics is required before khive supports larger blobs or concurrent traffic whose measured peak
+memory violates a supported deployment envelope.
+
+CI uses three layers:
+
+1. one shared `BlobStore` conformance suite for filesystem and S3 implementations;
+2. a pinned MinIO container as the required compatibility test for custom endpoint, SigV4,
+   path-style addressing, conditional create, CRUD, and multi-page LIST behavior;
+3. fake-client unit tests for timeout, authorization, quota, exhausted retry, and partial-page error
+   mapping.
+
+Live-provider tests are explicit, secret-gated, non-required smoke tests. A mock alone cannot prove
+wire compatibility; a live service alone is too dependent on credentials and network health to be
+the merge gate.
+
+### Alternatives considered
+
+**`aws-sdk-s3`.** It has the strongest AWS-specific service surface and supports custom endpoint and
+path-style configuration. It also brings a broader generated service and Smithy runtime surface
+than these five methods need. Rejected for v1 in favor of the narrower client, subject to the
+required binary measurement and compatibility gate. It remains the fallback if the selected
+`object_store` version cannot satisfy conditional create or endpoint compatibility.
+
+**Minimal SigV4 client over `reqwest`.** This reduces the named dependency count but leaves khive
+responsible for canonical request signing, clock skew, XML errors, pagination, retry
+classification, conditional requests, and protocol security maintenance. Rejected: the apparent
+dependency saving does not justify owning an S3 client.
+
+**Streaming trait now.** This would remove the known memory ceiling, but it changes both trait
+directions and introduces hash-finalization, replay, and multipart-cleanup decisions before a
+consumer exceeds the 64 MiB v1 envelope. Deferred behind the explicit threshold above.
+
+**Mock-only or live-only CI.** Mock-only does not exercise signing or endpoint behavior; live-only
+is not hermetic. Rejected in favor of required MinIO plus focused fakes and optional live smoke
+tests.
+
+### Consequences
+
+- `khive-storage` remains dependency-light and unchanged; provider types do not cross its trait
+  boundary.
+- `khive-db` owns both concrete blob backends and the S3 client dependency.
+- The config/boot layer gains one typed blob selector and must wire the same selection through
+  single- and multi-backend startup paths.
+- Existing configurations continue to select `FsBlobStore` with the current root and floor
+  behavior.
+- S3 deployments gain off-host blob storage but must provide environment credentials, an
+  unversioned bucket, and an offline maintenance window for deletion and sweep.
+- `BlobStore` still does not provide transactional reference GC; this amendment does not close or
+  weaken khive#924.
+
+---
+
 ## Implementation Notes
 
 - `crates/khive-storage/src/blob.rs` — `ContentRef`, `BlobOrphanSweepConfig`,
@@ -357,6 +557,8 @@ misses.
   `write_lock_for_root`/`root_write_locks` (the canonical-root-keyed shared-lock registry),
   `crosses_floor` (the pure write-size-aware floor comparison).
 - `crates/khive-db/src/backend.rs` — `StorageBackend::blob_store`.
+- Amendment 2 proposes `S3BlobStore` beside `FsBlobStore` plus one config-aware boot-layer selector;
+  no provider type enters `khive-storage`.
 - `crates/khive-db/sql/010-entities-content-ref.sql` — migration V10.
 - `crates/khive-db/sql/entities-ddl.sql` — mirrored `content_ref` column + index.
 - `crates/khive-db/src/stores/entity.rs` — `content_ref` threaded through
@@ -376,3 +578,12 @@ misses.
   stale.
 - [khive#924](https://github.com/ohdearquant/khive/issues/924) — follow-up: transactional,
   DB-coordinated `BlobStore` orphan sweep.
+- [`object_store` 0.13.2 S3 builder](https://docs.rs/object_store/0.13.2/object_store/aws/struct.AmazonS3Builder.html)
+  and [feature model](https://docs.rs/crate/object_store/0.13.2/features) — selected S3 client
+  surface and dependency boundary for Amendment 2.
+- [AWS SDK for Rust endpoint configuration](https://docs.aws.amazon.com/sdk-for-rust/latest/dg/endpoints.html)
+  — comparison evidence for custom endpoints and path-style support in the rejected SDK fork.
+- [Amazon S3 conditional writes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html)
+  — `If-None-Match: *` create-if-absent behavior and concurrent response semantics.
+- [Deleting objects from versioning-suspended buckets](https://docs.aws.amazon.com/AmazonS3/latest/userguide/DeletingObjectsfromVersioningSuspendedBuckets.html)
+  — why suspended versioning does not satisfy physical deletion.
