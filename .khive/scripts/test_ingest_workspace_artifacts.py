@@ -369,3 +369,14 @@ class ReconcileExistingNoteTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class NulByteTests(unittest.TestCase):
+    def test_nul_bytes_replaced_with_ufffd(self):
+        # Live tranche-2 abort 2026-07-16: NUL is valid UTF-8, survived
+        # replacement decoding, and crashed subprocess argv construction
+        # ("embedded null byte"). cap_content must map it to U+FFFD.
+        raw = b"before\x00after"
+        text = cap_content(raw)
+        self.assertNotIn("\x00", text)
+        self.assertEqual(text, "before�after")

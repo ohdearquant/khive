@@ -503,7 +503,11 @@ def cap_content(raw: bytes) -> str:
     original raw byte length is not sufficient: `errors="replace"` can
     expand invalid bytes (each -> U+FFFD, 3 bytes), so the cap must apply
     after replacement decoding, not before."""
-    text = raw.decode("utf-8", errors="replace")
+    # NUL is valid UTF-8 so errors="replace" keeps it, but the ops string is
+    # passed as a subprocess argv, and argv cannot contain NUL (Popen raises
+    # "embedded null byte" — live tranche-2 abort 2026-07-16). Map it to
+    # U+FFFD, consistent with the replacement-decode semantics above.
+    text = raw.decode("utf-8", errors="replace").replace("\x00", "�")
     encoded = text.encode("utf-8")
     if len(encoded) <= MAX_CONTENT_BYTES:
         return text
