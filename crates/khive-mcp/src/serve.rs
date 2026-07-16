@@ -3828,6 +3828,47 @@ region = "us-east-1"
         }
     }
 
+    /// RAII guard: clears the `KHIVE_*` variables that would otherwise
+    /// override the temp `khive.toml` the boot tests write, restoring each
+    /// prior value (or absence) on drop, even on panic/unwind. `#[serial]`
+    /// serializes access but does not restore process-global state; this
+    /// guard does.
+    struct ClearedKhiveEnvGuard {
+        prev: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl ClearedKhiveEnvGuard {
+        const VARS: [&'static str; 4] = [
+            "KHIVE_DB",
+            "KHIVE_ACTOR",
+            "KHIVE_PACKS",
+            "KHIVE_REQUIRE_ATTRIBUTED_ACTOR",
+        ];
+
+        fn clear() -> Self {
+            let prev = Self::VARS
+                .iter()
+                .map(|name| {
+                    let value = std::env::var_os(name);
+                    std::env::remove_var(name);
+                    (*name, value)
+                })
+                .collect();
+            Self { prev }
+        }
+    }
+
+    impl Drop for ClearedKhiveEnvGuard {
+        fn drop(&mut self) {
+            for (name, value) in self.prev.drain(..) {
+                match value {
+                    Some(v) => std::env::set_var(name, v),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
     fn s3_blob_config() -> BlobConfig {
         BlobConfig::S3 {
             bucket: "khive-blobs".to_string(),
@@ -3850,10 +3891,7 @@ region = "us-east-1"
     #[test]
     #[serial]
     fn single_backend_boot_installs_s3_blob_store_on_successful_selection() {
-        std::env::remove_var("KHIVE_DB");
-        std::env::remove_var("KHIVE_ACTOR");
-        std::env::remove_var("KHIVE_PACKS");
-        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+        let _env = ClearedKhiveEnvGuard::clear();
         let _creds = DummyAwsCredsGuard::set();
 
         let dir = tempfile::tempdir().expect("temp dir");
@@ -3953,10 +3991,7 @@ region = "us-east-1"
     #[tokio::test]
     #[serial]
     async fn single_backend_boot_default_fs_blob_store_is_usable_without_storage_section() {
-        std::env::remove_var("KHIVE_DB");
-        std::env::remove_var("KHIVE_ACTOR");
-        std::env::remove_var("KHIVE_PACKS");
-        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+        let _env = ClearedKhiveEnvGuard::clear();
 
         let dir = tempfile::tempdir().expect("temp dir");
         let db_path = dir.path().join("main.db");
