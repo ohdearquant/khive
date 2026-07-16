@@ -391,7 +391,9 @@ prefix = "blobs"
 `backend` is a closed `fs | s3` enum. For `s3`, `bucket` and `region` are required,
 `endpoint` is optional, and `prefix` defaults to `blobs`. Omitting `endpoint` uses the normal AWS
 S3 regional endpoint; setting it is the compatibility knob for Cloudflare R2, MinIO, Tigris, and
-other S3-compatible services. V1 uses path-style requests. A separately typed `allow_http = true`
+other S3-compatible services. V1 uses virtual-hosted-style requests when `endpoint` is omitted
+(real AWS, which has deprecated path-style for new buckets) and path-style requests when
+`endpoint` is set (the S3-compatible services above). A separately typed `allow_http = true`
 escape hatch may be used for a trusted local test endpoint; it defaults to `false`, and an
 `http://` endpoint without it is rejected.
 
