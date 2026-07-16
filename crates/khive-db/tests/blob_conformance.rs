@@ -10,6 +10,7 @@
 
 use std::sync::Arc;
 
+use futures::stream::StreamExt;
 use khive_db::stores::blob::FsBlobStore;
 use khive_db::stores::blob_s3::{S3BlobStore, S3BlobStoreConfig};
 use khive_storage::blob::{BlobOrphanSweepConfig, BlobStore, ContentRef};
@@ -89,4 +90,70 @@ async fn s3_blob_store_conforms_against_a_live_endpoint() {
     let store: Arc<dyn BlobStore> =
         Arc::new(S3BlobStore::new(config).expect("S3BlobStore::new against MinIO"));
     assert_conforms(store).await;
+}
+
+/// ADR-111 Amendment 2 (H3 fix round 2): `orphan_sweep`'s `ListObjectsV2`
+/// pagination is untested unless a real sweep crosses the 1,000-key page
+/// boundary. This populates `PAGE_CROSSING_OBJECT_COUNT` (> 1,000) tiny,
+/// distinct-content objects under a scratch prefix and confirms the sweep
+/// scans every one of them and reports zero orphans (all are in
+/// `live_refs`) -- proof the multi-page LIST loop in
+/// `S3BlobStore::orphan_sweep` actually continues past the first page rather
+/// than only ever exercising a single-page listing, as every other test in
+/// this suite does.
+#[tokio::test]
+async fn s3_blob_store_orphan_sweep_paginates_past_the_1000_key_page_boundary() {
+    let Ok(endpoint) = std::env::var("KHIVE_S3_TEST_ENDPOINT") else {
+        eprintln!(
+            "skipping s3_blob_store_orphan_sweep_paginates_past_the_1000_key_page_boundary: \
+             KHIVE_S3_TEST_ENDPOINT is not set (no live S3-compatible endpoint configured). \
+             This leg runs in CI's pinned-MinIO job; it is not exercised by a plain \
+             `cargo test` with no S3 endpoint available."
+        );
+        return;
+    };
+    let bucket =
+        std::env::var("KHIVE_S3_TEST_BUCKET").unwrap_or_else(|_| "khive-blob-conformance".into());
+    let region = std::env::var("KHIVE_S3_TEST_REGION").unwrap_or_else(|_| "us-east-1".into());
+
+    const PAGE_CROSSING_OBJECT_COUNT: usize = 1200;
+    const PUT_CONCURRENCY: usize = 64;
+
+    let config = S3BlobStoreConfig::new(bucket, region)
+        .with_endpoint(endpoint)
+        .with_allow_http(true)
+        .with_prefix(format!("pagination-{}", uuid::Uuid::new_v4()));
+    let store = S3BlobStore::new(config).expect("S3BlobStore::new against MinIO");
+
+    let live_refs: std::collections::HashSet<ContentRef> =
+        futures::stream::iter((0..PAGE_CROSSING_OBJECT_COUNT).map(|i| {
+            let store = &store;
+            async move {
+                store
+                    .put(format!("khive pagination object {i}").into_bytes())
+                    .await
+                    .expect("put a page-boundary object")
+            }
+        }))
+        .buffer_unordered(PUT_CONCURRENCY)
+        .collect()
+        .await;
+    assert_eq!(live_refs.len(), PAGE_CROSSING_OBJECT_COUNT);
+
+    let sweep = store
+        .orphan_sweep(&BlobOrphanSweepConfig {
+            live_refs,
+            dry_run: true,
+        })
+        .await
+        .expect("orphan_sweep must complete across every LIST page");
+    assert!(
+        sweep.scanned >= PAGE_CROSSING_OBJECT_COUNT as u64,
+        "sweep must scan every populated object across all LIST pages, got {sweep:?}"
+    );
+    assert_eq!(
+        sweep.would_delete, 0,
+        "every populated object is in live_refs; a paginated dry-run sweep must report \
+         zero orphans, got {sweep:?}"
+    );
 }

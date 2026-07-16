@@ -1558,6 +1558,19 @@ fn build_registry_for_multi_backend_inner(
         cfg
     });
 
+    // ADR-111 Amendment 2: resolve the config-selected `BlobStore` once
+    // against the main backend and install it on every runtime handle this
+    // boot produces (`default_runtime` plus each per-pack runtime), so a
+    // pack that later reads `KhiveRuntime::blob_store()` sees the same
+    // selection regardless of which backend its own KG data lives on.
+    if let Some(store) =
+        install_resolved_blob_store(&default_runtime, khive_cfg, main_backend.as_ref())?
+    {
+        for rt in per_pack_runtimes_local.values() {
+            rt.install_blob_store(store.clone());
+        }
+    }
+
     #[cfg(feature = "bench-embedder")]
     {
         for rt in per_pack_runtimes_local.values() {
@@ -1810,6 +1823,7 @@ pub fn build_server_with_explicit_namespace(
     if khive_cfg.backends.is_empty() {
         // Single-backend path — identical to pre-ADR-028 behavior.
         let runtime = KhiveRuntime::new(config)?;
+        install_resolved_blob_store(&runtime, &khive_cfg, runtime.backend())?;
         #[cfg(feature = "bench-embedder")]
         {
             for name in runtime.registered_embedding_model_names() {
@@ -2034,6 +2048,43 @@ pub fn checkpoint_pool_for(main_backend: &StorageBackend) -> Option<Arc<Connecti
         Some(main_backend.pool_arc())
     } else {
         None
+    }
+}
+
+/// Resolve `khive.toml`'s `[storage.blob]` selection against `backend` and
+/// install it on `rt` (ADR-111 Amendment 2's boot-wiring requirement).
+///
+/// Returns the resolved store on success so multi-backend callers can also
+/// install it on every per-pack runtime without re-resolving it.
+///
+/// An **explicit** `[storage.blob]` section that fails to resolve (an `s3`
+/// backend with no AWS credentials in the environment, an invalid prefix,
+/// etc.) aborts boot: silently falling back to `FsBlobStore` would defeat
+/// the point of declaring `backend = "s3"`. When `[storage.blob]` is
+/// **absent**, a resolution failure (e.g. an in-memory backend with no root
+/// to default beside — every `--db :memory:` invocation and most unit
+/// tests) is non-fatal and leaves `KhiveRuntime::blob_store()` unset:
+/// nothing yet consumes it, and forcing a filesystem root onto every
+/// in-memory boot would be a behavior change nobody asked for.
+fn install_resolved_blob_store(
+    rt: &KhiveRuntime,
+    khive_cfg: &KhiveConfig,
+    backend: &StorageBackend,
+) -> anyhow::Result<Option<Arc<dyn khive_storage::BlobStore>>> {
+    match khive_runtime::resolve_blob_store(khive_cfg, backend) {
+        Ok(store) => {
+            rt.install_blob_store(store.clone());
+            Ok(Some(store))
+        }
+        Err(e) if khive_cfg.storage.blob.is_none() => {
+            tracing::debug!(
+                error = %e,
+                "no usable BlobStore for this backend and no [storage.blob] configured; \
+                 leaving KhiveRuntime::blob_store() unset"
+            );
+            Ok(None)
+        }
+        Err(e) => Err(anyhow::anyhow!("[storage.blob] configuration error: {e}")),
     }
 }
 
@@ -2419,7 +2470,7 @@ fn resolve_actor_from_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use khive_runtime::Namespace;
+    use khive_runtime::{BlobConfig, Namespace, StorageSectionConfig};
     use serial_test::serial;
     use std::io::Write;
 
@@ -3601,6 +3652,124 @@ id = "lambda:project-actor"
         assert!(
             server.pool().is_none(),
             "in-memory multi-backend main must never carry a checkpoint pool"
+        );
+    }
+
+    // ── ADR-111 Amendment 2, H2 fix round 2: `resolve_blob_store` must
+    // actually be reached from the real boot paths, not only its own unit
+    // tests. Both tests below assert against the credential-env error
+    // `S3BlobStore::new` raises with no AWS creds in the environment --
+    // exactly the technique `khive-runtime`'s own `resolve_blob_store` tests
+    // use -- but reached through `build_server`/`build_registry_for_multi_backend`
+    // themselves, proving the boot path resolves and installs the configured
+    // `S3BlobStore` rather than silently keeping the default `FsBlobStore`.
+
+    #[test]
+    #[serial]
+    fn single_backend_boot_wires_configured_s3_blob_store() {
+        std::env::remove_var("KHIVE_DB");
+        std::env::remove_var("KHIVE_ACTOR");
+        std::env::remove_var("KHIVE_PACKS");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+        let prev_access_key = std::env::var("AWS_ACCESS_KEY_ID").ok();
+        let prev_secret_key = std::env::var("AWS_SECRET_ACCESS_KEY").ok();
+        std::env::remove_var("AWS_ACCESS_KEY_ID");
+        std::env::remove_var("AWS_SECRET_ACCESS_KEY");
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config_path = write_config(
+            dir.path(),
+            r#"
+[storage.blob]
+backend = "s3"
+bucket = "khive-blobs"
+region = "us-east-1"
+"#,
+        );
+
+        use clap::Parser;
+        let args = Args::parse_from([
+            "mcp",
+            "--db",
+            ":memory:",
+            "--pack",
+            "kg",
+            "--config",
+            config_path.to_str().expect("utf8 path"),
+        ]);
+
+        let result = build_server(&args);
+
+        match prev_access_key {
+            Some(v) => std::env::set_var("AWS_ACCESS_KEY_ID", v),
+            None => std::env::remove_var("AWS_ACCESS_KEY_ID"),
+        }
+        match prev_secret_key {
+            Some(v) => std::env::set_var("AWS_SECRET_ACCESS_KEY", v),
+            None => std::env::remove_var("AWS_SECRET_ACCESS_KEY"),
+        }
+
+        let err = result.err().expect(
+            "an s3 blob backend with no AWS credentials must fail boot through the real \
+             single-backend path -- a silent fs fallback would return Ok here instead",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("AWS_ACCESS_KEY_ID"),
+            "expected the credential-env error surfaced through build_server, got: {msg}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn multi_backend_boot_wires_configured_s3_blob_store() {
+        let prev_access_key = std::env::var("AWS_ACCESS_KEY_ID").ok();
+        let prev_secret_key = std::env::var("AWS_SECRET_ACCESS_KEY").ok();
+        std::env::remove_var("AWS_ACCESS_KEY_ID");
+        std::env::remove_var("AWS_SECRET_ACCESS_KEY");
+
+        let khive_cfg = KhiveConfig {
+            backends: vec![BackendConfig {
+                name: "main".to_string(),
+                kind: BackendKind::Memory,
+                path: None,
+                cache_mb: None,
+                journal_mode: None,
+                read_only: false,
+            }],
+            storage: StorageSectionConfig {
+                blob: Some(BlobConfig::S3 {
+                    bucket: "khive-blobs".to_string(),
+                    region: "us-east-1".to_string(),
+                    endpoint: None,
+                    prefix: None,
+                    allow_http: None,
+                }),
+            },
+            ..KhiveConfig::default()
+        };
+        let base_cfg = base_runtime_config_for_multi_backend();
+
+        let result = build_registry_for_multi_backend(base_cfg, &khive_cfg, None);
+
+        match prev_access_key {
+            Some(v) => std::env::set_var("AWS_ACCESS_KEY_ID", v),
+            None => std::env::remove_var("AWS_ACCESS_KEY_ID"),
+        }
+        match prev_secret_key {
+            Some(v) => std::env::set_var("AWS_SECRET_ACCESS_KEY", v),
+            None => std::env::remove_var("AWS_SECRET_ACCESS_KEY"),
+        }
+
+        let err = result.err().expect(
+            "an s3 blob backend with no AWS credentials must fail boot through the real \
+             multi-backend path -- a silent fs fallback would return Ok here instead",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("AWS_ACCESS_KEY_ID"),
+            "expected the credential-env error surfaced through \
+             build_registry_for_multi_backend, got: {msg}"
         );
     }
 

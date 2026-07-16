@@ -536,6 +536,12 @@ impl BlobStore for S3BlobStore {
     // `PAGE_SIZE` remote-listing entries held at once) and deletes run at
     // bounded concurrency; a list or delete failure aborts with an error
     // rather than reporting a partial scan as complete.
+    //
+    // Every network step -- each `stream.next()` poll and each concurrent
+    // delete -- is wrapped in `self.request_timeout`, same as `put`/`get`/
+    // `exists`/`delete` above (ADR-111 Amendment 2, H1 fix round 2): a
+    // deadline elapsing maps to `StorageError::Timeout`, and any other
+    // error the provider returns keeps the `Driver` classification.
     async fn orphan_sweep(
         &self,
         config: &BlobOrphanSweepConfig,
@@ -553,10 +559,13 @@ impl BlobStore for S3BlobStore {
         loop {
             let mut page: Vec<ObjectMeta> = Vec::with_capacity(PAGE_SIZE);
             while page.len() < PAGE_SIZE {
-                match stream.next().await {
-                    Some(Ok(meta)) => page.push(meta),
-                    Some(Err(e)) => return Err(map_object_store_err(e, "orphan_sweep_list")),
-                    None => break,
+                match tokio::time::timeout(self.request_timeout, stream.next()).await {
+                    Ok(Some(Ok(meta))) => page.push(meta),
+                    Ok(Some(Err(e))) => {
+                        return Err(map_object_store_err(e, "orphan_sweep_list"));
+                    }
+                    Ok(None) => break,
+                    Err(_elapsed) => return Err(timeout_error("orphan_sweep_list")),
                 }
             }
             if page.is_empty() {
@@ -583,16 +592,24 @@ impl BlobStore for S3BlobStore {
             }
 
             if !to_delete.is_empty() {
-                let results: Vec<Result<(), ObjectStoreError>> =
+                let request_timeout = self.request_timeout;
+                let results: Vec<StorageResult<()>> =
                     futures::stream::iter(to_delete.into_iter().map(|path| {
                         let client = Arc::clone(&self.client);
-                        async move { client.delete(&path).await }
+                        async move {
+                            match tokio::time::timeout(request_timeout, client.delete(&path)).await
+                            {
+                                Ok(Ok(())) => Ok(()),
+                                Ok(Err(e)) => Err(map_object_store_err(e, "orphan_sweep_delete")),
+                                Err(_elapsed) => Err(timeout_error("orphan_sweep_delete")),
+                            }
+                        }
                     }))
                     .buffer_unordered(DELETE_CONCURRENCY)
                     .collect()
                     .await;
                 for r in results {
-                    r.map_err(|e| map_object_store_err(e, "orphan_sweep_delete"))?;
+                    r?;
                     deleted += 1;
                 }
             }
@@ -898,16 +915,34 @@ mod tests {
 
         type Result<T> = std::result::Result<T, ObjectStoreError>;
 
+        /// One scripted outcome for a single entry the fake's `list` stream
+        /// yields (ADR-111 Amendment 2, H1 fix round 2 -- partial-page
+        /// error/timeout coverage for `orphan_sweep`).
+        #[derive(Clone, Debug)]
+        pub enum ListOutcome {
+            /// Yield one valid `ObjectMeta` at this object-store key.
+            Entry(String),
+            /// The list stream errors at this position (mid-page failure).
+            Err,
+            /// Never resolves within the test's configured `request_timeout`.
+            Hang,
+        }
+
         /// A scripted `ObjectStore` fake. `put_script`/`get_opts_script` are
         /// consumed in order, one entry per call; running past the end of a
         /// script repeats its last entry (so a short script can still cover
-        /// an unbounded outer-retry loop in a test).
+        /// an unbounded outer-retry loop in a test). `list_script` and
+        /// `delete_script` are Arc-wrapped because `delete_stream`/`list`
+        /// must return a `'static` stream that outlives the `&self` borrow.
         #[derive(Debug)]
         pub struct FakeObjectStore {
             put_script: Mutex<Vec<Outcome>>,
             get_script: Mutex<Vec<Outcome>>,
+            list_script: Arc<Mutex<Vec<ListOutcome>>>,
+            delete_script: Arc<Mutex<Vec<Outcome>>>,
             pub put_calls: AtomicUsize,
             pub get_calls: AtomicUsize,
+            pub delete_calls: Arc<AtomicUsize>,
             /// How long a `Hang` outcome sleeps before resolving --
             /// deliberately far longer than the test's configured
             /// `request_timeout`, so `tokio::time::timeout` always wins the
@@ -927,10 +962,28 @@ mod tests {
                 Self {
                     put_script: Mutex::new(put_script),
                     get_script: Mutex::new(get_script),
+                    list_script: Arc::new(Mutex::new(Vec::new())),
+                    delete_script: Arc::new(Mutex::new(vec![Outcome::Ok])),
                     put_calls: AtomicUsize::new(0),
                     get_calls: AtomicUsize::new(0),
+                    delete_calls: Arc::new(AtomicUsize::new(0)),
                     hang_delay: Duration::from_secs(3600),
                 }
+            }
+
+            /// Script the fake's `list` stream (H1 fix round 2): the sweep
+            /// tests below use this to yield N valid entries then an error,
+            /// or a `Hang` entry to exercise the per-page timeout.
+            pub fn with_list_script(self, script: Vec<ListOutcome>) -> Self {
+                *self.list_script.lock().unwrap() = script;
+                self
+            }
+
+            /// Script the fake's `delete` outcomes (H1 fix round 2). Defaults
+            /// to always-`Ok` so existing sweep behavior needs no script.
+            pub fn with_delete_script(self, script: Vec<Outcome>) -> Self {
+                *self.delete_script.lock().unwrap() = script;
+                self
             }
 
             fn next_outcome(script: &Mutex<Vec<Outcome>>, calls: &AtomicUsize) -> Outcome {
@@ -993,13 +1046,55 @@ mod tests {
 
             fn delete_stream(
                 &self,
-                _locations: BoxStream<'static, Result<ObjectPath>>,
+                locations: BoxStream<'static, Result<ObjectPath>>,
             ) -> BoxStream<'static, Result<ObjectPath>> {
-                unimplemented!("not exercised by these tests")
+                let delete_script = Arc::clone(&self.delete_script);
+                let delete_calls = Arc::clone(&self.delete_calls);
+                let hang_delay = self.hang_delay;
+                locations
+                    .then(move |loc_result| {
+                        let delete_script = Arc::clone(&delete_script);
+                        let delete_calls = Arc::clone(&delete_calls);
+                        async move {
+                            let location = loc_result?;
+                            let outcome =
+                                Self::next_outcome(delete_script.as_ref(), delete_calls.as_ref());
+                            if matches!(outcome, Outcome::Hang) {
+                                tokio::time::sleep(hang_delay).await;
+                            }
+                            outcome_to_result(&outcome, || location.clone())
+                        }
+                    })
+                    .boxed()
             }
 
             fn list(&self, _prefix: Option<&ObjectPath>) -> BoxStream<'static, Result<ObjectMeta>> {
-                stream::empty().boxed()
+                let script = self.list_script.lock().unwrap().clone();
+                let hang_delay = self.hang_delay;
+                if script.is_empty() {
+                    return stream::empty().boxed();
+                }
+                stream::iter(script)
+                    .then(move |outcome| async move {
+                        match outcome {
+                            ListOutcome::Entry(location) => Ok(ObjectMeta {
+                                location: ObjectPath::from(location),
+                                last_modified: chrono::Utc::now(),
+                                size: 0,
+                                e_tag: None,
+                                version: None,
+                            }),
+                            ListOutcome::Err => Err(ObjectStoreError::Generic {
+                                store: "fake",
+                                source: "list exhausted transient failure".into(),
+                            }),
+                            ListOutcome::Hang => {
+                                tokio::time::sleep(hang_delay).await;
+                                unreachable!("Hang must be intercepted before this resolves")
+                            }
+                        }
+                    })
+                    .boxed()
             }
 
             async fn list_with_delimiter(
@@ -1020,7 +1115,7 @@ mod tests {
         }
     }
 
-    use fake_client::{FakeObjectStore, Outcome};
+    use fake_client::{FakeObjectStore, ListOutcome, Outcome};
     use std::sync::atomic::Ordering;
 
     fn fake_store(
@@ -1124,6 +1219,81 @@ mod tests {
         let (_fake, store) = fake_store(vec![], vec![Outcome::Hang]);
         let content_ref = ContentRef::from_hex("d".repeat(64)).unwrap();
         let err = store.exists(&content_ref).await.unwrap_err();
+        assert!(matches!(err, StorageError::Timeout { .. }), "got {err:?}");
+    }
+
+    // ── `orphan_sweep` timeout/error-mapping tests (ADR-111 Amendment 2,
+    // H1 fix round 2) ──────────────────────────────────────────────────────
+
+    fn valid_shard_key(byte: char) -> String {
+        let hex = byte.to_string().repeat(64);
+        format!("blobs/{}/{}/{}", &hex[0..2], &hex[2..4], hex)
+    }
+
+    fn fake_sweep_store(list_script: Vec<ListOutcome>) -> (Arc<FakeObjectStore>, S3BlobStore) {
+        let fake = Arc::new(FakeObjectStore::new(vec![], vec![]).with_list_script(list_script));
+        let store = S3BlobStore::from_client_for_test(
+            Arc::clone(&fake) as Arc<dyn ObjectStore>,
+            "blobs",
+            3,
+            Duration::from_millis(50),
+            Duration::from_millis(1),
+        )
+        .unwrap();
+        (fake, store)
+    }
+
+    #[tokio::test]
+    async fn orphan_sweep_list_timeout_maps_to_storage_timeout() {
+        let (_fake, store) = fake_sweep_store(vec![ListOutcome::Hang]);
+        let config = BlobOrphanSweepConfig {
+            live_refs: Default::default(),
+            dry_run: true,
+        };
+        let err = store.orphan_sweep(&config).await.unwrap_err();
+        assert!(matches!(err, StorageError::Timeout { .. }), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn orphan_sweep_partial_page_then_error_returns_err_not_partial_success() {
+        // Two valid entries followed by a list error -- the sweep must
+        // never report the two valid entries as a completed (partial) scan.
+        let (_fake, store) = fake_sweep_store(vec![
+            ListOutcome::Entry(valid_shard_key('1')),
+            ListOutcome::Entry(valid_shard_key('2')),
+            ListOutcome::Err,
+        ]);
+        let config = BlobOrphanSweepConfig {
+            live_refs: Default::default(),
+            dry_run: true,
+        };
+        let err = store.orphan_sweep(&config).await.unwrap_err();
+        assert!(matches!(err, StorageError::Driver { .. }), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn orphan_sweep_delete_timeout_maps_to_storage_timeout() {
+        let fake = Arc::new(
+            FakeObjectStore::new(vec![], vec![])
+                .with_list_script(vec![ListOutcome::Entry(valid_shard_key('3'))])
+                .with_delete_script(vec![Outcome::Hang]),
+        );
+        let store = S3BlobStore::from_client_for_test(
+            Arc::clone(&fake) as Arc<dyn ObjectStore>,
+            "blobs",
+            3,
+            Duration::from_millis(50),
+            Duration::from_millis(1),
+        )
+        .unwrap();
+        // Empty `live_refs`: the single scripted entry is orphaned, so a
+        // non-dry-run sweep issues exactly one delete, which hangs past the
+        // configured request_timeout.
+        let config = BlobOrphanSweepConfig {
+            live_refs: Default::default(),
+            dry_run: false,
+        };
+        let err = store.orphan_sweep(&config).await.unwrap_err();
         assert!(matches!(err, StorageError::Timeout { .. }), "got {err:?}");
     }
 }

@@ -434,19 +434,20 @@ jobs:
       # `server /data` as its command, and GitHub Actions service containers
       # cannot override the image's default command/entrypoint.
       #
-      # TODO(pin): this must be pinned to an immutable `minio/minio@sha256:...`
-      # digest before this job is treated as a required merge gate, matching
-      # the repo's own supply-chain-pin convention (see `supply-chain` job
-      # above). This PR was authored without registry access to resolve a
-      # current digest -- do not merge this job as a required check on the
-      # floating `:latest` tag; resolve and pin the digest first.
+      # Pinned to an immutable digest (H3 fix round 2), matching the repo's
+      # own supply-chain-pin convention (see the `supply-chain` job above).
+      # Resolved 2026-07-16 from the `minio/minio:latest` manifest list via
+      # `registry-1.docker.io`'s `Docker-Content-Digest` response header
+      # (`docker.io/v2/minio/minio/manifests/latest`). Both the server
+      # container below and the `mc` client image in the next step pin the
+      # same digest.
       - name: Start pinned MinIO
         if: steps.changed.outputs.run == 'true'
         run: |
           docker run -d --name khive-minio -p 9000:9000 \
             -e MINIO_ROOT_USER=khive-ci \
             -e MINIO_ROOT_PASSWORD=khive-ci-secret \
-            minio/minio:latest \
+            minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e \
             server /data
           for _ in $(seq 1 30); do
             if curl -sf http://127.0.0.1:9000/minio/health/live >/dev/null; then
@@ -460,7 +461,8 @@ jobs:
       - name: Create the conformance bucket
         if: steps.changed.outputs.run == 'true'
         run: |
-          docker run --rm --network host --entrypoint /bin/sh minio/minio -c \
+          docker run --rm --network host --entrypoint /bin/sh \
+            minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e -c \
             "mc alias set ci http://127.0.0.1:9000 khive-ci khive-ci-secret && \
              mc mb --ignore-existing ci/khive-blob-conformance"
       - name: Shared BlobStore conformance suite against MinIO
@@ -589,6 +591,7 @@ jobs:
       - coverage-ratchet
       - wasm-parity
       - vamana-portability
+      - minio-blob-compat
     if: always()
     steps:
       - name: Check aggregated job results
