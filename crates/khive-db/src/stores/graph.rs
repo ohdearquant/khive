@@ -542,17 +542,8 @@ impl SqlGraphStore {
     /// Route a single-row write through the pool-wide `WriterTask` when
     /// `KHIVE_WRITE_QUEUE=1` and a handle is available; otherwise fall back
     /// to the legacy standalone-connection / pool-mutex path (ADR-067
-    /// Component A, Fork C slice 2).
-    ///
-    /// This is the ONE routing point for every `with_writer` caller in this
-    /// store (`upsert_edge`, `delete_edge`, `purge_incident_edges`). `f`
-    /// must be DML-only — on the flag-on path it runs inside the
-    /// WriterTask's own transaction, so a bare `BEGIN IMMEDIATE` would
-    /// violate SQLite's nested-transaction rule. `upsert_edges` (the batch
-    /// method) does its own flag check and returns early on `Some`, so its
-    /// fallback call into this helper only ever executes on the flag-off
-    /// path (`self.writer_task` is `None` by construction whenever that
-    /// call is reached) — no double-routing.
+    /// Component A, Fork C slice 2). `f` must be DML-only. See
+    /// `crates/khive-db/docs/api/graph.md` for the per-caller routing rules.
     async fn with_writer<F, R>(&self, op: &'static str, f: F) -> Result<R, StorageError>
     where
         F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
@@ -858,24 +849,12 @@ fn canonical_edge_endpoints(
 }
 
 /// DML-only batch upsert loop shared by both the legacy (flag-off) and
-/// WriterTask-routed (flag-on) `upsert_edges` paths (ADR-067 Component A).
-///
-/// Issues no `BEGIN` / `COMMIT` / `ROLLBACK` itself — the caller owns the
-/// enclosing transaction. All-or-nothing: the first row failure returns
-/// `Err` immediately (matching the pre-existing `upsert_edges` contract,
-/// unlike `upsert_entities`/`upsert_notes`'s partial-success accounting) —
-/// the caller's transaction wrapper (either the legacy `with_writer` closure
-/// or `WriteRequest::execute_and_reply`) issues the ROLLBACK.
-///
-/// Per-row DML comes from [`edge_upsert_statement`] — the SAME builder
-/// singleton `upsert_edge` calls (ADR-099 §B3): this function previously
-/// hand-wrote a second, textually-independent copy of the natural-key
-/// conflict arms here, the exact drift class the
-/// [`EDGE_NATURAL_KEY_CONFLICT_SET`] extraction was meant to close for good
-/// — a future change to that constant would have silently stopped reaching
-/// this batch path). `bind_params` is the same `SqlStatement` -> rusqlite
-/// binding `upsert_edge` uses; there is now exactly one literal for the
-/// edge natural-key conflict arms in the whole workspace.
+/// WriterTask-routed (flag-on) `upsert_edges` paths. Issues no
+/// `BEGIN`/`COMMIT`/`ROLLBACK` itself — the caller owns the transaction.
+/// All-or-nothing: the first row failure returns `Err` immediately. See
+/// `crates/khive-db/docs/api/graph.md` for why this shares
+/// [`edge_upsert_statement`]'s conflict-arm builder rather than a
+/// second copy.
 fn batch_upsert_edges(
     conn: &rusqlite::Connection,
     edges: &[Edge],
@@ -899,22 +878,13 @@ fn batch_upsert_edges(
     })
 }
 
-/// Standalone existence probe for both endpoints of a would-be edge,
-/// matching exactly the `WHERE EXISTS(...)` shape
+/// Standalone existence probe for both endpoints of a would-be edge (#769),
+/// matching the `WHERE EXISTS(...)` shape
 /// [`edge_insert_guarded_by_endpoints_statement`] embeds in its own guarded
-/// `INSERT`. Used by [`batch_upsert_edges_guarded`] to pre-check an entire
-/// batch, inside one write-locked transaction, before issuing any `INSERT`
-/// (#769) — SQLite's `BEGIN IMMEDIATE` holds the write lock for the whole
-/// closure, so nothing can delete an endpoint between this check and the
-/// batch's inserts. Also used by [`SqlGraphStore::upsert_edge_guarded`] to
-/// name which endpoint(s) were missing after a refused single-row insert,
-/// in the SAME writer closure as the insert itself — this is what makes the
-/// resulting `MissingEndpoints` an in-transaction fact rather than a
-/// reconstruction from a later, separately-scheduled read.
-///
-/// Returns per-endpoint existence rather than a single AND'd bool so callers
-/// can report exactly which side was missing instead of a generic
-/// "source or target" message.
+/// `INSERT`. Returns per-endpoint existence (not a single AND'd bool) so
+/// callers can report exactly which side was missing. See
+/// `crates/khive-db/docs/api/graph.md` for its two call sites and why both
+/// need in-transaction, not reconstructed-after-the-fact, results.
 fn edge_endpoints_exist(
     conn: &rusqlite::Connection,
     source_id: Uuid,
@@ -973,18 +943,11 @@ fn edge_insert_guarded(
 
 /// DML-only guarded batch upsert loop shared by both the legacy (flag-off)
 /// and WriterTask-routed (flag-on) `upsert_edges_guarded` paths, mirroring
-/// [`batch_upsert_edges`]'s split.
-///
-/// Pre-checks every edge's endpoints with [`edge_endpoints_exist`] BEFORE
-/// issuing any `INSERT` — if any endpoint is missing, the function returns
-/// immediately with `affected: 0` and issues no writes at all, so the
-/// caller's enclosing transaction has nothing to roll back (#769). Only
-/// once every edge has been confirmed does it fall through to the plain
-/// [`edge_upsert_statement`] writes, identical to `batch_upsert_edges`.
-///
-/// The refusing entry's index and its `MissingEndpoints` are captured by
-/// this same pre-check pass and returned as `GuardedBatchOutcome::refused`
-/// — the runtime layer no longer re-probes endpoints after the fact.
+/// [`batch_upsert_edges`]'s split. Pre-checks every edge's endpoints with
+/// [`edge_endpoints_exist`] BEFORE issuing any `INSERT` — if any endpoint is
+/// missing, returns immediately with `affected: 0` and no writes at all
+/// (#769), so the caller's transaction has nothing to roll back. See
+/// `crates/khive-db/docs/api/graph.md`.
 fn batch_upsert_edges_guarded(
     conn: &rusqlite::Connection,
     edges: &[Edge],

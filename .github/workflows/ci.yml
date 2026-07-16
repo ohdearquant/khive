@@ -392,6 +392,28 @@ jobs:
       - name: Native sequential and owned-storage tests
         run: cargo test -p khive-quant -p khive-vamana --no-default-features
 
+  check-windows:
+    name: Windows compile check
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: crates
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+          cache-on-failure: true
+      # 0.5.0 release blocker: khive-runtime/khive-mcp's daemon subsystem must
+      # compile on x86_64-pc-windows-msvc (the npm package's Windows target).
+      # Not (yet) a required check in branch protection — plain `cargo check`
+      # (no --all-targets) keeps this fast while the Windows lane is new;
+      # widen once it has proven stable.
+      - name: cargo check --workspace (Windows)
+        run: cargo check --workspace
+
   coverage-ratchet:
     name: Coverage ratchet
     runs-on: ubuntu-latest
@@ -406,6 +428,18 @@ jobs:
     # rejected and fail the job on every merge.
     steps:
       - uses: actions/checkout@v7
+      # `cargo llvm-cov --workspace` is the disk-heaviest command in CI: it
+      # instruments every crate and emits per-object profraw files on top of the
+      # normal target dir, overflowing the ubuntu runner's ~21GB and surfacing as
+      # `No space left on device`. The matrix `ci` job already purges the unused
+      # preinstalled toolchains to reclaim ~25GB; this gate needs the same purge.
+      - name: Free runner disk (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force || true
+          df -h /
       - uses: dtolnay/rust-toolchain@1.94.1
         with:
           components: llvm-tools-preview
@@ -413,6 +447,7 @@ jobs:
         with:
           workspaces: crates
           cache-on-failure: true
+          cache-targets: false
       # Pinned to a commit SHA, not the mutable @v2 tag (same rationale as the
       # #215 cargo-deny installer pin): a required gate's tooling must not drift.
       - uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2.82.2

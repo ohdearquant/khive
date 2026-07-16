@@ -190,3 +190,56 @@ Rationale: the kkernel unification (ADR-003 convergence path, now complete) abso
 `khive-mcp` as a library, making `kkernel` the sole shipped Rust binary. All MCP
 configurations, daemon-spawn logic, and user-facing documentation should reference
 `kkernel mcp` and `kkernel mcp --daemon` instead of `khive-mcp` and `khive-mcp --daemon`.
+
+## Amendment 2 (2026-07-14): graduated fail-loud fallback policy
+
+This amendment supersedes the unconditional fallback mandate in Decision section 2
+("**Fallback to local dispatch** is mandatory. ... The daemon is an **optimization, never a
+hard dependency**."). Operational experience showed that an unconditional silent fallback
+masks exactly the defect classes the daemon rollout must surface: configuration divergence
+between client and daemon, namespace mismatches, version skew after a binary upgrade, and
+broken daemon recovery (a spawn that fails, or a spawned child that exits before binding the
+socket). A client that silently serves such a request from its cold in-process registry
+reports success while hiding a topology fault.
+
+### Graduated policy
+
+Every fallback decision is classified by a closed `FallbackReason` set with stable string
+codes: `config_mismatch`, `namespace_mismatch`, `no_socket`, `parse_failure`,
+`protocol_mismatch`. Reasons carry a legitimacy tier that governs observability:
+
+- **No-daemon** (`no_socket`): a daemon is genuinely absent or unreachable. Fallback to
+  local dispatch proceeds quietly, as originally specified. Environments that cannot or
+  must not run a daemon opt out explicitly with `KHIVE_NO_DAEMON=1`, which short-circuits
+  before any spawn attempt; tests and the smoke test continue to run daemonless.
+- **Rollout-transient** (`protocol_mismatch`, `parse_failure`): expected briefly during
+  binary upgrades. Fallback proceeds, logged at WARN with the reason code.
+- **Illegitimate** (`config_mismatch`, `namespace_mismatch`): a correctly configured
+  deployment never produces these. Fallback is logged at ERROR and counted in a dedicated
+  strict-violations metric alongside the per-reason fallback counters.
+
+Under `KHIVE_DAEMON_STRICT=1`, a request that would fall back for **any** reason is instead
+rejected with a structured error carrying the reason code and a stable machine-checkable
+marker, so "strict mode active and fallback count zero" is a sound proof that every served
+request was daemon-dispatched. Strict mode is default-off.
+
+### Confirmed respawn failures reject
+
+When the client itself initiated daemon recovery and **positively observed** the failure —
+the spawn call returned an error, or the spawned child exited before binding the socket —
+the failure is a confirmed daemon-recovery fault, not a no-daemon environment. These paths
+do not fall back in either mode: they return a stable `respawn_failed` error with safe
+remediation text. Detailed context (spawn error, log excerpts, executable path) is emitted
+through local structured logging only and never included in the caller-visible error.
+
+Rationale: a confirmed respawn failure means the operator's installation is broken (bad
+binary, permissions, version skew). Serving the request cold would hide that fault behind
+degraded-but-working behavior; the explicit opt-outs (`KHIVE_NO_DAEMON=1` for daemonless
+environments) remain the sanctioned way to run without a daemon.
+
+### What is unchanged
+
+The daemon remains an optimization for warm-state reuse; the thin-client architecture,
+socket protocol, and background warm behavior of this ADR are unaffected. Quiet local
+dispatch remains the contract for genuinely daemonless environments (`no_socket` without a
+confirmed failed recovery attempt, and the `KHIVE_NO_DAEMON=1` opt-out).

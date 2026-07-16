@@ -143,10 +143,7 @@ impl Parser {
                 if c == '-' {
                     self.advance();
                 }
-                // Grammar (docs/design.md): integer = ["-"] digit+ ; float = ["-"]
-                // digit+ "." digit+ -- digits are required on both sides of the
-                // dot. Reject "1." and "-.5" instead of delegating the bare
-                // lexeme to f64::parse, which accepts both.
+                // Enforce digits on both sides; `f64::parse` would accept `1.` and `-.5`.
                 let int_start = self.pos;
                 while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
                     self.advance();
@@ -169,10 +166,7 @@ impl Parser {
                     }
                 }
                 let s: String = self.input[start..self.pos].iter().collect();
-                // No decimal point: integer lexeme -- parse as i64 so the value
-                // survives round-trip past 2^53 (f64's exact-integer limit) and
-                // both i64 bounds. Scientific notation is not part of this
-                // grammar, so an integer lexeme is always plain decimal digits.
+                // Preserve exact i64 values instead of rounding through f64 past 2^53.
                 if !has_frac {
                     let n: i64 = s.parse().map_err(|_| {
                         self.err(format!(
@@ -259,7 +253,6 @@ impl Parser {
             });
         }
 
-        // Variable name (optional — skip if next is ':' or '{')
         if let Some(c) = self.peek() {
             if c.is_alphabetic() || c == '_' {
                 let start = self.pos;
@@ -274,21 +267,18 @@ impl Parser {
             }
         }
 
-        // Kind label
         self.skip_whitespace();
         if self.peek() == Some(':') {
             self.advance();
             kind = Some(self.parse_ident()?.to_lowercase());
         }
 
-        // Properties
         self.skip_whitespace();
         if self.peek() == Some('{') {
             properties = self.parse_props()?;
         }
 
-        // Lift entity_type out of properties so the SQL compiler targets the
-        // dedicated column instead of json_extract(properties, '$.entity_type').
+        // `entity_type` has a governed column and must not become arbitrary JSON.
         let entity_type = match properties.remove("entity_type") {
             Some(ConditionValue::String(s)) => Some(s),
             Some(_) => return Err(self.err("entity_type must be a string literal")),
@@ -307,7 +297,6 @@ impl Parser {
     fn parse_edge_pattern(&mut self) -> Result<EdgePattern, QueryError> {
         self.skip_whitespace();
 
-        // Detect direction prefix
         let direction_start = if self.peek() == Some('<') {
             self.advance(); // '<'
             self.expect_char('-')?;
@@ -331,7 +320,6 @@ impl Parser {
             variable = Some(self.parse_ident()?);
         }
 
-        // Relation types
         self.skip_whitespace();
         if self.peek() == Some(':') {
             self.advance();
@@ -342,7 +330,6 @@ impl Parser {
             }
         }
 
-        // Variable-length range
         self.skip_whitespace();
         if self.peek() == Some('*') {
             self.advance();
@@ -365,9 +352,7 @@ impl Parser {
 
         self.expect_char(']')?;
 
-        // Direction suffix: a `-` is required after `]` to close the edge pattern.
-        // Without it, patterns like `(a)-[e:extends](b)` would be silently accepted
-        // with an arbitrary direction — reject instead.
+        // Require the closing dash so direction is never inferred from malformed syntax.
         self.expect_char('-')?;
         let direction = if self.peek() == Some('>') {
             self.advance();
@@ -489,7 +474,7 @@ impl Parser {
         })
     }
 
-    /// Parse a single AND-chain of conditions.
+    /// Parses one AND-chain.
     fn parse_and_expr(&mut self) -> Result<WhereExpr, QueryError> {
         let first = WhereExpr::Condition(self.parse_condition()?);
         let mut acc = first;
@@ -504,7 +489,7 @@ impl Parser {
         Ok(acc)
     }
 
-    /// Parse a WHERE expression: and_expr ('OR' and_expr)*. AND binds tighter than OR.
+    /// Parses OR-separated AND-chains, giving AND higher precedence.
     fn parse_where_expr(&mut self) -> Result<WhereExpr, QueryError> {
         let first = self.parse_and_expr()?;
         let mut acc = first;
@@ -581,19 +566,19 @@ impl Parser {
     }
 }
 
-/// Parse a GQL query string into a [`GqlQuery`] AST. Errors on invalid syntax.
+/// Parses the supported read-only GQL subset into a [`GqlQuery`].
+///
+/// # Errors
+///
+/// Returns [`QueryError`] for invalid, write-shaped, or unsupported syntax.
+/// See `crates/khive-query/docs/api/parsing.md` for grammar and literal rules.
 pub fn parse(input: &str) -> Result<GqlQuery, QueryError> {
     reject_gql_write(input.trim())?;
     let mut parser = Parser::new(input.trim());
     parser.parse_query()
 }
 
-/// Reject GQL/Cypher-style write forms with an explicit, actionable error.
-///
-/// The GQL parser already requires `MATCH` as the leading keyword, so
-/// `CREATE`, `DELETE`, `SET`, and `MERGE` are parse errors by accident.
-/// This check makes the rejection deliberate ("the query verb is read-only")
-/// rather than relying on the incidental grammar constraint.
+/// Deliberately rejects GQL/Cypher writes before the read grammar runs.
 fn reject_gql_write(input: &str) -> Result<(), QueryError> {
     let first = input.split_whitespace().next().unwrap_or("").to_uppercase();
     match first.as_str() {
@@ -691,7 +676,6 @@ mod tests {
 
     #[test]
     fn where_clause_and_or() {
-        // AND binds tighter than OR: `a AND b OR c` = `(a AND b) OR c`
         let q = parse(
             "MATCH (a:concept)-[e:extends]->(b) WHERE a.name = 'X' AND a.kind = 'concept' OR b.kind = 'project' RETURN a"
         ).unwrap();
@@ -792,8 +776,6 @@ mod tests {
         );
     }
 
-    // --- Read-only invariant regression tests (#16) ---
-
     #[test]
     fn gql_create_rejected_with_readonly_message() {
         let err = parse("CREATE (n:concept {name: 'X'}) RETURN n").unwrap_err();
@@ -843,7 +825,6 @@ mod tests {
 
     #[test]
     fn gql_match_still_compiles_after_write_guard() {
-        // Positive control: a valid MATCH must still parse correctly.
         let q = parse("MATCH (a:concept)-[:extends]->(b) RETURN a").unwrap();
         assert!(!q.pattern.elements.is_empty(), "valid MATCH must parse");
     }

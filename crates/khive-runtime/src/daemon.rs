@@ -8,24 +8,31 @@
 //! The client side (forwarding, auto-spawn) lives in the transport crate
 //! (e.g. `khive-mcp`), not here.
 
-use std::io::Write as _;
-use std::path::PathBuf;
 use std::sync::Arc;
 
+#[cfg(unix)]
+use std::io::Write as _;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
+#[cfg(unix)]
+use std::path::PathBuf;
 
+#[cfg(unix)]
 use async_trait::async_trait;
 #[cfg(unix)]
 use libc;
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 
+#[cfg(unix)]
 use khive_db::{run_checkpoint_task, CheckpointConfig, ConnectionPool};
 
+#[cfg(unix)]
 use crate::pack::RequestIdentity;
 
 /// Maximum frame size accepted in either direction.
@@ -38,21 +45,15 @@ pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// in every request; the daemon rejects mismatches with an explicit error
 /// that names both sides so the operator knows exactly what to do
 /// (`make local` rebuilds the client binary).
-///
-/// Version history:
-///   1 — initial versioned framing (added `protocol_version` + `version_mismatch`);
-///       added `probe_only` request field + probe-ack sentinel shape in response
-///   2 — gate subhandler verbs by wire origin (`from_wire` request field)
-///   3 — added per-request identity context to the request frame (`actor_id`,
-///       `visible_namespaces`); the daemon now serves a request under the
-///       frame's identity instead of rejecting on `namespace_mismatch` (the
-///       `config_id` equality reject stays hard)
+/// See `docs/api/daemon.md#protocol_version` for the version-by-version history.
 pub const PROTOCOL_VERSION: u32 = 3;
 
+#[cfg(unix)]
 const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 10;
 
 // ── paths ─────────────────────────────────────────────────────────────────────
 
+#[cfg(unix)]
 fn khive_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     PathBuf::from(home).join(".khive")
@@ -61,6 +62,7 @@ fn khive_dir() -> PathBuf {
 /// Unix socket path the daemon binds and clients connect to.
 ///
 /// Overridable via the `KHIVE_SOCKET` env var (for tests and ops).
+#[cfg(unix)]
 pub fn socket_path() -> PathBuf {
     if let Ok(p) = std::env::var("KHIVE_SOCKET") {
         if !p.is_empty() {
@@ -73,6 +75,7 @@ pub fn socket_path() -> PathBuf {
 /// PID file path written by the daemon.
 ///
 /// Overridable via the `KHIVE_PID` env var.
+#[cfg(unix)]
 pub fn pid_path() -> PathBuf {
     if let Ok(p) = std::env::var("KHIVE_PID") {
         if !p.is_empty() {
@@ -86,6 +89,7 @@ pub fn pid_path() -> PathBuf {
 /// clients (flock on the file; released when the lock file handle is dropped).
 ///
 /// Overridable via the `KHIVE_LOCK` env var (for tests).
+#[cfg(unix)]
 pub fn lock_path() -> PathBuf {
     if let Ok(p) = std::env::var("KHIVE_LOCK") {
         if !p.is_empty() {
@@ -104,6 +108,7 @@ pub fn lock_path() -> PathBuf {
 /// lock for that whole span would.
 ///
 /// Overridable via the `KHIVE_RECOVERER_LOCK` env var (for tests).
+#[cfg(unix)]
 pub fn recoverer_lock_path() -> PathBuf {
     if let Ok(p) = std::env::var("KHIVE_RECOVERER_LOCK") {
         if !p.is_empty() {
@@ -155,18 +160,16 @@ pub fn acquire_recovery_lock() -> Option<std::fs::File> {
 }
 
 /// Attempt to acquire an exclusive advisory flock on `path`, retrying with a
-/// non-blocking `flock(LOCK_NB)` until `deadline` elapses.
+/// non-blocking `flock(LOCK_NB)` until `deadline` elapses. Bounded alternative
+/// to `acquire_recovery_lock`/`acquire_daemon_boot_guard`'s unbounded blocking
+/// flock — see `docs/api/daemon.md#try_acquire_flock_until` for why a caller
+/// merely detecting lock freedom needs a deadline instead.
 ///
-/// Unlike [`acquire_recovery_lock`]/[`acquire_daemon_boot_guard`] (unbounded
-/// blocking `flock`, correct for the daemon's own boot sequence where waiting
-/// until quiescence IS the desired behavior), a caller only trying to *detect*
-/// whether a lock is currently free — without committing to wait forever for
-/// a possibly-wedged holder: needs a deadline instead. Returns:
-///   - `Ok(Some(file))` — the lock was free within the deadline.
-///   - `Ok(None)` — `deadline` elapsed while the lock stayed held; an
-///     explicit "could not confirm" outcome, distinct from a hard I/O error.
-///   - `Err(_)` — the lock file could not be opened, or `flock` failed for a
-///     reason other than contention.
+/// - `Ok(Some(file))` — the lock was free within the deadline.
+/// - `Ok(None)` — `deadline` elapsed while the lock stayed held; an explicit
+///   "could not confirm" outcome, distinct from a hard I/O error.
+/// - `Err(_)` — the lock file could not be opened, or `flock` failed for a
+///   reason other than contention.
 ///
 /// Blocking (paces retries with `std::thread::sleep`) — async callers must
 /// run this via `spawn_blocking`.
@@ -462,6 +465,7 @@ pub struct MetricsSnapshot {
 // ── framing ───────────────────────────────────────────────────────────────────
 
 /// Read one length-prefixed frame (4-byte BE u32 length + JSON bytes).
+#[cfg(unix)]
 pub async fn read_frame(stream: &mut UnixStream) -> std::io::Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
@@ -478,6 +482,7 @@ pub async fn read_frame(stream: &mut UnixStream) -> std::io::Result<Vec<u8>> {
 }
 
 /// Write one length-prefixed frame.
+#[cfg(unix)]
 pub async fn write_frame(stream: &mut UnixStream, payload: &[u8]) -> std::io::Result<()> {
     if payload.len() > MAX_FRAME_BYTES {
         return Err(std::io::Error::new(
@@ -503,6 +508,7 @@ pub async fn write_frame(stream: &mut UnixStream, payload: &[u8]) -> std::io::Re
 /// while honoring [`DaemonRequestFrame::from_wire`] (so subhandler visibility is
 /// gated by request origin, not by transport); any future transport can do the
 /// same.
+#[cfg(unix)]
 #[async_trait]
 pub trait DaemonDispatch: Clone + Send + Sync + 'static {
     /// Dispatch a verb-DSL request string and return the rendered result.
@@ -699,18 +705,9 @@ pub fn active_phase_names() -> Vec<String> {
 /// Build a point-in-time [`MetricsSnapshot`] of this process's server-side
 /// gauges. Called only from `handle_conn`'s `metrics_only` arm — a
 /// process-global, read-only assembly with no side effects of its own.
-///
-/// `tx_registry` (ADR-091 Plank 0) is a process-global singleton reachable
-/// directly, with no plumbing through `dispatcher`. `wal_pages` and the
-/// TRUNCATE counters (ADR-091 Plank 2) are read from `khive_db::checkpoint`'s
-/// module-scoped atomics, updated wherever the checkpoint task already calls
-/// `query_wal_pages`/`note_truncate_outcome` — mirroring the fallback-counter
-/// pattern in `khive-mcp/src/daemon.rs` rather than threading a metrics
-/// handle through every checkpoint call site, since the checkpoint task
-/// itself is a fire-and-forget `tokio::spawn` with no handle retained
-/// anywhere this accept loop can reach. `write_queue_depth`/`_capacity`
-/// (ADR-067 Component A) come from the dispatcher's own pool, if any, and
-/// are `None` unless `KHIVE_WRITE_QUEUE=1` actually spawned a writer task.
+/// See `docs/api/daemon.md#build_metrics_snapshot` for where each gauge is sourced
+/// from and why.
+#[cfg(unix)]
 fn build_metrics_snapshot<D: DaemonDispatch>(dispatcher: &D) -> MetricsSnapshot {
     let open_tx_count = khive_storage::tx_registry::snapshot().len();
     let (oldest_pinned_tx_micros, oldest_pinned_tx_label) =
@@ -740,6 +737,7 @@ fn build_metrics_snapshot<D: DaemonDispatch>(dispatcher: &D) -> MetricsSnapshot 
     }
 }
 
+#[cfg(unix)]
 async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
     let raw = match read_frame(&mut stream).await {
         Ok(r) => r,
@@ -937,45 +935,32 @@ async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
 /// Run the daemon: bind the socket, warm in the background, serve request
 /// frames until SIGTERM/SIGINT.
 ///
-/// Fatally acquires its own startup lock. This only protects
-/// cleanup→bind→pid-write; by the time this function runs, `dispatcher` (a
-/// `DaemonDispatch` built from a `KhiveMcpServer`) has *already* run
-/// migrations and applied pack schema plans while constructing itself,
-/// unguarded. Production boot must go through
-/// [`run_daemon_with_boot_guard`] instead, which extends the same lock back
-/// over that construction step. This entry point remains for callers (and
-/// tests) that build the dispatcher and start serving as one atomic step with
-/// no separate boot-guard window to protect — but it still acquires the boot
-/// guard fatally (never proceeds unguarded), so the cleanup→bind→pid-write
-/// race surface is always mutually excluded.
+/// Fatally acquires its own startup lock, which only protects
+/// cleanup→bind→pid-write — `dispatcher` has already run migrations and
+/// applied pack schema plans while constructing itself, unguarded. Production
+/// boot must go through [`run_daemon_with_boot_guard`] instead, which extends
+/// the same lock back over construction. This entry point is for callers
+/// (and tests) that build the dispatcher and start serving as one atomic
+/// step with no separate boot-guard window to protect.
+#[cfg(unix)]
 pub async fn run_daemon<D: DaemonDispatch>(dispatcher: D) -> anyhow::Result<()> {
-    #[cfg(unix)]
     let boot_guard = Some(acquire_daemon_boot_guard()?);
-    #[cfg(not(unix))]
-    let boot_guard = None;
     run_daemon_with_boot_guard(dispatcher, boot_guard).await
 }
 
 /// Run the daemon using a startup lock acquired by the caller *before*
-/// building `dispatcher`.
+/// building `dispatcher`, so a second process racing to boot (e.g. two
+/// `kkernel mcp --daemon` spawns before either has bound its socket) cannot
+/// run migrations/FTS DDL concurrently against the same database file.
+/// `boot_guard` is only `None` on non-unix targets, where there is no
+/// advisory boot lock to hold in the first place; every unix daemon-mode
+/// caller passes `Some`.
 ///
-/// Cold-boot schema initialization (migrations, pack schema plans / FTS DDL)
-/// happens while `dispatcher` is being constructed, i.e. before this
-/// function is ever called. Passing an already-held `boot_guard` in lets the
-/// caller extend that same lock backward over construction, so a second
-/// process racing to boot (e.g. two `kkernel mcp --daemon` spawns before
-/// either has bound its socket) cannot run migrations/FTS DDL concurrently
-/// against the same database file. On unix every daemon-mode
-/// caller passes `Some` — `run_daemon` and the production entry points
-/// (`serve.rs`, `kkernel`) all acquire the guard fatally via
-/// `acquire_daemon_boot_guard` before constructing `dispatcher`. `boot_guard`
-/// is only `None` on non-unix targets, where there is no advisory boot lock to
-/// hold in the first place.
-///
-/// The guard is held across cleanup → bind → pid-write, exactly as
-/// `run_daemon`'s inline lock used to be, then dropped — see the "Deadlock
-/// note" below for why the caller must not still be holding a *different*
-/// handle to the same lock file at that point.
+/// The guard is held across cleanup → bind → pid-write, then dropped. The
+/// caller must not still be holding a *different* handle to the same lock
+/// file when this function is entered — see the "Deadlock note" on the
+/// `_startup_lock` binding below for why that would self-deadlock on `flock`.
+#[cfg(unix)]
 pub async fn run_daemon_with_boot_guard<D: DaemonDispatch>(
     dispatcher: D,
     boot_guard: Option<std::fs::File>,
@@ -985,7 +970,6 @@ pub async fn run_daemon_with_boot_guard<D: DaemonDispatch>(
 
     if let Some(parent) = sock.parent() {
         std::fs::create_dir_all(parent)?;
-        #[cfg(unix)]
         if let Err(e) = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)) {
             tracing::warn!(error = %e, path = ?parent, "failed to chmod 0700 khive dir");
         }
@@ -1012,17 +996,14 @@ pub async fn run_daemon_with_boot_guard<D: DaemonDispatch>(
     }
 
     let listener = UnixListener::bind(&sock)?;
-    #[cfg(unix)]
     if let Err(e) = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600)) {
         tracing::warn!(error = %e, path = ?sock, "failed to chmod 0600 socket");
     }
     // Captured while still holding the startup lock, immediately after
     // bind, so shutdown cleanup can later prove "this is still the same socket
     // I bound" rather than trusting the path alone.
-    #[cfg(unix)]
     let bound_identity = socket_identity(&sock);
 
-    #[cfg(unix)]
     if let Err(e) = write_pid_file_exclusive(&pid_file) {
         if e.kind() == std::io::ErrorKind::AlreadyExists {
             // A PID file appeared between our own `cleanup_stale_daemon`
@@ -1049,12 +1030,9 @@ pub async fn run_daemon_with_boot_guard<D: DaemonDispatch>(
         }
         return Err(e.into());
     }
-    #[cfg(not(unix))]
-    write_pid_file_exclusive(&pid_file)?;
     // Release the startup lock now: the listener is bound and the PID file is
     // written.  Any concurrent client or daemon startup will observe a live
     // socket+pid and take the non-recovery path.
-    #[cfg(unix)]
     drop(_startup_lock);
     tracing::info!(socket = ?sock, pid = std::process::id(), "khived listening");
 
@@ -1138,24 +1116,16 @@ pub async fn run_daemon_with_boot_guard<D: DaemonDispatch>(
     // `sock` is still the exact one this daemon bound — otherwise a
     // replacement daemon owns those paths now and unlinking would delete its
     // live socket/PID out from under it.
-    #[cfg(unix)]
-    {
-        match acquire_recovery_lock() {
-            Some(_shutdown_lock) => {
-                shutdown_cleanup_if_owned(&sock, &pid_file, bound_identity);
-            }
-            None => {
-                tracing::warn!(
-                    "could not acquire recovery lock for shutdown cleanup; \
-                     skipping unlink to avoid deleting a replacement daemon's paths"
-                );
-            }
+    match acquire_recovery_lock() {
+        Some(_shutdown_lock) => {
+            shutdown_cleanup_if_owned(&sock, &pid_file, bound_identity);
         }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = std::fs::remove_file(&sock);
-        let _ = std::fs::remove_file(&pid_file);
+        None => {
+            tracing::warn!(
+                "could not acquire recovery lock for shutdown cleanup; \
+                 skipping unlink to avoid deleting a replacement daemon's paths"
+            );
+        }
     }
     tracing::info!("khived stopped");
     Ok(())
@@ -1198,6 +1168,7 @@ fn shutdown_cleanup_if_owned(
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 /// Liveness verdict for a `kill(pid, 0)` probe.
+#[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PidLiveness {
     /// errno 0 — signal delivery succeeded, the process exists and this
@@ -1212,6 +1183,7 @@ enum PidLiveness {
     PermissionDenied,
 }
 
+#[cfg(unix)]
 impl PidLiveness {
     fn is_running(self) -> bool {
         !matches!(self, PidLiveness::Dead)
@@ -1221,6 +1193,7 @@ impl PidLiveness {
 /// Maps a `kill(pid, 0)` outcome (return code + errno) to a [`PidLiveness`].
 /// Pure and side-effect-free so the errno mapping can be unit tested without
 /// a real process probe.
+#[cfg(unix)]
 fn classify_kill_result(rc: i32, errno: i32) -> PidLiveness {
     if rc == 0 {
         return PidLiveness::Alive;
@@ -1231,6 +1204,7 @@ fn classify_kill_result(rc: i32, errno: i32) -> PidLiveness {
     }
 }
 
+#[cfg(unix)]
 fn is_process_running(pid: u32) -> bool {
     let Ok(pid) = i32::try_from(pid) else {
         return false;
@@ -1244,6 +1218,7 @@ fn is_process_running(pid: u32) -> bool {
     classify_kill_result(rc, errno).is_running()
 }
 
+#[cfg(unix)]
 async fn cleanup_stale_daemon(sock: &std::path::Path, pid_file: &std::path::Path) -> bool {
     if let Ok(pid_str) = std::fs::read_to_string(pid_file) {
         if let Ok(pid) = pid_str.trim().parse::<u32>() {
@@ -1279,14 +1254,12 @@ async fn cleanup_stale_daemon(sock: &std::path::Path, pid_file: &std::path::Path
 /// the defense that holds even if the lock itself is unavailable to one side:
 /// the loser observes `ErrorKind::AlreadyExists` instead of clobbering the
 /// winner's PID out from under it.
+#[cfg(unix)]
 fn write_pid_file_exclusive(pid_file: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
+    opts.write(true).create_new(true).mode(0o600);
     let mut f = opts.open(pid_file)?;
     f.write_all(std::process::id().to_string().as_bytes())?;
     Ok(())
@@ -1313,6 +1286,7 @@ async fn pid_file_names_a_reachable_daemon(
         && UnixStream::connect(sock).await.is_ok()
 }
 
+#[cfg(unix)]
 async fn drain(active: &std::sync::atomic::AtomicUsize) {
     use std::sync::atomic::Ordering;
     let remaining = || active.load(Ordering::Relaxed) + background_task_count();
@@ -1333,6 +1307,7 @@ async fn drain(active: &std::sync::atomic::AtomicUsize) {
     }
 }
 
+#[cfg(unix)]
 fn drain_timeout() -> std::time::Duration {
     let secs = std::env::var("KHIVE_DRAIN_TIMEOUT_SECS")
         .ok()
@@ -1342,6 +1317,7 @@ fn drain_timeout() -> std::time::Duration {
 }
 
 /// Returns `true` for non-empty env values that are not `"0"` or `"false"`.
+#[cfg(unix)]
 pub fn env_truthy(key: &str) -> bool {
     std::env::var(key)
         .map(|v| {
@@ -1351,7 +1327,7 @@ pub fn env_truthy(key: &str) -> bool {
         .unwrap_or(false)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use serial_test::serial;

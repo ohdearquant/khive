@@ -1,6 +1,6 @@
 # ADR-108: Git Write Surface Through khive (Phase B)
 
-**Status**: Proposed\
+**Status**: Accepted\
 **Date**: 2026-07-11\
 **Authors**: khive maintainers\
 **Depends on**: ADR-088 (Git-Lifecycle Pack) and its Amendment 1 (`git.digest`), ADR-018

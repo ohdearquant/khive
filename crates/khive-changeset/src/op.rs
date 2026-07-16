@@ -7,8 +7,9 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::strict::{StrictEntity, StrictLink, StrictNote};
 
-/// One staged mutation. Tagged internally by `"op"` so every NDJSON-delta
-/// line self-describes its kind without a wrapping envelope.
+/// One staged mutation, internally tagged by the snake-case `op` field.
+///
+/// See `crates/khive-changeset/docs/api/create-and-link.md` for wire examples.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Op {
@@ -19,10 +20,9 @@ pub enum Op {
     Merge(MergeOp),
 }
 
-// ---- create -----------------------------------------------------------
-
-/// Create a new entity or note. `id` is minted at stage time and is stable
-/// across however long the change-set sits before it is applied.
+/// Creates an entity or note with an ID minted and stabilized at stage time.
+///
+/// See `crates/khive-changeset/docs/api/create-and-link.md` for field semantics.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateOp {
@@ -31,7 +31,7 @@ pub struct CreateOp {
     pub target: CreateTarget,
 }
 
-/// The substrate a `create` op targets, with its own field surface.
+/// Substrate-specific create fields, tagged by `kind`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CreateTarget {
@@ -39,6 +39,7 @@ pub enum CreateTarget {
     Note(NoteCreateFields),
 }
 
+/// Fields staged for a new entity.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EntityCreateFields {
@@ -54,6 +55,7 @@ pub struct EntityCreateFields {
     pub tags: Vec<String>,
 }
 
+/// Fields staged for a new note.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NoteCreateFields {
@@ -70,11 +72,11 @@ pub struct NoteCreateFields {
     pub decay_factor: Option<f64>,
 }
 
-// ---- link ---------------------------------------------------------------
-
-/// Create a new directed, typed edge. `id` is minted at stage time; `source`
-/// and `target` may resolve to another op's stage-time `id` in the same or a
-/// different change-set.
+/// Creates a directed edge whose ID is minted at stage time.
+///
+/// Endpoints may reference stage-time IDs from this or another change-set.
+/// `weight` must be finite and in `[0.0, 1.0]` when deserialized.
+/// See `crates/khive-changeset/docs/api/create-and-link.md` for field semantics.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(into = "LinkOpRaw")]
 pub struct LinkOp {
@@ -149,18 +151,11 @@ impl<'de> Deserialize<'de> for LinkOp {
     }
 }
 
-// ---- update ---------------------------------------------------------------
-
-/// Patch an existing entity, note, or edge's mutable fields, carrying a
-/// stage-time preimage scoped to exactly the fields the patch touches.
-/// `preimage`'s populated fields must equal `patch`'s touched fields —
-/// every field the patch sets or explicitly clears to null, and no field
-/// the patch leaves unchanged — enforced at deserialize time, the same
-/// discipline `DeleteOp` and `MergeOp` apply to their own preimages below.
-/// An `UpdateOp` whose preimage and patch disagree on which fields changed
-/// is unrepresentable — both the checked constructor and `Deserialize`
-/// enforce the same congruence validation, so there is no construction path
-/// that bypasses it.
+/// Patches one record with a stage-time preimage of exactly the touched fields.
+///
+/// Patch and preimage must target the same substrate and have identical field
+/// presence; both construction and deserialization enforce this invariant.
+/// See `crates/khive-changeset/docs/api/update.md` for nullable-field semantics.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct UpdateOp {
     target_id: Id128,
@@ -169,11 +164,12 @@ pub struct UpdateOp {
 }
 
 impl UpdateOp {
-    /// Construct an `UpdateOp`, enforcing the congruence invariant:
-    /// `preimage` must target the same substrate as `patch` and populate
-    /// exactly the fields `patch` touches. This is the same invariant the
-    /// `Deserialize` impl enforces on the wire, so an incongruent update
-    /// cannot be built through either entry point.
+    /// Constructs an update after validating patch/preimage congruence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for differing substrates or field sets, or for an
+    /// invalid captured salience, decay factor, or edge weight.
     pub fn new(
         target_id: Id128,
         patch: UpdatePatch,
@@ -221,6 +217,9 @@ impl<'de> Deserialize<'de> for UpdateOp {
     }
 }
 
+/// Substrate-specific patch tagged by `target`.
+///
+/// See `crates/khive-changeset/docs/api/update.md` for field-presence semantics.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "target", rename_all = "snake_case")]
 pub enum UpdatePatch {
@@ -229,8 +228,7 @@ pub enum UpdatePatch {
     Edge(EdgePatch),
 }
 
-/// Absent field = unchanged. `description` distinguishes explicit-null
-/// (clear) from absent (unchanged) via `Option<Option<String>>`.
+/// Entity fields to mutate; absent means unchanged and `Some(None)` clears description.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EntityPatch {
@@ -244,6 +242,7 @@ pub struct EntityPatch {
     pub tags: Option<Vec<String>>,
 }
 
+/// Note fields to mutate; nested options distinguish unchanged, clear, and set.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NotePatch {
@@ -259,9 +258,7 @@ pub struct NotePatch {
     pub tags: Option<Vec<String>>,
 }
 
-/// `weight`, when present, must be finite and in `[0.0, 1.0]` — the same
-/// invariant `LinkOp`/`khive_types::Link` enforce, so a staged edge update
-/// can never target a weight the live graph would itself reject.
+/// Edge fields to mutate; weight must be finite and in `[0.0, 1.0]`.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(into = "EdgePatchRaw")]
 pub struct EdgePatch {
@@ -316,8 +313,7 @@ impl<'de> Deserialize<'de> for EdgePatch {
     }
 }
 
-/// Serde helper for `Option<Option<T>>`: distinguishes absent (unchanged)
-/// from explicit `null` (clear) on partial-update patch fields.
+/// Distinguishes an absent patch field from an explicit `null` clear.
 mod opt_opt {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -342,15 +338,7 @@ mod opt_opt {
     }
 }
 
-// ---- update preimage -------------------------------------------------------
-
-/// Prior value of exactly the fields an [`UpdateOp`]'s patch touches,
-/// captured at stage time. Mirrors [`EntityPatch`]'s field shape one-to-one:
-/// a populated preimage field means "the patch touches this field, and this
-/// was its value before the patch"; an absent preimage field means "the
-/// patch leaves this field unchanged." [`UpdateOp`]'s custom `Deserialize`
-/// enforces that this field set exactly equals `EntityPatch`'s touched-field
-/// set.
+/// Prior entity values for exactly the fields touched by [`EntityPatch`].
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EntityPreimage {
@@ -364,12 +352,9 @@ pub struct EntityPreimage {
     pub tags: Option<Vec<String>>,
 }
 
-/// Prior value of exactly the fields an [`UpdateOp`]'s patch touches;
-/// mirrors [`NotePatch`] the same way [`EntityPreimage`] mirrors
-/// [`EntityPatch`]. A captured `salience`/`decay_factor` value, when
-/// present, must satisfy the same finite/range invariant
-/// `khive_types::Note::is_valid` enforces on a live note — a prior value
-/// outside that range could never have been real.
+/// Prior note values for exactly the fields touched by [`NotePatch`].
+///
+/// Captured salience is finite in `[0.0, 1.0]`; decay factor is finite and non-negative.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NotePreimage {
@@ -385,11 +370,9 @@ pub struct NotePreimage {
     pub tags: Option<Vec<String>>,
 }
 
-/// Prior value of exactly the fields an [`UpdateOp`]'s patch touches;
-/// mirrors [`EdgePatch`] the same way [`EntityPreimage`] mirrors
-/// [`EntityPatch`]. A captured `weight` value, when present, must satisfy
-/// the same finite/`[0.0, 1.0]` invariant `EdgePatch`/`LinkOp`/
-/// `khive_types::Link` enforce on a live edge weight.
+/// Prior edge values for exactly the fields touched by [`EdgePatch`].
+///
+/// Captured weight must be finite and in `[0.0, 1.0]`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EdgePreimage {
@@ -399,9 +382,7 @@ pub struct EdgePreimage {
     pub weight: Option<f64>,
 }
 
-/// The field-scoped preimage for one [`UpdateOp`], tagged by the same
-/// `target` discriminant [`UpdatePatch`] uses so a preimage's substrate is
-/// self-describing on the wire.
+/// Field-scoped preimage tagged with the same `target` as [`UpdatePatch`].
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "target", rename_all = "snake_case")]
 pub enum UpdatePreimage {
@@ -410,14 +391,7 @@ pub enum UpdatePreimage {
     Edge(EdgePreimage),
 }
 
-/// Enforce [`UpdateOp`]'s hard requirement: `preimage` targets the same
-/// substrate as `patch`, and the set of fields `preimage` populates equals
-/// the set of fields `patch` touches (sets or explicitly clears) exactly —
-/// no field the patch leaves unchanged, no field the patch touches left
-/// uncaptured. Also re-validates the finite/range invariants a captured
-/// prior `salience`, `decay_factor`, or edge `weight` must satisfy, since an
-/// out-of-range prior value could never have been a real previously-live
-/// state.
+/// Enforces substrate, exact field-set, and captured numeric-value invariants.
 fn validate_update_congruence(
     patch: &UpdatePatch,
     preimage: &UpdatePreimage,
@@ -516,13 +490,10 @@ fn preimage_target_name(preimage: &UpdatePreimage) -> &'static str {
     }
 }
 
-// ---- delete ---------------------------------------------------------------
-
-/// Remove an existing entity, note, or edge. `preimage` captures the full
-/// prior record state at stage time — required, not optional, so a `delete`
-/// op without a captured preimage is unrepresentable. `target_id` is
-/// validated against the embedded preimage's own record id at deserialize
-/// time; a mismatched pair is a parse error, not a silently-accepted op.
+/// Removes one record with its required, full stage-time preimage.
+///
+/// Deserialization requires `target_id` to equal the embedded record ID.
+/// See `crates/khive-changeset/docs/api/delete-and-merge.md` for strictness rules.
 #[derive(Clone, Debug, Serialize)]
 pub struct DeleteOp {
     pub target_id: Id128,
@@ -559,10 +530,7 @@ impl<'de> Deserialize<'de> for DeleteOp {
     }
 }
 
-// `Entity` and `Note` each already serialize their own `kind` field
-// (entity kind / note kind), so the discriminant tag here is `substrate`
-// (matching `khive_types::SubstrateKind`'s vocabulary) rather than `kind`,
-// which would collide and produce a "duplicate field `kind`" parse error.
+/// Full prior record state, tagged by `substrate` to avoid its embedded `kind` field.
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "substrate", rename_all = "snake_case")]
 pub enum DeletePreimage {
@@ -582,9 +550,7 @@ impl DeletePreimage {
     }
 }
 
-/// Deserialize-only mirror of [`DeletePreimage`], substituting each
-/// substrate's strict (`deny_unknown_fields`) wire-shape mirror for the
-/// looser `khive_types` deserializer.
+/// Strict deserialize-only mirror of [`DeletePreimage`].
 #[derive(Deserialize)]
 #[serde(tag = "substrate", rename_all = "snake_case")]
 enum DeletePreimageRaw {
@@ -611,14 +577,11 @@ impl<'de> Deserialize<'de> for DeletePreimage {
     }
 }
 
-// ---- merge ------------------------------------------------------------
-
-/// Merge two entities. `preimage` captures both prior entities and the
-/// incident edges the merge will rewire — required, not optional, so a
-/// `merge` op without a captured preimage is unrepresentable. `into_id` /
-/// `from_id` are validated against `preimage.into` / `preimage.from`'s own
-/// record ids, and every incident edge is validated to actually touch one
-/// of the two merge participants, at deserialize time.
+/// Merges two entities with required participant and incident-edge preimages.
+///
+/// Deserialization matches both IDs and requires every incident edge to touch
+/// at least one participant.
+/// See `crates/khive-changeset/docs/api/delete-and-merge.md` for the full contract.
 #[derive(Clone, Debug, Serialize)]
 pub struct MergeOp {
     pub into_id: Id128,
@@ -670,6 +633,9 @@ impl<'de> Deserialize<'de> for MergeOp {
     }
 }
 
+/// Full prior state required to validate and rewire an entity merge.
+///
+/// See `crates/khive-changeset/docs/api/delete-and-merge.md` for edge coverage rules.
 #[derive(Clone, Debug, Serialize)]
 pub struct MergePreimage {
     pub into: Box<Entity>,
@@ -775,7 +741,6 @@ mod tests {
 
     #[test]
     fn update_op_rejects_preimage_missing_touched_field() {
-        // patch sets `name`; preimage omits it.
         let json = serde_json::json!({
             "target_id": "00000000-0000-0000-0000-000000000001",
             "patch": { "target": "entity", "name": "new-name" },
@@ -787,7 +752,6 @@ mod tests {
 
     #[test]
     fn update_op_rejects_preimage_with_extra_untouched_field() {
-        // patch leaves `name` unchanged; preimage carries it anyway.
         let json = serde_json::json!({
             "target_id": "00000000-0000-0000-0000-000000000001",
             "patch": { "target": "entity", "tags": ["a"] },
@@ -867,10 +831,6 @@ mod tests {
 
     #[test]
     fn update_op_new_rejects_incongruent_construction() {
-        // The public `UpdateOp::new` constructor is the only in-memory way to
-        // build an `UpdateOp` — this proves it enforces the same congruence
-        // invariant `Deserialize` does, so no incongruent op (patch sets
-        // `name`, preimage doesn't capture it) can ever reach `to_ndjson`.
         let result = UpdateOp::new(
             Id128::from_u128(1),
             UpdatePatch::Entity(EntityPatch {

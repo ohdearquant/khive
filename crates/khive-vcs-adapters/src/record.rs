@@ -5,10 +5,9 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// Entity record shape produced by format adapters.
+/// Intermediate entity record validated and persisted by the standard import pipeline.
 ///
-/// Adapters produce these; the standard `khive kg import` pipeline validates
-/// and loads them into `working.db`.
+/// See `crates/khive-vcs-adapters/docs/api/wire-records.md`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntityRecord {
     pub id: Uuid,
@@ -78,7 +77,9 @@ impl TryFrom<EdgeRecordRaw> for EdgeRecord {
     }
 }
 
-/// Edge record shape produced by format adapters. Deserialization rejects non-finite weights.
+/// Intermediate edge record whose deserializer requires finite weight in `[0, 1]`.
+///
+/// See `crates/khive-vcs-adapters/docs/api/wire-records.md`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(try_from = "EdgeRecordRaw")]
 pub struct EdgeRecord {

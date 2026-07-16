@@ -14,29 +14,20 @@ pub mod tunable;
 
 pub use pack::MemoryPack;
 
-/// Bump the durable memory-ANN corpus epoch (#812). `kkernel reindex` mutates
-/// note vectors and deletes the persisted
-/// Vamana snapshot directly, out of process from any running khive daemon —
-/// its in-memory write-generation counter (`ann::bump_generation`) is simply
-/// unreachable from a separate process. Call this after invalidating the
-/// snapshot so a warm daemon sharing the same database file has a durable
-/// signal to observe on its next amortized freshness check
-/// (`ann::maybe_check_durable_epoch`, sampled from the recall path) and
-/// schedules a rebuild instead of serving pre-reindex vectors indefinitely.
+/// Increment and return the durable ANN corpus epoch after snapshot invalidation.
+///
+/// Returns a runtime error when the database update fails. Warm daemons observe the
+/// epoch asynchronously and schedule a rebuild. See `crates/khive-pack-memory/docs/api/ann-lifecycle.md`.
 pub async fn bump_memory_ann_epoch(
     rt: &khive_runtime::KhiveRuntime,
 ) -> Result<u64, khive_runtime::RuntimeError> {
     ann::bump_durable_epoch(rt).await
 }
 
-/// Ensure the `memory_ann_epoch` table exists on `rt` (idempotent, #812).
-/// Declared via
-/// `MemoryPack::SCHEMA_PLAN` for daemon boot (`server.rs`/`serve.rs` apply
-/// every loaded pack's schema plan up front), but `kkernel reindex` runs
-/// directly against a raw `KhiveRuntime` without ever booting a pack
-/// registry — it calls this explicitly, once, before its first
-/// `bump_memory_ann_epoch`, so a reindex against a brand-new database (no
-/// daemon ever started) doesn't fail before this table exists.
+/// Create the durable ANN epoch table if it does not exist.
+///
+/// The operation is idempotent and returns a runtime error on schema failure. Raw-runtime
+/// reindex callers must invoke it before their first epoch bump. See `crates/khive-pack-memory/docs/api/ann-lifecycle.md`.
 pub async fn ensure_ann_epoch_schema(
     rt: &khive_runtime::KhiveRuntime,
 ) -> Result<(), khive_runtime::RuntimeError> {

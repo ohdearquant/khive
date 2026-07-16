@@ -1,4 +1,5 @@
 //! Recall configuration types — scoring weights, decay models, and FTS gather options.
+//! See `crates/khive-pack-memory/docs/api/configuration.md` for the full policy reference.
 
 use std::collections::HashMap;
 
@@ -65,7 +66,7 @@ pub struct RecallConfig {
     /// Explicit max candidates per retrieval path before fusion. When None,
     /// candidate_multiplier keeps the legacy behavior.
     pub candidate_limit: Option<u32>,
-    /// Strategy used to fuse retrieval-source candidate lists. Default RRF k=60.
+    /// Strategy used to fuse retrieval lists. Default weighted `[vector=0.7, text=0.3]`.
     pub fuse_strategy: FusionStrategy,
     /// Minimum composite score to include in results. Default 0.0.
     pub min_score: f64,
@@ -87,24 +88,20 @@ pub struct RecallConfig {
     pub fts_gather: RecallFtsGatherConfig,
 
     // --- ANN over-fetch retry ---
-    /// Maximum rounds for the ANN namespace over-fetch retry loop.
-    ///
-    /// Round 1 is the initial over-fetch; rounds 2–N double the fetch window
-    /// until enough visible-namespace candidates are found or the corpus is
-    /// exhausted. When `None`, falls back to the `ANN_OVERFETCH_MAX_ROUNDS`
-    /// env var (default 3). Pass `Some(1)` to disable widening entirely.
+    /// Maximum rounds for the ANN namespace over-fetch retry loop. Round 1 is
+    /// the initial over-fetch; rounds 2–N double the fetch window until enough
+    /// visible-namespace candidates are found or the corpus is exhausted. When
+    /// `None`, falls back to the `ANN_OVERFETCH_MAX_ROUNDS` env var (default 3).
+    /// Pass `Some(1)` to disable widening entirely.
     pub ann_overfetch_max_rounds: Option<usize>,
 
-    /// Bounded wait (milliseconds) for a cold-miss `ensure_ann_for_model`
-    /// call on the recall path before degrading that model's contribution
-    /// to FTS-only (#836). Recall and the daemon's boot-time background
-    /// warm (`warm_existing_memory_indexes`) both funnel through
-    /// `ensure_ann_for_model`'s per-model single-flight lock; without a
-    /// bound, a recall landing while boot warm holds that lock for a
-    /// from-scratch corpus build waits out the full build (300s+ observed
-    /// in production). When `None`, falls back to the
+    /// Bounded wait (milliseconds) for a cold-miss `ensure_ann_for_model` call
+    /// on the recall path before degrading that model's contribution to
+    /// FTS-only (#836). When `None`, falls back to the
     /// `KHIVE_MEMORY_ANN_READY_TIMEOUT_MS` env var (default 8000ms — see
     /// `handlers::common::ann_ready_timeout_ms`).
+    ///
+    /// See `crates/khive-pack-memory/docs/api/configuration.md` for the operational rationale.
     pub ann_ready_timeout_ms: Option<u64>,
 }
 

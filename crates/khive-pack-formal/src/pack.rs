@@ -1,4 +1,4 @@
-//! `FormalPack` struct, `Pack` impl, self-registration factory, and `PackRuntime` impl.
+//! Formal ontology pack registration and runtime adapter.
 
 use std::sync::Arc;
 
@@ -13,7 +13,9 @@ use khive_types::{EdgeEndpointRule, HandlerDef, Pack};
 
 use crate::vocab::FORMAL_EDGE_RULES;
 
-/// Formal-math ontology pack — pure edge-rule extension, no verbs.
+/// Formal-mathematics edge-rule extension with no verbs or private schema.
+///
+/// See `crates/khive-pack-formal/docs/api/formal-edge-rules.md`.
 pub struct FormalPack {
     #[allow(dead_code)]
     runtime: KhiveRuntime,
@@ -31,12 +33,11 @@ impl Pack for FormalPack {
 }
 
 impl FormalPack {
+    /// Bind the vocabulary-only formal pack to `runtime`.
     pub fn new(runtime: KhiveRuntime) -> Self {
         Self { runtime }
     }
 }
-
-// ── inventory self-registration ───────────────────────────────────────────────
 
 struct FormalPackFactory;
 

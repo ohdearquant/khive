@@ -10,7 +10,6 @@ pub mod config;
 pub mod config_ledger;
 pub mod cost_unit;
 pub mod curation;
-#[cfg(unix)]
 pub mod daemon;
 pub mod embedder_registry;
 pub mod engine_config;
@@ -47,11 +46,10 @@ pub use curation::{
     EntityDedupMergePolicy, EntityPatch, MergeSummary, NotePatch,
 };
 #[cfg(unix)]
-pub use daemon::acquire_recovery_lock;
+pub use daemon::{acquire_recovery_lock, pid_path, run_daemon, socket_path, DaemonDispatch};
 pub use daemon::{
-    active_phase_names, background_task_count, pid_path, register_active_phase, run_daemon,
-    socket_path, track_background_task, DaemonDispatch, DaemonRequestFrame, DaemonResponseFrame,
-    PhaseGuard, PROTOCOL_VERSION,
+    active_phase_names, background_task_count, register_active_phase, track_background_task,
+    DaemonRequestFrame, DaemonResponseFrame, PhaseGuard, PROTOCOL_VERSION,
 };
 pub use embedder_registry::{EmbedderProvider, EmbedderRegistry, LatticeEmbedderProvider};
 pub use engine_config::{
@@ -92,7 +90,7 @@ pub use pack::{
     NoteLifecycleSpec, PackByIdResolver, PackFactory, PackInstall, PackLoadError, PackRegistration,
     PackRegistry, PackRuntime, PackSchemaCollisionError, PackSchemaPlan, ParamDef, RequestIdentity,
     SchemaPlan, VerbCategory, VerbPresentationPolicy, VerbRegistry, VerbRegistryBuilder,
-    Visibility,
+    VerifiedActor, Visibility,
 };
 pub use phase_events::{emit_phase_event, is_benign_shutdown_cancellation};
 pub use portability::{ImportSummary, KgArchive};
@@ -105,9 +103,9 @@ pub use registry::{ObjectiveRegistry, RegisteredObjective};
 pub use resource::{cpu_delta_us, process_resource_usage, ProcessResourceUsage};
 pub use retrieval::{SearchHit, SearchSource};
 pub use runtime::{
-    assert_db_anchor_consistent, parse_pack_list, resolve_db_anchor, resolve_project_actor_id,
-    runtime_config_from_khive_config, BackendId, EntityTypeValidatorFn, KhiveRuntime,
-    NamespaceToken, NoteMutationHookFn, RuntimeConfig,
+    assert_captured_db_anchor_consistent, assert_db_anchor_consistent, parse_pack_list,
+    resolve_db_anchor, resolve_project_actor_id, runtime_config_from_khive_config, BackendId,
+    EntityTypeValidatorFn, KhiveRuntime, NamespaceToken, NoteMutationHookFn, RuntimeConfig,
 };
 pub use secret_gate::SecretMatch;
 pub use validation::{

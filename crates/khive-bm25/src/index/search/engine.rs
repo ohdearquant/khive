@@ -22,13 +22,17 @@ use super::simd::select_score_batch_8;
 const SMALL_QUERY_POSTINGS_THRESHOLD: usize = 16_384;
 
 impl Bm25Index {
-    /// Search for documents matching the query, returning up to `k` results by score.
+    /// Return at most `k` matches by descending score and deterministic ID tie-break.
+    ///
+    /// Empty queries and `k == 0` return no results. See `crates/khive-bm25/docs/api/search.md`.
     pub fn search(&self, query_text: &str, k: usize) -> Vec<(Arc<str>, DeterministicScore)> {
         let mut ctx = SearchContext::new();
         self.search_with_context(query_text, k, &mut ctx)
     }
 
-    /// Search reusing a [`SearchContext`] to avoid per-query allocation churn.
+    /// Search with reusable scratch storage; the context is cleared but retains capacity.
+    ///
+    /// See `crates/khive-bm25/docs/api/search.md`.
     pub fn search_with_context(
         &self,
         query_text: &str,
@@ -193,7 +197,9 @@ impl Bm25Index {
         heap_to_results(self, ctx)
     }
 
-    /// Exact exhaustive scorer (fallback). SIMD-batched inner loop per platform.
+    /// Exhaustively score all matching postings with platform-selected SIMD or scalar code.
+    ///
+    /// Results use the same ordering as [`Self::search`]. See `crates/khive-bm25/docs/api/search.md`.
     #[doc(hidden)]
     pub fn search_brute_force(
         &self,

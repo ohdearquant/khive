@@ -73,3 +73,51 @@ via `khive.toml` (ADR-028).
 - The primary backend is always the first registered.
 - `LocatorCache` entries are immutable once inserted (backend affinity is stable per entity).
 - `fan_out_search` never panics on per-backend errors; errors are captured in the result.
+
+## `kkernel main.rs` — `-e`/subcommand dispatch
+
+`-e/--exec <OPS>` and a subcommand are the CLI's two mutually exclusive top-level
+entry points. clap's derive `conflicts_with` cannot name a `#[command(subcommand)]`
+field directly (confirmed via clap's own startup `debug_assert`, it is not a plain
+`Arg`), so the conflict — and the "neither was given" case — are enforced in
+`resolve_command_result` rather than declaratively on the field.
+
+## `kkernel main.rs` — coordinator-attached boot path
+
+`kkernel mcp` (the `Command::Mcp` branch) builds its multi-backend server through
+`build_multi_backend_server_with_coordinator` in `src/main.rs` — the one place that
+assembles the coordinator's `BackendRegistry`/`SubstrateCoordinator` inputs and hands
+them to `khive_mcp::serve::build_server_from_multi_backend_registry`. It funnels
+through the same `khive_mcp::serve::build_registry_for_multi_backend` choke point the
+plain (coordinator-less) `build_server_multi_backend` path uses, so the db-anchor
+consistency guard, the ADR-078 output-format resolution, and the ADR-091 checkpoint
+pool are each implemented exactly once and apply identically to both boot paths. It
+also returns the resolved `"schedule"`-pack runtime (ADR-106) read out of the same
+`multi.per_pack_runtimes` map used to build the `BackendRegistry`, so the daemon's
+`spawn_schedule_tick_loop_if_daemon` drains the exact backend this boot resolved
+rather than a re-derived config (PR #782).
+
+Regression coverage for this path, in `main.rs`'s `#[cfg(test)]` module:
+
+- `multi_backend_boot_paths_share_identical_non_default_output_format` (#613): the
+  sibling parity tests never configure a non-default output format, so without this
+  case, one boot path silently dropping `apply_env_output_format(...)` would still
+  pass (both would land on the built-in `Json` default). This test sets
+  `[runtime].default_output_format = Table` in the config both constructors consume
+  and asserts the captured format equals that non-default value — the explicit
+  expected-value check is what makes the assertion non-vacuous. `KHIVE_OUTPUT_FORMAT`
+  is cleared/restored via an RAII guard (`#[serial]`) so an ambient env var can never
+  mask a regression.
+- `coordinator_boundary_rejects_diverging_db_path`: a `db_path` that diverges from the
+  canonical anchor for the same `--db` input must be rejected at the coordinator
+  choke point exactly like the plain path rejects it.
+- `coordinator_boot_uses_anchor_captured_by_runtime_config` (#720): the
+  coordinator-attached boot must retain the HOME-derived db anchor captured during
+  runtime-config resolution even if `HOME` changes before registry construction —
+  it must never re-derive the anchor from a (possibly now-different) `HOME`.
+- `coordinator_link_annotates_resolves_edge_target_like_get` (#674): reproduces the
+  production topology (two backends, `session` pack bound to `sessions`, `kg` falling
+  back to `main`) that engages the `SubstrateCoordinator` for `kg` verbs. Before the
+  fix, the coordinator's node locator only probed entity/note substrates, so
+  `link(note, <edge_uuid>, annotates)` failed with "node not found on any backend"
+  even though `get(<edge_uuid>)` resolved the same UUID.
