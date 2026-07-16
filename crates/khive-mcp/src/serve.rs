@@ -3842,47 +3842,59 @@ region = "us-east-1"
     /// with valid (dummy) AWS credentials present, the single-backend startup
     /// path's `install_resolved_blob_store` call (`:1826`) must actually
     /// install an `S3BlobStore`, not merely fail closed when credentials are
-    /// absent. Calls `install_resolved_blob_store` directly -- the exact
-    /// private function that call site invokes -- because `build_server`'s
-    /// `KhiveMcpServer` return value does not expose the installed
-    /// `KhiveRuntime` for inspection after construction.
+    /// absent. Round-4 remediation: drives the real `build_server` boot entry
+    /// (not `KhiveRuntime::new` + a direct `install_resolved_blob_store` call)
+    /// via a temporary `khive.toml` + parsed `Args`, selecting the `schedule`
+    /// pack so its already-installed runtime (`:1847`) is returned for
+    /// inspection.
     #[test]
     #[serial]
     fn single_backend_boot_installs_s3_blob_store_on_successful_selection() {
+        std::env::remove_var("KHIVE_DB");
+        std::env::remove_var("KHIVE_ACTOR");
+        std::env::remove_var("KHIVE_PACKS");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
         let _creds = DummyAwsCredsGuard::set();
 
-        let config = RuntimeConfig {
-            db_path: None,
-            default_namespace: Namespace::parse("test").expect("ns"),
-            embedding_model: None,
-            additional_embedding_models: vec![],
-            packs: vec!["kg".to_string()],
-            ..RuntimeConfig::default()
-        };
-        let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config_path = write_config(
+            dir.path(),
+            r#"
+[storage.blob]
+backend = "s3"
+bucket = "khive-blobs"
+region = "us-east-1"
+"#,
+        );
 
-        let khive_cfg = KhiveConfig {
-            storage: StorageSectionConfig {
-                blob: Some(s3_blob_config()),
-            },
-            ..KhiveConfig::default()
-        };
+        use clap::Parser;
+        let args = Args::parse_from([
+            "mcp",
+            "--db",
+            ":memory:",
+            "--pack",
+            "kg",
+            "--pack",
+            "schedule",
+            "--config",
+            config_path.to_str().expect("utf8 path"),
+        ]);
 
-        let installed = install_resolved_blob_store(&runtime, &khive_cfg, runtime.backend())
-            .expect("valid dummy AWS credentials must resolve and install an S3BlobStore")
-            .expect("an explicit [storage.blob] selection must return Some(store)");
+        let (_server, schedule_rt) = build_server(&args).expect(
+            "valid dummy AWS credentials must resolve and install an S3BlobStore through the \
+             real single-backend boot path",
+        );
+        let runtime = schedule_rt
+            .expect("the schedule pack was selected so its installed runtime must be returned");
+
+        let installed = runtime.blob_store().expect(
+            "install_resolved_blob_store must call KhiveRuntime::install_blob_store at the \
+             real :1826 call site",
+        );
         let debug = format!("{installed:?}");
         assert!(
             debug.contains("S3BlobStore"),
             "expected the installed store to be an S3BlobStore, got: {debug}"
-        );
-
-        let from_runtime = runtime
-            .blob_store()
-            .expect("install_resolved_blob_store must call KhiveRuntime::install_blob_store");
-        assert!(
-            format!("{from_runtime:?}").contains("S3BlobStore"),
-            "the store installed on the runtime via the real :1826 call site must be the S3 selection"
         );
     }
 
@@ -3934,32 +3946,44 @@ region = "us-east-1"
     /// with no `[storage.blob]` section at all, the single-backend startup
     /// path must still install a usable `FsBlobStore` rooted beside the
     /// database file, and that store must actually round-trip a blob --
-    /// not merely construct without error.
+    /// not merely construct without error. Round-4 remediation: drives the
+    /// real `build_server` boot entry via a temporary (sectionless)
+    /// `khive.toml` + parsed `Args`, selecting the `schedule` pack so its
+    /// already-installed runtime (`:1847`) is returned for inspection.
     #[tokio::test]
     #[serial]
     async fn single_backend_boot_default_fs_blob_store_is_usable_without_storage_section() {
+        std::env::remove_var("KHIVE_DB");
+        std::env::remove_var("KHIVE_ACTOR");
+        std::env::remove_var("KHIVE_PACKS");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+
         let dir = tempfile::tempdir().expect("temp dir");
         let db_path = dir.path().join("main.db");
+        let config_path = write_config(dir.path(), "");
 
-        let config = RuntimeConfig {
-            db_path: Some(db_path),
-            default_namespace: Namespace::parse("test").expect("ns"),
-            embedding_model: None,
-            additional_embedding_models: vec![],
-            packs: vec!["kg".to_string()],
-            ..RuntimeConfig::default()
-        };
-        let runtime = KhiveRuntime::new(config).expect("file-backed runtime");
+        use clap::Parser;
+        let args = Args::parse_from([
+            "mcp",
+            "--db",
+            db_path.to_str().expect("utf8 path"),
+            "--pack",
+            "kg",
+            "--pack",
+            "schedule",
+            "--config",
+            config_path.to_str().expect("utf8 path"),
+        ]);
 
-        let khive_cfg = KhiveConfig::default();
-        assert!(
-            khive_cfg.storage.blob.is_none(),
-            "precondition: no [storage.blob] section configured"
+        let (_server, schedule_rt) = build_server(&args)
+            .expect("absent [storage.blob] must resolve the fs default through the real single-backend boot path");
+        let runtime = schedule_rt
+            .expect("the schedule pack was selected so its installed runtime must be returned");
+
+        let installed = runtime.blob_store().expect(
+            "install_resolved_blob_store must call KhiveRuntime::install_blob_store at the \
+             real :1826 call site for a file-backed backend",
         );
-
-        let installed = install_resolved_blob_store(&runtime, &khive_cfg, runtime.backend())
-            .expect("absent [storage.blob] must resolve the fs default beside a file-backed db")
-            .expect("a file-backed backend must resolve Some(FsBlobStore), not None");
         let debug = format!("{installed:?}");
         assert!(
             debug.contains("FsBlobStore"),
