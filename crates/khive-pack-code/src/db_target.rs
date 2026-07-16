@@ -74,8 +74,20 @@ pub(crate) fn resolve_target_db(
     if let Some(prod) = default_production_db_path() {
         forbidden.push(prod);
     }
-    if let Some(runtime_db) = runtime_db_path {
-        forbidden.push(runtime_db.to_path_buf());
+    match runtime_db_path {
+        Some(runtime_db) => forbidden.push(runtime_db.to_path_buf()),
+        // `config().db_path` is unresolved (not reachable by the production
+        // daemon today, which always populates it at startup) — fall back to
+        // `KHIVE_DB` directly so the fence is total rather than
+        // total-in-practice: an operator running with an env-only override
+        // and no resolved config path is still covered (#1042).
+        None => {
+            if let Ok(env_db) = std::env::var("KHIVE_DB") {
+                if !env_db.is_empty() {
+                    forbidden.push(PathBuf::from(env_db));
+                }
+            }
+        }
     }
 
     for forbidden_path in &forbidden {
@@ -158,5 +170,48 @@ mod tests {
         )
         .expect_err("symlinked-parent alias of the configured db must be rejected");
         assert!(err.contains("shared production database"));
+    }
+
+    /// Serializes tests that mutate the process-wide `KHIVE_DB` env var —
+    /// `std::env::set_var`/`remove_var` race across parallel `cargo test`
+    /// threads otherwise.
+    static KHIVE_DB_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn env_khive_db_is_fenced_when_config_db_path_is_unresolved() {
+        let _guard = KHIVE_DB_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let env_db = tmp.path().join("env-configured.db");
+        std::fs::write(&env_db, b"").expect("create sentinel file");
+        // SAFETY: serialized by KHIVE_DB_ENV_LOCK above.
+        unsafe {
+            std::env::set_var("KHIVE_DB", &env_db);
+        }
+        let result = resolve_target_db(
+            Some(env_db.to_str().unwrap()),
+            Path::new("/tmp/some-repo"),
+            None, // config().db_path unresolved — the #1042 gap
+        );
+        unsafe {
+            std::env::remove_var("KHIVE_DB");
+        }
+        let err = result.expect_err("KHIVE_DB must be fenced even when runtime_db_path is None");
+        assert!(err.contains("shared production database"));
+    }
+
+    #[test]
+    fn dedicated_path_still_accepted_with_no_khive_db_env_and_unresolved_config() {
+        let _guard = KHIVE_DB_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: serialized by KHIVE_DB_ENV_LOCK above.
+        unsafe {
+            std::env::remove_var("KHIVE_DB");
+        }
+        let db = resolve_target_db(
+            Some("/tmp/code-ingest-map-2.db"),
+            Path::new("/tmp/some-repo"),
+            None,
+        )
+        .expect("dedicated path accepted with no env override");
+        assert_eq!(db, PathBuf::from("/tmp/code-ingest-map-2.db"));
     }
 }
