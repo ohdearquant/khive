@@ -311,6 +311,22 @@ class ReconcileExistingNoteTests(unittest.TestCase):
         self.assertEqual(kk.link_calls, [])
         self.assertEqual(stats.edges_backfilled, 0)
 
+    def test_failed_backfill_link_raises(self):
+        # Round-3 regression: a rejected link write must raise (so the caller
+        # never appends the cursor), not silently count as backfilled.
+        class RejectingKKernel(FakeKKernel):
+            def write(self, ops: str) -> dict:
+                assert ops.startswith("link("), f"unexpected write ops: {ops}"
+                return {"results": [{"ok": False, "error": "validation failed"}]}
+
+        a = Artifact(artifact_class="workspace_doc", path=Path("/x"), rel_path="x", lane="lane-a")
+        kk = RejectingKKernel(existing_annotate_targets=set())
+        ws_cache = {"lane-a": "ws-1"}
+        stats = Stats()
+        with self.assertRaises(RuntimeError):
+            reconcile_existing_note(kk, a, "note-1", ws_cache, {}, stats)
+        self.assertEqual(stats.edges_backfilled, 0)
+
     def test_pr_miss_does_not_require_pr_edge(self):
         # No project-scoped pull_request match this run -> only the
         # workspace edge is required, even if it's a codex_verdict.

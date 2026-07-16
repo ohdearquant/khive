@@ -481,10 +481,11 @@ def reconcile_existing_note(
         return
     existing_targets = fetch_outgoing_annotate_targets(kk, note_id)
     for target_id in missing_annotate_targets(required, existing_targets):
-        kk.write(
+        resp = kk.write(
             f"link(source_id={dsl_str(note_id)}, target_id={dsl_str(target_id)}, "
             f'relation="annotates")'
         )
+        first_op_result(resp)
         stats.edges_backfilled += 1
 
 
