@@ -427,8 +427,35 @@ async fn generate_report(request: &AuditRequest) -> Result<AuditReport> {
         signals.push(unavailable_signal("duplicate_content_hash", reason));
     }
 
-    if caps.entities_ok && caps.edges_ok {
+    // Base edge signals (`module_fan_in`, `zero_in_edge_module`) only read
+    // `source_id`/`target_id`/`relation`/`deleted_at` — never `metadata` —
+    // so they must stay available on a map missing only the metadata column
+    // (codex round-2 Medium, `.khive/codex_reviews/codex_review_pr1052_round2.md`).
+    if caps.entities_ok && caps.edges_base_ok {
         fan_in_signals(reader.as_mut(), &mut signals).await?;
+        zero_in_edge_signals(
+            reader.as_mut(),
+            &policy,
+            &coverage_by_project,
+            &mut signals,
+            &mut errors,
+        )
+        .await?;
+    } else {
+        let reason = format!(
+            "graph_edges/entities base capability unavailable: {}",
+            caps.schema_errors.join("; ")
+        );
+        for id in ["module_fan_in", "zero_in_edge_module"] {
+            signals.push(unavailable_signal(id, reason.clone()));
+        }
+    }
+
+    // `layering_violation`, `manifest_import_mismatch`, and
+    // `dependency_cycle_summary` all read `graph_edges.metadata`
+    // (dependency-kind classification), so they additionally require the
+    // metadata column on top of the base edge columns.
+    if caps.entities_ok && caps.edges_base_ok && caps.edges_metadata_ok {
         layering_signals(
             reader.as_mut(),
             &policy,
@@ -440,25 +467,15 @@ async fn generate_report(request: &AuditRequest) -> Result<AuditReport> {
         .await?;
         manifest_import_mismatch_signals(reader.as_mut(), &mut signals).await?;
         dependency_cycle_signals(reader.as_mut(), &mut signals).await?;
-        zero_in_edge_signals(
-            reader.as_mut(),
-            &policy,
-            &coverage_by_project,
-            &mut signals,
-            &mut errors,
-        )
-        .await?;
     } else {
         let reason = format!(
-            "graph_edges/entities capability unavailable: {}",
+            "graph_edges.metadata capability unavailable: {}",
             caps.schema_errors.join("; ")
         );
         for id in [
-            "module_fan_in",
             "layering_violation",
             "manifest_import_mismatch",
             "dependency_cycle_summary",
-            "zero_in_edge_module",
         ] {
             signals.push(unavailable_signal(id, reason.clone()));
         }
@@ -498,9 +515,21 @@ fn map_storage_busy(e: khive_storage::StorageError) -> anyhow::Error {
 /// presence rather than aborting the whole report the first time an older
 /// or partial map is missing a table or column (H1,
 /// `.khive/codex_reviews/codex_review_pr1052.md`).
+///
+/// `edges_ok` was originally a single table-wide boolean, but that over-
+/// suppressed signals whose SQL never reads `graph_edges.metadata` on a map
+/// missing only that column (round-2 Medium,
+/// `.khive/codex_reviews/codex_review_pr1052_round2.md`). Edge capability is
+/// therefore split per the columns each signal group actually reads:
+/// `edges_base_ok` covers `id`/`source_id`/`target_id`/`relation`/
+/// `deleted_at` (read by every edge-derived signal), `edges_metadata_ok`
+/// additionally covers `metadata` (read only by the dependency-kind
+/// classification used in layering, manifest/import mismatch, and the
+/// project-level dependency-cycle graphs).
 struct SchemaCaps {
     entities_ok: bool,
-    edges_ok: bool,
+    edges_base_ok: bool,
+    edges_metadata_ok: bool,
     schema_errors: Vec<String>,
 }
 
@@ -512,14 +541,9 @@ const ENTITIES_REQUIRED_COLUMNS: &[&str] = &[
     "properties",
     "deleted_at",
 ];
-const EDGES_REQUIRED_COLUMNS: &[&str] = &[
-    "id",
-    "source_id",
-    "target_id",
-    "relation",
-    "deleted_at",
-    "metadata",
-];
+const EDGES_BASE_REQUIRED_COLUMNS: &[&str] =
+    &["id", "source_id", "target_id", "relation", "deleted_at"];
+const EDGES_METADATA_REQUIRED_COLUMNS: &[&str] = &["metadata"];
 
 async fn inspect_schema(reader: &mut dyn SqlReader) -> Result<SchemaCaps> {
     let table_rows = reader
@@ -541,17 +565,74 @@ async fn inspect_schema(reader: &mut dyn SqlReader) -> Result<SchemaCaps> {
     if let Some(e) = entities_err {
         schema_errors.push(e);
     }
-    let (edges_ok, edges_err) =
-        check_table_capability(reader, &tables, "graph_edges", EDGES_REQUIRED_COLUMNS).await?;
-    if let Some(e) = edges_err {
-        schema_errors.push(e);
-    }
+
+    let (edges_base_ok, edges_metadata_ok) = if !tables.contains("graph_edges") {
+        schema_errors.push(
+            "SCHEMA_UNSUPPORTED: table `graph_edges` is missing from the map database; every \
+             signal requiring it reports status=unavailable"
+                .to_string(),
+        );
+        (false, false)
+    } else {
+        let cols = table_columns(reader, "graph_edges").await?;
+        let (base_ok, base_err) =
+            missing_columns_error("graph_edges", &cols, EDGES_BASE_REQUIRED_COLUMNS);
+        if let Some(e) = base_err {
+            schema_errors.push(e);
+        }
+        let (metadata_ok, metadata_err) =
+            missing_columns_error("graph_edges", &cols, EDGES_METADATA_REQUIRED_COLUMNS);
+        if let Some(e) = metadata_err {
+            schema_errors.push(e);
+        }
+        (base_ok, base_ok && metadata_ok)
+    };
 
     Ok(SchemaCaps {
         entities_ok,
-        edges_ok,
+        edges_base_ok,
+        edges_metadata_ok,
         schema_errors,
     })
+}
+
+async fn table_columns(reader: &mut dyn SqlReader, table: &str) -> Result<BTreeSet<String>> {
+    let col_rows = reader
+        .query_all(SqlStatement {
+            sql: format!("PRAGMA table_info({table})"),
+            params: vec![],
+            label: Some(format!("code-audit {table} column inventory")),
+        })
+        .await
+        .map_err(map_storage_busy)?;
+    Ok(col_rows
+        .iter()
+        .filter_map(|r| text_col(r, "name"))
+        .collect())
+}
+
+fn missing_columns_error(
+    table: &str,
+    cols: &BTreeSet<String>,
+    required_cols: &[&str],
+) -> (bool, Option<String>) {
+    let missing: Vec<&str> = required_cols
+        .iter()
+        .filter(|c| !cols.contains(**c))
+        .copied()
+        .collect();
+    if missing.is_empty() {
+        (true, None)
+    } else {
+        (
+            false,
+            Some(format!(
+                "SCHEMA_UNSUPPORTED: table `{table}` is missing required column(s) [{}]; every \
+                 signal requiring them reports status=unavailable",
+                missing.join(", ")
+            )),
+        )
+    }
 }
 
 async fn check_table_capability(
@@ -569,35 +650,8 @@ async fn check_table_capability(
             )),
         ));
     }
-    let col_rows = reader
-        .query_all(SqlStatement {
-            sql: format!("PRAGMA table_info({table})"),
-            params: vec![],
-            label: Some(format!("code-audit {table} column inventory")),
-        })
-        .await
-        .map_err(map_storage_busy)?;
-    let cols: BTreeSet<String> = col_rows
-        .iter()
-        .filter_map(|r| text_col(r, "name"))
-        .collect();
-    let missing: Vec<&str> = required_cols
-        .iter()
-        .filter(|c| !cols.contains(**c))
-        .copied()
-        .collect();
-    if missing.is_empty() {
-        Ok((true, None))
-    } else {
-        Ok((
-            false,
-            Some(format!(
-                "SCHEMA_UNSUPPORTED: table `{table}` is missing required column(s) [{}]; every \
-                 signal requiring them reports status=unavailable",
-                missing.join(", ")
-            )),
-        ))
-    }
+    let cols = table_columns(reader, table).await?;
+    Ok(missing_columns_error(table, &cols, required_cols))
 }
 
 fn text_col(row: &khive_storage::SqlRow, name: &str) -> Option<String> {
@@ -1927,6 +1981,60 @@ crate-b = 1
             .signals
             .iter()
             .any(|s| s.id == "module_fan_in" && s.status == SignalStatus::Unavailable));
+    }
+
+    #[tokio::test]
+    async fn missing_edge_metadata_column_degrades_only_metadata_dependent_signals() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = tmp.path().join("map.db");
+        build_fixture(&db, [0, 1]).await;
+        {
+            let backend = StorageBackend::sqlite(&db).expect("open fixture backend");
+            let mut writer = backend.pool().writer().expect("writer guard");
+            writer
+                .conn_mut()
+                .execute_batch("ALTER TABLE graph_edges DROP COLUMN metadata;")
+                .expect(
+                    "drop metadata to simulate a map missing dependency-kind classification \
+                     while every other edge column is intact",
+                );
+        }
+        let policy = test_policy(tmp.path());
+
+        // Round-2 Medium: `module_fan_in` and `zero_in_edge_module` never
+        // read `graph_edges.metadata`, so a map missing ONLY that column
+        // must not suppress them — only the dependency-kind-classification
+        // signals (layering, manifest/import mismatch, dependency cycles)
+        // may degrade.
+        let report = generate_report(&base_request(db, policy)).await.unwrap();
+        assert!(report
+            .errors
+            .iter()
+            .any(|e| matches!(e.code, AuditErrorCode::SchemaUnsupported)
+                && e.message.contains("metadata")));
+
+        for id in ["module_fan_in", "zero_in_edge_module"] {
+            assert!(
+                report
+                    .signals
+                    .iter()
+                    .any(|s| s.id == id && s.status != SignalStatus::Unavailable),
+                "expected {id} to remain available when only graph_edges.metadata is missing"
+            );
+        }
+        for id in [
+            "layering_violation",
+            "manifest_import_mismatch",
+            "dependency_cycle_summary",
+        ] {
+            assert!(
+                report
+                    .signals
+                    .iter()
+                    .any(|s| s.id == id && s.status == SignalStatus::Unavailable),
+                "expected {id} to degrade to unavailable when graph_edges.metadata is missing"
+            );
+        }
     }
 
     #[tokio::test]
