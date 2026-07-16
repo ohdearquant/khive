@@ -1181,8 +1181,7 @@ fn telegram_ingest_namespace_from_env() -> String {
 /// A fetched batch's offset is committed (acknowledged to Telegram) only
 /// after every authorized envelope in it durably ingests via `comm.ingest`
 /// — mirrors the IMAP cursor-commit discipline at `channel_poll_loop`
-/// (~L492-550) without importing its IMAP-specific machinery (issue #113
-/// fix round 1, finding 2).
+/// without importing its IMAP-specific machinery (issue #113).
 #[cfg(feature = "channel-telegram")]
 async fn telegram_poll_loop(
     telegram_channel: std::sync::Arc<khive_channel_telegram::TelegramChannel>,
