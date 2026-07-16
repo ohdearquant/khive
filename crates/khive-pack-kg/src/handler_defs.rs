@@ -530,7 +530,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 18] = [
                 required: true,
                 description: "Edge relation (contains | part_of | instance_of | extends | variant_of | introduced_by | supersedes | derived_from | precedes | depends_on | enables | implements | competes_with | composed_with | annotates | supports | refutes). \
                     Each relation only accepts specific (source_kind -> target_kind) endpoint pairs; an out-of-allowlist pair is rejected with PermissionDenied, not silently accepted. \
-                    Base ADR-002 entity->entity allowlist (issue #964 — this table mirrors `base_entity_endpoint_rules()`, the exact source the validator consults, so it cannot drift out of sync): \
+                    Base ADR-002 entity->entity allowlist (issue #964 — this table is a hand-maintained mirror of `base_entity_endpoint_rules()` (khive-runtime) and is guarded by a regression test on key rows; the validator consults the function, not this text): \
                     contains: concept->concept, project->project, project->artifact, org->project, org->service. \
                     part_of: concept->concept, project->project, project->org. \
                     instance_of: *->concept (any source kind), service->project. \
@@ -547,7 +547,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 18] = [
                     supports / refutes: concept->concept, document->concept, dataset->concept, artifact->concept (evidence -> claim). \
                     annotates: note -> {entity, note, edge, event} (the only relation whose source is a note, not an entity). \
                     The `kg` pack additionally allows (pack-extensible, additive-only per ADR-017): part_of/instance_of person->org, part_of/instance_of person->project, depends_on/enables/contains/part_of/precedes org->org, precedes decision-note->decision-note. \
-                    Other loaded packs may add further pairs (e.g. `gtd` allows depends_on task-note->task-note; `formal` allows typed depends_on between theorem/definition/axiom/structure/instance/goal entity_types) — pack rules only ever add allowed pairs, never remove one listed here. Full pack-rule source: `docs/api/edge-rules-pack-kg.md`.",
+                    Other loaded packs may add further pairs (e.g. `gtd` allows depends_on task-note->task-note; `formal` allows typed depends_on between theorem/definition/axiom/structure/instance/goal entity_types) — pack rules only ever add allowed pairs, never remove one listed here. Full pack-rule source: `KG_EDGE_RULES` in `khive-pack-kg/src/pack.rs` (ADR-017).",
             },
             ParamDef {
                 name: "weight",
