@@ -380,3 +380,25 @@ class NulByteTests(unittest.TestCase):
         text = cap_content(raw)
         self.assertNotIn("\x00", text)
         self.assertEqual(text, "before�after")
+
+
+class C0ControlCharTests(unittest.TestCase):
+    def test_raw_c0_controls_escaped_as_unicode_escapes(self):
+        # Live tranche-2 abort 2026-07-16 (second shape): raw C0 chars other
+        # than NUL survive decode and the DSL parser rejects them ("invalid
+        # value: control character while parsing a string"). dsl_escape must
+        # emit JSON \uXXXX escapes for every remaining C0.
+        s = "a\tb\x1bc\x01d"
+        escaped = dsl_escape(s)
+        self.assertNotRegex(escaped, r"[\x00-\x1f]")
+        self.assertEqual(escaped, "a\\u0009b\\u001bc\\u0001d")
+
+    def test_c0_escapes_round_trip_via_json_decode(self):
+        import json
+
+        s = "tab\there\x0bvt\x1besc"
+        decoded = json.loads(f'"{dsl_escape(s)}"')
+        self.assertEqual(decoded, s)
+
+    def test_newline_and_cr_still_use_short_escapes(self):
+        self.assertEqual(dsl_escape("a\r\nb"), "a\\r\\nb")

@@ -150,6 +150,12 @@ def dsl_escape(s: str) -> str:
     escaped = (
         s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r")
     )
+    # The DSL string parser rejects RAW C0 control characters ("invalid
+    # value: control character found while parsing a string" -- live
+    # tranche-2 abort 2026-07-16 on a raw control byte in a workspace doc).
+    # Escape every remaining C0 as \uXXXX (JSON-standard, round-trips to
+    # the same char), preserving content fidelity for tabs et al.
+    escaped = "".join(ch if ch >= " " else f"\\u{ord(ch):04x}" for ch in escaped)
     if s == "$prev" or s.startswith("$prev.") or s.startswith("$prev["):
         escaped = "\\\\" + escaped
     return escaped
