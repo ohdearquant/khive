@@ -24,8 +24,15 @@ Design notes:
   records completed (source_path, sha16) pairs so a re-run after interruption
   skips already-ingested files without any server round-trip. As a second,
   server-side safety net (covers a lost/stale cursor file), --live also
-  bulk-loads existing ws-ingest-tagged notes once at startup and skips any
-  file whose key is already present there.
+  bulk-loads existing ws-ingest-tagged notes once at startup, keyed to their
+  note id. A file whose key is already present there is NOT accepted as
+  complete on sight: its note's outgoing `annotates` edges are checked
+  (`neighbors`, direction outgoing, relation annotates) against the targets
+  this artifact requires (workspace lane, and PR for codex verdicts), and
+  whatever is missing is created before the cursor is backfilled. This
+  covers a note left incomplete by a pre-fix run, or by a create-time link
+  failure whose runtime-side compensation was itself best-effort and did not
+  run to completion (crates/khive-runtime/src/operations.rs).
 - Content is truncated at ~48KB (of the FINAL UTF-8-encoded, replacement-
   decoded payload, marker space reserved) with a trailing marker; the sha256
   is always computed over the ORIGINAL (untruncated) bytes so the dedup key
@@ -36,9 +43,10 @@ Design notes:
   the note row) if an edge fails, so a note can never be persisted with a
   missing required edge (crates/khive-runtime/src/operations.rs
   create_note_inner).
-- CONCURRENCY: a same-host POSIX advisory lock (fcntl.flock on
-  `.khive/scripts/.ws_ingest.lock`) excludes concurrent --live invocations on
-  this machine. This is NOT a substitute for a server-side atomic natural-key
+- CONCURRENCY: a machine-wide POSIX advisory lock (fcntl.flock on the fixed
+  path `/tmp/lion-khive-wsingest.lock`, independent of which checkout/
+  worktree the script runs from) excludes concurrent --live invocations on
+  this host. This is NOT a substitute for a server-side atomic natural-key
   dedup: the generic `create` verb does not expose the `external_id` /
   `try_insert_note` atomic-insert path (that path exists only on the
   internal `try_create_note` runtime method, unused by the MCP `create`
@@ -71,7 +79,11 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent.parent  # .khive/scripts -> .khive -> repo root
 KHIVE_DIR = REPO_ROOT / ".khive"
 CURSOR_PATH = SCRIPT_DIR / ".ws_ingest_cursor"
-LOCK_PATH = SCRIPT_DIR / ".ws_ingest.lock"
+# Fixed, checkout-independent path: multiple worktrees of this repo (or
+# multiple repos, incidentally) share the same khive.db, so the exclusion
+# lock must be machine-wide, not per-checkout. /tmp, lion-prefixed, never
+# inside a cargo target tree (fleet lock-naming convention).
+LOCK_PATH = Path("/tmp/lion-khive-wsingest.lock")
 KKERNEL = os.path.expanduser("~/.cargo/bin/kkernel")
 
 MAX_CONTENT_BYTES = 48 * 1024
@@ -390,9 +402,12 @@ def load_existing_workspaces(kk: KKernel) -> dict[str, str]:
 
 def load_existing_ws_ingest_notes(
     kk: KKernel, note_kinds: list[str], page_limit: int = 200, max_pages: int = 500
-) -> set[tuple[str, str]]:
-    """(source_path, content_sha256_16) pairs already ingested by this script, across kinds."""
-    seen: set[tuple[str, str]] = set()
+) -> dict[tuple[str, str], str]:
+    """(source_path, content_sha256_16) -> note id, for notes already ingested
+    by this script, across kinds. The note id is retained (not just the key)
+    so a match can be reconciled — its `annotates` edges verified/backfilled
+    — rather than accepted as complete on sight; see reconcile_existing_note."""
+    seen: dict[tuple[str, str], str] = {}
     for kind in note_kinds:
         offset = 0
         for _ in range(max_pages):
@@ -408,11 +423,69 @@ def load_existing_ws_ingest_notes(
                 sp = props.get("source_path")
                 sha = props.get("content_sha256_16")
                 if sp and sha:
-                    seen.add((sp, sha))
+                    seen[(sp, sha)] = row["id"]
             if len(rows) < page_limit:
                 break
             offset += page_limit
     return seen
+
+
+def fetch_outgoing_annotate_targets(kk: KKernel, note_id: str) -> set[str]:
+    """Target ids of `note_id`'s outgoing `annotates` edges. Read-only."""
+    resp = kk.read(
+        f'neighbors(node_id={dsl_str(note_id)}, direction="outgoing", '
+        f"relations={json.dumps(['annotates'])})"
+    )
+    hits = first_op_result(resp)
+    return {hit["id"] for hit in hits if "id" in hit}
+
+
+def compute_annotate_targets(
+    a: Artifact, ws_id: str | None, pr_by_number: dict[int, str]
+) -> list[str]:
+    """The full set of `annotates` targets this artifact requires: its
+    workspace lane entity, plus (for codex verdicts with a project-scoped PR
+    match) the pull_request note. Pure — no I/O."""
+    targets: list[str] = []
+    if ws_id:
+        targets.append(ws_id)
+    if a.artifact_class == "codex_verdict" and a.pr_number in pr_by_number:
+        targets.append(pr_by_number[a.pr_number])
+    return targets
+
+
+def missing_annotate_targets(required: list[str], existing: set[str]) -> list[str]:
+    """Required targets not already covered by an existing outgoing edge.
+    Pure — no I/O."""
+    return [t for t in required if t not in existing]
+
+
+def reconcile_existing_note(
+    kk: KKernel,
+    a: Artifact,
+    note_id: str,
+    ws_cache: dict[str, str],
+    pr_by_number: dict[int, str],
+    stats: Stats,
+) -> None:
+    """A note matching this artifact's (source_path, sha16) key was found by
+    the startup server scan. Before accepting it as complete, verify its
+    outgoing `annotates` edges cover every target this artifact requires and
+    create whatever is missing — a note can be present with a missing edge
+    if it was written by a pre-fix run, or if create-time link-failure
+    compensation (best-effort, ignores its own failures — see
+    crates/khive-runtime/src/operations.rs) did not run to completion."""
+    ws_id = ensure_workspace(kk, a.lane, ws_cache, live=True, stats=stats)
+    required = compute_annotate_targets(a, ws_id, pr_by_number)
+    if not required:
+        return
+    existing_targets = fetch_outgoing_annotate_targets(kk, note_id)
+    for target_id in missing_annotate_targets(required, existing_targets):
+        kk.write(
+            f"link(source_id={dsl_str(note_id)}, target_id={dsl_str(target_id)}, "
+            f'relation="annotates")'
+        )
+        stats.edges_backfilled += 1
 
 
 def cap_content(raw: bytes) -> str:
@@ -461,6 +534,7 @@ class Stats:
     workspaces_to_create: int = 0
     edges_workspace_planned: int = 0
     edges_pr_planned: int = 0
+    edges_backfilled: int = 0
     pr_link_hits: int = 0
     pr_link_misses: int = 0
     pr_link_na: int = 0
@@ -468,19 +542,20 @@ class Stats:
 
 
 def _acquire_live_lock() -> "object":
-    """Same-host exclusion for --live runs (fcntl.flock, non-blocking).
-    See module docstring CONCURRENCY note for what this does and does not
-    cover."""
+    """Machine-wide exclusion for --live runs (fcntl.flock, non-blocking, on
+    a fixed path shared by every checkout on this host). See module
+    docstring CONCURRENCY note for what this does and does not cover."""
     fd = LOCK_PATH.open("w")
     try:
         fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError as e:
         fd.close()
         raise RuntimeError(
-            f"another --live ws-ingest run already holds {LOCK_PATH} (same-host "
-            "exclusion lock) — wait for it to finish before retrying. This lock "
-            "does NOT exclude concurrent --live runs on a different host against "
-            "the same khive.db; see module docstring CONCURRENCY note."
+            f"another --live ws-ingest run already holds {LOCK_PATH} (machine-wide "
+            "exclusion lock, shared across checkouts) — wait for it to finish "
+            "before retrying. This lock does NOT exclude concurrent --live runs "
+            "on a different host against the same khive.db; see module docstring "
+            "CONCURRENCY note."
         ) from e
     return fd
 
@@ -502,7 +577,7 @@ def process(dry_run: bool) -> tuple[Stats, list[Artifact]]:
         project_id = resolve_project_id(kk)
         pr_by_number = filter_pr_by_number(fetch_all(kk, "pull_request"), project_id)
         existing_notes = (
-            load_existing_ws_ingest_notes(kk, sorted(set(NOTE_KIND.values()))) if live else set()
+            load_existing_ws_ingest_notes(kk, sorted(set(NOTE_KIND.values()))) if live else {}
         )
 
         lanes_needed = sorted({a.lane for a in artifacts})
@@ -527,7 +602,7 @@ def _process_one(
     ws_cache: dict[str, str],
     pr_by_number: dict[int, str],
     cursor_done: set[tuple[str, str]],
-    existing_notes: set[tuple[str, str]],
+    existing_notes: dict[tuple[str, str], str],
     stats: Stats,
 ) -> None:
     key = (a.rel_path, a.sha16)
@@ -544,6 +619,7 @@ def _process_one(
         stats.notes_skipped_cursor += 1
         return
     if live and key in existing_notes:
+        reconcile_existing_note(kk, a, existing_notes[key], ws_cache, pr_by_number, stats)
         stats.notes_skipped_existing += 1
         append_cursor(*key)
         return
@@ -591,12 +667,12 @@ def _process_one(
     # Note + its annotates edges are created atomically in one call: the
     # runtime validates every target exists before any write and compensates
     # (deletes the note row) if an edge fails — see module docstring.
-    annotate_targets: list[str] = []
-    if ws_id:
-        annotate_targets.append(ws_id)
-    if a.artifact_class == "codex_verdict" and a.pr_number in pr_by_number:
-        annotate_targets.append(pr_by_number[a.pr_number])
-    elif a.artifact_class == "codex_verdict" and a.pr_number is not None:
+    annotate_targets = compute_annotate_targets(a, ws_id, pr_by_number)
+    if (
+        a.artifact_class == "codex_verdict"
+        and a.pr_number is not None
+        and a.pr_number not in pr_by_number
+    ):
         print(
             f"  [pr-link miss] {a.rel_path}: no project-scoped pull_request "
             f"note for #{a.pr_number}",
@@ -689,7 +765,8 @@ def main() -> int:
         print(
             f"LIVE run complete. notes_created={stats.notes_created} "
             f"skipped_cursor={stats.notes_skipped_cursor} "
-            f"skipped_existing={stats.notes_skipped_existing}"
+            f"skipped_existing={stats.notes_skipped_existing} "
+            f"edges_backfilled={stats.edges_backfilled}"
         )
 
     print(json.dumps(stats.by_class, indent=2))

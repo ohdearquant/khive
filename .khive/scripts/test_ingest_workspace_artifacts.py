@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Regression tests for ingest_workspace_artifacts.py — pure functions only,
-no DB / kkernel round-trip. Covers PR #1049 fix-round-1 findings:
+no DB / kkernel round-trip, except the fake-KKernel reconciliation tests at
+the bottom (no subprocess either). Covers PR #1049 fix-round-1 findings:
 
   M1 - DSL $prev-literal escaping (dsl_escape)
   M2 - CRLF round-trip (dsl_escape)
@@ -10,11 +11,19 @@ no DB / kkernel round-trip. Covers PR #1049 fix-round-1 findings:
        number-only cross-repository fallback (select_exact_project,
        filter_pr_by_number)
 
+...and PR #1049 fix-round-2 findings:
+
+  H1 - resume reconciliation: a note matching an artifact's key must have
+       its required `annotates` edges verified/backfilled, not accepted as
+       complete on sight (compute_annotate_targets, missing_annotate_targets,
+       reconcile_existing_note)
+
 Run: python3 .khive/scripts/test_ingest_workspace_artifacts.py
 """
 
 from __future__ import annotations
 
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -23,9 +32,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from ingest_workspace_artifacts import (  # noqa: E402
     MAX_CONTENT_BYTES,
+    Artifact,
+    Stats,
     cap_content,
+    compute_annotate_targets,
     dsl_escape,
     filter_pr_by_number,
+    missing_annotate_targets,
+    reconcile_existing_note,
     select_exact_project,
 )
 
@@ -184,6 +198,135 @@ class ProjectScopingTests(unittest.TestCase):
     def test_filter_pr_by_number_ignores_rows_missing_project_id(self):
         rows = [{"id": "n1", "properties": {"number": 1049}}]
         self.assertEqual(filter_pr_by_number(rows, "khive-oss-id"), {})
+
+
+class ComputeAnnotateTargetsTests(unittest.TestCase):
+    def test_workspace_doc_requires_only_workspace(self):
+        a = Artifact(artifact_class="workspace_doc", path=Path("/x"), rel_path="x", lane="lane-a")
+        self.assertEqual(compute_annotate_targets(a, "ws-1", {}), ["ws-1"])
+
+    def test_codex_verdict_with_pr_hit_requires_both(self):
+        a = Artifact(
+            artifact_class="codex_verdict",
+            path=Path("/x"),
+            rel_path="x",
+            lane="codex-reviews",
+            pr_number=1049,
+        )
+        self.assertEqual(compute_annotate_targets(a, "ws-1", {1049: "pr-1"}), ["ws-1", "pr-1"])
+
+    def test_codex_verdict_with_pr_miss_requires_only_workspace(self):
+        a = Artifact(
+            artifact_class="codex_verdict",
+            path=Path("/x"),
+            rel_path="x",
+            lane="codex-reviews",
+            pr_number=1049,
+        )
+        self.assertEqual(compute_annotate_targets(a, "ws-1", {}), ["ws-1"])
+
+    def test_no_workspace_id_yields_no_targets(self):
+        a = Artifact(artifact_class="workspace_doc", path=Path("/x"), rel_path="x", lane="lane-a")
+        self.assertEqual(compute_annotate_targets(a, None, {}), [])
+
+
+class MissingAnnotateTargetsTests(unittest.TestCase):
+    def test_missing_workspace_edge(self):
+        self.assertEqual(missing_annotate_targets(["ws-1", "pr-1"], {"pr-1"}), ["ws-1"])
+
+    def test_missing_pr_edge(self):
+        self.assertEqual(missing_annotate_targets(["ws-1", "pr-1"], {"ws-1"}), ["pr-1"])
+
+    def test_nothing_missing(self):
+        self.assertEqual(missing_annotate_targets(["ws-1", "pr-1"], {"ws-1", "pr-1"}), [])
+
+    def test_all_missing(self):
+        self.assertEqual(missing_annotate_targets(["ws-1", "pr-1"], set()), ["ws-1", "pr-1"])
+
+
+class FakeKKernel:
+    """Minimal ops-string-driven stand-in for KKernel — no subprocess. Answers
+    `neighbors` reads from a fixed set of existing target ids and records
+    every `link` write it's asked to perform."""
+
+    def __init__(self, existing_annotate_targets: set[str]):
+        self.live = True
+        self._existing = existing_annotate_targets
+        self.link_calls: list[tuple[str, str]] = []
+
+    def read(self, ops: str) -> dict:
+        assert ops.startswith("neighbors("), f"unexpected read ops: {ops}"
+        hits = [{"id": t} for t in self._existing]
+        return {"results": [{"ok": True, "result": hits}]}
+
+    def write(self, ops: str) -> dict:
+        assert ops.startswith("link("), f"unexpected write ops: {ops}"
+        m = re.search(r'source_id="([^"]*)".*target_id="([^"]*)"', ops)
+        assert m, f"could not parse link() ops: {ops}"
+        self.link_calls.append((m.group(1), m.group(2)))
+        return {"results": [{"ok": True, "result": {"ok": True}}]}
+
+
+class ReconcileExistingNoteTests(unittest.TestCase):
+    """H1 fix-round-2 regressions: a note matching an artifact's key is
+    reconciled — missing required `annotates` edges are backfilled — instead
+    of being accepted as complete on sight."""
+
+    def test_backfills_missing_workspace_edge(self):
+        a = Artifact(artifact_class="workspace_doc", path=Path("/x"), rel_path="x", lane="lane-a")
+        kk = FakeKKernel(existing_annotate_targets=set())
+        ws_cache = {"lane-a": "ws-1"}
+        stats = Stats()
+        reconcile_existing_note(kk, a, "note-1", ws_cache, {}, stats)
+        self.assertEqual(kk.link_calls, [("note-1", "ws-1")])
+        self.assertEqual(stats.edges_backfilled, 1)
+
+    def test_backfills_missing_pr_edge_when_workspace_edge_already_present(self):
+        a = Artifact(
+            artifact_class="codex_verdict",
+            path=Path("/x"),
+            rel_path="x",
+            lane="codex-reviews",
+            pr_number=1049,
+        )
+        kk = FakeKKernel(existing_annotate_targets={"ws-1"})
+        ws_cache = {"codex-reviews": "ws-1"}
+        stats = Stats()
+        reconcile_existing_note(kk, a, "note-1", ws_cache, {1049: "pr-1"}, stats)
+        self.assertEqual(kk.link_calls, [("note-1", "pr-1")])
+        self.assertEqual(stats.edges_backfilled, 1)
+
+    def test_no_backfill_when_all_required_edges_present(self):
+        a = Artifact(
+            artifact_class="codex_verdict",
+            path=Path("/x"),
+            rel_path="x",
+            lane="codex-reviews",
+            pr_number=1049,
+        )
+        kk = FakeKKernel(existing_annotate_targets={"ws-1", "pr-1"})
+        ws_cache = {"codex-reviews": "ws-1"}
+        stats = Stats()
+        reconcile_existing_note(kk, a, "note-1", ws_cache, {1049: "pr-1"}, stats)
+        self.assertEqual(kk.link_calls, [])
+        self.assertEqual(stats.edges_backfilled, 0)
+
+    def test_pr_miss_does_not_require_pr_edge(self):
+        # No project-scoped pull_request match this run -> only the
+        # workspace edge is required, even if it's a codex_verdict.
+        a = Artifact(
+            artifact_class="codex_verdict",
+            path=Path("/x"),
+            rel_path="x",
+            lane="codex-reviews",
+            pr_number=1049,
+        )
+        kk = FakeKKernel(existing_annotate_targets={"ws-1"})
+        ws_cache = {"codex-reviews": "ws-1"}
+        stats = Stats()
+        reconcile_existing_note(kk, a, "note-1", ws_cache, {}, stats)
+        self.assertEqual(kk.link_calls, [])
+        self.assertEqual(stats.edges_backfilled, 0)
 
 
 if __name__ == "__main__":
