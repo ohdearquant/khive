@@ -29,6 +29,13 @@ pub struct TelegramChannel {
     config: TelegramChannelConfig,
     connector: Box<dyn TelegramConnector>,
     offset: Mutex<Option<i64>>,
+    /// The offset [`Channel::poll`] would advance to, computed from the most
+    /// recent batch of fetched updates but not yet applied to `offset`.
+    /// Applied only by [`Self::commit_offset`], which callers must invoke
+    /// after every authorized envelope from that batch durably ingests.
+    /// Until then, the next `poll` call re-requests with the unchanged
+    /// `offset`, so a failed batch is re-fetched rather than lost.
+    pending_offset: Mutex<Option<i64>>,
 }
 
 impl TelegramChannel {
@@ -49,6 +56,7 @@ impl TelegramChannel {
             config,
             connector,
             offset: Mutex::new(None),
+            pending_offset: Mutex::new(None),
         }
     }
 
@@ -134,6 +142,14 @@ impl Channel for TelegramChannel {
     /// memory) is the sole progress mechanism, mirroring the ADR's explicit
     /// choice not to reuse the IMAP-style persisted checkpoint for this
     /// adapter.
+    ///
+    /// This does **not** advance the offset used for the next `getUpdates`
+    /// call — it only records the candidate advance in `pending_offset`.
+    /// Advancing the confirmed offset (so Telegram stops re-delivering this
+    /// batch) requires an explicit [`Self::commit_offset`] call, which the
+    /// caller must make only after every authorized envelope from this batch
+    /// durably ingests. Until committed, the next `poll` reuses the same
+    /// offset and re-fetches the same batch.
     async fn poll(&self, _since: DateTime<Utc>) -> Result<Vec<ChannelEnvelope>, ChannelError> {
         let updates = self.connector.get_updates(self.current_offset()).await?;
 
@@ -150,14 +166,36 @@ impl Channel for TelegramChannel {
             }
         }
 
-        // Advance the offset past every fetched update (authorized or not) so
-        // getUpdates never re-delivers an already-seen update, regardless of
-        // whether it produced an envelope.
         if let Some(max_id) = max_update_id {
-            self.advance_offset(max_id + 1);
+            *self
+                .pending_offset
+                .lock()
+                .expect("pending_offset mutex is never poisoned") = Some(max_id + 1);
         }
 
         Ok(envelopes)
+    }
+}
+
+impl TelegramChannel {
+    /// Advance the confirmed offset to the value computed by the most
+    /// recent [`Channel::poll`] call, so the next `getUpdates` request no
+    /// longer re-delivers that batch.
+    ///
+    /// Callers (the daemon poll loop) must call this only after every
+    /// authorized envelope from that batch has durably ingested via
+    /// `comm.ingest` — never unconditionally after `poll` returns. A no-op
+    /// if there is no pending advance (e.g. an empty batch, or this batch's
+    /// advance was already committed).
+    pub fn commit_offset(&self) {
+        let next = self
+            .pending_offset
+            .lock()
+            .expect("pending_offset mutex is never poisoned")
+            .take();
+        if let Some(next) = next {
+            self.advance_offset(next);
+        }
     }
 }
 
@@ -300,7 +338,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poll_advances_offset_past_all_fetched_updates_including_unauthorized() {
+    async fn poll_advances_offset_past_all_fetched_updates_including_unauthorized_after_commit() {
         let updates = vec![
             vec![
                 text_update(1, 999, "attacker", 1_700_000_000),
@@ -313,14 +351,73 @@ mod tests {
 
         let first = ch.poll(Utc::now()).await.unwrap();
         assert_eq!(first.len(), 1);
+        ch.commit_offset();
         let _second = ch.poll(Utc::now()).await.unwrap();
 
         let seen = connector.offsets_seen.lock().unwrap().clone();
         assert_eq!(
             seen,
             vec![None, Some(3)],
-            "second poll must request offset = last update_id + 1"
+            "second poll must request offset = last update_id + 1, once committed"
         );
+    }
+
+    #[tokio::test]
+    async fn poll_without_commit_reuses_old_offset_so_ingest_failure_can_retry() {
+        // Same batch returned twice: Telegram keeps re-delivering it because
+        // the offset was never acknowledged (no `commit_offset()` call
+        // between the two polls), simulating a failed `comm.ingest`.
+        let batch = vec![text_update(9, 555, "maintainer", 1_700_000_000)];
+        let updates = vec![batch.clone(), batch];
+        let connector = std::sync::Arc::new(MockConnector::new(updates));
+        let ch = TelegramChannel::with_connector(make_config(), Box::new(connector.clone()));
+
+        let first = ch.poll(Utc::now()).await.unwrap();
+        assert_eq!(first.len(), 1);
+        // Deliberately no commit_offset() call here — simulates comm.ingest
+        // failing for this batch.
+        let second = ch.poll(Utc::now()).await.unwrap();
+        assert_eq!(
+            second.len(),
+            1,
+            "an uncommitted batch must be re-fetched and re-delivered, not lost"
+        );
+
+        let seen = connector.offsets_seen.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![None, None],
+            "retry without commit must reuse the old (unset) offset"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_offset_after_successful_retry_advances_offset() {
+        let batch = vec![text_update(9, 555, "maintainer", 1_700_000_000)];
+        let updates = vec![batch.clone(), batch, vec![]];
+        let connector = std::sync::Arc::new(MockConnector::new(updates));
+        let ch = TelegramChannel::with_connector(make_config(), Box::new(connector.clone()));
+
+        let _first = ch.poll(Utc::now()).await.unwrap(); // simulated ingest failure, no commit
+        let _retry = ch.poll(Utc::now()).await.unwrap(); // re-fetched same batch
+        ch.commit_offset(); // this time ingest succeeds
+        let _third = ch.poll(Utc::now()).await.unwrap();
+
+        let seen = connector.offsets_seen.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![None, None, Some(10)],
+            "offset only advances after commit_offset() following a successful ingest"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_offset_without_pending_poll_is_a_noop() {
+        let ch =
+            TelegramChannel::with_connector(make_config(), Box::new(MockConnector::new(vec![])));
+        ch.commit_offset();
+        ch.commit_offset();
+        assert_eq!(ch.current_offset(), None);
     }
 
     #[tokio::test]

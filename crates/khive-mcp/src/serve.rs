@@ -1108,17 +1108,12 @@ fn spawn_telegram_channel_loops_if_daemon(server: &KhiveMcpServer, args: &Args) 
 /// durability model.
 #[cfg(feature = "channel-telegram")]
 fn spawn_telegram_channel_loops(server: &KhiveMcpServer) {
-    use khive_channel::ChannelRegistry;
     use khive_channel_telegram::TelegramChannel;
     use std::sync::Arc;
 
     match TelegramChannel::from_env() {
         Ok(tg_ch) => {
             let tg_ch = Arc::new(tg_ch);
-            let mut ch_registry = ChannelRegistry::new();
-            let dyn_ch: Arc<dyn khive_channel::Channel> = tg_ch.clone();
-            ch_registry.register(dyn_ch);
-            let ch_registry = Arc::new(ch_registry);
             let verb_reg = server.verb_registry_clone();
             let ingest_ns = telegram_ingest_namespace_from_env();
 
@@ -1126,11 +1121,12 @@ fn spawn_telegram_channel_loops(server: &KhiveMcpServer) {
             let verb_reg_outbox = verb_reg.clone();
             let ingest_ns_poll = ingest_ns.clone();
             let ingest_ns_outbox = ingest_ns.clone();
+            let tg_ch_poll = Arc::clone(&tg_ch);
             let tg_ch_outbox = Arc::clone(&tg_ch);
 
             let spawned = run_if_authorized(&ingest_ns, &verb_reg, || {
                 tokio::task::spawn(telegram_poll_loop(
-                    ch_registry,
+                    tg_ch_poll,
                     verb_reg_poll,
                     ingest_ns_poll,
                 ));
@@ -1170,49 +1166,75 @@ fn telegram_ingest_namespace_from_env() -> String {
         .unwrap_or_else(|| "local".to_string())
 }
 
-/// Background task that polls the Telegram channel every 5 seconds and
-/// ingests new inbound messages via `comm.ingest`. No backoff/heartbeat/
-/// lifecycle-event surface — see [`spawn_telegram_channel_loops`]'s doc
-/// comment for why this is a deliberately smaller loop than
-/// `channel_poll_loop`.
+/// Background task that polls the Telegram channel via `getUpdates` long
+/// polling and ingests new inbound messages via `comm.ingest`. No
+/// backoff/heartbeat/lifecycle-event surface — see
+/// [`spawn_telegram_channel_loops`]'s doc comment for why this is a
+/// deliberately smaller loop than `channel_poll_loop`.
+///
+/// The Bot API `getUpdates` call itself blocks server-side for the
+/// connector's long-poll timeout awaiting new updates (ADR-056 Amendment
+/// 2026-07-05 requires long polling, not short polling), so the success path
+/// adds no extra sleep between requests — the long poll paces the loop.
+/// Only the error path sleeps, so a failing Bot API does not hot-loop.
+///
+/// A fetched batch's offset is committed (acknowledged to Telegram) only
+/// after every authorized envelope in it durably ingests via `comm.ingest`
+/// — mirrors the IMAP cursor-commit discipline at `channel_poll_loop`
+/// (~L492-550) without importing its IMAP-specific machinery (issue #113
+/// fix round 1, finding 2).
 #[cfg(feature = "channel-telegram")]
 async fn telegram_poll_loop(
-    channels: std::sync::Arc<khive_channel::ChannelRegistry>,
+    telegram_channel: std::sync::Arc<khive_channel_telegram::TelegramChannel>,
     registry: khive_runtime::VerbRegistry,
     ingest_namespace: String,
 ) {
     use chrono::Utc;
+    use khive_channel::Channel;
     use serde_json::json;
 
-    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+    const ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
 
     loop {
-        tokio::time::sleep(POLL_INTERVAL).await;
-
-        for (kind, _slug, channel) in channels.iter() {
-            match channel.poll(Utc::now()).await {
-                Ok(envelopes) => {
-                    for env in envelopes {
-                        let params = json!({
-                            "namespace": ingest_namespace,
-                            "from": env.from,
-                            "to": env.to,
-                            "content": env.content,
-                            "channel_kind": kind,
-                            "external_id": env.external_id,
-                            "sent_at": env.sent_at.map(|ts| ts.to_rfc3339()),
-                        });
-                        if let Err(e) = registry.dispatch("comm.ingest", params).await {
-                            tracing::warn!(
-                                channel = kind,
-                                "comm.ingest failed for inbound telegram message: {e}"
-                            );
-                        }
+        match telegram_channel.poll(Utc::now()).await {
+            Ok(envelopes) => {
+                let kind = telegram_channel.kind();
+                let mut all_ingested = true;
+                for env in envelopes {
+                    let params = json!({
+                        "namespace": ingest_namespace,
+                        "from": env.from,
+                        "to": env.to,
+                        "content": env.content,
+                        "channel_kind": kind,
+                        "external_id": env.external_id,
+                        "sent_at": env.sent_at.map(|ts| ts.to_rfc3339()),
+                    });
+                    if let Err(e) = registry.dispatch("comm.ingest", params).await {
+                        tracing::warn!(
+                            channel = kind,
+                            "comm.ingest failed for inbound telegram message: {e}"
+                        );
+                        all_ingested = false;
                     }
                 }
-                Err(e) => {
-                    tracing::warn!(channel = kind, "telegram channel poll failed: {e}");
+
+                if all_ingested {
+                    telegram_channel.commit_offset();
+                } else {
+                    tracing::warn!(
+                        channel = kind,
+                        "not committing telegram offset: at least one message in this batch \
+                         failed comm.ingest; the whole batch will be retried next poll"
+                    );
                 }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    channel = telegram_channel.kind(),
+                    "telegram channel poll failed: {e}"
+                );
+                tokio::time::sleep(ERROR_BACKOFF).await;
             }
         }
     }
