@@ -26,13 +26,37 @@ Design notes:
   server-side safety net (covers a lost/stale cursor file), --live also
   bulk-loads existing ws-ingest-tagged notes once at startup and skips any
   file whose key is already present there.
-- Content is truncated at ~48KB with a trailing marker; the sha256 is always
-  computed over the ORIGINAL (untruncated) bytes so the dedup key is stable.
+- Content is truncated at ~48KB (of the FINAL UTF-8-encoded, replacement-
+  decoded payload, marker space reserved) with a trailing marker; the sha256
+  is always computed over the ORIGINAL (untruncated) bytes so the dedup key
+  is stable.
+- Note + its `annotates` edges (workspace lane, and PR for codex verdicts)
+  are created in ONE `create(..., annotates=[...])` call. The runtime
+  validates every annotate target before any write and compensates (deletes
+  the note row) if an edge fails, so a note can never be persisted with a
+  missing required edge (crates/khive-runtime/src/operations.rs
+  create_note_inner).
+- CONCURRENCY: a same-host POSIX advisory lock (fcntl.flock on
+  `.khive/scripts/.ws_ingest.lock`) excludes concurrent --live invocations on
+  this machine. This is NOT a substitute for a server-side atomic natural-key
+  dedup: the generic `create` verb does not expose the `external_id` /
+  `try_insert_note` atomic-insert path (that path exists only on the
+  internal `try_create_note` runtime method, unused by the MCP `create`
+  verb). Two --live runs on DIFFERENT hosts against the same khive.db are
+  NOT excluded and can still race to create duplicate notes for the same
+  (source_path, sha16). Product gap, not fixed here — see PR body.
+- PR annotation is scoped to THIS repository's `project` entity (exact-name
+  match against WS_INGEST_PROJECT_NAME, default "khive-oss"). A codex-verdict
+  file naming PR #N only annotates a `pull_request` note whose
+  properties.project_id matches that project; a same-numbered PR in another
+  repository's project is never used (mirrors khive-pack-git ingest.rs
+  find_by_number's project_id scoping).
 """
 
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -47,12 +71,18 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent.parent  # .khive/scripts -> .khive -> repo root
 KHIVE_DIR = REPO_ROOT / ".khive"
 CURSOR_PATH = SCRIPT_DIR / ".ws_ingest_cursor"
+LOCK_PATH = SCRIPT_DIR / ".ws_ingest.lock"
 KKERNEL = os.path.expanduser("~/.cargo/bin/kkernel")
 
 MAX_CONTENT_BYTES = 48 * 1024
 TRUNCATION_MARKER = "\n\n...[truncated by ws-ingest, original length {orig} bytes]...\n"
 
 INGEST_TAG = "ws-ingest"
+
+# This checkout's canonical `project` entity name (exact match). PR/issue
+# notes carry `properties.project_id`; PR numbers are only unique within a
+# project, so annotation must be scoped to this one, never number-only.
+WS_INGEST_PROJECT_NAME = os.environ.get("WS_INGEST_PROJECT_NAME", "khive-oss")
 
 # artifact_class -> canonical note kind (closed set: observation/insight/
 # question/decision/reference). Verdicts, workspace docs, and audits are all
@@ -85,8 +115,24 @@ def sha256_16(data: bytes) -> str:
 
 
 def dsl_escape(s: str) -> str:
-    """Escape a string for embedding as a double-quoted DSL literal."""
-    return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "")
+    """Escape a string for embedding as a double-quoted DSL literal.
+
+    Backslash/quote/newline/CR are JSON-escaped (CR as \\r, never dropped —
+    dropping it would silently alter CRLF content while the sha256 dedup key
+    still reflects the original bytes). A value that is, in full, a `$prev`
+    chain reference (`$prev`, `$prev.<path>`, `$prev[<idx>]...`) would
+    otherwise be promoted by the DSL parser into a chain reference instead of
+    the literal string (khive-request parser_impl.rs string_as_prev_ref); the
+    parser's own documented escape is a single leading backslash
+    (parser_impl.rs: `s.strip_prefix('\\')` then re-checks the $prev
+    prefixes), so such values get one extra literal backslash prepended.
+    """
+    escaped = (
+        s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r")
+    )
+    if s == "$prev" or s.startswith("$prev.") or s.startswith("$prev["):
+        escaped = "\\\\" + escaped
+    return escaped
 
 
 def dsl_str(s: str) -> str:
@@ -256,11 +302,6 @@ class KKernel:
         return self._run(ops)
 
 
-def annotate_op(source_id: str, target_id: str) -> str:
-    src, tgt, rel = dsl_str(source_id), dsl_str(target_id), dsl_str("annotates")
-    return f"link(source_id={src}, target_id={tgt}, relation={rel})"
-
-
 def first_op_result(resp: dict) -> dict:
     results = resp.get("results", [])
     if not results:
@@ -282,46 +323,68 @@ def list_items(result) -> list:
     return result
 
 
-def load_existing_pull_requests(
-    kk: KKernel, page_limit: int = 200, max_pages: int = 50
-) -> dict[int, str]:
-    """number -> note id, for existing pull_request notes. Bounded pagination."""
-    by_number: dict[int, str] = {}
+def fetch_all(kk: KKernel, kind: str, page_limit: int = 200, max_pages: int = 50) -> list[dict]:
+    """Fetch every row of `kind` via bounded pagination. Read-only."""
+    rows_all: list[dict] = []
     offset = 0
     for _ in range(max_pages):
-        resp = kk.read(f"list(kind={dsl_str('pull_request')}, limit={page_limit}, offset={offset})")
+        resp = kk.read(f"list(kind={dsl_str(kind)}, limit={page_limit}, offset={offset})")
         rows = list_items(first_op_result(resp))
         if not rows:
             break
-        for row in rows:
-            props = row.get("properties") or {}
-            num = props.get("number")
-            if isinstance(num, int):
-                by_number[num] = row["id"]
+        rows_all.extend(rows)
         if len(rows) < page_limit:
             break
         offset += page_limit
+    return rows_all
+
+
+def select_exact_project(project_rows: list[dict], expected_name: str) -> str | None:
+    """Exact-name match against `project` entity rows. 0 or >1 matches -> None
+    (an explicit miss the caller must log — never a fallback guess)."""
+    exact = [r for r in project_rows if r.get("name") == expected_name]
+    if len(exact) != 1:
+        return None
+    return exact[0]["id"]
+
+
+def resolve_project_id(kk: KKernel, expected_name: str = WS_INGEST_PROJECT_NAME) -> str | None:
+    project_id = select_exact_project(fetch_all(kk, "project"), expected_name)
+    if project_id is None:
+        print(
+            f"  [project-resolve] could not uniquely resolve this repo's project "
+            f"entity (expected exactly one `project` named {expected_name!r}); "
+            "codex_verdict notes will NOT be annotated to any pull_request note "
+            "this run.",
+            file=sys.stderr,
+        )
+    return project_id
+
+
+def filter_pr_by_number(pr_rows: list[dict], project_id: str | None) -> dict[int, str]:
+    """number -> note id, restricted to pull_request notes whose
+    properties.project_id matches this checkout's project. PR numbers are
+    only unique within a project (mirrors khive-pack-git ingest.rs
+    find_by_number); project_id=None (unresolved project) yields no matches
+    rather than a number-only cross-repository fallback."""
+    by_number: dict[int, str] = {}
+    if project_id is None:
+        return by_number
+    for row in pr_rows:
+        props = row.get("properties") or {}
+        num = props.get("number")
+        if isinstance(num, int) and props.get("project_id") == project_id:
+            by_number[num] = row["id"]
     return by_number
 
 
-def load_existing_workspaces(
-    kk: KKernel, page_limit: int = 200, max_pages: int = 50
-) -> dict[str, str]:
+def load_existing_workspaces(kk: KKernel) -> dict[str, str]:
     """lane name -> workspace entity id."""
     by_name: dict[str, str] = {}
-    offset = 0
-    for _ in range(max_pages):
-        resp = kk.read(f"list(kind={dsl_str('workspace')}, limit={page_limit}, offset={offset})")
-        rows = list_items(first_op_result(resp))
-        if not rows:
-            break
-        for row in rows:
-            name = row.get("name")
-            if name:
-                by_name[name] = row["id"]
-        if len(rows) < page_limit:
-            break
-        offset += page_limit
+    for row in fetch_all(kk, "workspace"):
+        name = row.get("name")
+        if name:
+            by_name[name] = row["id"]
     return by_name
 
 
@@ -352,15 +415,23 @@ def load_existing_ws_ingest_notes(
     return seen
 
 
-def build_note_content(artifact: Artifact) -> str:
-    raw = artifact.path.read_bytes()
+def cap_content(raw: bytes) -> str:
+    """Decode `raw` (replacing invalid UTF-8) and cap the FINAL encoded
+    payload at MAX_CONTENT_BYTES, marker space reserved. Capping on the
+    original raw byte length is not sufficient: `errors="replace"` can
+    expand invalid bytes (each -> U+FFFD, 3 bytes), so the cap must apply
+    after replacement decoding, not before."""
     text = raw.decode("utf-8", errors="replace")
-    if len(raw) > MAX_CONTENT_BYTES:
-        text = text.encode("utf-8", errors="replace")[:MAX_CONTENT_BYTES].decode(
-            "utf-8", errors="ignore"
-        )
-        text += TRUNCATION_MARKER.format(orig=len(raw))
-    return text
+    encoded = text.encode("utf-8")
+    if len(encoded) <= MAX_CONTENT_BYTES:
+        return text
+    marker = TRUNCATION_MARKER.format(orig=len(raw))
+    budget = max(MAX_CONTENT_BYTES - len(marker.encode("utf-8")), 0)
+    return encoded[:budget].decode("utf-8", errors="ignore") + marker
+
+
+def build_note_content(artifact: Artifact) -> str:
+    return cap_content(artifact.path.read_bytes())
 
 
 def ensure_workspace(
@@ -396,110 +467,153 @@ class Stats:
     samples: list = field(default_factory=list)
 
 
+def _acquire_live_lock() -> "object":
+    """Same-host exclusion for --live runs (fcntl.flock, non-blocking).
+    See module docstring CONCURRENCY note for what this does and does not
+    cover."""
+    fd = LOCK_PATH.open("w")
+    try:
+        fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as e:
+        fd.close()
+        raise RuntimeError(
+            f"another --live ws-ingest run already holds {LOCK_PATH} (same-host "
+            "exclusion lock) — wait for it to finish before retrying. This lock "
+            "does NOT exclude concurrent --live runs on a different host against "
+            "the same khive.db; see module docstring CONCURRENCY note."
+        ) from e
+    return fd
+
+
 def process(dry_run: bool) -> tuple[Stats, list[Artifact]]:
     live = not dry_run
     kk = KKernel(live=live)
     stats = Stats()
+    lock_fd = _acquire_live_lock() if live else None
 
-    artifacts = discover()
-    for a in artifacts:
-        stats.by_class[a.artifact_class] += 1
+    try:
+        artifacts = discover()
+        for a in artifacts:
+            stats.by_class[a.artifact_class] += 1
 
-    cursor_done = load_cursor()
+        cursor_done = load_cursor()
 
-    ws_cache = load_existing_workspaces(kk)
-    pr_by_number = load_existing_pull_requests(kk)
-    existing_notes = (
-        load_existing_ws_ingest_notes(kk, sorted(set(NOTE_KIND.values()))) if live else set()
-    )
-
-    lanes_needed = sorted({a.lane for a in artifacts})
-    for lane in lanes_needed:
-        if lane not in ws_cache:
-            stats.workspaces_to_create += 1
-
-    for a in artifacts:
-        key = (a.rel_path, a.sha16)
-
-        if a.artifact_class == "codex_verdict":
-            if a.pr_number is None:
-                stats.pr_link_na += 1
-            elif a.pr_number in pr_by_number:
-                stats.pr_link_hits += 1
-            else:
-                stats.pr_link_misses += 1
-
-        if key in cursor_done:
-            stats.notes_skipped_cursor += 1
-            continue
-        if live and key in existing_notes:
-            stats.notes_skipped_existing += 1
-            append_cursor(*key)
-            continue
-
-        note_kind = NOTE_KIND[a.artifact_class]
-        note_tags = [INGEST_TAG, a.artifact_class]
-        stats.edges_workspace_planned += 1
-        if a.artifact_class == "codex_verdict" and a.pr_number in pr_by_number:
-            stats.edges_pr_planned += 1
-
-        if len(stats.samples) < 10:
-            stats.samples.append(
-                {
-                    "source_path": a.rel_path,
-                    "artifact_class": a.artifact_class,
-                    "note_kind": note_kind,
-                    "lane": a.lane,
-                    "pr_number": a.pr_number,
-                    "pr_link": (
-                        "hit"
-                        if (a.pr_number is not None and a.pr_number in pr_by_number)
-                        else ("miss" if a.pr_number is not None else "n/a")
-                    ),
-                    "sha16": a.sha16,
-                    "size": a.size,
-                }
-            )
-
-        if not live:
-            stats.notes_created += 1  # "would create"
-            continue
-
-        ws_id = ensure_workspace(kk, a.lane, ws_cache, live, stats)
-
-        content = build_note_content(a)
-        properties = {
-            "source_path": a.rel_path,
-            "content_sha256_16": a.sha16,
-            "artifact_class": a.artifact_class,
-            "ingested_at": datetime.now(UTC).isoformat(),
-        }
-        if a.pr_number is not None:
-            properties["pr_number"] = a.pr_number
-
-        name = a.rel_path.rsplit("/", 1)[-1][:120]
-        props_json = json.dumps(properties)
-        resp = kk.write(
-            f"create(kind={dsl_str(note_kind)}, name={dsl_str(name)}, "
-            f"content={dsl_str(content)}, properties={props_json}, tags={json.dumps(note_tags)})"
+        ws_cache = load_existing_workspaces(kk)
+        project_id = resolve_project_id(kk)
+        pr_by_number = filter_pr_by_number(fetch_all(kk, "pull_request"), project_id)
+        existing_notes = (
+            load_existing_ws_ingest_notes(kk, sorted(set(NOTE_KIND.values()))) if live else set()
         )
-        note_id = first_op_result(resp)["id"]
 
-        if ws_id:
-            kk.write(annotate_op(note_id, ws_id))
+        lanes_needed = sorted({a.lane for a in artifacts})
+        for lane in lanes_needed:
+            if lane not in ws_cache:
+                stats.workspaces_to_create += 1
 
-        if a.artifact_class == "codex_verdict" and a.pr_number in pr_by_number:
-            kk.write(annotate_op(note_id, pr_by_number[a.pr_number]))
-        elif a.artifact_class == "codex_verdict" and a.pr_number is not None:
-            print(
-                f"  [pr-link miss] {a.rel_path}: no pull_request note for #{a.pr_number}",
-                file=sys.stderr,
-            )
-
-        stats.notes_created += 1
-        append_cursor(*key)
+        for a in artifacts:
+            _process_one(kk, a, live, ws_cache, pr_by_number, cursor_done, existing_notes, stats)
+    finally:
+        if lock_fd is not None:
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+            lock_fd.close()
 
     return stats, artifacts
+
+
+def _process_one(
+    kk: KKernel,
+    a: Artifact,
+    live: bool,
+    ws_cache: dict[str, str],
+    pr_by_number: dict[int, str],
+    cursor_done: set[tuple[str, str]],
+    existing_notes: set[tuple[str, str]],
+    stats: Stats,
+) -> None:
+    key = (a.rel_path, a.sha16)
+
+    if a.artifact_class == "codex_verdict":
+        if a.pr_number is None:
+            stats.pr_link_na += 1
+        elif a.pr_number in pr_by_number:
+            stats.pr_link_hits += 1
+        else:
+            stats.pr_link_misses += 1
+
+    if key in cursor_done:
+        stats.notes_skipped_cursor += 1
+        return
+    if live and key in existing_notes:
+        stats.notes_skipped_existing += 1
+        append_cursor(*key)
+        return
+
+    note_kind = NOTE_KIND[a.artifact_class]
+    note_tags = [INGEST_TAG, a.artifact_class]
+    stats.edges_workspace_planned += 1
+    if a.artifact_class == "codex_verdict" and a.pr_number in pr_by_number:
+        stats.edges_pr_planned += 1
+
+    if len(stats.samples) < 10:
+        stats.samples.append(
+            {
+                "source_path": a.rel_path,
+                "artifact_class": a.artifact_class,
+                "note_kind": note_kind,
+                "lane": a.lane,
+                "pr_number": a.pr_number,
+                "pr_link": (
+                    "hit"
+                    if (a.pr_number is not None and a.pr_number in pr_by_number)
+                    else ("miss" if a.pr_number is not None else "n/a")
+                ),
+                "sha16": a.sha16,
+                "size": a.size,
+            }
+        )
+
+    if not live:
+        stats.notes_created += 1  # "would create"
+        return
+
+    ws_id = ensure_workspace(kk, a.lane, ws_cache, live, stats)
+
+    content = build_note_content(a)
+    properties = {
+        "source_path": a.rel_path,
+        "content_sha256_16": a.sha16,
+        "artifact_class": a.artifact_class,
+        "ingested_at": datetime.now(UTC).isoformat(),
+    }
+    if a.pr_number is not None:
+        properties["pr_number"] = a.pr_number
+
+    # Note + its annotates edges are created atomically in one call: the
+    # runtime validates every target exists before any write and compensates
+    # (deletes the note row) if an edge fails — see module docstring.
+    annotate_targets: list[str] = []
+    if ws_id:
+        annotate_targets.append(ws_id)
+    if a.artifact_class == "codex_verdict" and a.pr_number in pr_by_number:
+        annotate_targets.append(pr_by_number[a.pr_number])
+    elif a.artifact_class == "codex_verdict" and a.pr_number is not None:
+        print(
+            f"  [pr-link miss] {a.rel_path}: no project-scoped pull_request "
+            f"note for #{a.pr_number}",
+            file=sys.stderr,
+        )
+
+    name = a.rel_path.rsplit("/", 1)[-1][:120]
+    props_json = json.dumps(properties)
+    resp = kk.write(
+        f"create(kind={dsl_str(note_kind)}, name={dsl_str(name)}, "
+        f"content={dsl_str(content)}, properties={props_json}, "
+        f"tags={json.dumps(note_tags)}, annotates={json.dumps(annotate_targets)})"
+    )
+    first_op_result(resp)  # raises on failure; note+edges are all-or-nothing
+
+    stats.notes_created += 1
+    append_cursor(*key)
 
 
 def write_dryrun_report(stats: Stats, artifacts: list[Artifact], out_path: Path) -> None:
