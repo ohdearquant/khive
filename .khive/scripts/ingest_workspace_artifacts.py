@@ -540,6 +540,7 @@ class Stats:
     pr_link_misses: int = 0
     pr_link_na: int = 0
     samples: list = field(default_factory=list)
+    blocked_secret_gate: list = field(default_factory=list)
 
 
 def _acquire_live_lock() -> "object":
@@ -689,7 +690,18 @@ def _process_one(
         f"content={dsl_str(content)}, properties={props_json}, "
         f"tags={json.dumps(note_tags)}, annotates={json.dumps(annotate_targets)})"
     )
-    first_op_result(resp)  # raises on failure; note+edges are all-or-nothing
+    try:
+        first_op_result(resp)  # raises on failure; note+edges are all-or-nothing
+    except RuntimeError as e:
+        if "matches secret pattern" in str(e):
+            # Daemon secret-gate false positive on legitimate artifact text
+            # (high-entropy string near a trigger word). Content is never
+            # reworded to dodge the gate — the artifact stays un-cursored
+            # for a later pass once the gate's masking handles it.
+            stats.blocked_secret_gate.append(a.rel_path)
+            print(f"  [secret-gate blocked] {a.rel_path}", file=sys.stderr)
+            return
+        raise
 
     stats.notes_created += 1
     append_cursor(*key)
@@ -778,8 +790,11 @@ def main() -> int:
             f"LIVE run complete. notes_created={stats.notes_created} "
             f"skipped_cursor={stats.notes_skipped_cursor} "
             f"skipped_existing={stats.notes_skipped_existing} "
-            f"edges_backfilled={stats.edges_backfilled}"
+            f"edges_backfilled={stats.edges_backfilled} "
+            f"blocked_secret_gate={len(stats.blocked_secret_gate)}"
         )
+        for rel in stats.blocked_secret_gate:
+            print(f"  blocked: {rel}")
 
     print(json.dumps(stats.by_class, indent=2))
     return 0
