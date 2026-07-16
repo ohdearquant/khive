@@ -50,7 +50,9 @@ pub struct CodeAuditArgs {
     /// Also evaluate `dev-dependencies`-only project edges in the layering
     /// signal (production edges are always evaluated). Dependency-cycle
     /// detection always reports production, dev, and module-import graphs
-    /// separately regardless of this flag.
+    /// separately regardless of this flag. Policy completeness reporting
+    /// (POLICY_INCOMPLETE) is unaffected by this flag — it evaluates the
+    /// full in-scope project set, not just evaluated edges.
     #[arg(long = "include-dev-dependencies", default_value_t = false)]
     pub include_dev_dependencies: bool,
 
@@ -81,18 +83,26 @@ struct AuditRequest {
     include_dev_dependencies: bool,
 }
 
+/// The only `policy_version` this build understands. A policy file carrying
+/// any other version (or none at all) is rejected outright — see M1 in
+/// `.khive/codex_reviews/codex_review_pr1052.md`.
+const SUPPORTED_POLICY_VERSION: u32 = 1;
+
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Policy {
-    #[serde(default = "default_policy_version")]
-    #[allow(dead_code)]
     policy_version: u32,
     crate_ranks: BTreeMap<String, i64>,
     #[serde(default)]
     denied_pairs: Vec<(String, String)>,
-}
-
-fn default_policy_version() -> u32 {
-    1
+    /// Minimum ingest-coverage ratio (`module_count / (module_count +
+    /// unresolved_specifier_count)`, see `ingest_coverage_signals`) a project
+    /// must meet before absence-based candidate signals (today:
+    /// `zero_in_edge_module`)
+    /// are reported for its modules. Below the floor, the candidate degrades to
+    /// `unavailable` rather than being silently emitted or dropped (M1).
+    #[serde(default)]
+    coverage_floor: f64,
 }
 
 impl Policy {
@@ -105,6 +115,23 @@ impl Policy {
             .iter()
             .any(|(x, y)| (x == a && y == b) || (x == b && y == a))
     }
+}
+
+fn load_policy(path: &std::path::Path) -> Result<(Policy, Vec<u8>)> {
+    let bytes =
+        std::fs::read(path).with_context(|| format!("read policy file {}", path.display()))?;
+    let policy: Policy =
+        toml::from_str(std::str::from_utf8(&bytes).context("policy file is not valid UTF-8")?)
+            .with_context(|| format!("parse policy file {}", path.display()))?;
+    if policy.policy_version != SUPPORTED_POLICY_VERSION {
+        anyhow::bail!(
+            "policy file {} declares policy_version {}, but this build only supports \
+             policy_version {SUPPORTED_POLICY_VERSION}",
+            path.display(),
+            policy.policy_version
+        );
+    }
+    Ok((policy, bytes))
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
@@ -125,11 +152,24 @@ struct Signal {
     limitations: Vec<String>,
 }
 
+fn unavailable_signal(id: &'static str, reason: String) -> Signal {
+    Signal {
+        id,
+        subject_id: "*".to_string(),
+        status: SignalStatus::Unavailable,
+        value: Value::Null,
+        evidence_ids: vec![],
+        limitations: vec![reason],
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 enum AuditErrorCode {
+    SchemaUnsupported,
     PolicyIncomplete,
     HistoryAbsent,
+    CoverageInsufficient,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -161,16 +201,23 @@ const SCHEMA_VERSION: u32 = 1;
 // fresh in-memory database, which rejects query-only SQL that assumes an
 // existing `entities`/`graph_edges` schema.
 
+const SQL_PROJECT_NAMES: &str = "
+SELECT id, name FROM entities
+WHERE kind = 'project' AND deleted_at IS NULL
+ORDER BY name;
+";
+
 const SQL_INGEST_COVERAGE: &str = "
 SELECT id, name, properties FROM entities
 WHERE kind = 'project' AND deleted_at IS NULL
 ORDER BY name;
 ";
 
-const SQL_MODULE_COUNT_FOR_PROJECT: &str = "
-SELECT count(*) FROM entities
+const SQL_MODULES_FOR_PROJECT: &str = "
+SELECT id, properties FROM entities
 WHERE entity_type = 'module' AND deleted_at IS NULL
-  AND json_extract(properties,'$.source_project') = ?1;
+  AND json_extract(properties,'$.source_project') = ?1
+ORDER BY id;
 ";
 
 const SQL_FAN_IN: &str = "
@@ -186,13 +233,14 @@ SELECT id, name FROM entities WHERE entity_type = 'module' AND deleted_at IS NUL
 ";
 
 const SQL_PROJECT_EDGES: &str = "
-SELECT e.id AS id, s.name AS source_name, t.name AS target_name, e.metadata AS metadata
+SELECT e.id AS id, e.source_id AS source_id, e.target_id AS target_id,
+       s.name AS source_name, t.name AS target_name, e.metadata AS metadata
 FROM graph_edges e
 JOIN entities s ON s.id = e.source_id
 JOIN entities t ON t.id = e.target_id
 WHERE e.relation = 'depends_on' AND e.deleted_at IS NULL
   AND s.kind = 'project' AND t.kind = 'project'
-ORDER BY e.id;
+ORDER BY e.source_id, e.target_id, e.id;
 ";
 
 const SQL_MANIFEST_IMPORT_MISMATCH: &str = "
@@ -208,28 +256,30 @@ WHERE e.relation = 'depends_on' AND e.deleted_at IS NULL
     SELECT 1 FROM json_each(e.metadata, '$.dependency_kinds')
     WHERE value IN ('dependencies', 'build-dependencies', 'dev-dependencies')
   )
-ORDER BY e.id;
+ORDER BY e.source_id, e.target_id, e.id;
 ";
 
 const SQL_MODULE_EDGES: &str = "
-SELECT e.id AS id, s.name AS source_name, t.name AS target_name
+SELECT e.id AS id, e.source_id AS source_id, e.target_id AS target_id,
+       s.name AS source_name, t.name AS target_name
 FROM graph_edges e
 JOIN entities s ON s.id = e.source_id
 JOIN entities t ON t.id = e.target_id
 WHERE e.relation = 'depends_on' AND e.deleted_at IS NULL
   AND s.entity_type = 'module' AND t.entity_type = 'module'
-ORDER BY e.id;
+ORDER BY e.source_id, e.target_id, e.id;
 ";
 
 const SQL_ZERO_IN_EDGE: &str = "
-SELECT m.id AS id, m.name AS name
+SELECT m.id AS id, m.name AS name,
+       json_extract(m.properties,'$.source_project') AS source_project
 FROM entities m
 WHERE m.entity_type = 'module' AND m.deleted_at IS NULL
   AND NOT EXISTS (
     SELECT 1 FROM graph_edges e
     WHERE e.relation = 'depends_on' AND e.deleted_at IS NULL AND e.target_id = m.id
   )
-ORDER BY m.name;
+ORDER BY m.name, m.id;
 ";
 
 const SQL_DUPLICATE_CONTENT_HASH: &str = "
@@ -248,8 +298,9 @@ ORDER BY content_hash;
 /// into `query_bundle_sha256` so a report can be tied back to the exact
 /// derivation logic that produced it.
 const QUERY_BUNDLE: &[&str] = &[
+    SQL_PROJECT_NAMES,
     SQL_INGEST_COVERAGE,
-    SQL_MODULE_COUNT_FOR_PROJECT,
+    SQL_MODULES_FOR_PROJECT,
     SQL_FAN_IN,
     SQL_MODULE_NAMES,
     SQL_PROJECT_EDGES,
@@ -313,12 +364,7 @@ async fn generate_report(request: &AuditRequest) -> Result<AuditReport> {
             request.map_db.display()
         );
     }
-    let policy_bytes = std::fs::read(&request.policy_path)
-        .with_context(|| format!("read policy file {}", request.policy_path.display()))?;
-    let policy: Policy = toml::from_str(
-        std::str::from_utf8(&policy_bytes).context("policy file is not valid UTF-8")?,
-    )
-    .with_context(|| format!("parse policy file {}", request.policy_path.display()))?;
+    let (policy, policy_bytes) = load_policy(&request.policy_path)?;
     let policy_sha256 = hex_sha256(&policy_bytes);
     let query_bundle_sha256 = hex_sha256(QUERY_BUNDLE.concat().as_bytes());
 
@@ -338,9 +384,15 @@ async fn generate_report(request: &AuditRequest) -> Result<AuditReport> {
     // concurrent writer the map database might otherwise have.
     let mut reader = sql.reader().await.map_err(map_storage_busy)?;
 
-    require_schema(reader.as_mut()).await?;
+    let caps = inspect_schema(reader.as_mut()).await?;
 
     let mut errors = Vec::new();
+    for msg in &caps.schema_errors {
+        errors.push(AuditErrorEntry {
+            code: AuditErrorCode::SchemaUnsupported,
+            message: msg.clone(),
+        });
+    }
     errors.push(AuditErrorEntry {
         code: AuditErrorCode::HistoryAbsent,
         message: format!(
@@ -352,24 +404,72 @@ async fn generate_report(request: &AuditRequest) -> Result<AuditReport> {
     });
 
     let mut signals = Vec::new();
-    let code_sweep_clocks = ingest_coverage_signals(reader.as_mut(), &mut signals).await?;
-    fan_in_signals(reader.as_mut(), &mut signals).await?;
-    layering_signals(
-        reader.as_mut(),
-        &policy,
-        request.include_dev_dependencies,
-        &mut signals,
-        &mut errors,
-    )
-    .await?;
-    manifest_import_mismatch_signals(reader.as_mut(), &mut signals).await?;
-    dependency_cycle_signals(reader.as_mut(), &mut signals).await?;
-    zero_in_edge_signals(reader.as_mut(), &mut signals).await?;
-    duplicate_content_hash_signals(reader.as_mut(), &mut signals).await?;
+    let mut code_sweep_clocks = BTreeMap::new();
+    let mut all_projects: BTreeSet<String> = BTreeSet::new();
+    let mut coverage_by_project: BTreeMap<String, f64> = BTreeMap::new();
+
+    if caps.entities_ok {
+        let coverage = ingest_coverage_signals(
+            reader.as_mut(),
+            &mut signals,
+            &mut code_sweep_clocks,
+            &mut all_projects,
+        )
+        .await?;
+        coverage_by_project = coverage;
+        duplicate_content_hash_signals(reader.as_mut(), &mut signals).await?;
+    } else {
+        let reason = format!(
+            "entities table capability unavailable: {}",
+            caps.schema_errors.join("; ")
+        );
+        signals.push(unavailable_signal("ingest_coverage", reason.clone()));
+        signals.push(unavailable_signal("duplicate_content_hash", reason));
+    }
+
+    if caps.entities_ok && caps.edges_ok {
+        fan_in_signals(reader.as_mut(), &mut signals).await?;
+        layering_signals(
+            reader.as_mut(),
+            &policy,
+            request.include_dev_dependencies,
+            &all_projects,
+            &mut signals,
+            &mut errors,
+        )
+        .await?;
+        manifest_import_mismatch_signals(reader.as_mut(), &mut signals).await?;
+        dependency_cycle_signals(reader.as_mut(), &mut signals).await?;
+        zero_in_edge_signals(
+            reader.as_mut(),
+            &policy,
+            &coverage_by_project,
+            &mut signals,
+            &mut errors,
+        )
+        .await?;
+    } else {
+        let reason = format!(
+            "graph_edges/entities capability unavailable: {}",
+            caps.schema_errors.join("; ")
+        );
+        for id in [
+            "module_fan_in",
+            "layering_violation",
+            "manifest_import_mismatch",
+            "dependency_cycle_summary",
+            "zero_in_edge_module",
+        ] {
+            signals.push(unavailable_signal(id, reason.clone()));
+        }
+    }
+
     unavailable_history_signals(&mut signals);
 
     signals.sort_by(|a, b| (a.id, &a.subject_id).cmp(&(b.id, &b.subject_id)));
-    errors.sort_by(|a, b| format!("{:?}", a.code).cmp(&format!("{:?}", b.code)));
+    errors.sort_by(|a, b| {
+        (format!("{:?}", a.code), &a.message).cmp(&(format!("{:?}", b.code), &b.message))
+    });
 
     Ok(AuditReport {
         schema_version: SCHEMA_VERSION,
@@ -393,27 +493,111 @@ fn map_storage_busy(e: khive_storage::StorageError) -> anyhow::Error {
     }
 }
 
-async fn require_schema(reader: &mut dyn SqlReader) -> Result<()> {
-    let row = reader
-        .query_scalar(SqlStatement {
-            sql: "SELECT count(*) FROM sqlite_master WHERE type='table' \
-                  AND name IN ('entities','graph_edges')"
-                .to_string(),
+/// What the open map database can support. Built once per report via
+/// `PRAGMA table_info` so every derivation can be gated on real column
+/// presence rather than aborting the whole report the first time an older
+/// or partial map is missing a table or column (H1,
+/// `.khive/codex_reviews/codex_review_pr1052.md`).
+struct SchemaCaps {
+    entities_ok: bool,
+    edges_ok: bool,
+    schema_errors: Vec<String>,
+}
+
+const ENTITIES_REQUIRED_COLUMNS: &[&str] = &[
+    "id",
+    "name",
+    "kind",
+    "entity_type",
+    "properties",
+    "deleted_at",
+];
+const EDGES_REQUIRED_COLUMNS: &[&str] = &[
+    "id",
+    "source_id",
+    "target_id",
+    "relation",
+    "deleted_at",
+    "metadata",
+];
+
+async fn inspect_schema(reader: &mut dyn SqlReader) -> Result<SchemaCaps> {
+    let table_rows = reader
+        .query_all(SqlStatement {
+            sql: "SELECT name FROM sqlite_master WHERE type='table'".to_string(),
             params: vec![],
-            label: Some("code-audit schema check".to_string()),
+            label: Some("code-audit table inventory".to_string()),
         })
         .await
         .map_err(map_storage_busy)?;
-    let count = match row {
-        Some(SqlValue::Integer(n)) => n,
-        _ => 0,
-    };
-    if count != 2 {
-        anyhow::bail!(
-            "SCHEMA_UNSUPPORTED: map database is missing the entities/graph_edges tables"
-        );
+    let tables: BTreeSet<String> = table_rows
+        .iter()
+        .filter_map(|r| text_col(r, "name"))
+        .collect();
+
+    let mut schema_errors = Vec::new();
+    let (entities_ok, entities_err) =
+        check_table_capability(reader, &tables, "entities", ENTITIES_REQUIRED_COLUMNS).await?;
+    if let Some(e) = entities_err {
+        schema_errors.push(e);
     }
-    Ok(())
+    let (edges_ok, edges_err) =
+        check_table_capability(reader, &tables, "graph_edges", EDGES_REQUIRED_COLUMNS).await?;
+    if let Some(e) = edges_err {
+        schema_errors.push(e);
+    }
+
+    Ok(SchemaCaps {
+        entities_ok,
+        edges_ok,
+        schema_errors,
+    })
+}
+
+async fn check_table_capability(
+    reader: &mut dyn SqlReader,
+    tables: &BTreeSet<String>,
+    table: &str,
+    required_cols: &[&str],
+) -> Result<(bool, Option<String>)> {
+    if !tables.contains(table) {
+        return Ok((
+            false,
+            Some(format!(
+                "SCHEMA_UNSUPPORTED: table `{table}` is missing from the map database; every \
+                 signal requiring it reports status=unavailable"
+            )),
+        ));
+    }
+    let col_rows = reader
+        .query_all(SqlStatement {
+            sql: format!("PRAGMA table_info({table})"),
+            params: vec![],
+            label: Some(format!("code-audit {table} column inventory")),
+        })
+        .await
+        .map_err(map_storage_busy)?;
+    let cols: BTreeSet<String> = col_rows
+        .iter()
+        .filter_map(|r| text_col(r, "name"))
+        .collect();
+    let missing: Vec<&str> = required_cols
+        .iter()
+        .filter(|c| !cols.contains(**c))
+        .copied()
+        .collect();
+    if missing.is_empty() {
+        Ok((true, None))
+    } else {
+        Ok((
+            false,
+            Some(format!(
+                "SCHEMA_UNSUPPORTED: table `{table}` is missing required column(s) [{}]; every \
+                 signal requiring them reports status=unavailable",
+                missing.join(", ")
+            )),
+        ))
+    }
 }
 
 fn text_col(row: &khive_storage::SqlRow, name: &str) -> Option<String> {
@@ -427,31 +611,45 @@ fn json_col(row: &khive_storage::SqlRow, name: &str) -> Option<Value> {
     text_col(row, name).and_then(|s| serde_json::from_str(&s).ok())
 }
 
+fn unresolved_count(properties: &Value) -> usize {
+    properties
+        .get("unresolved_specifiers")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0)
+}
+
 async fn ingest_coverage_signals(
     reader: &mut dyn SqlReader,
     signals: &mut Vec<Signal>,
-) -> Result<BTreeMap<String, BTreeMap<String, String>>> {
-    let sql = SQL_INGEST_COVERAGE;
+    code_sweep_clocks: &mut BTreeMap<String, BTreeMap<String, String>>,
+    all_projects: &mut BTreeSet<String>,
+) -> Result<BTreeMap<String, f64>> {
     let rows = reader
         .query_all(SqlStatement {
-            sql: sql.to_string(),
+            sql: SQL_INGEST_COVERAGE.to_string(),
             params: vec![],
             label: Some("code-audit ingest coverage".to_string()),
         })
         .await
         .map_err(map_storage_busy)?;
 
-    let mut clocks: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    let mut coverage_by_project: BTreeMap<String, f64> = BTreeMap::new();
+
     for row in &rows {
         let project_id = text_col(row, "id").unwrap_or_default();
         let project_name = text_col(row, "name").unwrap_or_default();
         let properties = json_col(row, "properties").unwrap_or(Value::Null);
+        all_projects.insert(project_name.clone());
 
-        let unresolved_count = properties
-            .get("unresolved_specifiers")
-            .and_then(|v| v.as_array())
-            .map(|a| a.len())
-            .unwrap_or(0);
+        // L1.5 records an unresolved intra-module import against the MODULE
+        // entity, not the project (source_ingest.rs:776-784) — the project's
+        // own `unresolved_specifiers` (manifest-level, if any) is only part
+        // of the picture. Aggregate both so a project with unresolved module
+        // imports is never reported as a false zero (H2).
+        let mut own_unresolved = unresolved_count(&properties);
+        let mut unresolved_evidence: BTreeSet<String> = BTreeSet::new();
+
         let sweep_clock = properties
             .get("sweep_clock")
             .and_then(|v| v.as_object())
@@ -464,21 +662,38 @@ async fn ingest_coverage_signals(
             }
         }
         if !languages.is_empty() {
-            clocks.insert(project_name.clone(), languages);
+            code_sweep_clocks.insert(project_name.clone(), languages);
         }
 
-        let module_row = reader
-            .query_scalar(SqlStatement {
-                sql: SQL_MODULE_COUNT_FOR_PROJECT.to_string(),
+        let module_rows = reader
+            .query_all(SqlStatement {
+                sql: SQL_MODULES_FOR_PROJECT.to_string(),
                 params: vec![SqlValue::Text(project_name.clone())],
-                label: Some("code-audit module count".to_string()),
+                label: Some("code-audit modules for project".to_string()),
             })
             .await
             .map_err(map_storage_busy)?;
-        let module_count = match module_row {
-            Some(SqlValue::Integer(n)) => n,
-            _ => 0,
+        let module_count = module_rows.len();
+        for module_row in &module_rows {
+            let module_id = text_col(module_row, "id").unwrap_or_default();
+            let module_properties = json_col(module_row, "properties").unwrap_or(Value::Null);
+            let n = unresolved_count(&module_properties);
+            if n > 0 {
+                own_unresolved += n;
+                unresolved_evidence.insert(module_id);
+            }
+        }
+
+        let denom = module_count + own_unresolved;
+        let coverage_ratio = if denom == 0 {
+            1.0
+        } else {
+            module_count as f64 / denom as f64
         };
+        coverage_by_project.insert(project_name.clone(), coverage_ratio);
+
+        let mut evidence_ids = vec![project_id];
+        evidence_ids.extend(unresolved_evidence);
 
         signals.push(Signal {
             id: "ingest_coverage",
@@ -486,9 +701,10 @@ async fn ingest_coverage_signals(
             status: SignalStatus::Observed,
             value: json!({
                 "module_count": module_count,
-                "unresolved_specifier_count": unresolved_count,
+                "unresolved_specifier_count": own_unresolved,
+                "coverage_ratio": coverage_ratio,
             }),
-            evidence_ids: vec![project_id],
+            evidence_ids,
             limitations: vec![
                 "total observed import count is not reconstructable in the phase-1 map \
                  schema: resolved specifiers are folded into depends_on edge metadata rather \
@@ -498,7 +714,7 @@ async fn ingest_coverage_signals(
             ],
         });
     }
-    Ok(clocks)
+    Ok(coverage_by_project)
 }
 
 async fn fan_in_signals(reader: &mut dyn SqlReader, signals: &mut Vec<Signal>) -> Result<()> {
@@ -549,6 +765,7 @@ async fn layering_signals(
     reader: &mut dyn SqlReader,
     policy: &Policy,
     include_dev: bool,
+    all_projects: &BTreeSet<String>,
     signals: &mut Vec<Signal>,
     errors: &mut Vec<AuditErrorEntry>,
 ) -> Result<()> {
@@ -561,7 +778,17 @@ async fn layering_signals(
         .await
         .map_err(map_storage_busy)?;
 
-    let mut unmapped: BTreeSet<String> = BTreeSet::new();
+    // POLICY_INCOMPLETE must be derived from the full in-scope project set,
+    // not just the crates that happen to appear in a selected edge — a
+    // project with no evaluated edge at all (e.g. no edges, or only a
+    // dev-only edge with dev evaluation disabled) is still unmapped and must
+    // still degrade rather than silently vanish (H4).
+    let unmapped: BTreeSet<String> = all_projects
+        .iter()
+        .filter(|name| policy.rank(name).is_none())
+        .cloned()
+        .collect();
+
     for row in &rows {
         let edge_id = text_col(row, "id").unwrap_or_default();
         let source_name = text_col(row, "source_name").unwrap_or_default();
@@ -579,17 +806,13 @@ async fn layering_signals(
         let is_dev_only = kinds.contains("dev-dependencies")
             && !kinds.contains("dependencies")
             && !kinds.contains("build-dependencies");
+        // include_dev_dependencies gates VIOLATION EVALUATION only; policy
+        // completeness (above) is independent of it (H4).
         if is_dev_only && !include_dev {
             continue;
         }
 
         let (Some(sr), Some(tr)) = (policy.rank(&source_name), policy.rank(&target_name)) else {
-            if policy.rank(&source_name).is_none() {
-                unmapped.insert(source_name.clone());
-            }
-            if policy.rank(&target_name).is_none() {
-                unmapped.insert(target_name.clone());
-            }
             continue;
         };
 
@@ -668,11 +891,16 @@ async fn manifest_import_mismatch_signals(
 }
 
 /// One directed edge in a dependency graph, used by the Tarjan SCC pass.
+/// Node identity is the map's `source_id`/`target_id` (entity UUIDs) rather
+/// than display names — module names are not unique across languages
+/// (ADR-085 §"module identity"), so keying the graph by name can silently
+/// merge two distinct module graphs into one false SCC (H3). Field order
+/// matches the required tie-break sort `(source_id, target_id, edge_id)`.
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
 struct DepEdge {
+    source_id: String,
+    target_id: String,
     id: String,
-    source: String,
-    target: String,
 }
 
 async fn dependency_cycle_signals(
@@ -688,12 +916,17 @@ async fn dependency_cycle_signals(
         .await
         .map_err(map_storage_busy)?;
 
+    let mut node_names: BTreeMap<String, String> = BTreeMap::new();
     let mut prod_edges = Vec::new();
     let mut dev_edges = Vec::new();
     for row in &project_rows {
         let edge_id = text_col(row, "id").unwrap_or_default();
+        let source_id = text_col(row, "source_id").unwrap_or_default();
+        let target_id = text_col(row, "target_id").unwrap_or_default();
         let source_name = text_col(row, "source_name").unwrap_or_default();
         let target_name = text_col(row, "target_name").unwrap_or_default();
+        node_names.insert(source_id.clone(), source_name);
+        node_names.insert(target_id.clone(), target_name);
         let metadata = json_col(row, "metadata").unwrap_or(Value::Null);
         let kinds: BTreeSet<String> = metadata
             .get("dependency_kinds")
@@ -706,8 +939,8 @@ async fn dependency_cycle_signals(
             .unwrap_or_default();
         let edge = DepEdge {
             id: edge_id,
-            source: source_name,
-            target: target_name,
+            source_id,
+            target_id,
         };
         let is_dev_only = kinds.contains("dev-dependencies")
             && !kinds.contains("dependencies")
@@ -729,10 +962,22 @@ async fn dependency_cycle_signals(
         .map_err(map_storage_busy)?;
     let module_edges: Vec<DepEdge> = module_rows
         .iter()
-        .map(|row| DepEdge {
-            id: text_col(row, "id").unwrap_or_default(),
-            source: text_col(row, "source_name").unwrap_or_default(),
-            target: text_col(row, "target_name").unwrap_or_default(),
+        .map(|row| {
+            let source_id = text_col(row, "source_id").unwrap_or_default();
+            let target_id = text_col(row, "target_id").unwrap_or_default();
+            node_names.insert(
+                source_id.clone(),
+                text_col(row, "source_name").unwrap_or_default(),
+            );
+            node_names.insert(
+                target_id.clone(),
+                text_col(row, "target_name").unwrap_or_default(),
+            );
+            DepEdge {
+                id: text_col(row, "id").unwrap_or_default(),
+                source_id,
+                target_id,
+            }
         })
         .collect();
 
@@ -753,16 +998,25 @@ async fn dependency_cycle_signals(
         for members in sccs {
             let evidence_ids: Vec<String> = edges
                 .iter()
-                .filter(|e| members.contains(&e.source) && members.contains(&e.target))
+                .filter(|e| members.contains(&e.source_id) && members.contains(&e.target_id))
                 .map(|e| e.id.clone())
                 .collect::<BTreeSet<_>>()
                 .into_iter()
+                .collect();
+            let member_details: Vec<Value> = members
+                .iter()
+                .map(|id| {
+                    json!({
+                        "id": id,
+                        "name": node_names.get(id).cloned().unwrap_or_default(),
+                    })
+                })
                 .collect();
             signals.push(Signal {
                 id: "dependency_cycle",
                 subject_id: format!("{graph_label}:{}", members.join(",")),
                 status: SignalStatus::Observed,
-                value: json!({ "graph": graph_label, "members": members }),
+                value: json!({ "graph": graph_label, "members": member_details }),
                 evidence_ids,
                 limitations: vec![],
             });
@@ -772,9 +1026,11 @@ async fn dependency_cycle_signals(
 }
 
 /// Deterministic Tarjan strongly-connected-components pass over `edges`,
-/// sorted by `(source, target)` first (ADR-Q1 §"Import cycles"). Returns
-/// each SCC of size > 1, plus single-node self-loops, as a sorted member
-/// list; SCCs themselves are returned in sorted order of their first member.
+/// sorted by `(source_id, target_id, edge_id)` first (ADR-Q1 §"Import
+/// cycles"). Node identity is the map entity ID (see [`DepEdge`]), never a
+/// display name. Returns each SCC of size > 1, plus single-node self-loops,
+/// as a sorted member-ID list; SCCs themselves are returned in sorted order
+/// of their first member.
 fn tarjan_sccs(edges: &[DepEdge]) -> Vec<Vec<String>> {
     let mut sorted_edges = edges.to_vec();
     sorted_edges.sort();
@@ -782,12 +1038,12 @@ fn tarjan_sccs(edges: &[DepEdge]) -> Vec<Vec<String>> {
     let mut adjacency: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut nodes: BTreeSet<String> = BTreeSet::new();
     for e in &sorted_edges {
-        nodes.insert(e.source.clone());
-        nodes.insert(e.target.clone());
+        nodes.insert(e.source_id.clone());
+        nodes.insert(e.target_id.clone());
         adjacency
-            .entry(e.source.clone())
+            .entry(e.source_id.clone())
             .or_default()
-            .insert(e.target.clone());
+            .insert(e.target_id.clone());
     }
 
     let mut index_counter = 0usize;
@@ -859,7 +1115,13 @@ fn tarjan_sccs(edges: &[DepEdge]) -> Vec<Vec<String>> {
     result
 }
 
-async fn zero_in_edge_signals(reader: &mut dyn SqlReader, signals: &mut Vec<Signal>) -> Result<()> {
+async fn zero_in_edge_signals(
+    reader: &mut dyn SqlReader,
+    policy: &Policy,
+    coverage_by_project: &BTreeMap<String, f64>,
+    signals: &mut Vec<Signal>,
+    errors: &mut Vec<AuditErrorEntry>,
+) -> Result<()> {
     let rows = reader
         .query_all(SqlStatement {
             sql: SQL_ZERO_IN_EDGE.to_string(),
@@ -868,20 +1130,64 @@ async fn zero_in_edge_signals(reader: &mut dyn SqlReader, signals: &mut Vec<Sign
         })
         .await
         .map_err(map_storage_busy)?;
+    let mut coverage_gated: BTreeSet<String> = BTreeSet::new();
     for row in &rows {
         let module_id = text_col(row, "id").unwrap_or_default();
         let module_name = text_col(row, "name").unwrap_or_default();
+        let source_project = text_col(row, "source_project");
+        let coverage = source_project
+            .as_deref()
+            .and_then(|p| coverage_by_project.get(p))
+            .copied();
+        let below_floor = coverage.map(|c| c < policy.coverage_floor).unwrap_or(false);
+
+        let mut limitations = vec![
+            "absence of an observed import in-edge is not proof of dead code; L1.5 \
+             regex-based import resolution has known false-negative gaps"
+                .to_string(),
+        ];
+        let status = if below_floor {
+            if let Some(p) = &source_project {
+                coverage_gated.insert(p.clone());
+            }
+            limitations.push(format!(
+                "ingest coverage for project {:?} ({:.3}) is below the policy coverage_floor \
+                 ({:.3}); this candidate is suppressed to unavailable rather than reported \
+                 (COVERAGE_INSUFFICIENT)",
+                source_project.clone().unwrap_or_default(),
+                coverage.unwrap_or(0.0),
+                policy.coverage_floor,
+            ));
+            SignalStatus::Unavailable
+        } else {
+            SignalStatus::Candidate
+        };
+
+        // Module identity, not display name, is the subject: two modules in
+        // different languages can share a display name (H3).
         signals.push(Signal {
             id: "zero_in_edge_module",
-            subject_id: module_name,
-            status: SignalStatus::Candidate,
-            value: json!({ "module_id": module_id }),
+            subject_id: module_id.clone(),
+            status,
+            value: json!({ "module_id": module_id, "name": module_name }),
             evidence_ids: vec![module_id],
-            limitations: vec![
-                "absence of an observed import in-edge is not proof of dead code; L1.5 \
-                 regex-based import resolution has known false-negative gaps"
-                    .to_string(),
-            ],
+            limitations,
+        });
+    }
+    if !coverage_gated.is_empty() {
+        errors.push(AuditErrorEntry {
+            code: AuditErrorCode::CoverageInsufficient,
+            message: format!(
+                "{} project(s) below policy coverage_floor ({:.3}); zero_in_edge candidates \
+                 suppressed to unavailable: {}",
+                coverage_gated.len(),
+                policy.coverage_floor,
+                coverage_gated
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
         });
     }
     Ok(())
@@ -1054,10 +1360,13 @@ mod tests {
     }
 
     /// Builds a fixture map database at `path` with a small, deterministic
-    /// project/module graph: two projects (`crate-a` depends_on `crate-b`,
-    /// declared + observed; a policy-unmapped `crate-z`), and two modules
-    /// forming a self-import cycle plus one zero-in-edge/duplicate-hash
-    /// module.
+    /// project/module graph: three projects (`crate-a` depends_on `crate-b`,
+    /// declared + observed; a policy-unmapped `crate-z` reachable only by a
+    /// dev edge; a policy-unmapped `crate-orphan` reachable by NO edge at
+    /// all), four modules (a self-import cycle between `crate_a::lib`/
+    /// `crate_a::util`, a zero-in-edge/duplicate-hash `crate_a::orphan`
+    /// carrying an unresolved import, and a same-named-but-different-
+    /// language `crate_a::lib` in python with no edges at all).
     async fn build_fixture(path: &Path, edge_insert_order: [usize; 2]) {
         let backend = StorageBackend::sqlite(path).expect("open fixture backend");
         {
@@ -1094,6 +1403,18 @@ mod tests {
             None,
             "crate-z",
             json!({"source_project": "crate-z", "last_seen_at": "2026-07-16T00:00:00Z"}),
+        )
+        .await
+        .unwrap();
+        // H4: a project reachable by NO edge at all — must still degrade to
+        // unavailable + POLICY_INCOMPLETE, not silently vanish.
+        seed(
+            writer.as_mut(),
+            "cccccccc-cccc-cccc-cccc-cccccccccccc",
+            "project",
+            None,
+            "crate-orphan",
+            json!({"source_project": "crate-orphan", "last_seen_at": "2026-07-16T00:00:00Z"}),
         )
         .await
         .unwrap();
@@ -1172,6 +1493,25 @@ mod tests {
                 "language": "rust",
                 "module_path": "crate_a::orphan",
                 "content_hash": "cafef00d",
+                "unresolved_specifiers": ["crate_a::missing"],
+            }),
+        )
+        .await
+        .unwrap();
+        // H3: a SECOND module named identically to `crate_a::lib`, but a
+        // distinct language/entity — must not be collapsed into the rust
+        // module's Tarjan node or zero-in-edge subject by name collision.
+        seed(
+            writer.as_mut(),
+            "dddddddd-dddd-dddd-dddd-dddddddddddd",
+            "concept",
+            Some("module"),
+            "crate_a::lib",
+            json!({
+                "source_project": "crate-a",
+                "language": "python",
+                "module_path": "crate_a::lib",
+                "content_hash": "beefcafe",
             }),
         )
         .await
@@ -1204,9 +1544,9 @@ mod tests {
     }
 
     fn test_policy(dir: &Path) -> PathBuf {
-        let path = dir.join("policy.toml");
-        std::fs::write(
-            &path,
+        write_policy(
+            dir,
+            "policy.toml",
             r#"
 policy_version = 1
 coverage_floor = 0.0
@@ -1217,7 +1557,11 @@ crate-a = 0
 crate-b = 1
 "#,
         )
-        .unwrap();
+    }
+
+    fn write_policy(dir: &Path, name: &str, contents: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, contents).unwrap();
         path
     }
 
@@ -1261,13 +1605,23 @@ crate-b = 1
             "crate-b->crate-a is the correct top-down direction and must not be flagged"
         );
 
-        // crate-b -> crate-z is dev-only, so it is skipped by default
-        // (include_dev_dependencies=false); it only surfaces the
-        // policy-incomplete degradation once dev edges are opted in.
-        assert!(!report
-            .signals
+        // crate-z is only reachable via a dev-only edge and crate-orphan has
+        // NO edge at all — both are unmapped in the policy, so BOTH must
+        // degrade to unavailable regardless of include_dev_dependencies (H4):
+        // POLICY_INCOMPLETE is derived from the full project set, not from
+        // which edges happened to be selected.
+        for unmapped in ["crate-z", "crate-orphan"] {
+            let signal = report
+                .signals
+                .iter()
+                .find(|s| s.id == "layering_violation" && s.subject_id == unmapped)
+                .unwrap_or_else(|| panic!("expected {unmapped} reported as policy-incomplete"));
+            assert_eq!(signal.status, SignalStatus::Unavailable);
+        }
+        assert!(report
+            .errors
             .iter()
-            .any(|s| s.id == "layering_violation" && s.subject_id == "crate-z"));
+            .any(|e| matches!(e.code, AuditErrorCode::PolicyIncomplete)));
 
         let mut with_dev = base_request(tmp.path().join("map.db"), test_policy(tmp.path()));
         with_dev.include_dev_dependencies = true;
@@ -1278,10 +1632,6 @@ crate-b = 1
             .find(|s| s.id == "layering_violation" && s.subject_id == "crate-z")
             .expect("expected crate-z reported as policy-incomplete once dev edges are included");
         assert_eq!(unmapped.status, SignalStatus::Unavailable);
-        assert!(report_with_dev
-            .errors
-            .iter()
-            .any(|e| matches!(e.code, AuditErrorCode::PolicyIncomplete)));
     }
 
     #[tokio::test]
@@ -1295,16 +1645,32 @@ crate-b = 1
         let project_cycle = report.signals.iter().any(|s| {
             s.id == "dependency_cycle"
                 && s.subject_id.starts_with("project_production:")
-                && s.subject_id.contains("crate-a")
-                && s.subject_id.contains("crate-b")
+                && s.subject_id
+                    .contains("11111111-1111-1111-1111-111111111111")
+                && s.subject_id
+                    .contains("22222222-2222-2222-2222-222222222222")
         });
         assert!(project_cycle, "expected a project_production cycle");
 
+        // H3: the module_import cycle must be exactly the rust lib/util
+        // pair by ID — the same-named python `crate_a::lib` module (which
+        // has no edges at all) must NOT appear in any cycle membership.
         let module_cycle = report
             .signals
             .iter()
-            .any(|s| s.id == "dependency_cycle" && s.subject_id.starts_with("module_import:"));
-        assert!(module_cycle, "expected a module_import cycle");
+            .find(|s| s.id == "dependency_cycle" && s.subject_id.starts_with("module_import:"))
+            .expect("expected a module_import cycle");
+        assert_eq!(
+            module_cycle.subject_id,
+            "module_import:77777777-7777-7777-7777-777777777777,\
+             88888888-8888-8888-8888-888888888888"
+        );
+        assert!(
+            !module_cycle
+                .subject_id
+                .contains("dddddddd-dddd-dddd-dddd-dddddddddddd"),
+            "the edge-less python crate_a::lib must not be pulled into the rust SCC by name"
+        );
     }
 
     #[tokio::test]
@@ -1315,12 +1681,29 @@ crate-b = 1
         let policy = test_policy(tmp.path());
 
         let report = generate_report(&base_request(db, policy)).await.unwrap();
+
+        // Subject is now the module's own ID (not its display name), so the
+        // two same-named `crate_a::lib` modules each get an independent,
+        // unambiguous zero_in_edge_module signal.
         let orphan = report
             .signals
             .iter()
-            .find(|s| s.id == "zero_in_edge_module" && s.subject_id == "crate_a::orphan")
+            .find(|s| {
+                s.id == "zero_in_edge_module"
+                    && s.subject_id == "99999999-9999-9999-9999-999999999999"
+            })
             .expect("orphan module has no incoming depends_on edge");
         assert_eq!(orphan.status, SignalStatus::Candidate);
+
+        let python_lib = report
+            .signals
+            .iter()
+            .find(|s| {
+                s.id == "zero_in_edge_module"
+                    && s.subject_id == "dddddddd-dddd-dddd-dddd-dddddddddddd"
+            })
+            .expect("edge-less python crate_a::lib is independently a zero-in-edge candidate");
+        assert_eq!(python_lib.status, SignalStatus::Candidate);
 
         let dup = report
             .signals
@@ -1329,6 +1712,74 @@ crate-b = 1
             .expect("crate_a::lib and crate_a::util share a content hash");
         assert_eq!(dup.status, SignalStatus::Candidate);
         assert_eq!(dup.evidence_ids.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn ingest_coverage_aggregates_module_level_unresolved_imports() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = tmp.path().join("map.db");
+        build_fixture(&db, [0, 1]).await;
+        let policy = test_policy(tmp.path());
+
+        let report = generate_report(&base_request(db, policy)).await.unwrap();
+        // crate-a itself carries no `unresolved_specifiers` property; the
+        // one unresolved import lives on its `crate_a::orphan` MODULE
+        // (source_ingest.rs:776-784). The pre-fix code read only the
+        // project's own property and reported 0 (H2).
+        let coverage = report
+            .signals
+            .iter()
+            .find(|s| s.id == "ingest_coverage" && s.subject_id == "crate-a")
+            .expect("expected an ingest_coverage signal for crate-a");
+        assert_eq!(
+            coverage
+                .value
+                .get("unresolved_specifier_count")
+                .and_then(Value::as_u64),
+            Some(1),
+            "unresolved specifier recorded on a module must roll up to its project"
+        );
+        assert!(coverage
+            .evidence_ids
+            .contains(&"99999999-9999-9999-9999-999999999999".to_string()));
+    }
+
+    #[tokio::test]
+    async fn coverage_floor_gates_zero_in_edge_to_unavailable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = tmp.path().join("map.db");
+        build_fixture(&db, [0, 1]).await;
+        // crate-a has 4 modules (lib, util, orphan, python-lib) and 1
+        // unresolved specifier => coverage_ratio = 4/(4+1) = 0.8. A floor of
+        // 0.9 must suppress crate-a's zero_in_edge candidates.
+        let policy = write_policy(
+            tmp.path(),
+            "strict-policy.toml",
+            r#"
+policy_version = 1
+coverage_floor = 0.9
+denied_pairs = []
+
+[crate_ranks]
+crate-a = 0
+crate-b = 1
+"#,
+        );
+
+        let report = generate_report(&base_request(db, policy)).await.unwrap();
+        let orphan = report
+            .signals
+            .iter()
+            .find(|s| {
+                s.id == "zero_in_edge_module"
+                    && s.subject_id == "99999999-9999-9999-9999-999999999999"
+            })
+            .unwrap();
+        assert_eq!(orphan.status, SignalStatus::Unavailable);
+        assert!(report
+            .errors
+            .iter()
+            .any(|e| matches!(e.code, AuditErrorCode::CoverageInsufficient)));
     }
 
     #[tokio::test]
@@ -1397,5 +1848,136 @@ crate-b = 1
             .await
             .unwrap_err();
         assert!(err.to_string().contains("does not exist"));
+    }
+
+    #[tokio::test]
+    async fn missing_table_degrades_affected_signals_instead_of_aborting() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = tmp.path().join("map.db");
+        build_fixture(&db, [0, 1]).await;
+        {
+            let backend = StorageBackend::sqlite(&db).expect("open fixture backend");
+            let mut writer = backend.pool().writer().expect("writer guard");
+            writer
+                .conn_mut()
+                .execute_batch("DROP TABLE graph_edges;")
+                .expect("drop graph_edges to simulate a partial/older map");
+        }
+        let policy = test_policy(tmp.path());
+
+        // H1: a partial map missing an entire table must still produce a
+        // report — not abort the whole command.
+        let report = generate_report(&base_request(db, policy)).await.unwrap();
+        assert!(report
+            .errors
+            .iter()
+            .any(|e| matches!(e.code, AuditErrorCode::SchemaUnsupported)
+                && e.message.contains("graph_edges")));
+        for id in [
+            "module_fan_in",
+            "layering_violation",
+            "manifest_import_mismatch",
+            "dependency_cycle_summary",
+            "zero_in_edge_module",
+        ] {
+            assert!(
+                report
+                    .signals
+                    .iter()
+                    .any(|s| s.id == id && s.status == SignalStatus::Unavailable),
+                "expected {id} to degrade to unavailable when graph_edges is missing"
+            );
+        }
+        // entities-only signals are unaffected by a missing graph_edges table.
+        assert!(report
+            .signals
+            .iter()
+            .any(|s| s.id == "ingest_coverage" && s.status == SignalStatus::Observed));
+    }
+
+    #[tokio::test]
+    async fn missing_column_degrades_affected_signals_instead_of_aborting() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = tmp.path().join("map.db");
+        build_fixture(&db, [0, 1]).await;
+        {
+            let backend = StorageBackend::sqlite(&db).expect("open fixture backend");
+            let mut writer = backend.pool().writer().expect("writer guard");
+            writer
+                .conn_mut()
+                .execute_batch(
+                    "DROP INDEX IF EXISTS idx_entities_kind_entity_type; \
+                     ALTER TABLE entities DROP COLUMN entity_type;",
+                )
+                .expect("drop entity_type to simulate an older map schema");
+        }
+        let policy = test_policy(tmp.path());
+
+        let report = generate_report(&base_request(db, policy)).await.unwrap();
+        assert!(report
+            .errors
+            .iter()
+            .any(|e| matches!(e.code, AuditErrorCode::SchemaUnsupported)
+                && e.message.contains("entity_type")));
+        assert!(report
+            .signals
+            .iter()
+            .any(|s| s.id == "ingest_coverage" && s.status == SignalStatus::Unavailable));
+        assert!(report
+            .signals
+            .iter()
+            .any(|s| s.id == "module_fan_in" && s.status == SignalStatus::Unavailable));
+    }
+
+    #[tokio::test]
+    async fn policy_rejects_unknown_fields() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let policy = write_policy(
+            tmp.path(),
+            "bad.toml",
+            r#"
+policy_version = 1
+typo_field = true
+
+[crate_ranks]
+crate-a = 0
+"#,
+        );
+        let err = load_policy(&policy).unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("typo_field")
+                || format!("{err:#}").to_lowercase().contains("unknown field")
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_rejects_missing_version() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let policy = write_policy(
+            tmp.path(),
+            "no-version.toml",
+            r#"
+[crate_ranks]
+crate-a = 0
+"#,
+        );
+        assert!(load_policy(&policy).is_err());
+    }
+
+    #[tokio::test]
+    async fn policy_rejects_unsupported_version() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let policy = write_policy(
+            tmp.path(),
+            "future-version.toml",
+            r#"
+policy_version = 99
+
+[crate_ranks]
+crate-a = 0
+"#,
+        );
+        let err = load_policy(&policy).unwrap_err();
+        assert!(err.to_string().contains("policy_version"));
     }
 }
