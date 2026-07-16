@@ -856,6 +856,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let db_path = dir.path().join("test.db");
         let rt = KhiveRuntime::new(RuntimeConfig {
+            git_write: Default::default(),
             db_path: Some(db_path),
             default_namespace: Namespace::local(),
             embedding_model: None,

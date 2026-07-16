@@ -918,6 +918,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.db");
         let config = RuntimeConfig {
+            git_write: Default::default(),
             db_path: Some(path),
             default_namespace: Namespace::local(),
             embedding_model: None,
@@ -941,6 +942,7 @@ mod tests {
     fn backend_data_dir_returns_none_for_from_backend_with_memory() {
         let backend = Arc::new(StorageBackend::memory().expect("memory backend"));
         let config = RuntimeConfig {
+            git_write: Default::default(),
             db_path: None,
             default_namespace: Namespace::local(),
             embedding_model: None,
@@ -962,6 +964,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.db");
         let config = RuntimeConfig {
+            git_write: Default::default(),
             db_path: Some(path.clone()),
             default_namespace: Namespace::parse("test").unwrap(),
             embedding_model: None,
@@ -983,6 +986,7 @@ mod tests {
     fn from_backend_uses_provided_backend() {
         let backend = Arc::new(StorageBackend::memory().expect("memory backend"));
         let config = RuntimeConfig {
+            git_write: Default::default(),
             db_path: None,
             default_namespace: Namespace::local(),
             embedding_model: None,
@@ -1140,6 +1144,7 @@ mod tests {
         // visible-set, but that does not change default_namespace. This test
         // asserts the write-routing invariant only.
         let base = RuntimeConfig {
+            git_write: Default::default(),
             db_path: None,
             default_namespace: Namespace::local(),
             embedding_model: None,
@@ -1164,6 +1169,7 @@ mod tests {
     #[test]
     fn runtime_config_from_khive_config_empty_actor_id_keeps_base_namespace() {
         let base = RuntimeConfig {
+            git_write: Default::default(),
             db_path: None,
             default_namespace: Namespace::parse("lambda:base").unwrap(),
             embedding_model: None,
@@ -1196,6 +1202,7 @@ mod tests {
     #[test]
     fn runtime_config_from_khive_config_absent_actor_id_keeps_base_namespace() {
         let base = RuntimeConfig {
+            git_write: Default::default(),
             db_path: None,
             default_namespace: Namespace::parse("lambda:base").unwrap(),
             embedding_model: None,
@@ -1220,6 +1227,7 @@ mod tests {
     #[test]
     fn runtime_config_from_khive_config_actor_id_with_engines() {
         let base = RuntimeConfig {
+            git_write: Default::default(),
             db_path: None,
             default_namespace: Namespace::local(),
             embedding_model: None,
@@ -1379,6 +1387,7 @@ mod tests {
 
     fn secondary_config() -> RuntimeConfig {
         RuntimeConfig {
+            git_write: Default::default(),
             db_path: None,
             default_namespace: Namespace::local(),
             embedding_model: None,
@@ -1455,6 +1464,7 @@ mod tests {
         let secondary_arc = migrated_memory_backend();
 
         let main_config = RuntimeConfig {
+            git_write: Default::default(),
             db_path: None,
             default_namespace: Namespace::local(),
             embedding_model: None,
@@ -1591,6 +1601,7 @@ mod tests {
         let rt_from = KhiveRuntime::from_backend(
             backend,
             RuntimeConfig {
+                git_write: Default::default(),
                 db_path: None,
                 default_namespace: Namespace::local(),
                 embedding_model: None,

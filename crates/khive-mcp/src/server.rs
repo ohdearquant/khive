@@ -19,6 +19,7 @@ use rmcp::{
     tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler, ServiceExt,
 };
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use khive_db::ConnectionPool;
 use khive_request::{parse_request, ArgValue, DslError, ExecutionMode, ParsedOp};
@@ -37,7 +38,8 @@ use crate::tools::request::RequestParams;
 ///
 /// Two servers produce the same id iff they can safely share one warm engine:
 /// same pack set (order-independent), same storage target, same embedders, same
-/// backend topology/routing, and same construction-baked outbound policy.
+/// backend topology/routing, and same construction-baked outbound and git-write
+/// policies.
 /// Identity fields (`namespace`, `actor_id`, `visible_namespaces`) are carried
 /// per request in the daemon frame and must never enter this key. The daemon
 /// compares this against each forwarded request's `config_id` and rejects
@@ -80,15 +82,29 @@ pub fn compute_config_id(
         .collect();
     outbound.sort();
     outbound.dedup();
+    let mut git_write_hasher = Sha256::new();
+    git_write_hasher.update(b"khive.git-write-policy.v1");
+    git_write_hasher.update((config.git_write.allowed.len() as u64).to_be_bytes());
+    for entry in &config.git_write.allowed {
+        git_write_hasher.update((entry.repo.len() as u64).to_be_bytes());
+        git_write_hasher.update(entry.repo.as_bytes());
+        git_write_hasher.update((entry.branches.len() as u64).to_be_bytes());
+        for branch in &entry.branches {
+            git_write_hasher.update((branch.len() as u64).to_be_bytes());
+            git_write_hasher.update(branch.as_bytes());
+        }
+    }
+    let git_write = format!("{:x}", git_write_hasher.finalize());
 
     let base = format!(
-        "packs=[{}];db={};embed={};extra=[{}];backend={:?};outbound=[{}]",
+        "packs=[{}];db={};embed={};extra=[{}];backend={:?};outbound=[{}];git_write={}",
         packs.join(","),
         db,
         primary,
         extra.join(","),
         config.backend_id,
         outbound.join(","),
+        git_write,
     );
 
     // Fold backend topology when non-empty so two configs differing only in

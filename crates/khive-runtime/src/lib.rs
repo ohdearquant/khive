@@ -53,7 +53,8 @@ pub use daemon::{
 };
 pub use embedder_registry::{EmbedderProvider, EmbedderRegistry, LatticeEmbedderProvider};
 pub use engine_config::{
-    config_from_env, BackendConfig, BackendKind, ConfigError, EngineConfig, KhiveConfig, PackConfig,
+    config_from_env, BackendConfig, BackendKind, ConfigError, EngineConfig, GitWriteEntryConfig,
+    GitWriteSectionConfig, KhiveConfig, PackConfig,
 };
 pub use error::{fts_text_leg_or_err, GuardedWriteFailure, RuntimeError, RuntimeResult};
 pub use fusion::FusionStrategy;

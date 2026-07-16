@@ -2,7 +2,7 @@
 
 One plugin for the whole khive surface: a knowledge graph, GTD, memory, inter-agent comm,
 scheduling, and a domain-knowledge corpus, all served by a single MCP server (`kkernel mcp`)
-exposing one tool, `request`, that dispatches 79 verbs across 11 packs.
+exposing one tool — `request` — that dispatches 82 verbs across 11 packs.
 
 This plugin is **guidance, not a second runtime**. It ships the pattern skills that teach an
 agent how to use each pack well, plus the kg stewardship agents. The data and verbs live in the
@@ -51,9 +51,11 @@ Once installed, invoke them as `khive:digester`, `khive:polisher`, and so on.
 
 The `kg` pack is the base (entities, edges, notes); every other pack builds on it. The default
 server config loads all eleven (`kg`, `gtd`, `memory`, `brain`, `comm`, `schedule`, `knowledge`,
-`session`, `git`, `code`, `workspace` — `git` contributes note kinds, a batch ingester, and the
-`git.digest` verb; `code` contributes the `code.ingest` L1/L1.5 source-ingest verb plus a
-`finding` note kind whose `findings.json` ingestion is reached only through the
+`session`, `git`, `code`, `workspace` — `git` contributes note kinds, a batch ingester, the
+`git.digest` verb, and three write verbs — `git.commit`/`git.branch`/`git.push` — that shell to
+system git with hardened, allowlisted argv construction and unconditional force-push denial
+(ADR-108); `code` contributes the `code.ingest` L1/L1.5 source-ingest verb plus a `finding`
+note kind whose `findings.json` batch ingestion is reached only through the
 `kkernel code-ingest` admin CLI; `workspace` contributes entity/endpoint vocabulary, no verbs) —
 this plugin currently ships pattern skills for the first seven; `session`, `git`, `code`, and
 `workspace` have no skill yet (see the Pattern skills table above).

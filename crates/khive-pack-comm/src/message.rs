@@ -357,6 +357,7 @@ mod tests {
         let recipient_ns = format!("t460-recipient-{}", Uuid::new_v4().simple());
 
         let runtime = KhiveRuntime::new(RuntimeConfig {
+            git_write: Default::default(),
             db_path: None,
             default_namespace: Namespace::parse(&sender_ns).unwrap(),
             embedding_model: None,

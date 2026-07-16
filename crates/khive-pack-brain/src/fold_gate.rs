@@ -535,6 +535,7 @@ mod tests {
         let db_path = dir.path().join("fold-gate-concurrency.db");
 
         let rt = KhiveRuntime::new(RuntimeConfig {
+            git_write: Default::default(),
             db_path: Some(db_path),
             default_namespace: Namespace::local(),
             embedding_model: None,
@@ -638,6 +639,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join(db_name);
         let rt = KhiveRuntime::new(RuntimeConfig {
+            git_write: Default::default(),
             db_path: Some(db_path),
             default_namespace: Namespace::local(),
             embedding_model: None,

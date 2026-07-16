@@ -769,6 +769,7 @@ mod tests {
         // `embedding_model` to a real on-disk model, which is absent on CI
         // runners and fails entity creation with `ModelInitialization`.
         let rt = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            git_write: Default::default(),
             db_path: None,
             default_namespace: Namespace::local(),
             embedding_model: None,

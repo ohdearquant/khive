@@ -197,7 +197,7 @@ def main():
         assert isinstance(verbs_result["verbs"], list), f"verbs must be a list: {verbs_result}"
         # Surface-contract tripwire: the default config (no --pack, KHIVE_PACKS
         # unset) loads 11 production packs (kg, gtd, memory, brain, comm, schedule,
-        # knowledge, session, git, code, workspace), so verbs() returns exactly 79 user-facing
+        # knowledge, session, git, code, workspace), so verbs() returns exactly 82 user-facing
         # MCP-callable verbs (count what verbs() returns, not internal dispatch
         # arms). The session pack contributes 4 agent-facing T1 verbs
         # (store/list/resume/export), promoted from internal subhandlers to
@@ -207,8 +207,10 @@ def main():
         # (#606, verified live 2026-07-04), comm.probe (#644 read-only
         # inbound poll), and brain.event_counts (#724, ADR-103 Stage 1
         # windowed event read) are included in the count; git contributes
-        # git.digest (ADR-088 Amendment 1); code contributes exactly one verb,
-        # `code.ingest` (ADR-085 Amendment 2, PR #1039 — L1 manifest +
+        # git.digest (ADR-088 Amendment 1) plus git.commit / git.branch /
+        # git.push (ADR-108, three thin write verbs shelling to system git
+        # with hardened argv construction); code contributes exactly one
+        # verb, `code.ingest` (ADR-085 Amendment 2, PR #1039 — L1 manifest +
         # L1.5 import-scan tiers; its `finding` note kind and
         # `findings.json` batch ingest remain reachable only via the
         # `kkernel code-ingest` admin CLI, never this MCP verb surface);
@@ -216,13 +218,14 @@ def main():
         # `workspace` entity kind and `contains` endpoint rules. Update this
         # number when the pack set or verb surface changes; a silent drift
         # here is the bug this assertion exists to catch.
-        assert verbs_result["total"] == 79, (
-            f"expected 79 user-facing verbs from the 11 default packs "
+        assert verbs_result["total"] == 82, (
+            f"expected 82 user-facing verbs from the 11 default packs "
             f"(session contributes 4 T1 verbs promoted to Visibility::Verb per "
             f"ADR-083; context is the 17th kg-substrate bare verb per ADR-089; "
             f"resolve is the 18th kg-substrate bare verb per the unified-verb "
             f"draft ADR Slice 1; comm.health is #606; comm.probe is #644; "
-            f"brain.event_counts is #724/ADR-103; git contributes git.digest; "
+            f"brain.event_counts is #724/ADR-103; git contributes git.digest plus "
+            f"git.commit/git.branch/git.push (ADR-108); "
             f"code contributes code.ingest per ADR-085 Amendment 2 (PR #1039); "
             f"workspace (#873) contributes zero verbs), "
             f"got {verbs_result['total']}: {verbs_result}"

@@ -20,6 +20,7 @@ fn make_rt(brain_profile: Option<String>, with_brain: bool) -> KhiveRuntime {
         vec!["kg".into(), "knowledge".into()]
     };
     KhiveRuntime::new(RuntimeConfig {
+        git_write: Default::default(),
         db_path: None,
         embedding_model: None,
         additional_embedding_models: vec![],
@@ -35,6 +36,7 @@ fn make_rt(brain_profile: Option<String>, with_brain: bool) -> KhiveRuntime {
 /// to a real on-disk model, absent on CI runners.
 fn make_rt_with_actor(actor: &str) -> KhiveRuntime {
     KhiveRuntime::new(RuntimeConfig {
+        git_write: Default::default(),
         db_path: None,
         default_namespace: Namespace::local(),
         embedding_model: None,
