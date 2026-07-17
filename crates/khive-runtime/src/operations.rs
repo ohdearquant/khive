@@ -2999,6 +2999,25 @@ impl KhiveRuntime {
         Ok(page.items)
     }
 
+    /// Count notes matching `kind`, summed across the caller's visible
+    /// namespaces. The store-layer `count_notes` is namespace-pinned by
+    /// design (no `NamespaceFilter`-style `IN (...)` support); this sums the
+    /// per-namespace store calls, mirroring [`Self::count_edges_by_relation`]
+    /// and the multi-namespace path in [`Self::list_notes`] so `stats().notes`
+    /// reconciles with a full `list` keyset walk under the same token.
+    pub async fn count_notes(
+        &self,
+        token: &NamespaceToken,
+        kind: Option<&str>,
+    ) -> RuntimeResult<u64> {
+        let mut total = 0u64;
+        for ns in token.visible_namespaces() {
+            let temp = NamespaceToken::for_namespace(ns.clone());
+            total += self.notes(&temp)?.count_notes(ns.as_str(), kind).await?;
+        }
+        Ok(total)
+    }
+
     /// Search notes using a hybrid FTS5 + vector pipeline with salience weighting.
     ///
     /// Pipeline:
@@ -3976,11 +3995,17 @@ impl KhiveRuntime {
         token: &NamespaceToken,
         kind: Option<&str>,
     ) -> RuntimeResult<u64> {
+        let ns_strs: Vec<String> = token
+            .visible_namespaces()
+            .iter()
+            .map(|ns| ns.as_str().to_owned())
+            .collect();
         let filter = EntityFilter {
             kinds: match kind {
                 Some(k) => vec![k.to_string()],
                 None => vec![],
             },
+            namespaces: ns_strs,
             ..Default::default()
         };
         Ok(self
@@ -4596,13 +4621,24 @@ impl KhiveRuntime {
         Ok(deleted)
     }
 
-    /// Count edges matching `filter`.
+    /// Count edges matching `filter`, summed across the caller's visible
+    /// namespaces (mirrors [`Self::count_edges_by_relation`] and
+    /// [`Self::list_edges`] so `stats().edges` reconciles with a full `list`
+    /// keyset walk under the same token).
     pub async fn count_edges(
         &self,
         token: &NamespaceToken,
         filter: crate::curation::EdgeListFilter,
     ) -> RuntimeResult<u64> {
-        Ok(self.graph(token)?.count_edges(filter.into()).await?)
+        let mut total = 0u64;
+        for ns in token.visible_namespaces() {
+            let temp = NamespaceToken::for_namespace(ns.clone());
+            total += self
+                .graph(&temp)?
+                .count_edges(filter.clone().into())
+                .await?;
+        }
+        Ok(total)
     }
 
     /// Validate and construct an edge from a [`LinkSpec`] without writing to storage.

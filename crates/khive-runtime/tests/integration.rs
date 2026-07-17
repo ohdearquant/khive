@@ -3012,3 +3012,117 @@ async fn delete_edge_cross_namespace_audit_uses_record_namespace_hard() {
         "EdgeDeleted payload.namespace must be the record's namespace (ns-owner-hard)"
     );
 }
+
+// =============================================================================
+// #711: stats() must aggregate over the caller's visible namespaces, matching
+// the scope a full `list` keyset walk computes over — not just token.namespace().
+// =============================================================================
+
+/// `count_entities` / `count_edges` / `count_edges_by_relation` / `count_notes`
+/// must all sum across an identity-bearing caller's visible-namespace set, so
+/// `stats()` totals reconcile with a full multi-namespace `list` walk, for
+/// entities, edges, and notes alike.
+#[tokio::test]
+async fn stats_totals_match_list_walk_across_visible_namespaces() {
+    use khive_runtime::EdgeListFilter;
+
+    // Identity-bearing caller: actor_id configured (not anonymous).
+    let rt = KhiveRuntime::new(RuntimeConfig {
+        db_path: None,
+        packs: vec!["kg".to_string()],
+        brain_profile: None,
+        actor_id: Some("lambda:stats-711-test".to_string()),
+        ..RuntimeConfig::no_embeddings()
+    })
+    .expect("in-memory runtime with actor identity");
+
+    let ns_a = Namespace::parse("stats-711-a").unwrap();
+    let ns_b = Namespace::parse("stats-711-b").unwrap();
+    let tok_a = rt.authorize(ns_a.clone()).unwrap();
+    let tok_b = rt.authorize(ns_b.clone()).unwrap();
+
+    // Entities: 2 in ns_a, 2 in ns_b (b2 created below, alongside the edges).
+    let a1 = rt
+        .create_entity(&tok_a, "concept", None, "StatsA1", None, None, vec![])
+        .await
+        .unwrap();
+    let a2 = rt
+        .create_entity(&tok_a, "concept", None, "StatsA2", None, None, vec![])
+        .await
+        .unwrap();
+    let b1 = rt
+        .create_entity(&tok_b, "concept", None, "StatsB1", None, None, vec![])
+        .await
+        .unwrap();
+
+    // Edges: two `extends` in ns_a, one `enables` in ns_b.
+    rt.link(&tok_a, a1.id, a2.id, EdgeRelation::Extends, 1.0, None)
+        .await
+        .unwrap();
+    rt.link(&tok_a, a2.id, a1.id, EdgeRelation::Extends, 1.0, None)
+        .await
+        .unwrap();
+    let b2 = rt
+        .create_entity(&tok_b, "concept", None, "StatsB2", None, None, vec![])
+        .await
+        .unwrap();
+    rt.link(&tok_b, b1.id, b2.id, EdgeRelation::Enables, 1.0, None)
+        .await
+        .unwrap();
+
+    // Notes: one in each namespace.
+    rt.create_note(&tok_a, "observation", None, "NoteInA", None, None, vec![])
+        .await
+        .unwrap();
+    rt.create_note(&tok_b, "observation", None, "NoteInB", None, None, vec![])
+        .await
+        .unwrap();
+
+    // Identity-bearing frame whose visible set spans both namespaces.
+    let vis_tok = rt
+        .authorize_with_visibility(ns_a.clone(), vec![ns_b.clone()])
+        .unwrap();
+
+    let full_entities = rt
+        .list_entities(&vis_tok, None, None, 500, 0)
+        .await
+        .unwrap();
+    let stats_entities = rt.count_entities(&vis_tok, None).await.unwrap();
+    assert_eq!(
+        stats_entities,
+        full_entities.len() as u64,
+        "stats() entity total must equal a full list keyset walk under the same identity"
+    );
+    assert_eq!(stats_entities, 4);
+
+    let full_edges = rt
+        .list_edges(&vis_tok, EdgeListFilter::default(), 1000, 0)
+        .await
+        .unwrap();
+    let stats_edges = rt
+        .count_edges(&vis_tok, EdgeListFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        stats_edges,
+        full_edges.len() as u64,
+        "stats() edge total must equal a full list keyset walk under the same identity"
+    );
+    assert_eq!(stats_edges, 3);
+
+    let edges_by_relation = rt.count_edges_by_relation(&vis_tok).await.unwrap();
+    let relation_sum: u64 = edges_by_relation.values().sum();
+    assert_eq!(
+        relation_sum, stats_edges,
+        "edges_by_relation must sum to the edges scalar under all identities"
+    );
+
+    let full_notes = rt.list_notes(&vis_tok, None, 200, 0).await.unwrap();
+    let stats_notes = rt.count_notes(&vis_tok, None).await.unwrap();
+    assert_eq!(
+        stats_notes,
+        full_notes.len() as u64,
+        "stats() note total must equal a full list keyset walk under the same identity"
+    );
+    assert_eq!(stats_notes, 2);
+}
