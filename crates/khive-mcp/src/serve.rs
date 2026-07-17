@@ -4025,18 +4025,29 @@ region = "us-east-1"
             "expected the default store to be an FsBlobStore, got: {debug}"
         );
 
-        let content_ref = installed
+        // The absent-section default keeps FsBlobStore's 100 GB free-space
+        // floor — that default is exactly what this test locks in, and a CI
+        // runner legitimately may not clear it. A CapacityFloor rejection can
+        // only come from inside FsBlobStore::put, so it is equally valid
+        // proof that the boot path wired a live fs-default store; round-trip
+        // only when the volume has room.
+        match installed
             .put(b"adr-111 fs-default regression".to_vec())
             .await
-            .expect("fs-default store must accept a write");
-        let round_tripped = installed
-            .get(&content_ref)
-            .await
-            .expect("fs-default store must serve back what it just accepted");
-        assert_eq!(
-            round_tripped, b"adr-111 fs-default regression",
-            "fs-default store must round-trip the exact bytes written"
-        );
+        {
+            Ok(content_ref) => {
+                let round_tripped = installed
+                    .get(&content_ref)
+                    .await
+                    .expect("fs-default store must serve back what it just accepted");
+                assert_eq!(
+                    round_tripped, b"adr-111 fs-default regression",
+                    "fs-default store must round-trip the exact bytes written"
+                );
+            }
+            Err(khive_storage::StorageError::CapacityFloor { .. }) => {}
+            Err(other) => panic!("fs-default store must accept a write: {other:?}"),
+        }
     }
 
     /// Regression for ADR-073: a pack assigned to a secondary backend must
