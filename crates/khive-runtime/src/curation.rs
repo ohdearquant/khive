@@ -3445,6 +3445,26 @@ mod tests {
             from_after.content, "From content",
             "dry_run must not mutate from-note"
         );
+
+        let events = rt
+            .events(&tok)
+            .unwrap()
+            .query_events(
+                khive_storage::EventFilter {
+                    kinds: vec![EventKind::NoteMerged],
+                    ..Default::default()
+                },
+                khive_storage::types::PageRequest {
+                    offset: 0,
+                    limit: 10,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            events.items.is_empty(),
+            "dry_run=true must not append a NoteMerged event"
+        );
     }
 
     // Merging two nameless notes with no embedding model configured: a raw SQL FTS
