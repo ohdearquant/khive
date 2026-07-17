@@ -1,6 +1,8 @@
 //! Typed document identifier for BM25 index operations.
 
-/// Typed document identifier; wire format is a plain JSON string (serde transparent).
+/// Typed document identifier serialized as a plain JSON string.
+///
+/// See `crates/khive-bm25/docs/api/index-lifecycle.md` for wire compatibility.
 #[derive(
     Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
@@ -90,11 +92,6 @@ impl PartialEq<String> for DocumentId {
     }
 }
 
-// ── Wire-format fixture: DocumentId ──────────────────────────────────────────
-//
-// These tests lock the JSON wire representation of `DocumentId` after its
-// migration to `transparent_string_newtype!`. Updating this fixture = a
-// wire-format migration that requires a PR-level migration plan.
 #[cfg(test)]
 mod document_id_wire_format {
     use super::DocumentId;

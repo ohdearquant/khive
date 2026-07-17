@@ -324,9 +324,8 @@ pub struct VamanaIndex {
     config: VamanaConfig,
     num_vectors: usize,
     dimensions: usize,
-    // ---- PR2: lifecycle fields (ADR-052 §2) ----
+    // ---- PR2: lifecycle fields (ADR-052 §2; see docs/design.md#lifecycle-fields) ----
     /// Bit-packed tombstone marks. Bit `i` set ⇒ node `i` is soft-deleted.
-    /// `Vec<u64>` with manual manipulation; no `bitvec` crate dependency (OQ3 resolution).
     tombstones: Vec<u64>,
     /// Count of currently tombstoned nodes.
     tombstone_count: usize,
@@ -334,8 +333,7 @@ pub struct VamanaIndex {
     ops_since_consolidation: usize,
     /// Recycled ordinal slots from previous tombstone calls; consumed by insert (PR3).
     free_slots: Vec<u32>,
-    /// Trigger tau for consolidation: fire when `ops_since_consolidation >= consolidation_tau`.
-    /// Field on `VamanaIndex`, not `VamanaConfig` — this is operational policy, not topology (OQ5).
+    /// Trigger tau: consolidation fires when `ops_since_consolidation >= consolidation_tau`.
     consolidation_tau: usize,
     // ---- SQ8 acquisition tier (ADR-052 §1, Step 2) ----
     /// Global-scale SQ8 codec trained over the build corpus; used for acquisition-tier distances.
@@ -352,10 +350,7 @@ struct IndexMetadata {
     alpha: f64,
 }
 
-/// Train a `GsSq8Codec` and encode `vectors` for the SQ8 acquisition tier.
-///
-/// Called by all index constructors (build, load, from_snapshot) so the codec
-/// is always consistent with the stored vectors.
+/// Train + encode the SQ8 acquisition-tier codec; called by every index constructor.
 fn train_codec_and_encode(vectors: &[f32], dims: usize) -> (GsSq8Codec, Vec<GsEncodedVector>) {
     let codec = GsSq8Codec::train_flat(vectors, dims);
     let codes = codec.encode_flat_par(vectors, dims);
@@ -646,12 +641,10 @@ impl VamanaIndex {
     }
 
     /// Load an index from a directory previously written by [`VamanaIndex::save`]
-    /// (v1 format) or [`VamanaIndex::save_atomic`] (v2 segmented format).
-    ///
-    /// The format is detected from `metadata.bin`'s magic: a v2 commit takes the raw
-    /// segment path (`load_v2_raw`); a legacy v1 metadata blob takes the path
-    /// below. Neither path rebuilds — a corrupt, torn, or absent index returns an error,
-    /// leaving the recovery decision to the caller (see [`Self::load_or_build`]).
+    /// (v1 format) or [`VamanaIndex::save_atomic`] (v2 segmented format); the format is
+    /// auto-detected from `metadata.bin`'s magic. Never rebuilds — a corrupt, torn, or
+    /// absent index returns an error, leaving the recovery decision to the caller (see
+    /// [`Self::load_or_build`] and crates/khive-vamana/docs/api/persistence.md#v2-crash-safe-save-load).
     #[cfg(feature = "mmap")]
     pub fn load(path: &Path) -> Result<Self> {
         let metadata_path = path.join("metadata.bin");
@@ -714,15 +707,12 @@ impl VamanaIndex {
         })
     }
 
-    /// Crash-safe v2 save. Writes vectors.bin and graph.bin (same formats as v1),
-    /// then lifecycle.bin (tombstones, free_slots, reverse_adj, ops_since_consolidation),
-    /// then atomically renames metadata.bin.tmp → metadata.bin as the commit record.
-    ///
-    /// If a crash interrupts before the rename the previous metadata.bin (v1 or v2) is
-    /// still valid. load_or_build never observes a torn v2 commit.
-    ///
-    /// Segments are staged under `.v2new` suffixes so a crash between segment write and
-    /// metadata rename does not corrupt a live v1-format set of segments.
+    /// Crash-safe v2 save: writes `vectors.bin`, `graph.bin`, and `lifecycle.bin`, then
+    /// atomically renames `metadata.bin.tmp` → `metadata.bin` as the commit record. A
+    /// crash at any point before that rename leaves the previous `metadata.bin` (v1 or
+    /// v2) valid and untouched — [`Self::load_or_build`] never observes a torn v2
+    /// commit. See crates/khive-vamana/docs/api/persistence.md#v2-crash-safe-save-load for
+    /// the staging/fsync sequence.
     #[cfg(feature = "mmap")]
     pub fn save_atomic(&self, path: &Path) -> Result<()> {
         fs::create_dir_all(path)?;
@@ -813,19 +803,12 @@ impl VamanaIndex {
         Ok(())
     }
 
-    /// Fingerprint-gated restore. On a corpus fingerprint match, loads all segments including
-    /// lifecycle state in O(N) without rebuilding reverse_adj. On mismatch or missing v2
-    /// commit, falls back to rebuild using `fallback_config`.
-    ///
-    /// `corpus_vectors` is the raw flat f32 slice from the caller's database layer.
-    /// `fallback_config` is used when no saved config is available (clean first run or total
-    /// corruption).
-    ///
-    /// Decision tree:
-    /// - metadata.bin with KHVVAMG2 magic AND checksums valid AND fingerprint matches → fast path
-    /// - metadata.bin with KHVVAMG2 but checksum or fingerprint mismatch → rebuild from commit config + save_atomic
-    /// - metadata.bin with KHVVAMM1 (v1) → v1 load + save_atomic upgrade
-    /// - metadata.bin missing or corrupt → rebuild from fallback_config + save_atomic
+    /// Fingerprint-gated restore. On a corpus fingerprint match, loads all segments
+    /// (including lifecycle state) in O(N) without rebuilding `reverse_adj`. On mismatch
+    /// or a missing/corrupt v2 commit, rebuilds from `corpus_vectors` (the caller's raw
+    /// flat f32 slice) using `fallback_config` or the commit's saved config, then
+    /// persists via `save_atomic`. Full decision tree:
+    /// crates/khive-vamana/docs/api/persistence.md#v2-crash-safe-save-load.
     #[cfg(feature = "mmap")]
     pub fn load_or_build(
         path: &Path,
@@ -1010,15 +993,10 @@ impl VamanaIndex {
         }
     }
 
-    /// Load a committed v2 index from `path` without a corpus and without rebuilding.
-    ///
-    /// Verifies the v2 commit magic, parses the commit record, reads and checksum-verifies
-    /// all three segments against the commit fingerprint, then restores the index (graph +
-    /// lifecycle) via [`Self::load_v2_fast`]. Returns an `InvalidFormat` error if `path`
-    /// holds no valid v2 commit — absent, v1-format, torn, checksum mismatch, or an
-    /// inconsistent lifecycle segment. Unlike [`Self::load_or_build`] it never rebuilds;
-    /// callers that hold a corpus decide whether to fall back. [`Self::load`] surfaces the
-    /// error directly.
+    /// Load a committed v2 index from `path` without a corpus and without rebuilding;
+    /// errors (never rebuilds) if no valid v2 commit is present. See
+    /// crates/khive-vamana/docs/api/persistence.md#v2-crash-safe-save-load for the full
+    /// decision tree shared with `load_or_build`.
     #[cfg(feature = "mmap")]
     fn load_v2_raw(path: &Path) -> Result<Self> {
         let metadata_bytes = fs::read(path.join("metadata.bin"))?;
@@ -1424,12 +1402,8 @@ impl VamanaIndex {
 
     // ---- PR3: Mmap-to-Owned promotion helper ----
 
-    /// Promote `VectorStorage::Mmap` to `Owned` by copying the mapping into a `Vec<f32>`.
-    ///
-    /// Called as the first statement of both `insert` and `consolidate` so that all
-    /// subsequent vector reads/writes operate on a mutable owned buffer. If already
-    /// `Owned`, this is a no-op. O(N × dim) once per promotion; the next `save`
-    /// creates a fresh mmap at next load.
+    /// Promote `VectorStorage::Mmap` to `Owned` (no-op if already `Owned`); called first
+    /// by both `insert` and `consolidate` so subsequent writes hit a mutable buffer.
     fn ensure_owned(&mut self) -> Result<()> {
         #[cfg(feature = "mmap")]
         if let VectorStorage::Mmap { .. } = &self.vectors {
@@ -1764,16 +1738,11 @@ impl VamanaIndex {
         Ok(new_to_old)
     }
 
-    /// Soft-delete the node at `node_id` with eager Wolverine 2-hop repair (ADR-052 §2).
-    ///
-    /// For each live in-neighbor `p` of `node_id`, the repair rebuilds `p`'s adjacency
-    /// by running RobustPrune over the union of `node_id`'s out-neighbors and `p`'s
-    /// current neighbors (minus `node_id`). All tombstoned candidates are excluded.
-    /// `reverse_adj` is updated in lockstep on every rewire.
-    ///
-    /// If `node_id` was the medoid, a new medoid is elected (centroid-nearest live node).
-    ///
-    /// Returns an error without mutating any state if the op would leave zero live nodes.
+    /// Soft-delete the node at `node_id` with eager Wolverine 2-hop repair (ADR-052 §2;
+    /// see crates/khive-vamana/docs/api/algorithm.md#wolverine-2-hop-repair for the rewire
+    /// mechanism). If `node_id` was the medoid, a new medoid is elected (centroid-nearest
+    /// live node). Returns an error without mutating any state if the op would leave zero
+    /// live nodes.
     pub fn tombstone(&mut self, node_id: u32) -> Result<()> {
         let idx = node_id as usize;
         if idx >= self.num_vectors {
@@ -1930,16 +1899,8 @@ impl VamanaIndex {
         Ok(())
     }
 
-    /// Tombstone a batch without Wolverine in-neighbor rewiring. Test support only.
-    ///
-    /// Sets tombstone bits and clears each deleted node's own forward adjacency (updating
-    /// `reverse_adj` in lockstep), but does NOT reselect in-neighbor lists via RobustPrune.
-    /// The medoid is re-elected once at the end if it falls in the batch.
-    ///
-    /// Used by the OQ1 empirical drift test to build a genuine no-repair control: search
-    /// still skips tombstoned nodes via the `Option<&[u64]>` guard in `greedy_search_inner`,
-    /// but in-neighbors that previously pointed to deleted nodes are NOT rewired, so the
-    /// graph retains dead-end paths that Wolverine would have bypassed.
+    /// Tombstone a batch without Wolverine rewiring — test support only, builds the OQ1
+    /// no-repair control. See crates/khive-vamana/docs/testing.md#oq1-no-repair-control.
     #[doc(hidden)]
     pub fn tombstone_batch_no_repair(&mut self, ordinals: &[u32]) -> Result<()> {
         if ordinals.is_empty() {
@@ -2025,16 +1986,10 @@ fn set_tombstone_bit(tombstones: &mut Vec<u64>, idx: usize) {
 
 // ---- PR2: Wolverine 2-hop repair (ADR-052 §2 steps 3-8) ----
 
-/// Core Wolverine repair: rewire each live in-neighbor of `deleted` so it bypasses
-/// the deleted node. Monotonic-path preservation: the new neighbor list is derived
-/// from a RobustPrune over `deleted`'s out-neighbors ∪ the in-neighbor's current
-/// neighbors (minus `deleted`), with all tombstoned candidates excluded.
-///
-/// `reverse_adj` is updated in lockstep on every rewire (the PR1 invariant).
-///
-/// # References
-/// - Wolverine: PVLDB 18(7):2268-2280, VLDB 2025 (Liu/Zheng/Yue/Ruan/Zhou/Jensen)
-/// - FreshDiskANN: SIGMOD 2022 (>95% recall at 20% deletion with eager repair)
+/// Core Wolverine repair: rewire each live in-neighbor of `deleted` to bypass it,
+/// updating `reverse_adj` in lockstep. See
+/// crates/khive-vamana/docs/api/algorithm.md#wolverine-2-hop-repair for the RobustPrune
+/// derivation and paper references.
 fn wolverine_repair(
     vectors: &[f32],
     dimensions: usize,
@@ -2706,21 +2661,8 @@ fn parse_v2_commit(data: &[u8]) -> Result<V2Commit> {
     })
 }
 
-/// Write lifecycle.bin.
-///
-/// Layout (all little-endian):
-///   magic            8 B   "KHVVLIF1"
-///   tombstone_words  8 B   (u64 count of u64 words)
-///   tombstone data   N × 8 B
-///   free_slots_count 8 B   (u64)
-///   free_slots data  M × 4 B (u32)
-///   ops              8 B   (u64)
-///   // reverse_adj: same format as graph.bin adjacency (per-node degree + neighbors)
-///   // num_nodes derived from tombstone_words (context: caller knows num_vectors)
-///   rev_num_nodes    8 B   (u64)
-///   for each node:
-///     degree         4 B   (u32)
-///     neighbors      degree × 4 B (u32 each)
+/// Write lifecycle.bin. See crates/khive-vamana/docs/api/persistence.md#lifecyclebin-format
+/// for the full byte layout.
 #[cfg(feature = "mmap")]
 fn write_lifecycle(
     path: &Path,

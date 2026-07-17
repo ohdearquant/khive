@@ -11,7 +11,7 @@ use khive_runtime::{
     EntityCreateSpec, KhiveRuntime, Namespace, NamespaceToken, ParamDef, RuntimeError,
     VerbCategory, VerbRegistry, VerbRegistryBuilder, VerifiedActor, Visibility,
 };
-use khive_storage::{Note, SqlStatement, SqlValue};
+use khive_storage::{Edge, EdgeRelation, Note, SqlStatement, SqlValue};
 use khive_types::Pack;
 use serde_json::{json, Value};
 
@@ -3829,6 +3829,433 @@ async fn neighbors_still_excludes_soft_deleted_entity_after_note_fix() {
     assert!(
         !ids.iter().any(|&id| id == deleted_id),
         "#748 regression: soft-deleted entity must still be excluded; ids={ids:?}"
+    );
+}
+
+// ---- #803: get(edge_id) surfaces annotating notes ----
+
+/// #803: `get(edge_id)` must include an `annotations` array with the full
+/// note bodies of every note that `annotates` the edge. Before this fix,
+/// `get(edge_id)` did not hydrate annotating-note bodies in its response —
+/// `neighbors()` on the edge id yields only name/kind summaries, and there
+/// is no `annotations()` verb.
+#[tokio::test]
+async fn get_edge_includes_annotating_notes() {
+    let pack = pack();
+
+    let a = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "EdgeAnnotationSourceA", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create a must succeed");
+    let a_id = a.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    let b = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "EdgeAnnotationTargetB", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create b must succeed");
+    let b_id = b.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    let edge = pack
+        .dispatch(
+            "link",
+            json!({"source_id": a_id, "target_id": b_id, "relation": "supersedes", "weight": 0.8}),
+        )
+        .await
+        .expect("link must succeed");
+    let edge_id = edge.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    let note = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "note",
+                "content": "edge annotation test content explaining the superseding relationship",
+                "annotates": [edge_id.clone()],
+            }),
+        )
+        .await
+        .expect("create annotating note must succeed");
+    let note_id = note.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    // Recover the exact annotates-edge id created by the annotates= param path.
+    let note_edges = pack
+        .dispatch(
+            "list",
+            json!({"kind": "edge", "source_id": note_id, "target_id": edge_id, "relations": ["annotates"]}),
+        )
+        .await
+        .expect("list annotates edges for note must succeed");
+    let note_edges = note_edges.as_array().expect("edge list must return array");
+    assert_eq!(
+        note_edges.len(),
+        1,
+        "expected one annotates edge for the note"
+    );
+    let note_annotation_edge_id = note_edges[0]
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+
+    // Second annotation via explicit link() so the created edge id is retained directly.
+    let note2 = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "note",
+                "content": "second edge annotation recording a follow-up incident",
+            }),
+        )
+        .await
+        .expect("create second annotating note must succeed");
+    let note2_id = note2.get("id").and_then(Value::as_str).unwrap().to_string();
+    let annotation_link = pack
+        .dispatch(
+            "link",
+            json!({"source_id": note2_id, "target_id": edge_id, "relation": "annotates"}),
+        )
+        .await
+        .expect("explicit annotates link must succeed");
+    let note2_annotation_edge_id = annotation_link
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+    assert_ne!(note_annotation_edge_id, note2_annotation_edge_id);
+
+    let fetched = pack
+        .dispatch("get", json!({"id": edge_id}))
+        .await
+        .expect("get edge must succeed");
+
+    assert_eq!(fetched.get("kind").and_then(Value::as_str), Some("edge"));
+    let annotations = fetched
+        .get("annotations")
+        .and_then(Value::as_array)
+        .expect("edge get response must carry an annotations array");
+    assert_eq!(
+        annotations.len(),
+        2,
+        "expected exactly two annotating notes; got {annotations:?}"
+    );
+    let by_note = |wanted: &str| {
+        annotations
+            .iter()
+            .find(|a| a.get("id").and_then(Value::as_str) == Some(wanted))
+            .unwrap_or_else(|| panic!("annotation for note {wanted} missing: {annotations:?}"))
+    };
+    let annotation = by_note(&note_id);
+    assert_eq!(
+        annotation.get("content").and_then(Value::as_str),
+        Some("edge annotation test content explaining the superseding relationship")
+    );
+    assert_eq!(
+        annotation.get("annotation_edge_id").and_then(Value::as_str),
+        Some(note_annotation_edge_id.as_str()),
+        "annotation entry must carry the exact annotates-edge id: {annotation:?}"
+    );
+    let annotation2 = by_note(&note2_id);
+    assert_eq!(
+        annotation2.get("content").and_then(Value::as_str),
+        Some("second edge annotation recording a follow-up incident")
+    );
+    assert_eq!(
+        annotation2
+            .get("annotation_edge_id")
+            .and_then(Value::as_str),
+        Some(note2_annotation_edge_id.as_str()),
+        "annotation entry must carry the exact annotates-edge id: {annotation2:?}"
+    );
+}
+
+/// #803 regression guard: an edge with no annotating notes must still return
+/// an `annotations` field, just empty — additive shape, no wire break for
+/// existing callers that don't look for the key.
+#[tokio::test]
+async fn get_edge_without_annotations_returns_empty_array() {
+    let pack = pack();
+
+    let a = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "EdgeWithoutAnnotationSource", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create a must succeed");
+    let a_id = a.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    let b = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "EdgeWithoutAnnotationTarget", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create b must succeed");
+    let b_id = b.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    let edge = pack
+        .dispatch(
+            "link",
+            json!({"source_id": a_id, "target_id": b_id, "relation": "extends"}),
+        )
+        .await
+        .expect("link must succeed");
+    let edge_id = edge.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    let fetched = pack
+        .dispatch("get", json!({"id": edge_id}))
+        .await
+        .expect("get edge must succeed");
+
+    let annotations = fetched
+        .get("annotations")
+        .and_then(Value::as_array)
+        .expect("edge get response must carry an annotations array even when empty");
+    assert!(
+        annotations.is_empty(),
+        "expected no annotating notes; got {annotations:?}"
+    );
+}
+
+/// #803: a soft-deleted annotating note must not leak into `get(edge_id)`'s
+/// `annotations` — mirrors the `neighbors_excludes_soft_deleted_note` (#748)
+/// guarantee at the by-ID edge read surface.
+#[tokio::test]
+async fn get_edge_excludes_soft_deleted_annotating_note() {
+    let pack = pack();
+
+    let a = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "DeletedAnnotationSource", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create a must succeed");
+    let a_id = a.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    let b = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "DeletedAnnotationTarget", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create b must succeed");
+    let b_id = b.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    let edge = pack
+        .dispatch(
+            "link",
+            json!({"source_id": a_id, "target_id": b_id, "relation": "extends"}),
+        )
+        .await
+        .expect("link must succeed");
+    let edge_id = edge.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    let note = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "note",
+                "content": "edge annotation note that will be soft-deleted",
+                "annotates": [edge_id.clone()],
+            }),
+        )
+        .await
+        .expect("create annotating note must succeed");
+    let note_id = note.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    pack.dispatch("delete", json!({"id": note_id, "kind": "note"}))
+        .await
+        .expect("delete note must succeed");
+
+    let fetched = pack
+        .dispatch("get", json!({"id": edge_id}))
+        .await
+        .expect("get edge must succeed");
+    let annotations = fetched
+        .get("annotations")
+        .and_then(Value::as_array)
+        .expect("edge get response must carry an annotations array");
+    assert!(
+        annotations.is_empty(),
+        "soft-deleted annotating note must not appear; got {annotations:?}"
+    );
+}
+
+/// ADR-007 by-ID reads are namespace-agnostic. Fetching a foreign edge must
+/// therefore include annotations even when neither the edge nor its annotating
+/// note is visible to the caller's explicit namespace.
+#[tokio::test]
+async fn get_edge_cross_namespace_includes_foreign_annotation() {
+    let pack = pack();
+
+    let source = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "entity",
+                "name": "CrossNamespaceAnnotationSource",
+                "entity_kind": "concept",
+                "namespace": "ns-a",
+            }),
+        )
+        .await
+        .expect("create source in ns-a");
+    let target = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "entity",
+                "name": "CrossNamespaceAnnotationTarget",
+                "entity_kind": "concept",
+                "namespace": "ns-a",
+            }),
+        )
+        .await
+        .expect("create target in ns-a");
+    let edge = pack
+        .dispatch(
+            "link",
+            json!({
+                "source_id": source["id"],
+                "target_id": target["id"],
+                "relation": "extends",
+                "namespace": "ns-a",
+            }),
+        )
+        .await
+        .expect("create edge in ns-a");
+    let edge_id = edge["id"].as_str().expect("edge id").to_string();
+    let note = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "note",
+                "content": "cross-namespace edge annotation content",
+                "annotates": [edge_id.clone()],
+                "namespace": "ns-a",
+            }),
+        )
+        .await
+        .expect("create annotating note in ns-a");
+
+    let fetched = pack
+        .dispatch("get", json!({"id": edge_id, "namespace": "ns-b"}))
+        .await
+        .expect("get foreign edge from ns-b");
+    let annotations = fetched["annotations"]
+        .as_array()
+        .expect("edge get must include annotations");
+    assert_eq!(annotations.len(), 1, "foreign annotation must be returned");
+    assert_eq!(annotations[0]["id"], note["id"]);
+    assert_eq!(
+        annotations[0]["content"],
+        "cross-namespace edge annotation content"
+    );
+}
+
+/// Hydrating more notes than SQLite's traditional 999-variable ceiling must
+/// be chunked internally while the public response still contains every note.
+#[tokio::test]
+async fn get_edge_returns_annotations_beyond_sqlite_bind_limit() {
+    const ANNOTATION_COUNT: usize = 1_000;
+
+    let (pack, runtime, token) = pack_and_runtime();
+    let source = runtime
+        .create_entity(
+            &token,
+            "concept",
+            None,
+            "HeavilyAnnotatedEdgeSource",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create source");
+    let target = runtime
+        .create_entity(
+            &token,
+            "concept",
+            None,
+            "HeavilyAnnotatedEdgeTarget",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create target");
+    let edge = runtime
+        .link(
+            &token,
+            source.id,
+            target.id,
+            EdgeRelation::Extends,
+            1.0,
+            None,
+        )
+        .await
+        .expect("create annotated edge");
+    let edge_id = uuid::Uuid::from(edge.id);
+
+    let notes: Vec<Note> = (0..ANNOTATION_COUNT)
+        .map(|index| {
+            Note::new(
+                "local",
+                "observation",
+                format!("bulk edge annotation {index}"),
+            )
+        })
+        .collect();
+    let now = chrono::Utc::now();
+    let annotation_edges: Vec<Edge> = notes
+        .iter()
+        .map(|note| Edge {
+            id: uuid::Uuid::new_v4().into(),
+            namespace: "local".to_string(),
+            source_id: note.id,
+            target_id: edge_id,
+            relation: EdgeRelation::Annotates,
+            weight: 1.0,
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+            metadata: None,
+            target_backend: None,
+        })
+        .collect();
+    runtime
+        .notes(&token)
+        .expect("note store")
+        .upsert_notes(notes)
+        .await
+        .expect("seed annotation notes");
+    runtime
+        .graph(&token)
+        .expect("graph store")
+        .upsert_edges(annotation_edges)
+        .await
+        .expect("seed annotation edges");
+
+    let fetched = pack
+        .dispatch("get", json!({"id": edge_id.to_string()}))
+        .await
+        .expect("get heavily annotated edge");
+    let annotations = fetched["annotations"]
+        .as_array()
+        .expect("edge get must include annotations");
+    assert_eq!(annotations.len(), ANNOTATION_COUNT);
+    assert!(
+        annotations
+            .iter()
+            .all(|annotation| annotation["annotation_edge_id"].is_string()),
+        "every hydrated note must retain its annotates-edge id"
     );
 }
 

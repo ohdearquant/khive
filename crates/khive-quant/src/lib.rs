@@ -25,15 +25,17 @@
 //! Both codecs share these inner functions:
 //! - `u8_dot_u32`: NEON `vmull_u8` (16-wide u8→u16→u32) or chunked portable fallback.
 //! - `u8_l2sq_u32`: NEON `vabdq_u8` + `vmull_u8` squaring or chunked portable fallback.
+//!
+//! See `docs/api/codecs.md` for the full function-by-function reference and
+//! `docs/design.md` for the anisotropy-gating rationale behind `GsSq8Codec`.
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
 // ─── NEON helpers ─────────────────────────────────────────────────────────────
 
-/// Compute `Σ a_i * b_i` over `u8` slices as a `u32` accumulator using NEON
-/// `vmull_u8` (8-wide u8→u16 widening multiply) on aarch64, or a chunked
-/// portable widening fallback elsewhere.
+/// `Σ a_i * b_i` over equal-length `u8` slices as a `u32` accumulator (NEON on
+/// aarch64, chunked portable fallback elsewhere). See `docs/api/codecs.md`.
 ///
 /// Safety: both slices must have the same length.
 #[inline(always)]
@@ -96,11 +98,11 @@ fn u8_dot_u32(a: &[u8], b: &[u8]) -> u32 {
     }
 }
 
-/// Compute `Σ (a_i - b_i)²` over `u8` slices as a `u32` accumulator using NEON
-/// `vabdq_u8` (absolute difference) + `vmull_u8` squaring on aarch64, or a
-/// chunked portable fallback elsewhere.
+/// `Σ (a_i - b_i)²` over equal-length `u8` slices as a `u32` accumulator
+/// (NEON on aarch64, chunked portable fallback elsewhere). See
+/// `docs/api/codecs.md` for the kernel breakdown.
 ///
-/// Safety: both slices must have the same length.
+/// Safety: both slices must have the same length (panics otherwise).
 #[inline(always)]
 pub fn u8_l2sq_u32(a: &[u8], b: &[u8]) -> u32 {
     assert_eq!(
@@ -222,10 +224,9 @@ impl std::fmt::Display for QuantError {
 
 impl std::error::Error for QuantError {}
 
-/// Compute per-dimension min/max over row-major flat vectors, validating
-/// `dims > 0`, a non-empty corpus, and that `vectors.len()` is a multiple of
-/// `dims`. Non-finite values are skipped (same convention as before); a
-/// dimension with no finite observation defaults to `[0, 1)`.
+/// Per-dimension min/max over row-major flat vectors; validates `dims > 0`,
+/// non-empty corpus, `vectors.len()` a multiple of `dims`. Non-finite values
+/// are skipped. See [`finalize_min_max`] for the empty-dimension default.
 fn flat_min_max(vectors: &[f32], dims: usize) -> Result<(Vec<f32>, Vec<f32>), QuantError> {
     if dims == 0 {
         return Err(QuantError::ZeroDims);
@@ -261,10 +262,8 @@ fn flat_min_max(vectors: &[f32], dims: usize) -> Result<(Vec<f32>, Vec<f32>), Qu
     Ok((min, max))
 }
 
-/// Compute per-dimension min/max over a slice of row vectors, validating a
-/// non-empty corpus, `dims > 0` (row 0's length), and that every row has the
-/// same length as row 0 (rectangular corpus). See [`flat_min_max`] for the
-/// finite-value and empty-dimension handling.
+/// Per-dimension min/max over row vectors; validates non-empty corpus,
+/// `dims > 0` (row 0's length), and every row matching row 0's length.
 fn row_min_max(vectors: &[Vec<f32>]) -> Result<(usize, Vec<f32>, Vec<f32>), QuantError> {
     if vectors.is_empty() {
         return Err(QuantError::EmptyCorpus);
@@ -412,9 +411,8 @@ impl Sq8Codec {
     }
 
     /// Fallible variant of [`Self::encode`]. Validates `v.len()` against the
-    /// codec's trained dims before encoding, replacing the prior
-    /// debug-only length assertion (which was compiled out in release
-    /// builds and could silently produce a truncated/malformed code vector).
+    /// codec's trained dims before encoding. See `docs/design.md` (QUANT-AUD-002)
+    /// for why this check must be a typed error, not a debug-only assertion.
     pub fn try_encode(&self, v: &[f32]) -> Result<EncodedVector, QuantError> {
         let dims = self.min.len();
         if v.len() != dims {
@@ -463,9 +461,7 @@ impl Sq8Codec {
 
     /// Fallible variant of [`Self::encode_flat_par`]. Validates `dims > 0`,
     /// divisibility, and that `dims` matches the codec's trained dims before
-    /// dividing `vectors.len() / dims`, replacing the prior unchecked
-    /// division (panics on `dims == 0`) and silent truncation (a non-multiple
-    /// `vectors.len()` previously dropped the trailing partial row).
+    /// dividing `vectors.len() / dims`. See `docs/design.md` (QUANT-AUD-002).
     pub fn try_encode_flat_par(
         &self,
         vectors: &[f32],
@@ -509,11 +505,8 @@ impl Sq8Codec {
             .unwrap_or_else(|e| panic!("{e}"))
     }
 
-    /// Fallible variant of [`Self::encode_par`]. Validates every row's
-    /// length against the codec's trained dims before dispatching to the
-    /// thread pool, replacing the prior `self.encode` call per row, which
-    /// unwrapped [`Self::try_encode`] and panicked mid-batch on a
-    /// length-mismatched row.
+    /// Fallible variant of [`Self::encode_par`]. Validates every row's length
+    /// against the codec's trained dims before dispatching to the thread pool.
     pub fn try_encode_par(&self, vectors: &[Vec<f32>]) -> Result<Vec<EncodedVector>, QuantError> {
         let dims = self.min.len();
         for v in vectors {
@@ -606,23 +599,15 @@ impl Sq8Codec {
 
 /// Global-scale SQ8 codec for L2 distance — the Vamana acquisition path.
 ///
-/// A single shared scale `gs = max_range_across_dims / 255` is used for all dims.
-/// Per-dim offsets (`min_i`) are still subtracted before quantizing so codes span
-/// [0, 255] for the widest dim and fewer levels for narrower dims (honest trade-off).
-///
-/// Encoding is **lossy**: f32 components are rounded and clamped to u8 before storage.
-/// L2² in code space (`gs² × Σ (a_i - b_i)²`) is exact *after* that lossy encode —
-/// offset terms cancel and `gs²` factorizes — but the round-trip error relative to
-/// the original f32 L2² can reach ~15% for anisotropic or out-of-distribution data.
-/// Recall safety must be established by probe (see `sq8_recall_parity_vs_f32_oracle`
-/// and `sq8_ood_fallback_deterministic_ranking_flip`), not by an exactness argument.
-/// No residual pass, no gate, no silent fallback for anisotropic data.
-///
-/// Historical note: the predecessor per-dim codec required `approx_l2_sq_fast` + an
-/// anisotropy gate (ratio ≤ 4.0) to achieve the integer-only hot path. The gate was
-/// calibrated on an LCG corpus that gave ratio ≈ 4.0; real transformer embeddings
-/// have rogue dimensions (ratio 10–32) that silently fell back to the full residual
-/// path, defeating the purpose. Global-scale eliminates the gate entirely — see ADR-052.
+/// A single shared scale `gs = max_range_across_dims / 255` is used for all
+/// dims; per-dim offsets are still subtracted before quantizing. Encoding is
+/// **lossy** (rounded + clamped to u8); L2² in code space is exact after that
+/// lossy encode, but round-trip error vs. true f32 L2² can reach ~15% for
+/// anisotropic/OOD data — no residual pass, no gate, no silent fallback.
+/// Callers needing correctness on OOD queries must check
+/// [`Self::is_in_distribution`] and fall back to exact f32 themselves.
+/// See `docs/api/codecs.md` for the full accuracy discussion and
+/// `docs/design.md` for why this replaced the earlier per-dim anisotropy-gated design.
 #[derive(Debug, Clone)]
 pub struct GsSq8Codec {
     /// Per-dimension minimum values.
@@ -716,11 +701,9 @@ impl GsSq8Codec {
     }
 
     /// Fallible variant of [`Self::encode`]. Validates `v.len()` against the
-    /// codec's trained dims before encoding, replacing the prior
-    /// debug-only length assertion (which was compiled out in release
-    /// builds and could silently produce a malformed code vector, e.g. an
-    /// empty `v` yields an empty code vector that `is_in_distribution`
-    /// vacuously accepts and `l2_sq` scores as 0.0).
+    /// codec's trained dims before encoding — an unchecked shape mismatch
+    /// (e.g. `v = &[]`) could otherwise score as a false exact match; see
+    /// `docs/design.md` (QUANT-AUD-002).
     pub fn try_encode(&self, v: &[f32]) -> Result<GsEncodedVector, QuantError> {
         let dims = self.min.len();
         if v.len() != dims {
@@ -755,8 +738,7 @@ impl GsSq8Codec {
 
     /// Fallible variant of [`Self::encode_flat_par`]. Validates `dims > 0`,
     /// divisibility, and that `dims` matches the codec's trained dims before
-    /// dividing `vectors.len() / dims`, replacing the prior unchecked
-    /// division (panics on `dims == 0`) and silent truncation.
+    /// dividing `vectors.len() / dims`. See `docs/design.md` (QUANT-AUD-002).
     pub fn try_encode_flat_par(
         &self,
         vectors: &[f32],

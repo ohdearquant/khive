@@ -1,7 +1,4 @@
-//! pack-formal — formal-math ontology pack for khive.
-//!
-//! Registers typed edge endpoint rules for six formal-math concept subtypes
-//! (theorem, definition, structure, instance, axiom, goal). Pure ontology: no verbs.
+//! Additive edge rules for six formal-mathematics concept subtypes.
 
 mod pack;
 pub(crate) mod vocab;

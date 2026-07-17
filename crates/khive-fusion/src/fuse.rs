@@ -8,9 +8,11 @@ use super::strategy::FusionStrategy;
 use super::union::union_fusion;
 use super::weighted::weighted_fusion;
 
-/// Fuse multiple ranked result lists into a single list sorted by fused score descending.
+/// Fuse ranked sources and retain at most `top_k` results.
 ///
-/// Dispatches by `strategy`; `Custom` strategies return [`FuseError::CustomRequiresRuntime`].
+/// RRF, weighted, and union results sort by score then ID; pass-through modes preserve source
+/// order. Custom strategies return [`FuseError::CustomRequiresRuntime`]. See
+/// `crates/khive-fusion/docs/api/fusion-functions.md`.
 pub fn fuse<Id: Eq + Hash + Clone + Ord>(
     sources: Vec<Vec<(Id, DeterministicScore)>>,
     strategy: &FusionStrategy,

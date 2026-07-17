@@ -1,6 +1,4 @@
-//! khive-pack-template — reference scaffold for new packs.
-//!
-//! See `docs/design.md` for the step-by-step guide to creating a new pack.
+//! Reference scaffold for a dynamically registered khive pack.
 
 pub mod handlers;
 mod pack;
@@ -14,7 +12,9 @@ pub(crate) use pack::TEMPLATE_HANDLERS;
 /// Canonical pack name. Must match the factory below and `PackFactory::name()`.
 pub(crate) const PACK_NAME: &str = "template";
 
-/// Template pack — replace with your pack's struct name and logic.
+/// Example pack joining vocabulary, handlers, dependencies, and a runtime handle.
+///
+/// See `crates/khive-pack-template/docs/api/pack-scaffold.md`.
 pub struct TemplatePack {
     runtime: KhiveRuntime,
 }
@@ -32,7 +32,7 @@ impl Pack for TemplatePack {
 }
 
 impl TemplatePack {
-    /// Constructs the template pack with a runtime handle.
+    /// Bind the template pack to the runtime used by its handlers.
     pub fn new(runtime: KhiveRuntime) -> Self {
         Self { runtime }
     }

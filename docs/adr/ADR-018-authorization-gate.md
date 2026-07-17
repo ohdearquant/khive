@@ -208,9 +208,10 @@ Callers can match on it to distinguish authorization failures from operational e
 
 ### Fail-open on gate `Err`
 
-A gate that errors out (Rego policy fails to compile, regorus throws, internal
-timeout) returns `Err(GateError)`. This is treated as **infrastructure failure**, not
-authorization decision. The dispatch proceeds; the error is logged.
+A gate that errors out before it can produce a decision (e.g. request serialization
+failure, a poisoned internal lock surfaced as `GateError::Internal`) returns
+`Err(GateError)`. This is treated as **infrastructure failure**, not an authorization
+decision. The dispatch proceeds; the error is logged.
 
 Rationale: blocking dispatch on infrastructure failures means every verb depends on
 gate-infrastructure availability. A misconfigured policy in production would take down
@@ -220,6 +221,17 @@ operators see the warning and fix the policy.
 This is distinct from `Deny`, which is an explicit policy decision. Deny blocks; Err
 does not. Future deployments needing strict-mode (block on gate Err) can wrap `Gate`
 in a `StrictGate { inner: Arc<dyn Gate> }` adapter — but that's not the default.
+
+**`RegoGate` narrows this further than the base contract implies.** Policy-load
+failures (a Rego file that fails to compile, or an empty policy directory) surface as
+`Err(GateError::Policy)` at construction time, before the gate is ever installed —
+consistent with fail-open-on-infra-error above. But at _dispatch_ time, `RegoGate`
+never returns `Err` for policy-evaluation uncertainty: an undefined `decision` rule, a
+`regorus` evaluation throw, a poisoned engine mutex, or a decision value that fails to
+serialize or doesn't match the `GateDecision` shape are all converted to an explicit
+`Ok(GateDecision::Deny)` with a diagnostic reason (`crates/khive-gate-rego/src/gate.rs`).
+Only pre-evaluation failures (request serialization) reach `Err(GateError)` for
+`RegoGate`. See `crates/khive-gate-rego/README.md` for the full breakdown.
 
 ### `AuditEvent` envelope
 

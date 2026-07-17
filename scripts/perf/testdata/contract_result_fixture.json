@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "suite": "local-engine-contract",
+  "sha": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+  "branch": "feat/bench-calibrate-contract-suite",
+  "started_at": "2026-07-15T12:00:00+00:00",
+  "finished_at": "2026-07-15T12:03:42+00:00",
+  "host": {
+    "machine": "Apple M-series",
+    "os": "macos-arm64",
+    "cpu_count": 12,
+    "mem_bytes": 34359738368
+  },
+  "isolation": {
+    "bench_window": true,
+    "loadavg_before": [1.2, 1.5, 1.8],
+    "loadavg_after": [1.4, 1.6, 1.9],
+    "cargo_target_dir_isolated": true
+  },
+  "calibration": {
+    "status": "uncalibrated"
+  },
+  "dimensions": {
+    "ingest": {
+      "dataset": "synthetic-clustered-128-seed42",
+      "corpus_docs": 10000,
+      "docs_per_s_embed_excluded": 8421.3,
+      "index_build_wall_s": 1.1876
+    },
+    "ann_query": {
+      "dataset": "synthetic-clustered-128-seed42",
+      "n_vectors": 10000,
+      "arms": [
+        {
+          "workers": 1,
+          "measured_recall_at_10": 0.962,
+          "p50_us": 145.0,
+          "p95_us": 289.0,
+          "p99_us": 402.0,
+          "queries": 1000,
+          "beam": 96
+        },
+        {
+          "workers": 4,
+          "measured_recall_at_10": 0.961,
+          "p50_us": 178.0,
+          "p95_us": 356.0,
+          "p99_us": 511.0,
+          "queries": 1000,
+          "beam": 96
+        },
+        {
+          "workers": 16,
+          "measured_recall_at_10": 0.960,
+          "p50_us": 612.0,
+          "p95_us": 1340.0,
+          "p99_us": 2079.0,
+          "queries": 1000,
+          "beam": 96
+        }
+      ]
+    },
+    "recall_at_k": {
+      "dataset": "synthetic-clustered-128-seed42",
+      "baseline": {
+        "kind": "vectorized-brute-force",
+        "query_us_p50": 810.0
+      },
+      "rows": [
+        {
+          "k": 10,
+          "recall": 0.962,
+          "speedup_vs_baseline": 5.586
+        }
+      ]
+    }
+  },
+  "ledger_rows_appended": 0,
+  "notes": "diagnostic (not a contract-result row): recall_at_1=0.99, recall_at_100=0.87 measured by vec_bench --dump-topk"
+}

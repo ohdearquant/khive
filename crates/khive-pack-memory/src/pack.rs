@@ -1,4 +1,5 @@
 //! `MemoryPack` struct, trait impls, verb handler table, and inventory registration.
+//! See `crates/khive-pack-memory/docs/api/pack-integration.md`.
 
 use std::sync::Mutex;
 
@@ -26,30 +27,21 @@ pub struct MemoryPack {
     pub(crate) ann: SharedAnn,
     /// Bounded exact-match query embedding cache (model_name, query_text) → `Vec<f32>`.
     pub(crate) query_cache: QueryEmbeddingCache,
-    /// In-memory Beta-posterior state for recall-domain feedback.
-    ///
-    /// Updated by `on_recall_hit`, `on_recall_miss`, and `on_explicit_feedback` in
-    /// `recall_feedback`. Posteriors flow into `RecallConfig` via `PackTunable`.
-    ///
-    /// Persistence is deferred — state is rebuilt from actions on restart.
+    /// In-memory recall posteriors; persistence is deferred and actions rebuild state.
     pub(crate) recall_state: Mutex<BalancedRecallState>,
-    /// Explicit brain profile ID from config (ADR-035 §Brain profile configuration).
-    ///
-    /// Tier-1 of the 3-tier feedback resolution: when set, `memory.feedback` directs
-    /// feedback to this profile via `brain.feedback`. When absent, tier-2
-    /// (namespace-bound profile) and tier-3 (global prior) are tried in order.
+    /// Optional tier-one brain profile used before binding and global-prior fallbacks.
     pub(crate) brain_profile: Option<String>,
 }
 
 impl MemoryPack {
-    /// Return a clone of the current active `RecallConfig`.
-    ///
-    /// Handlers call this to pick up the latest tuned parameters.
+    /// Clone the current tuned recall configuration for one request.
     pub(crate) fn active_config(&self) -> RecallConfig {
         self.config.lock().unwrap().clone()
     }
 
-    /// Create a new `MemoryPack` backed by the given runtime.
+    /// Create a memory pack with default recall policy, ANN state, and query cache.
+    ///
+    /// See `crates/khive-pack-memory/docs/api/pack-integration.md`.
     pub fn new(runtime: KhiveRuntime) -> Self {
         let brain_profile = runtime.config().brain_profile.clone();
         Self {
@@ -74,10 +66,7 @@ impl Pack for MemoryPack {
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &MEMORY_HANDLERS;
     const REQUIRES: &'static [&'static str] = &["kg"];
-    /// `memory_ann_epoch` (#812), a pack schema contract declared here instead
-    /// of created inline on the epoch
-    /// bump/read path, matching every other pack-auxiliary table in this
-    /// codebase (ADR-028). Applied at boot by `server.rs`/`serve.rs`.
+    /// Pack-owned durable ANN epoch schema, applied during registry boot.
     const SCHEMA_PLAN: Option<PackSchemaPlan> = Some(PackSchemaPlan {
         pack: "memory",
         statements: &MEMORY_SCHEMA_PLAN_STMTS,
@@ -409,29 +398,15 @@ impl PackRuntime for MemoryPack {
         fts_population_guard(&self.runtime).await;
     }
 
-    /// ADR-103 Amendment 1's `model_count` computation for `memory.remember`
-    /// without an explicit `embedding_model` override reads this at the
-    /// dispatch audit-row emission seam.
+    /// Report registered models for remember's dispatch resource accounting.
     fn registered_embedding_model_names(&self) -> Vec<String> {
         self.runtime.registered_embedding_model_names()
     }
 
-    /// #750: install a note-mutation hook on the runtime THIS
-    /// pack owns (`self.runtime`, not the `_runtime` param — mirrors
-    /// `KgPack::register_entity_type_validator`'s multi-backend rationale:
-    /// in a multi-backend deployment each pack is constructed with its own
-    /// per-pack runtime, and `self.runtime` is always that one).
+    /// Install memory-note generation bumps on this pack's own runtime.
     ///
-    /// KG's `update`/`delete` verbs reach `KhiveRuntime::update_note`/
-    /// `delete_note` with no dependency on `khive-pack-memory` at all. When
-    /// those touch a `kind="memory"` note (content update, soft delete, or
-    /// hard delete), this hook bumps the affected models' write-generation
-    /// counter (#750) and fires the same background warm `memory.remember`
-    /// fires on its own write path (#791) — so `ann::is_current()` correctly
-    /// treats the stale-but-still-installed index as behind, `search_loaded`
-    /// keeps serving it in the meantime, and the background warm eventually
-    /// installs a fresh one. This hook no longer clears the cache or deletes
-    /// the persisted snapshot (see `remember.rs`'s #791 rationale).
+    /// Generic KG mutation paths preserve the stale graph and schedule replacement. See
+    /// `crates/khive-pack-memory/docs/api/pack-integration.md`.
     fn register_note_mutation_hook(&self, _runtime: &KhiveRuntime) {
         let runtime = self.runtime.clone();
         let ann = self.ann.clone();
@@ -484,32 +459,10 @@ impl PackRuntime for MemoryPack {
 }
 
 impl MemoryPack {
-    /// #889: wraps `handle_recall` in a bounded end-to-end deadline so a
-    /// caller under sustained concurrent-load contention gets a fast, typed
-    /// error instead of hanging until an upstream client-side ceiling fires
-    /// (300s observed in production incidents on 2026-07-12). This bounds the
-    /// *entire* pipeline (profile resolution, FTS + vector candidate gather
-    /// and its ANN-overfetch retry loop, hydration, fusion/scoring, MMR, and
-    /// supersedes suppression) — distinct from (and layered on top of)
-    /// `#836`'s narrower `ann_ready_timeout_ms`, which bounds only a single
-    /// cold-miss ANN-build wait inside the vector leg and degrades in-band to
-    /// an FTS-only result. A timeout here does not cancel any in-flight
-    /// storage work still owned by the runtime; it only bounds how long this
-    /// call waits for a response.
+    /// Run the complete recall pipeline under its validated end-to-end deadline.
     ///
-    /// The deadline is read from `params.config.recall_deadline_ms` when
-    /// present (a per-request override, checked here rather than inside
-    /// `handle_recall` because the wrap has to start before that function's
-    /// own `deser(params)` runs); an absent or explicit-`null` value falls
-    /// through to the process-wide `recall_deadline_ms()` default/env value,
-    /// exactly like `handle_recall` itself already falls through to
-    /// `ann_ready_timeout_ms()`. A *present*, non-null value must be a
-    /// strictly positive integer — see `parse_recall_deadline_override`
-    /// (#889: a zero or malformed override is a per-op
-    /// `InvalidInput` error, not a silent coercion to the default). This
-    /// never tightens or duplicates `RecallParams`'s own validation of
-    /// `params`; `handle_recall` still parses (and rejects, if malformed)
-    /// the full params normally.
+    /// Timeout returns `DeadlineExceeded` without claiming to cancel runtime-owned storage
+    /// work. See `crates/khive-pack-memory/docs/api/recall-pipeline.md`.
     async fn handle_recall_with_deadline(
         &self,
         token: &NamespaceToken,
@@ -537,17 +490,7 @@ impl MemoryPack {
     }
 }
 
-/// #889: parse and validate an optional per-request
-/// `config.recall_deadline_ms` override. `None` (the key absent, or present
-/// as JSON `null`) means "no override" and the caller falls through to the
-/// process-wide `recall_deadline_ms()` default/env value. A *present*,
-/// non-null value must be a strictly positive integer — matching
-/// ADR-033's invalid-config contract ("Invalid configs ... are caught at
-/// handler entry and return a per-op `{ok: false, error: ...}` response;
-/// the batch does not abort"), this returns `InvalidInput` rather than
-/// silently coercing a malformed override to the default. Silent coercion
-/// would otherwise turn a caller's `0` into an always-immediate timeout, or
-/// swallow a caller's negative/non-numeric typo into an unnoticed default.
+/// Parse an optional positive per-request deadline; null or absence means fallback.
 pub(crate) fn parse_recall_deadline_override(params: &Value) -> Result<Option<u64>, RuntimeError> {
     let Some(raw) = params
         .get("config")
@@ -566,19 +509,9 @@ pub(crate) fn parse_recall_deadline_override(params: &Value) -> Result<Option<u6
     }
 }
 
-/// #889: pure parse/validate step for
-/// `KHIVE_MEMORY_RECALL_DEADLINE_MS`, split out of `recall_deadline_ms`'s
-/// `OnceLock` closure so it is unit-testable without touching real process
-/// environment state or the process-lifetime-cached `OnceLock` (which, once
-/// initialized by any test in this binary, can never re-observe a
-/// different env value for the rest of that test run).
+/// Parse the operator deadline, falling back to 30 seconds for absent or invalid input.
 ///
-/// An absent, zero, negative, or non-numeric env value all fall back to the
-/// default and log a warning — unlike an invalid *per-request* override
-/// (`parse_recall_deadline_override`), which is a hard per-op error. This
-/// asymmetry is deliberate: a caller's malformed request is a caller bug
-/// that should surface immediately; a malformed *operator* env value must
-/// not brick every `memory.recall` call on the daemon.
+/// Operator mistakes warn instead of breaking every recall; request mistakes are errors.
 pub(crate) fn parse_recall_deadline_env(raw: Option<&str>) -> u64 {
     const DEFAULT_RECALL_DEADLINE_MS: u64 = 30_000;
     let Some(raw) = raw else {
@@ -607,14 +540,7 @@ pub(crate) fn parse_recall_deadline_env(raw: Option<&str>) -> u64 {
     }
 }
 
-/// #889: bounded end-to-end deadline, in milliseconds, for the entire
-/// `memory.recall` pipeline. 30s sits comfortably above every latency this
-/// pipeline needs under normal-to-heavy load (single-digit-to-low-hundreds
-/// of milliseconds per stage even at 20-way concurrency in the #889
-/// load-harness repro, `.khive/workspaces/20260712/889-recall-stall/`) while
-/// staying far short of the 300s client-side ceiling the deadline exists to
-/// preempt. Overridable via env for operators who need to tune it for a
-/// larger corpus or heavier sustained concurrency than the repro covered.
+/// Return the cached end-to-end recall deadline, defaulting to 30 seconds.
 pub(crate) fn recall_deadline_ms() -> u64 {
     static DEADLINE_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *DEADLINE_MS.get_or_init(|| {
@@ -628,15 +554,8 @@ pub(crate) fn recall_deadline_ms() -> u64 {
     })
 }
 
-/// Check that the unified FTS tables are adequately populated relative to the
-/// base `notes` and `entities` tables. Called at daemon warm time (after
-/// `kkernel mcp` starts) to detect the V3→V4 migration footgun where the
-/// empty unified tables silently strand FTS recall at ~1% until a manual
-/// `kkernel reindex` is run.
-///
-/// Threshold: warns when `base_count > 100 AND fts_count < base_count / 2`.
-/// A legitimately fresh or empty database (base_count ≤ 100) never warns.
-/// Does NOT hard-fail — boot must succeed even on empty databases.
+/// Warn when a nontrivial base table has less than half its rows represented in FTS.
+/// Never fail boot for an empty, fresh, or partially migrated database.
 async fn fts_population_guard(rt: &KhiveRuntime) {
     use khive_storage::types::{SqlStatement, SqlValue};
 
@@ -773,29 +692,8 @@ mod ann_route_tests {
         }
     }
 
-    /// Regression: the second `memory.recall` call on a namespace with N embedded
-    /// notes must route through the warm Vamana ANN index, not the O(N) sqlite-vec
-    /// exact fallback.
-    ///
-    /// Proof of correctness: the first recall builds the ANN synchronously (via
-    /// `ensure_ann_for_model` awaited at `handlers.rs:690`). After the build the
-    /// `AnnState` warm-route counter is reset. The second recall hits
-    /// `search_loaded` with the index already loaded and increments the counter.
-    /// An assertion on the counter value is deterministic — it does not depend on
-    /// wall-clock timing or tracing output.
-    ///
-    /// Fail-on-revert proof: reverting the awaited `ensure_ann_for_model` call back
-    /// to fire-and-forget (`ensure_ann_background`) means the first recall does not
-    /// build the index synchronously. The second recall races against the background
-    /// task; in test execution without `tokio::time::sleep`, the task typically has
-    /// not completed, so `search_loaded` returns `Ok(None)` and the counter stays 0,
-    /// causing this assertion to fail.
-    // `#[serial(background_tasks)]`: both recalls below return non-empty
-    // results, which fire the serve-ledger append's
-    // `khive_runtime::track_background_task` (`handlers/recall.rs`), driving
-    // the same process-wide counter that `ann.rs`'s
-    // `ensure_ann_background_registers_a_tracked_task_not_a_bare_spawn`
-    // asserts on — untagged, cargo's default parallelism can race them.
+    /// The second recall uses the installed ANN index, measured by its route counter.
+    /// See `crates/khive-pack-memory/docs/api/ann-lifecycle.md`.
     #[tokio::test]
     #[serial(background_tasks)]
     async fn recall_second_call_uses_warm_ann_route() {
@@ -884,26 +782,8 @@ mod ann_route_tests {
     }
 }
 
-/// #750 regressions: `memory.prune`, KG `update`, and KG `delete`
-/// all mutate the same memory-note corpus the warm ANN cache is built from,
-/// but only `memory.remember` bumped `AnnState::generations` before this
-/// fix. Each test here warms the cache (proving `is_current()` is `true`
-/// for the registered model), performs the mutation WITHOUT any intervening
-/// `memory.remember`, and asserts `is_current()` is `false` afterward — the
-/// exact mechanism `handlers/common.rs`'s recall-path cache-hit gate checks
-/// before trusting an installed index.
-///
-/// This is a white-box, crate-internal assertion (`ann::is_current`/
-/// `ann::AnnKey` are `pub(crate)`) rather than a black-box recall-result
-/// check. Confirmed via a throwaway experiment (temporarily disabling the
-/// note-mutation hook call sites in `curation.rs`/`operations.rs`/
-/// `prune.rs`): for the delete path specifically, "the deleted note is
-/// absent from recall results" passes EVEN WITH THE BUG REINTRODUCED,
-/// because recall's post-search hydration filters soft-deleted notes
-/// regardless of ANN cache freshness — it is not a discriminating
-/// assertion. `is_current` is. The same experiment confirmed all three
-/// tests below fail (as expected) with the fix removed, and pass with it
-/// restored.
+/// Mutation-hook tests assert ANN generation staleness directly after corpus changes.
+/// See `crates/khive-pack-memory/docs/recall-reliability.md`.
 #[cfg(test)]
 mod note_mutation_hook_tests {
     use super::*;
@@ -916,14 +796,7 @@ mod note_mutation_hook_tests {
 
     const FR1_MODEL: &str = "fr1-mutation-hook-model";
 
-    /// Build a kg+memory registry AND wire the note-mutation hook.
-    /// Production boot does this via `khive-mcp`'s `serve.rs`/`server.rs`
-    /// calling `VerbRegistry::call_register_note_mutation_hooks`; a
-    /// hand-built test registry must call it explicitly, same as this
-    /// codebase's existing `call_register_entity_type_validators` test
-    /// pattern. Also returns the `MemoryPack`'s `SharedAnn` handle (cloned
-    /// before the pack is moved into the builder) so tests can assert
-    /// `ann::is_current` directly.
+    /// Builds a registry with the production note-mutation hook and returns its ANN state.
     fn build_note_hook_registry(rt: &KhiveRuntime) -> (khive_runtime::VerbRegistry, SharedAnn) {
         let mut builder = VerbRegistryBuilder::new();
         builder.register(KgPack::new(rt.clone()));
@@ -939,12 +812,7 @@ mod note_mutation_hook_tests {
         ann::AnnKey::new("local", FR1_MODEL)
     }
 
-    /// Seed one memory note, then run a `memory.recall` to synchronously
-    /// warm the ANN cache — the cache-miss fallback in `handlers/common.rs`
-    /// calls `ensure_ann_for_model` and awaits it before returning, so a
-    /// single recall is enough to guarantee the index is installed. Returns
-    /// the seeded note's id and asserts the cache is current before the
-    /// caller's mutation under test.
+    /// Seeds one note, warms ANN through recall, and verifies the pre-mutation state.
     async fn seed_and_warm_ann(
         rt: &KhiveRuntime,
         registry: &khive_runtime::VerbRegistry,
@@ -1073,22 +941,8 @@ mod note_mutation_hook_tests {
         );
     }
 
-    /// #750: `merge_note`'s non-dry-run
-    /// success path reindexes the surviving note (a corpus change exactly
-    /// like `update_note`'s `text_changed` branch) but never fired the
-    /// note-mutation hook. Same white-box shape as the three ANN-invalidation
-    /// tests above.
-    ///
-    /// Both notes are seeded and the cache is warmed only ONCE, AFTER both
-    /// exist, NOT via `seed_and_warm_ann` for the first note followed by a
-    /// second `memory.remember` for the second, because `memory.remember`'s
-    /// own handler already calls `ann::bump_generation` on every create
-    /// (`handlers/remember.rs`). Warming before the second note existed
-    /// would make the merge assertion pass trivially off that unrelated
-    /// bump — this exact non-discriminating-test trap is what caught out
-    /// an earlier draft of this test (confirmed by a disable/re-enable
-    /// run: the earlier draft still passed with the merge fix's hook-fire
-    /// call commented out).
+    /// A real merge invalidates an index warmed only after both notes were seeded.
+    /// See `crates/khive-pack-memory/docs/recall-reliability.md`.
     #[tokio::test]
     #[serial(background_tasks)]
     async fn kg_merge_invalidates_warm_ann_without_subsequent_remember() {
@@ -1136,13 +990,7 @@ mod note_mutation_hook_tests {
             )
             .await
             .expect("warm recall");
-        // ANN warming is asynchronous (`ann::ensure_ann_background`'s doc
-        // comment): both the seeding `memory.remember` calls above and this
-        // warm-up recall itself can fire a fire-and-forget background
-        // rebuild rather than complete it inline (#844). Wait for the
-        // single-flight `warming` guard for this key to clear before
-        // trusting `is_current` — the guard is only released once every
-        // in-flight rebuild for this key has actually finished.
+        // Trust freshness only after all single-flight rebuilds release the warm guard.
         ann::wait_until_warm_idle(&ann, &mutation_hook_ann_key()).await;
         assert!(
             ann::is_current(&ann, &mutation_hook_ann_key()).await,

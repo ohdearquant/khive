@@ -64,6 +64,8 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
 
     #[cfg(feature = "channel-email")]
     spawn_email_channel_loops_if_daemon(&server, &args);
+    #[cfg(feature = "channel-telegram")]
+    spawn_telegram_channel_loops_if_daemon(&server, &args);
     spawn_schedule_tick_loop_if_daemon(&args, &server, schedule_rt);
 
     #[cfg(unix)]
@@ -130,45 +132,16 @@ fn spawn_email_channel_loops_if_daemon(server: &KhiveMcpServer, args: &Args) {
     }
 }
 
-/// Spawn the daemon-resident schedule-event tick loop (ADR-106) if — and
-/// only if — `args` indicates this process is the daemon. Mirrors
-/// [`spawn_email_channel_loops_if_daemon`]'s `args.daemon` role gate (#602):
-/// a short-lived `kkernel exec`/stdio client process never spawns this, only
-/// the daemon does, exactly once per live process. Unlike the email loops,
-/// this is not behind a Cargo feature — the schedule pack is always linked,
-/// so the tick loop is always available.
-///
-/// `schedule_rt` is the daemon's own resolved `"schedule"`-pack runtime
-/// handle, as returned by [`build_server`] (or threaded through
-/// [`serve_server`] by `kkernel`'s coordinator-attached multi-backend boot
-/// path). Passing the ALREADY-RESOLVED runtime, rather than deriving a fresh
-/// `RuntimeConfig` from raw `args.db`/an inferred namespace inside the tick,
-/// is the fix for PR #782: the daemon resolves
-/// `--config`/`[[backends]]`/actor identity/`--pack` selection once at boot,
-/// and a second independent resolution inside the tick could silently target
-/// a different database, actor identity, or pack set. `None` means either
-/// this isn't the daemon role, or the resolved pack set does not include
-/// `"schedule"` (nothing to drain) — either way the tick loop is skipped.
-///
-/// `server` is the daemon's own live, fully-wired `KhiveMcpServer` — the
-/// SAME one [`build_server`] returned alongside `schedule_rt` and that this
-/// process is about to serve. It is cloned (cheap — `Arc`-wrapped
-/// internally) and handed to the tick loop for action-dispatch only (a
-/// continuation of PR #782, following the
-/// `schedule_rt`-only fix above): `schedule_rt` alone is correct for
-/// *scanning* `scheduled_event` rows (they live on the schedule pack's own
-/// backend), but building a throwaway `KhiveMcpServer` from `schedule_rt`
-/// alone for *dispatch* would register every pack against the schedule
-/// backend, so a replayed action belonging to another pack (e.g.
-/// `comm.send`) would route to the wrong backend in a multi-backend
-/// deployment. Passing the daemon's real `server` keeps replay routing
-/// identical to a live request.
-///
-/// If no daemon is running, scheduled events are simply not drained by this
-/// mechanism — the documented external-cron invocation
-/// (`kkernel exec --pending-events`) still works independently and safely
-/// races the tick loop when both are present (see the module docs on
-/// [`crate::pending_events`]).
+/// Spawn the daemon-resident schedule-event tick loop (ADR-106) iff `args`
+/// indicates this process is the daemon (mirrors
+/// [`spawn_email_channel_loops_if_daemon`]'s role gate, #602). `schedule_rt`
+/// MUST be the daemon's own already-resolved `"schedule"`-pack runtime
+/// (never a fresh `RuntimeConfig`, PR #782); `None` means either this isn't
+/// the daemon role or the pack set has no `"schedule"`. `server` MUST be the
+/// daemon's own live `KhiveMcpServer`, cloned for action-dispatch only — a
+/// throwaway server built from `schedule_rt` alone would misroute replayed
+/// actions in a multi-backend deployment. See
+/// `crates/khive-mcp/docs/api/pending-events.md`.
 fn spawn_schedule_tick_loop_if_daemon(
     args: &Args,
     server: &KhiveMcpServer,
@@ -314,7 +287,7 @@ fn allowed_recipients_from_env() -> Vec<String> {
 /// Returns `true` when the closure was called (preflight passed), `false`
 /// otherwise.  Tests can inject a counting closure to verify the loop is not
 /// started when preflight fails (ADR-056 §6 fail-closed contract).
-#[cfg(feature = "channel-email")]
+#[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
 fn run_if_authorized(
     ns_str: &str,
     registry: &khive_runtime::VerbRegistry,
@@ -334,7 +307,7 @@ fn run_if_authorized(
 /// gate permits it.  Returns `false` on any parse failure or authorization
 /// denial, after logging the reason.  The caller must not spawn the poll loop
 /// when this returns `false` (fail-closed, ADR-056 §6).
-#[cfg(feature = "channel-email")]
+#[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
 fn preflight_ingest_namespace(ns_str: &str, registry: &khive_runtime::VerbRegistry) -> bool {
     match khive_runtime::Namespace::parse(ns_str) {
         Ok(ns) => match registry.authorize_namespace(ns) {
@@ -718,22 +691,12 @@ fn channel_error_class(err: &khive_channel::ChannelError) -> &'static str {
 }
 
 /// Persist one poll attempt's outcome via the `comm.heartbeat` subhandler
-/// (#606). Best-effort: a failed heartbeat write is logged and does not
-/// interrupt the poll loop — the heartbeat row is an observability surface,
-/// not a correctness dependency for message delivery.
-///
-/// Takes NO `namespace` parameter (2026-07-04): heartbeat rows are an
-/// operational surface, not message data,
-/// so they are ALWAYS dispatched against
-/// `khive_pack_comm::CHANNEL_HEALTH_NAMESPACE` regardless of what
-/// `KHIVE_EMAIL_INGEST_NAMESPACE` this daemon is configured with for message
-/// ingestion. `handle_heartbeat` additionally hardcodes the persisted row's
-/// namespace to this same constant, so the guarantee holds even if a future
-/// caller changes what this dispatch call passes. `comm.health` no longer
-/// mirrors this fixed pin (khive #877): it reads from the caller's dispatch
-/// token, which resolves to this constant only for an unscoped (default)
-/// read — an explicitly-scoped `comm.health` call reads its own namespace,
-/// not necessarily where this function wrote.
+/// (#606). Best-effort: a failed write is logged, never interrupts the poll
+/// loop. Takes NO `namespace` param — heartbeat rows are always dispatched
+/// against `khive_pack_comm::CHANNEL_HEALTH_NAMESPACE` regardless of the
+/// daemon's configured `KHIVE_EMAIL_INGEST_NAMESPACE` (2026-07-04); an
+/// explicitly-scoped `comm.health` read may see a different namespace
+/// (khive #877).
 #[cfg(feature = "channel-email")]
 async fn record_channel_heartbeat(
     registry: &khive_runtime::VerbRegistry,
@@ -881,7 +844,7 @@ fn log_eligible_poll_failure(
 /// present-but-null `delivered_at` is undelivered, not delivered. Checking
 /// `.is_some()` alone would treat an explicit null (e.g. left by a curation
 /// `update`) as delivered and strand the note in the outbox forever.
-#[cfg(feature = "channel-email")]
+#[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
 fn note_already_delivered(props: &serde_json::Map<String, serde_json::Value>) -> bool {
     props
         .get("delivered_at")
@@ -1108,6 +1071,280 @@ async fn channel_outbox_loop(
     }
 }
 
+/// Whether this process owns the Telegram channel loops. Mirrors
+/// [`is_daemon_role`]'s email-channel role gate (#602): channel loops are a
+/// daemon-role responsibility, never spawned per client process.
+#[cfg(feature = "channel-telegram")]
+fn is_telegram_daemon_role(args: &Args) -> bool {
+    args.daemon
+}
+
+/// Spawn the Telegram channel loops if — and only if — `args` indicates this
+/// process is the daemon. Mirrors
+/// [`spawn_email_channel_loops_if_daemon`]. If no daemon is running, Telegram
+/// is simply not polled until one starts.
+#[cfg(feature = "channel-telegram")]
+fn spawn_telegram_channel_loops_if_daemon(server: &KhiveMcpServer, args: &Args) {
+    if is_telegram_daemon_role(args) {
+        tracing::info!("telegram channel loops: spawning (daemon role)");
+        spawn_telegram_channel_loops(server);
+    } else {
+        tracing::info!("telegram channel loops: skipped (client role; daemon owns channel loops)");
+    }
+}
+
+/// Spawn the Telegram channel polling + outbox loops if the `channel-telegram`
+/// feature is enabled and `KHIVE_TELEGRAM_*` config resolves. Non-fatal: logs
+/// a warning and returns on incomplete config. Only call this when
+/// [`is_telegram_daemon_role`] is true — use
+/// [`spawn_telegram_channel_loops_if_daemon`].
+///
+/// Unlike the email adapter, Telegram's poll offset is held in memory inside
+/// `TelegramChannel` itself (ADR-056 Amendment 2026-07-05, "Poll offset and
+/// restart durability") — there is no per-channel checkpoint/cursor
+/// persistence, backoff escalation, or ADR-094 lifecycle-event surface for
+/// this adapter; those are email-specific hardening (#605/#606/ADR-094)
+/// this ADR explicitly does not require for Telegram's simpler getUpdates
+/// durability model.
+#[cfg(feature = "channel-telegram")]
+fn spawn_telegram_channel_loops(server: &KhiveMcpServer) {
+    use khive_channel_telegram::TelegramChannel;
+    use std::sync::Arc;
+
+    match TelegramChannel::from_env() {
+        Ok(tg_ch) => {
+            let tg_ch = Arc::new(tg_ch);
+            let verb_reg = server.verb_registry_clone();
+            let ingest_ns = telegram_ingest_namespace_from_env();
+
+            let verb_reg_poll = verb_reg.clone();
+            let verb_reg_outbox = verb_reg.clone();
+            let ingest_ns_poll = ingest_ns.clone();
+            let ingest_ns_outbox = ingest_ns.clone();
+            let tg_ch_poll = Arc::clone(&tg_ch);
+            let tg_ch_outbox = Arc::clone(&tg_ch);
+
+            let spawned = run_if_authorized(&ingest_ns, &verb_reg, || {
+                tokio::task::spawn(telegram_poll_loop(
+                    tg_ch_poll,
+                    verb_reg_poll,
+                    ingest_ns_poll,
+                ));
+                tokio::task::spawn(telegram_outbox_loop(
+                    tg_ch_outbox,
+                    verb_reg_outbox,
+                    ingest_ns_outbox,
+                ));
+                tracing::info!("telegram channel polling and outbox loops started");
+            });
+            if !spawned {
+                tracing::error!(
+                    namespace = %ingest_ns,
+                    "telegram channel loops NOT started: ingest namespace authorization failed (fail-closed)"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                "channel-telegram feature is enabled but configuration is incomplete: {e}; \
+                 telegram polling is disabled"
+            );
+        }
+    }
+}
+
+/// Resolve the target namespace for ingested Telegram messages.
+///
+/// Reads `KHIVE_TELEGRAM_INGEST_NAMESPACE`; falls back to `"local"` when the
+/// variable is unset or blank. Called once at server startup before the poll
+/// loop is spawned.
+#[cfg(feature = "channel-telegram")]
+fn telegram_ingest_namespace_from_env() -> String {
+    std::env::var("KHIVE_TELEGRAM_INGEST_NAMESPACE")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "local".to_string())
+}
+
+/// Background task that polls the Telegram channel via `getUpdates` long
+/// polling and ingests new inbound messages via `comm.ingest`. No
+/// backoff/heartbeat/lifecycle-event surface — see
+/// [`spawn_telegram_channel_loops`]'s doc comment for why this is a
+/// deliberately smaller loop than `channel_poll_loop`.
+///
+/// The Bot API `getUpdates` call itself blocks server-side for the
+/// connector's long-poll timeout awaiting new updates (ADR-056 Amendment
+/// 2026-07-05 requires long polling, not short polling), so the success path
+/// adds no extra sleep between requests — the long poll paces the loop.
+/// Only the error path sleeps, so a failing Bot API does not hot-loop.
+///
+/// A fetched batch's offset is committed (acknowledged to Telegram) only
+/// after every authorized envelope in it durably ingests via `comm.ingest`
+/// — mirrors the IMAP cursor-commit discipline at `channel_poll_loop`
+/// without importing its IMAP-specific machinery (issue #113).
+#[cfg(feature = "channel-telegram")]
+async fn telegram_poll_loop(
+    telegram_channel: std::sync::Arc<khive_channel_telegram::TelegramChannel>,
+    registry: khive_runtime::VerbRegistry,
+    ingest_namespace: String,
+) {
+    use chrono::Utc;
+    use khive_channel::Channel;
+    use serde_json::json;
+
+    const ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
+
+    loop {
+        match telegram_channel.poll(Utc::now()).await {
+            Ok(envelopes) => {
+                let kind = telegram_channel.kind();
+                let mut all_ingested = true;
+                for env in envelopes {
+                    let params = json!({
+                        "namespace": ingest_namespace,
+                        "from": env.from,
+                        "to": env.to,
+                        "content": env.content,
+                        "channel_kind": kind,
+                        "external_id": env.external_id,
+                        "sent_at": env.sent_at.map(|ts| ts.to_rfc3339()),
+                    });
+                    if let Err(e) = registry.dispatch("comm.ingest", params).await {
+                        tracing::warn!(
+                            channel = kind,
+                            "comm.ingest failed for inbound telegram message: {e}"
+                        );
+                        all_ingested = false;
+                    }
+                }
+
+                if all_ingested {
+                    telegram_channel.commit_offset();
+                } else {
+                    tracing::warn!(
+                        channel = kind,
+                        "not committing telegram offset: at least one message in this batch \
+                         failed comm.ingest; the whole batch will be retried next poll"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    channel = telegram_channel.kind(),
+                    "telegram channel poll failed: {e}"
+                );
+                tokio::time::sleep(ERROR_BACKOFF).await;
+            }
+        }
+    }
+}
+
+/// Background task that delivers undelivered outbound notes addressed to a
+/// `telegram:` recipient every 5 seconds. Mirrors `channel_outbox_loop`'s
+/// note-scan/send/mark-delivered shape without the Message-ID minting logic
+/// (Telegram has no RFC 822 Message-ID concept).
+#[cfg(feature = "channel-telegram")]
+async fn telegram_outbox_loop(
+    telegram_channel: std::sync::Arc<khive_channel_telegram::TelegramChannel>,
+    registry: khive_runtime::VerbRegistry,
+    ingest_namespace: String,
+) {
+    use chrono::Utc;
+    use khive_channel::{Channel, ChannelEnvelope};
+    use serde_json::json;
+
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+        let list_params = json!({
+            "namespace": ingest_namespace,
+            "kind": "message",
+            "direction": "outbound",
+            "delivered": false,
+            "limit": 200,
+        });
+        let list_result = match registry.dispatch("list", list_params).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "telegram outbox loop: list failed");
+                continue;
+            }
+        };
+
+        let notes = match list_result.as_array() {
+            Some(arr) => arr.clone(),
+            None => continue,
+        };
+
+        for note_val in notes {
+            let props = match note_val.get("properties") {
+                Some(serde_json::Value::Object(m)) => m.clone(),
+                _ => continue,
+            };
+
+            if props.get("direction").and_then(|v| v.as_str()) != Some("outbound") {
+                continue;
+            }
+
+            let to_actor = match props.get("to_actor").and_then(|v| v.as_str()) {
+                Some(a) if a.starts_with("telegram:") => a.to_string(),
+                _ => continue,
+            };
+
+            if note_already_delivered(&props) {
+                continue;
+            }
+
+            let note_id = match note_val.get("id").and_then(|v| v.as_str()) {
+                Some(id) => id.to_string(),
+                None => continue,
+            };
+
+            let content = match note_val.get("content").and_then(|v| v.as_str()) {
+                Some(c) => c.to_string(),
+                None => continue,
+            };
+
+            let env = ChannelEnvelope::new("telegram:bot", to_actor, content);
+
+            match telegram_channel.send(env).await {
+                Ok(()) => {
+                    let delivered_at = Utc::now().to_rfc3339();
+                    let mark_result = registry
+                        .dispatch(
+                            "update",
+                            json!({
+                                "namespace": ingest_namespace,
+                                "id": note_id,
+                                "properties": { "delivered_at": delivered_at },
+                            }),
+                        )
+                        .await;
+                    match mark_result {
+                        Ok(_) => {
+                            tracing::info!(note_id = %note_id, "telegram outbox loop: delivered");
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                note_id = %note_id,
+                                error = %e,
+                                "telegram outbox loop: failed to set delivered_at (AT-LEAST-ONCE: will retry)"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        note_id = %note_id,
+                        error = %e,
+                        "telegram outbox loop: send failed; will retry next cycle"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Serve a pre-built server (ADR-029 Phase 2 boot path).
 ///
 /// Extracted from `run()` so that `kkernel`'s `Command::Mcp` arm can build a
@@ -1143,6 +1380,8 @@ pub async fn serve_server(
     }
     #[cfg(feature = "channel-email")]
     spawn_email_channel_loops_if_daemon(&server, args);
+    #[cfg(feature = "channel-telegram")]
+    spawn_telegram_channel_loops_if_daemon(&server, args);
     spawn_schedule_tick_loop_if_daemon(args, &server, schedule_rt);
 
     #[cfg(unix)]
@@ -1193,14 +1432,32 @@ pub fn build_registry_for_multi_backend(
     khive_cfg: &KhiveConfig,
     cli_db_override: Option<&str>,
 ) -> anyhow::Result<MultiBackendRegistry> {
+    khive_runtime::assert_db_anchor_consistent(base_config.db_path.as_deref(), cli_db_override)?;
+    build_registry_for_multi_backend_inner(base_config, khive_cfg, cli_db_override)
+}
+
+pub fn build_registry_for_multi_backend_with_db_anchor(
+    base_config: RuntimeConfig,
+    khive_cfg: &KhiveConfig,
+    cli_db_override: Option<&str>,
+    db_anchor: Option<&std::path::Path>,
+) -> anyhow::Result<MultiBackendRegistry> {
     // Regression fence: `base_config.db_path` feeds `compute_config_id` below,
     // so it must agree with the canonical anchor for this same `--db` input.
     // This is the shared choke point both multi-backend boot paths funnel
     // through — `build_server_multi_backend` in this file and `kkernel`'s
     // `Command::Mcp` coordinator-attached branch — so the guard lives here
     // once instead of at each caller.
-    khive_runtime::assert_db_anchor_consistent(base_config.db_path.as_deref(), cli_db_override)?;
+    khive_runtime::assert_captured_db_anchor_consistent(base_config.db_path.as_deref(), db_anchor)?;
 
+    build_registry_for_multi_backend_inner(base_config, khive_cfg, cli_db_override)
+}
+
+fn build_registry_for_multi_backend_inner(
+    base_config: RuntimeConfig,
+    khive_cfg: &KhiveConfig,
+    cli_db_override: Option<&str>,
+) -> anyhow::Result<MultiBackendRegistry> {
     let backend_count = khive_cfg.backends.len();
     let force_memory = match cli_db_override {
         Some(":memory:") => {
@@ -1300,6 +1557,19 @@ pub fn build_registry_for_multi_backend(
         cfg.backend_id = BackendId::main();
         cfg
     });
+
+    // ADR-111 Amendment 2: resolve the config-selected `BlobStore` once
+    // against the main backend and install it on every runtime handle this
+    // boot produces (`default_runtime` plus each per-pack runtime), so a
+    // pack that later reads `KhiveRuntime::blob_store()` sees the same
+    // selection regardless of which backend its own KG data lives on.
+    if let Some(store) =
+        install_resolved_blob_store(&default_runtime, khive_cfg, main_backend.as_ref())?
+    {
+        for rt in per_pack_runtimes_local.values() {
+            rt.install_blob_store(store.clone());
+        }
+    }
 
     #[cfg(feature = "bench-embedder")]
     {
@@ -1446,14 +1716,11 @@ pub(crate) fn is_strict_actor_mode() -> bool {
 /// - `khive_mcp::pending_events::run_pending_events` — drains and dispatches
 ///   scheduled events
 ///
-/// **Pure-introspection registry construction is intentionally EXEMPT** because it
-/// never dispatches verbs or reads comm/tenant data, so it carries no
-/// tenant-isolation risk. Requiring an actor identity there would make
-/// `kkernel pack list` and `kkernel kg validate` fail under strict mode without
-/// any security benefit — an operator must be able to introspect a strict-mode
-/// deployment. Exempt paths: `build_registry` in `crates/kkernel/src/pack_introspect.rs`
-/// and `build_taxonomy` in `crates/kkernel/src/kg/validate.rs`. Each of those
-/// functions carries an inline comment explaining why.
+/// **Pure-introspection registry construction is intentionally EXEMPT**
+/// (`build_registry` in `crates/kkernel/src/pack_introspect.rs`,
+/// `build_taxonomy` in `crates/kkernel/src/kg/validate.rs`) because it never
+/// dispatches verbs or reads comm/tenant data — an operator must still be
+/// able to introspect a strict-mode deployment.
 pub fn enforce_strict_actor_mode(
     actor_id: Option<&str>,
     loaded_packs: &[String],
@@ -1472,25 +1739,16 @@ pub fn enforce_strict_actor_mode(
 /// Build a fully-configured server from parsed args (without serving).
 ///
 /// Returns, alongside the server, the resolved [`KhiveRuntime`] handle the
-/// `"schedule"` pack is bound to — `None` when the resolved pack set does not
-/// include `"schedule"` — for `spawn_schedule_tick_loop_if_daemon` to drain
-/// against (ADR-106). This is the SAME runtime the server itself dispatches
-/// through: a single-backend boot shares one `KhiveRuntime` across every
-/// pack, and a multi-backend boot (ADR-028 `[[backends]]`) returns the
-/// specific per-pack runtime `"schedule"` was wired to. Threading this
-/// through — rather than having the tick loop re-resolve its own
-/// `RuntimeConfig` from raw `--db`/namespace args is the fix for PR #782: a
-/// second, independently-resolved config could
-/// silently target a different database, actor identity, or pack set than
-/// the daemon it claims to serve.
+/// `"schedule"` pack is bound to — `None` when the resolved pack set does
+/// not include `"schedule"` — for `spawn_schedule_tick_loop_if_daemon` to
+/// drain against (ADR-106). This is the SAME runtime the server itself
+/// dispatches through, never an independently re-resolved one (PR #782 —
+/// see `crates/khive-mcp/docs/api/pending-events.md`).
 ///
 /// Thin wrapper over [`build_server_with_explicit_namespace`]: derives the
-/// `(namespace, namespace_explicit)` pair from a real CLI parse via
-/// [`resolve_cli_namespace`], and — because this is the genuine `--actor`
-/// / `--namespace` CLI flag path — also treats that explicitness as a real
-/// actor override (`actor_explicit` mirrors `namespace_explicit` here; see
-/// `RuntimeConfigInputs::actor_explicit`'s field doc for why only this call
-/// site is allowed to do that).
+/// `(namespace, namespace_explicit)` pair from a real CLI parse and, because
+/// this is the genuine `--actor`/`--namespace` CLI flag path, also treats
+/// that explicitness as a real actor override.
 pub fn build_server(args: &Args) -> anyhow::Result<(KhiveMcpServer, Option<KhiveRuntime>)> {
     let (cli_namespace_explicit, cli_namespace) =
         resolve_cli_namespace(args).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1505,30 +1763,23 @@ pub fn build_server(args: &Args) -> anyhow::Result<(KhiveMcpServer, Option<Khive
 /// Build a fully-configured server from parsed args plus an independently
 /// resolved `(namespace, namespace_explicit, actor_explicit)` triple.
 ///
-/// Extracted from [`build_server`] (PR #782) so
-/// that non-interactive-CLI callers — e.g. the `--pending-events` one-shot
-/// drain wrapper in `pending_events.rs` — can supply a namespace default
-/// without it being misread as a genuine `--actor` override. `build_server`
-/// derives its namespace from a real CLI parse (`resolve_cli_namespace`),
-/// where "a namespace value is present" and "the operator explicitly
-/// overrode the actor identity" are the same fact by construction — there is
-/// no way to type `--namespace foo` without meaning it. A caller that
-/// synthesizes an `Args` value programmatically (no real flag parse behind
-/// it) does not get to make that same inference: passing a default
-/// namespace through `namespace_explicit: true` while asserting the actor
-/// identity was never touched (`actor_explicit: false`) is exactly the
-/// `kkernel exec` / `kkernel reindex` shape (see their own
-/// `resolve_runtime_config` call sites and the field doc on
-/// `RuntimeConfigInputs::actor_explicit`), and this function is the seam
-/// that lets any caller opt into that same, narrower semantic instead of
-/// `build_server`'s CLI-only one.
+/// Extracted from [`build_server`] (PR #782) so non-interactive-CLI callers
+/// (e.g. the `--pending-events` one-shot drain wrapper) can supply a
+/// namespace default without it being misread as a genuine `--actor`
+/// override. `build_server` derives `namespace_explicit` from a real CLI
+/// parse, where "a namespace value is present" and "the operator explicitly
+/// overrode the actor identity" are the same fact by construction. A caller
+/// that synthesizes an `Args` value programmatically does not get to make
+/// that inference — pass `actor_explicit: false` while `namespace_explicit`
+/// is still `true` (the `kkernel exec` / `kkernel reindex` shape; see
+/// `RuntimeConfigInputs::actor_explicit`'s field doc).
 pub fn build_server_with_explicit_namespace(
     args: &Args,
     namespace: khive_runtime::Namespace,
     namespace_explicit: bool,
     actor_explicit: bool,
 ) -> anyhow::Result<(KhiveMcpServer, Option<KhiveRuntime>)> {
-    let config = resolve_runtime_config(RuntimeConfigInputs {
+    let (config, db_anchor) = resolve_runtime_config_with_db_anchor(RuntimeConfigInputs {
         db: args.db.as_deref(),
         config: args.config.as_deref(),
         namespace,
@@ -1547,7 +1798,10 @@ pub fn build_server_with_explicit_namespace(
     // resolver derives from this same `--db` input, or `config_id` (computed
     // from `config.db_path` below) would silently desynchronize this process
     // from any daemon/peer anchored on the same database.
-    khive_runtime::assert_db_anchor_consistent(config.db_path.as_deref(), args.db.as_deref())?;
+    khive_runtime::assert_captured_db_anchor_consistent(
+        config.db_path.as_deref(),
+        db_anchor.as_deref(),
+    )?;
 
     // Load the KhiveConfig to check for multi-backend declarations (ADR-028).
     // When no [[backends]] are declared, fall through to the existing single-backend path
@@ -1569,6 +1823,7 @@ pub fn build_server_with_explicit_namespace(
     if khive_cfg.backends.is_empty() {
         // Single-backend path — identical to pre-ADR-028 behavior.
         let runtime = KhiveRuntime::new(config)?;
+        install_resolved_blob_store(&runtime, &khive_cfg, runtime.backend())?;
         #[cfg(feature = "bench-embedder")]
         {
             for name in runtime.registered_embedding_model_names() {
@@ -1603,7 +1858,12 @@ pub fn build_server_with_explicit_namespace(
     }
 
     // Multi-backend path (ADR-028).
-    let multi = build_registry_for_multi_backend(config, &khive_cfg, args.db.as_deref())?;
+    let multi = build_registry_for_multi_backend_with_db_anchor(
+        config,
+        &khive_cfg,
+        args.db.as_deref(),
+        db_anchor.as_deref(),
+    )?;
     let schedule_rt = multi
         .per_pack_runtimes
         .get("schedule")
@@ -1667,10 +1927,28 @@ pub fn build_server_multi_backend(
     khive_cfg: &KhiveConfig,
     cli_db_override: Option<&str>,
 ) -> anyhow::Result<KhiveMcpServer> {
+    khive_runtime::assert_db_anchor_consistent(base_config.db_path.as_deref(), cli_db_override)?;
+    let multi = build_registry_for_multi_backend_inner(base_config, khive_cfg, cli_db_override)?;
+    Ok(build_server_from_multi_backend_registry(
+        multi, khive_cfg, None,
+    ))
+}
+
+pub fn build_server_multi_backend_with_db_anchor(
+    base_config: RuntimeConfig,
+    khive_cfg: &KhiveConfig,
+    cli_db_override: Option<&str>,
+    db_anchor: Option<&std::path::Path>,
+) -> anyhow::Result<KhiveMcpServer> {
     // The db-anchor consistency guard runs inside `build_registry_for_multi_backend`
     // (the shared choke point every multi-backend boot path funnels through),
     // so it is not duplicated here.
-    let multi = build_registry_for_multi_backend(base_config, khive_cfg, cli_db_override)?;
+    let multi = build_registry_for_multi_backend_with_db_anchor(
+        base_config,
+        khive_cfg,
+        cli_db_override,
+        db_anchor,
+    )?;
     Ok(build_server_from_multi_backend_registry(
         multi, khive_cfg, None,
     ))
@@ -1770,6 +2048,43 @@ pub fn checkpoint_pool_for(main_backend: &StorageBackend) -> Option<Arc<Connecti
         Some(main_backend.pool_arc())
     } else {
         None
+    }
+}
+
+/// Resolve `khive.toml`'s `[storage.blob]` selection against `backend` and
+/// install it on `rt` (ADR-111 Amendment 2's boot-wiring requirement).
+///
+/// Returns the resolved store on success so multi-backend callers can also
+/// install it on every per-pack runtime without re-resolving it.
+///
+/// An **explicit** `[storage.blob]` section that fails to resolve (an `s3`
+/// backend with no AWS credentials in the environment, an invalid prefix,
+/// etc.) aborts boot: silently falling back to `FsBlobStore` would defeat
+/// the point of declaring `backend = "s3"`. When `[storage.blob]` is
+/// **absent**, a resolution failure (e.g. an in-memory backend with no root
+/// to default beside — every `--db :memory:` invocation and most unit
+/// tests) is non-fatal and leaves `KhiveRuntime::blob_store()` unset:
+/// nothing yet consumes it, and forcing a filesystem root onto every
+/// in-memory boot would be a behavior change nobody asked for.
+fn install_resolved_blob_store(
+    rt: &KhiveRuntime,
+    khive_cfg: &KhiveConfig,
+    backend: &StorageBackend,
+) -> anyhow::Result<Option<Arc<dyn khive_storage::BlobStore>>> {
+    match khive_runtime::resolve_blob_store(khive_cfg, backend) {
+        Ok(store) => {
+            rt.install_blob_store(store.clone());
+            Ok(Some(store))
+        }
+        Err(e) if khive_cfg.storage.blob.is_none() => {
+            tracing::debug!(
+                error = %e,
+                "no usable BlobStore for this backend and no [storage.blob] configured; \
+                 leaving KhiveRuntime::blob_store() unset"
+            );
+            Ok(None)
+        }
+        Err(e) => Err(anyhow::anyhow!("[storage.blob] configuration error: {e}")),
     }
 }
 
@@ -1903,7 +2218,18 @@ pub struct RuntimeConfigInputs<'a> {
 /// default/env model set while the MCP server serves recall from the
 /// config-file `[[engines]]` set.
 pub fn resolve_runtime_config(inputs: RuntimeConfigInputs<'_>) -> anyhow::Result<RuntimeConfig> {
-    let db_path = khive_runtime::resolve_db_anchor(inputs.db);
+    let (config, _) = resolve_runtime_config_with_db_anchor(inputs)?;
+    Ok(config)
+}
+
+/// Resolve a [`RuntimeConfig`] and return the database anchor captured at the
+/// same construction boundary. Server boot paths thread this value through
+/// consistency validation and registry construction without re-reading HOME.
+pub fn resolve_runtime_config_with_db_anchor(
+    inputs: RuntimeConfigInputs<'_>,
+) -> anyhow::Result<(RuntimeConfig, Option<PathBuf>)> {
+    let db_anchor = khive_runtime::resolve_db_anchor(inputs.db);
+    let db_path = db_anchor.clone();
 
     let packs = inputs
         .packs
@@ -1939,12 +2265,7 @@ pub fn resolve_runtime_config(inputs: RuntimeConfigInputs<'_>) -> anyhow::Result
             brain_profile: cli_brain_profile,
             ..RuntimeConfig::no_embeddings()
         };
-        resolve_actor_from_config(
-            inputs.config,
-            no_embed_base,
-            inputs.namespace_explicit,
-            db_path_for_config.as_deref(),
-        )?
+        resolve_actor_from_config(inputs.config, no_embed_base, db_path_for_config.as_deref())?
     } else {
         let base_config = RuntimeConfig {
             db_path,
@@ -2026,7 +2347,7 @@ pub fn resolve_runtime_config(inputs: RuntimeConfigInputs<'_>) -> anyhow::Result
 
     // Tier-3 env fallback: KHIVE_BRAIN_PROFILE is applied AFTER CLI (tier-1) and
     // config-file (tier-2) so that a project or global TOML always wins over the env var.
-    Ok(apply_env_brain_profile(resolved))
+    Ok((apply_env_brain_profile(resolved), db_anchor))
 }
 
 /// Apply `KHIVE_BRAIN_PROFILE` env var as the tier-3 fallback for `brain_profile`.
@@ -2120,19 +2441,17 @@ fn resolve_config(
     }
 }
 
-/// Resolve only the actor namespace from a config file (no-embed path).
+/// Resolve configuration without enabling embedding engines (no-embed path).
 ///
 /// `db_path` anchors tier-3 project-local config discovery to the database's
-/// own directory instead of the process cwd (see [`resolve_config`]).
+/// own directory instead of the process cwd (see [`resolve_config`]). The
+/// caller-owned namespace remains in `base`, while non-actor sections such as
+/// `[git_write]` are still loaded and validated.
 fn resolve_actor_from_config(
     config_path: Option<&std::path::Path>,
     base: RuntimeConfig,
-    cli_namespace_explicit: bool,
     db_path: Option<&std::path::Path>,
 ) -> anyhow::Result<RuntimeConfig> {
-    if cli_namespace_explicit {
-        return Ok(base);
-    }
     match KhiveConfig::load_with_home_fallback(config_path, db_path)
         .map_err(|e| anyhow::anyhow!("config error: {e}"))?
     {
@@ -2151,7 +2470,7 @@ fn resolve_actor_from_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use khive_runtime::Namespace;
+    use khive_runtime::{BlobConfig, Namespace, StorageSectionConfig};
     use serial_test::serial;
     use std::io::Write;
 
@@ -2447,6 +2766,43 @@ brain_profile = "project-profile"
             "lambda:agent-x",
             "the flag still sets the write namespace"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn no_embed_explicit_actor_preserves_git_write_config() {
+        std::env::remove_var("KHIVE_ACTOR");
+        let repo = tempfile::tempdir().expect("repo tempdir");
+        std::fs::create_dir(repo.path().join(".git")).expect("create .git");
+        let dir = tempfile::tempdir().expect("config tempdir");
+        let path = write_config(
+            dir.path(),
+            &format!(
+                "[[git_write.allowed]]\nrepo = {:?}\nbranches = [\"feat/*\"]\n",
+                repo.path().display().to_string()
+            ),
+        );
+
+        let resolved = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(":memory:"),
+            config: Some(&path),
+            namespace: Namespace::parse("lambda:cli-actor").expect("ns"),
+            namespace_explicit: true,
+            actor_explicit: true,
+            no_embed: true,
+            packs: None,
+            brain_profile: None,
+        })
+        .expect("resolve no-embed config");
+
+        assert_eq!(resolved.default_namespace.as_str(), "lambda:cli-actor");
+        assert_eq!(resolved.actor_id.as_deref(), Some("lambda:cli-actor"));
+        assert_eq!(resolved.git_write.allowed.len(), 1);
+        assert_eq!(
+            resolved.git_write.allowed[0].repo,
+            repo.path().display().to_string()
+        );
+        assert_eq!(resolved.git_write.allowed[0].branches, vec!["feat/*"]);
     }
 
     /// The `"local"` default namespace must stay anonymous (actor_id None) even when
@@ -3299,6 +3655,401 @@ id = "lambda:project-actor"
         );
     }
 
+    // ── ADR-111 Amendment 2, H2 fix round 2: `resolve_blob_store` must
+    // actually be reached from the real boot paths, not only its own unit
+    // tests. Both tests below assert against the credential-env error
+    // `S3BlobStore::new` raises with no AWS creds in the environment --
+    // exactly the technique `khive-runtime`'s own `resolve_blob_store` tests
+    // use -- but reached through `build_server`/`build_registry_for_multi_backend`
+    // themselves, proving the boot path resolves and installs the configured
+    // `S3BlobStore` rather than silently keeping the default `FsBlobStore`.
+
+    #[test]
+    #[serial]
+    fn single_backend_boot_wires_configured_s3_blob_store() {
+        std::env::remove_var("KHIVE_DB");
+        std::env::remove_var("KHIVE_ACTOR");
+        std::env::remove_var("KHIVE_PACKS");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+        let prev_access_key = std::env::var("AWS_ACCESS_KEY_ID").ok();
+        let prev_secret_key = std::env::var("AWS_SECRET_ACCESS_KEY").ok();
+        std::env::remove_var("AWS_ACCESS_KEY_ID");
+        std::env::remove_var("AWS_SECRET_ACCESS_KEY");
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config_path = write_config(
+            dir.path(),
+            r#"
+[storage.blob]
+backend = "s3"
+bucket = "khive-blobs"
+region = "us-east-1"
+"#,
+        );
+
+        use clap::Parser;
+        let args = Args::parse_from([
+            "mcp",
+            "--db",
+            ":memory:",
+            "--pack",
+            "kg",
+            "--config",
+            config_path.to_str().expect("utf8 path"),
+        ]);
+
+        let result = build_server(&args);
+
+        match prev_access_key {
+            Some(v) => std::env::set_var("AWS_ACCESS_KEY_ID", v),
+            None => std::env::remove_var("AWS_ACCESS_KEY_ID"),
+        }
+        match prev_secret_key {
+            Some(v) => std::env::set_var("AWS_SECRET_ACCESS_KEY", v),
+            None => std::env::remove_var("AWS_SECRET_ACCESS_KEY"),
+        }
+
+        let err = result.err().expect(
+            "an s3 blob backend with no AWS credentials must fail boot through the real \
+             single-backend path -- a silent fs fallback would return Ok here instead",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("AWS_ACCESS_KEY_ID"),
+            "expected the credential-env error surfaced through build_server, got: {msg}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn multi_backend_boot_wires_configured_s3_blob_store() {
+        let prev_access_key = std::env::var("AWS_ACCESS_KEY_ID").ok();
+        let prev_secret_key = std::env::var("AWS_SECRET_ACCESS_KEY").ok();
+        std::env::remove_var("AWS_ACCESS_KEY_ID");
+        std::env::remove_var("AWS_SECRET_ACCESS_KEY");
+
+        let khive_cfg = KhiveConfig {
+            backends: vec![BackendConfig {
+                name: "main".to_string(),
+                kind: BackendKind::Memory,
+                path: None,
+                cache_mb: None,
+                journal_mode: None,
+                read_only: false,
+            }],
+            storage: StorageSectionConfig {
+                blob: Some(BlobConfig::S3 {
+                    bucket: "khive-blobs".to_string(),
+                    region: "us-east-1".to_string(),
+                    endpoint: None,
+                    prefix: None,
+                    allow_http: None,
+                }),
+            },
+            ..KhiveConfig::default()
+        };
+        let base_cfg = base_runtime_config_for_multi_backend();
+
+        let result = build_registry_for_multi_backend(base_cfg, &khive_cfg, None);
+
+        match prev_access_key {
+            Some(v) => std::env::set_var("AWS_ACCESS_KEY_ID", v),
+            None => std::env::remove_var("AWS_ACCESS_KEY_ID"),
+        }
+        match prev_secret_key {
+            Some(v) => std::env::set_var("AWS_SECRET_ACCESS_KEY", v),
+            None => std::env::remove_var("AWS_SECRET_ACCESS_KEY"),
+        }
+
+        let err = result.err().expect(
+            "an s3 blob backend with no AWS credentials must fail boot through the real \
+             multi-backend path -- a silent fs fallback would return Ok here instead",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("AWS_ACCESS_KEY_ID"),
+            "expected the credential-env error surfaced through \
+             build_registry_for_multi_backend, got: {msg}"
+        );
+    }
+
+    // ── ADR-111 Amendment 2, round-3 Medium fix: the two tests above only
+    // prove the fail-closed error path. The three tests below exercise the
+    // successful construction-and-install branch of `install_resolved_blob_store`
+    // (the real call site: `:1826` single-backend, `:1567` multi-backend) plus
+    // the no-`[storage.blob]` filesystem-default boot promised by ADR-111
+    // Amendment 2. `BlobStore` carries a `Debug` supertrait (khive-storage)
+    // for exactly this purpose: it lets these tests tell which concrete
+    // backend got installed behind `Arc<dyn BlobStore>` via
+    // `format!("{store:?}")` without adding a downcast/type-name method to
+    // the production trait surface.
+
+    /// Isolated dummy (non-secret, never-valid) AWS credentials for the
+    /// success-path tests below. `S3BlobStore::new` only builds an
+    /// `AmazonS3` client (`object_store`'s `AmazonS3Builder::build`); it
+    /// performs no network I/O, so a syntactically-valid dummy key pair is
+    /// enough to reach a successful `Ok` construction.
+    const DUMMY_AWS_ACCESS_KEY_ID: &str = "AKIADUMMYWITNESSKEY00";
+    const DUMMY_AWS_SECRET_ACCESS_KEY: &str = "dummy-witness-secret-access-key-never-real";
+
+    /// RAII guard: sets the two AWS credential env vars to isolated dummy
+    /// values for the duration of the test, restoring whatever was
+    /// previously present (usually nothing) on drop. Paired with `#[serial]`
+    /// on every test that uses it, matching the convention the two boot
+    /// tests above already established for this same pair of env vars.
+    struct DummyAwsCredsGuard {
+        prev_access_key: Option<String>,
+        prev_secret_key: Option<String>,
+    }
+
+    impl DummyAwsCredsGuard {
+        fn set() -> Self {
+            let prev_access_key = std::env::var("AWS_ACCESS_KEY_ID").ok();
+            let prev_secret_key = std::env::var("AWS_SECRET_ACCESS_KEY").ok();
+            std::env::set_var("AWS_ACCESS_KEY_ID", DUMMY_AWS_ACCESS_KEY_ID);
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", DUMMY_AWS_SECRET_ACCESS_KEY);
+            Self {
+                prev_access_key,
+                prev_secret_key,
+            }
+        }
+    }
+
+    impl Drop for DummyAwsCredsGuard {
+        fn drop(&mut self) {
+            match self.prev_access_key.take() {
+                Some(v) => std::env::set_var("AWS_ACCESS_KEY_ID", v),
+                None => std::env::remove_var("AWS_ACCESS_KEY_ID"),
+            }
+            match self.prev_secret_key.take() {
+                Some(v) => std::env::set_var("AWS_SECRET_ACCESS_KEY", v),
+                None => std::env::remove_var("AWS_SECRET_ACCESS_KEY"),
+            }
+        }
+    }
+
+    /// RAII guard: clears the `KHIVE_*` variables that would otherwise
+    /// override the temp `khive.toml` the boot tests write, restoring each
+    /// prior value (or absence) on drop, even on panic/unwind. `#[serial]`
+    /// serializes access but does not restore process-global state; this
+    /// guard does.
+    struct ClearedKhiveEnvGuard {
+        prev: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl ClearedKhiveEnvGuard {
+        const VARS: [&'static str; 4] = [
+            "KHIVE_DB",
+            "KHIVE_ACTOR",
+            "KHIVE_PACKS",
+            "KHIVE_REQUIRE_ATTRIBUTED_ACTOR",
+        ];
+
+        fn clear() -> Self {
+            let prev = Self::VARS
+                .iter()
+                .map(|name| {
+                    let value = std::env::var_os(name);
+                    std::env::remove_var(name);
+                    (*name, value)
+                })
+                .collect();
+            Self { prev }
+        }
+    }
+
+    impl Drop for ClearedKhiveEnvGuard {
+        fn drop(&mut self) {
+            for (name, value) in self.prev.drain(..) {
+                match value {
+                    Some(v) => std::env::set_var(name, v),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    fn s3_blob_config() -> BlobConfig {
+        BlobConfig::S3 {
+            bucket: "khive-blobs".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: None,
+            prefix: None,
+            allow_http: None,
+        }
+    }
+
+    /// Positive counterpart to `single_backend_boot_wires_configured_s3_blob_store`:
+    /// with valid (dummy) AWS credentials present, the single-backend startup
+    /// path's `install_resolved_blob_store` call (`:1826`) must actually
+    /// install an `S3BlobStore`, not merely fail closed when credentials are
+    /// absent. Round-4 remediation: drives the real `build_server` boot entry
+    /// (not `KhiveRuntime::new` + a direct `install_resolved_blob_store` call)
+    /// via a temporary `khive.toml` + parsed `Args`, selecting the `schedule`
+    /// pack so its already-installed runtime (`:1847`) is returned for
+    /// inspection.
+    #[test]
+    #[serial]
+    fn single_backend_boot_installs_s3_blob_store_on_successful_selection() {
+        let _env = ClearedKhiveEnvGuard::clear();
+        let _creds = DummyAwsCredsGuard::set();
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config_path = write_config(
+            dir.path(),
+            r#"
+[storage.blob]
+backend = "s3"
+bucket = "khive-blobs"
+region = "us-east-1"
+"#,
+        );
+
+        use clap::Parser;
+        let args = Args::parse_from([
+            "mcp",
+            "--db",
+            ":memory:",
+            "--pack",
+            "kg",
+            "--pack",
+            "schedule",
+            "--config",
+            config_path.to_str().expect("utf8 path"),
+        ]);
+
+        let (_server, schedule_rt) = build_server(&args).expect(
+            "valid dummy AWS credentials must resolve and install an S3BlobStore through the \
+             real single-backend boot path",
+        );
+        let runtime = schedule_rt
+            .expect("the schedule pack was selected so its installed runtime must be returned");
+
+        let installed = runtime.blob_store().expect(
+            "install_resolved_blob_store must call KhiveRuntime::install_blob_store at the \
+             real :1826 call site",
+        );
+        let debug = format!("{installed:?}");
+        assert!(
+            debug.contains("S3BlobStore"),
+            "expected the installed store to be an S3BlobStore, got: {debug}"
+        );
+    }
+
+    /// Positive counterpart to `multi_backend_boot_wires_configured_s3_blob_store`:
+    /// with valid (dummy) AWS credentials present, the multi-backend startup
+    /// path must resolve the configured `S3BlobStore` once (`:1567`) and
+    /// install it on every per-pack runtime this boot produces.
+    #[test]
+    #[serial]
+    fn multi_backend_boot_installs_s3_blob_store_on_successful_selection() {
+        let _creds = DummyAwsCredsGuard::set();
+
+        let khive_cfg = KhiveConfig {
+            backends: vec![BackendConfig {
+                name: "main".to_string(),
+                kind: BackendKind::Memory,
+                path: None,
+                cache_mb: None,
+                journal_mode: None,
+                read_only: false,
+            }],
+            storage: StorageSectionConfig {
+                blob: Some(s3_blob_config()),
+            },
+            ..KhiveConfig::default()
+        };
+        let base_cfg = base_runtime_config_for_multi_backend();
+
+        let multi = build_registry_for_multi_backend(base_cfg, &khive_cfg, None)
+            .expect("valid dummy AWS credentials must resolve through the multi-backend path");
+
+        assert!(
+            !multi.per_pack_runtimes.is_empty(),
+            "precondition: the base config declares at least one pack"
+        );
+        for (pack_name, rt) in &multi.per_pack_runtimes {
+            let store = rt.blob_store().unwrap_or_else(|| {
+                panic!("pack {pack_name:?} must have the S3 selection installed on its runtime")
+            });
+            let debug = format!("{store:?}");
+            assert!(
+                debug.contains("S3BlobStore"),
+                "pack {pack_name:?}: expected the installed store to be an S3BlobStore, got: {debug}"
+            );
+        }
+    }
+
+    /// Guards the ADR-111 Amendment 2 fs-default promise (`docs/adr/ADR-111-blob-store.md:538-541`):
+    /// with no `[storage.blob]` section at all, the single-backend startup
+    /// path must still install a usable `FsBlobStore` rooted beside the
+    /// database file, and that store must actually round-trip a blob --
+    /// not merely construct without error. Round-4 remediation: drives the
+    /// real `build_server` boot entry via a temporary (sectionless)
+    /// `khive.toml` + parsed `Args`, selecting the `schedule` pack so its
+    /// already-installed runtime (`:1847`) is returned for inspection.
+    #[tokio::test]
+    #[serial]
+    async fn single_backend_boot_default_fs_blob_store_is_usable_without_storage_section() {
+        let _env = ClearedKhiveEnvGuard::clear();
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("main.db");
+        let config_path = write_config(dir.path(), "");
+
+        use clap::Parser;
+        let args = Args::parse_from([
+            "mcp",
+            "--db",
+            db_path.to_str().expect("utf8 path"),
+            "--pack",
+            "kg",
+            "--pack",
+            "schedule",
+            "--config",
+            config_path.to_str().expect("utf8 path"),
+        ]);
+
+        let (_server, schedule_rt) = build_server(&args)
+            .expect("absent [storage.blob] must resolve the fs default through the real single-backend boot path");
+        let runtime = schedule_rt
+            .expect("the schedule pack was selected so its installed runtime must be returned");
+
+        let installed = runtime.blob_store().expect(
+            "install_resolved_blob_store must call KhiveRuntime::install_blob_store at the \
+             real :1826 call site for a file-backed backend",
+        );
+        let debug = format!("{installed:?}");
+        assert!(
+            debug.contains("FsBlobStore"),
+            "expected the default store to be an FsBlobStore, got: {debug}"
+        );
+
+        // The absent-section default keeps FsBlobStore's 100 GB free-space
+        // floor — that default is exactly what this test locks in, and a CI
+        // runner legitimately may not clear it. A CapacityFloor rejection can
+        // only come from inside FsBlobStore::put, so it is equally valid
+        // proof that the boot path wired a live fs-default store; round-trip
+        // only when the volume has room.
+        match installed
+            .put(b"adr-111 fs-default regression".to_vec())
+            .await
+        {
+            Ok(content_ref) => {
+                let round_tripped = installed
+                    .get(&content_ref)
+                    .await
+                    .expect("fs-default store must serve back what it just accepted");
+                assert_eq!(
+                    round_tripped, b"adr-111 fs-default regression",
+                    "fs-default store must round-trip the exact bytes written"
+                );
+            }
+            Err(khive_storage::StorageError::CapacityFloor { .. }) => {}
+            Err(other) => panic!("fs-default store must accept a write: {other:?}"),
+        }
+    }
+
     /// Regression for ADR-073: a pack assigned to a secondary backend must
     /// have `core_backend` wired at boot so that `rt.core().backend_id()` returns "main".
     ///
@@ -3584,10 +4335,12 @@ id = "lambda:project-actor"
             }
         };
 
-        // One message to a different actor, one to ourselves.
+        // One message to a different actor, one explicit message to ourselves.
         let to_a = dispatch(r#"comm.send(to="actor-a", content="for-a")"#.to_string()).await;
         assert_eq!(to_a["results"][0]["ok"].as_bool(), Some(true), "{to_a}");
-        let to_b = dispatch(r#"comm.send(to="actor-b", content="for-b")"#.to_string()).await;
+        let to_b =
+            dispatch(r#"comm.send(to="actor-b", content="for-b", self_send=true)"#.to_string())
+                .await;
         assert_eq!(to_b["results"][0]["ok"].as_bool(), Some(true), "{to_b}");
 
         // Inbox for the configured actor (actor-b) must be filtered by to_actor.
@@ -3789,26 +4542,37 @@ id = "lambda:project-actor"
         );
     }
 
-    /// B-SHOULD-FIX-2 (data safety): Two [[backends]] entries whose sqlite paths
-    /// canonicalize to the same file must share a single Arc<StorageBackend> and
-    /// run migrations only once. Verified by using two names that differ only by
-    /// `./` prefix while pointing at the same absolute path.
-    #[test]
-    #[serial]
-    fn duplicate_sqlite_paths_deduplicated_to_single_backend() {
+    /// RAII guard: redirects `HOME` and restores the prior value on drop.
+    struct HomeGuard {
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl HomeGuard {
+        fn redirect_to(dir: &std::path::Path) -> Self {
+            let original = std::env::var_os("HOME");
+            std::env::set_var("HOME", dir);
+            Self { original }
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    fn duplicate_sqlite_path_config(db_path: &std::path::Path) -> KhiveConfig {
         use khive_runtime::PackConfig;
 
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("shared.db");
-        let db_path_str = db_path.to_str().unwrap();
-
-        // Two backend names pointing to the same file (one with ./ prefix).
-        let khive_cfg = KhiveConfig {
+        KhiveConfig {
             backends: vec![
                 BackendConfig {
                     name: "main".to_string(),
                     kind: BackendKind::Sqlite,
-                    path: Some(db_path.clone()),
+                    path: Some(db_path.to_path_buf()),
                     cache_mb: None,
                     journal_mode: None,
                     read_only: false,
@@ -3816,25 +4580,120 @@ id = "lambda:project-actor"
                 BackendConfig {
                     name: "alias".to_string(),
                     kind: BackendKind::Sqlite,
-                    path: Some(db_path.clone()),
+                    path: Some(db_path.to_path_buf()),
                     cache_mb: None,
                     journal_mode: None,
                     read_only: false,
                 },
             ],
             packs: {
-                let mut m = std::collections::HashMap::new();
-                m.insert(
+                let mut packs = std::collections::HashMap::new();
+                packs.insert(
                     "comm".to_string(),
                     PackConfig {
                         backend: "alias".to_string(),
                     },
                 );
-                m
+                packs
             },
             ..KhiveConfig::default()
+        }
+    }
+
+    fn memory_main_backend_config() -> KhiveConfig {
+        KhiveConfig {
+            backends: vec![BackendConfig {
+                name: "main".to_string(),
+                kind: BackendKind::Memory,
+                path: None,
+                cache_mb: None,
+                journal_mode: None,
+                read_only: false,
+            }],
+            ..KhiveConfig::default()
+        }
+    }
+
+    fn assert_db_anchor_drift<T>(result: anyhow::Result<T>) {
+        match result {
+            Err(error) => assert!(
+                error.to_string().contains("db-path resolution drift"),
+                "legacy builder must reject raw db input that disagrees with the resolved config: {error}"
+            ),
+            Ok(_) => panic!("legacy builder accepted raw db input that disagrees with the resolved config"),
+        }
+    }
+
+    #[test]
+    fn legacy_registry_rejects_mismatched_explicit_db_override() {
+        let base_cfg = RuntimeConfig {
+            db_path: Some(PathBuf::from("/tmp/khive-resolved.db")),
+            ..base_runtime_config_for_multi_backend()
         };
-        let _ = db_path_str; // used above to show intent
+
+        assert_db_anchor_drift(build_registry_for_multi_backend(
+            base_cfg,
+            &memory_main_backend_config(),
+            Some("/tmp/khive-raw.db"),
+        ));
+    }
+
+    #[test]
+    fn legacy_server_rejects_mismatched_explicit_db_override() {
+        let base_cfg = RuntimeConfig {
+            db_path: Some(PathBuf::from("/tmp/khive-resolved.db")),
+            ..base_runtime_config_for_multi_backend()
+        };
+
+        assert_db_anchor_drift(build_server_multi_backend(
+            base_cfg,
+            &memory_main_backend_config(),
+            Some("/tmp/khive-raw.db"),
+        ));
+    }
+
+    #[test]
+    #[serial]
+    fn legacy_registry_rejects_unset_db_after_home_changes() {
+        let first_home = tempfile::tempdir().unwrap();
+        let _home_guard = HomeGuard::redirect_to(first_home.path());
+        let base_cfg = base_runtime_config_for_multi_backend();
+        let second_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", second_home.path());
+
+        assert_db_anchor_drift(build_registry_for_multi_backend(
+            base_cfg,
+            &memory_main_backend_config(),
+            None,
+        ));
+    }
+
+    #[test]
+    #[serial]
+    fn legacy_server_rejects_unset_db_after_home_changes() {
+        let first_home = tempfile::tempdir().unwrap();
+        let _home_guard = HomeGuard::redirect_to(first_home.path());
+        let base_cfg = base_runtime_config_for_multi_backend();
+        let second_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", second_home.path());
+
+        assert_db_anchor_drift(build_server_multi_backend(
+            base_cfg,
+            &memory_main_backend_config(),
+            None,
+        ));
+    }
+
+    /// B-SHOULD-FIX-2 (data safety): Two [[backends]] entries whose sqlite paths
+    /// canonicalize to the same file must share a single Arc<StorageBackend> and
+    /// run migrations only once. Verified by using two names that differ only by
+    /// `./` prefix while pointing at the same absolute path.
+    #[test]
+    #[serial]
+    fn duplicate_sqlite_paths_deduplicated_to_single_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("shared.db");
+        let khive_cfg = duplicate_sqlite_path_config(&db_path);
 
         let base_cfg = base_runtime_config_for_multi_backend();
 
@@ -3843,6 +4702,48 @@ id = "lambda:project-actor"
         if let Err(ref e) = result {
             panic!(
                 "two backends with the same canonical path must share one Arc and boot ok; got: {e}"
+            );
+        }
+    }
+
+    /// Regression for #720: changing `HOME` after runtime-config resolution but
+    /// before multi-backend registry construction must not change the database
+    /// anchor used by the consistency guard.
+    #[test]
+    #[serial]
+    fn multi_backend_boot_uses_anchor_captured_by_runtime_config() {
+        let first_home = tempfile::tempdir().unwrap();
+        let _home_guard = HomeGuard::redirect_to(first_home.path());
+        let config_path = first_home.path().join("config.toml");
+        std::fs::write(&config_path, "").expect("write empty config");
+        let (base_cfg, db_anchor) = resolve_runtime_config_with_db_anchor(RuntimeConfigInputs {
+            db: None,
+            config: Some(&config_path),
+            namespace: Namespace::parse("local").expect("namespace"),
+            namespace_explicit: false,
+            actor_explicit: false,
+            no_embed: true,
+            packs: Some(vec!["kg".to_string()]),
+            brain_profile: None,
+        })
+        .expect("resolve runtime config before HOME changes");
+
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("shared.db");
+        let khive_cfg = duplicate_sqlite_path_config(&db_path);
+
+        let second_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", second_home.path());
+        let result = build_server_multi_backend_with_db_anchor(
+            base_cfg,
+            &khive_cfg,
+            None,
+            db_anchor.as_deref(),
+        );
+        if let Err(error) = result {
+            panic!(
+                "multi-backend construction must retain the anchor captured by \
+                 resolve_runtime_config instead of re-reading HOME: {error}"
             );
         }
     }

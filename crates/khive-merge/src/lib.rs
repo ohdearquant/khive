@@ -2,7 +2,8 @@
 //
 //! KG three-way merge.
 //!
-//! See `crates/khive-merge/docs/design.md` for architecture and invariants.
+//! See `crates/khive-merge/docs/semantic-merge-architecture.md` for design and
+//! `crates/khive-merge/docs/api/three-way-merge.md` for the caller contract.
 
 pub mod diff_local;
 pub mod edge;

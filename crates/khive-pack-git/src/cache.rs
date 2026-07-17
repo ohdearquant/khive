@@ -1,39 +1,21 @@
 //! Scratch-clone cache for `git.digest`'s remote-URL mode (ADR-088
-//! Amendment 1).
-//!
-//! Clones/fetches into `~/.khive/scratch/git-digest/<cache_key>/`, keyed by
-//! canonical URL (`crate::source::cache_key`). An LRU cap evicts the
-//! least-recently-used clone (by a `.khive-last-used` marker file's mtime,
-//! touched on every successful `ensure_clone`) once the cache exceeds
-//! `digest_cache_max_repos` entries or `digest_cache_max_bytes` total size --
-//! eviction is safe because ingest cursors live in the database, not the
-//! clone (ADR-088 Amendment 1 §Remote-URL mode). Eviction only ever removes
-//! entries it can *prove* it owns (`is_owned_entry`: a 16-hex cache-key
-//! directory name containing both a `.git` dir and the `.khive-last-used`
-//! marker) -- a `KHIVE_GIT_DIGEST_SCRATCH_ROOT` override pointed at a broader
-//! or pre-existing directory must never lose unrelated operator data.
-//!
-//! A per-clone size cap (`digest_cache_clone_max_bytes`) rejects a clone/
-//! fetch that grows past its own budget *before* it ever enters the
-//! addressable cache slot: `ensure_clone` clones/fetches into a staging
-//! directory outside the cache root, measures it, and only moves it into
-//! `<root>/<cache_key>/` when it is under the cap. A too-large clone is
-//! deleted from staging and never touches `evict_lru`'s bookkeeping or the
-//! cache slot. This guarantees the cap is enforced before the clone enters
-//! the cache -- it does NOT bound the transient disk usage of the clone/
-//! fetch child process itself while it runs in staging (`git` has no
-//! reliable pre-flight or mid-transfer size check for a partial
-//! `--filter=blob:none` clone); a single oversized `git clone` can still
-//! transiently consume disk in the staging directory before this check
-//! rejects and removes it.
-//!
-//! Config is env-var driven today (`KHIVE_GIT_DIGEST_CACHE_MAX_REPOS`,
-//! `KHIVE_GIT_DIGEST_CACHE_MAX_BYTES`, `KHIVE_GIT_DIGEST_CLONE_MAX_BYTES`,
-//! `KHIVE_GIT_DIGEST_SCRATCH_ROOT`) rather than a `[git]` TOML section --
-//! see the implementation report for why.
+//! Amendment 1). Clones/fetches into
+//! `~/.khive/scratch/git-digest/<cache_key>/`, keyed by canonical URL
+//! (`crate::source::cache_key`). An LRU cap (env-var configured:
+//! `KHIVE_GIT_DIGEST_CACHE_MAX_REPOS`, `KHIVE_GIT_DIGEST_CACHE_MAX_BYTES`,
+//! `KHIVE_GIT_DIGEST_CLONE_MAX_BYTES`, `KHIVE_GIT_DIGEST_SCRATCH_ROOT`)
+//! evicts least-recently-used clones once the cache exceeds its repo-count
+//! or total-byte limit; a per-clone size cap rejects an oversized
+//! clone/fetch before it enters the addressable cache slot. A per-`cache_key`
+//! advisory `slot_lock` (issue #805) serializes each slot's check-and-mutate
+//! span. See crates/khive-pack-git/docs/api/cache.md for the full design
+//! rationale (ownership-proof eviction, staging-then-move installation,
+//! per-clone cap enforcement, slot serialization).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use uuid::Uuid;
@@ -54,11 +36,9 @@ pub enum CacheError {
         bytes: u64,
         cap: u64,
     },
-    /// A repair operation (refetch/reclone) would have to touch a path that
-    /// does not prove itself an owned cache slot (`is_owned_entry`) or is
-    /// not a direct child of the scratch root — refused rather than risking
-    /// deletion of unrelated operator data under an overridden
-    /// `KHIVE_GIT_DIGEST_SCRATCH_ROOT`.
+    /// A repair operation would have to touch a path that does not prove
+    /// itself an owned cache slot. See
+    /// crates/khive-pack-git/docs/api/cache.md#cacheerrorunsafetoreplace.
     UnsafeToReplace(PathBuf),
 }
 
@@ -125,35 +105,125 @@ fn clone_max_bytes() -> u64 {
     env_u64("KHIVE_GIT_DIGEST_CLONE_MAX_BYTES", DEFAULT_CLONE_MAX_BYTES)
 }
 
+/// Per-cache-slot advisory locks, keyed by `cache_key` (issue #805): each of
+/// `ensure_clone`, `refetch_clone`, and `reclone` is a check-then-mutate
+/// sequence (does `is_owned_entry`/existence hold, act on the result), and
+/// nothing previously ordered two such sequences racing the *same* slot --
+/// `refetch_clone`'s own doc comment used to admit this. Holding this slot's
+/// lock for the full span of one of those functions serializes same-key
+/// mutation while leaving distinct keys free to run concurrently: each
+/// `cache_key` gets its own `Mutex` entry here, so locking one slot never
+/// blocks a caller operating on a different slot. `SlotLock::drop` removes
+/// an entry once the final live handle releases it, keeping the registry
+/// bounded by active slot operations rather than process-lifetime history.
+static SLOT_LOCKS: std::sync::LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+struct SlotLock {
+    key: String,
+    mutex: Arc<Mutex<()>>,
+}
+
+impl std::ops::Deref for SlotLock {
+    type Target = Mutex<()>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.mutex
+    }
+}
+
+impl Drop for SlotLock {
+    fn drop(&mut self) {
+        let mut locks = SLOT_LOCKS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // The registry and this handle are the final two owners only when no
+        // waiter or guard can still reference this mutex.
+        let is_final_handle = Arc::strong_count(&self.mutex) == 2;
+        let is_registered = locks
+            .get(&self.key)
+            .is_some_and(|mutex| Arc::ptr_eq(mutex, &self.mutex));
+        if is_final_handle && is_registered {
+            locks.remove(&self.key);
+            let live_entries = locks.len();
+            if locks.capacity() > live_entries.saturating_mul(4) {
+                locks.shrink_to(live_entries);
+            }
+        }
+    }
+}
+
+/// Eviction passes are serialized so the last overlapping slot mutation to
+/// reach eviction observes every earlier successful operation that has
+/// released its slot lock and can restore the configured caps. Callers
+/// already hold their own slot lock; eviction only probes candidate locks
+/// with `try_lock`, so this ordering cannot deadlock with another mutation
+/// waiting here.
+static EVICTION_LOCK: Mutex<()> = Mutex::new(());
+
+/// Get-or-create the advisory lock for cache slot `key`. Callers hold the
+/// returned lock for the entire check-and-mutate span of their operation on
+/// that slot (see `SLOT_LOCKS`). The handle's drop check runs while holding
+/// the registry mutex, so a concurrent lookup either increments the same
+/// `Arc` first or observes the entry only after its final handle is gone.
+fn slot_lock(key: &str) -> SlotLock {
+    let mut locks = SLOT_LOCKS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let key = key.to_string();
+    let mutex = locks
+        .entry(key.clone())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone();
+    SlotLock { key, mutex }
+}
+
 /// Ensure a local clone of `canonical_url` exists and is up to date; returns
 /// the repo's local path.
 ///
-/// An existing path at the cache-key slot is only ever treated as a fetchable
-/// cache slot when it already passes `is_owned_entry` -- a `.git` directory
-/// sitting at that path without the `.khive-last-used` marker (a foreign
-/// directory that happens to collide with the cache key, or a directory a
-/// crashed prior run left in a pre-`touch` state) is refused with
-/// `CacheError::UnsafeToReplace` rather than fetched into or adopted (issue
-/// #765). A fresh clone is written into a private
-/// staging directory first (`git clone --filter=blob:none`), measured there,
-/// marked with `.khive-last-used` there, and only *moved* into the
-/// addressable `<root>/<cache_key>/` slot once it is under the cap and
-/// already carries its ownership marker -- an oversized clone never enters
-/// the cache slot, never participates in `evict_lru`'s accounting, and is
-/// removed from staging immediately; a process interruption between the
-/// clone and the rename can never leave a live, markerless slot behind.
-///
-/// A repo that grew past the per-clone cap since it was last fetched is
-/// evicted from the cache slot on the spot, through the same ownership-
-/// guarded `remove_owned_entry` every other repair path uses, propagating
-/// any cleanup/ownership failure instead of discarding it.
-///
-/// Runs LRU eviction over the rest of the cache after a successful
-/// clone/fetch (this clone is exempt from its own eviction pass).
+/// Fetches into the existing slot if one already proves itself owned
+/// (`is_owned_entry`); otherwise clones fresh into a private staging
+/// directory, enforces the per-clone size cap, and only then moves it into
+/// the addressable cache slot. Returns `CacheError::UnsafeToReplace` if a
+/// non-owned directory already occupies the cache-key path, and
+/// `CacheError::CloneTooLarge` if the clone/fetch exceeds
+/// `digest_cache_clone_max_bytes`. Runs LRU eviction over the rest of the
+/// cache after a successful clone/fetch (this clone is exempt from its own
+/// eviction pass). See crates/khive-pack-git/docs/api/cache.md#ensure_clone for
+/// the staging-then-move and ownership-guard rationale.
 pub fn ensure_clone(canonical_url: &str) -> Result<PathBuf, CacheError> {
     let root = scratch_root();
-    std::fs::create_dir_all(&root)?;
+    let outcome = ensure_clone_locked(&root, canonical_url);
+    finish_mutation(&root, &outcome);
+    outcome
+}
+
+/// Bring the cache caps back within limits after a mutation whose slot lock
+/// has just been released. A successful `ensure_clone`/`refetch_clone`/
+/// `reclone` already ran `evict_lru` under its lock (protecting the slot it
+/// returns), so nothing is needed on success. A FAILED mutation skipped that
+/// pass, and a concurrent eviction may have deferred this slot while its lock
+/// was held — leaving the caps exceeded with nothing scheduled to correct them
+/// (#960). Enforce them now that the lock is free. Best-effort: the mutation's
+/// own error is the one propagated, so a secondary eviction failure is logged,
+/// not surfaced.
+fn finish_mutation(root: &Path, outcome: &Result<PathBuf, CacheError>) {
+    if outcome.is_ok() {
+        return;
+    }
+    if let Err(evict_err) = enforce_caps(root) {
+        tracing::warn!(
+            error = %evict_err,
+            "cap enforcement after a failed cache mutation did not complete"
+        );
+    }
+}
+
+fn ensure_clone_locked(root: &Path, canonical_url: &str) -> Result<PathBuf, CacheError> {
+    std::fs::create_dir_all(root)?;
     let key = cache_key(canonical_url);
+    let lock = slot_lock(&key);
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let repo_dir = root.join(&key);
     let cap = clone_max_bytes();
 
@@ -163,38 +233,38 @@ pub fn ensure_clone(canonical_url: &str) -> Result<PathBuf, CacheError> {
         }
         fetch(&repo_dir)?;
         // `repo_dir` was just fetched into and its ownership already
-        // confirmed above; it vanishing here is a real problem (e.g. a
-        // racing, non-serialized `ensure_clone`/`reclone` on the same key --
-        // see `refetch_clone`'s doc comment), not a maybe-absent slot, so
-        // propagate rather than swallow.
+        // confirmed above; it vanishing here is a real problem (`slot_lock`
+        // excludes a concurrent `ensure_clone`/`refetch_clone`/`reclone` on
+        // this same key, so nothing else in this crate should be touching
+        // it), not a maybe-absent slot, so propagate rather than swallow.
         let size = dir_size(&repo_dir)?;
         if size > cap {
-            remove_owned_entry(&root, &repo_dir)?;
+            remove_owned_entry(root, &repo_dir)?;
             return Err(CacheError::CloneTooLarge { bytes: size, cap });
         }
         touch(&repo_dir)?;
     } else {
-        install_fresh_clone(canonical_url, &root, &repo_dir, cap)?;
+        install_fresh_clone(canonical_url, root, &repo_dir, cap)?;
     }
 
-    evict_lru(&root, &repo_dir)?;
+    evict_lru(root, &repo_dir)?;
     Ok(repo_dir)
 }
 
 /// Re-fetch a corrupt-but-present cache slot with `git fetch --refetch`
-/// (issue #765): downloads a complete fresh filtered packfile rather than
-/// trusting the existing (possibly promisor-incomplete) object store,
-/// repairing a partial/pruned clone in place. Only ever operates on an
-/// existing slot -- callers repair a slot only after a prior `ensure_clone`
-/// already produced one. Re-checks `is_owned_entry` immediately before
-/// fetching (issue #765 follow-up PR #788): the
-/// gap between `ensure_clone`'s own ownership check and this repair running
-/// -- project resolution and GitHub ingestion happen in between -- is wide
-/// enough for the slot to go markerless or be replaced, so this function
-/// cannot rely on the caller having checked recently.
+/// (issue #765), re-checking ownership immediately before fetching. See
+/// crates/khive-pack-git/docs/api/cache.md#refetch_clone.
 pub(crate) fn refetch_clone(canonical_url: &str) -> Result<PathBuf, CacheError> {
     let root = scratch_root();
+    let outcome = refetch_clone_locked(&root, canonical_url);
+    finish_mutation(&root, &outcome);
+    outcome
+}
+
+fn refetch_clone_locked(root: &Path, canonical_url: &str) -> Result<PathBuf, CacheError> {
     let key = cache_key(canonical_url);
+    let lock = slot_lock(&key);
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let repo_dir = root.join(&key);
     if !repo_dir.join(".git").exists() {
         return Err(CacheError::Git(format!(
@@ -203,18 +273,7 @@ pub(crate) fn refetch_clone(canonical_url: &str) -> Result<PathBuf, CacheError> 
         )));
     }
     // Re-check ownership immediately before mutating the slot (issue #765
-    // follow-up PR #788): the caller's own
-    // ownership check (`ensure_clone`, much earlier in `handle_digest`)
-    // happens before project resolution and potentially lengthy GitHub
-    // ingestion, so the slot can go markerless -- or be replaced by a
-    // foreign directory colliding with the cache key -- in that interval.
-    // Without this re-check, `fetch_refetch` below would mutate whatever
-    // sits at `repo_dir` and `touch` would mark it owned, making it eligible
-    // for later deletion. There is no same-key serialization for cache
-    // mutation in this crate today (a concurrent `ensure_clone`/`reclone`
-    // racing this same slot is not otherwise excluded) -- this re-check
-    // narrows the adoption bug but does not close a true concurrent-writer
-    // race.
+    // follow-up PR #788) — see crates/khive-pack-git/docs/api/cache.md#refetch_clone.
     if !is_owned_entry(&repo_dir) {
         return Err(CacheError::UnsafeToReplace(repo_dir));
     }
@@ -222,58 +281,47 @@ pub(crate) fn refetch_clone(canonical_url: &str) -> Result<PathBuf, CacheError> 
     fetch_refetch(&repo_dir)?;
 
     let cap = clone_max_bytes();
-    // Same reasoning as `ensure_clone`: `repo_dir`'s ownership was just
-    // re-checked and it was just fetched into, so a vanish here is a real
-    // problem to surface, not a maybe-absent slot to size as `0`.
     let size = dir_size(&repo_dir)?;
     if size > cap {
-        // Route through the same ownership-guarded removal `reclone` uses
-        // (issue #765 remediation) rather than a raw
-        // `remove_dir_all` -- a repair primitive must never delete a path
-        // that doesn't prove itself an owned cache slot, even on the cap-
-        // exceeded cleanup path. Propagate a cleanup/ownership failure
-        // instead of discarding it: a refused or
-        // failed removal must surface as its own error, not be silently
-        // swallowed behind `CloneTooLarge`.
-        remove_owned_entry(&root, &repo_dir)?;
+        // Ownership-guarded removal, not a raw `remove_dir_all` — see
+        // crates/khive-pack-git/docs/api/cache.md#refetch_clone.
+        remove_owned_entry(root, &repo_dir)?;
         return Err(CacheError::CloneTooLarge { bytes: size, cap });
     }
 
     touch(&repo_dir)?;
-    evict_lru(&root, &repo_dir)?;
+    evict_lru(root, &repo_dir)?;
     Ok(repo_dir)
 }
 
 /// Evict an owned cache slot (if present) and install a fresh clone in its
-/// place (issue #765's fallback when a refetch cannot repair the slot).
-/// Refuses via `CacheError::UnsafeToReplace` when the existing path does not
-/// prove itself an owned cache slot -- the same ownership guard `evict_lru`
-/// uses, so a `KHIVE_GIT_DIGEST_SCRATCH_ROOT` override pointed at a broader
-/// or pre-existing directory can never lose unrelated operator data here
-/// either.
+/// place (issue #765's fallback when a refetch cannot repair the slot). See
+/// crates/khive-pack-git/docs/api/cache.md#reclone.
 pub(crate) fn reclone(canonical_url: &str) -> Result<PathBuf, CacheError> {
     let root = scratch_root();
-    std::fs::create_dir_all(&root)?;
+    let outcome = reclone_locked(&root, canonical_url);
+    finish_mutation(&root, &outcome);
+    outcome
+}
+
+fn reclone_locked(root: &Path, canonical_url: &str) -> Result<PathBuf, CacheError> {
+    std::fs::create_dir_all(root)?;
     let key = cache_key(canonical_url);
+    let lock = slot_lock(&key);
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let repo_dir = root.join(&key);
     let cap = clone_max_bytes();
 
-    remove_owned_entry(&root, &repo_dir)?;
-    install_fresh_clone(canonical_url, &root, &repo_dir, cap)?;
+    remove_owned_entry(root, &repo_dir)?;
+    install_fresh_clone(canonical_url, root, &repo_dir, cap)?;
 
-    evict_lru(&root, &repo_dir)?;
+    evict_lru(root, &repo_dir)?;
     Ok(repo_dir)
 }
 
 /// Shared staging-clone-then-move path for both a first-time `ensure_clone`
-/// and a `reclone` repair: clones into a private staging directory outside
-/// the cache root, measures it against the per-clone cap, writes the
-/// `.khive-last-used` ownership marker into the staging directory itself,
-/// and only then moves it into the addressable `<root>/<cache_key>/` slot --
-/// an oversized clone never enters the cache slot, and because the marker is
-/// written before the atomic rename, a process interruption between clone
-/// and rename can never leave a live, markerless slot at the cache-key path
-/// (issue #765).
+/// and a `reclone` repair. See
+/// crates/khive-pack-git/docs/api/cache.md#install_fresh_clone.
 fn install_fresh_clone(
     canonical_url: &str,
     root: &Path,
@@ -308,10 +356,7 @@ fn install_fresh_clone(
 }
 
 /// Remove `repo_dir` only when it is a direct child of `root` AND passes
-/// `is_owned_entry` -- refuses (`CacheError::UnsafeToReplace`) rather than
-/// deleting anything else, including a not-yet-existing or foreign-shaped
-/// path. A slot that does not currently exist is not an error: there is
-/// simply nothing to remove before installing a fresh clone.
+/// `is_owned_entry`. A slot that does not currently exist is not an error.
 fn remove_owned_entry(root: &Path, repo_dir: &Path) -> Result<(), CacheError> {
     if !repo_dir.exists() {
         return Ok(());
@@ -323,11 +368,8 @@ fn remove_owned_entry(root: &Path, repo_dir: &Path) -> Result<(), CacheError> {
     Ok(())
 }
 
-/// `std::fs::remove_dir_all` on a large git working tree can transiently
-/// fail with "directory not empty" when something else briefly touches the
-/// tree mid-removal (e.g. a filesystem indexer) -- retry a few times before
-/// giving up, rather than letting a one-off transient race abort a repair
-/// that would otherwise succeed.
+/// Retries `remove_dir_all` a few times before giving up — see
+/// crates/khive-pack-git/docs/api/cache.md#remove_dir_all_retrying.
 fn remove_dir_all_retrying(path: &Path) -> std::io::Result<()> {
     let mut last_err = None;
     for attempt in 0..5 {
@@ -344,41 +386,11 @@ fn remove_dir_all_retrying(path: &Path) -> std::io::Result<()> {
     Err(last_err.expect("loop always sets last_err before exiting"))
 }
 
-/// `-c maintenance.auto=false` on every clone/fetch into a cache slot, as
-/// defensive hardening. `git fetch` runs auto-maintenance after it
-/// finishes when `maintenance.auto` (default true) is set, and since git
-/// 2.47 that maintenance runs as a *detached background child*
-/// (`git maintenance run --auto --detach`) that can outlive the foreground
-/// command; on 2.46 and earlier it ran synchronously. The spawn is
-/// trace2-proven in both directions on the `fetch --refetch` path
-/// (`GIT_TRACE2_EVENT`, git 2.49: with default config the child forks; with
-/// `maintenance.auto=false` it does not). The same trace showed `clone`
-/// spawning no maintenance child; the flag is applied to the clone builder
-/// too purely as harmless defensive configuration, with no trace evidence
-/// claimed for that path. When one of the detached child's tasks fires it
-/// mutates the slot's `.git` tree (commit-graph writes, pack maintenance,
-/// lock files) concurrently with any `dir_size`/`evict_lru` walk of the
-/// same slot. Whether such a task actually fired in issue #842's historical
-/// macOS ENOENT failures is not proven -- in small repos the child
-/// typically finds no task to run and exits quickly -- so the load-bearing
-/// fix for that flake family is the descendant-vanish tolerance in
-/// `dir_size`; this flag removes the one background mutator git itself can
-/// fork into our cache slots. `gc.auto=0` alone does **not** suppress the
-/// child (trace2-verified); it is kept alongside because it disables
-/// `git gc --auto`'s separate opportunistic-gc check, harmless to also turn
-/// off here.
-///
-/// This does not mean a cache slot is naturally garbage-collected some other
-/// way instead: no cache-slot repo is ever gc'd or maintenance'd by us.
-/// Growth is bounded by wholesale eviction, not in-place compaction --
-/// `ensure_clone`/`refetch_clone` delete a slot outright
-/// (`remove_owned_entry`) the moment it measures over
-/// `digest_cache_clone_max_bytes` after a fetch, and `evict_lru` deletes
-/// whole least-recently-used slot directories once the cache-wide
-/// `digest_cache_max_repos`/`digest_cache_max_bytes` caps are exceeded. A
-/// slot can be fetched into repeatedly, but it can never accumulate objects
-/// past its own size cap without being deleted and re-cloned fresh, so there
-/// is nothing for git's own gc/maintenance to usefully do in a cache slot.
+/// `-c maintenance.auto=false` on every clone/fetch into a cache slot: git
+/// can otherwise spawn a detached background maintenance child that mutates
+/// the slot's `.git` tree concurrently with a `dir_size`/`evict_lru` walk
+/// (issue #842 flake family). See
+/// crates/khive-pack-git/docs/api/cache.md#clone-git-subprocess-maintenanceautofalse.
 fn clone(url: &str, dest: &Path) -> Result<(), CacheError> {
     let status = Command::new("git")
         .arg("-c")
@@ -428,8 +440,7 @@ fn fetch(repo: &Path) -> Result<(), CacheError> {
 
 /// Issue #765 repair primitive: `git fetch --refetch origin` obtains a
 /// complete fresh filtered packfile instead of incrementally trusting the
-/// existing (possibly promisor-incomplete) object store -- the documented
-/// fix for a partial clone that has dropped objects it should still have.
+/// existing object store.
 fn fetch_refetch(repo: &Path) -> Result<(), CacheError> {
     let status = Command::new("git")
         .arg("-c")
@@ -455,10 +466,7 @@ fn fetch_refetch(repo: &Path) -> Result<(), CacheError> {
     Ok(())
 }
 
-/// Wrap an I/O error with the operation and path it happened on -- a bare
-/// `CacheError::Io(e)` at these call sites used to surface as an opaque
-/// "No such file or directory" with no way to tell which of the many paths
-/// `dir_size`/`touch`/`evict_lru` touch actually disappeared.
+/// Wraps an I/O error with the operation and path it happened on.
 fn io_err(op: &str, path: &Path, e: std::io::Error) -> CacheError {
     CacheError::Io(std::io::Error::new(
         e.kind(),
@@ -472,33 +480,11 @@ fn touch(repo_dir: &Path) -> Result<(), CacheError> {
     Ok(())
 }
 
-/// Recursive directory size, following no symlinks (`symlink_metadata`
-/// throughout, so a symlink itself is sized but never traversed -- clones
-/// never legitimately contain symlinked directories pointing outside the
-/// clone, and this avoids any possibility of a symlink loop).
-///
-/// Tolerant of a *descendant* disappearing mid-walk (a vanished entry
-/// beneath an existing root contributes 0 bytes rather than aborting the
-/// whole size computation): a cache slot's `.git` tree can legitimately be
-/// mutated by something outside this function's control while it walks it
-/// -- a concurrent `evict_lru`/`ensure_clone` repair on the same slot, or a
-/// background `git maintenance` child from before `maintenance.auto=false`
-/// applied to every command this crate issues. This accounting is
-/// inherently a snapshot of a possibly-changing tree (ADR-088 Amendment 1:
-/// eviction is safe because ingest cursors live in the database, not the
-/// clone), so "a thing under the root I was about to size is already gone"
-/// is not an error here.
-///
-/// The walk **root** itself vanishing is different and is NOT tolerated --
-/// it surfaces as `CacheError::Io(NotFound)` rather than silently sizing to
-/// `0`. A caller that genuinely expects the root it's sizing to sometimes be
-/// absent (rather than an existing root racing a mid-walk mutation) must
-/// check for that error explicitly and decide its own semantics at that call
-/// site (`evict_lru` does this for a listed entry that a concurrent repair
-/// deleted between `read_dir` and this call -- see there); `dir_size` itself
-/// never launders a missing root into a bare `0`, which previously let
-/// `evict_lru` report success with a missing keep slot or count a phantom
-/// candidate and evict a valid one unnecessarily.
+/// Recursive directory size, following no symlinks. Tolerant of a
+/// *descendant* disappearing mid-walk (contributes 0 bytes); the walk
+/// **root** itself vanishing is NOT tolerated and surfaces as
+/// `CacheError::Io(NotFound)`. See
+/// crates/khive-pack-git/docs/api/cache.md#dir_size.
 fn dir_size(path: &Path) -> Result<u64, CacheError> {
     let mut total = 0u64;
     let mut stack = vec![path.to_path_buf()];
@@ -529,27 +515,23 @@ fn dir_size(path: &Path) -> Result<u64, CacheError> {
     Ok(total)
 }
 
+fn is_cache_key_name(name: &str) -> bool {
+    name.len() == 16
+        && name
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+}
+
 /// Whether `path` is a directory `ensure_clone` could plausibly have
-/// created: a 16-lowercase-hex `cache_key`-shaped directory name (never a
-/// UUID staging dir, never an arbitrary operator directory), itself a real
-/// directory rather than a symlink (a symlink placed at the cache-key path
-/// pointing at an unrelated owned-looking or foreign directory must never be
-/// treated as an owned slot), containing both a `.git` entry and the
-/// `.khive-last-used` marker written by `touch`. Eviction (and any future
-/// scratch-root cleanup) must only ever remove entries that pass this check
-/// -- a `KHIVE_GIT_DIGEST_SCRATCH_ROOT` override pointed at a broader or
-/// pre-existing directory must never lose unrelated data sitting next to the
-/// cache slots.
+/// created: a 16-lowercase-hex `cache_key`-shaped real directory (not a
+/// symlink) containing both a `.git` entry and the `.khive-last-used`
+/// marker. See crates/khive-pack-git/docs/api/cache.md#is_owned_entry.
 fn is_owned_entry(path: &Path) -> bool {
     let name = match path.file_name().and_then(|n| n.to_str()) {
         Some(n) => n,
         None => return false,
     };
-    if name.len() != 16
-        || !name
-            .chars()
-            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
-    {
+    if !is_cache_key_name(name) {
         return false;
     }
     match std::fs::symlink_metadata(path) {
@@ -559,25 +541,38 @@ fn is_owned_entry(path: &Path) -> bool {
     path.join(".git").exists() && path.join(MARKER_FILE).exists()
 }
 
-/// Evict least-recently-used clones under `root` (by `.khive-last-used`
-/// mtime) until both the repo-count cap and the total-byte cap are
-/// satisfied. `keep` (the clone `ensure_clone` just touched) is never
-/// evicted. Only removes paths that are direct children of `root` AND pass
-/// `is_owned_entry` -- eviction never touches user-owned or non-cache paths.
-///
-/// `keep`'s own `dir_size` (below) is deliberately NOT tolerant of `keep`
-/// vanishing: every caller touches (or freshly installs) `keep` immediately
-/// before calling `evict_lru` in the same synchronous call chain, so `keep`
-/// disappearing out from under this call is not an expected repair race --
-/// it is either a genuine bug or an external actor deleting our slot, and
-/// silently sizing it to `0` would let eviction report success while the
-/// slot the caller asked to keep is actually gone. A listed *candidate*
-/// entry (below) is different -- another `evict_lru`/`ensure_clone`
-/// repairing the same root can legitimately delete it between the
-/// `read_dir` listing above and the `dir_size` call below, so that vanish is
-/// tolerated by skipping the entry rather than aborting the whole pass.
+/// Evict least-recently-used clones under `root` until both the
+/// repo-count cap and the total-byte cap are satisfied. `keep` is never
+/// evicted, and its own vanishing is NOT tolerated (propagates as an
+/// error); a listed candidate entry vanishing mid-walk IS tolerated
+/// (skipped). See crates/khive-pack-git/docs/api/cache.md#evict_lru.
 fn evict_lru(root: &Path, keep: &Path) -> Result<(), CacheError> {
-    let mut entries: Vec<(PathBuf, SystemTime, u64)> = Vec::new();
+    evict_to_caps(root, Some(keep))
+}
+
+/// Enforce the cache caps with no protected slot: evict least-recently-used
+/// owned clones until both caps hold, treating every owned slot as a
+/// candidate. Run after a cache mutation releases its slot lock on a FAILURE
+/// path (#960). A failed `ensure_clone`/`refetch_clone`/`reclone` skips the
+/// success-path `evict_lru`, and a concurrent eviction may have deferred this
+/// slot (its lock was held) — so without this pass the caps can stay exceeded
+/// with nothing scheduled to correct them. See
+/// crates/khive-pack-git/docs/api/cache.md#enforce_caps.
+fn enforce_caps(root: &Path) -> Result<(), CacheError> {
+    evict_to_caps(root, None)
+}
+
+/// Shared eviction core. `keep = Some(slot)` protects that slot from eviction
+/// and requires it to still exist (its vanishing propagates as an error);
+/// `keep = None` protects nothing. Holds `EVICTION_LOCK` for the whole pass
+/// and takes each candidate's `slot_lock` with `try_lock`, deferring (skipping)
+/// a candidate whose lock is currently held rather than blocking on it — the
+/// deferred candidate's own mutation runs its own tail pass once it settles.
+fn evict_to_caps(root: &Path, keep: Option<&Path>) -> Result<(), CacheError> {
+    let _eviction_guard = EVICTION_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut entries: Vec<(PathBuf, String, SystemTime, u64)> = Vec::new();
     let read_dir =
         std::fs::read_dir(root).map_err(|e| io_err("evict_lru: read_dir root", root, e))?;
     for entry in read_dir {
@@ -590,7 +585,23 @@ fn evict_lru(root: &Path, keep: &Path) -> Result<(), CacheError> {
             Err(e) => return Err(io_err("evict_lru: read_dir entry", root, e)),
         };
         let p = entry.path();
-        if !p.is_dir() || p == keep || !is_owned_entry(&p) {
+        if keep == Some(p.as_path()) {
+            continue;
+        }
+        let Some(key) = p.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !is_cache_key_name(key) || !is_owned_entry(&p) {
+            continue;
+        }
+        let key = key.to_string();
+        let lock = slot_lock(&key);
+        let _candidate_guard = match lock.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => continue,
+        };
+        if !p.is_dir() || !is_owned_entry(&p) {
             continue;
         }
         let mtime = std::fs::metadata(p.join(MARKER_FILE))
@@ -604,34 +615,50 @@ fn evict_lru(root: &Path, keep: &Path) -> Result<(), CacheError> {
             Err(CacheError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(e),
         };
-        entries.push((p, mtime, size));
+        entries.push((p, key, mtime, size));
     }
-    entries.sort_by_key(|(_, mtime, _)| *mtime);
+    entries.sort_by_key(|(_, _, mtime, _)| *mtime);
 
-    let keep_size = dir_size(keep)?;
-    let mut total: u64 = entries.iter().map(|(_, _, s)| s).sum::<u64>() + keep_size;
-    let mut count = entries.len() + 1;
+    let (keep_size, keep_count) = match keep {
+        Some(keep) => (dir_size(keep)?, 1),
+        None => (0, 0),
+    };
+    let mut total: u64 = entries.iter().map(|(_, _, _, s)| s).sum::<u64>() + keep_size;
+    let mut count = entries.len() + keep_count;
     let cap_repos = max_repos();
     let cap_bytes = max_total_bytes();
 
-    for (path, _, size) in entries {
+    for (path, key, _, measured_size) in entries {
         if count <= cap_repos && total <= cap_bytes {
             break;
         }
-        let _ = std::fs::remove_dir_all(&path);
+        let lock = slot_lock(&key);
+        let _candidate_guard = match lock.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => continue,
+        };
+        if !is_owned_entry(&path) {
+            count = count.saturating_sub(1);
+            total = total.saturating_sub(measured_size);
+            continue;
+        }
+        let current_size = dir_size(&path)?;
+        total = total
+            .saturating_sub(measured_size)
+            .saturating_add(current_size);
+        if count <= cap_repos && total <= cap_bytes {
+            break;
+        }
+        remove_owned_entry(root, &path)?;
         count -= 1;
-        total = total.saturating_sub(size);
+        total = total.saturating_sub(current_size);
     }
     Ok(())
 }
 
-/// `scratch_root()` reads process-global env vars; serialize any in-crate
-/// test (in this module or elsewhere, e.g. `recovery_tests.rs`) that touches
-/// it, so the whole `cargo test` binary's parallel test threads never race
-/// on `KHIVE_GIT_DIGEST_SCRATCH_ROOT`/cache-cap env vars/`PATH`. A
-/// `tokio::sync::Mutex` rather than `std::sync::Mutex` so async tests can
-/// hold the guard across `.await` points (`blocking_lock()` for this
-/// module's plain sync `#[test]`s).
+/// Serializes tests that touch process-global env vars (`scratch_root()`
+/// reads them). See crates/khive-pack-git/docs/api/cache.md#env_mutex.
 #[cfg(test)]
 pub(crate) static ENV_MUTEX: std::sync::LazyLock<tokio::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
@@ -640,9 +667,7 @@ pub(crate) static ENV_MUTEX: std::sync::LazyLock<tokio::sync::Mutex<()>> =
 mod tests {
     use super::*;
 
-    /// Build a directory shaped exactly like a real `ensure_clone` cache
-    /// slot: a 16-lowercase-hex name (a real `cache_key` output) containing
-    /// a `.git` dir and (optionally) the `.khive-last-used` marker.
+    /// Build a directory shaped exactly like a real `ensure_clone` cache slot.
     fn make_owned_entry(root: &Path, key: &str, with_marker: bool) -> PathBuf {
         assert_eq!(key.len(), 16, "test cache keys must be 16 hex chars");
         let p = root.join(key);
@@ -653,12 +678,21 @@ mod tests {
         p
     }
 
-    /// ADR-088 Amendment 1: a `git clone` failure (bad
-    /// source, no network needed -- a nonexistent local path fails
-    /// immediately) must not leave a `.staging-<uuid>` directory behind.
-    /// `evict_lru` deliberately never touches non-owned names, so a leaked
-    /// staging dir would otherwise accumulate forever across repeated
-    /// failures.
+    fn slot_lock_registry_len() -> usize {
+        SLOT_LOCKS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+
+    fn slot_lock_registry_capacity() -> usize {
+        SLOT_LOCKS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .capacity()
+    }
+
+    /// A `git clone` failure must not leave a `.staging-<uuid>` dir behind.
     #[test]
     fn ensure_clone_cleans_up_staging_dir_on_clone_failure() {
         let _guard = ENV_MUTEX.blocking_lock();
@@ -704,6 +738,77 @@ mod tests {
 
         assert!(!old.exists(), "the older clone must be evicted");
         assert!(new.exists(), "the kept clone must survive");
+
+        std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
+        std::env::remove_var("KHIVE_GIT_DIGEST_CACHE_MAX_REPOS");
+        std::env::remove_var("KHIVE_GIT_DIGEST_CACHE_MAX_BYTES");
+    }
+
+    /// Issue #960: a cache mutation that FAILS must still leave the caps
+    /// enforced. A failed `refetch_clone` returns before its success-path
+    /// `evict_lru`, and under concurrency a sibling eviction pass can defer
+    /// this slot (its lock is held) — so without a post-release cap pass the
+    /// caps stay exceeded with nothing scheduled to correct them.
+    /// `finish_mutation` runs `enforce_caps` once the lock is free. This pins
+    /// the settled-state invariant the concurrent case also relies on: two
+    /// owned slots over a repo cap of 1, a failed refetch of one, and
+    /// afterward exactly one owned slot remains.
+    #[test]
+    fn a_failed_mutation_enforces_caps_over_the_settled_set() {
+        let _guard = ENV_MUTEX.blocking_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT", dir.path());
+        std::env::set_var("KHIVE_GIT_DIGEST_CACHE_MAX_REPOS", "1");
+        std::env::set_var("KHIVE_GIT_DIGEST_CACHE_MAX_BYTES", "1000000000");
+
+        let root = dir.path();
+        // Two owned slots present, one over the repo cap of 1. The slot we
+        // will fail to refetch is the newer one; the older sibling is the LRU
+        // eviction victim, showing the failed mutation enforced the cap over a
+        // slot it was not itself operating on.
+        let url_victim = "https://example.com/lru-victim.git";
+        let url_target = "https://example.com/refetch-target.git";
+        let key_victim = cache_key(url_victim);
+        let key_target = cache_key(url_target);
+        assert_ne!(
+            key_victim, key_target,
+            "distinct urls must map to distinct slots"
+        );
+
+        let victim = make_owned_entry(root, &key_victim, true);
+        // Ensure a real mtime gap so `victim` is unambiguously the LRU.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let target = make_owned_entry(root, &key_target, true);
+
+        // `target`'s `.git` is an empty directory, not a real repository, so
+        // `git fetch --refetch` fails deterministically with no network. The
+        // mutation therefore returns Err before its own eviction pass.
+        let result = refetch_clone(url_target);
+        assert!(
+            result.is_err(),
+            "refetch of a slot with no valid git repo must fail: {result:?}"
+        );
+
+        // The failed mutation must nonetheless have enforced the caps.
+        let owned: Vec<_> = std::fs::read_dir(root)
+            .expect("read scratch root")
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| is_owned_entry(p))
+            .collect();
+        assert_eq!(
+            owned.len(),
+            1,
+            "a failed mutation must leave the repo cap enforced, found: {owned:?}"
+        );
+        assert!(
+            target.exists(),
+            "the newer (refetched) slot must survive as the non-LRU entry"
+        );
+        assert!(
+            !victim.exists(),
+            "the older sibling must be evicted to satisfy the repo cap"
+        );
 
         std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
         std::env::remove_var("KHIVE_GIT_DIGEST_CACHE_MAX_REPOS");
@@ -760,6 +865,27 @@ mod tests {
     }
 
     #[test]
+    fn evict_lru_does_not_grow_registry_for_unrelated_scratch_root_children() {
+        let _guard = ENV_MUTEX.blocking_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("scratch-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let kept = make_owned_entry(&root, "4444444444444444", true);
+
+        for index in 0..32 {
+            std::fs::create_dir_all(root.join(format!("operator-data-{index}"))).unwrap();
+        }
+
+        let baseline = slot_lock_registry_len();
+        evict_lru(&root, &kept).expect("evict");
+        assert_eq!(
+            slot_lock_registry_len(),
+            baseline,
+            "unrelated scratch-root children must not allocate slot locks"
+        );
+    }
+
+    #[test]
     fn evict_lru_never_removes_an_owned_looking_dir_missing_the_marker() {
         let _guard = ENV_MUTEX.blocking_lock();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -773,11 +899,17 @@ mod tests {
         let no_marker = make_owned_entry(&root, "5555555555555555", false);
         let kept = make_owned_entry(&root, "6666666666666666", true);
 
+        let baseline = slot_lock_registry_len();
         evict_lru(&root, &kept).expect("evict");
 
         assert!(
             no_marker.exists(),
             "an owned-looking directory without the marker must survive eviction"
+        );
+        assert_eq!(
+            slot_lock_registry_len(),
+            baseline,
+            "an unowned cache-shaped child must not allocate a slot lock"
         );
 
         std::env::remove_var("KHIVE_GIT_DIGEST_CACHE_MAX_REPOS");
@@ -820,11 +952,7 @@ mod tests {
         assert_eq!(dir_size(dir.path()).unwrap(), 15);
     }
 
-    /// PR #847: the walk root vanishing must surface as an
-    /// error, never a laundered `Ok(0)` -- distinct from a descendant
-    /// vanishing beneath a still-existing root (see the Barrier tests
-    /// below). A root that was never there to begin with is the simplest,
-    /// fully deterministic instance of "the root itself is missing".
+    /// PR #847: walk root vanishing must error, never launder to `Ok(0)`.
     #[test]
     fn dir_size_errors_when_the_root_itself_is_missing() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -836,12 +964,7 @@ mod tests {
         );
     }
 
-    /// `evict_lru`'s `keep` argument: every caller (`ensure_clone`,
-    /// `refetch_clone`, `reclone`) has just touched or freshly installed
-    /// `keep` immediately before calling `evict_lru`, so `keep` vanishing is
-    /// a real problem to surface, not a maybe-absent slot -- `evict_lru`
-    /// must propagate `dir_size(keep)`'s error rather than treat it as an
-    /// empty, evictable-looking slot.
+    /// `keep` vanishing must propagate, not be treated as an empty slot.
     #[test]
     fn evict_lru_errors_when_keep_itself_is_missing() {
         let _guard = ENV_MUTEX.blocking_lock();
@@ -863,25 +986,9 @@ mod tests {
         std::env::remove_var("KHIVE_GIT_DIGEST_CACHE_MAX_BYTES");
     }
 
-    /// Issue #842's macOS ENOENT flake family: `dir_size` walks a tree that
-    /// can legitimately be mutated out from under it (git's own detached
-    /// background maintenance child, or a racing `evict_lru`/`ensure_clone`
-    /// repair on the same
-    /// slot) -- a subdirectory disappearing between `read_dir` listing it and
-    /// this walk descending into it must shrink the total, not abort the
-    /// whole computation with `CacheError::Io(NotFound)`.
-    ///
-    /// This is a genuine cross-thread filesystem race, not a fully
-    /// deterministic single-shot repro: a `std::sync::Barrier` releases both
-    /// threads at the same instant, a wide fan of sibling subdirectories
-    /// gives the walk many entries to still be processing when the deleter
-    /// runs, and the whole race is repeated many times so the window is
-    /// almost certain to be hit at least once across the loop. Pre-fix (see
-    /// the sabotage note on `dir_size` above), this reliably reproduces
-    /// `CacheError::Io` within a handful of iterations on this machine; it is
-    /// not a `sleep`-based synchronization, so it is not always the exact
-    /// same interleaving twice, but the failure is real and observable, not
-    /// theoretical.
+    /// Issue #842 macOS ENOENT flake family: a descendant disappearing
+    /// mid-walk must shrink the total, not abort with `NotFound`. See
+    /// crates/khive-pack-git/docs/api/cache.md#test-module-notes.
     #[test]
     fn dir_size_tolerates_a_subdirectory_removed_mid_walk() {
         for _ in 0..200 {
@@ -924,21 +1031,9 @@ mod tests {
         }
     }
 
-    /// Companion to the test above, pinning the other half of the
-    /// contract (PR #847): when the vanishing path is the walk
-    /// **root** itself -- not a descendant beneath a still-existing root --
-    /// `dir_size` must surface an error rather than tolerate it. Same
-    /// barrier-race harness, but `root` is left empty (an empty-directory
-    /// removal is a single `rmdir` syscall, the same order of cost as the
-    /// `symlink_metadata`/`read_dir` calls `dir_size` opens with -- a
-    /// populated root, by contrast, has its own directory entry removed
-    /// *last* by `remove_dir_all` after every child, well after the
-    /// walker's first two syscalls would already have completed, which
-    /// would make the root-vanish race effectively unreachable). Pre-fix,
-    /// `dir_size` treated a disappearing root exactly like a disappearing
-    /// descendant and returned `Ok(0)`, which could let `evict_lru` report
-    /// success over a missing `keep` slot or count a phantom `0`-byte
-    /// candidate.
+    /// Companion to the test above (PR #847): the walk root itself
+    /// vanishing must error, not tolerate like a descendant. See
+    /// crates/khive-pack-git/docs/api/cache.md#test-module-notes.
     #[test]
     fn dir_size_errors_when_the_root_is_removed_mid_walk() {
         let mut saw_error = false;
@@ -994,10 +1089,8 @@ mod tests {
         );
     }
 
-    /// A real local repo usable as an `ensure_clone`/`refetch_clone`/`reclone`
-    /// `canonical_url` (git accepts a plain filesystem path as a clone/fetch
-    /// source, same as the existing `ensure_clone_cleans_up_staging_dir_*`
-    /// test does for a failure case).
+    /// A real local repo usable as a `canonical_url` (git accepts a plain
+    /// filesystem path as a clone/fetch source).
     fn init_origin_with_one_commit(repo: &Path) {
         git(repo, &["init", "-q", "-b", "main"]);
         git(repo, &["config", "user.email", "test@example.com"]);
@@ -1023,11 +1116,8 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
-    /// The primary #765 acceptance path: a slot already exists (via
-    /// `ensure_clone`); `refetch_clone` must pull history the slot doesn't
-    /// have yet (standing in for genuinely corrupt/incomplete objects, which
-    /// `git fetch --refetch` repairs the same way -- by re-obtaining a
-    /// complete fresh packfile from the remote).
+    /// Primary #765 acceptance path — see
+    /// crates/khive-pack-git/docs/api/cache.md#test-module-notes.
     #[test]
     fn refetch_clone_updates_an_existing_slot_to_the_remote_tip() {
         let _guard = ENV_MUTEX.blocking_lock();
@@ -1052,20 +1142,8 @@ mod tests {
         std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
     }
 
-    /// Remediation (issue #765): `refetch_clone`'s over-cap cleanup must go through
-    /// the same ownership guard `reclone` uses, not a raw `remove_dir_all`,
-    /// AND must propagate that guard's failure rather than discarding it --
-    /// a slot that has lost its `.khive-last-used` marker (simulating a
-    /// directory the guard cannot prove it owns) survives over-cap cleanup,
-    /// and the caller sees the ownership failure (`UnsafeToReplace`) that
-    /// actually occurred, not a laundered `CloneTooLarge`. Since a later
-    /// fix added a pre-fetch ownership re-check, this markerless
-    /// slot is now refused before `fetch_refetch` even runs (see
-    /// `refetch_clone_refuses_a_markerless_slot_under_the_cap` below) rather
-    /// than at the over-cap cleanup step this test originally targeted --
-    /// the assertions still hold (`UnsafeToReplace`, slot survives), so this
-    /// remains a valid regression guard for the cleanup path once a slot
-    /// somehow reaches it un-owned.
+    /// Remediation (issue #765) — see
+    /// crates/khive-pack-git/docs/api/cache.md#test-module-notes.
     #[test]
     fn refetch_clone_over_cap_cleanup_never_deletes_an_unproven_slot() {
         let _guard = ENV_MUTEX.blocking_lock();
@@ -1098,14 +1176,8 @@ mod tests {
         std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
     }
 
-    /// Remediation (issue #765 follow-up PR #788):
-    /// `refetch_clone` must refuse a markerless slot *before* ever calling
-    /// `fetch_refetch`, not only on the over-cap cleanup branch the previous
-    /// test exercises. Under the default (non-cap-exceeded) cap, a
-    /// pre-fetch ownership check is the only thing standing between a
-    /// markerless slot and a real fetch: the origin is given fresh history
-    /// so a fetch that ran despite the missing marker would be directly
-    /// observable via a moved `HEAD`.
+    /// Remediation (issue #765 follow-up PR #788) — see
+    /// crates/khive-pack-git/docs/api/cache.md#test-module-notes.
     #[test]
     fn refetch_clone_refuses_a_markerless_slot_under_the_cap() {
         let _guard = ENV_MUTEX.blocking_lock();
@@ -1159,11 +1231,8 @@ mod tests {
         std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
     }
 
-    /// #765's fallback path: a refetch that cannot repair the slot (here,
-    /// simulated by pointing the existing slot's `origin` remote at a
-    /// nonexistent path so `git fetch --refetch` itself fails) is followed by
-    /// `reclone`, which ignores the broken clone entirely and clones fresh
-    /// from the still-good `canonical_url`.
+    /// #765's fallback path — see
+    /// crates/khive-pack-git/docs/api/cache.md#test-module-notes.
     #[test]
     fn reclone_replaces_a_slot_whose_refetch_cannot_succeed() {
         let _guard = ENV_MUTEX.blocking_lock();
@@ -1208,11 +1277,8 @@ mod tests {
         std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
     }
 
-    /// Ownership guard (ADR-088 Amendment 1 / PR #761): `reclone` must never
-    /// delete a directory that doesn't prove itself an owned cache slot, even
-    /// though its path is exactly where the cache key says the slot should
-    /// be -- a `KHIVE_GIT_DIGEST_SCRATCH_ROOT` override pointed at a broader
-    /// directory must never lose unrelated operator data to a repair.
+    /// Ownership guard (ADR-088 Amendment 1 / PR #761) — see
+    /// crates/khive-pack-git/docs/api/cache.md#test-module-notes.
     #[test]
     fn reclone_refuses_to_replace_a_foreign_looking_directory() {
         let _guard = ENV_MUTEX.blocking_lock();
@@ -1240,9 +1306,7 @@ mod tests {
         std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
     }
 
-    /// When no slot exists at all yet, `reclone` has nothing to remove and
-    /// simply installs a fresh clone -- the same fallback a first-ever
-    /// `ensure_clone` would have taken.
+    /// No slot exists yet: `reclone` simply installs a fresh clone.
     #[test]
     fn reclone_installs_fresh_when_no_slot_exists_yet() {
         let _guard = ENV_MUTEX.blocking_lock();
@@ -1259,16 +1323,8 @@ mod tests {
         std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
     }
 
-    /// Remediation (issue #765): `ensure_clone` must
-    /// never adopt, fetch into, or touch a directory sitting at the
-    /// cache-key path that does not already prove itself owned via
-    /// `is_owned_entry`. Here the directory is a genuine Git repository (so
-    /// the pre-fix `repo_dir.join(".git").exists()` check alone would have
-    /// accepted it) but is missing the `.khive-last-used` marker -- standing
-    /// in for an operator's own repository that happens to land on the same
-    /// cache-key path under an overridden `KHIVE_GIT_DIGEST_SCRATCH_ROOT`.
-    /// The call must refuse with `UnsafeToReplace` and the sentinel operator
-    /// data inside must survive completely untouched.
+    /// Remediation (issue #765) — see
+    /// crates/khive-pack-git/docs/api/cache.md#test-module-notes.
     #[test]
     fn ensure_clone_refuses_a_markerless_git_directory_at_the_cache_key_path() {
         let _guard = ENV_MUTEX.blocking_lock();
@@ -1306,10 +1362,7 @@ mod tests {
         std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
     }
 
-    /// Same guard, symlink variant: a symlink placed at the cache-key path
-    /// pointing at an unrelated owned-looking directory must not be treated
-    /// as an owned slot either -- `is_owned_entry` requires the cache-key
-    /// path itself to be a real directory, not a symlink to one.
+    /// Same guard, symlink variant.
     #[cfg(unix)]
     #[test]
     fn ensure_clone_refuses_a_symlink_at_the_cache_key_path() {
@@ -1337,6 +1390,172 @@ mod tests {
             real_owned.join("sentinel.txt").exists(),
             "the symlink target's sentinel data must survive a refused ensure_clone"
         );
+
+        std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
+    }
+
+    // ── issue #805: same-key mutation serialization ────────────────────────
+
+    /// `slot_lock` must serialize a *repeated* lookup of the same cache key
+    /// (both calls return handles to the same underlying `Mutex`) while
+    /// leaving a distinct key completely unaffected -- the acceptance
+    /// criterion from issue #805 ("serialize per-key without serializing
+    /// distinct keys").
+    #[test]
+    fn slot_lock_serializes_same_key_but_not_distinct_keys() {
+        let _env_guard = ENV_MUTEX.blocking_lock();
+        let key_a = "abcdef0123456789";
+        let key_b = "fedcba9876543210";
+
+        let lock_a1 = slot_lock(key_a);
+        let guard = lock_a1.lock().expect("lock key_a");
+
+        let lock_a2 = slot_lock(key_a);
+        assert!(
+            lock_a2.try_lock().is_err(),
+            "a second lookup of the same cache key must observe the first as held"
+        );
+
+        let lock_b = slot_lock(key_b);
+        assert!(
+            lock_b.try_lock().is_ok(),
+            "locking a distinct cache key must never be blocked by another key's held lock"
+        );
+
+        drop(guard);
+        drop(lock_a1);
+
+        let guard = lock_a2.lock().expect("re-lock key_a");
+        let lock_a3 = slot_lock(key_a);
+        assert!(
+            lock_a3.try_lock().is_err(),
+            "dropping one handle must not replace the lock while another handle still exists"
+        );
+        drop(guard);
+    }
+
+    #[test]
+    fn released_distinct_slot_locks_do_not_grow_the_registry() {
+        let _env_guard = ENV_MUTEX.blocking_lock();
+        let baseline = slot_lock_registry_len();
+        let baseline_capacity = slot_lock_registry_capacity();
+        let locks: Vec<_> = (0..64)
+            .map(|index| slot_lock(&format!("released-distinct-key-{index}")))
+            .collect();
+
+        assert_eq!(
+            slot_lock_registry_len(),
+            baseline + locks.len(),
+            "live handles must remain registered"
+        );
+        drop(locks);
+        assert_eq!(
+            slot_lock_registry_len(),
+            baseline,
+            "released handles must remove idle registry entries"
+        );
+        assert!(
+            slot_lock_registry_capacity() <= baseline_capacity,
+            "released handles must not retain registry capacity above its baseline"
+        );
+    }
+
+    /// An eviction pass for one key must not delete another key while that
+    /// key is inside its slot-locked mutation span. The active thread models
+    /// the interval in which `ensure_clone` is blocked in `git fetch`; before
+    /// eviction consulted candidate locks, the count cap deleted `active`
+    /// despite its guard and the operation resumed over a missing slot.
+    #[test]
+    fn eviction_defers_a_candidate_with_an_active_slot_mutation() {
+        let _guard = ENV_MUTEX.blocking_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("KHIVE_GIT_DIGEST_CACHE_MAX_REPOS", "1");
+        std::env::set_var("KHIVE_GIT_DIGEST_CACHE_MAX_BYTES", "1000000000");
+
+        let root = dir.path();
+        let active_key = "aaaaaaaaaaaaaaaa";
+        let active = make_owned_entry(root, active_key, true);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let keep = make_owned_entry(root, "bbbbbbbbbbbbbbbb", true);
+
+        let active_lock = slot_lock(active_key);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let active_for_thread = active.clone();
+        let handle = std::thread::spawn(move || {
+            let _active_guard = active_lock.lock().expect("lock active slot");
+            started_tx.send(()).expect("signal active mutation");
+            release_rx.recv().expect("release active mutation");
+            assert!(
+                active_for_thread.exists(),
+                "an active slot must still exist when its mutation resumes"
+            );
+            std::fs::write(active_for_thread.join("mutation-complete"), b"")
+                .expect("complete active mutation");
+        });
+
+        started_rx.recv().expect("wait for active mutation");
+        evict_lru(root, &keep).expect("evict around active slot");
+        assert!(active.exists(), "eviction must defer the active candidate");
+        release_tx.send(()).expect("release active mutation");
+        handle.join().expect("active mutation thread");
+        assert!(active.join("mutation-complete").exists());
+
+        std::env::remove_var("KHIVE_GIT_DIGEST_CACHE_MAX_REPOS");
+        std::env::remove_var("KHIVE_GIT_DIGEST_CACHE_MAX_BYTES");
+    }
+
+    /// The concrete regression issue #805 describes: before `slot_lock`,
+    /// concurrent `ensure_clone` calls for the same never-before-cached URL
+    /// could both observe an absent slot and both proceed to
+    /// `install_fresh_clone`, racing `std::fs::rename` onto the same
+    /// `<root>/<cache_key>/` path -- the loser's rename fails because the
+    /// winner already populated a non-empty directory there. With same-key
+    /// mutation serialized, the loser instead waits, observes the slot the
+    /// winner installed, and takes the existing-slot (`fetch`) path -- every
+    /// concurrent call succeeds and resolves to the same slot.
+    #[test]
+    fn concurrent_ensure_clone_on_same_key_never_races_the_slot() {
+        let _guard = ENV_MUTEX.blocking_lock();
+        let scratch = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT", scratch.path());
+
+        let origin_dir = tempfile::tempdir().expect("tempdir");
+        init_origin_with_one_commit(origin_dir.path());
+        let canonical = origin_dir.path().to_str().unwrap().to_string();
+
+        const CONCURRENCY: usize = 6;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(CONCURRENCY));
+        let handles: Vec<_> = (0..CONCURRENCY)
+            .map(|_| {
+                let canonical = canonical.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    ensure_clone(&canonical)
+                })
+            })
+            .collect();
+
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|h| h.join().expect("ensure_clone thread panicked"))
+            .collect();
+
+        for result in &results {
+            assert!(
+                result.is_ok(),
+                "concurrent ensure_clone calls on the same key must never race the slot: {result:?}"
+            );
+        }
+        let first = results[0].as_ref().unwrap();
+        for result in &results[1..] {
+            assert_eq!(
+                result.as_ref().unwrap(),
+                first,
+                "every concurrent call must resolve to the same cache slot"
+            );
+        }
 
         std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
     }

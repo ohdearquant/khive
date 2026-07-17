@@ -88,11 +88,32 @@ const SEARCH_SCORE_FLOOR: f64 = 0.0;
 /// "search picked this out" by confidence alone; the raw RRF value is still
 /// preserved in `ReferenceCandidate.score` for `Ambiguous` listings.
 const SEARCH_RESOLVED_CONFIDENCE: f64 = 0.6;
+/// Floor on the retrieval depth stage 4 asks `hybrid_search` for, independent
+/// of the caller's requested `limit`.
+///
+/// `KhiveRuntime::hybrid_search` truncates its returned hit list to exactly
+/// the `limit` it is called with (its final step is `fused.truncate(limit as
+/// usize)`), so that `limit` doubles as both "how deep to search" and "how
+/// many hits to hand back" — for `resolve`, whose caller-facing default
+/// `limit` is 5 (`khive_pack_kg::handlers::resolve::DEFAULT_LIMIT`), a
+/// caller asking for a short candidate list was silently also asking for a
+/// shallow search. A genuine canonical-name match ranked, say, 6th-to-10th —
+/// exactly where a qualified natural-language ref (a project prefix ahead of
+/// a short canonical name) lands when it beats the exact-name stage above
+/// but only partially matches the text leg and is corroborated by the vector
+/// leg — was truncated out of the stage-4 candidate set entirely even though
+/// the same query against a wider `limit` (e.g. the `search` verb's own
+/// default of 10) surfaces it as the top hit (#908). Retrieving at this
+/// floor decouples "how deep to search" from "how many candidates the caller
+/// asked for". The full pool is retained for the decisiveness check, while an
+/// `Ambiguous` payload is truncated back to the caller's `limit` before it is
+/// returned.
+const STAGE4_MIN_SEARCH_LIMIT: u32 = 20;
 
 /// Resolve one natural-language reference for `token`'s actor.
 ///
 /// `limit` bounds the hybrid-search fallback candidate count (Layer-0 stage
-/// 3); it has no effect on the id-string or ring stages, which are always
+/// 4); it has no effect on the id-string or ring stages, which are always
 /// exact-or-nothing / small in-memory scans. `entity_kind`, if set, restricts
 /// stage 3 to that entity kind (e.g. `"concept"`); the id-string and ring
 /// stages are kind-agnostic by construction (a ring entry or an explicit id
@@ -220,13 +241,19 @@ pub async fn resolve_reference(
         return Ok(resolution);
     }
 
-    // Stage 4: hybrid-search fallback over the namespace.
+    // Stage 4: hybrid-search fallback over the namespace. Search deeper than
+    // the caller's requested `limit` (see `STAGE4_MIN_SEARCH_LIMIT`) so a
+    // genuine match ranked just outside a small `limit` isn't truncated out
+    // of the pool before it's even ranked against the alternatives; the
+    // caller's `limit` still bounds how many candidates get rendered below.
+    let candidate_limit = limit.max(1);
+    let search_limit = candidate_limit.max(STAGE4_MIN_SEARCH_LIMIT);
     let hits = runtime
         .hybrid_search(
             token,
             trimmed,
             None,
-            limit.max(1),
+            search_limit,
             entity_kind,
             None,
             &[],
@@ -263,6 +290,14 @@ pub async fn resolve_reference(
                     confidence: SEARCH_RESOLVED_CONFIDENCE,
                 })
             } else {
+                // Non-exact ambiguity: bound the payload to the caller's
+                // `limit`. Any deterministic identity (an exact canonical
+                // name) was already resolved by stage 3 above, so nothing
+                // withheld here is "the" answer — outside exact matches there
+                // is no oracle for a single canonical candidate. Raising
+                // `limit` surfaces deeper ranks (#970; resolve() contract).
+                let mut candidates = candidates;
+                candidates.truncate(candidate_limit as usize);
                 Ok(ReferenceResolution::Ambiguous { candidates })
             }
         }
@@ -612,5 +647,203 @@ mod tests {
             }
             other => panic!("expected Ambiguous driven by storage total (11), got {other:?}"),
         }
+    }
+
+    // Regression for #908 / #970: an exact canonical-name ref resolves to a
+    // single id through the stage-3 exact-name lookup, which short-circuits
+    // BEFORE the stage-4 hybrid fallback and its `limit` bound. Many other
+    // entities are strong hybrid matches for the same term — enough that
+    // hybrid alone would rank them close together and return `Ambiguous` — yet
+    // the exact name resolves deterministically to its owner. The returned
+    // `EXACT_NAME_CONFIDENCE` (not the stage-4 `SEARCH_RESOLVED_CONFIDENCE`)
+    // proves the result came from stage 3, regardless of the target's hybrid
+    // rank. An exact name is an identity, not a ranked candidate.
+    #[tokio::test]
+    async fn exact_name_resolves_ahead_of_competing_hybrid_matches() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let token = actor_token("resolver-test");
+        let ring = ReferenceRing::new();
+
+        let target = rt
+            .create_entity(
+                &token,
+                "concept",
+                None,
+                "ADR-040",
+                Some("khive ADR-040"),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create target entity");
+
+        // Competitors that also match "ADR-040" strongly in hybrid search but
+        // do NOT carry it as an exact name; only the target owns the exact
+        // name, so only the target satisfies the stage-3 lookup.
+        for i in 0..12 {
+            rt.create_entity(
+                &token,
+                "concept",
+                None,
+                &format!("ADR-040 companion {i}"),
+                Some("ADR-040 ADR-040 ADR-040 ADR-040 ADR-040"),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create competing entity");
+        }
+
+        // Even at limit = 1 — the tightest bound — the exact name resolves to
+        // the target, at the stage-3 confidence, never a ranked hybrid pick.
+        let resolution = resolve_reference(&rt, &ring, &token, "ADR-040", 1, None)
+            .await
+            .expect("resolve_reference");
+        assert_eq!(
+            resolution,
+            ReferenceResolution::Resolved {
+                id: target.id,
+                confidence: EXACT_NAME_CONFIDENCE,
+            }
+        );
+    }
+
+    // The complement of the exact-name contract: a NON-exact ref (no entity
+    // carries it as an exact name) that stays ambiguous returns a bounded
+    // sample capped at the caller's `limit`. Outside exact matches there is no
+    // oracle for a single "canonical" candidate, so the bound is the
+    // intentional, documented resolve() contract (raise `limit` to surface
+    // deeper ranks) — not a withheld identity. Any deterministic identity
+    // would have resolved upstream in stage 3.
+    #[tokio::test]
+    async fn fallback_stage_bounds_non_exact_payload_to_limit() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let token = actor_token("resolver-test");
+        let ring = ReferenceRing::new();
+
+        // Twelve near-equal matches, each with a distinct name and the same
+        // descriptive text — none is the "right" answer, so the result is a
+        // genuinely bounded ambiguous sample, not a suppressed target.
+        for i in 0..12 {
+            rt.create_entity(
+                &token,
+                "concept",
+                None,
+                &format!("Retrieval Fusion Note {i}"),
+                Some("khive retrieval fusion ranking note"),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create entity");
+        }
+
+        let resolution = resolve_reference(
+            &rt,
+            &ring,
+            &token,
+            "khive retrieval fusion ranking",
+            5,
+            None,
+        )
+        .await
+        .expect("resolve_reference");
+
+        match resolution {
+            ReferenceResolution::Ambiguous { candidates } => {
+                assert_eq!(
+                    candidates.len(),
+                    5,
+                    "a non-exact ref's ambiguity payload is bounded to the caller's limit"
+                );
+            }
+            other => panic!("expected a bounded Ambiguous sample, got {other:?}"),
+        }
+    }
+
+    // Regression for #908: genuine ambiguity — two entities with the exact
+    // same canonical name — must still return `Ambiguous`, never a silent
+    // pick, after widening stage 4's retrieval floor.
+    #[tokio::test]
+    async fn fallback_stage_still_reports_ambiguous_on_genuine_tie() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let token = actor_token("resolver-test");
+        let ring = ReferenceRing::new();
+
+        let a = rt
+            .create_entity(
+                &token,
+                "concept",
+                None,
+                "Twin Record",
+                Some("khive Twin Record document"),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create entity a");
+        let b = rt
+            .create_entity(
+                &token,
+                "concept",
+                None,
+                "Twin Record",
+                Some("khive Twin Record document"),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create entity b");
+
+        // Exact byte-identical names hit stage 3 (exact-name storage
+        // lookup), not stage 4 — but the same "must not silently pick"
+        // contract applies at both stages, and stage 3 is a cheaper,
+        // deterministic way to pin it.
+        let resolution = resolve_reference(&rt, &ring, &token, "Twin Record", 5, None)
+            .await
+            .expect("resolve_reference");
+
+        match resolution {
+            ReferenceResolution::Ambiguous { candidates } => {
+                let ids: std::collections::HashSet<Uuid> =
+                    candidates.iter().map(|c| c.id).collect();
+                assert!(ids.contains(&a.id) && ids.contains(&b.id));
+            }
+            other => panic!("expected Ambiguous on a genuine name tie, got {other:?}"),
+        }
+    }
+
+    // Regression for #908: garbage input that matches nothing must still be
+    // `NotFound` after widening stage 4's retrieval floor — the widened pool
+    // must not turn "nothing relevant exists" into a spurious pick.
+    #[tokio::test]
+    async fn fallback_stage_still_not_found_on_garbage() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let token = actor_token("resolver-test");
+        let ring = ReferenceRing::new();
+
+        rt.create_entity(
+            &token,
+            "concept",
+            None,
+            "ADR-040",
+            Some("khive ADR-040"),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create unrelated entity");
+
+        let resolution = resolve_reference(
+            &rt,
+            &ring,
+            &token,
+            "zzqxw completely unrelated garbage nonsense",
+            5,
+            None,
+        )
+        .await
+        .expect("resolve_reference");
+        assert_eq!(resolution, ReferenceResolution::NotFound);
     }
 }

@@ -924,6 +924,7 @@ async fn file_backed_runtime_persists() {
 
     {
         let config = RuntimeConfig {
+            git_write: Default::default(),
             db_path: Some(path.clone()),
             default_namespace: Namespace::local(),
             embedding_model: None,
@@ -946,6 +947,7 @@ async fn file_backed_runtime_persists() {
     // Re-open the same file
     {
         let config = RuntimeConfig {
+            git_write: Default::default(),
             db_path: Some(path.clone()),
             default_namespace: Namespace::local(),
             embedding_model: None,
@@ -999,11 +1001,13 @@ async fn synthetic_edge_observed_as_selected_returns_memory_note() {
 
     // Step 2: create an event of kind SearchExecuted with a payload that
     // includes `selected: [memory_id]`.  The storage layer's `append_event`
-    // implementation calls `decode_recall_observations`, which reads
-    // `payload["selected"]` and inserts a row into `event_observations` with
-    // role="selected" and entity_id=memory_id. (`selected` is part of
-    // `SearchExecuted`/`RecallExecuted`'s ADR-041 projection contract;
-    // their payloads are untyped JSON —
+    // routes `SearchExecuted` to `decode_search_observations`, which requires
+    // the `result_kind` discriminator (`entity` | `note`) to identify which
+    // substrate owns every UUID in `candidates` and `selected`, then inserts a
+    // row into `event_observations` with role="selected" and
+    // entity_id=memory_id. (`selected` is part of `SearchExecuted`/
+    // `RecallExecuted`'s ADR-041 projection contract; `RecallExecuted` still
+    // decodes via `decode_recall_observations` from flat note UUID lists,
     // unlike `RerankExecuted`, which projects `selected` rows from
     // `final_scores`/`reranked` instead, since its typed payload has no
     // `selected` field.)
@@ -1443,6 +1447,7 @@ mod embedder_registry_tests {
 
     fn memory_rt_no_model() -> KhiveRuntime {
         KhiveRuntime::new(RuntimeConfig {
+            git_write: Default::default(),
             db_path: None,
             default_namespace: Namespace::local(),
             embedding_model: None,
@@ -1504,6 +1509,7 @@ mod embedder_registry_tests {
     async fn dual_embedding_regression_both_models_registered() {
         use khive_runtime::RuntimeConfig;
         let rt = KhiveRuntime::new(RuntimeConfig {
+            git_write: Default::default(),
             db_path: None,
             default_namespace: Namespace::local(),
             embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),

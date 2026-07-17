@@ -6,6 +6,7 @@ pub mod actor_identity;
 pub mod atomic_plan;
 pub mod atomic_prepare;
 pub mod atomic_runner;
+pub mod blob;
 pub mod config;
 pub mod config_ledger;
 pub mod cost_unit;
@@ -40,6 +41,7 @@ pub use atomic_plan::{
 pub use atomic_runner::{
     run_atomic_unit, AtomicOpFailure, AtomicOpPlan, AtomicRunOutcome, AtomicRunnerError,
 };
+pub use blob::resolve_blob_store;
 pub use cost_unit::{base_resource_payload, cost_unit_for_dispatch, resource_payload};
 pub use curation::{
     entity_fts_document, note_fts_document, ContentMergeStrategy, EdgeListFilter, EdgePatch,
@@ -53,7 +55,8 @@ pub use daemon::{
 };
 pub use embedder_registry::{EmbedderProvider, EmbedderRegistry, LatticeEmbedderProvider};
 pub use engine_config::{
-    config_from_env, BackendConfig, BackendKind, ConfigError, EngineConfig, KhiveConfig, PackConfig,
+    config_from_env, BackendConfig, BackendKind, BlobConfig, ConfigError, EngineConfig,
+    GitWriteEntryConfig, GitWriteSectionConfig, KhiveConfig, PackConfig, StorageSectionConfig,
 };
 pub use error::{fts_text_leg_or_err, GuardedWriteFailure, RuntimeError, RuntimeResult};
 pub use fusion::FusionStrategy;
@@ -102,9 +105,9 @@ pub use registry::{ObjectiveRegistry, RegisteredObjective};
 pub use resource::{cpu_delta_us, process_resource_usage, ProcessResourceUsage};
 pub use retrieval::{SearchHit, SearchSource};
 pub use runtime::{
-    assert_db_anchor_consistent, parse_pack_list, resolve_db_anchor, resolve_project_actor_id,
-    runtime_config_from_khive_config, BackendId, EntityTypeValidatorFn, KhiveRuntime,
-    NamespaceToken, NoteMutationHookFn, RuntimeConfig,
+    assert_captured_db_anchor_consistent, assert_db_anchor_consistent, parse_pack_list,
+    resolve_db_anchor, resolve_project_actor_id, runtime_config_from_khive_config, BackendId,
+    EntityTypeValidatorFn, KhiveRuntime, NamespaceToken, NoteMutationHookFn, RuntimeConfig,
 };
 pub use secret_gate::SecretMatch;
 pub use validation::{

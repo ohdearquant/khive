@@ -208,6 +208,24 @@ async fn search_executed_rejects_unknown_result_kind() {
     );
 }
 
+#[tokio::test]
+async fn search_executed_rejects_absent_result_kind() {
+    let store = setup_memory_store();
+    let mut event = make_event("default");
+    event.payload = json!({
+        "candidates": [Uuid::new_v4().to_string()],
+        "selected": []
+    });
+    let event_id = event.id;
+
+    let result = store.append_event(event).await;
+    assert!(result.is_err(), "absent result_kind must be rejected");
+    assert!(
+        store.get_event(event_id).await.unwrap().is_none(),
+        "invalid event and projection must roll back atomically"
+    );
+}
+
 async fn selected_uuids_for(store: &SqlEventStore, event_id: Uuid) -> Vec<String> {
     let pool = Arc::clone(&store.pool);
     let event_id_str = event_id.to_string();

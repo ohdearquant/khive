@@ -12,7 +12,16 @@ use crate::types::{
 use super::parser_impl::Parser;
 use super::scan::{check_json_nesting_depth, find_prev_ref_pos, json_value_contains_prev_ref};
 
-/// Parse a request input string into a single op or a batch.
+/// Parses function-call, batch, chain, or JSON request syntax.
+///
+/// The returned operations preserve input order and are not executed.
+///
+/// # Errors
+///
+/// Returns [`DslError`] for empty/oversized/deep input, malformed syntax or
+/// JSON shape, too many operations, illegal `$prev` placement, mixed execution
+/// separators, duplicate args, nested tool namespaces, or envelope-only args.
+/// See `crates/khive-request/docs/api/parsing.md` for routing and form contracts.
 pub fn parse_request(input: &str) -> Result<ParsedRequest, DslError> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -68,7 +77,7 @@ pub fn parse_request(input: &str) -> Result<ParsedRequest, DslError> {
     })
 }
 
-/// Parse the rest of a chain after the first op has been consumed.
+/// Parses a chain tail after its first operation.
 fn parse_chain_tail(mut p: Parser<'_>, first_op: ParsedOp) -> Result<ParsedRequest, DslError> {
     reject_reserved_args(&first_op)?;
     let mut ops = vec![first_op];
@@ -103,10 +112,7 @@ fn parse_chain_tail(mut p: Parser<'_>, first_op: ParsedOp) -> Result<ParsedReque
 }
 
 fn parse_json_form(input: &str) -> Result<ParsedRequest, DslError> {
-    // `serde_json`'s untyped `Value` deserializer has no exposed depth knob,
-    // so bound nesting with a cheap pre-pass scan before handing the input to
-    // it, otherwise a deeply-nested JSON-form payload recurses the native
-    // parser unbounded (CWE-674).
+    // `serde_json::Value` exposes no depth knob, so bound native recursion first.
     check_json_nesting_depth(input)?;
     let v: Value = serde_json::from_str(input).map_err(|e| DslError::InvalidJson {
         error: e.to_string(),
@@ -153,7 +159,6 @@ fn parse_json_form(input: &str) -> Result<ParsedRequest, DslError> {
                 })
             }
         };
-        // JSON form: recursively scan for $prev references and reject.
         let mut args: BTreeMap<String, ArgValue> = BTreeMap::new();
         for (k, v) in args_map {
             if json_value_contains_prev_ref(&v) {
@@ -220,7 +225,6 @@ fn parse_fn_batch(input: &str) -> Result<ParsedRequest, DslError> {
             expected: "end of input",
         });
     }
-    // PrevRef inside a parallel batch is invalid.
     for op in &ops {
         if let Some(pos) = find_prev_ref_pos(op) {
             return Err(DslError::PrevRefOutsideChain { pos });
@@ -233,7 +237,7 @@ fn parse_fn_batch(input: &str) -> Result<ParsedRequest, DslError> {
     })
 }
 
-/// Reject reserved envelope-level args inside a verb's argument list.
+/// Rejects envelope-only fields inside a verb argument list.
 pub(super) fn reject_reserved_args(op: &ParsedOp) -> Result<(), DslError> {
     for reserved in RESERVED_ENVELOPE_ARGS {
         if op.args.contains_key(*reserved) {

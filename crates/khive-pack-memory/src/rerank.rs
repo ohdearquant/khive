@@ -1,4 +1,5 @@
 //! Weighted feature-combination reranking for memory recall candidates.
+//! See `crates/khive-pack-memory/docs/api/scoring.md`.
 
 use std::collections::HashMap;
 
@@ -165,9 +166,7 @@ mod tests {
         );
     }
 
-    /// Normalization: doubling all weights must NOT change the output score.
-    /// Un-normalized: (0.8*2.0 + 0.6*0.6) / 1 = 1.96 — clearly wrong.
-    /// Normalized:    (0.8*2.0 + 0.6*0.6) / (2.0 + 0.6) = same as weight 1.0 + 0.3.
+    /// Scaling all positive weights must not change the normalized score.
     #[test]
     fn doubling_all_weights_does_not_change_score() {
         let weights_1x: HashMap<String, f64> = [
@@ -191,8 +190,7 @@ mod tests {
         );
     }
 
-    /// Normalization: a single weight of any positive magnitude returns the feature
-    /// value directly (the weight cancels out in numerator / denominator).
+    /// One positive weight returns its feature value because magnitude cancels.
     #[test]
     fn single_weight_of_any_magnitude_returns_feature_value() {
         let f = features(); // relevance=0.8

@@ -1458,15 +1458,9 @@ async fn w4_c4_feedback_accepts_valid_target_and_profile() {
     assert_eq!(result["signal"], json!("useful"));
 }
 
-/// Regression test (#831): ADR-041
-/// permits `brain.feedback` targets on entities AND notes, but the emitted
-/// event previously always carried `SubstrateKind::Event`, so the
-/// `event_observations` decoder hard-coded `ReferentKind::Entity` and the
-/// `observed_as_signal` synthetic-edge query lowering only admitted entity
-/// referents — a note target's signal observation existed in storage but
-/// was unreachable from `observed_as_signal`. Feed a REAL stored note
-/// through `brain.feedback` end-to-end and confirm it resolves via the
-/// canonical ADR-041 §11 GQL query.
+/// Regression (#831): a note-target `brain.feedback` signal must resolve via
+/// `observed_as_signal` (previously unreachable — the decoder hard-coded
+/// `ReferentKind::Entity`). See crates/khive-pack-brain/docs/dispatch-namespace-isolation.md#feedback_note_target_resolves_through_observed_as_signal.
 #[tokio::test]
 async fn feedback_note_target_resolves_through_observed_as_signal() {
     let (pack, rt) = make_pack();
@@ -2205,6 +2199,7 @@ fn make_pack_with_actor(actor_id: &str) -> (BrainPack, KhiveRuntime) {
     // Default impl resolves embedding_model to a real on-disk model, which is
     // absent on CI runners and fails entity creation with ModelInitialization.
     let rt = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+        git_write: Default::default(),
         db_path: None,
         default_namespace: Namespace::local(),
         embedding_model: None,
@@ -2227,12 +2222,12 @@ fn make_pack_with_actor(actor_id: &str) -> (BrainPack, KhiveRuntime) {
 /// balanced-recall-v1 — and must leave the default profile's posteriors untouched.
 #[tokio::test]
 async fn feedback_697_unattributed_resolves_via_actor_binding() {
-    let (pack, rt) = make_pack_with_actor("leo");
+    let (pack, rt) = make_pack_with_actor("test-actor");
     let registry = empty_registry();
     let token = rt.authorize(Namespace::local()).unwrap();
     assert_eq!(
         token.actor().id,
-        "leo",
+        "test-actor",
         "test setup: token must carry the configured actor"
     );
 
@@ -2240,7 +2235,7 @@ async fn feedback_697_unattributed_resolves_via_actor_binding() {
 
     pack.dispatch(
         "brain.create_profile",
-        json!({"name": "leo-bound-v1", "consumer_kind": "recall"}),
+        json!({"name": "test-bound-v1", "consumer_kind": "recall"}),
         &registry,
         &token,
     )
@@ -2248,7 +2243,7 @@ async fn feedback_697_unattributed_resolves_via_actor_binding() {
     .unwrap();
     pack.dispatch(
         "brain.activate",
-        json!({"profile_id": "leo-bound-v1"}),
+        json!({"profile_id": "test-bound-v1"}),
         &registry,
         &token,
     )
@@ -2258,7 +2253,7 @@ async fn feedback_697_unattributed_resolves_via_actor_binding() {
     // namespace-only resolution (pre-#697) can never reach this binding.
     pack.dispatch(
         "brain.bind",
-        json!({"actor": "leo", "profile_id": "leo-bound-v1", "consumer_kind": "recall"}),
+        json!({"actor": "test-actor", "profile_id": "test-bound-v1", "consumer_kind": "recall"}),
         &registry,
         &token,
     )
@@ -2290,7 +2285,7 @@ async fn feedback_697_unattributed_resolves_via_actor_binding() {
     let bound_after = pack
         .dispatch(
             "brain.profile",
-            json!({"profile_id": "leo-bound-v1"}),
+            json!({"profile_id": "test-bound-v1"}),
             &registry,
             &token,
         )
@@ -2317,6 +2312,141 @@ async fn feedback_697_unattributed_resolves_via_actor_binding() {
     assert_eq!(
         default_after, default_before,
         "the default profile's posteriors must be untouched when a binding resolves the event elsewhere"
+    );
+}
+
+/// #1016: every persisted feedback event payload must carry the RESOLVED
+/// `served_by_profile_id` plus the `profile_resolution` marker — across all
+/// three resolution tiers AND the gated implicit append path (which builds
+/// its event inside the fold-gate atomic unit from a cloned `base_data`).
+#[tokio::test]
+async fn feedback_1016_event_payload_stamps_resolved_profile_all_tiers() {
+    use khive_storage::event::EventFilter;
+    use khive_storage::types::PageRequest;
+
+    let (pack, rt) = make_pack_with_actor("test-actor");
+    let registry = empty_registry();
+    let token = rt.authorize(Namespace::local()).unwrap();
+    let target = create_test_entity(&rt, &token).await;
+
+    // Tier 3 (default): no explicit value, no binding — ordinary append path.
+    pack.dispatch(
+        "brain.feedback",
+        json!({"target_id": target, "signal": "useful"}),
+        &registry,
+        &token,
+    )
+    .await
+    .unwrap();
+
+    // Tier 3, gated implicit: same resolution, fold-gate append closure.
+    pack.dispatch(
+        "brain.feedback",
+        json!({"target_id": target, "signal": "implicit_positive"}),
+        &registry,
+        &token,
+    )
+    .await
+    .unwrap();
+
+    // Tier 2 (binding): bound profile resolves when the caller omits the id.
+    for (verb, params) in [
+        (
+            "brain.create_profile",
+            json!({"name": "test-bound-v1", "consumer_kind": "recall"}),
+        ),
+        ("brain.activate", json!({"profile_id": "test-bound-v1"})),
+        (
+            "brain.bind",
+            json!({"actor": "test-actor", "profile_id": "test-bound-v1", "consumer_kind": "recall"}),
+        ),
+    ] {
+        pack.dispatch(verb, params, &registry, &token)
+            .await
+            .unwrap();
+    }
+    pack.dispatch(
+        "brain.feedback",
+        json!({"target_id": target, "signal": "useful"}),
+        &registry,
+        &token,
+    )
+    .await
+    .unwrap();
+
+    // Tier 1 (explicit): caller-supplied id wins over the binding.
+    pack.dispatch(
+        "brain.feedback",
+        json!({
+            "target_id": target,
+            "signal": "useful",
+            "served_by_profile_id": "balanced-recall-v1"
+        }),
+        &registry,
+        &token,
+    )
+    .await
+    .unwrap();
+
+    let events = rt
+        .events(&token)
+        .expect("event store")
+        .query_events(
+            EventFilter::default(),
+            PageRequest {
+                offset: 0,
+                limit: 1000,
+            },
+        )
+        .await
+        .expect("query_events");
+    let mut stamps: Vec<(String, String, String)> = events
+        .items
+        .iter()
+        .filter(|e| e.verb == "brain.feedback")
+        .map(|e| {
+            (
+                e.payload["signal"].as_str().unwrap_or("").to_string(),
+                e.payload["served_by_profile_id"]
+                    .as_str()
+                    .unwrap_or("<missing>")
+                    .to_string(),
+                e.payload["profile_resolution"]
+                    .as_str()
+                    .unwrap_or("<missing>")
+                    .to_string(),
+            )
+        })
+        .collect();
+    stamps.sort();
+
+    let mut expected = vec![
+        (
+            "useful".to_string(),
+            "balanced-recall-v1".to_string(),
+            "default".to_string(),
+        ),
+        (
+            "implicit_positive".to_string(),
+            "balanced-recall-v1".to_string(),
+            "default".to_string(),
+        ),
+        (
+            "useful".to_string(),
+            "test-bound-v1".to_string(),
+            "binding".to_string(),
+        ),
+        (
+            "useful".to_string(),
+            "balanced-recall-v1".to_string(),
+            "explicit".to_string(),
+        ),
+    ];
+    expected.sort();
+
+    assert_eq!(
+        stamps, expected,
+        "#1016: all four feedback events must persist the resolved profile and its resolution marker"
     );
 }
 
@@ -2461,7 +2591,7 @@ async fn feedback_697_unattributed_no_binding_falls_back_to_default() {
 /// actor binding.
 #[tokio::test]
 async fn feedback_697_explicit_profile_overrides_actor_binding() {
-    let (pack, rt) = make_pack_with_actor("leo");
+    let (pack, rt) = make_pack_with_actor("test-actor");
     let registry = empty_registry();
     let token = rt.authorize(Namespace::local()).unwrap();
 
@@ -2469,7 +2599,7 @@ async fn feedback_697_explicit_profile_overrides_actor_binding() {
 
     pack.dispatch(
         "brain.create_profile",
-        json!({"name": "leo-bound-v2", "consumer_kind": "recall"}),
+        json!({"name": "test-bound-v2", "consumer_kind": "recall"}),
         &registry,
         &token,
     )
@@ -2477,7 +2607,7 @@ async fn feedback_697_explicit_profile_overrides_actor_binding() {
     .unwrap();
     pack.dispatch(
         "brain.activate",
-        json!({"profile_id": "leo-bound-v2"}),
+        json!({"profile_id": "test-bound-v2"}),
         &registry,
         &token,
     )
@@ -2485,14 +2615,14 @@ async fn feedback_697_explicit_profile_overrides_actor_binding() {
     .unwrap();
     pack.dispatch(
         "brain.bind",
-        json!({"actor": "leo", "profile_id": "leo-bound-v2", "consumer_kind": "recall"}),
+        json!({"actor": "test-actor", "profile_id": "test-bound-v2", "consumer_kind": "recall"}),
         &registry,
         &token,
     )
     .await
     .unwrap();
 
-    // Explicit param names balanced-recall-v1 even though "leo" has a binding.
+    // Explicit param names balanced-recall-v1 even though "test-actor" has a binding.
     pack.dispatch(
         "brain.feedback",
         json!({
@@ -2509,7 +2639,7 @@ async fn feedback_697_explicit_profile_overrides_actor_binding() {
     let bound_events = pack
         .dispatch(
             "brain.profile",
-            json!({"profile_id": "leo-bound-v2"}),
+            json!({"profile_id": "test-bound-v2"}),
             &registry,
             &token,
         )
@@ -3571,15 +3701,11 @@ async fn crit1_create_profile_accepts_seed_priors_within_ess_cap() {
 // tracker lock is held, so a concurrent dispatch can never observe active=true
 // with stale state.
 
-/// After ensure_loaded returns, the tracker and shared state must be in a
-/// consistent three-way view: active_namespace == namespace, loaded_namespaces
-/// contains namespace, and the shared BrainState is the one for that namespace.
-///
-/// We test this by:
-///   1. Loading namespace A and writing a binding (observable state mutation).
-///   2. Loading namespace B — saves A's state, loads fresh B state.
-///   3. Switching back to namespace A — restores the saved state.
-///   4. After each ensure_loaded the tracker fields must be consistent.
+/// Invariant: after `ensure_loaded` returns, the tracker and shared state
+/// must be in a consistent three-way view: `active_namespace == namespace`,
+/// `loaded_namespaces` contains `namespace`, and the shared `BrainState` is
+/// the one for that namespace. Exercised across an A→B→A load sequence. See
+/// crates/khive-pack-brain/docs/dispatch-namespace-isolation.md#ensure_loaded_publication_is_atomic.
 #[tokio::test]
 async fn ensure_loaded_publication_is_atomic() {
     use core::convert::TryFrom;
@@ -3826,31 +3952,9 @@ async fn ensure_loaded_cross_namespace_concurrent_does_not_corrupt_saved_states(
     );
 }
 
-/// Deterministic interleaving test for the concurrent cold-load race.
-///
-/// Interleaving manufactured by the test-only `POST_LOAD_HOOK` in persist.rs:
-///
-///   1. Loader B is spawned; it calls `ensure_loaded` for "race-ns", completes
-///      the async DB scan, then PAUSES at the hook before acquiring the final
-///      tracker lock (it signals "reached" on a oneshot and awaits "proceed").
-///   2. While B is paused, the test task runs Loader A to completion (no hook
-///      active for A — hook was already consumed by B's `.take()`).  A publishes
-///      "race-ns" as active.
-///   3. The test task mutates state via `brain.bind` (adds one binding to A's
-///      namespace).  Binding count is now 1.
-///   4. The test task sends "proceed" to B.  B resumes, enters the final
-///      tracker block, and:
-///        • OLD code: sees `current_ns = Some("race-ns")`, takes the
-///          `swap_namespace` path, and B's stale cold-loaded `brain_state`
-///          (binding count 0) overrides the live state.  Final binding
-///          count = 0.  TEST FAILS.
-///        • FIXED code: re-checks `is_active("race-ns")` — true — and
-///          returns early without touching `*state`.  Final binding
-///          count = 1.  TEST PASSES.
-///
-/// FAIL-before / PASS-after evidence is produced by running:
-///   cargo test -p khive-pack-brain -- concurrent_cold_load_does_not_clobber_live_state
-/// against the reverted commit and against the fixed commit.
+/// Deterministic interleaving test for the concurrent cold-load race, using
+/// the test-only `POST_LOAD_HOOK` in persist.rs to pause a loader mid-load.
+/// See crates/khive-pack-brain/docs/dispatch-namespace-isolation.md#concurrent_cold_load_does_not_clobber_live_state.
 #[tokio::test]
 async fn concurrent_cold_load_does_not_clobber_live_state() {
     use core::convert::TryFrom;
@@ -3949,23 +4053,10 @@ async fn concurrent_cold_load_does_not_clobber_live_state() {
     );
 }
 
-/// Proves the dispatch atomicity race EXISTS without the gate.
-///
-/// Directly manufactures the interleaving that dispatch() without a gate
-/// would permit: A calls ensure_loaded(ns-a) → B calls ensure_loaded(ns-b)
-/// (swaps slot to ns-b) → A runs its handler against the now-ns-b slot.
-///
-/// This test does NOT go through dispatch() — it manually sequences the
-/// ensure_loaded + handler steps in the exact order that a scheduler can
-/// produce, giving a deterministic reproduction of the race.
-///
-/// Expected: A's brain.bind lands in the wrong namespace's bookkeeping.
-/// See the comment at the assertions below for the exact (durability-fix-era)
-/// shape of the corruption this produces.
-///
-/// This test runs against the PRODUCTION code (not a simulated removal)
-/// by calling ensure_loaded and the handler directly, bypassing the gate.
-/// It proves the gate is NECESSARY, not just incidental.
+/// Proves the dispatch atomicity race EXISTS without the gate: manually
+/// sequences ensure_loaded + handler calls (bypassing `dispatch()`'s gate)
+/// to deterministically reproduce a cross-namespace bookkeeping corruption.
+/// See crates/khive-pack-brain/docs/dispatch-namespace-isolation.md#dispatch_gate_race_is_observable_without_gate.
 #[tokio::test]
 async fn dispatch_gate_race_is_observable_without_gate() {
     use core::convert::TryFrom;
@@ -4003,19 +4094,8 @@ async fn dispatch_gate_race_is_observable_without_gate() {
     .await
     .expect("handle_bind for a");
 
-    // Step 4: Assert the binding landed in the WRONG namespace slot.
-    //
-    // Since #457/#458, `handle_bind` durably persists through
-    // `persist_brain_state_mutation`, which also republishes
-    // `tracker.active_namespace` as `token.namespace()` (`bare-ns-a`) on
-    // success — even though the live state it mutated was actually ns-b's
-    // (loaded in step 2). That mislabels the save-restore bookkeeping, so
-    // the corruption now surfaces on the OPPOSITE side from before the
-    // durability fix: ns-b's slot comes back empty (its live content, plus
-    // A's leaked write, gets saved under the wrong namespace key), and A's
-    // leaked binding resurfaces under ns-a instead. The exact shape of the
-    // corruption changed; the underlying point — that bypassing the gate
-    // corrupts namespace isolation — still holds.
+    // Step 4: Assert the binding landed in the WRONG namespace slot (see
+    // guide for the #457/#458 durability-fix-era corruption shape).
     let bindings_b_now = pack
         .dispatch("brain.bindings", json!({}), &registry, &token_b)
         .await
@@ -4037,26 +4117,10 @@ async fn dispatch_gate_race_is_observable_without_gate() {
     );
 }
 
-/// Proves the dispatch gate FIXES the race: with the gate held across
-/// ensure_loaded + handler, no concurrent namespace swap can occur between
-/// the two steps.
-///
-/// Interleaving manufactured by DISPATCH_INTERLEAVE_HOOK in pack.rs
-/// (cfg(test) only), which fires inside dispatch() AFTER ensure_loaded
-/// returns and BEFORE the handler acquires self.state.  While A is paused
-/// at the hook:
-///   - With the gate: B is blocked on dispatch_gate.lock().await.
-///   - Without the gate: B would run and swap the slot.
-///
-/// Test sequence:
-///   1. A enters dispatch(), acquires gate, calls ensure_loaded(ns-a), pauses.
-///   2. B tries to enter dispatch() — blocked on the gate.
-///   3. Test releases A — A's handler runs brain.bind for ns-a.
-///   4. A completes, releases gate.  B runs: ensure_loaded(ns-b) + brain.bind.
-///   5. Assert bindings(ns-a) == 1, bindings(ns-b) == 1.
-///
-/// PASS (gate present): each namespace sees exactly its own binding.
-/// FAIL (gate absent): see dispatch_gate_race_is_observable_without_gate.
+/// Proves the dispatch gate FIXES the race from
+/// `dispatch_gate_race_is_observable_without_gate`: with the gate held
+/// across ensure_loaded + handler, no concurrent namespace swap can occur.
+/// See crates/khive-pack-brain/docs/dispatch-namespace-isolation.md#dispatch_gate_prevents_cross_namespace_slot_swap.
 #[tokio::test]
 async fn dispatch_gate_prevents_cross_namespace_slot_swap() {
     use core::convert::TryFrom;
@@ -6305,6 +6369,209 @@ mod event_counts_tests {
                 );
             }
             other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    /// A date-only `since` (no time-of-day component) is coerced to midnight
+    /// UTC rather than silently resolving to a null result — the bug reported
+    /// in #984, where the RFC-3339 parser rejected the value but the failure
+    /// never surfaced to the caller.
+    #[tokio::test]
+    async fn date_only_since_is_coerced_to_midnight_utc() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        let result = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({"since": "2026-07-07"}),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("date-only `since` must be accepted, not silently nulled");
+
+        let since = result["since"].as_str().expect("since must be a string");
+        assert!(
+            since.starts_with("2026-07-07T00:00:00"),
+            "date-only `since` must coerce to midnight UTC: {result}"
+        );
+    }
+
+    /// A date-only `until` must include the entire named day, not just its
+    /// midnight instant — the window is half-open `[since, until)`, so a
+    /// date-only `until` has to roll to the *next* day's midnight or the
+    /// whole named day is silently dropped (#994).
+    #[tokio::test]
+    async fn date_only_until_includes_the_whole_named_day() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        let just_before_day = chrono::NaiveDate::from_ymd_opt(2026, 7, 6)
+            .unwrap()
+            .and_hms_opt(23, 59, 59)
+            .unwrap()
+            .and_utc()
+            .timestamp_micros();
+        // Last representable instant of the `until` day = the INCLUDED end of the edge;
+        // paired with `next_midnight` (the first EXCLUDED instant) this pins both sides
+        // of the exclusive upper bound to within one microsecond.
+        let end_of_named_day = chrono::NaiveDate::from_ymd_opt(2026, 7, 7)
+            .unwrap()
+            .and_hms_micro_opt(23, 59, 59, 999_999)
+            .unwrap()
+            .and_utc()
+            .timestamp_micros();
+        let next_midnight = chrono::NaiveDate::from_ymd_opt(2026, 7, 8)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp_micros();
+
+        seed_event(
+            &rt,
+            &token,
+            "search",
+            EventKind::SearchExecuted,
+            "lambda:a",
+            just_before_day,
+            json!({}),
+        )
+        .await;
+        seed_event(
+            &rt,
+            &token,
+            "search",
+            EventKind::SearchExecuted,
+            "lambda:a",
+            end_of_named_day,
+            json!({}),
+        )
+        .await;
+        // Exactly at the next day's midnight — must still be EXCLUDED.
+        seed_event(
+            &rt,
+            &token,
+            "search",
+            EventKind::SearchExecuted,
+            "lambda:a",
+            next_midnight,
+            json!({}),
+        )
+        .await;
+
+        assert_eq!(seeded_count(&rt, &token).await, 3);
+
+        let result = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({
+                    "since": "2026-07-06",
+                    "until": "2026-07-07",
+                }),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("brain.event_counts must succeed");
+
+        assert_eq!(
+            result["total"],
+            json!(2),
+            "date-only `until` must include the whole named day and exclude the next day's midnight: {result}"
+        );
+    }
+
+    /// A value that is neither a valid date nor a valid RFC-3339 datetime
+    /// still gets a named validation error, never a null result.
+    #[tokio::test]
+    async fn garbage_since_is_rejected_not_silently_nulled() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        let result = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({"since": "2026-13-99"}),
+                &registry,
+                &token,
+            )
+            .await;
+
+        match result {
+            Ok(v) => panic!("invalid `since` must not silently succeed with a value: {v}"),
+            Err(RuntimeError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains("since") && msg.contains("2026-13-99"),
+                    "error must name the field and offending value: {msg}"
+                );
+            }
+            Err(other) => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    /// A value that is neither a valid date nor a valid RFC-3339 datetime
+    /// still gets a named validation error on `until`, not silently nulled —
+    /// mirrors `garbage_since_is_rejected_not_silently_nulled` for the
+    /// role-aware `until` parse path (#994).
+    #[tokio::test]
+    async fn garbage_until_is_rejected_not_silently_nulled() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        let result = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({"since": "2026-07-01", "until": "2026-13-40"}),
+                &registry,
+                &token,
+            )
+            .await;
+
+        match result {
+            Ok(v) => panic!("invalid `until` must not silently succeed with a value: {v}"),
+            Err(RuntimeError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains("until") && msg.contains("2026-13-40"),
+                    "error must name the field and offending value: {msg}"
+                );
+            }
+            Err(other) => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    /// `until` at chrono's maximum representable date (NaiveDate::MAX,
+    /// 262142-12-31) would overflow the next-day roll; the handler must return
+    /// a named validation error instead of panicking on caller input (#994).
+    #[tokio::test]
+    async fn max_date_only_until_is_rejected_not_panicked() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        let result = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({"since": "2026-07-01", "until": "+262142-12-31"}),
+                &registry,
+                &token,
+            )
+            .await;
+
+        match result {
+            Ok(v) => panic!("`until` at the max representable date must not silently succeed: {v}"),
+            Err(RuntimeError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains("until") && msg.contains("262142-12-31"),
+                    "error must name the field and offending value: {msg}"
+                );
+            }
+            Err(other) => panic!("expected InvalidInput, got {other:?}"),
         }
     }
 

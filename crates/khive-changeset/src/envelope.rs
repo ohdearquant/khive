@@ -6,8 +6,9 @@ use serde::{Deserialize, Serialize};
 /// The NDJSON-delta schema version this crate currently emits and accepts.
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 
-/// Change-set-level metadata block. Carries producer identity and model
-/// family; individual ops never reference it and stay producer-agnostic.
+/// Change-set-wide producer identity and stage-time provenance.
+///
+/// See `crates/khive-changeset/docs/api/envelope.md` for commit-trailer behavior.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Envelope {
@@ -19,18 +20,14 @@ pub struct Envelope {
     pub producer_model_family: String,
     /// Wall-clock time the change-set was staged, supplied by the caller.
     pub staged_at: Timestamp,
-    /// Opaque producer-assigned batch identifier. When present, a commit
-    /// landing this change-set uses it verbatim as the provenance trailer;
-    /// when absent, the committing tool derives a deterministic fallback
-    /// from `producer` and `staged_at` instead. Optional because the
-    /// identifier is opaque producer-internal tracking — a producer without
-    /// its own batching model is not forced to invent one.
+    /// Optional producer batch ID used verbatim for commit provenance; absent
+    /// values let the committer derive a deterministic producer/time fallback.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub batch_id: Option<String>,
 }
 
 impl Envelope {
-    /// Construct an envelope stamped with [`CURRENT_SCHEMA_VERSION`] and no `batch_id`.
+    /// Constructs an envelope at [`CURRENT_SCHEMA_VERSION`] with no batch ID.
     pub fn new(
         producer: impl Into<String>,
         producer_model_family: impl Into<String>,
@@ -45,7 +42,7 @@ impl Envelope {
         }
     }
 
-    /// Attach a producer-assigned batch identifier.
+    /// Attaches an opaque producer-assigned batch identifier.
     pub fn with_batch_id(mut self, batch_id: impl Into<String>) -> Self {
         self.batch_id = Some(batch_id.into());
         self

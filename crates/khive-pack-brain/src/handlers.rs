@@ -742,9 +742,9 @@ impl BrainPack {
                     .to_string(),
             )
         })?;
-        let since_us = parse_rfc3339_micros("since", since_raw)?;
+        let since_us = parse_rfc3339_micros("since", since_raw, false)?;
         let until_us = match p.until.as_deref() {
-            Some(u) => parse_rfc3339_micros("until", u)?,
+            Some(u) => parse_rfc3339_micros("until", u, true)?,
             None => Utc::now().timestamp_micros(),
         };
 
@@ -1227,20 +1227,23 @@ impl BrainPack {
     /// which resolves its own tier and passes an explicit profile) always
     /// originates from the recall serve loop, so it must resolve against the
     /// same binding bucket the serve path used.
+    /// Returns the profile id plus a resolution marker (`explicit` |
+    /// `binding` | `default`) so event payloads can record call-site
+    /// discipline separately from attribution (#1016).
     fn resolve_effective_feedback_profile(
         &self,
         token: &NamespaceToken,
         explicit: Option<&str>,
-    ) -> String {
+    ) -> (String, &'static str) {
         if let Some(profile_id) = explicit {
-            return profile_id.to_string();
+            return (profile_id.to_string(), "explicit");
         }
         let actor = token.actor().binding_id();
         let namespace = token.namespace().as_str();
         let state = self.state.lock().unwrap();
         match state.resolve_with_match(actor, Some(namespace), ConsumerKind::Recall.as_str()) {
-            Some((record, _matched_kind, true)) => record.id.clone(),
-            _ => "balanced-recall-v1".to_string(),
+            Some((record, _matched_kind, true)) => (record.id.clone(), "binding"),
+            _ => ("balanced-recall-v1".to_string(), "default"),
         }
     }
 
@@ -1328,7 +1331,7 @@ impl BrainPack {
         // Compute the effective serving profile (explicit, else a matching
         // actor+namespace binding, else the system default — #697), then
         // validate that it exists in the registry and is not Archived.
-        let effective_profile =
+        let (effective_profile, profile_resolution) =
             self.resolve_effective_feedback_profile(token, p.served_by_profile_id.as_deref());
         let effective_profile = effective_profile.as_str();
         {
@@ -1415,10 +1418,15 @@ impl BrainPack {
         // Base feedback payload, shared by every signal kind. The gated
         // (implicit) path below adds a "gate" key inside the atomic unit;
         // the ungated path (explicit/correction) adds nothing further.
-        let mut base_data = json!({"signal": signal});
-        if let Some(ref profile_id) = p.served_by_profile_id {
-            base_data["served_by_profile_id"] = json!(profile_id);
-        }
+        // #1016: always stamp the resolved profile (not just the
+        // caller-explicit value) so event_counts attribution and ADR-032
+        // replay match what the posterior fold actually credited; the
+        // marker records how it was resolved.
+        let mut base_data = json!({
+            "signal": signal,
+            "served_by_profile_id": effective_profile,
+            "profile_resolution": profile_resolution,
+        });
         if let Some(ref ss) = p.section_signals {
             base_data["section_signals"] = ss.clone();
         }
@@ -2309,8 +2317,43 @@ impl BrainPack {
 /// Parse an ISO-8601/RFC-3339 datetime string into a microsecond epoch,
 /// naming the offending field/value in the error rather than a bare parse
 /// failure (`brain.event_counts`, ADR-103 Stage 1).
-fn parse_rfc3339_micros(field: &'static str, value: &str) -> Result<i64, RuntimeError> {
-    chrono::DateTime::parse_from_rfc3339(value.trim())
+///
+/// A bare `YYYY-MM-DD` date (no time-of-day component) is coerced to
+/// midnight UTC rather than rejected — RFC-3339 requires a time component,
+/// but a date-only value is unambiguous and a common caller shorthand; the
+/// alternative is silently returning nothing until the caller happens to
+/// probe the full timestamp form (#984).
+///
+/// `roll_to_next_day` handles the `until` bound: the window is applied as
+/// half-open `[since, until)` (see `EventCounts` handler), so a date-only
+/// `since` correctly means "that day's midnight" but a date-only `until`
+/// must mean "the end of that day" — i.e. the *next* day's midnight —
+/// otherwise the exclusive upper bound drops the entire named day (#994).
+fn parse_rfc3339_micros(
+    field: &'static str,
+    value: &str,
+    roll_to_next_day: bool,
+) -> Result<i64, RuntimeError> {
+    let trimmed = value.trim();
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
+        let date = if roll_to_next_day {
+            // Fallible at chrono's representable max (NaiveDate::MAX,
+            // 262142-12-31): the roll would overflow. Return the named
+            // validation error rather than panicking on caller input (#994).
+            date.checked_add_days(chrono::Days::new(1)).ok_or_else(|| {
+                RuntimeError::InvalidInput(format!(
+                    "invalid `{field}`: {value:?} is past the maximum representable date"
+                ))
+            })?
+        } else {
+            date
+        };
+        let midnight = date
+            .and_hms_opt(0, 0, 0)
+            .expect("00:00:00 is always a valid time");
+        return Ok(midnight.and_utc().timestamp_micros());
+    }
+    chrono::DateTime::parse_from_rfc3339(trimmed)
         .map(|dt| dt.with_timezone(&Utc).timestamp_micros())
         .map_err(|e| {
             RuntimeError::InvalidInput(format!(

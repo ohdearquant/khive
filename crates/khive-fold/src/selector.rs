@@ -27,26 +27,21 @@ pub struct SelectorInput<T> {
     pub category: Option<String>,
     /// Pre-computed information gain (KL divergence proxy) for this candidate.
     ///
-    /// Callers pre-compute this because the Selector is pure-math and has no
-    /// access to the embedding space required to estimate KL divergence. When
-    /// `None` (the default), the value is treated as 0.0. Only has an effect
-    /// when `SelectorWeights.epistemic_weight > 0.0`.
+    /// Defaults to 0.0 when `None`. Only affects selection when
+    /// `SelectorWeights.epistemic_weight > 0.0`. See
+    /// crates/khive-fold/docs/design.md#adr-024-bayesian-extensions-selector-budget-packing-and-precision-weighted-scoring
+    /// for why this is caller-supplied rather than computed by the Selector.
     #[cfg_attr(feature = "serde", serde(default))]
     pub information_gain: Option<f32>,
     /// Higher-precision pre-conversion effective score used for rank
     /// comparisons, when available.
     ///
-    /// Callers that compute the score in `f64` (e.g. `ComposePipeline`, which
-    /// multiplies an objective score by a precision weight) should set this
-    /// instead of relying solely on the narrowed `score: f32` field — ranking
-    /// widens `score` back through `DeterministicScore::from_f32` when this is
-    /// `None`, but two `f64` scores that differ by less than an `f32` ulp would
-    /// otherwise collapse to the same `f32` bit pattern before the selector
-    /// ever compares them (khive-score contract: ADR fixed-point ranking).
-    /// Does not affect `min_score` filtering, which continues to operate on
-    /// `score`. `category_weights` multipliers DO scale `rank_score` (by the
-    /// same weight applied to `score`) so a caller-supplied high-precision
-    /// rank base still reflects category weighting during rank comparisons.
+    /// When `None`, ranking widens `score` back to `f64` via
+    /// `DeterministicScore::from_f32`. Does not affect `min_score` filtering,
+    /// which always operates on `score`. `category_weights` multipliers scale
+    /// `rank_score` by the same weight applied to `score`. See
+    /// crates/khive-fold/docs/api/selector.md#rank-score-precision-pr-535 for
+    /// why callers need this instead of relying on the narrowed `score` field.
     #[cfg_attr(feature = "serde", serde(default))]
     pub rank_score: Option<f64>,
 }
@@ -103,37 +98,23 @@ pub trait Selector<T>: Send + Sync {
 /// Budget-constrained greedy packer.
 ///
 /// Filters by `SelectorWeights.min_score`, applies `category_weights` multipliers
-/// to adjust scores, then greedily packs until the budget is exhausted.
-///
-/// When `diversity_bias > 0`, uses a pick-best-remaining loop: at each step the
-/// item with the highest *effective* score (after diversity penalty) is selected.
-/// The penalty is `score * (1 - bias * n / (n + 1))` where `n` is the number of
-/// already-selected items in the same category. At bias=0 this collapses to a
-/// single-pass sort (backward-compatible).
-///
-/// Tie-breaking is deterministic: size ascending, then id ascending.
+/// to adjust scores, then greedily packs until the budget is exhausted. When
+/// `diversity_bias > 0`, uses a pick-best-remaining loop instead of a single
+/// sort pass. Tie-breaking is deterministic: effective score descending, size
+/// ascending, then id ascending. See
+/// crates/khive-fold/docs/design.md#adr-024-bayesian-extensions-selector-budget-packing-and-precision-weighted-scoring
+/// for the diversity-penalty formula.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GreedySelector;
 
-/// Widen `score` (and any `rank_score` override) into the `f64` domain used
-/// for rank-comparison arithmetic.
-///
-/// `rank_score`, when present, carries the caller's full-precision effective
-/// score (e.g. `ComposePipeline`'s `objective_score * precision` in `f64`
-/// before it was narrowed to `f32` for the `score` field). Falling back to
-/// `score as f64` for plain callers (e.g. `khive-pack-knowledge`'s direct
-/// JSON-supplied candidates) is lossless — those scores were never more
-/// precise than `f32` to begin with.
+/// Widen `score` (or `rank_score` if set) to `f64` for rank comparisons.
+/// See crates/khive-fold/docs/api/selector.md#rank-score-precision-pr-535.
 #[inline]
 fn rank_base<T>(item: &SelectorInput<T>) -> f64 {
     item.rank_score.unwrap_or(item.score as f64)
 }
 
-/// Compute the base pragmatic score adjusted for epistemic weight, in `f64`.
-///
-/// `base` is the pragmatic score (after category-weight multipliers, which
-/// still apply to `score` before this is called). `epistemic_weight *
-/// information_gain` is the epistemic bonus.
+/// Pragmatic score plus the epistemic (information-gain) bonus, in `f64`.
 #[inline]
 fn pragmatic_plus_epistemic<T>(item: &SelectorInput<T>, epistemic_weight: f32) -> f64 {
     let base = rank_base(item);
@@ -218,12 +199,8 @@ impl<T: Clone> Selector<T> for GreedySelector {
         // Filter non-finite and below min_score.
         inputs.retain(|i| i.score.is_finite() && i.score >= weights.min_score);
 
-        // Apply category_weights multipliers. `rank_score`, when present, is
-        // the caller's higher-precision f64 rank base (see `rank_base` doc) —
-        // it must be scaled by the same weight or rank comparisons would see
-        // the unweighted value while `min_score` filtering sees the weighted
-        // one, silently defeating `category_weights` for any candidate that
-        // set `rank_score` (khive PR #535).
+        // rank_score must be scaled by the same category weight as score, or
+        // it silently defeats category_weights (khive PR #535; see design.md).
         if !weights.category_weights.is_empty() {
             for item in &mut inputs {
                 if let Some(ref cat) = item.category {
@@ -241,13 +218,8 @@ impl<T: Clone> Selector<T> for GreedySelector {
 
         let ew = weights.epistemic_weight;
 
-        // Initial sort: effective score (pragmatic + epistemic bonus) desc, size asc, id asc —
-        // deterministic across platforms. Non-finite effective scores are rejected rather
-        // than silently sorted, since a checked score can still overflow to non-finite.
-        // Comparisons run through `DeterministicScore` (khive-score's i64 fixed-point
-        // contract), not raw `f32::total_cmp` — matches the objective-path ranking
-        // pattern in `objective::traits::RankedIndex` and preserves precision that a
-        // caller-supplied `rank_score` (f64) carries past what `f32` can hold.
+        // Sort by effective score desc, size asc, id asc via DeterministicScore
+        // (not raw f32::total_cmp) — see design.md#rank-score-precision-pr-535.
         let mut ranked = Vec::with_capacity(inputs.len());
         for input in inputs {
             let effective = pragmatic_plus_epistemic(&input, ew);
@@ -795,13 +767,8 @@ mod tests {
 
     #[test]
     fn greedy_selector_handles_extreme_f32_products_without_overflow() {
-        // Ranking now runs in f64/DeterministicScore rather than raw f32
-        // arithmetic: `f32::MAX * f32::MAX` (~1.15e77) no longer overflows to
-        // `f32::INFINITY` the way it did under the old f32-only computation —
-        // it's a large-but-finite f64 value, saturated into DeterministicScore
-        // rather than rejected. This is exactly the precision upgrade FOLD-AUD
-        // (khive-score fixed-point contract) requires: a real magnitude, not a
-        // spurious f32 rounding artifact, decides the outcome.
+        // f64/DeterministicScore ranking no longer overflows on f32::MAX products
+        // (FOLD-AUD); see design.md#test-rationale-notes.
         let inputs = vec![input_with_gain("a", 100, f32::MAX, f32::MAX)];
         let w = SelectorWeights {
             epistemic_weight: f32::MAX,
@@ -828,11 +795,8 @@ mod tests {
 
     #[test]
     fn rank_score_saturates_at_deterministic_score_max_without_panic() {
-        // Two candidates whose rank_score both exceed DeterministicScore's
-        // i64/2^32 representable range must both saturate to MAX rather than
-        // panicking or overflowing, then fall back to the deterministic
-        // size/id tie-break — same contract as DeterministicScore's own
-        // saturating arithmetic (khive-score score.rs `from_rounded_arithmetic`).
+        // rank_score beyond DeterministicScore's range saturates to MAX rather
+        // than panicking; see design.md#test-rationale-notes.
         let mut big = input("big", 200, 0.0);
         big.rank_score = Some(f64::MAX);
         let mut small = input("small", 50, 0.0);
@@ -849,10 +813,8 @@ mod tests {
 
     #[test]
     fn rank_score_distinguishes_values_within_f32_ulp_of_one() {
-        // 1.0 and 1.00000004 collapse to the identical f32 bit pattern (delta
-        // is below the f32 ulp at magnitude 1.0) but are distinct at the
-        // khive-score 2^32 fixed-point scale — `rank_score` must be the value
-        // that decides ranking, not the narrowed `score` field.
+        // 1.0 vs 1.00000004 collapse to identical f32 bits but differ at
+        // khive-score's fixed-point scale; see design.md#test-rationale-notes.
         let a_score = 1.0_f32;
         let b_score = 1.0_f32; // identical f32 bits to a after narrowing
         assert_eq!(a_score.to_bits(), b_score.to_bits());
@@ -874,12 +836,8 @@ mod tests {
 
     #[test]
     fn category_weights_reorder_candidates_when_rank_score_present() {
-        // Same shape as `category_weights_boost_preferred_category`, but both
-        // candidates carry an explicit `rank_score` equal to `score` widened
-        // to f64. Before the fix, rank comparisons read the unweighted
-        // `rank_score` (weights only ever touched `score`), so "a" (raw 0.9,
-        // "low") would win despite "high" carrying a 2.0x weight. The fix
-        // must scale `rank_score` by the same weight so "b" still wins.
+        // Regression for PR #535: rank_score must be scaled by category
+        // weight too, or "a" wins despite "high"'s 2.0x weight.
         let mut a = input_cat("a", 100, 0.9, "low");
         a.rank_score = Some(0.9);
         let mut b = input_cat("b", 100, 0.5, "high");

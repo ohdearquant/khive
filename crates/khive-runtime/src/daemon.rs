@@ -45,15 +45,7 @@ pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// in every request; the daemon rejects mismatches with an explicit error
 /// that names both sides so the operator knows exactly what to do
 /// (`make local` rebuilds the client binary).
-///
-/// Version history:
-///   1 — initial versioned framing (added `protocol_version` + `version_mismatch`);
-///       added `probe_only` request field + probe-ack sentinel shape in response
-///   2 — gate subhandler verbs by wire origin (`from_wire` request field)
-///   3 — added per-request identity context to the request frame (`actor_id`,
-///       `visible_namespaces`); the daemon now serves a request under the
-///       frame's identity instead of rejecting on `namespace_mismatch` (the
-///       `config_id` equality reject stays hard)
+/// See `docs/api/daemon.md#protocol_version` for the version-by-version history.
 pub const PROTOCOL_VERSION: u32 = 3;
 
 #[cfg(unix)]
@@ -168,18 +160,16 @@ pub fn acquire_recovery_lock() -> Option<std::fs::File> {
 }
 
 /// Attempt to acquire an exclusive advisory flock on `path`, retrying with a
-/// non-blocking `flock(LOCK_NB)` until `deadline` elapses.
+/// non-blocking `flock(LOCK_NB)` until `deadline` elapses. Bounded alternative
+/// to `acquire_recovery_lock`/`acquire_daemon_boot_guard`'s unbounded blocking
+/// flock — see `docs/api/daemon.md#try_acquire_flock_until` for why a caller
+/// merely detecting lock freedom needs a deadline instead.
 ///
-/// Unlike [`acquire_recovery_lock`]/[`acquire_daemon_boot_guard`] (unbounded
-/// blocking `flock`, correct for the daemon's own boot sequence where waiting
-/// until quiescence IS the desired behavior), a caller only trying to *detect*
-/// whether a lock is currently free — without committing to wait forever for
-/// a possibly-wedged holder: needs a deadline instead. Returns:
-///   - `Ok(Some(file))` — the lock was free within the deadline.
-///   - `Ok(None)` — `deadline` elapsed while the lock stayed held; an
-///     explicit "could not confirm" outcome, distinct from a hard I/O error.
-///   - `Err(_)` — the lock file could not be opened, or `flock` failed for a
-///     reason other than contention.
+/// - `Ok(Some(file))` — the lock was free within the deadline.
+/// - `Ok(None)` — `deadline` elapsed while the lock stayed held; an explicit
+///   "could not confirm" outcome, distinct from a hard I/O error.
+/// - `Err(_)` — the lock file could not be opened, or `flock` failed for a
+///   reason other than contention.
 ///
 /// Blocking (paces retries with `std::thread::sleep`) — async callers must
 /// run this via `spawn_blocking`.
@@ -715,18 +705,8 @@ pub fn active_phase_names() -> Vec<String> {
 /// Build a point-in-time [`MetricsSnapshot`] of this process's server-side
 /// gauges. Called only from `handle_conn`'s `metrics_only` arm — a
 /// process-global, read-only assembly with no side effects of its own.
-///
-/// `tx_registry` (ADR-091 Plank 0) is a process-global singleton reachable
-/// directly, with no plumbing through `dispatcher`. `wal_pages` and the
-/// TRUNCATE counters (ADR-091 Plank 2) are read from `khive_db::checkpoint`'s
-/// module-scoped atomics, updated wherever the checkpoint task already calls
-/// `query_wal_pages`/`note_truncate_outcome` — mirroring the fallback-counter
-/// pattern in `khive-mcp/src/daemon.rs` rather than threading a metrics
-/// handle through every checkpoint call site, since the checkpoint task
-/// itself is a fire-and-forget `tokio::spawn` with no handle retained
-/// anywhere this accept loop can reach. `write_queue_depth`/`_capacity`
-/// (ADR-067 Component A) come from the dispatcher's own pool, if any, and
-/// are `None` unless `KHIVE_WRITE_QUEUE=1` actually spawned a writer task.
+/// See `docs/api/daemon.md#build_metrics_snapshot` for where each gauge is sourced
+/// from and why.
 #[cfg(unix)]
 fn build_metrics_snapshot<D: DaemonDispatch>(dispatcher: &D) -> MetricsSnapshot {
     let open_tx_count = khive_storage::tx_registry::snapshot().len();
@@ -955,17 +935,13 @@ async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
 /// Run the daemon: bind the socket, warm in the background, serve request
 /// frames until SIGTERM/SIGINT.
 ///
-/// Fatally acquires its own startup lock. This only protects
-/// cleanup→bind→pid-write; by the time this function runs, `dispatcher` (a
-/// `DaemonDispatch` built from a `KhiveMcpServer`) has *already* run
-/// migrations and applied pack schema plans while constructing itself,
-/// unguarded. Production boot must go through
-/// [`run_daemon_with_boot_guard`] instead, which extends the same lock back
-/// over that construction step. This entry point remains for callers (and
-/// tests) that build the dispatcher and start serving as one atomic step with
-/// no separate boot-guard window to protect — but it still acquires the boot
-/// guard fatally (never proceeds unguarded), so the cleanup→bind→pid-write
-/// race surface is always mutually excluded.
+/// Fatally acquires its own startup lock, which only protects
+/// cleanup→bind→pid-write — `dispatcher` has already run migrations and
+/// applied pack schema plans while constructing itself, unguarded. Production
+/// boot must go through [`run_daemon_with_boot_guard`] instead, which extends
+/// the same lock back over construction. This entry point is for callers
+/// (and tests) that build the dispatcher and start serving as one atomic
+/// step with no separate boot-guard window to protect.
 #[cfg(unix)]
 pub async fn run_daemon<D: DaemonDispatch>(dispatcher: D) -> anyhow::Result<()> {
     let boot_guard = Some(acquire_daemon_boot_guard()?);
@@ -973,25 +949,17 @@ pub async fn run_daemon<D: DaemonDispatch>(dispatcher: D) -> anyhow::Result<()> 
 }
 
 /// Run the daemon using a startup lock acquired by the caller *before*
-/// building `dispatcher`.
+/// building `dispatcher`, so a second process racing to boot (e.g. two
+/// `kkernel mcp --daemon` spawns before either has bound its socket) cannot
+/// run migrations/FTS DDL concurrently against the same database file.
+/// `boot_guard` is only `None` on non-unix targets, where there is no
+/// advisory boot lock to hold in the first place; every unix daemon-mode
+/// caller passes `Some`.
 ///
-/// Cold-boot schema initialization (migrations, pack schema plans / FTS DDL)
-/// happens while `dispatcher` is being constructed, i.e. before this
-/// function is ever called. Passing an already-held `boot_guard` in lets the
-/// caller extend that same lock backward over construction, so a second
-/// process racing to boot (e.g. two `kkernel mcp --daemon` spawns before
-/// either has bound its socket) cannot run migrations/FTS DDL concurrently
-/// against the same database file. On unix every daemon-mode
-/// caller passes `Some` — `run_daemon` and the production entry points
-/// (`serve.rs`, `kkernel`) all acquire the guard fatally via
-/// `acquire_daemon_boot_guard` before constructing `dispatcher`. `boot_guard`
-/// is only `None` on non-unix targets, where there is no advisory boot lock to
-/// hold in the first place.
-///
-/// The guard is held across cleanup → bind → pid-write, exactly as
-/// `run_daemon`'s inline lock used to be, then dropped — see the "Deadlock
-/// note" below for why the caller must not still be holding a *different*
-/// handle to the same lock file at that point.
+/// The guard is held across cleanup → bind → pid-write, then dropped. The
+/// caller must not still be holding a *different* handle to the same lock
+/// file when this function is entered — see the "Deadlock note" on the
+/// `_startup_lock` binding below for why that would self-deadlock on `flock`.
 #[cfg(unix)]
 pub async fn run_daemon_with_boot_guard<D: DaemonDispatch>(
     dispatcher: D,
