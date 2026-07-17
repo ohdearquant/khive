@@ -135,6 +135,7 @@ For historical context, see [v0 archive](../_archive/adr_v0/README.md). v0 ADRs 
 | [ADR-112](ADR-112-git-outbound-publish-verbs.md)             | Outbound GitHub Publish Verbs with a Publication-Hygiene Scan                                         |
 | [ADR-113](ADR-113-identifier-continuity.md)                  | Identifier Continuity — Merged-Entity Redirect Resolution and Split Endpoint-Move                     |
 | [ADR-114](ADR-114-code-audit-derived-report.md)              | Code-Audit Derived Report, Not Agent Findings                                                         |
+| [ADR-115](ADR-115-secret-gate-content-manifest-exemption.md) | Exact-Content Manifest Exemption for the Write Secret Gate                                            |
 
 ## Closed Taxonomies — Quick Reference
 
