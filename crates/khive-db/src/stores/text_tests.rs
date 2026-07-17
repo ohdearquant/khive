@@ -2258,3 +2258,52 @@ async fn upsert_documents_routes_through_writer_task_when_flag_enabled() {
         "the flag-ON path must actually spawn and use the writer task"
     );
 }
+
+/// #1064 regression: a hyphenated identifier token mixed with plain keyword
+/// terms (`"ADR-086 workspace mirror"`) must still surface the document whose
+/// title/body contains that identifier under the production `trigram`
+/// tokenizer, in both `Plain` and `AnyTerm` mode.
+#[tokio::test]
+async fn test_search_hyphenated_id_with_plain_terms_matches_exact_id() {
+    let store = setup_trigram_store("issue_1064_hyphenated_multiword");
+    let target_id = Uuid::new_v4();
+    store
+        .upsert_document(make_document(
+            target_id,
+            "ADR-086",
+            "ADR-086 workspace mirror amendment document",
+        ))
+        .await
+        .unwrap();
+    let unrelated_id = Uuid::new_v4();
+    store
+        .upsert_document(make_document(
+            unrelated_id,
+            "unrelated",
+            "completely unrelated gardening content",
+        ))
+        .await
+        .unwrap();
+
+    for mode in [TextQueryMode::Plain, TextQueryMode::AnyTerm] {
+        let hits = store
+            .search(TextSearchRequest {
+                query: "ADR-086 workspace mirror".to_string(),
+                mode: mode.clone(),
+                filter: Some(ns_filter("test_ns")),
+                top_k: 10,
+                snippet_chars: 64,
+            })
+            .await
+            .unwrap();
+        let hit_ids: std::collections::HashSet<_> = hits.iter().map(|h| h.subject_id).collect();
+        assert!(
+            hit_ids.contains(&target_id),
+            "#1064 {mode:?} query must match {target_id}, got {hit_ids:?}"
+        );
+        assert!(
+            !hit_ids.contains(&unrelated_id),
+            "#1064 {mode:?} query must not match unrelated doc, got {hit_ids:?}"
+        );
+    }
+}

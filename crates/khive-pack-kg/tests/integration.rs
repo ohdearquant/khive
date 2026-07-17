@@ -11764,3 +11764,81 @@ async fn search_note_emits_exactly_one_search_executed_event_with_note_result_ki
     assert_eq!(event.payload["result_count"], json!(hits.len()));
     assert_search_projection(&rt, &store, event, hits, "note").await;
 }
+
+/// #1061 regression: `search` must reject an unregistered kind the same way
+/// `list` does — a loud `{ok: false, error: "unknown kind ..."}`, never a
+/// silent empty result.
+#[tokio::test]
+async fn search_unregistered_kind_matches_list_error_shape() {
+    let pack = pack();
+    let search_err = pack
+        .dispatch(
+            "search",
+            json!({"kind": "workspace_doc", "query": "anything", "limit": 5}),
+        )
+        .await
+        .unwrap_err();
+    let list_err = pack
+        .dispatch("list", json!({"kind": "workspace_doc", "limit": 3}))
+        .await
+        .unwrap_err();
+
+    assert!(
+        is_invalid_input(&search_err),
+        "#1061 search with unregistered kind must be InvalidInput, got {search_err:?}"
+    );
+    assert_eq!(
+        invalid_input_message(&search_err),
+        invalid_input_message(&list_err),
+        "#1061 search and list must report the identical unknown-kind error"
+    );
+}
+
+/// #1064 regression, full dispatch path: an entity named after a hyphenated
+/// ADR id must be found by a `search(kind="entity", ...)` query that mixes
+/// the hyphenated id with plain keyword terms.
+#[tokio::test]
+async fn search_entity_hyphenated_adr_id_with_plain_terms_matches() {
+    let pack = pack();
+    pack.dispatch(
+        "create",
+        json!({
+            "kind": "entity",
+            "name": "ADR-086",
+            "entity_kind": "document",
+            "description": "workspace mirror amendment document"
+        }),
+    )
+    .await
+    .expect("create must succeed");
+
+    pack.dispatch(
+        "create",
+        json!({
+            "kind": "entity",
+            "name": "unrelated gardening note",
+            "entity_kind": "document",
+            "description": "completely unrelated content"
+        }),
+    )
+    .await
+    .expect("create must succeed");
+
+    let result = pack
+        .dispatch(
+            "search",
+            json!({"kind": "entity", "query": "ADR-086 workspace mirror", "limit": 10}),
+        )
+        .await
+        .expect("search must succeed");
+    let titles: Vec<_> = result
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|h| h.get("title").and_then(Value::as_str))
+        .collect();
+    assert!(
+        titles.iter().any(|t| t.contains("ADR-086")),
+        "#1064 hyphenated query must surface ADR-086 entity; got titles={titles:?}, full={result}"
+    );
+}
