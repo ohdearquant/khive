@@ -742,9 +742,9 @@ impl BrainPack {
                     .to_string(),
             )
         })?;
-        let since_us = parse_rfc3339_micros("since", since_raw)?;
+        let since_us = parse_rfc3339_micros("since", since_raw, false)?;
         let until_us = match p.until.as_deref() {
-            Some(u) => parse_rfc3339_micros("until", u)?,
+            Some(u) => parse_rfc3339_micros("until", u, true)?,
             None => Utc::now().timestamp_micros(),
         };
 
@@ -2323,9 +2323,24 @@ impl BrainPack {
 /// but a date-only value is unambiguous and a common caller shorthand; the
 /// alternative is silently returning nothing until the caller happens to
 /// probe the full timestamp form (#984).
-fn parse_rfc3339_micros(field: &'static str, value: &str) -> Result<i64, RuntimeError> {
+///
+/// `roll_to_next_day` handles the `until` bound: the window is applied as
+/// half-open `[since, until)` (see `EventCounts` handler), so a date-only
+/// `since` correctly means "that day's midnight" but a date-only `until`
+/// must mean "the end of that day" — i.e. the *next* day's midnight —
+/// otherwise the exclusive upper bound drops the entire named day (#994).
+fn parse_rfc3339_micros(
+    field: &'static str,
+    value: &str,
+    roll_to_next_day: bool,
+) -> Result<i64, RuntimeError> {
     let trimmed = value.trim();
     if let Ok(date) = chrono::NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
+        let date = if roll_to_next_day {
+            date + chrono::Days::new(1)
+        } else {
+            date
+        };
         let midnight = date
             .and_hms_opt(0, 0, 0)
             .expect("00:00:00 is always a valid time");
