@@ -13,7 +13,12 @@
 # `[dependencies]` graph (dev-dependencies excluded — several packs carry
 # deliberate cyclic dev-only test deps, e.g. khive-pack-kg/khive-pack-gtd and
 # khive-pack-brain/khive-pack-memory; production dependencies among them do
-# not cycle). Every directory under `crates/` must appear here.
+# not cycle). Every ingested `project` in the code map must appear here — the
+# Rust crates under `crates/` and every other manifest `code.ingest` resolves
+# (the npm distribution packages, the Python contract/workspace projects).
+# Those non-crate projects form a dependency island disconnected from the Rust
+# crate graph (no cross edges), so their ranks are evaluated in isolation and
+# never interact with the crate ranks above.
 policy_version = 1
 coverage_floor = 0.0
 
@@ -66,3 +71,22 @@ khive-pack-knowledge = 6
 khive-pack-memory = 6
 khive-mcp = 7
 kkernel = 8
+
+# Non-crate projects the workspace also ships and `code.ingest` resolves. The
+# npm distribution graph is a real DAG evaluated in isolation: the six
+# platform-native kernel binaries are leaves, the `khive` npm root bundles them
+# as optional platform deps (rank 1), and `@khive-ai/cli` aliases `khive`
+# (rank 2). `khive-contract` (Python contract-test harness) and
+# `khive-workspace` have no in-map project dependencies (their specifiers
+# resolve outside the code map), so they are leaves in the project graph
+# (rank 0).
+"@khive-ai/kernel-darwin-arm64" = 0
+"@khive-ai/kernel-darwin-x64" = 0
+"@khive-ai/kernel-linux-arm64" = 0
+"@khive-ai/kernel-linux-x64-gnu" = 0
+"@khive-ai/kernel-linux-x64-musl" = 0
+"@khive-ai/kernel-win32-x64" = 0
+khive = 1
+"@khive-ai/cli" = 2
+khive-contract = 0
+khive-workspace = 0
