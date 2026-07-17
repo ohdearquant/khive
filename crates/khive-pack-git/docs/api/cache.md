@@ -34,6 +34,16 @@ Config is env-var driven today (`KHIVE_GIT_DIGEST_CACHE_MAX_REPOS`,
 `KHIVE_GIT_DIGEST_CACHE_MAX_BYTES`, `KHIVE_GIT_DIGEST_CLONE_MAX_BYTES`,
 `KHIVE_GIT_DIGEST_SCRATCH_ROOT`) rather than a `[git]` TOML section.
 
+`ensure_clone`/`refetch_clone`/`reclone` each check a slot's state and then
+mutate it based on that check. A per-`cache_key` advisory `slot_lock` (issue
+#805) is held for the full span of each of those functions, so two calls
+racing the same slot can never interleave their check-and-mutate sequences.
+Calls against distinct keys run their clone/fetch work concurrently; only
+the short cache-wide `evict_lru` pass is serialized (by a separate
+process-wide `EVICTION_LOCK`), and that pass defers — rather than blocks on
+— any candidate whose per-slot lock is currently held. See `slot_lock` and
+`evict_lru` below.
+
 ## `CacheError::UnsafeToReplace`
 
 A repair operation (refetch/reclone) would have to touch a path that does
@@ -79,11 +89,16 @@ Re-checks `is_owned_entry` immediately before fetching (issue #765
 follow-up PR #788): the gap between `ensure_clone`'s own ownership check
 and this repair running — project resolution and GitHub ingestion happen
 in between — is wide enough for the slot to go markerless or be replaced,
-so this function cannot rely on the caller having checked recently. There
-is no same-key serialization for cache mutation in this crate today (a
-concurrent `ensure_clone`/`reclone` racing this same slot is not otherwise
-excluded) — this re-check narrows the adoption bug but does not close a
-true concurrent-writer race.
+so this function cannot rely on the caller having checked recently.
+Concurrent same-key mutation is separately excluded by `slot_lock` (issue
+#805, see below): a per-`cache_key` advisory lock held across the whole
+check-and-mutate span of `ensure_clone`/`refetch_clone`/`reclone`, so two
+calls racing the same slot cannot interleave. That lock does not close the
+staleness window this re-check addresses — it is held only for a single
+call's own span, not across the caller's earlier `ensure_clone` (released
+before project resolution and lengthy GitHub ingestion run) — so the slot
+can still go markerless in that intra-request interval, and the re-check is
+what narrows it.
 
 The over-cap cleanup path routes through the same ownership-guarded
 `remove_owned_entry` `reclone` uses, rather than a raw `remove_dir_all` — a
@@ -98,6 +113,24 @@ place (issue #765's fallback when a refetch cannot repair the slot).
 Refuses via `CacheError::UnsafeToReplace` when the existing path does not
 prove itself an owned cache slot — the same ownership guard `evict_lru`
 uses.
+
+## `slot_lock`
+
+Returns the per-`cache_key` advisory `Mutex` from a process-global registry
+(issue #805), creating it on first use. `ensure_clone`, `refetch_clone`, and
+`reclone` each hold this lock for their whole check-and-mutate span, so two
+calls racing the same slot cannot interleave a check against another call's
+mutation. The lock is advisory and same-process only: it serializes this
+crate's own cache mutations, not an external process touching the scratch
+root. It is deliberately *not* held across a caller's separate `ensure_clone`
+and later `refetch_clone` calls within one request — that intra-request
+staleness window is what `refetch_clone`'s pre-fetch ownership re-check
+narrows instead.
+
+`evict_lru` takes each candidate slot's lock with `try_lock` rather than
+blocking, so a cache-wide eviction pass never waits on an in-flight same-key
+mutation. How a deferred candidate is nonetheless brought back under the
+caps is covered under `evict_lru` below.
 
 ## `install_fresh_clone`
 
@@ -236,6 +269,36 @@ different — another `evict_lru`/`ensure_clone` repairing the same root can
 legitimately delete it between the `read_dir` listing and the `dir_size`
 call, so that vanish is tolerated by skipping the entry rather than
 aborting the whole pass.
+
+A candidate whose `slot_lock` is currently held (an in-flight mutation on
+that key) is deferred: `evict_lru` takes each candidate lock with `try_lock`
+and skips a `WouldBlock` rather than waiting, so an eviction pass never
+blocks on a concurrent clone/fetch (and, holding `EVICTION_LOCK` while a
+mutation may hold a slot lock and be about to wait on `EVICTION_LOCK`, must
+not). A deferred candidate is therefore *not* counted in this pass — so this
+pass alone can return with the caps still exceeded. The guarantee that the
+caps are nonetheless restored is `enforce_caps` (below): every mutation runs
+a cap pass on its own exit, so the last of a set of concurrent mutations to
+release its lock sees the others unlocked and enforces the caps over the
+settled set.
+
+`evict_lru` and `enforce_caps` share one core (`evict_to_caps`) that differs
+only in whether a `keep` slot is protected.
+
+## `enforce_caps`
+
+The keep-less cap pass (`evict_to_caps` with no protected slot). Run after a
+cache mutation releases its slot lock on a FAILURE path (issue #960). On
+success a mutation already ran `evict_lru` under its lock, protecting the
+slot it returns; a *failed* `ensure_clone`/`refetch_clone`/`reclone` returns
+before that pass, and a concurrent eviction may have deferred this slot while
+its lock was held — leaving the caps exceeded with nothing scheduled to
+correct them. `finish_mutation` runs `enforce_caps` once the lock is free (no
+slot is protected because a failed mutation has no slot to return), so the
+deferred candidate is finally accounted for. It acquires only `EVICTION_LOCK`
+and `try_lock`s candidates — never held while a slot lock is held — so it
+cannot deadlock with a success-path `evict_lru`. Best-effort: a failure here
+is logged, and the mutation's own error is what propagates.
 
 ## `ENV_MUTEX`
 
