@@ -1706,10 +1706,7 @@ fn merge_note_sql(
         }
 
         conn.execute(
-            "INSERT OR REPLACE INTO notes \
-             (id, namespace, kind, status, name, content, salience, decay_factor, \
-              expires_at, properties, created_at, updated_at, deleted_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            khive_db::stores::note::NOTE_UPSERT_SQL,
             rusqlite::params![
                 &into_str,
                 &namespace,

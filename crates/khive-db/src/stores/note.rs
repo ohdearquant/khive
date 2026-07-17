@@ -32,18 +32,42 @@ fn map_sqlite_err(e: SqliteError, op: &'static str) -> StorageError {
 // and ADR-099's atomic prepare path (`khive-runtime`) both call these.
 // ---------------------------------------------------------------------------
 
-/// The exact `INSERT OR REPLACE` this store's `upsert_note` issues.
+/// The single true UPSERT every note writer (single, batch, and note-merge)
+/// issues against `notes` (ADR-116 memory-ANN-generation-coherence prereq).
+///
+/// `INSERT OR REPLACE` is a SQLite DELETE-then-INSERT on a conflicting `id`:
+/// it fires DELETE-path triggers (spuriously invalidating ANN generation
+/// state once ADR-116's liveness triggers land) and discards the row's
+/// original `created_at`/rowid identity. This form updates in place on a
+/// primary-key conflict instead. `created_at` is deliberately absent from
+/// the `DO UPDATE SET` list — it is bound for the INSERT branch only and
+/// left untouched by the UPDATE branch, so an existing row keeps its
+/// original `created_at` across any number of upserts.
+pub const NOTE_UPSERT_SQL: &str = "INSERT INTO notes \
+     (id, namespace, kind, status, name, content, salience, decay_factor, expires_at, \
+      properties, created_at, updated_at, deleted_at) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+     ON CONFLICT(id) DO UPDATE SET \
+       namespace = excluded.namespace, \
+       kind = excluded.kind, \
+       status = excluded.status, \
+       name = excluded.name, \
+       content = excluded.content, \
+       salience = excluded.salience, \
+       decay_factor = excluded.decay_factor, \
+       expires_at = excluded.expires_at, \
+       properties = excluded.properties, \
+       updated_at = excluded.updated_at, \
+       deleted_at = excluded.deleted_at";
+
+/// The exact true UPSERT this store's `upsert_note` issues.
 pub fn note_upsert_statement(note: &Note) -> SqlStatement {
     let properties_str = note
         .properties
         .as_ref()
         .map(|v| serde_json::to_string(v).unwrap_or_default());
     SqlStatement {
-        sql: "INSERT OR REPLACE INTO notes \
-              (id, namespace, kind, status, name, content, salience, decay_factor, expires_at, \
-               properties, created_at, updated_at, deleted_at) \
-              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
-            .to_string(),
+        sql: NOTE_UPSERT_SQL.to_string(),
         params: vec![
             SqlValue::Text(note.id.to_string()),
             SqlValue::Text(note.namespace.clone()),
@@ -374,10 +398,7 @@ fn batch_upsert_notes(
             .map(|v| serde_json::to_string(v).unwrap_or_default());
 
         match conn.execute(
-            "INSERT OR REPLACE INTO notes \
-             (id, namespace, kind, status, name, content, salience, decay_factor, expires_at, \
-              properties, created_at, updated_at, deleted_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            NOTE_UPSERT_SQL,
             rusqlite::params![
                 id_str,
                 &note.namespace,
@@ -417,10 +438,9 @@ fn batch_upsert_notes(
 
 /// Assign a note id its durable, non-reusing sequence number the first time
 /// it is inserted (khive #827 — see `sql/007-notes-seq.sql`). `INSERT OR
-/// IGNORE` makes this idempotent across an `INSERT OR REPLACE`
-/// delete+reinsert of the same note id: the sequence value is fixed at the
-/// note's first insert and never reassigned, unlike `notes`' own implicit
-/// rowid.
+/// IGNORE` makes this idempotent across repeated upserts of the same note
+/// id: the sequence value is fixed at the note's first insert and never
+/// reassigned, unlike `notes`' own implicit rowid.
 fn assign_note_seq(conn: &rusqlite::Connection, note_id: &str) -> Result<(), rusqlite::Error> {
     conn.execute(
         "INSERT OR IGNORE INTO notes_seq (note_id) VALUES (?1)",
