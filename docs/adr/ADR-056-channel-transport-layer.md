@@ -527,13 +527,23 @@ Telegram amendment's `from = "telegram:<maintainer-slug>"`).
 
 **Sender validation (ADR-056 §8 applied to this adapter).** §8 requires every adapter to
 validate the external sender identity on every inbound item before it becomes an envelope. For
-iMessage, that requirement is met by two checks, both mandatory: the row must belong to the
-configured maintainer conversation, and the row's sender handle must equal the configured
-`KHIVE_IMESSAGE_MAINTAINER_HANDLE`. A row failing either check is dropped -- it is never ingested
-and never attributed -- and the drop is counted, mirroring the Telegram adapter's
-`UnauthorizedSender` drop-and-count behavior (§8) rather than the email adapter's quarantine
-disposition, since (unlike inbound email) the bridge host's Messages database has no
+iMessage, that requirement is met by three checks, all mandatory: `message.is_from_me` must be
+`0`, the row must belong to the configured maintainer conversation, and the row's sender handle
+must equal the configured `KHIVE_IMESSAGE_MAINTAINER_HANDLE`. A row failing any check is dropped
+-- it is never ingested and never attributed -- and the drop is counted, mirroring the Telegram
+adapter's `UnauthorizedSender` drop-and-count behavior (§8) rather than the email adapter's
+quarantine disposition, since (unlike inbound email) the bridge host's Messages database has no
 open-relay exposure: only the maintainer's own conversation is polled.
+
+The `is_from_me` check exists because the adapter's own outbound sends (via `osascript`, above)
+land in the same one-to-one conversation the inbound poll reads, and, being part of that
+conversation, can carry the maintainer's own handle on the row. Without excluding
+`is_from_me = 1` rows, the adapter would read back its own outbound sends as trusted inbound
+maintainer input: for a chat channel feeding an autonomous loop, that is a self-echo path -- the
+daemon replying to its own prior message and re-ingesting that reply in turn. The other two
+checks (conversation membership, handle match) do not catch this case, because an adapter-sent
+row satisfies both. Acceptance property: an adapter-sent row in the maintainer conversation is
+never ingested as inbound.
 
 ### Restart durability: a persisted ROWID checkpoint
 
@@ -553,11 +563,6 @@ Concretely:
   subhandlers Amendment 2026-07-09 added to `khive-pack-comm`. No new schema and no new table:
   the iMessage adapter is a second caller of the same checkpoint mechanism the email adapter's
   `channel_poll_loop` already drives, not a parallel implementation of it.
-- The poll query is anchored on `chat.db`'s own monotone insertion key, the message table's
-  `ROWID`: each poll fetches rows with `ROWID` strictly greater than the committed checkpoint,
-  ordered ascending, and drains the backlog in pages, continuing until a page returns short of
-  the page limit (the signal that the poll has caught up). No row between polls can fall outside
-  a bounded window and be skipped, because the query has no window -- only a floor.
 - The checkpoint commits only after every row in a drained page has successfully reached
   `comm.ingest`, mirroring `channel_poll_loop`'s `cursor_get -> poll_page -> ingest each ->
   cursor_commit` sequencing for email (§Amendment 2026-07-09). A partial-page ingest failure
@@ -569,17 +574,70 @@ Concretely:
   is what prevents rows from being skipped; GUID dedup is what prevents an already-ingested row
   in a re-fetched page from being written twice.
 
+**Cursor identity: source and generation.** The `comm_channel_cursor` table (Amendment
+2026-07-09) stores `source` and `generation` alongside the `high_water` mark, and this amendment
+defines both for iMessage. `source` is a non-secret stable identity string composed of the
+configured `KHIVE_IMESSAGE_SSH_TARGET` and the remote `chat.db` path on the bridge host, in the
+form `imessage-ssh:{ssh_target}:{remote_db_path}`, mirroring the shape of the email adapter's
+`imap+tls:{host}:{port}:{mailbox}:INBOX` source string (§Amendment 2026-07-09). Both components
+are configuration values, not credentials, and the cursor row itself lives only in the daemon's
+own local store, never on the bridge host. `generation` starts at `1` when the cursor row is
+first created for a given `(channel_kind, channel_slug)` and increments by one on every
+checkpoint reset (below). A configuration change that alters the source identity -- a different
+`KHIVE_IMESSAGE_SSH_TARGET` or a different remote database path -- produces a different `source`
+string and therefore a new cursor row keyed by that new source; the prior row is left intact,
+untouched and unreferenced, never overwritten or migrated.
+
+**Identity guard and forward-only reset.** A `ROWID` alone is not a stable identity across a
+replaced or migrated `chat.db`: a new database can reuse the same `ROWID` values for entirely
+different messages. The checkpoint therefore stores, alongside the `ROWID` high-water mark, the
+GUID of the last-ingested row at that `ROWID` (the same `chat.db` message GUID used for dedup
+below, applied here to a different purpose: identity of the anchor row, not overlap protection
+for retries). Before applying the stored high-water mark, each poll first re-reads that `ROWID`
+from the remote `chat.db` and verifies its GUID still matches the stored one:
+
+- **Match**: the stored high-water mark is trusted; the poll proceeds as normal.
+- **Mismatch, or the `ROWID` no longer exists** (the database was replaced, reset, migrated, or
+  the anchor row was deleted): the adapter does not trust the stale mark. It resets
+  forward-only -- the checkpoint becomes the current maximum `ROWID` in the database, `generation`
+  increments, and the reset is logged and counted as a distinct, observable event.
+
+This is a deliberate trade-off, stated explicitly: a deleted anchor row forces a forward-only
+reset that can skip rows that arrived between the old checkpoint and the new one. That is
+accepted because it matches this adapter's own activation semantic (history is not imported on
+first activation, below), it is always loudly counted rather than silent, and the alternative --
+applying an old high-water `ROWID` to a database that may no longer be the one it was recorded
+against -- risks silently skipping unrelated rows or ingesting the wrong conversation's history
+under a stale mark. The guard's job is narrower than perfect continuity: a stale mark is never
+applied once the GUID check fails.
+
+**Bounded drain per tick.** The poll query is anchored on `chat.db`'s own monotone insertion
+key, the message table's `ROWID`: each poll fetches rows with `ROWID` strictly greater than the
+committed checkpoint, ordered ascending, in pages. A tick drains pages until either a page
+returns short of the page limit (the signal that the poll has caught up) or a fixed cap of
+**10 full pages** is reached, whichever comes first -- this constant is normative text, not a new
+environment variable. The checkpoint commits after every successfully ingested page, not only at
+the end of the tick. When the 10-page cap is reached before catching up, the task does not keep
+draining: it sleeps its normal `KHIVE_IMESSAGE_POLL_SECS` interval and resumes on the next tick
+from the checkpoint the last page committed. This bounds each tick's SSH/query/ingest work under
+sustained arrivals -- a conversation receiving messages faster than one page drains cannot pin
+the task in a continuous poll loop -- while the per-page commit means no row is lost or
+re-skipped across the sleep boundary: the next tick continues from exactly where the last page
+left off. No row between polls can fall outside a bounded window and be skipped, because the
+query has no window -- only a floor -- and the 10-page cap bounds duty cycle, not correctness.
+
 **Activation semantic.** On first activation for a given `(kind, slug)` -- no prior checkpoint
 row exists -- the checkpoint initializes to the current maximum `ROWID` in `chat.db`, not to
-zero. The channel is forward-only from the moment it is activated: message history that predates
-activation is never imported, matching the Telegram and email adapters' first-poll behavior.
-This also bounds the very first drain to new messages only, so activation on an established
-`chat.db` does not attempt to ingest years of prior conversation history.
+zero, and `generation` initializes to `1` (§Cursor identity above). The channel is forward-only
+from the moment it is activated: message history that predates activation is never imported,
+matching the Telegram and email adapters' first-poll behavior. This also bounds the very first
+drain to new messages only, so activation on an established `chat.db` does not attempt to ingest
+years of prior conversation history.
 
 This resolves the query-shape question the original decision text of this amendment left open:
 the windowed `SELECT ... WHERE date > T LIMIT N` form is prohibited -- it is exactly the shape
-issue #449 fixed for email -- and the `ROWID`-floor, page-until-short-page form above is the
-normative query.
+issue #449 fixed for email -- and the `ROWID`-floor, bounded-drain form above (§Bounded drain
+per tick) is the normative query.
 
 ### Outbound addressing
 
@@ -633,7 +691,9 @@ System Settings click path, which drifts across macOS releases.
 with `khive-channel-imessage` an optional dependency, mirroring `channel-email` and
 `channel-telegram`. Default build excludes it. `channel-email`, `channel-telegram`, and
 `channel-imessage` can all be enabled together; the `ChannelRegistry` keys by `(kind, slug)`, so
-all three adapters coexist.
+all three adapters coexist. Shipping the adapter through the product executable additionally
+requires a kkernel `channel-imessage` pass-through feature, mirroring the existing
+`channel-email` and `channel-telegram` pass-throughs.
 
 ### Out of scope (v1)
 
@@ -663,8 +723,17 @@ all three adapters coexist.
    never ingested.
 7. `KHIVE_IMESSAGE_POLL_SECS` set to `0`, a negative integer, or a non-integer string fails
    channel construction with a warning naming the variable; the channel does not start.
-8. A `chat.db` row whose sender handle does not equal `KHIVE_IMESSAGE_MAINTAINER_HANDLE`, or
-   that falls outside the maintainer conversation, is not ingested; the drop is counted.
+8. A `chat.db` row with `is_from_me = 1`, a sender handle that does not equal
+   `KHIVE_IMESSAGE_MAINTAINER_HANDLE`, or a conversation outside the maintainer conversation, is
+   not ingested; the drop is counted. An adapter-sent row in the maintainer conversation is never
+   ingested as inbound.
+9. Under sustained arrivals exceeding the 10-page cap, the inbound task sleeps its normal poll
+   interval between ticks rather than draining continuously, and no row is skipped across that
+   sleep boundary -- the next tick resumes from the checkpoint the last page committed.
+10. When the GUID at the stored checkpoint `ROWID` no longer matches the remote database (row
+    deleted, database replaced), the next poll resets forward-only to the current maximum
+    `ROWID`, increments `generation`, and logs and counts the reset; a stale high-water mark is
+    never applied once the GUID check fails.
 
 ### Consequences
 
@@ -681,7 +750,13 @@ all three adapters coexist.
 - The inbound poll cursor is durable, not in-memory: it reuses the `comm_channel_cursor`
   checkpoint mechanism Amendment 2026-07-09 introduced for email, anchored on `chat.db`'s `ROWID`
   rather than a time window, so the missed-ingest failure class issue #449 fixed for email cannot
-  recur here.
+  recur here. The cursor's `source` identifies the configured bridge target and database path,
+  its `generation` tracks resets, and a GUID identity guard on the anchor row forces a loudly
+  counted, forward-only reset rather than silently applying a stale mark to a replaced database.
+  Each poll tick is bounded to 10 full pages, sleeping between ticks under sustained arrivals
+  rather than draining continuously.
+- Inbound rows sent by the adapter itself (`is_from_me = 1`) are excluded at ingest, preventing
+  the adapter from re-ingesting its own outbound sends as trusted maintainer input.
 - The address form (`imessage:<slug>`, normative) and the poll-interval and sender-validation
   rules are settled by this amendment text; no open items remain for design sign-off.
 
