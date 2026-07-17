@@ -852,13 +852,20 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 18] = [
     HandlerDef {
         name: "resolve",
         description: "Resolve natural-language references to ids. Each ref in \
-                       `refs` is resolved through: (1) id-string passthrough \
-                       (UUID / 8+ hex prefix) via the existing by-ID path; \
-                       (2) this actor's recently-referenced ring; (3) hybrid \
-                       search over the namespace. Returns one of \
-                       Resolved{id,confidence} | Ambiguous{candidates} | \
-                       NotFound per ref — never a silent pick among close \
-                       candidates. Read-only: performs no mutation.",
+                       `refs` is resolved through, in order: (1) id-string \
+                       passthrough (UUID / 8+ hex prefix) via the by-ID path; \
+                       (2) this actor's recently-referenced ring; (3) an exact, \
+                       case-sensitive entity-name match, which resolves \
+                       deterministically regardless of search rank (one match \
+                       -> Resolved; several identically-named entities -> \
+                       Ambiguous over exactly that set); (4) hybrid search over \
+                       the namespace. Returns one of Resolved{id,confidence} | \
+                       Ambiguous{candidates} | NotFound per ref — never a silent \
+                       pick among close candidates. For a non-exact ref that \
+                       stays ambiguous, `candidates` is a bounded sample capped \
+                       at `limit` (raise `limit` to surface deeper-ranked \
+                       matches); an exact-name match is an identity and is \
+                       exempt from that bound. Read-only: performs no mutation.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -874,16 +881,20 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 18] = [
                 name: "kind",
                 param_type: "string",
                 required: false,
-                description: "Restrict the hybrid-search fallback (stage 3) \
-                              to an entity kind (e.g. \"concept\", \"project\"). \
-                              Has no effect on the id-string or ring stages.",
+                description: "Restrict the exact-name (stage 3) and \
+                              hybrid-search (stage 4) stages to an entity kind \
+                              (e.g. \"concept\", \"project\"). Has no effect on \
+                              the id-string or ring stages.",
             },
             ParamDef {
                 name: "limit",
                 param_type: "integer",
                 required: false,
-                description: "Max candidates returned per ref from the \
-                              hybrid-search fallback. Default 5, max 20.",
+                description: "Max candidates in a non-exact ref's Ambiguous \
+                              payload from the hybrid-search fallback; raise it \
+                              to surface deeper-ranked matches. An exact-name \
+                              match resolves to a single id and ignores this \
+                              bound. Default 5, max 20.",
             },
         ],
     },
