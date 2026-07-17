@@ -954,11 +954,13 @@ fn heartbeat_note_id(namespace: &str, channel_kind: &str, channel_slug: &str) ->
 }
 
 /// `heartbeat` — persist one poll attempt's outcome into the channel's
-/// heartbeat row (khive #606). Subhandler — only the daemon's channel poll
-/// loop calls this. Read-modify-write: `created_at` is preserved across
-/// updates, `last_error` is RETAINED across a subsequent success (design
-/// review amendment 3), and `consecutive_failures` resets on success /
-/// increments on failure, read from the prior row (correct across restarts).
+/// heartbeat row (khive #606). Internal subhandler with no MCP wire path: its
+/// production local caller is the daemon's channel poll loop, and khive #917
+/// also lets authorized per-tenant writers reach it via `dispatch_as`.
+/// Read-modify-write: `created_at` is preserved across updates, `last_error`
+/// is RETAINED across a subsequent success (design review amendment 3), and
+/// `consecutive_failures` resets on success / increments on failure, read from
+/// the prior row (correct across restarts).
 pub(crate) async fn handle_heartbeat(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,

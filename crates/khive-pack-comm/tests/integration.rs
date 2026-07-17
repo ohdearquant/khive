@@ -5591,8 +5591,9 @@ async fn health_channel_entry_never_carries_a_healthy_bool() {
 /// caller's injected namespace (`token.namespace()`), not the fixed
 /// `khive_pack_comm::CHANNEL_HEALTH_NAMESPACE` constant. Plants one row
 /// directly under `"local"` and one directly under a non-local `"tenant-a"`
-/// namespace (bypassing `comm.heartbeat`, which still always writes to
-/// `"local"` — this test exercises the read path only). An unscoped call
+/// namespace, planting directly rather than via `comm.heartbeat` to isolate
+/// the `comm.health` read path under test — the heartbeat write-path namespace
+/// is covered by the #917 writer tests below. An unscoped call
 /// defaults to `"local"` and must see only the local row; a call with an
 /// explicit `namespace="tenant-a"` must see only tenant-a's row, never
 /// local's. Also asserts the response's `namespace` field (khive #877)
@@ -5749,6 +5750,77 @@ async fn authorized_writer_persists_heartbeat_under_its_own_tenant_namespace() {
         default_channels.is_empty(),
         "the local-scoped read must not see the tenant's heartbeat row: {default_channels:?}"
     );
+}
+
+/// khive #917 regression guard: the write namespace is a component of the
+/// deterministic heartbeat row id (`heartbeat_note_id`), so two authorized
+/// per-tenant writers dispatching `comm.heartbeat` for the SAME
+/// `(channel_kind, channel_slug)` under DIFFERENT namespaces must produce two
+/// distinct rows — one visible under each tenant's scoped `comm.health`, never
+/// colliding onto a single id. Were the namespace dropped from the id hash,
+/// both writes would resolve to one UUID and the second would replace the first
+/// (`upsert_note`'s `INSERT OR REPLACE` keys on the row id), so
+/// `comm.health(namespace="tenant-a")` would return an empty set instead of
+/// tenant-a's own heartbeat — and every existing #917 test would still pass.
+/// Drives the real handler via `dispatch_as` (not direct note planting) so it
+/// pins the write-path id derivation the plant-based read-path test cannot.
+#[tokio::test]
+async fn two_tenants_same_channel_get_distinct_heartbeat_rows() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    registry
+        .dispatch_as(
+            "comm.heartbeat",
+            serde_json::json!({
+                "namespace": "tenant-a",
+                "channel_kind": "email",
+                "channel_slug": "shared@example.com",
+                "outcome": "success",
+            }),
+            khive_runtime::VerifiedActor::new("tenant-a-writer").expect("non-blank actor id"),
+        )
+        .await
+        .expect("tenant-a heartbeat succeeds");
+
+    registry
+        .dispatch_as(
+            "comm.heartbeat",
+            serde_json::json!({
+                "namespace": "tenant-b",
+                "channel_kind": "email",
+                "channel_slug": "shared@example.com",
+                "outcome": "success",
+            }),
+            khive_runtime::VerifiedActor::new("tenant-b-writer").expect("non-blank actor id"),
+        )
+        .await
+        .expect("tenant-b heartbeat succeeds");
+
+    // Each tenant's scoped read must see exactly its OWN row for the shared
+    // channel. If the namespace were dropped from the id hash the two writes
+    // would collide onto one row and one of these reads would be empty.
+    for ns in ["tenant-a", "tenant-b"] {
+        let health = registry
+            .dispatch("comm.health", serde_json::json!({ "namespace": ns }))
+            .await
+            .expect("tenant-scoped health succeeds");
+        let channels = health["channels"].as_array().expect("array");
+        assert_eq!(
+            channels.len(),
+            1,
+            "namespace {ns} must see exactly its own heartbeat row \
+             (distinct id per namespace): {channels:?}"
+        );
+        assert_eq!(
+            channels[0]["channel_slug"].as_str(),
+            Some("shared@example.com")
+        );
+        assert_eq!(
+            health["namespace"].as_str(),
+            Some(ns),
+            "scoped health must echo the namespace it read"
+        );
+    }
 }
 
 // ── #493: comm.inbox from_actor / from_prefix sender filter ─────────────────

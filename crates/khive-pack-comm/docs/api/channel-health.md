@@ -51,8 +51,11 @@ always serialize to distinct byte sequences.
 ## `handlers.rs::handle_heartbeat`
 
 Persists one poll attempt's outcome into the channel's heartbeat row (khive
-#606). Subhandler — only the daemon's channel poll loop
-(`crates/khive-mcp/src/serve.rs::channel_poll_loop`) calls this.
+#606). Internal subhandler with no MCP wire path: its production local caller
+is the daemon's channel poll loop
+(`crates/khive-mcp/src/serve.rs::channel_poll_loop`); khive #917 also lets
+authorized per-tenant writers reach it via `dispatch_as` (see the persistence
+note below).
 
 Read-modify-write against the existing row (if any) so that:
 - `created_at` is preserved across updates (first-seen time), not reset every
