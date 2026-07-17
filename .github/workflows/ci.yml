@@ -154,6 +154,9 @@ jobs:
       - name: macOS PR platform tests
         if: env.CI_SUITE == 'macos-pr'
         run: ../scripts/ci.sh macos-pr-tests
+      - name: Lockfile freshness
+        if: env.CI_SUITE == 'full'
+        run: ../scripts/ci.sh lockfile
       - name: Forward-deployed crate checks
         if: env.CI_SUITE == 'full'
         run: ../scripts/ci.sh forward-deployed
