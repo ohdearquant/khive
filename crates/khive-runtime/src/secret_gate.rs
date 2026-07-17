@@ -573,8 +573,9 @@ const HEX_CREDENTIAL_LENGTHS: &[usize] = &[32, 40, 64, 128];
 /// a fragment count cannot be bypassed that way — repeating the delimiter
 /// inside a single gap never creates a new fragment. This still bounds the
 /// reconstruction to a small local neighborhood (never a document-wide scan):
-/// each extension consumes one immediately-adjacent tokenizer token, and the
-/// walk stops the moment a gap contains an ASCII alphanumeric character.
+/// each extension consumes one real fragment plus up to
+/// [`MAX_BRIDGE_GLUE_TOKENS`] delimiter-only glue tokens crossed to reach it,
+/// and the walk stops the moment a gap contains an ASCII alphanumeric character.
 const MAX_BRIDGE_FRAGMENTS: usize = 6;
 
 /// Maximum number of delimiter-only tokens (see [`is_delimiter_only_token`])
@@ -818,10 +819,13 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
             // reconstructed" — that overclaimed round-3 comment was itself
             // the round-3 review finding): reconstruction covers splits of
             // up to MAX_BRIDGE_FRAGMENTS real fragments (each individually
-            // meeting MIN_BRIDGE_FRAGMENT_LEN), joined by any number of
-            // whitespace/Unicode/delimiter-only-token gaps. A split into
-            // MORE than MAX_BRIDGE_FRAGMENTS real fragments, or into
-            // fragments individually below MIN_BRIDGE_FRAGMENT_LEN, is an
+            // meeting MIN_BRIDGE_FRAGMENT_LEN), where a single gap between
+            // two fragments may be any byte length but spans at most
+            // MAX_BRIDGE_GLUE_TOKENS delimiter-only intermediary tokens per
+            // probe direction. A split into MORE than MAX_BRIDGE_FRAGMENTS
+            // real fragments, into fragments individually below
+            // MIN_BRIDGE_FRAGMENT_LEN, or across MORE than
+            // MAX_BRIDGE_GLUE_TOKENS delimiter-only tokens in one gap, is an
             // accepted residual limitation of the local-neighborhood bound,
             // not a soundness gap to close here: per ADR-096 / ADR-115, this
             // gate is accidental-persistence hygiene on a single-principal
