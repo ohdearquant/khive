@@ -422,3 +422,60 @@ async fn rejects_nonexistent_path() {
         khive_pack_code::CodeSourceIngestError::InvalidPath(_)
     ));
 }
+
+/// finding-2: `code.ingest(path="pkg/src")` must attribute files to `pkg`'s
+/// own `Cargo.toml` package name, walking up past the ingest root to find
+/// it — not fall back to the basename of the ingested subfolder.
+#[tokio::test]
+async fn subtree_ingest_attributes_to_ancestor_manifest_package_name() {
+    let root = TempDir::new().expect("tempdir");
+    let pkg = root.path().join("pkg");
+    std::fs::create_dir_all(pkg.join("src")).unwrap();
+    std::fs::write(pkg.join("Cargo.toml"), "[package]\nname = \"pkg\"\n").unwrap();
+    std::fs::write(pkg.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+
+    let db = root.path().join("subtree.db");
+    let rt = rt_at(&db);
+    let token = rt.authorize(Namespace::local()).expect("token");
+
+    run_code_ingest(
+        &rt,
+        &token,
+        CodeSourceIngestOptions {
+            path: &pkg.join("src"),
+            languages: all_languages(),
+            sweep_time: Utc::now(),
+            enable_l1: false,
+            enable_l1_5: true,
+            enable_l2: false,
+        },
+    )
+    .await
+    .expect("subtree ingest succeeds");
+
+    let sql = rt.sql();
+    let mut reader = sql.reader().await.expect("reader");
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: "SELECT name, kind FROM entities WHERE deleted_at IS NULL ORDER BY name".into(),
+            params: vec![],
+            label: Some("test_subtree_entities".into()),
+        })
+        .await
+        .expect("query entities");
+    let names: Vec<String> = rows
+        .into_iter()
+        .filter_map(|r| match r.get("name") {
+            Some(SqlValue::Text(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        names.contains(&"pkg".to_string()),
+        "expected a project entity named 'pkg' (from the ancestor Cargo.toml), got: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n == "src"),
+        "must not fall back to the basename of the ingested subfolder, got: {names:?}"
+    );
+}

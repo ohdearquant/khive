@@ -1001,22 +1001,31 @@ impl KhiveRuntime {
         if ids.is_empty() {
             return Ok(vec![]);
         }
-        let filter = EntityFilter {
-            ids: ids.to_vec(),
-            ..Default::default()
-        };
-        let page = self
-            .entities(token)?
-            .query_entities(
-                token.namespace().as_str(),
-                filter,
-                PageRequest {
-                    offset: 0,
-                    limit: ids.len() as u32,
-                },
-            )
-            .await?;
-        Ok(page.items)
+        // Chunked at 900 so every caller is safe regardless of how many ids
+        // it passes: `EntityFilter::ids` compiles to a SQL `IN (...)` clause,
+        // and SQLite's SQLITE_MAX_VARIABLE_NUMBER defaults to 999
+        // (khive-db `graph.rs` chunking precedent).
+        const CHUNK: usize = 900;
+        let mut out = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(CHUNK) {
+            let filter = EntityFilter {
+                ids: chunk.to_vec(),
+                ..Default::default()
+            };
+            let page = self
+                .entities(token)?
+                .query_entities(
+                    token.namespace().as_str(),
+                    filter,
+                    PageRequest {
+                        offset: 0,
+                        limit: chunk.len() as u32,
+                    },
+                )
+                .await?;
+            out.extend(page.items);
+        }
+        Ok(out)
     }
 
     /// Like `get_entities_by_ids` but scoped to the token's full visible-namespace

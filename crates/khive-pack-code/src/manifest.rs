@@ -211,13 +211,14 @@ pub(crate) fn parse_package_json(root: &Path, text: &str) -> Option<ManifestProj
     })
 }
 
-/// Find the nearest governing manifest at or above `file_dir`, never walking
-/// above `ingest_root` (B4: "the nearest governing manifest at or above that
-/// file"; this ingest run only has visibility into `ingest_root`'s subtree).
-/// Returns `(project_root, project_name)`.
+/// Find the nearest governing manifest at or above `file_dir` (B4: "the
+/// nearest governing manifest at or above that file", read literally — the
+/// walk is not bounded by the ingested folder; `code.ingest(path="pkg/src")`
+/// must still attribute files to `pkg`'s own manifest one level above the
+/// ingest root). Walks up to the filesystem root before giving up. Returns
+/// `(project_root, project_name)`.
 pub(crate) fn find_governing_manifest(
     file_dir: &Path,
-    ingest_root: &Path,
     language: &str,
 ) -> Option<(PathBuf, String)> {
     let mut dir = Some(file_dir);
@@ -236,9 +237,6 @@ pub(crate) fn find_governing_manifest(
         };
         if let Some(project) = found {
             return Some((project.root, project.name));
-        }
-        if d == ingest_root {
-            break;
         }
         dir = d.parent();
     }

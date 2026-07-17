@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
-use khive_storage::{Edge, Entity, LinkId};
+use khive_storage::{DeleteMode, Edge, EdgeFilter, Entity, LinkId, PageRequest};
 use khive_types::EdgeRelation;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -27,6 +27,23 @@ use crate::imports::{self, Resolved};
 use crate::ingest::CODE_INGEST_NAMESPACE;
 use crate::manifest;
 use crate::scanner_rust;
+
+/// SQLite `SQLITE_MAX_VARIABLE_NUMBER` defaults to 999; chunk at 900 to stay
+/// safe (precedent: `khive-db/src/stores/graph.rs`).
+const SQL_ID_CHUNK: usize = 900;
+
+/// Provenance marker stamped on every edge this L2 pass writes, distinguishing
+/// L2-derived edges from edges any other tier or caller might create between
+/// the same endpoints — the reconciliation scope for finding-1.
+const L2_PROVENANCE_KEY: &str = "l2_derived";
+
+fn is_l2_derived(edge: &Edge) -> bool {
+    edge.metadata
+        .as_ref()
+        .and_then(|m| m.get(L2_PROVENANCE_KEY))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
 
 /// Outcome counters for one `code.ingest` call, mirroring `git.digest`'s
 /// `IngestReport` shape (ADR-088 Amendment 1 precedent).
@@ -49,6 +66,12 @@ pub struct CodeSourceIngestReport {
     /// floor, analogous to L1.5's unresolved-specifier queue but without a
     /// deferred re-resolve pass in this slice — see ADR-085 PR body).
     pub symbol_dependencies_unresolved: u64,
+    /// L2-derived edges (call `depends_on`, `implements`) soft-deleted this
+    /// sweep because the declaration that originally produced them was
+    /// re-extracted and no longer resolves to that target (finding-1
+    /// reconciliation — never applied to a declaration absent from this
+    /// scan; B5's no-automatic-deletion-on-absence rule is unaffected).
+    pub symbol_edges_reconciled: u64,
     pub languages: Vec<String>,
     /// Per-manifest / per-file failures that did not abort the pass (fail
     /// loud without silently dropping the rest of the run).
@@ -261,32 +284,34 @@ async fn touch_last_seen_at(
     }
     use khive_storage::types::{SqlStatement, SqlValue};
 
-    let placeholders: Vec<String> = (0..ids.len()).map(|i| format!("?{}", i + 4)).collect();
-    let sql = format!(
-        "UPDATE entities SET properties = json_set(COALESCE(properties, '{{}}'), \
-         '$.last_seen_at', ?1), updated_at = ?2 WHERE namespace = ?3 AND id IN ({})",
-        placeholders.join(", ")
-    );
-    let mut params = vec![
-        SqlValue::Text(sweep_time.to_rfc3339()),
-        SqlValue::Integer(ts(sweep_time)),
-        SqlValue::Text(token.namespace().as_str().to_string()),
-    ];
-    params.extend(ids.iter().map(|id| SqlValue::Uuid(*id)));
+    for chunk in ids.chunks(SQL_ID_CHUNK) {
+        let placeholders: Vec<String> = (0..chunk.len()).map(|i| format!("?{}", i + 4)).collect();
+        let sql = format!(
+            "UPDATE entities SET properties = json_set(COALESCE(properties, '{{}}'), \
+             '$.last_seen_at', ?1), updated_at = ?2 WHERE namespace = ?3 AND id IN ({})",
+            placeholders.join(", ")
+        );
+        let mut params = vec![
+            SqlValue::Text(sweep_time.to_rfc3339()),
+            SqlValue::Integer(ts(sweep_time)),
+            SqlValue::Text(token.namespace().as_str().to_string()),
+        ];
+        params.extend(chunk.iter().map(|id| SqlValue::Uuid(*id)));
 
-    let mut writer = rt
-        .sql()
-        .writer()
-        .await
-        .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?;
-    writer
-        .execute(SqlStatement {
-            sql,
-            params,
-            label: Some("code_ingest_touch_last_seen".into()),
-        })
-        .await
-        .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?;
+        let mut writer = rt
+            .sql()
+            .writer()
+            .await
+            .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?;
+        writer
+            .execute(SqlStatement {
+                sql,
+                params,
+                label: Some("code_ingest_touch_last_seen".into()),
+            })
+            .await
+            .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?;
+    }
     Ok(())
 }
 
@@ -828,7 +853,17 @@ pub async fn run_code_ingest(
         }
     }
 
-    reresolve_pass(rt, token, opts.sweep_time, &mut report).await?;
+    // Only L1 (project-level manifest deps) and L1.5 (module/project import
+    // scan) ever record `unresolved_specifiers`; L2 resolves synchronously
+    // against its own in-pass `symbol_index` and never uses this queue.
+    // Gating on their disjunction (finding-5b) means an L2-only call never
+    // replays and materializes an L1.5 import edge left pending by some
+    // earlier, differently-tiered ingest of the same database, while an
+    // L1-only call still resolves its own manifest-declared dependency
+    // edges exactly as before.
+    if opts.enable_l1 || opts.enable_l1_5 {
+        reresolve_pass(rt, token, opts.sweep_time, &mut report).await?;
+    }
 
     Ok(report)
 }
@@ -916,10 +951,74 @@ fn resolve_call_target(caller_module_path: &str, segments: &[String]) -> Option<
             name.clone(),
         )),
         "super" => {
-            let parent = parent_module_path(caller_module_path);
-            Some((join_module_path(&parent, &prefix[1..]), name.clone()))
+            // Consume ALL consecutive leading `super` segments (finding-4):
+            // `super::super::helper` from `a::b::c` must resolve against
+            // `a`, not `a::super::helper` (the old first-only bug). Walking
+            // above the crate root returns `None` — unresolved is always
+            // safer than a wrong path.
+            let mut base = caller_module_path.to_string();
+            let mut rest = prefix;
+            while rest.first().map(String::as_str) == Some("super") {
+                if base == "crate" {
+                    return None;
+                }
+                base = parent_module_path(&base);
+                rest = &rest[1..];
+            }
+            Some((join_module_path(&base, rest), name.clone()))
         }
         _ => None,
+    }
+}
+
+/// L2 scanner dispatch table (finding-11): the one place that maps a
+/// language to its Scanner+Extractor adapter. Adding a new language's L2
+/// support means adding one match arm here, not expanding
+/// `run_import_scan`'s control flow.
+fn l2_scanner_supported(language: &str) -> bool {
+    matches!(language, "rust")
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_l2_scan(
+    language: &str,
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    proj_name: &str,
+    module_path: &str,
+    module_id: Uuid,
+    content: &str,
+    file: &Path,
+    sweep_time: DateTime<Utc>,
+    symbol_index: &mut HashMap<(String, String, String, DeclKind), Uuid>,
+    pending_calls: &mut Vec<PendingCall>,
+    pending_impls: &mut Vec<PendingImpl>,
+    touch_ids: &mut Vec<Uuid>,
+    scanned_decl_ids: &mut BTreeSet<Uuid>,
+    report: &mut CodeSourceIngestReport,
+) -> Result<(), CodeSourceIngestError> {
+    match language {
+        "rust" => {
+            scan_rust_l2(
+                rt,
+                token,
+                proj_name,
+                language,
+                module_path,
+                module_id,
+                content,
+                file,
+                sweep_time,
+                symbol_index,
+                pending_calls,
+                pending_impls,
+                touch_ids,
+                scanned_decl_ids,
+                report,
+            )
+            .await
+        }
+        _ => Ok(()),
     }
 }
 
@@ -935,6 +1034,14 @@ async fn run_import_scan(
     project_ids: &mut HashMap<String, Uuid>,
     report: &mut CodeSourceIngestReport,
 ) -> Result<(), CodeSourceIngestError> {
+    // finding-5a: a language with no L2 scanner and no L1.5 request does
+    // zero work for this call — no file walk, no read, no hash, no module
+    // upsert. Must be checked before `collect_source_files` runs at all.
+    let l2_here = enable_l2 && l2_scanner_supported(language);
+    if !enable_l1_5 && !l2_here {
+        return Ok(());
+    }
+
     let Some(ext) = imports::extension_for_language(language) else {
         return Ok(());
     };
@@ -960,20 +1067,23 @@ async fn run_import_scan(
     // exactly (finding-4): stamped with a single batched last_seen_at-only
     // UPDATE at the end of this language pass instead of a full rewrite.
     let mut touch_ids: Vec<Uuid> = Vec::new();
+    // Every L2 declaration id re-extracted this scan, across every file of
+    // this language pass — the reconciliation scope for finding-1. A
+    // declaration NOT in this set (an unscanned file, an unsupported
+    // language) is never touched by reconciliation.
+    let mut scanned_decl_ids: BTreeSet<Uuid> = BTreeSet::new();
 
     for file in files {
         let Some(file_dir) = file.parent() else {
             continue;
         };
-        let (proj_root, proj_name) =
-            manifest::find_governing_manifest(file_dir, ingest_root, language).unwrap_or_else(
-                || {
-                    (
-                        ingest_root.to_path_buf(),
-                        basename_project_name(ingest_root),
-                    )
-                },
-            );
+        let (proj_root, proj_name) = manifest::find_governing_manifest(file_dir, language)
+            .unwrap_or_else(|| {
+                (
+                    ingest_root.to_path_buf(),
+                    basename_project_name(ingest_root),
+                )
+            });
         let Some(module_path) = imports::module_path_for_file(&file, &proj_root, language) else {
             continue;
         };
@@ -1032,12 +1142,12 @@ async fn run_import_scan(
             touch_ids.push(module_id);
         }
 
-        if enable_l2 && language == "rust" {
-            scan_rust_l2(
+        if l2_here {
+            dispatch_l2_scan(
+                language,
                 rt,
                 token,
                 &proj_name,
-                language,
                 &module_path,
                 module_id,
                 &content,
@@ -1047,6 +1157,7 @@ async fn run_import_scan(
                 &mut pending_calls,
                 &mut pending_impls,
                 &mut touch_ids,
+                &mut scanned_decl_ids,
                 report,
             )
             .await?;
@@ -1091,7 +1202,6 @@ async fn run_import_scan(
     // than its caller still resolve here. Resolved targets are deduped per
     // caller (finding-6: N calls to one helper yield one edge) and batched
     // into a single `upsert_edges` call (finding-5).
-    let mut resolved_edges: Vec<Edge> = Vec::new();
     let mut call_targets: HashMap<Uuid, BTreeSet<Uuid>> = HashMap::new();
     for call in &pending_calls {
         let Some((module_path, name)) =
@@ -1116,35 +1226,7 @@ async fn run_import_scan(
             None => report.symbol_dependencies_unresolved += 1,
         }
     }
-    for (source_id, targets) in call_targets {
-        for target_id in targets {
-            let edge_id = edge_uuid(EdgeRelation::DependsOn, source_id, target_id);
-            let existed = rt
-                .graph(token)?
-                .get_edge(LinkId::from(edge_id))
-                .await
-                .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?
-                .is_some();
-            resolved_edges.push(Edge {
-                id: LinkId::from(edge_id),
-                namespace: token.namespace().as_str().to_string(),
-                source_id,
-                target_id,
-                relation: EdgeRelation::DependsOn,
-                weight: 1.0,
-                created_at: sweep_time,
-                updated_at: sweep_time,
-                deleted_at: None,
-                metadata: Some(json!({ "dependency_kind": "build" })),
-                target_backend: None,
-            });
-            if existed {
-                report.edges_updated += 1;
-            } else {
-                report.edges_created += 1;
-            }
-        }
-    }
+    let mut impl_targets: HashMap<Uuid, BTreeSet<Uuid>> = HashMap::new();
     for imp in &pending_impls {
         let type_key = (
             imp.project_name.clone(),
@@ -1160,44 +1242,179 @@ async fn run_import_scan(
         );
         match (symbol_index.get(&type_key), symbol_index.get(&trait_key)) {
             (Some(type_id), Some(trait_id)) => {
-                let edge_id = edge_uuid(EdgeRelation::Implements, *type_id, *trait_id);
-                let existed = rt
-                    .graph(token)?
-                    .get_edge(LinkId::from(edge_id))
-                    .await
-                    .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?
-                    .is_some();
-                resolved_edges.push(Edge {
-                    id: LinkId::from(edge_id),
-                    namespace: token.namespace().as_str().to_string(),
-                    source_id: *type_id,
-                    target_id: *trait_id,
-                    relation: EdgeRelation::Implements,
-                    weight: 1.0,
-                    created_at: sweep_time,
-                    updated_at: sweep_time,
-                    deleted_at: None,
-                    metadata: Some(json!({})),
-                    target_backend: None,
-                });
-                if existed {
-                    report.edges_updated += 1;
-                } else {
-                    report.edges_created += 1;
-                }
+                impl_targets.entry(*type_id).or_default().insert(*trait_id);
             }
             _ => report.symbol_dependencies_unresolved += 1,
         }
     }
+
+    let mut desired: Vec<(Uuid, Uuid, EdgeRelation)> = Vec::new();
+    for (source_id, targets) in &call_targets {
+        for target_id in targets {
+            desired.push((*source_id, *target_id, EdgeRelation::DependsOn));
+        }
+    }
+    for (source_id, targets) in &impl_targets {
+        for target_id in targets {
+            desired.push((*source_id, *target_id, EdgeRelation::Implements));
+        }
+    }
+
+    // finding-8: one batched existence lookup instead of N serial awaited
+    // `get_edge` reads — `get_edges` already chunks internally at 900
+    // (khive-db `graph.rs` precedent), so this stays safe at any scale.
+    let desired_ids: Vec<LinkId> = desired
+        .iter()
+        .map(|(source_id, target_id, relation)| {
+            LinkId::from(edge_uuid(*relation, *source_id, *target_id))
+        })
+        .collect();
+    let existing_ids: std::collections::HashSet<LinkId> = rt
+        .graph(token)?
+        .get_edges(&desired_ids)
+        .await
+        .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?
+        .into_iter()
+        .map(|e| e.id)
+        .collect();
+
+    let mut resolved_edges: Vec<Edge> = Vec::with_capacity(desired.len());
+    for ((source_id, target_id, relation), edge_id) in
+        desired.iter().copied().zip(desired_ids.iter().copied())
+    {
+        let existed = existing_ids.contains(&edge_id);
+        let metadata = match relation {
+            EdgeRelation::DependsOn => json!({ "dependency_kind": "build", "l2_derived": true }),
+            _ => json!({ "l2_derived": true }),
+        };
+        resolved_edges.push(Edge {
+            id: edge_id,
+            namespace: token.namespace().as_str().to_string(),
+            source_id,
+            target_id,
+            relation,
+            weight: 1.0,
+            created_at: sweep_time,
+            updated_at: sweep_time,
+            deleted_at: None,
+            metadata: Some(metadata),
+            target_backend: None,
+        });
+        if existed {
+            report.edges_updated += 1;
+        } else {
+            report.edges_created += 1;
+        }
+    }
     upsert_edges_batch(rt, token, resolved_edges).await?;
+
+    reconcile_stale_l2_edges(
+        rt,
+        token,
+        &scanned_decl_ids,
+        &call_targets,
+        &impl_targets,
+        report,
+    )
+    .await?;
 
     touch_last_seen_at(rt, token, &touch_ids, sweep_time).await?;
 
     Ok(())
 }
 
+/// finding-1: for every declaration re-extracted this scan, soft-delete any
+/// of its existing outgoing L2-derived `depends_on`/`implements` edges whose
+/// target this scan did not re-resolve.
+///
+/// Scoped strictly to `scanned_decl_ids`: a declaration this scan never
+/// touched (an unscanned file, an unsupported language) is never examined,
+/// so ADR-085 B5's absence-based no-automatic-deletion rule is untouched —
+/// this only corrects edges whose own source declaration this scan
+/// positively re-observed with a different outgoing edge set, distinct from
+/// inferring staleness from a declaration simply not appearing in a sweep.
+/// Only edges carrying the `l2_derived` provenance marker are ever
+/// considered, so an edge some other tier or caller created between the
+/// same two entities is never touched.
+async fn reconcile_stale_l2_edges(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    scanned_decl_ids: &BTreeSet<Uuid>,
+    call_targets: &HashMap<Uuid, BTreeSet<Uuid>>,
+    impl_targets: &HashMap<Uuid, BTreeSet<Uuid>>,
+    report: &mut CodeSourceIngestReport,
+) -> Result<(), CodeSourceIngestError> {
+    if scanned_decl_ids.is_empty() {
+        return Ok(());
+    }
+    let empty: BTreeSet<Uuid> = BTreeSet::new();
+    let ids: Vec<Uuid> = scanned_decl_ids.iter().copied().collect();
+    let graph = rt.graph(token)?;
+    for chunk in ids.chunks(SQL_ID_CHUNK) {
+        let filter = EdgeFilter {
+            source_ids: chunk.to_vec(),
+            relations: vec![EdgeRelation::DependsOn, EdgeRelation::Implements],
+            ..Default::default()
+        };
+        let page = graph
+            .query_edges(
+                filter,
+                vec![],
+                PageRequest {
+                    offset: 0,
+                    limit: u32::MAX,
+                },
+            )
+            .await
+            .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?;
+        for edge in page.items {
+            if !is_l2_derived(&edge) {
+                continue;
+            }
+            let new_targets = match edge.relation {
+                EdgeRelation::DependsOn => call_targets.get(&edge.source_id).unwrap_or(&empty),
+                EdgeRelation::Implements => impl_targets.get(&edge.source_id).unwrap_or(&empty),
+                _ => &empty,
+            };
+            if !new_targets.contains(&edge.target_id) {
+                graph
+                    .delete_edge(edge.id, DeleteMode::Soft)
+                    .await
+                    .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?;
+                report.symbol_edges_reconciled += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The immediate containing entity for a declaration at `module_segments`
+/// relative to the file's own `module_path` (finding-3a/d): the file-level
+/// `module_id` when the declaration is at top level, or the nested inline
+/// module's own `symbol_uuid` (D2 `module` token) otherwise — the same id
+/// that declaration's own `RustDeclKind::Module` entry resolves to.
+fn contains_parent_id(
+    proj_name: &str,
+    language: &str,
+    module_path: &str,
+    module_id: Uuid,
+    module_segments: &[String],
+) -> Uuid {
+    match module_segments.split_last() {
+        None => module_id,
+        Some((name, parent_segments)) => symbol_uuid(
+            proj_name,
+            language,
+            &join_module_path(module_path, parent_segments),
+            name,
+            "module",
+        ),
+    }
+}
+
 /// L2 declaration scan for one already-read Rust file (ADR-085 Amendment 2
-/// B2-B4): upserts a subtype `concept` entity per top-level declaration,
+/// B2-B4): upserts a subtype `concept` entity per declaration (including
+/// inline-module, method, and trait-default-method declarations — finding-3)
 /// links it to its containing module via `contains`, and queues its
 /// call/impl targets for same-project resolution once the whole language
 /// pass's `symbol_index` is complete.
@@ -1223,6 +1440,7 @@ async fn scan_rust_l2(
     pending_calls: &mut Vec<PendingCall>,
     pending_impls: &mut Vec<PendingImpl>,
     touch_ids: &mut Vec<Uuid>,
+    scanned_decl_ids: &mut BTreeSet<Uuid>,
     report: &mut CodeSourceIngestReport,
 ) -> Result<(), CodeSourceIngestError> {
     let scan = match scanner_rust::scan_rust_source(content) {
@@ -1236,14 +1454,26 @@ async fn scan_rust_l2(
     };
     let extracted = extractor::from_rust_scan(scan);
 
+    // Each declaration's own full module path (finding-3a): a top-level item
+    // uses the file's `module_path` unchanged; an item nested inside `mod
+    // inner { .. }` (or deeper) uses `module_path` joined with its
+    // `module_segments`. This is the path stored on the entity, used as the
+    // symbol identity input, and used as the caller module for its own call
+    // resolution.
+    let decl_module_paths: Vec<String> = extracted
+        .declarations
+        .iter()
+        .map(|decl| join_module_path(module_path, &decl.module_segments))
+        .collect();
     let decl_ids: Vec<Uuid> = extracted
         .declarations
         .iter()
-        .map(|decl| {
+        .zip(decl_module_paths.iter())
+        .map(|(decl, decl_module_path)| {
             symbol_uuid(
                 proj_name,
                 language,
-                module_path,
+                decl_module_path,
                 &decl.name,
                 decl.kind.code_token(),
             )
@@ -1260,11 +1490,17 @@ async fn scan_rust_l2(
     let mut changed_entities: Vec<Entity> = Vec::new();
     let mut changed_edges: Vec<Edge> = Vec::new();
 
-    for (decl, decl_id) in extracted.declarations.iter().zip(decl_ids.iter().copied()) {
+    for ((decl, decl_module_path), decl_id) in extracted
+        .declarations
+        .iter()
+        .zip(decl_module_paths.iter())
+        .zip(decl_ids.iter().copied())
+    {
+        scanned_decl_ids.insert(decl_id);
         symbol_index.insert(
             (
                 proj_name.to_string(),
-                module_path.to_string(),
+                decl_module_path.clone(),
                 decl.name.clone(),
                 decl.kind,
             ),
@@ -1276,7 +1512,7 @@ async fn scan_rust_l2(
                 pending_calls.push(PendingCall {
                     source_id: decl_id,
                     project_name: proj_name.to_string(),
-                    caller_module_path: module_path.to_string(),
+                    caller_module_path: decl_module_path.clone(),
                     segments: callee.segments.clone(),
                 });
             }
@@ -1296,7 +1532,7 @@ async fn scan_rust_l2(
         let mut props = serde_json::Map::new();
         props.insert("source_project".into(), json!(proj_name));
         props.insert("language".into(), json!(language));
-        props.insert("module_path".into(), json!(module_path));
+        props.insert("module_path".into(), json!(decl_module_path));
         props.insert("content_hash".into(), json!(decl.content_hash));
         props.insert("last_seen_at".into(), json!(sweep_time.to_rfc3339()));
 
@@ -1317,18 +1553,25 @@ async fn scan_rust_l2(
             report.symbols_updated += 1;
         }
 
-        let contains_edge_id = edge_uuid(EdgeRelation::Contains, module_id, decl_id);
+        let parent_id = contains_parent_id(
+            proj_name,
+            language,
+            module_path,
+            module_id,
+            &decl.module_segments,
+        );
+        let contains_edge_id = edge_uuid(EdgeRelation::Contains, parent_id, decl_id);
         changed_edges.push(Edge {
             id: LinkId::from(contains_edge_id),
             namespace: token.namespace().as_str().to_string(),
-            source_id: module_id,
+            source_id: parent_id,
             target_id: decl_id,
             relation: EdgeRelation::Contains,
             weight: 1.0,
             created_at: sweep_time,
             updated_at: sweep_time,
             deleted_at: None,
-            metadata: Some(json!({})),
+            metadata: Some(json!({ "l2_derived": true })),
             target_backend: None,
         });
         if is_new {
@@ -1344,7 +1587,7 @@ async fn scan_rust_l2(
     for imp in &extracted.impls {
         pending_impls.push(PendingImpl {
             project_name: proj_name.to_string(),
-            module_path: module_path.to_string(),
+            module_path: join_module_path(module_path, &imp.module_segments),
             type_name: imp.type_name.clone(),
             trait_name: imp.trait_name.clone(),
         });
@@ -1380,5 +1623,40 @@ mod l2_identity_tests {
         let a = symbol_uuid("proj", "rust", "crate::foo", "helper", "function");
         let b = symbol_uuid("proj", "rust", "crate::foo", "helper", "function");
         assert_eq!(a, b);
+    }
+}
+
+#[cfg(test)]
+mod resolve_call_target_tests {
+    use super::resolve_call_target;
+
+    fn segs(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// finding-4: every consecutive leading `super` is consumed, not just
+    /// the first — from `a::b::c`, `super::super::helper` resolves to `a`.
+    #[test]
+    fn multi_super_walks_up_one_level_per_segment() {
+        let (module_path, name) =
+            resolve_call_target("a::b::c", &segs(&["super", "super", "helper"])).unwrap();
+        assert_eq!(module_path, "a");
+        assert_eq!(name, "helper");
+    }
+
+    #[test]
+    fn single_super_still_works() {
+        let (module_path, name) =
+            resolve_call_target("a::b::c", &segs(&["super", "helper"])).unwrap();
+        assert_eq!(module_path, "a::b");
+        assert_eq!(name, "helper");
+    }
+
+    /// An underflowing `super` chain (walking above the crate root) must
+    /// return unresolved, never a wrong path.
+    #[test]
+    fn underflowing_super_chain_is_unresolved() {
+        assert!(resolve_call_target("a", &segs(&["super", "super", "helper"])).is_none());
+        assert!(resolve_call_target("crate", &segs(&["super", "helper"])).is_none());
     }
 }

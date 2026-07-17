@@ -5,13 +5,14 @@
 //! only adapter this slice ships — Python/TypeScript/Lean adapters (B2's
 //! delivery order) feed the exact same `ExtractedFile` shape when they land.
 
-use crate::scanner_rust::{CallRef, RustDeclKind, RustFileScan};
+use crate::scanner_rust::{RustDeclKind, RustFileScan};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum DeclKind {
     Function,
     Datatype,
     Interface,
+    Module,
 }
 
 impl DeclKind {
@@ -21,6 +22,7 @@ impl DeclKind {
             DeclKind::Function => "function",
             DeclKind::Datatype => "datatype",
             DeclKind::Interface => "interface",
+            DeclKind::Module => "module",
         }
     }
 }
@@ -31,8 +33,22 @@ impl From<RustDeclKind> for DeclKind {
             RustDeclKind::Function => DeclKind::Function,
             RustDeclKind::Datatype => DeclKind::Datatype,
             RustDeclKind::Interface => DeclKind::Interface,
+            RustDeclKind::Module => DeclKind::Module,
         }
     }
+}
+
+/// A call-target path as written at the call site, e.g. `["helper"]` for a
+/// bare `helper()` or `["crate", "foo", "bar"]` for `crate::foo::bar()`.
+/// Language-neutral (finding-10): kept as raw segments rather than
+/// pre-resolved, since resolving `crate`/`self`/`super` qualifiers requires
+/// the calling declaration's own module path, which lives in
+/// `source_ingest::resolve_call_target`, not any per-language Scanner.
+/// Each Scanner adapter (e.g. `from_rust_scan`) converts its own raw
+/// call-site representation into this shared shape.
+#[derive(Debug, Clone)]
+pub(crate) struct CallRef {
+    pub segments: Vec<String>,
 }
 
 /// A language-agnostic declaration ready for D2 mapping — the Extractor's
@@ -48,6 +64,12 @@ pub(crate) struct ExtractedDeclaration {
     /// declaration set happens in the ingest pipeline, which has the
     /// project-wide view a single file's Extractor pass does not.
     pub calls: Vec<CallRef>,
+    /// Module path segments this declaration lives under, relative to the
+    /// declaring file's own module root (finding-3): empty for a top-level
+    /// file item, `["inner"]` for an item inside `mod inner { .. }`. The
+    /// ingest pipeline appends these onto the file's module path to get the
+    /// declaration's full module path.
+    pub module_segments: Vec<String>,
 }
 
 /// A syntactically resolvable `datatype implements interface` relationship
@@ -56,6 +78,9 @@ pub(crate) struct ExtractedDeclaration {
 pub(crate) struct ExtractedImpl {
     pub type_name: String,
     pub trait_name: String,
+    /// Same convention as `ExtractedDeclaration::module_segments` — the
+    /// `impl` block's own module, relative to the file's module root.
+    pub module_segments: Vec<String>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -87,7 +112,12 @@ pub(crate) fn from_rust_scan(scan: RustFileScan) -> ExtractedFile {
             name: d.name,
             description: d.doc,
             content_hash: fnv1a(&d.span_text),
-            calls: d.calls,
+            calls: d
+                .calls
+                .into_iter()
+                .map(|segments| CallRef { segments })
+                .collect(),
+            module_segments: d.module_segments,
         })
         .collect();
     let impls = scan
@@ -96,6 +126,7 @@ pub(crate) fn from_rust_scan(scan: RustFileScan) -> ExtractedFile {
         .map(|i| ExtractedImpl {
             type_name: i.type_name,
             trait_name: i.trait_name,
+            module_segments: i.module_segments,
         })
         .collect();
     ExtractedFile {

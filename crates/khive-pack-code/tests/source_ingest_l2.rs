@@ -15,6 +15,10 @@ fn rust_only() -> BTreeSet<&'static str> {
     ["rust"].into_iter().collect()
 }
 
+fn all_languages() -> BTreeSet<&'static str> {
+    ["rust", "python", "typescript"].into_iter().collect()
+}
+
 fn rt_at(db_path: &Path) -> KhiveRuntime {
     let config = RuntimeConfig {
         db_path: Some(db_path.to_path_buf()),
@@ -589,4 +593,327 @@ async fn tiers_are_independently_selectable_and_compose() {
             "l2 alone must run the symbol tier"
         );
     }
+}
+
+fn write_polyglot_fixture(root: &Path) {
+    std::fs::create_dir_all(root.join("rustpkg/src")).unwrap();
+    std::fs::write(
+        root.join("rustpkg/Cargo.toml"),
+        "[package]\nname = \"rustpkg\"\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("rustpkg/src/lib.rs"), "pub fn f() {}\n").unwrap();
+
+    std::fs::create_dir_all(root.join("pypkg")).unwrap();
+    std::fs::write(
+        root.join("pypkg/pyproject.toml"),
+        "[project]\nname = \"pypkg\"\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("pypkg/mod.py"), "def g():\n    pass\n").unwrap();
+
+    std::fs::create_dir_all(root.join("tspkg")).unwrap();
+    std::fs::write(root.join("tspkg/package.json"), "{\"name\": \"tspkg\"}").unwrap();
+    std::fs::write(root.join("tspkg/index.ts"), "export function h() {}\n").unwrap();
+}
+
+/// finding-5a: an L2-only ingest over a polyglot tree must not walk, read,
+/// hash, or upsert modules for languages L2 doesn't support (python,
+/// typescript) — only the rust project/module gets touched.
+#[tokio::test]
+async fn l2_only_polyglot_ingest_touches_only_rust() {
+    let root = TempDir::new().expect("tempdir");
+    write_polyglot_fixture(root.path());
+    let db = root.path().join("polyglot_l2.db");
+    let rt = rt_at(&db);
+    let token = rt.authorize(Namespace::local()).expect("token");
+
+    let report = run_code_ingest(
+        &rt,
+        &token,
+        CodeSourceIngestOptions {
+            path: root.path(),
+            languages: all_languages(),
+            sweep_time: Utc::now(),
+            enable_l1: false,
+            enable_l1_5: false,
+            enable_l2: true,
+        },
+    )
+    .await
+    .expect("l2-only polyglot ingest succeeds");
+
+    assert_eq!(
+        report.projects_created, 1,
+        "only the rust project should be touched: {report:?}"
+    );
+    assert_eq!(
+        report.modules_created, 1,
+        "only the rust module should be walked: {report:?}"
+    );
+    assert!(report.symbols_created > 0);
+}
+
+/// finding-5c: an ingest with every tier disabled performs zero writes.
+#[tokio::test]
+async fn all_tiers_disabled_performs_zero_writes() {
+    let root = TempDir::new().expect("tempdir");
+    write_fixture(root.path());
+    let db = root.path().join("zero_tier.db");
+    let rt = rt_at(&db);
+    let token = rt.authorize(Namespace::local()).expect("token");
+
+    let report = run_code_ingest(
+        &rt,
+        &token,
+        CodeSourceIngestOptions {
+            path: root.path(),
+            languages: rust_only(),
+            sweep_time: Utc::now(),
+            enable_l1: false,
+            enable_l1_5: false,
+            enable_l2: false,
+        },
+    )
+    .await
+    .expect("all-tiers-disabled ingest succeeds");
+
+    assert_eq!(report.projects_created, 0);
+    assert_eq!(report.modules_created, 0);
+    assert_eq!(report.symbols_created, 0);
+    assert_eq!(report.edges_created, 0);
+    assert_eq!(report.unresolved_recorded, 0);
+}
+
+/// finding-1: a declaration re-extracted this scan whose freshly extracted
+/// call list no longer includes a previously recorded target must have that
+/// stale `depends_on` edge reconciled away, while a still-valid edge (and
+/// the newly resolved one) survives.
+#[tokio::test]
+async fn stale_call_edge_is_reconciled_when_declaration_changes() {
+    let root = TempDir::new().expect("tempdir");
+    write_fixture(root.path());
+    let db = root.path().join("reconcile.db");
+    let rt = rt_at(&db);
+    let token = rt.authorize(Namespace::local()).expect("token");
+
+    let opts = || CodeSourceIngestOptions {
+        path: root.path(),
+        languages: rust_only(),
+        sweep_time: Utc::now(),
+        enable_l1: true,
+        enable_l1_5: true,
+        enable_l2: true,
+    };
+    let first = run_code_ingest(&rt, &token, opts())
+        .await
+        .expect("first ingest");
+    assert_eq!(first.symbol_edges_reconciled, 0);
+    let edges = edge_triples(&rt).await;
+    assert!(
+        edges
+            .iter()
+            .any(|(rel, src, tgt)| rel == "depends_on" && src == "caller" && tgt == "helper"),
+        "expected initial caller->helper edge, got: {edges:?}"
+    );
+
+    // `caller` now calls `other` instead of `helper`.
+    std::fs::write(
+        root.path().join("src/lib.rs"),
+        r#"
+/// Greets someone.
+pub trait Greeter {
+    fn greet(&self);
+}
+
+/// A friendly struct.
+pub struct Hello;
+
+impl Greeter for Hello {}
+
+/// Does the real work.
+pub fn helper() -> u32 {
+    42
+}
+
+/// Something else entirely.
+pub fn other() -> u32 {
+    7
+}
+
+/// Calls other now, not helper.
+pub fn caller() -> u32 {
+    other()
+}
+
+/// Never called by anything in this crate.
+pub fn orphan() -> u32 {
+    0
+}
+"#,
+    )
+    .unwrap();
+
+    let second = run_code_ingest(&rt, &token, opts())
+        .await
+        .expect("second ingest reconciles the stale edge");
+    assert_eq!(
+        second.symbol_edges_reconciled, 1,
+        "expected exactly the stale caller->helper edge to be reconciled"
+    );
+    let edges = edge_triples(&rt).await;
+    assert!(
+        !edges
+            .iter()
+            .any(|(rel, src, tgt)| rel == "depends_on" && src == "caller" && tgt == "helper"),
+        "stale caller->helper edge must be gone after re-ingest, got: {edges:?}"
+    );
+    assert!(
+        edges
+            .iter()
+            .any(|(rel, src, tgt)| rel == "depends_on" && src == "caller" && tgt == "other"),
+        "new caller->other edge must exist, got: {edges:?}"
+    );
+    // implements edge (Hello implements Greeter) is untouched — unrelated
+    // to caller's own outgoing edge set.
+    assert!(edges
+        .iter()
+        .any(|(rel, src, tgt)| rel == "implements" && src == "Hello" && tgt == "Greeter"));
+}
+
+/// findings 6/9: a file with more declarations than SQLite's
+/// `SQLITE_MAX_VARIABLE_NUMBER` (999) must still ingest successfully (the
+/// `get_entities_by_ids` content-hash lookup) and re-ingest successfully
+/// unchanged (the `touch_last_seen_at` batched UPDATE).
+#[tokio::test]
+async fn ingest_with_over_900_declarations_does_not_exceed_sql_param_limits() {
+    let root = TempDir::new().expect("tempdir");
+    std::fs::create_dir_all(root.path().join("src")).unwrap();
+    std::fs::write(
+        root.path().join("Cargo.toml"),
+        "[package]\nname = \"bigcrate\"\n",
+    )
+    .unwrap();
+    let mut src = String::new();
+    for i in 0..950 {
+        src.push_str(&format!("pub fn f{i}() {{}}\n"));
+    }
+    std::fs::write(root.path().join("src/lib.rs"), src).unwrap();
+
+    let db = root.path().join("big.db");
+    let rt = rt_at(&db);
+    let token = rt.authorize(Namespace::local()).expect("token");
+    let opts = || CodeSourceIngestOptions {
+        path: root.path(),
+        languages: rust_only(),
+        sweep_time: Utc::now(),
+        enable_l1: true,
+        enable_l1_5: true,
+        enable_l2: true,
+    };
+
+    let report = run_code_ingest(&rt, &token, opts())
+        .await
+        .expect("large ingest succeeds without exceeding SQL param limits");
+    assert_eq!(report.symbols_created, 950);
+
+    let report2 = run_code_ingest(&rt, &token, opts())
+        .await
+        .expect("unchanged re-ingest of large fixture succeeds (chunked last_seen_at touch)");
+    assert_eq!(report2.symbols_created, 0);
+    assert_eq!(report2.symbols_updated, 0);
+}
+
+/// finding-3: inline modules, inherent/trait impl methods, and trait
+/// default-body methods all produce declarations end to end, and a call
+/// inside a nested module resolves against that module's own path.
+#[tokio::test]
+async fn l2_extracts_methods_and_inline_modules_end_to_end() {
+    let root = TempDir::new().expect("tempdir");
+    std::fs::create_dir_all(root.path().join("src")).unwrap();
+    std::fs::write(
+        root.path().join("Cargo.toml"),
+        "[package]\nname = \"modcrate\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("src/lib.rs"),
+        r#"
+pub struct S;
+impl S {
+    pub fn m() {}
+}
+
+pub trait T {
+    fn required(&self);
+    fn provided(&self) {}
+}
+impl T for S {
+    fn required(&self) {}
+}
+
+pub mod inner {
+    pub fn helper() {}
+    pub fn f() {
+        helper();
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let db = root.path().join("mods.db");
+    let rt = rt_at(&db);
+    let token = rt.authorize(Namespace::local()).expect("token");
+    run_code_ingest(
+        &rt,
+        &token,
+        CodeSourceIngestOptions {
+            path: root.path(),
+            languages: rust_only(),
+            sweep_time: Utc::now(),
+            enable_l1: true,
+            enable_l1_5: true,
+            enable_l2: true,
+        },
+    )
+    .await
+    .expect("ingest succeeds");
+
+    let entities = entity_rows(&rt).await;
+    let names: Vec<&str> = entities.iter().map(|(n, ..)| n.as_str()).collect();
+    assert!(names.contains(&"S::m"), "impl method: {names:?}");
+    assert!(
+        names.contains(&"T::provided"),
+        "trait default method: {names:?}"
+    );
+    assert!(
+        names.contains(&"S::required"),
+        "trait impl method: {names:?}"
+    );
+    // `inner`'s own module-kind entity is proven indirectly below (the
+    // `inner -> helper` contains edge requires it to exist as an endpoint);
+    // `entity_rows` only selects function/datatype/interface entity_types.
+    assert!(
+        names.contains(&"helper"),
+        "fn nested in inline module: {names:?}"
+    );
+    assert!(
+        names.contains(&"f"),
+        "fn nested in inline module: {names:?}"
+    );
+
+    let edges = edge_triples(&rt).await;
+    assert!(
+        edges
+            .iter()
+            .any(|(rel, src, tgt)| rel == "depends_on" && src == "f" && tgt == "helper"),
+        "call inside inner::f must resolve against inner's own module path, got: {edges:?}"
+    );
+    assert!(
+        edges
+            .iter()
+            .any(|(rel, src, tgt)| rel == "contains" && src == "inner" && tgt == "helper"),
+        "inner module must contain its nested fn via `contains`, got: {edges:?}"
+    );
 }
