@@ -142,8 +142,11 @@ pub struct BlobOrphanSweepResult {
 /// any future backend (object storage, a different CAS layout) implements
 /// the same operations. Per ADR-005 constraint 4, a `BlobStore` instance
 /// talks to exactly one backend.
+// `Debug` is a supertrait so boot-path tests can distinguish which concrete
+// backend was installed behind `Arc<dyn BlobStore>` via `format!("{:?}", ..)`
+// without adding a downcast/type-name method to the production surface.
 #[async_trait]
-pub trait BlobStore: Send + Sync + 'static {
+pub trait BlobStore: Send + Sync + std::fmt::Debug + 'static {
     /// Store `bytes`, returning the content-addressed reference under which
     /// they are now retrievable. Storing byte-identical content more than
     /// once returns the same `ContentRef` and does not re-write the object.

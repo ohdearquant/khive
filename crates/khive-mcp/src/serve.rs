@@ -1558,6 +1558,19 @@ fn build_registry_for_multi_backend_inner(
         cfg
     });
 
+    // ADR-111 Amendment 2: resolve the config-selected `BlobStore` once
+    // against the main backend and install it on every runtime handle this
+    // boot produces (`default_runtime` plus each per-pack runtime), so a
+    // pack that later reads `KhiveRuntime::blob_store()` sees the same
+    // selection regardless of which backend its own KG data lives on.
+    if let Some(store) =
+        install_resolved_blob_store(&default_runtime, khive_cfg, main_backend.as_ref())?
+    {
+        for rt in per_pack_runtimes_local.values() {
+            rt.install_blob_store(store.clone());
+        }
+    }
+
     #[cfg(feature = "bench-embedder")]
     {
         for rt in per_pack_runtimes_local.values() {
@@ -1810,6 +1823,7 @@ pub fn build_server_with_explicit_namespace(
     if khive_cfg.backends.is_empty() {
         // Single-backend path — identical to pre-ADR-028 behavior.
         let runtime = KhiveRuntime::new(config)?;
+        install_resolved_blob_store(&runtime, &khive_cfg, runtime.backend())?;
         #[cfg(feature = "bench-embedder")]
         {
             for name in runtime.registered_embedding_model_names() {
@@ -2034,6 +2048,43 @@ pub fn checkpoint_pool_for(main_backend: &StorageBackend) -> Option<Arc<Connecti
         Some(main_backend.pool_arc())
     } else {
         None
+    }
+}
+
+/// Resolve `khive.toml`'s `[storage.blob]` selection against `backend` and
+/// install it on `rt` (ADR-111 Amendment 2's boot-wiring requirement).
+///
+/// Returns the resolved store on success so multi-backend callers can also
+/// install it on every per-pack runtime without re-resolving it.
+///
+/// An **explicit** `[storage.blob]` section that fails to resolve (an `s3`
+/// backend with no AWS credentials in the environment, an invalid prefix,
+/// etc.) aborts boot: silently falling back to `FsBlobStore` would defeat
+/// the point of declaring `backend = "s3"`. When `[storage.blob]` is
+/// **absent**, a resolution failure (e.g. an in-memory backend with no root
+/// to default beside — every `--db :memory:` invocation and most unit
+/// tests) is non-fatal and leaves `KhiveRuntime::blob_store()` unset:
+/// nothing yet consumes it, and forcing a filesystem root onto every
+/// in-memory boot would be a behavior change nobody asked for.
+fn install_resolved_blob_store(
+    rt: &KhiveRuntime,
+    khive_cfg: &KhiveConfig,
+    backend: &StorageBackend,
+) -> anyhow::Result<Option<Arc<dyn khive_storage::BlobStore>>> {
+    match khive_runtime::resolve_blob_store(khive_cfg, backend) {
+        Ok(store) => {
+            rt.install_blob_store(store.clone());
+            Ok(Some(store))
+        }
+        Err(e) if khive_cfg.storage.blob.is_none() => {
+            tracing::debug!(
+                error = %e,
+                "no usable BlobStore for this backend and no [storage.blob] configured; \
+                 leaving KhiveRuntime::blob_store() unset"
+            );
+            Ok(None)
+        }
+        Err(e) => Err(anyhow::anyhow!("[storage.blob] configuration error: {e}")),
     }
 }
 
@@ -2419,7 +2470,7 @@ fn resolve_actor_from_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use khive_runtime::Namespace;
+    use khive_runtime::{BlobConfig, Namespace, StorageSectionConfig};
     use serial_test::serial;
     use std::io::Write;
 
@@ -3602,6 +3653,401 @@ id = "lambda:project-actor"
             server.pool().is_none(),
             "in-memory multi-backend main must never carry a checkpoint pool"
         );
+    }
+
+    // ── ADR-111 Amendment 2, H2 fix round 2: `resolve_blob_store` must
+    // actually be reached from the real boot paths, not only its own unit
+    // tests. Both tests below assert against the credential-env error
+    // `S3BlobStore::new` raises with no AWS creds in the environment --
+    // exactly the technique `khive-runtime`'s own `resolve_blob_store` tests
+    // use -- but reached through `build_server`/`build_registry_for_multi_backend`
+    // themselves, proving the boot path resolves and installs the configured
+    // `S3BlobStore` rather than silently keeping the default `FsBlobStore`.
+
+    #[test]
+    #[serial]
+    fn single_backend_boot_wires_configured_s3_blob_store() {
+        std::env::remove_var("KHIVE_DB");
+        std::env::remove_var("KHIVE_ACTOR");
+        std::env::remove_var("KHIVE_PACKS");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+        let prev_access_key = std::env::var("AWS_ACCESS_KEY_ID").ok();
+        let prev_secret_key = std::env::var("AWS_SECRET_ACCESS_KEY").ok();
+        std::env::remove_var("AWS_ACCESS_KEY_ID");
+        std::env::remove_var("AWS_SECRET_ACCESS_KEY");
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config_path = write_config(
+            dir.path(),
+            r#"
+[storage.blob]
+backend = "s3"
+bucket = "khive-blobs"
+region = "us-east-1"
+"#,
+        );
+
+        use clap::Parser;
+        let args = Args::parse_from([
+            "mcp",
+            "--db",
+            ":memory:",
+            "--pack",
+            "kg",
+            "--config",
+            config_path.to_str().expect("utf8 path"),
+        ]);
+
+        let result = build_server(&args);
+
+        match prev_access_key {
+            Some(v) => std::env::set_var("AWS_ACCESS_KEY_ID", v),
+            None => std::env::remove_var("AWS_ACCESS_KEY_ID"),
+        }
+        match prev_secret_key {
+            Some(v) => std::env::set_var("AWS_SECRET_ACCESS_KEY", v),
+            None => std::env::remove_var("AWS_SECRET_ACCESS_KEY"),
+        }
+
+        let err = result.err().expect(
+            "an s3 blob backend with no AWS credentials must fail boot through the real \
+             single-backend path -- a silent fs fallback would return Ok here instead",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("AWS_ACCESS_KEY_ID"),
+            "expected the credential-env error surfaced through build_server, got: {msg}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn multi_backend_boot_wires_configured_s3_blob_store() {
+        let prev_access_key = std::env::var("AWS_ACCESS_KEY_ID").ok();
+        let prev_secret_key = std::env::var("AWS_SECRET_ACCESS_KEY").ok();
+        std::env::remove_var("AWS_ACCESS_KEY_ID");
+        std::env::remove_var("AWS_SECRET_ACCESS_KEY");
+
+        let khive_cfg = KhiveConfig {
+            backends: vec![BackendConfig {
+                name: "main".to_string(),
+                kind: BackendKind::Memory,
+                path: None,
+                cache_mb: None,
+                journal_mode: None,
+                read_only: false,
+            }],
+            storage: StorageSectionConfig {
+                blob: Some(BlobConfig::S3 {
+                    bucket: "khive-blobs".to_string(),
+                    region: "us-east-1".to_string(),
+                    endpoint: None,
+                    prefix: None,
+                    allow_http: None,
+                }),
+            },
+            ..KhiveConfig::default()
+        };
+        let base_cfg = base_runtime_config_for_multi_backend();
+
+        let result = build_registry_for_multi_backend(base_cfg, &khive_cfg, None);
+
+        match prev_access_key {
+            Some(v) => std::env::set_var("AWS_ACCESS_KEY_ID", v),
+            None => std::env::remove_var("AWS_ACCESS_KEY_ID"),
+        }
+        match prev_secret_key {
+            Some(v) => std::env::set_var("AWS_SECRET_ACCESS_KEY", v),
+            None => std::env::remove_var("AWS_SECRET_ACCESS_KEY"),
+        }
+
+        let err = result.err().expect(
+            "an s3 blob backend with no AWS credentials must fail boot through the real \
+             multi-backend path -- a silent fs fallback would return Ok here instead",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("AWS_ACCESS_KEY_ID"),
+            "expected the credential-env error surfaced through \
+             build_registry_for_multi_backend, got: {msg}"
+        );
+    }
+
+    // ── ADR-111 Amendment 2, round-3 Medium fix: the two tests above only
+    // prove the fail-closed error path. The three tests below exercise the
+    // successful construction-and-install branch of `install_resolved_blob_store`
+    // (the real call site: `:1826` single-backend, `:1567` multi-backend) plus
+    // the no-`[storage.blob]` filesystem-default boot promised by ADR-111
+    // Amendment 2. `BlobStore` carries a `Debug` supertrait (khive-storage)
+    // for exactly this purpose: it lets these tests tell which concrete
+    // backend got installed behind `Arc<dyn BlobStore>` via
+    // `format!("{store:?}")` without adding a downcast/type-name method to
+    // the production trait surface.
+
+    /// Isolated dummy (non-secret, never-valid) AWS credentials for the
+    /// success-path tests below. `S3BlobStore::new` only builds an
+    /// `AmazonS3` client (`object_store`'s `AmazonS3Builder::build`); it
+    /// performs no network I/O, so a syntactically-valid dummy key pair is
+    /// enough to reach a successful `Ok` construction.
+    const DUMMY_AWS_ACCESS_KEY_ID: &str = "AKIADUMMYWITNESSKEY00";
+    const DUMMY_AWS_SECRET_ACCESS_KEY: &str = "dummy-witness-secret-access-key-never-real";
+
+    /// RAII guard: sets the two AWS credential env vars to isolated dummy
+    /// values for the duration of the test, restoring whatever was
+    /// previously present (usually nothing) on drop. Paired with `#[serial]`
+    /// on every test that uses it, matching the convention the two boot
+    /// tests above already established for this same pair of env vars.
+    struct DummyAwsCredsGuard {
+        prev_access_key: Option<String>,
+        prev_secret_key: Option<String>,
+    }
+
+    impl DummyAwsCredsGuard {
+        fn set() -> Self {
+            let prev_access_key = std::env::var("AWS_ACCESS_KEY_ID").ok();
+            let prev_secret_key = std::env::var("AWS_SECRET_ACCESS_KEY").ok();
+            std::env::set_var("AWS_ACCESS_KEY_ID", DUMMY_AWS_ACCESS_KEY_ID);
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", DUMMY_AWS_SECRET_ACCESS_KEY);
+            Self {
+                prev_access_key,
+                prev_secret_key,
+            }
+        }
+    }
+
+    impl Drop for DummyAwsCredsGuard {
+        fn drop(&mut self) {
+            match self.prev_access_key.take() {
+                Some(v) => std::env::set_var("AWS_ACCESS_KEY_ID", v),
+                None => std::env::remove_var("AWS_ACCESS_KEY_ID"),
+            }
+            match self.prev_secret_key.take() {
+                Some(v) => std::env::set_var("AWS_SECRET_ACCESS_KEY", v),
+                None => std::env::remove_var("AWS_SECRET_ACCESS_KEY"),
+            }
+        }
+    }
+
+    /// RAII guard: clears the `KHIVE_*` variables that would otherwise
+    /// override the temp `khive.toml` the boot tests write, restoring each
+    /// prior value (or absence) on drop, even on panic/unwind. `#[serial]`
+    /// serializes access but does not restore process-global state; this
+    /// guard does.
+    struct ClearedKhiveEnvGuard {
+        prev: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl ClearedKhiveEnvGuard {
+        const VARS: [&'static str; 4] = [
+            "KHIVE_DB",
+            "KHIVE_ACTOR",
+            "KHIVE_PACKS",
+            "KHIVE_REQUIRE_ATTRIBUTED_ACTOR",
+        ];
+
+        fn clear() -> Self {
+            let prev = Self::VARS
+                .iter()
+                .map(|name| {
+                    let value = std::env::var_os(name);
+                    std::env::remove_var(name);
+                    (*name, value)
+                })
+                .collect();
+            Self { prev }
+        }
+    }
+
+    impl Drop for ClearedKhiveEnvGuard {
+        fn drop(&mut self) {
+            for (name, value) in self.prev.drain(..) {
+                match value {
+                    Some(v) => std::env::set_var(name, v),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    fn s3_blob_config() -> BlobConfig {
+        BlobConfig::S3 {
+            bucket: "khive-blobs".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: None,
+            prefix: None,
+            allow_http: None,
+        }
+    }
+
+    /// Positive counterpart to `single_backend_boot_wires_configured_s3_blob_store`:
+    /// with valid (dummy) AWS credentials present, the single-backend startup
+    /// path's `install_resolved_blob_store` call (`:1826`) must actually
+    /// install an `S3BlobStore`, not merely fail closed when credentials are
+    /// absent. Round-4 remediation: drives the real `build_server` boot entry
+    /// (not `KhiveRuntime::new` + a direct `install_resolved_blob_store` call)
+    /// via a temporary `khive.toml` + parsed `Args`, selecting the `schedule`
+    /// pack so its already-installed runtime (`:1847`) is returned for
+    /// inspection.
+    #[test]
+    #[serial]
+    fn single_backend_boot_installs_s3_blob_store_on_successful_selection() {
+        let _env = ClearedKhiveEnvGuard::clear();
+        let _creds = DummyAwsCredsGuard::set();
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config_path = write_config(
+            dir.path(),
+            r#"
+[storage.blob]
+backend = "s3"
+bucket = "khive-blobs"
+region = "us-east-1"
+"#,
+        );
+
+        use clap::Parser;
+        let args = Args::parse_from([
+            "mcp",
+            "--db",
+            ":memory:",
+            "--pack",
+            "kg",
+            "--pack",
+            "schedule",
+            "--config",
+            config_path.to_str().expect("utf8 path"),
+        ]);
+
+        let (_server, schedule_rt) = build_server(&args).expect(
+            "valid dummy AWS credentials must resolve and install an S3BlobStore through the \
+             real single-backend boot path",
+        );
+        let runtime = schedule_rt
+            .expect("the schedule pack was selected so its installed runtime must be returned");
+
+        let installed = runtime.blob_store().expect(
+            "install_resolved_blob_store must call KhiveRuntime::install_blob_store at the \
+             real :1826 call site",
+        );
+        let debug = format!("{installed:?}");
+        assert!(
+            debug.contains("S3BlobStore"),
+            "expected the installed store to be an S3BlobStore, got: {debug}"
+        );
+    }
+
+    /// Positive counterpart to `multi_backend_boot_wires_configured_s3_blob_store`:
+    /// with valid (dummy) AWS credentials present, the multi-backend startup
+    /// path must resolve the configured `S3BlobStore` once (`:1567`) and
+    /// install it on every per-pack runtime this boot produces.
+    #[test]
+    #[serial]
+    fn multi_backend_boot_installs_s3_blob_store_on_successful_selection() {
+        let _creds = DummyAwsCredsGuard::set();
+
+        let khive_cfg = KhiveConfig {
+            backends: vec![BackendConfig {
+                name: "main".to_string(),
+                kind: BackendKind::Memory,
+                path: None,
+                cache_mb: None,
+                journal_mode: None,
+                read_only: false,
+            }],
+            storage: StorageSectionConfig {
+                blob: Some(s3_blob_config()),
+            },
+            ..KhiveConfig::default()
+        };
+        let base_cfg = base_runtime_config_for_multi_backend();
+
+        let multi = build_registry_for_multi_backend(base_cfg, &khive_cfg, None)
+            .expect("valid dummy AWS credentials must resolve through the multi-backend path");
+
+        assert!(
+            !multi.per_pack_runtimes.is_empty(),
+            "precondition: the base config declares at least one pack"
+        );
+        for (pack_name, rt) in &multi.per_pack_runtimes {
+            let store = rt.blob_store().unwrap_or_else(|| {
+                panic!("pack {pack_name:?} must have the S3 selection installed on its runtime")
+            });
+            let debug = format!("{store:?}");
+            assert!(
+                debug.contains("S3BlobStore"),
+                "pack {pack_name:?}: expected the installed store to be an S3BlobStore, got: {debug}"
+            );
+        }
+    }
+
+    /// Guards the ADR-111 Amendment 2 fs-default promise (`docs/adr/ADR-111-blob-store.md:538-541`):
+    /// with no `[storage.blob]` section at all, the single-backend startup
+    /// path must still install a usable `FsBlobStore` rooted beside the
+    /// database file, and that store must actually round-trip a blob --
+    /// not merely construct without error. Round-4 remediation: drives the
+    /// real `build_server` boot entry via a temporary (sectionless)
+    /// `khive.toml` + parsed `Args`, selecting the `schedule` pack so its
+    /// already-installed runtime (`:1847`) is returned for inspection.
+    #[tokio::test]
+    #[serial]
+    async fn single_backend_boot_default_fs_blob_store_is_usable_without_storage_section() {
+        let _env = ClearedKhiveEnvGuard::clear();
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("main.db");
+        let config_path = write_config(dir.path(), "");
+
+        use clap::Parser;
+        let args = Args::parse_from([
+            "mcp",
+            "--db",
+            db_path.to_str().expect("utf8 path"),
+            "--pack",
+            "kg",
+            "--pack",
+            "schedule",
+            "--config",
+            config_path.to_str().expect("utf8 path"),
+        ]);
+
+        let (_server, schedule_rt) = build_server(&args)
+            .expect("absent [storage.blob] must resolve the fs default through the real single-backend boot path");
+        let runtime = schedule_rt
+            .expect("the schedule pack was selected so its installed runtime must be returned");
+
+        let installed = runtime.blob_store().expect(
+            "install_resolved_blob_store must call KhiveRuntime::install_blob_store at the \
+             real :1826 call site for a file-backed backend",
+        );
+        let debug = format!("{installed:?}");
+        assert!(
+            debug.contains("FsBlobStore"),
+            "expected the default store to be an FsBlobStore, got: {debug}"
+        );
+
+        // The absent-section default keeps FsBlobStore's 100 GB free-space
+        // floor — that default is exactly what this test locks in, and a CI
+        // runner legitimately may not clear it. A CapacityFloor rejection can
+        // only come from inside FsBlobStore::put, so it is equally valid
+        // proof that the boot path wired a live fs-default store; round-trip
+        // only when the volume has room.
+        match installed
+            .put(b"adr-111 fs-default regression".to_vec())
+            .await
+        {
+            Ok(content_ref) => {
+                let round_tripped = installed
+                    .get(&content_ref)
+                    .await
+                    .expect("fs-default store must serve back what it just accepted");
+                assert_eq!(
+                    round_tripped, b"adr-111 fs-default regression",
+                    "fs-default store must round-trip the exact bytes written"
+                );
+            }
+            Err(khive_storage::StorageError::CapacityFloor { .. }) => {}
+            Err(other) => panic!("fs-default store must accept a write: {other:?}"),
+        }
     }
 
     /// Regression for ADR-073: a pack assigned to a secondary backend must

@@ -6,6 +6,7 @@ pub mod actor_identity;
 pub mod atomic_plan;
 pub mod atomic_prepare;
 pub mod atomic_runner;
+pub mod blob;
 pub mod config;
 pub mod config_ledger;
 pub mod cost_unit;
@@ -40,6 +41,7 @@ pub use atomic_plan::{
 pub use atomic_runner::{
     run_atomic_unit, AtomicOpFailure, AtomicOpPlan, AtomicRunOutcome, AtomicRunnerError,
 };
+pub use blob::resolve_blob_store;
 pub use cost_unit::{base_resource_payload, cost_unit_for_dispatch, resource_payload};
 pub use curation::{
     entity_fts_document, note_fts_document, ContentMergeStrategy, EdgeListFilter, EdgePatch,
@@ -53,8 +55,8 @@ pub use daemon::{
 };
 pub use embedder_registry::{EmbedderProvider, EmbedderRegistry, LatticeEmbedderProvider};
 pub use engine_config::{
-    config_from_env, BackendConfig, BackendKind, ConfigError, EngineConfig, GitWriteEntryConfig,
-    GitWriteSectionConfig, KhiveConfig, PackConfig,
+    config_from_env, BackendConfig, BackendKind, BlobConfig, ConfigError, EngineConfig,
+    GitWriteEntryConfig, GitWriteSectionConfig, KhiveConfig, PackConfig, StorageSectionConfig,
 };
 pub use error::{fts_text_leg_or_err, GuardedWriteFailure, RuntimeError, RuntimeResult};
 pub use fusion::FusionStrategy;
