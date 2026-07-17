@@ -1632,3 +1632,136 @@ async fn link_entity_precedes_entity_unaffected_by_decision_note_rule() {
         "entity->entity precedes must remain accepted under the composed rule set (base ADR-002 contract)"
     );
 }
+
+// ── #969 regression: `reason` must survive the public dispatch route ───────
+//
+// The runtime-level tests in khive-runtime/src/curation.rs call
+// `merge_entity_with_reason` / `merge_note_with_reason` directly, bypassing
+// `handle_merge`'s MergeParams deserialization and kind resolution. These
+// tests dispatch `merge` through the registry (the same route the MCP
+// `request` tool uses) so a regression that drops `MergeParams.reason` at
+// the handler boundary is caught even though the direct-fn tests stay green.
+
+#[tokio::test]
+async fn merge_entity_reason_forwarded_through_registry_dispatch() {
+    use crate::KgPack;
+    use khive_runtime::{KhiveRuntime, Namespace, VerbRegistryBuilder};
+    use khive_types::EventKind;
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry build");
+    let token = rt.authorize(Namespace::local()).expect("authorize local");
+
+    let into = rt
+        .create_entity(&token, "concept", None, "Into", None, None, vec![])
+        .await
+        .expect("create into entity");
+    let from = rt
+        .create_entity(&token, "concept", None, "From", None, None, vec![])
+        .await
+        .expect("create from entity");
+
+    registry
+        .dispatch(
+            "merge",
+            json!({
+                "kind": "entity",
+                "into_id": into.id.to_string(),
+                "from_id": from.id.to_string(),
+                "reason": "duplicate via dispatch",
+            }),
+        )
+        .await
+        .expect("merge dispatch must succeed");
+
+    let events = rt
+        .events(&token)
+        .unwrap()
+        .query_events(
+            khive_storage::EventFilter {
+                kinds: vec![EventKind::EntityMerged],
+                ..Default::default()
+            },
+            khive_storage::types::PageRequest {
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        events.items.len(),
+        1,
+        "merge dispatch must emit exactly one EntityMerged event"
+    );
+    assert_eq!(
+        events.items[0].payload.get("reason").and_then(|v| v.as_str()),
+        Some("duplicate via dispatch"),
+        "reason supplied through the registry dispatch route must land in the EntityMerged payload; got: {:?}",
+        events.items[0].payload
+    );
+}
+
+#[tokio::test]
+async fn merge_note_reason_forwarded_through_registry_dispatch() {
+    use crate::KgPack;
+    use khive_runtime::{KhiveRuntime, Namespace, VerbRegistryBuilder};
+    use khive_types::EventKind;
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry build");
+    let token = rt.authorize(Namespace::local()).expect("authorize local");
+
+    let into = rt
+        .create_note(&token, "observation", None, "into note", None, None, vec![])
+        .await
+        .expect("create into note");
+    let from = rt
+        .create_note(&token, "observation", None, "from note", None, None, vec![])
+        .await
+        .expect("create from note");
+
+    registry
+        .dispatch(
+            "merge",
+            json!({
+                "kind": "note",
+                "into_id": into.id.to_string(),
+                "from_id": from.id.to_string(),
+                "reason": "duplicate via dispatch",
+            }),
+        )
+        .await
+        .expect("merge dispatch must succeed");
+
+    let events = rt
+        .events(&token)
+        .unwrap()
+        .query_events(
+            khive_storage::EventFilter {
+                kinds: vec![EventKind::NoteMerged],
+                ..Default::default()
+            },
+            khive_storage::types::PageRequest {
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        events.items.len(),
+        1,
+        "merge dispatch must emit exactly one NoteMerged event"
+    );
+    assert_eq!(
+        events.items[0].payload.get("reason").and_then(|v| v.as_str()),
+        Some("duplicate via dispatch"),
+        "reason supplied through the registry dispatch route must land in the NoteMerged payload; got: {:?}",
+        events.items[0].payload
+    );
+}

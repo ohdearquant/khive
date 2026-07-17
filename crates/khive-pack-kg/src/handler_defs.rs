@@ -414,10 +414,10 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 18] = [
             },
         ],
     },
-    // Declaration: declares two entities identical
+    // Declaration: declares two records identical
     HandlerDef {
         name: "merge",
-        description: "Deduplicate two entities. Returns {kept_id, removed_id, edges_rewired, properties_merged, tags_unioned, content_appended, dry_run}; \
+        description: "Deduplicate two entities or notes. Successful non-dry-run merges emit an entity_merged or note_merged audit event. Returns {kept_id, removed_id, edges_rewired, properties_merged, tags_unioned, content_appended, dry_run}; \
                        chain with $prev.kept_id (not $prev.id — merge does not return a top-level id field).",
         visibility: Visibility::Verb,
         category: VerbCategory::Declaration,
@@ -426,13 +426,43 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 18] = [
                 name: "into_id",
                 param_type: "uuid",
                 required: true,
-                description: "The entity that survives the merge (canonical).",
+                description: "The entity or note that survives the merge (canonical).",
             },
             ParamDef {
                 name: "from_id",
                 param_type: "uuid",
                 required: true,
-                description: "The entity to merge from (will be soft-deleted after merge).",
+                description: "The entity or note to merge from (will be soft-deleted after merge).",
+            },
+            ParamDef {
+                name: "kind",
+                param_type: "string",
+                required: false,
+                description: "Optional substrate or granular kind hint. Omit to resolve the substrate from into_id.",
+            },
+            ParamDef {
+                name: "strategy",
+                param_type: "string",
+                required: false,
+                description: "Field merge policy: prefer_into (default) | prefer_from | union.",
+            },
+            ParamDef {
+                name: "content_strategy",
+                param_type: "string",
+                required: false,
+                description: "Description/content policy: append (default) | prefer_into | prefer_from.",
+            },
+            ParamDef {
+                name: "dry_run",
+                param_type: "bool",
+                required: false,
+                description: "If true, return the planned summary without mutating records or emitting an event.",
+            },
+            ParamDef {
+                name: "reason",
+                param_type: "string",
+                required: false,
+                description: "Optional caller-supplied reason preserved verbatim in the merge audit event.",
             },
         ],
     },
@@ -1318,5 +1348,26 @@ mod tests {
             h.description.contains("$prev.kept_id"),
             "merge description must document chaining via $prev.kept_id"
         );
+    }
+
+    #[test]
+    fn merge_metadata_documents_the_complete_wire_contract() {
+        let h = find_handler("merge");
+        assert!(
+            h.description.contains("entities or notes"),
+            "merge description must cover both supported substrates"
+        );
+        for required in ["into_id", "from_id"] {
+            assert!(
+                h.params.iter().any(|p| p.name == required && p.required),
+                "merge must document required {required}"
+            );
+        }
+        for optional in ["kind", "strategy", "content_strategy", "dry_run", "reason"] {
+            assert!(
+                h.params.iter().any(|p| p.name == optional && !p.required),
+                "merge must document optional {optional}"
+            );
+        }
     }
 }

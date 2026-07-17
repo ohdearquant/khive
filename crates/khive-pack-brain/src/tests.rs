@@ -6369,6 +6369,209 @@ mod event_counts_tests {
         }
     }
 
+    /// A date-only `since` (no time-of-day component) is coerced to midnight
+    /// UTC rather than silently resolving to a null result — the bug reported
+    /// in #984, where the RFC-3339 parser rejected the value but the failure
+    /// never surfaced to the caller.
+    #[tokio::test]
+    async fn date_only_since_is_coerced_to_midnight_utc() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        let result = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({"since": "2026-07-07"}),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("date-only `since` must be accepted, not silently nulled");
+
+        let since = result["since"].as_str().expect("since must be a string");
+        assert!(
+            since.starts_with("2026-07-07T00:00:00"),
+            "date-only `since` must coerce to midnight UTC: {result}"
+        );
+    }
+
+    /// A date-only `until` must include the entire named day, not just its
+    /// midnight instant — the window is half-open `[since, until)`, so a
+    /// date-only `until` has to roll to the *next* day's midnight or the
+    /// whole named day is silently dropped (#994).
+    #[tokio::test]
+    async fn date_only_until_includes_the_whole_named_day() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        let just_before_day = chrono::NaiveDate::from_ymd_opt(2026, 7, 6)
+            .unwrap()
+            .and_hms_opt(23, 59, 59)
+            .unwrap()
+            .and_utc()
+            .timestamp_micros();
+        // Last representable instant of the `until` day = the INCLUDED end of the edge;
+        // paired with `next_midnight` (the first EXCLUDED instant) this pins both sides
+        // of the exclusive upper bound to within one microsecond.
+        let end_of_named_day = chrono::NaiveDate::from_ymd_opt(2026, 7, 7)
+            .unwrap()
+            .and_hms_micro_opt(23, 59, 59, 999_999)
+            .unwrap()
+            .and_utc()
+            .timestamp_micros();
+        let next_midnight = chrono::NaiveDate::from_ymd_opt(2026, 7, 8)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp_micros();
+
+        seed_event(
+            &rt,
+            &token,
+            "search",
+            EventKind::SearchExecuted,
+            "lambda:a",
+            just_before_day,
+            json!({}),
+        )
+        .await;
+        seed_event(
+            &rt,
+            &token,
+            "search",
+            EventKind::SearchExecuted,
+            "lambda:a",
+            end_of_named_day,
+            json!({}),
+        )
+        .await;
+        // Exactly at the next day's midnight — must still be EXCLUDED.
+        seed_event(
+            &rt,
+            &token,
+            "search",
+            EventKind::SearchExecuted,
+            "lambda:a",
+            next_midnight,
+            json!({}),
+        )
+        .await;
+
+        assert_eq!(seeded_count(&rt, &token).await, 3);
+
+        let result = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({
+                    "since": "2026-07-06",
+                    "until": "2026-07-07",
+                }),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("brain.event_counts must succeed");
+
+        assert_eq!(
+            result["total"],
+            json!(2),
+            "date-only `until` must include the whole named day and exclude the next day's midnight: {result}"
+        );
+    }
+
+    /// A value that is neither a valid date nor a valid RFC-3339 datetime
+    /// still gets a named validation error, never a null result.
+    #[tokio::test]
+    async fn garbage_since_is_rejected_not_silently_nulled() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        let result = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({"since": "2026-13-99"}),
+                &registry,
+                &token,
+            )
+            .await;
+
+        match result {
+            Ok(v) => panic!("invalid `since` must not silently succeed with a value: {v}"),
+            Err(RuntimeError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains("since") && msg.contains("2026-13-99"),
+                    "error must name the field and offending value: {msg}"
+                );
+            }
+            Err(other) => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    /// A value that is neither a valid date nor a valid RFC-3339 datetime
+    /// still gets a named validation error on `until`, not silently nulled —
+    /// mirrors `garbage_since_is_rejected_not_silently_nulled` for the
+    /// role-aware `until` parse path (#994).
+    #[tokio::test]
+    async fn garbage_until_is_rejected_not_silently_nulled() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        let result = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({"since": "2026-07-01", "until": "2026-13-40"}),
+                &registry,
+                &token,
+            )
+            .await;
+
+        match result {
+            Ok(v) => panic!("invalid `until` must not silently succeed with a value: {v}"),
+            Err(RuntimeError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains("until") && msg.contains("2026-13-40"),
+                    "error must name the field and offending value: {msg}"
+                );
+            }
+            Err(other) => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    /// `until` at chrono's maximum representable date (NaiveDate::MAX,
+    /// 262142-12-31) would overflow the next-day roll; the handler must return
+    /// a named validation error instead of panicking on caller input (#994).
+    #[tokio::test]
+    async fn max_date_only_until_is_rejected_not_panicked() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        let result = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({"since": "2026-07-01", "until": "+262142-12-31"}),
+                &registry,
+                &token,
+            )
+            .await;
+
+        match result {
+            Ok(v) => panic!("`until` at the max representable date must not silently succeed: {v}"),
+            Err(RuntimeError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains("until") && msg.contains("262142-12-31"),
+                    "error must name the field and offending value: {msg}"
+                );
+            }
+            Err(other) => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn missing_since_is_rejected() {
         let (pack, rt) = make_pack();
