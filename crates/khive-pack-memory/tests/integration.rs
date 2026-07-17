@@ -5,6 +5,7 @@ use khive_pack_memory::MemoryPack;
 use khive_runtime::{
     EmbedderProvider, FusionStrategy, KhiveRuntime, Namespace, RuntimeConfig, VerbRegistryBuilder,
 };
+use khive_storage::{SqlStatement, SqlValue};
 use khive_types::Pack;
 use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
 use serde_json::json;
@@ -140,14 +141,24 @@ async fn test_recall_decay_ranking() {
         .expect("old remember");
     let old_id = old["id"].as_str().unwrap().to_string();
 
-    // Manually backdate the old note to simulate age
+    // Manually backdate the old note to simulate age. `upsert_note` preserves
+    // `created_at` on existing rows, so the backdate must be a direct UPDATE.
     let old_uuid: uuid::Uuid = old_id.parse().unwrap();
-    let note_store = rt
-        .notes(&rt.authorize(Namespace::local()).unwrap())
-        .unwrap();
-    let mut old_note = note_store.get_note(old_uuid).await.unwrap().unwrap();
-    old_note.created_at -= 90 * 86_400_000_000i64; // 90 days in microseconds
-    note_store.upsert_note(old_note).await.unwrap();
+    let sql = rt.sql();
+    let mut writer = sql.writer().await.expect("sql writer");
+    let backdated = writer
+        .execute(SqlStatement {
+            sql: "UPDATE notes SET created_at = created_at - ? WHERE id = ?".into(),
+            params: vec![
+                SqlValue::Integer(90 * 86_400_000_000i64),
+                SqlValue::Text(old_uuid.to_string()),
+            ],
+            label: Some("test-backdate-note".into()),
+        })
+        .await
+        .expect("backdate update");
+    assert_eq!(backdated, 1, "backdate must touch exactly the old note row");
+    drop(writer);
 
     // Disable MMR penalty so identical-content notes are ranked purely by
     // temporal decay. MMR would suppress the second hit (rank 2) by -0.1,
