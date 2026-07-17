@@ -1,345 +1,157 @@
 # Knowledge Graph Modeling
 
-This guide covers how to think about modeling in khive: when to use each entity
-kind, which edge relation fits, when something belongs as a note versus an
-entity, and common modeling patterns for research work.
+The knowledge graph is for keeping a durable, queryable model of a body of
+work: the things that exist, the claims and decisions made about them, and the
+relationships between them. Use it when a fact should remain useful after the
+session that produced it.
 
-## The two substrates
+You work with two kinds of record directly:
 
-khive has two kinds of records:
+- **Entities** are independently identifiable things: a paper, method,
+  repository, person, or dataset. They give the graph its stable structure.
+- **Notes** capture time-bound work about those things: an observation, a
+  conclusion, a question, a decision, or a reference. Notes can be linked back
+  to their subject.
 
-- **Entities** are things in the world: algorithms, papers, people, projects,
-  datasets, organizations, binaries, APIs. They are graph nodes with typed edges
-  between them.
-- **Notes** are your observations about the world: what you noticed, concluded,
-  decided, asked, or cited. They are temporal records with salience, optional
-  decay, and can annotate entities via `annotates` edges.
+An edge is a typed relationship within the entity graph layer, not a record you
+create on its own. Entities and notes are two of khive's three storage
+substrates; the third, events, is an immutable audit log the system writes and
+you query, not something you author directly. The active entity, note, and edge
+vocabularies are all closed sets. Model distinctions that do not belong in a
+kind or relation as properties instead of inventing a new label.
 
-The rule of thumb: if it has a name and exists independently of your session,
-it is an entity. If it is something you thought or recorded during a session,
-it is a note.
+Full verb signatures and return shapes live in the [KG pack rustdoc](https://docs.rs/khive-pack-kg/latest/khive_pack_kg/) and the
+[`request` tool rustdoc](https://docs.rs/khive-mcp/latest/khive_mcp/tools/request/struct.RequestParams.html).
+The [API reference](api-reference.md) is the local wire reference.
 
-## Entity kinds
+## Choose the right record
 
-khive has 9 entity kinds. This is a closed set: you cannot add new kinds
-without an ADR.
+Create an entity when it has a stable name and would make sense outside the
+current session. Create a note when it records what was learned, decided, or
+asked during work. A useful pattern is to create the entity first, then add
+notes that annotate it.
 
-### concept
+| Entity kind | Use for                                                                   |
+| ----------- | ------------------------------------------------------------------------- |
+| `concept`   | Methods, algorithms, architectures, theories, and models                  |
+| `document`  | Papers, reports, posts, and books                                         |
+| `dataset`   | Benchmarks, corpora, and evaluation sets                                  |
+| `project`   | Repositories, libraries, tools, and frameworks                            |
+| `person`    | Authors, researchers, and engineers                                       |
+| `org`       | Companies, labs, and institutions                                         |
+| `artifact`  | Checkpoints, packages, images, and binaries                               |
+| `service`   | APIs, endpoints, and hosted products                                      |
+| `resource`  | Reusable operational content such as atoms, skills, prompts, and runbooks |
 
-Algorithms, techniques, architectures, theories, models. This is the most
-common kind and the default.
+These nine KG base entity kinds are closed. Use `entity_type`, tags, and
+properties for finer distinctions; for example, a `document` can have
+`entity_type="paper"`.
 
-```
-create(kind="entity", entity_kind="concept", name="LoRA",
-       description="Low-Rank Adaptation of LLMs",
-       properties={"domain": "fine-tuning", "type": "technique", "year": 2021})
-```
+| Note kind     | Use for                                    |
+| ------------- | ------------------------------------------ |
+| `observation` | A factual capture or finding               |
+| `insight`     | A conclusion synthesized from observations |
+| `question`    | An unresolved inquiry                      |
+| `decision`    | A choice and its rationale                 |
+| `reference`   | A pointer to an external source            |
 
-Use `concept` for anything that is an idea, method, or approach. Use
-`properties.type` for finer classification: `algorithm`, `technique`,
-`architecture`, `model`, `theory`.
+These five KG base note kinds are also closed. `observation` is the default for
+a KG note when no note kind is supplied. Loaded packs can register additional
+closed kinds and additive endpoint rules. For example, the default `workspace`
+pack adds the `workspace` entity kind, which requires an integer
+`properties.schema_version` when created; use `verbs()` and the API reference
+for your server's loaded-pack surface.
 
-### document
+## Model relationships deliberately
 
-Papers, preprints, technical reports, blog posts, books.
+Edges are directed unless noted otherwise. Their 17 relation names are grouped
+by purpose below; the set is closed.
 
-```
-create(kind="entity", entity_kind="document",
-       name="Attention Is All You Need",
-       properties={"authors": "Vaswani et al.", "year": 2017,
-                   "source": "arxiv:1706.03762"})
-```
+| Group          | Relations                                              | Typical reading                                    |
+| -------------- | ------------------------------------------------------ | -------------------------------------------------- |
+| Structure      | `contains`, `part_of`, `instance_of`                   | parent → child, child → parent, specific → general |
+| Derivation     | `extends`, `variant_of`, `introduced_by`, `supersedes` | newer or derived idea → its predecessor or source  |
+| Provenance     | `derived_from`                                         | output → input                                     |
+| Temporal       | `precedes`                                             | earlier → later                                    |
+| Dependency     | `depends_on`, `enables`                                | consumer → dependency; prerequisite → outcome      |
+| Implementation | `implements`                                           | code or project → concept                          |
+| Lateral        | `competes_with`, `composed_with`                       | peer relationship; both are symmetric              |
+| Annotation     | `annotates`                                            | note → its subject                                 |
+| Epistemic      | `supports`, `refutes`                                  | evidence → claim                                   |
 
-Name the entity with its short title. Put full title, authors, year, and
-citation pointer in `properties`.
+The endpoint rules are part of the model, not suggestions. `annotates` is the
+cross-substrate relation. `supersedes`, `supports`, and `refutes` are
+same-substrate only: entity → entity or note → note. The source of a
+`supports` or `refutes` edge is evidence; the target is the claim. In the KG
+base contract, the remaining base relations are entity → entity, subject to
+their specific allowlist.
 
-### dataset
+## Work through the request DSL
 
-Benchmarks, corpora, evaluation sets.
+All KG verbs are called through the single `request` MCP tool. A `|` chain runs
+left to right and lets the next operation read the preceding result through
+`$prev`. A batch in `[...]` runs independently and has no ordering guarantee.
 
-```
-create(kind="entity", entity_kind="dataset", name="MMLU",
-       description="Massive Multitask Language Understanding benchmark",
-       properties={"type": "benchmark", "year": 2021})
-```
-
-### project
-
-Codebases, libraries, tools, frameworks.
-
-```
-create(kind="entity", entity_kind="project", name="lattice-inference",
-       description="Pure-Rust transformer inference engine",
-       properties={"status": "implemented"})
-```
-
-### person
-
-Researchers, engineers, authors.
-
-```
-create(kind="entity", entity_kind="person", name="Edward Hu",
-       properties={"affiliation": "Microsoft"})
-```
-
-### org
-
-Labs, companies, institutions.
-
-```
-create(kind="entity", entity_kind="org", name="Anthropic",
-       description="AI safety company")
-```
-
-### artifact
-
-Binaries, model checkpoints, Docker images, packages.
-
-```
-create(kind="entity", entity_kind="artifact", name="Llama-3-70B",
-       properties={"type": "checkpoint", "source": "meta-llama"})
-```
-
-### service
-
-APIs, hosted endpoints, SaaS products.
+Create a concept and connect it to an existing document in one chain. Replace
+the document UUID with an ID returned by `search` or `resolve`.
 
 ```
-create(kind="entity", entity_kind="service", name="OpenAI API",
-       properties={"type": "api"})
+request(ops="create(kind=\"concept\", name=\"Grouped-query attention\") | link(source_id=$prev.id, target_id=\"<document-uuid>\", relation=\"introduced_by\")")
 ```
 
-### resource
-
-Actionable knowledge resources: atoms, domain knowledge packs, skills. Governed
-by the KG pack (ADR-048). Use `resource` for reusable knowledge objects that are
-managed by the knowledge pack rather than authored as raw entities.
+Find the best matching entity, then inspect all of its immediate neighbors.
 
 ```
-create(kind="entity", entity_kind="resource", name="retrieval-patterns",
-       description="Domain knowledge pack for hybrid retrieval patterns",
-       properties={"type": "domain"})
+request(ops="search(kind=\"entity\", query=\"grouped-query attention\", limit=1) | neighbors(node_id=$prev[0].id, direction=\"both\")")
 ```
 
-## Note kinds
-
-khive has 5 base note kinds (also a closed set):
-
-| Kind          | What it records        | Example                                                             |
-| ------------- | ---------------------- | ------------------------------------------------------------------- |
-| `observation` | An empirical capture   | "FlashAttention reduces memory from O(N^2) to O(N)"                 |
-| `insight`     | A synthetic conclusion | "Tiling is the key technique across all IO-aware attention methods" |
-| `question`    | An open inquiry        | "Does FlashAttention-3 support GQA natively?"                       |
-| `decision`    | A committed choice     | "We will use FlashAttention-2 for the inference engine"             |
-| `reference`   | An external pointer    | "See arxiv:2205.14135 Section 3.2 for the tiling algorithm"         |
-
-`observation` is the default if you omit `note_kind`.
-
-Packs add their own note kinds too: `task` (GTD pack), `memory` (Memory pack),
-`message` (Comm pack), `scheduled_event` (Schedule pack), and `session`
-(Session pack). The generic `create(kind="note", note_kind="...")` path accepts
-all of these directly (verified against a scratch DB: `note_kind="task"`,
-`"memory"`, `"message"`, `"scheduled_event"`, and `"session"` all succeed;
-`task` additionally requires a `title` field). Prefer the pack-specific verbs
-(`gtd.assign`, `memory.remember`, `comm.send`, `schedule.remind`,
-`session.store`) when you need their defaults, validation, or side effects.
-Use the generic path only when you need a raw note write without those extras.
-
-## Edge relations
-
-khive has 17 edge relations (15 base + 2 epistemic via ADR-055). This is a closed set enforced at compile time.
-
-### When to use each relation
-
-**Structure**: parent/child and classification
-
-| Relation      | Direction           | When to use                                            |
-| ------------- | ------------------- | ------------------------------------------------------ |
-| `contains`    | parent to child     | A system contains a module. An org contains a project. |
-| `part_of`     | child to parent     | Inverse of contains. A module is part of a system.     |
-| `instance_of` | specific to general | GQA is an instance of multi-query attention.           |
-
-**Derivation**: how ideas build on each other
-
-| Relation        | Direction           | When to use                                   |
-| --------------- | ------------------- | --------------------------------------------- |
-| `extends`       | child to parent     | FlashAttention-2 extends FlashAttention.      |
-| `variant_of`    | variant to original | QLoRA is a variant of LoRA.                   |
-| `introduced_by` | concept to source   | LoRA was introduced by the LoRA paper.        |
-| `supersedes`    | new to old          | FlashAttention-3 supersedes FlashAttention-2. |
-
-**Provenance**: where things come from
-
-| Relation       | Direction       | When to use                                |
-| -------------- | --------------- | ------------------------------------------ |
-| `derived_from` | output to input | A model checkpoint derived from a dataset. |
-
-**Temporal**: ordering
-
-| Relation   | Direction        | When to use                           |
-| ---------- | ---------------- | ------------------------------------- |
-| `precedes` | earlier to later | Paper A was published before Paper B. |
-
-**Dependency**: runtime/build relationships
-
-| Relation     | Direction               | When to use                                       |
-| ------------ | ----------------------- | ------------------------------------------------- |
-| `depends_on` | consumer to dependency  | Project A depends on Project B at runtime.        |
-| `enables`    | prerequisite to outcome | BPE tokenization enables subword-level attention. |
-
-**Implementation**: code realizes concept
-
-| Relation     | Direction       | When to use                                  |
-| ------------ | --------------- | -------------------------------------------- |
-| `implements` | code to concept | lattice-inference implements FlashAttention. |
-
-**Lateral**: peer relationships
-
-| Relation        | Direction        | When to use                                          |
-| --------------- | ---------------- | ---------------------------------------------------- |
-| `competes_with` | either direction | LoRA competes with full fine-tuning.                 |
-| `composed_with` | either direction | FlashAttention composed with GQA in a serving stack. |
-
-**Annotation**: notes observing entities
-
-| Relation    | Direction        | When to use                                                 |
-| ----------- | ---------------- | ----------------------------------------------------------- |
-| `annotates` | note to anything | An observation about a concept, a decision about a project. |
-
-**Epistemic**: evidence relationships (added by ADR-055)
-
-| Relation   | Direction         | When to use                                         |
-| ---------- | ----------------- | --------------------------------------------------- |
-| `supports` | evidence to claim | A paper or dataset supports a concept or finding.   |
-| `refutes`  | evidence to claim | A paper or experiment refutes a concept or finding. |
-
-`supports` and `refutes` are same-substrate: source and target must both be
-entities or both be notes. The source is the evidence; the target is the claim.
-
-### Edge endpoint rules
-
-Not every `(source_kind, relation, target_kind)` triple is valid. The base
-contract in ADR-002 defines which entity kinds can appear as source and target
-for each relation. Key rules:
-
-- `annotates` is the only cross-substrate relation. Source must be a note;
-  target can be anything (entity, note, edge, event).
-- `supersedes`, `supports`, and `refutes` are same-substrate only: entity to
-  entity, or note to note.
-- All other 13 relations require entity-to-entity endpoints.
-- `competes_with` and `composed_with` are symmetric: the system canonicalizes
-  direction internally.
-
-Packs can add endpoint pairs through the `EDGE_RULES` mechanism (ADR-017). The
-KG pack adds person-to-org and org-to-org pairs. The GTD pack allows task-to-task
-`depends_on` edges. These are additive; packs cannot tighten the base contract.
-
-### Why a closed ontology
-
-A sparse, fixed set of relations keeps the graph queryable. Ad-hoc relations
-like `uses`, `related_to`, or `loaded_by` fragment the graph and make traversal
-meaningless. If your relationship does not fit one of the 17, it is probably a
-property on the entity rather than an edge.
-
-## Modeling patterns
-
-### Research papers
-
-A paper typically produces: one `document` entity (the paper itself), one or
-more `concept` entities (the ideas it introduces), and `introduced_by` edges
-from concepts to the paper.
+Explore a small, relation-filtered neighborhood from a known root UUID.
 
 ```
-create(kind="entity", entity_kind="document", name="LoRA Paper",
-       properties={"title": "LoRA: Low-Rank Adaptation of Large Language Models",
-                   "authors": "Hu et al.", "year": 2021, "source": "arxiv:2106.09685"})
-
-create(kind="entity", entity_kind="concept", name="LoRA",
-       properties={"domain": "fine-tuning", "type": "technique"})
-
-link(source_id="<lora_id>", target_id="<paper_id>", relation="introduced_by")
+request(ops="traverse(roots=[\"<root-uuid>\"], max_depth=2, direction=\"both\", relations=[\"extends\", \"variant_of\", \"introduced_by\"])")
 ```
 
-For citation chains between papers, use `precedes` (temporal ordering):
+For discovery, start with `search` for content, `resolve` for a name or other
+human reference, and `neighbors` or `traverse` for graph structure. Use
+`verbs(pack="kg")` to inspect the available KG surface. `context` is useful when
+an agent needs a compact, bounded 1–2-hop view around selected entities. Use
+`list` and `stats` for structured browsing and graph health; use `query` for
+read-only GQL or SPARQL pattern matching. `propose`, `review`, and `withdraw`
+provide a reviewed change workflow when direct mutation is not appropriate.
 
-```
-link(source_id="<earlier_paper>", target_id="<later_paper>", relation="precedes")
-```
+## Behavior worth knowing
 
-### Software projects
+- `list`, `search`, and a singleton `create` need a `kind`. Supply a substrate
+  such as `entity` or `note`, or a granular kind such as `concept` or
+  `decision`. A bulk `create(items=[...])` carries a `kind` on each item, so it
+  needs no top-level `kind`.
+- `get`, `update`, and `delete` are by-ID operations. Use a UUID rather than a
+  natural-language name; use `resolve` when you have a human reference.
+- `neighbors` returns edges in both directions by default. Pass
+  `direction="outgoing"` or `direction="incoming"` to restrict to one direction.
+- `merge` returns `kept_id`, not `id`; a following chain step must use
+  `$prev.kept_id`.
+- `query` is read-only. Use `create`, `link`, `update`, `merge`, or `delete` to
+  mutate the graph.
 
-Model a project with `contains` for internal structure, `implements` for the
-concepts it realizes, and `depends_on` for external dependencies:
+## Gotchas
 
-```
-create(kind="entity", entity_kind="project", name="lattice-inference",
-       properties={"status": "implemented"})
+- Do not create a second entity for a spelling variant or alternate title.
+  Search first; if it is a duplicate, use `merge` rather than splitting its
+  edges across records.
+- `supersedes` preserves the old record and marks the replacement relationship;
+  it does not delete history.
+- Direction matters: a concept is `introduced_by` a document, while a project
+  `implements` a concept. Read each relation as source → target before linking.
+- An edge can be rejected even with a valid relation name when its source and
+  target kinds are not an allowed pair. Do not substitute an ad-hoc relation to
+  work around that validation.
+- `delete` is soft by default. A hard delete permanently removes the record and
+  cascades its edges.
+- `$prev` refers only to the immediately preceding operation. Split work into
+  separate requests if a later step needs an earlier result that the intervening
+  step did not return.
 
-link(source_id="<lattice_id>", target_id="<flash_id>", relation="implements")
-link(source_id="<lattice_id>", target_id="<tokio_id>", relation="depends_on")
-```
-
-### People and organizations
-
-```
-create(kind="entity", entity_kind="person", name="Tri Dao")
-create(kind="entity", entity_kind="org", name="Princeton")
-
-link(source_id="<person_id>", target_id="<org_id>", relation="part_of")
-```
-
-### Decision records
-
-Use `decision` notes that annotate the entities they concern:
-
-```
-create(kind="note", note_kind="decision",
-       content="We will use FlashAttention-2 over vanilla attention because memory reduction is critical for 70B inference",
-       annotates=["<flash2_id>", "<project_id>"])
-```
-
-### Temporal chains
-
-For versioned artifacts or sequential papers:
-
-```
-link(source_id="<flash1_id>", target_id="<flash2_id>", relation="precedes")
-link(source_id="<flash2_id>", target_id="<flash3_id>", relation="precedes")
-link(source_id="<flash3_id>", target_id="<flash2_id>", relation="supersedes")
-```
-
-## Anti-patterns
-
-| Pattern                        | Problem                                                                                         | Fix                                                                      |
-| ------------------------------ | ----------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
-| Storing findings only as notes | Notes are temporal context; entities are structural. A concept worth naming deserves an entity. | Create the entity, then annotate it with notes.                          |
-| Creating duplicate entities    | Fragments the graph, splits edges.                                                              | Always `search` before `create`. If found, `link` to it.                 |
-| Using ad-hoc relation names    | `link(relation="uses")` will be rejected.                                                       | Map to the 15 closed relations. If none fit, use a property.             |
-| Reversed `introduced_by`       | `paper → concept` is wrong.                                                                     | Direction is `concept → paper` (the paper introduces the concept).       |
-| Over-noting                    | 20 observations but zero entities.                                                              | Extract the structural content into entities first.                      |
-| Under-linking                  | Entities with 0-1 edges are orphans.                                                            | Target 5+ edges per entity. Below 3 means the entity needs more context. |
-| Version numbers in names       | "LoRA v2" instead of "QLoRA".                                                                   | Version info goes in properties. Names are canonical short forms.        |
-
-## Edge density
-
-Sparse graphs are useless for traversal. Target minimums:
-
-| Entity kind         | Min edges | What to link                                                                                 |
-| ------------------- | --------- | -------------------------------------------------------------------------------------------- |
-| concept (algorithm) | 4         | `extends` or `instance_of` (parent), `introduced_by` (paper), `competes_with` (alternatives) |
-| concept (paper)     | 2         | `introduced_by` edges from concepts it introduced                                            |
-| project             | 3         | `implements` (concepts), `depends_on` (deps), `contains`/`part_of` (structure)               |
-| person              | 1         | `introduced_by` edges from their work                                                        |
-
-Overall target: 5+ edges per entity average. Check with `stats()`; if
-`total_edges / total_entities` is below 4, the graph needs polish.
-
-## See also
-
-- [Prompt Cookbook](prompt-cookbook.md): concrete verb patterns for all the
-  operations described here
-- [Search and Retrieval](search.md): how to find things in the graph
-- [Specialized Packs](specialized-packs.md): niche packs, such as the
-  formal-math pack, that extend the base edge ontology additively
-- [AGENTS.md](../../AGENTS.md): the full agent reference with GQL/SPARQL
-  examples
+For the complete domain vocabulary, see the [core type rustdoc](https://docs.rs/khive-types/latest/khive_types/). For more request
+examples, use the [API reference](api-reference.md); the [KG pack rustdoc](https://docs.rs/khive-pack-kg/latest/khive_pack_kg/) is the
+authoritative list of every verb parameter.

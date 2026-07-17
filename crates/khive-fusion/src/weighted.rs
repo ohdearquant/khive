@@ -33,8 +33,11 @@ fn min_max_normalize_source<Id>(
         .collect()
 }
 
-/// Weighted linear combination of per-source min-max-normalized scores.
-/// Negatives/NaN weights → 0; all-zero falls back to equal distribution.
+/// Fuse per-source min-max-normalized scores with lossy normalized weights.
+///
+/// Negative/non-finite weights become zero and all-zero input becomes equal weights. Results sort
+/// by descending score, breaking ties by ascending ID. See
+/// `crates/khive-fusion/docs/api/fusion-functions.md`.
 pub fn weighted_fusion<Id: Eq + Hash + Clone + Ord>(
     sources: Vec<Vec<(Id, DeterministicScore)>>,
     weights: &[f64],
@@ -43,31 +46,25 @@ pub fn weighted_fusion<Id: Eq + Hash + Clone + Ord>(
         return Vec::new();
     }
 
-    // Treat non-finite weights as 0.0 before normalization to avoid NaN/inf
-    // propagating into DeterministicScore arithmetic (finding #3).
+    // Sanitize before fixed-point conversion so NaN/Inf cannot enter arithmetic.
     let sanitized: Vec<f64> = weights
         .iter()
         .map(|&w| if w.is_finite() && w > 0.0 { w } else { 0.0 })
         .collect();
 
-    // Normalize weights. Only consider entries that correspond to an actual source
-    // (extra weight entries beyond sources.len() do not correspond to any source
-    // and must not steal probability mass — finding #1).
+    // Extra weights must not steal probability mass from real sources.
     let active_count = sources.len().min(sanitized.len());
     let weight_sum: f64 = sanitized[..active_count].iter().sum();
 
     let normalized: Vec<f64> = if weight_sum <= 0.0 {
-        // All zero/negative/non-finite weights -> equal distribution across sources
         vec![1.0 / sources.len() as f64; sources.len()]
     } else {
-        // Build a per-source normalized weight vector of length == sources.len().
-        // Sources beyond the weights array receive 0.0 (excluded from output).
         (0..sources.len())
             .map(|i| sanitized.get(i).map(|&w| w / weight_sum).unwrap_or(0.0))
             .collect()
     };
 
-    // Estimate capacity (safe saturating sum to avoid usize overflow — finding #6).
+    // Saturation keeps adversarial length sums from wrapping allocation capacity.
     let estimated_capacity: usize = sources
         .iter()
         .map(|s| s.len())
@@ -77,19 +74,12 @@ pub fn weighted_fusion<Id: Eq + Hash + Clone + Ord>(
     for (source_idx, results) in sources.into_iter().enumerate() {
         let weight = normalized[source_idx];
 
-        // Skip zero-weight sources entirely — they must not inject documents
-        // with zero scores into the output (finding #2).
+        // A zero-weight source must not inject zero-score IDs into the union.
         if weight == 0.0 {
             continue;
         }
 
-        // Normalize each source to [0,1] before weighted combination so that
-        // BM25 unbounded scores and cosine [0,1] scores contribute proportionally
-        // to their configured weights (#2496/#2639).
-        //
-        // Deduplicate IDs within the source before merging: keep the maximum
-        // normalized score for each ID so one retriever cannot double-count a
-        // document (finding #4).
+        // Normalize source scales and keep one maximum contribution per ID.
         let norm_results = min_max_normalize_source(results);
         let mut source_best: HashMap<Id, DeterministicScore> =
             HashMap::with_capacity(norm_results.len());
@@ -105,10 +95,7 @@ pub fn weighted_fusion<Id: Eq + Hash + Clone + Ord>(
         }
 
         for (id, score) in source_best {
-            // weighted_sum converts weight to DeterministicScore internally and
-            // accumulates in i128 — no float arithmetic in the hot path.
-            // weight is finite and > 0 here (checked above), so weighted_sum
-            // cannot return NonFiniteWeight.
+            // Sanitized finite weights make this fixed-point operation infallible.
             let w = match weighted_sum(&[score], &[weight]) {
                 Ok(s) => s,
                 Err(_) => continue, // defensive: skip on unexpected error
@@ -118,7 +105,6 @@ pub fn weighted_fusion<Id: Eq + Hash + Clone + Ord>(
         }
     }
 
-    // Sort by score descending, then by ID ascending for deterministic tie-breaking.
     let mut fused: Vec<(Id, DeterministicScore)> = combined.into_iter().collect();
 
     fused.sort_by(
@@ -137,7 +123,9 @@ pub fn weights_are_normalized(weights: &[f64], tolerance: f64) -> bool {
     (sum - 1.0).abs() <= tolerance
 }
 
-/// Normalize weights to sum to 1.0. Negative weights become 0.0; all-zero gives equal distribution.
+/// Lossily normalize finite positive weights; all-zero input becomes equal weights.
+///
+/// See `crates/khive-fusion/docs/api/fusion-functions.md`.
 pub fn normalize_weights(weights: &[f64]) -> Vec<f64> {
     if weights.is_empty() {
         return Vec::new();
@@ -155,7 +143,7 @@ pub fn normalize_weights(weights: &[f64]) -> Vec<f64> {
     }
 }
 
-/// Normalize weights with strict validation. Returns `Err(index)` if any weight is non-finite.
+/// Reject the first non-finite weight, then apply [`normalize_weights`].
 pub fn try_normalize_weights(weights: &[f64]) -> Result<Vec<f64>, usize> {
     for (i, &w) in weights.iter().enumerate() {
         if !w.is_finite() {

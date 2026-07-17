@@ -500,15 +500,16 @@ is out of scope for this repository.
 
 ## Amendment 2 (2026-07-09): code.ingest verb + acceptance
 
-**Status (as of Amendment 3, 2026-07-11): accepted but deferred, not yet
-implemented.** The `code.ingest` verb this amendment specifies has no
-handler in `crates/khive-pack-code` today; the shipped pack contributes zero
-MCP verbs. Amendment 3 below documents the current (zero-verb) production
-surface and adds no verb of its own — it covers an unrelated admin CLI path
-for `findings.json`, not this amendment's Scanner/Extractor design. The
-design and acceptance recorded in this section remain the plan for when
-`code.ingest` is implemented; nothing here is being withdrawn or
-superseded, only marked not-yet-built.
+**Status (as of PR #1039, 2026-07-15): accepted and shipped — L1 (manifest
+edges) + L1.5 (import-scan edges) only.** The `code.ingest` verb has a
+handler in `crates/khive-pack-code` and is live on the default MCP surface,
+which now reports 79 verbs. Amendment 3 below documented the interim
+zero-verb production surface (2026-07-11 through PR #1039) — that window has
+closed; the pack now contributes one verb, `code.ingest`, in addition to the
+`finding` note kind. L2 (the full Scanner/Extractor pipeline over the D2-D3
+vocabulary at declaration granularity) remains unimplemented and out of
+scope for PR #1039; the design and acceptance recorded in the rest of this
+section remain the plan for that future work.
 
 The base text left the Scanner/Extractor pipeline over the D2-D3 vocabulary as
 "separate ADR-069-layer work" and explicitly out of scope. That pipeline now has a
@@ -719,12 +720,14 @@ default pack set khive-mcp and `kkernel` load when no `--pack`/`KHIVE_PACKS`
 override is given. Every default-configuration server and admin invocation
 from this point on validates and stores `finding` notes and the pack's 22
 additive `EDGE_RULES`; a caller no longer has to opt in with an explicit
-`--pack code` to make audit findings queryable. The pack still contributes
-zero MCP verbs today and zero new entity kinds; only its note kind, edge
-rules, and entity-subtype registrations become reachable by default. (This
-is a statement of current fact, not a standing invariant: Amendment 2
-accepts a `code.ingest` source-ingest verb that remains unimplemented. The
-no-verb statements in this amendment are scoped to the findings surface.)
+`--pack code` to make audit findings queryable. At the time of this
+amendment the pack contributed zero MCP verbs and zero new entity kinds;
+only its note kind, edge rules, and entity-subtype registrations were
+reachable by default. (This was a statement of current fact, not a standing
+invariant: Amendment 2's `code.ingest` source-ingest verb shipped in PR
+#1039, so the pack now contributes one verb — see Amendment 2's updated
+status. The no-verb statements in this amendment were scoped to the
+findings surface and predate that verb landing.)
 
 ### C2: Ingestion is an admin/runner-side path, not a verb
 

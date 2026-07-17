@@ -1,5 +1,4 @@
-//! `FindingHook` — validates and defaults the `finding` note kind on the
-//! shared `create(kind="finding", ...)` path.
+//! Validation/defaulting for the shared finding-note create path.
 
 use async_trait::async_trait;
 use serde_json::{json, Value};

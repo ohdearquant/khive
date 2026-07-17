@@ -1,7 +1,6 @@
 // Copyright 2026 Haiyang Li. Licensed under Apache-2.0.
 //
-//! KG import/export format adapters. See `docs/protocol.md` for the
-//! full pipeline description, parse strategy notes, and deferred format list.
+//! Pure KG import format adapters and intermediate wire records.
 
 mod error;
 pub use error::AdapterError;

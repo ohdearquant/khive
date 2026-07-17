@@ -37,7 +37,7 @@ Defaults are tuned for `m=20` which is optimal for k=10 recall at 384d (empirica
 improve cache locality during graph traversal. All nodes for a given layer are stored in a
 contiguous `Vec`, with inter-node references stored as integer indices rather than pointers.
 
-See `src/arena/` and `docs/arena.md` for full design rationale.
+See `src/arena/` and `docs/api/arena.md` for full design rationale.
 
 ## Tombstone Handling
 
@@ -52,7 +52,7 @@ edges. See `TombstoneStats` for monitoring.
 `HnswCheckpoint` stores the snapshot plus metadata for incremental recovery. Load a checkpoint
 with `HnswCheckpointStore::load` after crash or restart.
 
-See `docs/checkpoint.md` for tombstone tracking, determinism, and khive-fold integration.
+See `docs/api/checkpoint.md` for tombstone tracking, determinism, and khive-fold integration.
 
 ## Tests and Benchmarks
 

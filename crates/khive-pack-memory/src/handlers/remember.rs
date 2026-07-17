@@ -31,12 +31,8 @@ impl MemoryPack {
         let memory_type = p.memory_type.as_deref().unwrap_or("episodic");
         validate_memory_type(memory_type)?;
 
-        // Resolve the write namespace (ADR-007 Rev 6 carve-out):
-        //   1. Explicit override (`namespace=` param) → use that.
-        //   2. Episodic memory → stamp with the caller's actor id.
-        //      ActorRef::anonymous() has id="local", so unconfigured actors produce no change.
-        //   3. Semantic memory → unchanged (shared "local" pool).
-        // Defense-in-depth for direct (non-dispatch) callers; dispatch pre-mints override ns via Rule-3 escape (pack.rs:~886).
+        // Explicit namespace wins; otherwise episodic uses actor scope and semantic uses local.
+        // Direct-call defense in depth mirrors dispatch's Rule-3 namespace escape.
         let write_token_owned: Option<NamespaceToken> = if let Some(ns_str) = p.namespace.as_deref()
         {
             let ns = Namespace::parse(ns_str).map_err(|e| {
@@ -63,9 +59,7 @@ impl MemoryPack {
                 )));
             }
             Some(v) => v,
-            // episodic: lower default — session events decay quickly and should not
-            // crowd out timeless semantic memories in recall ranking.
-            // semantic: higher default — durable facts warrant stronger base weight.
+            // Short-lived episodes start below durable semantic facts.
             None => match memory_type {
                 "semantic" => DEFAULT_SALIENCE_SEMANTIC,
                 _ => DEFAULT_SALIENCE_EPISODIC,
@@ -78,8 +72,7 @@ impl MemoryPack {
                 )));
             }
             Some(v) => v,
-            // episodic: ~35-day half-life — short-lived session context ages out fast.
-            // semantic: ~139-day half-life — durable facts stay relevant much longer.
+            // Episodic context decays at ~35 days; semantic facts at ~139 days.
             None => match memory_type {
                 "semantic" => DEFAULT_DECAY_SEMANTIC,
                 _ => DEFAULT_DECAY_EPISODIC,
@@ -136,31 +129,13 @@ impl MemoryPack {
             .await?;
 
         {
-            // #791: do NOT clear the in-memory ANN cache or delete the
-            // persisted snapshot here. That used to destroy the only fast
-            // fallback a concurrent `memory.recall` had — a recall landing
-            // before the background warm below finished was forced into a
-            // synchronous full-corpus rebuild inline on its own request
-            // path. Bumping the write-generation counter is the only
-            // invalidation signal needed: the recall-path freshness gate
-            // (`ann::is_current`, `handlers/common.rs`) already treats a
-            // present-but-behind-counter entry as stale, serves it anyway,
-            // and fires this same background warm so a later recall
-            // benefits from the fresher build once `install_if_fresher`
-            // installs it.
+            // Preserve the stale graph as a fast fallback; generation is the invalidation signal.
             let affected_models: Vec<String> = match p.embedding_model.as_deref() {
                 Some(model) => vec![model.to_owned()],
                 None => self.runtime.registered_embedding_model_names(),
             };
             for model in affected_models {
-                // #750: bump this model's write-generation counter BEFORE
-                // triggering the background warm, so `ensure_ann_background`'s
-                // (and, downstream, `ensure_ann_for_model`'s) write-generation
-                // floor for this call always reflects the note just written —
-                // any build that started capturing its own floor before this
-                // point is provably looking at a stale corpus and will lose
-                // the install race to whichever rebuild captures at or after
-                // this bump.
+                // Bump BEFORE warming so this write is included in the required generation floor.
                 let key = ann::AnnKey::from_token(write_token, &model);
                 ann::bump_generation(&self.ann, &key).await;
                 ann::ensure_ann_background(&self.runtime, write_token, &self.ann, &model).await;

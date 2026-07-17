@@ -7,14 +7,9 @@ use crate::record::{EdgeRecord, EntityRecord};
 
 /// A format adapter for the KG import pipeline.
 ///
-/// Implementations parse a source format and yield entity and edge records
-/// using the standard `EntityRecord`/`EdgeRecord` wire shapes. The adapter writes no database
-/// state — its output is consumed by the standard `khive kg import` pipeline.
-///
-/// Each iterator item is `Ok(record)` on success or `Err(AdapterError)` on a per-record
-/// parse failure. Non-fatal issues (unknown optional fields, etc.) accumulate internally
-/// and are retrievable via [`FormatAdapter::warnings`]. Parsing may be eager or lazy
-/// depending on the implementation.
+/// Implementations write no database state. Record failures remain in iterators and non-fatal
+/// issues accumulate in [`Self::warnings`]. See
+/// `crates/khive-vcs-adapters/docs/api/adapter-protocol.md`.
 pub trait FormatAdapter {
     /// Short name of the format handled by this adapter (e.g. `"csv"`, `"json"`).
     fn name(&self) -> &str;

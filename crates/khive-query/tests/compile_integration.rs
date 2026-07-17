@@ -966,7 +966,7 @@ fn gql_inline_property_map_float_overflow_rejected() {
     );
 }
 
-// --- Numeric literal grammar (docs/design.md): digits required on both
+// --- Numeric literal grammar (docs/api/parsing.md): digits required on both
 // sides of the dot. `1.`, `-.5`, and `.5` must all be rejected, not
 // delegated to f64::parse's looser rules. ---
 

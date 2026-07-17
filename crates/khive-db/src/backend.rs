@@ -1106,4 +1106,284 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1);
     }
+
+    /// khive#1029 repro: a `create_entity`-shaped write sequence (entity
+    /// upsert, then FTS `upsert_document` on the SAME file-backed DB, SAME
+    /// `StorageBackend`/pool) against a fresh tenant DB file, with a short
+    /// `busy_timeout` so a genuine lock hang fails fast instead of burning
+    /// 30s. Runs with `write_queue_enabled: false` — the legacy pool-mutex /
+    /// standalone-connection path (`KHIVE_WRITE_QUEUE` unset/0 in the
+    /// hosted symptom report is one of the two configs to check; see the
+    /// `_write_queue_enabled` sibling below for the flag-on config).
+    fn issue_1029_pool(write_queue_enabled: bool) -> (tempfile::TempDir, StorageBackend) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("issue_1029.db");
+        let config = crate::pool::PoolConfig {
+            path: Some(path.clone()),
+            busy_timeout: std::time::Duration::from_millis(200),
+            write_queue_enabled,
+            ..crate::pool::PoolConfig::default()
+        };
+        let pool = ConnectionPool::new(config).expect("fresh tenant-shaped pool should open");
+        let backend = StorageBackend {
+            pool: Arc::new(pool),
+            is_file_backed: true,
+            path: Some(path),
+            notes_seq_repair_runs: AtomicUsize::new(0),
+        };
+        (dir, backend)
+    }
+
+    async fn issue_1029_create_entity_shaped_sequence(
+        backend: &StorageBackend,
+    ) -> Result<(), String> {
+        let entities = backend
+            .entities_for_namespace("tenant_ns")
+            .map_err(|e| format!("entities_for_namespace: {e}"))?;
+        let entity = khive_storage::entity::Entity::new("tenant_ns", "concept", "Issue1029Repro");
+        let entity_id = entity.id;
+        entities
+            .upsert_entity(entity)
+            .await
+            .map_err(|e| format!("upsert_entity: {e}"))?;
+
+        let text = backend.text("entities").map_err(|e| format!("text: {e}"))?;
+        let doc = khive_storage::types::TextDocument {
+            subject_id: entity_id,
+            kind: khive_types::SubstrateKind::Entity,
+            title: Some("Issue1029Repro".to_string()),
+            body: "issue 1029 repro body".to_string(),
+            tags: vec![],
+            namespace: "tenant_ns".to_string(),
+            metadata: None,
+            updated_at: chrono::Utc::now(),
+        };
+        text.upsert_document(doc)
+            .await
+            .map_err(|e| format!("fts_upsert: {e}"))
+    }
+
+    /// khive#1029 H1/H2 control: `KHIVE_WRITE_QUEUE` unset (legacy pool-mutex
+    /// / standalone-connection path for both stores, sharing ONE
+    /// `ConnectionPool` via ONE `StorageBackend` — the topology this test
+    /// exists to confirm or kill as the lock source, isolated from any
+    /// multi-pool or multi-backend wiring question).
+    #[tokio::test]
+    async fn issue_1029_create_entity_shaped_sequence_write_queue_off() {
+        let (_dir, backend) = issue_1029_pool(false);
+        let result = issue_1029_create_entity_shaped_sequence(&backend).await;
+        assert!(
+            result.is_ok(),
+            "khive#1029 repro (KHIVE_WRITE_QUEUE off): fts_upsert step failed: {:?}",
+            result.err()
+        );
+    }
+
+    /// khive#1029 H1 direct test: `KHIVE_WRITE_QUEUE=1`, single shared
+    /// `ConnectionPool`/`StorageBackend` (so the pool-wide `WriterTask` is
+    /// shared by construction) — isolates whether the WriterTask's
+    /// transaction lifecycle itself (not a multi-pool topology) is the lock
+    /// source.
+    #[tokio::test]
+    async fn issue_1029_create_entity_shaped_sequence_write_queue_on() {
+        let (_dir, backend) = issue_1029_pool(true);
+        let result = issue_1029_create_entity_shaped_sequence(&backend).await;
+        assert!(
+            result.is_ok(),
+            "khive#1029 repro (KHIVE_WRITE_QUEUE=1): fts_upsert step failed: {:?}",
+            result.err()
+        );
+    }
+
+    /// khive#1029 H2 direct test: TWO independent `ConnectionPool`s (hence
+    /// two independent writer connections / two independent `WriterTask`
+    /// `OnceLock`s) opened against the SAME tenant DB file — the shape a
+    /// per-store (rather than per-backend) pool construction would produce.
+    /// Entity writes go through pool A, the FTS write through pool B, each
+    /// with `write_queue_enabled: true` so each independently spawns its own
+    /// WriterTask on first access.
+    #[tokio::test]
+    async fn issue_1029_two_pools_same_file_write_queue_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("issue_1029_two_pools.db");
+
+        let cfg = |p: std::path::PathBuf| crate::pool::PoolConfig {
+            path: Some(p),
+            busy_timeout: std::time::Duration::from_millis(200),
+            write_queue_enabled: true,
+            ..crate::pool::PoolConfig::default()
+        };
+
+        let pool_a = ConnectionPool::new(cfg(path.clone())).expect("pool A should open");
+        let backend_a = StorageBackend {
+            pool: Arc::new(pool_a),
+            is_file_backed: true,
+            path: Some(path.clone()),
+            notes_seq_repair_runs: AtomicUsize::new(0),
+        };
+        let pool_b = ConnectionPool::new(cfg(path.clone())).expect("pool B should open");
+        let backend_b = StorageBackend {
+            pool: Arc::new(pool_b),
+            is_file_backed: true,
+            path: Some(path),
+            notes_seq_repair_runs: AtomicUsize::new(0),
+        };
+
+        let entities = backend_a
+            .entities_for_namespace("tenant_ns")
+            .expect("entities_for_namespace on pool A");
+        let entity =
+            khive_storage::entity::Entity::new("tenant_ns", "concept", "Issue1029TwoPools");
+        let entity_id = entity.id;
+        entities
+            .upsert_entity(entity)
+            .await
+            .expect("pool A entity upsert should succeed");
+
+        let text = backend_b.text("entities").expect("text on pool B");
+        let doc = khive_storage::types::TextDocument {
+            subject_id: entity_id,
+            kind: khive_types::SubstrateKind::Entity,
+            title: Some("Issue1029TwoPools".to_string()),
+            body: "issue 1029 two-pool repro body".to_string(),
+            tags: vec![],
+            namespace: "tenant_ns".to_string(),
+            metadata: None,
+            updated_at: chrono::Utc::now(),
+        };
+        let result = text.upsert_document(doc).await;
+        assert!(
+            result.is_ok(),
+            "khive#1029 two-pool repro: fts_upsert on an independent pool for the \
+             same tenant DB file failed: {:?}",
+            result.err()
+        );
+    }
+
+    /// Minimal thread-local capture subscriber for asserting emitted events —
+    /// mirrors the capture subscriber in `checkpoint.rs`'s tick tests.
+    struct StarvationCaptureSubscriber {
+        events: Arc<std::sync::Mutex<Vec<std::collections::BTreeMap<String, String>>>>,
+    }
+
+    impl tracing::Subscriber for StarvationCaptureSubscriber {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            #[derive(Default)]
+            struct FieldVisitor(std::collections::BTreeMap<String, String>);
+            impl tracing::field::Visit for FieldVisitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0
+                        .insert(field.name().to_string(), format!("{value:?}"));
+                }
+            }
+            let mut visitor = FieldVisitor::default();
+            event.record(&mut visitor);
+            self.events.lock().unwrap().push(visitor.0);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// Regression coverage for the lock-starvation diagnostic itself: when a
+    /// text write starves on the SQLite write lock, `with_writer_unmanaged`
+    /// must emit the WARN carrying the `tx_registry` snapshot — operation
+    /// name, open-transaction count, and the registered labels.
+    ///
+    /// `#[serial(tx_registry)]`: the registry is a process-wide singleton
+    /// shared across this test binary; this group serializes every test that
+    /// registers fixture entries or asserts snapshot contents (see
+    /// `checkpoint.rs`, `pool.rs`, `sql_bridge.rs`). The assertion checks the
+    /// fixture label is PRESENT rather than the snapshot being exactly one
+    /// entry, so unrelated short-lived production registrations elsewhere in
+    /// the binary cannot flake it.
+    #[tokio::test]
+    #[serial_test::serial(tx_registry)]
+    async fn issue_1029_starvation_warn_reports_registered_transactions() {
+        let (_dir, backend) = issue_1029_pool(false);
+        // Create the store (and its FTS DDL) BEFORE the lock is held, so the
+        // starvation happens inside `upsert_document` itself.
+        let text = backend.text("entities").expect("text store");
+
+        // Hold a genuine SQLite write lock on a separate standalone writer
+        // connection, with a registered fixture transaction the diagnostic
+        // must surface.
+        let holder = backend
+            .pool
+            .open_standalone_writer()
+            .expect("holder connection");
+        holder
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("holder BEGIN IMMEDIATE");
+        let fixture =
+            khive_storage::tx_registry::register(Some("issue_1029_fixture_tx".to_string()));
+
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = StarvationCaptureSubscriber {
+            events: Arc::clone(&events),
+        };
+        let guard = tracing::subscriber::set_default(subscriber);
+
+        let doc = khive_storage::types::TextDocument {
+            subject_id: uuid::Uuid::new_v4(),
+            kind: khive_types::SubstrateKind::Entity,
+            title: Some("Issue1029Starved".to_string()),
+            body: "issue 1029 starvation diagnostic body".to_string(),
+            tags: vec![],
+            namespace: "tenant_ns".to_string(),
+            metadata: None,
+            updated_at: chrono::Utc::now(),
+        };
+        let result = text.upsert_document(doc).await;
+
+        drop(guard);
+        drop(fixture);
+        holder
+            .execute_batch("ROLLBACK")
+            .expect("holder ROLLBACK releases the lock");
+
+        assert!(
+            result.is_err(),
+            "upsert_document must starve while another connection holds the write lock"
+        );
+
+        let events = events.lock().unwrap();
+        let warn = events
+            .iter()
+            .find(|fields| {
+                fields
+                    .get("message")
+                    .is_some_and(|m| m.contains("text write starved"))
+            })
+            .unwrap_or_else(|| panic!("expected a starvation WARN, captured events: {events:?}"));
+        assert!(
+            warn.get("op").is_some_and(|op| op.contains("fts_upsert")),
+            "WARN must name the starved operation, got: {warn:?}"
+        );
+        assert!(
+            warn.get("open_txs")
+                .is_some_and(|txs| txs.contains("issue_1029_fixture_tx")),
+            "WARN must list the registered holder label, got: {warn:?}"
+        );
+        let count: usize = warn
+            .get("open_tx_count")
+            .expect("WARN must carry open_tx_count")
+            .parse()
+            .expect("open_tx_count must be numeric");
+        assert!(
+            count >= 1,
+            "open_tx_count must count the fixture, got {count}"
+        );
+    }
 }

@@ -4,6 +4,7 @@
 //! `khive-storage` capability traits against the shared connection pool.
 
 pub mod blob;
+pub mod blob_s3;
 pub mod entity;
 pub mod event;
 pub mod graph;

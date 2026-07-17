@@ -1,6 +1,6 @@
 # ADR-069: The Subject Model -- Domain-Ontology Ingestion and Map Pipeline
 
-**Status**: Proposed\
+**Status**: Accepted\
 **Date**: 2026-06-23\
 **Authors**: khive maintainers
 **Depends on**: ADR-001 (Entity Kind Taxonomy), ADR-002 (Edge Ontology), ADR-013 (Note Kind

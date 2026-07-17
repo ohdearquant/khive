@@ -34,10 +34,13 @@ sqlite-vec = { workspace = true, optional = true }
 blake3 = { workspace = true }
 fs4 = { workspace = true }
 tempfile = { workspace = true }
+futures = { workspace = true }
+object_store = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
 rusqlite = { workspace = true, features = ["bundled", "column_decltype"] }
+bytes = "1"
 khive-storage = { version = "0.5.0", path = "../khive-storage" }
 khive-types = { version = "0.5.0", path = "../khive-types", features = ["serde"] }
 uuid = { workspace = true }

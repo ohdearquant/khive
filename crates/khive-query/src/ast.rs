@@ -1,8 +1,10 @@
-//! GQL abstract syntax tree.
+//! Shared query AST for GQL/SPARQL parsing and SQL compilation.
 
 use std::collections::HashMap;
 
-/// A SQL parameter value emitted by the query compiler.
+/// A backend-independent SQL parameter emitted by the compiler.
+///
+/// See `crates/khive-query/docs/api/ast.md` for value and precision semantics.
 #[derive(Clone, Debug)]
 pub enum QueryValue {
     Null,
@@ -12,7 +14,7 @@ pub enum QueryValue {
     Blob(Vec<u8>),
 }
 
-/// Top-level GQL query node produced by the parser.
+/// A parsed query: pattern, predicates, projections, and optional row limit.
 #[derive(Debug, Clone)]
 pub struct GqlQuery {
     pub pattern: MatchPattern,
@@ -21,7 +23,7 @@ pub struct GqlQuery {
     pub limit: Option<usize>,
 }
 
-/// A WHERE expression tree supporting AND, OR, and leaf conditions.
+/// A WHERE expression tree that preserves AND/OR grouping.
 #[derive(Debug, Clone)]
 pub enum WhereExpr {
     /// AND of two sub-expressions.
@@ -109,6 +111,7 @@ impl MatchPattern {
         })
     }
 
+    /// Returns whether any edge permits more than one hop.
     pub fn has_variable_length(&self) -> bool {
         self.edges().any(|e| e.max_hops > 1)
     }
@@ -121,18 +124,17 @@ pub enum PatternElement {
     Edge(EdgePattern),
 }
 
-/// A node binding in the MATCH pattern with optional kind, entity_type, and property filters.
+/// A node binding with optional kind, governed subtype, and property filters.
 #[derive(Debug, Clone)]
 pub struct NodePattern {
     pub variable: Option<String>,
     pub kind: Option<String>,
-    /// Governed subtype within the kind (e.g. "researcher" within "person").
-    /// Compiled to `entity_type = ?` — a direct column, not a property extraction.
+    /// Governed subtype compiled against the dedicated `entity_type` column.
     pub entity_type: Option<String>,
     pub properties: HashMap<String, ConditionValue>,
 }
 
-/// An edge binding in the MATCH pattern with optional relation filters, direction, and hop bounds.
+/// An edge binding with relation alternatives, direction, and inclusive hop bounds.
 #[derive(Debug, Clone)]
 pub struct EdgePattern {
     pub variable: Option<String>,
@@ -178,15 +180,13 @@ pub enum CompareOp {
     IsNotNull,
 }
 
-/// Right-hand side value in a WHERE condition.
+/// A typed condition value; integer and decimal forms remain distinct.
+///
+/// See `crates/khive-query/docs/api/ast.md` for binding and precision details.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConditionValue {
     String(String),
-    /// An integer literal (no decimal point in the source lexeme), preserved
-    /// as `i64` so it binds as `QueryValue::Integer` and compares exactly
-    /// against `json_extract`'s INTEGER storage class -- `f64` cannot
-    /// represent every `i64` exactly past 2^53, which silently rounds large
-    /// literals (e.g. `9007199254740993`) to the wrong value (issue #832).
+    /// Exact `i64` literal whose source lexeme had no decimal point.
     Integer(i64),
     /// A float literal (decimal point present in the source lexeme).
     Number(f64),

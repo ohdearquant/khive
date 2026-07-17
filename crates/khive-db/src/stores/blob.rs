@@ -225,6 +225,7 @@ fn write_lock_for_root(root: &Path) -> std::io::Result<Arc<tokio::sync::Mutex<()
 }
 
 /// A `BlobStore` backed by a BLAKE3-sharded directory tree.
+#[derive(Debug)]
 pub struct FsBlobStore {
     root: PathBuf,
     floor_bytes: u64,

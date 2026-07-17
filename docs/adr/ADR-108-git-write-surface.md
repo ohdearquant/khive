@@ -1,6 +1,6 @@
 # ADR-108: Git Write Surface Through khive (Phase B)
 
-**Status**: Proposed\
+**Status**: Accepted\
 **Date**: 2026-07-11\
 **Authors**: khive maintainers\
 **Depends on**: ADR-088 (Git-Lifecycle Pack) and its Amendment 1 (`git.digest`), ADR-018
@@ -352,3 +352,113 @@ caller class; they are necessary but not sufficient for an untrusted-caller thre
   Fork (b)
 - `crates/khive-pack-git/src/pack.rs`, `src/handlers.rs` - existing pack structure new write
   handlers would extend
+
+## Amendment 1 (2026-07-11) - Handler-Level Fail-Closed Policy Allowlist and Hooks-Disabled Execution
+
+### Context
+
+Implementation review of the write verbs (`git.commit` / `git.branch` / `git.push`) found
+two gaps between what this ADR's threat notes assume and what the shipped default actually
+enforced.
+
+First, Fork (c) resolved that `repo`/`branch` stay ordinary verb arguments, policed by the
+Gate (ADR-018), rather than becoming typed `GateRequest` fields. That resolution is
+unaffected by this amendment, but it left an unstated assumption exposed: the runtime's
+default `Gate` implementation is `AllowAllGate` (`crates/khive-runtime/src/config.rs`), and
+nothing in this ADR's Decision or Hard rules sections required a stricter Gate to be
+configured before the write verbs became reachable. Under the shipped default, any principal
+able to reach the MCP surface at all could invoke `git.commit` / `git.branch` / `git.push`
+against any local path that resolves `validate_repo_path`'s `.git`-entry check, with no
+policy consulted at any layer.
+
+Second, Fork (d) / Open Question 4 resolved that fork-content write capability "stays
+unbuilt" for this phase, and that "the absence of the capability is itself the trust
+boundary." As shipped, that boundary was not actually concrete: `validate_repo_path`
+accepted any absolute path containing a `.git` entry, so nothing distinguished an
+operator-trusted repository from an arbitrary clone (including one populated from untrusted
+fork content) sitting on the same filesystem the khive daemon can reach. The absence of a
+purpose-built "apply and push a diff" verb does not, by itself, establish that boundary when
+the general-purpose write verbs impose no repo-identity check at all.
+
+Third, `run_git` (the write path's shell-out primitive, `write_handlers.rs`) invoked system
+git with no hardening beyond the argv-construction rules Fork (b) specifies. The read/ingest
+path's clone and fetch operations (`crates/khive-pack-git/src/cache.rs`) already run with
+`-c core.hooksPath=/dev/null` specifically because repo-configured hooks execute in the
+daemon's own process and credential context; the write path had no equivalent control, so a
+`pre-commit`/`post-commit`/`pre-push` hook script present in a repo the write verbs touched
+would execute as a side effect of an otherwise-successful, policy-permitted write.
+
+### Decision
+
+1. **Handler-level fail-closed precondition, independent of Gate configuration.** Each of
+   the three write verbs now consults a git-write policy artifact -- a closed allowlist of
+   `(repo_path, branch_patterns)` entries -- before performing any repository mutation. When
+   no policy artifact is configured, or the artifact's allowlist is empty, all three verbs
+   fail with an error stating the verb is unavailable until a git-write policy is
+   configured. This check runs at the handler level (`crates/khive-pack-git/src/
+   write_policy.rs`, consulted from `write_handlers.rs`), in the same enforcement class as
+   this ADR's existing unconditional force-push denial (`reject_force`): it does not depend
+   on any `Gate` implementation being configured, and it runs in addition to, not instead
+   of, whatever Gate policy is also in effect. This closes the first gap: `AllowAllGate`
+   alone no longer makes the write verbs reachable against an arbitrary repository.
+
+2. **The allowlist is the concrete implementation of Open Question 4's provenance
+   boundary.** A repo is eligible for a khive-mediated write only if it exactly matches an
+   allowlisted `repo_path` entry, and the target branch matches that entry's
+   `branch_patterns` (an exact name or a single-`*`-wildcard glob, e.g. `release-*`). Both
+   sides of the repo comparison are canonicalized (`std::fs::canonicalize`) before matching:
+   a symlink that resolves to an allowlisted repo's real path is accepted as naming that same
+   repo, and a symlink that resolves anywhere else is denied exactly as if the caller had
+   passed that other path directly -- canonicalization normalizes how the same repo can be
+   spelled, it never widens what is reachable. An allowlisted repo is operator-declared
+   trusted provenance: this is what "the absence of the capability is itself the trust
+   boundary" concretely means for the write verbs this ADR ships, closing the second gap.
+   The policy is configured via a `[git_write]` section in the standard khive config file
+   (`khive.toml` / `.khive/config.toml`, resolved through the same discovery chain --
+   `--config`/`KHIVE_CONFIG`, project config, db-anchored config, `~/.khive/config.toml` --
+   every other khive config value uses):
+
+   ```toml
+   [[git_write.allowed]]
+   repo = "/abs/path/repo"
+   branches = ["feat/*", "fix/*"]
+   ```
+
+   An entry's `repo` must be an absolute path and its `branches` list must be non-empty;
+   both are rejected at config-load time otherwise, so a malformed entry fails startup
+   loudly rather than resolving to a silently-inert allowlist row.
+
+3. **Every write git invocation runs with repo-configured hooks disabled.** `run_git`
+   (`write_handlers.rs`) now passes `-c core.hooksPath=/dev/null` on every invocation,
+   mirroring the read/ingest path's clone/fetch hardening in `cache.rs`. This closes the
+   third gap: a hook script present in an allowlisted repository cannot execute as a side
+   effect of a khive-mediated commit, branch creation, or push, regardless of what the hook
+   would otherwise do in the daemon's credential context. `GIT_CONFIG_GLOBAL` /
+   `GIT_CONFIG_SYSTEM` neutralization -- which the test-hermeticity fix applies to the test
+   harness's own git invocations -- is deliberately **not** applied to this production write
+   path: these are real, operator-owned repositories, and a commit or push needs the
+   operator's actual author identity and credential helpers (SSH keys, `credential.helper`)
+   configured in global/system git config to function at all. Neutralizing that
+   configuration would break the legitimate write path without closing an attack surface it
+   does not itself pose -- hooks are the code-execution risk this rule addresses; identity
+   and credential configuration are not. The test harness's own git invocations (which
+   exercise disposable, throwaway repos) continue to neutralize `GIT_CONFIG_GLOBAL` /
+   `GIT_CONFIG_SYSTEM` for full hermeticity against the host machine's git configuration,
+   independent of this rule.
+
+### Consequences
+
+- The write verbs are unusable out of the box, by design: an operator must populate
+  `[git_write]` before `git.commit` / `git.branch` / `git.push` accept any request, even
+  under `AllowAllGate`. This is the intended default -- it converts "no policy configured"
+  from "wide open" to "unavailable."
+- Fork (c)'s resolution (`repo`/`branch` remain ordinary verb arguments, no `GateRequest`
+  amendment) still stands; this amendment adds a second, independent enforcement layer
+  rather than revisiting that fork.
+- The Open Question 4 boundary ("fork-content write capability stays unbuilt") is now
+  enforced structurally by the allowlist rather than resting solely on the absence of a
+  diff-apply verb: even the general-purpose write verbs this ADR does ship cannot reach a
+  repository the operator has not explicitly named.
+- Operators who want the write verbs to work at all must maintain the `[git_write]` section
+  as repos and branch conventions change; this is an explicit operational cost of the
+  fail-closed default, accepted in exchange for closing the reachable-by-default gap.

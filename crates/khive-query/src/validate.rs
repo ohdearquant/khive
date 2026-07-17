@@ -1,4 +1,4 @@
-//! AST validation: relation normalization, namespace guard, depth cap.
+//! AST validation and relation normalization.
 
 use std::collections::HashSet;
 use std::str::FromStr;
@@ -8,7 +8,7 @@ use khive_types::EdgeRelation;
 use crate::ast::{CompareOp, Condition, ConditionValue, GqlQuery, PatternElement};
 use crate::error::QueryError;
 
-/// Valid synthetic relations; unknown `observed_as_*` strings are rejected.
+/// Closed synthetic relation set handled outside the canonical edge enum.
 const SYNTHETIC_RELATIONS: &[&str] = &[
     "observed_as_candidate",
     "observed_as_selected",
@@ -16,18 +16,28 @@ const SYNTHETIC_RELATIONS: &[&str] = &[
     "observed_as_signal",
 ];
 
-/// Maximum traversal depth allowed by the query layer.
+/// Maximum accepted traversal depth, in hops.
 pub const MAX_DEPTH: usize = 10;
 
-/// Validate and normalise an AST in place.
+/// Validates and normalizes `query` in place.
+///
+/// # Errors
+///
+/// Returns [`QueryError::Validation`] for structural or taxonomy violations and
+/// [`QueryError::InvalidInput`] for hop bounds above [`MAX_DEPTH`].
+/// See `crates/khive-query/docs/api/validation.md` for the full rule set.
 pub fn validate(query: &mut GqlQuery) -> Result<(), QueryError> {
     validate_with_warnings(query).map(|_| ())
 }
 
-/// Validate that a pattern alternates Node/Edge/Node correctly.
+/// Validates that a non-empty pattern alternates node/edge/node.
+///
+/// # Errors
+///
+/// Returns [`QueryError::Validation`] for an even-length or misordered pattern.
 pub fn validate_pattern_shape(elements: &[PatternElement]) -> Result<(), QueryError> {
     if elements.is_empty() {
-        // Empty pattern: caught separately by the compiler as "empty pattern".
+        // Compilation owns the more specific empty-pattern diagnostic.
         return Ok(());
     }
     if elements.len().is_multiple_of(2) {
@@ -50,17 +60,18 @@ pub fn validate_pattern_shape(elements: &[PatternElement]) -> Result<(), QueryEr
     Ok(())
 }
 
-/// Validate and normalise an AST in place, returning any warnings generated.
+/// Validates and normalizes `query`, returning non-fatal diagnostics.
+///
+/// # Errors
+///
+/// Returns the same errors as [`validate`].
+/// See `crates/khive-query/docs/api/validation.md` for mutation and warning behavior.
 pub fn validate_with_warnings(query: &mut GqlQuery) -> Result<Vec<String>, QueryError> {
     let warnings: Vec<String> = Vec::new();
 
-    // Structural shape check: must alternate Node/Edge/Node.
     validate_pattern_shape(&query.pattern.elements)?;
 
-    // Pattern variables are bindings — the same variable name appearing twice
-    // would mean "same node/edge" and require alias-equality predicates in
-    // SQL. Until that is implemented, reject repeated bindings explicitly so
-    // cycles and self-reachability don't silently compile to wrong results.
+    // Repeated bindings require alias-equality SQL that is not yet representable.
     let mut seen_node_vars: HashSet<&str> = HashSet::new();
     let mut seen_edge_vars: HashSet<&str> = HashSet::new();
     for element in &query.pattern.elements {
@@ -98,14 +109,7 @@ pub fn validate_with_warnings(query: &mut GqlQuery) -> Result<Vec<String>, Query
             }
             PatternElement::Edge(edge) => {
                 for relation in edge.relations.iter_mut() {
-                    // Synthetic observed_as_* relations do not exist in the
-                    // closed EdgeRelation enum — skip taxonomy validation and
-                    // leave the string unchanged.  The SQL compiler handles them
-                    // via the event_observations join path.
-                    // Only the four known synthetic relations are valid; an unknown
-                    // observed_as_* string must be rejected (closes the bypass that
-                    // allowed arbitrary observed_as_bogus strings to compile as
-                    // canonical graph_edges queries).
+                    // Synthetic projections are closed but intentionally outside EdgeRelation.
                     if relation.starts_with("observed_as_") {
                         if !SYNTHETIC_RELATIONS.contains(&relation.as_str()) {
                             return Err(QueryError::Validation(format!(
@@ -126,24 +130,19 @@ pub fn validate_with_warnings(query: &mut GqlQuery) -> Result<Vec<String>, Query
                             .into(),
                     ));
                 }
-                // Reject inverted ranges before any clamping — silently
-                // rewriting *3..1 to *1..1 changes query semantics.
+                // Never rewrite inverted ranges; doing so changes query semantics.
                 if edge.min_hops > edge.max_hops {
                     return Err(QueryError::Validation(format!(
                         "invalid hop range: min {} > max {}",
                         edge.min_hops, edge.max_hops
                     )));
                 }
-                // If the minimum already exceeds our depth cap, the query
-                // can never produce results — reject rather than silently
-                // returning an empty set from a clamped range.
                 if edge.min_hops > MAX_DEPTH {
                     return Err(QueryError::Unsupported(format!(
                         "minimum hop count {} exceeds depth cap {}",
                         edge.min_hops, MAX_DEPTH
                     )));
                 }
-                // Reject max_hops above the depth cap.
                 if edge.max_hops > MAX_DEPTH {
                     return Err(QueryError::InvalidInput(format!(
                         "max_hops {} exceeds the depth cap of {}; reduce the range or use a smaller bound",
@@ -154,10 +153,7 @@ pub fn validate_with_warnings(query: &mut GqlQuery) -> Result<Vec<String>, Query
         }
     }
 
-    // Build variable → kind map so condition validation is context-aware.
-    // `kind` and `relation` only get taxonomy enforcement on the correct
-    // variable type (node vs edge). On the other type, they're treated as
-    // ordinary JSON property keys.
+    // Taxonomy-sensitive property names apply only to their matching binding kind.
     let mut var_kinds: std::collections::HashMap<&str, VarKind> = std::collections::HashMap::new();
     for element in &query.pattern.elements {
         match element {
@@ -174,7 +170,6 @@ pub fn validate_with_warnings(query: &mut GqlQuery) -> Result<Vec<String>, Query
         }
     }
 
-    // Walk all leaf conditions in the WHERE expression tree.
     let mut validate_err: Option<QueryError> = None;
     query.where_clause.for_each_condition_mut(&mut |cond| {
         if validate_err.is_some() {

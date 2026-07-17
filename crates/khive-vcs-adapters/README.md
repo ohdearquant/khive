@@ -54,7 +54,7 @@ Only the JSON array format (`JsonFormatAdapter`) is implemented today. `PHASE0_F
 expected to accept; `AdapterError::NotYetImplemented` is the error path reserved for
 formats declared but not yet backed by an adapter. Additional formats (BibTeX,
 Turtle/N-Triples, JSON-LD, GraphML, GEXF, Markdown) are tracked as deferred work — see
-`docs/protocol.md` in this crate.
+`docs/api/adapter-protocol.md` in this crate.
 
 ## Where this sits
 
