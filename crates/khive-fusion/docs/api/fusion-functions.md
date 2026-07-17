@@ -22,10 +22,9 @@ Within a source, duplicate IDs keep their maximum normalized value. Fixed-point 
 then accumulate deterministically. The full unique result set is returned in ranking order.
 
 `try_normalize_weights` rejects the first non-finite value by index. `normalize_weights` keeps
-only strictly positive weights (others become zero, all-zero input becomes equal weights) but,
-unlike `weighted_fusion`, does not screen non-finite values: a positive infinite weight enters the
-sum and yields non-finite output. `weights_are_normalized` checks whether the positive sum is
-within a caller-supplied tolerance of one.
+only finite, strictly positive weights (others become zero, all-zero input becomes equal weights),
+matching `weighted_fusion`'s sanitization. `weights_are_normalized` checks whether the positive sum
+is within a caller-supplied tolerance of one.
 
 ## `union_fusion`
 

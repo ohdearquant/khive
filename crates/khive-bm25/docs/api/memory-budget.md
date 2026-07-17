@@ -7,10 +7,9 @@ measurement and intentionally excludes disposable caches.
 
 `Bm25Index::memory_usage` estimates owned heap storage for term keys, the structure-of-arrays
 postings (`u32` document ID plus `u8` term frequency), block-max sidecars, ID maps, forward-index
-strings, the `u32`-keyed document-length map, and the `f32` document-length mirror. The
-`usize` document-length vector mirror is currently excluded from both `memory_usage` and
-`estimate_document_cost`, so budgets slightly underestimate that allocation. It also includes approximate hash-bucket,
-vector, lock, configuration, and tokenizer overhead.
+strings, the `u32`-keyed document-length map, and both the `usize` and `f32` document-length
+vector mirrors. It also includes approximate hash-bucket, vector, lock, configuration, and
+tokenizer overhead.
 
 The estimate uses lengths rather than vector capacities and assumes conventional 64-bit Rust
 layouts: hash entries and `Arc<str>` control blocks are approximate. The IDF cache is excluded
