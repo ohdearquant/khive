@@ -32,7 +32,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
-      contents: read
+      # disablePullRequestAutoMerge needs contents: write in addition to
+      # pull-requests: write — with contents: read the mutation is rejected
+      # ("Resource not accessible by integration") and, because this job
+      # fail-closes into the CI gate, every push to an armed PR turned the
+      # gate red even after re-review (first hit: PR #1054, 2026-07-17).
+      contents: write
       pull-requests: write
     steps:
       - name: Disable stale auto-merge request
