@@ -28,28 +28,53 @@
 //! `memory.recall`'s response marks every result with `"degraded": "ann_unavailable"`
 //! when at least one queried model's vector leg missed its bounded ANN-readiness wait
 //! and was served FTS-only instead (`crates/khive-pack-memory/src/handlers/recall.rs`,
-//! `#836`). That marker is the only route-quality signal the verb surface exposes to a
-//! caller outside the crate — the harness lives in `benches/`, a separate crate that only
-//! sees `khive-pack-memory`'s `pub` items, so it cannot read the crate-private `ann`
-//! module's per-model freshness state (`ann::is_current`) or its internal
-//! `ann_route` debug variable (`"ann"` vs `"sqlite_vec"`) directly.
+//! `#836`). This harness polls `memory.recall` after seeding until it observes several
+//! consecutive clean (non-degraded, non-empty) responses, treating that as "ANN warm"
+//! before starting the timed loop, and asserts on every timed sample that the response
+//! carries no `degraded` marker and is non-empty, panicking immediately otherwise. This
+//! positively rules out the bounded-wait FTS-degradation fallback for every recorded
+//! sample.
 //!
-//! Given that, this harness: (1) polls `memory.recall` after seeding until it observes
-//! several consecutive clean (non-degraded, non-empty) responses, treating that as "ANN
-//! warm" before starting the timed loop, and (2) asserts on every timed sample that the
-//! response carries no `degraded` marker and is non-empty, panicking immediately
-//! otherwise. This positively rules out the FTS-degradation fallback for every recorded
-//! sample. It does **not** positively distinguish a genuine Vamana ANN hit from the
-//! internal sqlite-vec exact-fallback path, since that path only triggers on an ANN
-//! search error and carries no response-visible marker; it is ruled out by construction
-//! instead — the corpus is sized to force a Vamana build (`MEMORIES_PER_MODEL`), and the
-//! warm-wait requires a stable clean run before any sample is timed. Partial honesty
-//! about what is and is not assertable beats a fabricated positive-route assertion.
+//! The `khive-pack-memory::ann` module's per-model freshness state (`ann::is_current`),
+//! its ANN-vs-sqlite-vec route variable, and its `warm_route_count` counter are all
+//! `pub(crate)` — invisible to this harness, which lives in `benches/`, a separate crate
+//! that only sees `khive-pack-memory`'s `pub` items. What *is* `pub` and crate-external is
+//! the event plane: `ensure_ann_for_model` (the only path that installs or rebuilds a
+//! model's ANN graph) emits a `memory.ann_warm` phase-started/completed event through
+//! `KhiveRuntime::events`, a `pub` accessor returning `khive_storage::EventStore`
+//! (`count_events`/`query_events` are both `pub` trait methods). This harness uses that:
+//! it snapshots the `memory.ann_warm` event count immediately before the timed loop and
+//! again immediately after, and asserts the count is unchanged. No ANN rebuild happens
+//! without one of these events, and the internal sqlite-vec exact-fallback path (taken
+//! only after an ANN search error) clears the model's cached graph as a side effect, so
+//! the *next* recall for that model would trigger exactly such a rebuild — making a
+//! zero-event-count window strong (though not airtight) evidence that none of the timed
+//! samples took the exact-fallback path either.
 //!
-//! Run (inside the fleet bench-window lock, see khive/CLAUDE.md):
+//! One wrinkle: a per-model durable-epoch debounce check (`maybe_check_durable_epoch`,
+//! independent of ADR-116) can itself kick off a background ANN rebuild once its debounce
+//! interval elapses after seeding — a benign maintenance action that still serves the
+//! stale-but-installed graph on the fast path (not a slow/degraded sample) but does emit
+//! `memory.ann_warm` events. Left unhandled this trips the event-count assertion on a false
+//! positive. The harness closes over this by sleeping past that debounce interval plus one
+//! settle recall (`EPOCH_DEBOUNCE_SETTLE`) after the warm-wait and before opening the timed
+//! window, so any such rebuild fires and completes before counting starts; the ~200-call
+//! timed window itself completes in well under one further debounce interval.
+//!
+//! The residual gap: an exact-fallback on the very last timed sample, with no subsequent
+//! call in the window to reveal the resulting rebuild, would not be caught. Closing that
+//! gap requires a `pub(crate)`-or-narrower counter to become crate-visible; tracked as
+//! issue #1084 (verb-surface route observability). Partial honesty about what is and is
+//! not assertable beats a fabricated positive-route assertion.
+//!
+//! Run:
 //! ```bash
 //! cd crates && cargo bench -p khive-pack-memory --bench p95_gate
 //! ```
+//!
+//! Isolation: run on a quiet machine with no concurrent builds, benchmarks, or heavy I/O
+//! in progress. Run the suite twice and require consistent numbers across both runs
+//! before recording or refreshing baselines.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -58,7 +83,8 @@ use serde_json::{json, Value};
 
 use khive_pack_kg::KgPack;
 use khive_pack_memory::MemoryPack;
-use khive_runtime::{KhiveRuntime, RuntimeConfig, VerbRegistryBuilder};
+use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig, VerbRegistryBuilder};
+use khive_storage::EventFilter;
 use lattice_embed::EmbeddingModel;
 
 /// Memories seeded per registered model. Large enough to force the Vamana ANN path (not
@@ -67,6 +93,15 @@ const MEMORIES_PER_MODEL: usize = 200;
 
 /// Recall iterations measured per configuration after warmup, for percentile stats.
 const RECALL_ITERS: usize = 200;
+
+/// `khive_pack_memory::ann::maybe_check_durable_epoch`'s debounce interval outside a
+/// `#[cfg(test)]` build (5s). One settle sleep of longer than this, followed by one more
+/// recall, lets any epoch-check due since seeding fire and its background rebuild's
+/// `memory.ann_warm` events land before the timed window opens — otherwise that debounced
+/// check (a background maintenance action against a still-warm, still-fast route; see
+/// `search_loaded_serves_stale_installed_entry_without_rebuild` in `ann.rs`) can fire mid-
+/// timing and trip the event-count assertion below on a false positive.
+const EPOCH_DEBOUNCE_SETTLE: Duration = Duration::from_millis(5_200);
 
 /// Bounded attempts while polling for a stable warm ANN route before timing starts.
 const WARM_WAIT_MAX_ATTEMPTS: usize = 200;
@@ -155,6 +190,23 @@ fn make_runtime(
         ..RuntimeConfig::default()
     })
     .expect("file-backed WAL runtime")
+}
+
+/// Count `memory.ann_warm` phase events recorded so far in `rt`'s local namespace. This is
+/// the `pub` oracle instrument for ANN (re)builds — see the module-level "Warm-route
+/// assertion" doc for what a stable count across the timed window does and does not prove.
+async fn ann_warm_event_count(rt: &KhiveRuntime) -> u64 {
+    let token = rt
+        .authorize(Namespace::local())
+        .expect("authorize local namespace for event-plane read");
+    let events = rt.events(&token).expect("event store available");
+    events
+        .count_events(EventFilter {
+            verbs: vec!["memory.ann_warm".to_string()],
+            ..EventFilter::default()
+        })
+        .await
+        .expect("count_events")
 }
 
 fn make_registry(rt: &KhiveRuntime) -> khive_runtime::VerbRegistry {
@@ -318,6 +370,20 @@ async fn bench_configuration(config: &GateConfig) -> Percentiles {
 
     wait_until_ann_warm(&registry, config.label, config.recall_model).await;
 
+    // Let any durable-epoch debounce check already due from seeding fire and settle
+    // (see EPOCH_DEBOUNCE_SETTLE) before opening the timed window, then confirm one more
+    // clean call — this both consumes the next due check deterministically and re-asserts
+    // the route is still clean after whatever background rebuild that check may have kicked
+    // off.
+    tokio::time::sleep(EPOCH_DEBOUNCE_SETTLE).await;
+    let (_us, settle_resp) = recall_once(&registry, config.recall_model).await;
+    assert!(
+        is_clean_ann_route(&settle_resp),
+        "[{}] post-settle recall observed ann_unavailable degradation (or empty results)",
+        config.label
+    );
+
+    let ann_warm_events_before = ann_warm_event_count(&rt).await;
     let mut latencies = Vec::with_capacity(RECALL_ITERS);
     for i in 0..RECALL_ITERS {
         let (us, resp) = recall_once(&registry, config.recall_model).await;
@@ -329,6 +395,15 @@ async fn bench_configuration(config: &GateConfig) -> Percentiles {
         );
         latencies.push(us);
     }
+    let ann_warm_events_after = ann_warm_event_count(&rt).await;
+    assert_eq!(
+        ann_warm_events_after, ann_warm_events_before,
+        "[{}] a memory.ann_warm phase event fired during the timed window — an ANN graph \
+         (re)build started mid-measurement, meaning at least one timed sample raced a rebuild \
+         or took the sqlite-vec exact-fallback route (which clears the cached graph and \
+         triggers exactly this event on the following call). Refusing to record this baseline.",
+        config.label
+    );
     let stats = percentiles(latencies);
     eprintln!(
         "  {}: p50={:.3}ms p95={:.3}ms p99={:.3}ms n={}",
