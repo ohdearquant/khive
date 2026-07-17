@@ -27,6 +27,11 @@ This ADR therefore:
   `memory_ann_epoch` protocol, while retaining its single-flight, RAII guard-release, bounded
   rebuild, hydration, and cold-start mechanics where they do not conflict here.
 
+While this ADR is Proposed, ADR-107 remains the accepted contract. Acceptance of this ADR MUST
+include, in the same change, an amendment to ADR-107 adding a forward link that marks its
+memory-ANN freshness provisions superseded by ADR-116, so the corpus never carries two accepted,
+competing authorities.
+
 ## Teardown: refute first
 
 ### “Only two external writer paths matter, so bump only those”
@@ -191,8 +196,21 @@ END;
 ```
 
 Equivalent SQL is acceptable only if the names, event columns, `WHEN` semantics, overflow abort,
-and transaction behavior remain identical. There is deliberately no INSERT trigger: a note row
-without a vector is not ANN graph input, while the vector insert performs the model-specific bump.
+and transaction behavior remain identical.
+
+There is deliberately no INSERT trigger on `notes`, and its soundness depends on an ordering
+invariant that MUST be enforced, not assumed. A note row without a vector is not ANN graph input,
+and the vector insert performs the model-specific bump — but if a `kind='note'` vector could be
+committed before its note row exists, a later live-note INSERT would adopt that orphan vector into
+the JOIN without any generation advance, and `Gann == Gdb` would certify a graph missing it.
+Caller write-ordering conventions cannot close this (the same unknown-writer argument as the
+teardown above), so V11 closes it at the storage layer: the single seam that creates each
+`vec_{model_key}` table (`crates/khive-db/src/backend.rs:398`) MUST also install a `BEFORE INSERT`
+guard trigger on that table which rejects a `kind='note'` row whose `subject_id` has no `notes`
+row (live or soft-deleted). With parent-before-vector enforced, a live-note INSERT can never make
+a pre-existing vector ANN-eligible: a vector inserted while its note is soft-deleted is excluded
+by the liveness JOIN, and a later un-delete changes `deleted_at` nullness, which fires the
+liveness UPDATE trigger. Entity-kind vector rows are not constrained by the guard.
 
 Generation values use SQLite's non-negative signed 64-bit range. Increment at the maximum is a
 write error; the enclosing corpus mutation MUST roll back rather than wrap or reset.
@@ -318,8 +336,12 @@ rebuild, with no effect on served recall latency, and the single-transaction req
 bounds durable cost to one commit per batch. Note-mutation authority is assumed trusted in this cut: mutations are
 authorized at the Gate (ADR-018), and namespace is attribution rather than a storage boundary
 (ADR-007), so corpus-wide per-model invalidation stays inside the trust boundary of a
-single-writer-authority deployment. Per-tenant availability isolation on a shared multi-tenant
-backend is out of scope for this ADR. A future amendment MAY add model-membership-targeted
+single-writer-authority deployment. That assumption is a normative deployment fence, not an
+aside: because the all-model liveness triggers give any authorized note-mutator a corpus-wide
+invalidation primitive, a deployment serving mutually untrusted tenants from one shared database
+MUST NOT enable this cut as its recall path. Shared multi-tenant service requires the
+model-membership-targeted amendment below plus Gate-level mutation rate bounding, adopted
+together, before this mechanism is exposed to co-tenants. A future amendment MAY add model-membership-targeted
 note-liveness invalidation that computes the affected models in the Rust delete path and advances
 only those, which removes the cross-model over-invalidation and is the migration path if khive later
 serves untrusted co-tenants from one database.
@@ -381,6 +403,23 @@ For a model build/restore attempt:
 A mutation that commits after the final read is ordered after this build's coherence point. It
 advances the row; the next recall rejects the installed generation. An older snapshot written in
 that gap is likewise rejected by exact generation equality.
+
+### Stale-window load behavior
+
+Invalidation routes recalls to exact sqlite-vec search until a rebuild installs a matching
+generation, and bulk liveness mutations invalidate every initialized model at once, so the
+stale-window cost MUST be characterized, not left open. The window's duration is capped by the
+retained single-flight, bounded-time rebuild: concurrent recalls never trigger parallel rebuilds,
+and the first successful rebuild restores ANN service for its model. Under sustained mutation the
+build-race rule keeps discarding candidates and the system remains on exact search; that is the
+correct state under this contract (correct but slower), and it degrades no further — exact search
+is the floor, not a cliff. The performance gate therefore extends beyond the warm read check: the
+benchmark suite MUST record exact-search fallback p50/p95 at the gate corpus scale under
+concurrent recalls during an in-flight rebuild, so operators can size corpora against the
+documented fallback latency. A benchmarked fallback is the availability trade this ADR makes
+explicit; an unmeasured one would be a regression channel. Rebuild scheduling MAY debounce or
+batch retriggering under sustained invalidation; the durable generation read on the recall path
+MUST NOT be debounced (the fail-closed rule above).
 
 ## Snapshot versioning
 
@@ -489,6 +528,14 @@ can make a stale ANN appear correct. Tests MUST assert generations, ANN-route co
    removes only the legacy memory rows.
 10. **Performance**: record the one/three-model warm-read benchmark and counter-write throughput.
     Enforce the warm p95 gate above; report write amplification rather than hiding it.
+11. **Orphan guard**: on every created `vec_{model_key}` table, assert the parent-existence
+    trigger is present; insert a `kind='note'` vector row for a nonexistent note id and assert
+    rejection; assert an entity-kind row is not constrained. Then create the note and its vector
+    in the normal order and assert ANN eligibility with a matching generation advance.
+12. **Stale-window fallback**: invalidate an installed graph, issue concurrent recalls during the
+    single-flight rebuild, and record exact-search p50/p95 at the gate corpus scale plus the
+    rebuild duration. Assert every stale-window recall used exact search (zero stale-ANN
+    searches) and that rebuild completion restores the ANN route.
 
 ## Alternatives considered
 
@@ -566,7 +613,9 @@ open on epoch read errors, contrary to #752's required next-recall/fail-closed s
 - real-process unchanged-shape reindex test;
 - build/install race and legacy snapshot tests;
 - generation-read failure injection with a zero warm-route count;
-- one/three-model hot-path p95 benchmark.
+- one/three-model hot-path p95 benchmark;
+- vec-table orphan-guard presence and rejection test;
+- stale-window exact-search fallback benchmark with zero stale-ANN searches.
 
 ## Consequences
 
