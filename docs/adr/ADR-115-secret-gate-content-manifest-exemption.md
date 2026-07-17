@@ -1,6 +1,6 @@
 # ADR-115: Exact-Content Manifest Exemption for the Write Secret Gate
 
-**Status**: Proposed
+**Status**: Accepted
 **Date**: 2026-07-16
 **Authors**: khive maintainers
 **Relates to**: [ADR-018](ADR-018-authorization-gate.md) (authorization Gate seam, rejected as
