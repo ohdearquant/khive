@@ -6542,6 +6542,36 @@ mod event_counts_tests {
         }
     }
 
+    /// `until` at chrono's maximum representable date (NaiveDate::MAX,
+    /// 262142-12-31) would overflow the next-day roll; the handler must return
+    /// a named validation error instead of panicking on caller input (#994).
+    #[tokio::test]
+    async fn max_date_only_until_is_rejected_not_panicked() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        let result = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({"since": "2026-07-01", "until": "+262142-12-31"}),
+                &registry,
+                &token,
+            )
+            .await;
+
+        match result {
+            Ok(v) => panic!("`until` at the max representable date must not silently succeed: {v}"),
+            Err(RuntimeError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains("until") && msg.contains("262142-12-31"),
+                    "error must name the field and offending value: {msg}"
+                );
+            }
+            Err(other) => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn missing_since_is_rejected() {
         let (pack, rt) = make_pack();

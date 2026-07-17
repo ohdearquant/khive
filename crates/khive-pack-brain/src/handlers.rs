@@ -2337,7 +2337,14 @@ fn parse_rfc3339_micros(
     let trimmed = value.trim();
     if let Ok(date) = chrono::NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
         let date = if roll_to_next_day {
-            date + chrono::Days::new(1)
+            // Fallible at chrono's representable max (NaiveDate::MAX,
+            // 262142-12-31): the roll would overflow. Return the named
+            // validation error rather than panicking on caller input (#994).
+            date.checked_add_days(chrono::Days::new(1)).ok_or_else(|| {
+                RuntimeError::InvalidInput(format!(
+                    "invalid `{field}`: {value:?} is past the maximum representable date"
+                ))
+            })?
         } else {
             date
         };
