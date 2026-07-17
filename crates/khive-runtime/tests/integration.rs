@@ -1001,11 +1001,13 @@ async fn synthetic_edge_observed_as_selected_returns_memory_note() {
 
     // Step 2: create an event of kind SearchExecuted with a payload that
     // includes `selected: [memory_id]`.  The storage layer's `append_event`
-    // implementation calls `decode_recall_observations`, which reads
-    // `payload["selected"]` and inserts a row into `event_observations` with
-    // role="selected" and entity_id=memory_id. (`selected` is part of
-    // `SearchExecuted`/`RecallExecuted`'s ADR-041 projection contract;
-    // their payloads are untyped JSON —
+    // routes `SearchExecuted` to `decode_search_observations`, which requires
+    // the `result_kind` discriminator (`entity` | `note`) to identify which
+    // substrate owns every UUID in `candidates` and `selected`, then inserts a
+    // row into `event_observations` with role="selected" and
+    // entity_id=memory_id. (`selected` is part of `SearchExecuted`/
+    // `RecallExecuted`'s ADR-041 projection contract; `RecallExecuted` still
+    // decodes via `decode_recall_observations` from flat note UUID lists,
     // unlike `RerankExecuted`, which projects `selected` rows from
     // `final_scores`/`reranked` instead, since its typed payload has no
     // `selected` field.)
@@ -1018,6 +1020,7 @@ async fn synthetic_edge_observed_as_selected_returns_memory_note() {
         "agent:test",
     );
     event.payload = serde_json::json!({
+        "result_kind": "note",
         "candidates": [],
         "selected": [memory_id.to_string()]
     });

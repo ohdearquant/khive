@@ -5896,6 +5896,9 @@ mod event_counts_tests {
         );
         event.created_at = created_at;
         event.payload = payload;
+        if kind == EventKind::SearchExecuted && event.payload.get("result_kind").is_none() {
+            event.payload["result_kind"] = json!("note");
+        }
         rt.events(token)
             .expect("event store")
             .append_event(event)

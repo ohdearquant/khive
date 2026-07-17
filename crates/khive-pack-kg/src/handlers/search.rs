@@ -6,10 +6,12 @@ use std::collections::HashMap;
 /// See `docs/api/scan-cliff.md`.
 const FILTERED_SCAN_CAP: u32 = 500;
 
-use serde_json::Value;
+use std::time::Instant;
+
+use serde_json::{json, Value};
 use uuid::Uuid;
 
-use khive_runtime::{NamespaceToken, RuntimeError, VerbRegistry};
+use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
 use khive_storage::types::PageRequest;
 use khive_storage::EntityFilter;
 
@@ -26,6 +28,7 @@ impl KgPack {
         params: Value,
         registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
+        let search_start = Instant::now();
         let p: SearchParams = deser(params)?;
         let limit = p.limit.unwrap_or(10).min(100);
         let spec = resolve_kind_spec(&p.kind, registry)?;
@@ -141,6 +144,13 @@ impl KgPack {
                         })
                     })
                     .collect();
+                self.track_search_serve(
+                    token,
+                    &p.query,
+                    "entity",
+                    &result,
+                    search_start.elapsed().as_micros() as i64,
+                );
                 to_json(&result)
             }
             KindSpec::Note { specific } => {
@@ -242,6 +252,13 @@ impl KgPack {
                         })
                     })
                     .collect();
+                self.track_search_serve(
+                    token,
+                    &p.query,
+                    "note",
+                    &result,
+                    search_start.elapsed().as_micros() as i64,
+                );
                 to_json(&result)
             }
             KindSpec::Edge => Err(RuntimeError::InvalidInput(
@@ -254,5 +271,93 @@ impl KgPack {
                 "search does not support kind=proposal — use `list(kind=\"proposal\", ...)` for proposal browsing".into(),
             )),
         }
+    }
+
+    /// Fire-and-forget `search_executed` telemetry (ADR-103 event plane),
+    /// mirroring `memory.recall`'s `track_recall_serve` seam (#866): the
+    /// event append runs off the response path via `track_background_task`
+    /// so a slow or failing event store never affects a served search.
+    fn track_search_serve(
+        &self,
+        token: &NamespaceToken,
+        query_raw: &str,
+        result_kind: &'static str,
+        results: &[Value],
+        latency_us: i64,
+    ) {
+        let selected: Vec<String> = results
+            .iter()
+            .filter_map(|r| r.get("id").and_then(Value::as_str).map(str::to_string))
+            .collect();
+        let result_count = selected.len();
+        let query = query_raw.to_string();
+        let actor = format!("{}:{}", token.actor().kind, token.actor().id);
+        let runtime = self.runtime.clone();
+        let token = token.clone();
+
+        khive_runtime::track_background_task(async move {
+            emit_search_executed_event(
+                &runtime,
+                &token,
+                actor,
+                query,
+                result_kind,
+                selected,
+                result_count,
+                latency_us,
+            )
+            .await;
+        });
+    }
+}
+
+/// Append best-effort search telemetry without affecting the search response.
+#[allow(clippy::too_many_arguments)]
+async fn emit_search_executed_event(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    actor: String,
+    query: String,
+    result_kind: &'static str,
+    selected: Vec<String>,
+    result_count: usize,
+    latency_us: i64,
+) {
+    let store = match rt.events(token) {
+        Ok(store) => store,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                namespace = token.namespace().as_str(),
+                event_kind = "search_executed",
+                "search_executed event store acquisition failed; search result is unaffected"
+            );
+            return;
+        }
+    };
+    let payload = json!({
+        "actor": actor,
+        "served_by_profile_id": Value::Null,
+        "query": query,
+        "result_kind": result_kind,
+        "result_count": result_count,
+        "candidates": selected,
+        "selected": selected,
+        "latency_us": latency_us,
+    });
+    let event = khive_storage::Event::new(
+        token.namespace().as_str(),
+        "search",
+        khive_types::EventKind::SearchExecuted,
+        khive_types::SubstrateKind::Event,
+        actor,
+    )
+    .with_payload(payload)
+    .with_duration_us(latency_us);
+    if let Err(err) = store.append_event(event).await {
+        tracing::warn!(
+            error = %err,
+            "search_executed event append failed; search result is unaffected"
+        );
     }
 }
