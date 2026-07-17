@@ -913,16 +913,36 @@ fn endpoint_kind_label(kind: &EndpointKind) -> String {
     }
 }
 
+/// Relations `validate_edge_relation_endpoints`
+/// (`crates/khive-runtime/src/operations.rs`) resolves in its own dedicated
+/// branch — before the generic pack-rule branch (`pack_rule_allows`) is ever
+/// reached. For these three relations the validator additionally accepts
+/// any `note -> note` pair unconditionally, regardless of note kind
+/// (ADR-002 §"Versioning" and §"Epistemic"), and never consults pack
+/// `EDGE_RULES` at all, on either substrate.
+const SPECIAL_RELATIONS: &[khive_types::EdgeRelation] = &[
+    khive_types::EdgeRelation::Supersedes,
+    khive_types::EdgeRelation::Supports,
+    khive_types::EdgeRelation::Refutes,
+];
+
 /// Compose the full per-relation endpoint allowlist surfaced by
 /// `link(help=true)` (issue #964).
 ///
 /// Combines the base entity-to-entity endpoint contract
 /// (`operations::base_entity_endpoint_rules`) with every loaded pack's
-/// additive `EDGE_RULES`, plus the `annotates` note-to-any special case —
-/// the exact same sources `valid_relations_for_entity_pair`
-/// (`khive-pack-kg`) consults when enriching a rejected `link` call, so a
-/// caller reading this table cannot diverge from what the validator itself
-/// accepts.
+/// additive `EDGE_RULES`, the unconditional `note -> note` allowance for the
+/// three special relations (`supersedes` / `supports` / `refutes` —
+/// `operations.rs`'s dedicated special-relation branch), and the
+/// `annotates` note-to-any special case — the exact same sources
+/// `valid_relations_for_entity_pair` (`khive-pack-kg`) consults when
+/// enriching a rejected `link` call, so a caller reading this table cannot
+/// diverge from what the validator itself accepts.
+///
+/// Pack `EDGE_RULES` for a special relation are deliberately excluded: the
+/// validator's special-relation branch returns before `pack_rule_allows` is
+/// ever reached (`operations.rs`), so advertising such a rule here would
+/// claim enforcement that never actually happens.
 fn edge_endpoint_table(packs: &[Box<dyn PackRuntime>]) -> Vec<Value> {
     let mut rows: Vec<Value> = crate::operations::base_entity_endpoint_rules()
         .iter()
@@ -935,8 +955,19 @@ fn edge_endpoint_table(packs: &[Box<dyn PackRuntime>]) -> Vec<Value> {
         })
         .collect();
 
+    for rel in SPECIAL_RELATIONS {
+        rows.push(serde_json::json!({
+            "relation": rel.as_str(),
+            "source": "note:*",
+            "target": "note:*",
+        }));
+    }
+
     for pack in packs.iter() {
         for rule in pack.edge_rules().iter() {
+            if SPECIAL_RELATIONS.contains(&rule.relation) {
+                continue;
+            }
             rows.push(serde_json::json!({
                 "relation": rule.relation.as_str(),
                 "source": endpoint_kind_label(&rule.source),
@@ -6221,12 +6252,23 @@ mod help_tests {
 
     // A pack-declared additive edge rule (mirrors the GTD pack's real
     // task-to-task `depends_on` rule), used to verify `link(help=true)`
-    // surfaces pack-composed rules alongside the base entity table.
-    static HELP_EDGE_RULES: [EdgeEndpointRule; 1] = [EdgeEndpointRule {
-        relation: khive_types::EdgeRelation::DependsOn,
-        source: EndpointKind::NoteOfKind("task"),
-        target: EndpointKind::NoteOfKind("task"),
-    }];
+    // surfaces pack-composed rules alongside the base entity table. The
+    // second entry declares a rule for a special relation
+    // (`supersedes`) that the validator's dedicated special-relation
+    // branch never consults `pack_rule_allows` for — it must NOT be
+    // advertised (see `test_link_help_true_matches_special_relation_validator_set`).
+    static HELP_EDGE_RULES: [EdgeEndpointRule; 2] = [
+        EdgeEndpointRule {
+            relation: khive_types::EdgeRelation::DependsOn,
+            source: EndpointKind::NoteOfKind("task"),
+            target: EndpointKind::NoteOfKind("task"),
+        },
+        EdgeEndpointRule {
+            relation: khive_types::EdgeRelation::Supersedes,
+            source: EndpointKind::NoteOfKind("task"),
+            target: EndpointKind::NoteOfKind("task"),
+        },
+    ];
 
     #[async_trait]
     impl PackRuntime for HelpPack {
@@ -6397,6 +6439,79 @@ mod help_tests {
             0,
             "link(help=true) must not invoke pack dispatch"
         );
+    }
+
+    /// `link(help=true)`'s `endpoint_rules` must match, set-for-set, every
+    /// endpoint pair `validate_edge_relation_endpoints`
+    /// (`crates/khive-runtime/src/operations.rs`) actually accepts for the
+    /// three special relations (`supersedes` / `supports` / `refutes`):
+    ///
+    /// - a `note -> note` row for each of the three relations (the
+    ///   validator's dedicated special-relation branch accepts any
+    ///   `Resolved::Note(_), Resolved::Note(_)` pair unconditionally,
+    ///   `operations.rs:1338` / `:1527` — before `pack_rule_allows` is ever
+    ///   reached);
+    /// - the base entity->entity rows for the three relations
+    ///   (`base_entity_endpoint_rules`, e.g. `concept -[supersedes]-> concept`);
+    /// - and, critically, NOT a row for `HelpPack`'s pack-declared
+    ///   `supersedes` rule on `note:task -> note:task`
+    ///   (`HELP_EDGE_RULES[1]`) — because the validator's special-relation
+    ///   branch returns before `pack_rule_allows` is consulted, that pack
+    ///   rule is never actually enforced, so advertising it would be a false
+    ///   promise (the exact codex HIGH this test guards against, issue #991).
+    #[tokio::test]
+    async fn test_link_help_true_matches_special_relation_validator_set() {
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let reg = build_help_registry(invocations.clone());
+
+        let result = reg
+            .dispatch("link", serde_json::json!({ "help": true }))
+            .await
+            .expect("help=true must succeed for link");
+
+        let rules = result["endpoint_rules"]
+            .as_array()
+            .expect("link help must include an endpoint_rules array");
+
+        for relation in ["supersedes", "supports", "refutes"] {
+            // The unconditional note -> note row must appear.
+            assert!(
+                rules.iter().any(|r| r["relation"] == relation
+                    && r["source"] == "note:*"
+                    && r["target"] == "note:*"),
+                "endpoint_rules must include the note:*->note:* row for '{relation}' \
+                 (validator accepts any note->note pair unconditionally); got {rules:#?}"
+            );
+
+            // HelpPack's pack-declared rule for this relation on note:task->note:task
+            // (only Supersedes is declared in HELP_EDGE_RULES) must NOT be advertised
+            // as a distinct entity — the validator never reaches pack_rule_allows for
+            // special relations, so no note:task->note:task row should exist for it.
+            assert!(
+                !rules.iter().any(|r| r["relation"] == relation
+                    && r["source"] == "note:task"
+                    && r["target"] == "note:task"),
+                "endpoint_rules must NOT advertise a pack EDGE_RULES row for special \
+                 relation '{relation}' — validate_edge_relation_endpoints never consults \
+                 pack_rule_allows for supersedes/supports/refutes; got {rules:#?}"
+            );
+        }
+
+        // Base entity->entity rows for the three relations (from
+        // base_entity_endpoint_rules) must still appear alongside the note rows.
+        for (relation, kind) in [
+            ("supersedes", "concept"),
+            ("supports", "concept"),
+            ("refutes", "concept"),
+        ] {
+            assert!(
+                rules.iter().any(|r| r["relation"] == relation
+                    && r["source"] == format!("entity:{kind}")
+                    && r["target"] == "entity:concept"),
+                "endpoint_rules must include the base entity:{kind}->entity:concept row \
+                 for '{relation}'; got {rules:#?}"
+            );
+        }
     }
 
     /// help=true is intercepted before pack dispatch — the pack's dispatch method
