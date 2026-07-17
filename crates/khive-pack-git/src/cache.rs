@@ -193,7 +193,34 @@ fn slot_lock(key: &str) -> SlotLock {
 /// the staging-then-move and ownership-guard rationale.
 pub fn ensure_clone(canonical_url: &str) -> Result<PathBuf, CacheError> {
     let root = scratch_root();
-    std::fs::create_dir_all(&root)?;
+    let outcome = ensure_clone_locked(&root, canonical_url);
+    finish_mutation(&root, &outcome);
+    outcome
+}
+
+/// Bring the cache caps back within limits after a mutation whose slot lock
+/// has just been released. A successful `ensure_clone`/`refetch_clone`/
+/// `reclone` already ran `evict_lru` under its lock (protecting the slot it
+/// returns), so nothing is needed on success. A FAILED mutation skipped that
+/// pass, and a concurrent eviction may have deferred this slot while its lock
+/// was held — leaving the caps exceeded with nothing scheduled to correct them
+/// (#960). Enforce them now that the lock is free. Best-effort: the mutation's
+/// own error is the one propagated, so a secondary eviction failure is logged,
+/// not surfaced.
+fn finish_mutation(root: &Path, outcome: &Result<PathBuf, CacheError>) {
+    if outcome.is_ok() {
+        return;
+    }
+    if let Err(evict_err) = enforce_caps(root) {
+        tracing::warn!(
+            error = %evict_err,
+            "cap enforcement after a failed cache mutation did not complete"
+        );
+    }
+}
+
+fn ensure_clone_locked(root: &Path, canonical_url: &str) -> Result<PathBuf, CacheError> {
+    std::fs::create_dir_all(root)?;
     let key = cache_key(canonical_url);
     let lock = slot_lock(&key);
     let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -212,15 +239,15 @@ pub fn ensure_clone(canonical_url: &str) -> Result<PathBuf, CacheError> {
         // it), not a maybe-absent slot, so propagate rather than swallow.
         let size = dir_size(&repo_dir)?;
         if size > cap {
-            remove_owned_entry(&root, &repo_dir)?;
+            remove_owned_entry(root, &repo_dir)?;
             return Err(CacheError::CloneTooLarge { bytes: size, cap });
         }
         touch(&repo_dir)?;
     } else {
-        install_fresh_clone(canonical_url, &root, &repo_dir, cap)?;
+        install_fresh_clone(canonical_url, root, &repo_dir, cap)?;
     }
 
-    evict_lru(&root, &repo_dir)?;
+    evict_lru(root, &repo_dir)?;
     Ok(repo_dir)
 }
 
@@ -229,6 +256,12 @@ pub fn ensure_clone(canonical_url: &str) -> Result<PathBuf, CacheError> {
 /// crates/khive-pack-git/docs/api/cache.md#refetch_clone.
 pub(crate) fn refetch_clone(canonical_url: &str) -> Result<PathBuf, CacheError> {
     let root = scratch_root();
+    let outcome = refetch_clone_locked(&root, canonical_url);
+    finish_mutation(&root, &outcome);
+    outcome
+}
+
+fn refetch_clone_locked(root: &Path, canonical_url: &str) -> Result<PathBuf, CacheError> {
     let key = cache_key(canonical_url);
     let lock = slot_lock(&key);
     let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -252,12 +285,12 @@ pub(crate) fn refetch_clone(canonical_url: &str) -> Result<PathBuf, CacheError> 
     if size > cap {
         // Ownership-guarded removal, not a raw `remove_dir_all` — see
         // crates/khive-pack-git/docs/api/cache.md#refetch_clone.
-        remove_owned_entry(&root, &repo_dir)?;
+        remove_owned_entry(root, &repo_dir)?;
         return Err(CacheError::CloneTooLarge { bytes: size, cap });
     }
 
     touch(&repo_dir)?;
-    evict_lru(&root, &repo_dir)?;
+    evict_lru(root, &repo_dir)?;
     Ok(repo_dir)
 }
 
@@ -266,17 +299,23 @@ pub(crate) fn refetch_clone(canonical_url: &str) -> Result<PathBuf, CacheError> 
 /// crates/khive-pack-git/docs/api/cache.md#reclone.
 pub(crate) fn reclone(canonical_url: &str) -> Result<PathBuf, CacheError> {
     let root = scratch_root();
-    std::fs::create_dir_all(&root)?;
+    let outcome = reclone_locked(&root, canonical_url);
+    finish_mutation(&root, &outcome);
+    outcome
+}
+
+fn reclone_locked(root: &Path, canonical_url: &str) -> Result<PathBuf, CacheError> {
+    std::fs::create_dir_all(root)?;
     let key = cache_key(canonical_url);
     let lock = slot_lock(&key);
     let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let repo_dir = root.join(&key);
     let cap = clone_max_bytes();
 
-    remove_owned_entry(&root, &repo_dir)?;
-    install_fresh_clone(canonical_url, &root, &repo_dir, cap)?;
+    remove_owned_entry(root, &repo_dir)?;
+    install_fresh_clone(canonical_url, root, &repo_dir, cap)?;
 
-    evict_lru(&root, &repo_dir)?;
+    evict_lru(root, &repo_dir)?;
     Ok(repo_dir)
 }
 
@@ -508,6 +547,28 @@ fn is_owned_entry(path: &Path) -> bool {
 /// error); a listed candidate entry vanishing mid-walk IS tolerated
 /// (skipped). See crates/khive-pack-git/docs/api/cache.md#evict_lru.
 fn evict_lru(root: &Path, keep: &Path) -> Result<(), CacheError> {
+    evict_to_caps(root, Some(keep))
+}
+
+/// Enforce the cache caps with no protected slot: evict least-recently-used
+/// owned clones until both caps hold, treating every owned slot as a
+/// candidate. Run after a cache mutation releases its slot lock on a FAILURE
+/// path (#960). A failed `ensure_clone`/`refetch_clone`/`reclone` skips the
+/// success-path `evict_lru`, and a concurrent eviction may have deferred this
+/// slot (its lock was held) — so without this pass the caps can stay exceeded
+/// with nothing scheduled to correct them. See
+/// crates/khive-pack-git/docs/api/cache.md#enforce_caps.
+fn enforce_caps(root: &Path) -> Result<(), CacheError> {
+    evict_to_caps(root, None)
+}
+
+/// Shared eviction core. `keep = Some(slot)` protects that slot from eviction
+/// and requires it to still exist (its vanishing propagates as an error);
+/// `keep = None` protects nothing. Holds `EVICTION_LOCK` for the whole pass
+/// and takes each candidate's `slot_lock` with `try_lock`, deferring (skipping)
+/// a candidate whose lock is currently held rather than blocking on it — the
+/// deferred candidate's own mutation runs its own tail pass once it settles.
+fn evict_to_caps(root: &Path, keep: Option<&Path>) -> Result<(), CacheError> {
     let _eviction_guard = EVICTION_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -524,7 +585,7 @@ fn evict_lru(root: &Path, keep: &Path) -> Result<(), CacheError> {
             Err(e) => return Err(io_err("evict_lru: read_dir entry", root, e)),
         };
         let p = entry.path();
-        if p == keep {
+        if keep == Some(p.as_path()) {
             continue;
         }
         let Some(key) = p.file_name().and_then(|name| name.to_str()) else {
@@ -558,9 +619,12 @@ fn evict_lru(root: &Path, keep: &Path) -> Result<(), CacheError> {
     }
     entries.sort_by_key(|(_, _, mtime, _)| *mtime);
 
-    let keep_size = dir_size(keep)?;
+    let (keep_size, keep_count) = match keep {
+        Some(keep) => (dir_size(keep)?, 1),
+        None => (0, 0),
+    };
     let mut total: u64 = entries.iter().map(|(_, _, _, s)| s).sum::<u64>() + keep_size;
-    let mut count = entries.len() + 1;
+    let mut count = entries.len() + keep_count;
     let cap_repos = max_repos();
     let cap_bytes = max_total_bytes();
 
@@ -674,6 +738,77 @@ mod tests {
 
         assert!(!old.exists(), "the older clone must be evicted");
         assert!(new.exists(), "the kept clone must survive");
+
+        std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
+        std::env::remove_var("KHIVE_GIT_DIGEST_CACHE_MAX_REPOS");
+        std::env::remove_var("KHIVE_GIT_DIGEST_CACHE_MAX_BYTES");
+    }
+
+    /// Issue #960: a cache mutation that FAILS must still leave the caps
+    /// enforced. A failed `refetch_clone` returns before its success-path
+    /// `evict_lru`, and under concurrency a sibling eviction pass can defer
+    /// this slot (its lock is held) — so without a post-release cap pass the
+    /// caps stay exceeded with nothing scheduled to correct them.
+    /// `finish_mutation` runs `enforce_caps` once the lock is free. This pins
+    /// the settled-state invariant the concurrent case also relies on: two
+    /// owned slots over a repo cap of 1, a failed refetch of one, and
+    /// afterward exactly one owned slot remains.
+    #[test]
+    fn a_failed_mutation_enforces_caps_over_the_settled_set() {
+        let _guard = ENV_MUTEX.blocking_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT", dir.path());
+        std::env::set_var("KHIVE_GIT_DIGEST_CACHE_MAX_REPOS", "1");
+        std::env::set_var("KHIVE_GIT_DIGEST_CACHE_MAX_BYTES", "1000000000");
+
+        let root = dir.path();
+        // Two owned slots present, one over the repo cap of 1. The slot we
+        // will fail to refetch is the newer one; the older sibling is the LRU
+        // eviction victim, showing the failed mutation enforced the cap over a
+        // slot it was not itself operating on.
+        let url_victim = "https://example.com/lru-victim.git";
+        let url_target = "https://example.com/refetch-target.git";
+        let key_victim = cache_key(url_victim);
+        let key_target = cache_key(url_target);
+        assert_ne!(
+            key_victim, key_target,
+            "distinct urls must map to distinct slots"
+        );
+
+        let victim = make_owned_entry(root, &key_victim, true);
+        // Ensure a real mtime gap so `victim` is unambiguously the LRU.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let target = make_owned_entry(root, &key_target, true);
+
+        // `target`'s `.git` is an empty directory, not a real repository, so
+        // `git fetch --refetch` fails deterministically with no network. The
+        // mutation therefore returns Err before its own eviction pass.
+        let result = refetch_clone(url_target);
+        assert!(
+            result.is_err(),
+            "refetch of a slot with no valid git repo must fail: {result:?}"
+        );
+
+        // The failed mutation must nonetheless have enforced the caps.
+        let owned: Vec<_> = std::fs::read_dir(root)
+            .expect("read scratch root")
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| is_owned_entry(p))
+            .collect();
+        assert_eq!(
+            owned.len(),
+            1,
+            "a failed mutation must leave the repo cap enforced, found: {owned:?}"
+        );
+        assert!(
+            target.exists(),
+            "the newer (refetched) slot must survive as the non-LRU entry"
+        );
+        assert!(
+            !victim.exists(),
+            "the older sibling must be evicted to satisfy the repo cap"
+        );
 
         std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
         std::env::remove_var("KHIVE_GIT_DIGEST_CACHE_MAX_REPOS");
