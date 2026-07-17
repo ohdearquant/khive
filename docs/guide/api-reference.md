@@ -52,9 +52,11 @@ manifest + L1.5 import-scan source ingest, ADR-085 Amendment 2 — see below); i
 path, not the MCP verb surface.
 
 `blob` registers no note or entity kinds; its three verbs (`blob.put` / `blob.get` /
-`blob.stat`) dispatch over the `BlobStore` content-addressed storage trait (ADR-111) and
-error as unconfigured until a backend is installed via `[storage.blob]` or
-`KHIVE_BLOB_ROOT`.
+`blob.stat`) dispatch over the `BlobStore` content-addressed storage trait (ADR-111). A
+normal file-backed boot installs a default `FsBlobStore` rooted beside the database file
+even with no `[storage.blob]` section and no `KHIVE_BLOB_ROOT` set; the verbs only stay
+unconfigured (erroring until a backend is installed) when the server boots against an
+in-memory backend, which has no directory to default a root beside.
 
 The default binary (no `KHIVE_PACKS`/`--pack` override) loads all 12 packs: 18 + 5 + 5 +
 15 + 7 + 4 + 19 + 4 + 4 + 1 + 0 + 3 = **85 verbs**.
@@ -1671,24 +1673,28 @@ request(ops="code.ingest(path=\"/repo/crates/my-crate\")")
 ## `blob` pack — 3 verbs
 
 Content-addressed binary object storage (ADR-111). Optional; load with
-`KHIVE_PACKS=kg,blob`. Registers no note or entity kinds. Every verb errors as
-unconfigured until a `BlobStore` backend is installed via `[storage.blob]` in
-`khive.toml` or the `KHIVE_BLOB_ROOT` environment variable.
+`KHIVE_PACKS=kg,blob`. Registers no note or entity kinds. A normal file-backed boot
+installs a default `FsBlobStore` rooted beside the database file even with no
+`[storage.blob]` section in `khive.toml` and no `KHIVE_BLOB_ROOT` set; the verbs stay
+unconfigured (erroring until a backend is installed) only when the server boots against
+an in-memory backend, which has no directory to default a root beside.
 
 ### `blob.put` — Commissive
 
 Store bytes (base64) in the content-addressed blob store; returns the BLAKE3
 `ContentRef`. Idempotent: identical content returns the same ref without a re-write.
 
-| Param   | Type   | Required | Notes                                                                      |
-| ------- | ------ | -------- | -------------------------------------------------------------------------- |
-| `bytes` | string | yes      | Base64-encoded object content. Decoded size is capped at 128 MiB per call. |
+| Param   | Type   | Required | Notes                                                                                                   |
+| ------- | ------ | -------- | ------------------------------------------------------------------------------------------------------- |
+| `bytes` | string | yes      | Base64-encoded object content. Decoded size is capped at 64 MiB per call (ADR-111's v1 object ceiling). |
 
 ### `blob.get` — Assertive
 
 Read an object back by `content_ref`, base64-encoded in the response, with an optional
 byte range. The object is rejected before any bytes are hydrated if it exceeds the
-128 MiB ceiling this verb will fetch.
+64 MiB ceiling this verb will fetch, or if the requested slice would base64-encode to a
+response exceeding the daemon's IPC frame cap. Concurrent `blob.get` hydration is bounded
+by a small pack-level semaphore.
 
 | Param         | Type   | Required | Notes                                                                                                                             |
 | ------------- | ------ | -------- | --------------------------------------------------------------------------------------------------------------------------------- |

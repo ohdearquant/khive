@@ -181,7 +181,9 @@ system git with hardened, allowlisted argv construction and unconditional force-
 Ask A) added 2026-07-08; kg.resolve added 2026-07-09; workspace (#873) contributes zero verbs,
 adding only the `workspace` entity kind and `contains` endpoint rules to git/gtd/session notes;
 blob contributes three verbs, blob.put/blob.get/blob.stat (ADR-111), over the `BlobStore`
-content-addressed storage trait, erroring as unconfigured until a backend is installed;
+content-addressed storage trait; a normal file-backed boot installs a default `FsBlobStore`
+beside the database file with no config needed, and the verbs stay unconfigured only
+against an in-memory backend;
 regenerate via `request(ops="verbs()")` before editing this line).
 
 ### KG pack verbs (18 — ADR-017, ADR-046, ADR-089)

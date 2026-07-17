@@ -1,8 +1,9 @@
 //! Blob verb pack — thin MCP verbs over the existing `BlobStore` CAS.
 //!
 //! Phase 1 of the blob-consumer surface: three verbs — `blob.put`, `blob.get`,
-//! `blob.stat` — mapped directly
-//! onto `khive_storage::BlobStore::{put,get,exists}`. This pack adds no
+//! `blob.stat` — mapped directly onto `khive_storage::BlobStore::{put,get,size}`
+//! (`blob.stat` maps to `size`, not `exists`/`get`: it answers existence and
+//! size from one call without ever hydrating the object's bytes). This pack adds no
 //! entity/note kind, no schema, and no storage backend of its own; it only
 //! exposes the pre-existing content-addressed store on the MCP `request`
 //! surface. Physical `delete`/`orphan_sweep` stay admin-only (ADR-111 §8)

@@ -25,6 +25,10 @@ async fn assert_conforms(store: Arc<dyn BlobStore>) {
     assert_eq!(ref_a, ref_b);
 
     assert!(store.exists(&ref_a).await.expect("exists"));
+    assert_eq!(
+        store.size(&ref_a).await.expect("size"),
+        Some(bytes.len() as u64)
+    );
 
     let round_tripped = store.get(&ref_a).await.expect("get");
     assert_eq!(round_tripped, bytes);
