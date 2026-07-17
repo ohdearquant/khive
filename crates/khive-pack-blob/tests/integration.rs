@@ -145,58 +145,40 @@ async fn get_on_unknown_ref_errors_not_found() {
 }
 
 #[tokio::test]
-async fn put_rejects_both_bytes_and_path() {
-    let (registry, _rt, _dir) = build_registry();
-
-    let err = registry
-        .dispatch(
-            "blob.put",
-            serde_json::json!({ "bytes": BASE64.encode(b"x"), "path": "/tmp/whatever" }),
-        )
-        .await
-        .unwrap_err();
-    assert!(err.to_string().contains("exactly one"));
-}
-
-#[tokio::test]
-async fn put_rejects_neither_bytes_nor_path() {
+async fn put_rejects_missing_bytes() {
     let (registry, _rt, _dir) = build_registry();
 
     let err = registry
         .dispatch("blob.put", serde_json::json!({}))
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("requires either"));
+    assert!(err.to_string().contains("requires"));
 }
 
+// Security regression guard: `path` was removed from `blob.put` because reading
+// a server-local file is an exfiltration surface for any caller reaching the
+// verb. A `path` field must be inert (treated as absent, never read), so a put
+// carrying only `path` fails the missing-`bytes` check instead of reading it.
 #[tokio::test]
-async fn put_from_path_reads_the_file() {
+async fn put_does_not_read_a_server_local_path() {
     let (registry, _rt, _dir) = build_registry();
 
     let mut src = tempfile::NamedTempFile::new().expect("named temp file");
     use std::io::Write as _;
-    src.write_all(b"from a path, not base64")
+    src.write_all(b"secret-bytes-that-must-not-be-read")
         .expect("write temp file");
 
-    let put = registry
+    let err = registry
         .dispatch(
             "blob.put",
             serde_json::json!({ "path": src.path().to_str().unwrap() }),
         )
         .await
-        .expect("blob.put from path dispatches");
-    assert_eq!(put["size"], "from a path, not base64".len());
-
-    let content_ref = put["content_ref"].as_str().unwrap().to_string();
-    let get = registry
-        .dispatch(
-            "blob.get",
-            serde_json::json!({ "content_ref": content_ref }),
-        )
-        .await
-        .expect("blob.get dispatches");
-    let bytes = BASE64.decode(get["bytes"].as_str().unwrap()).unwrap();
-    assert_eq!(bytes, b"from a path, not base64");
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("requires"),
+        "path-only put must fail as missing bytes, got: {err}"
+    );
 }
 
 #[tokio::test]

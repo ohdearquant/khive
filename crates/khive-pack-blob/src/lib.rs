@@ -1,7 +1,7 @@
 //! Blob verb pack — thin MCP verbs over the existing `BlobStore` CAS.
 //!
-//! Phase 1 of the blob-consumer surface (Track A, `blob-consumer/DESIGN.md`
-//! §2a): three verbs — `blob.put`, `blob.get`, `blob.stat` — mapped directly
+//! Phase 1 of the blob-consumer surface: three verbs — `blob.put`, `blob.get`,
+//! `blob.stat` — mapped directly
 //! onto `khive_storage::BlobStore::{put,get,exists}`. This pack adds no
 //! entity/note kind, no schema, and no storage backend of its own; it only
 //! exposes the pre-existing content-addressed store on the MCP `request`

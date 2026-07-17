@@ -12,26 +12,17 @@ use crate::{handlers, BlobPack, PACK_NAME};
 pub(crate) static BLOB_HANDLERS: [HandlerDef; 3] = [
     HandlerDef {
         name: "blob.put",
-        description: "Store bytes (base64) or a server-local file path in the content-addressed \
+        description: "Store bytes (base64) in the content-addressed \
                        blob store; returns the BLAKE3 ContentRef. Idempotent — identical content \
                        returns the same ref without a re-write.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Commissive,
-        params: &[
-            ParamDef {
-                name: "bytes",
-                param_type: "string",
-                required: false,
-                description: "Base64-encoded object content. Mutually exclusive with \"path\".",
-            },
-            ParamDef {
-                name: "path",
-                param_type: "string",
-                required: false,
-                description: "Server-local filesystem path to read the object from. Mutually \
-                               exclusive with \"bytes\".",
-            },
-        ],
+        params: &[ParamDef {
+            name: "bytes",
+            param_type: "string",
+            required: true,
+            description: "Base64-encoded object content.",
+        }],
     },
     HandlerDef {
         name: "blob.get",

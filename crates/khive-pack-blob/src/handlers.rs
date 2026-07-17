@@ -1,6 +1,5 @@
 //! Verb handlers for the blob pack — thin wrappers over `BlobStore`.
 
-use std::path::Path;
 use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -55,9 +54,13 @@ fn verify_digest(bytes: &[u8], expected: &ContentRef) -> bool {
     &actual == expected
 }
 
-/// `blob.put` — store `bytes` (base64) or the contents of a server-local
-/// `path`, returning the resulting `ContentRef`. Exactly one of the two input
-/// fields is required; supplying both, or neither, is `InvalidInput`.
+/// `blob.put` — store `bytes` (base64), returning the resulting `ContentRef`.
+/// The `bytes` field is required; a missing or non-string value is `InvalidInput`.
+///
+/// This verb does not accept a server-local file path: reading an arbitrary
+/// path on the server host would be an exfiltration surface for any caller
+/// reaching the verb. Callers that want to store a file read it themselves and
+/// pass the base64 bytes.
 pub(crate) async fn handle_put(
     runtime: &KhiveRuntime,
     _token: &NamespaceToken,
@@ -65,75 +68,22 @@ pub(crate) async fn handle_put(
 ) -> Result<Value, RuntimeError> {
     let store = blob_store(runtime)?;
 
-    let bytes_field = params.get("bytes").and_then(Value::as_str);
-    let path_field = params.get("path").and_then(Value::as_str);
-
-    let bytes = match (bytes_field, path_field) {
-        (Some(_), Some(_)) => {
-            return Err(RuntimeError::InvalidInput(
-                "blob.put accepts exactly one of \"bytes\" or \"path\", not both".to_string(),
-            ))
-        }
-        (Some(b64), None) => {
-            let decoded = BASE64.decode(b64).map_err(|e| {
-                RuntimeError::InvalidInput(format!("blob.put: \"bytes\" is not valid base64: {e}"))
-            })?;
-            if decoded.len() as u64 > MAX_PUT_BYTES {
-                return Err(RuntimeError::InvalidInput(format!(
-                    "blob.put: input is {} bytes, exceeding the {MAX_PUT_BYTES}-byte maximum",
-                    decoded.len()
-                )));
-            }
-            decoded
-        }
-        (None, Some(path)) => read_path(path).await?,
-        (None, None) => {
-            return Err(RuntimeError::InvalidInput(
-                "blob.put requires either \"bytes\" (base64) or \"path\"".to_string(),
-            ))
-        }
-    };
+    let b64 = params.get("bytes").and_then(Value::as_str).ok_or_else(|| {
+        RuntimeError::InvalidInput("blob.put requires \"bytes\" (base64)".to_string())
+    })?;
+    let bytes = BASE64.decode(b64).map_err(|e| {
+        RuntimeError::InvalidInput(format!("blob.put: \"bytes\" is not valid base64: {e}"))
+    })?;
+    if bytes.len() as u64 > MAX_PUT_BYTES {
+        return Err(RuntimeError::InvalidInput(format!(
+            "blob.put: input is {} bytes, exceeding the {MAX_PUT_BYTES}-byte maximum",
+            bytes.len()
+        )));
+    }
 
     let size = bytes.len();
     let content_ref = store.put(bytes).await?;
     Ok(json!({ "content_ref": content_ref.to_string(), "size": size }))
-}
-
-async fn read_path(path: &str) -> Result<Vec<u8>, RuntimeError> {
-    let owned = path.to_string();
-    tokio::task::spawn_blocking(move || read_path_blocking(&owned))
-        .await
-        .map_err(|e| RuntimeError::Internal(format!("blob.put: path read task failed: {e}")))?
-}
-
-fn read_path_blocking(path: &str) -> Result<Vec<u8>, RuntimeError> {
-    let p = Path::new(path);
-    let metadata = std::fs::metadata(p).map_err(|e| map_path_io_err(e, path))?;
-    if !metadata.is_file() {
-        return Err(RuntimeError::InvalidInput(format!(
-            "blob.put: path {path:?} is not a regular file"
-        )));
-    }
-    if metadata.len() > MAX_PUT_BYTES {
-        return Err(RuntimeError::InvalidInput(format!(
-            "blob.put: file at {path:?} is {} bytes, exceeding the {MAX_PUT_BYTES}-byte maximum",
-            metadata.len()
-        )));
-    }
-    std::fs::read(p).map_err(|e| map_path_io_err(e, path))
-}
-
-fn map_path_io_err(e: std::io::Error, path: &str) -> RuntimeError {
-    match e.kind() {
-        std::io::ErrorKind::NotFound => {
-            RuntimeError::NotFound(format!("blob.put: no file at path {path:?}"))
-        }
-        std::io::ErrorKind::PermissionDenied => RuntimeError::PermissionDenied {
-            verb: "blob.put".to_string(),
-            reason: format!("permission denied reading path {path:?}"),
-        },
-        _ => RuntimeError::InvalidInput(format!("blob.put: failed to read path {path:?}: {e}")),
-    }
 }
 
 /// `blob.get` — fetch an object by `content_ref`, base64-encoded in the
@@ -195,7 +145,7 @@ pub(crate) async fn handle_get(
 /// size-only accessor (`khive-storage/src/blob.rs`), so an existing object's
 /// size can only be answered by reading it in full through the existing
 /// trait — this phase deliberately does not extend that trait (out of
-/// scope; see `DESIGN.md` §5.1).
+/// scope for the phase-1 verb surface).
 pub(crate) async fn handle_stat(
     runtime: &KhiveRuntime,
     _token: &NamespaceToken,
