@@ -2039,6 +2039,7 @@ dependencies = [
  "khive-channel-email",
  "khive-channel-telegram",
  "khive-db",
+ "khive-pack-blob",
  "khive-pack-brain",
  "khive-pack-code",
  "khive-pack-comm",
@@ -2067,6 +2068,24 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "khive-pack-blob"
+version = "0.5.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "blake3",
+ "inventory",
+ "khive-db",
+ "khive-runtime",
+ "khive-storage",
+ "khive-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
