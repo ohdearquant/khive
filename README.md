@@ -160,7 +160,9 @@ The **khived daemon** (ADR-049) keeps the runtime warm between MCP sessions: the
 stays loaded, SQLite connections stay open, and pack registries stay initialized. It auto-spawns on
 first request and persists in the background, eliminating cold-start overhead on reconnect.
 
-HTTP gateway, CLI, and visual frontend are planned for future releases.
+HTTP gateway and visual frontend are planned for future releases. The `kkernel` admin CLI
+(migrations, reindexing, data import/export, diagnostics) ships today, documented in
+[docs/operations.md](docs/operations.md).
 
 ---
 
