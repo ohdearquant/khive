@@ -791,7 +791,19 @@ introduced here. The three verbs below are pure readers: each opens a map
 database, computes over its stored entities and edges, and returns a
 result. None of them writes to any database, production or map.
 
-### E2: `code.coupling(db, level?, limit?, offset?)`
+All three verbs additionally observe soft-delete state. Every query
+underlying `code.coupling`, `code.health`, and `code.cycles` participates
+only rows with `deleted_at IS NULL` — entities, `depends_on` edges, and
+`contains` (containment) edges alike. This is khive's ordinary soft-delete
+convention (a deleted row stays in storage; every reader filters it out at
+query time), restated here because these three verbs compute aggregates and
+graph structure rather than returning individual rows, and an aggregate has
+no obvious place to apply a filter unless every underlying query does it
+consistently. A soft-deleted module, or a soft-deleted edge between two
+otherwise-live modules, contributes to no coupling number, no dead-module
+count, no aggregation, and no cyclic component.
+
+### E2: `code.coupling(db, level?, top_n?)`
 
 Fan-in/fan-out over `depends_on` edges, per module by default
 (`level="module"`), or per project when `level="project"` — aggregating the
@@ -805,8 +817,15 @@ Each result row carries the entity id, its name, `fan_in` (incoming
 `depends_on` edge count), and `fan_out` (outgoing `depends_on` edge count).
 Rows are ordered by total degree (fan_in + fan_out) descending, then by
 entity id ascending as a tiebreaker — a total order, so two identical calls
-return rows in the same sequence and paginating through `limit`/`offset`
-reproduces exactly the prefix an unpaginated call would return (E8).
+return rows in the same sequence (E8). The result is bounded by `top_n`
+(default 50, max 500) rather than offset-paginated: degree ranking cannot be
+sliced without first aggregating every row's total degree, so an
+offset-based page over the map-database scale this pack targets would redo
+that full aggregation on every page for no benefit over asking for a larger
+`top_n` once. There is no `offset` parameter in v1. A materialized-cursor
+contract — one that lets a caller resume a coupling listing without
+re-aggregating from scratch — is deferred until a consumer demonstrates an
+actual need for it; nothing here forecloses adding one later.
 
 At `level="project"`, `fan_out` counts the number of _distinct_ neighbor
 projects this project depends on, and `fan_in` counts the number of
@@ -840,7 +859,12 @@ KG-substrate counts and has no target-database parameter:
 
 `code.health` is a composition of `code.coupling` and `code.cycles` plus
 counting; it introduces no computation beyond what those two verbs already
-define. `db` is required, per E7.
+define. Every part of that composition — both counts, the coupling-outlier
+computation, and the cyclic-component count — runs inside one read-only
+transaction held open on a single reader connection, so every field in the
+returned summary is computed against the same database state. No field can
+reflect a write that landed between two of the sub-computations; the summary
+describes one snapshot, never a mix. `db` is required, per E7.
 
 ### E4: `code.cycles(db, limit?, max_members?)`
 
@@ -890,17 +914,21 @@ recipe that could have been written instead.
 ### E6: Non-goals
 
 - No declaration-level (L2) analysis semantics are defined here. `level` is
-  a closed enum, `module` or `project`, for both `code.coupling` and
-  `code.cycles` in v1. `code.ingest`'s L2 tier remains unimplemented;
-  declaration-level analysis is deferred to a future amendment once L2
-  ships, and that amendment — not this one — owns eligibility, aggregation,
-  selectors, and health semantics for declaration entities. Nothing here
-  implies what that shape will be. Regardless of what else a target map
-  database contains (a future L2's declaration-level entities, or ordinary
-  `finding` notes), `code.coupling` and `code.cycles` filter to
-  module-to-module `depends_on` edges only in v1 — plus the
-  project-to-project and module-mediated project handling defined in E2 for
-  `level="project"`.
+  a closed enum, `module` or `project`, on `code.coupling` only. `code.cycles`
+  takes no `level` parameter at all: it is module-level only in v1 (E4), full
+  stop. A `level` parameter for `code.cycles`, if ever wanted, is not this
+  amendment's decision to make — it belongs to the future declaration-level
+  amendment below, alongside the rest of that amendment's eligibility,
+  aggregation, selectors, and health semantics for declaration entities.
+  `code.ingest`'s L2 tier remains unimplemented; declaration-level analysis
+  is deferred to that future amendment once L2 ships. Nothing here implies
+  what that shape will be. Regardless of what else a target map database
+  contains (a future L2's declaration-level entities, or ordinary `finding`
+  notes), `code.coupling` filters to module-to-module `depends_on` edges
+  only in v1 at `level="module"` — plus the project-to-project and
+  module-mediated project handling defined in E2 for `level="project"` — and
+  `code.cycles` filters to module-to-module `depends_on` edges only, with no
+  project-level variant.
 - No mutation. All three verbs are read-only, per E1.
 - No scheduled or background analysis. Every call computes fresh over the
   database's current state at call time; there is no cached or
@@ -925,28 +953,55 @@ The shared resolver is hardened by this amendment, not replaced: the
 existing path-based rejection (comparing the resolved target path string
 against the known production database path) stays in place but is not
 sufficient on its own, since a hard link gives a second path pointing at
-the same underlying file. The resolver now also performs opened-file
-identity verification — after opening the target database file, its
-(device, inode) identity is compared against the resolved production
-database file's (device, inode) identity, and a match aborts with the same
-fence error the path-based check already raises. Because the resolution is
-shared (B1, B7), `code.ingest` gains this same hardening; this amendment
-does not introduce a second resolution path, it strengthens the one B7
-already established.
+the same underlying file. Opening a resolved `db` target for analysis now
+follows a fixed sequence, and every step is a rejection point:
+
+1. The target file must already exist. A `db` path that resolves to
+   nothing is rejected outright — an analysis call never creates the
+   database it was asked to read.
+2. Before the file is opened, its (device, inode) identity is probed
+   directly off the filesystem path and compared against the production
+   database's own (device, inode) identity; a match aborts with the fence
+   error before any connection is made, catching a hard link the
+   path-string comparison alone would miss.
+3. Once the file is open, the same (device, inode) comparison runs again
+   against the opened handle, catching a target that was swapped out
+   between the path probe and the open.
+4. The file is opened through the storage layer's read-only backend
+   constructor class — the one that opens with `SQLITE_OPEN_READ_ONLY` plus
+   `query_only`, refuses to create a missing file, and runs no migrations —
+   never through the general runtime constructor. That general constructor
+   is create-capable (a missing path is created, not rejected) and
+   unconditionally runs migrations against whatever it opens; migrations
+   are schema writes, and a read-only analysis call has no business
+   mutating a map database's schema. Migrations are prohibited on the
+   analysis path for exactly this reason: the read-only backend
+   constructor neither creates a missing file nor runs migrations, which is
+   the posture steps 1 and 4 both need, and the general constructor
+   provides neither guarantee.
+
+Because path resolution and the existence/identity checks are shared with
+`code.ingest` (B1, B7), `code.ingest` gains the strengthened identity checks
+too; this amendment does not introduce a second resolution path, it
+strengthens the one B7 already established. `code.ingest` itself still opens
+its target through the general, create-capable constructor for its own
+writes — only the three analysis verbs are constrained to the read-only
+backend constructor class.
 
 The D6.1 granularity fence exists to keep exhaustive symbol/call graphs out
 of the shared production graph; letting analysis verbs read the production
 database would not itself violate that fence's storage rule, but it would
 create a second path that depends on the fence never being violated
 elsewhere, which is exactly the posture B7 already rejected once for
-writes. Restating the same fence for reads, with the added hard-link
-hardening, keeps the rule uniform across the pack's entire verb surface:
-`db` always means a dedicated map database, verified by identity, not just
-by the path the caller happened to supply.
+writes. Restating the same fence for reads, with the added existence check
+and the pre-open/post-open identity hardening, keeps the rule uniform
+across the pack's entire verb surface: `db` always means a dedicated map
+database, verified to exist and verified by identity twice, not just
+inferred from the path the caller happened to supply.
 
 ### E8: Acceptance
 
-An implementation of this amendment is acceptance-tested against six
+An implementation of this amendment is acceptance-tested against ten
 properties:
 
 1. **Coupling correctness.** `code.coupling` run against a small fixture
@@ -968,17 +1023,39 @@ properties:
    with the same fence error as property 3 — the opened-file (device,
    inode) identity check (E7) catches what the path-based check alone
    would miss.
-5. **Deterministic ordering and pagination.** Two consecutive calls to the
-   same verb with the same `db` and the same other parameters, with no
-   intervening write, return identical, identically-ordered results
-   (idempotent reads); and for `code.coupling`, stitching together
-   successive `limit`/`offset` pages reproduces exactly the prefix an
-   unpaginated call over the same rows would return, verifying the total
-   order defined in E2.
-6. **Truncated giant component.** `code.cycles` run against a fixture whose
-   cyclic component exceeds `max_members` returns that component with
-   `truncated: true`, a member list capped at `max_members`, and a
-   `member_count` equal to the component's true, untruncated size.
+5. **Missing-file rejection.** All three verbs, called with `db` pointed at
+   a path that does not exist, are rejected outright, and no file is
+   created at that path as a side effect of the call (E7 step 1).
+6. **Byte identity across an analysis call.** For a fixture database plus
+   its WAL and SHM sidecar files, a byte-for-byte snapshot taken
+   immediately before and immediately after a `code.coupling`,
+   `code.health`, or `code.cycles` call is identical across all three
+   files — direct evidence that the call opened the target read-only (E7
+   step 4) rather than merely refraining from writes it was otherwise
+   capable of.
+7. **Tombstone exclusion.** A fixture containing one soft-deleted edge and
+   one soft-deleted entity — each of which would otherwise participate in
+   a coupling number, a dead-module count, an aggregation, or a cyclic
+   component — is confirmed to influence none of them, across all three
+   verbs (E1).
+8. **Health snapshot coherence under concurrent ingest.** `code.health` run
+   against a database that a concurrent `code.ingest` call is actively
+   mutating returns a summary whose fields all agree with one database
+   state: none of `entities_by_kind`, `edges_by_relation`,
+   `coupling_outliers`, `dead_module_candidate_count`, or
+   `cyclic_component_count` reflects a partial mix of pre- and mid-ingest
+   state (E3).
+9. **Deterministic ordering and top-N prefix extension.** Two consecutive
+   calls to the same verb with the same `db` and the same other
+   parameters, with no intervening write, return identical,
+   identically-ordered results (idempotent reads); and for
+   `code.coupling`, a call with a larger `top_n` returns, as a strict
+   prefix, exactly the ordered rows a call with a smaller `top_n` returned
+   over the same rows — verifying the total order defined in E2.
+10. **Truncated giant component.** `code.cycles` run against a fixture whose
+    cyclic component exceeds `max_members` returns that component with
+    `truncated: true`, a member list capped at `max_members`, and a
+    `member_count` equal to the component's true, untruncated size.
 
 ### E9: Interface note — verb count delta
 
