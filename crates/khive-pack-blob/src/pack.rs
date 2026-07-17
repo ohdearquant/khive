@@ -48,9 +48,9 @@ pub(crate) static BLOB_HANDLERS: [HandlerDef; 3] = [
     },
     HandlerDef {
         name: "blob.stat",
-        description: "Report whether an object exists and its size, without implying any lease \
-                       or reservation. Flags digest corruption if the stored bytes no longer hash \
-                       to their own ContentRef.",
+        description: "Report whether an object exists and its size, without hydrating its bytes \
+                       or implying any lease or reservation. Digest verification happens on the \
+                       blob.get read path, where the bytes are already fetched.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[ParamDef {

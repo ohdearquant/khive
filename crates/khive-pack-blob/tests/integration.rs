@@ -7,6 +7,7 @@ use base64::Engine as _;
 use khive_db::stores::blob::FsBlobStore;
 use khive_pack_blob::BlobPack;
 use khive_runtime::{KhiveRuntime, VerbRegistry, VerbRegistryBuilder};
+use khive_storage::BlobStore;
 use khive_types::Pack;
 
 fn build_registry() -> (VerbRegistry, KhiveRuntime, tempfile::TempDir) {
@@ -68,7 +69,6 @@ async fn put_stat_get_round_trips_and_put_is_idempotent() {
         .expect("blob.stat dispatches");
     assert_eq!(stat["exists"], true);
     assert_eq!(stat["size"], payload.len());
-    assert_eq!(stat["corrupt"], false);
 
     let get = registry
         .dispatch(
@@ -193,4 +193,183 @@ async fn get_rejects_malformed_content_ref() {
         .await
         .unwrap_err();
     assert!(err.to_string().contains("invalid content_ref"));
+}
+
+#[tokio::test]
+async fn stat_reports_size_without_a_corrupt_field_for_a_present_object() {
+    let (registry, _rt, _dir) = build_registry();
+
+    let payload = b"stat must not hydrate this".to_vec();
+    let put = registry
+        .dispatch(
+            "blob.put",
+            serde_json::json!({ "bytes": BASE64.encode(&payload) }),
+        )
+        .await
+        .expect("blob.put dispatches");
+    let content_ref = put["content_ref"].as_str().unwrap().to_string();
+
+    let stat = registry
+        .dispatch(
+            "blob.stat",
+            serde_json::json!({ "content_ref": content_ref }),
+        )
+        .await
+        .expect("blob.stat dispatches");
+    assert_eq!(stat["exists"], true);
+    assert_eq!(stat["size"], payload.len());
+    assert!(
+        stat.get("corrupt").is_none(),
+        "stat answers existence+size from BlobStore::size only, never hydrates bytes to \
+         digest-verify: {stat:?}"
+    );
+}
+
+#[tokio::test]
+async fn stat_reports_absent_for_an_unknown_ref() {
+    let (registry, _rt, _dir) = build_registry();
+    let unknown_ref = "9".repeat(64);
+
+    let stat = registry
+        .dispatch(
+            "blob.stat",
+            serde_json::json!({ "content_ref": unknown_ref }),
+        )
+        .await
+        .expect("blob.stat dispatches for an absent ref");
+    assert_eq!(stat["exists"], false);
+    assert!(stat.get("size").is_none());
+}
+
+#[tokio::test]
+async fn get_rejects_an_object_over_the_hydration_ceiling() {
+    let (registry, _rt, dir) = build_registry();
+
+    // Bypass blob.put's own ceiling by writing directly through the store,
+    // matching MAX_OBJECT_BYTES in crates/khive-pack-blob/src/handlers.rs
+    // (128 MiB) plus one byte so blob.get's independent ceiling check is
+    // what actually rejects the read.
+    let store = khive_db::stores::blob::FsBlobStore::new(dir.path().to_path_buf(), 0)
+        .expect("fs blob store for oversized write");
+    let oversized = vec![0u8; 128 * 1024 * 1024 + 1];
+    let content_ref = store.put(oversized).await.expect("direct store put");
+
+    let err = registry
+        .dispatch(
+            "blob.get",
+            serde_json::json!({ "content_ref": content_ref.to_string() }),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("exceeding"),
+        "expected a ceiling-exceeded error, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn get_rejects_a_non_object_range() {
+    let (registry, _rt, _dir) = build_registry();
+
+    let put = registry
+        .dispatch(
+            "blob.put",
+            serde_json::json!({ "bytes": BASE64.encode(b"range validation") }),
+        )
+        .await
+        .expect("blob.put dispatches");
+    let content_ref = put["content_ref"].as_str().unwrap().to_string();
+
+    let err = registry
+        .dispatch(
+            "blob.get",
+            serde_json::json!({ "content_ref": content_ref, "range": "not-an-object" }),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("range must be a JSON object"),
+        "got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn get_rejects_a_string_range_offset() {
+    let (registry, _rt, _dir) = build_registry();
+
+    let put = registry
+        .dispatch(
+            "blob.put",
+            serde_json::json!({ "bytes": BASE64.encode(b"range validation") }),
+        )
+        .await
+        .expect("blob.put dispatches");
+    let content_ref = put["content_ref"].as_str().unwrap().to_string();
+
+    let err = registry
+        .dispatch(
+            "blob.get",
+            serde_json::json!({ "content_ref": content_ref, "range": { "offset": "3" } }),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("range.offset must be a non-negative integer"),
+        "got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn get_rejects_a_negative_range_offset() {
+    let (registry, _rt, _dir) = build_registry();
+
+    let put = registry
+        .dispatch(
+            "blob.put",
+            serde_json::json!({ "bytes": BASE64.encode(b"range validation") }),
+        )
+        .await
+        .expect("blob.put dispatches");
+    let content_ref = put["content_ref"].as_str().unwrap().to_string();
+
+    let err = registry
+        .dispatch(
+            "blob.get",
+            serde_json::json!({ "content_ref": content_ref, "range": { "offset": -1 } }),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("range.offset must be a non-negative integer"),
+        "got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn get_rejects_a_float_range_length() {
+    let (registry, _rt, _dir) = build_registry();
+
+    let put = registry
+        .dispatch(
+            "blob.put",
+            serde_json::json!({ "bytes": BASE64.encode(b"range validation") }),
+        )
+        .await
+        .expect("blob.put dispatches");
+    let content_ref = put["content_ref"].as_str().unwrap().to_string();
+
+    let err = registry
+        .dispatch(
+            "blob.get",
+            serde_json::json!({ "content_ref": content_ref, "range": { "offset": 0, "length": 2.5 } }),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("range.length must be a non-negative integer"),
+        "got: {err}"
+    );
 }

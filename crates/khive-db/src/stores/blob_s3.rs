@@ -509,6 +509,16 @@ impl BlobStore for S3BlobStore {
         }
     }
 
+    async fn size(&self, content_ref: &ContentRef) -> StorageResult<Option<u64>> {
+        let key = self.shard_key(content_ref);
+        match tokio::time::timeout(self.request_timeout, self.client.head(&key)).await {
+            Ok(Ok(meta)) => Ok(Some(meta.size)),
+            Ok(Err(ObjectStoreError::NotFound { .. })) => Ok(None),
+            Ok(Err(e)) => Err(map_object_store_err(e, "size")),
+            Err(_elapsed) => Err(timeout_error("size")),
+        }
+    }
+
     async fn delete(&self, content_ref: &ContentRef) -> StorageResult<bool> {
         let key = self.shard_key(content_ref);
         // HEAD-then-DELETE (ADR-111 Amendment 2): S3 DELETE is idempotent
@@ -1206,6 +1216,21 @@ mod tests {
         let (_fake, store) = fake_store(vec![], vec![Outcome::Hang]);
         let content_ref = ContentRef::from_hex("b".repeat(64)).unwrap();
         let err = store.get(&content_ref).await.unwrap_err();
+        assert!(matches!(err, StorageError::Timeout { .. }), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn size_returns_none_for_a_missing_object() {
+        let (_fake, store) = fake_store(vec![], vec![Outcome::NotFound]);
+        let content_ref = ContentRef::from_hex("1".repeat(64)).unwrap();
+        assert_eq!(store.size(&content_ref).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn size_timeout_maps_to_storage_timeout() {
+        let (_fake, store) = fake_store(vec![], vec![Outcome::Hang]);
+        let content_ref = ContentRef::from_hex("2".repeat(64)).unwrap();
+        let err = store.size(&content_ref).await.unwrap_err();
         assert!(matches!(err, StorageError::Timeout { .. }), "got {err:?}");
     }
 

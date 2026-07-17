@@ -1,14 +1,14 @@
 # API Reference
 
-khive exposes exactly one MCP tool, `request`. Everything else, 82 verbs across 11
+khive exposes exactly one MCP tool, `request`. Everything else, 85 verbs across 12
 production packs, is dispatched through that single tool via a small request DSL.
 This page documents the DSL grammar, the response envelope, and every verb's full
 parameter contract, so an agent can call khive correctly without reading Rust source.
 
 This page is verified against the live registry (`request(ops="verbs()")`, run
-2026-07-16) and the pack source (`crates/khive-pack-*/src/*.rs` `HandlerDef`/`ParamDef`
-struct literals). Verb count: **82**, matching both the live registry `total` field and
-the sum of the 11 pack counts below. If your server reports a different total, your
+2026-07-17) and the pack source (`crates/khive-pack-*/src/*.rs` `HandlerDef`/`ParamDef`
+struct literals). Verb count: **85**, matching both the live registry `total` field and
+the sum of the 12 pack counts below. If your server reports a different total, your
 `KHIVE_PACKS` configuration loads a different pack set than the default — run
 `request(ops="verbs()")` against your own server to get the authoritative list.
 
@@ -32,6 +32,7 @@ An always-machine-readable copy of this page is at
 | `git`       | 4     | `KHIVE_PACKS=kg,git`                       | Yes                 |
 | `code`      | 1     | `KHIVE_PACKS=kg,code`                      | Yes                 |
 | `workspace` | 0     | `KHIVE_PACKS=kg,git,gtd,session,workspace` | Yes                 |
+| `blob`      | 3     | `KHIVE_PACKS=kg,blob`                      | Yes                 |
 
 `git` also registers the `commit` / `issue` / `pull_request` note kinds and the shared
 `run_ingest` core (`crates/khive-pack-git/src/ingest.rs`) that both `git.digest` and the
@@ -50,8 +51,13 @@ manifest + L1.5 import-scan source ingest, ADR-085 Amendment 2 — see below); i
 `findings.json` batch ingest still runs only through the `kkernel code-ingest` admin CLI
 path, not the MCP verb surface.
 
-The default binary (no `KHIVE_PACKS`/`--pack` override) loads all 11 packs: 18 + 5 + 5 +
-15 + 7 + 4 + 19 + 4 + 4 + 1 + 0 = **82 verbs**.
+`blob` registers no note or entity kinds; its three verbs (`blob.put` / `blob.get` /
+`blob.stat`) dispatch over the `BlobStore` content-addressed storage trait (ADR-111) and
+error as unconfigured until a backend is installed via `[storage.blob]` or
+`KHIVE_BLOB_ROOT`.
+
+The default binary (no `KHIVE_PACKS`/`--pack` override) loads all 12 packs: 18 + 5 + 5 +
+15 + 7 + 4 + 19 + 4 + 4 + 1 + 0 + 3 = **85 verbs**.
 
 Verb names in the `kg` pack are bare (`create`, `search`, `link`, …). Every other pack
 namespaces its verbs with a `pack.` prefix (`gtd.assign`, `memory.recall`,
@@ -1658,6 +1664,49 @@ becomes known.
 
 ```
 request(ops="code.ingest(path=\"/repo/crates/my-crate\")")
+```
+
+---
+
+## `blob` pack — 3 verbs
+
+Content-addressed binary object storage (ADR-111). Optional; load with
+`KHIVE_PACKS=kg,blob`. Registers no note or entity kinds. Every verb errors as
+unconfigured until a `BlobStore` backend is installed via `[storage.blob]` in
+`khive.toml` or the `KHIVE_BLOB_ROOT` environment variable.
+
+### `blob.put` — Commissive
+
+Store bytes (base64) in the content-addressed blob store; returns the BLAKE3
+`ContentRef`. Idempotent: identical content returns the same ref without a re-write.
+
+| Param   | Type   | Required | Notes                                                                      |
+| ------- | ------ | -------- | -------------------------------------------------------------------------- |
+| `bytes` | string | yes      | Base64-encoded object content. Decoded size is capped at 128 MiB per call. |
+
+### `blob.get` — Assertive
+
+Read an object back by `content_ref`, base64-encoded in the response, with an optional
+byte range. The object is rejected before any bytes are hydrated if it exceeds the
+128 MiB ceiling this verb will fetch.
+
+| Param         | Type   | Required | Notes                                                                                                                             |
+| ------------- | ------ | -------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `content_ref` | string | yes      | 64-char lowercase-hex BLAKE3 content reference returned by `blob.put`.                                                            |
+| `range`       | object | no       | `{offset, length}`, both non-negative integers when present. Applied to the fetched object as a slice, not a streamed range read. |
+
+### `blob.stat` — Assertive
+
+Report whether an object exists and its size, answered by a single metadata read with
+no bytes hydrated.
+
+| Param         | Type   | Required | Notes                                                                  |
+| ------------- | ------ | -------- | ---------------------------------------------------------------------- |
+| `content_ref` | string | yes      | 64-char lowercase-hex BLAKE3 content reference returned by `blob.put`. |
+
+```
+request(ops="blob.put(bytes=\"aGVsbG8=\")")
+request(ops="blob.stat(content_ref=\"<64-char-hex>\")")
 ```
 
 ---
