@@ -1,7 +1,8 @@
 # ADR-111: BlobStore — Content-Addressed Binary Object Storage
 
 **Status**: accepted
-**Date**: 2026-07-12 (amended 2026-07-13, PR #922; Amendment 2 proposed 2026-07-16)
+**Date**: 2026-07-12 (amended 2026-07-13, PR #922; Amendment 2 proposed 2026-07-16; Amendment 3
+accepted 2026-07-17)
 **Authors**: khive maintainers
 **Depends on**:
 
@@ -429,6 +430,7 @@ ADR's physical-deletion and orphan-reclamation contract.
 | `get(content_ref)`     | `GET Object`                                              | Return exact bytes. A missing key maps to `StorageError::NotFound` with capability `Blob`, resource `blob`, and the content ref as key.                                                                                           |
 | `exists(content_ref)`  | `HEAD Object`                                             | Success is `true`; not-found is `false`. Authorization, timeout, and transport failures remain errors and must not masquerade as absence.                                                                                         |
 | `delete(content_ref)`  | `HEAD Object`, then `DELETE Object`                       | Under the required quiescence, an absent HEAD returns `false`; a present HEAD followed by successful deletion returns `true`. The HEAD is necessary because S3 DELETE is idempotent and does not reliably report prior existence. |
+| `size(content_ref)`    | `HEAD Object`                                             | Returns `Some(size)` from the HEAD response's content length, or `None` when the HEAD reports the key absent. See Amendment 3.                                                                                                    |
 | `orphan_sweep(config)` | Paginated `ListObjectsV2`, diff, bounded deletes          | List only the configured prefix, process no more than 1,000 keys per page, validate the exact shard/key form, compare to `live_refs`, and retain only page-sized remote state. Dry-run never deletes.                             |
 
 `orphan_sweep` continues until the provider returns no continuation token. Delete request size and
@@ -550,6 +552,53 @@ tests.
   unversioned bucket, and an offline maintenance window for deletion and sweep.
 - `BlobStore` still does not provide transactional reference GC; this amendment does not close or
   weaken khive#924.
+
+---
+
+## Amendment 3 (2026-07-17): `size` accessor
+
+**Status:** accepted.
+
+### Context and decision
+
+The blob verb surface's `blob.stat` verb answers "does this object exist, and how big is it"
+without any need for the object's bytes. Before this amendment, `BlobStore` exposed no
+size-only accessor: `exists` answers presence only, and the only way to learn an object's
+length was `get`, which hydrates the full object into memory. `blob.stat` and `blob.get`'s
+own pre-fetch bound check both needed a metadata-only answer, so this amendment adds it to
+the trait rather than layering a second full-read workaround on top of `get`.
+
+`BlobStore` gains:
+
+```rust
+async fn size(&self, content_ref: &ContentRef) -> StorageResult<Option<u64>>;
+```
+
+`Ok(None)` means no object exists for this reference — this is the existence check and the
+size read in one call, so a caller never pays for a full read just to answer "does this exist
+and how big is it". `FsBlobStore` answers `size` from filesystem metadata (`stat`, not `read`).
+`S3BlobStore` answers it from the same `HEAD Object` request `exists` already issues, reading
+the response's content length instead of discarding it (see the trait method mapping table in
+Amendment 2). Both implementations map a not-found response to `Ok(None)`, not an error.
+
+`size` is a required trait method — this is a two-implementation trait (`FsBlobStore`,
+`S3BlobStore`), and a metadata-only size accessor is meaningful for either backend, so there is
+no principled default to fall back on.
+
+Downstream, the `blob.stat` verb handler now answers directly from `size` and no longer reads
+or digest-verifies the object; digest verification remains on the `blob.get` read path, where
+the bytes are already fetched to serve. `blob.get` also calls `size` before hydrating, and
+rejects an object exceeding its hydration ceiling before any bytes are read.
+
+### Consequences
+
+- `BlobStore` implementers must provide a metadata-only size accessor; both implementations
+  in this crate already have direct access to the required information (`stat`/`HEAD`).
+- `blob.stat` no longer reports whether a stored object's bytes match its own `ContentRef`
+  (the `corrupt` field is removed); that check happens on `blob.get`, the only verb that
+  actually reads the bytes.
+- No schema, wire-format, or `ContentRef` change; this amendment is additive to the trait
+  surface only.
 
 ---
 
