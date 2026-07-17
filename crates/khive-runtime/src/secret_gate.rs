@@ -577,6 +577,16 @@ const HEX_CREDENTIAL_LENGTHS: &[usize] = &[32, 40, 64, 128];
 /// walk stops the moment a gap contains an ASCII alphanumeric character.
 const MAX_BRIDGE_FRAGMENTS: usize = 6;
 
+/// Maximum number of delimiter-only tokens (see [`is_delimiter_only_token`])
+/// the walk may absorb as glue, in ONE direction, while searching for the
+/// next real fragment across them (#1062 H1 round 3 PoC 3). Glue tokens do
+/// not count against [`MAX_BRIDGE_FRAGMENTS`] — they carry none of the
+/// credential's own characters — but the search across them still needs its
+/// own bound, or a document seeded with a long run of punctuation-only
+/// tokens (`--- --- --- ...`) could turn the walk into a document-wide scan
+/// instead of the small local neighborhood the module doc promises.
+const MAX_BRIDGE_GLUE_TOKENS: usize = 6;
+
 /// Shortest bare token treated as a plausible FRAGMENT of a separator-split
 /// credential (see the `is_bridge_candidate` check in
 /// [`check_entropy_heuristic`]). Below this, common short words (`dead`,
@@ -792,14 +802,34 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
             // 40 hex chars). `bridge_fragment_chain` fixes both: it walks
             // outward in BOTH directions across a bounded CHAIN of fragments
             // (MAX_BRIDGE_FRAGMENTS, not a byte-length gap), so repeating the
-            // delimiter cannot buy an attacker anything and a three-or-more
-            // way split is reconstructed the same as a two-way split. Every
-            // fragment merged into the chain — not just the anchor — must
-            // itself be [`is_bridge_fragment_shape`] (alphanumeric,
-            // MIN_BRIDGE_FRAGMENT_LEN+): this is what stops the walk at a
-            // short trigger/glue word (`key`, `api`, `for`, 3-4 chars) either
-            // side of the real fragments, rather than dragging prose into
-            // the reconstruction and corrupting it.
+            // delimiter cannot buy an attacker anything. A delimiter-only
+            // token sitting between two Unicode gaps (`---` glue, #1062 H1
+            // round 3 PoC 3) is itself transparent to the walk — see
+            // [`is_delimiter_only_token`] — so it is absorbed as gap material
+            // rather than treated as a chain-terminating non-fragment token.
+            // Every fragment actually merged into the chain — not just the
+            // anchor — must itself be [`is_bridge_fragment_shape`]
+            // (alphanumeric, MIN_BRIDGE_FRAGMENT_LEN+): this is what stops
+            // the walk at a short trigger/glue word (`key`, `api`, `for`,
+            // 3-4 chars) either side of the real fragments, rather than
+            // dragging prose into the reconstruction and corrupting it.
+            //
+            // ACTUAL GUARANTEE (not "every three-or-more-way split is
+            // reconstructed" — that overclaimed round-3 comment was itself
+            // the round-3 review finding): reconstruction covers splits of
+            // up to MAX_BRIDGE_FRAGMENTS real fragments (each individually
+            // meeting MIN_BRIDGE_FRAGMENT_LEN), joined by any number of
+            // whitespace/Unicode/delimiter-only-token gaps. A split into
+            // MORE than MAX_BRIDGE_FRAGMENTS real fragments, or into
+            // fragments individually below MIN_BRIDGE_FRAGMENT_LEN, is an
+            // accepted residual limitation of the local-neighborhood bound,
+            // not a soundness gap to close here: per ADR-096 / ADR-115, this
+            // gate is accidental-persistence hygiene on a single-principal
+            // same-uid host, not defense against a same-uid adversary
+            // hand-splitting a credential to evade it — that adversary can
+            // write the DB directly. See
+            // `allows_seven_way_hex_split_beyond_fragment_cap_documented_limitation`
+            // and `allows_six_way_sub_floor_hex_split_documented_limitation`.
             //
             // The chain is checked two ways. `contains_normalized_hex_credential`
             // runs over the fragments joined by a plain space — a non-
@@ -933,18 +963,77 @@ fn is_bridge_fragment_shape(s: &str) -> bool {
     s.len() >= MIN_BRIDGE_FRAGMENT_LEN && s.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
+/// `true` when `s` holds no ASCII alphanumeric character at all — the same
+/// predicate [`adjacent_gap_is_bridgeable`] applies to the byte-range GAP
+/// between two tokenizer tokens, applied here to a tokenizer TOKEN itself
+/// (`s` is always non-empty: the tokenizer filters empty tokens). A
+/// delimiter-only token such as `---` sitting between two Unicode-separator
+/// gaps (#1062 H1 round 3 PoC 3) carries none of a credential's own
+/// characters — it is exactly as transparent to reconstruction as the
+/// surrounding whitespace/Unicode gaps are, so [`bridge_fragment_chain`]
+/// treats it as glue to walk across, not as a chain-terminating non-fragment
+/// token. A token can never be both this and [`is_bridge_fragment_shape`]:
+/// the latter requires only alphanumeric bytes, this requires none.
+fn is_delimiter_only_token(s: &str) -> bool {
+    !s.bytes().any(|b| b.is_ascii_alphanumeric())
+}
+
+/// Looks outward from `tokens[edge]` in `dir` (`-1` = toward index 0, `+1` =
+/// toward the end) for the next [`is_bridge_fragment_shape`] token, walking
+/// transparently across up to [`MAX_BRIDGE_GLUE_TOKENS`] consecutive
+/// [`is_delimiter_only_token`] glue tokens along the way. Every gap crossed
+/// — including the ones on either side of a glue token — must be
+/// [`adjacent_gap_is_bridgeable`]. Returns the found fragment's index, or
+/// `None` if the walk runs off the end of `tokens`, meets a token that is
+/// neither a fragment nor glue, meets a non-bridgeable gap, or exhausts the
+/// glue budget before finding a fragment.
+fn probe_bridge_fragment(
+    tokens: &[(usize, &str)],
+    text: &str,
+    edge: usize,
+    dir: isize,
+) -> Option<usize> {
+    let mut i = edge;
+    let mut glue_skipped = 0usize;
+    loop {
+        let next_i = i.checked_add_signed(dir)?;
+        if next_i >= tokens.len() {
+            return None;
+        }
+        let (lo, hi) = if dir < 0 { (next_i, i) } else { (i, next_i) };
+        let (lo_offset, lo_raw) = tokens[lo];
+        let (hi_offset, _) = tokens[hi];
+        let gap_start = lo_offset + lo_raw.len();
+        if !adjacent_gap_is_bridgeable(text, gap_start, hi_offset) {
+            return None;
+        }
+        let candidate = strip_delimiters(tokens[next_i].1);
+        if is_bridge_fragment_shape(candidate) {
+            return Some(next_i);
+        }
+        if is_delimiter_only_token(candidate) && glue_skipped < MAX_BRIDGE_GLUE_TOKENS {
+            glue_skipped += 1;
+            i = next_i;
+            continue;
+        }
+        return None;
+    }
+}
+
 /// Reconstructs the bounded chain of tokenizer fragments containing
-/// `tokens[anchor_idx]`, by walking outward in both directions while each
-/// adjacent gap is [`adjacent_gap_is_bridgeable`], the candidate fragment on
-/// the far side of that gap is itself [`is_bridge_fragment_shape`], and the
-/// chain has not yet reached [`MAX_BRIDGE_FRAGMENTS`] fragments. Returns each
-/// fragment's [`strip_delimiters`]-ed body, in document order, for the caller
-/// to recombine — WITH a separator (so [`contains_normalized_hex_credential`]'s
-/// existing run-reset logic applies unchanged) for the hex-length check, and
-/// WITHOUT one for the generic entropy check. Extends both directions every
-/// iteration so a credential split with fragments on both sides of the
-/// anchor (e.g. the anchor is the MIDDLE fragment of a three-way split) is
-/// fully reconstructed, not just one side of it. A length-1 result means no
+/// `tokens[anchor_idx]`, by walking outward in both directions via
+/// [`probe_bridge_fragment`] until the chain has reached
+/// [`MAX_BRIDGE_FRAGMENTS`] real fragments or neither direction can extend
+/// further. Returns each REAL fragment's [`strip_delimiters`]-ed body, in
+/// document order, for the caller to recombine — any delimiter-only glue
+/// tokens absorbed along the way (#1062 H1 round 3) are dropped from the
+/// result entirely, so a caller joining fragments with a space
+/// ([`contains_normalized_hex_credential`]) or concatenating them directly
+/// (the generic entropy check) sees only the genuine fragments, exactly as
+/// if the glue were more gap. Extends both directions every iteration so a
+/// credential split with fragments on both sides of the anchor (e.g. the
+/// anchor is the MIDDLE fragment of a three-way split) is fully
+/// reconstructed, not just one side of it. A length-1 result means no
 /// extension was possible — callers should skip further work in that case.
 fn bridge_fragment_chain<'a>(
     tokens: &[(usize, &'a str)],
@@ -958,27 +1047,15 @@ fn bridge_fragment_chain<'a>(
     loop {
         let mut extended = false;
         if fragment_count < MAX_BRIDGE_FRAGMENTS && start > 0 {
-            let (prev_offset, prev_raw) = tokens[start - 1];
-            let (cur_offset, _) = tokens[start];
-            let gap_start = prev_offset + prev_raw.len();
-            let prev_stripped = strip_delimiters(prev_raw);
-            if is_bridge_fragment_shape(prev_stripped)
-                && adjacent_gap_is_bridgeable(text, gap_start, cur_offset)
-            {
-                start -= 1;
+            if let Some(new_start) = probe_bridge_fragment(tokens, text, start, -1) {
+                start = new_start;
                 fragment_count += 1;
                 extended = true;
             }
         }
         if fragment_count < MAX_BRIDGE_FRAGMENTS && end + 1 < tokens.len() {
-            let (cur_offset, cur_raw) = tokens[end];
-            let (next_offset, next_raw) = tokens[end + 1];
-            let gap_start = cur_offset + cur_raw.len();
-            let next_stripped = strip_delimiters(next_raw);
-            if is_bridge_fragment_shape(next_stripped)
-                && adjacent_gap_is_bridgeable(text, gap_start, next_offset)
-            {
-                end += 1;
+            if let Some(new_end) = probe_bridge_fragment(tokens, text, end, 1) {
+                end = new_end;
                 fragment_count += 1;
                 extended = true;
             }
@@ -991,6 +1068,7 @@ fn bridge_fragment_chain<'a>(
     tokens[start..=end]
         .iter()
         .map(|&(_, raw)| strip_delimiters(raw))
+        .filter(|stripped| !is_delimiter_only_token(stripped))
         .collect()
 }
 
@@ -3145,6 +3223,70 @@ mod tests {
         assert!(
             check(content).is_err(),
             "base64-like Unicode-split credential must be blocked: got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_punctuation_glue_between_two_unicode_gaps() {
+        // #1062 H1 round-3 PoC 3: two 20-char hex fragments separated by a
+        // punctuation-only token (`---`) sandwiched between two U+200B
+        // gaps. `adjacent_gap_is_bridgeable` already accepts any
+        // non-alphanumeric GAP between tokens; before this fix, `---` was
+        // tokenized as its own TOKEN (not gap text), failed
+        // `is_bridge_fragment_shape` (not alphanumeric), and stopped the
+        // walk before it ever reached the second hex fragment — the two
+        // real fragments were never joined, contradicting the bridge's own
+        // stated intent that delimiter-only material is transparent to
+        // reconstruction. `is_delimiter_only_token` now lets the walk
+        // absorb `---` as glue and continue to the fragment on its far
+        // side, without counting it against `MAX_BRIDGE_FRAGMENTS`.
+        let content = "api key 0123456789abcdef0123\u{200B}---\u{200B}456789abcdef01234567";
+        assert!(
+            check(content).is_err(),
+            "punctuation-glue split hex credential between two Unicode gaps must be \
+             blocked: got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn allows_seven_way_hex_split_beyond_fragment_cap_documented_limitation() {
+        // #1062 H1 round-3 PoC 1: a 64-hex credential split into SEVEN
+        // Unicode-separated fragments (each meeting MIN_BRIDGE_FRAGMENT_LEN)
+        // exceeds MAX_BRIDGE_FRAGMENTS (6), so no chain the walk can build
+        // ever reconstructs the full 64 chars. This is an ACCEPTED RESIDUAL
+        // of the local-neighborhood bound, not a defect to fix here: per
+        // ADR-096 / ADR-115 the secret gate is accidental-persistence
+        // hygiene on a single-principal same-uid host, not defense against a
+        // same-uid adversary hand-splitting a credential to evade it — that
+        // adversary could write the DB directly instead. This test pins the
+        // boundary so a future reader does not mistake it for an
+        // unaddressed bypass.
+        let content = "api key 012345678\u{200B}9abcdef01\u{200B}23456789a\u{200B}bcdef0123\u{200B}456789abc\u{200B}def012345\u{200B}6789abcdef";
+        assert!(
+            check(content).is_ok(),
+            "seven-way hex split beyond MAX_BRIDGE_FRAGMENTS is a documented residual \
+             limitation and must stay allowed: got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn allows_six_way_sub_floor_hex_split_documented_limitation() {
+        // #1062 H1 round-3 PoC 2: a 40-hex credential split into six
+        // Unicode-separated fragments each individually below
+        // MIN_BRIDGE_FRAGMENT_LEN (8) — 7/7/7/7/6/6 characters. Every
+        // fragment fails `is_bridge_candidate`, so none ever reaches
+        // `bridge_fragment_chain` in the first place. Same accepted-residual
+        // rationale as the seven-way split above: a same-uid adversary
+        // splitting fragments this small to evade the gate can equally
+        // write the DB directly. This test pins the boundary.
+        let content = "api key 0123456\u{200B}789abcd\u{200B}ef01234\u{200B}56789ab\u{200B}cdef01\u{200B}234567";
+        assert!(
+            check(content).is_ok(),
+            "six-way sub-MIN_BRIDGE_FRAGMENT_LEN hex split is a documented residual \
+             limitation and must stay allowed: got {:?}",
             scan(content)
         );
     }
