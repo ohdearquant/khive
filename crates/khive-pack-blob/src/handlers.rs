@@ -71,6 +71,16 @@ pub(crate) async fn handle_put(
     let b64 = params.get("bytes").and_then(Value::as_str).ok_or_else(|| {
         RuntimeError::InvalidInput("blob.put requires \"bytes\" (base64)".to_string())
     })?;
+    // Bound the decode before allocating: 4 base64 chars encode 3 bytes, so an
+    // input longer than MAX_PUT_BYTES * 4/3 cannot fit under the ceiling. Reject
+    // an oversized put here rather than materializing it in memory first.
+    let max_b64_len = MAX_PUT_BYTES.saturating_mul(4) / 3 + 4;
+    if b64.len() as u64 > max_b64_len {
+        return Err(RuntimeError::InvalidInput(format!(
+            "blob.put: base64 input is {} chars, exceeding the {MAX_PUT_BYTES}-byte ceiling",
+            b64.len()
+        )));
+    }
     let bytes = BASE64.decode(b64).map_err(|e| {
         RuntimeError::InvalidInput(format!("blob.put: \"bytes\" is not valid base64: {e}"))
     })?;

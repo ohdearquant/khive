@@ -1128,7 +1128,10 @@ mod tests {
         assert!(cfg.packs.contains(&"git".to_string()));
         assert!(cfg.packs.contains(&"code".to_string()));
         assert!(cfg.packs.contains(&"workspace".to_string()));
-        assert_eq!(cfg.packs.len(), 11);
+        // blob loads by default; its verbs error as unconfigured until a
+        // BlobStore is installed, so default deployments gain no behavior.
+        assert!(cfg.packs.contains(&"blob".to_string()));
+        assert_eq!(cfg.packs.len(), 12);
         if let Some(v) = prior {
             // SAFETY: single-threaded test cleanup; restores KHIVE_PACKS to its prior value.
             unsafe {

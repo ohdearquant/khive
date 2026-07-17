@@ -310,6 +310,7 @@ impl Default for RuntimeConfig {
                     "git",
                     "code",
                     "workspace",
+                    "blob",
                 ]
                 .into_iter()
                 .map(String::from)
