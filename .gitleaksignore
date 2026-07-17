@@ -3,5 +3,10 @@
 # two documentation lines matched by the generic-api-key rule.
 498faca9c73bbb3214ca4995dd34c76d699c8544:crates/khive-pack-git/src/cache.rs:generic-api-key:1405
 498faca9c73bbb3214ca4995dd34c76d699c8544:crates/khive-pack-git/src/cache.rs:generic-api-key:1406
+# The same two hex cache-lock test fixtures (in
+# slot_lock_serializes_same_key_but_not_distinct_keys) after #960 (f245f9600)
+# shifted them to lines 1407-1408, re-attributing the finding to that commit.
+f245f9600e47ee5cb6740189b265b9ef71f7cb0f:crates/khive-pack-git/src/cache.rs:generic-api-key:1407
+f245f9600e47ee5cb6740189b265b9ef71f7cb0f:crates/khive-pack-git/src/cache.rs:generic-api-key:1408
 4ce001460f67750796f533b1269c74c90c67eb5c:docs/adr/ADR-101-kg-changeset-model.md:generic-api-key:135
 39fb7052c29916e50f20083f5f6281861bb7ebd9:docs/adr/ADR-101-kg-changeset-model.md:generic-api-key:155

@@ -5591,8 +5591,9 @@ async fn health_channel_entry_never_carries_a_healthy_bool() {
 /// caller's injected namespace (`token.namespace()`), not the fixed
 /// `khive_pack_comm::CHANNEL_HEALTH_NAMESPACE` constant. Plants one row
 /// directly under `"local"` and one directly under a non-local `"tenant-a"`
-/// namespace (bypassing `comm.heartbeat`, which still always writes to
-/// `"local"` — this test exercises the read path only). An unscoped call
+/// namespace, planting directly rather than via `comm.heartbeat` to isolate
+/// the `comm.health` read path under test — the heartbeat write-path namespace
+/// is covered by the #917 writer tests below. An unscoped call
 /// defaults to `"local"` and must see only the local row; a call with an
 /// explicit `namespace="tenant-a"` must see only tenant-a's row, never
 /// local's. Also asserts the response's `namespace` field (khive #877)
@@ -5688,6 +5689,138 @@ async fn health_scoped_to_injected_namespace_sees_only_its_own_rows() {
         Some("tenant-a"),
         "response must echo the explicitly-scoped namespace, not local: {scoped_health}"
     );
+}
+
+/// khive #917: an authorized per-tenant writer — an embedding host that
+/// authenticates a tenant principal out-of-band and dispatches via
+/// `VerbRegistry::dispatch_as` with a `VerifiedActor`, passing the tenant's
+/// own namespace as the explicit `namespace` dispatch param (ADR-007 Rev 6
+/// Rule 3's explicit escape, the same mechanism the local poll loop already
+/// uses to pin its own writes to `"local"`) — persists its `comm.heartbeat`
+/// row under that tenant's own namespace rather than the fixed
+/// `khive_pack_comm::CHANNEL_HEALTH_NAMESPACE` constant. A tenant-scoped
+/// `comm.health` read now sees that row (closing the "reads an empty set by
+/// construction" gap #917 reports), while the default (local-scoped)
+/// `comm.health` read is unaffected — heartbeat rows for different
+/// namespaces do not bleed into each other.
+#[tokio::test]
+async fn authorized_writer_persists_heartbeat_under_its_own_tenant_namespace() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    registry
+        .dispatch_as(
+            "comm.heartbeat",
+            serde_json::json!({
+                "namespace": "tenant-a",
+                "channel_kind": "email",
+                "channel_slug": "tenant-a-inbox@example.com",
+                "outcome": "success",
+            }),
+            khive_runtime::VerifiedActor::new("tenant-a-writer").expect("non-blank actor id"),
+        )
+        .await
+        .expect("authorized tenant heartbeat succeeds");
+
+    let scoped_health = registry
+        .dispatch(
+            "comm.health",
+            serde_json::json!({ "namespace": "tenant-a" }),
+        )
+        .await
+        .expect("tenant-scoped health succeeds");
+    let scoped_channels = scoped_health["channels"].as_array().expect("array");
+    assert_eq!(
+        scoped_channels.len(),
+        1,
+        "tenant-scoped comm.health must see the row the authorized writer produced: \
+         {scoped_channels:?}"
+    );
+    assert_eq!(
+        scoped_channels[0]["channel_slug"].as_str(),
+        Some("tenant-a-inbox@example.com")
+    );
+    assert_eq!(scoped_health["role"].as_str(), Some("daemon"));
+
+    let default_health = registry
+        .dispatch("comm.health", serde_json::json!({}))
+        .await
+        .expect("unscoped health succeeds");
+    let default_channels = default_health["channels"].as_array().expect("array");
+    assert!(
+        default_channels.is_empty(),
+        "the local-scoped read must not see the tenant's heartbeat row: {default_channels:?}"
+    );
+}
+
+/// khive #917 regression guard: the write namespace is a component of the
+/// deterministic heartbeat row id (`heartbeat_note_id`), so two authorized
+/// per-tenant writers dispatching `comm.heartbeat` for the SAME
+/// `(channel_kind, channel_slug)` under DIFFERENT namespaces must produce two
+/// distinct rows — one visible under each tenant's scoped `comm.health`, never
+/// colliding onto a single id. Were the namespace dropped from the id hash,
+/// both writes would resolve to one UUID and the second would replace the first
+/// (`upsert_note`'s `INSERT OR REPLACE` keys on the row id), so
+/// `comm.health(namespace="tenant-a")` would return an empty set instead of
+/// tenant-a's own heartbeat — and every existing #917 test would still pass.
+/// Drives the real handler via `dispatch_as` (not direct note planting) so it
+/// pins the write-path id derivation the plant-based read-path test cannot.
+#[tokio::test]
+async fn two_tenants_same_channel_get_distinct_heartbeat_rows() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    registry
+        .dispatch_as(
+            "comm.heartbeat",
+            serde_json::json!({
+                "namespace": "tenant-a",
+                "channel_kind": "email",
+                "channel_slug": "shared@example.com",
+                "outcome": "success",
+            }),
+            khive_runtime::VerifiedActor::new("tenant-a-writer").expect("non-blank actor id"),
+        )
+        .await
+        .expect("tenant-a heartbeat succeeds");
+
+    registry
+        .dispatch_as(
+            "comm.heartbeat",
+            serde_json::json!({
+                "namespace": "tenant-b",
+                "channel_kind": "email",
+                "channel_slug": "shared@example.com",
+                "outcome": "success",
+            }),
+            khive_runtime::VerifiedActor::new("tenant-b-writer").expect("non-blank actor id"),
+        )
+        .await
+        .expect("tenant-b heartbeat succeeds");
+
+    // Each tenant's scoped read must see exactly its OWN row for the shared
+    // channel. If the namespace were dropped from the id hash the two writes
+    // would collide onto one row and one of these reads would be empty.
+    for ns in ["tenant-a", "tenant-b"] {
+        let health = registry
+            .dispatch("comm.health", serde_json::json!({ "namespace": ns }))
+            .await
+            .expect("tenant-scoped health succeeds");
+        let channels = health["channels"].as_array().expect("array");
+        assert_eq!(
+            channels.len(),
+            1,
+            "namespace {ns} must see exactly its own heartbeat row \
+             (distinct id per namespace): {channels:?}"
+        );
+        assert_eq!(
+            channels[0]["channel_slug"].as_str(),
+            Some("shared@example.com")
+        );
+        assert_eq!(
+            health["namespace"].as_str(),
+            Some(ns),
+            "scoped health must echo the namespace it read"
+        );
+    }
 }
 
 // ── #493: comm.inbox from_actor / from_prefix sender filter ─────────────────
