@@ -55,6 +55,7 @@ impl Bm25Index {
             }
         }
 
+        let doc_lengths_vec_size = self.doc_lengths_vec.len() * size_of::<usize>() + 24;
         let doc_lengths_f32_size = self.doc_lengths_f32.len() * size_of::<f32>() + 24;
 
         let index_map_overhead = self.inverted_index.len() * 64;
@@ -64,6 +65,7 @@ impl Bm25Index {
         inverted_index_size
             + block_max_size
             + doc_lengths_size
+            + doc_lengths_vec_size
             + doc_lengths_f32_size
             + forward_index_size
             + id_map_size
@@ -118,6 +120,9 @@ impl Bm25Index {
 
         let doc_entry_cost: usize = 4 + size_of::<usize>() + 32;
 
+        // Each new document appends one slot to both O(1) doc-length vector mirrors.
+        let doc_length_vectors_cost: usize = size_of::<usize>() + size_of::<f32>();
+
         let forward_index_cost: usize = 4
             + 24
             + 32
@@ -135,7 +140,50 @@ impl Bm25Index {
             + new_term_cost
             + additional_block_cost
             + doc_entry_cost
+            + doc_length_vectors_cost
             + forward_index_cost
             + id_map_cost
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_memory_usage_accounts_for_doc_lengths_vec_mirror() {
+        let mut index = Bm25Index::default();
+        let before = index.memory_usage();
+
+        // Grow both O(1) doc-length vector mirrors by one slot, bypassing indexing so no
+        // other accounted structure (postings, terms, id maps) changes.
+        index.set_doc_length_fast(0, 42);
+
+        let after = index.memory_usage();
+        let delta = after - before;
+
+        assert!(
+            delta >= size_of::<usize>() + size_of::<f32>(),
+            "memory_usage delta ({delta}) must cover both the usize and f32 \
+             doc-length vector mirrors"
+        );
+    }
+
+    #[test]
+    fn test_estimate_document_cost_does_not_underestimate_doc_lengths_vec() {
+        let mut index = Bm25Index::default();
+        let text = "quick brown fox jumps over the lazy dog";
+
+        let before = index.memory_usage();
+        let cost = index.estimate_document_cost(text);
+        index.index_document("doc1", text).expect("index succeeds");
+        let after = index.memory_usage();
+        let actual_delta = after - before;
+
+        assert!(
+            cost >= actual_delta,
+            "estimated cost ({cost}) must not underestimate actual memory growth \
+             ({actual_delta}), or a memory_budget could be exceeded silently"
+        );
     }
 }

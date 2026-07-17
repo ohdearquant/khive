@@ -131,14 +131,21 @@ pub fn normalize_weights(weights: &[f64]) -> Vec<f64> {
         return Vec::new();
     }
 
-    let weight_sum: f64 = weights.iter().filter(|w| **w > 0.0).sum();
+    // Sanitize before summing so NaN/Inf cannot enter arithmetic (matches weighted_fusion).
+    let weight_sum: f64 = weights.iter().filter(|w| w.is_finite() && **w > 0.0).sum();
 
     if weight_sum <= 0.0 {
         vec![1.0 / weights.len() as f64; weights.len()]
     } else {
         weights
             .iter()
-            .map(|w| if *w > 0.0 { w / weight_sum } else { 0.0 })
+            .map(|w| {
+                if w.is_finite() && *w > 0.0 {
+                    w / weight_sum
+                } else {
+                    0.0
+                }
+            })
             .collect()
     }
 }
@@ -362,6 +369,25 @@ mod tests {
     fn test_normalize_weights_empty() {
         let normalized = normalize_weights(&[]);
         assert!(normalized.is_empty());
+    }
+
+    #[test]
+    fn test_normalize_weights_non_finite() {
+        let normalized = normalize_weights(&[f64::INFINITY, 1.0]);
+        assert!(normalized.iter().all(|w| w.is_finite()));
+        assert!((normalized[0] - 0.0).abs() < 1e-10);
+        assert!((normalized[1] - 1.0).abs() < 1e-10);
+
+        let normalized = normalize_weights(&[f64::NAN, 2.0, 2.0]);
+        assert!(normalized.iter().all(|w| w.is_finite()));
+        assert!((normalized[0] - 0.0).abs() < 1e-10);
+        assert!((normalized[1] - 0.5).abs() < 1e-10);
+        assert!((normalized[2] - 0.5).abs() < 1e-10);
+
+        let normalized = normalize_weights(&[f64::INFINITY, f64::NAN]);
+        assert!(normalized.iter().all(|w| w.is_finite()));
+        assert!((normalized[0] - 0.5).abs() < 1e-10);
+        assert!((normalized[1] - 0.5).abs() < 1e-10);
     }
 
     // ── #2496 / #2639: per-source min-max normalization before fusion ──────
