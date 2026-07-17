@@ -478,11 +478,16 @@ A new sibling crate `crates/khive-channel-imessage`, at the same platform layer 
 - Spawned only under the daemon role, via a `channel-imessage`-feature-gated
   `spawn_imessage_channel_loops` mirroring `spawn_email_channel_loops` and
   `spawn_telegram_channel_loops`: one inbound poll task and one outbound task per adapter
-  instance, not the abstract `ChannelRegistry::poll_all` sweep §6 describes in the original
-  decision text. This is not a departure from that text -- the 2026-07-05 Telegram amendment
-  already established the per-adapter `spawn_*_channel_loops` task pair as the shipped mechanism
-  and marked §6's `poll_all`-sweep description superseded in the same way it un-staled §5c/§5d;
-  this amendment simply applies that same shipped mechanism to iMessage.
+  instance, not the abstract `ChannelRegistry::poll_all` sweep §§4, 6, and 12 describe in the
+  original decision text. The 2026-07-05 Telegram amendment established the per-adapter
+  `spawn_*_channel_loops` task pair as the shipped mechanism, but its supersession claim was
+  scoped narrowly to §5c/§5d (the outbound-path and reply-routing DEFERRED labels) -- it did not
+  supersede §6's `poll_all` lifecycle description. This amendment corrects that gap directly: it
+  supersedes the `poll_all` lifecycle prescriptions of §§4, 6, and 12. The authoritative
+  lifecycle model, matching the shipped email and Telegram adapters, is per-adapter loop pairs
+  spawned by the daemon role and registered through the `ChannelRegistry` keyed by `(kind,
+  slug)`. Every future adapter ships its own daemon-spawned loop pair; `poll_all` is retired and
+  MUST NOT be implemented.
 - When configuration is absent, `ImessageChannelConfig::from_env()` returns `ChannelError::Config`
   and the server logs a warning and skips the adapter without crashing, matching Telegram and
   email `from_env()` behavior (§14, §Amendment 2026-07-05).
@@ -515,54 +520,77 @@ applies equally to this shell-out surface.
 Inbound messages are read by polling the bridge host's `~/Library/Messages/chat.db` (Apple's own
 SQLite store for the Messages application) over the same SSH transport, at a configurable
 interval (`KHIVE_IMESSAGE_POLL_SECS`, default 5 seconds, mirroring §12's default inter-poll
-interval). The database is always opened with read-only semantics; the adapter never writes to
-`chat.db`. Delivery into `comm.ingest` is attributed as `imessage:<slug>` inbound, following the
-channel-prefixed `from` form OQ-1 established (§14; also used by the Telegram amendment's
-`from = "telegram:<maintainer-slug>"`).
+interval; validation rule below). The database is always opened with read-only semantics; the
+adapter never writes to `chat.db`. Delivery into `comm.ingest` is attributed as `imessage:<slug>`
+inbound, following the channel-prefixed `from` form OQ-1 established (§14; also used by the
+Telegram amendment's `from = "telegram:<maintainer-slug>"`).
 
-### Restart durability and the GUID dedup invariant
+**Sender validation (ADR-056 §8 applied to this adapter).** §8 requires every adapter to
+validate the external sender identity on every inbound item before it becomes an envelope. For
+iMessage, that requirement is met by two checks, both mandatory: the row must belong to the
+configured maintainer conversation, and the row's sender handle must equal the configured
+`KHIVE_IMESSAGE_MAINTAINER_HANDLE`. A row failing either check is dropped -- it is never ingested
+and never attributed -- and the drop is counted, mirroring the Telegram adapter's
+`UnauthorizedSender` drop-and-count behavior (§8) rather than the email adapter's quarantine
+disposition, since (unlike inbound email) the bridge host's Messages database has no
+open-relay exposure: only the maintainer's own conversation is polled.
 
-The poll offset (the last-seen row position in `chat.db`) is held in memory in the iMessage poll
-task, exactly as the Telegram amendment's in-memory `offset` watermark (§Amendment 2026-07-05,
-"Poll offset and restart durability"). This is safe against a restart producing a double-ingest
-only because inbound ingest deduplicates by the Messages database's stable per-message `GUID`
-column through the same durable `idx_comm_message_external_id` mechanism (§11) every other
-adapter uses: the invariant that makes the in-memory offset safe is that a `chat.db` row's GUID
-is a stable, durable dedup key across restarts, so any row re-read after a crash is rejected at
-the storage layer rather than re-ingested.
+### Restart durability: a persisted ROWID checkpoint
 
-**Flagged, not resolved.** GUID dedup closes the _double-ingest_ failure mode the same way
-Telegram's `external_id` uniqueness does. It does not, by itself, close the _missed-ingest_
-failure mode Amendment 2026-07-09 fixed for email: issue #449 was not about re-ingesting a
-message twice, it was about a bounded-page, unordered-relative-to-a-time-window query
-permanently skipping rows above the page limit once the time window advanced past them, with no
-persisted high-water mark to resume from. A `chat.db` poll implemented as "rows since timestamp
-T, page size N" has the same shape as the IMAP `SINCE`-plus-page-limit query #449 fixed, and GUID
-dedup does not protect against it -- dedup only prevents an already-fetched row from being
-written twice, it cannot recover a row polling never fetched in the first place. Whether this
-risk is live depends on the concrete `chat.db` query the implementation uses (a monotonic
-`ROWID`- or `date`-ordered walk with an explicit `> high_water` filter, unbounded per poll or
-paginated with continuation, does not have this failure mode; a windowed `SELECT ... WHERE date >
-T LIMIT N` does). This amendment's settled scope is the Telegram-style in-memory-offset model
-for v1 (non-goal #9 below); the query shape needed to make that safe against the #449 failure
-class is an implementation detail this amendment does not pin down and flags for the
-implementation PR and its review to verify explicitly, not an ADR-level decision resolved here.
+The iMessage adapter does not use an in-memory poll offset. It uses the same durability
+mechanism class Amendment 2026-07-09 established for email: a durable per-channel checkpoint,
+committed to the daemon's store only after a batch has fully and successfully ingested. That
+amendment introduced this pattern for exactly this reason -- issue #449 showed that an
+in-memory or window-bounded cursor can permanently skip rows once a page limit or time window
+moves past them, and that a dedup index alone cannot recover a row that polling never fetched in
+the first place. The iMessage adapter adopts the pattern rather than repeating the email
+adapter's earlier mistake.
+
+Concretely:
+
+- The checkpoint is keyed by `(channel_kind, channel_slug)` -- `("imessage", <slug>)` -- reusing
+  the pack-owned `comm_channel_cursor` table and the `comm.cursor_get` / `comm.cursor_commit`
+  subhandlers Amendment 2026-07-09 added to `khive-pack-comm`. No new schema and no new table:
+  the iMessage adapter is a second caller of the same checkpoint mechanism the email adapter's
+  `channel_poll_loop` already drives, not a parallel implementation of it.
+- The poll query is anchored on `chat.db`'s own monotone insertion key, the message table's
+  `ROWID`: each poll fetches rows with `ROWID` strictly greater than the committed checkpoint,
+  ordered ascending, and drains the backlog in pages, continuing until a page returns short of
+  the page limit (the signal that the poll has caught up). No row between polls can fall outside
+  a bounded window and be skipped, because the query has no window -- only a floor.
+- The checkpoint commits only after every row in a drained page has successfully reached
+  `comm.ingest`, mirroring `channel_poll_loop`'s `cursor_get -> poll_page -> ingest each ->
+  cursor_commit` sequencing for email (§Amendment 2026-07-09). A partial-page ingest failure
+  leaves the checkpoint at its prior value, so the next poll re-selects the whole page; GUID
+  dedup through `idx_comm_message_external_id` (§11) then skips re-storing the rows that already
+  succeeded, and only the failed row is effectively retried.
+- GUID dedup is retained, but its role changes: it is overlap protection for the re-selected
+  page on a partial-failure retry, not the primary durability mechanism. The `ROWID` checkpoint
+  is what prevents rows from being skipped; GUID dedup is what prevents an already-ingested row
+  in a re-fetched page from being written twice.
+
+**Activation semantic.** On first activation for a given `(kind, slug)` -- no prior checkpoint
+row exists -- the checkpoint initializes to the current maximum `ROWID` in `chat.db`, not to
+zero. The channel is forward-only from the moment it is activated: message history that predates
+activation is never imported, matching the Telegram and email adapters' first-poll behavior.
+This also bounds the very first drain to new messages only, so activation on an established
+`chat.db` does not attempt to ingest years of prior conversation history.
+
+This resolves the query-shape question the original decision text of this amendment left open:
+the windowed `SELECT ... WHERE date > T LIMIT N` form is prohibited -- it is exactly the shape
+issue #449 fixed for email -- and the `ROWID`-floor, page-until-short-page form above is the
+normative query.
 
 ### Outbound addressing
 
-**Flagged, not resolved.** The settled design states the address form as `imessage:<handle>`
-(handle = phone number or Apple ID email) in one place and "maintainer-slug model identical to
-the Telegram amendment" in another. Those two are not the same shape: the Telegram amendment's
-routable address is `telegram:<slug>` (§Amendment 2026-07-05, "Outbound addressing"), where
-`<slug>` is a stable local name that resolves via config to the transport identifier
-(`KHIVE_TELEGRAM_MAINTAINER_CHAT_ID`); the raw chat id never appears in an envelope's `from`/`to`.
-The handle (a phone number or email address) is comparably sensitive transport-identifying
-material. This amendment resolves the inconsistency by following the Telegram precedent
-literally: the routable address is `imessage:<slug>` (default slug `maintainer`,
-`KHIVE_IMESSAGE_MAINTAINER_SLUG`), which resolves to `KHIVE_IMESSAGE_MAINTAINER_HANDLE`; the raw
-handle is config-only and never appears in a `ChannelEnvelope`, a note property, or any content
-verb. `imessage:<handle>` is not a supported address form in v1. This should be confirmed at
-sign-off rather than assumed, since the settled-design text as given supports both readings.
+The routable address is `imessage:<slug>` (default slug `maintainer`, overridable by
+`KHIVE_IMESSAGE_MAINTAINER_SLUG`), following the Telegram amendment's precedent exactly:
+`<slug>` is a stable local name that resolves via config to the transport identifier, here
+`KHIVE_IMESSAGE_MAINTAINER_HANDLE`. The raw handle -- a phone number or Apple ID email, and
+comparably sensitive transport-identifying material to Telegram's numeric `chat_id` -- is
+config-only and never appears in a `ChannelEnvelope`, a note property, or any content verb.
+`imessage:<handle>` is not a supported address form in v1; `imessage:<slug>` is the only
+normative form.
 
 v1 is single-maintainer, matching Telegram and email: an outbound note addressed to any
 `imessage:` slug other than the configured maintainer slug is unroutable and is logged and
@@ -575,11 +603,20 @@ dropped, never sent to the maintainer chat by default.
 | `KHIVE_IMESSAGE_SSH_TARGET`        | yes      | --           | SSH target for the bridge host (`user@host`). Credentials resolve via the SSH client, not this config.                |
 | `KHIVE_IMESSAGE_MAINTAINER_HANDLE` | yes      | --           | The maintainer's iMessage handle (phone number or Apple ID email). Config-only; never appears in an envelope or note. |
 | `KHIVE_IMESSAGE_MAINTAINER_SLUG`   | no       | `maintainer` | The slug in `imessage:<slug>` that maps to the maintainer handle.                                                     |
-| `KHIVE_IMESSAGE_POLL_SECS`         | no       | `5`          | Inbound poll interval against the bridge host's `chat.db`.                                                            |
+| `KHIVE_IMESSAGE_POLL_SECS`         | no       | `5`          | Inbound poll interval against the bridge host's `chat.db`. Must parse as an integer >= 1 (validation rule below).     |
 | `KHIVE_IMESSAGE_INGEST_NAMESPACE`  | no       | `local`      | Target namespace for ingested inbound messages (passed as `namespace` to `comm.ingest`).                              |
 
 No secret material beyond what the SSH client already manages is configured here, and nothing
 above is written to any khive store, matching §9.
+
+**Poll-interval validation.** `KHIVE_IMESSAGE_POLL_SECS` is validated at config load, not at
+first use: it must parse as an integer greater than or equal to 1. A zero value, a negative
+value, or a value that fails to parse as an integer is rejected: `ImessageChannelConfig::from_env`
+returns `ChannelError::Config`, the channel does not start, and the logged warning names the
+variable. This matches the fail-loud posture the rest of this adapter's configuration already
+has (`KHIVE_IMESSAGE_SSH_TARGET` and `KHIVE_IMESSAGE_MAINTAINER_HANDLE` fail construction the
+same way when absent) rather than silently clamping to the default or to 1. Regression coverage
+is named in the acceptance properties below.
 
 ### Host requirements (informative)
 
@@ -606,9 +643,6 @@ all three adapters coexist.
   maintainer slug.
 - Writing to `chat.db` in any form. This is a permanent prohibition, not a v1 deferral: the
   adapter never writes to Apple's own database, in any future version.
-- A durable, persisted poll cursor. The in-memory offset plus GUID dedup is the v1 durability
-  model (§Restart durability above), matching Telegram, not the persisted `(UIDVALIDITY,
-  high_water)` checkpoint the email adapter now uses (§Amendment 2026-07-09).
 
 ### Acceptance properties (testable, transport mocked)
 
@@ -621,6 +655,16 @@ all three adapters coexist.
    configured channels are unaffected and the daemon does not fault.
 4. Every `chat.db` open the adapter performs is asserted read-only by the test double (no write
    flags requested).
+5. A poll after a simulated restart resumes strictly above the committed `ROWID` checkpoint, not
+   from an in-memory default; a `chat.db` row with `ROWID` at or below the checkpoint is never
+   re-ingested and a row above it is never skipped, across a page-limit boundary.
+6. On first activation for a `(kind, slug)` with no prior checkpoint row, the checkpoint
+   initializes to the current maximum `ROWID`; a `chat.db` row inserted before activation is
+   never ingested.
+7. `KHIVE_IMESSAGE_POLL_SECS` set to `0`, a negative integer, or a non-integer string fails
+   channel construction with a warning naming the variable; the channel does not start.
+8. A `chat.db` row whose sender handle does not equal `KHIVE_IMESSAGE_MAINTAINER_HANDLE`, or
+   that falls outside the maintainer conversation, is not ingested; the drop is counted.
 
 ### Consequences
 
@@ -628,14 +672,18 @@ all three adapters coexist.
   space (`imessage:<slug>`) reuses `comm.ingest`, the dispatch gate, the dedup index, and the
   envelope exactly as email and Telegram do.
 - A new `khive-channel-imessage` crate at the platform layer; a `channel-imessage`-gated
-  `spawn_imessage_channel_loops` in `khive-mcp`, following the per-adapter loop pair pattern the
-  Telegram amendment established as normative.
+  `spawn_imessage_channel_loops` in `khive-mcp`. This amendment corrects and extends the
+  per-adapter loop pair pattern to a fleet-wide rule: it supersedes the `poll_all` lifecycle
+  prescriptions of §§4, 6, and 12, and every future adapter is required to ship its own
+  daemon-spawned loop pair.
 - No credentials in any note, entity, or KG store; the SSH keypair and the maintainer handle are
   env/SSH-client configuration only.
-- Two open items are flagged above for resolution at design sign-off, not resolved by this
-  amendment text alone: the `imessage:<handle>` vs. `imessage:<slug>` address-form
-  inconsistency in the settled design, and whether the concrete `chat.db` poll query shape avoids
-  the bounded-page/missed-ingest failure class Amendment 2026-07-09 fixed for email.
+- The inbound poll cursor is durable, not in-memory: it reuses the `comm_channel_cursor`
+  checkpoint mechanism Amendment 2026-07-09 introduced for email, anchored on `chat.db`'s `ROWID`
+  rather than a time window, so the missed-ingest failure class issue #449 fixed for email cannot
+  recur here.
+- The address form (`imessage:<slug>`, normative) and the poll-interval and sender-validation
+  rules are settled by this amendment text; no open items remain for design sign-off.
 
 ## Context
 
@@ -818,6 +866,11 @@ impl ChannelRegistry {
 }
 ```
 
+> **Lifecycle amended 2026-07-17.** The `poll_all` sweep above is a design description, not the
+> shipped mechanism. It is superseded by per-adapter loop pairs registered through
+> `ChannelRegistry` and spawned individually by the daemon role. See
+> [§Amendment 2026-07-17](#amendment-2026-07-17----imessage-channel-over-an-ssh-bridge).
+
 ### 5. Comm-pack integration: the `comm.ingest` verb
 
 The channel layer integrates with the comm store through the single public gated dispatch path:
@@ -938,6 +991,11 @@ which writes the note into the correct namespace. This is what makes the inbound
 
 The loop sleeps a fixed 5-second interval between `poll_all` calls.
 
+> **Superseded 2026-07-17.** The single-loop, `poll_all`-driven model above is superseded by
+> per-adapter loop pairs (`spawn_*_channel_loops`), one inbound task and one outbound task per
+> configured channel, matching the shipped email and Telegram adapters. See
+> [§Amendment 2026-07-17](#amendment-2026-07-17----imessage-channel-over-an-ssh-bridge).
+
 ### 7. Inbound polling vs webhook
 
 Long-poll is the default. The embedded deployment runs with no routable public URL.
@@ -1027,6 +1085,10 @@ The index is PARTIAL UNIQUE: the `WHERE` clause excludes rows with a null or emp
 
 The ingest loop enforces a configurable minimum inter-poll interval (default 5 seconds) via
 `tokio::time::sleep` between `poll_all` calls.
+
+> **Superseded 2026-07-17.** The interval is unchanged in shape, but it now governs the sleep
+> inside each adapter's own inbound loop rather than a shared `poll_all` sweep. See
+> [§Amendment 2026-07-17](#amendment-2026-07-17----imessage-channel-over-an-ssh-bridge).
 
 ### 13. Alternatives considered
 
