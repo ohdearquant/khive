@@ -13,7 +13,8 @@ CI-enforced check.
 
 ## Run
 
-- Date: 2026-07-16
+- Date: 2026-07-16 (regenerated for the #1062 round-2 Medium fix: the round-1
+  file promised SHA-256 digests but never actually committed any)
 - Corpus: a local read-only copy of the production `khive.db` (`notes.content`
   where `deleted_at IS NULL`, `entities.description` where `deleted_at IS
   NULL`)
@@ -24,18 +25,111 @@ CI-enforced check.
 
 | Metric | Value |
 | --- | --- |
-| Total strings scanned | 64047 |
-| Total blocked | 63 |
-| Block rate | ~0.098% |
+| Total strings scanned | 64405 |
+| Total blocked | 65 |
+| Block rate | ~0.101% |
 
 ### Counts by detector
 
 | Detector | Count |
 | --- | --- |
-| `hex-credential-token` | 45 |
-| `high-entropy-token` | 14 |
+| `hex-credential-token` | 44 |
+| `high-entropy-token` | 17 |
 | `url-userinfo` | 3 |
 | `uuid-near-trigger` | 1 |
+
+### Blocked content SHA-256 by detector
+
+Hashes only — `sha256(content)` of each blocked string, in the order the
+generator's SQL scan produced them (duplicates are the same content string
+matched by more than one row, e.g. a note and its edit history). These let
+anyone with local read access to the same DB copy look up the exact verdict
+for a given hash without this file ever holding the content itself.
+
+`hex-credential-token` (44):
+
+```
+331976f39cc2e9c337e55ab1a94ded70b1fd1aa9ca37e0e22c40c61608c312fd
+77d4356a891fe56452ec7dbb71e2ed8c2d4ca61f810a1dfed4977d5ed78fa206
+3f1c4424c0c5b8046e6116e11c8643012388828929eeda7a3fab110e9d044203
+e27f2a996f2ca207a243ad6c9f6bd3114801ad0b6339703d38c509df3d3cdbd9
+67b2f3e5082669fd48816d9d3364207c0bf215f729e9e5e09f5395dbc61fa90b
+9fa51e203a68a078726fc7faf359291f3c5825338281a78707f7453f648a0f10
+3c6a066959cf4926e9dbedd46e372dca9253cb5fd2f8498c5cfd8b6336a5bf14
+83d5e9d7954d4e6407b07cec2b07970385195592a8e3ebf1915c9c0d8c78a48e
+4bad7e34b71f20e5813f3f81a39a8e8ba18246de05e6befd9c7165e8597aed08
+8f384f8d91134653ecf054230dd7d0d1b90a986ae05dbf0385bdf55e4686296a
+c36770bf24d7adbd54bb7f42c977c47862e060f64d56c35b821d6803741929c7
+caa88c5fd08d8b5b36fdce4a8d2bdbfb7c308f6e2f5861812c2065595cc8fc96
+8febdcee4b3bc41111cac6d3e1c722d150f24d77f8015bd391cceeb5255d19e5
+6a22d91ab7e4a7119cfa3badb59d0e682e9ed3bd1da9e1cd4d04fcce0382dafd
+91bd03faca1cdccb73a3bc1ebe8c86c951325840f6ea0c7678cc44348fcd0440
+283bee2671ba9963856cb18689d4635bf77052c26b8fedc31006671a19d1b47b
+53470c5679d8a5c9e3dc81a63c3f0e83fda9de7e6e1b24ae08b0686ebc8ffe92
+f8cb0def07f13c7f295634dd6dd0e28520a1c89be83889bc5a9c4b3d8039fbc0
+f8cb0def07f13c7f295634dd6dd0e28520a1c89be83889bc5a9c4b3d8039fbc0
+53470c5679d8a5c9e3dc81a63c3f0e83fda9de7e6e1b24ae08b0686ebc8ffe92
+6124b1892189bc983113bf7f238e57d6da594e97faab2d4030b879c8e82ab406
+6124b1892189bc983113bf7f238e57d6da594e97faab2d4030b879c8e82ab406
+1ba164aad61a7f185cb1ebce79b65247b74e08cf7769a68de1264cee95d97af6
+1ba164aad61a7f185cb1ebce79b65247b74e08cf7769a68de1264cee95d97af6
+5779e5c69479ffec2fc4b878f08b53a3f0be4e231e127414b796485a197b4b5e
+5779e5c69479ffec2fc4b878f08b53a3f0be4e231e127414b796485a197b4b5e
+53445da90f60ee5c462289380fbc7be75c763cb402de6ed3ec9c6b5bb67c293e
+53445da90f60ee5c462289380fbc7be75c763cb402de6ed3ec9c6b5bb67c293e
+5c731648662f8b97b459bdb6366b205c154374d6cb1045f16b1c9aee7056ff46
+5c731648662f8b97b459bdb6366b205c154374d6cb1045f16b1c9aee7056ff46
+3f1c4424c0c5b8046e6116e11c8643012388828929eeda7a3fab110e9d044203
+e27f2a996f2ca207a243ad6c9f6bd3114801ad0b6339703d38c509df3d3cdbd9
+67b2f3e5082669fd48816d9d3364207c0bf215f729e9e5e09f5395dbc61fa90b
+9fa51e203a68a078726fc7faf359291f3c5825338281a78707f7453f648a0f10
+3c6a066959cf4926e9dbedd46e372dca9253cb5fd2f8498c5cfd8b6336a5bf14
+83d5e9d7954d4e6407b07cec2b07970385195592a8e3ebf1915c9c0d8c78a48e
+4bad7e34b71f20e5813f3f81a39a8e8ba18246de05e6befd9c7165e8597aed08
+8759564e33428b45f4d15e58b4ae19432207625828e2387baf631a73070e3e41
+e73a7e131f31ec2a6f556da91453ea5140b89ad3be1e42adb082bc7e0cbdfe3e
+e73a7e131f31ec2a6f556da91453ea5140b89ad3be1e42adb082bc7e0cbdfe3e
+d40e7a588341ac5995d01d875b0f880d088d68da4621eac732c913512cac0978
+8ca12bfcb3e4dd6b67152a228df122ca2963228a91887d667eca90886edbecd4
+dcf45c4da2c2fe43667ebf355383b3874d612c51957173c83466fba01040d8cb
+a58309df1f68191a08e940441b4f7197d12c92c626efa8b99f540161f9c81865
+```
+
+`high-entropy-token` (17):
+
+```
+345383fcf8161e7db9c949cbab3c6d8997e7472d2eb05cf5b82bb66c3d0f55c5
+960fa947df04996573501ee92946ac8d12f2dd9fbb75adefacc9b37e52421292
+1601bff952631e7a1b1f195cf8f610a0b27fc42ca8e07cfc320b04ec6fa12f31
+07aa62258f72e5f9f00a686ca60264a6e22cc0bdf6097da8848783717067f55a
+0bcb933e85a5236ec954afb19049f300fe4ec414358e996870ca008af2561863
+e046a9dd6ac3a540a42d2bfe4bdacf1f09003645e36e937925a1c1d8c23c2f83
+ec3d0bbf494629544883a08af0f5c5e4b6f982f868aa02cdbff16630e9e52358
+0652388b323c498d639640c1bb4454b54e9ece85d71c733bc4e30be8a9aef4ee
+a810bd315e7df2256baa2e2bf72dfcf329613e5e864fab6b72e5841257dd621b
+70e9d03bebd13c41312d9708125b22b3142acf7eb4a57263c2bc7d2ece130652
+073266e26b6f3dfeb03c1f84d2b70560f7953be5363205070dc92912745bdde6
+6d1c5e1476a89004c65574b4a7d7dbdad1f0f935d070366428b70c808c07d81e
+01d3a37f6862604f9c7f29f19ff8f825e18f044bf09fd7ecb893ec401b1d6075
+7d7d426fc243d167f8bc7cc2ce763e8ef1574b3f84dcfda25f5313cea276dece
+d0e83b362334d6214585828adb825b6992990eca28bb84be0529190e762faf8d
+fe26a4cde3793915f41d22a10a0bae6d82af74a371f226d9a57db64b613ff427
+d1eae845b338770ce5d25b7e3d0a52c2d9b92aa71ed08c335733c0f7d1ae4235
+```
+
+`url-userinfo` (3):
+
+```
+9f1d2f949f47bf0f4dacba6c9f6a846f523354d29aa816fb67706f6f4f16b8a9
+3f9824ea014ab7c6be7433bc345297550118434affba964af3551d0292d96dce
+4bc8cef8e06cdf9f61e3f2dd6a9abc9e0a21886f1a81e586e138c2fbe74013b3
+```
+
+`uuid-near-trigger` (1):
+
+```
+7f0f152287a495f2a87a6d431e2a787af14aaf2bf0e3eb8ffa0508f2158f02d0
+```
 
 ### Scope note on the #1040/#1056 claim
 
@@ -52,7 +146,7 @@ the checked-in, always-run adversarial regression-test suite in
 instead answers the adjacent, verifiable question the Medium finding also
 raised: is the detector's overall false-positive exposure on real production
 content small enough to support keeping the `near_trigger` gate unconditional
-rather than loosening it? At a 0.098% block rate across 64047 real strings,
+rather than loosening it? At a ~0.101% block rate across 64405 real strings,
 yes — and every blocked hash above can be looked up locally against the same
 DB to inspect the specific verdict without exposing content in this file.
 
@@ -87,3 +181,17 @@ content-independent at fixed length; two different N-character strings can
 and do have different actual entropy, but neither can be distinguished from
 the other by an entropy threshold alone when both sit near that shared
 ceiling).
+
+## #1062 H1 round-2 fragment-chain bridge — separately regression-tested
+
+The round-2 fix to the separator-split bridge (bounded fragment-count
+reconstruction instead of a byte-length gap, plus a generic non-hex entropy
+path) is guarded by its own regression suite in `secret_gate.rs`, not by this
+corpus replay (a repeated-Unicode-separator or three-way split credential is
+adversarial-only content that does not occur in the real corpus):
+
+- `blocks_separator_split_hex_credential_repeated_unicode_gap`
+- `blocks_separator_split_three_way_hex_credential_mixed_case`
+- `blocks_separator_split_base64_like_unicode_credential`
+- `allows_unrelated_short_fragments_cited_near_a_trigger_word`
+- `allows_unrelated_short_base64_like_fragments_cited_near_a_trigger_word`
