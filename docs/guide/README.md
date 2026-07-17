@@ -2,16 +2,18 @@
 
 Documentation for using khive as a research knowledge graph runtime.
 
-| Guide                                               | What it covers                                  |
-| --------------------------------------------------- | ----------------------------------------------- |
-| [Getting Started](getting-started.md)               | Install, connect, first session                 |
-| [Knowledge Graph Modeling](knowledge-graph.md)      | Entity kinds, edge relations, modeling patterns |
-| [Prompt Cookbook](prompt-cookbook.md)               | 20+ real-world verb patterns with examples      |
-| [Search and Retrieval](search.md)                   | FTS, vector, hybrid fusion, reranking           |
-| [Memory and Recall](memory.md)                      | Episodic vs semantic, salience, decay           |
-| [GTD Task Management](tasks.md)                     | Task lifecycle, priorities, dependencies        |
-| [Tips and Tricks](tips-and-tricks.md)               | Query craft, DSL round-trips, param gotchas     |
-| [Proof-Graph Case Study](proof-graph-case-study.md) | Mathlib as a khive-at-scale case study          |
+| Guide                                               | What it covers                                     |
+| --------------------------------------------------- | -------------------------------------------------- |
+| [Getting Started](getting-started.md)               | Install, connect, first session                    |
+| [Request and DSL](request-and-dsl.md)               | Single tool, syntax, batches, chains, errors       |
+| [Knowledge Graph Modeling](knowledge-graph.md)      | Entity kinds, edge relations, modeling patterns    |
+| [Prompt Cookbook](prompt-cookbook.md)               | 20+ real-world verb patterns with examples         |
+| [Search and Retrieval](search.md)                   | FTS, vector, hybrid fusion, reranking              |
+| [Query Cookbook](query-cookbook.md)                 | GQL/SPARQL question classes, verified idioms, gaps |
+| [Memory and Recall](memory.md)                      | Episodic vs semantic, salience, decay              |
+| [GTD Task Management](tasks.md)                     | Task lifecycle, priorities, dependencies           |
+| [Tips and Tricks](tips-and-tricks.md)               | Query craft, DSL round-trips, param gotchas        |
+| [Proof-Graph Case Study](proof-graph-case-study.md) | Mathlib as a khive-at-scale case study             |
 
 ## How to read these guides
 

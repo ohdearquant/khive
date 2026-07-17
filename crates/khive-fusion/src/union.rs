@@ -5,7 +5,9 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::hash::Hash;
 
-/// Union fusion: take max score per ID, sorted descending with ID tie-breaking.
+/// Return every ID at its maximum source score, ordered by score then ID.
+///
+/// See `crates/khive-fusion/docs/api/fusion-functions.md`.
 pub fn union_fusion<Id: Eq + Hash + Clone + Ord>(
     sources: Vec<Vec<(Id, DeterministicScore)>>,
 ) -> Vec<(Id, DeterministicScore)> {
@@ -30,7 +32,6 @@ pub fn union_fusion<Id: Eq + Hash + Clone + Ord>(
     }
 
     let mut fused: Vec<(Id, DeterministicScore)> = combined.into_iter().collect();
-    // Sort by score descending, then by ID ascending for determinism
     fused.sort_by(
         |(id_a, score_a), (id_b, score_b)| match score_b.cmp(score_a) {
             Ordering::Equal => id_a.cmp(id_b),

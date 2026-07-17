@@ -1,6 +1,6 @@
 # ADR-102: Tiered Validate-and-Merge — Rule-Gated Fast Path and Reviewed Change-Set Path
 
-**Status**: Proposed
+**Status**: Accepted
 **Date**: 2026-07-08
 **Amends**: [ADR-020](ADR-020-git-native-kg-implementation.md) (restores the `kg commit` CLI
 primitive to the `kkernel kg` subcommand surface; see "Amendment to ADR-020" below)

@@ -3,6 +3,7 @@
 //! These functions mutate a `BalancedRecallState` in place at the point of action:
 //! after a recall hit/miss and after explicit feedback. No fold trait or event log
 //! needed — pack-memory owns its own posterior lifecycle.
+//! See `crates/khive-pack-memory/docs/api/memory-lifecycle.md`.
 
 use khive_brain_core::{BalancedRecallState, BetaPosterior, FeedbackEventKind, FeedbackSignal};
 use uuid::Uuid;

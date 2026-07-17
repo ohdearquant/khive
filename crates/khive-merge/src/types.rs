@@ -1,15 +1,14 @@
 // Copyright 2026 Haiyang Li. Licensed under Apache-2.0.
 //
-//! Merge-engine types for the three-way merge algorithm.
+//! Public strategies, results, conflicts, errors, and engine contract.
+//!
+//! See `crates/khive-merge/docs/api/conflict-and-error-taxonomy.md`.
 
 use khive_runtime::portability::KgArchive;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// Snapshot merge strategy selector (ADR-010).
-///
-/// Renamed from `MergeStrategy` to avoid collision with `ContentMergeStrategy` in
-/// the note-curation layer (ADR-014).
+/// Selects semantic conflict detection or a last-write-wins branch preference.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SnapshotMergeStrategy {
     /// Three-way merge with conflict detection.
@@ -20,7 +19,7 @@ pub enum SnapshotMergeStrategy {
     Theirs,
 }
 
-/// Result of a three-way merge operation.
+/// A clean owned archive or typed conflicts requiring resolution.
 #[derive(Clone, Debug)]
 pub enum MergeResult {
     /// The merge completed without conflicts.
@@ -29,7 +28,9 @@ pub enum MergeResult {
     Conflicts { conflicts: Vec<MergeConflict> },
 }
 
-/// A conflict detected during three-way merge.
+/// A well-formed but unresolved semantic disagreement between branches.
+///
+/// See `crates/khive-merge/docs/api/conflict-and-error-taxonomy.md`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum MergeConflict {
     /// Entity name differs between branches.
@@ -88,12 +89,14 @@ pub enum BranchSide {
     Theirs,
 }
 
-/// Trait for merge engine implementations.
-///
-/// Register an implementation of this trait in `khive-vcs` at startup to
-/// replace the default no-op merge engine.
+/// Strategy-neutral interface for snapshot merge engines.
 pub trait MergeEngine {
-    /// Run a three-way merge of `ours` and `theirs` against their common `base`.
+    /// Merges `ours` and `theirs` against their common `base`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MergeError`] when the inputs violate archive invariants or
+    /// the implementation cannot reconstruct a valid result.
     fn merge_branch(
         &self,
         base: &KgArchive,
@@ -103,9 +106,10 @@ pub trait MergeEngine {
     ) -> Result<MergeResult, MergeError>;
 }
 
-/// Merge-specific error type.
+/// Invalid-input and internal failures that prevent merge evaluation.
 #[derive(Debug, thiserror::Error)]
 pub enum MergeError {
+    /// The three archives do not share a namespace.
     #[error("namespace mismatch: base={base}, ours={ours}, theirs={theirs}")]
     NamespaceMismatch {
         base: String,
@@ -113,12 +117,15 @@ pub enum MergeError {
         theirs: String,
     },
 
+    /// An archive contains a NaN or infinite edge weight.
     #[error("invalid edge weight: {0}")]
     InvalidEdgeWeight(String),
 
+    /// An archive repeats an entity UUID.
     #[error("duplicate entity IDs in archive: {entity_id}")]
     DuplicateEntityId { entity_id: Uuid },
 
+    /// An archive repeats a semantic `(source, target, relation)` edge key.
     #[error("duplicate edge key in archive: ({edge_source}, {edge_target}, {edge_relation})")]
     DuplicateEdgeKey {
         edge_source: Uuid,
@@ -126,6 +133,7 @@ pub enum MergeError {
         edge_relation: String,
     },
 
+    /// Another invariant failed, such as a duplicate edge UUID or invalid relation.
     #[error("internal: {0}")]
     Internal(String),
 }

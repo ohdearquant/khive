@@ -677,34 +677,10 @@ async fn run_exec_inline_with_forward(
 }
 
 /// Build the server used whenever `kkernel exec` dispatches a request locally
-/// instead of through the warm daemon.
-///
-/// Two call sites hit this: the daemon-unreachable/mismatch fallback inside
-/// `run_exec_inline_with_forward`, and the `--ops-file` bulk-apply path
-/// (`run_exec_ops_file`), which deliberately never attempts the daemon fast
-/// path at all (ADR-067 Context: bulk apply bypasses the daemon for cross-op
-/// atomicity).
-///
-/// `KhiveMcpServer::new` alone only ever builds a single-backend runtime — it
-/// has no visibility into a `khive.toml` `[[backends]]` declaration. Before
-/// this fix, both of exec's local-dispatch paths always took that
-/// single-backend constructor, so a config declaring a separate backend for
-/// e.g. the `session` pack was invisible to them: the in-process fallback
-/// would silently write that pack's data into the `main` backend instead of
-/// its declared one. This function makes both paths agree with the daemon's
-/// own boot logic (`khive_mcp::serve::build_server`): when
-/// `khive_cfg.backends` is empty, build the plain single-backend server
-/// exactly as before (byte-identical `config_id`, since `compute_config_id`
-/// skips the topology fold for an empty backends list); otherwise delegate to
-/// `build_server_multi_backend_with_db_anchor`, the captured-anchor constructor
-/// used by the production MCP boot path.
-///
-/// `cli_db_override` is the raw, pre-resolution `--db`/`KHIVE_DB` value —
-/// required for `--db :memory:` multi-backend override handling (ADR-028 §8).
-/// Passing the wrong value here would silently ignore an operator's in-memory
-/// isolation request.
-/// `db_anchor` is the canonical anchor captured alongside `cfg`; passing it
-/// through prevents fallback construction from re-reading a changed `HOME`.
+/// instead of through the warm daemon (both the fallback and `--ops-file`
+/// bulk-apply paths). See
+/// `crates/kkernel/docs/design.md#exec-local-dispatch-fallback-server-adr-067-adr-028-8`
+/// for why this must agree with the daemon's own multi-backend boot logic.
 fn build_local_fallback_server(
     cfg: RuntimeConfig,
     khive_cfg: &KhiveConfig,
@@ -1923,21 +1899,8 @@ default = true
 
     // ── strict-actor mode: daemon bypass regression ───────────────────────────
 
-    /// Regression: `run_exec_inline` must enforce the strict-actor gate BEFORE
-    /// forwarding to the daemon, so a comm-capable anonymous daemon already running
-    /// cannot be used to bypass `KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1`.
-    ///
-    /// Prior to this fix, `enforce_strict_actor_mode` was only called in the
-    /// in-process fallback path (after the daemon fast-path returned).  An attacker
-    /// or misconfigured operator could start a no-actor daemon, then run strict-mode
-    /// `kkernel exec` which would forward through it and exit 0.
-    ///
-    /// The fix moves the check to before the daemon block.  This test drives
-    /// `run_exec_inline` directly with a config that has `comm` in the pack list
-    /// and no actor identity.  It must return an `Err` whose message names
-    /// `KHIVE_REQUIRE_ATTRIBUTED_ACTOR` regardless of whether a daemon is reachable
-    /// (KHIVE_NO_DAEMON=1 is set to keep the test isolated from any running daemon,
-    /// but the error should fire before any forwarding attempt anyway).
+    /// Security regression: strict-actor gate must fire before daemon forward.
+    /// See `crates/kkernel/docs/design.md#execrs-regression-test-notes`.
     #[tokio::test]
     #[serial]
     async fn strict_mode_rejects_before_daemon_forward_when_comm_and_no_actor() {
@@ -3329,23 +3292,8 @@ backend = "sessions"
         );
     }
 
-    /// Atomic `update` null/type semantics must match
-    /// canonical's ACTUALLY REACHABLE behavior. Empirically verified against
-    /// the live `handle_update` (two scratch probe tests run directly
-    /// against `KgPack::handle_update`, then removed) that `name=null` and
-    /// `description=null` are canonical NO-OPS, not rejections: canonical's
-    /// field type is `Option<Value>`, and serde_json's derived
-    /// `Deserialize` for `Option<T>` intercepts a literal JSON `null` at the
-    /// OUTER Option boundary and maps it straight to Rust `None` —
-    /// regardless of the inner type — so canonical's own "reject null"/
-    /// "clear on null" arms in `string_value`/`optional_string_patch` are
-    /// unreachable through normal struct deserialization. This deliberately
-    /// does NOT implement the naive literal expectation
-    /// ("`update(name=null)` REJECTED") — that expectation does not match
-    /// the live canonical system. What canonical DOES still reject is a non-null,
-    /// non-string `name` (e.g. `name: 123`) — pre-fix, atomic silently
-    /// treated that as absent too (reporting success for an invalid
-    /// update), which is the real violation this test locks down.
+    /// Atomic `update` null/type semantics must match canonical's actually-reachable
+    /// behavior. See `crates/kkernel/docs/design.md#execrs-regression-test-notes`.
     #[tokio::test]
     async fn atomic_update_null_and_type_semantics_match_canonical_no_op_behavior() {
         let db_file = NamedTempFile::new().expect("temp db");

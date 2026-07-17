@@ -6,22 +6,13 @@
 //! channel it drains. Callers reach it exclusively through a
 //! [`WriterTaskHandle`], sending a typed closure and awaiting a typed
 //! oneshot reply so each store method's natural return type (e.g.
-//! `BatchWriteSummary`, with its `attempted`/`affected`/`failed`/
-//! `first_error` fields) survives the trip through the type-erased channel
+//! `BatchWriteSummary`) survives the trip through the type-erased channel
 //! unmodified — a flat `Result<u64, StorageError>` reply would conflate
-//! `affected`/`failed` into one count and drop `first_error` (ADR-067
-//! Component A, lines 176-224).
+//! `affected`/`failed` into one count and drop `first_error`.
 //!
-//! Slice 1 scope: this module builds the mechanism and wires exactly one
-//! write path (`SqlEntityStore::upsert_entities`, gated behind
-//! `KHIVE_WRITE_QUEUE=1` / `PoolConfig::write_queue_enabled`) through it. It
-//! commits one request per `BEGIN IMMEDIATE` — Component B's batched-commit
-//! window and three-level SAVEPOINT hierarchy, Component C's checkpoint
-//! coordination signal, and Component D's transaction watchdog are later
-//! slices. With only one store migrated, other write paths still open their
-//! own writer connections, so this slice does not yet reduce contention or
-//! claim the ADR's single-writer guarantee — it proves the mechanism works
-//! and that the flag-off path is unchanged.
+//! See `crates/khive-db/docs/api/writer-task.md` for migration-slice scope
+//! (which write paths currently route through this vs. the legacy
+//! pool-mutex path) and the ADR-067 component breakdown.
 
 use rusqlite::Connection;
 use tokio::sync::{mpsc, oneshot};
@@ -320,22 +311,20 @@ impl WriterTaskHandle {
 /// runtime.
 ///
 /// Opens a dedicated standalone writer connection
-/// ([`ConnectionPool::open_standalone_writer`]) that the task owns
-/// exclusively for its lifetime — independent of the pool's Mutex-guarded
-/// `writer()` connection, which unmigrated paths continue to use in this
-/// slice. Returns the cloneable [`WriterTaskHandle`] sender half; the task
-/// keeps running in the background until every clone of the handle is
-/// dropped and the channel closes, at which point the drain loop exits.
+/// ([`ConnectionPool::open_standalone_writer`]), independent of the pool's
+/// Mutex-guarded `writer()` connection used by unmigrated paths. Returns the
+/// cloneable [`WriterTaskHandle`] sender half; the task runs until every
+/// handle clone is dropped and the channel closes.
 ///
-/// `capacity` bounds the channel (ADR-067 recommends 256;
-/// `PoolConfig::write_queue_capacity` resolves the default from
-/// `KHIVE_WRITE_QUEUE_CAPACITY`). Slice 1 commits one request per `BEGIN
-/// IMMEDIATE` — Component B's batched-commit window is a later slice.
+/// `capacity` bounds the channel (`PoolConfig::write_queue_capacity` /
+/// `KHIVE_WRITE_QUEUE_CAPACITY`, ADR-067 recommends 256).
 ///
-/// Must be called from within a Tokio runtime context (this calls
+/// # Errors
+/// Must be called from within a Tokio runtime context (calls
 /// `tokio::spawn`). Returns an error if the pool cannot open a standalone
-/// writer connection — for example, an in-memory pool, which has no
-/// standalone-connection support (`ConnectionPool::open_standalone_writer`).
+/// writer connection (e.g. an in-memory pool has no standalone-connection
+/// support). See `crates/khive-db/docs/api/writer-task.md` for the
+/// migration-slice scope this commits per `BEGIN IMMEDIATE`.
 pub fn spawn(pool: &ConnectionPool, capacity: usize) -> Result<WriterTaskHandle, SqliteError> {
     let conn = pool.open_standalone_writer()?;
     let (tx, rx) = mpsc::channel(capacity.max(1));
@@ -344,24 +333,14 @@ pub fn spawn(pool: &ConnectionPool, capacity: usize) -> Result<WriterTaskHandle,
 }
 
 /// Drain loop: the sole caller of `BEGIN IMMEDIATE` for write traffic routed
-/// through the channel (ADR-067 Component A).
-///
-/// A `BEGIN IMMEDIATE` failure (for example, `SQLITE_BUSY` from lock
-/// contention with an unmigrated writer path still holding the pool's writer
-/// mutex — reachable while only `entity.rs` is routed through this channel
-/// in this slice) replies the request's error via
-/// [`AnyWriteRequest::reply_error`] without ever invoking the request's
-/// operation closure via [`AnyWriteRequest::execute_and_reply`]. Slice 1 has
-/// no watchdog/retry story for a failed `BEGIN` (Component D is a later
-/// slice); the connection simply tries `BEGIN IMMEDIATE` fresh on the next
-/// request.
-///
-/// Exits when every [`WriterTaskHandle`] clone is dropped and the channel
-/// closes (`rx.recv()` returns `None`), or if the blocking closure panics.
-/// Either way, this task's `rx` is dropped when the function returns, which
-/// is what turns subsequent `WriterTaskHandle::send` calls into
-/// `StorageError::Internal` (ADR-067 failure-mode table: "Receiver drop
-/// (writer task stopped)" / "Writer task panic").
+/// through the channel. A `BEGIN IMMEDIATE` failure replies the request's
+/// error via [`AnyWriteRequest::reply_error`] without invoking the
+/// request's closure; no retry — the connection tries fresh next request.
+/// Exits when every [`WriterTaskHandle`] clone drops and the channel closes,
+/// or the blocking closure panics — either way `rx` drops with it, which is
+/// what turns subsequent `send` calls into `StorageError::Internal`. See
+/// `crates/khive-db/docs/api/writer-task.md` for the ADR-067 failure-mode
+/// table this implements.
 async fn run_writer_task(
     mut conn: Connection,
     mut rx: mpsc::Receiver<Box<dyn AnyWriteRequest + Send>>,

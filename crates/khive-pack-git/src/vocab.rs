@@ -2,14 +2,8 @@
 //! declaration, the `precedes` commit→commit edge extension, and the
 //! pack-auxiliary cursor schema.
 //!
-//! ADR-088 v0 shipped with no `HANDLERS` and no `EDGE_RULES`: zero new verbs,
-//! relying exclusively on the base `annotates` contract (note -> any
-//! substrate) for provenance edges. ADR-088 Amendment 1 adds exactly one
-//! verb (`git.digest`) and one endpoint extension (`precedes` commit→commit,
-//! for parent→child commit lineage — the base contract only allows
-//! `precedes` between five entity kinds, never between notes; this pack
-//! extends it the same additive way `khive-pack-gtd` extends `depends_on` to
-//! task→task). See `crates/khive-pack-git/src/pack.rs`.
+//! See crates/khive-pack-git/docs/api/vocab.md for the ADR-088 v0 → Amendment 1
+//! rationale behind this module's design.
 
 use khive_runtime::{NoteKindSpec, NoteLifecycleSpec};
 use khive_types::{
@@ -17,9 +11,8 @@ use khive_types::{
     VerbCategory, Visibility,
 };
 
-/// Lifecycle declaration shared by `issue` and `pull_request` — both track an
-/// open/closed state with the same posture as ADR-088's `finding` precedent:
-/// declared for introspection, not yet enforced by the runtime (Phase 1).
+/// Shared open/closed lifecycle for `issue` and `pull_request`. See
+/// crates/khive-pack-git/docs/api/vocab.md#git_lifecycle.
 const GIT_LIFECYCLE: NoteLifecycleSpec = NoteLifecycleSpec {
     field: "kind_status",
     initial: "open",
@@ -44,15 +37,8 @@ pub(crate) static GIT_NOTE_KIND_SPECS: [NoteKindSpec; 2] = [
     },
 ];
 
-/// Pack-auxiliary schema: the git-ingest cursor table (ADR-088 §5, ADR-087
-/// operational pattern reused).
-///
-/// Shape is intentionally generic across git record kinds within a project —
-/// `kind` distinguishes `commits` / `issues` / `prs` cursors so a follow-up
-/// pack (e.g. a code-review pack) can reuse this exact table for its own
-/// cursor rows without a schema change, keyed by its own `project_id`/`kind`
-/// pair. Idempotent (`CREATE TABLE IF NOT EXISTS`), applied once at pack
-/// registration time; not part of the core versioned migration chain.
+/// Pack-auxiliary schema: the git-ingest cursor table (ADR-088 §5). See
+/// crates/khive-pack-git/docs/api/vocab.md#git_schema_plan_stmts.
 pub(crate) static GIT_SCHEMA_PLAN_STMTS: [&str; 2] = [
     "CREATE TABLE IF NOT EXISTS git_mirror_cursor (\
         project_id   TEXT NOT NULL,\
@@ -65,12 +51,8 @@ pub(crate) static GIT_SCHEMA_PLAN_STMTS: [&str; 2] = [
         ON git_mirror_cursor(updated_at DESC)",
 ];
 
-/// ADR-088 Amendment 1 ingest enrichment: parent→child commit lineage as
-/// `precedes` edges. The base endpoint contract only allows `precedes`
-/// between five entity kinds (`document`, `dataset`, `artifact`, `service`,
-/// `project` — see `khive-runtime::operations::BASE_ENTITY_ENDPOINT_RULES`);
-/// it has no note→note case at all. This is the same additive-extension
-/// mechanism `khive-pack-gtd` uses for `depends_on` task→task.
+/// ADR-088 Amendment 1: parent→child commit lineage as `precedes` edges
+/// (note→note extension). See crates/khive-pack-git/docs/api/vocab.md#git_edge_rules.
 pub(crate) static GIT_EDGE_RULES: [EdgeEndpointRule; 1] = [EdgeEndpointRule {
     relation: EdgeRelation::Precedes,
     source: EndpointKind::NoteOfKind("commit"),
@@ -78,22 +60,7 @@ pub(crate) static GIT_EDGE_RULES: [EdgeEndpointRule; 1] = [EdgeEndpointRule {
 }];
 
 /// Pack-declared `Document` entity-type subtype: Architecture Decision
-/// Records.
-///
-/// `find_document_for_path` (`src/ingest.rs`) resolves pre-existing
-/// `document` entities by git-tracked file path (`properties.source_uri`) so
-/// commits/PRs can `annotates`-link to them; this pack never creates those
-/// document entities itself ("v0 never creates documents on the ingester's
-/// behalf"). The single most common git-tracked document kind ingesting
-/// agents attach to a repo's `document` entities is its ADR corpus
-/// (`docs/adr/*.md`) — but `EntityTypeRegistry::BUILTIN_DEFS` has no `adr`
-/// Document subtype, so any caller attempting `entity_type="adr"` was
-/// rejected at the handler layer, and callers omitted `entity_type`
-/// entirely rather than retry against an unknown value: a schema gap, not a
-/// data gap. Declaring it here (composed at boot via
-/// `VerbRegistry::all_entity_types`, ADR-017's additive pack-vocabulary
-/// pattern) makes ADR documents representable without editing the builtin
-/// registry.
+/// Records. See crates/khive-pack-git/docs/api/vocab.md#git_entity_types.
 pub(crate) static GIT_ENTITY_TYPES: [EntityTypeDef; 1] = [EntityTypeDef {
     kind: EntityKind::Document,
     type_name: "adr",
@@ -102,47 +69,156 @@ pub(crate) static GIT_ENTITY_TYPES: [EntityTypeDef; 1] = [EntityTypeDef {
 
 /// Illocutionary classification (Searle 1976): `git.digest` commits data to
 /// the graph (ingests notes and edges), so it is `Commissive` — the same
-/// category `create`/`link`/`remember` use.
-pub(crate) static GIT_HANDLERS: [HandlerDef; 1] = [HandlerDef {
-    name: "git.digest",
-    description: "Ingest commit/issue/pull_request provenance from a local git repo path or an \
-                   https:// URL into the graph. Bounded and cursor-resumable: call repeatedly \
-                   until the response's `done` field is true.",
-    visibility: Visibility::Verb,
-    category: VerbCategory::Commissive,
-    params: &[
-        ParamDef {
-            name: "source",
-            param_type: "string",
-            required: true,
-            description: "Absolute local path to a git repository (must contain a .git entry), \
-                           or an https:// URL. Any https host is accepted; non-github.com hosts \
-                           degrade to commits-only (gh cannot serve their issues/PRs). ssh://, \
-                           git://, http://, and scp-shorthand (user@host:path) sources are \
-                           rejected.",
-        },
-        ParamDef {
-            name: "project",
-            param_type: "string",
-            required: false,
-            description: "UUID or 8+ hex prefix of the repo-anchor project entity. When absent, \
-                           resolved by matching properties.repo_url or name, or created if none \
-                           is found (see the response's project_id and project_created).",
-        },
-        ParamDef {
-            name: "max_items",
-            param_type: "integer",
-            required: false,
-            description: "Bounded work for this call, counted across commits + issues + PRs \
-                           (default 500, clamped to 1..=2000). Cursor-resumable: call again \
-                           while the response's done field is false.",
-        },
-        ParamDef {
-            name: "include",
-            param_type: "array of string",
-            required: false,
-            description: "Which record kinds to ingest this call: any of commits | issues | \
-                           pull_requests (default: all three).",
-        },
-    ],
-}];
+/// category `create`/`link`/`remember` use. `git.commit` / `git.branch` /
+/// `git.push` (ADR-108) mutate a git repository, not the graph, but are
+/// still `Commissive` — the speaker commits a persistent change, exactly the
+/// same illocutionary force as `create`/`link`, just against a different
+/// substrate (a git repo instead of khive's own storage).
+pub(crate) static GIT_HANDLERS: [HandlerDef; 4] = [
+    HandlerDef {
+        name: "git.digest",
+        description: "Ingest commit/issue/pull_request provenance from a local git repo path or \
+                       an https:// URL into the graph. Bounded and cursor-resumable: call \
+                       repeatedly until the response's `done` field is true.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
+        params: &[
+            ParamDef {
+                name: "source",
+                param_type: "string",
+                required: true,
+                description: "Absolute local path to a git repository (must contain a .git \
+                               entry), or an https:// URL. Any https host is accepted; \
+                               non-github.com hosts degrade to commits-only (gh cannot serve \
+                               their issues/PRs). ssh://, git://, http://, and scp-shorthand \
+                               (user@host:path) sources are rejected.",
+            },
+            ParamDef {
+                name: "project",
+                param_type: "string",
+                required: false,
+                description: "UUID or 8+ hex prefix of the repo-anchor project entity. When \
+                               absent, resolved by matching properties.repo_url or name, or \
+                               created if none is found (see the response's project_id and \
+                               project_created).",
+            },
+            ParamDef {
+                name: "max_items",
+                param_type: "integer",
+                required: false,
+                description: "Bounded work for this call, counted across commits + issues + PRs \
+                               (default 500, clamped to 1..=2000). Cursor-resumable: call again \
+                               while the response's done field is false.",
+            },
+            ParamDef {
+                name: "include",
+                param_type: "array of string",
+                required: false,
+                description: "Which record kinds to ingest this call: any of commits | issues | \
+                               pull_requests (default: all three).",
+            },
+        ],
+    },
+    HandlerDef {
+        name: "git.commit",
+        description: "Stage and commit against a local git repo (ADR-108). Shells to system git \
+                       with hardened, allowlisted argv construction — no shell interpolation. \
+                       Returns the resulting commit SHA.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
+        params: &[
+            ParamDef {
+                name: "repo",
+                param_type: "string",
+                required: true,
+                description: "Absolute local path to a git repository (must contain a .git \
+                               entry).",
+            },
+            ParamDef {
+                name: "message",
+                param_type: "string",
+                required: true,
+                description: "Commit message, passed to git as a single -m argument value.",
+            },
+            ParamDef {
+                name: "paths",
+                param_type: "array of string",
+                required: false,
+                description: "Relative paths to stage and scope the commit to. Absent commits \
+                               everything currently staged/modified in tracked files (git \
+                               commit -a) — never auto-adds new untracked files.",
+            },
+            ParamDef {
+                name: "author",
+                param_type: "string",
+                required: false,
+                description: "Override the commit author, e.g. \"Name <email>\".",
+            },
+        ],
+    },
+    HandlerDef {
+        name: "git.branch",
+        description: "Create a branch in a local git repo, optionally from a named ref or SHA \
+                       (ADR-108).",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
+        params: &[
+            ParamDef {
+                name: "repo",
+                param_type: "string",
+                required: true,
+                description: "Absolute local path to a git repository (must contain a .git \
+                               entry).",
+            },
+            ParamDef {
+                name: "name",
+                param_type: "string",
+                required: true,
+                description: "New branch name.",
+            },
+            ParamDef {
+                name: "from",
+                param_type: "string",
+                required: false,
+                description: "Ref or SHA to branch from. Absent uses the repo's current HEAD.",
+            },
+        ],
+    },
+    HandlerDef {
+        name: "git.push",
+        description: "Push a branch to a remote (ADR-108). Force-push is always denied — no \
+                       policy or argument combination can authorize it through this verb.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
+        params: &[
+            ParamDef {
+                name: "repo",
+                param_type: "string",
+                required: true,
+                description: "Absolute local path to a git repository (must contain a .git \
+                               entry).",
+            },
+            ParamDef {
+                name: "branch",
+                param_type: "string",
+                required: true,
+                description: "Branch to push.",
+            },
+            ParamDef {
+                name: "remote",
+                param_type: "string",
+                required: false,
+                description: "Remote to push to (default: origin).",
+            },
+            ParamDef {
+                name: "force",
+                param_type: "bool",
+                required: false,
+                description: "Always rejected when true — force-push is never permitted through \
+                               this verb (ADR-108 hard rule 1). Present only so a caller's \
+                               explicit force=true request fails loudly rather than being \
+                               silently ignored.",
+            },
+        ],
+    },
+];

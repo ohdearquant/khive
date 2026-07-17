@@ -1,24 +1,19 @@
-//! ADR-099 migration step 2 — parse-time rejection of atomic-inadmissible
-//! verbs.
-//!
-//! `--atomic` bulk apply (ADR-099 migration step 4, not yet built) must
-//! reject an inadmissible op **before any execution**. This module exposes
-//! that check as a pure function over already-parsed ops so the future
-//! `--atomic` runner can call it without re-deriving the admissible set —
-//! the set itself lives in `khive_types::pack` (shared pack metadata, ADR-099
-//! D3: admissibility is a static per-verb property, "declared per verb as
-//! pack metadata").
+//! Pure ADR-099 atomic-admissibility preflight over parsed operations.
 
 use khive_types::pack::{atomic_admissibility, AtomicRejectionReason, ATOMIC_ADMISSIBLE_VERBS};
 
 use crate::types::ParsedOp;
 
-/// One rejected op inside a would-be `--atomic` file: its zero-based index in
-/// the op list, its tool name, and why it was rejected.
+/// One atomic-preflight rejection.
+///
+/// See `crates/khive-request/docs/api/atomic-admissibility.md` for reason semantics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AtomicRejection {
+    /// Zero-based operation position.
     pub op_index: usize,
+    /// Rejected tool name.
     pub tool: String,
+    /// Static admissibility category.
     pub reason: AtomicRejectionReason,
 }
 
@@ -54,16 +49,12 @@ impl std::fmt::Display for AtomicRejection {
     }
 }
 
-/// Check every op's tool name against the ADR-099 v1 admissible verb set.
+/// Checks every tool name against the ADR-099 v1 atomic policy.
 ///
-/// Returns every rejection found (not just the first), so a caller preparing
-/// to reject the whole file up front can report every offending line in one
-/// pass, naming the line and verb per op (ADR-099 acceptance criteria). An
-/// empty result means every op in `ops` is atomic-admissible.
-///
-/// This function is pure: it performs no I/O and does not execute any op. It
-/// is the seam the future `--atomic` runner (ADR-099 migration step 4) calls
-/// before the prepare pass begins.
+/// Returns every rejection in input order; an empty vector means every op is
+/// admissible. This function performs no I/O or execution and must run before
+/// an atomic prepare pass.
+/// See `crates/khive-request/docs/api/atomic-admissibility.md` for policy boundaries.
 pub fn check_atomic_admissible(ops: &[ParsedOp]) -> Vec<AtomicRejection> {
     ops.iter()
         .enumerate()
@@ -91,8 +82,6 @@ mod tests {
 
     #[test]
     fn all_admissible_ops_pass_with_no_rejections() {
-        // `merge` is deferred under B3; see
-        // `known_unimplemented_verbs_rejected_before_any_write` below.
         let ops = vec![op("update"), op("delete"), op("link")];
         assert!(check_atomic_admissible(&ops).is_empty());
     }
@@ -146,12 +135,6 @@ mod tests {
 
     #[test]
     fn all_v1_admissible_verbs_from_the_ordered_ops_file_pass() {
-        // ADR-099 D3's full v1 list, exercised through the ops-file shape
-        // (tool name only — the parse-time check does not need args),
-        // EXCLUDING the governance verbs: those are still on
-        // ATOMIC_ADMISSIBLE_VERBS (conceptually admissible per the ADR) but
-        // are rejected at this same static layer as known-unimplemented
-        // (ADR-099 B3) — see the dedicated test below.
         let ops: Vec<ParsedOp> = ATOMIC_ADMISSIBLE_VERBS
             .iter()
             .filter(|v| !khive_types::pack::ATOMIC_KNOWN_UNIMPLEMENTED_VERBS.contains(v))
@@ -162,10 +145,6 @@ mod tests {
 
     #[test]
     fn known_unimplemented_verbs_rejected_before_any_write() {
-        // ADR-099 B3: propose/review/withdraw AND (deferred) merge must all
-        // be rejected at THIS pre-runtime static check — not admitted here
-        // and left to fail later inside `atomic_prepare::prepare_op` after a
-        // runtime has already been constructed.
         let ops: Vec<ParsedOp> = khive_types::pack::ATOMIC_KNOWN_UNIMPLEMENTED_VERBS
             .iter()
             .map(|v| op(v))
@@ -188,10 +167,6 @@ mod tests {
 
     #[test]
     fn known_unimplemented_merge_names_non_atomic_merge_as_the_supported_route() {
-        // Leo refinement (2026-07-07): merge's rejection message must be
-        // specific and actionable, naming the non-atomic merge verb (the
-        // blessed defer shape), not just the generic
-        // "no --atomic prepare/apply seam yet" phrasing governance verbs use.
         let rejection = AtomicRejection {
             op_index: 0,
             tool: "merge".to_string(),

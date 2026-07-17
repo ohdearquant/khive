@@ -3,17 +3,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{ActorRef, GateDecision, Obligation};
 
-// ---------- Audit event ----------
-
 /// Structured audit record emitted once per gate consultation.
 ///
-/// The JSON projection of this struct is the **public contract** — field names
-/// are stable. Adding fields is non-breaking; removing or renaming requires a
-/// new ADR.
-///
-/// Events are emitted via `tracing::info!` as structured JSON. When the
-/// dispatch registry is configured with an `EventStore`, the same envelope is
-/// also persisted as an audit event.
+/// JSON field names are stable; events reach tracing and the configured event store. See
+/// `crates/khive-gate/docs/api/audit-events.md`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AuditEvent {
     /// Wall-clock timestamp of the gate check (UTC, RFC3339 in JSON).
@@ -29,10 +22,7 @@ pub struct AuditEvent {
     /// Deny reason, present only when `decision == "deny"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deny_reason: Option<String>,
-    /// Obligations attached by the policy on Allow (empty array on Deny).
-    /// Always serialized — `obligations: []` is the wire shape when there
-    /// are none, so non-Rust consumers do not need to special-case absence
-    /// vs. emptiness.
+    /// Obligations on allow; always serialized and empty on deny.
     #[serde(default)]
     pub obligations: Vec<Obligation>,
     /// Name of the gate implementation that produced this decision.
@@ -51,7 +41,9 @@ pub enum AuditDecision {
 }
 
 impl AuditEvent {
-    /// Build an `AuditEvent` from the gate inputs and output.
+    /// Project one request/decision pair into a timestamped stable audit envelope.
+    ///
+    /// See `crates/khive-gate/docs/api/audit-events.md`.
     pub fn from_check(req: &crate::GateRequest, decision: &GateDecision, gate_impl: &str) -> Self {
         let (audit_decision, deny_reason, obligations) = match decision {
             GateDecision::Allow { obligations } => {

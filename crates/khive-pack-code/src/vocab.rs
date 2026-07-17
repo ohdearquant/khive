@@ -2,7 +2,42 @@
 //! and additive `EDGE_RULES` over the closed relation set.
 
 use khive_runtime::{NoteKindSpec, NoteLifecycleSpec};
-use khive_types::{EdgeEndpointRule, EdgeRelation, EndpointKind};
+use khive_types::{
+    EdgeEndpointRule, EdgeRelation, EndpointKind, HandlerDef, ParamDef, VerbCategory, Visibility,
+};
+
+/// `code.ingest` — the pack's first verb (ADR-085 Amendment 2 B1).
+pub(crate) static CODE_HANDLERS: [HandlerDef; 1] = [HandlerDef {
+    name: "code.ingest",
+    description: "Ingest L1 manifest edges and L1.5 regex import-scan edges from a source \
+                   folder into a dedicated map database (never the shared production graph). \
+                   L2 Scanner/Extractor symbol-tier ingest is not implemented by this call.",
+    visibility: Visibility::Verb,
+    category: VerbCategory::Commissive,
+    params: &[
+        ParamDef {
+            name: "path",
+            param_type: "string",
+            required: true,
+            description: "Folder to ingest — a monorepo subtree (a single crate/package) is \
+                           first-class, not a special case of whole-repo ingest.",
+        },
+        ParamDef {
+            name: "db",
+            param_type: "string",
+            required: false,
+            description: "Target map database path. Defaults to <path>/.khive/code-map.db. \
+                           The shared production database is always rejected, with no override.",
+        },
+        ParamDef {
+            name: "languages",
+            param_type: "array of string",
+            required: false,
+            description: "Restrict ingest to a subset of rust | python | typescript. Defaults \
+                           to all three (auto-detected from manifests found under path).",
+        },
+    ],
+}];
 
 pub(crate) const VALID_SEVERITIES: &[&str] = &["critical", "high", "medium", "low", "info"];
 pub(crate) const VALID_CONFIDENCES: &[&str] = &["high", "medium", "low"];

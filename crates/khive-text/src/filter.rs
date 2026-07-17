@@ -49,7 +49,9 @@ impl TokenFilter for MaxLengthFilter {
     }
 }
 
-/// Drops English stop words. Assumes input is already lowercased.
+/// Drops the general English stop-word set; input must already be lowercase.
+///
+/// See `crates/khive-text/docs/api/filters.md`.
 #[derive(Debug, Default, Clone)]
 pub struct StopWordFilter;
 
@@ -231,7 +233,9 @@ impl TokenFilter for Bm25StopWordFilter {
     }
 }
 
-/// Snowball stemmer. Only stems ASCII-alphabetic tokens; others pass through.
+/// Snowball stemmer for ASCII-alphabetic tokens; all other tokens pass through.
+///
+/// See `crates/khive-text/docs/api/filters.md`.
 #[cfg(feature = "stem")]
 pub struct SnowballStemmer(rust_stemmers::Stemmer);
 

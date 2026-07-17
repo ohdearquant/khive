@@ -1,8 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-// ---------- Context ----------
-
 /// Per-request context — session, timing, transport source.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct GateContext {

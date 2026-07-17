@@ -3,48 +3,27 @@ use std::fmt;
 
 use serde_json::Value;
 
-/// Hard cap on operations per request.
+/// Maximum operations in a batch or chain.
 pub const MAX_OPS: usize = 100;
 
-/// Hard cap on the byte length of a raw `ops` input string, checked before any
-/// parsing begins. A cheap O(1) first line of defense against pathological
-/// input; does not by itself bound container-nesting depth (see
-/// [`NESTING_DEPTH_LIMIT`]), since a compact payload can still pack tens of
-/// thousands of nesting levels into a few KiB.
+/// Maximum raw `ops` byte length, checked before parsing.
 ///
-/// 1 MiB, not 256 KiB: ADR-038's bulk-operations contract promises up to 1000
-/// items per bulk `create` call (`crates/khive-pack-kg/src/handler_defs.rs`,
-/// `items` param). A realistic 1000-item batch with ~220-byte descriptions
-/// runs to roughly 276 KB once wrapped in the `request` DSL/JSON envelope,
-/// which already blows past a 256 KiB cap. 1 MiB gives that documented
-/// contract several times its observed size in headroom while still
-/// rejecting the multi-hundred-MB inputs this cap exists to stop.
+/// See `crates/khive-request/docs/api/limits-and-errors.md` for the bulk-size rationale.
 pub const MAX_OPS_INPUT_LEN: usize = 1024 * 1024;
 
-/// Hard cap on container-nesting depth (`[`/`{`) tracked through the DSL
-/// parser, the JSON-form pre-pass scan, and (by construction, since
-/// `ArgValue::Array` and `ArgValue::Object` are only ever built inside the
-/// depth-guarded parser functions) any `$prev` reference nested inside
-/// array/object literals.
+/// Maximum array/object nesting in function and JSON forms.
 ///
-/// 64 gives generous headroom over real khive `ops` payloads (observed at 2-4
-/// levels of nesting) while remaining far too shallow for a native recursive
-/// descent to threaten the thread stack (CWE-674).
+/// See `crates/khive-request/docs/api/limits-and-errors.md` for stack-safety details.
 pub const NESTING_DEPTH_LIMIT: usize = 64;
 
 /// Names reserved at the request-envelope level; rejected if they appear inside verb args.
 pub const RESERVED_ENVELOPE_ARGS: &[&str] = &["presentation", "presentation_per_op"];
 
-/// Iteratively check container-nesting depth of a runtime [`Value`], returning
-/// `false` once nesting exceeds `max_depth`.
+/// Returns whether every array/object in `value` is at most `max_depth` deep.
 ///
-/// Unlike the parser guards above (which bound the DSL's own syntax tree),
-/// values checked here come from verb handler results, e.g. a `traverse` or
-/// `context` result about to be stored as `$prev` chain context, and are
-/// otherwise unbounded. Walks an explicit worklist on the heap instead of
-/// native recursion, so a pathologically deep result cannot overflow the
-/// thread stack via `Value::clone` or serialization (CWE-674) before this
-/// check has a chance to reject it.
+/// The walk is iterative, so checking an untrusted handler result cannot itself
+/// overflow the thread stack. Scalar roots have depth zero.
+/// See `crates/khive-request/docs/api/limits-and-errors.md` for usage with `$prev`.
 pub fn value_nesting_within_limit(value: &Value, max_depth: usize) -> bool {
     let mut stack: Vec<(&Value, usize)> = vec![(value, 0)];
     while let Some((v, depth)) = stack.pop() {
@@ -80,7 +59,9 @@ pub enum ExecutionMode {
     Chain,
 }
 
-/// An argument value in a [`ParsedOp`]: concrete JSON, a `$prev` path ref, or a nested container.
+/// A concrete JSON argument or chain-time `$prev` expression.
+///
+/// See `crates/khive-request/docs/api/previous-result.md` for path semantics.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ArgValue {
     /// A concrete JSON value (no `$prev` references anywhere inside).
@@ -107,7 +88,10 @@ impl ArgValue {
         matches!(self, ArgValue::PrevRef { .. })
     }
 
-    /// Resolve a `$prev` reference against a preceding op's result, returning `None` on miss.
+    /// Resolves this reference by borrowing from `prev_result`.
+    ///
+    /// Returns `None` for a non-reference, missing field, non-array index target,
+    /// or out-of-range index.
     pub fn resolve_prev<'a>(&self, prev_result: &'a Value) -> Option<&'a Value> {
         let ArgValue::PrevRef { path } = self else {
             return None;
@@ -122,7 +106,7 @@ impl ArgValue {
         Some(cur)
     }
 
-    /// Recursively resolve all `$prev` refs within this value; returns `None` if any path is absent.
+    /// Materializes this argument, returning `None` if any nested reference misses.
     pub fn resolve_all<'a>(&'a self, prev_result: &'a Value) -> Option<Value> {
         match self {
             ArgValue::Value(v) => Some(v.clone()),
@@ -145,21 +129,26 @@ impl ArgValue {
     }
 }
 
-/// A single parsed operation: tool name plus named argument bag.
+/// One parsed tool name and its deterministically ordered named arguments.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParsedOp {
     pub tool: String,
     pub args: BTreeMap<String, ArgValue>,
 }
 
-/// Result of parsing a `request` input: a list of ops and their execution mode.
+/// Parsed operations in input order plus their execution mode.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParsedRequest {
     pub ops: Vec<ParsedOp>,
     pub mode: ExecutionMode,
 }
 
-/// Parser error — surfaced as `invalid_params` at the MCP boundary.
+/// Request syntax or preflight error surfaced as MCP `invalid_params`.
+///
+/// No operation has executed when this error is returned. Resource, syntax,
+/// reference-placement, conflict, and envelope variants retain their relevant
+/// count, position, field, or tool names.
+/// See `crates/khive-request/docs/api/limits-and-errors.md` for the full taxonomy.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DslError {
     Empty,
@@ -167,15 +156,12 @@ pub enum DslError {
         count: usize,
         max: usize,
     },
-    /// Raw `ops` input exceeds [`MAX_OPS_INPUT_LEN`], rejected before any parsing begins.
+    /// Raw input exceeds [`MAX_OPS_INPUT_LEN`] before parsing begins.
     InputTooLarge {
         len: usize,
         max: usize,
     },
-    /// Container nesting (`[`/`{`) exceeds [`NESTING_DEPTH_LIMIT`]. Covers the
-    /// function-call array/object parser, the JSON-form pre-pass scan, and any
-    /// `$prev` reference nested inside array/object literals (bounded at the
-    /// same construction sites).
+    /// Array/object nesting exceeds [`NESTING_DEPTH_LIMIT`].
     NestingTooDeep {
         pos: usize,
         depth: usize,
@@ -206,20 +192,11 @@ pub enum DslError {
     UnclosedBracket {
         kind: char,
     },
-    /// `$prev` reference used outside a chain context — emitted for Single-op
-    /// and Parallel-batch forms, and for JSON form.
-    ///
-    /// `$prev` references are only meaningful in chain (`|`) mode. If they
-    /// appear in a non-chain context the parser rejects the request here so
-    /// downstream consumers get a typed error rather than a runtime string.
+    /// Function-form `$prev` appears outside chain mode.
     PrevRefOutsideChain {
         pos: usize,
     },
-    /// `$prev` found in JSON-form input — JSON form does not support chains.
-    ///
-    /// JSON form (`[{"tool":"...","args":{...}},...]`) always runs in parallel.
-    /// To use `$prev` substitution, use the function-call DSL with the `|`
-    /// chain operator: `verb1(...) | verb2(id=$prev.id)`.
+    /// `$prev` appears in JSON form, which cannot express chains.
     PrevRefInJsonForm {
         arg_name: String,
     },
@@ -227,28 +204,20 @@ pub enum DslError {
     MixedSeparators,
     /// Empty batch `[]` — no ops provided.
     EmptyBatch,
-    /// Dotted verb name with more than one level (e.g. `a.b.c`). Only
-    /// single-level dotted names are supported (`a.b`).
+    /// Tool name contains more than one namespace dot.
     UnsupportedVerbNesting {
         pos: usize,
     },
-    /// Two or more ops in a parallel batch write to the same UUID.
-    ///
-    /// Write-key conflict detection is a preflight check applied after parsing.
-    /// Write ops are: `update`, `delete`, `merge`, `link`. When two ops share
-    /// the same `id` (or `into_id` / `from_id` for `merge`,
-    /// `source_id`/`target_id` for `link`) the batch is rejected before any op
-    /// is dispatched.
+    /// Two parallel operations claim the same derived write key.
     WriteKeyConflict {
-        /// The duplicated UUID.
+        /// Duplicated substrate-prefixed key.
         id: String,
         /// Name of the first op that claimed the key.
         first_op: String,
         /// Name of the second op that conflicts.
         second_op: String,
     },
-    /// `presentation` and `presentation_per_op` are envelope-only fields and
-    /// must not appear inside individual verb argument lists.
+    /// An envelope-only field appears inside a verb argument list.
     ReservedEnvelopeArg {
         arg_name: String,
         verb: String,

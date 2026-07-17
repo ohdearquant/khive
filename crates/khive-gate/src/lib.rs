@@ -1,9 +1,4 @@
-//! Pluggable authorization gate for verb dispatch.
-//!
-//! The runtime consults a [`Gate`] impl before dispatching each verb. The default
-//! [`AllowAllGate`] is permissive. For production enforcement, plug a Rego-backed
-//! or capability-witness-backed impl into `RuntimeConfig.gate`.
-//! Wire types validate invariants at construction and deserialization boundaries.
+//! Validated authorization request, decision, obligation, audit, and gate interfaces.
 
 mod actor;
 mod audit;

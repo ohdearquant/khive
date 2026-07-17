@@ -179,63 +179,26 @@ pub trait PackRuntime: Send + Sync {
         &[]
     }
 
-    /// Register custom embedding providers with the runtime.
-    ///
-    /// Called by the transport during pack initialisation, before the first verb
-    /// dispatch, so that `KhiveRuntime::embedder(name)` resolves provider names
-    /// declared here.
-    ///
-    /// Implement this method to contribute non-lattice embedding backends:
-    ///
-    /// ```ignore
-    /// fn register_embedders(&self, runtime: &KhiveRuntime) {
-    ///     runtime.register_embedder(MyCustomProvider::new());
-    /// }
-    /// ```
-    ///
-    /// The default no-op preserves backwards compatibility — packs that only
-    /// use built-in lattice models do not need to override this method.
+    /// Register custom embedding providers with the runtime. Called during pack
+    /// initialisation, before the first verb dispatch, so `KhiveRuntime::embedder(name)`
+    /// resolves provider names declared here. Default no-op — packs that only use
+    /// built-in lattice models do not need to override this.
+    /// See `docs/api/pack.md#register_embedders` for a usage example.
     fn register_embedders(&self, _runtime: &KhiveRuntime) {}
 
-    /// Install a pack-owned entity-type validator on the runtime.
-    ///
-    /// Called by the transport during pack initialisation, after the registry
-    /// is built and before the first verb dispatch, so that `create_many` and
-    /// `create_entity` reject unregistered `entity_type` values at the runtime
-    /// layer in addition to the handler layer.
-    ///
-    /// Packs that own `EntityTypeRegistry` vocabularies (e.g. `KgPack`) should
-    /// override this to install their registry's `resolve` function.  The
-    /// default no-op leaves the runtime validator absent (skip-when-None), which
-    /// is the correct behaviour for bare runtimes without packs.
-    ///
-    /// This single-argument hook is intentionally left unchanged (not
-    /// widened) so an out-of-tree pack that already overrides it keeps
-    /// compiling even if it declares no entity types. A pack that needs the
-    /// boot-time composed pack vocabulary should override
-    /// [`register_entity_type_validator_with_types`](Self::register_entity_type_validator_with_types)
-    /// instead — `call_register_entity_type_validators` calls that hook, not
-    /// this one.
+    /// Install a pack-owned entity-type validator on the runtime, called during pack
+    /// initialisation (after the registry is built, before the first dispatch) so
+    /// `create_many`/`create_entity` reject unregistered `entity_type` values at the
+    /// runtime layer. Default no-op leaves the validator absent (skip-when-None).
+    /// See `docs/api/pack.md#register_entity_type_validator` for the two-hook compatibility contract.
     fn register_entity_type_validator(&self, _runtime: &KhiveRuntime) {}
 
-    /// Install a pack-owned entity-type validator that also receives the
-    /// boot-time composed set of every loaded pack's `ENTITY_TYPES`
-    /// ([`VerbRegistry::all_entity_types`]) — the same aggregate every pack
-    /// in the loaded set receives, mirroring how `EDGE_RULES` are aggregated
-    /// once and consulted by every pack.
-    ///
-    /// Defaults to calling
-    /// [`register_entity_type_validator`](Self::register_entity_type_validator)
-    /// with just the runtime, so a pack that overrides only the older,
-    /// simpler hook — or overrides neither — keeps compiling and behaving
-    /// exactly as before. `call_register_entity_type_validators` calls this
-    /// hook, not the older one, so a pack that wants the composed vocabulary
-    /// must override this one.
-    ///
-    /// Packs that own `EntityTypeRegistry` vocabularies (e.g. `KgPack`)
-    /// should override this hook to compose
-    /// `EntityTypeRegistry::with_extra(pack_entity_types)` and install its
-    /// `resolve` function.
+    /// Install a pack-owned entity-type validator that also receives the boot-time
+    /// composed set of every loaded pack's `ENTITY_TYPES` ([`VerbRegistry::all_entity_types`]).
+    /// Defaults to calling [`register_entity_type_validator`](Self::register_entity_type_validator)
+    /// with just the runtime. `call_register_entity_type_validators` calls this hook, not
+    /// the simpler one — override this to receive the composed vocabulary.
+    /// See `docs/api/pack.md#register_entity_type_validator` for the two-hook compatibility contract.
     fn register_entity_type_validator_with_types(
         &self,
         runtime: &KhiveRuntime,
@@ -244,44 +207,23 @@ pub trait PackRuntime: Send + Sync {
         self.register_entity_type_validator(runtime);
     }
 
-    /// Install a pack-owned note-mutation hook on the runtime.
-    ///
-    /// Called by the transport during pack initialisation, after the registry
-    /// is built and before the first verb dispatch — same timing as
-    /// `register_entity_type_validator`. Packs that cache derived state keyed
-    /// by note content (e.g. `khive-pack-memory`'s warm ANN index) should
-    /// override this to install a hook via `KhiveRuntime::install_note_mutation_hook`,
-    /// so `update_note`/`delete_note` notify them even when the mutation
-    /// arrived through a different pack's verb that has no dependency on the
-    /// reacting pack (e.g. KG's `update`/`delete` on a `kind="memory"` note).
-    ///
-    /// The default no-op leaves the runtime hook absent (skip-when-None),
-    /// which is the correct behaviour for packs that don't cache note-derived
-    /// state and for bare runtimes without packs.
+    /// Install a pack-owned note-mutation hook on the runtime, called during pack
+    /// initialisation with the same timing as `register_entity_type_validator`. Packs
+    /// that cache derived state keyed by note content (e.g. `khive-pack-memory`'s warm
+    /// ANN index) override this to install a hook via
+    /// `KhiveRuntime::install_note_mutation_hook`. Default no-op leaves the hook absent.
+    /// See `docs/api/pack.md#register_note_mutation_hook` for cross-pack notification rationale.
     fn register_note_mutation_hook(&self, _runtime: &KhiveRuntime) {}
 
-    /// Warm up any in-memory state from persisted snapshots (optional).
-    ///
-    /// Called by the transport after all packs are registered but before
-    /// serving the first request, giving packs a chance to pre-load expensive
-    /// in-memory structures (e.g. ANN indexes) so that the first query does
-    /// not incur rebuild latency.
-    ///
-    /// The default no-op is correct for all packs that have no warm-start
-    /// state. Packs that override this must make it idempotent and infallible:
-    /// any errors are logged internally, not propagated to the caller.
+    /// Warm up any in-memory state from persisted snapshots (optional). Called after
+    /// all packs are registered but before serving the first request. Must be
+    /// idempotent and infallible — errors are logged internally, never propagated.
     async fn warm(&self) {}
 
-    /// Names of all embedding models registered on this pack's underlying
-    /// runtime handle.
-    ///
-    /// Used by ADR-103 Amendment 1's `model_count` computation at the
-    /// dispatch audit-row emission seam (`VerbRegistry::dispatch_with_identity`)
-    /// for the two embedding-bearing verb families whose model fan-out is
-    /// not a per-dispatch constant: singleton `create` and `memory.remember`
-    /// without an explicit `embedding_model` override. Defaults to empty —
-    /// only the packs that own those verbs (kg, memory) need to override
-    /// this by forwarding to their internal `KhiveRuntime`.
+    /// Names of all embedding models registered on this pack's underlying runtime
+    /// handle. Defaults to empty — only packs that own embedding-bearing verbs
+    /// (kg, memory) need to override this.
+    /// See `docs/api/pack.md#registered_embedding_model_names` for the ADR-103 consumer.
     fn registered_embedding_model_names(&self) -> Vec<String> {
         Vec::new()
     }
@@ -1099,12 +1041,10 @@ impl VerbRegistry {
     /// Some(id)` uses `id.namespace` / `id.actor_id` / `id.visible_namespaces`
     /// in place of `self.default_namespace` / `self.actor_id` /
     /// `self.visible_namespaces` for this call's namespace resolution, gate
-    /// request, and token minting — the registry's own fields are never
-    /// mutated, so concurrent calls with different (or no) identity are
-    /// independent. This is what lets one warm registry correctly serve
-    /// requests from many attribution identities over the same shared
-    /// backend (same db, same warm ANN indexes) instead of rejecting or
-    /// silently dispatching under its own baked identity.
+    /// request, and token minting. The registry's own fields are never mutated,
+    /// so concurrent calls with different (or no) identity are independent.
+    /// See `docs/api/pack.md#dispatch_with_identity` for why this enables one warm
+    /// registry to serve many attribution identities over a shared backend.
     pub async fn dispatch_with_identity(
         &self,
         verb: &str,
@@ -1554,34 +1494,21 @@ impl VerbRegistry {
 
     /// Dispatch a verb under an out-of-band verified actor identity.
     ///
-    /// For embedding hosts (gateways, servers, or other processes that embed
-    /// this runtime as a library) that authenticate a principal through their
-    /// own channel — not through the request DSL — and then need that
-    /// principal to be the effective actor for one dispatch. `verified_actor`
-    /// is a typed Rust-side argument: it can only be supplied by code holding
-    /// a `VerbRegistry` handle. `dispatch_as` never reads `params["actor"]`
-    /// to derive the effective actor; individual verbs may still accept an
-    /// `actor` field for their own documented business semantics, unrelated
-    /// to the acting principal.
+    /// `verified_actor` is a typed [`VerifiedActor`] (constructor rejects blank
+    /// identifiers) — only code holding a `VerbRegistry` handle can supply it.
+    /// `dispatch_as` never reads `params["actor"]` to derive the effective actor;
+    /// individual verbs may still accept an `actor` field for their own documented
+    /// business semantics, unrelated to the acting principal. Every pack handler
+    /// that reads "who is calling" resolves it from the `NamespaceToken` the
+    /// dispatch boundary mints, so `verified_actor` becomes exactly the principal
+    /// those handlers observe.
     ///
-    /// `verified_actor` is a [`VerifiedActor`], whose constructor rejects
-    /// blank identifiers. This keeps an authentication-integration failure
-    /// (an empty subject from the host's own auth channel) from silently
-    /// downgrading to the anonymous/local actor — the failure surfaces at
-    /// `VerifiedActor::new` instead of being laundered into a valid dispatch.
-    ///
-    /// Every pack handler that reads "who is calling" (for example, a
-    /// proposal review's `reviewer` field) resolves it from the
-    /// `NamespaceToken` the dispatch boundary mints, so `verified_actor`
-    /// becomes exactly the principal those handlers observe.
-    ///
-    /// Equivalent to `dispatch_with_identity(verb, params, Some(identity))`
-    /// with `identity.actor_id = Some(verified_actor)` and every other
-    /// identity scalar (namespace, visible namespaces) left at this
-    /// registry's construction-baked value — only the acting principal
-    /// changes for this one call. [`Self::dispatch`] and
-    /// [`Self::dispatch_with_identity`] are unaffected: this is a purely
-    /// additive entry point.
+    /// Equivalent to `dispatch_with_identity(verb, params, Some(identity))` with
+    /// `identity.actor_id = Some(verified_actor)` and every other identity scalar
+    /// (namespace, visible namespaces) left at this registry's construction-baked
+    /// value. [`Self::dispatch`] and [`Self::dispatch_with_identity`] are unaffected.
+    /// See `docs/api/pack.md#dispatch_as` for the embedding-host use case and the
+    /// blank-identifier safety rationale.
     pub async fn dispatch_as(
         &self,
         verb: &str,
@@ -2243,20 +2170,7 @@ fn target_id_from_args(args: &serde_json::Value) -> Option<uuid::Uuid> {
 }
 
 /// Build a v1-shape audit storage event from a gate check outcome.
-///
-/// Shared by the immediate-append path (all verbs, denied calls, bulk
-/// `links`) and the deferred singleton-`link` fallback so both audit
-/// shapes are produced by one code path.
-///
-/// `resource` is the ADR-103 `resource` payload object. ADR-103 Decision (a)
-/// stamps the closed `work_class` enum on every event, so every call site
-/// passes `Some`: `crate::cost_unit::resource_payload` (`{"work_class": ...,
-/// "cost_unit": ...}`) for a successfully-resolved dispatch, or
-/// `crate::cost_unit::base_resource_payload` (`{"work_class": ...}`, no
-/// `cost_unit` key) for denied calls, errored dispatches, and the
-/// no-pack-owns-this-verb case. `None` is reserved for a caller with no
-/// `work_class` to stamp at all (none exist today); it must never be used to
-/// omit `cost_unit` alone.
+/// See `docs/api/pack.md#build_audit_storage_event` for the `resource` payload contract.
 fn build_audit_storage_event(
     gate_req: &GateRequest,
     audit: &AuditEvent,
@@ -2301,11 +2215,8 @@ async fn append_audit_event_best_effort(store: &Arc<dyn EventStore>, event: Even
     }
 }
 
-/// Schema v2 audit payload for a successful singleton `link` call.
-///
-/// Additive over the v1 `AuditEvent` shape: every v1 field is preserved via
-/// `#[serde(flatten)]`, and the edge identity/relation/weight the caller
-/// created or resolved are added at the top level.
+/// Schema v2 audit payload for a successful singleton `link` call — additive
+/// over v1 via `#[serde(flatten)]`. See `docs/api/pack.md#linkauditsuccessv2`.
 #[derive(Debug, Clone, serde::Serialize)]
 struct LinkAuditSuccessV2 {
     #[serde(flatten)]
@@ -2317,12 +2228,9 @@ struct LinkAuditSuccessV2 {
     weight: f64,
 }
 
-/// Extract the edge fields needed to enrich a successful singleton `link`
-/// audit row from the handler's returned JSON.
-///
-/// Returns `None` (rather than a `Result`) on any missing/malformed field —
-/// the caller treats that as "cannot enrich" and falls back to the v1 audit
-/// shape instead of failing the already-succeeded `link` call.
+/// Extract edge fields to enrich a successful singleton `link` audit row.
+/// Returns `None` on any missing/malformed field (falls back to v1 shape).
+/// See `docs/api/pack.md#link_audit_success_from_result`.
 fn link_audit_success_from_result(
     audit: AuditEvent,
     result: &serde_json::Value,
@@ -2362,10 +2270,8 @@ fn link_audit_success_from_result(
 ///   a malformed explicit value must never be silently coerced to the
 ///   default namespace.
 ///
-/// This is the single chokepoint both `VerbRegistry::dispatch` (single-backend
-/// and JSON-form ingress) and the multi-backend coordinator intercept
-/// (`dispatch_via_coordinator_inner` in `khive-mcp`) call into, so no ingress
-/// path can bypass the fail-closed rule by routing around `dispatch`.
+/// Single chokepoint for both `VerbRegistry::dispatch` and the multi-backend
+/// coordinator intercept — see `docs/api/pack.md#resolve_explicit_namespace`.
 pub fn resolve_explicit_namespace(
     params: &Value,
     default_namespace: &str,
