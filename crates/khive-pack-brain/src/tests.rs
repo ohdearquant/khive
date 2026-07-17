@@ -6412,9 +6412,12 @@ mod event_counts_tests {
             .unwrap()
             .and_utc()
             .timestamp_micros();
-        let during_day = chrono::NaiveDate::from_ymd_opt(2026, 7, 7)
+        // Last representable instant of the `until` day = the INCLUDED end of the edge;
+        // paired with `next_midnight` (the first EXCLUDED instant) this pins both sides
+        // of the exclusive upper bound to within one microsecond.
+        let end_of_named_day = chrono::NaiveDate::from_ymd_opt(2026, 7, 7)
             .unwrap()
-            .and_hms_opt(12, 0, 0)
+            .and_hms_micro_opt(23, 59, 59, 999_999)
             .unwrap()
             .and_utc()
             .timestamp_micros();
@@ -6441,7 +6444,7 @@ mod event_counts_tests {
             "search",
             EventKind::SearchExecuted,
             "lambda:a",
-            during_day,
+            end_of_named_day,
             json!({}),
         )
         .await;
