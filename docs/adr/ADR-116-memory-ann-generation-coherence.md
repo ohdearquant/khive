@@ -43,9 +43,12 @@ daemon. Selective bumps would therefore replace a data invariant with a caller-r
 convention and would not cover issue #752's third affected path (“any other external process”).
 
 **Verdict**: reject known-path-only bumps. Every committed mutation that changes a model's ANN input
-MUST advance that model's durable generation in the mutation's SQLite transaction. The added write
-MAY be coalesced to once per affected model per transaction/batch; the contract is not one increment
-per row.
+MUST advance that model's durable generation in the mutation's SQLite transaction. Where the
+mutation's own code performs the advance (the vector write sites below), the added write MAY be
+coalesced to once per affected model per transaction/batch. The note-liveness triggers advance once
+per qualifying row instead, because SQLite has no statement-level triggers. Both are correct: the
+contract is equality-based, any strict advance invalidates, and the durable cost is bounded per
+commit, not per increment.
 
 ### “A durable write per note is too expensive”
 
@@ -154,6 +157,11 @@ Register it in `crates/khive-db/src/migrations.rs` as `V11_UP` with a new
 `VersionedMigration { version: 11, name: "memory_ann_generations", ... }`. DDL MUST live in the SQL
 file and be pulled with `include_str!`. V1 MUST NOT be edited. `scripts/lint-sql.sh` MUST pass.
 
+The generations table and the note triggers are core `khive-db` schema rather than memory-pack
+schema deliberately: the triggers attach to the core `notes` table and must hold for every
+deployment that can mutate notes, regardless of which packs are loaded. This is a scoped exception
+to pack-scoped schema ownership (ADR-028), recorded here so schema authority stays unambiguous.
+
 The same V11 file defines these note-liveness triggers after the table:
 
 ```sql
@@ -227,13 +235,21 @@ vectors and applies memory-kind/visibility filtering after hydration.
 
 1. **Single insert/update** — `replace_vector_row_dml` / `vec_upsert_atomic_dml`, reached by
    `SqliteVecStore::insert` and `update` (`vectors.rs:325-379`, `503-535`, `648-747`, `812-907`).
-   After a successful `note.content` replacement, advance the row named by `embedding_model` before
-   releasing/committing the enclosing savepoint/transaction.
+   Membership MUST be computed from both sides of the replacement: `replace_vector_row_dml`
+   deletes every row for `(subject_id, namespace)` in the model table before inserting the new
+   `(kind, field)` row (`vectors.rs:342-377`), so a replacement whose inserted row is not
+   `note.content` can still remove a prior `note.content` row from the graph input. Advance the
+   row named by `embedding_model`, before releasing/committing the enclosing
+   savepoint/transaction, when the inserted postimage is ANN input or the deleted preimage
+   contained ANN input. Implementations MAY establish the preimage with a pre-delete existence
+   check or `DELETE ... RETURNING`, and MAY conservatively advance on every note-substrate
+   replacement for the model instead.
 
 2. **Batch insert/reindex** — `batch_insert_vectors_dml` (`vectors.rs:402-492`). Track whether at
-   least one relevant record's savepoint succeeded. Advance the model exactly once after the loop
-   when `affected > 0`; a generation failure rolls back the outer batch transaction. Failed record
-   savepoints do not independently advance it.
+   least one record's committed savepoint changed ANN input under the site-1 preimage/postimage
+   rule. Advance the model exactly once after the loop when `affected > 0`; a generation failure
+   rolls back the outer batch transaction. Failed record savepoints do not independently advance
+   it.
 
 3. **Single/bulk delete** — `SqliteVecStore::delete` and `delete_subjects`
    (`vectors.rs:909-918`, `1085-1117`). Determine whether relevant rows were actually deleted and
@@ -258,8 +274,10 @@ After this transition, `begin_reindex_epoch` and the completion-side global epoc
 `reindex.rs` have no authority and SHOULD be removed rather than maintained as a second freshness
 system. Reindex snapshot deletion MAY remain as defense in depth.
 
-Counter increments MAY be coalesced once per model per SQLite transaction. They MUST NOT be moved to
-post-commit effects.
+Counter increments performed by Rust-side vector DML MAY be coalesced once per model per SQLite
+transaction. The V11 note-liveness triggers cannot coalesce, because SQLite triggers execute per
+row; their cost model is specified in the next section. Increments MUST NOT be moved to post-commit
+effects in either case.
 
 ### Note membership triggers and atomic delete plans
 
@@ -277,19 +295,27 @@ for:
 same protection. Inserts do not need a note trigger: a note without a vector is not graph input, and
 the subsequent vector insert owns the per-model bump.
 
-Because these triggers advance every initialized model row on each qualifying note-row change, bulk
-deletion MUST execute its note-row mutations within a single enclosing transaction. The advances
-then coalesce to one increment per model per batch, following the coalescing allowance above, rather
-than one increment per note. `memory.prune` currently soft-deletes N notes in N separate
-transactions (`handlers/prune.rs:130-145`), so it MUST wrap the batch in one transaction.
-`delete_subjects` and any other multi-note deletion path carry the same requirement. Without it,
-pruning N notes performs O(N×M) generation writes and routes every model to exact search.
+SQLite triggers execute once per affected row; there is no statement-level trigger, and an
+enclosing transaction does not merge trigger executions. Bulk deletion of N live notes therefore
+fires the trigger N times, each execution running the overflow guard and one UPDATE over the M-row
+counter table, and each model's generation advances by N. That is semantically correct: the
+coherence contract tests equality only, any strict advance invalidates, and the counter value has
+no arithmetic meaning. What the transaction boundary changes is the cost model, not the increment
+count. Inside one transaction the N×M row updates are page-cache mutations against a tiny table
+with a single durable commit; split across N autocommit transactions they become N durable commits
+and N separately observable invalidation points. Bulk deletion MUST therefore execute its note-row
+mutations within a single enclosing transaction, for atomicity and to bound durable cost to one
+commit per batch, not because trigger advances coalesce (they do not). `memory.prune` currently
+soft-deletes N notes in N separate transactions (`handlers/prune.rs:130-145`), so it MUST wrap the
+batch in one transaction. `delete_subjects` and any other multi-note deletion path carry the same
+requirement. If per-row trigger execution ever measures as a bulk-deletion bottleneck, the remedy
+is the membership-targeted Rust-side invalidation described below, not weakening the trigger.
 
 Advancing all initialized models rather than only the models that hold a vector for the mutated note
 is a deliberate simplification, because a SQL trigger cannot cheaply compute per-note model
 membership. The cost is bounded. A retired model that no recall queries incurs only a wasted lazy
-rebuild, with no effect on served recall latency, and the coalescing above caps writes at one per
-model per transaction. Note-mutation authority is assumed trusted in this cut: mutations are
+rebuild, with no effect on served recall latency, and the single-transaction requirement above
+bounds durable cost to one commit per batch. Note-mutation authority is assumed trusted in this cut: mutations are
 authorized at the Gate (ADR-018), and namespace is attribution rather than a storage boundary
 (ADR-007), so corpus-wide per-model invalidation stays inside the trust boundary of a
 single-writer-authority deployment. Per-tenant availability isolation on a shared multi-tenant
@@ -431,9 +457,11 @@ can make a stale ANN appear correct. Tests MUST assert generations, ANN-route co
    zero-row, entity-only, and failed-record paths do not. Inject a failure after vector DELETE and a
    generation-write failure; assert both vector data and generation roll back.
 3. **Note trigger matrix**: prune/soft delete, raw soft delete, hard delete, and namespace move
-   advance initialized models in the same transaction. Salience/decay/properties/status/expiry-only
-   updates do not. An atomic note-delete rollback does not advance; commit does. Verify
-   `INSERT OR REPLACE` is gone or cannot trigger delete semantics.
+   advance initialized models in the same transaction. Assert a strict advance, not a delta of
+   exactly one: the per-row triggers make a multi-row batch's delta equal the affected row count.
+   Salience/decay/properties/status/expiry-only updates do not advance. An atomic note-delete
+   rollback does not advance; commit does. Verify `INSERT OR REPLACE` is gone or cannot trigger
+   delete semantics.
 4. **Two runtimes, one file DB**: seed all notes, warm runtime A, reset route counters/events, mutate
    through runtime B, then recall through A. Assert A observes a higher durable generation and
    performs **zero ANN searches at the stale generation**; it uses exact search until a
@@ -505,7 +533,8 @@ open on epoch read errors, contrary to #752's required next-recall/fail-closed s
 ### MAY
 
 - Batch generation reads for all recall models into one SQL statement.
-- Coalesce multiple relevant mutations to one increment per model per SQLite transaction.
+- Coalesce multiple relevant Rust-side vector mutations to one increment per model per SQLite
+  transaction; the note-liveness triggers advance per row and are exempt.
 - Retain eager in-process eviction/rebuild scheduling and the ordered content hash.
 - Retain active snapshot deletion after reindex as defense in depth.
 - Leave the old `memory_ann_epoch` table unused for one compatibility release.
@@ -517,7 +546,8 @@ open on epoch read errors, contrary to #752's required next-recall/fail-closed s
 - Treat count/dimensions, snapshot presence, in-process generation, notification, or post-commit
   hook success as proof of freshness.
 - Advance generations after commit or allow a generation-write failure to commit corpus changes.
-- Increment once per row in a successful batch when one per model/transaction suffices.
+- Increment once per row from Rust-side vector DML in a successful batch when one per
+  model/transaction suffices; the V11 note triggers are per-row by SQLite semantics and exempt.
 - Fire generation triggers for salience-only or other score/metadata-only updates.
 - Decode a legacy snapshot and stamp it with the current generation.
 - Edit V1, put V11 DDL inline in Rust, or keep pack-owned ad hoc creation as the schema authority.
@@ -537,7 +567,8 @@ open on epoch read errors, contrary to #752's required next-recall/fail-closed s
 
 The memory ANN no longer serves a graph that it cannot prove current at the recall's database-read
 coherence point. Cross-process writers and restarts share the same proof, and rollback preserves the
-proof automatically. The cost is one fresh small SQLite read per recall and one coalesced small
-write per affected model/transaction, plus exact-search latency while a stale graph rebuilds.
+proof automatically. The cost is one fresh small SQLite read per recall, one coalesced counter
+write per affected model per vector-DML transaction (per affected row on the note trigger path,
+still one durable commit per batch), plus exact-search latency while a stale graph rebuilds.
 
 This is a deliberate reversal of ADR-107's availability-first stale-serving choice. Reviewers must sign off on that product-intent change before implementation merges.
