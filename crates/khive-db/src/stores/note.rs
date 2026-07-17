@@ -388,6 +388,12 @@ fn batch_upsert_notes(
     let mut failed = 0u64;
     let mut first_error = String::new();
 
+    // Prepare the UPSERT once for the whole batch — `Connection::execute`
+    // re-parses and re-plans the statement on every call, which dominates
+    // wall time at conflict-heavy batch sizes (measured 536ms vs 260ms at
+    // 50k conflicts; see PR #1082 review).
+    let mut stmt = conn.prepare_cached(NOTE_UPSERT_SQL)?;
+
     for note in notes {
         let id_str = note.id.to_string();
         let kind_str = note.kind.to_string();
@@ -397,24 +403,21 @@ fn batch_upsert_notes(
             .as_ref()
             .map(|v| serde_json::to_string(v).unwrap_or_default());
 
-        match conn.execute(
-            NOTE_UPSERT_SQL,
-            rusqlite::params![
-                id_str,
-                &note.namespace,
-                kind_str,
-                status_str,
-                &note.name,
-                note.content,
-                note.salience,
-                note.decay_factor,
-                note.expires_at,
-                properties_str,
-                note.created_at,
-                note.updated_at,
-                note.deleted_at,
-            ],
-        ) {
+        match stmt.execute(rusqlite::params![
+            id_str,
+            &note.namespace,
+            kind_str,
+            status_str,
+            &note.name,
+            note.content,
+            note.salience,
+            note.decay_factor,
+            note.expires_at,
+            properties_str,
+            note.created_at,
+            note.updated_at,
+            note.deleted_at,
+        ]) {
             Ok(_) => {
                 assign_note_seq(conn, &id_str)?;
                 affected += 1;
@@ -638,7 +641,7 @@ impl NoteStore for SqlNoteStore {
         let id_str = note.id.to_string();
         let statement = note_upsert_statement(&note);
         self.with_writer_tx("upsert_note", move |conn| {
-            let mut stmt = conn.prepare(&statement.sql)?;
+            let mut stmt = conn.prepare_cached(&statement.sql)?;
             bind_params(&mut stmt, &statement.params)?;
             stmt.raw_execute()?;
             assign_note_seq(conn, &id_str)?;

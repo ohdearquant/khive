@@ -446,7 +446,13 @@ async fn test_upsert_note_is_true_upsert_no_delete_semantics() {
         writer
             .conn()
             .execute_batch(
-                "CREATE TABLE delete_fires (n INTEGER);
+                // `recursive_triggers` defaults OFF, under which SQLite does
+                // NOT fire AFTER DELETE triggers for the delete half of an
+                // `INSERT OR REPLACE` conflict resolution — so without this
+                // pragma the probe below would read 0 even on the old
+                // INSERT-OR-REPLACE path, and the test would prove nothing.
+                "PRAGMA recursive_triggers = ON;
+                 CREATE TABLE delete_fires (n INTEGER);
                  CREATE TRIGGER notes_delete_probe AFTER DELETE ON notes \
                  BEGIN INSERT INTO delete_fires VALUES (1); END;",
             )

@@ -1705,9 +1705,8 @@ fn merge_note_sql(
             }
         }
 
-        conn.execute(
-            khive_db::stores::note::NOTE_UPSERT_SQL,
-            rusqlite::params![
+        conn.prepare_cached(khive_db::stores::note::NOTE_UPSERT_SQL)?
+            .execute(rusqlite::params![
                 &into_str,
                 &namespace,
                 &into_note.kind,
@@ -1721,8 +1720,7 @@ fn merge_note_sql(
                 into_note.created_at,
                 now,
                 into_note.deleted_at,
-            ],
-        )?;
+            ])?;
 
         conn.execute(
             &format!(
