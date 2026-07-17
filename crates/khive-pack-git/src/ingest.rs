@@ -140,6 +140,17 @@ pub struct IngestReport {
     /// embedding input was truncated to a UTF-8-safe head prefix at the cap
     /// (issue #764). Only incremented for successfully created commits.
     pub commit_embeddings_truncated: u64,
+    /// Total `commit` notes annotating this pass's project in the database
+    /// AFTER this pass completes — a row count, not an in-memory delta
+    /// (issue #1045). `commits_ingested` only counts creations THIS process
+    /// observed; if the daemon respawns mid-digest and drops a response
+    /// after the write already landed, that response's `commits_ingested`
+    /// is lost from any cumulative sum a caller keeps across calls, even
+    /// though the row was durably written. This field is derived by
+    /// querying the DB after the walk, so it survives that loss and is safe
+    /// to compare directly against an independent source of truth (e.g.
+    /// `git rev-list --count <ref>`).
+    pub commits_total_in_db: u64,
 }
 
 /// Run one ingest pass over `opts.repo`: issues + PRs first (via `gh`, when
@@ -273,6 +284,12 @@ pub(crate) async fn run_ingest_with_commit_recovery(
         &mut report,
     )
     .await;
+
+    // Derived fresh from the database on every pass (regardless of which
+    // branch above ran, or whether this pass ingested anything new), so it
+    // stays a truthful completeness signal across daemon restarts — see
+    // `IngestReport::commits_total_in_db` (issue #1045).
+    report.commits_total_in_db = count_commit_notes_for_project(runtime, token, project_id).await?;
 
     Ok(report)
 }
@@ -1067,6 +1084,37 @@ async fn ingest_commits(
         report.warnings.push(warning);
     }
     Ok(())
+}
+
+/// Count `commit` notes annotating `project_id`, derived fresh from the
+/// database rather than tracked in-memory across process invocations — see
+/// `IngestReport::commits_total_in_db` (issue #1045).
+async fn count_commit_notes_for_project(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    project_id: Uuid,
+) -> Result<u64> {
+    let sql = runtime.sql();
+    let mut r = sql.reader().await.map_err(|e| anyhow!("{e}"))?;
+    let row = r
+        .query_scalar(SqlStatement {
+            sql: "SELECT COUNT(*) FROM notes n \
+                  JOIN graph_edges e ON e.source_id = n.id AND e.namespace = n.namespace \
+                  WHERE n.kind = 'commit' AND n.namespace = ?1 AND n.deleted_at IS NULL \
+                  AND e.relation = 'annotates' AND e.target_id = ?2 AND e.deleted_at IS NULL"
+                .into(),
+            params: vec![
+                SqlValue::Text(token.namespace().as_str().to_string()),
+                SqlValue::Text(project_id.to_string()),
+            ],
+            label: Some("git_ingest_count_commit_notes".into()),
+        })
+        .await
+        .map_err(|e| anyhow!("{e}"))?;
+    match row {
+        Some(SqlValue::Integer(n)) => Ok(n as u64),
+        _ => Ok(0),
+    }
 }
 
 // ── issues + PRs (gh CLI) ───────────────────────────────────────────────────
