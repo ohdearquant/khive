@@ -842,8 +842,9 @@ async fn invalidate_vamana_snapshots(rt: &KhiveRuntime, namespace: &str) -> anyh
 }
 
 /// Remove per-namespace memory Vamana snapshot rows (legacy `{ns}::memory_vamana::*` format).
-/// After FTS+ANN consolidation the active key is `global::memory_vamana::*`; old per-ns rows
-/// are orphaned. Best-effort — missing table or SQL failure is logged and ignored.
+/// After FTS+ANN consolidation the active, retained key is `global::memory_vamana::{model}`
+/// (ADR-062, corrected by ADR-116); old per-ns rows are orphaned. Best-effort — missing table
+/// or SQL failure is logged and ignored.
 async fn purge_stale_memory_vamana_snapshots(rt: &KhiveRuntime) {
     use khive_storage::types::SqlStatement;
     let sql = rt.sql();
@@ -852,8 +853,16 @@ async fn purge_stale_memory_vamana_snapshots(rt: &KhiveRuntime) {
     };
     match writer
         .execute(SqlStatement {
+            // `retrieval_snapshots.namespace` holds the FULL composite key produced by
+            // `ann::snapshot_key` (`"global::memory_vamana::{model}"`), not a bare
+            // namespace — `namespace != 'global'` never matches that literal string and
+            // so purged every memory_vamana row unconditionally, including current,
+            // still-valid `global::memory_vamana::*` snapshots (ADR-116 condition 4).
+            // Match the retained key's prefix instead, mirroring
+            // `invalidate_active_memory_vamana_snapshot`'s LIKE pattern below.
             sql: "DELETE FROM retrieval_snapshots \
-                  WHERE index_type = 'memory_vamana' AND namespace != 'global'"
+                  WHERE index_type = 'memory_vamana' \
+                    AND namespace NOT LIKE 'global::memory_vamana::%'"
                 .into(),
             params: vec![],
             label: Some("purge_stale_memory_vamana_snapshots".into()),
@@ -1455,6 +1464,90 @@ mod tests {
             remaining.contains(&"local::memory_vamana::model-a".to_string()),
             "legacy per-namespace memory Vamana rows are purge_stale_memory_vamana_snapshots's \
              job, not this function's: {remaining:?}"
+        );
+    }
+
+    /// Regression test (ADR-116 condition 4): `purge_stale_memory_vamana_snapshots` must
+    /// keep the current, retained `global::memory_vamana::{model}` key (ADR-062) and purge
+    /// only legacy per-namespace `{ns}::memory_vamana::*` rows. The prior predicate
+    /// (`namespace != 'global'`) matched every row unconditionally, since the namespace
+    /// column stores the full composite key and is never the bare string `'global'`.
+    #[tokio::test]
+    async fn test_purge_stale_memory_vamana_snapshots_keeps_current_key() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let sql = rt.sql();
+
+        let mut w = sql.writer().await.expect("writer");
+        w.execute_script(
+            "CREATE TABLE IF NOT EXISTS retrieval_snapshots (\
+             namespace TEXT NOT NULL, \
+             index_type TEXT NOT NULL, \
+             snapshot BLOB NOT NULL, \
+             created_at INTEGER NOT NULL, \
+             PRIMARY KEY (namespace, index_type));"
+                .into(),
+        )
+        .await
+        .expect("create table");
+
+        for (ns, idx_type) in &[
+            ("global::memory_vamana::model-a", "memory_vamana"),
+            ("local::memory_vamana::model-a", "memory_vamana"),
+            ("tenant-a::memory_vamana::model-b", "memory_vamana"),
+            ("local::vamana::model-a", "vamana"),
+        ] {
+            w.execute(SqlStatement {
+                sql: "INSERT INTO retrieval_snapshots \
+                      (namespace, index_type, snapshot, created_at) \
+                      VALUES (?1, ?2, ?3, 0)"
+                    .into(),
+                params: vec![
+                    SqlValue::Text(ns.to_string()),
+                    SqlValue::Text(idx_type.to_string()),
+                    SqlValue::Blob(b"{}".to_vec()),
+                ],
+                label: None,
+            })
+            .await
+            .expect("insert row");
+        }
+        drop(w);
+
+        purge_stale_memory_vamana_snapshots(&rt).await;
+
+        let mut r = sql.reader().await.expect("reader");
+        let rows = r
+            .query_all(SqlStatement {
+                sql: "SELECT namespace FROM retrieval_snapshots ORDER BY namespace".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("query");
+
+        let remaining: Vec<String> = rows
+            .iter()
+            .filter_map(|row| match row.get("namespace") {
+                Some(SqlValue::Text(s)) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            remaining.contains(&"global::memory_vamana::model-a".to_string()),
+            "current-key global memory Vamana snapshot must be retained: {remaining:?}"
+        );
+        assert!(
+            !remaining.contains(&"local::memory_vamana::model-a".to_string()),
+            "legacy per-namespace memory Vamana snapshot must be purged: {remaining:?}"
+        );
+        assert!(
+            !remaining.contains(&"tenant-a::memory_vamana::model-b".to_string()),
+            "legacy per-namespace memory Vamana snapshot must be purged: {remaining:?}"
+        );
+        assert!(
+            remaining.contains(&"local::vamana::model-a".to_string()),
+            "unrelated knowledge Vamana rows must survive: {remaining:?}"
         );
     }
 
