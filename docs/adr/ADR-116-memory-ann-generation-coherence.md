@@ -340,27 +340,42 @@ count. Inside one transaction the N×M row updates are page-cache mutations agai
 with a single durable commit; split across N autocommit transactions they become N durable commits
 and N separately observable invalidation points. Bulk deletion MUST therefore execute its note-row
 mutations within a single enclosing transaction, for atomicity and to bound durable cost to one
-commit per batch, not because trigger advances coalesce (they do not). `memory.prune` currently
-soft-deletes N notes in N separate transactions (`handlers/prune.rs:130-145`), so it MUST wrap the
-batch in one transaction. `delete_subjects` and any other multi-note deletion path carry the same
-requirement. If per-row trigger execution ever measures as a bulk-deletion bottleneck, the remedy
+commit per batch, not because trigger advances coalesce (they do not). The single-transaction
+requirement has an owning API rather than a convention: `NoteStore` (khive-db) gains a batch
+soft-delete operation that executes all row mutations — and therefore all their trigger
+executions — inside one writer transaction it owns. `memory.prune` currently soft-deletes N notes
+in N separate transactions (`handlers/prune.rs:130-145`) and MUST route through that batch
+operation; so must `delete_subjects` and every other multi-note deletion path. No caller may loop
+single-note deletes or open an ad hoc transaction above the storage boundary to satisfy this
+rule. If per-row trigger execution ever measures as a bulk-deletion bottleneck, the remedy
 is the membership-targeted Rust-side invalidation described below, not weakening the trigger.
 
 That measurement is a required acceptance gate, not an open question. The benchmark suite MUST
-soft-delete 10,000 live notes with three initialized model rows inside one transaction and compare
-against the identical batch with the V11 triggers absent. Acceptance requires at most 1.5x the
-trigger-free batch latency and exactly one durable commit. The M in the N×M cost is the number of
-initialized embedding models — single digits in every supported deployment — and each trigger
-execution is one overflow probe plus one UPDATE over that M-row table, so the expected result is
-page-cache-bound; the gate exists to prove it rather than assume it.
+soft-delete 10,000 live notes with the supported-maximum initialized model rows inside one
+transaction and compare against the identical batch with the V11 triggers absent. Acceptance
+requires at most 1.5x the trigger-free batch latency and exactly one durable commit. The M in the
+N×M cost is the number of initialized embedding models, and the informal single-digits expectation
+is now a normative bound: this cut supports at most **eight initialized embedding models per
+database**. Initializing a ninth model MUST fail with a documented error naming this ADR; raising
+the bound is an amendment with re-run gates, not a config knob. Every performance gate that scales
+with M (this one and the stale-window gates below) runs at the supported maximum, so acceptance
+covers the worst supported deployment, not the typical one. Each trigger execution is one overflow
+probe plus one UPDATE over that M-row table, so the expected result is page-cache-bound; the gate
+exists to prove it rather than assume it.
 
 Advancing all initialized models rather than only the models that hold a vector for the mutated
-note is a deliberate simplification, because a SQL trigger cannot cheaply compute per-note model
-membership and cannot query `vec0` virtual tables at all. The amplification is real: one liveness
-change can stale every initialized model at once, forcing each queried model onto exact search
-until its own rebuild completes. Two bounds keep that trade governed. First, rebuild scheduling
-MUST cap concurrent memory-ANN model rebuilds at two unless a deployment explicitly raises it;
-remaining models queue on the existing single-flight machinery, so an invalidation burst cannot
+note is a deliberate simplification, because a SQL trigger cannot compute per-note model
+membership: trigger bodies reference tables by fixed name at trigger-creation time, and the
+`vec_{model_key}` tables it would need are created dynamically per model, so no note-side trigger
+can enumerate them (independently, they are `vec0` virtual tables). The amplification is real: one
+liveness change can stale every initialized model at once, forcing each queried model onto exact
+search until its own rebuild completes. Two bounds keep that trade governed. First, rebuild
+scheduling MUST cap concurrent memory-ANN model rebuilds at two unless a deployment explicitly
+raises it. The cap is owned by one process-wide rebuild scheduler in the memory pack's ANN
+module — a single shared limiter that every rebuild spawn path MUST acquire, wrapping the existing
+per-model single-flight guards; the permit count defaults to two and is configurable through the
+memory pack's configuration surface, and no spawn path may bypass the limiter or carry a private
+cap. Remaining models queue on the single-flight machinery, so an invalidation burst cannot
 become an unbounded CPU and I/O storm. Second, the stale-window section below attaches numeric
 acceptance bounds to exact-search fallback latency and rebuild duration, so the degraded mode is
 measured and gated rather than merely described. A retired model that no recall queries incurs
@@ -375,13 +390,16 @@ independent of this mechanism. The fence here restates that system boundary for 
 hazard the triggers introduce: because the all-model liveness triggers give any authorized
 note-mutator a corpus-wide invalidation primitive, such a deployment MUST NOT enable this cut as
 its recall path. No runtime topology probe could enforce the fence — khive has no tenant concept
-to detect — so enforcement sits where all khive authorization sits, the Gate (ADR-018): a
-deployment that exposes note-mutation verbs to semi-trusted callers MUST bound mutation rates in
-Gate policy, the single seam every mutation path already crosses. A future amendment MAY add
-model-membership-targeted note-liveness invalidation that computes the affected models in the Rust
-delete path and advances only those, which removes the cross-model over-invalidation and, adopted
-together with Gate-level rate bounding, is the migration path if khive later serves untrusted
-co-tenants from one database.
+to detect — and this ADR makes no claim that rate limiting rescues the unsupported topology.
+Today's Gate contract (ADR-018) treats rate obligations as declarative, not runtime-enforced, and
+this cut neither changes that nor needs to: co-tenant service is outside the supported topology
+regardless of rate limiting, so an enforced per-principal mutation limiter is not a requirement
+this ADR can or does satisfy. A future ADR that introduces a supported co-tenancy topology owns
+that limiter as part of the Gate contract, together with the model-membership-targeted
+note-liveness invalidation this section reserves as an amendment: computing the affected models in
+the Rust delete path and advancing only those removes the cross-model over-invalidation, and the
+two adopted together are the migration path if khive later serves untrusted co-tenants from one
+database.
 
 Current note persistence uses `INSERT OR REPLACE` at three independent sites: the canonical
 single-note upsert (`stores/note.rs:35-81`), the batch upsert (`stores/note.rs:377`), and note-merge
@@ -424,8 +442,11 @@ file-backed WAL benchmark with warm page cache at one and three models: added ge
 MUST be at most 1.0 ms absolute p95 and at most 5% of end-to-end warm `memory.recall` p95 — the
 permitted cost is the smaller of the two. At the currently measured baselines (PR #1083: 4.351 ms
 one-model and 9.032 ms three-model warm p95), the 5% bound is the binding constraint, roughly
-0.22 ms and 0.45 ms respectively; the absolute cap binds only if baselines grow past 20 ms. If the
-gate fails, optimize batching/reader reuse; do not debounce the correctness read.
+0.22 ms and 0.45 ms respectively; the absolute cap binds only if baselines grow past 20 ms. One
+implementation constraint is known in advance: acquiring a fresh SQLite connection, with its
+per-connection PRAGMA setup, for each generation read does not fit this budget — the
+implementation MUST serve the read from a persistent or pooled reader. If the gate fails,
+optimize batching/reader reuse further; do not debounce the correctness read.
 
 ### Build, snapshot load, and install
 
@@ -456,10 +477,19 @@ correct state under this contract (correct but slower), and it degrades no furth
 is the floor, not a cliff. The performance gate therefore extends beyond the warm read check: the
 benchmark suite MUST record exact-search fallback p50/p95 at the gate corpus scale under
 concurrent recalls during an in-flight rebuild, so operators can size corpora against the
-documented fallback latency. Recording is not sufficient: at the gate corpus scale, acceptance
-requires exact-search fallback p95 at most five times the same configuration's warm ANN recall
-p95, and single-model rebuild duration at most 60 seconds. These bounds hold at gate scale;
-production-scale rebuild cost is a rollout concern addressed in the upgrade section below. A
+documented fallback latency. The gate corpus scale is now defined, not implied: **10,000 live
+`note.content` vectors per initialized model**. Recording is not sufficient: at that scale,
+acceptance requires exact-search fallback p95 at most five times the same configuration's warm ANN
+recall p95, and single-model rebuild duration at most 60 seconds. The fallback benchmark MUST
+include the fan-out case — at least three queried models across at least three visible
+namespaces — because fail-closed fallback executes one exact search per visible namespace per
+queried model, so a single-namespace run alone cannot certify the supported shape; and it MUST run
+at the supported-maximum model cardinality defined above. The fallback query itself MUST apply the
+same input predicate as ANN graph construction — `kind='note'`, `field='note.content'`, the
+queried model, joined live note — so route choice never changes result membership: a note vector
+under any other field is excluded on both routes, and the regression suite proves it with such a
+vector seeded. These bounds hold at gate scale; production-scale rebuild cost is a rollout concern
+addressed in the upgrade section below. A
 benchmarked fallback is the availability trade this ADR makes explicit; an unmeasured one would
 be a regression channel. Rebuild scheduling MAY debounce or
 batch retriggering under sustained invalidation; the durable generation read on the recall path
@@ -514,6 +544,19 @@ vector recall for every model at once.
    admin warm/reindex path against the upgraded binary so rebuilds complete before the deployment
    serves recalls. The release upgrade note MUST document this expectation and the rebuild cost
    drivers (corpus size, model count).
+5. Mixed-version writers are a correctness hazard, not an operational nuisance. A pre-V11 process
+   that stays attached after migration commits vector writes with neither the chokepoint orphan
+   check nor coupled generation DML, and no mechanical fence can exist on the vector tables (the
+   same trigger limitation established above). The note-liveness triggers do fire for legacy
+   writers, so their note mutations are covered; their vector writes are not. The rollout
+   therefore REQUIRES quiescing: every khive process attached to the database MUST be stopped
+   before the V11 migration runs, and only V11 binaries may attach afterward. The regression
+   suite MUST include a mixed-version test — a simulated legacy vector write after migration —
+   asserting the generation stays unchanged while the graph input differs, which documents the
+   exact boundary the quiesce requirement protects. A stronger mechanical fence (versioned
+   vector-table names that render legacy writes inert) was considered and rejected for this cut
+   as migration-cost-heavy; it is the escalation path if mixed-version attachment ever needs
+   real support.
 
 ## Fail-closed semantics
 
@@ -608,15 +651,30 @@ can make a stale ANN appear correct. Tests MUST assert generations, ANN-route co
     rebuild duration. Assert every stale-window recall used exact search (zero stale-ANN
     searches), that rebuild completion restores the ANN route, and that both numbers sit within
     the stale-window acceptance bounds.
-13. **Bulk-liveness throughput**: soft-delete 10,000 live notes with three initialized model rows
-    in one transaction; assert exactly one durable commit, a strict all-model advance, and latency
-    within 1.5x the trigger-free baseline batch.
-14. **Direct-DML inventory**: a source-level test scans workspace source for statements that write
-    `vec_*` tables and compares the found sites against an explicit allowlist maintained in the
-    test, seeded from the implementation-review audit. A site missing from the allowlist fails the
-    suite; an allowlist entry is added only in the same change that gives that site its coupled
-    generation DML. Note-table DML needs no inventory: note liveness is covered mechanically by
-    the V11 triggers regardless of which code path writes the row.
+13. **Bulk-liveness throughput**: soft-delete 10,000 live notes with the supported-maximum eight
+    initialized model rows in one transaction, through the owning `NoteStore` batch operation;
+    assert exactly one durable commit, a strict all-model advance, and latency within 1.5x the
+    trigger-free baseline batch.
+14. **Direct-DML inventory**: `vec_{model_key}` name construction is confined by contract to the
+    vector-store module in `khive-db`, whose name-derivation helper MUST be private to it. The
+    source-level test enforces three mechanical rules across the workspace: (a) no SQL string
+    literal referencing a `vec_` table outside that module; (b) no call to or re-export of the
+    name-derivation helper outside that module; (c) inside the module, every construction site
+    that interpolates a table name into a write statement appears in the test's explicit
+    allowlist, seeded from the implementation-review audit. A site missing from the allowlist
+    fails the suite; an allowlist entry is added only in the same change that gives that site its
+    coupled generation DML. Dynamically constructed SQL (`DELETE FROM {table}`) is covered by (b)
+    and (c): the table string cannot be derived without the helper. Note-table DML needs no
+    inventory: note liveness is covered mechanically by the V11 triggers regardless of which code
+    path writes the row.
+15. **Mixed-version fence**: after V11 migration, simulate a legacy vector write (no chokepoint
+    check, no generation DML); assert the durable generation is unchanged while the graph input
+    differs. The test documents the boundary the rollout quiesce requirement protects.
+16. **Route parity**: seed a note vector whose `field` is not `note.content`; assert it is
+    excluded from both the ANN route and the exact fallback route, with identical result
+    membership across routes.
+17. **Cardinality bound**: initializing a ninth embedding model fails with the documented error;
+    the bulk-liveness and stale-window gates run at the supported maximum of eight.
 
 ## Alternatives considered
 
@@ -702,8 +760,11 @@ open on epoch read errors, contrary to #752's required next-recall/fail-closed s
 - vector-write orphan-rejection test through every helper path;
 - stale-window exact-search fallback benchmark with zero stale-ANN searches, within its bounds;
 - bulk-liveness trigger throughput benchmark within its bound;
-- direct `vec_*` DML inventory scan;
-- post-upgrade rollout window measurement.
+- direct `vec_*` DML inventory scan (helper-confinement rules);
+- post-upgrade rollout window measurement;
+- mixed-version legacy-writer fence test;
+- route-parity test for non-`note.content` note vectors;
+- model-cardinality bound validation at the supported maximum.
 
 ## Consequences
 
