@@ -2,15 +2,18 @@
 
 **Status**: Accepted (amended 2026-07-02 -- inbound authentication hardening; amended 2026-07-03
 -- Exchange Online no-authserv-id boundary; amended 2026-07-05 -- Telegram adapter
-implementation and two-way chat; amended 2026-07-09 -- durable IMAP UID cursor; see
+implementation and two-way chat; amended 2026-07-09 -- durable IMAP UID cursor; amended
+2026-07-17 -- iMessage channel over an SSH bridge; see
 [§Amendment 2026-07-02](#amendment-2026-07-02----inbound-authentication-hardening),
 [§Amendment 2026-07-03](#amendment-2026-07-03----exchange-online-no-authserv-id-boundary),
 [§Amendment 2026-07-05](#amendment-2026-07-05----telegram-adapter-implementation-and-two-way-chat),
-[§Amendment 2026-07-09](#amendment-2026-07-09----durable-imap-uid-cursor))\
-**Date**: 2026-06-14 (amended 2026-07-02, 2026-07-03, 2026-07-05, 2026-07-09)\
+[§Amendment 2026-07-09](#amendment-2026-07-09----durable-imap-uid-cursor),
+[§Amendment 2026-07-17](#amendment-2026-07-17----imessage-channel-over-an-ssh-bridge))\
+**Date**: 2026-06-14 (amended 2026-07-02, 2026-07-03, 2026-07-05, 2026-07-09, 2026-07-17)\
 **Authors**: khive maintainers
 **Depends on**: ADR-017 (Pack Standard), ADR-018 (Authorization Gate), ADR-040 (Communication
-and Schedule Packs), ADR-053 (ActorStore / SessionStore -- extends ADR-018's actor model)\
+and Schedule Packs), ADR-053 (ActorStore / SessionStore -- extends ADR-018's actor model),
+ADR-108 (Git Write Surface -- hardened shell-out argv pattern reused by this amendment)\
 **Related issues**: #112 (khive-channel umbrella), #113 (Telegram adapter), #114 (email adapter),
 #448 (inbound header spoofing -- resolved by this amendment), #449 (IMAP UID progress -- resolved
 by the 2026-07-09 amendment)
@@ -451,6 +454,188 @@ Telegram's offset remains in-memory as originally documented.
   daemon poll loop's internal dispatch calls.
 - Telegram's in-memory offset watermark and its restart-durability rationale (Amendment
   2026-07-05) are unchanged by this amendment.
+
+## Amendment 2026-07-17 -- iMessage channel over an SSH bridge
+
+### Motivation
+
+The maintainer wants a chat channel reachable through iMessage, alongside the existing email and
+Telegram adapters. Unlike those two, no directly reachable protocol endpoint exists: sending and
+reading iMessage requires the Messages application on a macOS host signed into the destination
+Apple ID. The daemon host is not, in general, that host. This amendment specifies a
+`khive-channel-imessage` adapter that bridges to a remote macOS host over SSH and implements the
+same `Channel` trait (§2) the email and Telegram adapters implement, so `comm.send`,
+`comm.inbox`, `comm.reply`, and `comm.thread` are unchanged for agents.
+
+### The `khive-channel-imessage` crate
+
+A new sibling crate `crates/khive-channel-imessage`, at the same platform layer as
+`khive-channel-telegram` and `khive-channel-email`:
+
+- `kind()` -> `"imessage"`.
+- Registered in the `ChannelRegistry` keyed by `(kind, slug)` (#606), coexisting with any other
+  configured adapter, matching the Telegram and email precedent.
+- Spawned only under the daemon role, via a `channel-imessage`-feature-gated
+  `spawn_imessage_channel_loops` mirroring `spawn_email_channel_loops` and
+  `spawn_telegram_channel_loops`: one inbound poll task and one outbound task per adapter
+  instance, not the abstract `ChannelRegistry::poll_all` sweep §6 describes in the original
+  decision text. This is not a departure from that text -- the 2026-07-05 Telegram amendment
+  already established the per-adapter `spawn_*_channel_loops` task pair as the shipped mechanism
+  and marked §6's `poll_all`-sweep description superseded in the same way it un-staled §5c/§5d;
+  this amendment simply applies that same shipped mechanism to iMessage.
+- When configuration is absent, `ImessageChannelConfig::from_env()` returns `ChannelError::Config`
+  and the server logs a warning and skips the adapter without crashing, matching Telegram and
+  email `from_env()` behavior (§14, §Amendment 2026-07-05).
+
+### Transport: SSH to a bridge host
+
+The daemon reaches the bridge host by shelling `ssh` to a configured target
+(`KHIVE_IMESSAGE_SSH_TARGET`, `user@host`) on the local network. The bridge host needs no
+resident service beyond macOS's built-in `sshd`. Credentials are an SSH keypair resolved by the
+SSH client's own configuration (`~/.ssh/config`, agent, or known keys) and are never stored in
+any khive store, consistent with §9 ("no secrets in the store"). An unreachable bridge host is a
+transport failure local to this one channel: it degrades to a channel-down warning and does not
+affect any other configured channel or fault the daemon.
+
+### Outbound: `osascript` via hardened argv, no text interpolation
+
+On the bridge host, delivery drives the Messages application via `osascript`. Message text is
+never interpolated into a shell string or an AppleScript source string: the text travels over
+stdin (or a temp file consumed by a fixed, pre-written script), and the `ssh`/`osascript`
+invocation argv is constructed from an allowlisted fixed form -- the daemon never assembles a
+shell command by string concatenation with caller-supplied content. This is the same
+argv-only-construction pattern ADR-108 Fork (b) B2 establishes for `git.commit`/`git.branch`/
+`git.push`: a fixed argument vector via `std::process::Command::new(...).args([...])`, no shell
+interpolation, and no caller-supplied value reaching the process boundary unvalidated. ADR-108's
+Amendment 1 requirement for a dedicated adversarial security review at implementation time
+applies equally to this shell-out surface.
+
+### Inbound: read-only polling of the bridge host's Messages database
+
+Inbound messages are read by polling the bridge host's `~/Library/Messages/chat.db` (Apple's own
+SQLite store for the Messages application) over the same SSH transport, at a configurable
+interval (`KHIVE_IMESSAGE_POLL_SECS`, default 5 seconds, mirroring §12's default inter-poll
+interval). The database is always opened with read-only semantics; the adapter never writes to
+`chat.db`. Delivery into `comm.ingest` is attributed as `imessage:<slug>` inbound, following the
+channel-prefixed `from` form OQ-1 established (§14; also used by the Telegram amendment's
+`from = "telegram:<maintainer-slug>"`).
+
+### Restart durability and the GUID dedup invariant
+
+The poll offset (the last-seen row position in `chat.db`) is held in memory in the iMessage poll
+task, exactly as the Telegram amendment's in-memory `offset` watermark (§Amendment 2026-07-05,
+"Poll offset and restart durability"). This is safe against a restart producing a double-ingest
+only because inbound ingest deduplicates by the Messages database's stable per-message `GUID`
+column through the same durable `idx_comm_message_external_id` mechanism (§11) every other
+adapter uses: the invariant that makes the in-memory offset safe is that a `chat.db` row's GUID
+is a stable, durable dedup key across restarts, so any row re-read after a crash is rejected at
+the storage layer rather than re-ingested.
+
+**Flagged, not resolved.** GUID dedup closes the _double-ingest_ failure mode the same way
+Telegram's `external_id` uniqueness does. It does not, by itself, close the _missed-ingest_
+failure mode Amendment 2026-07-09 fixed for email: issue #449 was not about re-ingesting a
+message twice, it was about a bounded-page, unordered-relative-to-a-time-window query
+permanently skipping rows above the page limit once the time window advanced past them, with no
+persisted high-water mark to resume from. A `chat.db` poll implemented as "rows since timestamp
+T, page size N" has the same shape as the IMAP `SINCE`-plus-page-limit query #449 fixed, and GUID
+dedup does not protect against it -- dedup only prevents an already-fetched row from being
+written twice, it cannot recover a row polling never fetched in the first place. Whether this
+risk is live depends on the concrete `chat.db` query the implementation uses (a monotonic
+`ROWID`- or `date`-ordered walk with an explicit `> high_water` filter, unbounded per poll or
+paginated with continuation, does not have this failure mode; a windowed `SELECT ... WHERE date >
+T LIMIT N` does). This amendment's settled scope is the Telegram-style in-memory-offset model
+for v1 (non-goal #9 below); the query shape needed to make that safe against the #449 failure
+class is an implementation detail this amendment does not pin down and flags for the
+implementation PR and its review to verify explicitly, not an ADR-level decision resolved here.
+
+### Outbound addressing
+
+**Flagged, not resolved.** The settled design states the address form as `imessage:<handle>`
+(handle = phone number or Apple ID email) in one place and "maintainer-slug model identical to
+the Telegram amendment" in another. Those two are not the same shape: the Telegram amendment's
+routable address is `telegram:<slug>` (§Amendment 2026-07-05, "Outbound addressing"), where
+`<slug>` is a stable local name that resolves via config to the transport identifier
+(`KHIVE_TELEGRAM_MAINTAINER_CHAT_ID`); the raw chat id never appears in an envelope's `from`/`to`.
+The handle (a phone number or email address) is comparably sensitive transport-identifying
+material. This amendment resolves the inconsistency by following the Telegram precedent
+literally: the routable address is `imessage:<slug>` (default slug `maintainer`,
+`KHIVE_IMESSAGE_MAINTAINER_SLUG`), which resolves to `KHIVE_IMESSAGE_MAINTAINER_HANDLE`; the raw
+handle is config-only and never appears in a `ChannelEnvelope`, a note property, or any content
+verb. `imessage:<handle>` is not a supported address form in v1. This should be confirmed at
+sign-off rather than assumed, since the settled-design text as given supports both readings.
+
+v1 is single-maintainer, matching Telegram and email: an outbound note addressed to any
+`imessage:` slug other than the configured maintainer slug is unroutable and is logged and
+dropped, never sent to the maintainer chat by default.
+
+### Configuration (env-only, canonical config home `~/.khive/.env`)
+
+| Variable                           | Required | Default      | Description                                                                                                           |
+| ---------------------------------- | -------- | ------------ | --------------------------------------------------------------------------------------------------------------------- |
+| `KHIVE_IMESSAGE_SSH_TARGET`        | yes      | --           | SSH target for the bridge host (`user@host`). Credentials resolve via the SSH client, not this config.                |
+| `KHIVE_IMESSAGE_MAINTAINER_HANDLE` | yes      | --           | The maintainer's iMessage handle (phone number or Apple ID email). Config-only; never appears in an envelope or note. |
+| `KHIVE_IMESSAGE_MAINTAINER_SLUG`   | no       | `maintainer` | The slug in `imessage:<slug>` that maps to the maintainer handle.                                                     |
+| `KHIVE_IMESSAGE_POLL_SECS`         | no       | `5`          | Inbound poll interval against the bridge host's `chat.db`.                                                            |
+| `KHIVE_IMESSAGE_INGEST_NAMESPACE`  | no       | `local`      | Target namespace for ingested inbound messages (passed as `namespace` to `comm.ingest`).                              |
+
+No secret material beyond what the SSH client already manages is configured here, and nothing
+above is written to any khive store, matching §9.
+
+### Host requirements (informative)
+
+The bridge host must be signed into the Messages application under the Apple ID that carries the
+destination handle. The SSH-invoked processes need two one-time macOS permission grants on the
+bridge host: Full Disk Access (for the `chat.db` reads) and Automation permission for the
+Messages application (for the `osascript` sends). Both are host-local, one-time grants made by
+whoever administers that Mac; this amendment names the requirement without prescribing the exact
+System Settings click path, which drifts across macOS releases.
+
+### Feature gating
+
+`khive-mcp/Cargo.toml` gains `channel-imessage = ["khive-channel", "khive-channel-imessage"]`
+with `khive-channel-imessage` an optional dependency, mirroring `channel-email` and
+`channel-telegram`. Default build excludes it. `channel-email`, `channel-telegram`, and
+`channel-imessage` can all be enabled together; the `ChannelRegistry` keys by `(kind, slug)`, so
+all three adapters coexist.
+
+### Out of scope (v1)
+
+- Group chats.
+- Attachments and rich content (text only).
+- Multiple maintainer handles / a general `imessage:<slug>` address book beyond the single
+  maintainer slug.
+- Writing to `chat.db` in any form. This is a permanent prohibition, not a v1 deferral: the
+  adapter never writes to Apple's own database, in any future version.
+- A durable, persisted poll cursor. The in-memory offset plus GUID dedup is the v1 durability
+  model (§Restart durability above), matching Telegram, not the persisted `(UIDVALIDITY,
+  high_water)` checkpoint the email adapter now uses (§Amendment 2026-07-09).
+
+### Acceptance properties (testable, transport mocked)
+
+1. The outbound argv passed to the SSH/`osascript` invocation contains no message text --
+   message text reaches the bridge host only via stdin or a temp file, never as an argv element
+   or an interpolated shell/AppleScript string (the injection fence).
+2. Simulating a restart mid-poll and re-delivering an already-seen `chat.db` row does not produce
+   a duplicate inbound note; dedup is by GUID through `idx_comm_message_external_id`.
+3. An unreachable bridge host degrades that one channel to a channel-down warning; other
+   configured channels are unaffected and the daemon does not fault.
+4. Every `chat.db` open the adapter performs is asserted read-only by the test double (no write
+   flags requested).
+
+### Consequences
+
+- `comm.inbox`/`read`/`reply`/`thread` unchanged for agents; a new channel-prefixed address
+  space (`imessage:<slug>`) reuses `comm.ingest`, the dispatch gate, the dedup index, and the
+  envelope exactly as email and Telegram do.
+- A new `khive-channel-imessage` crate at the platform layer; a `channel-imessage`-gated
+  `spawn_imessage_channel_loops` in `khive-mcp`, following the per-adapter loop pair pattern the
+  Telegram amendment established as normative.
+- No credentials in any note, entity, or KG store; the SSH keypair and the maintainer handle are
+  env/SSH-client configuration only.
+- Two open items are flagged above for resolution at design sign-off, not resolved by this
+  amendment text alone: the `imessage:<handle>` vs. `imessage:<slug>` address-form
+  inconsistency in the settled design, and whether the concrete `chat.db` poll query shape avoids
+  the bounded-page/missed-ingest failure class Amendment 2026-07-09 fixed for email.
 
 ## Context
 
@@ -998,3 +1183,6 @@ attributed. See [§Amendment 2026-07-02](#amendment-2026-07-02----inbound-authen
   2026-07-02 amendment: attribution requires the two-part authentication gate, and quarantined
   mail is written without a trusted actor identity.
 - ADR-028: Pack-Scoped Backends -- offset/cursor persistence pattern for channel adapters.
+- ADR-108: Git Write Surface -- the hardened, allowlisted argv-construction pattern for shelling
+  out to an external process, reused by the 2026-07-17 amendment's `ssh`/`osascript` outbound
+  path.
