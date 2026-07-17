@@ -39,7 +39,11 @@ else
     echo "=== PREFLIGHT (metadata + tarball file list + workspace check; pass --live to publish for real) ==="
 fi
 
-cd "$(dirname "$0")/../crates"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=lib/publish_guard.sh
+source "$SCRIPT_DIR/lib/publish_guard.sh"
+
+cd "$SCRIPT_DIR/../crates"
 
 # Dependency order: each crate only depends on crates above it.
 CRATES=(
@@ -86,6 +90,21 @@ CRATES=(
 )
 
 DELAY=10  # seconds to wait for crates.io index between publishes
+
+# Preflight guard (#1069): fail loud if any publishable workspace member is
+# missing from CRATES. Closes the gap #1068 hit — khive-channel-telegram was
+# added to the workspace but never wired into the publish ladder, invisible
+# until `make publish-dry` failed at the SemVer gate. Runs in preflight and
+# live alike, before any real publish work.
+echo ""
+echo "--- Publish ladder guard (CRATES membership vs cargo metadata) ---"
+METADATA_JSON=$(mktemp)
+trap 'rm -f "$METADATA_JSON"' EXIT
+cargo metadata --no-deps --format-version=1 >"$METADATA_JSON"
+if ! check_crates_ladder "$METADATA_JSON" "${CRATES[@]}"; then
+    exit 1
+fi
+echo "    CRATES ladder OK (${#CRATES[@]} publishable workspace members all present)"
 
 # SemVer gate (ADR-066 §3 release-gate component, relocated from per-PR #216).
 # cargo-semver-checks compares each publishable crate's public API against its
