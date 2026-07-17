@@ -12,11 +12,8 @@ use uuid::Uuid;
 
 /// A [`FormatAdapter`] that parses a JSON array of objects.
 ///
-/// Entities and edges may be mixed in the same array — the adapter dispatches
-/// by checking for `source` + `target` keys (edge) vs. their absence (entity).
-///
-/// Construct with [`JsonFormatAdapter::new`], passing the raw JSON bytes.
-/// The constructor parses eagerly; iteration is cheap once constructed.
+/// Parsing is eager; objects with source and target keys become edges. See
+/// `crates/khive-vcs-adapters/docs/api/json-array-adapter.md`.
 pub struct JsonFormatAdapter {
     entities: Vec<Result<EntityRecord, AdapterError>>,
     edges: Vec<Result<EdgeRecord, AdapterError>>,
@@ -24,26 +21,19 @@ pub struct JsonFormatAdapter {
 }
 
 impl JsonFormatAdapter {
-    /// Parse `json_input` and return a ready adapter.
+    /// Parse a JSON array using only base entity kinds and aliases.
     ///
-    /// Returns `Err(AdapterError::Parse)` if `json_input` is not valid JSON or
-    /// is not a JSON array at the top level. Entity `kind` is validated only
-    /// against the base ADR-001 kind set (plus aliases): pack-registered
-    /// granular kinds (e.g. `resource`, ADR-048) are rejected here. Use
-    /// [`Self::new_with_valid_kinds`] to accept a wider, caller-supplied set.
+    /// Returns [`AdapterError::Parse`] for invalid JSON or a non-array top level. Pack-defined
+    /// kinds require [`Self::new_with_valid_kinds`]. See
+    /// `crates/khive-vcs-adapters/docs/api/json-array-adapter.md`.
     pub fn new(json_input: &str) -> Result<Self, AdapterError> {
         Self::new_with_valid_kinds(json_input, &[])
     }
 
-    /// Like [`Self::new`], but entity `kind` values not recognized by the
-    /// base ADR-001 enum are additionally accepted when they exact-match
-    /// (case-insensitive) an entry in `extra_valid_kinds`.
+    /// Parse a JSON array, also accepting case-insensitive `extra_valid_kinds` matches.
     ///
-    /// Callers that have a merged pack/runtime kind registry (e.g.
-    /// `KhiveRuntime::install_kind_registry`'s installed entity kinds) should
-    /// pass it here so pack-registered granular kinds like `resource` are not
-    /// rejected before the runtime even sees them (issue #530, the JSON/NDJSON
-    /// counterpart to the archive-format fix in #529 / issue #438).
+    /// Returns the same parse and record errors as [`Self::new`]. See
+    /// `crates/khive-vcs-adapters/docs/api/json-array-adapter.md`.
     pub fn new_with_valid_kinds(
         json_input: &str,
         extra_valid_kinds: &[String],
@@ -119,10 +109,6 @@ impl FormatAdapter for JsonFormatAdapter {
         &self.warnings
     }
 }
-
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
 
 /// Remove a key from the map case-insensitively.
 ///

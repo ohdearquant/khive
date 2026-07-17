@@ -1,7 +1,5 @@
 use thiserror::Error;
 
-// ---------- Validation error ----------
-
 /// Validation error for gate wire types.
 ///
 /// Returned by `try_new` constructors and custom `Deserialize` impls when
@@ -23,8 +21,6 @@ pub enum GateValidationError {
     #[error("rate limit max must be > 0")]
     ZeroRateLimitMax,
 }
-
-// ---------- Error ----------
 
 /// Errors returned by [`crate::Gate::check`].
 #[derive(Error, Debug)]

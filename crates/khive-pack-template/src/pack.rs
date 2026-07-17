@@ -1,6 +1,4 @@
-//! Pack registration, handler table, and PackRuntime dispatch for the template pack.
-//!
-//! Non-kg packs must prefix all verb names with the pack name: `<pack>.<verb>`.
+//! Handler table, inventory registration, and runtime dispatch for the template pack.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -11,10 +9,9 @@ use khive_types::{HandlerDef, ParamDef, Visibility};
 
 use crate::{handlers, TemplatePack, PACK_NAME};
 
-/// Handler table. Add one `HandlerDef` per verb.
+/// Example public handler table; one definition is required per dispatchable verb.
 ///
-/// `Visibility::Verb`       = exposed on the MCP `request` tool (agent-facing).
-/// `Visibility::Subhandler` = CLI-only / internal; not on the MCP wire.
+/// See `crates/khive-pack-template/docs/api/pack-scaffold.md`.
 pub(crate) static TEMPLATE_HANDLERS: [HandlerDef; 1] = [HandlerDef {
     name: "template.my_verb",
     description: "Example pack-prefixed verb. Non-kg packs must use pack.verb naming.",
@@ -27,11 +24,6 @@ pub(crate) static TEMPLATE_HANDLERS: [HandlerDef; 1] = [HandlerDef {
         description: "Non-empty string field to echo in the template response.",
     }],
 }];
-
-// ── Inventory self-registration ───────────────────────────────────────────────
-//
-// Registers the pack factory so the linker includes it in the binary's
-// inventory at startup. One `inventory::submit!` per pack crate.
 
 struct TemplatePackFactory;
 
@@ -48,8 +40,6 @@ impl khive_runtime::PackFactory for TemplatePackFactory {
 }
 
 inventory::submit! { khive_runtime::PackRegistration(&TemplatePackFactory) }
-
-// ── PackRuntime impl ──────────────────────────────────────────────────────────
 
 #[async_trait]
 impl PackRuntime for TemplatePack {
@@ -69,7 +59,7 @@ impl PackRuntime for TemplatePack {
         <TemplatePack as khive_types::Pack>::REQUIRES
     }
 
-    /// Dispatch a verb call. Add a match arm for each entry in `TEMPLATE_HANDLERS`.
+    /// Dispatch a declared verb or return invalid-input for an unknown name.
     async fn dispatch(
         &self,
         verb: &str,

@@ -1,10 +1,5 @@
-//! Strict, `deny_unknown_fields` wire-shape mirrors of the three
-//! `khive_types` record shapes a preimage can embed. `Entity`, `Note`, and
-//! `Link`'s own `Deserialize` impls accept unknown fields, which would let a
-//! preimage with an extraneous or misspelled key round-trip silently — this
-//! module closes that gap without editing `khive-types` itself. Conversion
-//! back into the real types reuses each type's own validation
-//! (`Link::is_valid`, `Note::is_valid`) rather than duplicating range checks.
+//! Strict embedded-record wire mirrors that reject unknown preimage fields.
+//! Conversion reuses the domain types' live-record validation.
 
 use std::collections::BTreeMap;
 

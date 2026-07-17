@@ -25,7 +25,9 @@ impl TryFrom<RawBm25Config> for Bm25Config {
     }
 }
 
-/// BM25 configuration parameters. Defaults: k1=1.2, b=0.75.
+/// BM25 parameters with validated `k1 >= 0` and `b` in `[0, 1]`; defaults are 1.2 and 0.75.
+///
+/// See `crates/khive-bm25/docs/api/index-lifecycle.md`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(try_from = "RawBm25Config")]
 pub struct Bm25Config {

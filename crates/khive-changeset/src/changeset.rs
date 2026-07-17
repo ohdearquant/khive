@@ -3,25 +3,29 @@
 use crate::envelope::{Envelope, CURRENT_SCHEMA_VERSION};
 use crate::op::Op;
 
-/// A staged change-set: envelope metadata plus an ordered list of operations.
+/// Envelope metadata plus an ordered list of staged operations.
 ///
 /// Operation order is semantically load-bearing (a `link` may target an
-/// earlier `create`'s stage-time id) and is preserved exactly through
-/// [`to_ndjson`] / [`from_ndjson`].
+/// earlier `create` ID) and is preserved exactly by the NDJSON codec.
+/// See `crates/khive-changeset/docs/api/ndjson-codec.md` for the wire contract.
 #[derive(Clone, Debug)]
 pub struct ChangeSet {
+    /// Change-set-wide stage-time provenance.
     pub envelope: Envelope,
+    /// Operations in semantic application order.
     pub ops: Vec<Op>,
 }
 
 impl ChangeSet {
+    /// Stores `envelope` and `ops` without reordering or validation.
     pub fn new(envelope: Envelope, ops: Vec<Op>) -> Self {
         Self { envelope, ops }
     }
 }
 
-/// Errors from NDJSON-delta encode/decode. No variant touches the filesystem
-/// or performs any I/O — every value here is constructed from in-memory input.
+/// In-memory NDJSON encode/decode errors; no variant represents I/O.
+///
+/// See `crates/khive-changeset/docs/api/ndjson-codec.md` for variant semantics.
 #[derive(Debug, thiserror::Error)]
 pub enum ChangeSetError {
     #[error("NDJSON-delta input is empty; expected an envelope header line")]
@@ -41,9 +45,13 @@ pub enum ChangeSetError {
     Serialize(#[source] serde_json::Error),
 }
 
-/// Encode a [`ChangeSet`] as NDJSON-delta: the envelope as line 1, then one
-/// line per op in stage order. No filesystem access — returns an in-memory
-/// `String`; the caller decides what to do with it.
+/// Encodes the envelope as line one and each op on a following line, in order.
+///
+/// The returned in-memory string ends every line, including the last, with `\n`.
+///
+/// # Errors
+///
+/// Returns [`ChangeSetError::Serialize`] if any envelope or op cannot serialize.
 pub fn to_ndjson(changeset: &ChangeSet) -> Result<String, ChangeSetError> {
     let mut out = String::new();
     out.push_str(&serde_json::to_string(&changeset.envelope).map_err(ChangeSetError::Serialize)?);
@@ -55,12 +63,16 @@ pub fn to_ndjson(changeset: &ChangeSet) -> Result<String, ChangeSetError> {
     Ok(out)
 }
 
-/// Decode NDJSON-delta text into a [`ChangeSet`]. Line 1 must parse as the
-/// envelope; every subsequent non-empty line must parse as one [`Op`], in
-/// stage order. Rejects an envelope whose `schema_version` this crate does
-/// not recognize, and rejects any line carrying an unknown field (fail-loud,
-/// matching the `deny_unknown_fields` posture the rest of the codebase uses
-/// for configuration surfaces).
+/// Decodes an envelope header and every following line as one ordered [`Op`].
+///
+/// Blank lines and unknown fields are errors; schema version must equal
+/// [`CURRENT_SCHEMA_VERSION`].
+///
+/// # Errors
+///
+/// Returns [`ChangeSetError::Empty`], [`ChangeSetError::MalformedLine`], or
+/// [`ChangeSetError::UnsupportedSchemaVersion`] according to the failed stage.
+/// See `crates/khive-changeset/docs/api/ndjson-codec.md` for line semantics.
 pub fn from_ndjson(input: &str) -> Result<ChangeSet, ChangeSetError> {
     let mut lines = input.lines().enumerate();
     let (_, first_line) = lines.next().ok_or(ChangeSetError::Empty)?;
@@ -73,10 +85,7 @@ pub fn from_ndjson(input: &str) -> Result<ChangeSet, ChangeSetError> {
         });
     }
 
-    // A blank line (including a genuinely empty one) is not skipped: it is
-    // fed to the same Op parser as every other line and rejected with the
-    // same MalformedLine shape, keeping "every line must be a valid op"
-    // exception-free rather than special-casing whitespace.
+    // Parse blank lines too, preserving “every post-header line is an op.”
     let mut ops = Vec::new();
     for (idx, line) in lines {
         let op: Op =

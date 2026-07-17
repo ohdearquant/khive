@@ -39,9 +39,9 @@ graph-based retrieval engine (ADR-048).
 
 **Related docs:**
 
-- [algorithm.md](algorithm.md) -- build/search/prune algorithm details
+- [api/algorithm.md](api/algorithm.md) -- build/search/prune algorithm details
 - [benchmarks.md](benchmarks.md) -- benchmark ledger and ADR-048 pass criteria
-- [persistence.md](persistence.md) -- binary file format and snapshot contract
+- [api/persistence.md](api/persistence.md) -- binary file format and snapshot contract
 - [testing.md](testing.md) -- test organization and adversarial invariants
 
 ---
@@ -105,11 +105,20 @@ Key design decisions and constraints:
 
 ---
 
+## Lifecycle fields
+
+`VamanaIndex`'s PR2 lifecycle fields (ADR-052 §2): `tombstones` is a `Vec<u64>`
+bit-packed bitvec with manual manipulation rather than a `bitvec` crate dependency
+(OQ3 resolution). `consolidation_tau` lives on `VamanaIndex`, not `VamanaConfig`,
+because it is operational policy (when to compact), not graph topology (OQ5).
+
+---
+
 ## Consistency Notes
 
 - The `Vec<Vec<u32>>` adjacency layout is intentional for build-phase pruning
   flexibility. A CSR flat layout would improve memory locality and serialization
-  size; migration is tracked in `docs/persistence.md` for when N > 1M or
+  size; migration is tracked in `docs/api/persistence.md` for when N > 1M or
   mmap-graph streaming is needed.
 
 - The single `unsafe` block in `mmap_vectors` maps `vectors.bin` read-only. The

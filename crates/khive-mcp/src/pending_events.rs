@@ -67,7 +67,7 @@
 //! comparison.
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Duration, Months, Utc};
+use chrono::{DateTime, Duration, FixedOffset, Months, Utc};
 use serde_json::{json, Value};
 
 use crate::server::KhiveMcpServer;
@@ -215,35 +215,17 @@ pub async fn run_pending_events(
 /// One-shot drain against an already-constructed [`KhiveRuntime`] +
 /// [`KhiveMcpServer`] pair (ADR-106; PR #782).
 ///
-/// [`run_pending_events`] is the CLI-facing entry point (`kkernel exec
-/// --pending-events`); it now resolves both `rt` and `server` via
-/// `khive-mcp::serve::build_server_with_explicit_namespace`, the same multi-backend-aware
-/// construction the daemon boot path uses, one fresh pair per invocation —
-/// correct for a short-lived cron-invoked process.
-///
-/// The daemon-resident tick ([`schedule_tick_loop`]) must NOT build its own
-/// pair: the daemon boot path (`khive-mcp::serve::build_server` /
-/// `build_registry_for_multi_backend`) already resolves `--config`,
-/// `[[backends]]`, actor identity, and `--pack` selection once at startup.
-/// This function therefore takes both by reference — the caller supplies the
-/// already-resolved, already-validated pair so its storage target, actor
-/// identity, and pack set are always identical to the server it is ticking
-/// for (or, for the one-shot path, to what `build_server` just resolved).
-///
-/// `rt` and `server` serve two different roles that must NOT be collapsed
-/// into one (an earlier version incorrectly collapsed them): `rt` is the
-/// **schedule pack's own runtime**. The scan/claim/finalize SQL below reads
-/// and CAS-writes `scheduled_event` notes
-/// directly through it, so it must point at whichever backend the `schedule`
-/// pack is wired to. `server` is the **daemon's live, fully-wired
-/// `KhiveMcpServer`** — every pack registered against its own backend per
-/// `[[backends]]`/`[packs.*].backend` — used only for `dispatch_action`
-/// (replaying a stored action's DSL). Building a second `KhiveMcpServer` from
-/// `rt` alone (`KhiveMcpServer::new(rt.clone())`) would register EVERY pack
-/// against the schedule backend, so a replayed `comm.send` (or any other
-/// pack's action) would silently dispatch into the schedule backend instead
-/// of that pack's configured one in a multi-backend deployment — passing the
-/// real `server` in is what keeps replay routing identical to a live request.
+/// The caller supplies an already-resolved, already-validated pair — both by
+/// reference — so the drain's storage target, actor identity, and pack set
+/// are always identical to the server it is ticking for. `rt` and `server`
+/// serve two different roles that must NOT be collapsed into one: `rt` is
+/// the **schedule pack's own runtime** (the scan/claim/finalize SQL below
+/// reads and CAS-writes `scheduled_event` notes directly through it) while
+/// `server` is the **daemon's live, fully-wired `KhiveMcpServer`**, used
+/// only for `dispatch_action` (replaying a stored action's DSL) — building a
+/// second server from `rt` alone would misroute replayed actions in a
+/// multi-backend deployment. See
+/// `crates/khive-mcp/docs/api/pending-events.md` for the full rationale.
 pub async fn run_pending_events_on(
     rt: &KhiveRuntime,
     server: &KhiveMcpServer,
@@ -493,8 +475,24 @@ pub async fn run_pending_events_on(
                     .and_then(|p| p.get("trigger_at"))
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                let trigger_at = match trigger_at_str.parse::<DateTime<Utc>>() {
-                    Ok(ts) => ts,
+                // Parsed as `DateTime<FixedOffset>` (not straight to
+                // `DateTime<Utc>`) so the caller's original UTC offset is
+                // retained alongside the UTC instant — `khive-pack-schedule`
+                // round-trips the caller's original `trigger_at` string
+                // verbatim, offset included (H5), and that offset must
+                // survive repeat advancement (issue #792): rendering the
+                // advanced `trigger_at` via a bare `DateTime<Utc>::to_rfc3339`
+                // always stamps `+00:00`, silently rewriting a non-UTC
+                // schedule to UTC on its first advance.
+                //
+                // Uses the same relaxed grammar as the write boundary
+                // (`khive-pack-schedule`'s `at.parse::<DateTime<Utc>>()`),
+                // not the strict `DateTime::parse_from_rfc3339`: already
+                // persisted `trigger_at` strings can use the relaxed RFC
+                // 3339 form (space instead of `T`, offset without a colon),
+                // and the strict parser would silently skip them forever.
+                let trigger_at_fixed = match trigger_at_str.parse::<DateTime<FixedOffset>>() {
+                    Ok(dt) => dt,
                     Err(_) => {
                         if verbose {
                             eprintln!(
@@ -505,6 +503,8 @@ pub async fn run_pending_events_on(
                         continue;
                     }
                 };
+                let trigger_at = trigger_at_fixed.with_timezone(&Utc);
+                let trigger_offset = *trigger_at_fixed.offset();
 
                 if trigger_at > now {
                     summary.skipped_not_due += 1;
@@ -621,8 +621,10 @@ pub async fn run_pending_events_on(
                     match advance_repeat_past_missed(&repeat, trigger_at, now) {
                         Some(next_at) => {
                             // Repeating event: skip this occurrence, re-arm
-                            // pending at the next future one.
-                            props["trigger_at"] = json!(next_at.to_rfc3339());
+                            // pending at the next future one. Rendered at the
+                            // original offset (issue #792), not UTC.
+                            props["trigger_at"] =
+                                json!(next_at.with_timezone(&trigger_offset).to_rfc3339());
                             props["status"] = json!("pending");
                         }
                         None => {
@@ -718,7 +720,12 @@ pub async fn run_pending_events_on(
                 match next_trigger_at(&repeat, trigger_at) {
                     Some(next_at) => {
                         // Repeating event: advance to next occurrence.
-                        props["trigger_at"] = json!(next_at.to_rfc3339());
+                        // Rendered at the original offset (issue #792), not
+                        // UTC — `next_trigger_at` computes the advanced
+                        // instant in UTC, but the caller's original
+                        // `trigger_at` offset must survive serialization.
+                        props["trigger_at"] =
+                            json!(next_at.with_timezone(&trigger_offset).to_rfc3339());
                         props["status"] = json!("pending");
                         props["fired_at"] = json!(fired_at_rfc);
                         properties = Some(props);
@@ -795,23 +802,10 @@ pub async fn run_pending_events_on(
 }
 
 /// CAS-claim a pending scheduled event for firing: `pending -> firing`.
-///
-/// Returns `Ok(Some(firing_at))` iff exactly one row transitioned, meaning
-/// this drain (and not a concurrent `schedule.cancel`) now owns the row.
-/// The returned `firing_at` (epoch µs) is this drain's **claim token** —
-/// callers MUST thread it through to `finalize_fired_event` so finalization
-/// binds to the specific claim that won, not merely to `status='firing'`
-/// (issue #462: a stale claimant that resumes after a reclaim +
-/// re-claim must not be able to finalize over the new claimant's row).
-/// Mirrors the `schedule.cancel` CAS in `khive-pack-schedule/src/handlers.rs`
-/// so the two writers share one state machine: cancel only matches
-/// `status='pending'`, so once a row is claimed to `firing` a racing cancel
-/// fails cleanly instead of clobbering (or being clobbered by) this drain's
-/// eventual write.
-///
-/// Also stamps `properties.firing_at` (epoch µs, same instant as
-/// `updated_at`) so a later drain pass can detect and reclaim this row if
-/// this process crashes before `finalize_fired_event` runs (issue #462).
+/// Returns `Ok(Some(firing_at))` iff exactly one row transitioned; the
+/// returned `firing_at` is this drain's claim token, threaded through to
+/// `finalize_fired_event` (issue #462). See
+/// `crates/khive-mcp/docs/api/pending-events.md`.
 async fn claim_pending_event(
     rt: &KhiveRuntime,
     namespace: &str,
@@ -850,21 +844,9 @@ async fn claim_pending_event(
 }
 
 /// Reclaim `scheduled_event` rows stuck in `status="firing"` whose
-/// `firing_at` is older than `stale_before_micros` (epoch µs) back to
-/// `status="pending"` (issue #462).
-///
-/// Runs across all namespaces in one statement (a maintenance sweep, not a
-/// namespace-scoped read) — mirrors `discover_pending_namespaces`, which also
-/// queries `rt.sql()` directly rather than per-namespace tokens.
-///
-/// The `WHERE` clause matches only rows whose `firing_at` predates the
-/// threshold, so a claim made by a still-running drain (fresh `firing_at`)
-/// never matches and is never stolen. Rows claimed by a pre-#462 binary
-/// (missing `firing_at` entirely) are treated as maximally stale and
-/// reclaimed unconditionally, since there is no timestamp to compare against
-/// and leaving them wedged forever is strictly worse.
-///
-/// Returns the number of rows reclaimed.
+/// `firing_at` predates `stale_before_micros` (epoch µs) back to
+/// `status="pending"` (issue #462). Returns the number of rows reclaimed.
+/// See `crates/khive-mcp/docs/api/pending-events.md`.
 async fn reclaim_stale_firing_events(rt: &KhiveRuntime, stale_before_micros: i64) -> Result<u64> {
     let mut writer = rt
         .sql()
@@ -892,28 +874,12 @@ async fn reclaim_stale_firing_events(rt: &KhiveRuntime, stale_before_micros: i64
 }
 
 /// CAS-persist the post-dispatch state of a claimed event: `firing -> {fired
-/// | pending}` (the latter for an advanced repeat), replacing the full-row
-/// `upsert_note` that could otherwise clobber a concurrent write.
-///
-/// `claimed_firing_at` is the claim token returned by `claim_pending_event`
-/// (or reconstructed from a reclaimed row's own `firing_at`) — the CAS
-/// requires the row's CURRENT `firing_at` to still equal this value, not
-/// merely that `status='firing'`. Without this, a stale claimant that stalls
-/// past `STALE_FIRING_TIMEOUT_MICROS`, gets reclaimed, and is then re-claimed
-/// by a second drain could resume and finalize over the second drain's live
-/// claim purely because both rows share `status='firing'` (issue #462).
-/// Binding to the specific `firing_at` instant closes that gap:
-/// a reclaim always rewrites `firing_at` (via a fresh `claim_pending_event`
-/// call) or clears `status` back to `pending`, so a stale token can never
-/// match the row's current one.
-///
-/// `properties` must NOT already carry a `firing_at` field for the terminal
-/// write — this function clears it (the event has reached a terminal state
-/// for this cycle, `fired` or re-armed `pending`, so no claim token should
-/// survive to be mistaken for a live claim by a future finalize).
-///
-/// Returns `Ok(true)` iff exactly one row (still `firing` under this exact
-/// claim token) was updated.
+/// | pending}` (the latter for an advanced repeat). `claimed_firing_at` is
+/// the claim token from `claim_pending_event`; the CAS requires the row's
+/// CURRENT `firing_at` to still equal it, not merely `status='firing'`
+/// (issue #462). Clears `firing_at` on the terminal write. Returns
+/// `Ok(true)` iff exactly one row was updated. See
+/// `crates/khive-mcp/docs/api/pending-events.md`.
 async fn finalize_fired_event(
     rt: &KhiveRuntime,
     namespace: &str,
@@ -998,19 +964,11 @@ fn is_five_field_cron(expr: &str) -> bool {
 
 /// Advance a missed repeating event's `trigger_at` past every occurrence at
 /// or before `now`, landing on the first occurrence strictly after `now`
-/// (ADR-106 missed-event amendment). This is what makes a missed repeat
-/// re-arm without ever firing a catch-up burst: a daily reminder that was
-/// due 10 times while the daemon was down skips straight to tomorrow's
-/// occurrence instead of firing 10 times in a row.
-///
+/// (ADR-106 missed-event amendment) — avoids firing a catch-up burst.
 /// Returns `None` when the event does not advance at all (no `repeat`, or an
-/// unsupported cron form per [`next_trigger_at`]) — the caller then marks the
-/// event terminally `"missed"` instead of re-arming it.
-///
-/// Terminates because [`next_trigger_at`]'s named-alias arms are always
-/// strictly increasing (`current + positive duration`), so each loop
-/// iteration moves `current` forward; `now` is fixed, so the loop reaches
-/// `next > now` in a bounded number of steps.
+/// unsupported cron form); the caller then marks it terminally `"missed"`.
+/// See `crates/khive-mcp/docs/api/pending-events.md` for the termination
+/// argument.
 fn advance_repeat_past_missed(
     repeat: &Option<String>,
     current: DateTime<Utc>,
@@ -1174,21 +1132,11 @@ async fn dispatch_action(
 
 /// Discover all distinct namespaces that have at least one pending, due
 /// `scheduled_event` note (i.e. `status="pending"` AND `trigger_at <= now`).
-///
-/// Uses a direct SQL query for efficiency — avoids fetching all pending notes
-/// across all namespaces up front. The `trigger_at` comparison is done via
-/// SQLite's `datetime(...)`, not a raw string comparison (PR #782):
-/// `khive-pack-schedule` round-trips the caller's
-/// original `trigger_at` string verbatim, offset included (H5), and
-/// `validate_at` in `handlers.rs` accepts any RFC 3339 offset — a raw-text
-/// `<=` only matches chronological order when every stored string happens to
-/// share `now`'s UTC offset, which is not guaranteed. `datetime(...)`
-/// normalizes both sides to UTC before comparing, making the comparison
-/// chronological regardless of offset; storage still round-trips the
-/// caller's original string unchanged (H5 unaffected). The Rust layer
-/// downstream still re-parses and re-checks each candidate row with
-/// `DateTime<Utc>` as the final authority — this SQL predicate is a fetch
-/// bound, not the last word.
+/// The `trigger_at` comparison uses SQLite's `datetime(...)` rather than a
+/// raw string comparison, since stored offsets are not normalized to UTC
+/// (PR #782); the Rust layer downstream re-checks each candidate with
+/// `DateTime<Utc>` as the final authority. See
+/// `crates/khive-mcp/docs/api/pending-events.md`.
 async fn discover_pending_namespaces(rt: &KhiveRuntime, now: DateTime<Utc>) -> Result<Vec<String>> {
     use khive_storage::types::{SqlStatement, SqlValue};
 
@@ -1294,55 +1242,15 @@ pub fn tick_interval_from_env() -> std::time::Duration {
 
 /// Daemon-resident periodic drain loop (ADR-106).
 ///
-/// Runs [`run_pending_events_on`] on a fixed interval for as long as the
-/// daemon process lives. Only the daemon role spawns this loop (mirrors the
-/// `is_daemon_role` gate `khive-mcp::serve` already applies to the email
-/// channel loops, #602) — a short-lived `kkernel exec`/stdio client process
-/// never calls this, so there is exactly one tick loop per live daemon.
-///
-/// `rt` is the daemon's own resolved runtime handle for the `"schedule"` pack
-/// — for a single-backend boot, the one `KhiveRuntime` the whole daemon
-/// shares; for a multi-backend boot (ADR-028 `[[backends]]`), the specific
-/// per-pack runtime `schedule` was wired to. `khive-mcp::serve::build_server`
-/// resolves this once at daemon boot (the same `--config`/`[[backends]]`/
-/// actor-identity/`--pack` resolution the live server itself uses) and passes
-/// it through here, so every tick drains the SAME storage target under the
-/// SAME actor identity and pack set as the daemon it belongs to — never a
-/// silently-reconstructed `RuntimeConfig::default()` (PR #782):
-/// a config-backed daemon's tick could otherwise drain
-/// `$HOME/.khive/khive.db` instead of the configured backend, trip
-/// strict-actor-mode failures the live server never has, or dispatch stored
-/// actions through packs the daemon never loaded). `rt.clone()` is cheap
-/// (`KhiveRuntime` is `Arc`-wrapped internally) — every tick reuses the same
-/// warm connection pool rather than opening a fresh one.
-///
-/// Ticks on a fixed `tokio::time::interval` with
-/// [`tokio::time::MissedTickBehavior::Skip`] rather than sleeping `interval`
-/// AFTER each drain: a sleep-after-drain loop's effective cadence is
-/// `interval + drain_duration`, which drifts further behind on every pass
-/// that finds a nontrivial backlog (PR #782). ADR-106
-/// specifies a fixed interval). The first tick fires after one full
-/// `interval` has elapsed (via `interval_at(now + interval, interval)`),
-/// matching the original sleep-based boot behavior instead of draining
-/// immediately at daemon start.
-///
-/// `server` is the daemon's own live [`KhiveMcpServer`] (cloned — cheap,
-/// `Arc`-wrapped internally), used ONLY for replaying a fired event's stored
-/// action DSL (`dispatch_action`, inside [`run_pending_events_on`]). This is
-/// a SEPARATE handle from `rt` on purpose (PR #782): an earlier
-/// version of this fix built a fresh `KhiveMcpServer::new(rt
-/// .clone())` from the schedule runtime alone, which registered EVERY pack
-/// against the schedule backend — correct for scanning `scheduled_event`
-/// rows (which do live on the schedule backend), but wrong for dispatch: a
-/// replayed `comm.send` (or any other pack's action) would then have run
-/// against the schedule backend instead of that pack's own configured
-/// backend in a multi-backend deployment. Passing the daemon's actual,
-/// already-multi-backend-wired `server` through here — the SAME one
-/// `build_server` handed back alongside `rt` at boot — keeps replayed-action
-/// routing identical to a live request against this daemon.
-///
-/// A per-tick failure (e.g. a transient SQL error) is logged and does not
-/// stop the loop — the next tick simply tries again.
+/// Runs [`run_pending_events_on`] on `interval` for as long as the daemon
+/// process lives; only the daemon role spawns this loop. `rt` MUST be the
+/// daemon's own already-resolved runtime handle for the `"schedule"` pack
+/// and `server` MUST be the daemon's own live [`KhiveMcpServer`] — never
+/// freshly reconstructed — or replayed actions can silently dispatch against
+/// the wrong backend (PR #782). Ticks on a fixed interval with
+/// `Skip`-missed-tick behavior so a long drain cannot make the loop drift
+/// behind. A per-tick failure is logged; the loop never stops.
+/// See `crates/khive-mcp/docs/api/pending-events.md` for the full rationale.
 pub async fn schedule_tick_loop(
     rt: KhiveRuntime,
     server: KhiveMcpServer,
@@ -1382,7 +1290,6 @@ pub async fn schedule_tick_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::FixedOffset;
     use khive_runtime::{Gate, GateDecision, GateError, GateRequest, RuntimeConfig};
     use khive_storage::event::EventFilter;
     use khive_storage::types::PageRequest;
@@ -2001,6 +1908,139 @@ mod tests {
             new_ts,
             original + Duration::days(1),
             "daily advance must add 1 day"
+        );
+    }
+
+    /// Issue #792: repeat advancement must preserve the original
+    /// `trigger_at` timezone offset — not silently re-serialize the advanced
+    /// occurrence as UTC. A `+04:00` schedule that fires and advances must
+    /// still carry `+04:00` (and the same local wall-clock hour) on its next
+    /// occurrence, not drift to a different wall-clock hour under `+00:00`.
+    #[tokio::test]
+    async fn daily_repeat_advance_preserves_original_offset() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+
+        // Chronologically a few seconds ago (in-grace), formatted at a
+        // non-UTC +04:00 wall-clock offset — the exact shape
+        // `khive-pack-schedule` round-trips verbatim from the caller (H5).
+        let plus_four = FixedOffset::east_opt(4 * 3600).expect("valid offset");
+        let trigger_instant = Utc::now() - Duration::seconds(5);
+        let past = trigger_instant.with_timezone(&plus_four).to_rfc3339();
+
+        let id = create_scheduled_event(
+            &rt,
+            "local",
+            &past,
+            Some("stats()"),
+            Some("daily"),
+            "schedule",
+        )
+        .await;
+
+        let summary = drain_for_test(&db_path).await.expect("drain");
+        assert!(
+            summary.advanced >= 1,
+            "daily event with a non-UTC offset must be advanced, not fired"
+        );
+
+        let props = get_note_props(&rt, id).await;
+        let new_trigger = props["trigger_at"]
+            .as_str()
+            .expect("trigger_at must be set");
+
+        // The advanced occurrence must still carry the ORIGINAL +04:00
+        // offset, not be silently re-serialized as UTC (+00:00).
+        assert!(
+            new_trigger.ends_with("+04:00"),
+            "advanced trigger_at must preserve the original +04:00 offset, got {new_trigger:?}"
+        );
+
+        let new_dt = DateTime::parse_from_rfc3339(new_trigger).expect("parseable advanced ts");
+        let original_dt = DateTime::parse_from_rfc3339(&past).expect("parseable original ts");
+        assert_eq!(
+            *new_dt.offset(),
+            plus_four,
+            "advanced trigger_at offset must equal the original +04:00 offset"
+        );
+        assert_eq!(
+            new_dt.with_timezone(&Utc),
+            original_dt.with_timezone(&Utc) + Duration::days(1),
+            "daily advance must add exactly 1 day to the chronological instant"
+        );
+        // Wall-clock hour must be unchanged (the drift this issue reports):
+        // same local time-of-day at the same offset, one day later.
+        assert_eq!(
+            new_dt.time(),
+            original_dt.time(),
+            "advanced occurrence must retain the same local wall-clock time"
+        );
+    }
+
+    /// The drain must keep accepting the *same* `trigger_at` grammar the
+    /// write boundary validates with (`khive-pack-schedule`'s
+    /// `at.parse::<DateTime<Utc>>()`, which is chrono's relaxed RFC 3339
+    /// form) — not narrow to strict `DateTime::parse_from_rfc3339`. A
+    /// legacy stored timestamp using a space instead of `T` and an offset
+    /// without a colon (e.g. `2026-07-14 09:00:00+0400`) must still be
+    /// recognized as due and advanced, not silently skipped forever as
+    /// "unparseable".
+    #[tokio::test]
+    async fn relaxed_legacy_grammar_repeat_advance_preserves_offset() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+
+        let plus_four = FixedOffset::east_opt(4 * 3600).expect("valid offset");
+        // Whole-second precision: the relaxed `%z` format below drops
+        // fractional seconds, so the fixture must match what actually
+        // round-trips through it.
+        let trigger_instant =
+            DateTime::from_timestamp((Utc::now() - Duration::seconds(5)).timestamp(), 0)
+                .expect("valid timestamp");
+        let past_relaxed = trigger_instant
+            .with_timezone(&plus_four)
+            .format("%Y-%m-%d %H:%M:%S%z")
+            .to_string();
+        assert!(
+            past_relaxed.contains(' ') && !past_relaxed.contains('T'),
+            "fixture must use the relaxed space separator, got {past_relaxed:?}"
+        );
+
+        let id = create_scheduled_event(
+            &rt,
+            "local",
+            &past_relaxed,
+            Some("stats()"),
+            Some("daily"),
+            "schedule",
+        )
+        .await;
+
+        let summary = drain_for_test(&db_path).await.expect("drain");
+        assert!(
+            summary.advanced >= 1,
+            "a relaxed-grammar legacy trigger_at must still be recognized as due and \
+             advanced, not skipped as unparseable"
+        );
+        assert_eq!(
+            summary.skipped_not_due, 0,
+            "relaxed-grammar trigger_at must not be treated as unparseable"
+        );
+
+        let props = get_note_props(&rt, id).await;
+        let new_trigger = props["trigger_at"]
+            .as_str()
+            .expect("trigger_at must be set");
+        assert!(
+            new_trigger.ends_with("+04:00"),
+            "advanced trigger_at must preserve the original +04:00 offset, got {new_trigger:?}"
+        );
+
+        let new_dt = DateTime::parse_from_rfc3339(new_trigger).expect("parseable advanced ts");
+        assert_eq!(
+            new_dt.with_timezone(&Utc),
+            trigger_instant + Duration::days(1),
+            "daily advance must add exactly 1 day to the chronological instant"
         );
     }
 
@@ -2905,6 +2945,58 @@ mod tests {
             new_trigger <= now + Duration::days(1),
             "re-armed trigger_at must be the very next occurrence, not skip further \
              (no catch-up burst), got {new_trigger} (now={now})"
+        );
+    }
+
+    /// Issue #792 (missed-path variant): a missed repeat's re-arm must also
+    /// preserve the original `trigger_at` offset, not just the normal
+    /// fire-and-advance path — both call through the same
+    /// `next_trigger_at`-derived arithmetic and must both render at the
+    /// caller's original offset.
+    #[tokio::test]
+    async fn missed_repeat_rearm_preserves_original_offset() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+
+        // 10 days overdue with a daily repeat, formatted at a non-UTC
+        // +04:00 wall-clock offset.
+        let plus_four = FixedOffset::east_opt(4 * 3600).expect("valid offset");
+        let original_trigger = (Utc::now() - Duration::days(10)).with_timezone(&plus_four);
+        let id = create_scheduled_event(
+            &rt,
+            "local",
+            &original_trigger.to_rfc3339(),
+            Some("stats()"),
+            Some("daily"),
+            "schedule",
+        )
+        .await;
+
+        let summary = drain_for_test(&db_path).await.expect("drain");
+        assert_eq!(
+            summary.missed.len(),
+            1,
+            "exactly one missed occurrence recorded"
+        );
+
+        let props = get_note_props(&rt, id).await;
+        let new_trigger = props["trigger_at"]
+            .as_str()
+            .expect("trigger_at must be set");
+        assert!(
+            new_trigger.ends_with("+04:00"),
+            "re-armed trigger_at must preserve the original +04:00 offset, got {new_trigger:?}"
+        );
+        let new_dt = DateTime::parse_from_rfc3339(new_trigger).expect("parseable re-armed ts");
+        assert_eq!(
+            *new_dt.offset(),
+            plus_four,
+            "re-armed trigger_at offset must equal the original +04:00 offset"
+        );
+        assert_eq!(
+            new_dt.time(),
+            original_trigger.time(),
+            "re-armed occurrence must retain the same local wall-clock time"
         );
     }
 

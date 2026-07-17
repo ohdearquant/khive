@@ -1,6 +1,6 @@
 # ADR-081: Recall Retune Driver — Governed Ingestion of Implicit Feedback
 
-**Status**: Proposed\
+**Status**: Accepted\
 **Date**: 2026-07-02\
 **Authors**: khive maintainers
 **Measurement evidence**: hook scorer v0 dry run over 19 serve ledgers, 7 sessions (2026-07-02)\

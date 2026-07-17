@@ -26,6 +26,7 @@ use std::sync::Arc;
 
 fn rt_with_embedder() -> KhiveRuntime {
     KhiveRuntime::new(RuntimeConfig {
+        git_write: Default::default(),
         db_path: None,
         default_namespace: Namespace::local(),
         embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),

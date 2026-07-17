@@ -70,7 +70,7 @@ for the lowest-common-ancestor walk this crate's `lca` module performs). It depe
 `exclude = ["khive-merge"]`) **and not published to crates.io.** It compiles standalone via its
 own `[workspace]` table (`cargo check -p khive-merge` works from its own directory), but no
 production pack currently calls into it — the v1 path (`khive-vcs`, git line-merge over sorted
-NDJSON) governs KG merges today. See `crates/khive-merge/docs/design.md` for the full
+NDJSON) governs KG merges today. See `crates/khive-merge/docs/semantic-merge-architecture.md` for the full
 promotion plan.
 
 Relates to [ADR-010](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-010-kg-versioning.md)

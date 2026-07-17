@@ -1,6 +1,6 @@
 # ADR-088: Git-Lifecycle Pack — Commit and Issue Note Kinds
 
-**Status**: Proposed\
+**Status**: Accepted\
 **Date**: 2026-07-03\
 **Authors**: khive maintainers
 **Depends on**: ADR-001 (Entity Kind Taxonomy — `project` as the repo anchor), ADR-002

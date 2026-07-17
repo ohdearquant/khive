@@ -23,7 +23,6 @@ htmlcov/
 target/
 .cargo-target/
 **/*.rs.bk
-Cargo.lock
 
 # Next.js / Node
 node_modules/

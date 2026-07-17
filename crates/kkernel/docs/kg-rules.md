@@ -70,3 +70,18 @@ kkernel kg validate [--repo <path>] [--rules <path>] [--fix] [--strict] [--forma
 - Malformed `rules.toml` — returns a parse error; no checks are applied.
 - Unknown `kind` in a rule — the rule is skipped with a warning.
 - A rule with neither `condition` nor `require_field` matches nothing.
+
+## `build_taxonomy` — strict-actor-mode exemption
+
+`build_taxonomy` (`src/kg/validate.rs`) merges the entity-kind/note-kind sets declared by
+every registered pack, mirroring the `build_registry()` pattern in `pack_introspect`; no DB
+is opened, only pack metadata is read. It deliberately does NOT call
+`enforce_strict_actor_mode`: that enforcement seam protects the **comm dispatch boundary** —
+it prevents a server from accepting comm operations without a configured actor identity.
+`build_taxonomy` is metadata/introspection-only and never dispatches a verb or reads
+comm/tenant data, so there is no tenant-isolation risk here — requiring an actor identity
+would make `kkernel kg validate` fail under `KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1` with no
+security benefit, and an operator must be able to run taxonomy validation against a
+strict-mode deployment. See `enforce_strict_actor_mode` in `crates/khive-mcp/src/serve.rs`
+for the authoritative boundary definition. `KgTaxonomy` itself is `pub(super)` so
+`kg::commit` (ADR-102) can reuse the same taxonomy sets rather than re-deriving them.

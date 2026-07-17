@@ -1,197 +1,101 @@
 # GTD Task Management
 
-This guide covers task management in khive — the GTD lifecycle, priority levels,
-task dependencies, and common workflow patterns.
+The GTD pack manages work as `task` notes. A task has a lifecycle, a priority,
+and an optional assignee; it can also be connected to the rest of the knowledge
+graph. Use it to capture work, decide what is ready, record work in progress,
+and retain the outcome.
 
-## What tasks are
+Calls go through `request` using the function-call DSL. For the enclosing call
+format and batching rules, see the [request tool rustdoc](../../crates/khive-mcp/src/tools/request.rs).
 
-Tasks in khive are notes with `kind=task`, managed by the GTD pack. They have a
-status lifecycle, priority level, optional assignee, and can be linked to
-entities in the knowledge graph.
+## Lifecycle
 
-Tasks are created with `gtd.assign`, not `create(kind="note")`. The GTD pack
-handles lifecycle validation and status transitions.
+The normal path is:
 
-## Task lifecycle
-
-```
-inbox ──> next ──> active ──> done
-  │         │        │
-  │         │        └──> cancelled
-  │         │
-  └──> someday    waiting ◄──┐
-         │                    │
-         └────────────────────┘
+```text
+inbox -> next -> active -> done
+                          \
+                           -> cancelled
 ```
 
-### Status meanings
+`inbox` is untriaged work. Move work to `next` when it is ready to be picked
+up, then to `active` when work starts. `waiting` holds work blocked by something
+outside the task, and `someday` keeps work that is deliberately deferred.
 
-| Status      | Meaning                       | When to use                                           |
-| ----------- | ----------------------------- | ----------------------------------------------------- |
-| `inbox`     | Captured but not committed    | Default. Something that needs triage.                 |
-| `next`      | Committed, ready to work on   | After triage — this is actionable and prioritized.    |
-| `active`    | Currently in progress         | When you start working on it.                         |
-| `done`      | Completed                     | Finished successfully.                                |
-| `cancelled` | Abandoned                     | No longer relevant.                                   |
-| `waiting`   | Blocked on something external | Waiting for a response, a dependency, or a condition. |
-| `someday`   | Deferred indefinitely         | Not urgent, not committed, but worth remembering.     |
+The pack validates each requested transition with its lifecycle rules. A task
+can move among the non-terminal states only where that rule permits it. `done`
+and `cancelled` are terminal: create a new task if work needs to be reopened.
 
-### Valid transitions
+## Capture and assign work
 
-Not all transitions are valid. The GTD pack validates them:
+Create a task with `gtd.assign`. It defaults to `status="inbox"` and
+`priority="p2"`; `p0` is the highest priority. The optional `assignee` is an
+opaque identifier used to route and filter work. Use one stable identifier for
+each queue.
 
-- `inbox` can go to: `next`, `someday`, `cancelled`
-- `next` can go to: `active`, `waiting`, `someday`, `cancelled`
-- `active` can go to: `done`, `waiting`, `cancelled`
-- `waiting` can go to: `next`, `active`, `cancelled`
-- `someday` can go to: `next`, `cancelled`
-
-Idempotent transitions (same status to same status) are accepted silently.
-
-## Creating tasks
-
-### Basic task
-
-```
-request(ops="gtd.assign(title=\"Implement FlashAttention-3 in lattice\")")
+```text
+request(ops="gtd.assign(title=\"Triage documentation feedback\", assignee=\"docs-maintainer\")")
 ```
 
-Defaults: `status=inbox`, `priority=p2`.
+The response includes the task identifier needed by later operations. A task
+can also have a description, context entity, due/start/end dates, tags, and
+dependencies.
 
-### Task with priority and status
+## Choose the next task
 
-```
-request(ops="gtd.assign(title=\"Benchmark attention variants\", priority=\"p0\", status=\"next\")")
-```
+Use `gtd.next` to read the actionable queue. It considers only `next` and
+`active` tasks, sorts them by priority (`p0` first), and can filter by exact
+assignee. It defaults to `limit=10` and silently clamps `limit` to 1–200. If
+more than 20,000 actionable tasks match, it returns an error; narrow the query
+(for example with the exact `assignee` filter) and retry.
 
-### Task linked to an entity
-
-```
-request(ops="gtd.assign(title=\"Review FlashAttention paper\", context_entity_id=\"<entity_id>\")")
-```
-
-The `context_entity_id` links the task to a KG entity, making it discoverable
-via graph traversal.
-
-### Task with assignee
-
-```
-request(ops="gtd.assign(title=\"Write attention tests\", assignee=\"agent:platform\")")
+```text
+request(ops="gtd.next(assignee=\"docs-maintainer\", limit=10)")
 ```
 
-### Task with tags
+Use `gtd.tasks` when reviewing work by status, assignee, or priority. Both
+`gtd.tasks` and `gtd.next` accept an assignee filter. Without a status filter,
+`gtd.tasks` shows non-terminal work; pass a terminal status when reviewing
+completed or cancelled tasks. It defaults to `limit=50, offset=0`, and
+silently clamps `limit` to 1–200.
 
-```
-request(ops="gtd.assign(title=\"Profile memory usage\", tags=[\"perf\", \"attention\"])")
-```
+## Start and finish work
 
-## Priority levels
+Use `gtd.transition` for an explicit lifecycle change. This chained request
+creates a ready task and starts it, using the identifier returned by the first
+operation:
 
-| Priority | Meaning                                  |
-| -------- | ---------------------------------------- |
-| `p0`     | Critical — do now, everything else waits |
-| `p1`     | High — do today                          |
-| `p2`     | Normal — do this cycle (default)         |
-| `p3`     | Low — do when convenient                 |
-
-## Working with tasks
-
-### Get next actions
-
-```
-request(ops="gtd.next(limit=5)")
+```text
+request(ops="gtd.assign(title=\"Review the task guide\", assignee=\"docs-maintainer\", status=\"next\") | gtd.transition(id=$prev.id, status=\"active\", note=\"started review\")")
 ```
 
-Returns tasks with `status` in `[next, active]`, sorted by priority (p0 first).
+`gtd.transition` validates the lifecycle with `can_transition` before writing.
+A repeated transition to the current status is a no-op. Use `gtd.complete` to
+finish an actionable task (`next` or `active`); it records `completed_at`, and
+can mark the task `done` (the default) or `cancelled`.
 
-### List tasks by status
+When `gtd.transition` is a no-op, branch on `transitioned`: when it is `false`,
+only `transitioned`, `id`, `full_id`, `from`, `to`, and `note` are present.
 
-```
-request(ops="gtd.tasks(status=\"active\")")
-request(ops="gtd.tasks(status=\"waiting\", assignee=\"agent:docs\")")
-```
+## Dependencies
 
-### Transition a task
+Pass task identifiers in `depends_on` when creating a task to express blockers.
+The GTD pack adds a `depends_on` endpoint rule for task-to-task edges; other
+note or entity types are not valid dependency targets. `gtd.next` omits a task
+until every listed dependency is `done`.
 
-```
-request(ops="gtd.transition(id=\"<task_id>\", status=\"active\", note=\"started implementation\")")
-```
+## Gotchas
 
-The `note` parameter records why the transition happened.
-
-### Complete a task
-
-```
-request(ops="gtd.transition(id=\"<task_id>\", status=\"done\")")
-```
-
-You can also use `gtd.complete`:
-
-```
-request(ops="gtd.complete(id=\"<task_id>\", result=\"all benchmarks pass\")")
-```
-
-Note: `gtd.complete` requires the task to be in `active` status. Use
-`gtd.transition(status="done")` if the task is in another status.
-
-## Task dependencies
-
-Tasks can depend on other tasks using `depends_on` edges. The GTD pack extends
-the base edge contract to allow task-to-task `depends_on` relationships:
-
-```
-request(ops="gtd.assign(title=\"Write tests\", status=\"next\")")
-# Get the task id from the response
-
-request(ops="gtd.assign(title=\"Run CI\", depends_on=[\"<test_task_id>\"])")
-```
-
-Or link them explicitly:
-
-```
-request(ops="link(source_id=\"<ci_task_id>\", target_id=\"<test_task_id>\", relation=\"depends_on\")")
-```
-
-## Workflow patterns
-
-### Daily review
-
-```
-request(ops="gtd.next(limit=10)")
-```
-
-Review actionable tasks, reprioritize, transition stale items to `waiting` or
-`someday`.
-
-### Triage inbox
-
-```
-request(ops="gtd.tasks(status=\"inbox\")")
-```
-
-For each inbox item, decide: promote to `next`, defer to `someday`, or
-`cancel`.
-
-```
-request(ops="gtd.transition(id=\"<task_id>\", status=\"next\", note=\"promoted after review\")")
-```
-
-### Context switching
-
-When picking up a new area of work, filter by assignee or tags:
-
-```
-request(ops="gtd.tasks(assignee=\"agent:docs\", status=\"next\")")
-```
-
-### Batch status update
-
-```
-request(ops="[gtd.transition(id=\"<id1>\", status=\"done\"), gtd.transition(id=\"<id2>\", status=\"done\")]")
-```
+- An assignee is a routing field, not an automatic personal queue. Always pass
+  your assignee to `gtd.next` or `gtd.tasks`; a task assigned to a different
+  identifier is not work to take without coordination.
+- `done` and `cancelled` cannot transition again. Capture follow-up work as a
+  new task instead of trying to reopen a terminal one.
+- `gtd.complete` is for actionable tasks. To finish an inbox, waiting, or
+  someday task directly, use a valid `gtd.transition` to `done` or `cancelled`.
 
 ## See also
 
-- [Prompt Cookbook](prompt-cookbook.md) — task verb patterns
-- [Knowledge Graph Modeling](knowledge-graph.md) — linking tasks to entities
-- [Memory and Recall](memory.md) — storing context alongside tasks
+- [Knowledge Graph Modeling](knowledge-graph.md) — model the entities that a
+  task concerns.
+- [Prompt Cookbook](prompt-cookbook.md) — additional request DSL patterns.

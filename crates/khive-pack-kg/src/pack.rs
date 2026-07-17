@@ -4,11 +4,16 @@ use khive_types::{EdgeEndpointRule, EdgeRelation, EndpointKind, HandlerDef, Pack
 
 use crate::handler_defs::KG_HANDLERS;
 
-/// Pack-extensible edge endpoint rules — adds person→org, person→project, and org→org
-/// pairs to the base allowlist. The person→project rows mirror person→org (issue #60):
-/// a person is a member of a project the same way they are a member of an org, so the
-/// same member-not-component semantic stretch accepted for person→org is extended here.
-pub(crate) static KG_EDGE_RULES: [EdgeEndpointRule; 9] = [
+/// Pack-extensible edge endpoint rules (person↔org, person↔project, org↔org).
+/// See `docs/api/edge-rules-pack-kg.md`.
+///
+/// ADR-087 Amendment 1 §A9: decision review rounds chain via
+/// `decision precedes decision` note-to-note edges. Round N-1 precedes round
+/// N; this is NOT `supersedes` — earlier rounds stay authoritative for their
+/// own commit. The base `precedes` contract (ADR-002) is entity-to-entity
+/// only; this rule additively extends it to `decision` note pairs, mirroring
+/// the GTD pack's `task`->`task` `depends_on` rule.
+pub(crate) static KG_EDGE_RULES: [EdgeEndpointRule; 10] = [
     EdgeEndpointRule {
         relation: EdgeRelation::PartOf,
         source: EndpointKind::EntityOfKind("person"),
@@ -54,6 +59,11 @@ pub(crate) static KG_EDGE_RULES: [EdgeEndpointRule; 9] = [
         source: EndpointKind::EntityOfKind("org"),
         target: EndpointKind::EntityOfKind("org"),
     },
+    EdgeEndpointRule {
+        relation: EdgeRelation::Precedes,
+        source: EndpointKind::NoteOfKind("decision"),
+        target: EndpointKind::NoteOfKind("decision"),
+    },
 ];
 
 /// KG pack vocabulary declaration.
@@ -90,7 +100,6 @@ mod tests {
     use super::*;
     use khive_types::EndpointKind;
 
-    /// Extract a comparable (source_str, target_str) pair from an EndpointKind.
     fn endpoint_str(ep: &EndpointKind) -> &'static str {
         match ep {
             EndpointKind::EntityOfKind(k) => k,
@@ -100,12 +109,6 @@ mod tests {
     }
 
     /// ADR-076 §D2: no duplicate (relation, source, target) triples in KG_EDGE_RULES.
-    ///
-    /// A duplicated triple would be a no-op additive rule (adding the same endpoint
-    /// pair a second time changes nothing) and is a sign of a copy-paste error.
-    /// Semantic similarity between relations (e.g. multiple relations accepting
-    /// `org→org`) is expected and correct; this test checks only for exact-triple
-    /// duplicates, not for shared per-relation endpoint sets.
     #[test]
     fn kg_pack_edge_rules_contain_no_duplicate_triples() {
         let triples: Vec<(&str, &str, &str)> = KG_EDGE_RULES
@@ -136,13 +139,7 @@ mod tests {
         );
     }
 
-    /// Regression: the KG_EDGE_RULES array has exactly the expected relations.
-    ///
-    /// This is a deliberate-change tripwire over the live KG_EDGE_RULES, complementing
-    /// the ADR-076 §D2 non-redundancy certificate in the certificate test suite.
-    ///
-    /// A change to the set of relations that get pack-level endpoint extensions
-    /// should be a deliberate, reviewed decision — not an accidental side effect.
+    /// Deliberate-change tripwire: KG_EDGE_RULES covers exactly this relation set.
     #[test]
     fn kg_pack_edge_rules_cover_expected_relations() {
         let mut seen: Vec<&str> = KG_EDGE_RULES.iter().map(|r| r.relation.as_str()).collect();

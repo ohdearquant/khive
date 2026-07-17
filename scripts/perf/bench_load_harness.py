@@ -642,9 +642,8 @@ def main() -> int:
             }
 
         recall_latencies = latencies_by_op.get("memory.recall", [])
-        compose_latencies = latencies_by_op.get("knowledge.compose", []) + latencies_by_op.get(
-            "knowledge.search", []
-        )
+        compose_latencies = latencies_by_op.get("knowledge.compose", [])
+        knowledge_search_latencies = latencies_by_op.get("knowledge.search", [])
 
         # fallback scrape (dim 1) — across every worker's own front-end stderr
         fallback_lines: list[str] = []
@@ -727,9 +726,13 @@ def main() -> int:
                 "distinct tenants get distinct attributed identities (no cross-tenant collapse).",
                 "detail": attributions,
             },
-            "9_brain_slot_throughput": {
+            "9_knowledge_latency": {
                 "channel": "client-measured",
-                **_percentiles(compose_latencies),
+                "compose": _percentiles(compose_latencies),
+                "search": _percentiles(knowledge_search_latencies),
+                "note": "renamed from 9_brain_slot_throughput, which mislabeled this block: it "
+                "aggregated knowledge.compose and knowledge.search client latencies into one "
+                "percentile set and measured nothing brain-slot-related",
             },
         }
 

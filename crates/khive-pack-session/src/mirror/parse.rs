@@ -256,28 +256,19 @@ pub fn parse_codex_line(line: &str, session_id: &str, abs_byte_offset: u64) -> O
     }
 }
 
-/// Parse a ChatGPT data-export `conversations.json` file.
-///
-/// Unlike `parse_cc_line`/`parse_codex_line` (one JSONL line in, one event
-/// out), a ChatGPT export is a single static JSON array of conversation
-/// objects — this function parses the whole file at once and returns every
-/// message-bearing event across every conversation it contains.
+/// Parse a ChatGPT data-export `conversations.json` file: parses the whole
+/// file at once (unlike the line-at-a-time `parse_cc_line`/`parse_codex_line`)
+/// and returns every message-bearing event across every conversation, in
+/// deterministic DFS preorder per conversation.
 ///
 /// Returns `None` when `content` is not valid JSON or the top level is not a
-/// JSON array. The caller treats that as a per-file error so the mirror
-/// cursor does not advance: a partially-downloaded export is retried whole
-/// on the next tick, never half-consumed. A malformed *conversation* inside
-/// an otherwise-valid array is skipped individually (see `parse_conversation`)
-/// so one bad entry cannot sink the rest of the file.
-///
-/// Each conversation's `mapping` forms a tree; events are emitted in
-/// deterministic DFS preorder from the root, following each node's
-/// `children` array order (never JSON object key order). Nodes off the
-/// `current_node` root-to-tip path are flagged `is_sidechain`, mirroring how
-/// Claude Code flags abandoned/regenerated branches.
-///
-/// The returned `raw` and `text` fields have secrets masked, exactly like
-/// `parse_cc_line`/`parse_codex_line`.
+/// JSON array — the caller treats that as a per-file error so the mirror
+/// cursor does not advance. A malformed *conversation* inside an otherwise-
+/// valid array is skipped individually, not the whole file. The returned
+/// `raw` and `text` fields have secrets masked, exactly like
+/// `parse_cc_line`/`parse_codex_line`. See
+/// `crates/khive-pack-session/docs/api/mirror-parse.md` for the DFS/sidechain
+/// algorithm detail.
 pub fn parse_chatgpt_export(content: &str) -> Option<Vec<ParsedEvent>> {
     let value: Value = serde_json::from_str(content).ok()?;
     let conversations = value.as_array()?;
@@ -289,9 +280,8 @@ pub fn parse_chatgpt_export(content: &str) -> Option<Vec<ParsedEvent>> {
     Some(events)
 }
 
-/// Extract a display-friendly text string from a message `content` value.
-///
-/// Handles both the string form and the structured-block array form.
+/// Extract a display-friendly text string from a message `content` value
+/// (string form or structured-block array form).
 fn extract_text(content: Option<&Value>) -> Option<String> {
     match content? {
         Value::String(s) => Some(s.clone()),
@@ -307,13 +297,9 @@ fn extract_text(content: Option<&Value>) -> Option<String> {
     }
 }
 
-/// Extract a display string from a single content block.
-///
-/// Handled block types:
-/// - `"text"` — Claude Code plain text block.
-/// - `"input_text"` / `"output_text"` — Codex user and assistant text blocks.
-/// - `"tool_use"` — tool invocation (name + input JSON, truncated to 500 chars).
-/// - `"tool_result"` — tool output (content string, truncated to 500 chars).
+/// Extract a display string from a single content block (`"text"` /
+/// `"input_text"` / `"output_text"` / `"tool_use"` / `"tool_result"`). See
+/// `crates/khive-pack-session/docs/api/mirror-parse.md#extract_text--extract_block-claude-code--codex-block-extraction`.
 fn extract_block(block: &Value) -> Option<String> {
     let map = block.as_object()?;
     match map.get("type")?.as_str()? {
@@ -354,24 +340,20 @@ fn truncate(s: &str, max_chars: usize) -> String {
     }
 }
 
-/// Context threaded through node visitation for one conversation — the
-/// pieces that don't change as the DFS walks the mapping tree.
+/// Context threaded through one conversation's DFS walk. See
+/// `crates/khive-pack-session/docs/api/mirror-parse.md#convcontext`.
 struct ConvContext<'a> {
     mapping: &'a Map<String, Value>,
     current_path: &'a HashSet<String>,
     session_id: &'a str,
-    /// Conversation-level `create_time` in micros (0 if absent) — the
-    /// fallback used when a message's own `create_time` is null/absent.
     conv_created_at_micros: i64,
     slug: Option<&'a str>,
 }
 
-/// Parse one ChatGPT export conversation object, appending its
-/// message-bearing nodes (deterministic DFS preorder from the mapping root)
-/// to `out`.
-///
-/// Skips the whole conversation on a missing/empty `id` or missing `mapping`
-/// so one malformed entry cannot sink the rest of the file.
+/// Parse one ChatGPT export conversation object (skips the whole
+/// conversation on a missing/empty `id` or missing `mapping`), appending its
+/// message-bearing nodes to `out` in deterministic DFS preorder. See
+/// `crates/khive-pack-session/docs/api/mirror-parse.md#parse_conversation`.
 fn parse_conversation(conv: &Value, out: &mut Vec<ParsedEvent>) {
     let Some(conv_obj) = conv.as_object() else {
         return;
@@ -399,10 +381,8 @@ fn parse_conversation(conv: &Value, out: &mut Vec<ParsedEvent>) {
         .map(|secs| (secs * 1_000_000.0) as i64)
         .unwrap_or(0);
 
-    // ── current-path set: walk current_node -> parent -> ... -> root ────────
-    //
-    // Off-path nodes (abandoned/regenerated branches) are flagged
-    // is_sidechain, mirroring how Claude Code flags sidechains.
+    // current-path set: walk current_node -> parent -> ... -> root; off-path
+    // nodes are flagged is_sidechain (see docs guide).
     let mut current_path: HashSet<String> = HashSet::new();
     if let Some(current_node) = conv_obj.get("current_node").and_then(|v| v.as_str()) {
         let mut cursor = Some(current_node.to_string());
@@ -436,10 +416,7 @@ fn parse_conversation(conv: &Value, out: &mut Vec<ParsedEvent>) {
         slug: slug.as_deref(),
     };
 
-    // ── deterministic DFS preorder from the root, following `children` order ─
-    //
-    // Explicit stack, not recursion — a long linear conversation can nest
-    // thousands of turns deep and would risk overflowing a worker-thread stack.
+    // Deterministic DFS preorder, explicit stack (not recursion — see docs guide).
     let mut stack: Vec<String> = vec![root_id];
     let mut visited: HashSet<String> = HashSet::new();
 
@@ -471,11 +448,10 @@ fn parse_conversation(conv: &Value, out: &mut Vec<ParsedEvent>) {
     }
 }
 
-/// Build a `ParsedEvent` for a single message-bearing mapping node.
-///
-/// Returns `None` when the message carries no `id`, or when the extracted
-/// text is empty/whitespace-only (ChatGPT scaffolding nodes, e.g. system
-/// prompts with `parts: [""]`).
+/// Build a `ParsedEvent` for a single message-bearing mapping node; `None`
+/// on a missing `id` or empty/whitespace-only extracted text (ChatGPT
+/// scaffolding nodes). See
+/// `crates/khive-pack-session/docs/api/mirror-parse.md#build_chatgpt_event`.
 fn build_chatgpt_event(
     node_id: &str,
     node: &Map<String, Value>,
@@ -513,12 +489,8 @@ fn build_chatgpt_event(
         .map(|secs| (secs * 1_000_000.0) as i64)
         .unwrap_or(ctx.conv_created_at_micros);
 
-    // Some(parent_node_id) only when that parent node itself carries a
-    // (non-null) message — the ChatGPT root is normally message=null, so its
-    // children correctly get parent_uuid=None. A parent that DOES carry a
-    // message but was itself skipped as an event (e.g. empty-parts
-    // scaffolding) still counts — this is provenance linkage, matching how
-    // CC parent chains can reference events that were never mirrored.
+    // parent_uuid is Some only when the parent node itself carries a message
+    // (provenance linkage — see docs guide).
     let parent_uuid = node
         .get("parent")
         .and_then(|v| v.as_str())
@@ -555,12 +527,8 @@ fn build_chatgpt_event(
 }
 
 /// Extract display text from a ChatGPT message `content` object per its
-/// `content_type`.
-///
-/// - `"text"` — join string `parts` with `"\n"` (non-string parts ignored
-///   defensively).
-/// - anything else (`"code"`, `"execution_output"`, …) — `content.text` if
-///   present, else joined string `parts`, else `None`.
+/// `content_type`. See
+/// `crates/khive-pack-session/docs/api/mirror-parse.md#extract_chatgpt_text`.
 fn extract_chatgpt_text(
     content_type: &str,
     content: Option<&Map<String, Value>>,
