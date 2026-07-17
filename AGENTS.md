@@ -68,11 +68,15 @@ plain hex) is parsed directly; (2) otherwise an 8-or-more hex-character string e
 prefix lookup, but in practice only the exact 8-char compact ID returned by write verbs resolves,
 because stored UUIDs carry a dash at position 9, so a 9+ pure-hex string never matches; (3) anything
 else falls through to an exact, case-insensitive entity-name lookup. `create`, `list`, `search`
-require `kind=entity|note` (or `kind=edge` for `list`; `kind=event` for audit events per
-[ADR-022](docs/adr/ADR-022-events-query-surface.md)).
+take a `kind` discriminant: either a substrate name (`entity`, `note`, plus `edge` for `list` and
+`event` for audit events per [ADR-022](docs/adr/ADR-022-events-query-surface.md)) or a
+pack-registered granular kind (`concept`, `document`, `task`, `observation`, …), which the registry
+resolves to its substrate.
 
-**Create is not an upsert.** Every successful `create` call writes a new record and returns a
-new UUID. Entity names are mutable labels, not unique keys. When reuse is intended, call
+**Create is not an upsert.** Every successful `create` writes a new record rather than reusing an
+existing one. A singleton create returns the new record's UUID; a bulk `items=[...]` create returns
+aggregate counts (`attempted`/`created`/`skipped`/`failed`). Entity names are mutable labels, not
+unique keys. When reuse is intended, call
 `resolve` or `search`, inspect the `Resolved`/`Ambiguous` candidates, and create only after
 `NotFound` or an intentional decision to represent a distinct entity. Use `merge` only after
 establishing that two UUIDs denote the same entity. `skip_dedup_check` disables the post-create
