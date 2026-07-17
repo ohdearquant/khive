@@ -431,6 +431,99 @@ async fn test_upsert_note_insert_and_seq_assignment_are_atomic() {
     );
 }
 
+/// ADR-116 prerequisite: `upsert_note` must be a true UPSERT (`INSERT ...
+/// ON CONFLICT(id) DO UPDATE`), not `INSERT OR REPLACE` — the latter is a
+/// SQLite DELETE-then-INSERT that would spuriously fire ANN-generation
+/// DELETE triggers and discard the row's original `created_at`. This
+/// installs a stand-in DELETE trigger (the shape ADR-116 lands on `notes`)
+/// to prove upserting an existing row never fires it, while a real delete
+/// still does — confirming the probe itself is live.
+#[tokio::test]
+async fn test_upsert_note_is_true_upsert_no_delete_semantics() {
+    let store = setup_memory_store();
+    {
+        let writer = store.pool.try_writer().unwrap();
+        writer
+            .conn()
+            .execute_batch(
+                // `recursive_triggers` defaults OFF, under which SQLite does
+                // NOT fire AFTER DELETE triggers for the delete half of an
+                // `INSERT OR REPLACE` conflict resolution — so without this
+                // pragma the probe below would read 0 even on the old
+                // INSERT-OR-REPLACE path, and the test would prove nothing.
+                "PRAGMA recursive_triggers = ON;
+                 CREATE TABLE delete_fires (n INTEGER);
+                 CREATE TRIGGER notes_delete_probe AFTER DELETE ON notes \
+                 BEGIN INSERT INTO delete_fires VALUES (1); END;",
+            )
+            .unwrap();
+    }
+
+    let mut note = make_note("default", "observation", "v1");
+    let id = note.id;
+    let original_created_at = note.created_at;
+
+    store.upsert_note(note.clone()).await.unwrap();
+
+    // Re-upsert the same id with mutated fields and a later created_at, as a
+    // careless caller might pass — the store must still preserve the original.
+    note.content = "v2".to_string();
+    note.salience = Some(0.9);
+    note.updated_at += 1_000;
+    note.created_at += 1_000;
+    store.upsert_note(note).await.unwrap();
+
+    let fetched = store.get_note(id).await.unwrap().unwrap();
+    assert_eq!(
+        fetched.content, "v2",
+        "mutable fields must reflect the second upsert"
+    );
+    assert_eq!(fetched.salience, Some(0.9));
+    assert_eq!(
+        fetched.created_at, original_created_at,
+        "created_at must be preserved across an upsert of an existing row"
+    );
+
+    let (row_count, delete_fires): (i64, i64) = {
+        let writer = store.pool.try_writer().unwrap();
+        let conn = writer.conn();
+        let row_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM notes WHERE id = ?1",
+                rusqlite::params![id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let delete_fires: i64 = conn
+            .query_row("SELECT COUNT(*) FROM delete_fires", [], |row| row.get(0))
+            .unwrap();
+        (row_count, delete_fires)
+    };
+    assert_eq!(
+        row_count, 1,
+        "upsert must update in place, never duplicate rows"
+    );
+    assert_eq!(
+        delete_fires, 0,
+        "upserting an existing row must not fire DELETE-path triggers"
+    );
+
+    // Sanity: a real delete does fire the probe, proving it would have
+    // caught the old INSERT OR REPLACE delete+insert behavior.
+    store.delete_note(id, DeleteMode::Hard).await.unwrap();
+    let delete_fires_after: i64 = {
+        let writer = store.pool.try_writer().unwrap();
+        writer
+            .conn()
+            .query_row("SELECT COUNT(*) FROM delete_fires", [], |row| row.get(0))
+            .unwrap()
+    };
+    assert_eq!(
+        delete_fires_after, 1,
+        "the probe trigger must fire on a genuine delete"
+    );
+}
+
 /// Same regression as `test_upsert_note_insert_and_seq_assignment_are_atomic`
 /// for `try_insert_note`'s flag-off path.
 #[tokio::test]
