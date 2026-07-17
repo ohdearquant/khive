@@ -954,11 +954,13 @@ fn heartbeat_note_id(namespace: &str, channel_kind: &str, channel_slug: &str) ->
 }
 
 /// `heartbeat` — persist one poll attempt's outcome into the channel's
-/// heartbeat row (khive #606). Subhandler — only the daemon's channel poll
-/// loop calls this. Read-modify-write: `created_at` is preserved across
-/// updates, `last_error` is RETAINED across a subsequent success (design
-/// review amendment 3), and `consecutive_failures` resets on success /
-/// increments on failure, read from the prior row (correct across restarts).
+/// heartbeat row (khive #606). Internal subhandler with no MCP wire path: its
+/// production local caller is the daemon's channel poll loop, and khive #917
+/// also lets authorized per-tenant writers reach it via `dispatch_as`.
+/// Read-modify-write: `created_at` is preserved across updates, `last_error`
+/// is RETAINED across a subsequent success (design review amendment 3), and
+/// `consecutive_failures` resets on success / increments on failure, read from
+/// the prior row (correct across restarts).
 pub(crate) async fn handle_heartbeat(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -999,10 +1001,30 @@ pub(crate) async fn handle_heartbeat(
         ));
     }
 
-    // #606: heartbeat rows are OPERATIONAL, not message data — always persist to
-    // `CHANNEL_HEALTH_NAMESPACE`, never `token.namespace()` (never read back by
-    // `handle_health`'s #877 namespace-scoped read either; see docs/api/channel-health.md).
-    let ns = crate::CHANNEL_HEALTH_NAMESPACE;
+    // Issue #917: heartbeat rows persist under `token.namespace()` — the
+    // dispatch-authorized namespace every other comm verb already uses —
+    // rather than the fixed `crate::CHANNEL_HEALTH_NAMESPACE` constant #606
+    // pinned this to. `comm.heartbeat` is `Visibility::Subhandler` (never
+    // reachable from the MCP wire); the only callers able to dispatch it are
+    // trusted internal Rust code holding a `&VerbRegistry` handle, so the
+    // gate check `VerbRegistry::dispatch_with_identity` already runs for
+    // every dispatch (subhandlers included) is the sole authorization
+    // boundary here (ADR-018) — this handler must not layer a second,
+    // handler-local namespace check on top of it.
+    //
+    // The local single-tenant poll loop (`khive-mcp`'s
+    // `record_channel_heartbeat`) is unaffected: it always passes
+    // `"namespace": crate::CHANNEL_HEALTH_NAMESPACE` explicitly in its own
+    // dispatch params, so it keeps writing under `"local"` exactly as
+    // before. An authorized per-tenant writer (#917) instead dispatches via
+    // `VerbRegistry::dispatch_as` with a `VerifiedActor` (an out-of-band
+    // authenticated tenant principal, never derived from a wire-supplied
+    // field — this verb has no wire path at all) and passes that tenant's
+    // own namespace as this same explicit `namespace` dispatch param. Those
+    // heartbeat rows land under that tenant's namespace, so a tenant-scoped
+    // `comm.health` (#877) now observes real writer state
+    // instead of an empty set by construction.
+    let ns = token.namespace().as_str();
     let store = runtime.notes(token)?;
     let id = heartbeat_note_id(ns, &p.channel_kind, &p.channel_slug);
 

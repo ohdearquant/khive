@@ -7,19 +7,25 @@ verb — how poll-loop outcomes are persisted and reported, spanning `lib.rs` an
 
 ## `lib.rs::CHANNEL_HEALTH_NAMESPACE` — rationale
 
-Channel heartbeat rows are an OPERATIONAL surface, not message data: the write
-must not follow `KHIVE_EMAIL_INGEST_NAMESPACE` (or any other caller-chosen
-namespace) — `handle_heartbeat` is the ONLY comm handler pinned to this
-constant (khive #606 design review Blocker fix, example actor 2026-07-04).
+Channel heartbeat rows are an OPERATIONAL surface, not message data. `#606`
+introduced this constant as the fixed namespace every heartbeat write landed
+under; `#917` narrowed its role. `handle_heartbeat` no longer pins its write
+to this constant: it persists under `token.namespace()`, the same
+dispatch-authorized namespace every other comm verb uses (khive #917). This
+constant is now the namespace the local single-tenant poll loop (`khive-mcp`'s
+`record_channel_heartbeat`) passes explicitly as its own `namespace` dispatch
+param, so that loop's writes still land under `"local"` and must not follow
+`KHIVE_EMAIL_INGEST_NAMESPACE` (or any other caller-chosen namespace) even
+though that env var configures the same daemon's message-ingestion namespace
+(khive #606 design review Blocker fix, example actor 2026-07-04).
 
-`comm.health` no longer reads this constant unconditionally (khive #877): it
-resolves its read namespace from the dispatch token (`token.namespace()`), the
-same explicit `namespace=` escape / `"local"` default every other comm verb
-uses. An unscoped `comm.health()` call still defaults to `"local"` and so
-still observes rows this constant wrote — but a call with an explicit
-non-local `namespace=` reads that namespace instead, and must not fall back to
-this constant to find heartbeat state a single-namespace daemon wrote
-elsewhere.
+`comm.health` reads via the dispatch token (`token.namespace()`) too (khive
+#877): the same explicit `namespace=` escape / `"local"` default every other
+comm verb uses. An unscoped `comm.health()` call still defaults to `"local"`
+and so still observes the rows the local poll loop wrote under this constant —
+but a call with an explicit non-local `namespace=` reads that namespace
+instead, observing the heartbeat rows an authorized per-tenant writer (khive
+#917) produced there, and must not fall back to this constant.
 
 ## `handlers.rs::heartbeat_note_id`
 
@@ -45,8 +51,11 @@ always serialize to distinct byte sequences.
 ## `handlers.rs::handle_heartbeat`
 
 Persists one poll attempt's outcome into the channel's heartbeat row (khive
-#606). Subhandler — only the daemon's channel poll loop
-(`crates/khive-mcp/src/serve.rs::channel_poll_loop`) calls this.
+#606). Internal subhandler with no MCP wire path: its production local caller
+is the daemon's channel poll loop
+(`crates/khive-mcp/src/serve.rs::channel_poll_loop`); khive #917 also lets
+authorized per-tenant writers reach it via `dispatch_as` (see the persistence
+note below).
 
 Read-modify-write against the existing row (if any) so that:
 - `created_at` is preserved across updates (first-seen time), not reset every
@@ -59,19 +68,28 @@ Read-modify-write against the existing row (if any) so that:
   read from the prior row rather than any in-process counter, so it is
   correct even across a daemon restart.
 
-Heartbeat rows are an OPERATIONAL surface, not message data (#606). Persists to
-`crate::CHANNEL_HEALTH_NAMESPACE` ALWAYS — never `token.namespace()` — so a
-poll loop configured with a non-local `KHIVE_EMAIL_INGEST_NAMESPACE` cannot
-cause heartbeat rows to land anywhere but this one fixed namespace. This is
-enforced here (not just at the serve.rs call site) so the guarantee holds even
-if a future caller passes a different `namespace` dispatch param.
+Heartbeat rows are an OPERATIONAL surface, not message data (#606). Persists
+under `token.namespace()` (khive #917) — the dispatch-authorized namespace
+every other comm verb uses — not the fixed `crate::CHANNEL_HEALTH_NAMESPACE`
+constant #606 originally pinned it to. `comm.heartbeat` is a `Subhandler`
+(never reachable from the MCP wire); the gate check
+`VerbRegistry::dispatch_with_identity`, which runs for every dispatch
+(subhandlers included), is the sole authorization boundary (ADR-018), so this
+handler must not layer a second, handler-local namespace check on top of it.
 
-`handle_health` (khive #877) no longer mirrors this fixed pin: it reads from
-`token.namespace()`, which only resolves to this same constant for an
-unscoped (default-namespace) caller. An explicitly-scoped `comm.health` caller
-reads its own namespace, not wherever this handler wrote — do not reintroduce
-a `handle_health` read of this constant to "fix" that; it is the
-cross-namespace leak #877 closed.
+The local single-tenant poll loop (`khive-mcp`'s `record_channel_heartbeat`)
+is unaffected: it always passes `crate::CHANNEL_HEALTH_NAMESPACE` explicitly as
+its `namespace` dispatch param, so it keeps writing under `"local"` exactly as
+before. An authorized per-tenant writer (#917) instead dispatches via
+`VerbRegistry::dispatch_as` with a `VerifiedActor` (an out-of-band
+authenticated tenant principal, never a wire-supplied field — this verb has no
+wire path at all) and passes that tenant's own namespace, so its heartbeat
+rows land under that namespace.
+
+`handle_health` (khive #877) reads from `token.namespace()` the same way, so a
+tenant-scoped `comm.health` now observes that tenant's writer state instead of
+an empty set by construction. An unscoped read still resolves to `"local"` and
+sees the poll loop's rows.
 
 ## `handlers.rs::channel_health_to_json`
 
@@ -89,11 +107,13 @@ Reads the daemon-persisted `channel_health` rows from `token.namespace()`
 uses (ADR-007 Rev 6 Rule 3: `namespace=` is the caller's explicit escape;
 absent that, the token pins to `"local"`). Unscoped callers (single-tenant
 local daemon, the common case) see exactly what they saw before this fix,
-since heartbeat rows still land under `crate::CHANNEL_HEALTH_NAMESPACE`
-(`"local"`) and an unscoped token also resolves to `"local"`. A caller that
-passes an explicit non-local `namespace=` now reads that namespace's rows
-only — never `"local"`'s — closing the cross-namespace operational-surface
-leak that held this verb off the cloud data plane (#877).
+since the local poll loop's heartbeat rows still land under
+`crate::CHANNEL_HEALTH_NAMESPACE` (`"local"`) and an unscoped token also
+resolves to `"local"`. A caller that passes an explicit non-local `namespace=`
+now reads that namespace's rows only — never `"local"`'s — observing the
+heartbeat rows an authorized per-tenant writer (khive #917) produced there, and
+closing the cross-namespace operational-surface leak that held this verb off
+the cloud data plane (#877).
 
 `role` answers "who owns the loops", not "whose memory answered": any
 persisted row means some daemon owns the channel loops, so `role` is reported
@@ -110,13 +130,15 @@ available at this layer.
 echoed back so the shape is self-describing for both the unscoped and the
 explicitly-scoped case: `role: "client"` / empty `channels` is now ambiguous on
 its own, since it is also the correct, expected shape for a `namespace=`-scoped
-call in the shipped OSS build (`comm.heartbeat` only ever persists under
-`crate::CHANNEL_HEALTH_NAMESPACE`, and there is no OSS producer for
-tenant-scoped heartbeat rows yet — that is cloud-side follow-up). A caller
-reading `namespace: "tenant-a"` alongside `role: "client"` can tell "no daemon
-anywhere" (unscoped call, `namespace: "local"`) apart from "no rows written
-under my scope yet" (scoped call, `namespace: "tenant-a"`) without khive
-silently falling back to `"local"` to paper over the difference.
+call whose namespace has no heartbeat rows yet: `comm.heartbeat` now persists
+under `token.namespace()` (khive #917), so an authorized per-tenant writer's
+rows are what a scoped read observes, and an empty `channels` array for a
+scoped read means no writer has been authorized for that namespace yet, not
+that the feature is unreachable. A caller reading `namespace: "tenant-a"`
+alongside `role: "client"` can tell "no daemon anywhere" (unscoped call,
+`namespace: "local"`) apart from "no rows written under my scope yet" (scoped
+call, `namespace: "tenant-a"`) without khive silently falling back to `"local"`
+to paper over the difference.
 
 Never returns a computed `healthy: bool` (design review amendment: "report
 timestamps only") — staleness/alerting judgment belongs to the caller.
