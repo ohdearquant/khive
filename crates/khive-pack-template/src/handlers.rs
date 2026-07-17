@@ -8,6 +8,7 @@ use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 ///
 /// Accepts `{ "name": "<string>" }` and returns `{ "ok": true, "name": "<string>" }`.
 /// Returns an error when `name` is absent or not a non-empty string.
+/// See `crates/khive-pack-template/docs/api/pack-scaffold.md`.
 pub(crate) async fn handle_my_verb(
     _runtime: &KhiveRuntime,
     _token: &NamespaceToken,

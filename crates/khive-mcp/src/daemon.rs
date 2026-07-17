@@ -59,42 +59,21 @@ pub(crate) static DAEMON_DISPATCH: std::sync::atomic::AtomicUsize =
 
 /// Test-only rendezvous point: when set, every [`kill_and_respawn`] call
 /// waits on this barrier right after its own initial probe independently
-/// classifies the daemon `Dead` and BEFORE it attempts the recoverer lock.
-///
-/// #838: the two-recoverer regression test previously let
-/// each `kill_and_respawn` call reach that point on its own schedule, then
-/// used a side-channel poll on `SPAWN_COUNT` to decide when to fake a live
-/// replacement daemon. With the recoverer lock deliberately removed
-/// (sabotage check), the two calls still did not race concurrently — normal
-/// tokio scheduling let the first call run far enough ahead that its
-/// classification, kill, and spawn completed (flipping the fake daemon
-/// live) before the second call's own classification rounds observed
-/// anything, so the test passed even with the lock's acquisition deleted.
-/// This barrier forces every concurrent recoverer under test to reach the
-/// classification-complete point at the same instant, so the recoverer
-/// lock (or its absence) is what determines whether one or both proceed to
-/// kill+spawn — not scheduler luck.
+/// classifies the daemon `Dead` and BEFORE it attempts the recoverer lock —
+/// forces concurrent recoverers under test to race on the lock itself
+/// rather than on scheduler luck (#838). See
+/// `crates/khive-mcp/docs/api/daemon-lifecycle.md`.
 #[cfg(test)]
 pub(crate) static RECOVERY_RACE_BARRIER: std::sync::Mutex<
     Option<std::sync::Arc<tokio::sync::Barrier>>,
 > = std::sync::Mutex::new(None);
 
 /// Test-only second rendezvous point, right before a recoverer that
-/// classified `Dead` actually commits to `kill_stale_daemon_inner` +
-/// `spawn_daemon`. `RECOVERY_RACE_BARRIER` alone only synchronizes the
-/// START of `confirm_genuinely_dead`; its internal rounds still run against
-/// a real, deadline-based lock check (`spawn_blocking` against a real OS
-/// thread pool), which introduces enough real-world jitter over
-/// `DEAD_CONFIRM_ROUNDS` rounds that one recoverer can still finish and
-/// call `spawn_daemon()` measurably before the other's last round — giving
-/// the fake-daemon watcher time to bind and make the slower recoverer
-/// observe `Alive` on its own, even with the recoverer lock removed. This
-/// second, BOUNDED barrier (falls through after its bound rather than
-/// waiting forever, so a recoverer that legitimately never reaches this
-/// point — e.g. because it is still blocked acquiring the real recoverer
-/// lock — cannot deadlock it) forces both recoverers that did independently
-/// classify `Dead` to commit to spawning at the same instant, closing the
-/// jitter window the fake-daemon watcher could otherwise race against.
+/// classified `Dead` commits to kill+spawn. Bounded (falls through after its
+/// bound rather than waiting forever) so a recoverer still blocked on the
+/// real recoverer lock cannot deadlock it. See
+/// `crates/khive-mcp/docs/api/daemon-lifecycle.md` for the jitter window
+/// this closes.
 #[cfg(test)]
 pub(crate) static SPAWN_COMMIT_BARRIER: std::sync::Mutex<
     Option<std::sync::Arc<tokio::sync::Barrier>>,
@@ -210,22 +189,12 @@ enum FallbackSeverity {
     NoDaemon,
 }
 
-/// `KHIVE_DAEMON_STRICT=1` elevates `Illegitimate`-severity fallbacks
-/// (`ConfigMismatch`, `NamespaceMismatch`) from a WARN to an error-level
-/// structured event plus a dedicated violation counter (D2-R1) — see
-/// [`record_fallback`]. It also, independent of severity, rejects the request
-/// outright instead of letting it complete through local dispatch (#947) —
-/// see `fallback_or_reject`. Together these make an illegitimate mismatch
-/// impossible to miss AND make "strict mode active" a sound proof that no
-/// request in the window was served off the local fallback path.
-///
-/// No hosted-vs-local auto-detection signal exists in this codebase (there is
-/// no build-time or runtime "is this the hosted fleet image" flag anywhere in
-/// the workspace) and none is invented here: this resolves as a plain opt-in,
-/// default OFF, matching the shape of `is_strict_actor_mode`'s
-/// `KHIVE_REQUIRE_ATTRIBUTED_ACTOR`. The hosted/fleet image is expected to set
-/// `KHIVE_DAEMON_STRICT=1` explicitly in its own deployment environment; a
-/// bare local `kkernel` invocation is unaffected by default.
+/// `KHIVE_DAEMON_STRICT=1` elevates `Illegitimate`-severity fallbacks to an
+/// error-level event (D2-R1, see [`record_fallback`]) and rejects the
+/// request outright instead of completing it locally (#947, see
+/// `fallback_or_reject`). Plain opt-in, default OFF — no hosted-vs-local
+/// auto-detection exists in this codebase. See
+/// `crates/khive-mcp/docs/api/daemon-lifecycle.md`.
 fn is_daemon_strict_mode() -> bool {
     env_truthy("KHIVE_DAEMON_STRICT")
 }
@@ -259,12 +228,10 @@ static FALLBACK_STRICT_VIOLATIONS: std::sync::atomic::AtomicUsize =
 // needing to touch `record_fallback`'s call sites. Exercised directly by the counter
 // tests below in the meantime.
 #[allow(dead_code)]
-/// `khive_daemon_fallback_total{reason="<all>"}` — total fallback count across
-/// all reasons, derived by summing the five reason counters on read rather
-/// than tracked as a separate atomic. A separate total can be observed
-/// momentarily out of sync with the sum of reasons (two independent
-/// `fetch_add`s); deriving it makes total == sum-of-reasons a structural
-/// invariant instead of a timing-dependent one.
+/// `khive_daemon_fallback_total{reason="<all>"}` — sums the five reason
+/// counters on read rather than tracking a separate atomic, so
+/// total == sum-of-reasons is a structural invariant. See
+/// `crates/khive-mcp/docs/api/daemon-lifecycle.md`.
 pub(crate) fn fallback_total() -> usize {
     use std::sync::atomic::Ordering::SeqCst;
     FALLBACK_CONFIG_MISMATCH.load(SeqCst)
@@ -302,26 +269,11 @@ pub(crate) fn reset_fallback_counters() {
 /// Emit the standardized `daemon_fallback` event and increment the matching
 /// counters. Call exactly once per fallback event, at the point where the
 /// caller is about to dispatch locally instead of via the warm daemon.
-///
-/// `config_id_daemon` is `None` when no daemon response was available to read
-/// it from (socket unreachable, undecodable response) or the daemon omitted it
-/// (legacy daemon) — logged as the literal `"none"` string rather than the
-/// field being absent, since presence-vs-absence is itself diagnostic. `db`
-/// (the canonical db path) is intentionally not logged here: neither call site
-/// has it in scope without broader plumbing, and inventing a value would be
-/// worse than omitting the field.
-///
-/// Log level and counter are graduated by [`FallbackReason::severity`] and
-/// [`is_daemon_strict_mode`] (D2-R1): an `Illegitimate` reason observed while
-/// `KHIVE_DAEMON_STRICT=1` is set logs at `error!` and bumps
-/// `FALLBACK_STRICT_VIOLATIONS` in addition to its own per-reason counter;
-/// every other case (non-strict mode, or a `RolloutTransient`/`NoDaemon`
-/// reason regardless of mode) logs at `warn!`, exactly as before this change
-/// (D2-R3 — strict mode keys on `FallbackReason`, never on "did a fallback
-/// happen at all"). This function only records; it never decides whether the
-/// caller proceeds locally — every call site pairs it with
-/// `fallback_or_reject` (#947), which is what converts a strict-mode
-/// fallback into a hard error instead of a local dispatch.
+/// Log level/counter are graduated by [`FallbackReason::severity`] and
+/// [`is_daemon_strict_mode`] (D2-R1/D2-R3). This function only records; it
+/// never decides whether the caller proceeds locally — every call site
+/// pairs it with `fallback_or_reject` (#947). See
+/// `crates/khive-mcp/docs/api/daemon-lifecycle.md`.
 fn record_fallback(
     reason: FallbackReason,
     config_id_client: &str,
@@ -360,22 +312,14 @@ fn record_fallback(
 
 /// #947: the single decision point for what a caller sees when a request
 /// would fall back to local dispatch. Always records `reason` via
-/// [`record_fallback`] first — counters and the graduated WARN/ERROR log stay
-/// exactly as they were (D2-R1/D2-R3 are untouched by this function). Then,
-/// under `KHIVE_DAEMON_STRICT=1`, rejects the request instead of letting it
-/// complete locally: the interim daemon-engagement proof in Benchmark SPEC
-/// Amendment 1 §3 ("strict mode active AND daemon_fallback_count == 0") is
-/// only sound if a fallback that DID happen can never be reported back as a
-/// successful, locally-served response. Every `FallbackReason` is rejected
-/// here, not just the `Illegitimate` tier — that tier only governs the WARN
-/// vs ERROR log level inside `record_fallback`, an orthogonal concern.
+/// [`record_fallback`] first, then under `KHIVE_DAEMON_STRICT=1` rejects the
+/// request instead of letting it complete locally — every `FallbackReason`
+/// is rejected, not just the `Illegitimate` tier. See
+/// `crates/khive-mcp/docs/api/daemon-lifecycle.md`.
 ///
-/// `data` marker on a strict-fallback rejection's [`McpError`] (#947 Medium
-/// finding): `request()` in `server.rs` inspects this to tell "the daemon was
-/// never reached and strict mode rejected the fallback" apart from every
-/// other daemon-forward `McpError` (protocol mismatch, oversized frame,
-/// ambiguous post-write outcome), which stay RPC-level errors. Kept as a
-/// shared constant so the tag and the check can never drift independently.
+/// `STRICT_FALLBACK_MARKER` tags a strict-fallback rejection's [`McpError`]
+/// so `request()` in `server.rs` can tell it apart from every other
+/// daemon-forward `McpError`, which stay RPC-level errors.
 pub(crate) const STRICT_FALLBACK_MARKER: &str = "khive_strict_daemon_fallback";
 
 /// Call exactly where the caller was about to `return None` (local dispatch)
@@ -1027,23 +971,12 @@ const DEAD_CONFIRM_POLL_MS: u64 = 75;
 const BOOT_QUIESCENCE_LOCK_TIMEOUT_MS: u64 = 500;
 
 /// Block until no concurrent boot holds the shared boot/recovery lock (or the
-/// bounded wait's deadline elapses), then re-probe daemon identity.
-///
-/// Same mechanism as [`wait_for_boot_quiescence_then_reprobe`], factored out
-/// so [`confirm_genuinely_dead`] can reuse it too (#758): a peer's
-/// `kill_and_respawn` (kill+spawn) or a daemon's own cold boot both hold this
-/// lock, so successfully reacquiring-then-immediately-dropping it proves
-/// neither is currently mid-critical-section at the moment this returns.
-///
-/// #838: unlike `wait_for_boot_quiescence_then_reprobe`
-/// (which genuinely wants to wait out a real boot once one is known to be in
-/// flight), this uses the DEADLINE-BOUNDED
-/// [`khive_runtime::daemon::try_acquire_daemon_boot_guard_until`] instead of
-/// the unbounded blocking `flock` — a wedged lock holder must not block
-/// `confirm_genuinely_dead`'s rounds forever. A deadline-elapsed or
-/// otherwise-failed acquisition returns the distinct
-/// [`ProbeOutcome::LockContended`] rather than collapsing into `Timeout`
-/// (which means something different: "the daemon itself answered slowly").
+/// bounded wait's deadline elapses), then re-probe daemon identity — reused
+/// by [`confirm_genuinely_dead`] (#758). Deadline-bounded (unlike an
+/// unbounded `flock`), so a wedged lock holder cannot block confirmation
+/// rounds forever; a contended/failed acquisition returns the distinct
+/// [`ProbeOutcome::LockContended`], not `Timeout` (#838). See
+/// `crates/khive-mcp/docs/api/daemon-lifecycle.md`.
 async fn quiesce_then_probe_identity(
     config_id: &str,
     namespace: &str,
@@ -1075,25 +1008,14 @@ async fn quiesce_then_probe_identity(
 }
 
 /// Confirm a `Dead` probe result is not racing a peer's in-flight
-/// `kill_and_respawn` or the daemon's own cold boot (#758).
-///
-/// `spawn_daemon()` is fire-and-forget: `cmd.spawn()` returns as soon as the
-/// child process exists, well before that child reaches its own
-/// `acquire_daemon_boot_guard()` call. A bare identity probe taken in that
-/// gap sees `NoSocket` and is classified `Dead` even though a replacement
-/// daemon is legitimately on its way up — a second recoverer trusting that
-/// single `Dead` reading would kill nothing useful (the pre-existing #645
-/// pid/socket rechecks in [`kill_stale_daemon_inner`] already prevent it
-/// from deleting a *bound* replacement's files) but would still spawn a
-/// wasteful, storm-prone extra daemon.
-///
-/// Retries [`quiesce_then_probe_identity`] up to [`DEAD_CONFIRM_ROUNDS`]
-/// times, paced by [`DEAD_CONFIRM_POLL_MS`]: returns as soon as a peer's boot
-/// is observed completing (`Alive`) or going slow (`Timeout` —
-/// NEVER-KILL-SLOW). Only returns `Dead` once every round agrees, which in
-/// practice bounds the confirm window well above typical process-start
-/// latency (single-digit to low tens of milliseconds) for the fork-to-flock
-/// gap this closes.
+/// `kill_and_respawn` or the daemon's own cold boot (#758) — closes the
+/// fork-to-flock gap where `spawn_daemon()`'s child exists but has not yet
+/// reached its own `acquire_daemon_boot_guard()` call. Retries
+/// [`quiesce_then_probe_identity`] up to [`DEAD_CONFIRM_ROUNDS`] times,
+/// paced by [`DEAD_CONFIRM_POLL_MS`]; returns as soon as a peer's boot is
+/// observed completing (`Alive`) or going slow (`Timeout`, NEVER-KILL-SLOW).
+/// Only `Dead` once every round agrees. See
+/// `crates/khive-mcp/docs/api/daemon-lifecycle.md`.
 async fn confirm_genuinely_dead(config_id: &str, namespace: &str) -> ProbeOutcome {
     // `LockContended` means "still could not confirm this round" — the same
     // "keep polling" shape as `Dead`, not a terminal state like `Alive`/
@@ -1129,63 +1051,22 @@ async fn confirm_genuinely_dead(config_id: &str, namespace: &str) -> ProbeOutcom
     }
 }
 
-/// Deadline for acquiring the recoverer-only lock
-/// ([`khive_runtime::daemon::recoverer_lock_path`]) before starting the
-/// dead-confirmation → kill → spawn critical section. Generous enough to
-/// cover a peer's full worst-case critical section — up to
-/// `DEAD_CONFIRM_ROUNDS * (BOOT_QUIESCENCE_LOCK_TIMEOUT_MS +
-/// BOOT_FENCE_PROBE_TIMEOUT_MS + DEAD_CONFIRM_POLL_MS)` for
-/// `confirm_genuinely_dead`, plus kill+spawn overhead — so a healthy peer's
-/// turn is never mistaken for a wedge.
+/// Deadline for acquiring the recoverer-only lock before starting the
+/// dead-confirmation → kill → spawn critical section — generous enough to
+/// cover a peer's full worst-case critical section so a healthy peer's turn
+/// is never mistaken for a wedge. See
+/// `crates/khive-mcp/docs/api/daemon-lifecycle.md`.
 const RECOVERER_LOCK_TIMEOUT_MS: u64 = 8_000;
 
 /// Kill the stale daemon and spawn a fresh one, serialized against concurrent
-/// recoverers by a dedicated recoverer-only lock.
-///
-/// Implements double-checked recovery: an initial bounded `probe_only` frame
-/// (500 ms timeout) is sent under the shared boot/recovery lock
-/// ([`acquire_recovery_lock`]) before anything else — this is the same
-/// cheap fast-path check as before, letting a client that finds the daemon
-/// obviously alive return `Skipped` immediately without ever touching the
-/// recoverer lock.
-///
-/// #838: a bare `Dead` reading on the initial probe used to
-/// fall straight into `confirm_genuinely_dead` → kill → spawn with no
-/// linearization point across concurrent recoverers, so two clients racing
-/// from a genuinely dead daemon could both classify `Dead` and both spawn a
-/// replacement. The fix acquires
-/// [`khive_runtime::daemon::try_acquire_recoverer_lock_until`] — a SEPARATE
-/// lock file from the daemon's own boot lock — before `confirm_genuinely_dead`
-/// runs, and holds it through `kill_stale_daemon_inner` + `spawn_daemon`. This
-/// makes recovery mutually exclusive across recoverers without risking a
-/// deadlock against a booting daemon: the daemon never acquires this lock
-/// (only `kill_and_respawn` does), so nothing on the daemon-boot side is ever
-/// waiting on a client holding it. A bounded, deadline-aware acquisition
-/// (rather than an unbounded blocking `flock`) is used for the same
-/// rationale: a second recoverer must not block forever if the first is
-/// itself wedged — see `RECOVERER_LOCK_TIMEOUT_MS`.
-///
-/// Why a second lock file rather than reusing the boot lock for this whole
-/// span: the daemon acquires the boot lock (via `acquire_daemon_boot_guard`)
-/// as the very first thing it does on boot (see `kkernel::main`), so a client
-/// holding that SAME lock across confirm-through-spawn would deadlock every
-/// recovery attempt against the very child it just spawned and is waiting to
-/// observe. `confirm_genuinely_dead` still uses the boot lock internally
-/// (bounded, per-round) purely to detect quiescence — it never holds it
-/// across the whole function. The recoverer lock is orthogonal: it excludes
-/// PEER RECOVERERS from each other, not from the daemon.
-///
-/// Outcomes:
-///   `Alive`/`Timeout` (initial or confirmed) → `RecoveryOutcome::Skipped`,
-///       no kill. NEVER-KILL-SLOW: a timed-out probe means the daemon may be
-///       alive but busy, not dead.
-///   `LockContended` (confirm rounds could not establish quiescence) or the
-///       recoverer lock itself timing out → `RecoveryOutcome::Uncertain`,
-///       no kill. Same safe behavior as `Skipped` — the caller forwards the
-///       real request either way — but reported distinctly so this state is
-///       never silently conflated with a positive "confirmed alive" result.
-///   `Dead` (confirmed, recoverer lock held) → kill+spawn;
-///       `RecoveryOutcome::Spawned`.
+/// recoverers by a dedicated recoverer-only lock (#838 double-checked
+/// recovery). Outcomes: `Alive`/`Timeout` → `Skipped`, no kill
+/// (NEVER-KILL-SLOW). `LockContended` (confirm rounds inconclusive, or the
+/// recoverer lock itself timed out) → `Uncertain`, no kill — same safe
+/// behavior as `Skipped` but reported distinctly. `Dead` (confirmed,
+/// recoverer lock held) → kill+spawn → `Spawned`. See
+/// `crates/khive-mcp/docs/api/daemon-lifecycle.md` for why a second lock
+/// file is required and how this avoids deadlocking a booting daemon.
 async fn kill_and_respawn<F>(
     config_id: &str,
     namespace: &str,
@@ -1513,27 +1394,12 @@ fn decide_mismatch_recovery(resumed_generation: Option<u32>) -> MismatchRecovery
 }
 
 /// Trigger the bridge's self-heal recovery for a `ProtocolMismatch` outcome.
-///
-/// Called from both `forward_or_spawn` `ProtocolMismatch` arms (the
-/// first-attempt arm and the arm inside the post-recovery retry loop — either
-/// can observe the mismatch depending on whether this was the first probe or
-/// a retry after a kill/respawn). Both arms already construct and return the
-/// hard mismatch error to the caller; this call schedules the recovery
-/// alongside that return, never in place of it.
-///
-/// Concurrency note (#714 design discussion, accepted risk, not fixed by
-/// this change): if the bridge is mid-flight on more than one outstanding
-/// client request when the mismatch fires, only the request that triggered
-/// this arm gets the ambiguous-error-then-resume treatment. Any other
-/// in-flight request loses its response the same way it would today if the
-/// process crashed — a pre-existing risk, not introduced here. Relatedly,
-/// [`fire_pending_self_heal`] fires on the next successful flush of *any*
-/// message, not specifically the mismatch response's own flush — on this
-/// bridge's dominant single-request-at-a-time usage those are the same
-/// event, but a genuinely concurrent second in-flight request could in
-/// principle flush first. That race is strictly better than the pre-fix
-/// timer (which could fire before *any* flush completed at all) and is the
-/// same class of pre-existing concurrency risk noted above, not a new one.
+/// Called from both `forward_or_spawn` `ProtocolMismatch` arms; both already
+/// construct and return the hard mismatch error, this schedules recovery
+/// alongside that return, never in place of it. Accepted concurrency risk
+/// (#714, not fixed by this change): a genuinely concurrent second in-flight
+/// request could observe the wrong flush event. See
+/// `crates/khive-mcp/docs/api/daemon-lifecycle.md`.
 fn trigger_bridge_self_heal() {
     match decide_mismatch_recovery(resumed_generation()) {
         MismatchRecovery::ReexecScheduled => schedule_reexec_on_mismatch(),
@@ -1678,20 +1544,12 @@ fn reexec_in_place() {
 }
 
 /// Wraps a [`rmcp::transport::Transport`] so every message it successfully
-/// flushes to the client fires [`fire_pending_self_heal`] afterward.
-///
-/// This is the actual happens-after edge #714's self-heal design requires,
-/// not the fixed-duration sleep the first version of this change used.
-/// [`rmcp::transport::async_rw::AsyncRwTransport::send`] — the concrete
-/// transport `KhiveMcpServer::serve_stdio` wraps this around — resolves its
-/// returned future only once the message has been encoded and flushed to
-/// the underlying writer (`FramedWrite::send` is `futures::SinkExt::send`,
-/// i.e. `feed` + `flush`). `rmcp`'s own service loop enqueues a tool
-/// handler's response and returns almost immediately, then performs that
-/// real write+flush on a separately spawned task with no duration bound —
-/// so the handler itself has no way to await it directly. Wrapping the
-/// transport instead intercepts every flush completion regardless of which
-/// task drives it.
+/// flushes to the client fires [`fire_pending_self_heal`] afterward — the
+/// actual happens-after edge #714's self-heal design requires, not a
+/// fixed-duration sleep. Wraps the transport (not the handler) because the
+/// handler itself has no way to await the real write+flush, which `rmcp`
+/// performs on a separately spawned task. See
+/// `crates/khive-mcp/docs/api/daemon-lifecycle.md`.
 pub(crate) struct SelfHealOnFlushTransport<T> {
     inner: T,
 }
@@ -1831,27 +1689,19 @@ async fn wait_for_boot_quiescence_then_reprobe(frame: &DaemonRequestFrame) -> Bo
 ///
 /// Returns `None` only when nothing was ever written to the daemon and local
 /// dispatch is therefore safe: `KHIVE_NO_DAEMON` is set, or no daemon socket
-/// could be reached (`NoSocket`). It never returns `None` after the real frame
-/// has been written. `Some(Ok)` / `Some(Err)` both mean the request's fate is
-/// already decided at the daemon and the caller must not dispatch locally.
+/// could be reached (`NoSocket`) — never after the real frame has been
+/// written. `Some(Ok)` / `Some(Err)` both mean the request's fate is already
+/// decided at the daemon and the caller must not dispatch locally. Under
+/// `KHIVE_DAEMON_STRICT=1` the `NoSocket` case instead becomes
+/// `Some(Err(..))` (`KHIVE_NO_DAEMON` is unaffected — it is an explicit
+/// caller opt-out, not a fallback).
 ///
-/// #947: under `KHIVE_DAEMON_STRICT=1`, the `NoSocket` case is instead
-/// `Some(Err(..))` — see `fallback_or_reject` — so it no longer joins
-/// `KHIVE_NO_DAEMON` as a safe-to-dispatch-locally outcome. `KHIVE_NO_DAEMON`
-/// itself is unaffected: it is the caller's explicit, unconditional opt-out
-/// of the daemon (not a fallback — nothing is ever recorded or counted for
-/// it), so it is not a case strict mode has any basis to override.
-///
-/// The real (possibly mutating) request frame is written to the daemon socket
-/// at most once per call. A `NoSocket` outcome never writes anything, so it is
-/// safe to establish or recover the daemon (via `kill_and_respawn`, which
-/// itself uses only `probe_only` frames) and retry the connect-and-write step
-/// until a response arrives or the readiness deadline elapses.
-///
-/// Once the real frame IS fully written — `ForwardOutcome::ParseFailure` or
-/// `ForwardOutcome::ProtocolMismatch` — this returns a hard error immediately
-/// (`ambiguous_forward_error`) instead of killing/respawning/retrying or
-/// falling back locally. See #644.
+/// The real (possibly mutating) request frame is written to the daemon
+/// socket at most once per call; a `NoSocket` outcome never writes anything,
+/// so it is safe to recover the daemon and retry. Once the real frame IS
+/// fully written (`ParseFailure`/`ProtocolMismatch`), this returns a hard
+/// error immediately instead of killing/respawning/retrying or falling back
+/// locally (#644). See `crates/khive-mcp/docs/api/daemon-lifecycle.md`.
 pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<String, McpError>> {
     forward_or_spawn_with(frame, &spawn_daemon).await
 }
@@ -2051,7 +1901,8 @@ mod tests {
 
     use khive_runtime::engine_config::ActorConfig;
     use khive_runtime::{
-        runtime_config_from_khive_config, KhiveConfig, KhiveRuntime, Namespace, RuntimeConfig,
+        runtime_config_from_khive_config, GitWriteEntryConfig, GitWriteSectionConfig, KhiveConfig,
+        KhiveRuntime, Namespace, RuntimeConfig,
     };
 
     fn memory_runtime_config() -> RuntimeConfig {
@@ -3286,6 +3137,85 @@ mod tests {
 
         handle.abort();
         let _ = handle.await;
+        clear_daemon_env();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn daemon_rejects_client_after_git_write_policy_is_revoked() {
+        clear_daemon_env();
+        reset_fallback_counters();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("khived.sock");
+        let pid = dir.path().join("khived.pid");
+        std::env::set_var("KHIVE_SOCKET", &sock);
+        std::env::set_var("KHIVE_PID", &pid);
+        std::env::remove_var("KHIVE_NO_DAEMON");
+
+        let mut allowed_config = memory_runtime_config();
+        allowed_config.default_namespace = Namespace::parse("test").unwrap();
+        allowed_config.packs = vec!["kg".to_string()];
+        allowed_config.git_write = GitWriteSectionConfig {
+            allowed: vec![GitWriteEntryConfig {
+                repo: "/srv/repos/alpha".to_string(),
+                branches: vec!["feat/*".to_string()],
+            }],
+        };
+        let revoked_config = RuntimeConfig {
+            git_write: GitWriteSectionConfig::default(),
+            ..allowed_config.clone()
+        };
+
+        let daemon_server = crate::server::KhiveMcpServer::new(
+            KhiveRuntime::new(allowed_config).expect("allowed-policy runtime"),
+        )
+        .expect("allowed-policy server");
+        let daemon_config_id = daemon_server.config_id().to_string();
+        let revoked_config_id = crate::server::compute_config_id(&revoked_config, None);
+        assert_ne!(
+            daemon_config_id, revoked_config_id,
+            "revoking the allowlist must change the daemon identity"
+        );
+
+        let handle = tokio::spawn(async move {
+            let _ = run_daemon(daemon_server).await;
+        });
+        let ready = connect_when_ready(&sock).await;
+        drop(ready);
+
+        let request = DaemonRequestFrame {
+            ops: "stats()".to_string(),
+            presentation: None,
+            presentation_per_op: None,
+            namespace: "test".to_string(),
+            actor_id: None,
+            visible_namespaces: Vec::new(),
+            config_id: revoked_config_id.clone(),
+            protocol_version: PROTOCOL_VERSION,
+            probe_only: false,
+            metrics_only: false,
+            format: None,
+            format_per_op: None,
+            from_wire: false,
+            request_id: None,
+        };
+        let response = exchange(&sock, &request).await;
+
+        assert!(response.config_mismatch, "revoked policy must be rejected");
+        assert!(!response.ok, "the old-policy daemon must not dispatch");
+        assert_eq!(
+            response.served_config_id.as_deref(),
+            Some(daemon_config_id.as_str())
+        );
+        assert!(
+            map_response(response, &revoked_config_id, "test").is_none(),
+            "non-strict clients must take the established config-mismatch fallback path"
+        );
+        assert_eq!(fallback_count(FallbackReason::ConfigMismatch), 1);
+
+        handle.abort();
+        let _ = handle.await;
+        reset_fallback_counters();
         clear_daemon_env();
     }
 

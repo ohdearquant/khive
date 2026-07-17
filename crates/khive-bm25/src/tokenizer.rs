@@ -3,7 +3,9 @@
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
-/// Extensible text tokenization for BM25 indexing.
+/// Deterministic, thread-safe term extraction for BM25 indexing.
+///
+/// See `crates/khive-bm25/docs/api/tokenizer.md`.
 pub trait Tokenizer: Send + Sync {
     /// Tokenize text into terms. Returns empty vec for empty input.
     fn tokenize(&self, text: &str) -> Vec<String>;
@@ -26,7 +28,9 @@ static STOP_WORDS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     ])
 });
 
-/// Default tokenizer: whitespace split with lowercase and stop-word filtering.
+/// Configurable whitespace tokenizer with punctuation, case, length, and stop-word processing.
+///
+/// See `crates/khive-bm25/docs/api/tokenizer.md`.
 #[derive(Debug, Clone)]
 pub struct SimpleTokenizer {
     /// Whether to lowercase tokens.
@@ -60,24 +64,20 @@ impl SimpleTokenizer {
 
 impl Tokenizer for SimpleTokenizer {
     fn tokenize(&self, text: &str) -> Vec<String> {
-        // Fast path: estimate capacity to avoid re-allocations.
-        // Average English word ~5 chars + 1 space, so text.len()/6 is a reasonable estimate.
+        // Average English word length gives a useful allocation estimate.
         let estimated_tokens = text.len() / 6 + 1;
         let mut result = Vec::with_capacity(estimated_tokens.min(32));
 
         for word in text.split_whitespace() {
-            // Remove leading/trailing punctuation
             let trimmed = word.trim_matches(|c: char| c.is_ascii_punctuation());
 
             if trimmed.len() < self.min_length {
                 continue;
             }
 
-            // Fast ASCII lowercase check: if all bytes are ASCII, lowercase in-place
-            // to avoid the overhead of `str::to_lowercase()` (which handles Unicode).
+            // Avoid Unicode lowercase allocation for the common ASCII path.
             let token = if self.lowercase {
                 if trimmed.is_ascii() {
-                    // Fast path: ASCII-only, lowercase via byte manipulation
                     let mut s = String::with_capacity(trimmed.len());
                     for &byte in trimmed.as_bytes() {
                         s.push(byte.to_ascii_lowercase() as char);
@@ -101,7 +101,7 @@ impl Tokenizer for SimpleTokenizer {
     }
 }
 
-/// Tokenize text using the default SimpleTokenizer.
+/// Tokenize text with `SimpleTokenizer::default()`; empty input returns no terms.
 pub fn tokenize(text: &str) -> Vec<String> {
     SimpleTokenizer::default().tokenize(text)
 }

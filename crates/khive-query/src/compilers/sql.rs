@@ -1,10 +1,10 @@
-//! Compile GQL AST to parameterized SQL (JOIN chain or recursive CTE).
+//! Parameterized SQL compilation for fixed and variable-length query patterns.
 
 use crate::ast::*;
 use crate::error::QueryError;
 use crate::validate::{validate_with_warnings, MAX_DEPTH};
 
-/// Observation roles used by the synthetic edge compiler.
+/// Closed observation projections handled outside canonical graph edges.
 const SYNTHETIC_RELATIONS: &[&str] = &[
     "observed_as_candidate",
     "observed_as_selected",
@@ -26,12 +26,7 @@ fn synthetic_role(rel: &str) -> Option<&'static str> {
     }
 }
 
-/// Union of every primary-substrate table (entities, notes, events, graph_edges)
-/// that can legally bind to a canonical `-[:relation]->` endpoint (issue #467).
-/// Canonical edge endpoints are not entity-only: `annotates` admits note/entity/
-/// note/event/edge targets, and same-substrate relations like `supports` admit
-/// note-note pairs. This source lets node binding stay substrate-agnostic instead
-/// of hard-coding `entities`.
+/// Substrate-agnostic source for canonical edge endpoints (issue #467).
 const PRIMARY_NODE_SQL: &str = "\
     SELECT id, namespace, kind, entity_type, name, description, NULL AS content, \
            NULL AS status, NULL AS salience, NULL AS decay_factor, properties, \
@@ -60,11 +55,7 @@ fn primary_node_source(alias: &str) -> String {
     format!("({PRIMARY_NODE_SQL}) {alias}")
 }
 
-/// Union of entity/note tables that can legally bind to a synthetic
-/// `observed_as_*` target (issue #468): `observed_as_target` and
-/// `observed_as_signal` both admit entity OR note referents (ADR-041
-/// Amendment A2). This source lets the target join stay entity-capable
-/// instead of hard-coding `notes`.
+/// Entity/note referent source for synthetic observation targets (issue #468).
 const OBSERVATION_TARGET_SQL: &str = "\
     SELECT id, namespace, kind, entity_type, name, description, \
            NULL AS content, NULL AS status, NULL AS salience, \
@@ -81,37 +72,37 @@ fn observation_target_source(alias: &str) -> String {
     format!("({OBSERVATION_TARGET_SQL}) {alias}")
 }
 
-/// Parameterized SQL emitted by the compiler, ready for execution by the runtime.
+/// Parameterized read-only SQL plus the metadata required to decode its result.
+///
+/// See `crates/khive-query/docs/api/sql-compilation.md` for lowering rules.
 #[derive(Debug)]
 pub struct CompiledQuery {
+    /// SQL statement using positional `?N` placeholders.
     pub sql: String,
+    /// Parameters in placeholder order.
     pub params: Vec<QueryValue>,
+    /// Caller-requested projections in result-column order.
     pub return_vars: Vec<ReturnItem>,
+    /// Non-fatal validation or compilation diagnostics.
     pub warnings: Vec<String>,
-    /// Present when the server-side `max_limit` cap is the binding
-    /// constraint on this query (no explicit `LIMIT`, or an explicit
-    /// `LIMIT` above the cap). The emitted SQL fetches `max_limit + 1`
-    /// rows (a sentinel row) so the execution site can detect whether the
-    /// true match count exceeded the cap and warn accordingly, instead of
-    /// inferring truncation from the requested `LIMIT` alone (issue #777).
+    /// Sentinel metadata when SQL fetches `max_limit + 1` to detect real truncation.
     pub truncation_check: Option<TruncationCheck>,
 }
 
-/// See [`CompiledQuery::truncation_check`].
+/// Instructions for stripping a row-cap sentinel after execution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TruncationCheck {
-    /// The server-side row cap; the execution site truncates to this many
-    /// rows after stripping the sentinel.
+    /// Server cap to enforce after detecting and removing the sentinel.
     pub max_limit: usize,
-    /// The caller's explicit `LIMIT`, if any, for warning-message purposes.
+    /// Explicit caller limit, retained for diagnostics.
     pub requested_limit: Option<usize>,
 }
 
 /// Runtime options injected by the caller to scope and cap query execution.
 pub struct CompileOptions {
-    /// Namespace scope. Empty = cross-namespace (all). Non-empty = filter to these namespaces.
+    /// Namespace scope; empty means all namespaces.
     pub scopes: Vec<String>,
-    /// Hard limit cap (server-side safety). Query limit is min(requested, max_limit).
+    /// Hard server row cap applied against any explicit query limit.
     pub max_limit: usize,
 }
 
@@ -124,18 +115,8 @@ impl Default for CompileOptions {
     }
 }
 
-/// Compute the SQL `LIMIT` to emit and whether the execution site must
-/// perform a cap-sentinel check (issue #777).
-///
-/// When the caller's own `LIMIT` is at or below `max_limit`, the cap never
-/// binds: we fetch exactly what was requested and no truncation is
-/// possible. When there is no explicit `LIMIT`, or the explicit `LIMIT`
-/// exceeds `max_limit`, the cap is the binding constraint — we fetch one
-/// extra row (`max_limit + 1`) so the caller can tell, from the actual
-/// result set, whether there were more matches than the cap allows. This
-/// replaces inferring truncation from the requested `LIMIT` alone, which is
-/// both a false positive (`LIMIT 1000` matching only 20 rows) and a false
-/// negative (no `LIMIT`, 501+ rows actually match).
+/// Chooses the SQL limit and optional cap-sentinel check (issue #777).
+/// See `crates/khive-query/docs/api/sql-compilation.md` for lifecycle details.
 fn effective_limit(
     requested_limit: Option<usize>,
     max_limit: usize,
@@ -152,13 +133,20 @@ fn effective_limit(
     }
 }
 
-/// Compile a `GqlQuery` AST to a parameterized SQL string and bound parameters.
+/// Compiles `query` to parameterized, read-only SQL under `opts`.
+///
+/// The returned parameter vector is ordered to match the statement's `?N` placeholders.
+///
+/// # Errors
+///
+/// Returns [`QueryError`] when validation fails, a construct is unsupported,
+/// a projection cannot be lowered, or a bound limit/value is invalid.
+/// See `crates/khive-query/docs/api/sql-compilation.md` for compilation paths.
 pub fn compile(query: &GqlQuery, opts: &CompileOptions) -> Result<CompiledQuery, QueryError> {
     if query.pattern.elements.is_empty() {
         return Err(QueryError::Compile("empty pattern".into()));
     }
 
-    // Validate edge relations + structural rules before emitting SQL.
     let mut query = query.clone();
     let warnings = validate_with_warnings(&mut query)?;
 
@@ -169,22 +157,13 @@ pub fn compile(query: &GqlQuery, opts: &CompileOptions) -> Result<CompiledQuery,
     };
     compiled.warnings.extend(warnings);
 
-    // Defense-in-depth: assert the emitted SQL is SELECT-only.
-    // The parsers already reject write-shaped input; this guard ensures a future
-    // code path cannot accidentally emit a non-SELECT statement through the
-    // compiler. Fails closed with an explicit read-only message.
+    // Fail closed if a future lowering path accidentally emits a mutation.
     assert_select_only(&compiled.sql)?;
 
     Ok(compiled)
 }
 
-/// Assert that the emitted SQL starts with SELECT (or WITH for recursive CTEs).
-///
-/// This is a compiler-level read-only invariant guard. The parsers reject
-/// write-shaped input before AST construction, but this check prevents a
-/// hypothetical future code path from emitting `INSERT`/`UPDATE`/`DELETE`
-/// SQL through the compile path. It is not a security boundary — the SQLite
-/// reader connection already enforces read-only at the driver level.
+/// Enforces the compiler's SELECT/WITH-only invariant; the reader is the security boundary.
 fn assert_select_only(sql: &str) -> Result<(), QueryError> {
     let first = sql.split_whitespace().next().unwrap_or("").to_uppercase();
     if first == "SELECT" || first == "WITH" {
@@ -216,18 +195,7 @@ fn namespace_filter(alias: &str, opts: &CompileOptions, params: &mut Vec<QueryVa
     }
 }
 
-/// Compile a node label's `kind` predicate against a primary-substrate union
-/// source (the `entities`/`notes`/`events`/`graph_edges` union carrying a
-/// `substrate_kind` column, aliased `primary_nodes` in variable-length
-/// queries and inlined in fixed-length ones).
-///
-/// A substrate label (`entity`/`note`/`event`/`edge`) names a table, not a
-/// stored `kind` value — stored `kind` is always granular (`concept`,
-/// `task`, `observation`, ...). This mirrors the substrate/granular split in
-/// `resolve_kind_spec` (`khive-pack-kg/src/handlers/common.rs`), which the
-/// verb-dispatch surface (`create`/`list`/`search`) already applies. Without
-/// it, `kind = 'entity'` is unsatisfiable by construction: no stored row's
-/// `kind` column is ever literally `"entity"` (issue #849).
+/// Maps substrate labels to the union discriminator and granular labels to `kind`.
 fn kind_filter_predicate(alias: &str, kind: &str, params: &mut Vec<QueryValue>) -> String {
     match kind {
         "entity" | "note" | "event" | "edge" => {
@@ -241,9 +209,7 @@ fn kind_filter_predicate(alias: &str, kind: &str, params: &mut Vec<QueryValue>) 
     }
 }
 
-/// Same as [`kind_filter_predicate`], for the entity/note-only observation-
-/// target union (`referent_kind` column, issue #468) — only `entity`/`note`
-/// are legal substrate labels there.
+/// Applies kind filtering to the entity/note observation-target union.
 fn observation_kind_filter_predicate(
     alias: &str,
     kind: &str,
@@ -261,22 +227,8 @@ fn observation_kind_filter_predicate(
     }
 }
 
-/// Compile an inline property-map equality (`{key: value}`) to a parameterized
-/// SQL predicate, either against a direct text column (`text_column`, for keys
-/// like `name`/`content` that are stored as dedicated columns) or against
-/// `json_extract(<alias>.properties, '$.<key>')`.
-///
-/// String values bind as `TEXT` with `COLLATE NOCASE` (case-insensitive match,
-/// matching prior behavior). Integer values bind as `INTEGER`, and Bool values
-/// bind as `INTEGER` (0/1) — SQLite's `json_extract` returns JSON
-/// numbers/booleans as numeric storage classes, so a numeric literal must
-/// compare against a numeric parameter, not a `COLLATE NOCASE` text
-/// comparison that can never match (issue #755). Integer literals bind as
-/// `QueryValue::Integer` rather than `Float` so values beyond `f64`'s exact
-/// 2^53 integer range (and both `i64` bounds) survive round-trip (issue
-/// #832). Float values are rejected here if non-finite, matching the
-/// `is_finite()` invariant enforced by WHERE-clause compilation
-/// (see `docs/design.md`).
+/// Compiles typed inline-map equality against a direct or JSON property column.
+/// See `crates/khive-query/docs/api/sql-compilation.md` for storage-class rules.
 fn compile_property_equality(
     alias: &str,
     key: &str,
@@ -346,7 +298,7 @@ fn synthetic_endpoint_node_indices(
     (source_set, target_set)
 }
 
-/// Compile fixed-length patterns to a JOIN chain.
+/// Compiles fixed-length patterns to a JOIN chain.
 fn compile_fixed_length(
     query: &GqlQuery,
     opts: &CompileOptions,
@@ -362,9 +314,7 @@ fn compile_fixed_length(
     let mut var_to_alias: std::collections::HashMap<String, (String, VarKind)> =
         std::collections::HashMap::new();
 
-    // Pre-compute which node indices are endpoints of synthetic edges.
-    // Source nodes bind to `events`; target nodes bind to the entity/note
-    // observation-target union (issue #468).
+    // Synthetic endpoints bind different substrate sources (issue #468).
     let (event_source_indices, observation_target_indices) =
         synthetic_endpoint_node_indices(&query.pattern.elements);
 
@@ -384,28 +334,23 @@ fn compile_fixed_length(
                     if is_event_source {
                         from_parts.push(format!("events {alias}"));
                     } else if !is_observation_target {
-                        // Observation targets are joined by the synthetic edge handler, not FROM.
                         from_parts.push(primary_node_source(&alias));
                     }
                 }
 
                 if is_event_source {
-                    // Events table does not have `deleted_at`; filter is omitted.
-                    // Namespace filter uses the `events.namespace` column directly.
+                    // Events have no `deleted_at`; namespace is filtered directly.
                     let ns_filter = namespace_filter(&alias, opts, &mut params);
                     if !ns_filter.is_empty() {
                         where_parts.push(ns_filter.trim_start_matches(" AND ").to_string());
                     }
-                    // `kind` on an event node filters events.kind (e.g. "recall_executed").
-                    // The bare substrate label "event" needs no filter here — the FROM
-                    // source is already the events table exclusively (issue #849).
+                    // Bare `event` needs no kind predicate on an event-only source.
                     if let Some(ref kind) = np.kind {
                         if kind != "event" {
                             params.push(QueryValue::Text(kind.clone()));
                             where_parts.push(format!("{alias}.kind = ?{}", params.len()));
                         }
                     }
-                    // entity_type and properties are not columns on events — reject explicitly.
                     if np.entity_type.is_some() {
                         return Err(QueryError::Compile(
                             "event nodes do not have an entity_type column".into(),
@@ -419,7 +364,6 @@ fn compile_fixed_length(
                         ));
                     }
                 } else if is_observation_target {
-                    // Observation targets: entity/note union (joined by the synthetic edge handler).
                     where_parts.push(format!("{alias}.deleted_at IS NULL"));
 
                     let ns_filter = namespace_filter(&alias, opts, &mut params);
@@ -435,8 +379,6 @@ fn compile_fixed_length(
                         ));
                     }
 
-                    // entity_type is NULL on note rows and populated on entity rows;
-                    // the filter still applies correctly across the union.
                     if let Some(ref et) = np.entity_type {
                         params.push(QueryValue::Text(et.clone()));
                         where_parts.push(format!("{alias}.entity_type = ?{}", params.len()));
@@ -509,10 +451,7 @@ fn compile_fixed_length(
 
                 edge_aliases.push(e_alias.clone());
 
-                // Detect synthetic event_observations edges (observed_as_* relations).
-                // A synthetic edge is one whose only relation(s) are observed_as_* names.
-                // Mixed synthetic+canonical relations are rejected: the two tables don't share
-                // a common join key that would make an OR across them meaningful.
+                // The synthetic and canonical backing tables have no meaningful shared join key.
                 let has_synthetic = ep.relations.iter().any(|r| is_synthetic(r));
                 let has_canonical = ep.relations.iter().any(|r| !is_synthetic(r));
                 if has_synthetic && has_canonical {
@@ -524,9 +463,7 @@ fn compile_fixed_length(
                 }
 
                 if has_synthetic {
-                    // Synthetic edge: join event_observations.
-                    // Direction is always event → entity/note (OUT from the event node).
-                    // The event node is the source (prev_node); the entity/note is the target.
+                    // Synthetic projections are always event-to-referent.
                     if !matches!(ep.direction, EdgeDirection::Out) {
                         return Err(QueryError::Compile(
                             "synthetic observed_as_* edges are always event → entity (outbound only)".into(),
@@ -535,7 +472,6 @@ fn compile_fixed_length(
                     join_parts.push(format!(
                         "JOIN event_observations {e_alias} ON {e_alias}.event_id = {prev_node}.id"
                     ));
-                    // Roles: collect the unique role values from the synthetic relation names.
                     let roles: Vec<&'static str> = ep
                         .relations
                         .iter()
@@ -555,25 +491,19 @@ fn compile_fixed_length(
                         where_parts
                             .push(format!("{e_alias}.role IN ({})", placeholders.join(", ")));
                     }
-                    // Join the target node via event_observations.entity_id against the
-                    // entity/note referent union, discriminated by referent_kind so
-                    // cross-substrate ID collisions cannot occur.
+                    // `referent_kind` prevents equal IDs on different substrates from colliding.
                     join_parts.push(format!(
                         "JOIN {} ON {next_alias}.id = {e_alias}.entity_id \
                          AND {next_alias}.referent_kind = {e_alias}.referent_kind",
                         observation_target_source(&next_alias)
                     ));
-                    // Admit exactly the in-code legal (role, referent_kind) pairs:
-                    // candidate/selected -> note only; target -> entity or note;
-                    // signal -> entity or note (ADR-041 permits both substrates
-                    // as brain.feedback targets).
+                    // Enforce the ADR-041 role/substrate matrix.
                     where_parts.push(format!(
                         "(({e_alias}.role IN ('candidate', 'selected') AND {e_alias}.referent_kind = 'note') \
                           OR ({e_alias}.role = 'target' AND {e_alias}.referent_kind IN ('entity', 'note')) \
                           OR ({e_alias}.role = 'signal' AND {e_alias}.referent_kind IN ('entity', 'note')))"
                     ));
                 } else {
-                    // Standard canonical edge: join graph_edges.
                     let (source_join, target_join) = match ep.direction {
                         EdgeDirection::Out => (
                             format!("{e_alias}.source_id = {prev_node}.id"),
@@ -643,12 +573,10 @@ fn compile_fixed_length(
         }
     }
 
-    // WHERE clause conditions from GQL WHERE (supports AND / OR tree)
     if let Some(where_sql) = compile_where_expr(&query.where_clause, &var_to_alias, &mut params)? {
         where_parts.push(where_sql);
     }
 
-    // SELECT clause
     for item in &query.return_items {
         let var = item.variable();
         if let Some((alias, kind)) = var_to_alias.get(var) {
@@ -731,7 +659,7 @@ fn compile_fixed_length(
     })
 }
 
-/// Compile a `WhereExpr` tree into a SQL fragment.
+/// Compiles a `WhereExpr` while preserving its boolean grouping.
 fn compile_where_expr(
     expr: &WhereExpr,
     var_to_alias: &std::collections::HashMap<String, (String, VarKind)>,
@@ -802,7 +730,6 @@ fn compile_single_condition(
             }
         }
         VarKind::EventNode => {
-            // Events table has direct columns only; reject unknown fields.
             if EVENT_COLUMNS.contains(&cond.property.as_str()) {
                 format!("{alias}.{}", cond.property)
             } else {
@@ -962,7 +889,7 @@ fn expr_endpoint_set(
     }
 }
 
-/// Return `Err(Unsupported)` if any `Or` node spans both endpoint variables.
+/// Rejects OR subtrees that cannot be preserved across CTE endpoint phases.
 fn reject_or_spanning_endpoints(
     expr: &WhereExpr,
     start: &NodePattern,
@@ -997,7 +924,6 @@ fn reject_or_spanning_impl(
                         .into(),
                 ));
             }
-            // Even if this OR is safe, recurse to catch nested ORs.
             reject_or_spanning_impl(l, start_var, end_var)?;
             reject_or_spanning_impl(r, start_var, end_var)
         }
@@ -1036,7 +962,7 @@ fn compile_var_len_condition(
     Ok((sql, col_alias))
 }
 
-/// Walk the `WhereExpr` tree for variable-length patterns, routing conditions to start or end.
+/// Routes variable-length predicates to the start or end CTE phase.
 fn compile_variable_length_where(
     expr: &WhereExpr,
     start_var: Option<&str>,
@@ -1076,9 +1002,7 @@ fn compile_variable_length_where(
             Ok(None)
         }
         WhereExpr::Or(l, r) => {
-            // After reject_or_spanning_endpoints we know this Or does not straddle
-            // both endpoints.  Compile each branch to a SQL string, then combine
-            // with OR and push into the appropriate condition list.
+            // The prior spanning check guarantees both branches use one endpoint.
             let l_sql = compile_variable_length_where_to_sql(l, start_var, end_var, params)?;
             let r_sql = compile_variable_length_where_to_sql(r, start_var, end_var, params)?;
             match (l_sql, r_sql) {
@@ -1098,7 +1022,6 @@ fn compile_variable_length_where(
                     }
                 }
                 (Some((ls, la)), Some((rs, _ra))) => {
-                    // Both non-None and same alias (guaranteed by the spanning check).
                     let combined = format!("({ls} OR {rs})");
                     if la == "s" {
                         start_conditions.push(combined);
@@ -1112,7 +1035,7 @@ fn compile_variable_length_where(
     }
 }
 
-/// Compile a `WhereExpr` sub-tree to a SQL string plus the endpoint alias (`"s"` or `"r"`).
+/// Compiles one endpoint-local expression and returns its CTE alias.
 fn compile_variable_length_where_to_sql(
     expr: &WhereExpr,
     start_var: Option<&str>,
@@ -1146,7 +1069,7 @@ fn compile_variable_length_where_to_sql(
     }
 }
 
-/// Compile variable-length patterns to a recursive CTE.
+/// Compiles one variable-length edge to a recursive CTE.
 fn compile_variable_length(
     query: &GqlQuery,
     opts: &CompileOptions,
@@ -1155,9 +1078,7 @@ fn compile_variable_length(
     let mut var_to_alias: std::collections::HashMap<String, (String, VarKind)> =
         std::collections::HashMap::new();
 
-    // For variable-length, we expect exactly: start_node -[*N..M]-> end_node.
-    // Mixed fixed+variable chains and additional trailing pattern elements are
-    // not yet supported — reject explicitly rather than silently dropping them.
+    // Reject extra elements rather than silently dropping part of the pattern.
     let nodes: Vec<&NodePattern> = query.pattern.nodes().collect();
     let edges: Vec<&EdgePattern> = query.pattern.edges().collect();
 
@@ -1173,10 +1094,7 @@ fn compile_variable_length(
     let edge = &edges[0];
     let end = &nodes[1];
 
-    // Synthetic observed_as_* edges join event_observations, which has no
-    // recursive path structure — reject them in variable-length patterns before
-    // attempting CTE compilation (would produce a CTE over graph_edges with an
-    // invalid relation string).
+    // event_observations has no recursive path structure.
     if edge.relations.iter().any(|r| is_synthetic(r)) {
         return Err(QueryError::Unsupported(
             "synthetic observed_as_* edges cannot be variable-length; \
@@ -1185,11 +1103,9 @@ fn compile_variable_length(
         ));
     }
 
-    // MAJ-2: depth cap — always parameterized, never injected as literal
     let max_depth = edge.max_hops.min(MAX_DEPTH);
     let min_depth = edge.min_hops;
 
-    // Build start-node conditions
     let mut start_conditions: Vec<String> = vec!["s.deleted_at IS NULL".to_string()];
     let ns_filter = namespace_filter("s", opts, &mut params);
     if !ns_filter.is_empty() {
@@ -1216,7 +1132,6 @@ fn compile_variable_length(
         )?);
     }
 
-    // Relation filter
     let mut relation_condition = String::new();
     if !edge.relations.is_empty() {
         if edge.relations.len() == 1 {
@@ -1235,10 +1150,8 @@ fn compile_variable_length(
         }
     }
 
-    // Edge namespace filter
     let e_ns_filter = namespace_filter("e", opts, &mut params);
 
-    // Direction-dependent JOIN
     let (seed_join, seed_next, recurse_join, recurse_next) = match edge.direction {
         EdgeDirection::Out => (
             "e.source_id = s.id",
@@ -1260,10 +1173,7 @@ fn compile_variable_length(
         ),
     };
 
-    // Build the next-intermediate-node namespace filter.
-    // This is applied in the recursive CTE member to prevent traversal through
-    // deleted or out-of-scope intermediate nodes.  Without it, a path like
-    // A -> B_deleted -> C would be returned even when B is soft-deleted.
+    // Filter every intermediate node so paths cannot cross deleted or out-of-scope rows.
     let next_node_ns_filter = namespace_filter("next_node", opts, &mut params);
 
     let max_depth_i64 = i64::try_from(max_depth)
@@ -1271,9 +1181,7 @@ fn compile_variable_length(
     params.push(QueryValue::Integer(max_depth_i64));
     let depth_param = params.len();
 
-    // End-node conditions (applied in outer WHERE). `r` is always joined
-    // unconditionally below so these references resolve regardless of whether
-    // the end variable is projected.
+    // End filters require `r` even when the end variable is not projected.
     let mut end_conditions: Vec<String> = vec!["r.deleted_at IS NULL".to_string()];
     let r_ns_filter = namespace_filter("r", opts, &mut params);
     if !r_ns_filter.is_empty() {
@@ -1299,14 +1207,8 @@ fn compile_variable_length(
         )?);
     }
 
-    // WHERE clause conditions for variable-length patterns.
-    // OR expressions that span both start and end nodes are not supported — reject
-    // explicitly with an actionable error message rather than silently converting OR to AND.
     reject_or_spanning_endpoints(&query.where_clause, start, end)?;
 
-    // Compile the WHERE tree preserving Or/And connectives.  After the spanning
-    // check above we know every Or node touches at most one endpoint, so we can
-    // safely route whole sub-trees to start_conditions or end_conditions.
     if let Some(where_sql) = compile_variable_length_where(
         &query.where_clause,
         start.variable.as_deref(),
@@ -1315,13 +1217,10 @@ fn compile_variable_length(
         &mut start_conditions,
         &mut end_conditions,
     )? {
-        // A non-None return means the expression spans no variable (WhereExpr::True
-        // is the only such case and returns None).  This branch is unreachable given
-        // the reject_or_spanning_endpoints guard above, but handle it safely.
+        // Keep the defensive fallback if a future expression has no endpoint binding.
         start_conditions.push(where_sql);
     }
 
-    // MAJ-2: min_depth is always a bound parameter, never a literal
     if min_depth > 0 {
         let min_depth_i64 = i64::try_from(min_depth)
             .map_err(|_| QueryError::InvalidInput("min_depth exceeds i64::MAX".into()))?;
@@ -1335,7 +1234,6 @@ fn compile_variable_length(
     params.push(QueryValue::Integer(limit_i64));
     let limit_param = params.len();
 
-    // Register variables
     if let Some(ref var) = start.variable {
         var_to_alias.insert(var.clone(), ("s".to_string(), VarKind::Node));
     }
@@ -1346,7 +1244,6 @@ fn compile_variable_length(
         var_to_alias.insert(var.clone(), ("e".to_string(), VarKind::Edge));
     }
 
-    // Build SELECT based on RETURN items
     let mut select_parts: Vec<String> = Vec::new();
     let mut has_start = false;
 
@@ -1409,8 +1306,6 @@ fn compile_variable_length(
                         }
                     }
                     VarKind::EventNode | VarKind::ObservationTargetNode => {
-                        // Synthetic observed_as_* edges require a fixed-length pattern;
-                        // variable-length recursion over the events/notes tables is not supported.
                         return Err(QueryError::Unsupported(
                             "synthetic observed_as_* edges cannot be used in variable-length \
                              patterns; use a fixed-length edge pattern instead"
@@ -1432,14 +1327,10 @@ fn compile_variable_length(
         }
     }
 
-    // Always include traversal metadata
     select_parts.push("t.depth AS _depth".to_string());
     select_parts.push("t.total_weight AS _total_weight".to_string());
 
-    // `s` is optional (only joined if the start variable is projected); `r` is
-    // always joined because the outer WHERE always references `r.deleted_at`,
-    // `r.namespace` (and possibly r.kind / r.properties) regardless of whether
-    // it appears in RETURN.
+    // `r` is required by end filters; `s` is needed only for a start projection.
     let join_start = if has_start {
         "JOIN primary_nodes s ON s.id = t.start_id"
     } else {
@@ -1447,8 +1338,6 @@ fn compile_variable_length(
     };
     let join_end = "JOIN primary_nodes r ON r.id = t.current_id";
 
-    // Build the next-node namespace filter clause (may be empty).
-    // Already pushed into params by namespace_filter above.
     let next_node_ns_and = if next_node_ns_filter.is_empty() {
         String::new()
     } else {
@@ -1510,10 +1399,9 @@ fn compile_variable_length(
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum VarKind {
     Node,
-    /// Node that maps to the `events` table (synthetic `observed_as_*` edge source).
+    /// Synthetic observation source backed by `events`.
     EventNode,
-    /// Node that maps to an entity/note `event_observations` referent
-    /// (synthetic `observed_as_*` edge target).
+    /// Synthetic observation target backed by an entity/note referent.
     ObservationTargetNode,
     Edge,
 }
@@ -1529,8 +1417,7 @@ const NODE_COLUMNS: &[&str] = &[
     "created_at",
     "updated_at",
 ];
-/// Columns available for projection on entity/note observation-target nodes
-/// (synthetic edge targets, issue #468).
+/// Projection columns for entity/note observation targets.
 const OBSERVATION_TARGET_COLUMNS: &[&str] = &[
     "id",
     "namespace",
@@ -1546,7 +1433,7 @@ const OBSERVATION_TARGET_COLUMNS: &[&str] = &[
     "updated_at",
     "referent_kind",
 ];
-/// Columns available for projection on `events` table nodes (synthetic edge sources).
+/// Projection columns for synthetic event sources.
 const EVENT_COLUMNS: &[&str] = &[
     "id",
     "namespace",
@@ -1581,10 +1468,7 @@ fn property_to_column<'a>(prop: &'a str, kind: &VarKind) -> Result<&'a str, Quer
     }
 }
 
-// INLINE TEST JUSTIFICATION: Tests access private helpers (compile_fixed_length,
-// compile_variable_length, compile_single_condition, compile_var_len_condition) and
-// internal types (VarKind) via pub(crate) visibility; moving to crates/khive-query/tests/
-// would require making those items pub, which would widen the public API surface.
+// Inline tests exercise private compiler phases without widening the public API.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1617,18 +1501,15 @@ mod tests {
                 ReturnItem::Variable("b".into()),
             ]
         );
-        // No recursive CTE for fixed-length
         assert!(!compiled.sql.contains("WITH RECURSIVE"));
     }
 
     #[test]
     fn namespace_scoping_injected() {
-        // Namespace must come from opts, never from the query
         let q =
             gql::parse("MATCH (a:concept)-[e:introduced_by]->(b:paper) RETURN a LIMIT 5").unwrap();
         let compiled = compile(&q, &scoped("research")).unwrap();
         assert!(compiled.sql.contains("namespace"));
-        // The namespace value must appear as a parameter, not a literal in SQL
         let has_ns_param = compiled
             .params
             .iter()
@@ -1638,7 +1519,6 @@ mod tests {
 
     #[test]
     fn edge_property_whitelist_rejects_unknown() {
-        // MAJ-1: only 'relation' and 'weight' are queryable edge properties
         let q = gql::parse("MATCH (a)-[e:introduced_by]->(b) WHERE e.source_id = 'x' RETURN a")
             .unwrap();
         let result = compile(&q, &opts());
@@ -1683,8 +1563,6 @@ mod tests {
 
     #[test]
     fn depth_cap_at_ten_rejects_above_max() {
-        // Exceeding MAX_DEPTH is an InvalidInput error at validation time —
-        // the compiler never sees a query with depth > 10.
         let q = gql::parse("MATCH (a)-[:extends*1..50]->(b) RETURN b").unwrap();
         let err = compile(&q, &opts()).unwrap_err();
         assert!(
@@ -1695,11 +1573,9 @@ mod tests {
 
     #[test]
     fn depth_within_cap_compiles() {
-        // depth *1..10 is at the cap — must compile successfully.
         let q = gql::parse("MATCH (a)-[:extends*1..10]->(b) RETURN b").unwrap();
         let compiled = compile(&q, &opts()).unwrap();
         assert!(compiled.sql.contains("WITH RECURSIVE"));
-        // The depth parameter must equal 10
         let depth_val = compiled.params.iter().find_map(|p| {
             if let QueryValue::Integer(n) = p {
                 Some(*n)
@@ -1712,10 +1588,6 @@ mod tests {
 
     #[test]
     fn limit_capped_by_max_limit() {
-        // Query requests 1000, max_limit is 500 — the compiler now emits a
-        // sentinel LIMIT of 501 so the execution site can detect and warn on
-        // real truncation (issue #777); the returned rows are still capped
-        // at 500 once the sentinel is stripped at the execution site.
         let q = gql::parse("MATCH (a:concept)-[e]->(b) RETURN a LIMIT 1000").unwrap();
         let compiled = compile(&q, &opts()).unwrap();
         let limit_param = compiled.params.last().unwrap();
@@ -1727,9 +1599,6 @@ mod tests {
 
     #[test]
     fn limit_over_cap_requests_sentinel_row() {
-        // LIMIT 1000 against the default max_limit=500 — the cap is binding,
-        // so the compiler must fetch a max_limit+1 sentinel row rather than
-        // inferring truncation from the requested LIMIT alone (issue #777).
         let q = gql::parse("MATCH (a:concept)-[e]->(b) RETURN a LIMIT 1000").unwrap();
         let compiled = compile(&q, &opts()).unwrap();
         assert_eq!(
@@ -1748,8 +1617,6 @@ mod tests {
 
     #[test]
     fn limit_exactly_at_cap_no_sentinel() {
-        // LIMIT 500 == max_limit exactly — the cap never binds, fetch exactly
-        // what was requested and no sentinel check is needed.
         let q = gql::parse("MATCH (a:concept)-[e]->(b) RETURN a LIMIT 500").unwrap();
         let compiled = compile(&q, &opts()).unwrap();
         assert_eq!(compiled.truncation_check, None);
@@ -1759,7 +1626,6 @@ mod tests {
 
     #[test]
     fn limit_below_cap_no_sentinel() {
-        // Explicit LIMIT 100, well under the 500 cap — not truncated, no sentinel.
         let q = gql::parse("MATCH (a:concept)-[e]->(b) RETURN a LIMIT 100").unwrap();
         let compiled = compile(&q, &opts()).unwrap();
         assert_eq!(compiled.truncation_check, None);
@@ -1769,10 +1635,6 @@ mod tests {
 
     #[test]
     fn no_explicit_limit_requests_sentinel_row() {
-        // No LIMIT clause at all — the cap is the only bound, and the true
-        // match count is unknown at compile time, so the compiler must fetch
-        // a sentinel row to let the execution site detect real truncation
-        // (this is issue #777's original silent-truncation case).
         let q = gql::parse("MATCH (a:concept)-[e]->(b) RETURN a").unwrap();
         let compiled = compile(&q, &opts()).unwrap();
         assert_eq!(
@@ -1791,7 +1653,6 @@ mod tests {
 
     #[test]
     fn variable_length_limit_over_cap_requests_sentinel_row() {
-        // Same sentinel-row coverage for the variable-length/traversal compile path.
         let q = gql::parse("MATCH (a)-[:extends*1..3]->(b) RETURN b LIMIT 5000").unwrap();
         let compiled = compile(&q, &opts()).unwrap();
         assert_eq!(
@@ -1818,8 +1679,6 @@ mod tests {
 
     #[test]
     fn compile_unknown_kind_passes_through() {
-        // Pack-agnostic: any string is accepted as an entity kind at the query layer.
-        // Validation is a pack-handler concern.
         let q = gql::parse("MATCH (a:gizmo)-[:extends]->(b) RETURN a").unwrap();
         let compiled = compile(&q, &opts()).unwrap();
         let has_gizmo = compiled
@@ -1834,8 +1693,6 @@ mod tests {
 
     #[test]
     fn compile_kind_passes_through_unchanged() {
-        // Pack-agnostic: 'paper' is no longer normalized to 'document' at the query layer.
-        // The string passes through as-is.
         let q =
             gql::parse("MATCH (a:paper)-[:introduced_by]->(b:concept) RETURN a LIMIT 1").unwrap();
         let compiled = compile(&q, &opts()).unwrap();
@@ -1868,7 +1725,6 @@ mod tests {
 
     #[test]
     fn compile_kind_in_where_passes_through_unchanged() {
-        // Pack-agnostic: kind strings in WHERE conditions pass through as-is.
         let q = gql::parse("MATCH (a)-[:extends]->(b) WHERE a.kind = 'paper' RETURN a").unwrap();
         let compiled = compile(&q, &opts()).unwrap();
         let has_paper = compiled
@@ -1883,9 +1739,6 @@ mod tests {
 
     #[test]
     fn variable_length_return_start_only_joins_end_entity() {
-        // Even when only the start variable is projected, the outer query
-        // references `r.deleted_at` / `r.namespace`, so primary_nodes r must be
-        // joined unconditionally.
         let q = gql::parse("MATCH (a:concept)-[:extends*1..3]->(b) RETURN a LIMIT 10").unwrap();
         let compiled = compile(&q, &opts()).unwrap();
         assert!(
@@ -1907,8 +1760,6 @@ mod tests {
 
     #[test]
     fn variable_length_mixed_chain_unsupported() {
-        // Mixed fixed + variable in one chain — has_variable_length() triggers
-        // the variable-length path, which must reject because edges.len() > 1.
         let q = gql::parse("MATCH (a)-[:extends]->(b)-[:implements*1..2]->(c) RETURN c").unwrap();
         let err = compile(&q, &opts()).unwrap_err();
         assert!(matches!(err, QueryError::Unsupported(_)), "got {err:?}");
@@ -1921,8 +1772,7 @@ mod tests {
         assert!(matches!(err, QueryError::Unsupported(_)), "got {err:?}");
     }
 
-    /// Regression guard for ISSUE #231: SPARQL subject→predicate→object direction.
-    /// `?a :extends ?b` must bind ?a to source_id and ?b to target_id, not swapped.
+    /// Preserves SPARQL subject-to-object edge direction (issue #231).
     #[test]
     fn sparql_subject_object_direction_compiles_outbound() {
         use crate::parsers::sparql;
@@ -1955,7 +1805,6 @@ mod tests {
             gql::parse("MATCH (a:concept)-[e:extends]->(b:concept) RETURN a.name, b.name LIMIT 5")
                 .unwrap();
         let compiled = compile(&q, &opts()).unwrap();
-        // Node aliases are n0, n1; the SQL uses `alias.col AS var_prop`
         assert!(
             compiled.sql.contains(".name AS a_name"),
             "sql: {}",
@@ -1997,7 +1846,6 @@ mod tests {
         let q =
             gql::parse("MATCH (a)-[e:extends]->(b) RETURN e.relation, e.weight LIMIT 5").unwrap();
         let compiled = compile(&q, &opts()).unwrap();
-        // Edge alias is e0; SQL: `e0.relation AS e_relation`
         assert!(
             compiled.sql.contains(".relation AS e_relation"),
             "sql: {}",
@@ -2012,8 +1860,6 @@ mod tests {
 
     #[test]
     fn entity_type_compiles_as_direct_column_not_json_extract() {
-        // entity_type in a NodePattern must become `alias.entity_type = ?N` in the WHERE
-        // clause — a direct column reference, not json_extract from the properties blob.
         let q = gql::parse("MATCH (n:document {entity_type: 'paper'})-[:extends]->(m) RETURN n")
             .unwrap();
         let compiled = compile(&q, &opts()).unwrap();
@@ -2036,8 +1882,6 @@ mod tests {
             "entity_type value 'paper' must appear as a bound parameter"
         );
     }
-
-    // --- OR support in WHERE clause ---
 
     #[test]
     fn where_or_compiles_to_sql_or() {
@@ -2064,20 +1908,16 @@ mod tests {
 
     #[test]
     fn where_and_or_precedence() {
-        // `a AND b OR c` should compile as `(a AND b) OR c`
         let q = gql::parse(
             "MATCH (a:concept)-[e:extends]->(b) WHERE a.name = 'X' AND a.kind = 'concept' OR b.kind = 'project' RETURN a"
         ).unwrap();
         let compiled = compile(&q, &opts()).unwrap();
-        // The SQL should contain an OR at the outer level wrapping the AND group
         assert!(
             compiled.sql.contains(" OR "),
             "expected OR in sql; sql: {}",
             compiled.sql
         );
     }
-
-    // --- event_observations synthetic edge support ---
 
     #[test]
     fn synthetic_edge_joins_event_observations() {
@@ -2100,9 +1940,6 @@ mod tests {
         assert!(has_role_param, "role 'selected' must be a bound parameter");
     }
 
-    // CRIT-1 regression: event source node must bind to `events` table, not `entities`.
-    // Previously `FROM entities n0 JOIN event_observations e0 ON e0.event_id = n0.id`
-    // was emitted — IDs are disjoint so every query returned zero rows.
     #[test]
     fn synthetic_edge_event_source_binds_events_table() {
         let q = gql::parse("MATCH (ev)-[:observed_as_selected]->(m:memory) RETURN ev, m").unwrap();
@@ -2123,11 +1960,8 @@ mod tests {
 
     #[test]
     fn synthetic_edge_event_observation_join_uses_events_id() {
-        // The JOIN must be `event_observations.event_id = events_alias.id`,
-        // not `event_observations.event_id = entities_alias.id`.
         let q = gql::parse("MATCH (ev)-[:observed_as_selected]->(m) RETURN m").unwrap();
         let compiled = compile(&q, &opts()).unwrap();
-        // The event alias is n0; the join must reference n0 against `events` table.
         assert!(
             compiled
                 .sql
@@ -2139,8 +1973,6 @@ mod tests {
 
     #[test]
     fn synthetic_edge_event_node_projects_event_columns() {
-        // The event variable in RETURN must select event-table columns (verb, outcome, …),
-        // not entity columns (name, entity_type, properties, …).
         let q = gql::parse("MATCH (ev)-[:observed_as_selected]->(m) RETURN ev").unwrap();
         let compiled = compile(&q, &opts()).unwrap();
         assert!(
@@ -2167,12 +1999,8 @@ mod tests {
 
     #[test]
     fn synthetic_edge_namespace_filter_on_events_table() {
-        // MIN-2: when scoped, the namespace filter must target the events table
-        // (which has a namespace column) — not rely on entities indirection.
         let q = gql::parse("MATCH (ev)-[:observed_as_selected]->(m) RETURN m").unwrap();
         let compiled = compile(&q, &scoped("test-ns")).unwrap();
-        // Both the event alias (n0, now from `events`) and the target alias (n1, from `entities`)
-        // must have namespace filters.
         let ns_count = compiled
             .params
             .iter()
@@ -2203,7 +2031,6 @@ mod tests {
 
     #[test]
     fn synthetic_edge_multi_role() {
-        // Multiple observed_as_* relations compile to a role IN (...) predicate.
         let q =
             gql::parse("MATCH (ev)-[:observed_as_candidate|observed_as_selected]->(m) RETURN m")
                 .unwrap();
@@ -2240,12 +2067,8 @@ mod tests {
         );
     }
 
-    // --- MAJ-1: OR spanning both endpoints in variable-length patterns must be rejected ---
-
     #[test]
     fn variable_length_or_across_endpoints_rejected() {
-        // MAJ-1: `WHERE a.name='X' OR b.name='Y'` in a variable-length pattern must be
-        // rejected with Unsupported — not silently compiled to AND.
         let q = gql::parse(
             "MATCH (a)-[:extends*1..3]->(b) WHERE a.name = 'X' OR b.name = 'Y' RETURN a",
         )
@@ -2264,7 +2087,6 @@ mod tests {
 
     #[test]
     fn variable_length_or_single_endpoint_still_works() {
-        // OR within a single endpoint (same alias) must still compile successfully.
         let q = gql::parse(
             "MATCH (a)-[:extends*1..3]->(b) WHERE a.name = 'X' OR a.name = 'Y' RETURN a",
         )
@@ -2278,7 +2100,6 @@ mod tests {
 
     #[test]
     fn variable_length_and_across_endpoints_still_works() {
-        // AND across endpoints must still compile (the existing behavior is correct for AND).
         let q = gql::parse(
             "MATCH (a)-[:extends*1..3]->(b) WHERE a.name = 'X' AND b.name = 'Y' RETURN a",
         )
@@ -2290,24 +2111,18 @@ mod tests {
         );
     }
 
-    // --- Regression tests for #379: variable-length WHERE OR must not flatten to AND ---
-
     #[test]
     fn test_variable_length_or_compiles_to_or() {
-        // #379: MATCH (a)-[*1..3 WHERE p1 OR p2]-> in GQL surface maps to a single-endpoint
-        // OR in the WHERE clause.  The compiled SQL must contain OR, not AND.
         let q = gql::parse(
             "MATCH (a)-[:extends*1..3]->(b) WHERE a.name = 'LoRA' OR a.name = 'QLoRA' RETURN b",
         )
         .unwrap();
         let compiled = compile(&q, &opts()).unwrap();
-        // The start_conditions list must contain an OR fragment, not two AND-joined conditions.
         assert!(
             compiled.sql.contains(" OR "),
             "#379: variable-length single-endpoint OR must produce SQL OR; sql: {}",
             compiled.sql
         );
-        // Both values must appear as bound parameters.
         let has_lora = compiled
             .params
             .iter()
@@ -2321,8 +2136,6 @@ mod tests {
 
     #[test]
     fn test_single_endpoint_or_at_depth_1() {
-        // #379: single-hop pattern with single-endpoint OR in WHERE.
-        // The OR must appear in the compiled SQL (not silently become AND).
         let q = gql::parse(
             "MATCH (a)-[r:extends]->(b) WHERE r.weight > 0.5 OR r.relation = 'extends' RETURN a",
         )
@@ -2345,13 +2158,11 @@ mod tests {
 
     #[test]
     fn test_and_still_works() {
-        // #379: regression guard — simple WHERE p1 AND p2 must still emit AND.
         let q = gql::parse(
             "MATCH (a)-[:extends*1..3]->(b) WHERE a.name = 'LoRA' AND a.kind = 'concept' RETURN b",
         )
         .unwrap();
         let compiled = compile(&q, &opts()).unwrap();
-        // The SQL must not contain a bare " OR " from the AND expression.
         assert!(
             !compiled.sql.contains(" OR "),
             "#379: AND must not produce OR; sql: {}",
@@ -2371,9 +2182,7 @@ mod tests {
         );
     }
 
-    // --- Regression tests for P0/P1 correctness fixes ---
-
-    /// max_limit overflow: usize::MAX as i64 == -1 on 64-bit, defeating the cap.
+    /// Rejects row caps that cannot be represented by SQL's integer parameter.
     #[test]
     fn max_limit_overflow_returns_error() {
         let q = gql::parse("MATCH (a)-[:extends]->(b) RETURN a").unwrap();
@@ -2381,16 +2190,10 @@ mod tests {
             scopes: vec![],
             max_limit: usize::MAX,
         };
-        // On 64-bit: usize::MAX > i64::MAX, so try_from must return Err.
-        // On 32-bit: usize::MAX == u32::MAX which fits in i64, so this may succeed —
-        // either way we must not produce a negative limit.
         let result = compile(&q, &opts);
         match result {
-            Err(QueryError::InvalidInput(_)) => {
-                // Expected on 64-bit: overflow detected, error returned.
-            }
+            Err(QueryError::InvalidInput(_)) => {}
             Ok(compiled) => {
-                // On 32-bit: limit fits in i64 — verify it is non-negative.
                 let limit_param = compiled.params.last().unwrap();
                 assert!(
                     matches!(limit_param, QueryValue::Integer(n) if *n >= 0),
@@ -2401,9 +2204,7 @@ mod tests {
         }
     }
 
-    /// max_limit=0 with no query limit: the cap is binding (0 rows allowed),
-    /// so the compiler fetches a single sentinel row (max_limit+1 = 1) to
-    /// detect whether any row exists at all, no crash.
+    /// A zero cap still permits one sentinel row for truncation detection.
     #[test]
     fn max_limit_zero_compiles() {
         let q = gql::parse("MATCH (a)-[:extends]->(b) RETURN a").unwrap();
@@ -2426,11 +2227,8 @@ mod tests {
         );
     }
 
-    /// Variable-length synthetic edges must be rejected.
     #[test]
     fn variable_length_synthetic_edge_rejected() {
-        // observed_as_selected*1..3 must be rejected — the recursive CTE targets
-        // graph_edges, which has no event_observations data.
         let q = gql::parse("MATCH (ev)-[:observed_as_selected*1..3]->(m) RETURN m").unwrap();
         let err = compile(&q, &opts()).unwrap_err();
         assert!(
@@ -2443,13 +2241,11 @@ mod tests {
         );
     }
 
-    /// Variable-length traversal must not pass through deleted intermediate nodes.
-    /// The compiled SQL must join entities for the next node in the recursive member.
+    /// Recursive traversal filters deleted intermediate nodes.
     #[test]
     fn variable_length_recursive_member_joins_next_node_for_deleted_filter() {
         let q = gql::parse("MATCH (a)-[:extends*1..3]->(b) RETURN b").unwrap();
         let compiled = compile(&q, &opts()).unwrap();
-        // The recursive CTE member must join next_node to filter deleted intermediates.
         assert!(
             compiled.sql.contains("JOIN primary_nodes next_node"),
             "recursive CTE must join primary_nodes next_node for deleted-intermediate filtering; sql: {}",
@@ -2462,13 +2258,11 @@ mod tests {
         );
     }
 
-    /// Variable-length traversal with namespace scope: the next_node join must
-    /// also apply the namespace filter to prevent namespace-crossing intermediates.
+    /// Recursive traversal scopes intermediate nodes.
     #[test]
     fn variable_length_recursive_member_namespace_scopes_intermediates() {
         let q = gql::parse("MATCH (a)-[:extends*1..3]->(b) RETURN b").unwrap();
         let compiled = compile(&q, &scoped("test-ns")).unwrap();
-        // The next_node join must include a namespace condition.
         assert!(
             compiled.sql.contains("next_node.namespace"),
             "recursive CTE next_node join must filter namespace; sql: {}",
@@ -2476,12 +2270,10 @@ mod tests {
         );
     }
 
-    /// Public AST panic: compile must return an error for a malformed AST instead
-    /// of panicking with an out-of-bounds index.
+    /// Malformed public ASTs return errors rather than panicking.
     #[test]
     fn compile_malformed_ast_returns_error_not_panic() {
         use crate::ast::{EdgeDirection, EdgePattern, GqlQuery, MatchPattern, PatternElement};
-        // An AST that starts with an Edge (no leading Node) is malformed.
         let q = GqlQuery {
             pattern: MatchPattern {
                 elements: vec![PatternElement::Edge(EdgePattern {
@@ -2503,8 +2295,7 @@ mod tests {
         );
     }
 
-    /// GQL edge pattern suffix fix: `(a)-[e:extends](b)` must be rejected because
-    /// the `-` suffix after `]` is required.
+    /// Rejects an edge pattern missing the closing dash.
     #[test]
     fn edge_pattern_without_suffix_dash_rejected() {
         let result = gql::parse("MATCH (a)-[e:extends](b) RETURN a");
@@ -2514,9 +2305,6 @@ mod tests {
         );
     }
 
-    // --- Read-only invariant regression tests (#16) ---
-
-    /// assert_select_only accepts SELECT and WITH (recursive CTE).
     #[test]
     fn assert_select_only_accepts_select_and_with() {
         assert!(
@@ -2529,7 +2317,6 @@ mod tests {
         );
     }
 
-    /// assert_select_only rejects write SQL with the canonical read-only message.
     #[test]
     fn assert_select_only_rejects_write_sql_with_readonly_message() {
         for stmt in &[
@@ -2555,8 +2342,6 @@ mod tests {
         }
     }
 
-    /// Regression: compile() for a valid GQL query must still succeed end-to-end.
-    /// This guards against assert_select_only incorrectly rejecting compiler output.
     #[test]
     fn readonly_guard_does_not_break_valid_gql_compile() {
         let q = gql::parse("MATCH (a:concept)-[:extends]->(b) RETURN a LIMIT 10").unwrap();
@@ -2568,7 +2353,6 @@ mod tests {
         );
     }
 
-    /// Regression: compile() for a variable-length GQL query must still succeed.
     #[test]
     fn readonly_guard_does_not_break_valid_cte_compile() {
         let q = gql::parse("MATCH (a)-[:extends*1..3]->(b) RETURN b LIMIT 10").unwrap();
@@ -2580,7 +2364,6 @@ mod tests {
         );
     }
 
-    /// GQL write forms are rejected at the parse layer before reaching the compiler.
     #[test]
     fn gql_write_form_rejected_before_compile() {
         use crate::parsers::gql;
@@ -2595,7 +2378,6 @@ mod tests {
         );
     }
 
-    /// SPARQL write forms are rejected at the parse layer before reaching the compiler.
     #[test]
     fn sparql_write_form_rejected_before_compile() {
         use crate::parsers::sparql;
@@ -2610,7 +2392,6 @@ mod tests {
         );
     }
 
-    /// Duplicate inline property rejection.
     #[test]
     fn duplicate_inline_property_rejected() {
         let result = gql::parse("MATCH (n {name: 'A', name: 'B'}) RETURN n");
@@ -2625,7 +2406,6 @@ mod tests {
         );
     }
 
-    /// Unknown synthetic relation must be rejected at validation.
     #[test]
     fn unknown_synthetic_relation_rejected_at_compile() {
         let q = gql::parse("MATCH (a)-[:observed_as_bogus]->(b) RETURN a").unwrap();
@@ -2636,10 +2416,7 @@ mod tests {
         );
     }
 
-    // --- Issue #467: canonical edge queries must admit legal note endpoints ---
-
-    /// `annotates` is the cross-substrate relation: note -> entity/note/event/edge.
-    /// Endpoints must not be hard-bound to `entities` only.
+    /// Canonical `annotates` can bind every legal target substrate (issue #467).
     #[test]
     fn canonical_edge_annotates_compiles_note_source_and_any_target_substrate() {
         let q = gql::parse("MATCH (n)-[:annotates]->(x) RETURN n.id, x.id LIMIT 10").unwrap();
@@ -2658,8 +2435,7 @@ mod tests {
         }
     }
 
-    /// `supports` is same-substrate: note -> note (or entity -> entity). A
-    /// legal note-note pair must be able to bind through the endpoint source.
+    /// Canonical `supports` can bind note-to-note endpoints.
     #[test]
     fn canonical_edge_supports_compiles_note_note_endpoints() {
         let q = gql::parse("MATCH (a)-[:supports]->(b) RETURN a.id, b.id LIMIT 10").unwrap();
@@ -2672,8 +2448,7 @@ mod tests {
         );
     }
 
-    /// Pack-declared `depends_on` on task-kind notes must bind through the
-    /// endpoint source rather than being restricted to `entities`.
+    /// Pack-declared relations can bind task-note endpoints.
     #[test]
     fn canonical_edge_depends_on_compiles_pack_task_note_endpoints() {
         let q = gql::parse("MATCH (a:task)-[:depends_on]->(b:task) RETURN a.id, b.id LIMIT 10")
@@ -2696,8 +2471,7 @@ mod tests {
         );
     }
 
-    /// Variable-length canonical traversal must bind seed, intermediate, and
-    /// final endpoints to the primary substrate union, not `entities` only.
+    /// Recursive canonical traversal uses the primary-substrate union throughout.
     #[test]
     fn variable_length_canonical_compiles_primary_substrate_nodes() {
         let q = gql::parse("MATCH (a)-[:supports*1..2]->(b) RETURN b.id LIMIT 10").unwrap();
@@ -2719,10 +2493,7 @@ mod tests {
         );
     }
 
-    // --- Issue #468: observed_as_target/observed_as_signal must admit entity referents ---
-
-    /// `observed_as_target` admits entity OR note referents (event.substrate
-    /// determines the legal referent_kind); the target must not be forced to notes.
+    /// `observed_as_target` admits entity and note referents (issue #468).
     #[test]
     fn synthetic_edge_observed_as_target_compiles_entity_referents() {
         let q = gql::parse("MATCH (ev)-[:observed_as_target]->(t) RETURN t.id LIMIT 10").unwrap();
@@ -2746,8 +2517,7 @@ mod tests {
         );
     }
 
-    /// `observed_as_signal` admits entity OR note referents (ADR-041: brain
-    /// feedback signals may target either substrate).
+    /// `observed_as_signal` admits entity and note referents.
     #[test]
     fn synthetic_edge_observed_as_signal_compiles_entity_and_note_referents() {
         let q = gql::parse("MATCH (ev)-[:observed_as_signal]->(t) RETURN t.id LIMIT 10").unwrap();
@@ -2761,8 +2531,7 @@ mod tests {
         );
     }
 
-    /// `observed_as_selected` must still be restricted to note referents —
-    /// the fix must not widen recall/rerank observations to entities.
+    /// `observed_as_selected` remains note-only.
     #[test]
     fn synthetic_edge_observed_as_selected_still_compiles_note_referents() {
         let q = gql::parse("MATCH (ev)-[:observed_as_selected]->(m:memory) RETURN m.id LIMIT 10")

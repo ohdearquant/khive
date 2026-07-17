@@ -1,18 +1,5 @@
-//! Composite memory scoring — ported from the archived internal service (v1 archive).
-//!
-//! Provides a fully-tunable scoring pipeline:
-//!   1. `ScoringConfig`  — all knobs, all `pub`, all serde-friendly for agent sweeps.
-//!   2. `calculate_score` — multiplicative formula: `w_rel × relevance × (1 + w_temp × recency) × (1 + w_imp × salience)`.
-//!   3. `ScoreAdjustment` — declarative conditional rules applied after the base formula.
-//!   4. `normalize_rrf_scores` / `normalize_rank_fusion_scores` — RRF and raw-cosine normalization.
-//!   5. `normalize_min_score` — dual-scale input (0.0–1.0 fraction or 0–100 integer).
-//!   6. `is_meaningful_query` — noise gate before embedding compute.
-//!   7. `contains_cjk` — CJK routing decision.
-//!   8. `needs_multilingual` — broad multilingual routing gate (non-ASCII alphabetic script).
-// FILE SIZE JUSTIFICATION: scoring.rs bundles ScoringConfig, all normalization helpers,
-// CJK routing, and the full test suite for the scoring pipeline. The tests require access
-// to module-private helpers; splitting would require pub(crate) promotion of private fns.
-
+//! Tunable composite scoring, normalization, adjustments, and language routing.
+//! See `crates/khive-pack-memory/docs/api/scoring.md` for the complete scoring model.
 use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
@@ -78,22 +65,8 @@ pub struct CandidateContext<'a> {
     pub entity_names: &'a [String],
 }
 
-/// Returns `true` when `needle` occurs in `haystack` at a **word (character)
-/// boundary**. The character immediately before the match (if any) and the
-/// character immediately after the match (if any) are both non-alphanumeric
-/// (or the match sits at the start/end of `haystack`).
-///
-/// Plain substring `contains` matches inside unrelated words: a candidate
-/// `"beta"` matches `"alphabet"` and `"betamax"`; `"car"` matches
-/// `"scarcity"`. Anchoring to boundaries closes that class of false positive
-/// while still matching multi-word phrases on their own boundaries. A
-/// caller-supplied explicit name like `"knowledge graph"` still matches
-/// `"...the knowledge graph shows..."` because the space characters on
-/// either side of the phrase are themselves non-alphanumeric, satisfying the
-/// boundary check without any special-casing for internal spaces.
-///
-/// Both `haystack` and `needle` are expected pre-lowercased by the caller
-/// (matching `EntityMatch`'s existing lowercase-both-sides contract).
+/// Match a pre-lowercased name at non-alphanumeric outer boundaries.
+/// All-CJK names use substring matching because equivalent word boundaries are absent.
 fn contains_at_word_boundary(haystack: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return false;
@@ -246,12 +219,7 @@ pub fn default_adjustments() -> Vec<ScoreAdjustment> {
 
 // ── Auto entity-name extraction ─────────────────────────────────────────────────
 
-/// A small closed set of common English function words, used to keep
-/// auto-extracted entity candidates low-noise. Deliberately conservative
-/// (articles, prepositions, pronouns, conjunctions, common auxiliary verbs
-/// only) — content words are intentionally left out of this list, since
-/// distinguishing a proper noun from a common noun without an NER model
-/// is exactly what the capitalization / length rules below are for.
+/// Conservative English function words excluded from heuristic entity candidates.
 const ENTITY_STOPWORDS: &[&str] = &[
     "a", "an", "the", "and", "or", "but", "of", "in", "on", "at", "to", "for", "with", "by",
     "from", "is", "are", "was", "were", "be", "been", "being", "this", "that", "these", "those",
@@ -262,13 +230,7 @@ const ENTITY_STOPWORDS: &[&str] = &[
     "why", "how",
 ];
 
-/// Maximum number of auto-extracted entity-name candidates per query.
-/// `EntityMatch` (see `default_adjustments` above) applies its multiplier to
-/// *any* candidate memory that contains *any* one of the extracted names —
-/// this constant does not limit how many memories can receive the boost
-/// (one generic name can still match many memories). It only bounds the
-/// extracted-name list length and, transitively, the number of
-/// `contains_at_word_boundary` scans `EntityMatch` performs per note.
+/// Maximum heuristic entity names per query; it bounds scans, not boosted memories.
 pub const MAX_AUTO_ENTITY_NAMES: usize = 8;
 
 /// Strip leading/trailing non-alphanumeric characters from a token (quotes,
@@ -278,39 +240,11 @@ fn strip_token_punctuation(token: &str) -> &str {
     token.trim_matches(|c: char| !c.is_alphanumeric())
 }
 
-/// Auto-extract entity-name candidates from a recall query when the caller
-/// does not supply `entity_names` explicitly.
+/// Extract capitalized, non-stopword entity names for the default entity boost.
 ///
-/// Context (khive #dead-parameter defect): `entity_names` was a
-/// caller-supplied request field that fed `EntityMatch` — but no caller ever
-/// populated it, so the ×1.3 boost in `default_adjustments` never fired in
-/// practice. This function derives candidates server-side from the query
-/// text so the boost has something to match against.
-///
-/// **Capitalized tokens only.** A query token qualifies iff, after stripping
-/// surrounding punctuation, it is not a stopword and starts with an
-/// uppercase letter. Capitalization is the only signal used here because it
-/// is the sole low-noise proper-noun indicator available without an NER
-/// model or a lookup against known entity records — `EntityMatch::matches`
-/// (above) does a free-text boundary-anchored match against raw memory
-/// content, not something anchored to actual KG entity references, so
-/// admitting ordinary lowercase content words as candidates degenerates the
-/// boost into a second, redundant lexical-overlap signal on top of
-/// retrieval-stage relevance (confirmed by review: realistic score inputs
-/// clamp at the `[0, 1]` ceiling and flatten top-rank ordering when generic
-/// query words are treated as entity candidates).
-///
-/// **Queries with no capitalization extract nothing.** Many recall callers —
-/// agents in particular — pass fully lowercase queries, and this function
-/// deliberately returns an empty list for them rather than guessing at
-/// content words. Covering that case precisely requires anchoring candidates
-/// against known entity records (e.g. resolving query tokens against the KG)
-/// rather than lexical heuristics over the query string; that is out of
-/// scope here.
-///
-/// Returned names are lowercased (matching `EntityMatch`'s own lowercasing
-/// of both sides before the boundary-anchored match), deduplicated
-/// preserving first-seen order, and capped at `MAX_AUTO_ENTITY_NAMES`.
+/// Results are punctuation-trimmed, lowercase, first-seen deduplicated, and capped at
+/// [`MAX_AUTO_ENTITY_NAMES`]. Lowercase-only queries return no heuristic names.
+/// See `crates/khive-pack-memory/docs/api/scoring.md` for the precision rationale.
 pub fn extract_entity_candidates(query: &str) -> Vec<String> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut out: Vec<String> = Vec::new();
@@ -337,11 +271,7 @@ pub fn extract_entity_candidates(query: &str) -> Vec<String> {
     out
 }
 
-/// Maximum number of candidate strings a single recall sends to the batched
-/// entity-name lookup
-/// (ADR-104 §5 / Stage C, rider R1). Bounds the candidate `VALUES` relation
-/// consumed by `khive-db`, independent of `MAX_AUTO_ENTITY_NAMES`, which bounds
-/// the unrelated capitalized-token fallback list above.
+/// Maximum candidate strings sent to one batched KG entity-name lookup.
 pub const MAX_ENTITY_LOOKUP_CANDIDATES: usize = 64;
 
 const MAX_BIGRAM_LOOKUP_CANDIDATES: usize = MAX_ENTITY_LOOKUP_CANDIDATES / 4;
@@ -357,22 +287,11 @@ fn entity_lookup_case_variants(candidate: String) -> [Option<String>; 2] {
     }
 }
 
-/// Build the candidate strings a recall query offers to the entity-anchored
-/// lookup (ADR-104 §5 / Stage C). Alphabetic-script queries contribute
-/// ASCII-lowercased non-stopword unigrams and reserve one quarter of the cap
-/// for adjacent-token bigrams. Candidates containing non-ASCII characters also
-/// retain their raw form for exact matching. CJK substrings reserve a fair quota
-/// for every supported length from 2 through 8, redistributing unused quota from
-/// short runs. Within each length, available start positions are sampled evenly.
-/// Quotas greater than one guarantee both the first and final valid starts;
-/// a quota of one selects the first endpoint. The result is both length-fair
-/// and position-fair under the 64-candidate cap. All candidates are deduplicated.
+/// Build bounded strings for recall's batched, case-insensitive KG entity lookup.
 ///
-/// Unlike `extract_entity_candidates` above, this does **not** filter on
-/// capitalization, lowercase queries are the whole point of this extension.
-/// The precision-safety property instead comes from the caller (the
-/// `memory.recall` handler) only keeping a candidate that matches the *name*
-/// of a real KG entity, via one batched `EntityFilter::names_ci` lookup.
+/// Includes lowercase unigrams/bigrams and length-fair CJK substrings, deduplicated and
+/// capped at [`MAX_ENTITY_LOOKUP_CANDIDATES`]. The caller restores precision by retaining
+/// only real entity names. See `crates/khive-pack-memory/docs/api/scoring.md`.
 pub fn entity_lookup_candidates(query: &str) -> Vec<String> {
     let tokens: Vec<String> = query
         .split_whitespace()
@@ -648,10 +567,7 @@ pub const MAX_TOKEN_BUDGET: usize = 16_000;
 pub const MAX_RECALL_LIMIT: usize = 200;
 
 impl ScoringConfig {
-    /// Clamp all DoS-cap fields to their server-side maximums.
-    ///
-    /// Called at the start of `handle_recall` so callers cannot trigger
-    /// unbounded candidate retrieval or token budget consumption.
+    /// Clamp candidate, result, and token budgets to their server-side maximums.
     pub fn apply_dos_caps(&mut self) {
         self.max_recall_candidates = self.max_recall_candidates.min(MAX_RECALL_CANDIDATES);
         self.default_token_budget = self.default_token_budget.min(MAX_TOKEN_BUDGET);
@@ -686,22 +602,10 @@ pub fn contains_cjk(text: &str) -> bool {
     (cjk as f32) / (chars.len() as f32) > 0.15
 }
 
-/// Returns `true` when `text` should be routed to the multilingual embedding model
-/// for dense retrieval.
+/// Return whether more than 15% of alphabetic characters are non-ASCII.
 ///
-/// Triggers when >15% of **alphabetic** characters are non-ASCII-alphabetic.
-/// Denominator is alphabetic-character count (not total characters), so punctuation,
-/// digits, and whitespace do not dilute the signal. This means `Müller` and
-/// `Müller?` and `Müller!!!` all route identically.
-///
-/// Covers: CJK, Cyrillic, Arabic, Devanagari, Hebrew, Thai, accented-Latin
-/// (é, ü, ñ, …) and any other non-ASCII script Unicode recognises as alphabetic,
-/// without introducing new crate dependencies.
-///
-/// **Known limitation**: ASCII-only non-English Latin (`bonjour le monde`,
-/// `como estas`, `ich suche einen buchhalter`) is NOT detected and routes to the
-/// primary model. Real language detection for that case requires a dedicated crate
-/// and is tracked as a follow-up to issue #101.
+/// Punctuation and digits do not dilute the ratio. ASCII-only non-English Latin remains
+/// undetected and uses the primary model. See `crates/khive-pack-memory/docs/api/scoring.md`.
 pub fn needs_multilingual(text: &str) -> bool {
     let alpha_chars: Vec<char> = text.chars().filter(|c| c.is_alphabetic()).collect();
     if alpha_chars.is_empty() {

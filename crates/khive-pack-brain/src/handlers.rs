@@ -1227,20 +1227,23 @@ impl BrainPack {
     /// which resolves its own tier and passes an explicit profile) always
     /// originates from the recall serve loop, so it must resolve against the
     /// same binding bucket the serve path used.
+    /// Returns the profile id plus a resolution marker (`explicit` |
+    /// `binding` | `default`) so event payloads can record call-site
+    /// discipline separately from attribution (#1016).
     fn resolve_effective_feedback_profile(
         &self,
         token: &NamespaceToken,
         explicit: Option<&str>,
-    ) -> String {
+    ) -> (String, &'static str) {
         if let Some(profile_id) = explicit {
-            return profile_id.to_string();
+            return (profile_id.to_string(), "explicit");
         }
         let actor = token.actor().binding_id();
         let namespace = token.namespace().as_str();
         let state = self.state.lock().unwrap();
         match state.resolve_with_match(actor, Some(namespace), ConsumerKind::Recall.as_str()) {
-            Some((record, _matched_kind, true)) => record.id.clone(),
-            _ => "balanced-recall-v1".to_string(),
+            Some((record, _matched_kind, true)) => (record.id.clone(), "binding"),
+            _ => ("balanced-recall-v1".to_string(), "default"),
         }
     }
 
@@ -1328,7 +1331,7 @@ impl BrainPack {
         // Compute the effective serving profile (explicit, else a matching
         // actor+namespace binding, else the system default — #697), then
         // validate that it exists in the registry and is not Archived.
-        let effective_profile =
+        let (effective_profile, profile_resolution) =
             self.resolve_effective_feedback_profile(token, p.served_by_profile_id.as_deref());
         let effective_profile = effective_profile.as_str();
         {
@@ -1415,10 +1418,15 @@ impl BrainPack {
         // Base feedback payload, shared by every signal kind. The gated
         // (implicit) path below adds a "gate" key inside the atomic unit;
         // the ungated path (explicit/correction) adds nothing further.
-        let mut base_data = json!({"signal": signal});
-        if let Some(ref profile_id) = p.served_by_profile_id {
-            base_data["served_by_profile_id"] = json!(profile_id);
-        }
+        // #1016: always stamp the resolved profile (not just the
+        // caller-explicit value) so event_counts attribution and ADR-032
+        // replay match what the posterior fold actually credited; the
+        // marker records how it was resolved.
+        let mut base_data = json!({
+            "signal": signal,
+            "served_by_profile_id": effective_profile,
+            "profile_resolution": profile_resolution,
+        });
         if let Some(ref ss) = p.section_signals {
             base_data["section_signals"] = ss.clone();
         }

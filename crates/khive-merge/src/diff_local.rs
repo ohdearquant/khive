@@ -1,12 +1,8 @@
 // Copyright 2026 Haiyang Li. Licensed under Apache-2.0.
 //
-//! Minimal entity+edge diff computation for the merge use case.
+//! Merge-specific entity and edge change classification.
 //!
-//! This is a private implementation used only by `khive-merge`. It does NOT
-//! implement a full bidirectional graph diff format — it produces the
-//! categorized entity/edge change sets that the merge algorithm needs.
-//!
-//! When `khive-diff` ships in v0.4, this can be replaced by a dep on that crate.
+//! See `crates/khive-merge/docs/api/entity-merge.md` and `edge-merge.md`.
 
 use std::collections::{HashMap, HashSet};
 
@@ -26,9 +22,7 @@ pub enum EntityChange {
     Deleted,
     /// Modified in branch (fields differ from base).
     Modified {
-        // REASON: base is retained for future conflict-resolution UX (show "was → now").
-        // Currently only `branch` is read in merge patterns; `base` is present for
-        // completeness and will be used when we add a diff display path.
+        // Retained for future “was → now” conflict displays.
         #[allow(dead_code)]
         base: ExportedEntity,
         branch: ExportedEntity,
@@ -46,8 +40,7 @@ pub enum EdgeChange {
     Deleted,
     /// Weight modified.
     WeightModified {
-        // REASON: base_weight is retained for future diff display (show "was → now").
-        // Currently only `branch_weight` is read in merge patterns.
+        // Retained for future “was → now” diff displays.
         #[allow(dead_code)]
         base_weight: f64,
         branch_weight: f64,
@@ -57,17 +50,20 @@ pub enum EdgeChange {
 /// Composite key for edge identity.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct EdgeKey {
+    /// Canonical source UUID.
     pub source: Uuid,
+    /// Canonical target UUID.
     pub target: Uuid,
+    /// Governed relation name.
     pub relation: String,
 }
 
 impl EdgeKey {
-    /// Construct an `EdgeKey` from a `ExportedEdge` by cloning its identity fields.
+    /// Clones an edge's semantic identity into a key.
     ///
-    /// Symmetric relations (e.g. `competes_with`, `composed_with`) canonicalize
-    /// endpoints to `min(source, target)`/`max(source, target)` (ADR-002) so that
-    /// a swapped-order duplicate collides with the original in the key's hash/eq.
+    /// Symmetric-relation endpoints are canonicalized to `(min, max)` so
+    /// swapped duplicates compare equal.
+    /// See `crates/khive-merge/docs/api/edge-merge.md` for identity rules.
     pub fn from_edge(e: &ExportedEdge) -> Self {
         let (source, target) = if e.relation.is_symmetric() && e.target < e.source {
             (e.target, e.source)
@@ -83,7 +79,10 @@ impl EdgeKey {
     }
 }
 
-/// Compute entity changes between `base` and `branch`.
+/// Classifies every entity UUID in the union of `base` and `branch`.
+///
+/// Structural equality excludes timestamps. See
+/// `crates/khive-merge/docs/api/entity-merge.md` for the classification table.
 pub fn diff_entities(base: &KgArchive, branch: &KgArchive) -> HashMap<Uuid, EntityChange> {
     let base_map: HashMap<Uuid, &ExportedEntity> =
         base.entities.iter().map(|e| (e.id, e)).collect();
@@ -118,11 +117,15 @@ pub fn diff_entities(base: &KgArchive, branch: &KgArchive) -> HashMap<Uuid, Enti
     result
 }
 
-/// Compute edge changes between `base` and `branch`.
+/// Classifies every semantic edge key in the union of `base` and `branch`.
 ///
-/// The maps retain full `ExportedEdge` values (not just weights) so that
-/// `edge_id` is preserved in `EdgeChange::Added` entries. Edge identity must
-/// survive merge/diff cycles — callers must not regenerate a fresh UUID.
+/// Added values retain their original `edge_id`; weights differing by less
+/// than `f64::EPSILON` are unchanged. See `crates/khive-merge/docs/api/edge-merge.md`.
+///
+/// # Errors
+///
+/// The current classifier is infallible; the result shape is retained for its
+/// merge-layer contract.
 pub fn diff_edges(
     base: &KgArchive,
     branch: &KgArchive,
@@ -151,7 +154,6 @@ pub fn diff_edges(
 
     for key in all_keys_sorted {
         let change = match (base_map.get(&key), branch_map.get(&key)) {
-            // Added in branch: carry the branch edge verbatim to preserve edge_id.
             (None, Some(branch_e)) => EdgeChange::Added((*branch_e).clone()),
             (Some(_), None) => EdgeChange::Deleted,
             (Some(base_e), Some(branch_e)) => {
@@ -172,7 +174,7 @@ pub fn diff_edges(
     Ok(result)
 }
 
-/// Structural equality check for entities (excludes timestamps).
+/// Compares merge-relevant entity fields, excluding timestamps.
 fn entities_equal(a: &ExportedEntity, b: &ExportedEntity) -> bool {
     a.id == b.id
         && a.kind == b.kind
@@ -183,7 +185,7 @@ fn entities_equal(a: &ExportedEntity, b: &ExportedEntity) -> bool {
         && properties_equal(&a.properties, &b.properties)
 }
 
-/// Property equality check; shared with entity.rs for duplicate-addition detection.
+/// Compares optional property payloads exactly.
 pub(crate) fn properties_equal(
     a: &Option<serde_json::Value>,
     b: &Option<serde_json::Value>,
@@ -194,8 +196,6 @@ pub(crate) fn properties_equal(
         _ => false,
     }
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

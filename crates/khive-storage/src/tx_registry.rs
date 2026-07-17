@@ -14,13 +14,11 @@ use std::time::{Duration, Instant};
 
 /// Identifier for one registered transaction span.
 ///
-/// The wrapped value is public so consumers of [`oldest`] can detect when the
-/// registry's oldest entry has *changed identity* between two observations —
-/// distinct from "is it still above a threshold" — without needing a live
-/// registration of their own (e.g. `khive-db`'s `TxAgeSweepState` pure
-/// state-machine unit tests construct synthetic ids directly). Equality is
-/// the only operation this type supports; the numeric value carries no
-/// meaning beyond "same span" vs. "different span".
+/// Public so consumers of [`oldest`] can detect the oldest entry *changing
+/// identity* between observations without a live registration of their own.
+/// Equality is the only supported operation; the numeric value carries no
+/// meaning beyond "same span" vs. "different span". See
+/// `crates/khive-storage/docs/api/tx-registry.md`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TxId(pub u64);
 
@@ -52,11 +50,9 @@ impl Drop for TxHandle {
 
 /// Register a new open transaction span with an optional diagnostic label.
 ///
-/// This is observe-only telemetry: a poisoned lock (some other holder panicked
-/// mid-critical-section) must not make the registry silently stop tracking new
-/// spans, or a subsequent WAL-pressure diagnosis could read a false "no open
-/// transactions" signal. Recovers via `into_inner()` rather than the previous
-/// `if let Ok(..)` pattern, which dropped the write on poison.
+/// Recovers a poisoned lock via `into_inner()` rather than dropping the
+/// write — a poisoned registry must keep tracking spans, not go silently
+/// blind. See `crates/khive-storage/docs/api/tx-registry.md`.
 pub fn register(label: Option<String>) -> TxHandle {
     let id = TxId(NEXT_ID.fetch_add(1, Ordering::Relaxed));
     let meta = TxMeta {
@@ -72,18 +68,11 @@ pub fn register(label: Option<String>) -> TxHandle {
 }
 
 /// Identity, age, and label of the oldest currently-open registry entry, if
-/// any.
-///
-/// The [`TxId`] lets callers distinguish "the same span is still oldest and
-/// still above a threshold" from "a *different* span became oldest between
-/// two observations" — the latter must re-arm any latched escalation state,
-/// since a departed entry's threshold-crossing history says nothing about
-/// its replacement (`khive-db`'s `TxAgeSweepState` is the consumer this
-/// exists for).
-///
-/// Recovers a poisoned lock via `into_inner()` (see [`register`]) instead of
-/// returning `None`, which would otherwise read identically to "no open
-/// transactions" — indistinguishable from the genuinely-empty case.
+/// any. The [`TxId`] lets callers distinguish "still the same oldest span"
+/// from "a different span became oldest" (must re-arm latched escalation
+/// state). Recovers a poisoned lock via `into_inner()` (see [`register`])
+/// rather than returning `None`, which would read identically to the
+/// genuinely-empty case. See `crates/khive-storage/docs/api/tx-registry.md`.
 pub fn oldest() -> Option<(TxId, Duration, Option<String>)> {
     let registry = REGISTRY
         .lock()
@@ -94,11 +83,9 @@ pub fn oldest() -> Option<(TxId, Duration, Option<String>)> {
         .map(|(id, meta)| (*id, meta.opened_at.elapsed(), meta.label.clone()))
 }
 
-/// Age and label of every currently-open registry entry.
-///
-/// Recovers a poisoned lock via `into_inner()` (see [`register`]) instead of
-/// returning an empty `Vec`, which would otherwise read identically to "no
-/// open transactions" during the one moment this diagnostic matters most.
+/// Age and label of every currently-open registry entry. Recovers a poisoned
+/// lock via `into_inner()` (see [`register`]) instead of returning an empty
+/// `Vec` — see `crates/khive-storage/docs/api/tx-registry.md`.
 pub fn snapshot() -> Vec<(Duration, Option<String>)> {
     let registry = REGISTRY
         .lock()

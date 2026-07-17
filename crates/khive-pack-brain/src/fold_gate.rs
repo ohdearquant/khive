@@ -1,69 +1,16 @@
 //! ADR-081 §2 bounded-mass fold gate for implicit feedback.
 //!
-//! Invariant: at any instant, the decayed implicit feedback mass folded into a
-//! posterior for a given accounting key `(profile_id, namespace, target_id)` never
-//! exceeds `IMPLICIT_MASS_CAP` — the weight of one explicit event. An incoming
-//! implicit event folds at its full weight only if `M(k) + w <= CAP`; otherwise it
-//! is recorded in the event log (audit preserved, per the data-vs-view principle)
-//! and folded at zero weight.
+//! Invariant: the decayed implicit feedback mass folded into a posterior for a
+//! given `(profile_id, namespace, target_id)` key never exceeds
+//! `IMPLICIT_MASS_CAP` (the weight of one explicit event); an event that would
+//! exceed the cap is recorded in the event log but folds at zero weight. The
+//! whole check-and-fold, including scorer dedup, runs as one
+//! `SqlAccess::atomic_unit` under `BEGIN IMMEDIATE` per ADR-081 §2's
+//! cross-process single-writer requirement.
 //!
-//! `M(k) = sum(w_i * 2^(-dt_i / T))` is not recomputed from the raw event log on
-//! every fold. It is maintained as a single-row-per-key materialized accumulator
-//! (`brain_implicit_mass`), read-decayed-written on each gated event, mirroring the
-//! existing `brain_profile_snapshots` pattern of a derived accumulator living
-//! alongside the append-only `brain_event_log`.
-//!
-//! Concurrency (ADR-081 §2 — normative): "the mass check and the fold execute in
-//! one SQLite transaction opened with `BEGIN IMMEDIATE`... database-level
-//! single-writer semantics serialize every check-and-fold against all concurrent
-//! writers." `apply_fold_gate` satisfies this by handing the whole
-//! check-and-fold — the mass `SELECT`, the decision (computed in Rust from the
-//! row read inside the unit), and the `INSERT ... ON CONFLICT ... DO UPDATE` —
-//! to `SqlAccess::atomic_unit` as ONE suspension-free unit. The seam owns the
-//! transaction boundary: the unit runs under a single `BEGIN IMMEDIATE` with
-//! commit-on-Ok / rollback-on-Err, on the writer task's connection when the
-//! single-writer queue is enabled and on one held writer connection otherwise.
-//! On a file-backed pool that `BEGIN IMMEDIATE` acquires SQLite's actual
-//! file-level RESERVED lock for the duration, which SQLite enforces **across
-//! processes**, not just within one. This is the property production needs:
-//! khive-mcp routinely runs multiple concurrent daemon processes against the same
-//! database file (issue #407), so an in-process mutex alone (e.g. `dispatch_gate`
-//! in `BrainPack::dispatch`) cannot serialize the check-and-fold — only SQLite's
-//! own write lock can. (Historical note: this function originally issued
-//! `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK` itself on a retained `writer()` handle;
-//! that shape nests inside the writer task's own transaction under the
-//! single-writer queue and was converted to `atomic_unit`. The trait's
-//! `begin_tx`/`SqlTransaction` surface it once avoided has since been retired
-//! entirely.) The concurrency proof below
-//! (`fold_gate_concurrent_writers_never_exceed_cap`) uses a real file-backed
-//! `KhiveRuntime` because only the file-backed path exhibits genuine
-//! cross-connection contention — the same shape production's multiple
-//! concurrent `kkernel mcp` processes have.
-//!
-//! SQL math functions (`pow`/`exp`/`ln`/`log`) are unavailable on this
-//! `rusqlite`/SQLite build (verified empirically: `SELECT pow(2.0, -1.0)` raises
-//! "no such function"), which rules out expressing the entire decayed-mass +
-//! clamp decision as one `INSERT ... RETURNING` statement with the decay math
-//! inlined in SQL. The decay/clamp math instead runs in Rust (`decayed_mass`,
-//! `gate_decision`, both pure and unit-tested below) between the `BEGIN IMMEDIATE`
-//! and the `INSERT`, reading only the row already fetched on the held connection
-//! — so no other writer can observe or mutate that row between the read and the
-//! write.
-//!
-//! Scorer dedup (ADR-081 §2/§6): a scorer-tagged event additionally claims a
-//! `(scorer_run_id, serve_ledger_id)` key in `brain_scorer_dedup` via
-//! `INSERT OR IGNORE`, inside the SAME held `BEGIN IMMEDIATE` transaction as
-//! the mass check-and-fold. A conflicting insert (0 rows affected) means a
-//! prior call already claimed this exact pair, and this call returns
-//! `GateOutcome::Deduped` before touching `brain_implicit_mass` at all — the
-//! claim and the fold commit or roll back together, so a crash between them
-//! cannot leave a claimed-but-never-folded key. Reading the ledger row's
-//! `scorer_run_id` column first (as `serve_ledger::resolve` does) cannot
-//! provide this guarantee: two concurrent duplicate submissions both observe
-//! the pre-backfill NULL and both pass, since the column is only backfilled
-//! after the fold completes (`backfill_grade`, called from `handlers.rs`
-//! after event append) — that check is a useful non-atomic fast path, not a
-//! correctness mechanism.
+//! See `crates/khive-pack-brain/docs/api/fold-gate.md` for the full mass
+//! invariant, concurrency proof, why the decay math runs in Rust not SQL, and
+//! the scorer-dedup atomicity argument.
 use khive_runtime::RuntimeError;
 use khive_storage::event::Event;
 use khive_storage::types::{SqlStatement, SqlValue};
@@ -138,18 +85,12 @@ pub enum GateOutcome {
 ///
 /// `profile_id`/`namespace`/`target_id` form the accounting key. `weight` is the
 /// nominal implicit weight (`FeedbackEventKind::update_weight()`, ADR-081 §1 —
-/// currently `0.1`). `now_us` is the event's timestamp.
-///
-/// `dedup_key`, when supplied, is `(scorer_run_id, serve_ledger_id)` (ADR-081
-/// §2/§6): claimed atomically, inside the same transaction as the mass
-/// check-and-fold, before either runs. `None` means ordinary non-scorer
-/// implicit feedback — no dedup, folds unconditionally subject to the clamp.
-///
-/// The dedup claim, the mass check, and the fold write happen inside one
-/// `BEGIN IMMEDIATE` transaction held on a single `SqlWriter` connection
-/// (module doc above), so a concurrent caller — another daemon process, on
-/// the same file-backed database — cannot observe the pre-claim/pre-fold
-/// state and race the write.
+/// currently `0.1`). `now_us` is the event's timestamp. `dedup_key`, when
+/// supplied, is `(scorer_run_id, serve_ledger_id)` (ADR-081 §2/§6), claimed
+/// atomically in the same transaction as the mass check-and-fold; `None` means
+/// ordinary non-scorer feedback with no dedup. The whole claim+check+fold runs
+/// inside one held `BEGIN IMMEDIATE` transaction (see module docs and
+/// `crates/khive-pack-brain/docs/api/fold-gate.md`).
 pub async fn apply_fold_gate(
     sql: &dyn SqlAccess,
     namespace: &str,
@@ -159,15 +100,8 @@ pub async fn apply_fold_gate(
     now_us: i64,
     dedup_key: Option<(&str, &str)>,
 ) -> Result<GateOutcome, RuntimeError> {
-    // ADR-067 Component A (Fork C slice 2): the whole claim+check+fold unit
-    // is handed to `atomic_unit` as ONE closure instead of this function
-    // opening its own `writer()` handle and issuing `BEGIN IMMEDIATE`/
-    // `COMMIT`/`ROLLBACK` by hand. On the flag-on path `atomic_unit` runs
-    // this closure inside the writer task's single request transaction —
-    // no separate connection competes for SQLite's write lock. On the
-    // flag-off (or in-memory) path `atomic_unit` wraps it in the same
-    // manual BEGIN IMMEDIATE/COMMIT/ROLLBACK sequence this function used to
-    // issue directly, so that path is unchanged.
+    // ADR-067 Component A: one `atomic_unit` closure, not a hand-rolled
+    // BEGIN IMMEDIATE/COMMIT/ROLLBACK — see docs/api/fold-gate.md.
     let namespace = namespace.to_string();
     let profile_id = profile_id.to_string();
     let target_id = target_id.to_string();
@@ -249,30 +183,18 @@ pub enum GateAndAppendOutcome {
     Applied(Box<GateAndAppendResult>),
 }
 
-/// ADR-081 §2/§6 (PR #497):
-/// claim the `(scorer_run_id, serve_ledger_id)` dedup key (if supplied), run
-/// the bounded-mass fold gate (or skip it for `ForcedZero`), and append the
-/// resulting `brain.feedback` event — as ONE atomic, all-or-nothing unit on
-/// a single held `BEGIN IMMEDIATE` writer transaction, mirroring
-/// `apply_fold_gate`'s commit/rollback shape.
+/// ADR-081 §2/§6 (PR #497): claim the `(scorer_run_id, serve_ledger_id)` dedup
+/// key (if supplied), run the bounded-mass fold gate (or skip it for
+/// `ForcedZero`), and append the resulting `brain.feedback` event — as ONE
+/// atomic, all-or-nothing unit on a single held `BEGIN IMMEDIATE` writer
+/// transaction, mirroring `apply_fold_gate`'s commit/rollback shape.
 ///
-/// `build_event` is called with the gate outcome (after the claim/fold step,
-/// before the event is appended) so the event payload can carry the fold's
-/// numbers; it runs inside the transaction, so an error surfaced from
-/// appending the event it returns aborts the whole unit.
-///
-/// Claim-conflict handling: on a claim conflict, this returns `Deduped` before running
-/// the fold or building/appending any event. If instead the claim succeeds
-/// but the event append fails, the whole transaction — claim included —
-/// rolls back (the same commit/rollback shell as `apply_fold_gate`), so a
-/// retry sees no claim and proceeds normally; the claim can never outlive a
-/// failed event append the way it could when the event append ran in its own
-/// separate transaction after this one committed.
-///
-/// Forced-zero handling: `FeedbackGateMode::ForcedZero` still runs the dedup claim
-/// step above — only the mass fold itself is skipped — so two concurrent
-/// forced-zero submissions for the same `(scorer_run_id, serve_ledger_id)`
-/// pair can no longer both append a zero-weight audit event.
+/// `build_event` runs inside the transaction with the gate outcome, so its
+/// event payload can carry the fold's numbers, and an append error aborts the
+/// whole unit (claim included). On a claim conflict, returns `Deduped` before
+/// running the fold or calling `build_event` at all. See
+/// `crates/khive-pack-brain/docs/api/fold-gate.md` for the claim-rollback and
+/// forced-zero interaction details.
 #[allow(clippy::too_many_arguments)]
 pub async fn apply_fold_gate_and_append_event<F>(
     sql: &dyn SqlAccess,
@@ -287,10 +209,7 @@ pub async fn apply_fold_gate_and_append_event<F>(
 where
     F: FnOnce(Option<&FoldGateOutcome>, bool) -> Event + Send + 'static,
 {
-    // ADR-067 Component A (Fork C slice 2): see `apply_fold_gate`'s doc
-    // comment — same conversion, from a manually-owned `writer()` handle
-    // with hand-issued `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK` to ONE
-    // `atomic_unit` closure.
+    // ADR-067 Component A: same atomic_unit conversion as `apply_fold_gate`.
     let namespace = namespace.to_string();
     let profile_id = profile_id.to_string();
     let target_id = target_id.to_string();
@@ -603,23 +522,10 @@ mod tests {
         assert!((mass16 - 1.5).abs() < 1e-9);
     }
 
-    /// Proves the check-and-fold is atomic under genuine
-    /// concurrent access, not just within one process's async runtime.
-    ///
-    /// Spawns 30 concurrent tasks, each calling `apply_fold_gate` directly
-    /// (bypassing `BrainPack::dispatch`'s in-process `dispatch_gate` mutex
-    /// entirely — the point is to prove the fold gate module itself, not an
-    /// outer application lock, provides the safety) against the SAME
-    /// accounting key on a file-backed runtime, all at the same `now_us` (no
-    /// artificial time separation between tasks, to maximize race pressure).
-    ///
-    /// `IMPLICIT_MASS_CAP` / `WEIGHT` = 1.5 / 0.1 → floor(1.5 / 0.1) = 15 must
-    /// pass at full weight and the other 15 must clamp to zero, REGARDLESS of
-    /// scheduling order — this is a deterministic arithmetic consequence of
-    /// correct serialization, not a timing-sensitive assertion. A reverted
-    /// TOCTOU implementation (read-then-write outside a held lock) would very
-    /// likely let more than 15 pass, since concurrent readers could observe
-    /// the same stale pre-write mass simultaneously.
+    /// Proves the check-and-fold is atomic under genuine concurrent access
+    /// (30 tasks, same key, file-backed runtime, bypassing `dispatch_gate`):
+    /// exactly `floor(CAP/WEIGHT)` = 15 must pass at full weight regardless
+    /// of scheduling order. See `docs/api/fold-gate.md`.
     #[tokio::test]
     async fn fold_gate_concurrent_writers_never_exceed_cap() {
         use khive_runtime::{BackendId, KhiveRuntime, Namespace, RuntimeConfig};
@@ -629,6 +535,7 @@ mod tests {
         let db_path = dir.path().join("fold-gate-concurrency.db");
 
         let rt = KhiveRuntime::new(RuntimeConfig {
+            git_write: Default::default(),
             db_path: Some(db_path),
             default_namespace: Namespace::local(),
             embedding_model: None,
@@ -732,6 +639,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join(db_name);
         let rt = KhiveRuntime::new(RuntimeConfig {
+            git_write: Default::default(),
             db_path: Some(db_path),
             default_namespace: Namespace::local(),
             embedding_model: None,

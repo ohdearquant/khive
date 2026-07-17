@@ -1,5 +1,9 @@
 # khive-storage Design
 
+Function-specific technical reference docs (error taxonomy, blob store,
+transaction registry) live in [`docs/api/`](api/). This document covers
+design rationale and ADR compliance.
+
 ## Scope
 
 Trait-only storage capability surface. Contains zero backend implementations.

@@ -1800,18 +1800,9 @@ mod tests {
         );
     }
 
-    /// khive #449 follow-up: the connector-level
-    /// `one_poison_uid_does_not_starve_51_later_valid_uids_and_cursor_passes_it`
-    /// test in `imap.rs` only proves `process_selected_page` assigns the
-    /// poison UID a `SelectedMessage::Malformed` disposition -- it never
-    /// proves that disposition survives into the actual `ChannelEnvelope`
-    /// `EmailChannel::poll_page` hands to `comm.ingest`. Drives a
-    /// `SelectedMessage::Malformed` entry (as the IMAP connector would
-    /// return it for an unparseable UID) through `poll_page`'s public
-    /// pipeline and asserts the resulting envelope carries the stable
-    /// `imap:{host}:{uidvalidity}:{uid}` external ID plus durable quarantine
-    /// metadata -- exactly what the daemon's ingest/query layer needs to
-    /// prove a durable quarantine record, not just an intermediate value.
+    /// khive #449 follow-up: proves a `Malformed` disposition survives
+    /// end-to-end through `poll_page` into the emitted `ChannelEnvelope`,
+    /// not just `process_selected_page`'s intermediate value.
     #[tokio::test]
     async fn poll_page_malformed_uid_produces_a_stable_external_id_and_quarantine_metadata() {
         let since = Utc::now();

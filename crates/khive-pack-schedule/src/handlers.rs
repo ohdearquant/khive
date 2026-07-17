@@ -61,18 +61,9 @@ fn deser<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, RuntimeErro
         .map_err(|e| RuntimeError::InvalidInput(format!("bad params: {e}")))
 }
 
-/// Validate that `at` is a valid RFC 3339 timestamp and lies in the future.
-///
-/// Accepts any RFC 3339 string that `chrono` can parse as a `DateTime<Utc>`
-/// (e.g. "2027-01-01T00:00:00Z" or "2027-01-01T00:00:00+05:30").
-///
-/// Returns the parsed UTC instant so callers can use it for comparisons
-/// without re-parsing. The original string is preserved by callers who want
-/// to store it as-is (see H5 fix below).
-///
-/// Rejects:
-/// - Unparseable strings (not RFC 3339).
-/// - Timestamps that lie in the past relative to `Utc::now()`.
+/// Validates `at` is an RFC 3339 timestamp lying in the future; returns the
+/// parsed instant. See `docs/api/replay-validation.md#validate_at` for accepted
+/// formats and rationale.
 fn validate_at(verb: &str, at: &str) -> Result<DateTime<Utc>, RuntimeError> {
     let parsed = at.parse::<DateTime<Utc>>().map_err(|_| {
         RuntimeError::InvalidInput(format!(
@@ -88,27 +79,10 @@ fn validate_at(verb: &str, at: &str) -> Result<DateTime<Utc>, RuntimeError> {
     Ok(parsed)
 }
 
-/// Validate a repeat spec: named aliases or a limited five-field form.
-///
-/// Accepts the literals `daily`, `weekly`, `monthly`, and a limited five-field
-/// form `MIN HOUR DOM MON DOW`, where each field is exactly `*` or one
-/// non-negative integer within the accepted range:
-/// - MIN  0–59
-/// - HOUR 0–23
-/// - DOM  1–31
-/// - MON  1–12
-/// - DOW  0–7
-///
-/// Standard cron operators such as steps (`*/15`), ranges (`9-17`), and lists
-/// (`0,30`) are NOT accepted (issue #481): `kkernel`'s pending-events runner
-/// does not yet compute next-fire times for cron-form repeats (it fires them
-/// one-shot), so advertising and accepting full cron syntax here would imply
-/// recurrence semantics that do not exist yet. Use `daily` / `weekly` /
-/// `monthly` for recurring runtime advancement until cron next-fire support
-/// lands.
-///
-/// Malformed fields (non-numeric, out-of-range, or a cron operator) are
-/// rejected with `RuntimeError::InvalidInput` rather than silently accepted.
+/// Validates a repeat spec: `daily`/`weekly`/`monthly`, or a limited 5-field
+/// `MIN HOUR DOM MON DOW` cron-lite form (no steps/ranges/lists — issue
+/// #481). See `docs/api/replay-validation.md#validate_repeat` for field ranges
+/// and rationale.
 fn validate_repeat(repeat: &str) -> Result<(), RuntimeError> {
     match repeat {
         "daily" | "weekly" | "monthly" => return Ok(()),
@@ -156,11 +130,9 @@ fn validate_repeat(repeat: &str) -> Result<(), RuntimeError> {
     Ok(())
 }
 
-/// Validate that `action` is parseable DSL via `khive_request::parse_request`.
-///
-/// This catches garbage like `"x"` or `"bogus-not-a-valid-verb()"` at write
-/// time rather than at trigger time, when nobody is watching. Returns the
-/// parsed request so callers can inspect the verb names without re-parsing.
+/// Validates `action` parses as DSL via `khive_request::parse_request`,
+/// catching garbage at write time rather than trigger time. Returns the
+/// parsed request so callers can inspect verb names without re-parsing.
 fn validate_action(action: &str) -> Result<khive_request::ParsedRequest, RuntimeError> {
     khive_request::parse_request(action).map_err(|e| {
         RuntimeError::InvalidInput(format!(
@@ -170,18 +142,11 @@ fn validate_action(action: &str) -> Result<khive_request::ParsedRequest, Runtime
     })
 }
 
-/// Validate that a parsed `schedule.schedule` action can be replayed exactly
-/// as stored (issue #461).
-///
-/// The pending-events runner reparses the stored DSL at trigger time and
-/// dispatches it through the normal request surface. For that replay to
-/// succeed it must be a single op against an exactly-registered handler name
-/// (not a bare shorthand resolved via a `schedule.{tool}` fallback), with
-/// only literal argument values (no `$prev` references, which are only
-/// meaningful inside a chain the replay path does not reconstruct) and all
-/// required handler parameters present. Rejecting anything else here, at
-/// write time, prevents storing an action that is guaranteed to fail (and be
-/// silently marked "fired") when it comes due.
+/// Validates a parsed `schedule.schedule` action can be replayed exactly as
+/// stored (issue #461): single op, exactly-registered handler, literal args
+/// only, all required params present, and no handler that treats
+/// `namespace` as a business arg (issue #461/#462). See
+/// `docs/api/replay-validation.md#validate_replayable_single_action`.
 fn validate_replayable_single_action(
     parsed: &khive_request::ParsedRequest,
     registry: &VerbRegistry,
@@ -215,20 +180,8 @@ fn validate_replayable_single_action(
         }
     }
 
-    // Reject any handler whose schema declares `namespace` as a business
-    // param (issue #461/#462). `dispatch_action` in `pending_events.rs`
-    // unconditionally injects the firing event's routing namespace into
-    // every op's args, and the registry passes it through unchanged
-    // whenever the handler declares `namespace` (`khive-runtime/src/pack.rs`).
-    // For handlers that treat `namespace` as a business param (e.g.
-    // `brain.bind`, `brain.resolve`), that silently changes the business
-    // value on replay — even when the *stored* action omitted `namespace`
-    // entirely (e.g. `brain.bind` defaults an omitted `namespace` to the
-    // wildcard `"*"` at write time; replay would instead bind it to
-    // whatever namespace the event happens to fire from). Replay cannot yet
-    // carry routing-namespace and arg-namespace as separate concepts, so
-    // reject at write time based on the handler's schema alone, regardless
-    // of whether the stored args happen to include `namespace`.
+    // Reject handlers whose schema declares `namespace` as a business param
+    // (issue #461/#462) — see docs/api/replay-validation.md#validate_replayable_single_action.
     let handler_accepts_namespace =
         help.get("params")
             .and_then(Value::as_array)
@@ -251,31 +204,11 @@ fn validate_replayable_single_action(
     validate_conditional_requirements(&op.tool, &op.args, registry)
 }
 
-/// Reject scheduled actions known to fail a handler's *conditional* required
-/// param even though `describe_verb` marks none of the alternatives
-/// `required:true` (issue #461).
-///
-/// `validate_args_against_help` only enforces metadata-declared
-/// `required:true` params. Some handlers accept one of several alternative
-/// arg sets (e.g. `create` requires `kind` unless bulk `items` is given), so
-/// neither alternative is marked required in metadata and both can be
-/// omitted at write time — then fail at trigger-time replay. This function
-/// hard-codes the known cases; it is not a general conditional-requirements
-/// mechanism (there is no metadata surface for that yet), so it does not
-/// guarantee every handler-internal semantic precondition is caught.
-///
-/// For `tool == "create"`, this mirrors the singleton branches of the KG
-/// pack's own `handle_create` (`khive-pack-kg/src/handlers/create.rs`):
-/// entity/granular-entity creates require `name`, note/granular-note creates
-/// require `content`, and a bare `kind="entity"` requires an `entity_kind`
-/// (or a granular entity kind) to resolve a concrete kind. It also validates
-/// `entity_type` against the KG entity-type/subtype registry when present
-/// — see `validate_entity_type_for_replay`.
-/// `khive-pack-schedule` does not depend on `khive-pack-kg` (only as a
-/// dev-dependency for tests), so this reimplements the classification using
-/// `VerbRegistry::all_entity_kinds` / `all_note_kinds` — the same data
-/// `resolve_kind_spec` consults — rather than importing the KG pack's
-/// private helpers.
+/// Rejects scheduled actions known to fail a handler's *conditional*
+/// required param even though `describe_verb` marks none of the
+/// alternatives `required:true` (issue #461) — hard-codes the `create`
+/// kind/name/content cases. See
+/// `docs/api/replay-validation.md#validate_conditional_requirements`.
 fn validate_conditional_requirements(
     tool: &str,
     args: &std::collections::BTreeMap<String, khive_request::ArgValue>,
@@ -395,23 +328,10 @@ enum CreateKindClass {
     Note { specific: Option<String> },
 }
 
-/// Classify a `create(kind=...)` value the same way
-/// `khive-pack-kg::handlers::common::resolve_kind_spec` does: literal
-/// substrate keywords first, then base-8-kind aliases (`khive_types::EntityKind`,
-/// e.g. `"paper"` -> `document` — a real, non-dev dependency already shared
-/// with khive-pack-kg, so this is genuine reuse, not a hand-copy), then the
-/// pack-local `resource`-kind alias set (`"atom"`, `"runbook"`, etc. ->
-/// `resource`, ADR-048; hand-copied via `resource_alias_for_replay` since
-/// `khive-pack-kg::vocab::EntityKind` is pack-private — see that function's
-/// doc comment), then the registry's merged entity/note-kind vocabulary (the
-/// same final fallback `resolve_kind_spec` uses). Returns an error for any
-/// `kind` that is guaranteed to fail replay outright: `edge` (create edges
-/// via `link`), `event` (immutable), `proposal` (create via `propose`), or
-/// an unrecognized kind string.
-///
-/// The pre-fix version skipped alias resolution
-/// entirely, causing schedule-time false rejections (not a security hole)
-/// for legitimate KG-accepted spellings like `"paper"` and `"atom"`.
+/// Classifies a `create(kind=...)` value mirroring
+/// `khive-pack-kg::handlers::common::resolve_kind_spec`; errors on any kind
+/// guaranteed to fail replay (`edge`, `event`, `proposal`, unrecognized). See
+/// `docs/api/replay-validation.md#classify_create_kind`.
 fn classify_create_kind(
     raw: &str,
     registry: &VerbRegistry,
@@ -471,21 +391,9 @@ fn classify_create_kind(
     )))
 }
 
-/// Canonicalize a legacy `entity_kind` value the same way
-/// `khive-pack-kg::handlers::common::canonical_entity_kind` does: try the
-/// base `khive_types::EntityKind` parser (the 8 base kinds plus its common
-/// aliases, e.g. `"paper"` -> `document`; a real, non-dev dependency already
-/// shared with khive-pack-kg — genuine reuse, not a hand-copy), then the
-/// pack-local `resource`-kind alias set (`"atom"`, `"runbook"`, etc. ->
-/// `resource`, ADR-048; hand-copied via `resource_alias_for_replay` since
-/// `khive-pack-kg::vocab::EntityKind` is pack-private and
-/// `khive-pack-schedule` does not depend on `khive-pack-kg` in production —
-/// dev-dependency only, for tests), then fall back to the registry's merged
-/// entity-kind vocabulary (covers any further pack-declared additions).
-///
-/// The pre-fix version resolved neither alias
-/// set, causing schedule-time false rejections (not a security hole) for
-/// legitimate KG-accepted spellings like `"paper"` and `"atom"`.
+/// Canonicalizes a legacy `entity_kind` value mirroring
+/// `khive-pack-kg::handlers::common::canonical_entity_kind`. See
+/// `docs/api/replay-validation.md#canonical_entity_kind_for_replay-canonical_note_kind_for_replay`.
 fn canonical_entity_kind_for_replay(
     raw: &str,
     registry: &VerbRegistry,
@@ -508,10 +416,9 @@ fn canonical_entity_kind_for_replay(
     )))
 }
 
-/// Canonicalize a legacy `note_kind` value the same way
-/// `khive-pack-kg::handlers::common::canonical_note_kind` does. Note kinds
-/// carry no alias set beyond their 5 canonical names (ADR-013), so this is
-/// exactly the registry's merged note-kind vocabulary check.
+/// Canonicalizes a legacy `note_kind` value mirroring
+/// `khive-pack-kg::handlers::common::canonical_note_kind`; note kinds carry
+/// no alias set beyond their 5 canonical names (ADR-013).
 fn canonical_note_kind_for_replay(
     raw: &str,
     registry: &VerbRegistry,
@@ -528,19 +435,11 @@ fn canonical_note_kind_for_replay(
     )))
 }
 
-/// Pack-local `resource`-kind aliases (ADR-048), mirroring
-/// `khive-pack-kg::vocab::EntityKind`'s `FromStr` arm `"resource" | "atom" |
-/// "runbook" | "template" | "prompt" | "skill" | "tool"`
-/// (`khive-pack-kg/src/vocab.rs`). That type is `pub(crate)` to
-/// `khive-pack-kg` and `khive-pack-schedule` does not depend on
-/// `khive-pack-kg` in production (dev-dependency only, for tests), so this
-/// hand-copies just the alias set — six short strings — rather than the
-/// type. `normalized` must already be trimmed + lowercased (callers already
-/// compute this for the registry-vocabulary fallback). Kept in sync by
-/// `entity_kind_resource_aliases_match_real_vocab` in `create_validation.rs`,
-/// which asserts this list against the live `khive-pack-kg` vocab (via the
-/// dev-dependency) so drift is caught in CI rather than silently reproducing
-/// a similar false rejection.
+/// Hand-copied ADR-048 `resource`-kind alias set mirroring
+/// `khive-pack-kg::vocab::EntityKind`'s `FromStr` arm (that type is
+/// pack-private). `normalized` must already be trimmed + lowercased. Kept in
+/// sync with the CI-checked `entity_kind_resource_aliases_match_real_vocab`
+/// test. See `docs/api/replay-validation.md#resource_alias_for_replay`.
 fn resource_alias_for_replay(normalized: &str) -> bool {
     matches!(
         normalized,
@@ -548,27 +447,12 @@ fn resource_alias_for_replay(normalized: &str) -> bool {
     )
 }
 
-/// Validate an `entity_type` value the same way
-/// `khive-pack-kg::handlers::common::validate_entity_type` does: parse
-/// `canonical_kind_name` into the base `khive_types::EntityKind` first, then
-/// resolve the subtype against the boot-time composed registry (builtin
-/// subtypes plus every loaded pack's `ENTITY_TYPES`, `VerbRegistry::
-/// all_entity_types`) — NOT the builtin-only `EntityTypeRegistry::global()`.
-/// KG create validation and schedule replay validation resolve against the
-/// exact same composed set, so this cannot drift from the real handler's
-/// vocabulary, and a scheduled `create` naming a pack-declared subtype (e.g.
-/// git's `adr` Document subtype) is accepted at schedule time exactly when
-/// the real handler would accept it at trigger time.
-///
-/// The kind-parse step is exactly what makes a pack-owned kind like
-/// `"resource"` reject *any* non-`None` `entity_type` outright: `resource`
-/// has no variant in the base 8-kind enum, so parsing `canonical_kind_name`
-/// fails before the subtype table is even consulted — the real handler has
-/// this same short-circuit (`khive-pack-kg/src/handlers/common.rs`,
-/// `validate_entity_type`), verified live via `kkernel exec` against a
-/// scratch DB. This mirrors that behavior rather than "fixing" it: the
-/// contract here is bit-for-bit replay parity with the real handler, not
-/// what the real handler arguably should do.
+/// Validates an `entity_type` value mirroring bit-for-bit
+/// `khive-pack-kg::handlers::common::validate_entity_type`'s replay parity,
+/// resolving subtypes against the boot-time composed registry (builtin +
+/// every loaded pack's `ENTITY_TYPES`), not the builtin-only
+/// `EntityTypeRegistry::global()`. See
+/// `docs/api/replay-validation.md#validate_entity_type_for_replay`.
 fn validate_entity_type_for_replay(
     canonical_kind_name: &str,
     entity_type: Option<&str>,
@@ -588,14 +472,11 @@ fn validate_entity_type_for_replay(
         .map_err(RuntimeError::from)
 }
 
-/// Reconcile a granular `kind`'s resolved `specific` value against a legacy
+/// Reconciles a granular `kind`'s resolved `specific` value against a legacy
 /// `entity_kind`/`note_kind` argument, mirroring
-/// `khive-pack-kg::handlers::common::reconcile_specific` exactly (including
-/// the contradiction error shape) so a scheduled action that the real KG
-/// `create` handler would reject for a kind/legacy-kind contradiction is
-/// rejected at schedule time too, not only discovered at trigger-time replay.
-/// `context` prefixes error messages (e.g. `"items[3] "` for a bulk entry,
-/// `""` for the singleton path).
+/// `khive-pack-kg::handlers::common::reconcile_specific` exactly. `context`
+/// prefixes error messages (e.g. `"items[3] "` for a bulk entry). See
+/// `docs/api/replay-validation.md#reconcile_specific_for_replay`.
 fn reconcile_specific_for_replay(
     context: &str,
     spec_specific: Option<String>,

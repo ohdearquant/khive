@@ -20,6 +20,7 @@ use tempfile::TempDir;
 
 fn file_rt(db_path: std::path::PathBuf) -> KhiveRuntime {
     KhiveRuntime::new(RuntimeConfig {
+        git_write: Default::default(),
         db_path: Some(db_path),
         default_namespace: Namespace::local(),
         embedding_model: None,

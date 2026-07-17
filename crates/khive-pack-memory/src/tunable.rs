@@ -1,4 +1,5 @@
 //! Brain-tunable parameter surface for the memory pack's recall scoring pipeline.
+//! See `crates/khive-pack-memory/docs/api/pack-integration.md`.
 
 use khive_brain_core::BalancedRecallState;
 use khive_brain_core::{PackTunable, ParameterDef, ParameterSpace};
@@ -8,17 +9,10 @@ use serde_json::Value;
 use crate::config::RecallConfig;
 use crate::MemoryPack;
 
-/// `MemoryPack` implements `PackTunable` so that the brain can adjust the
-/// recall scoring pipeline based on observed usage patterns (Issue #159).
+/// Brain tuning maps relevance, salience, and temporal posterior means to recall weights.
 ///
-/// Parameter names (`memory::relevance_weight`, `memory::salience_weight`,
-/// `memory::temporal_weight`) correspond to the three Beta posteriors in
-/// `BalancedRecallState`. Posterior means flow directly into
-/// `RecallConfig`.
-///
-/// `project_config` reads posterior means → `RecallConfig`.
-/// `apply_config` validates and stores the new config; future recall calls
-/// pick it up via `MemoryPack::active_config()`.
+/// Projection is pure; applying a projected config validates it before replacing the active
+/// value. See `crates/khive-pack-memory/docs/api/pack-integration.md`.
 impl PackTunable for MemoryPack {
     fn parameter_space(&self) -> ParameterSpace {
         ParameterSpace {
@@ -49,10 +43,7 @@ impl PackTunable for MemoryPack {
         }
     }
 
-    /// Project the current `BalancedRecallState` posteriors into a `RecallConfig` value.
-    ///
-    /// Reads the three posterior means from the profile state. Falls back to the
-    /// current active config if a parameter is absent (brain not yet warmed up).
+    /// Project posterior means into a recall config, retaining active values when absent.
     fn project_config(&self, state: &BalancedRecallState) -> Value {
         let current = self.active_config();
 
@@ -70,11 +61,7 @@ impl PackTunable for MemoryPack {
         serde_json::to_value(projected).unwrap_or_else(|_| serde_json::json!({}))
     }
 
-    /// Apply a projected config to the pack.
-    ///
-    /// Deserializes the JSON value into a `RecallConfig`, validates it, and
-    /// stores it as the active config. Future recall calls pick up the new
-    /// weights via `MemoryPack::active_config()`.
+    /// Deserialize, validate, and atomically install a projected recall config.
     fn apply_config(&self, config: Value) -> Result<(), RuntimeError> {
         let new_cfg: RecallConfig = serde_json::from_value(config)
             .map_err(|e| RuntimeError::InvalidInput(format!("invalid RecallConfig: {e}")))?;

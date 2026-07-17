@@ -32,7 +32,7 @@ Key design decisions and constraints:
 
 ## Consistency Notes
 
-- The `README.md` and `docs/protocol.md` retain ADR-018 cross-references for external readers
+- The `README.md` and `docs/api/policy-contract.md` retain ADR-018 cross-references for external readers
   navigating from documentation to the authoritative design record. Only the `.rs` source files
   have had ADR citations removed.
 - The fail-open behavior described here matches the production runtime behavior in

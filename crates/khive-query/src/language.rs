@@ -12,7 +12,12 @@ pub enum QueryLanguage {
     Sparql,
 }
 
-/// Parse a query string in the given language into a [`GqlQuery`] AST.
+/// Parses `input` as the selected language into a [`GqlQuery`].
+///
+/// # Errors
+///
+/// Returns [`QueryError`] when syntax is invalid, write-shaped, or unsupported.
+/// See `crates/khive-query/docs/api/parsing.md` for accepted dialect subsets.
 pub fn parse(language: QueryLanguage, input: &str) -> Result<GqlQuery, QueryError> {
     match language {
         QueryLanguage::Gql => parsers::gql::parse(input),
@@ -20,17 +25,14 @@ pub fn parse(language: QueryLanguage, input: &str) -> Result<GqlQuery, QueryErro
     }
 }
 
-/// Auto-detect language and parse (`SELECT` → SPARQL, `MATCH` → GQL, fallback → GQL).
+/// Auto-detects SPARQL for `SELECT`, GQL for `MATCH`, and otherwise falls back to GQL.
 ///
-/// Write-shaped input is rejected before dialect dispatch with a clear,
-/// actionable error naming the mutation verbs to use instead.  This guard
-/// runs first so that forms such as `WITH <g> DELETE …` and
-/// `PREFIX ex: <…> INSERT DATA { … }` — which don't start with `SELECT` and
-/// therefore fall through to the GQL path — are caught on the public entry
-/// point rather than producing a generic parse error.
+/// Write-shaped input is rejected before dispatch, including SPARQL prologues.
 ///
-/// The per-parser guards in `parsers::gql` and `parsers::sparql` remain in
-/// place for defense-in-depth for direct callers of those functions.
+/// # Errors
+///
+/// Returns [`QueryError`] when syntax is invalid, write-shaped, or unsupported.
+/// See `crates/khive-query/docs/api/parsing.md` for detection and guard behavior.
 pub fn parse_auto(input: &str) -> Result<GqlQuery, QueryError> {
     let trimmed = input.trim();
     reject_write(trimmed)?;
@@ -47,20 +49,15 @@ pub fn parse_auto(input: &str) -> Result<GqlQuery, QueryError> {
     {
         parsers::gql::parse(trimmed)
     } else {
-        // Fall back to GQL to preserve existing behavior for unknown prefixes.
+        // Preserve compatibility for inputs without a recognized leading keyword.
         parsers::gql::parse(trimmed)
     }
 }
 
-/// Unified write-shape guard: rejects GQL/Cypher mutations and SPARQL Update
-/// ops before dialect dispatch.  Uses `leading_keyword` so that SPARQL
-/// prologues (PREFIX / BASE) and line comments are skipped before the keyword
-/// is inspected.
+/// Rejects GQL/Cypher mutations and SPARQL Update before dialect dispatch.
 fn reject_write(input: &str) -> Result<(), QueryError> {
     match leading_keyword(input).as_str() {
-        // GQL / Cypher write forms
         "CREATE" | "DELETE" | "DETACH" | "SET" | "REMOVE" | "MERGE" | "INSERT" | "UPDATE"
-        // SPARQL Update forms
         | "WITH" | "LOAD" | "CLEAR" | "DROP" | "COPY" | "MOVE" | "ADD" => {
             Err(QueryError::Unsupported(
                 "the query verb is read-only; \
@@ -76,8 +73,6 @@ fn reject_write(input: &str) -> Result<(), QueryError> {
 mod tests {
     use super::*;
     use crate::error::QueryError;
-
-    // --- Read-only public-path regression tests (#16) ---
 
     #[test]
     fn parse_auto_with_delete_rejected() {
@@ -107,7 +102,6 @@ mod tests {
 
     #[test]
     fn parse_auto_prefixed_with_delete_rejected() {
-        // Proves both prologue-skip (PREFIX) AND WITH keyword on the public path.
         let err = parse_auto(
             "PREFIX ex: <http://e/> WITH <http://g> DELETE { ?s ?p ?o } WHERE { ?s ?p ?o }",
         )
@@ -148,10 +142,6 @@ mod tests {
 
     #[test]
     fn parse_auto_load_rejected() {
-        // LOAD is in reject_write's union set but NOT in reject_gql_write, so
-        // if reject_write is reverted this routes to GQL and returns a Parse
-        // error, not Unsupported. This test is therefore sensitive to the
-        // parse_auto guard specifically.
         let err = parse_auto("LOAD <http://e/data>").unwrap_err();
         assert!(
             matches!(err, QueryError::Unsupported(_)),
