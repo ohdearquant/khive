@@ -31,9 +31,20 @@ pub(crate) struct RustDeclaration {
     /// Token-stream rendering of the item, used only as `content_hash`
     /// input (change detection, not identity — B4).
     pub span_text: String,
-    /// Bare call-target names found in a function body (coverage-floor call
+    /// Call-target paths found in a function body (coverage-floor call
     /// extraction — see `collect_calls`). Empty for non-function kinds.
-    pub calls: Vec<String>,
+    pub calls: Vec<CallRef>,
+}
+
+/// A call-target path as written at the call site, e.g. `["helper"]` for a
+/// bare `helper()` or `["crate", "foo", "bar"]` for `crate::foo::bar()`.
+/// Kept as raw segments rather than pre-resolved: resolving `crate`/`self`/
+/// `super` qualifiers requires the calling declaration's own module path,
+/// which this scanner does not have (that context lives in
+/// `source_ingest::resolve_call_target`).
+#[derive(Debug, Clone)]
+pub(crate) struct CallRef {
+    pub segments: Vec<String>,
 }
 
 /// A syntactically resolvable `impl Trait for Type` relationship (D3 rule 13:
@@ -73,7 +84,9 @@ fn doc_from_attrs(attrs: &[Attribute]) -> Option<String> {
         if let syn::Meta::NameValue(nv) = &attr.meta {
             if let Expr::Lit(expr_lit) = &nv.value {
                 if let syn::Lit::Str(s) = &expr_lit.lit {
-                    lines.push(s.value().trim().to_string());
+                    // Transcribe verbatim (ADR-069 D5) — do not trim, that would
+                    // silently alter the doc comment's recorded text.
+                    lines.push(s.value());
                 }
             }
         }
@@ -158,21 +171,27 @@ fn scan_item(item: &Item, out: &mut RustFileScan) {
 /// (`self.foo()`, `x.foo()`) are not resolvable from syntax alone and are
 /// skipped rather than guessed at.
 struct CallCollector {
-    calls: Vec<String>,
+    calls: Vec<CallRef>,
 }
 
 impl<'ast> Visit<'ast> for CallCollector {
     fn visit_expr_call(&mut self, node: &'ast ExprCall) {
         if let Expr::Path(p) = node.func.as_ref() {
-            if let Some(seg) = p.path.segments.last() {
-                self.calls.push(seg.ident.to_string());
+            let segments: Vec<String> = p
+                .path
+                .segments
+                .iter()
+                .map(|s| s.ident.to_string())
+                .collect();
+            if !segments.is_empty() {
+                self.calls.push(CallRef { segments });
             }
         }
         visit::visit_expr_call(self, node);
     }
 }
 
-fn collect_calls(f: &ItemFn) -> Vec<String> {
+fn collect_calls(f: &ItemFn) -> Vec<CallRef> {
     let mut collector = CallCollector { calls: Vec::new() };
     collector.visit_block(&f.block);
     collector.calls
@@ -204,7 +223,9 @@ mod tests {
         assert!(names.contains(&("Alias", RustDeclKind::Datatype)));
         assert!(names.contains(&("T", RustDeclKind::Interface)));
         let f = scan.declarations.iter().find(|d| d.name == "f").unwrap();
-        assert_eq!(f.doc.as_deref(), Some("Doc for f."));
+        // Verbatim (ADR-069 D5): the space rustc keeps between `///` and the
+        // comment text is not trimmed away.
+        assert_eq!(f.doc.as_deref(), Some(" Doc for f."));
     }
 
     #[test]
@@ -237,9 +258,18 @@ mod tests {
             .iter()
             .find(|d| d.name == "caller")
             .unwrap();
-        assert!(caller.calls.contains(&"helper".to_string()));
-        assert!(caller.calls.contains(&"nested_call".to_string()));
-        assert!(!caller.calls.iter().any(|c| c == "method_call"));
+        assert!(caller
+            .calls
+            .iter()
+            .any(|c| c.segments == vec!["helper".to_string()]));
+        assert!(caller
+            .calls
+            .iter()
+            .any(|c| c.segments == vec!["other", "path", "nested_call"]));
+        assert!(!caller
+            .calls
+            .iter()
+            .any(|c| c.segments.last().map(String::as_str) == Some("method_call")));
     }
 
     #[test]

@@ -148,6 +148,8 @@ async fn two_package_fixture_converges_regardless_of_ingest_order() {
                 path: &root.path().join(pkg),
                 languages: all_languages(),
                 sweep_time: Utc::now(),
+                enable_l1: true,
+                enable_l1_5: true,
                 enable_l2: false,
             },
         )
@@ -167,6 +169,8 @@ async fn two_package_fixture_converges_regardless_of_ingest_order() {
                 path: &root.path().join(pkg),
                 languages: all_languages(),
                 sweep_time: Utc::now(),
+                enable_l1: true,
+                enable_l1_5: true,
                 enable_l2: false,
             },
         )
@@ -211,6 +215,8 @@ async fn reingesting_same_fixture_is_idempotent() {
         path: root.path(),
         languages: all_languages(),
         sweep_time: Utc::now(),
+        enable_l1: true,
+        enable_l1_5: true,
         enable_l2: false,
     };
 
@@ -235,9 +241,9 @@ async fn reingesting_same_fixture_is_idempotent() {
         "re-ingesting the same fixture must not create duplicate or divergent edges"
     );
     assert_eq!(
-        first.projects_created + first.modules_created,
-        second.projects_updated + second.modules_updated,
-        "everything created on the first pass must be reported as updated on the second"
+        first.projects_created, second.projects_updated,
+        "every project created on the first pass must be reported as updated on the second \
+         (projects carry no content_hash, so they always rewrite)"
     );
     assert_eq!(
         second.projects_created, 0,
@@ -246,6 +252,11 @@ async fn reingesting_same_fixture_is_idempotent() {
     assert_eq!(
         second.modules_created, 0,
         "second pass must create zero new modules"
+    );
+    assert_eq!(
+        second.modules_updated, 0,
+        "an unchanged module's content_hash must match on the second pass, so it gets a \
+         last_seen_at-only touch, not a reported update (finding-4)"
     );
 }
 
@@ -285,6 +296,8 @@ async fn rust_item_import_resolves_to_containing_module_after_reingest() {
         path: root.path(),
         languages: all_languages(),
         sweep_time: Utc::now(),
+        enable_l1: true,
+        enable_l1_5: true,
         enable_l2: false,
     };
 
@@ -338,6 +351,8 @@ async fn manifestless_rust_folder_uses_basename_fallback() {
             path: &proj,
             languages: all_languages(),
             sweep_time: Utc::now(),
+            enable_l1: true,
+            enable_l1_5: true,
             enable_l2: false,
         },
     )
@@ -352,6 +367,8 @@ async fn manifestless_rust_folder_uses_basename_fallback() {
             path: &proj,
             languages: all_languages(),
             sweep_time: Utc::now(),
+            enable_l1: true,
+            enable_l1_5: true,
             enable_l2: false,
         },
     )
@@ -393,6 +410,8 @@ async fn rejects_nonexistent_path() {
             path: &root.path().join("does-not-exist"),
             languages: all_languages(),
             sweep_time: Utc::now(),
+            enable_l1: true,
+            enable_l1_5: true,
             enable_l2: false,
         },
     )

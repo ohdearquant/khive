@@ -11,7 +11,8 @@ pub(crate) static CODE_HANDLERS: [HandlerDef; 1] = [HandlerDef {
     name: "code.ingest",
     description: "Ingest L1 manifest edges and L1.5 regex import-scan edges from a source \
                    folder into a dedicated map database (never the shared production graph). \
-                   L2 Scanner/Extractor symbol-tier ingest is not implemented by this call.",
+                   The L2 Scanner/Extractor symbol tier (Rust only) is available via \
+                   tiers=[\"l2\"] but not run by default.",
     visibility: Visibility::Verb,
     category: VerbCategory::Commissive,
     params: &[

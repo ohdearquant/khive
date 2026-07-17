@@ -65,17 +65,19 @@ impl CodePack {
             .map_err(RuntimeError::InvalidInput)?;
 
         // Defaults to L1+L1.5 only (`["l1", "l1.5"]`) so a caller that never
-        // passes `tiers` sees byte-identical behavior to before L2 existed
-        // (ADR-085 Amendment 2 B3: tiers are independently usable). `l2`
-        // opts into the Rust Scanner/Extractor symbol pass.
+        // passes `tiers` sees byte-identical behavior to before L2 existed.
+        // Each named tier runs ONLY its own entities/edges (ADR-085 Amendment
+        // 2 B3: tiers are independently switchable) — `tiers=["l1"]` runs
+        // manifest parsing alone, `["l1.5"]` runs the import scan alone,
+        // `["l2"]` runs the symbol tier alone, and any combination composes.
         const VALID_TIERS: &[&str] = &["l1", "l1.5", "l2"];
-        let enable_l2 = match params.get("tiers") {
-            None | Some(Value::Null) => false,
+        let (enable_l1, enable_l1_5, enable_l2) = match params.get("tiers") {
+            None | Some(Value::Null) => (true, true, false),
             Some(v) => {
                 let arr = v.as_array().ok_or_else(|| {
                     RuntimeError::InvalidInput("tiers must be an array of strings".into())
                 })?;
-                let mut enable_l2 = false;
+                let mut selected: BTreeSet<&str> = BTreeSet::new();
                 for entry in arr {
                     let s = entry.as_str().ok_or_else(|| {
                         RuntimeError::InvalidInput("tiers entries must be strings".into())
@@ -86,11 +88,13 @@ impl CodePack {
                             VALID_TIERS.join(", ")
                         )));
                     }
-                    if s == "l2" {
-                        enable_l2 = true;
-                    }
+                    selected.insert(s);
                 }
-                enable_l2
+                (
+                    selected.contains("l1"),
+                    selected.contains("l1.5"),
+                    selected.contains("l2"),
+                )
             }
         };
 
@@ -113,6 +117,8 @@ impl CodePack {
                 path: &path,
                 languages,
                 sweep_time: Utc::now(),
+                enable_l1,
+                enable_l1_5,
                 enable_l2,
             },
         )

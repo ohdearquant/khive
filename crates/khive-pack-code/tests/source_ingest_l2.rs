@@ -153,6 +153,8 @@ async fn l2_creates_declaration_entities_with_verbatim_docs() {
             path: root.path(),
             languages: rust_only(),
             sweep_time: Utc::now(),
+            enable_l1: true,
+            enable_l1_5: true,
             enable_l2: true,
         },
     )
@@ -162,20 +164,22 @@ async fn l2_creates_declaration_entities_with_verbatim_docs() {
     let entities = entity_rows(&rt).await;
     let find = |name: &str| entities.iter().find(|(n, ..)| n == name);
 
+    // Verbatim transcription (ADR-069 D5): the space between `///` and the
+    // comment text is part of the doc string, not trimmed away.
     let (_, kind, doc, props) = find("helper").expect("helper entity created");
     assert_eq!(kind, "function");
-    assert_eq!(doc.as_deref(), Some("Does the real work."));
+    assert_eq!(doc.as_deref(), Some(" Does the real work."));
     let props: serde_json::Value = serde_json::from_str(props.as_deref().unwrap()).unwrap();
     assert!(props["content_hash"].as_str().is_some());
     assert_eq!(props["language"], "rust");
 
     let (_, kind, doc, _) = find("Hello").expect("Hello entity created");
     assert_eq!(kind, "datatype");
-    assert_eq!(doc.as_deref(), Some("A friendly struct."));
+    assert_eq!(doc.as_deref(), Some(" A friendly struct."));
 
     let (_, kind, doc, _) = find("Greeter").expect("Greeter entity created");
     assert_eq!(kind, "interface");
-    assert_eq!(doc.as_deref(), Some("Greets someone."));
+    assert_eq!(doc.as_deref(), Some(" Greets someone."));
 }
 
 /// D3 rule 13 (`datatype implements interface`) and rules 17-19 (`module
@@ -195,6 +199,8 @@ async fn l2_creates_implements_and_containment_edges() {
             path: root.path(),
             languages: rust_only(),
             sweep_time: Utc::now(),
+            enable_l1: true,
+            enable_l1_5: true,
             enable_l2: true,
         },
     )
@@ -238,6 +244,8 @@ async fn l2_function_depends_on_edges_support_blast_radius_and_dead_symbol_queri
             path: root.path(),
             languages: rust_only(),
             sweep_time: Utc::now(),
+            enable_l1: true,
+            enable_l1_5: true,
             enable_l2: true,
         },
     )
@@ -278,6 +286,8 @@ async fn l2_reingest_is_idempotent_no_duplicate_symbol_entities() {
         path: root.path(),
         languages: rust_only(),
         sweep_time: Utc::now(),
+        enable_l1: true,
+        enable_l1_5: true,
         enable_l2: true,
     };
 
@@ -295,11 +305,20 @@ async fn l2_reingest_is_idempotent_no_duplicate_symbol_entities() {
         entities_after_first, entities_after_second,
         "re-ingest must not create duplicate declaration entities"
     );
+    assert!(
+        first.symbols_created > 0,
+        "first pass must create the fixture's declarations"
+    );
     assert_eq!(
         second.symbols_created, 0,
         "second pass creates zero new symbols"
     );
-    assert_eq!(first.symbols_created, second.symbols_updated);
+    assert_eq!(
+        second.symbols_updated, 0,
+        "every declaration's content_hash matches the prior sweep unchanged, so the second \
+         pass reports zero symbol updates — a last_seen_at-only touch, not a rewrite \
+         (finding-4)"
+    );
 }
 
 /// When `enable_l2` is false (the default), no symbol-tier entities are
@@ -319,6 +338,8 @@ async fn l2_disabled_by_default_creates_no_symbol_entities() {
             path: root.path(),
             languages: rust_only(),
             sweep_time: Utc::now(),
+            enable_l1: true,
+            enable_l1_5: true,
             enable_l2: false,
         },
     )
@@ -331,4 +352,241 @@ async fn l2_disabled_by_default_creates_no_symbol_entities() {
         entities.is_empty(),
         "no entity_type-carrying entities expected without l2, got: {entities:?}"
     );
+}
+
+/// finding-1: a doc comment carrying a credential-shaped string must not
+/// reach storage — L2 entity writes go through the same secret gate
+/// `KhiveRuntime::create_entity` applies (ADR-085 D6), not a raw
+/// `EntityStore::upsert_entity` call that bypasses it.
+#[tokio::test]
+async fn l2_rejects_declaration_whose_doc_comment_carries_a_secret() {
+    let root = TempDir::new().expect("tempdir");
+    std::fs::create_dir_all(root.path().join("src")).unwrap();
+    std::fs::write(
+        root.path().join("Cargo.toml"),
+        "[package]\nname = \"secretcrate\"\n",
+    )
+    .unwrap();
+    let leaky_source = "/// token: ghp_abcdefghijklmnopqrstuvwxyz1234567890\npub fn leaky() {}\n"; // gitleaks:allow
+    std::fs::write(root.path().join("src/lib.rs"), leaky_source).unwrap();
+    let db = root.path().join("secret.db");
+    let rt = rt_at(&db);
+    let token = rt.authorize(Namespace::local()).expect("token");
+
+    let err = run_code_ingest(
+        &rt,
+        &token,
+        CodeSourceIngestOptions {
+            path: root.path(),
+            languages: rust_only(),
+            sweep_time: Utc::now(),
+            enable_l1: true,
+            enable_l1_5: true,
+            enable_l2: true,
+        },
+    )
+    .await
+    .expect_err("a doc comment carrying a credential-shaped string must be rejected");
+    assert!(
+        err.to_string().to_lowercase().contains("secret"),
+        "expected a secret-gate rejection, got: {err}"
+    );
+
+    let entities = entity_rows(&rt).await;
+    assert!(
+        entities.is_empty(),
+        "the leaking declaration must never reach storage, got: {entities:?}"
+    );
+}
+
+/// finding-3: the same-named function in two different modules must resolve
+/// its `helper()` call only within its own module — the symbol index is
+/// keyed by `(project, module_path, name, kind)`, not `(project, name,
+/// kind)`, so the two `helper` declarations never collapse onto one entry.
+#[tokio::test]
+async fn l2_same_named_function_in_different_modules_resolves_within_own_module_only() {
+    let root = TempDir::new().expect("tempdir");
+    std::fs::create_dir_all(root.path().join("src")).unwrap();
+    std::fs::write(
+        root.path().join("Cargo.toml"),
+        "[package]\nname = \"qualcrate\"\n",
+    )
+    .unwrap();
+    std::fs::write(root.path().join("src/lib.rs"), "mod a;\nmod b;\n").unwrap();
+    std::fs::write(
+        root.path().join("src/a.rs"),
+        "pub fn helper() -> u32 { 1 }\npub fn caller() -> u32 { helper() }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("src/b.rs"),
+        "pub fn helper() -> u32 { 2 }\n",
+    )
+    .unwrap();
+    let db = root.path().join("qual.db");
+    let rt = rt_at(&db);
+    let token = rt.authorize(Namespace::local()).expect("token");
+
+    run_code_ingest(
+        &rt,
+        &token,
+        CodeSourceIngestOptions {
+            path: root.path(),
+            languages: rust_only(),
+            sweep_time: Utc::now(),
+            enable_l1: true,
+            enable_l1_5: true,
+            enable_l2: true,
+        },
+    )
+    .await
+    .expect("l2 ingest succeeds");
+
+    let edges = edge_triples(&rt).await;
+    let depends_on: Vec<_> = edges
+        .iter()
+        .filter(|(rel, ..)| rel == "depends_on")
+        .collect();
+    assert_eq!(
+        depends_on.len(),
+        1,
+        "expected exactly one depends_on edge (a::caller -> a::helper), got: {edges:?}"
+    );
+    assert!(
+        depends_on
+            .iter()
+            .any(|(_, s, t)| s == "caller" && t == "helper"),
+        "expected caller depends_on helper, got: {edges:?}"
+    );
+}
+
+/// finding-6: two calls to the same helper from one function must collapse
+/// onto a single `depends_on` edge, not one edge operation per call site.
+#[tokio::test]
+async fn l2_dedups_repeated_calls_to_the_same_helper_into_one_edge() {
+    let root = TempDir::new().expect("tempdir");
+    std::fs::create_dir_all(root.path().join("src")).unwrap();
+    std::fs::write(
+        root.path().join("Cargo.toml"),
+        "[package]\nname = \"dedupcrate\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("src/lib.rs"),
+        "pub fn helper() -> u32 { 0 }\npub fn caller() -> u32 { helper() + helper() + helper() }\n",
+    )
+    .unwrap();
+    let db = root.path().join("dedup.db");
+    let rt = rt_at(&db);
+    let token = rt.authorize(Namespace::local()).expect("token");
+
+    run_code_ingest(
+        &rt,
+        &token,
+        CodeSourceIngestOptions {
+            path: root.path(),
+            languages: rust_only(),
+            sweep_time: Utc::now(),
+            enable_l1: true,
+            enable_l1_5: true,
+            enable_l2: true,
+        },
+    )
+    .await
+    .expect("l2 ingest succeeds");
+
+    let edges = edge_triples(&rt).await;
+    let depends_on: Vec<_> = edges
+        .iter()
+        .filter(|(rel, s, t)| rel == "depends_on" && s == "caller" && t == "helper")
+        .collect();
+    assert_eq!(
+        depends_on.len(),
+        1,
+        "three calls to the same helper must yield exactly one depends_on edge, got: {edges:?}"
+    );
+}
+
+/// finding-2: `tiers=["l1"]`/`["l1.5"]`/`["l2"]` each run only their own
+/// tier, and combinations compose.
+#[tokio::test]
+async fn tiers_are_independently_selectable_and_compose() {
+    let root = TempDir::new().expect("tempdir");
+    write_fixture(root.path());
+
+    // l1 alone: no manifest dependencies in this fixture, so l1 produces the
+    // project entity but no modules and no symbols.
+    {
+        let db = root.path().join("l1_only.db");
+        let rt = rt_at(&db);
+        let token = rt.authorize(Namespace::local()).expect("token");
+        let report = run_code_ingest(
+            &rt,
+            &token,
+            CodeSourceIngestOptions {
+                path: root.path(),
+                languages: rust_only(),
+                sweep_time: Utc::now(),
+                enable_l1: true,
+                enable_l1_5: false,
+                enable_l2: false,
+            },
+        )
+        .await
+        .expect("l1-only ingest succeeds");
+        assert_eq!(report.projects_created, 1);
+        assert_eq!(report.modules_created, 0, "l1 alone must not walk files");
+        assert_eq!(report.symbols_created, 0);
+    }
+
+    // l1.5 alone: modules created, no symbol-tier entities.
+    {
+        let db = root.path().join("l1_5_only.db");
+        let rt = rt_at(&db);
+        let token = rt.authorize(Namespace::local()).expect("token");
+        let report = run_code_ingest(
+            &rt,
+            &token,
+            CodeSourceIngestOptions {
+                path: root.path(),
+                languages: rust_only(),
+                sweep_time: Utc::now(),
+                enable_l1: false,
+                enable_l1_5: true,
+                enable_l2: false,
+            },
+        )
+        .await
+        .expect("l1.5-only ingest succeeds");
+        assert!(report.modules_created > 0, "l1.5 alone must walk files");
+        assert_eq!(
+            report.symbols_created, 0,
+            "l1.5 alone must not run the symbol tier"
+        );
+    }
+
+    // l2 alone: symbol-tier entities created, no import-edge unresolved specs.
+    {
+        let db = root.path().join("l2_only.db");
+        let rt = rt_at(&db);
+        let token = rt.authorize(Namespace::local()).expect("token");
+        let report = run_code_ingest(
+            &rt,
+            &token,
+            CodeSourceIngestOptions {
+                path: root.path(),
+                languages: rust_only(),
+                sweep_time: Utc::now(),
+                enable_l1: false,
+                enable_l1_5: false,
+                enable_l2: true,
+            },
+        )
+        .await
+        .expect("l2-only ingest succeeds");
+        assert!(
+            report.symbols_created > 0,
+            "l2 alone must run the symbol tier"
+        );
+    }
 }

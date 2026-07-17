@@ -5,7 +5,7 @@
 //! only adapter this slice ships — Python/TypeScript/Lean adapters (B2's
 //! delivery order) feed the exact same `ExtractedFile` shape when they land.
 
-use crate::scanner_rust::{RustDeclKind, RustFileScan};
+use crate::scanner_rust::{CallRef, RustDeclKind, RustFileScan};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum DeclKind {
@@ -43,11 +43,11 @@ pub(crate) struct ExtractedDeclaration {
     pub name: String,
     pub description: Option<String>,
     pub content_hash: String,
-    /// Call-target names this declaration references (D3 rule 1: `function
+    /// Call-target paths this declaration references (D3 rule 1: `function
     /// depends_on function`). Resolution against the project's own
     /// declaration set happens in the ingest pipeline, which has the
     /// project-wide view a single file's Extractor pass does not.
-    pub calls: Vec<String>,
+    pub calls: Vec<CallRef>,
 }
 
 /// A syntactically resolvable `datatype implements interface` relationship
@@ -68,7 +68,7 @@ pub(crate) struct ExtractedFile {
 /// module `content_hash` already uses, applied here to one declaration's
 /// token-stream rendering rather than a whole file. Not a security
 /// boundary, purely a changed-vs-unchanged signal (B4).
-fn fnv1a(content: &str) -> String {
+pub(crate) fn fnv1a(content: &str) -> String {
     let mut hash: u64 = 0xcbf29ce484222325;
     for b in content.as_bytes() {
         hash ^= *b as u64;
@@ -131,7 +131,7 @@ mod tests {
             .find(|d| d.name == "f")
             .unwrap();
         assert_eq!(f.kind, DeclKind::Function);
-        assert!(f.calls.contains(&"helper".to_string()));
+        assert!(f.calls.iter().any(|c| c.segments == vec!["helper"]));
         assert!(!f.content_hash.is_empty());
     }
 
