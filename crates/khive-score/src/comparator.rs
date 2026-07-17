@@ -3,7 +3,10 @@
 use crate::DeterministicScore;
 use std::cmp::Ordering;
 
-/// Scored item implementing max-heap `Ord`: higher score wins, lower ID breaks ties.
+/// Max-heap ranking item: higher score wins and lower ID breaks ties.
+///
+/// Ordinary vector sorting is ascending; see
+/// `crates/khive-score/docs/api/aggregation-and-ranking.md`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Ranked<T: Ord> {
     score: DeterministicScore,
@@ -132,8 +135,6 @@ mod tests {
         assert_eq!(id, 42u64);
     }
 
-    // ── Ranked Ord is max-heap adapter, not natural sort order ───────────────
-
     /// `BinaryHeap<Ranked<_>>` must pop best (highest score) first.
     #[test]
     fn ranked_heap_pops_highest_score_first() {
@@ -148,9 +149,7 @@ mod tests {
         assert_eq!(first.id(), &1u64);
     }
 
-    /// `Vec<Ranked<_>>::sort()` produces ascending order (lowest score first)
-    /// because `Ranked::Ord` is a max-heap adapter.  This test documents that
-    /// behaviour — callers who need descending order MUST use `cmp_desc_then_id`.
+    /// `Vec::sort` is ascending; ranking order requires `cmp_desc_then_id`.
     #[test]
     fn ranked_vec_sort_is_ascending_not_ranking_order() {
         let mut items = [

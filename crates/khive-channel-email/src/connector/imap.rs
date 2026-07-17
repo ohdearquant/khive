@@ -444,21 +444,11 @@ fn next_progress(
 }
 
 /// Validate a fully-fetched selected page and build the [`SelectedMessage`]
-/// list, in `selected_uids` order -- exactly one entry per selected UID.
-///
-/// Every UID in `selected_uids` must appear exactly once in `fetched_raw`;
-/// a gap (UID absent from the fetch response entirely) or a duplicate
-/// response for the same UID still fails the whole page (no partial
-/// advancement — these are protocol anomalies, not permanent per-message
-/// failures, and a genuinely expunged message will not be re-selected next
-/// poll). A missing RFC822 body or an unparseable body, by contrast, is a
-/// permanent per-UID failure (khive #449 High fix): rather than failing the
-/// whole page and re-selecting the same poison UID forever, that UID gets a
-/// durable [`SelectedMessage::Malformed`] disposition so the caller can
-/// quarantine it and advance past it. A fetch response for a UID outside
-/// `selected_uids` is unrequested (e.g. a stray server response) and is
-/// ignored with a `warn!`; it can never affect page validity or the
-/// candidate high-water.
+/// list, in `selected_uids` order — exactly one entry per selected UID. A
+/// gap or duplicate fails the whole page (no partial advancement); a missing
+/// or unparseable body gets a durable `Malformed` disposition instead
+/// (khive #449) so the caller can quarantine it and advance past it.
+/// See `crates/khive-channel-email/docs/api/imap-connector.md`.
 pub(crate) fn process_selected_page(
     uid_validity: NonZeroU32,
     selected_uids: &[NonZeroU32],

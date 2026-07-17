@@ -4,12 +4,10 @@ use crate::identifier::{is_identifier, split_identifier};
 use crate::lang::is_cjk_char;
 use crate::Tokenizer;
 
-// ---------------------------------------------------------------------------
-// WhitespaceTokenizer
-// ---------------------------------------------------------------------------
-
-/// Splits on ASCII whitespace, trims leading/trailing ASCII punctuation from
+/// Splits on Unicode whitespace, trims leading/trailing ASCII punctuation from
 /// each token, and drops empty results.
+///
+/// See `crates/khive-text/docs/api/tokenizers.md`.
 #[derive(Debug, Default, Clone)]
 pub struct WhitespaceTokenizer;
 
@@ -25,11 +23,9 @@ impl Tokenizer for WhitespaceTokenizer {
     }
 }
 
-// ---------------------------------------------------------------------------
-// CjkCharTokenizer
-// ---------------------------------------------------------------------------
-
 /// Emits each CJK character as its own token; non-CJK runs split on whitespace with ASCII punctuation stripped.
+///
+/// See `crates/khive-text/docs/api/tokenizers.md`.
 #[derive(Debug, Default, Clone)]
 pub struct CjkCharTokenizer;
 
@@ -61,10 +57,6 @@ impl Tokenizer for CjkCharTokenizer {
     }
 }
 
-// ---------------------------------------------------------------------------
-// KeywordTokenizer
-// ---------------------------------------------------------------------------
-
 /// Returns the entire (whitespace-trimmed) input as a single token.
 /// Empty input → empty vec.
 #[derive(Debug, Default, Clone)]
@@ -81,12 +73,10 @@ impl Tokenizer for KeywordTokenizer {
     }
 }
 
-// ---------------------------------------------------------------------------
-// IdentifierTokenizer
-// ---------------------------------------------------------------------------
-
 /// Identifier-aware tokenizer: emits lowercased original + split parts for identifiers,
 /// falls back to `WhitespaceTokenizer` for plain words.
+///
+/// See `crates/khive-text/docs/api/tokenizers.md`.
 #[derive(Debug, Clone)]
 pub struct IdentifierTokenizer {
     pub min_part_len: usize,
@@ -125,10 +115,6 @@ impl Tokenizer for IdentifierTokenizer {
     }
 }
 
-// ---------------------------------------------------------------------------
-// UnicodeWordTokenizer (feature = "unicode")
-// ---------------------------------------------------------------------------
-
 /// Splits on Unicode word boundaries using `unicode_segmentation`.
 ///
 /// Enable with `features = ["unicode"]`.
@@ -146,15 +132,9 @@ impl Tokenizer for UnicodeWordTokenizer {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // --- WhitespaceTokenizer ---
 
     #[test]
     fn whitespace_normal() {
@@ -185,8 +165,6 @@ mod tests {
     fn whitespace_all_punct_dropped() {
         assert!(WhitespaceTokenizer.tokenize("... , ...").is_empty());
     }
-
-    // --- CjkCharTokenizer ---
 
     #[test]
     fn cjk_spec_example() {
@@ -223,8 +201,6 @@ mod tests {
         assert_eq!(CjkCharTokenizer.tokenize("가나"), vec!["가", "나"]);
     }
 
-    // --- KeywordTokenizer ---
-
     #[test]
     fn keyword_whole_phrase() {
         assert_eq!(
@@ -248,8 +224,6 @@ mod tests {
     fn keyword_single_word() {
         assert_eq!(KeywordTokenizer.tokenize("LoRA"), vec!["LoRA"]);
     }
-
-    // --- IdentifierTokenizer ---
 
     #[test]
     fn identifier_spec_example() {
@@ -308,8 +282,6 @@ mod tests {
             "expected unicode single-char part to be filtered; got: {got:?}"
         );
     }
-
-    // --- UnicodeWordTokenizer ---
 
     #[cfg(feature = "unicode")]
     #[test]

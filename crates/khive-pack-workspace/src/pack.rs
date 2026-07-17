@@ -1,5 +1,4 @@
-//! `WorkspacePack` struct, `Pack` impl, self-registration factory, and
-//! `PackRuntime` impl.
+//! Workspace pack registration and runtime adapter.
 
 use std::sync::Arc;
 
@@ -13,10 +12,9 @@ use khive_types::{EdgeEndpointRule, HandlerDef, Pack};
 use crate::hook::WorkspaceHook;
 use crate::vocab::{ENTITY_KINDS, WORKSPACE_EDGE_RULES};
 
-/// Workspace pack (issue #873 v0)  -  registers the pack-owned `workspace`
-/// entity kind and five additive `contains` endpoint rules to already-shipped
-/// member note kinds. Zero new verbs: workspaces are created and linked
-/// through the existing generic `create` and `link` KG verbs.
+/// Vocabulary-only workspace pack with five membership rules and no verbs.
+///
+/// See `crates/khive-pack-workspace/docs/api/workspace-registration.md`.
 pub struct WorkspacePack {
     runtime: KhiveRuntime,
 }
@@ -31,7 +29,7 @@ impl Pack for WorkspacePack {
 }
 
 impl WorkspacePack {
-    /// Create a new `WorkspacePack` bound to the given runtime.
+    /// Bind the vocabulary-only workspace pack to `runtime`.
     pub fn new(runtime: KhiveRuntime) -> Self {
         Self { runtime }
     }
@@ -41,8 +39,6 @@ impl WorkspacePack {
         &self.runtime
     }
 }
-
-// -- inventory self-registration --------------------------------------------
 
 struct WorkspacePackFactory;
 

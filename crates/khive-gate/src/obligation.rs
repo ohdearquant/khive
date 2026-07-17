@@ -2,17 +2,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::GateValidationError;
 
-// ---------- Obligation ----------
-
-/// Side-effects a policy may attach to an `Allow` decision.
+/// Policy instructions attached to an allow; only `Audit` has v0 runtime handling.
 ///
-/// v0 obligation handling is intentionally narrow:
-/// - `Audit` obligations are persisted inside the dispatch `AuditEvent` when an
-///   `EventStore` is wired; otherwise they are emitted through tracing only.
-/// - `RateLimit` and `Custom` obligations are NOT enforced in v0.
-///
-/// `RateLimit` validates that `window_secs > 0` and `max > 0` at construction
-/// and deserialization.
+/// `RateLimit` requires positive values but is not enforced in v0. See
+/// `crates/khive-gate/docs/api/policy-types.md`.
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Obligation {
@@ -23,10 +16,7 @@ pub enum Obligation {
         window_secs: u64,
         max: u32,
     },
-    /// Escape hatch for policy-specific obligations. `value` accepts ARBITRARY
-    /// JSON (objects, arrays, scalars, null) — the struct-like variant shape
-    /// is required because serde's internally-tagged enums cannot merge the
-    /// `kind` discriminator into a non-object newtype payload.
+    /// Policy-specific arbitrary JSON; the struct form preserves internally tagged scalar values.
     Custom {
         value: serde_json::Value,
     },

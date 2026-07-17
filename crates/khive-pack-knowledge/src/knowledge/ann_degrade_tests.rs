@@ -93,6 +93,7 @@ impl EmbedderProvider for FakeDimProvider {
 
 fn rt_with_fake_embedder() -> KhiveRuntime {
     let rt = KhiveRuntime::new(RuntimeConfig {
+        git_write: Default::default(),
         db_path: None,
         default_namespace: Namespace::local(),
         embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
@@ -116,6 +117,7 @@ fn rt_with_fake_embedder() -> KhiveRuntime {
 /// `retrieval_snapshots` write path, so an in-memory rebuild persists nothing.
 fn file_rt_with_fake_embedder(db_path: std::path::PathBuf) -> KhiveRuntime {
     let rt = KhiveRuntime::new(RuntimeConfig {
+        git_write: Default::default(),
         db_path: Some(db_path),
         default_namespace: Namespace::local(),
         embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),

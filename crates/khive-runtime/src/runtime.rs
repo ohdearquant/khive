@@ -44,8 +44,9 @@ pub type NoteMutationHookFn = Arc<
 >;
 
 pub use crate::config::{
-    assert_db_anchor_consistent, parse_pack_list, resolve_db_anchor, resolve_project_actor_id,
-    runtime_config_from_khive_config, BackendId, NamespaceToken, RuntimeConfig,
+    assert_captured_db_anchor_consistent, assert_db_anchor_consistent, parse_pack_list,
+    resolve_db_anchor, resolve_project_actor_id, runtime_config_from_khive_config, BackendId,
+    NamespaceToken, RuntimeConfig,
 };
 
 // ---- KhiveRuntime ----
@@ -102,6 +103,15 @@ pub struct KhiveRuntime {
     /// no pack cares about note-mutation notifications) — the call becomes a
     /// no-op check of an `Option`.
     note_mutation_hook: Arc<RwLock<Option<NoteMutationHookFn>>>,
+    /// The config-resolved `BlobStore` (ADR-111 Amendment 2), installed by
+    /// the boot path (`khive-mcp`'s single- and multi-backend startup paths)
+    /// via [`install_blob_store`](Self::install_blob_store) once `khive.toml`'s
+    /// `[storage.blob]` selection has been resolved through
+    /// `khive_runtime::resolve_blob_store`. `None` until installed — every
+    /// constructor here defaults it unset rather than eagerly resolving a
+    /// filesystem default, because many callers (unit tests, `memory()`) use
+    /// an in-memory backend with no blob root configured at all.
+    blob_store: Arc<RwLock<Option<Arc<dyn khive_storage::BlobStore>>>>,
 }
 
 impl KhiveRuntime {
@@ -139,6 +149,7 @@ impl KhiveRuntime {
             valid_note_kinds: Arc::new(RwLock::new(Vec::new())),
             entity_type_validator: Arc::new(RwLock::new(None)),
             note_mutation_hook: Arc::new(RwLock::new(None)),
+            blob_store: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -168,6 +179,7 @@ impl KhiveRuntime {
             valid_note_kinds: Arc::new(RwLock::new(Vec::new())),
             entity_type_validator: Arc::new(RwLock::new(None)),
             note_mutation_hook: Arc::new(RwLock::new(None)),
+            blob_store: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -196,6 +208,7 @@ impl KhiveRuntime {
             valid_note_kinds: Arc::new(RwLock::new(Vec::new())),
             entity_type_validator: Arc::new(RwLock::new(None)),
             note_mutation_hook: Arc::new(RwLock::new(None)),
+            blob_store: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -253,6 +266,7 @@ impl KhiveRuntime {
                     valid_note_kinds: self.valid_note_kinds.clone(),
                     entity_type_validator: self.entity_type_validator.clone(),
                     note_mutation_hook: self.note_mutation_hook.clone(),
+                    blob_store: self.blob_store.clone(),
                 }
             }
         }
@@ -539,6 +553,27 @@ impl KhiveRuntime {
         if let Ok(mut guard) = self.edge_rules.write() {
             *guard = rules;
         }
+    }
+
+    /// Install the config-resolved `BlobStore` (ADR-111 Amendment 2).
+    ///
+    /// Called by the boot path (`khive-mcp`'s single- and multi-backend
+    /// startup paths, `crates/khive-mcp/src/serve.rs`) once
+    /// `khive_runtime::resolve_blob_store` has selected the backend
+    /// `khive.toml`'s `[storage.blob]` section requests. Idempotent: a later
+    /// call overwrites the previous handle.
+    pub fn install_blob_store(&self, store: Arc<dyn khive_storage::BlobStore>) {
+        if let Ok(mut guard) = self.blob_store.write() {
+            *guard = Some(store);
+        }
+    }
+
+    /// Return the installed `BlobStore`, if the boot path resolved and
+    /// installed one. `None` when no `[storage.blob]` selection was ever
+    /// installed — e.g. a bare/test runtime constructed without going
+    /// through the `khive-mcp` boot path.
+    pub fn blob_store(&self) -> Option<Arc<dyn khive_storage::BlobStore>> {
+        self.blob_store.read().ok().and_then(|guard| guard.clone())
     }
 
     /// Install the pack-aggregated valid entity and note kinds.
@@ -917,6 +952,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.db");
         let config = RuntimeConfig {
+            git_write: Default::default(),
             db_path: Some(path),
             default_namespace: Namespace::local(),
             embedding_model: None,
@@ -940,6 +976,7 @@ mod tests {
     fn backend_data_dir_returns_none_for_from_backend_with_memory() {
         let backend = Arc::new(StorageBackend::memory().expect("memory backend"));
         let config = RuntimeConfig {
+            git_write: Default::default(),
             db_path: None,
             default_namespace: Namespace::local(),
             embedding_model: None,
@@ -961,6 +998,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.db");
         let config = RuntimeConfig {
+            git_write: Default::default(),
             db_path: Some(path.clone()),
             default_namespace: Namespace::parse("test").unwrap(),
             embedding_model: None,
@@ -982,6 +1020,7 @@ mod tests {
     fn from_backend_uses_provided_backend() {
         let backend = Arc::new(StorageBackend::memory().expect("memory backend"));
         let config = RuntimeConfig {
+            git_write: Default::default(),
             db_path: None,
             default_namespace: Namespace::local(),
             embedding_model: None,
@@ -1139,6 +1178,7 @@ mod tests {
         // visible-set, but that does not change default_namespace. This test
         // asserts the write-routing invariant only.
         let base = RuntimeConfig {
+            git_write: Default::default(),
             db_path: None,
             default_namespace: Namespace::local(),
             embedding_model: None,
@@ -1163,6 +1203,7 @@ mod tests {
     #[test]
     fn runtime_config_from_khive_config_empty_actor_id_keeps_base_namespace() {
         let base = RuntimeConfig {
+            git_write: Default::default(),
             db_path: None,
             default_namespace: Namespace::parse("lambda:base").unwrap(),
             embedding_model: None,
@@ -1195,6 +1236,7 @@ mod tests {
     #[test]
     fn runtime_config_from_khive_config_absent_actor_id_keeps_base_namespace() {
         let base = RuntimeConfig {
+            git_write: Default::default(),
             db_path: None,
             default_namespace: Namespace::parse("lambda:base").unwrap(),
             embedding_model: None,
@@ -1219,6 +1261,7 @@ mod tests {
     #[test]
     fn runtime_config_from_khive_config_actor_id_with_engines() {
         let base = RuntimeConfig {
+            git_write: Default::default(),
             db_path: None,
             default_namespace: Namespace::local(),
             embedding_model: None,
@@ -1378,6 +1421,7 @@ mod tests {
 
     fn secondary_config() -> RuntimeConfig {
         RuntimeConfig {
+            git_write: Default::default(),
             db_path: None,
             default_namespace: Namespace::local(),
             embedding_model: None,
@@ -1454,6 +1498,7 @@ mod tests {
         let secondary_arc = migrated_memory_backend();
 
         let main_config = RuntimeConfig {
+            git_write: Default::default(),
             db_path: None,
             default_namespace: Namespace::local(),
             embedding_model: None,
@@ -1590,6 +1635,7 @@ mod tests {
         let rt_from = KhiveRuntime::from_backend(
             backend,
             RuntimeConfig {
+                git_write: Default::default(),
                 db_path: None,
                 default_namespace: Namespace::local(),
                 embedding_model: None,

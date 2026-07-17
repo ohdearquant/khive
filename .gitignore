@@ -87,6 +87,10 @@ npm/bin/khive-*
 # Codex review artifacts (local working notes, not part of the codebase)
 codex_review_*.md
 
+# Agent workflow scratch notes (some review/fix legs write these at the repo
+# root as process notes; they are never part of the source tree)
+implementation_notes.md
+
 # Real-data recall benchmark corpus (extracted from khive-graph.db, never commit)
 crates/khive-pack-memory/tests/fixtures/
 

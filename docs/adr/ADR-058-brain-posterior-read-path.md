@@ -1,6 +1,6 @@
 # ADR-058: Brain Posterior Read Path — Wiring Profile Posteriors into Recall Ranking
 
-**Status**: Proposed\
+**Status**: Accepted\
 **Date**: 2026-06-15 (updated 2026-06-23)\
 **Authors**: khive maintainers
 **Depends on**:
@@ -16,12 +16,20 @@
 
 ---
 
-## Seed-readiness notice
+## Seed-readiness notice (resolved)
 
-Until this ADR is implemented, **"profile-tuned recall" and "self-improving recall" must not be
-claimed in any pitch deck, investor README, or product copy.** The posteriors are written and
-persisted correctly; the read path that would make them steer ranking does not exist. This ADR
-is the plan to make the claim true — it is not yet true.
+This notice was written while this ADR was a plan and the posterior read path did not yet
+exist. The read path is now implemented: at serve time recall projects the resolved profile's
+posterior means into its scoring weights (see
+[ADR-104](ADR-104-posterior-serving-recall.md) §1 and
+`crates/khive-pack-memory/src/handlers/recall.rs`). The historical warning is retained below
+for context.
+
+Until this ADR was implemented, **"profile-tuned recall" and "self-improving recall" could not
+be claimed** in any pitch deck, investor README, or product copy: the posteriors were written
+and persisted correctly, but the read path that would make them steer ranking did not exist.
+The Context and design sections below describe that design-time gap; they are the point-in-time
+record of the decision, not a description of current behavior.
 
 ---
 

@@ -323,36 +323,15 @@ pub struct BrainMutationEvent {
 /// `mutate` runs against a *proposed* copy of the state (never the live
 /// `state` mutex) built via a snapshot round-trip. Its result and the
 /// resulting snapshot are then persisted — brain event-log append AND
-/// snapshot upsert — as ONE atomic unit via `SqlAccess::atomic_unit`
-/// (ADR-067 Component A, Fork C slice 2). Only after that unit
-/// commits does the proposed state replace the live state and the tracker
-/// get marked clean.
-///
-/// This deliberately does NOT issue a manual
-/// `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK` sequence on a plain
-/// `SqlWriter` handle (the trait's former `begin_tx`/`SqlTransaction`
-/// surface, retired entirely, is likewise not an option): under
-/// `KHIVE_WRITE_QUEUE=1` that sequence would nest
-/// inside the WriterTask's own per-request `BEGIN IMMEDIATE`, which SQLite
-/// rejects ("cannot start a transaction within a transaction" — the same
-/// class of bug `fold_gate.rs`'s `atomic_unit` conversion fixed). Handing the
-/// whole append+upsert unit to `atomic_unit` instead means the WriterTask's
-/// own transaction wrapping provides the atomicity on the flag-on path, and
-/// `run_manual_atomic_unit` (khive-db) preserves the old manual-transaction
-/// shape byte-for-byte on the flag-off/in-memory path.
-///
-/// If `mutate` fails, or the atomic unit fails to append, upsert, or commit,
-/// this returns `Err` and the live state is left completely untouched —
-/// there is no in-memory mutation to roll back because it was never applied
-/// to the shared state in the first place.
-///
-/// Takes `sql: &dyn SqlAccess` rather than `&KhiveRuntime` — the only thing
-/// this function ever needed from the runtime was its `SqlAccess` handle
-/// (`KhiveRuntime::sql()`). Narrowing the parameter lets tests exercise this
-/// function against a bare `SqlBridge`/`ConnectionPool` (write-queue-enabled
-/// via a `PoolConfig` literal, mirroring `fold_gate.rs`'s routing test)
-/// without needing a full file-backed `KhiveRuntime` and its associated
-/// `KHIVE_WRITE_QUEUE` env-var race across this crate's test binary.
+/// snapshot upsert — as ONE atomic unit via `SqlAccess::atomic_unit`. Only
+/// after that unit commits does the proposed state replace the live state
+/// and the tracker get marked clean. If `mutate` fails, or the atomic unit
+/// fails to append, upsert, or commit, this returns `Err` and the live state
+/// is left completely untouched — there is no in-memory mutation to roll
+/// back because it was never applied to the shared state in the first
+/// place. See `crates/khive-pack-brain/docs/api/persist.md` for why this
+/// takes `&dyn SqlAccess` and why it uses `atomic_unit` over a manual
+/// transaction.
 pub async fn persist_brain_state_mutation<R>(
     sql: &dyn SqlAccess,
     token: &NamespaceToken,
@@ -1498,32 +1477,11 @@ mod persist_write_queue_routing {
     use khive_brain_core::BrainState;
     use khive_runtime::{KhiveRuntime, Namespace};
 
-    /// Fork C slice 2: proves `persist_brain_state_mutation`
-    /// — after its conversion from a manual `BEGIN IMMEDIATE`/`COMMIT` sequence
-    /// to the `SqlAccess::atomic_unit` seam — is actually enqueued on the
+    /// Proves `persist_brain_state_mutation` is actually enqueued on the
     /// pool's shared `WriterTaskHandle` channel when the write queue is
-    /// enabled, mirroring `fold_gate.rs`'s
-    /// `fold_gate_apply_routes_through_writer_task_when_flag_enabled` test
-    /// (same `queue_depth` + occupier-parked-on-oneshot technique; a
-    /// wall-clock/timing-based test would be indistinguishable from the
-    /// flag-off fallback, which serializes via real SQLite file locking
-    /// regardless of Rust-level routing — see that test's doc comment for the
-    /// full rationale).
-    ///
-    /// Deliberately does NOT construct a full file-backed `KhiveRuntime` (with
-    /// or without the `KHIVE_WRITE_QUEUE` env var) for the `sql` handle this
-    /// function now takes directly: `persist_brain_state_mutation`'s `sql`
-    /// parameter is a bare `&dyn SqlAccess`, so this test builds a
-    /// `ConnectionPool`/`SqlBridge` straight from a `PoolConfig` literal with
-    /// `write_queue_enabled: true` (no env var, no `#[serial]`, no risk to any
-    /// other test in this binary — the exact env-var race documented on the
-    /// fold_gate test). A `NamespaceToken` is still required by this
-    /// function's signature; `NamespaceToken`'s constructors are
-    /// crate-private to `khive-runtime`, so one is minted via
-    /// `KhiveRuntime::memory().authorize(..)` — an in-memory runtime never
-    /// spawns a writer task (`open_standalone_writer` requires a real file
-    /// path) and is completely inert with respect to `KHIVE_WRITE_QUEUE`,
-    /// so minting the token this way cannot introduce the race either.
+    /// enabled, mirroring `fold_gate.rs`'s equivalent routing test (same
+    /// `queue_depth` + occupier-parked-on-oneshot technique; see that test's
+    /// doc comment for why a wall-clock test can't distinguish this).
     #[tokio::test]
     async fn persist_brain_state_mutation_routes_through_writer_task_when_flag_enabled() {
         // Token minted from an in-memory runtime: never touches the write

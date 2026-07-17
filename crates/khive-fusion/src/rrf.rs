@@ -5,8 +5,11 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
-/// Reciprocal Rank Fusion: `score(d) = sum 1/(k + rank_i(d))` over all sources.
-/// `sources` sorted score-descending; `k` >= 1 enforced internally.
+/// Fuse score-descending sources by `sum 1/(max(k, 1) + one_based_rank)`.
+///
+/// Duplicate IDs vote once per source. All IDs are returned by descending score, breaking ties by
+/// ascending ID. See
+/// `crates/khive-fusion/docs/api/fusion-functions.md`.
 pub fn reciprocal_rank_fusion<Id: Eq + Hash + Clone + Ord>(
     sources: Vec<Vec<(Id, DeterministicScore)>>,
     k: usize,
@@ -15,11 +18,9 @@ pub fn reciprocal_rank_fusion<Id: Eq + Hash + Clone + Ord>(
         return Vec::new();
     }
 
-    // Ensure k >= 1 to avoid division issues
     let k = k.max(1);
 
-    // Estimate capacity as sum of all source lengths (upper bound on unique IDs).
-    // Use saturating_add to avoid usize overflow on adversarial inputs (finding #6).
+    // Saturation keeps adversarial length sums from wrapping allocation capacity.
     let estimated_capacity: usize = sources
         .iter()
         .map(|s| s.len())
@@ -27,16 +28,12 @@ pub fn reciprocal_rank_fusion<Id: Eq + Hash + Clone + Ord>(
     let mut combined: HashMap<Id, DeterministicScore> = HashMap::with_capacity(estimated_capacity);
 
     for results in sources {
-        // Deduplicate IDs within the same source: keep only the best (lowest) rank
-        // so one retriever cannot vote multiple times for the same document
-        // (finding #4). We iterate in rank order (best first) and skip duplicates.
+        // Keep the best rank so one retriever cannot vote twice for one ID.
         let mut seen_in_source: HashSet<Id> = HashSet::with_capacity(results.len());
         for (rank_0_indexed, (id, _score)) in results.into_iter().enumerate() {
             if !seen_in_source.insert(id.clone()) {
-                // Already seen: a later (worse) occurrence — skip it.
                 continue;
             }
-            // rank is 1-indexed: position 0 in the input list → rank 1
             let rank_1_indexed = rank_0_indexed + 1;
             let contribution = rrf_score(rank_1_indexed, k);
             let entry = combined.entry(id).or_insert(DeterministicScore::ZERO);
@@ -44,12 +41,8 @@ pub fn reciprocal_rank_fusion<Id: Eq + Hash + Clone + Ord>(
         }
     }
 
-    // Sort descending by fixed-point score; permutation-invariant since DeterministicScore
-    // addition is order-independent (i128 accumulation in Add impl).
     let mut fused: Vec<(Id, DeterministicScore)> = combined.into_iter().collect();
 
-    // Sort by score descending, then by ID ascending for deterministic tie-breaking
-    // This ensures cross-platform consistency when scores are equal
     fused.sort_by(
         |(id_a, score_a), (id_b, score_b)| match score_b.cmp(score_a) {
             Ordering::Equal => id_a.cmp(id_b),

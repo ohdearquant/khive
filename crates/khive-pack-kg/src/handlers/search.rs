@@ -3,13 +3,7 @@
 use std::collections::HashMap;
 
 /// Maximum candidate window used when property/tag filters are active.
-///
-/// Predicates are applied BEFORE result truncation inside the runtime's
-/// candidate budget (`search_limit × CANDIDATE_MULTIPLIER`). This constant
-/// widens the handler's initial `search_limit` so that sparse matches ranked
-/// just below the bare `limit` remain within the candidate window.
-/// Matches ranked beyond the overall budget may still be missed — use
-/// specific query text to keep target records near the top of the ranking.
+/// See `docs/api/scan-cliff.md`.
 const FILTERED_SCAN_CAP: u32 = 500;
 
 use serde_json::Value;
@@ -62,11 +56,7 @@ impl KgPack {
                 });
                 let tag_filter = p.tags.as_ref().filter(|tags| !tags.is_empty());
                 let search_limit = if props_filter.is_some() || tag_filter.is_some() {
-                    // Widen the candidate window so sparse matches ranked below the
-                    // bare `limit` remain within the runtime's retrieval budget.
-                    // Predicates are applied BEFORE result truncation (entity tags:
-                    // SQL-level via EntityFilter; properties: Rust-level in alive-set
-                    // loop). The cap bounds worst-case scan cost.
+                    // See docs/api/scan-cliff.md.
                     (limit * 50).min(FILTERED_SCAN_CAP)
                 } else {
                     limit
@@ -169,12 +159,7 @@ impl KgPack {
                 });
                 let tag_filter = p.tags.as_ref().filter(|tags| !tags.is_empty());
                 let search_limit = if props_filter.is_some() || tag_filter.is_some() {
-                    // Widen the candidate window so sparse matches ranked below the
-                    // bare `limit` remain within the runtime's retrieval budget.
-                    // Predicates are applied BEFORE result truncation (note tags and
-                    // properties: Rust-level in the alive-set loop, since notes have
-                    // no dedicated tag column — tags live in `properties["tags"]`).
-                    // The cap bounds worst-case scan cost.
+                    // See docs/api/scan-cliff.md.
                     (limit * 50).min(FILTERED_SCAN_CAP)
                 } else {
                     limit

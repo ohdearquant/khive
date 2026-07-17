@@ -31,9 +31,11 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::Parser;
 
+#[cfg(test)]
+use khive_mcp::serve::resolve_runtime_config;
 use khive_mcp::serve::{
-    apply_env_output_format, build_server_multi_backend, config_discovery_db_anchor,
-    enforce_strict_actor_mode, resolve_runtime_config, RuntimeConfigInputs,
+    apply_env_output_format, build_server_multi_backend_with_db_anchor, config_discovery_db_anchor,
+    enforce_strict_actor_mode, RuntimeConfigInputs,
 };
 #[cfg(unix)]
 use khive_mcp::server::compute_config_id;
@@ -434,37 +436,45 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
     // forwarded frame as a `ConfigMismatch` and `exec` silently fell back to an
     // in-process, TOML-blind, effectively-anonymous dispatch (issue #581).
     let namespace = Namespace::parse(&args.namespace).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let cfg = resolve_runtime_config(RuntimeConfigInputs {
-        db: args.db.as_deref(),
-        config: None, // `kkernel exec` has no `--config` flag today
-        namespace,
-        // `--namespace` has a clap `default_value = "local"`, so it is always
-        // present — there is no way to distinguish "operator typed --namespace
-        // local" from "operator didn't pass --namespace at all". `true` is the
-        // conservative, behavior-preserving choice: it keeps exec's pre-existing
-        // semantics (the CLI/default value always becomes `default_namespace`,
-        // matching what `resolve_runtime_config`'s embed path already did
-        // unconditionally). It is also empirically inert for config_id parity:
-        // in the embed path (`no_embed: false`, exec's only mode), this flag
-        // gates only the actor_id fill-when-None guard in `resolve_runtime_config`
-        // — and `compute_config_id` never reads identity fields (`actor_id` or
-        // `visible_namespaces`; namespace is carried separately per its own doc
-        // comment). See the
-        // `namespace_explicit_changes_actor_id_fill_but_not_config_id` and
-        // `exec_config_id_matches_serve_config_id_for_project_toml_actor` tests
-        // below, which construct both arms and assert this directly rather than
-        // assuming it.
-        namespace_explicit: true,
-        actor_explicit: false,
-        no_embed: false,
-        packs: None,
-        brain_profile: None,
-    })?;
+    let (cfg, db_anchor) =
+        khive_mcp::serve::resolve_runtime_config_with_db_anchor(RuntimeConfigInputs {
+            db: args.db.as_deref(),
+            config: None, // `kkernel exec` has no `--config` flag today
+            namespace,
+            // `--namespace` has a clap `default_value = "local"`, so it is always
+            // present — there is no way to distinguish "operator typed --namespace
+            // local" from "operator didn't pass --namespace at all". `true` is the
+            // conservative, behavior-preserving choice: it keeps exec's pre-existing
+            // semantics (the CLI/default value always becomes `default_namespace`,
+            // matching what `resolve_runtime_config`'s embed path already did
+            // unconditionally). It is also empirically inert for config_id parity:
+            // in the embed path (`no_embed: false`, exec's only mode), this flag
+            // gates only the actor_id fill-when-None guard in `resolve_runtime_config`
+            // — and `compute_config_id` never reads identity fields (`actor_id` or
+            // `visible_namespaces`; namespace is carried separately per its own doc
+            // comment). See the
+            // `namespace_explicit_changes_actor_id_fill_but_not_config_id` and
+            // `exec_config_id_matches_serve_config_id_for_project_toml_actor` tests
+            // below, which construct both arms and assert this directly rather than
+            // assuming it.
+            namespace_explicit: true,
+            actor_explicit: false,
+            no_embed: false,
+            packs: None,
+            brain_profile: None,
+        })?;
 
     // Regression fence: `cfg.db_path` must agree with the canonical anchor for
     // this same `--db`/`KHIVE_DB` input, or `compute_config_id` would silently
     // desynchronize `kkernel exec` from the daemon it is trying to reach.
-    khive_runtime::assert_db_anchor_consistent(cfg.db_path.as_deref(), args.db.as_deref())?;
+    khive_runtime::assert_captured_db_anchor_consistent(
+        cfg.db_path.as_deref(),
+        db_anchor.as_deref(),
+    )?;
+    let db_context = ExecDbContext {
+        raw: args.db,
+        anchor: db_anchor,
+    };
 
     match mode {
         ExecMode::Inline(ops) => {
@@ -474,7 +484,7 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
                 args.presentation,
                 args.output_format,
                 args.save_file,
-                args.db,
+                db_context,
             )
             .await
         }
@@ -484,7 +494,7 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
                 cfg,
                 args.presentation,
                 args.dry_run,
-                args.db,
+                db_context,
                 args.atomic,
                 args.atomic_max_ops,
             )
@@ -498,13 +508,19 @@ enum ExecMode {
     OpsFile(PathBuf),
 }
 
+#[derive(Default)]
+struct ExecDbContext {
+    raw: Option<String>,
+    anchor: Option<PathBuf>,
+}
+
 async fn run_exec_inline(
     ops: String,
     cfg: RuntimeConfig,
     presentation: Option<String>,
     output_format: Option<String>,
     save_file: Option<String>,
-    db: Option<String>,
+    db_context: ExecDbContext,
 ) -> Result<()> {
     #[cfg(unix)]
     return run_exec_inline_with_forward(
@@ -513,13 +529,20 @@ async fn run_exec_inline(
         presentation,
         output_format,
         save_file,
-        db,
+        db_context,
         forward_or_spawn_boxed,
     )
     .await;
     #[cfg(not(unix))]
-    return run_exec_inline_with_forward(ops, cfg, presentation, output_format, save_file, db)
-        .await;
+    return run_exec_inline_with_forward(
+        ops,
+        cfg,
+        presentation,
+        output_format,
+        save_file,
+        db_context,
+    )
+    .await;
 }
 
 /// Inner implementation of `run_exec_inline`, parameterised over the daemon
@@ -541,7 +564,7 @@ async fn run_exec_inline_with_forward(
     presentation: Option<String>,
     output_format: Option<String>,
     save_file: Option<String>,
-    db: Option<String>,
+    db_context: ExecDbContext,
     #[cfg(unix)] forward_fn: ForwardFnPtr,
 ) -> Result<()> {
     // ── strict-actor gate (before any forwarding) ─────────────────────────────
@@ -574,7 +597,7 @@ async fn run_exec_inline_with_forward(
     // diverged, so a correctly-configured client was rejected as a
     // `ConfigMismatch` and silently fell back to the cold in-process path on
     // every call.
-    let db_path_for_config = config_discovery_db_anchor(db.as_deref());
+    let db_path_for_config = config_discovery_db_anchor(db_context.raw.as_deref());
     let khive_cfg = KhiveConfig::load_with_home_fallback(None, db_path_for_config.as_deref())
         .map_err(|e| anyhow::anyhow!("config error: {e}"))?
         .unwrap_or_default();
@@ -627,7 +650,12 @@ async fn run_exec_inline_with_forward(
     // precedence chain (env var over TOML `[runtime] default_output_format`
     // over builtin json) AND honors `[[backends]]` multi-backend topology —
     // see its doc comment.
-    let server = build_local_fallback_server(cfg, &khive_cfg, db.as_deref())?;
+    let server = build_local_fallback_server(
+        cfg,
+        &khive_cfg,
+        db_context.raw.as_deref(),
+        db_context.anchor.as_deref(),
+    )?;
 
     let params = RequestParams {
         ops,
@@ -649,36 +677,15 @@ async fn run_exec_inline_with_forward(
 }
 
 /// Build the server used whenever `kkernel exec` dispatches a request locally
-/// instead of through the warm daemon.
-///
-/// Two call sites hit this: the daemon-unreachable/mismatch fallback inside
-/// `run_exec_inline_with_forward`, and the `--ops-file` bulk-apply path
-/// (`run_exec_ops_file`), which deliberately never attempts the daemon fast
-/// path at all (ADR-067 Context: bulk apply bypasses the daemon for cross-op
-/// atomicity).
-///
-/// `KhiveMcpServer::new` alone only ever builds a single-backend runtime — it
-/// has no visibility into a `khive.toml` `[[backends]]` declaration. Before
-/// this fix, both of exec's local-dispatch paths always took that
-/// single-backend constructor, so a config declaring a separate backend for
-/// e.g. the `session` pack was invisible to them: the in-process fallback
-/// would silently write that pack's data into the `main` backend instead of
-/// its declared one. This function makes both paths agree with the daemon's
-/// own boot logic (`khive_mcp::serve::build_server`): when
-/// `khive_cfg.backends` is empty, build the plain single-backend server
-/// exactly as before (byte-identical `config_id`, since `compute_config_id`
-/// skips the topology fold for an empty backends list); otherwise delegate to
-/// `build_server_multi_backend`, the same constructor `kkernel mcp` uses.
-///
-/// `cli_db_override` is the raw, pre-resolution `--db`/`KHIVE_DB` value —
-/// required by `build_server_multi_backend`'s db-anchor consistency guard and
-/// its `--db :memory:` multi-backend override handling (ADR-028 §8); passing
-/// the wrong value here would either falsely reject a legitimate `--db` or
-/// silently ignore an operator's `:memory:` isolation request.
+/// instead of through the warm daemon (both the fallback and `--ops-file`
+/// bulk-apply paths). See
+/// `crates/kkernel/docs/design.md#exec-local-dispatch-fallback-server-adr-067-adr-028-8`
+/// for why this must agree with the daemon's own multi-backend boot logic.
 fn build_local_fallback_server(
     cfg: RuntimeConfig,
     khive_cfg: &KhiveConfig,
     cli_db_override: Option<&str>,
+    db_anchor: Option<&std::path::Path>,
 ) -> Result<KhiveMcpServer> {
     // Held across construction below (`KhiveRuntime::new` / `KhiveMcpServer::new`
     // / `build_server_multi_backend`, both of which run migrations and apply
@@ -691,17 +698,16 @@ fn build_local_fallback_server(
             .map_err(|e| anyhow::anyhow!("{e}"))?
             .with_default_output_format(env_fmt))
     } else {
-        build_server_multi_backend(cfg, khive_cfg, cli_db_override)
+        build_server_multi_backend_with_db_anchor(cfg, khive_cfg, cli_db_override, db_anchor)
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_exec_ops_file(
     path: PathBuf,
     cfg: RuntimeConfig,
     presentation: Option<String>,
     dry_run: bool,
-    db: Option<String>,
+    db_context: ExecDbContext,
     atomic: bool,
     atomic_max_ops: Option<usize>,
 ) -> Result<()> {
@@ -736,7 +742,7 @@ async fn run_exec_ops_file(
     // `[[backends]]` multi-backend topology exactly like the daemon-fallback
     // path — see `build_local_fallback_server`.
     enforce_strict_actor_mode(cfg.actor_id.as_deref(), &cfg.packs)?;
-    let db_path_for_config = config_discovery_db_anchor(db.as_deref());
+    let db_path_for_config = config_discovery_db_anchor(db_context.raw.as_deref());
     let khive_cfg = KhiveConfig::load_with_home_fallback(None, db_path_for_config.as_deref())
         .map_err(|e| anyhow::anyhow!("config error: {e}"))?
         .unwrap_or_default();
@@ -753,7 +759,12 @@ async fn run_exec_ops_file(
         return Ok(());
     }
 
-    let server = build_local_fallback_server(cfg, &khive_cfg, db.as_deref())?;
+    let server = build_local_fallback_server(
+        cfg,
+        &khive_cfg,
+        db_context.raw.as_deref(),
+        db_context.anchor.as_deref(),
+    )?;
 
     apply_ops_file(&server, ops, presentation).await
 }
@@ -1241,7 +1252,7 @@ default = true
         // `db_path` here is NOT the actual storage location when `[[backends]]`
         // is declared — `build_server_multi_backend` opens each backend's own
         // declared path (the tempfiles above) independently. It is only the
-        // identity/fingerprint value `assert_db_anchor_consistent` checks
+        // identity/fingerprint value `assert_captured_db_anchor_consistent` checks
         // against `resolve_db_anchor(cli_db_override)`, exactly mirroring what
         // a real `kkernel exec` invocation with NO explicit `--db` flag would
         // resolve to (the realistic shape when `[[backends]]` fully governs
@@ -1260,7 +1271,8 @@ default = true
         // matching the `cfg.db_path` shape above. An explicit override here
         // would be rejected as ambiguous by `build_registry_for_multi_backend`
         // (ADR-028 §8) since 2 backends are already declared.
-        let server = build_local_fallback_server(cfg, &khive_cfg, None)
+        let db_anchor = cfg.db_path.clone();
+        let server = build_local_fallback_server(cfg, &khive_cfg, None, db_anchor.as_deref())
             .expect("multi-backend local fallback must build");
 
         let send = server
@@ -1330,6 +1342,42 @@ default = true
              (khive-pack-comm's message.rs), both via the SAME pack runtime, so a \
              single self-send yields 2 `message` notes in whichever backend `comm` \
              is pinned to"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn build_local_fallback_server_uses_captured_anchor_after_home_changes() {
+        let (previous_home, _first_home) = isolate_home_for_test();
+        let cfg = RuntimeConfig {
+            db_path: khive_runtime::resolve_db_anchor(None),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        };
+        let db_anchor = cfg.db_path.clone();
+        let khive_cfg = KhiveConfig {
+            backends: vec![khive_runtime::BackendConfig {
+                name: "main".to_string(),
+                kind: khive_runtime::BackendKind::Memory,
+                path: None,
+                cache_mb: None,
+                journal_mode: None,
+                read_only: false,
+            }],
+            ..KhiveConfig::default()
+        };
+        let second_home = tempfile::tempdir().expect("second HOME");
+        std::env::set_var("HOME", second_home.path());
+
+        let result = build_local_fallback_server(cfg, &khive_cfg, None, db_anchor.as_deref());
+        restore_home(previous_home);
+
+        assert!(
+            result.is_ok(),
+            "exec fallback must use the anchor captured with RuntimeConfig after HOME changes: {}",
+            result.err().unwrap()
         );
     }
 
@@ -1408,7 +1456,7 @@ default = true
             // built `KhiveRuntime`/`KhiveMcpServer` without acquiring any
             // guard, so it could run migrations/FTS DDL concurrently with
             // the guarded boot above against the same file.
-            let server = build_local_fallback_server(cfg, &khive_cfg, None)
+            let server = build_local_fallback_server(cfg, &khive_cfg, None, None)
                 .expect("guarded local-exec construction must succeed");
 
             for i in 0..count {
@@ -1485,8 +1533,8 @@ default = true
             // The exact call under test: every non-atomic local-exec path
             // (daemon-unreachable fallback, --save-file, KHIVE_NO_DAEMON=1,
             // non-atomic --ops-file) funnels through this one function.
-            let result =
-                rt_handle.block_on(async { build_local_fallback_server(cfg, &khive_cfg, None) });
+            let result = rt_handle
+                .block_on(async { build_local_fallback_server(cfg, &khive_cfg, None, None) });
             // Sent only AFTER construction returns — the test observes
             // whether this arrives before or after the lock is released.
             let _ = tx.send(());
@@ -1817,9 +1865,17 @@ default = true
         };
 
         // dry_run=true → no writes.
-        run_exec_ops_file(path.clone(), cfg.clone(), None, true, None, false, None)
-            .await
-            .unwrap();
+        run_exec_ops_file(
+            path.clone(),
+            cfg.clone(),
+            None,
+            true,
+            ExecDbContext::default(),
+            false,
+            None,
+        )
+        .await
+        .unwrap();
 
         // Verify nothing was written by checking with a fresh server.
         let server = isolated_server(&db_path);
@@ -1843,21 +1899,8 @@ default = true
 
     // ── strict-actor mode: daemon bypass regression ───────────────────────────
 
-    /// Regression: `run_exec_inline` must enforce the strict-actor gate BEFORE
-    /// forwarding to the daemon, so a comm-capable anonymous daemon already running
-    /// cannot be used to bypass `KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1`.
-    ///
-    /// Prior to this fix, `enforce_strict_actor_mode` was only called in the
-    /// in-process fallback path (after the daemon fast-path returned).  An attacker
-    /// or misconfigured operator could start a no-actor daemon, then run strict-mode
-    /// `kkernel exec` which would forward through it and exit 0.
-    ///
-    /// The fix moves the check to before the daemon block.  This test drives
-    /// `run_exec_inline` directly with a config that has `comm` in the pack list
-    /// and no actor identity.  It must return an `Err` whose message names
-    /// `KHIVE_REQUIRE_ATTRIBUTED_ACTOR` regardless of whether a daemon is reachable
-    /// (KHIVE_NO_DAEMON=1 is set to keep the test isolated from any running daemon,
-    /// but the error should fire before any forwarding attempt anyway).
+    /// Security regression: strict-actor gate must fire before daemon forward.
+    /// See `crates/kkernel/docs/design.md#execrs-regression-test-notes`.
     #[tokio::test]
     #[serial]
     async fn strict_mode_rejects_before_daemon_forward_when_comm_and_no_actor() {
@@ -1877,7 +1920,15 @@ default = true
             ..RuntimeConfig::default()
         };
 
-        let result = run_exec_inline("stats()".to_string(), cfg, None, None, None, None).await;
+        let result = run_exec_inline(
+            "stats()".to_string(),
+            cfg,
+            None,
+            None,
+            None,
+            ExecDbContext::default(),
+        )
+        .await;
 
         // Restore env.
         match prev_strict {
@@ -1924,7 +1975,15 @@ default = true
         };
 
         // The strict gate must pass; the actual dispatch will succeed (stats() is safe).
-        let result = run_exec_inline("stats()".to_string(), cfg, None, None, None, None).await;
+        let result = run_exec_inline(
+            "stats()".to_string(),
+            cfg,
+            None,
+            None,
+            None,
+            ExecDbContext::default(),
+        )
+        .await;
 
         match prev_strict {
             Some(v) => std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", v),
@@ -1961,7 +2020,15 @@ default = true
             ..RuntimeConfig::default()
         };
 
-        let result = run_exec_inline("stats()".to_string(), cfg, None, None, None, None).await;
+        let result = run_exec_inline(
+            "stats()".to_string(),
+            cfg,
+            None,
+            None,
+            None,
+            ExecDbContext::default(),
+        )
+        .await;
 
         match prev_strict {
             Some(v) => std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", v),
@@ -2039,7 +2106,7 @@ default = true
             None,
             None, // output_format
             None,
-            None, // db
+            ExecDbContext::default(),
             spy_forward_records_call,
         )
         .await;
@@ -2095,7 +2162,7 @@ default = true
             None,
             None, // output_format
             None,
-            None, // db
+            ExecDbContext::default(),
             spy_forward_records_call,
         )
         .await;
@@ -2213,7 +2280,7 @@ backend = "sessions"
             None,
             None,
             None,
-            None, // db: no explicit --db, matching default discovery
+            ExecDbContext::default(),
             spy_capture_config_id,
         )
         .await;
@@ -3225,23 +3292,8 @@ backend = "sessions"
         );
     }
 
-    /// Atomic `update` null/type semantics must match
-    /// canonical's ACTUALLY REACHABLE behavior. Empirically verified against
-    /// the live `handle_update` (two scratch probe tests run directly
-    /// against `KgPack::handle_update`, then removed) that `name=null` and
-    /// `description=null` are canonical NO-OPS, not rejections: canonical's
-    /// field type is `Option<Value>`, and serde_json's derived
-    /// `Deserialize` for `Option<T>` intercepts a literal JSON `null` at the
-    /// OUTER Option boundary and maps it straight to Rust `None` —
-    /// regardless of the inner type — so canonical's own "reject null"/
-    /// "clear on null" arms in `string_value`/`optional_string_patch` are
-    /// unreachable through normal struct deserialization. This deliberately
-    /// does NOT implement the naive literal expectation
-    /// ("`update(name=null)` REJECTED") — that expectation does not match
-    /// the live canonical system. What canonical DOES still reject is a non-null,
-    /// non-string `name` (e.g. `name: 123`) — pre-fix, atomic silently
-    /// treated that as absent too (reporting success for an invalid
-    /// update), which is the real violation this test locks down.
+    /// Atomic `update` null/type semantics must match canonical's actually-reachable
+    /// behavior. See `crates/kkernel/docs/design.md#execrs-regression-test-notes`.
     #[tokio::test]
     async fn atomic_update_null_and_type_semantics_match_canonical_no_op_behavior() {
         let db_file = NamedTempFile::new().expect("temp db");

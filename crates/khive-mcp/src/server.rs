@@ -19,6 +19,7 @@ use rmcp::{
     tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler, ServiceExt,
 };
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use khive_db::ConnectionPool;
 use khive_request::{parse_request, ArgValue, DslError, ExecutionMode, ParsedOp};
@@ -37,7 +38,8 @@ use crate::tools::request::RequestParams;
 ///
 /// Two servers produce the same id iff they can safely share one warm engine:
 /// same pack set (order-independent), same storage target, same embedders, same
-/// backend topology/routing, and same construction-baked outbound policy.
+/// backend topology/routing, and same construction-baked outbound and git-write
+/// policies.
 /// Identity fields (`namespace`, `actor_id`, `visible_namespaces`) are carried
 /// per request in the daemon frame and must never enter this key. The daemon
 /// compares this against each forwarded request's `config_id` and rejects
@@ -80,15 +82,29 @@ pub fn compute_config_id(
         .collect();
     outbound.sort();
     outbound.dedup();
+    let mut git_write_hasher = Sha256::new();
+    git_write_hasher.update(b"khive.git-write-policy.v1");
+    git_write_hasher.update((config.git_write.allowed.len() as u64).to_be_bytes());
+    for entry in &config.git_write.allowed {
+        git_write_hasher.update((entry.repo.len() as u64).to_be_bytes());
+        git_write_hasher.update(entry.repo.as_bytes());
+        git_write_hasher.update((entry.branches.len() as u64).to_be_bytes());
+        for branch in &entry.branches {
+            git_write_hasher.update((branch.len() as u64).to_be_bytes());
+            git_write_hasher.update(branch.as_bytes());
+        }
+    }
+    let git_write = format!("{:x}", git_write_hasher.finalize());
 
     let base = format!(
-        "packs=[{}];db={};embed={};extra=[{}];backend={:?};outbound=[{}]",
+        "packs=[{}];db={};embed={};extra=[{}];backend={:?};outbound=[{}];git_write={}",
         packs.join(","),
         db,
         primary,
         extra.join(","),
         config.backend_id,
         outbound.join(","),
+        git_write,
     );
 
     // Fold backend topology when non-empty so two configs differing only in
@@ -441,7 +457,7 @@ impl KhiveMcpServer {
     ///
     /// `VerbRegistry` is internally `Arc`-wrapped so this clone is cheap. The returned
     /// registry shares the same packs and dispatch state as the server.
-    #[cfg(feature = "channel-email")]
+    #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
     pub(crate) fn verb_registry_clone(&self) -> VerbRegistry {
         self.registry.clone()
     }
@@ -1053,24 +1069,13 @@ impl KhiveMcpServer {
 }
 
 /// Route a `link` or `search` verb through `coord` when in multi-backend mode.
-///
-/// This is the shared logic behind both dispatch sites (`dispatch_op` chain mode
-/// and the parallel/single closure in `run_parsed`). Extracted as a free async
-/// function so closures that don't have access to `&self` can call it.
-///
-/// Returns `Some(Ok(Value))` when the coordinator handled the op successfully.
-/// Returns `Some(Err((tool, error_value)))` when the coordinator returned an error,
-/// including when a caller-supplied `namespace` argument fails fail-closed
-/// validation (see below).
-/// Returns `None` to indicate fall-through (caller should dispatch through the registry).
-///
-/// RUNTIME-AUD-002 (#433, PR #549 blocker): this coordinator intercept runs
-/// *before* `VerbRegistry::dispatch`, so it must apply the exact same
-/// fail-closed namespace rule `dispatch` applies — a present-but-non-string
-/// `namespace` (null/number/bool/array/object) must be rejected, never
-/// silently substituted with the server default. Both call sites route
-/// through `resolve_explicit_namespace` (the same chokepoint `dispatch` uses)
-/// so this can't drift out of sync again.
+/// Shared logic behind both dispatch sites (`dispatch_op` chain mode and the
+/// parallel/single closure in `run_parsed`). Returns `Some(Ok(Value))` when
+/// the coordinator handled the op, `Some(Err((tool, error_value)))` on a
+/// coordinator error (including fail-closed namespace rejection), `None` to
+/// fall through to the registry. Must apply the exact same fail-closed
+/// namespace rule as `VerbRegistry::dispatch` (RUNTIME-AUD-002, #433) — see
+/// `crates/khive-mcp/docs/api/coordinator.md`.
 async fn dispatch_via_coordinator_inner(
     coord: &dyn CoordinatorService,
     tool: &str,
@@ -1291,18 +1296,10 @@ async fn dispatch_via_coordinator_inner(
 }
 
 /// Returns `true` when a raw handler `result` value's container nesting is
-/// within [`khive_request::NESTING_DEPTH_LIMIT`].
-///
-/// Handler results (e.g. `traverse`/`context`) are not bounded by the DSL
-/// parser's syntax-tree guard, so a pathologically deep result could
-/// overflow the stack via recursive `Value::clone`, `json!`/
-/// `serde_json::to_value` serialization, or the agent-mode presentation
-/// transform — all of which recurse natively over `Value`. Callers MUST
-/// call this on the raw value coming straight out of coordinator/registry
-/// dispatch, before any of those operations touch it. Delegates to
-/// [`khive_request::value_nesting_within_limit`], which walks an explicit
-/// worklist instead of native recursion, so the check itself cannot
-/// overflow the stack on the same input it is screening.
+/// within [`khive_request::NESTING_DEPTH_LIMIT`]. Callers MUST call this on
+/// the raw value straight out of coordinator/registry dispatch, before any
+/// recursive `Value` operation (clone, serialize, presentation transform)
+/// touches it — see `crates/khive-mcp/docs/design.md` (Result depth guard).
 fn result_within_depth_limit(result: &Value) -> bool {
     khive_request::value_nesting_within_limit(result, khive_request::NESTING_DEPTH_LIMIT)
 }
@@ -1402,16 +1399,12 @@ fn result_exceeds_depth_limit(result_obj: &Value) -> bool {
         .is_some_and(|v| !result_within_depth_limit(v))
 }
 
-/// Chain-mode aggregation-loop seam in [`KhiveMcpServer::run_parsed`]: the
-/// second, defense-in-depth check applied to a dispatched op's full
-/// `result_obj` envelope. By the time this runs, `dispatch_op`'s own
-/// `chain_ok_envelope_or_depth_error` has already screened the same
-/// `result` field, so this should never trip in practice — but if a future
-/// refactor bypasses that earlier guard, the rejected envelope must still be
-/// discarded iteratively rather than dropped natively, or the recursive
-/// `Drop` this branch exists to prevent happens anyway on the way out of
-/// scope. Returns the unchanged envelope on success, or an already-built
-/// error entry (with the oversized value already drained) on rejection.
+/// Chain-mode aggregation-loop seam in [`KhiveMcpServer::run_parsed`]:
+/// defense-in-depth depth check on a dispatched op's full `result_obj`
+/// envelope (should never trip — `dispatch_op` already screened `result`).
+/// Returns the unchanged envelope on success, or an already-built error
+/// entry on rejection. See `crates/khive-mcp/docs/design.md` (Result depth
+/// guard) for why the rejected envelope is drained iteratively.
 fn chain_aggregation_depth_reject(result_obj: Value) -> Result<Value, Value> {
     if result_exceeds_depth_limit(&result_obj) {
         let tool_name = result_obj
@@ -1502,8 +1495,12 @@ several independent ops can run together; use chain when each op needs the prior
 result (e.g. create then link with the new entity's id)."#)]
     async fn request(&self, Parameters(p): Parameters<RequestParams>) -> Result<String, McpError> {
         // Forward to the warm daemon when reachable, auto-spawning it
-        // on first use. Any failure (no socket, spawn failure, namespace
-        // mismatch, KHIVE_NO_DAEMON) falls through to local dispatch.
+        // on first use. An ordinary no-socket condition, a namespace
+        // mismatch, or KHIVE_NO_DAEMON falls through to local dispatch.
+        // A confirmed respawn failure (spawn error, or the child exits
+        // before binding the socket) instead returns a caller-visible
+        // `respawn_failed` error without local dispatch, per ADR-049
+        // Amendment 2.
         //
         // MCP-AUD-002: the daemon wire frame has no `save_to` field, so
         // daemon-forwarded requests silently drop the sink and return the
@@ -1516,13 +1513,14 @@ result (e.g. create then link with the new entity's id)."#)]
             if let Some(res) = crate::daemon::forward_or_spawn(&frame).await {
                 return match res {
                     Ok(s) => Ok(s),
-                    // #947: a strict-mode fallback rejection is tagged with
+                    // #947/#898: a strict-mode pre-dispatch rejection is
+                    // tagged with
                     // `daemon::STRICT_FALLBACK_MARKER` so it can be reshaped
                     // into the normal per-op envelope instead of surfacing as
                     // an RPC-level error. Every other daemon-forward error
-                    // (protocol mismatch, oversized frame, ambiguous
-                    // post-write outcome) is untagged and passes through
-                    // unchanged.
+                    // (non-strict respawn failure, protocol mismatch,
+                    // oversized frame, ambiguous post-write outcome) is
+                    // untagged and passes through unchanged.
                     Err(e) => match strict_fallback_reason(&e) {
                         Some(reason) => strict_fallback_envelope_response(&p, reason),
                         None => Err(e),
@@ -1567,7 +1565,8 @@ fn strict_fallback_envelope_response(
     let total = parsed.ops.len();
     let error_msg = format!(
         "daemon fallback rejected under KHIVE_DAEMON_STRICT=1: reason={reason}; \
-         refusing to complete the request via local dispatch"
+         refusing to complete the request via local dispatch; \
+         rebuild with `make local` and retry"
     );
 
     let results: Vec<Value> = match parsed.mode {
@@ -2356,6 +2355,60 @@ mod tests {
         }
     }
 
+    // ── request-boundary regression: raw controls survive wire decoding ─────
+
+    #[tokio::test]
+    async fn request_boundary_raw_control_bytes_reach_handler() {
+        // Simulates the actual MCP wire: a JSON-RPC client sends the tool's
+        // `ops` argument as a JSON string using the standard JSON `\n`
+        // escape. Deserializing `RequestParams` decodes that escape into an
+        // actual raw LF byte inside the DSL source — the exact shape
+        // `escape_literal_control_chars` (crates/khive-request/src/parser/scan.rs)
+        // exists to accept. This confirms the decoded raw newline survives
+        // parsing and dispatch all the way to the pack handler's result.
+        let wire = "{\"ops\":\"create(kind=\\\"entity\\\", entity_kind=\\\"concept\\\", name=\\\"line1\\nline2\\\")\"}";
+        let params: RequestParams = serde_json::from_str(wire).expect("wire JSON deserializes");
+        assert!(
+            params.ops.contains('\n'),
+            "deserialized ops must carry a raw LF, not the two-char escape: {:?}",
+            params.ops
+        );
+
+        let config = RuntimeConfig {
+            db_path: None,
+            default_namespace: Namespace::local(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        };
+        let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
+        let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
+
+        let parsed = parse_request(&params.ops).expect("literal newline inside quotes must parse");
+        let response = server
+            .run_parsed(
+                parsed.ops,
+                parsed.mode,
+                PresentationMode::Verbose,
+                None,
+                false,
+                None,
+            )
+            .await;
+
+        let results = response["results"]
+            .as_array()
+            .expect("results must be an array");
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0]["ok"],
+            json!(true),
+            "unexpected result: {response:?}"
+        );
+        assert_eq!(results[0]["result"]["name"], json!("line1\nline2"));
+    }
+
     // ── MCP-AUD-002 regression: save_to must bypass daemon forwarding ────────
 
     fn make_daemon_save_to_test_server() -> KhiveMcpServer {
@@ -2711,8 +2764,9 @@ mod tests {
         clear_daemon_env();
         crate::daemon::reset_fallback_counters();
         let dir = tempfile::tempdir().expect("tempdir");
-        // Never bound by anything in this test — the daemon is genuinely
-        // unreachable, exactly like `daemon::forward_or_spawn_strict_mode_errors_when_daemon_unreachable`.
+        // Never bound by anything in this test. The spawned test harness exits
+        // immediately on `mcp --daemon`, so #898 classifies this as a confirmed
+        // respawn failure rather than the older generic `no_socket` fallback.
         std::env::set_var("KHIVE_SOCKET", dir.path().join("khived.sock"));
         std::env::set_var("KHIVE_PID", dir.path().join("khived.pid"));
         std::env::set_var("KHIVE_LOCK", dir.path().join("khived.recovery.lock"));
@@ -2752,8 +2806,12 @@ mod tests {
                 "error must name the strict mode that rejected the fallback: {msg}"
             );
             assert!(
-                msg.contains("no_socket"),
-                "error must name the fallback reason: {msg}"
+                msg.contains("respawn_failed"),
+                "error must name the confirmed respawn failure: {msg}"
+            );
+            assert!(
+                msg.contains("make local"),
+                "error must include the safe respawn remediation: {msg}"
             );
         }
 

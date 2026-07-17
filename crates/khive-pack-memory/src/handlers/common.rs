@@ -1,4 +1,5 @@
 //! Shared types, utilities, and pipeline helpers for the memory verb handlers.
+//! See `crates/khive-pack-memory/docs/api/recall-pipeline.md`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicU64;
@@ -27,10 +28,7 @@ use crate::config::{RecallConfig, ScoreBreakdown, WeightedContributions};
 use crate::query_cache::QueryEmbeddingCache;
 use crate::MemoryPack;
 
-// ---------------------------------------------------------------------------
-// Per-call stage profiling, gated by KHIVE_RECALL_PROFILE=1.
-// Emits JSON lines to stderr: {"c":<call_id>,"s":<stage>,"us":<microseconds>}
-// ---------------------------------------------------------------------------
+// KHIVE_RECALL_PROFILE emits per-call stage JSON to stderr.
 pub(super) static RECALL_CALL_ID: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
@@ -64,14 +62,8 @@ pub(super) fn ann_overfetch_max_rounds() -> usize {
     })
 }
 
-/// #836: bounded wait, in milliseconds, for a cold-miss `ensure_ann_for_model`
-/// call on the recall path before that model's vector leg degrades to
-/// FTS-only. 8s sits in the middle of the 5-10s range judged long enough to
-/// absorb a snapshot-restore warm (the common cold-miss case) while still
-/// being far short of a from-scratch corpus rebuild (300s+ observed in
-/// production — the #836 hang). Overridable per-request via
-/// `RecallConfig::ann_ready_timeout_ms`; this env fallback covers callers
-/// that never set it.
+/// Return the cached ANN readiness timeout, defaulting to 8 seconds.
+/// See `crates/khive-pack-memory/docs/api/configuration.md`.
 pub(super) fn ann_ready_timeout_ms() -> u64 {
     static TIMEOUT_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *TIMEOUT_MS.get_or_init(|| {
@@ -101,11 +93,7 @@ pub(super) fn plog_n(call_id: u64, stage: &str, us: u128, n: usize) {
     );
 }
 
-/// Embed one query string for one model, checking the pack-local LRU cache first.
-///
-/// Uses query-side instruction prefix so instruction-tuned models (e.g.
-/// multilingual-e5) land in the correct retrieval space. For models with no
-/// query instruction this is identical to the generic embed path.
+/// Embed one model/query pair with the instruction-aware runtime path and local LRU.
 pub(super) async fn embed_query_model(
     runtime: khive_runtime::KhiveRuntime,
     cache: QueryEmbeddingCache,
@@ -159,12 +147,7 @@ pub(super) fn parse_fusion_strategy_str(s: &str) -> Result<FusionStrategy, Runti
     }
 }
 
-/// Resolve the serving profile via ADR-035 tiers 1-2 only (explicit config,
-/// then actor+namespace-bound `brain.resolve(consumer_kind="recall")`). Shared
-/// by `memory.feedback` (which falls through to its own tier-3 global-prior
-/// behavior on `None`) and `memory.recall`'s ADR-081 §5 serve-time stamp
-/// (which simply omits the stamp on `None`) — extracted so the two resolution
-/// paths cannot drift apart.
+/// Resolve an explicit or actor-plus-namespace recall profile; omit global fallback.
 pub(super) async fn resolve_serving_profile(
     brain_profile: &Option<String>,
     token: &NamespaceToken,
@@ -174,8 +157,7 @@ pub(super) async fn resolve_serving_profile(
         return Some(profile_id.clone());
     }
     let ns = token.namespace().as_str().to_string();
-    // #697: thread the caller's actor identity through so actor-scoped
-    // bindings match, not just namespace-scoped ones.
+    // Actor identity is required for actor-scoped, not merely namespace-scoped, bindings.
     let actor = token.actor().binding_id();
     khive_brain_core::resolve_consumer_profile(
         registry,
@@ -186,19 +168,10 @@ pub(super) async fn resolve_serving_profile(
     .await
 }
 
-/// Entity-posterior cache capacity used when reconstructing a served
-/// profile's `BalancedRecallState` from its `brain.profile` snapshot
-/// (ADR-104 §1). Matches the capacity `MemoryPack::recall_state` uses for
-/// its own in-process posterior state (`pack.rs`); the brain pack's
-/// snapshot carries its own LRU eviction order (`entity_posterior_order`),
-/// so this only bounds how many entries `from_snapshot` restores.
+/// Maximum entity posteriors restored from a served profile snapshot.
 pub(super) const PROFILE_STATE_ENTITY_CAPACITY: usize = 10_000;
 
-/// Reconstruct a served profile's live `BalancedRecallState` from a
-/// `brain.profile` response's `state_snapshot` field (ADR-104 §1).
-///
-/// Returns `None` when the snapshot is absent or malformed — callers
-/// degrade to configured defaults in that case, never fail the recall.
+/// Reconstruct profile state, returning `None` for absent or malformed snapshots.
 pub(super) fn balanced_recall_state_from_profile_response(
     resp: &Value,
 ) -> Option<khive_brain_core::BalancedRecallState> {
@@ -227,9 +200,7 @@ pub(super) struct RememberParams {
     pub(super) tags: Option<Vec<String>>,
     #[serde(default)]
     pub(super) embedding_model: Option<String>,
-    /// Optional write-namespace override. When absent, episodic memories land in
-    /// the actor's namespace and semantic memories land in "local" (the shared pool).
-    /// When present, overrides both routing rules and stamps the note in this namespace.
+    /// Exact namespace override; otherwise episodic uses actor scope and semantic uses local.
     #[serde(default)]
     pub(super) namespace: Option<String>,
 }
@@ -282,27 +253,10 @@ pub(super) struct RecallParams {
     pub(super) entity_names: Option<Vec<String>>,
     #[serde(default)]
     pub(super) full_content: Option<bool>,
-    /// ADR-104 §4: explicit serving-profile override. When set, short-circuits
-    /// ADR-081 binding resolution — the named profile's `BalancedRecallState`
-    /// serves this request and is stamped as `served_by_profile_id`, exactly
-    /// like a resolved profile. An unknown profile_id is a per-op error, not
-    /// a silent fallback to defaults.
+    /// Serving-profile override; unknown IDs are per-operation errors.
     #[serde(default)]
     pub(super) profile_id: Option<String>,
-    /// ADR-007 Rev 6 §"multi-record ops default to local + explicit escape"
-    /// (#733): exact-match read-namespace override. When absent, recall reads
-    /// the caller token's namespace (which defaults to `local`) — byte-identical
-    /// to pre-#733 behavior. When present, the candidate fetch (FTS + vector +
-    /// the ANN over-fetch retry loop) is scoped to exactly this namespace
-    /// instead of the token's (possibly wider) visible-namespace set. Invalid
-    /// values are rejected via the same `Namespace::parse` machinery used
-    /// elsewhere — never silently coerced.
-    ///
-    /// This is normally already pre-applied by `VerbRegistry::dispatch`'s
-    /// Rule-3 explicit-namespace escape (the token this handler receives
-    /// already carries `visible=[namespace]` in that path) — this field's
-    /// handling below is defense-in-depth for direct (non-dispatch) callers,
-    /// mirroring `RememberParams::namespace` / `handle_remember`.
+    /// Exact read namespace; invalid values error and direct callers receive defense-in-depth.
     #[serde(default)]
     pub(super) namespace: Option<String>,
 }
@@ -484,14 +438,9 @@ pub(super) struct RecallCandidateParams<'a> {
     pub(super) scoring_cfg: &'a crate::scoring::ScoringConfig,
     pub(super) snippet_policy: TextSnippetPolicy,
     pub(super) fts_gather: &'a crate::config::RecallFtsGatherConfig,
-    /// Maximum rounds for the ANN over-fetch retry loop. Threaded from
-    /// `RecallConfig::ann_overfetch_max_rounds` (with OnceLock env fallback)
-    /// so tests can drive both branches in-process without env mutation.
+    /// Bounded ANN widening rounds, resolved before collection.
     pub(super) ann_overfetch_max_rounds: usize,
-    /// #836: bounded wait (ms) for a cold-miss `ensure_ann_for_model` before
-    /// degrading that model to FTS-only. Threaded from
-    /// `RecallConfig::ann_ready_timeout_ms` (with OnceLock env fallback) so
-    /// tests can force the timeout branch deterministically.
+    /// Cold-ANN readiness wait before this model degrades to FTS-only.
     pub(super) ann_ready_timeout_ms: u64,
 }
 
@@ -504,25 +453,16 @@ pub(super) struct RecallVectorCandidateParams<'a> {
     /// Namespace set the caller is allowed to read. ANN returns global candidates;
     /// post-filter trims to this set before returning hits.
     pub(super) visible_namespaces: Vec<String>,
-    /// Maximum rounds for the ANN over-fetch retry loop.
-    ///
-    /// Resolved from `RecallConfig::ann_overfetch_max_rounds` (per-request) with
-    /// fallback to the process-wide `ANN_OVERFETCH_MAX_ROUNDS` env OnceLock.
-    /// Passed explicitly so tests can drive both branches in-process without
-    /// mutating the process-wide env.
+    /// Bounded widening rounds, already resolved from request or environment.
     pub(super) ann_overfetch_max_rounds: usize,
-    /// #836: bounded wait (ms) for a cold-miss `ensure_ann_for_model` before
-    /// degrading that model to FTS-only. See `RecallCandidateParams`'s field
-    /// of the same name.
+    /// Cold-ANN readiness wait before this model degrades to FTS-only.
     pub(super) ann_ready_timeout_ms: u64,
 }
 
 pub(super) struct RecallVectorCandidateResult {
     pub(super) vector_hits_per_model: Vec<(String, Vec<VectorSearchHit>)>,
     pub(super) multilingual_routed: bool,
-    /// #836: true when at least one model's vector leg hit the bounded ANN
-    /// readiness wait and was served FTS-only for this recall. The ANN
-    /// build itself keeps running in the background unaffected.
+    /// Whether any model timed out to FTS-only while its tracked build continued.
     pub(super) ann_degraded: bool,
 }
 
@@ -687,24 +627,8 @@ pub(super) fn recall_text_terms_with_limit(query: &str, limit: usize) -> Vec<Str
 }
 
 impl MemoryPack {
-    /// ADR-104 §5 (Stage C): entity-anchored candidate extraction. A single,
-    /// namespace-scoped, batched lookup against the entity store's live-row
-    /// `(namespace, LOWER(name))` index. This satisfies R1's "one batched indexed
-    /// lookup per recall, no unbounded per-recall scans of the entity table."
-    ///
-    /// `crate::scoring::entity_lookup_candidates` derives up to
-    /// `MAX_ENTITY_LOOKUP_CANDIDATES` raw and ASCII-lowercased unigram, bigram,
-    /// and bounded CJK substring candidates. One `EntityFilter::names_ci` call
-    /// resolves a distinct candidate relation with one `LIMIT 1` index seek per
-    /// name. The store skips the separate count for this filter, so lookup work
-    /// is bounded by the 64-candidate input rather than matching entity rows.
-    ///
-    /// A candidate only survives this lookup by naming a real, non-deleted
-    /// entity in the caller's namespace. That match against a real record
-    /// is the precision-safe property the ADR-104 §5 rationale hangs on. A
-    /// storage-layer failure here degrades to no anchored candidates (never
-    /// fails the recall). The caller still has `extract_entity_candidates`'s
-    /// capitalized-token fallback.
+    /// Resolve bounded query strings against live entity names in one namespace-scoped batch.
+    /// See `crates/khive-pack-memory/docs/api/recall-pipeline.md`.
     pub(super) async fn entity_anchored_candidates(
         &self,
         token: &NamespaceToken,
@@ -758,24 +682,9 @@ impl MemoryPack {
         let t_fts = if prof { Some(Instant::now()) } else { None };
         let searcher = self.runtime.text_for_notes(token)?;
 
-        // FTS5 parser syntax errors (#388, #389): sanitize_fts5_query
-        // already strips known-unsafe FTS5 metacharacters, but if the lexical
-        // leg still errors at runtime on residual punctuation the sanitizer
-        // does not strip, per #569 this now fails loud instead of degrading
-        // to an empty candidate set, so `memory.recall` surfaces the bad
-        // query instead of silently losing the lexical leg.
-        //
-        // Note: when `fts_gather.enabled`, `collect_text_hits` (text_gather.rs)
-        // already collapses every `StorageError` into `RuntimeError::Internal`
-        // via `.map_err(|e| RuntimeError::Internal(e.to_string()))` before this
-        // match ever sees it — the structured error is gone by the time it
-        // gets here, so it can never be classified as an FTS5 syntax error and
-        // always propagates in that branch. That is a pre-existing, separate
-        // information-loss issue in `collect_text_hits`, out of scope for this
-        // fix (which targets the four fail-open match arms named in #389 round
-        // 2, not `collect_text_hits`'s own `?`-propagation); it does not weaken
-        // this fix — it only means the gather-optimization path never degrades
-        // (always propagates), which is the safe direction.
+        // Sanitization handles known FTS5 syntax; residual parser errors propagate rather
+        // than silently deleting the lexical leg. Gather-mode storage errors are already
+        // flattened to RuntimeError::Internal and therefore also propagate.
         let fts_result: Result<Vec<TextSearchHit>, RuntimeError> = if fts_gather.enabled {
             crate::text_gather::collect_text_hits(
                 searcher.as_ref(),
@@ -835,13 +744,8 @@ impl MemoryPack {
             ann_ready_timeout_ms,
         } = opts;
 
-        // FTS recall uses the single shared fts_notes table (V4 migration). Namespace
-        // filtering is applied via TextFilter.namespaces with the full visible set
-        // (ADR-007 Rev 4 Phase 1.5 — visible includes {local} ∪ {actor.id} ∪
-        // {actor.visible_namespaces} as built by token.visible_namespace_strs()).
-        // ANN recall uses the single global index per model (spans all namespaces).
-        // Namespace scoping is applied post-search: the vector path over-fetches,
-        // then filters candidates to the caller's visible set before returning.
+        // FTS filters the shared table by visible namespaces; global ANN over-fetches and
+        // post-filters to the same set.
         let visible: Vec<String> = token
             .visible_namespace_strs()
             .into_iter()
@@ -883,18 +787,10 @@ impl MemoryPack {
         })
     }
 
-    /// Collect vector (ANN / sqlite-vec) recall candidates.
+    /// Collect namespace-safe model candidates through ANN or exact sqlite-vec.
     ///
-    /// ANN path: the global index spans all namespaces. To respect the caller's
-    /// visible namespace set we over-fetch and then apply a post-filter at note
-    /// hydration time (see `load_memory_candidate_notes`). The over-fetch factor
-    /// is F=4 with a fixed margin M=32: k' = max(k * 4, k + 32). This ensures
-    /// enough candidates survive the namespace filter to fill `k` results on a
-    /// single-namespace store at no extra cost (all candidates pass the filter
-    /// on round 1). On a multi-namespace store the margin absorbs foreign hits.
-    ///
-    /// sqlite-vec fallback: namespace filter is passed directly into the query
-    /// (`namespace = ?`) so no over-fetch is required.
+    /// Global ANN starts at `max(k * 4, k + 32)` and post-filters; sqlite-vec filters in
+    /// SQL. See `crates/khive-pack-memory/docs/api/recall-pipeline.md`.
     pub(super) async fn collect_recall_vector_hits(
         &self,
         token: &NamespaceToken,
@@ -1016,10 +912,7 @@ impl MemoryPack {
                 }
             }
 
-            // ann_overfetch_max_rounds is resolved by the caller (from RecallConfig or
-            // the process-wide OnceLock env fallback) and threaded via
-            // RecallVectorCandidateParams so both branches are exercisable in-process
-            // without env mutation.
+            // Widening rounds are resolved before this loop, enabling deterministic tests.
 
             let t_ann_total = if prof { Some(Instant::now()) } else { None };
             let mut ann_route = "ann";
@@ -1027,49 +920,10 @@ impl MemoryPack {
             for (model_name, vec) in query_vecs {
                 let key = AnnKey::new(ns, &model_name);
 
-                // ANN path: search the global index with ann_fetch_limit (over-fetch)
-                // plus a bounded widening retry. The index spans all namespaces;
-                // namespace scoping is enforced here by counting how many returned IDs
-                // belong to the caller's visible_namespaces set. If fewer than
-                // candidate_limit candidates survive, we double the fetch window and
-                // retry — up to ANN_OVERFETCH_MAX_ROUNDS total rounds, or until the
-                // index is exhausted (returned hits < requested k). Single-namespace
-                // stores fill on round 1 at zero extra cost.
-                // #750: `is_current` treats "present but stale relative to
-                // this model's write-generation counter" as behind, so a
-                // background build that snapshotted the corpus before the
-                // most recent write is never mistaken for a fully fresh one.
-                //
-                // #791: being behind is no longer treated the same as a
-                // genuine cache miss. It used to route straight into
-                // `ensure_ann_for_model`, which — on a cache that a
-                // concurrent `memory.remember` had just cleared and whose
-                // snapshot it had just deleted — meant a full synchronous
-                // corpus rebuild inline on THIS recall's own request path
-                // (the #791 hang: single-flighted, so every other concurrent
-                // recall for the same model waited out the same rebuild).
-                // Writes no longer clear the cache at all (`ann::bump_generation`'s
-                // doc comment), so the previous, still-installed entry is
-                // always tried first via `search_loaded` regardless of
-                // freshness. A stale-but-present hit is served immediately;
-                // the already-existing background warm is (re-)fired so a
-                // later recall benefits from the fresher build once
-                // `install_if_fresher` installs it. Only a genuine miss —
-                // nothing installed for this model at all, e.g. before the
-                // very first warm has ever completed — still pays for an
-                // inline `ensure_ann_for_model`, and even that no longer
-                // monopolizes a tokio worker: the CPU-bound graph build
-                // inside it now runs via `tokio::task::spawn_blocking`
-                // (`ann.rs::load_and_build_from_vector_store`).
-                //
-                // PR #812: `is_current` alone only
-                // sees THIS process's write-generation counter, which
-                // `kkernel reindex` (a separate OS process) never touches —
-                // an already-warm daemon would otherwise trust its cached
-                // entry forever after a cross-process reindex. The amortized
-                // durable-epoch check below observes a signal written to the
-                // shared SQLite file instead, debounced so it doesn't add a
-                // DB round-trip to every recall.
+                // Global ANN search widens only when namespace post-filtering leaves too few hits.
+                // A stale installed graph remains the immediate fallback and triggers background
+                // replacement; only a genuine miss waits for ensure. Durable epoch checking adds
+                // cross-process reindex visibility beyond in-process generations.
                 ann::maybe_check_durable_epoch(&self.runtime, &self.ann, &key).await;
                 let cache_fresh = ann::is_current(&self.ann, &key).await;
                 let search_result =
@@ -1077,45 +931,9 @@ impl MemoryPack {
                 if !cache_fresh && matches!(search_result, Ok(Some(_))) {
                     ann::ensure_ann_background(&self.runtime, token, &self.ann, &model_name).await;
                 }
-                // #836: a genuine cache miss (nothing installed for this
-                // model at all) still pays for an inline `ensure_ann_for_model`,
-                // but that call contends on the same per-model single-flight
-                // lock the daemon's boot-time `warm_existing_memory_indexes`
-                // holds for the duration of a from-scratch corpus build
-                // (300s+ observed in production). Bound the wait: past
-                // `ann_ready_timeout_ms`, abandon WAITING for this attempt and
-                // degrade this model's vector leg to FTS-only for this recall.
-                //
-                // PR #836: the build itself must never be dropped on
-                // timeout. In the CONTENDED case (some other holder — e.g.
-                // boot warm — already owns `ensure_ann_for_model`'s per-model
-                // `model_warm_lock`) that other holder's own call keeps
-                // running unaffected either way. But on a genuine SELF-BUILD
-                // (no other holder — a cold embedded runtime, or a new model
-                // introduced over a big corpus after boot) this call IS the
-                // only build in flight: dropping the bare timed-out future
-                // used to abandon it mid-build after it had already emitted
-                // `PhaseStarted`, so the matching `PhaseCompleted`/
-                // `PhaseCancelled` never fired (breaking the phase-span
-                // invariant), and left nothing running in the background —
-                // every later recall repeated the same doomed from-scratch
-                // build and timed out again, forever.
-                //
-                // Fix: spawn the `ensure_ann_for_model` call onto a tracked
-                // background task (same `khive_runtime::track_background_task`
-                // `ensure_ann_background` uses, so daemon shutdown's drain()
-                // waits for it) and race a completion signal against the
-                // deadline instead of racing the build itself. On timeout,
-                // only the receiving half is dropped — the sender side (the
-                // spawned task, and the `ensure_ann_for_model` call inside
-                // it) runs to completion regardless, so the phase-event pair
-                // always closes and a later recall finds a warm index.
-                // `ensure_ann_for_model`'s own per-model `model_warm_lock`
-                // single-flights every caller against the same key (spawned
-                // or not), so a second concurrent detach here just blocks on
-                // that lock and returns `AlreadyLoaded` once the first
-                // finishes — it can never start a second build for the same
-                // model.
+                // Bound genuine-miss readiness, but never drop the build itself: a tracked task
+                // owns ensure and its phase span while this request races only the result channel.
+                // Per-model single flight prevents duplicate detached builds.
                 let mut model_ann_timed_out = false;
                 let initial_raw_hits: Option<Vec<(Uuid, f32)>> = match search_result {
                     Ok(Some(hits)) => Some(hits),
@@ -1152,14 +970,7 @@ impl MemoryPack {
                             }
                             Ok(Ok(Err(e))) => return Err(e),
                             Ok(Err(_sender_dropped)) => {
-                                // The tracked task's sender was dropped
-                                // without sending — only reachable if that
-                                // task itself panicked (its
-                                // `BackgroundTaskGuard` still decrements the
-                                // shared counter on unwind). Degrade this
-                                // model's vector leg rather than surfacing a
-                                // different task's panic as this recall's
-                                // own error.
+                                // A detached-task panic degrades this model instead of failing recall.
                                 tracing::warn!(
                                     model = %model_name,
                                     namespace = %ns,
@@ -1200,33 +1011,18 @@ impl MemoryPack {
                 };
 
                 if model_ann_timed_out {
-                    // FTS-only degraded fallback: contribute zero vector
-                    // candidates for this model rather than falling through
-                    // to the sqlite-vec exact-search branch below, which is
-                    // itself an O(corpus) scan unsuited to a bounded-latency
-                    // fallback. `fuse_candidates` degenerates to the lexical
-                    // (FTS) arm for this model's contribution.
+                    // Do not replace a bounded timeout with an O(corpus) exact scan.
                     results.push((model_name, Vec::new()));
                     continue;
                 }
 
                 if let Some(first_raw) = initial_raw_hits {
-                    // Bounded retry: widen fetch window if visible-namespace survivors
-                    // are short. Termination: enough survivors OR corpus exhausted (returned
-                    // hits < requested k means the index has no more candidates).
+                    // Widen until enough visible hits survive or ANN reports corpus exhaustion.
                     let note_store = self.runtime.notes(token)?;
                     let visible_set: std::collections::HashSet<&str> =
                         visible_namespaces.iter().map(String::as_str).collect();
 
-                    // Gate: run the retry loop only when the global ANN index contains
-                    // vectors from namespaces outside the caller's visible set.
-                    //
-                    // We query the namespace set stored on the loaded AnnBridge. If the
-                    // set is empty (e.g. freshly snapshot-restored bridge whose set has
-                    // not yet been populated) we treat it conservatively as "may contain
-                    // non-visible namespaces" and proceed with the loop. If the index
-                    // namespace set is a subset of visible_set then all indexed vectors
-                    // pass the post-filter on round 1 — no retry needed.
+                    // Empty namespace metadata is conservative; a visible-only set skips retry.
                     let index_has_non_visible =
                         match ann::index_namespace_set(&self.ann, &key).await {
                             Some(index_ns) if !index_ns.is_empty() => {
@@ -1240,10 +1036,7 @@ impl MemoryPack {
                     let mut best_raw = first_raw;
                     let mut current_fetch_limit = ann_fetch_limit;
 
-                    // Run the retry loop only when the index spans namespaces outside
-                    // the caller's visible set. On a single-namespace store where the
-                    // index only covers the visible namespace, this is skipped entirely
-                    // at zero extra cost (no note-batch fetch, no extra ANN searches).
+                    // Visible-only indexes incur no hydration or extra ANN searches here.
                     if index_has_non_visible {
                         for _round in 1..ann_overfetch_max_rounds {
                             let corpus_exhausted = best_raw.len() < current_fetch_limit;

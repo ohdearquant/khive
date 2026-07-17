@@ -15,18 +15,11 @@ pub(crate) struct SendParams {
     pub subject: Option<String>,
     #[serde(default)]
     pub thread_id: Option<String>,
-    /// Structured provenance tags (e.g. run id, job id, traffic class), persisted
-    /// verbatim to `properties["tags"]` on both the outbound and inbound copies.
-    /// Mirrors the shipped `memory.remember` `tags` precedent (issue #495).
+    /// Structured provenance tags, persisted verbatim on both copies (issue #495).
     #[serde(default)]
     pub tags: Option<Vec<String>>,
-    /// Explicit acknowledgment that `to` intentionally names the sender's own
-    /// resolved actor identity (khive #820). Required whenever the resolved
-    /// `to_actor` equals `from_actor`; without it such a send is rejected rather
-    /// than silently delivered, since a sub-agent session addressing a distinct
-    /// parent/orchestrator actor that happens to collapse onto its own identity
-    /// (both resolve `[actor] id` from the same project-scoped
-    /// `.khive/config.toml`, ADR-096 Fork 2) is a mis-resolution, not intent.
+    /// Opt-in to send to one's own actor identity (khive #820). See
+    /// crates/khive-pack-comm/docs/api/message-lifecycle.md#handlersrshandle_send
     #[serde(default)]
     pub self_send: bool,
 }
@@ -73,32 +66,21 @@ pub(crate) struct ThreadParams {
     pub id: String,
     #[serde(default)]
     pub limit: Option<u32>,
-    /// Ordering of the returned messages: `"asc"` (default, chronological) |
-    /// `"desc"` (newest first). Truncation to `limit` applies after ordering,
-    /// so `order="desc"` returns the newest `limit` messages instead of the
-    /// oldest (issue #494 — long threads previously lost the tail).
+    /// `"asc"` (default) | `"desc"`. Truncation to `limit` applies after
+    /// ordering (issue #494 — long threads previously lost the tail).
     #[serde(default)]
     pub order: Option<String>,
-    /// Cursor: a message id (short prefix or full UUID) or an RFC 3339
-    /// timestamp. Id cursors compare on the total order `(created_at,
-    /// full_id)` so equal-timestamp messages are never skipped or duplicated;
-    /// timestamp cursors are parsed (any valid RFC 3339 form) rather than
-    /// string-compared. "After" is relative to the chosen `order` (for
-    /// `desc`, strictly older in the descending sequence). An unparseable or
-    /// unresolvable cursor is an error, never silently ignored.
+    /// Message id or RFC 3339 timestamp cursor. See
+    /// crates/khive-pack-comm/docs/api/message-lifecycle.md#handlersrshandle_thread
     #[serde(default)]
     pub after: Option<String>,
 }
 
-/// Parameters for `comm.ingest` — ingests a single inbound message from a channel adapter.
-///
-/// `deny_unknown_fields` is intentionally absent: the polling loop may pass extra fields
-/// (including the `namespace` routing key consumed by the dispatch layer) that future
-/// handler versions can extend without breaking existing deployments.
-///
-/// The `namespace` key is consumed by `VerbRegistry::dispatch` to mint the `NamespaceToken`
-/// before the handler is called; the handler uses `token` directly and does not read
-/// `namespace` from this struct.
+/// Parameters for `comm.ingest` — ingests a single inbound message from a
+/// channel adapter. `deny_unknown_fields` is intentionally absent (forward-
+/// compat with future handler fields); `namespace` is consumed by
+/// `VerbRegistry::dispatch`, not read from this struct. See
+/// crates/khive-pack-comm/docs/api/message-lifecycle.md#handlersrshandle_ingest
 #[derive(Deserialize)]
 pub(crate) struct IngestParams {
     /// Sender address in `channel-kind:addr` form.
@@ -123,38 +105,28 @@ pub(crate) struct IngestParams {
     /// External correlation key for thread resolution (e.g. X-Khive-Thread-ID or In-Reply-To value).
     #[serde(default)]
     pub correlation_external_id: Option<String>,
-    /// Actor to route to when no correlation resolves a prior sender (e.g. `"lambda:leo"`).
-    /// When absent and no correlation match is found, falls back to `p.to.trim()`.
+    /// Actor to route to when no correlation resolves a prior sender. Falls
+    /// back to `p.to.trim()` when absent and no correlation match is found.
     #[serde(default)]
     pub default_inbound_actor: Option<String>,
-    /// This message's own RFC 822 Message-ID (including angle brackets), when the
-    /// channel adapter captured one. Distinct from `external_id` (the transport
-    /// dedup key). Persisted so a later reply to this note can set In-Reply-To /
-    /// References for native MUA conversation grouping.
+    /// This message's own RFC 822 Message-ID (angle brackets included), distinct
+    /// from `external_id` (the transport dedup key). Persisted for In-Reply-To/
+    /// References on a later reply.
     #[serde(default)]
     pub wire_message_id: Option<String>,
-    /// This message's own RFC 822 References header value, verbatim, when the
-    /// channel adapter captured one. Persisted so a later reply to this note can
-    /// extend the full ancestor chain instead of truncating it to this message's
-    /// own Message-ID (issue #403).
+    /// This message's own RFC 822 References header value, verbatim. Persisted
+    /// so a later reply can extend the full ancestor chain (issue #403).
     #[serde(default)]
     pub wire_references: Option<String>,
-    /// Optional transport-layer metadata passthrough, merged verbatim into the
-    /// stored note's properties alongside the fields above. Generic and
-    /// channel-agnostic: the comm pack does not interpret any key in this map,
-    /// it only persists it. A channel adapter that needs to attach adapter-specific
-    /// markers (e.g. the email channel's quarantine flags, ADR-056 Amendment
-    /// 2026-07-02) sets `ChannelEnvelope.metadata`; the MCP poll loop forwards it
-    /// here unchanged. Absent metadata is today's behavior exactly (issue #448).
+    /// Transport-layer metadata passthrough, merged verbatim into the stored
+    /// note's properties. Generic and channel-agnostic — see
+    /// docs/api/message-lifecycle.md#handlersrshandle_ingest.
     #[serde(default)]
     pub metadata: Option<serde_json::Map<String, Value>>,
 }
 
 /// Parameters for `comm.heartbeat` — persists a per-channel-credential heartbeat row.
-///
-/// `deny_unknown_fields` is intentionally absent, matching `IngestParams`: the
-/// `namespace` routing key is consumed by `VerbRegistry::dispatch` before the
-/// handler sees `params`, not read from this struct.
+/// `deny_unknown_fields` is intentionally absent, matching `IngestParams`.
 #[derive(Deserialize)]
 pub(crate) struct HeartbeatParams {
     pub channel_kind: String,

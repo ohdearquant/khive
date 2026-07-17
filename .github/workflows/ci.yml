@@ -32,7 +32,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
-      contents: read
+      # disablePullRequestAutoMerge needs contents: write in addition to
+      # pull-requests: write — with contents: read the mutation is rejected
+      # ("Resource not accessible by integration") and, because this job
+      # fail-closes into the CI gate, every push to an armed PR turned the
+      # gate red even after re-review (first hit: PR #1054, 2026-07-17).
+      contents: write
       pull-requests: write
     steps:
       - name: Disable stale auto-merge request
@@ -392,6 +397,92 @@ jobs:
       - name: Native sequential and owned-storage tests
         run: cargo test -p khive-quant -p khive-vamana --no-default-features
 
+  minio-blob-compat:
+    name: MinIO BlobStore compatibility (ADR-111 Amendment 2)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: crates
+    steps:
+      - uses: actions/checkout@v7
+      # Gate on storage-layer changes only: the MinIO leg (container start,
+      # image pull) is the slowest part of this job, and most PRs never touch
+      # the blob store. `git diff` against the PR base (or the pushed range
+      # on a direct push) decides whether the rest of the job runs at all.
+      - name: Determine whether storage crates changed
+        id: changed
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+          else
+            base="${{ github.event.before }}"
+          fi
+          if [ -z "$base" ] || ! git cat-file -e "$base" 2>/dev/null; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "no comparable base SHA -- running the MinIO leg to be safe"
+            exit 0
+          fi
+          if git diff --name-only "$base" HEAD -- .. | grep -qE '^(crates/khive-db/|crates/khive-storage/|docs/adr/ADR-111)'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: dtolnay/rust-toolchain@1.94.1
+        if: steps.changed.outputs.run == 'true'
+      - uses: Swatinem/rust-cache@v2
+        if: steps.changed.outputs.run == 'true'
+        with:
+          workspaces: crates
+          cache-on-failure: true
+      # `docker run` rather than a `services:` container: MinIO's image needs
+      # `server /data` as its command, and GitHub Actions service containers
+      # cannot override the image's default command/entrypoint.
+      #
+      # Pinned to an immutable digest (H3 fix round 2), matching the repo's
+      # own supply-chain-pin convention (see the `supply-chain` job above).
+      # Resolved 2026-07-16 from the `minio/minio:latest` manifest list via
+      # `registry-1.docker.io`'s `Docker-Content-Digest` response header
+      # (`docker.io/v2/minio/minio/manifests/latest`). Both the server
+      # container below and the `mc` client image in the next step pin the
+      # same digest.
+      - name: Start pinned MinIO
+        if: steps.changed.outputs.run == 'true'
+        run: |
+          docker run -d --name khive-minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=khive-ci \
+            -e MINIO_ROOT_PASSWORD=khive-ci-secret \
+            minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e \
+            server /data
+          for _ in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:9000/minio/health/live >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "MinIO did not become healthy in time" >&2
+          docker logs khive-minio || true
+          exit 1
+      - name: Create the conformance bucket
+        if: steps.changed.outputs.run == 'true'
+        run: |
+          docker run --rm --network host --entrypoint /bin/sh \
+            minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e -c \
+            "mc alias set ci http://127.0.0.1:9000 khive-ci khive-ci-secret && \
+             mc mb --ignore-existing ci/khive-blob-conformance"
+      - name: Shared BlobStore conformance suite against MinIO
+        if: steps.changed.outputs.run == 'true'
+        env:
+          KHIVE_S3_TEST_ENDPOINT: http://127.0.0.1:9000
+          KHIVE_S3_TEST_BUCKET: khive-blob-conformance
+          KHIVE_S3_TEST_REGION: us-east-1
+          AWS_ACCESS_KEY_ID: khive-ci
+          AWS_SECRET_ACCESS_KEY: khive-ci-secret
+        run: cargo test -p khive-db --test blob_conformance
+      - name: Stop MinIO
+        if: always() && steps.changed.outputs.run == 'true'
+        run: docker rm -f khive-minio || true
+
   check-windows:
     name: Windows compile check
     runs-on: windows-latest
@@ -428,6 +519,18 @@ jobs:
     # rejected and fail the job on every merge.
     steps:
       - uses: actions/checkout@v7
+      # `cargo llvm-cov --workspace` is the disk-heaviest command in CI: it
+      # instruments every crate and emits per-object profraw files on top of the
+      # normal target dir, overflowing the ubuntu runner's ~21GB and surfacing as
+      # `No space left on device`. The matrix `ci` job already purges the unused
+      # preinstalled toolchains to reclaim ~25GB; this gate needs the same purge.
+      - name: Free runner disk (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force || true
+          df -h /
       - uses: dtolnay/rust-toolchain@1.94.1
         with:
           components: llvm-tools-preview
@@ -493,6 +596,7 @@ jobs:
       - coverage-ratchet
       - wasm-parity
       - vamana-portability
+      - minio-blob-compat
     if: always()
     steps:
       - name: Check aggregated job results
