@@ -791,43 +791,85 @@ introduced here. The three verbs below are pure readers: each opens a map
 database, computes over its stored entities and edges, and returns a
 result. None of them writes to any database, production or map.
 
-### E2: `code.coupling(db?, level?, limit?, offset?)`
+### E2: `code.coupling(db, level?, limit?, offset?)`
 
 Fan-in/fan-out over `depends_on` edges, per module by default
 (`level="module"`), or per project when `level="project"` — aggregating the
 same edges up to the `project contains module` containment rule (D3 #9).
-Results are sorted by total degree (fan_in + fan_out) descending. Each
-result row carries the entity id, its name, `fan_in` (incoming `depends_on`
-edge count), and `fan_out` (outgoing `depends_on` edge count). `limit` and
-`offset` paginate the sorted result the same way `list` does elsewhere in
-the pack surface.
+`level` is a closed enum, `module` or `project`; see E6 for why
+declaration-level coupling is out of scope for this amendment. `db` is
+required (E7) — there is no `path`-derived default for analysis verbs the
+way `code.ingest` has one for `path` itself (B1).
 
-### E3: `code.health(db?)`
+Each result row carries the entity id, its name, `fan_in` (incoming
+`depends_on` edge count), and `fan_out` (outgoing `depends_on` edge count).
+Rows are ordered by total degree (fan_in + fan_out) descending, then by
+entity id ascending as a tiebreaker — a total order, so two identical calls
+return rows in the same sequence and paginating through `limit`/`offset`
+reproduces exactly the prefix an unpaginated call would return (E8).
 
-A single summary object over one map database:
+At `level="project"`, `fan_out` counts the number of _distinct_ neighbor
+projects this project depends on, and `fan_in` counts the number of
+distinct neighbor projects that depend on it — not edge counts. A
+dependency from project A to project B counts as one neighbor relationship
+if there is a direct project-to-project `depends_on` edge from A to B, or
+at least one module-to-module `depends_on` edge whose source module
+belongs (via `contains`) to A and whose target module belongs to B; A and
+B count as neighbors once regardless of how many edges — direct or
+module-mediated — witness the relationship.
 
-- entity and edge counts, broken down by kind (mirroring `stats()`'s shape
-  for the KG substrate, scoped to the target map database);
-- the top-N coupling outliers, reusing E2's computation rather than a
-  separate query;
-- the count of modules with zero incoming `depends_on` edges — dead-module
-  candidates, scoped to modules actually present in the ingested set, the
-  same scoping Amendment 2's B8 acceptance property 1 uses for dead symbols;
-- the cycle count, reusing E4's computation rather than a separate query.
+### E3: `code.health(db, top_n?)`
+
+A single summary object over one map database, computed directly against
+that database — not a call to the existing `stats()` verb, which reports
+KG-substrate counts and has no target-database parameter:
+
+- `entities_by_kind` — a map from entity-kind token to count, over the
+  target database's own entities.
+- `edges_by_relation` — a map from edge-relation token to count, over the
+  target database's own edges.
+- `coupling_outliers` — an array of coupling rows in E2's shape and order,
+  reusing E2's computation rather than a separate query. Its length is
+  `top_n` (default 10, max 100).
+- `dead_module_candidate_count` — the count of modules with zero incoming
+  `depends_on` edges, scoped to modules actually present in the ingested
+  set, the same scoping Amendment 2's B8 acceptance property 1 uses for dead
+  symbols.
+- `cyclic_component_count` — the number of cyclic components (E4), reusing
+  E4's computation rather than a separate query.
 
 `code.health` is a composition of `code.coupling` and `code.cycles` plus
 counting; it introduces no computation beyond what those two verbs already
-define.
+define. `db` is required, per E7.
 
-### E4: `code.cycles(db?, limit?)`
+### E4: `code.cycles(db, limit?, max_members?)`
 
-Enumerates module-level `depends_on` cycles: strongly connected components
-of size two or more over the `concept/module -> depends_on -> concept/module`
-edge set (D3 #8), plus self-loops (a module depending on itself). Each
-cycle is returned as an ordered list of module ids and names. `limit`
-bounds the number of cycles returned, not the traversal itself — the
-underlying SCC computation always runs over the full module graph of the
-target database.
+`code.cycles` returns **cyclic components**, not enumerated simple cycles.
+Each result item is one strongly connected component of size two or more
+over the `concept/module -> depends_on -> concept/module` edge set (D3 #8),
+or a self-loop component of size one (a module depending on itself).
+Simple-cycle enumeration — every distinct cycle through a component's
+members — is exponential in the worst case and is out of scope; a
+component's presence proves at least one directed cycle runs through its
+members, without claiming to enumerate all of them.
+
+Each component is returned as an ordered list of module ids and names,
+members ordered by entity id ascending. The top-level result list is
+ordered by member_count descending, then by the smallest member id
+ascending — a total order, for the same pagination-determinism reason as
+E2.
+
+Detection cost is linear in the size of the target database's module
+graph — a single Tarjan pass over its `depends_on` edges, run once
+regardless of how many components exist or how the caller bounds the
+response. `limit` (default 20, max 100) and `max_members` (default 100,
+max 1000) bound only the response's size, not detection: `limit` caps the
+number of components serialized, and `max_members` caps how many members a
+single component's member list serializes before truncating. A component
+whose true member count exceeds `max_members` still reports its full
+`member_count` and sets `truncated: true`; its serialized member list is
+cut to the first `max_members` members in the component's own id-ascending
+order.
 
 ### E5: Cycle detection is in-process, not a query recipe
 
@@ -840,19 +882,25 @@ own design, not a convenience choice: `khive-query`'s validator
 that repeats a node variable, with the rejection reason stated in the error
 text itself as cycle/self-reachability detection, and the rejection is
 locked by regression tests. A pattern that walks a module back to itself —
-the shape a cycle query needs — cannot be expressed in either query
-language today. `code.cycles` exists because the gap is structural, not
-because in-process computation was preferred over a documented query recipe
-that could have been written instead.
+the shape a cyclic-component query needs — cannot be expressed in either
+query language today. `code.cycles` exists because the gap is structural,
+not because in-process computation was preferred over a documented query
+recipe that could have been written instead.
 
 ### E6: Non-goals
 
-- No declaration-level (L2) analysis semantics are defined here. `code.ingest`'s
-  L2 tier remains unimplemented; once it ships, `code.coupling` and
-  `code.cycles` extend naturally to the D2 subtypes (`function`, `datatype`,
-  `interface`) without a further ADR, because both verbs already operate on
-  arbitrary `depends_on` edges rather than a module-only special case. This
-  amendment does not specify that extension's exact shape.
+- No declaration-level (L2) analysis semantics are defined here. `level` is
+  a closed enum, `module` or `project`, for both `code.coupling` and
+  `code.cycles` in v1. `code.ingest`'s L2 tier remains unimplemented;
+  declaration-level analysis is deferred to a future amendment once L2
+  ships, and that amendment — not this one — owns eligibility, aggregation,
+  selectors, and health semantics for declaration entities. Nothing here
+  implies what that shape will be. Regardless of what else a target map
+  database contains (a future L2's declaration-level entities, or ordinary
+  `finding` notes), `code.coupling` and `code.cycles` filter to
+  module-to-module `depends_on` edges only in v1 — plus the
+  project-to-project and module-mediated project handling defined in E2 for
+  `level="project"`.
 - No mutation. All three verbs are read-only, per E1.
 - No scheduled or background analysis. Every call computes fresh over the
   database's current state at call time; there is no cached or
@@ -861,24 +909,44 @@ that could have been written instead.
   unchanged from Amendment 3 (C1).
 - No schema change. `SCHEMA_PLAN` remains `None`, as declared in D5.
 
-### E7: Target database posture — the production-db fence is restated, not relaxed
+### E7: Target database posture — the production-db fence is restated, hardened, not relaxed
 
 `code.coupling`, `code.health`, and `code.cycles` resolve their `db`
 parameter through the same db-target resolution `code.ingest` uses (B1,
 B7), and each refuses the shared production database exactly as
 `code.ingest` does: analysis over `khive.db` is rejected with no override
-available on any of the three verbs. The D6.1 granularity fence exists to
-keep exhaustive symbol/call graphs out of the shared production graph;
-letting analysis verbs read the production database would not itself
-violate that fence's storage rule, but it would create a second path that
-depends on the fence never being violated elsewhere, which is exactly the
-posture B7 already rejected once for writes. Restating the same fence for
-reads keeps the rule uniform across the pack's entire verb surface: `db`
-always means a dedicated map database.
+available on any of the three verbs. `db` is required on all three analysis
+verbs — there is no `path`-derived default the way `code.ingest` has one
+for `path` itself (B1), so an omitted `db` has nothing to derive a target
+from and is rejected outright; resolution reuse with `code.ingest`
+therefore applies to explicit caller-supplied values only.
+
+The shared resolver is hardened by this amendment, not replaced: the
+existing path-based rejection (comparing the resolved target path string
+against the known production database path) stays in place but is not
+sufficient on its own, since a hard link gives a second path pointing at
+the same underlying file. The resolver now also performs opened-file
+identity verification — after opening the target database file, its
+(device, inode) identity is compared against the resolved production
+database file's (device, inode) identity, and a match aborts with the same
+fence error the path-based check already raises. Because the resolution is
+shared (B1, B7), `code.ingest` gains this same hardening; this amendment
+does not introduce a second resolution path, it strengthens the one B7
+already established.
+
+The D6.1 granularity fence exists to keep exhaustive symbol/call graphs out
+of the shared production graph; letting analysis verbs read the production
+database would not itself violate that fence's storage rule, but it would
+create a second path that depends on the fence never being violated
+elsewhere, which is exactly the posture B7 already rejected once for
+writes. Restating the same fence for reads, with the added hard-link
+hardening, keeps the rule uniform across the pack's entire verb surface:
+`db` always means a dedicated map database, verified by identity, not just
+by the path the caller happened to supply.
 
 ### E8: Acceptance
 
-An implementation of this amendment is acceptance-tested against four
+An implementation of this amendment is acceptance-tested against six
 properties:
 
 1. **Coupling correctness.** `code.coupling` run against a small fixture
@@ -886,16 +954,31 @@ properties:
    values matching the hand count, at both `level="module"` and
    `level="project"`.
 2. **Cycle detection, positive and negative.** `code.cycles` run against a
-   synthetic fixture containing a 3-module cycle (`A depends_on B
-   depends_on C depends_on A`) returns exactly that cycle; run against a
-   synthetic fixture whose module graph is a DAG, it returns an empty
-   result.
-3. **Production-db fence.** All three verbs, called with `db` unset or
-   explicitly pointed at the shared production database, are rejected with
-   the same error class `code.ingest` uses for the same condition (B7).
-4. **Idempotent reads.** Two consecutive calls to the same verb with the
-   same `db` and the same other parameters, with no intervening write,
-   return identical results.
+   synthetic fixture containing a 3-module cyclic component (`A depends_on
+   B depends_on C depends_on A`) returns exactly that component; run
+   against a synthetic fixture whose module graph is a DAG, it returns an
+   empty result.
+3. **Production-db fence.** All three verbs, called with `db` explicitly
+   pointed at the shared production database, are rejected with the same
+   error class `code.ingest` uses for the same condition (B7). (An omitted
+   `db` is a separate, ordinary missing-required-parameter rejection — see
+   E7 — not this fence error.)
+4. **Hard-link rejection.** A hard link to the production database file,
+   opened as an explicit `db` target under a different path, is rejected
+   with the same fence error as property 3 — the opened-file (device,
+   inode) identity check (E7) catches what the path-based check alone
+   would miss.
+5. **Deterministic ordering and pagination.** Two consecutive calls to the
+   same verb with the same `db` and the same other parameters, with no
+   intervening write, return identical, identically-ordered results
+   (idempotent reads); and for `code.coupling`, stitching together
+   successive `limit`/`offset` pages reproduces exactly the prefix an
+   unpaginated call over the same rows would return, verifying the total
+   order defined in E2.
+6. **Truncated giant component.** `code.cycles` run against a fixture whose
+   cyclic component exceeds `max_members` returns that component with
+   `truncated: true`, a member list capped at `max_members`, and a
+   `member_count` equal to the component's true, untruncated size.
 
 ### E9: Interface note — verb count delta
 
