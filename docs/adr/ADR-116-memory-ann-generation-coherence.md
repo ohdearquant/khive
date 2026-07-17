@@ -436,8 +436,13 @@ example:
 
 ```sql
 WHERE index_type = 'memory_vamana'
-  AND namespace NOT LIKE 'global::memory_vamana::%'
+  AND namespace NOT GLOB 'global::memory_vamana::*'
 ```
+
+The prefix match MUST be case-sensitive. SQLite `LIKE` is ASCII case-insensitive by default, so a
+`NOT LIKE` form would also retain legacy rows whose namespace differs from the retained key only by
+case (`GLOBAL::memory_vamana::…` passes namespace validation); `GLOB` compares case-sensitively.
+The regression suite MUST include an uppercase-namespace legacy row.
 
 This purge deletes legacy `{namespace}::memory_vamana::{model}` rows but preserves active global
 rows. Active-row invalidation after reindex MAY remain a defense-in-depth latency optimization; it
