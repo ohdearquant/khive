@@ -1,5 +1,6 @@
-//! `code.ingest` L1 (manifest edges) + L1.5 (import-scan edges) core pipeline
-//! (ADR-085 Amendment 2 B3-B6). L2 Scanner/Extractor is out of scope (PR-2).
+//! `code.ingest` L1 (manifest edges) + L1.5 (import-scan edges) + L2
+//! (Scanner/Extractor symbol tier, Rust only) core pipeline (ADR-085
+//! Amendment 2 B3-B6).
 //!
 //! Identity (B4): every entity this pipeline creates has a `uuid5`-derived
 //! id, so re-ingesting the same path is a pure upsert — no dedup lookups are
@@ -21,9 +22,11 @@ use khive_types::EdgeRelation;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use crate::extractor::{self, DeclKind};
 use crate::imports::{self, Resolved};
 use crate::ingest::CODE_INGEST_NAMESPACE;
 use crate::manifest;
+use crate::scanner_rust;
 
 /// Outcome counters for one `code.ingest` call, mirroring `git.digest`'s
 /// `IngestReport` shape (ADR-088 Amendment 1 precedent).
@@ -33,10 +36,19 @@ pub struct CodeSourceIngestReport {
     pub projects_updated: u64,
     pub modules_created: u64,
     pub modules_updated: u64,
+    /// L2 symbol-tier declaration entities (ADR-085 Amendment 2 B2-B3),
+    /// zero when `enable_l2` is false.
+    pub symbols_created: u64,
+    pub symbols_updated: u64,
     pub edges_created: u64,
     pub edges_updated: u64,
     pub unresolved_recorded: u64,
     pub unresolved_resolved: u64,
+    /// L2 call-target / impl-target names that did not resolve against the
+    /// same `source_project`'s declaration set (a same-project coverage
+    /// floor, analogous to L1.5's unresolved-specifier queue but without a
+    /// deferred re-resolve pass in this slice — see ADR-085 PR body).
+    pub symbol_dependencies_unresolved: u64,
     pub languages: Vec<String>,
     /// Per-manifest / per-file failures that did not abort the pass (fail
     /// loud without silently dropping the rest of the run).
@@ -58,6 +70,12 @@ pub struct CodeSourceIngestOptions<'a> {
     pub path: &'a Path,
     pub languages: BTreeSet<&'static str>,
     pub sweep_time: DateTime<Utc>,
+    /// Run the L2 Scanner/Extractor symbol tier (ADR-085 Amendment 2 B2-B3)
+    /// in addition to L1/L1.5. Defaults to `false` at the verb boundary
+    /// (`handlers.rs`'s `tiers` param) so existing callers see no change.
+    /// Rust (`syn`) is the only Scanner this slice ships; other languages
+    /// are silently unaffected when this is `true`.
+    pub enable_l2: bool,
 }
 
 fn uuid5_json(value: &Value) -> Uuid {
@@ -80,6 +98,28 @@ fn module_uuid(source_project: &str, language: &str, module_path: &str) -> Uuid 
         "module_path": module_path,
         "name": module_path,
         "symbol_kind": "module",
+    }))
+}
+
+/// B4 identity for an L2 declaration entity: `uuid5` over `(source_project,
+/// language, module_path, name, kind)`, `kind` being one of the four
+/// canonical D2 tokens — the same `CODE_INGEST_NAMESPACE` seed and shape
+/// `module_uuid` uses, with `name` the declaration's own name rather than
+/// the module path.
+fn symbol_uuid(
+    source_project: &str,
+    language: &str,
+    module_path: &str,
+    name: &str,
+    code_token: &str,
+) -> Uuid {
+    uuid5_json(&json!({
+        "kind": "code-source-symbol",
+        "source_project": source_project,
+        "language": language,
+        "module_path": module_path,
+        "name": name,
+        "symbol_kind": code_token,
     }))
 }
 
@@ -602,9 +642,10 @@ fn content_hash(content: &str) -> String {
     format!("{hash:016x}")
 }
 
-/// Run one L1 + L1.5 ingest pass over `opts.path` into the runtime `rt`
-/// (already bound to the caller-selected target database — B7 target
-/// selection happens in the verb handler, not here).
+/// Run one L1 + L1.5 (+ L2 when `opts.enable_l2`) ingest pass over
+/// `opts.path` into the runtime `rt` (already bound to the caller-selected
+/// target database — B7 target selection happens in the verb handler, not
+/// here).
 pub async fn run_code_ingest(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
@@ -656,6 +697,7 @@ pub async fn run_code_ingest(
             language,
             opts.path,
             opts.sweep_time,
+            opts.enable_l2,
             &mut project_ids,
             &mut report,
         )
@@ -676,6 +718,23 @@ fn basename_project_name(ingest_root: &Path) -> String {
         .unwrap_or_else(|| ingest_root.display().to_string())
 }
 
+/// A call-target or impl-target name pending resolution against the
+/// project-wide L2 symbol index, accumulated across every file of one
+/// `run_import_scan` language pass and resolved once all files are scanned
+/// (mirrors L1.5's within-pass ordering independence: a caller earlier than
+/// its callee in file-walk order still resolves).
+struct PendingCall {
+    source_id: Uuid,
+    project_name: String,
+    callee_name: String,
+}
+
+struct PendingImpl {
+    project_name: String,
+    type_name: String,
+    trait_name: String,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_import_scan(
     rt: &KhiveRuntime,
@@ -683,6 +742,7 @@ async fn run_import_scan(
     language: &'static str,
     ingest_root: &Path,
     sweep_time: DateTime<Utc>,
+    enable_l2: bool,
     project_ids: &mut HashMap<String, Uuid>,
     report: &mut CodeSourceIngestReport,
 ) -> Result<(), CodeSourceIngestError> {
@@ -696,6 +756,15 @@ async fn run_import_scan(
             .push(format!("walking {}: {e}", ingest_root.display()));
         return Ok(());
     }
+
+    // L2 project-wide symbol index (name+kind -> entity id) and deferred
+    // call/impl resolution, populated as files are scanned below and
+    // resolved once after the whole file loop completes. Rust-only in this
+    // slice (B2's Scanner delivery order); a no-op set for every other
+    // language.
+    let mut symbol_index: HashMap<(String, String, DeclKind), Uuid> = HashMap::new();
+    let mut pending_calls: Vec<PendingCall> = Vec::new();
+    let mut pending_impls: Vec<PendingImpl> = Vec::new();
 
     for file in files {
         let Some(file_dir) = file.parent() else {
@@ -764,6 +833,25 @@ async fn run_import_scan(
             report.edges_updated += 1;
         }
 
+        if enable_l2 && language == "rust" {
+            scan_rust_l2(
+                rt,
+                token,
+                &proj_name,
+                language,
+                &module_path,
+                module_id,
+                &content,
+                &file,
+                sweep_time,
+                &mut symbol_index,
+                &mut pending_calls,
+                &mut pending_impls,
+                report,
+            )
+            .await?;
+        }
+
         for raw in imports::extract_raw_imports(language, &content) {
             let resolved = if language == "typescript" && raw.starts_with('.') {
                 let rel_dir = file_dir.strip_prefix(&proj_root).unwrap_or(Path::new(""));
@@ -794,5 +882,217 @@ async fn run_import_scan(
             }
         }
     }
+
+    // L2 same-project symbol resolution: every declaration across every
+    // file of this language pass is now in `symbol_index`, so calls/impls
+    // recorded against a declaration that appeared later in file-walk order
+    // than its caller still resolve here.
+    for call in pending_calls {
+        let key = (
+            call.project_name.clone(),
+            call.callee_name.clone(),
+            DeclKind::Function,
+        );
+        match symbol_index.get(&key) {
+            Some(target_id) => {
+                let edge_id = edge_uuid(EdgeRelation::DependsOn, call.source_id, *target_id);
+                let created = upsert_edge(
+                    rt,
+                    token,
+                    edge_id,
+                    call.source_id,
+                    *target_id,
+                    EdgeRelation::DependsOn,
+                    json!({ "dependency_kind": "build" }),
+                    sweep_time,
+                )
+                .await?;
+                if created {
+                    report.edges_created += 1;
+                } else {
+                    report.edges_updated += 1;
+                }
+            }
+            None => report.symbol_dependencies_unresolved += 1,
+        }
+    }
+    for imp in pending_impls {
+        let type_key = (
+            imp.project_name.clone(),
+            imp.type_name.clone(),
+            DeclKind::Datatype,
+        );
+        let trait_key = (
+            imp.project_name.clone(),
+            imp.trait_name.clone(),
+            DeclKind::Interface,
+        );
+        match (symbol_index.get(&type_key), symbol_index.get(&trait_key)) {
+            (Some(type_id), Some(trait_id)) => {
+                let edge_id = edge_uuid(EdgeRelation::Implements, *type_id, *trait_id);
+                let created = upsert_edge(
+                    rt,
+                    token,
+                    edge_id,
+                    *type_id,
+                    *trait_id,
+                    EdgeRelation::Implements,
+                    json!({}),
+                    sweep_time,
+                )
+                .await?;
+                if created {
+                    report.edges_created += 1;
+                } else {
+                    report.edges_updated += 1;
+                }
+            }
+            _ => report.symbol_dependencies_unresolved += 1,
+        }
+    }
+
     Ok(())
+}
+
+/// L2 declaration scan for one already-read Rust file (ADR-085 Amendment 2
+/// B2-B4): upserts a subtype `concept` entity per top-level declaration,
+/// links it to its containing module via `contains`, and queues its
+/// call/impl targets for same-project resolution once the whole language
+/// pass's `symbol_index` is complete.
+#[allow(clippy::too_many_arguments)]
+async fn scan_rust_l2(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    proj_name: &str,
+    language: &str,
+    module_path: &str,
+    module_id: Uuid,
+    content: &str,
+    file: &Path,
+    sweep_time: DateTime<Utc>,
+    symbol_index: &mut HashMap<(String, String, DeclKind), Uuid>,
+    pending_calls: &mut Vec<PendingCall>,
+    pending_impls: &mut Vec<PendingImpl>,
+    report: &mut CodeSourceIngestReport,
+) -> Result<(), CodeSourceIngestError> {
+    let scan = match scanner_rust::scan_rust_source(content) {
+        Ok(scan) => scan,
+        Err(e) => {
+            report
+                .warnings
+                .push(format!("L2 scanning {}: {e}", file.display()));
+            return Ok(());
+        }
+    };
+    let extracted = extractor::from_rust_scan(scan);
+
+    for decl in &extracted.declarations {
+        let decl_id = symbol_uuid(
+            proj_name,
+            language,
+            module_path,
+            &decl.name,
+            decl.kind.code_token(),
+        );
+        let existing = get_entity_opt(rt, token, decl_id).await?;
+        let is_new = existing.is_none();
+
+        let mut props = serde_json::Map::new();
+        props.insert("source_project".into(), json!(proj_name));
+        props.insert("language".into(), json!(language));
+        props.insert("module_path".into(), json!(module_path));
+        props.insert("content_hash".into(), json!(decl.content_hash));
+        props.insert("last_seen_at".into(), json!(sweep_time.to_rfc3339()));
+
+        let mut entity = Entity::new(token.namespace().as_str(), "concept", decl.name.clone())
+            .with_entity_type(Some(decl.kind.code_token()));
+        entity.id = decl_id;
+        if let Some(desc) = &decl.description {
+            entity.description = Some(desc.clone());
+        }
+        entity.properties = Some(Value::Object(props));
+        let now = ts(sweep_time);
+        entity.created_at = existing.as_ref().map(|e| e.created_at).unwrap_or(now);
+        entity.updated_at = now;
+        upsert_entity(rt, token, entity).await?;
+
+        if is_new {
+            report.symbols_created += 1;
+        } else {
+            report.symbols_updated += 1;
+        }
+
+        symbol_index.insert(
+            (proj_name.to_string(), decl.name.clone(), decl.kind),
+            decl_id,
+        );
+
+        let contains_edge_id = edge_uuid(EdgeRelation::Contains, module_id, decl_id);
+        let created = upsert_edge(
+            rt,
+            token,
+            contains_edge_id,
+            module_id,
+            decl_id,
+            EdgeRelation::Contains,
+            json!({}),
+            sweep_time,
+        )
+        .await?;
+        if created {
+            report.edges_created += 1;
+        } else {
+            report.edges_updated += 1;
+        }
+
+        if decl.kind == DeclKind::Function {
+            for callee in &decl.calls {
+                pending_calls.push(PendingCall {
+                    source_id: decl_id,
+                    project_name: proj_name.to_string(),
+                    callee_name: callee.clone(),
+                });
+            }
+        }
+    }
+
+    for imp in &extracted.impls {
+        pending_impls.push(PendingImpl {
+            project_name: proj_name.to_string(),
+            type_name: imp.type_name.clone(),
+            trait_name: imp.trait_name.clone(),
+        });
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod l2_identity_tests {
+    use super::symbol_uuid;
+
+    /// ADR-085 Amendment 2 B8 property 3 (cross-language identity
+    /// disjointness): `language` is part of the identity tuple specifically
+    /// so two same-named, same-kind declarations whose module paths
+    /// coincide across languages never collapse onto one entity.
+    #[test]
+    fn symbol_uuid_differs_by_language() {
+        let rust_id = symbol_uuid("proj", "rust", "crate", "helper", "function");
+        let py_id = symbol_uuid("proj", "python", "crate", "helper", "function");
+        assert_ne!(rust_id, py_id);
+    }
+
+    #[test]
+    fn symbol_uuid_differs_by_kind() {
+        let as_function = symbol_uuid("proj", "rust", "crate", "Thing", "function");
+        let as_datatype = symbol_uuid("proj", "rust", "crate", "Thing", "datatype");
+        assert_ne!(as_function, as_datatype);
+    }
+
+    #[test]
+    fn symbol_uuid_is_stable_across_calls() {
+        let a = symbol_uuid("proj", "rust", "crate::foo", "helper", "function");
+        let b = symbol_uuid("proj", "rust", "crate::foo", "helper", "function");
+        assert_eq!(a, b);
+    }
 }

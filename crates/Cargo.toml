@@ -118,6 +118,11 @@ base64 = "0.22"
 # S3-compatible BlobStore backend (ADR-111 Amendment 2). aws-only: no fs/azure/gcs
 # backends, no multipart-upload surface we don't use.
 object_store = { version = "=0.14.1", default-features = false, features = ["aws"] }
+# Rust Scanner (ADR-085 Amendment 2 B2, L2 symbol tier): syntax-only AST
+# parsing, no type-checking. `visit` for the call-expression walker,
+# `extra-traits` for PartialEq/Debug on syn types used in tests.
+syn = { version = "2", features = ["full", "extra-traits", "visit"] }
+quote = "1"
 
 [profile.release]
 opt-level = 3

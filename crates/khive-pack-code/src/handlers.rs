@@ -64,6 +64,36 @@ impl CodePack {
         let db_path = resolve_target_db(db_param, &path, runtime_db_path.as_deref())
             .map_err(RuntimeError::InvalidInput)?;
 
+        // Defaults to L1+L1.5 only (`["l1", "l1.5"]`) so a caller that never
+        // passes `tiers` sees byte-identical behavior to before L2 existed
+        // (ADR-085 Amendment 2 B3: tiers are independently usable). `l2`
+        // opts into the Rust Scanner/Extractor symbol pass.
+        const VALID_TIERS: &[&str] = &["l1", "l1.5", "l2"];
+        let enable_l2 = match params.get("tiers") {
+            None | Some(Value::Null) => false,
+            Some(v) => {
+                let arr = v.as_array().ok_or_else(|| {
+                    RuntimeError::InvalidInput("tiers must be an array of strings".into())
+                })?;
+                let mut enable_l2 = false;
+                for entry in arr {
+                    let s = entry.as_str().ok_or_else(|| {
+                        RuntimeError::InvalidInput("tiers entries must be strings".into())
+                    })?;
+                    if !VALID_TIERS.contains(&s) {
+                        return Err(RuntimeError::InvalidInput(format!(
+                            "unknown tier {s:?}; valid: {}",
+                            VALID_TIERS.join(", ")
+                        )));
+                    }
+                    if s == "l2" {
+                        enable_l2 = true;
+                    }
+                }
+                enable_l2
+            }
+        };
+
         let config = RuntimeConfig {
             db_path: Some(db_path.clone()),
             packs: vec!["kg".to_string(), "code".to_string()],
@@ -83,6 +113,7 @@ impl CodePack {
                 path: &path,
                 languages,
                 sweep_time: Utc::now(),
+                enable_l2,
             },
         )
         .await

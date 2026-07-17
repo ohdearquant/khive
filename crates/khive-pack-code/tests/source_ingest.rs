@@ -148,6 +148,7 @@ async fn two_package_fixture_converges_regardless_of_ingest_order() {
                 path: &root.path().join(pkg),
                 languages: all_languages(),
                 sweep_time: Utc::now(),
+                enable_l2: false,
             },
         )
         .await
@@ -166,6 +167,7 @@ async fn two_package_fixture_converges_regardless_of_ingest_order() {
                 path: &root.path().join(pkg),
                 languages: all_languages(),
                 sweep_time: Utc::now(),
+                enable_l2: false,
             },
         )
         .await
@@ -209,6 +211,7 @@ async fn reingesting_same_fixture_is_idempotent() {
         path: root.path(),
         languages: all_languages(),
         sweep_time: Utc::now(),
+        enable_l2: false,
     };
 
     let first = run_code_ingest(&rt, &token, opts())
@@ -282,6 +285,7 @@ async fn rust_item_import_resolves_to_containing_module_after_reingest() {
         path: root.path(),
         languages: all_languages(),
         sweep_time: Utc::now(),
+        enable_l2: false,
     };
 
     // First pass records the item import as unresolved (module `foo` did
@@ -334,6 +338,7 @@ async fn manifestless_rust_folder_uses_basename_fallback() {
             path: &proj,
             languages: all_languages(),
             sweep_time: Utc::now(),
+            enable_l2: false,
         },
     )
     .await
@@ -347,6 +352,7 @@ async fn manifestless_rust_folder_uses_basename_fallback() {
             path: &proj,
             languages: all_languages(),
             sweep_time: Utc::now(),
+            enable_l2: false,
         },
     )
     .await
@@ -387,6 +393,7 @@ async fn rejects_nonexistent_path() {
             path: &root.path().join("does-not-exist"),
             languages: all_languages(),
             sweep_time: Utc::now(),
+            enable_l2: false,
         },
     )
     .await
