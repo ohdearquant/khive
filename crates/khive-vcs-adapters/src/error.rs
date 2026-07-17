@@ -6,10 +6,8 @@ use thiserror::Error;
 
 /// An error produced by a format adapter.
 ///
-/// Fatal errors (missing required fields, structural failures) are non-recoverable:
-/// the adapter aborts and the caller must handle the error atomically. Non-fatal
-/// issues (unknown but non-required fields) are warnings reported in the import
-/// summary.
+/// Variants are fatal to the containing record/source and require atomic caller handling;
+/// optional issues use warnings. See `crates/khive-vcs-adapters/docs/api/wire-records.md`.
 #[derive(Debug, Error)]
 pub enum AdapterError {
     /// A required field is missing from a record.
@@ -32,7 +30,7 @@ pub enum AdapterError {
     #[error("record {index}: unknown entity kind '{kind}'")]
     UnknownKind { index: usize, kind: String },
 
-    /// An edge relation is not in the closed set of 15 canonical relations.
+    /// An edge relation is not in the closed set of 17 canonical relations.
     ///
     /// This is always an error regardless of `--schema-mode`.
     #[error("record {index}: unknown edge relation '{relation}'")]

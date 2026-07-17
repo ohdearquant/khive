@@ -1,11 +1,4 @@
-//! `WorkspaceHook`  -  validates the `workspace` entity kind's required
-//! `properties.schema_version` field on create (SPEC-gate ruling 4).
-//!
-//! `name` is already required and validated by the generic entity-create
-//! path (`khive-pack-kg::handlers::create`); this hook only adds the
-//! workspace-specific `schema_version` requirement. `filesystem_path` stays
-//! an optional, unvalidated property (ruling 4/6: it is a locator, not
-//! identity, and may go stale without becoming an error).
+//! Workspace-specific `properties.schema_version` validation for generic creation.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -13,6 +6,9 @@ use uuid::Uuid;
 
 use khive_runtime::{KhiveRuntime, KindHook, RuntimeError};
 
+/// Generic-create hook requiring an integer workspace schema version.
+///
+/// See `crates/khive-pack-workspace/docs/api/workspace-registration.md`.
 #[derive(Debug, Default)]
 pub struct WorkspaceHook;
 

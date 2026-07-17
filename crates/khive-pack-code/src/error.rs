@@ -2,10 +2,9 @@
 
 use thiserror::Error;
 
-/// Errors returned by [`crate::ingest::ingest_findings_json`].
+/// Fail-closed ingest errors that name the invalid field, accepted values, or shape.
 ///
-/// All variants name the valid values or shapes so callers can fix input
-/// without consulting external documentation.
+/// See `crates/khive-pack-code/docs/api/findings-ingest.md`.
 #[derive(Debug, Error)]
 pub enum CodeIngestError {
     #[error("findings.json must be a JSON object with required field findings: array")]

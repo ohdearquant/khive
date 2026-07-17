@@ -136,20 +136,8 @@ impl MemoryPack {
             }
         }
 
-        // #750: `note_store.delete_note` above is the raw
-        // `NoteStore` capability — it bypasses `KhiveRuntime::delete_note`'s
-        // orchestration entirely (no FTS/vector cleanup, no note-mutation
-        // hook fire), so it does NOT go through the generic hook wired into
-        // `update_note`/`delete_note` for KG's delete path. Prune is inside
-        // the same crate as `ann`, so it bumps generation directly, mirroring
-        // `memory.remember`'s own write-path pattern in `remember.rs`.
-        //
-        // #791: no longer clears the in-memory cache or deletes the
-        // persisted snapshot (see `remember.rs`'s rationale) — bumping
-        // generation is the only invalidation signal needed, and the
-        // background warm fired here re-scans the corpus (already filtering
-        // `deleted_at IS NULL`, `ann.rs`), correctly excluding the just-pruned
-        // rows once it installs.
+        // Raw NoteStore deletion bypasses runtime mutation hooks, so prune bumps directly.
+        // Keep the stale graph intact while a live-row scan builds its replacement.
         if pruned > 0 {
             for model in self.runtime.registered_embedding_model_names() {
                 let key = ann::AnnKey::new(namespace.as_str(), model.as_str());
@@ -171,14 +159,7 @@ impl MemoryPack {
             RuntimeError::InvalidInput(format!("memory.vacuum: invalid params: {e}"))
         })?;
 
-        // VACUUM must run outside an open transaction. Under
-        // `KHIVE_WRITE_QUEUE=1`, a plain `execute_script` call would run
-        // inside the WriterTask's per-request `BEGIN IMMEDIATE` — SQLite
-        // rejects VACUUM there (ADR-067 Component A, Fork C slice 2).
-        // `execute_script_top_level` is still serialized through
-        // the single writer owner but skips that transaction wrap, so
-        // VACUUM runs genuinely top-level on both the flag-on and flag-off
-        // paths.
+        // SQLite forbids VACUUM in a transaction; top-level execution still uses one writer.
         let sql = self.runtime.sql();
         let mut writer = sql.writer().await?;
         writer
@@ -194,31 +175,8 @@ impl MemoryPack {
 
 #[cfg(test)]
 mod vacuum_write_queue_tests {
-    /// Fork C slice 2: before this fix, `handle_vacuum`
-    /// sent `"VACUUM;"` via plain `execute_script`, which — once
-    /// `execute_script`'s flag-on path was migrated to route through the
-    /// writer task (an earlier Fork C slice) — ran inside that task's
-    /// per-request `BEGIN IMMEDIATE`. SQLite rejects `VACUUM` inside any
-    /// open transaction ("cannot VACUUM from within a transaction"), so
-    /// `memory.vacuum` broke under `KHIVE_WRITE_QUEUE=1`. This proves the
-    /// fix: routing the SAME statement through
-    /// `SqlWriter::execute_script_top_level` (what `handle_vacuum` now
-    /// calls) succeeds with the write queue enabled.
-    ///
-    /// Deliberately does NOT build a full `KhiveRuntime` (env-var or
-    /// otherwise) to reach `handle_vacuum` through the `memory.vacuum` verb
-    /// dispatch: `MemoryPack::new` requires an owned `KhiveRuntime`, and
-    /// `KhiveRuntime`/`RuntimeConfig` have no config-injection path for
-    /// `PoolConfig::write_queue_enabled` other than the process-global
-    /// `KHIVE_WRITE_QUEUE` env var — which this crate's other tests are NOT
-    /// `#[serial]` against (the exact race documented on
-    /// `khive-pack-brain`'s `fold_gate.rs` / `persist.rs` sibling routing
-    /// tests for this same round). Exercising the identical
-    /// `sql.writer().await?.execute_script_top_level("VACUUM;")` call
-    /// `handle_vacuum` makes, over a bare write-queue-enabled
-    /// `ConnectionPool`/`SqlBridge` built from a `PoolConfig` literal,
-    /// proves the same fix with no env var and no risk to any other test in
-    /// this binary.
+    /// Verifies top-level VACUUM succeeds with the write queue enabled, without env mutation.
+    /// See `crates/khive-pack-memory/docs/api/memory-lifecycle.md`.
     #[tokio::test]
     async fn vacuum_top_level_succeeds_with_write_queue_enabled() {
         let dir = tempfile::tempdir().expect("tempdir");

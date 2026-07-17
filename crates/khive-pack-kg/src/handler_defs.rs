@@ -558,7 +558,26 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 18] = [
                 name: "relation",
                 param_type: "string",
                 required: true,
-                description: "Edge relation (contains | part_of | instance_of | extends | variant_of | introduced_by | supersedes | derived_from | precedes | depends_on | enables | implements | competes_with | composed_with | annotates | supports | refutes).",
+                description: "Edge relation (contains | part_of | instance_of | extends | variant_of | introduced_by | supersedes | derived_from | precedes | depends_on | enables | implements | competes_with | composed_with | annotates | supports | refutes). \
+                    Each relation only accepts specific (source_kind -> target_kind) endpoint pairs; an out-of-allowlist pair between two otherwise-valid endpoints is rejected with InvalidInput, and a missing endpoint returns NotFound — never silently accepted. \
+                    Base ADR-002 entity->entity allowlist (issue #964 — this table is a hand-maintained mirror of `base_entity_endpoint_rules()` (khive-runtime) and is guarded by a regression test on key rows; enforcement consults the shared rule data via `base_entity_rule_allows()`, not this text — `base_entity_endpoint_rules()` is just an exposed view of the same constant): \
+                    contains: concept->concept, project->project, project->artifact, org->project, org->service. \
+                    part_of: concept->concept, project->project, project->org. \
+                    instance_of: *->concept (any source kind), service->project. \
+                    extends: concept->concept. variant_of: concept->concept, artifact->artifact. \
+                    introduced_by: concept->document, concept->person, concept->org, artifact->document, document->person, document->org. \
+                    derived_from: artifact->dataset, artifact->document, artifact->project, artifact->artifact. \
+                    precedes: document->document, dataset->dataset, artifact->artifact, service->service, project->project. \
+                    depends_on: project->project, service->project, service->service, service->artifact, service->dataset, artifact->project, artifact->service, document->document. \
+                    enables: concept->concept, service->concept, dataset->concept. \
+                    implements: project->concept, service->concept. \
+                    competes_with (symmetric): concept<->concept, project<->project, service<->service. \
+                    composed_with (symmetric): concept<->concept, project<->project. \
+                    supersedes: concept->concept, document->document, artifact->artifact, service->service, dataset->dataset, note->note (same-substrate only). \
+                    supports / refutes: concept->concept, document->concept, dataset->concept, artifact->concept (evidence -> claim), note->note (same-substrate only). \
+                    annotates: note -> {entity, note, edge, event} — the only relation permitting a note source paired with ANY target substrate (supersedes/supports/refutes also permit a note source, but only same-substrate: a note source there requires a note target too). \
+                    The `kg` pack additionally allows (pack-extensible, additive-only per ADR-017): part_of/instance_of person->org, part_of/instance_of person->project, depends_on/enables/contains/part_of/precedes org->org, precedes decision-note->decision-note. \
+                    Other loaded packs may add further pairs (e.g. `gtd` allows depends_on task-note->task-note; `formal` allows typed depends_on between theorem/definition/axiom/structure/instance/goal entity_types) — pack rules only ever add allowed pairs, never remove one listed here. Full pack-rule source: `KG_EDGE_RULES` in `khive-pack-kg/src/pack.rs` (ADR-017).",
             },
             ParamDef {
                 name: "weight",
@@ -947,12 +966,8 @@ mod tests {
             .unwrap_or_else(|| panic!("handler {name:?} not found in KG_HANDLERS"))
     }
 
-    /// Regression for #899: `create.entity_kind` and `list.entity_kind` hand-write
-    /// the enumerated entity-kind list in their `help=true` description text. This
-    /// asserts every canonical name in `EntityKind::NAMES` (the actual vocabulary,
-    /// ADR-001 + ADR-048's 9-kind set) appears in both descriptions, so adding or
-    /// renaming an entity kind without updating the doc text fails loudly here
-    /// instead of shipping a stale `help=true` schema.
+    /// Regression for #899: `create.entity_kind`/`list.entity_kind` help text must list
+    /// every canonical `EntityKind::NAMES` entry, so a stale hand-written list fails loudly.
     #[test]
     fn entity_kind_param_descriptions_list_all_canonical_kinds() {
         for handler_name in ["create", "list"] {
@@ -1029,6 +1044,111 @@ mod tests {
             h.params.iter().any(|p| p.name == "comment" && !p.required),
             "review must document optional comment param"
         );
+    }
+
+    /// Locate the substring of `desc` documenting `relation` — either its own
+    /// `"{relation}:"` clause, its `"{relation} (symmetric):"` clause, or a
+    /// grouped `"a / b:"` clause (used for `supports / refutes`).
+    fn relation_clause<'a>(desc: &'a str, relation: &str) -> &'a str {
+        desc.split(". ")
+            .find(|c| {
+                c.contains(&format!("{relation}:"))
+                    || c.contains(&format!("{relation} ("))
+                    || c.contains(&format!("{relation} /"))
+                    || c.contains(&format!("/ {relation}"))
+            })
+            .unwrap_or_else(|| {
+                panic!("link.relation help must document a clause for relation `{relation}`")
+            })
+    }
+
+    fn endpoint_kind_label(kind: &khive_types::EndpointKind) -> String {
+        match kind {
+            khive_types::EndpointKind::EntityOfKind(k) => (*k).to_string(),
+            khive_types::EndpointKind::NoteOfKind(k) => format!("{k}-note"),
+            khive_types::EndpointKind::EntityOfType { kind, .. } => (*kind).to_string(),
+        }
+    }
+
+    /// Regression for #964: `link(help=true)` must surface the per-relation
+    /// edge-endpoint allowlist so batch appliers can defer to the kernel's own
+    /// table instead of reimplementing (and drifting from) it.
+    ///
+    /// Full-coverage drift tripwire (codex PR #1060 review): derives the
+    /// expected rows from the live rule sources (`base_entity_endpoint_rules()`
+    /// and `KG_EDGE_RULES`) instead of asserting a handful of substrings, so a
+    /// typo'd or dropped row in an untested relation (e.g. `derived_from`,
+    /// `depends_on`, the epistemic pairs) fails the test rather than shipping
+    /// a stale contract.
+    #[test]
+    fn link_relation_param_documents_edge_endpoint_allowlist() {
+        let h = find_handler("link");
+        let relation_param = h
+            .params
+            .iter()
+            .find(|p| p.name == "relation")
+            .expect("link must document a relation param");
+        let desc = relation_param.description;
+
+        for (src, relation, tgt) in khive_runtime::base_entity_endpoint_rules() {
+            let rel = relation.as_str();
+            let clause = relation_clause(desc, rel);
+            if relation.is_symmetric() {
+                let a = format!("{src}<->{tgt}");
+                let b = format!("{tgt}<->{src}");
+                assert!(
+                    clause.contains(&a) || clause.contains(&b),
+                    "link.relation help missing symmetric base row {rel}: {src}<->{tgt}"
+                );
+            } else {
+                let row = format!("{src}->{tgt}");
+                assert!(
+                    clause.contains(&row),
+                    "link.relation help missing base row {rel}: {row}\nclause: {clause}"
+                );
+            }
+        }
+
+        // The three same-substrate note->note families (ADR-055/ADR-002) must
+        // be documented alongside their entity->entity cases.
+        for rel in ["supersedes", "supports", "refutes"] {
+            let clause = relation_clause(desc, rel);
+            assert!(
+                clause.contains("note->note"),
+                "link.relation help must document {rel}: note->note (same-substrate only)"
+            );
+        }
+
+        // annotates: the only relation permitting a note source with any target.
+        assert!(
+            desc.contains("annotates: note ->"),
+            "link.relation help must document the annotates note->* endpoint"
+        );
+
+        // kg pack's additive EDGE_RULES — every (relation, source, target)
+        // TRIPLE must appear in the pack clause, not merely the endpoint pair.
+        // The clause groups relations that share an endpoint pair
+        // ("part_of/instance_of person->org"), so a row is verified by finding a
+        // comma-delimited segment that carries BOTH the relation token AND the
+        // "src->tgt" endpoint — deleting a relation from a grouped run (e.g.
+        // dropping instance_of but keeping part_of) then fails the test.
+        let kg_clause = desc
+            .split(". ")
+            .find(|c| c.contains("kg` pack additionally allows"))
+            .expect("link.relation help must document the kg pack's additive EDGE_RULES clause");
+        for rule in crate::pack::KG_EDGE_RULES.iter() {
+            let src = endpoint_kind_label(&rule.source);
+            let tgt = endpoint_kind_label(&rule.target);
+            let row = format!("{src}->{tgt}");
+            let rel = rule.relation.as_str();
+            let matched = kg_clause
+                .split(", ")
+                .any(|seg| seg.contains(&row) && seg.contains(rel));
+            assert!(
+                matched,
+                "kg pack EDGE_RULES triple missing from help: {rel} {row}\nclause: {kg_clause}"
+            );
+        }
     }
 
     #[test]

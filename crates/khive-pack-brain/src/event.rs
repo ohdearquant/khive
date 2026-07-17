@@ -210,6 +210,31 @@ mod tests {
     }
 
     #[test]
+    fn brain_feedback_with_resolution_marker_decodes_served_by() {
+        // #1016: handle_feedback now always stamps the resolved profile plus a
+        // `profile_resolution` marker. The marker is payload-only metadata —
+        // the decoder must surface served_by_profile_id and ignore the marker.
+        let id = Uuid::new_v4();
+        let mut e = make_event("brain.feedback", EventOutcome::Success, Some(id));
+        e.payload = serde_json::json!({
+            "signal": "useful",
+            "served_by_profile_id": "balanced-recall-v1",
+            "profile_resolution": "default"
+        });
+        match interpret(&e) {
+            BrainSignal::Feedback {
+                target_id,
+                served_by_profile_id,
+                ..
+            } => {
+                assert_eq!(target_id, id);
+                assert_eq!(served_by_profile_id.as_deref(), Some("balanced-recall-v1"));
+            }
+            other => panic!("expected Feedback, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn brain_feedback_without_target_is_irrelevant() {
         let e = make_event("brain.feedback", EventOutcome::Success, None);
         assert!(matches!(interpret(&e), BrainSignal::Irrelevant));

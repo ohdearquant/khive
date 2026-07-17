@@ -95,12 +95,9 @@ pub(crate) struct ListParams {
 #[serde(deny_unknown_fields)]
 pub(crate) struct StatsParams {}
 
-/// ADR-099 B3: this struct is `pub` (not `pub(crate)`) SPECIFICALLY so
-/// `kkernel`'s `--atomic` validation seam (`atomic_apply::validate_atomic_args`)
-/// can deserialize an op's args through the SAME canonical struct
-/// `handle_update` uses, reproducing `deny_unknown_fields` rejection with
-/// zero duplicated field lists. Fields stay `pub(crate)` — the atomic seam
-/// only needs the `Result<_, _>` outcome, never field access.
+/// ADR-099 B3: `pub` so kkernel's `--atomic` seam can deserialize through this same
+/// canonical struct, reproducing `deny_unknown_fields` rejection. Fields stay
+/// `pub(crate)` — the atomic seam only needs the `Result<_, _>` outcome.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateParams {

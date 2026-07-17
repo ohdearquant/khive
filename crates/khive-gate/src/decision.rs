@@ -2,8 +2,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::{GateValidationError, Obligation};
 
-// ---------- Decision ----------
-
 /// Gate decision: allow (with optional obligations) or deny (with reason).
 ///
 /// `Deny` requires a non-empty `reason`. Enforced at construction and

@@ -17,6 +17,7 @@ use khive_pack_knowledge as _;
 use async_trait::async_trait;
 use khive_mcp::server::KhiveMcpServer;
 use khive_runtime::{
+    runtime_config_from_khive_config, GitWriteEntryConfig, GitWriteSectionConfig, KhiveConfig,
     KhiveRuntime, Namespace, NamespaceToken, PackRuntime, RuntimeConfig, RuntimeError,
     VerbRegistry, VerbRegistryBuilder,
 };
@@ -4389,6 +4390,103 @@ fn compute_config_id_is_stable_under_allowed_outbound_namespace_reorder() {
         compute_config_id(&cfg_ab, None),
         compute_config_id(&cfg_dup, None),
         "compute_config_id must be stable under duplication of allowed_outbound_namespaces"
+    );
+}
+
+// =============================================================================
+// ADR-108: the construction-baked git-write policy is part of daemon identity.
+// =============================================================================
+
+#[test]
+fn compute_config_id_fingerprints_git_write_policy_deterministically_and_in_entry_order() {
+    use khive_mcp::server::compute_config_id;
+
+    let base = KhiveRuntime::memory()
+        .expect("memory runtime")
+        .config()
+        .clone();
+    let policy = GitWriteSectionConfig {
+        allowed: vec![
+            GitWriteEntryConfig {
+                repo: "/srv/repos/alpha".to_string(),
+                branches: vec!["feat/*".to_string(), "fix/*".to_string()],
+            },
+            GitWriteEntryConfig {
+                repo: "/srv/repos/beta".to_string(),
+                branches: vec!["release/*".to_string()],
+            },
+        ],
+    };
+    let configured = RuntimeConfig {
+        git_write: policy.clone(),
+        ..base.clone()
+    };
+    let identical = RuntimeConfig {
+        git_write: policy.clone(),
+        ..base.clone()
+    };
+    let changed = RuntimeConfig {
+        git_write: GitWriteSectionConfig {
+            allowed: vec![GitWriteEntryConfig {
+                repo: "/srv/repos/alpha".to_string(),
+                branches: vec!["fix/*".to_string()],
+            }],
+        },
+        ..base.clone()
+    };
+    let reordered = RuntimeConfig {
+        git_write: GitWriteSectionConfig {
+            allowed: policy.allowed.into_iter().rev().collect(),
+        },
+        ..base
+    };
+
+    let configured_id = compute_config_id(&configured, None);
+    assert_eq!(
+        configured_id,
+        compute_config_id(&identical, None),
+        "identical ordered git-write policies must fingerprint deterministically"
+    );
+    assert_ne!(
+        configured_id,
+        compute_config_id(&changed, None),
+        "a changed git-write allowlist must invalidate the warm daemon"
+    );
+    assert_ne!(
+        configured_id,
+        compute_config_id(&reordered, None),
+        "git-write allowlist entry order is semantic because policy evaluation uses the first matching repo"
+    );
+}
+
+#[test]
+fn compute_config_id_normalizes_absent_and_present_but_empty_git_write_to_same_fail_closed_policy()
+{
+    use khive_mcp::server::compute_config_id;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let absent_path = dir.path().join("absent.toml");
+    let empty_path = dir.path().join("empty.toml");
+    std::fs::write(&absent_path, "").expect("write config without git_write section");
+    std::fs::write(&empty_path, "[git_write]\n")
+        .expect("write config with an empty git_write section");
+    let absent_config = KhiveConfig::load(Some(&absent_path))
+        .expect("load absent policy config")
+        .expect("config exists");
+    let empty_config = KhiveConfig::load(Some(&empty_path))
+        .expect("load empty policy config")
+        .expect("config exists");
+    let base = KhiveRuntime::memory()
+        .expect("memory runtime")
+        .config()
+        .clone();
+    let absent = runtime_config_from_khive_config(&absent_config, base.clone());
+    let present_but_empty = runtime_config_from_khive_config(&empty_config, base);
+
+    assert_eq!(
+        compute_config_id(&absent, None),
+        compute_config_id(&present_but_empty, None),
+        "both forms resolve to the same empty RuntimeConfig policy and deny every git write"
     );
 }
 

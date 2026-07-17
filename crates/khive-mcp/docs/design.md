@@ -1,5 +1,10 @@
 # khive-mcp Design
 
+Function-specific technical reference docs (coordinator dispatch contract)
+live in [`docs/api/`](api/); save-sink rationale lives in
+[`docs/save-sink.md`](save-sink.md). This document covers ADR-driven design
+decisions and rationale.
+
 ## ADR Compliance
 
 ### Request DSL — Single `request` Tool (ADR-016)
@@ -95,6 +100,39 @@
 - Pack registration is fail-fast: unknown names or unsatisfied dependencies
   abort construction and return the original runtime so callers can recover.
   The `PackRegError` type carries the runtime for this reason.
+
+### Result depth guard — stack-overflow defense (`server.rs`)
+
+Handler results (e.g. `traverse`/`context`) are not bounded by the DSL
+parser's syntax-tree guard, so a pathologically deep result could overflow
+the stack via recursive `Value::clone`, JSON serialization, or the agent-mode
+presentation transform — all of which recurse natively over `Value`.
+`result_within_depth_limit` MUST be called on the raw value coming straight
+out of coordinator/registry dispatch, before any of those operations touch
+it; it delegates to `khive_request::value_nesting_within_limit`, which walks
+an explicit worklist instead of native recursion, so the check itself cannot
+overflow the stack on the same input it is screening.
+
+`chain_aggregation_depth_reject` is the second, defense-in-depth check
+applied to a dispatched op's full result envelope in chain mode. By the time
+it runs, `dispatch_op`'s own `chain_ok_envelope_or_depth_error` has already
+screened the same `result` field, so this should never trip in practice —
+but if a future refactor bypasses that earlier guard, the rejected envelope
+must still be discarded iteratively rather than dropped natively, or the
+recursive `Drop` this branch exists to prevent happens anyway on the way out
+of scope.
+
+### Bench embedder — feature hashing (`bench_embedder.rs`)
+
+`FeatureHashProvider` is a bench-only deterministic embedder, never compiled
+into release/publish builds, registered under the `all-minilm-l6-v2` name so
+it overrides the real lattice provider for that slot without changing
+`compute_config_id`. `hash_embed` tokenises → maps each token to a (dimension,
+sign) pair via FNV-1a → accumulates → L2-normalises. Lexically similar texts
+share tokens and therefore accumulate signal in the same dimensions with the
+same sign, producing correlated vectors — this lets a benchmark exercise the
+vector/ANN/fusion legs rather than treating embeddings as pure noise (as the
+previous whole-text FNV avalanche did).
 
 ## Consistency Notes
 
