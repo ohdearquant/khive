@@ -43,7 +43,7 @@ defined in [ADR-023](docs/adr/ADR-023-declarative-pack-format.md).
 
 | Verb        | What it does                                                                                     | When to use                                                             |
 | ----------- | ------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------- |
-| `create`    | Add an entity or note                                                                            | New concept, paper, observation, decision worth tracking                |
+| `create`    | Add a new entity or note; never reuses by name (`create` is not an upsert)                       | New record creation after caller-side entity resolution                 |
 | `get`       | Fetch any record by UUID (auto-detects type)                                                     | When you have a UUID and need the full record                           |
 | `search`    | Text + semantic search over entities or notes                                                    | Finding things by content similarity                                    |
 | `list`      | Structured filtering (by kind, tags, etc.)                                                       | Browsing a category or namespace                                        |
@@ -70,6 +70,20 @@ because stored UUIDs carry a dash at position 9, so a 9+ pure-hex string never m
 else falls through to an exact, case-insensitive entity-name lookup. `create`, `list`, `search`
 require `kind=entity|note` (or `kind=edge` for `list`; `kind=event` for audit events per
 [ADR-022](docs/adr/ADR-022-events-query-surface.md)).
+
+**Create is not an upsert.** Every successful `create` call writes a new record and returns a
+new UUID. Entity names are mutable labels, not unique keys. When reuse is intended, call
+`resolve` or `search`, inspect the `Resolved`/`Ambiguous` candidates, and create only after
+`NotFound` or an intentional decision to represent a distinct entity. Use `merge` only after
+establishing that two UUIDs denote the same entity. `skip_dedup_check` disables the post-create
+`similar_existing` hint; it does not change write semantics. Notes are duplicate-tolerant and
+are not resolved by name.
+
+```text
+request(ops='resolve(refs=["RoPE"], kind="concept", limit=5)')
+# Inspect status and candidates. Only then, if distinct or NotFound:
+request(ops='create(kind="concept", name="RoPE", description="...")')
+```
 
 ### GTD pack — 5 verbs (`gtd.` prefix, [ADR-019](docs/adr/ADR-019-gtd-pack.md))
 
