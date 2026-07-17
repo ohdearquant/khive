@@ -12,9 +12,9 @@ use crate::section_state::{SectionPosteriorSnapshot, SectionPosteriorState};
 /// Sort a slice of profile candidates in ascending `(created_at, id)` order.
 ///
 /// This is the canonical fallback selection key: earliest creation time wins,
-/// with alphabetical `id` as a tiebreaker.  Extracted into a standalone helper
-/// so it can be unit-tested with intentionally unsorted input, providing
-/// fail-before/pass-after coverage that does not rely on `HashMap` randomisation.
+/// with alphabetical `id` as a tiebreaker. See
+/// crates/khive-brain-core/docs/design-rationale.md#sort_fallback_candidates--why-its-a-standalone-helper
+/// for why this is a standalone helper rather than inlined.
 pub fn sort_fallback_candidates(candidates: &mut [&ProfileRecord]) {
     candidates.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
 }
@@ -300,23 +300,19 @@ pub fn validate_brain_state_snapshot(snapshot: &BrainStateSnapshot) -> Result<()
 /// Rejects a snapshot whose `balanced_recall` or any `profile_states` entry
 /// holds more entity posteriors than `entity_capacity`, and rejects
 /// `entity_posterior_order` values that contain duplicate ids or reference
-/// ids absent from `entity_posteriors`. This is the capacity-aware
-/// counterpart used at the persistence load boundary, so a crafted or legacy
-/// oversized snapshot is rejected outright rather than silently truncated.
+/// ids absent from `entity_posteriors`.
 ///
 /// `entity_posteriors_version` gates how strictly `entity_posterior_order` is
 /// checked:
 /// - version `0` (legacy, pre-ordering snapshots) — order MUST be empty;
 ///   restore falls back to the deterministic ascending-`Uuid` compatibility
-///   path in [`crate::posterior::EntityPosteriors::from_snapshot`]. A
-///   version-0 snapshot with a non-empty order is not legacy compatibility
-///   data — it is partial order metadata that `serde(default)` let through
-///   (an omitted or explicit-zero version field) and is rejected here.
+///   path in [`crate::posterior::EntityPosteriors::from_snapshot`].
 /// - version `1` (current) — order MUST cover every `entity_posteriors` key
-///   exactly (same length, no duplicates, no unknown ids). A partial order on
-///   a current-format snapshot is corruption, not a compatibility case, and is
-///   rejected here rather than silently normalized at restore.
+///   exactly (same length, no duplicates, no unknown ids).
 /// - any other version — rejected outright as unknown.
+///
+/// See crates/khive-brain-core/docs/api/snapshot-validation.md#validate_brain_state_snapshot_with_capacity--entity_posterior_order-version-gating-rationale
+/// for why each of these is rejected outright rather than silently repaired.
 pub fn validate_brain_state_snapshot_with_capacity(
     snapshot: &BrainStateSnapshot,
     entity_capacity: usize,
@@ -357,27 +353,15 @@ pub fn validate_brain_state_snapshot_with_capacity(
             }
         }
 
-        // Version 0 is the legacy, pre-ordering compatibility case and is
-        // only valid with an EMPTY order — restore falls back to the
-        // deterministic ascending-`Uuid` order in that case. A version-0
-        // snapshot with a non-empty (necessarily partial, since full coverage
-        // is only ever written under version 1) order is not legacy
-        // compatibility data; it is corruption that `serde(default)` would
-        // otherwise let through unnoticed (a snapshot with an omitted or
-        // explicit-zero version field), and restore would silently normalize
-        // it by appending the missing keys (posterior.rs `from_snapshot`).
-        // Reject it outright rather than let it round-trip.
+        // Version 0 requires an EMPTY order; a non-empty order here is
+        // corruption, not compatibility data — see design-notes.md.
         if br.entity_posteriors_version == 0 && !br.entity_posterior_order.is_empty() {
             return Err(format!(
                 "{label}.entity_posterior_order: non-empty order requires entity_posteriors_version >= 1 (got version 0, the legacy empty-order compatibility version)",
             ));
         }
 
-        // Non-legacy (version >= 1) snapshots must have an order entry for
-        // every entity_posteriors key. Combined with the duplicate/unknown-id
-        // checks above (which already guarantee every order id is a distinct,
-        // valid map key), an equal length here proves the id sets are
-        // identical — no entity_posteriors key is missing from the order.
+        // Version >= 1 must have full order coverage — see design-notes.md.
         if br.entity_posteriors_version >= 1
             && br.entity_posterior_order.len() != br.entity_posteriors.len()
         {
@@ -425,14 +409,8 @@ mod tests {
         }
     }
 
-    /// `sort_fallback_candidates` must produce `(created_at ASC, id ASC)` order
-    /// on an intentionally REVERSE-sorted input vector.
-    ///
-    /// This is a fail-before/pass-after unit test for the helper itself: the old
-    /// `HashMap.values().find_map()` implementation would have returned the first
-    /// element from HashMap iteration order (non-deterministic).  The helper under
-    /// test sorts its input in-place; passing a reverse-order slice guarantees the
-    /// test would fail against any implementation that skips the sort.
+    /// `sort_fallback_candidates` produces `(created_at ASC, id ASC)` order.
+    /// See crates/khive-brain-core/docs/testing-strategy.md#brain_staters-sort_fallback_candidates_produces_created_at_then_id_order
     #[test]
     fn sort_fallback_candidates_produces_created_at_then_id_order() {
         // Three profiles inserted in DESCENDING created_at order (worst case for
@@ -475,9 +453,8 @@ mod tests {
         assert_eq!(candidates[2].id, "z-profile");
     }
 
-    /// End-to-end: `BrainState::resolve` must select the earliest-created profile
-    /// regardless of HashMap insertion order.  This is a secondary integration guard
-    /// that complements the helper unit tests above.
+    /// `BrainState::resolve` selects the earliest-created profile regardless
+    /// of HashMap insertion order (integration guard on `sort_fallback_candidates`).
     #[test]
     fn resolve_fallback_is_deterministic() {
         let p_early = make_profile("alpha", "recall", 1_000);
@@ -517,11 +494,7 @@ mod tests {
         assert_eq!(id_a, id_b, "fallback resolution must be deterministic");
     }
 
-    /// `router_state` and `adapter_set` survive a `to_snapshot` / `from_snapshot`
-    /// round-trip byte-for-byte.
-    ///
-    /// This is a fail-before/pass-after test: it would fail if either conversion
-    /// dropped the new fields.
+    /// `router_state` and `adapter_set` survive a snapshot round-trip byte-for-byte.
     #[test]
     fn router_state_and_adapter_set_round_trip() {
         let mut state = BrainState::new(8);
@@ -558,12 +531,8 @@ mod tests {
         );
     }
 
-    /// Deserializing a `BrainStateSnapshot` JSON that omits `router_state` and
-    /// `adapter_set` must succeed and yield empty maps (no migration required).
-    ///
-    /// The test serializes a fresh snapshot, strips both keys from the JSON
-    /// object, then re-deserializes — proving that `#[serde(default)]` is wired
-    /// correctly.
+    /// Omitting `router_state`/`adapter_set` from JSON must deserialize to
+    /// empty maps via `#[serde(default)]`, with no migration required.
     #[test]
     fn snapshot_missing_router_and_adapter_fields_defaults_to_empty() {
         let state = BrainState::new(8);
@@ -618,9 +587,8 @@ mod tests {
         );
     }
 
-    /// BRAINCORE-AUD-001 regression: capacity violation in a named
-    /// `profile_states` entry (not just the default profile) must also be
-    /// rejected.
+    /// BRAINCORE-AUD-001: capacity violation in a named `profile_states`
+    /// entry (not just the default profile) must also be rejected.
     #[test]
     fn validate_brain_state_snapshot_with_capacity_rejects_profile_state_over_capacity() {
         use uuid::Uuid;
@@ -765,12 +733,8 @@ mod tests {
 
     #[test]
     fn validate_brain_state_snapshot_with_capacity_rejects_version_zero_with_partial_order() {
-        // PR #535: a version-0 snapshot with a
-        // non-empty (here: partial) order is NOT the legacy empty-order
-        // compatibility case. `serde(default)` lets `entity_posteriors_version`
-        // silently resolve to 0 on an omitted field, so this must be rejected
-        // outright rather than passed through to `restore`, which would
-        // silently normalize `[A]` order over `{A, B}` posteriors to `[A, B]`.
+        // PR #535: version-0 with a partial order is corruption, not legacy
+        // compatibility data — see design-notes.md.
         let capacity = 4;
         let mut snapshot = make_versioned_recall_snapshot(capacity, 2);
         snapshot.entity_posteriors_version = 0;
@@ -806,9 +770,7 @@ mod tests {
     }
 
     /// A validated snapshot must restore→re-snapshot→restore to the same
-    /// state — the validation gate must not itself introduce drift, and a
-    /// snapshot that passes validation once must keep passing after a
-    /// round-trip through `BrainState`.
+    /// state — the validation gate must not itself introduce drift.
     #[test]
     fn restore_to_snapshot_restore_idempotency() {
         let capacity = 4;

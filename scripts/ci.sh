@@ -4,6 +4,14 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR/../crates"
 
+phase_lockfile() {
+    echo "=== Lockfile Freshness ==="
+    # crates/Cargo.lock is committed (#920): dependency pins land as reviewable
+    # diffs and CI resolves exactly what was reviewed. --locked fails instead of
+    # silently re-resolving if Cargo.lock drifts from what the manifests allow.
+    cargo check --workspace --locked
+}
+
 phase_forward_deployed() {
     echo "=== Forward-Deployed Crates Check ==="
     # Excluded workspace crates (forward-deployed infrastructure) must still compile,
@@ -134,6 +142,7 @@ phase_macos_pr_tests() {
 
 run_phase() {
     case "$1" in
+        lockfile) phase_lockfile ;;
         forward-deployed) phase_forward_deployed ;;
         lint) phase_lint ;;
         no-stubs) phase_no_stubs ;;
@@ -152,7 +161,7 @@ run_phase() {
         macos-pr-tests) phase_macos_pr_tests ;;
         *)
             echo "Unknown CI phase: $1" >&2
-            echo "Valid phases: forward-deployed lint no-stubs clippy docs tests channel-email no-default-features release contract-tests deno-tests smoke-tests vector-smoke contract-suite macos-pr-check macos-pr-tests" >&2
+            echo "Valid phases: lockfile forward-deployed lint no-stubs clippy docs tests channel-email no-default-features release contract-tests deno-tests smoke-tests vector-smoke contract-suite macos-pr-check macos-pr-tests" >&2
             exit 2
             ;;
     esac
@@ -160,6 +169,7 @@ run_phase() {
 
 run_all() {
     for phase in \
+        lockfile \
         forward-deployed \
         lint \
         no-stubs \

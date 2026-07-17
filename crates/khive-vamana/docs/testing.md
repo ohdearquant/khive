@@ -32,6 +32,19 @@
 
 ---
 
+## OQ1 no-repair control
+
+`VamanaIndex::tombstone_batch_no_repair` (`#[doc(hidden)]`, test support only) sets
+tombstone bits and clears each deleted node's own forward adjacency (updating
+`reverse_adj` in lockstep), but does NOT reselect in-neighbor lists via RobustPrune —
+no Wolverine rewiring. The medoid is re-elected once at the end if it falls in the
+batch. It builds a genuine no-repair control for the OQ1 empirical drift test: search
+still skips tombstoned nodes via the `Option<&[u64]>` guard in `greedy_search_inner`,
+but in-neighbors that previously pointed to deleted nodes are NOT rewired, so the graph
+retains dead-end paths that Wolverine repair would otherwise have bypassed.
+
+---
+
 ## Ignored / long-running tests
 
 `benchmark_random_5000x384_recall_at_10_at_least_85_percent` is marked

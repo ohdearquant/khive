@@ -12,16 +12,8 @@ const INLINE_POLICY_NAME: &str = "inline.rego";
 
 /// Rego-backed [`Gate`] impl.
 ///
-/// Construct with [`Self::from_policy_str`] for a single inline policy or
-/// [`Self::from_dir`] to load every `.rego` file under a directory. Override
-/// the rule path with [`Self::try_with_entrypoint`] (operator configuration) or
-/// [`Self::with_entrypoint`] (programmatic, pre-validated use) when your policy
-/// doesn't use the default `data.khive.gate.decision` package.
-///
-/// The engine is held behind a `Mutex` because `regorus::Engine::eval_rule`
-/// requires `&mut self`. This serializes evaluations on the dispatch hot path;
-/// revisit (compiled policy / engine pool) if hard-enforcement workloads show
-/// contention.
+/// Evaluations serialize through one engine mutex and fail closed on policy uncertainty. See
+/// `crates/khive-gate-rego/docs/api/policy-contract.md`.
 pub struct RegoGate {
     pub(crate) engine: Mutex<regorus::Engine>,
     pub(crate) entrypoint: String,
@@ -36,7 +28,10 @@ impl std::fmt::Debug for RegoGate {
 }
 
 impl RegoGate {
-    /// Build a gate from a single inline Rego source string.
+    /// Compile one inline policy with the default entrypoint.
+    ///
+    /// Returns [`GateError::Policy`] on parse or compilation failure. See
+    /// `crates/khive-gate-rego/docs/api/policy-loading.md`.
     pub fn from_policy_str(source: &str) -> Result<Self, GateError> {
         let mut engine = regorus::Engine::new();
         engine
@@ -48,11 +43,10 @@ impl RegoGate {
         })
     }
 
-    /// Load every `*.rego` file under `dir` (non-recursive).
+    /// Load all direct-child `.rego` files in deterministic path order.
     ///
-    /// Returns an error if `dir` cannot be read or any file fails to
-    /// parse. Sorting by file name produces deterministic load order across
-    /// platforms — relevant when policies depend on import order.
+    /// Returns [`GateError::Policy`] for directory, empty-set, read, or compile failures. See
+    /// `crates/khive-gate-rego/docs/api/policy-loading.md`.
     pub fn from_dir(dir: impl AsRef<Path>) -> Result<Self, GateError> {
         let dir = dir.as_ref();
         let read = std::fs::read_dir(dir)
@@ -90,33 +84,19 @@ impl RegoGate {
         })
     }
 
-    /// Override the rule path the gate evaluates (default
-    /// `data.khive.gate.decision`).
+    /// Install a trimmed, already-validated rule path without checking it.
     ///
-    /// This method is infallible and intended for programmatic use with
-    /// already-validated entrypoints. For operator-supplied configuration
-    /// use [`Self::try_with_entrypoint`] instead, which rejects empty,
-    /// whitespace-only, or non-`data.`-prefixed strings before the gate
-    /// is installed — preventing a misconfigured entrypoint from causing
-    /// fail-open dispatch errors at runtime.
+    /// Operator input should use [`Self::try_with_entrypoint`]. See
+    /// `crates/khive-gate-rego/docs/api/policy-loading.md`.
     pub fn with_entrypoint(mut self, entrypoint: impl Into<String>) -> Self {
         self.entrypoint = entrypoint.into().trim().to_string();
         self
     }
 
-    /// Override the rule path with validation, returning `Err` for empty,
-    /// whitespace-only, non-`data.`-prefixed, or malformed-segment entrypoints,
-    /// and for entrypoints that do not name an existing rule in the loaded policy.
+    /// Validate and install an operator-supplied `data.*` rule that exists in the policy.
     ///
-    /// Prefer this over [`Self::with_entrypoint`] for operator-supplied
-    /// configuration. A misconfigured entrypoint discovered at construction
-    /// time produces a deterministic `GateError::Policy` rather than a
-    /// dispatch-time evaluation failure. `RegoGate::check` converts all
-    /// evaluation failures (missing rule, undefined result, serialization
-    /// error, poisoned engine) to `Ok(GateDecision::Deny)` (fail-closed);
-    /// construction-time validation is defense-in-depth. The runtime's
-    /// `Err(_)` branch is reserved for non-evaluation gate errors (e.g.
-    /// infrastructure faults from other `Gate` implementations).
+    /// Returns [`GateError::Policy`] for malformed or missing rules and [`GateError::Internal`]
+    /// for a poisoned validation mutex. See `crates/khive-gate-rego/docs/api/policy-loading.md`.
     pub fn try_with_entrypoint(mut self, entrypoint: impl Into<String>) -> Result<Self, GateError> {
         let ep = entrypoint.into();
         let trimmed = ep.trim();
@@ -130,24 +110,18 @@ impl RegoGate {
                 "entrypoint must begin with 'data.' (got: {trimmed:?})"
             )));
         }
-        // Validate path segments after the "data." prefix: no empty components
-        // (which arise from consecutive dots, a leading dot after "data.", or a
-        // trailing dot).  "data.a..b" and "data.a." are rejected here.
+        // Reject empty segments created by consecutive, leading, or trailing dots.
         let suffix = &trimmed["data.".len()..];
         if suffix.is_empty() || suffix.split('.').any(|seg| seg.is_empty()) {
             return Err(GateError::Policy(format!(
                 "entrypoint has empty path segment (got: {trimmed:?})"
             )));
         }
-        // Confirm the rule exists in the currently-loaded policy.  eval_rule
-        // returns Err("not a valid rule path") when the path is not a compiled
-        // rule — catching misconfigurations at boot rather than at first request.
+        // Probe rule existence at boot rather than on the first request.
         {
             let mut engine = self.engine.lock().map_err(|e| {
                 GateError::Internal(format!("engine mutex poisoned during validation: {e}"))
             })?;
-            // A dummy empty-object input is sufficient; we only care whether the
-            // rule path exists, not the evaluated value.
             engine.set_input(regorus::Value::new_object());
             if let Err(e) = engine.eval_rule(trimmed.to_string()) {
                 return Err(GateError::Policy(format!(
@@ -167,10 +141,7 @@ impl Gate for RegoGate {
         let input_value: regorus::Value = input.into();
 
         let result = {
-            // A poisoned mutex means a prior eval_rule call panicked while
-            // holding the lock.  That is itself an evaluation failure: deny
-            // immediately rather than propagating Err into the runtime's
-            // fail-open branch.
+            // A poisoned evaluator is policy uncertainty, so return an explicit denial.
             let mut engine = match self.engine.lock() {
                 Ok(guard) => guard,
                 Err(_) => {
@@ -188,9 +159,7 @@ impl Gate for RegoGate {
             engine.eval_rule(self.entrypoint.clone())
         };
 
-        // Fail closed: any evaluation failure (missing rule, undefined, engine
-        // error) becomes an explicit Deny rather than propagating an Err that the
-        // runtime's fail-open branch would treat as "allow".
+        // Gate errors are dispatcher-fail-open; policy evaluation uncertainty must deny.
         let value = match result {
             Ok(v) => v,
             Err(e) => {
@@ -206,8 +175,7 @@ impl Gate for RegoGate {
             }
         };
 
-        // regorus returns Value::Undefined when the rule exists but no branch
-        // matched without a default.  Treat undefined as deny.
+        // A rule with no matching branch and no default is not authorization.
         if value == regorus::Value::Undefined {
             return Ok(GateDecision::deny(format!(
                 "policy rule {} is undefined for this input",
@@ -215,8 +183,6 @@ impl Gate for RegoGate {
             )));
         }
 
-        // Serialization failure is treated as an evaluation failure: deny
-        // rather than propagating Err into the runtime's fail-open branch.
         let decision_json = match value.to_json_str() {
             Ok(s) => s,
             Err(e) => {
@@ -232,25 +198,7 @@ impl Gate for RegoGate {
             }
         };
 
-        // A result that parses to a non-GateDecision shape (e.g. a boolean,
-        // plain string, or wrong object) is also treated as deny rather than
-        // propagating an Err.
-        //
-        // GATEREGO-AUD-001: a malformed policy can return caller-supplied
-        // input (e.g. `input.args`) verbatim as its "decision" value. Prior
-        // to this fix, `decision_json` (the raw policy output) was embedded
-        // in both the tracing warn and the generated Deny reason, so a
-        // request secret (API key, token) present anywhere in the request
-        // would be echoed back to the caller via `PermissionDenied` and
-        // persisted into audit events. Only a type-shape summary (never the
-        // value) is surfaced now.
-        //
-        // GATEREGO-AUD-002: `serde_json::from_str::<GateDecision>` uses an
-        // internally-tagged enum (`#[serde(tag = "decision")]`), so its
-        // deserialization error text includes the unrecognized `decision`
-        // value verbatim (e.g. `unknown variant \`<secret>\`, expected
-        // \`allow\` or \`deny\``). That error must never be logged; only a
-        // fixed, caller-data-free category is recorded.
+        // Never log raw policy output or serde errors: either may contain caller secrets.
         match serde_json::from_str::<GateDecision>(&decision_json) {
             Ok(decision) => Ok(decision),
             Err(_) => {
@@ -276,9 +224,7 @@ impl Gate for RegoGate {
     }
 }
 
-/// Top-level JSON type name of `value`, with no field contents, used to
-/// describe a wrong-shaped policy result without echoing any of the
-/// (possibly caller-supplied) data it may carry.
+/// Describe wrong-shaped output without echoing caller-controlled contents.
 fn describe_json_shape(value: serde_json::Value) -> &'static str {
     match value {
         serde_json::Value::Null => "null",

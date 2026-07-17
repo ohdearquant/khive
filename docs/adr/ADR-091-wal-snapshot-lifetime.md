@@ -495,7 +495,7 @@ Existing, unchanged: `KHIVE_CHECKPOINT_INTERVAL_MS` (500), `KHIVE_WAL_WARN_PAGES
    mean vendoring a patched SQLite build for a config-and-scheduling-level fix. Revisit
    only if WAL2 reaches upstream stable and the config-level fix proves insufficient.
 2. **External checkpointer process** (litestream-style out-of-process WAL manager).
-   Rejected: khive embeds SQLite in-process by design (single 18MB binary); an external
+   Rejected: khive embeds SQLite in-process by design (single self-contained binary); an external
    process reintroduces an operational dependency and IPC surface for a problem a
    background `tokio::spawn` task (already present, `checkpoint.rs`) solves in-process.
 3. **Kill long-lived reader sessions at the OS level** (SIGKILL `kkernel mcp` processes

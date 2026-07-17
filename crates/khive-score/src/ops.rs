@@ -4,7 +4,10 @@ use crate::DeterministicScore;
 use std::fmt;
 use std::num::NonZeroUsize;
 
-/// Errors produced by score aggregation and distance conversion operations.
+/// Validation errors from aggregation and distance conversion.
+///
+/// See `crates/khive-score/docs/api/aggregation-and-ranking.md` and
+/// `crates/khive-score/docs/api/distance-conversion.md`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScoreError {
     /// The two input slices have different lengths.
@@ -94,7 +97,7 @@ pub fn avg_scores(scores: &[DeterministicScore]) -> DeterministicScore {
     ) as i64)
 }
 
-/// Return the mean of `scores` and a boolean saturation flag.
+/// Return the mean and whether absolute input mass or the result approaches saturation.
 #[inline]
 pub fn avg_scores_checked(scores: &[DeterministicScore]) -> (DeterministicScore, bool) {
     if scores.is_empty() {
@@ -103,8 +106,7 @@ pub fn avg_scores_checked(scores: &[DeterministicScore]) -> (DeterministicScore,
     const SATURATION_THRESHOLD: i128 = (i64::MAX as i128) * 9 / 10;
     let sum: i128 = scores.iter().map(|s| s.to_raw() as i128).sum();
     let mean = sum / scores.len() as i128;
-    // Use order-independent measures: check the absolute sum of all input
-    // magnitudes (independent of sign cancellation order) and the final mean.
+    // Absolute mass makes the warning independent of iteration order and sign cancellation.
     let abs_mass: i128 = scores
         .iter()
         .map(|s| (s.to_raw() as i128).unsigned_abs() as i128)
@@ -170,7 +172,10 @@ pub fn rrf_score_zero_based(index: usize, k: usize) -> DeterministicScore {
 
 const SCALE_RAW: i128 = 4_294_967_296; // 2^32 — matches DeterministicScore::SCALE
 
-/// Weighted sum of `scores`. Errors on length mismatch or non-finite weights.
+/// Return a saturating weighted sum.
+///
+/// Errors on length mismatch or the first non-finite weight. See
+/// `crates/khive-score/docs/api/aggregation-and-ranking.md`.
 #[inline]
 pub fn weighted_sum(
     scores: &[DeterministicScore],
@@ -325,8 +330,6 @@ mod tests {
         assert_eq!(err, ScoreError::NonFiniteWeight { index: 0 });
     }
 
-    // ── rrf_score_one_based / rrf_score_zero_based ────────────────────────────
-
     #[test]
     fn rrf_one_based_rank_1_equals_legacy_rank_1() {
         use std::num::NonZeroUsize;
@@ -376,12 +379,9 @@ mod tests {
         assert_eq!(score, DeterministicScore::ZERO);
     }
 
-    // ── avg_scores_checked order-independence ─────────────────────────────────
-
     #[test]
     fn avg_scores_checked_saturation_flag_is_order_independent() {
-        // Build two orderings of the same multiset.
-        // The near_saturation flag must be the same regardless of order.
+        // The warning must be invariant under permutation of the same multiset.
         let big = DeterministicScore::from_raw(i64::MAX / 2);
         let neg = DeterministicScore::from_raw(i64::MIN / 2 + 1);
         let scores_order_a = [big, neg, big, neg];

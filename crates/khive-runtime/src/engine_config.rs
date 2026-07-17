@@ -69,6 +69,9 @@ pub enum ConfigError {
          `[[backends]].path` to declare storage backend topology"
     )]
     UnsupportedTopLevelDb { value: String },
+
+    #[error("[[git_write.allowed]] entry {repo:?}: {reason}")]
+    InvalidGitWriteEntry { repo: String, reason: String },
 }
 
 // ---- Config structs ----
@@ -230,6 +233,109 @@ pub struct PackConfig {
     pub backend: String,
 }
 
+// ---- Blob store config (ADR-111 Amendment 2) ----
+
+/// `[storage.blob]` section: a closed `backend = "fs" | "s3"` selector.
+///
+/// Internally tagged on `backend` with `deny_unknown_fields`: an unknown
+/// top-level key, a field that belongs to the other backend variant (e.g.
+/// `bucket` under `backend = "fs"`), or an S3 credential field (never
+/// accepted in TOML -- ADR-111 Amendment 2 reads credentials from the
+/// process environment only) are all rejected at config-load time by the
+/// same mechanism, since each variant only declares its own fields.
+///
+/// ```toml
+/// [storage.blob]
+/// backend = "fs"
+/// root = "/var/lib/khive/blobs"
+/// floor_bytes = 100000000000
+/// ```
+///
+/// ```toml
+/// [storage.blob]
+/// backend = "s3"
+/// bucket = "khive-blobs"
+/// region = "us-east-1"
+/// endpoint = "https://objects.example.invalid"
+/// prefix = "blobs"
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "backend", rename_all = "lowercase", deny_unknown_fields)]
+pub enum BlobConfig {
+    /// Filesystem-backed blob storage (`FsBlobStore`). Root resolution is
+    /// unchanged from khive#292: `KHIVE_BLOB_ROOT` env var, then this
+    /// `root`, then `<db_dir>/blobs`.
+    Fs {
+        #[serde(default)]
+        root: Option<String>,
+        #[serde(default)]
+        floor_bytes: Option<u64>,
+    },
+    /// S3-compatible blob storage (`S3BlobStore`). `KHIVE_BLOB_ROOT` has no
+    /// effect for this backend. Credentials always come from
+    /// `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_SESSION_TOKEN` in the
+    /// process environment, never from this section.
+    S3 {
+        bucket: String,
+        region: String,
+        #[serde(default)]
+        endpoint: Option<String>,
+        #[serde(default)]
+        prefix: Option<String>,
+        #[serde(default)]
+        allow_http: Option<bool>,
+    },
+}
+
+/// `[storage]` section in `khive.toml`. Holds storage-layer config not
+/// already covered by `[[backends]]` (ADR-028).
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct StorageSectionConfig {
+    /// Blob store backend selector (ADR-111 Amendment 2). Absent means
+    /// `FsBlobStore` at the existing root-resolution precedence, unchanged
+    /// from khive#292 -- existing configurations keep behaving exactly as
+    /// they did before this section existed.
+    #[serde(default)]
+    pub blob: Option<BlobConfig>,
+}
+
+// ---- git-write policy (ADR-108 Amendment) ----
+
+/// One `[[git_write.allowed]]` entry: a repo this operator has declared
+/// trusted for khive-mediated git writes, plus the branches on it a write
+/// verb (`git.commit`/`git.branch`/`git.push`) may target.
+///
+/// ```toml
+/// [[git_write.allowed]]
+/// repo = "/abs/path/repo"
+/// branches = ["feat/*", "fix/*"]
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct GitWriteEntryConfig {
+    /// Absolute local path to the allowlisted repository.
+    pub repo: String,
+    /// Non-empty list of exact branch names or single-`*`-wildcard globs
+    /// this repo entry permits writes against.
+    pub branches: Vec<String>,
+}
+
+/// `[git_write]` section — the closed repo/branch allowlist consulted by
+/// `khive-pack-git`'s write verbs at the handler level (ADR-108 Amendment),
+/// independent of Gate policy. Absent or empty `allowed` is the fail-closed
+/// default: the write verbs report themselves unavailable rather than
+/// defaulting open.
+///
+/// ```toml
+/// [[git_write.allowed]]
+/// repo = "/abs/path/repo"
+/// branches = ["feat/*", "fix/*"]
+/// ```
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct GitWriteSectionConfig {
+    #[serde(default)]
+    pub allowed: Vec<GitWriteEntryConfig>,
+}
+
 /// Top-level khive configuration loaded from `khive.toml` or `config.toml`.
 ///
 /// Sections consumed today:
@@ -282,6 +388,17 @@ pub struct KhiveConfig {
     /// must appear in `backends`.
     #[serde(default)]
     pub packs: std::collections::HashMap<String, PackConfig>,
+
+    /// Git-write policy allowlist (ADR-108 Amendment). Absent or empty
+    /// `allowed` fails closed — `khive-pack-git`'s write verbs are
+    /// unavailable until this section is populated.
+    #[serde(default)]
+    pub git_write: GitWriteSectionConfig,
+
+    /// Storage-layer config not covered by `[[backends]]` (ADR-111
+    /// Amendment 2: `[storage.blob]`'s `fs`/`s3` selector).
+    #[serde(default)]
+    pub storage: StorageSectionConfig,
 }
 
 /// `[runtime]` section in `khive.toml`.
@@ -566,6 +683,51 @@ impl KhiveConfig {
                         defined: defined.join(", "),
                     });
                 }
+            }
+        }
+
+        // Validate [[git_write.allowed]] entries (ADR-108 Amendment): each
+        // repo must be a non-empty absolute path, and each entry must carry
+        // at least one branch pattern — an entry with an empty `branches`
+        // list would silently allowlist a repo for no branch at all, which
+        // reads as "configured" while behaving identically to "not
+        // allowlisted"; reject it loudly instead of leaving that trap.
+        for entry in &self.git_write.allowed {
+            if entry.repo.trim().is_empty() {
+                return Err(ConfigError::InvalidGitWriteEntry {
+                    repo: entry.repo.clone(),
+                    reason: "repo must not be empty".to_string(),
+                });
+            }
+            if !Path::new(&entry.repo).is_absolute() {
+                return Err(ConfigError::InvalidGitWriteEntry {
+                    repo: entry.repo.clone(),
+                    reason: "repo must be an absolute path".to_string(),
+                });
+            }
+            if entry.branches.is_empty() {
+                return Err(ConfigError::InvalidGitWriteEntry {
+                    repo: entry.repo.clone(),
+                    reason: "branches must not be empty".to_string(),
+                });
+            }
+            if entry.branches.iter().any(|b| b.trim().is_empty()) {
+                return Err(ConfigError::InvalidGitWriteEntry {
+                    repo: entry.repo.clone(),
+                    reason: "branches entries must not be empty".to_string(),
+                });
+            }
+            // ADR-108 specifies exact name or a SINGLE-star wildcard per
+            // branch pattern -- a pattern with two or more `*` (e.g. `**`,
+            // `rel-*-*-final`) is a wider grammar than the ADR authorizes
+            // and must be rejected at config load, not silently accepted.
+            if let Some(bad) = entry.branches.iter().find(|b| b.matches('*').count() > 1) {
+                return Err(ConfigError::InvalidGitWriteEntry {
+                    repo: entry.repo.clone(),
+                    reason: format!(
+                        "branch pattern {bad:?} must contain at most one '*' wildcard (ADR-108)"
+                    ),
+                });
             }
         }
 
@@ -1598,5 +1760,280 @@ db = "/tmp/scratch/demo.db"
             matches!(err, ConfigError::UnsupportedTopLevelDb { ref value } if value == "/tmp/scratch/demo.db"),
             "expected UnsupportedTopLevelDb {{ value: \"/tmp/scratch/demo.db\" }}, got {err:?}"
         );
+    }
+
+    // ── [git_write] section (ADR-108 Amendment) ─────────────────────────────
+
+    // No [git_write] section at all -> empty allowlist, valid config.
+    #[test]
+    fn test_no_git_write_section_is_valid_and_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(&dir, "# no git_write section\n");
+        let cfg = KhiveConfig::load(Some(&path))
+            .expect("no error")
+            .expect("file found");
+        assert!(cfg.git_write.allowed.is_empty());
+    }
+
+    // A well-formed [[git_write.allowed]] entry parses correctly.
+    #[test]
+    fn test_git_write_entry_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            r#"
+[[git_write.allowed]]
+repo = "/abs/path/repo"
+branches = ["feat/*", "fix/*"]
+"#,
+        );
+        let cfg = KhiveConfig::load(Some(&path))
+            .expect("no error")
+            .expect("file found");
+        assert_eq!(cfg.git_write.allowed.len(), 1);
+        assert_eq!(cfg.git_write.allowed[0].repo, "/abs/path/repo");
+        assert_eq!(
+            cfg.git_write.allowed[0].branches,
+            vec!["feat/*".to_string(), "fix/*".to_string()]
+        );
+    }
+
+    // A relative repo path is rejected at validate() time.
+    #[test]
+    fn test_git_write_relative_repo_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            r#"
+[[git_write.allowed]]
+repo = "relative/path"
+branches = ["main"]
+"#,
+        );
+        let err = KhiveConfig::load(Some(&path)).expect_err("relative repo must be rejected");
+        assert!(
+            matches!(err, ConfigError::InvalidGitWriteEntry { ref repo, .. } if repo == "relative/path"),
+            "expected InvalidGitWriteEntry, got {err:?}"
+        );
+    }
+
+    // ADR-108: a branch pattern with more than one `*` is rejected at
+    // validate() time -- the ADR authorizes exact-name or single-wildcard
+    // patterns only.
+    #[test]
+    fn test_git_write_multi_star_branch_pattern_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            r#"
+[[git_write.allowed]]
+repo = "/abs/path"
+branches = ["**"]
+"#,
+        );
+        let err = KhiveConfig::load(Some(&path)).expect_err("** must be rejected");
+        assert!(
+            matches!(err, ConfigError::InvalidGitWriteEntry { ref repo, .. } if repo == "/abs/path"),
+            "expected InvalidGitWriteEntry, got {err:?}"
+        );
+
+        let dir2 = tempfile::tempdir().unwrap();
+        let path2 = write_toml(
+            &dir2,
+            r#"
+[[git_write.allowed]]
+repo = "/abs/path"
+branches = ["rel-*-*-final"]
+"#,
+        );
+        let err2 = KhiveConfig::load(Some(&path2)).expect_err("rel-*-*-final must be rejected");
+        assert!(
+            matches!(err2, ConfigError::InvalidGitWriteEntry { .. }),
+            "expected InvalidGitWriteEntry, got {err2:?}"
+        );
+    }
+
+    // Single-wildcard patterns remain accepted.
+    #[test]
+    fn test_git_write_single_star_branch_pattern_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            r#"
+[[git_write.allowed]]
+repo = "/abs/path"
+branches = ["a*b", "main"]
+"#,
+        );
+        let cfg = KhiveConfig::load(Some(&path))
+            .expect("no error")
+            .expect("file found");
+        assert_eq!(cfg.git_write.allowed[0].branches, vec!["a*b", "main"]);
+    }
+
+    // An entry with an empty branches list is rejected at validate() time --
+    // it would otherwise silently allowlist a repo for no branch at all.
+    #[test]
+    fn test_git_write_empty_branches_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            r#"
+[[git_write.allowed]]
+repo = "/abs/path"
+branches = []
+"#,
+        );
+        let err = KhiveConfig::load(Some(&path)).expect_err("empty branches must be rejected");
+        assert!(
+            matches!(err, ConfigError::InvalidGitWriteEntry { ref repo, .. } if repo == "/abs/path"),
+            "expected InvalidGitWriteEntry, got {err:?}"
+        );
+    }
+
+    // ── [storage.blob] section (ADR-111 Amendment 2) ─────────────────────────
+
+    // No [storage] section at all -> fs default, existing configurations
+    // keep behaving exactly as they did before this section existed.
+    #[test]
+    fn test_no_storage_section_defaults_to_fs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(&dir, "# no storage section\n");
+        let cfg = KhiveConfig::load(Some(&path))
+            .expect("no error")
+            .expect("file found");
+        assert!(cfg.storage.blob.is_none());
+    }
+
+    #[test]
+    fn test_storage_blob_fs_selection_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            r#"
+[storage.blob]
+backend = "fs"
+root = "/var/lib/khive/blobs"
+floor_bytes = 100000000000
+"#,
+        );
+        let cfg = KhiveConfig::load(Some(&path))
+            .expect("no error")
+            .expect("file found");
+        match cfg.storage.blob {
+            Some(BlobConfig::Fs { root, floor_bytes }) => {
+                assert_eq!(root.as_deref(), Some("/var/lib/khive/blobs"));
+                assert_eq!(floor_bytes, Some(100_000_000_000));
+            }
+            other => panic!("expected BlobConfig::Fs, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_storage_blob_s3_selection_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            r#"
+[storage.blob]
+backend = "s3"
+bucket = "khive-blobs"
+region = "us-east-1"
+endpoint = "https://objects.example.invalid"
+prefix = "blobs"
+"#,
+        );
+        let cfg = KhiveConfig::load(Some(&path))
+            .expect("no error")
+            .expect("file found");
+        match cfg.storage.blob {
+            Some(BlobConfig::S3 {
+                bucket,
+                region,
+                endpoint,
+                prefix,
+                allow_http,
+            }) => {
+                assert_eq!(bucket, "khive-blobs");
+                assert_eq!(region, "us-east-1");
+                assert_eq!(endpoint.as_deref(), Some("https://objects.example.invalid"));
+                assert_eq!(prefix.as_deref(), Some("blobs"));
+                assert_eq!(allow_http, None);
+            }
+            other => panic!("expected BlobConfig::S3, got {other:?}"),
+        }
+    }
+
+    // An unknown field under [storage.blob] must be a startup error, not
+    // silently ignored -- unlike the rest of KhiveConfig, this section is
+    // strict (deny_unknown_fields).
+    #[test]
+    fn test_storage_blob_unknown_field_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            r#"
+[storage.blob]
+backend = "fs"
+made_up_field = "x"
+"#,
+        );
+        let err = KhiveConfig::load(Some(&path)).expect_err("unknown field must be rejected");
+        assert!(matches!(err, ConfigError::Parse { .. }), "got {err:?}");
+    }
+
+    // An s3-only field (bucket) under backend = "fs" must be rejected: the
+    // internally tagged enum's Fs variant doesn't declare it, so it is an
+    // unknown field for that variant.
+    #[test]
+    fn test_storage_blob_other_backend_field_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            r#"
+[storage.blob]
+backend = "fs"
+bucket = "khive-blobs"
+"#,
+        );
+        let err = KhiveConfig::load(Some(&path)).expect_err("s3 field under fs must be rejected");
+        assert!(matches!(err, ConfigError::Parse { .. }), "got {err:?}");
+    }
+
+    // Credentials are never accepted in TOML (ADR-111 Amendment 2): an
+    // access-key field under backend = "s3" is unknown to that variant and
+    // must be rejected, the same way an other-backend field is.
+    #[test]
+    fn test_storage_blob_credential_field_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            r#"
+[storage.blob]
+backend = "s3"
+bucket = "khive-blobs"
+region = "us-east-1"
+access_key_id = "AKIAEXAMPLE"
+"#,
+        );
+        let err = KhiveConfig::load(Some(&path))
+            .expect_err("a credential field in TOML must be rejected");
+        assert!(matches!(err, ConfigError::Parse { .. }), "got {err:?}");
+    }
+
+    // An unrecognized backend value is rejected by the internally tagged
+    // enum's own tag matching, same mechanism as an unknown field.
+    #[test]
+    fn test_storage_blob_unknown_backend_value_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            r#"
+[storage.blob]
+backend = "gcs"
+"#,
+        );
+        let err = KhiveConfig::load(Some(&path)).expect_err("unknown backend must be rejected");
+        assert!(matches!(err, ConfigError::Parse { .. }), "got {err:?}");
     }
 }

@@ -1,7 +1,8 @@
 # khive — Developer Guide
 
 **What this is**: A research knowledge graph runtime. Typed entities, closed edge ontology,
-hybrid search, GQL/SPARQL queries — all in a single 18MB Rust binary over MCP stdio.
+hybrid search, GQL/SPARQL queries — all in a single ~21MB Rust binary over MCP stdio (see #1055;
+measure a fresh `main` build before citing an exact figure — it drifts).
 
 **v0.3.0** — [crates.io](https://crates.io/crates/khive-mcp) | Apache 2.0
 
@@ -168,12 +169,15 @@ request(ops="[{\"tool\":\"v1\",\"args\":{...}}, ...]")
 
 Verbs come from whichever packs are loaded via `KHIVE_PACKS` (env) or `--pack` (CLI). Default
 loads all 11 production packs: kg, gtd, memory, brain, comm, schedule, knowledge, session, git,
-code, workspace (verbs unchanged at 78: the `code` pack currently contributes zero verbs (ADR-085 D1;
-Amendment 2's `code.ingest` verb is accepted but unimplemented); its `finding` note kind and
-`findings.json` ingest are reached only through the `kkernel code-ingest` admin CLI path
-(ADR-085 Amendment 3), never the MCP verb surface; git contributes
-commit/issue/pull_request note kinds, a batch ingester, and the git.digest verb (ADR-088
-Amendment 1); comm.probe (#644) added 2026-07-07; brain.event_counts (ADR-103 Stage 1, #724
+code, workspace (verbs at 82: the `code` pack contributes one verb, `code.ingest`
+(ADR-085 Amendment 2, PR #1039 — L1 manifest + L1.5 import-scan source ingest into a
+dedicated map database); its `finding` note kind and `findings.json` batch ingest are
+still reached only through the `kkernel code-ingest` admin CLI path (ADR-085 Amendment
+3), never the MCP verb surface; git contributes
+commit/issue/pull_request note kinds, a batch ingester, the git.digest verb (ADR-088
+Amendment 1), and three write verbs — git.commit / git.branch / git.push — that shell to
+system git with hardened, allowlisted argv construction and unconditional force-push denial
+(ADR-108); comm.probe (#644) added 2026-07-07; brain.event_counts (ADR-103 Stage 1, #724
 Ask A) added 2026-07-08; kg.resolve added 2026-07-09; workspace (#873) contributes zero verbs,
 adding only the `workspace` entity kind and `contains` endpoint rules to git/gtd/session notes;
 regenerate via `request(ops="verbs()")` before editing this line).

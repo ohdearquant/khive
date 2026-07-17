@@ -109,6 +109,8 @@ pub enum ProposalChangeset {
     /// Supersede an entity with another (sets `supersedes` edge).
     SupersedeEntity { old: Uuid, new: Uuid },
     /// Compound: an ordered sequence of the above, applied atomically.
+    /// NOTE: as of PR #517, only single-step Compound is accepted at propose-time
+    /// and legacy-apply-time — see "Compound changeset semantics (Fix 4)" below.
     Compound { steps: Vec<ProposalChangeset> },
 }
 
@@ -155,6 +157,18 @@ applies steps in order. The apply worker uses a single SQLite write transaction
 wrapping all steps (since all v1 backends share the same SQLite connection per
 `khive-db`). If ANY step's runtime validation fails, the entire transaction
 rolls back and the worker emits
+
+> **Current restriction (PR #517, containment fix for #423):** multi-step `Compound`
+> (more than one step, including nested `Compound` containing more than one step) is
+> rejected at propose-time and legacy-apply-time — `propose` returns
+> `InvalidInput("multi-step Compound proposals are not supported until atomic proposal
+> apply is available")` (`crates/khive-pack-kg/src/handlers/proposal.rs`,
+> `has_multi_step_compound`). This is pending a real runtime/storage atomic-apply
+> primitive that can span multiple public mutations — today `create_entity`, `link`,
+> `merge`, and event-append are separate transactions, so the single-SQLite-transaction
+> guarantee described below does not yet hold for genuinely multi-step compounds.
+> Single-step `Compound` is unaffected and applies as described.
+
 `ProposalApplied { result: Failed { error, applied_step_count: 0 } }`.
 
 Cross-store atomicity (e.g., entity creation in SQLite + vector insert in
@@ -346,7 +360,8 @@ On each approved review handled by `handle_review`, `ProposalApplyWorker::maybe_
    - `AddNote` → `runtime.notes.create(...)`
    - `MergeEntities` → `runtime.curation.merge_entities(...)`
    - `SupersedeEntity` → adds `supersedes` edge via `runtime.graph.link(...)`
-   - `Compound` → recursive within a single transaction
+   - `Compound` → recursive within a single transaction (multi-step Compound
+     currently rejected before this stage — see the current-restriction note above)
 4. Emits `ProposalApplied` with `Success { created_records }` or `Failed { error }`.
 
 Authorization (ADR-018) checks the apply attempt. The worker's actor identity

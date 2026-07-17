@@ -2,21 +2,10 @@
 
 use khive_types::{HandlerDef, ParamDef, Visibility};
 
-/// Pack-auxiliary indexes for comm inbox and thread queries.
-///
-/// Indexes use `WHERE deleted_at IS NULL` (not `WHERE kind = 'message'`) so that
-/// SQLite's index planner can match them when queries contain the parameterized
-/// `kind = ?N` predicate emitted by `build_note_filter_where`.  A literal-value
-/// partial index (`WHERE kind = 'message'`) cannot be used for a parameterized
-/// comparison — the planner sees different predicates and falls back to a table scan.
-/// `deleted_at IS NULL` is always present in filtered queries, so the partial
-/// condition is always satisfied and the index is eligible.
-/// `kind` is included as an indexed column so the `kind = ?N` predicate is covered.
-/// Statements are idempotent (`CREATE INDEX IF NOT EXISTS`).
-///
-/// The `idx_comm_message_external_id` UNIQUE index is NOT listed here; it is
-/// created by the V5 schema migration (`005-unique-comm-external-id.sql`), which
-/// is the sole durable authority for that index.
+/// Pack-auxiliary indexes for comm inbox and thread queries (idempotent). See
+/// crates/khive-pack-comm/docs/api/message-lifecycle.md#vocabrscomm_schema_plan_stmts for
+/// why they filter on `deleted_at IS NULL` rather than a literal `kind` value,
+/// and why `idx_comm_message_external_id` is deliberately absent from this list.
 pub(crate) static COMM_SCHEMA_PLAN_STMTS: [&str; 4] = [
     "CREATE INDEX IF NOT EXISTS idx_comm_message_direction \
         ON notes(namespace, kind, json_extract(properties, '$.direction'), \
@@ -35,18 +24,9 @@ pub(crate) static COMM_SCHEMA_PLAN_STMTS: [&str; 4] = [
     COMM_CHANNEL_CURSOR_SCHEMA_STMT,
 ];
 
-/// Pack-owned auxiliary cursor table for durable channel poll progress
-/// (issue #449): one row per `(channel_kind, channel_slug)`, holding the
-/// transport-neutral checkpoint fields from `khive_channel::ChannelCheckpoint`.
-/// For IMAP, `generation` is `UIDVALIDITY` and `high_water` is the greatest
-/// durably handled UID. `source` detects a host/port/mailbox/folder change
-/// under the same registry identity, so a stale checkpoint is never applied
-/// to a different configuration.
-///
-/// Idempotent (`CREATE TABLE IF NOT EXISTS`), applied at boot via
-/// `schema_plan` and shared verbatim with `handle_cursor_get`/
-/// `handle_cursor_commit`'s lazy bootstrap for in-memory/test runtimes that
-/// never run the boot-time schema plan.
+/// Pack-owned auxiliary cursor table for durable channel poll progress (issue
+/// #449), idempotent (`CREATE TABLE IF NOT EXISTS`). See
+/// crates/khive-pack-comm/docs/api/probe-cursor.md#vocabrscomm_channel_cursor_schema_stmt
 pub(crate) const COMM_CHANNEL_CURSOR_SCHEMA_STMT: &str =
     "CREATE TABLE IF NOT EXISTS comm_channel_cursor (\
     channel_kind TEXT NOT NULL CHECK (length(trim(channel_kind)) > 0),\
@@ -94,6 +74,12 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 11] = [
                 param_type: "array of string",
                 required: false,
                 description: "Structured provenance tags (e.g. run id, job id, traffic class), persisted verbatim to `properties[\"tags\"]` on both the outbound and inbound copies.",
+            },
+            ParamDef {
+                name: "self_send",
+                param_type: "boolean",
+                required: false,
+                description: "Explicitly allow delivery when `to` matches the configured sender actor. Defaults to false: such self-addressed sends are rejected unless this is true. The anonymous `local` fallback is exempt.",
             },
         ],
     },

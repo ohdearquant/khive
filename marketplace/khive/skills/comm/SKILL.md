@@ -38,6 +38,10 @@ request(ops="comm.send(to=\"lambda:leo\", subject=\"CI status\", content=\"all 7
   share a namespace" rule no longer holds — address the actor, not a namespace.
 - **Always set `subject`** — it is the one field a busy recipient scans first. An un-subjected
   send is harder to triage and easier to miss.
+- **Treat a self-address rejection as an identity check.** When `to` matches the configured
+  sender actor, `comm.send` rejects by default; the anonymous `local` fallback is exempt. If the
+  message is genuinely a note to yourself, resend with `self_send=true`. If you meant to reach a
+  distinct parent or sub-agent, configure distinct actor identities instead of opting in.
 
 ### 3. Triage your inbox by sender + subject
 
@@ -80,6 +84,8 @@ Any message id in the thread resolves to the same canonical thread.
 
 - **Sending as `"local"`.** Unattributed and unscoped. Set `KHIVE_ACTOR` first.
 - **No subject.** The recipient can't triage. Always set one.
+- **Using `self_send=true` to mask an identity collapse.** It is only for an intentional note to
+  yourself; distinct agents need distinct configured actor identities.
 - **Believing cross-namespace is denied.** It is not — delivery is actor-routed (ADR-057).
   Address `to="lambda:<name>"` directly.
 - **Reading `properties` to find the sender.** `from` / `subject` / `preview` are top-level.

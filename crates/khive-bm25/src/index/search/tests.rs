@@ -30,10 +30,6 @@ const TEST_K1P1: f32 = 2.2; // k1 + 1 = 1.2 + 1
 const TEST_BASE: f32 = 0.3; // k1 * (1 - b) = 1.2 * 0.25
 const TEST_DL_FAC: f32 = 0.09; // k1 * b / avgdl = 1.2 * 0.75 / 10.0
 
-// -----------------------------------------------------------------------
-// Test 1: scalar_4 vs reference (parity check)
-// -----------------------------------------------------------------------
-
 #[test]
 fn test_score_batch_4_matches_scalar() {
     let tfs: [u8; 4] = [1, 3, 5, 10];
@@ -52,10 +48,6 @@ fn test_score_batch_4_matches_scalar() {
         );
     }
 }
-
-// -----------------------------------------------------------------------
-// Test 2: x86_64 AVX2 8-wide vs scalar parity
-// -----------------------------------------------------------------------
 
 #[cfg(target_arch = "x86_64")]
 #[test]
@@ -84,10 +76,6 @@ fn test_avx2_matches_scalar_basic() {
         );
     }
 }
-
-// -----------------------------------------------------------------------
-// Test 3: AVX2+FMA vs scalar (slightly relaxed tolerance due to FMA rounding)
-// -----------------------------------------------------------------------
 
 #[cfg(target_arch = "x86_64")]
 #[test]
@@ -121,10 +109,6 @@ fn test_avx2_fma_matches_scalar() {
     }
 }
 
-// -----------------------------------------------------------------------
-// Test 4: x86_64 dispatch function selects correctly and produces correct results
-// -----------------------------------------------------------------------
-
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn test_dispatch_score_batch_8() {
@@ -149,10 +133,6 @@ fn test_dispatch_score_batch_8() {
         );
     }
 }
-
-// -----------------------------------------------------------------------
-// Test 5: Edge case -- tf=0 produces zero score
-// -----------------------------------------------------------------------
 
 #[test]
 fn test_tf_zero_produces_zero_score() {
@@ -186,10 +166,6 @@ fn test_tf_zero_produces_zero_score() {
     }
 }
 
-// -----------------------------------------------------------------------
-// Test 6: Edge case -- very large doc_length
-// -----------------------------------------------------------------------
-
 #[test]
 fn test_large_doc_length() {
     let tfs: [u8; 4] = [5, 10, 20, 50];
@@ -210,10 +186,6 @@ fn test_large_doc_length() {
     }
 }
 
-// -----------------------------------------------------------------------
-// Test 7: Edge case -- max tf (255)
-// -----------------------------------------------------------------------
-
 #[test]
 fn test_max_tf() {
     let tfs: [u8; 4] = [255, 255, 255, 255];
@@ -231,11 +203,7 @@ fn test_max_tf() {
     }
 }
 
-// -----------------------------------------------------------------------
-// Test 8: Integration test -- brute-force search with various posting lengths
-// Exercises batch sizes 1, 7, 8, 16, 100 by indexing documents.
-// -----------------------------------------------------------------------
-
+/// Exercises brute-force batch tails at posting lengths 1, 7, 8, 16, and 100.
 #[test]
 fn test_brute_force_search_various_sizes() {
     use crate::{Bm25Config, Bm25Index};
@@ -291,10 +259,6 @@ fn test_brute_force_search_various_sizes() {
     );
 }
 
-// -----------------------------------------------------------------------
-// Test 9: scalar_8 matches reference (non-SIMD path)
-// -----------------------------------------------------------------------
-
 #[cfg(not(target_arch = "aarch64"))]
 #[test]
 fn test_score_batch_scalar_8_matches_reference() {
@@ -313,10 +277,6 @@ fn test_score_batch_scalar_8_matches_reference() {
         );
     }
 }
-
-// -----------------------------------------------------------------------
-// Test 10: Empty posting list handled correctly (no panic)
-// -----------------------------------------------------------------------
 
 #[test]
 fn test_empty_posting_list_search() {

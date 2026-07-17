@@ -3,16 +3,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{ActorRef, GateContext, GateValidationError};
 
-// ---------- Request ----------
-
 /// What the gate sees on every verb invocation.
 ///
-/// The JSON projection of this struct is the input shape policies receive
-/// (e.g. Rego's `input.actor`, `input.verb`, `input.args`). The shape is a
-/// public contract — changing field names is a breaking change.
-///
-/// Invariant: `verb` must be non-empty. `actor` is validated by [`ActorRef`].
-/// Enforced at construction and deserialization.
+/// Its JSON fields are a stable policy-input contract; `verb` must be non-empty. See
+/// `crates/khive-gate/docs/api/policy-types.md`.
 #[derive(Clone, Debug, Serialize)]
 pub struct GateRequest {
     pub actor: ActorRef,

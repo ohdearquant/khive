@@ -1,6 +1,6 @@
 # ADR-090: Docs site standard — navigation, agent md/txt surfaces, visual style
 
-**Status**: Proposed
+**Status**: Accepted
 **Date**: 2026-07-04
 **Depends on**: none (governs `.github/workflows/pages.yml` and `docs/guide/*.md`)
 

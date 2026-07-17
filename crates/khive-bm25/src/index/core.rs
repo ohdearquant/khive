@@ -56,7 +56,9 @@ pub(super) mod arc_str_vec_serde {
     }
 }
 
-/// In-memory BM25 inverted index. Custom `Deserialize` rebuilds derived caches.
+/// In-memory BM25 index whose custom deserializer validates state and rebuilds derived caches.
+///
+/// See `crates/khive-bm25/docs/api/index-lifecycle.md`.
 #[derive(Serialize)]
 pub struct Bm25Index {
     /// Term -> posting list (SoA layout: separate doc_id and term_freq arrays).

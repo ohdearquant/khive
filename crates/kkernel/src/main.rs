@@ -1,27 +1,7 @@
-//! `kkernel` binary — khive admin/management Rust CLI.
+//! `kkernel` binary — khive admin/management Rust CLI (the kernel/MCP split
+//! keeps admin and infrastructure operations out of the MCP surface).
 //!
-//! The kernel/MCP split keeps admin and infrastructure operations out of the
-//! MCP surface.
-//!
-//! Subcommands:
-//!
-//! - `sync`    — build a queryable SQLite DB from NDJSON sources (issue #174)
-//! - `pack`    — introspect registered packs (`list`, `handler <name>`)
-//! - `kg`      — KG validation, init, hook management
-//! - `engine`  — embedding model lifecycle: list/status/migrate/drift-check
-//! - `vector`  — vector store capabilities and orphan sweep
-//! - `reindex` — rebuild embedding vectors for entities, notes, and the
-//!   knowledge corpus (fans out across every configured engine)
-//! - `exec`    — run a verb DSL expression through the pack registry
-//! - `mcp`     — serve the MCP `request` surface (stdio / daemon / transports)
-//! - `backend` — inspect registered backends (`list`, `info <name>`)
-//! - `git-ingest` — one-shot batch ingest of commit/issue/pull_request
-//!   provenance notes from a local git repository (ADR-088)
-//! - `code-ingest`: admin path that validates and ingests a `findings.json`
-//!   audit sweep into the graph as `finding` notes (ADR-085 Amendment 3)
-//!
-//! All subcommands emit JSON on stdout by default for easy piping/parsing.
-//! Pass `--human` to switch to a readable table where supported.
+//! See `crates/kkernel/docs/usage.md` for the full subcommand reference.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -31,7 +11,7 @@ use clap::{Parser, Subcommand};
 
 use khive_runtime::{BackendId, KhiveConfig, KhiveRuntime, RuntimeConfig};
 use kkernel::{
-    code_ingest,
+    code_audit, code_ingest,
     coordinator::{BackendRegistry, SubstrateCoordinator, SubstrateCoordinatorService},
     engine, exec, git_ingest, kg, pack_introspect, reindex, sync, vector,
 };
@@ -111,6 +91,10 @@ enum Command {
     /// Validate and ingest a `findings.json` audit sweep into the graph as
     /// `finding` notes (ADR-085 Amendment 3).
     CodeIngest(code_ingest::CodeIngestArgs),
+
+    /// Read-only derived-report pass over a dedicated code-map database
+    /// (ADR-Q1/Q2 phase 1). Never writes to any graph.
+    CodeAudit(code_audit::CodeAuditArgs),
 }
 
 /// Database schema lifecycle subcommands.
@@ -299,22 +283,23 @@ async fn main() -> Result<()> {
                 let (cli_ns_explicit, cli_ns) = khive_mcp::args::resolve_cli_namespace(&a)
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-                let base_cfg = khive_mcp::serve::resolve_runtime_config(
-                    khive_mcp::serve::RuntimeConfigInputs {
-                        db: a.db.as_deref(),
-                        config: a.config.as_deref(),
-                        namespace: cli_ns,
-                        namespace_explicit: cli_ns_explicit,
-                        actor_explicit: cli_ns_explicit,
-                        no_embed: a.no_embed,
-                        packs: if a.pack.is_empty() {
-                            None
-                        } else {
-                            Some(a.pack.clone())
+                let (base_cfg, db_anchor) =
+                    khive_mcp::serve::resolve_runtime_config_with_db_anchor(
+                        khive_mcp::serve::RuntimeConfigInputs {
+                            db: a.db.as_deref(),
+                            config: a.config.as_deref(),
+                            namespace: cli_ns,
+                            namespace_explicit: cli_ns_explicit,
+                            actor_explicit: cli_ns_explicit,
+                            no_embed: a.no_embed,
+                            packs: if a.pack.is_empty() {
+                                None
+                            } else {
+                                Some(a.pack.clone())
+                            },
+                            brain_profile: a.brain_profile.clone(),
                         },
-                        brain_profile: a.brain_profile.clone(),
-                    },
-                )?;
+                    )?;
 
                 // #667: acquire the boot/recovery lock before building the
                 // coordinator server — that construction runs migrations and
@@ -334,11 +319,13 @@ async fn main() -> Result<()> {
                 #[cfg(not(unix))]
                 let boot_guard: Option<std::fs::File> = None;
 
-                let (server, schedule_rt) = build_multi_backend_server_with_coordinator(
-                    base_cfg,
-                    &khive_cfg,
-                    a.db.as_deref(),
-                )?;
+                let (server, schedule_rt) =
+                    build_multi_backend_server_with_coordinator_and_db_anchor(
+                        base_cfg,
+                        &khive_cfg,
+                        a.db.as_deref(),
+                        db_anchor.as_deref(),
+                    )?;
 
                 khive_mcp::serve::serve_server(
                     server,
@@ -353,6 +340,7 @@ async fn main() -> Result<()> {
         Command::Backend(b) => cmd_backend(b),
         Command::GitIngest(a) => git_ingest::run_git_ingest(a).await,
         Command::CodeIngest(a) => code_ingest::run_code_ingest(a).await,
+        Command::CodeAudit(a) => code_audit::run_code_audit(a).await,
     }
 }
 
@@ -366,21 +354,12 @@ enum ResolveCommandError {
 }
 
 /// Pure resolution of the effective `Command` from the two mutually exclusive
-/// top-level entry points: the `-e/--exec` quick-shot flag and a subcommand.
-/// Split out from [`resolve_command`] so the four cases are unit-testable
-/// without triggering `clap`'s process-exiting `.error(...).exit()` path.
-///
-/// - `-e <OPS>` alone → `Command::Exec`, parsed via `ExecArgs::parse_from(["exec",
-///   "--", &ops])` so it is byte-identical to typing `exec -- <OPS>` (same
-///   defaults, same env-var bindings). The `--` separator forces `ops` to bind
-///   as the positional OPS value even when it starts with `-` (without it,
-///   `-e '--pending-events'` would reparse as exec's `--pending-events` flag).
-/// - a subcommand alone → that subcommand, unchanged.
-/// - neither → `Err(ResolveCommandError::Missing)`.
-/// - both → `Err(ResolveCommandError::Conflict)`. clap's derive `conflicts_with`
-///   cannot name a `#[command(subcommand)]` field directly (it is not a plain
-///   `Arg` — confirmed via clap's own startup debug_assert), so this case is
-///   enforced here rather than declaratively on the field.
+/// top-level entry points (`-e/--exec` vs. a subcommand); split out from
+/// [`resolve_command`] so all four cases are unit-testable without triggering
+/// clap's process-exiting `.error(...).exit()` path. `-e <OPS>` reparses through
+/// `ExecArgs::parse_from(["exec", "--", &ops])` (byte-identical to `exec -- <OPS>`).
+/// See `crates/kkernel/docs/coordinator.md` for why the exec/subcommand conflict
+/// can't be declared on the field itself via clap's `conflicts_with`.
 fn resolve_command_result(
     exec: Option<String>,
     command: Option<Command>,
@@ -417,35 +396,41 @@ fn resolve_command(exec: Option<String>, command: Option<Command>) -> Command {
     }
 }
 
-/// Build the coordinator-attached multi-backend server for `kkernel mcp`
-/// (the `Command::Mcp` branch, taken when `[[backends]]` declares more than
-/// one backend).
-///
-/// Extracted out of `main()` (#603) so this is the ONE place that assembles
-/// the `BackendRegistry`/`SubstrateCoordinator` inputs and hands them to the
-/// shared `khive_mcp::serve::build_server_from_multi_backend_registry`
-/// constructor — everything but that coordinator attachment (registry
-/// assembly, the ADR-078 output format, the ADR-091 checkpoint pool) now
-/// lives in exactly one place in `khive-mcp::serve`, not hand-copied here.
-/// Extraction also makes this branch directly comparable, in a test, against
-/// `khive_mcp::serve::build_server_multi_backend` (the sibling boot path) —
-/// see `multi_backend_boot_paths_share_identical_wiring_surface` below.
-///
-/// Also returns the resolved `"schedule"`-pack runtime (ADR-106), read out of
-/// the same `multi.per_pack_runtimes` map used to build the coordinator's
-/// `BackendRegistry` below — `None` when the resolved pack set does not
-/// include `"schedule"`. The caller threads this through
-/// `khive_mcp::serve::serve_server` so the daemon-resident tick loop
-/// (`spawn_schedule_tick_loop_if_daemon`) drains the exact backend this
-/// coordinator-attached boot resolved, never a re-derived config (PR
-/// #782).
+/// Build the coordinator-attached multi-backend server for `kkernel mcp` (the
+/// `Command::Mcp` branch, when `[[backends]]` declares more than one backend).
+/// See `crates/kkernel/docs/coordinator.md#kkernel-mainrs--coordinator-attached-boot-path`
+/// for why this is the one place that assembles the coordinator inputs.
+#[cfg(test)]
 fn build_multi_backend_server_with_coordinator(
     base_cfg: RuntimeConfig,
     khive_cfg: &KhiveConfig,
     cli_db_override: Option<&str>,
 ) -> Result<(khive_mcp::server::KhiveMcpServer, Option<KhiveRuntime>)> {
-    let multi =
-        khive_mcp::serve::build_registry_for_multi_backend(base_cfg, khive_cfg, cli_db_override)?;
+    let db_anchor = if cli_db_override == Some(":memory:") {
+        None
+    } else {
+        base_cfg.db_path.clone()
+    };
+    build_multi_backend_server_with_coordinator_and_db_anchor(
+        base_cfg,
+        khive_cfg,
+        cli_db_override,
+        db_anchor.as_deref(),
+    )
+}
+
+fn build_multi_backend_server_with_coordinator_and_db_anchor(
+    base_cfg: RuntimeConfig,
+    khive_cfg: &KhiveConfig,
+    cli_db_override: Option<&str>,
+    db_anchor: Option<&std::path::Path>,
+) -> Result<(khive_mcp::server::KhiveMcpServer, Option<KhiveRuntime>)> {
+    let multi = khive_mcp::serve::build_registry_for_multi_backend_with_db_anchor(
+        base_cfg,
+        khive_cfg,
+        cli_db_override,
+        db_anchor,
+    )?;
 
     let schedule_rt = multi
         .per_pack_runtimes
@@ -1048,20 +1033,8 @@ mod tests {
         );
     }
 
-    /// #613: the two sibling tests above never configure
-    /// a non-default output format, so `output_format` parity was vacuous —
-    /// both paths landing on the built-in `Json` default would pass even if one
-    /// path silently dropped `apply_env_output_format(khive_cfg.runtime.default_output_format)`
-    /// (the exact ADR-078 regression class this consolidation exists to prevent).
-    ///
-    /// This case sets `[runtime].default_output_format = Table` (a non-default
-    /// value, `khive_runtime::engine_config::RuntimeSectionConfig::default_output_format`)
-    /// in the SAME `KhiveConfig` both constructors consume, then asserts not just
-    /// that the two surfaces match but that the captured format equals the
-    /// configured non-default value — the explicit expected-value check is what
-    /// makes the assertion non-vacuous. `KHIVE_OUTPUT_FORMAT` is cleared and
-    /// restored around the test (`#[serial]`) so an ambient env var can never
-    /// mask a regression in the TOML-default resolution tier.
+    /// #613 non-vacuous output-format parity check — see
+    /// `crates/kkernel/docs/coordinator.md#kkernel-mainrs--coordinator-attached-boot-path`.
     #[test]
     #[serial]
     fn multi_backend_boot_paths_share_identical_non_default_output_format() {
@@ -1131,14 +1104,8 @@ mod tests {
         // restoring KHIVE_OUTPUT_FORMAT regardless of assertion outcome.
     }
 
-    /// The kkernel `Command::Mcp` coordinator-attached multi-backend boot path
-    /// (`build_multi_backend_server_with_coordinator`, the real `kkernel mcp
-    /// --daemon` production boundary) funnels through
-    /// `khive_mcp::serve::build_registry_for_multi_backend` exactly like the
-    /// plain `build_server_multi_backend` path does — that shared choke point
-    /// is where the db-anchor consistency guard lives, so a `db_path` that
-    /// diverges from the canonical anchor for the same `--db` input must be
-    /// rejected here too, naming both paths.
+    /// db-anchor consistency guard applies at the coordinator choke point too —
+    /// see `crates/kkernel/docs/coordinator.md#kkernel-mainrs--coordinator-attached-boot-path`.
     #[test]
     fn coordinator_boundary_rejects_diverging_db_path() {
         let args_db = "/tmp/khive-coordinator-guard-real.db";
@@ -1150,8 +1117,13 @@ mod tests {
         };
         let khive_cfg = KhiveConfig::default();
 
-        let result =
-            build_multi_backend_server_with_coordinator(base_cfg, &khive_cfg, Some(args_db));
+        let db_anchor = khive_runtime::resolve_db_anchor(Some(args_db));
+        let result = build_multi_backend_server_with_coordinator_and_db_anchor(
+            base_cfg,
+            &khive_cfg,
+            Some(args_db),
+            db_anchor.as_deref(),
+        );
 
         let err = match result {
             Ok(_) => panic!(
@@ -1173,23 +1145,73 @@ mod tests {
         );
     }
 
+    /// Regression for #720 — see
+    /// `crates/kkernel/docs/coordinator.md#kkernel-mainrs--coordinator-attached-boot-path`.
+    #[test]
+    #[serial]
+    fn coordinator_boot_uses_anchor_captured_by_runtime_config() {
+        struct HomeGuard(Option<std::ffi::OsString>);
+
+        impl Drop for HomeGuard {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(home) => std::env::set_var("HOME", home),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+
+        let original_home = std::env::var_os("HOME");
+        let _home_guard = HomeGuard(original_home);
+        let first_home = TempDir::new().expect("first HOME");
+        std::env::set_var("HOME", first_home.path());
+        let config_path = first_home.path().join("config.toml");
+        std::fs::write(&config_path, "").expect("write empty config");
+
+        let (base_cfg, db_anchor) = khive_mcp::serve::resolve_runtime_config_with_db_anchor(
+            khive_mcp::serve::RuntimeConfigInputs {
+                db: None,
+                config: Some(&config_path),
+                namespace: khive_runtime::Namespace::parse("local").expect("namespace"),
+                namespace_explicit: false,
+                actor_explicit: false,
+                no_embed: true,
+                packs: Some(vec!["kg".to_string()]),
+                brain_profile: None,
+            },
+        )
+        .expect("resolve runtime config before HOME changes");
+
+        let mut khive_cfg = single_main_backend_config(khive_runtime::BackendKind::Memory, None);
+        khive_cfg.backends.push(khive_runtime::BackendConfig {
+            name: "secondary".to_string(),
+            kind: khive_runtime::BackendKind::Memory,
+            path: None,
+            cache_mb: None,
+            journal_mode: None,
+            read_only: false,
+        });
+
+        let second_home = TempDir::new().expect("second HOME");
+        std::env::set_var("HOME", second_home.path());
+        let result = build_multi_backend_server_with_coordinator_and_db_anchor(
+            base_cfg,
+            &khive_cfg,
+            None,
+            db_anchor.as_deref(),
+        );
+        if let Err(error) = result {
+            panic!(
+                "coordinator-attached construction must retain the anchor captured by \
+                 resolve_runtime_config instead of re-reading HOME: {error}"
+            );
+        }
+    }
+
     // --- #674: coordinator link-target resolution parity with `get` ---
 
-    /// Regression for #674: a full-UUID `link(..., relation="annotates")` whose
-    /// target is an edge-substrate UUID must succeed on the coordinator-attached
-    /// multi-backend boot path, exactly like `get(<edge_uuid>)` does.
-    ///
-    /// Reproduces the production topology from the issue: two backends (`main`
-    /// plus `sessions`), with the `session` pack bound to `sessions` while `kg`
-    /// falls back to `main`. That pack-to-backend split is what engages the
-    /// `SubstrateCoordinator` for `kg` verbs (`build_multi_backend_server_with_coordinator`,
-    /// not the coordinator-less `khive_mcp::serve::build_server_multi_backend`) —
-    /// a single-backend or unsplit config does not reproduce the bug.
-    ///
-    /// Before the fix, the coordinator's node locator only probed entity and
-    /// note substrates, so `link(note, <edge_uuid>, annotates)` failed with
-    /// "node <uuid> not found on any backend" even though `get(<edge_uuid>)`
-    /// resolved the same UUID.
+    /// Regression for #674 — see
+    /// `crates/kkernel/docs/coordinator.md#kkernel-mainrs--coordinator-attached-boot-path`.
     #[tokio::test]
     async fn coordinator_link_annotates_resolves_edge_target_like_get() {
         use khive_mcp::tools::request::RequestParams;

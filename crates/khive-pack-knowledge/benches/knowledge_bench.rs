@@ -19,6 +19,7 @@ use khive_types::Namespace;
 
 fn build_runtime() -> KhiveRuntime {
     KhiveRuntime::new(RuntimeConfig {
+        git_write: Default::default(),
         db_path: None,
         default_namespace: Namespace::local(),
         embedding_model: None,

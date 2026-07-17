@@ -107,17 +107,18 @@ jobs:
           # Graph Modeling, Memory, Search, Tasks, Prompt Cookbook, API Reference.
           declare -A NAV_ORDER=(
             [getting-started]="2|Getting Started|Install, connect an MCP client, and run your first khive session."
-            [knowledge-graph]="3|Knowledge Graph Modeling|Entity kinds, edge relations, and modeling patterns for the KG substrate."
-            [memory]="4|Memory and Recall|Episodic vs semantic memory, salience, and decay-weighted recall."
-            [search]="5|Search and Retrieval|FTS5, vector search, hybrid fusion, and reranking."
-            [tasks]="6|GTD Task Management|Task lifecycle, priorities, and dependency edges."
-            [communication]="7|Communication and Email|Actor-addressed messaging, threading, and the optional email channel."
-            [sessions-and-ingest]="8|Agent Sessions and Data Ingest|Session record verbs and provider transcript mirror ingest."
-            [specialized-packs]="9|Specialized Packs|Niche packs beyond the production set, starting with the formal-math pack."
-            [prompt-cookbook]="10|Prompt Cookbook|Ready-to-use verb patterns for common agent workflows."
-            [tips-and-tricks]="11|Tips and Tricks|Query craft, DSL round-trips, param gotchas, and troubleshooting for the request tool."
-            [proof-graph-case-study]="12|Proof Graph Case Study|Mathlib ingested as a 320K-entity, 4.4M-edge khive graph: ingestion path and traversal at scale."
-            [api-reference]="13|API Reference|Full verb catalog for all 9 production packs: params, DSL examples, response envelope."
+            [request-and-dsl]="3|Request and the Verb-Dispatch DSL|The single request tool: input forms, parallel batches, chains, and the result envelope."
+            [knowledge-graph]="4|Knowledge Graph Modeling|Entity kinds, edge relations, and modeling patterns for the KG substrate."
+            [memory]="5|Memory and Recall|Episodic vs semantic memory, salience, and decay-weighted recall."
+            [search]="6|Search and Retrieval|FTS5, vector search, hybrid fusion, and reranking."
+            [tasks]="7|GTD Task Management|Task lifecycle, priorities, and dependency edges."
+            [communication]="8|Communication and Email|Actor-addressed messaging, threading, and the optional email channel."
+            [sessions-and-ingest]="9|Agent Sessions and Data Ingest|Session record verbs and provider transcript mirror ingest."
+            [specialized-packs]="10|Specialized Packs|Niche packs beyond the production set, starting with the formal-math pack."
+            [prompt-cookbook]="11|Prompt Cookbook|Ready-to-use verb patterns for common agent workflows."
+            [tips-and-tricks]="12|Tips and Tricks|Query craft, DSL round-trips, param gotchas, and troubleshooting for the request tool."
+            [proof-graph-case-study]="13|Proof Graph Case Study|Mathlib ingested as a 320K-entity, 4.4M-edge khive graph: ingestion path and traversal at scale."
+            [api-reference]="14|API Reference|Full verb catalog for all 9 production packs: params, DSL examples, response envelope."
           )
 
           cat > "$SRC/index.md" <<'EOF'

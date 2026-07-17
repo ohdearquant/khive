@@ -74,12 +74,7 @@ struct NeighborRecord {
     via: Option<Uuid>,
 }
 
-/// True iff every relation in the filter is a symmetric relation. Mirrors
-/// `normalize_symmetric_direction` in `khive-runtime/src/operations.rs`
-/// (private to that crate) — kept in lockstep because `neighbors_with_query`
-/// forces `Direction::Both` under this exact condition regardless of the
-/// direction actually requested, and the handler must know that happened to
-/// tag direction correctly instead of issuing a second, redundant call.
+/// True iff every relation in the filter is symmetric. See `docs/api/context-verb.md`.
 fn relations_all_symmetric(relations: Option<&[EdgeRelation]>) -> bool {
     match relations {
         None => false,
@@ -90,9 +85,8 @@ fn relations_all_symmetric(relations: Option<&[EdgeRelation]>) -> bool {
     }
 }
 
-/// Fetch up to `fanout` neighbors of `node_id`, each tagged with its actual
-/// direction relative to `node_id`. See module docs for why this can't just
-/// trust a `direction` field on a plain `NeighborHit`.
+/// Fetch up to `fanout` neighbors of `node_id`, each tagged with its actual direction.
+/// See `docs/api/context-verb.md`.
 async fn fetch_directed_neighbors(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -160,12 +154,7 @@ async fn fetch_directed_neighbors(
                 .collect())
         }
         Direction::Both => {
-            // Single UNION ALL query for both directions (ADR-089 context-verb
-            // optimization) instead of two separate direction-scoped calls —
-            // halves the storage neighbor SELECT count for this branch. The
-            // op already returns hits in global weight-descending,
-            // node_id-ascending order truncated to `fanout`, so no local
-            // re-sort/truncate is needed.
+            // ADR-089 UNION ALL optimization; see docs/api/context-verb.md.
             let hits = runtime
                 .neighbors_with_query_directed(
                     token,
@@ -181,8 +170,7 @@ async fn fetch_directed_neighbors(
             Ok(hits
                 .into_iter()
                 .map(|(h, dir)| {
-                    // `neighbors_with_query_directed` only ever tags hits `Out`/`In`
-                    // (see `DirectedNeighborHit` doc comment) — `Both` never appears.
+                    // `neighbors_with_query_directed` only ever tags `Out`/`In`, never `Both`.
                     let tag = if dir == Direction::Out {
                         "outgoing"
                     } else {
@@ -260,13 +248,8 @@ impl KgPack {
                 }
             }
         }
-        // `entity_ids` is an explicit entity-anchor contract (ADR-089 §1: "honored
-        // in full"). `resolve_uuid_async` accepts any syntactically valid UUID
-        // without checking substrate or existence, so a random UUID, a note UUID,
-        // or an edge UUID would otherwise resolve here and then silently vanish
-        // from the response in Stage 4's lenient "missing entity" fallback. Fail
-        // loudly instead: one batch existence check naming every offending id
-        // Regression coverage.
+        // ADR-089 §1 explicit-anchor contract; fail loudly on bad ids instead of
+        // silently vanishing them in Stage 4. See docs/api/context-verb.md.
         if !explicit_ids.is_empty() {
             let mut dedup_explicit = explicit_ids.clone();
             dedup_explicit.sort_unstable();
@@ -313,13 +296,8 @@ impl KgPack {
         let t1 = if prof { Some(Instant::now()) } else { None };
         if has_query {
             let q = p.query.as_deref().unwrap();
-            // Fetch a larger candidate window than `limit` so that anchors which
-            // collapse into `entity_ids` duplicates don't under-fill the query
-            // leg: ADR-089 §1 promises search "fills up to `limit` additional
-            // anchors" after explicit ids, which requires looking past the first
-            // `limit` hits when some of them overlap explicit anchors. Bounded
-            // by a documented cap so a pathological
-            // overlap can't turn into an unbounded search.
+            // Overfetch so entity_ids-overlap doesn't under-fill (ADR-089 §1); see
+            // docs/api/context-verb.md.
             const QUERY_FILL_WINDOW_MULTIPLIER: u32 = 4;
             let fetch_n = limit
                 .saturating_add(explicit_ids.len() as u32)
@@ -400,10 +378,7 @@ impl KgPack {
                         hop2_pool.push((*parent, id, relation, weight, dir));
                     }
                 }
-                // One stratum across all hop-1 parents under this anchor: sort by
-                // weight desc, then neighbor id, then parent id (the last key only
-                // arbitrates true ties — same neighbor, same weight, different
-                // parent — so the "first discovering parent" is deterministic).
+                // Deterministic hop-1 stratum ordering; see docs/api/context-verb.md.
                 hop2_pool.sort_by(|a, b| {
                     b.3.partial_cmp(&a.3)
                         .unwrap_or(std::cmp::Ordering::Equal)
@@ -474,13 +449,7 @@ impl KgPack {
 
         // ---- Stage 4: assembly with budget enforcement ----
         let t4 = if prof { Some(Instant::now()) } else { None };
-        // Explicit `entity_ids` anchors are already verified to exist in Stage 1
-        // This only guards the residual race of an
-        // anchor deleted concurrently between resolution and this fetch, or a
-        // neighbor entity that vanished the same way. Neighbors get the same
-        // lenient "missing node reads as absent" convention `neighbors_with_query`
-        // already applies (it returns an empty Vec rather than erroring on a
-        // nonexistent `node_id`) — they never enter the budget accounting below.
+        // Guards only the residual delete race; see docs/api/context-verb.md.
         let mut blocks: Vec<AnchorBlock> = Vec::with_capacity(anchor_ids.len());
         for (i, anchor) in anchor_ids.iter().enumerate() {
             let Some(e) = entity_meta.get(anchor) else {
@@ -535,11 +504,7 @@ impl KgPack {
     }
 }
 
-/// Deterministic-order budget walk: append anchor entity records and their
-/// neighbor records (each already produced in final display order) until the
-/// next record's compact-JSON Unicode-scalar length would push the running
-/// total past `budget`. Returns (assembled anchors, truncated, dropped
-/// anchors, dropped neighbors).
+/// Deterministic-order budget walk over anchors + neighbors. See `docs/api/context-verb.md`.
 fn assemble_within_budget(
     blocks: &[AnchorBlock],
     budget: usize,
