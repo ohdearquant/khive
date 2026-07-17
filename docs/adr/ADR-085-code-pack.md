@@ -822,10 +822,14 @@ return rows in the same sequence (E8). The result is bounded by `top_n`
 sliced without first aggregating every row's total degree, so an
 offset-based page over the map-database scale this pack targets would redo
 that full aggregation on every page for no benefit over asking for a larger
-`top_n` once. There is no `offset` parameter in v1. A materialized-cursor
-contract — one that lets a caller resume a coupling listing without
-re-aggregating from scratch — is deferred until a consumer demonstrates an
-actual need for it; nothing here forecloses adding one later.
+`top_n` once. There is no `offset` parameter in v1. When fewer than `top_n`
+rows exist — including an empty or newly-ingested database with no modules
+at all — `code.coupling` returns every available row, or an empty array; it
+never invents rows to reach `top_n` and never errors for having fewer rows
+than requested. A materialized-cursor contract — one that lets a caller
+resume a coupling listing without re-aggregating from scratch — is
+deferred until a consumer demonstrates an actual need for it; nothing here
+forecloses adding one later.
 
 At `level="project"`, `fan_out` counts the number of _distinct_ neighbor
 projects this project depends on, and `fan_in` counts the number of
@@ -849,7 +853,8 @@ KG-substrate counts and has no target-database parameter:
   target database's own edges.
 - `coupling_outliers` — an array of coupling rows in E2's shape and order,
   reusing E2's computation rather than a separate query. Its length is
-  `top_n` (default 10, max 100).
+  `min(top_n, available rows)`, `top_n` defaulting to 10 (max 100) — the
+  same availability-bounded behavior as `code.coupling` itself (E2).
 - `dead_module_candidate_count` — the count of modules with zero incoming
   `depends_on` edges, scoped to modules actually present in the ingested
   set, the same scoping Amendment 2's B8 acceptance property 1 uses for dead
@@ -859,12 +864,19 @@ KG-substrate counts and has no target-database parameter:
 
 `code.health` is a composition of `code.coupling` and `code.cycles` plus
 counting; it introduces no computation beyond what those two verbs already
-define. Every part of that composition — both counts, the coupling-outlier
-computation, and the cyclic-component count — runs inside one read-only
-transaction held open on a single reader connection, so every field in the
-returned summary is computed against the same database state. No field can
-reflect a write that landed between two of the sub-computations; the summary
-describes one snapshot, never a mix. `db` is required, per E7.
+define. Rather than holding one read-only transaction open across the full
+computation, `code.health` opens a single short read-only transaction,
+reads the eligible entities and edges — the same rows `code.coupling` and
+`code.cycles` would each query, filtered by the same soft-delete rule (E1)
+— into an in-memory snapshot, and commits that transaction promptly. All
+subsequent work — both counts, the coupling-outlier computation, and the
+cyclic-component count — runs entirely against the materialized snapshot,
+with no further reads against the database. Every field in the returned
+summary therefore derives from that one snapshot: no field can reflect a
+write that landed after the snapshot was taken, and the summary describes
+one coherent state, never a mix — without holding a WAL reader open across
+the CPU-heavy aggregation and cycle-detection work that follows. `db` is
+required, per E7.
 
 ### E4: `code.cycles(db, limit?, max_members?)`
 
@@ -953,20 +965,32 @@ The shared resolver is hardened by this amendment, not replaced: the
 existing path-based rejection (comparing the resolved target path string
 against the known production database path) stays in place but is not
 sufficient on its own, since a hard link gives a second path pointing at
-the same underlying file. Opening a resolved `db` target for analysis now
-follows a fixed sequence, and every step is a rejection point:
+the same underlying file. This amendment also extends the fence to
+SQLite's WAL and SHM sidecar files: a read-only open still creates or
+updates a `-shm` file, and can create a `-wal` file, even though no
+logical write occurs — so a target sidecar hard-linked or symlinked to a
+production sidecar would let an analysis call write protected state
+without the production `.db` file itself ever being opened. The fence
+therefore covers the target's main file plus any `-wal` and `-shm`
+companions that exist alongside it. Opening a resolved `db` target for
+analysis now follows a fixed sequence, and every step is a rejection
+point:
 
 1. The target file must already exist. A `db` path that resolves to
    nothing is rejected outright — an analysis call never creates the
    database it was asked to read.
-2. Before the file is opened, its (device, inode) identity is probed
-   directly off the filesystem path and compared against the production
-   database's own (device, inode) identity; a match aborts with the fence
-   error before any connection is made, catching a hard link the
-   path-string comparison alone would miss.
-3. Once the file is open, the same (device, inode) comparison runs again
-   against the opened handle, catching a target that was swapped out
-   between the path probe and the open.
+2. Before the file is opened, the target's main file and each present
+   `-wal`/`-shm` sidecar are checked in turn: each must be a regular file
+   — a symlink is rejected outright, not resolved and compared — and each
+   file's (device, inode) identity is probed directly off the filesystem
+   path and compared against the production database's own main-file and
+   sidecar identities. A match on any pairing — main-to-main,
+   main-to-sidecar, or sidecar-to-sidecar — aborts with the fence error
+   before any connection is made, catching a hard link the path-string
+   comparison alone would miss.
+3. Once the file is open, the same regular-file and (device, inode)
+   checks run again against the opened handle for the main file, catching
+   a target that was swapped out between the path probe and the open.
 4. The file is opened through the storage layer's read-only backend
    constructor class — the one that opens with `SQLITE_OPEN_READ_ONLY` plus
    `query_only`, refuses to create a missing file, and runs no migrations —
@@ -980,13 +1004,15 @@ follows a fixed sequence, and every step is a rejection point:
    the posture steps 1 and 4 both need, and the general constructor
    provides neither guarantee.
 
-Because path resolution and the existence/identity checks are shared with
-`code.ingest` (B1, B7), `code.ingest` gains the strengthened identity checks
-too; this amendment does not introduce a second resolution path, it
-strengthens the one B7 already established. `code.ingest` itself still opens
-its target through the general, create-capable constructor for its own
-writes — only the three analysis verbs are constrained to the read-only
-backend constructor class.
+Because path resolution and the identity checks are shared with
+`code.ingest` (B1, B7), `code.ingest` gains the strengthened
+regular-file-and-identity checks too; this amendment does not introduce a
+second resolution path, it strengthens the one B7 already established. The
+existence check (step 1) is analysis-only: `code.ingest` remains
+create-capable and never requires its target to pre-exist. `code.ingest`
+itself still opens its target through the general, create-capable
+constructor for its own writes — only the three analysis verbs are
+constrained to the read-only backend constructor class.
 
 The D6.1 granularity fence exists to keep exhaustive symbol/call graphs out
 of the shared production graph; letting analysis verbs read the production
@@ -1022,7 +1048,11 @@ properties:
    opened as an explicit `db` target under a different path, is rejected
    with the same fence error as property 3 — the opened-file (device,
    inode) identity check (E7) catches what the path-based check alone
-   would miss.
+   would miss. The same rejection applies when only a sidecar is linked: a
+   fixture whose target's `-shm` file is hard-linked or symlinked to the
+   production database's `-shm` file is rejected before any connection is
+   made, even though the target's own main `.db` file is a distinct,
+   unlinked file (E7 step 2).
 5. **Missing-file rejection.** All three verbs, called with `db` pointed at
    a path that does not exist, are rejected outright, and no file is
    created at that path as a side effect of the call (E7 step 1).
@@ -1051,7 +1081,11 @@ properties:
    identically-ordered results (idempotent reads); and for
    `code.coupling`, a call with a larger `top_n` returns, as a strict
    prefix, exactly the ordered rows a call with a smaller `top_n` returned
-   over the same rows — verifying the total order defined in E2.
+   over the same rows, up to the number of rows actually available —
+   verifying the total order defined in E2 together with its
+   min(requested, available) bound. A fixture with fewer modules than the
+   smaller `top_n` returns every available row from both calls, with no
+   invented rows and no error.
 10. **Truncated giant component.** `code.cycles` run against a fixture whose
     cyclic component exceeds `max_members` returns that component with
     `truncated: true`, a member list capped at `max_members`, and a
