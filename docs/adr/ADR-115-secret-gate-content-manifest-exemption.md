@@ -132,7 +132,11 @@ SHA256("khive-secret-gate-v1\0" || runtime_field_scope || "\0" || exact_value_pa
 minimum: record content, name/description, JSON properties, tags, and code source. An exemption
 computed for one field scope never applies to another; a value that is byte-identical between two
 scopes still requires two independent manifest entries. The frozen 548-record corpus uses the record
-content scope.
+content scope. For the JSON-properties scope specifically, the current scanner examines keys and
+values as independent strings (`scan_json_value` applies no key-conditioned value heuristics), so a
+per-string manifest entry is exactly as granular as the detector it overrides; any future detector
+that becomes key-aware — scoring a value differently because of the key it sits under — breaks that
+equivalence and must revisit this exemption's per-string lookup in the same change.
 
 Caller-supplied `properties.content_sha256_16`, `source_path`, `namespace`, `actor`, and `verb` play
 no role in eligibility. Only the runtime-recomputed full digest and runtime-assigned field scope
@@ -185,7 +189,10 @@ value; it originates only from the typed internal exemption outcome the gate ret
 
 Every write path that accepts or carries `properties` **must reject** a caller attempt to create,
 set, replace, merge, or remove `khive:secret_gate`, whether or not the record is actually exempted.
-This reservation applies across the full write inventory, not only the public `create` verb:
+The sole tolerated caller-side appearance of the key is the byte-exact echo of the currently
+persisted value defined in the update rule below, which is stripped before any diff or merge —
+never accepted as an input. This reservation applies across the full write inventory, not only the
+public `create` verb:
 
 - KG create, update, atomic-prepare, curation, merge, and delete/restoration paths that copy
   properties;
@@ -202,34 +209,48 @@ This reservation applies across the full write inventory, not only the public `c
 An implementation that enforces this reservation only on the workspace ingest script or only on the
 public `create` verb does not satisfy this decision.
 
-**Mechanism, not a threaded capability token.** The reservation above is enforced by routing every
-write path's property persistence through the shared write-finalization step each already funnels
-through before reaching storage — the same choke point that already normalizes and validates
-`properties` for every create/update/curation/proposal path. The typed `Exempted` outcome is
-consumed exactly once, at that finalization step, immediately after `secret_gate` returns it; it is
-not threaded as a capability object through the ~20 intermediate call sites. Any implementation that
-instead grows a bespoke unforgeable-token parameter through every handler signature is solving a
-different, more invasive problem than this decision requires.
+**Mechanism, not a threaded capability token.** The reservation above is enforced at a single
+shared write-finalization boundary — which this decision **requires the implementation to
+introduce**, not one it assumes exists. Today the listed write paths invoke the gate at separate
+sites: the curation update path composes and merges patches itself, the create family checks in the
+runtime operations layer, and `code.ingest`'s direct-write path runs its own preflight. The
+implementation must refactor these into (or route them through) one shared finalization step
+through which every runtime, pack, and direct-write path persists properties, with `code.ingest`
+reaching the same reservation logic and the same atomic stamp-plus-audit write rather than a
+parallel copy. The typed `Exempted` outcome is consumed exactly once, at that finalization step,
+immediately after `secret_gate` returns it; it is not threaded as a capability object through the
+~20 intermediate call sites. The full-inventory acceptance test verifies this concrete boundary,
+not the call graph's current shape. Any implementation that instead grows a bespoke
+unforgeable-token parameter through every handler signature is solving a different, more invasive
+problem than this decision requires.
 
 **Updates to an already-exempted record must not blindly preserve the stamp.** A caller performing
 an ordinary read-modify-write — fetching a record, changing an unrelated field, writing the whole
 payload back — must not be blocked merely because the fetched payload still carries
-`khive:secret_gate` from the prior read. The reservation in this section applies to what the caller's
-patch **asserts**, not to a caller round-tripping a field it did not intend to change. Concretely:
+`khive:secret_gate` from the prior read. Caller intent is not observable at the write boundary, so
+the reservation is defined as an observable wire rule over the payload bytes, never an intent rule:
 
-- If a write does not modify the bytes on the exempted field/scope, the runtime carries the existing
-  stamp and audit linkage forward unchanged, without re-running the exemption lookup and without the
-  caller supplying or asserting the property value itself.
-- If a write **does** modify the bytes on the exempted field/scope, the runtime treats the new bytes
-  as an entirely new scanner input: it re-runs the manifest lookup against the new content, and the
-  prior stamp is **not** carried forward. A miss on the new content falls through to the ordinary
-  heuristic path exactly as it would for a never-exempted record. An implementation that preserves
-  the stamp across a content-changing update — allowing an attacker to swap an exempted record's
-  content for an evasive, unreviewed payload while the record still reads as exempted — does not
-  satisfy this decision; the acceptance suite's failure-and-laundering path (below) tests this
-  directly.
-- The caller may never supply, assert, or request a specific stamp value in either case; only the
-  runtime's own before/after content comparison and manifest lookup determine what is written.
+- **Echo normalization.** Before any property diff or merge, the runtime strips from the incoming
+  payload a `khive:secret_gate` entry whose value is byte-identical to the value currently
+  persisted on the target record. Such an echo has no effect on the outcome; the stored value is
+  determined solely by the runtime rule below. This is the only caller-side appearance of the key
+  that is tolerated.
+- **Everything else is rejected.** Supplying the key where the target record has none persisted,
+  supplying any value that differs from the currently persisted one, or explicitly removing a
+  persisted one (where the write shape expresses removal as an operation rather than omission) must
+  fail. Write shapes that replace the full property set rather than patch it distinguish the
+  tolerated echo from every forbidden variant by the same byte comparison against the persisted
+  value.
+- **The runtime alone decides the stored value.** After echo normalization: if the write does not
+  modify the bytes on the exempted field/scope, the runtime carries the existing stamp and audit
+  linkage forward unchanged, without re-running the exemption lookup. If the write **does** modify
+  those bytes, the runtime treats the new bytes as an entirely new scanner input: it re-runs the
+  manifest lookup against the new content, and the prior stamp is **not** carried forward. A miss
+  on the new content falls through to the ordinary heuristic path exactly as it would for a
+  never-exempted record. An implementation that preserves the stamp across a content-changing
+  update — allowing an attacker to swap an exempted record's content for an evasive, unreviewed
+  payload while the record still reads as exempted — does not satisfy this decision; the acceptance
+  suite's failure-and-laundering path (below) tests this directly.
 
 **Exemption scope is content-and-field-scope, not record-scoped, and this is deliberate.** A manifest
 entry exempts a specific byte sequence at a specific field scope wherever that exact sequence recurs,
@@ -418,9 +439,13 @@ the claim to the boundaries above.
 1. Exercise absent, unreadable, malformed, duplicate-conflicting, stale-version, unsupported-
    algorithm, truncated-digest, and refresh-failure manifests. Each case must preserve the current
    blocking behavior for the false-positive corpus.
-2. Attempt to set, replace, merge, and remove `khive:secret_gate` through every write family listed
-   in Decision §4, including proposal apply and `code.ingest`. Every caller-originated attempt must
-   fail.
+2. Attempt every forbidden `khive:secret_gate` variant through every write family listed in
+   Decision §4, including proposal apply and `code.ingest`: supply the key where none is persisted,
+   supply a value differing from the persisted one, and explicitly remove a persisted one. Every
+   such attempt must fail. Then submit a full-payload write echoing the exact persisted value with
+   only an unrelated field changed, and assert it succeeds with the echo stripped — the stored
+   stamp afterwards reflects only the runtime's own carry-forward/re-lookup rule, with no new
+   exemption event.
 3. Force stamp-persistence failure and exemption-audit-persistence failure. No exempted record may
    remain stored in either case.
 4. Verify that source class, actor, namespace, verb, and caller-supplied hashes never change
