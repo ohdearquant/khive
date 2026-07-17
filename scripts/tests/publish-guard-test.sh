@@ -56,5 +56,22 @@ else
     echo "PASS"
 fi
 
+echo "--- case 4: malformed metadata makes the guard fail CLOSED (non-zero), not silently pass ---"
+BAD_FIXTURE=$(mktemp)
+printf 'this is not valid json\n' >"$BAD_FIXTURE"
+if check_crates_ladder "$BAD_FIXTURE" crate-a crate-b 2>"$STDERR_CAPTURE"; then
+    rm -f "$BAD_FIXTURE"
+    echo "FAIL: guard passed on malformed metadata (fail-open)" >&2
+    exit 1
+fi
+rm -f "$BAD_FIXTURE"
+if grep -qiE "parser failed|could not enumerate" "$STDERR_CAPTURE"; then
+    echo "PASS"
+else
+    echo "FAIL: guard failed on malformed metadata but without a clear parser-failure error" >&2
+    cat "$STDERR_CAPTURE" >&2
+    exit 1
+fi
+
 echo ""
 echo "=== publish-guard-test: all cases passed ==="

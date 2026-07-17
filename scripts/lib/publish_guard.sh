@@ -32,9 +32,20 @@ check_crates_ladder() {
     shift
     local -a ladder=("$@")
     local -a missing=()
-    local name found c
+    local name found c members
+
+    # Capture the producer's output AND its exit status explicitly. A process
+    # substitution's exit status is not propagated to a `while` loop, so a
+    # failed parser (invalid/corrupt metadata, missing python3) would yield no
+    # names and let the guard pass silently. A publish preflight must fail
+    # CLOSED when it cannot enumerate members (#1071 review).
+    if ! members=$(publishable_members_from_metadata < "$metadata_path"); then
+        echo "ERROR: could not enumerate publishable workspace members from cargo metadata (parser failed) — refusing to proceed" >&2
+        return 2
+    fi
 
     while IFS= read -r name; do
+        [[ -n "$name" ]] || continue
         found=false
         for c in "${ladder[@]}"; do
             if [[ "$c" == "$name" ]]; then
@@ -43,7 +54,7 @@ check_crates_ladder() {
             fi
         done
         $found || missing+=("$name")
-    done < <(publishable_members_from_metadata < "$metadata_path")
+    done <<< "$members"
 
     if [[ ${#missing[@]} -gt 0 ]]; then
         echo "ERROR: publishable workspace member(s) missing from the CRATES ladder in scripts/publish.sh:" >&2
