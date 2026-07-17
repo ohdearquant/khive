@@ -117,7 +117,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 base64 = "0.22"
 # S3-compatible BlobStore backend (ADR-111 Amendment 2). aws-only: no fs/azure/gcs
 # backends, no multipart-upload surface we don't use.
-object_store = { version = "=0.13.2", default-features = false, features = ["aws"] }
+object_store = { version = "=0.14.1", default-features = false, features = ["aws"] }
 
 [profile.release]
 opt-level = 3

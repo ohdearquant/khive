@@ -1009,6 +1009,7 @@ mod tests {
                 outcome_to_result(&outcome, || PutResult {
                     e_tag: None,
                     version: None,
+                    extensions: Default::default(),
                 })
             }
 
@@ -1042,6 +1043,7 @@ mod tests {
                     },
                     range: 0..0,
                     attributes: Default::default(),
+                    extensions: Default::default(),
                 })
             }
 

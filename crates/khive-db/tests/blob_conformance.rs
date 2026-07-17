@@ -61,10 +61,12 @@ async fn assert_conforms(store: Arc<dyn BlobStore>) {
 #[tokio::test]
 async fn fs_blob_store_conforms() {
     let dir = tempfile::tempdir().unwrap();
-    let store: Arc<dyn BlobStore> = Arc::new(
-        FsBlobStore::new(dir.path().to_path_buf(), FsBlobStore::DEFAULT_FLOOR_BYTES)
-            .expect("FsBlobStore::new"),
-    );
+    // Explicit floor_bytes=0, not the default 100GB — the free space on
+    // whatever volume runs this test is not this test's concern (and a
+    // dev machine or CI runner legitimately may not clear 100GB free).
+    // The floor guard itself is covered by unit tests in stores/blob.rs.
+    let store: Arc<dyn BlobStore> =
+        Arc::new(FsBlobStore::new(dir.path().to_path_buf(), 0).expect("FsBlobStore::new"));
     assert_conforms(store).await;
 }
 
