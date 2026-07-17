@@ -131,16 +131,24 @@ pub fn normalize_weights(weights: &[f64]) -> Vec<f64> {
         return Vec::new();
     }
 
-    // Sanitize before summing so NaN/Inf cannot enter arithmetic (matches weighted_fusion).
-    let weight_sum: f64 = weights.iter().filter(|w| w.is_finite() && **w > 0.0).sum();
+    // Only finite positive weights participate; a shared predicate keeps the sum filter and the
+    // normalization map from drifting apart (matches weighted_fusion).
+    let finite_positive = |w: f64| w.is_finite() && w > 0.0;
+    let weight_sum: f64 = weights
+        .iter()
+        .copied()
+        .filter(|&w| finite_positive(w))
+        .sum();
 
-    if weight_sum <= 0.0 {
+    // A finite positive sum can still overflow to infinity (e.g. [f64::MAX, f64::MAX]); fall back
+    // to a uniform distribution rather than dividing by a non-finite denominator.
+    if !weight_sum.is_finite() || weight_sum <= 0.0 {
         vec![1.0 / weights.len() as f64; weights.len()]
     } else {
         weights
             .iter()
-            .map(|w| {
-                if w.is_finite() && *w > 0.0 {
+            .map(|&w| {
+                if finite_positive(w) {
                     w / weight_sum
                 } else {
                     0.0
@@ -386,6 +394,17 @@ mod tests {
 
         let normalized = normalize_weights(&[f64::INFINITY, f64::NAN]);
         assert!(normalized.iter().all(|w| w.is_finite()));
+        assert!((normalized[0] - 0.5).abs() < 1e-10);
+        assert!((normalized[1] - 0.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_normalize_weights_overflow_sum() {
+        // Finite positive weights whose sum overflows to infinity must still normalize to a valid
+        // distribution rather than collapsing to zeros (issue #1074 review).
+        let normalized = normalize_weights(&[f64::MAX, f64::MAX]);
+        assert!(normalized.iter().all(|w| w.is_finite()));
+        assert!((normalized.iter().sum::<f64>() - 1.0).abs() < 1e-10);
         assert!((normalized[0] - 0.5).abs() < 1e-10);
         assert!((normalized[1] - 0.5).abs() < 1e-10);
     }
