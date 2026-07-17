@@ -277,10 +277,35 @@ for:
 same protection. Inserts do not need a note trigger: a note without a vector is not graph input, and
 the subsequent vector insert owns the per-model bump.
 
-Current note persistence uses `INSERT OR REPLACE` (`stores/note.rs:35-81`). Before enabling a DELETE
-trigger, canonical note upsert MUST be changed to a true `INSERT ... ON CONFLICT(id) DO UPDATE` (or
-an equivalently proven non-delete form). Otherwise a salience-only upsert can look like a row delete
-to SQLite and spuriously advance every model. This is a prerequisite, not optional cleanup.
+Because these triggers advance every initialized model row on each qualifying note-row change, bulk
+deletion MUST execute its note-row mutations within a single enclosing transaction. The advances
+then coalesce to one increment per model per batch, following the coalescing allowance above, rather
+than one increment per note. `memory.prune` currently soft-deletes N notes in N separate
+transactions (`handlers/prune.rs:130-145`), so it MUST wrap the batch in one transaction.
+`delete_subjects` and any other multi-note deletion path carry the same requirement. Without it,
+pruning N notes performs O(N×M) generation writes and routes every model to exact search.
+
+Advancing all initialized models rather than only the models that hold a vector for the mutated note
+is a deliberate simplification, because a SQL trigger cannot cheaply compute per-note model
+membership. The cost is bounded. A retired model that no recall queries incurs only a wasted lazy
+rebuild, with no effect on served recall latency, and the coalescing above caps writes at one per
+model per transaction. Note-mutation authority is assumed trusted in this cut: mutations are
+authorized at the Gate (ADR-018), and namespace is attribution rather than a storage boundary
+(ADR-007), so corpus-wide per-model invalidation stays inside the trust boundary of a
+single-writer-authority deployment. Per-tenant availability isolation on a shared multi-tenant
+backend is out of scope for this ADR. A future amendment MAY add model-membership-targeted
+note-liveness invalidation that computes the affected models in the Rust delete path and advances
+only those, which removes the cross-model over-invalidation and is the migration path if khive later
+serves untrusted co-tenants from one database.
+
+Current note persistence uses `INSERT OR REPLACE` at three independent sites: the canonical
+single-note upsert (`stores/note.rs:35-81`), the batch upsert (`stores/note.rs:377`), and note-merge
+(`runtime/src/curation.rs:1709`). Before enabling a DELETE trigger, all three MUST route through one
+shared true `INSERT ... ON CONFLICT(id) DO UPDATE` statement, or an equivalently proven non-delete
+form. `INSERT OR REPLACE` is a DELETE followed by an INSERT, so a salience-only upsert through any of
+these paths looks like a row delete to SQLite and spuriously advances every model. One raw writer
+left in place defeats the prerequisite. This is a required migration with all three sites
+enumerated, not optional cleanup.
 
 The trigger update column list/`WHEN` predicates MUST exclude `salience`, `decay_factor`,
 `properties`, `status`, `expires_at`, and content-only changes. Salience-only updates MUST leave all
@@ -466,6 +491,11 @@ open on epoch read errors, contrary to #752's required next-recall/fail-closed s
   prohibited by contract.
 - **Generation rows for retired models**: retain them; their cardinality is embedding-model count,
   not note count. Cleanup is optional future work.
+- **Cross-model over-invalidation on shared backends**: note-liveness triggers advance all
+  initialized models, so on a shared multi-tenant database an authorized writer's note mutations
+  invalidate co-tenant model caches. This is bounded by the single-writer-authority trust model
+  (Gate authorization, ADR-018) and deferred to a future membership-targeting amendment; this cut
+  does not isolate co-tenants.
 - **Availability trade**: exact fallback may be slower than ADR-107's stale serving during rebuild.
   This is deliberate. Operators may not re-enable stale ANN without a later ADR changing the
   consistency contract.
