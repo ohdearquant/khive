@@ -318,7 +318,15 @@ jobs:
           # GPL-1.0-or-later — a known false positive for this package. Scope the
           # exception to exactly this purl so the allow-list above is unchanged
           # for everything else.
-          allow-dependencies-licenses: pkg:pypi/typing-extensions
+          #
+          # sqlite-vec is dual-licensed MIT OR Apache-2.0 (both already in the
+          # allow-list above), but dependency-review's SPDX parser cannot parse
+          # its combined license string and tags it LicenseRef-bad-mitapache-2.0.
+          # Our own cargo-deny gate (crates/deny.toml) already accepts it. Once
+          # crates/Cargo.lock is committed (#992), the full cargo tree becomes
+          # visible to dependency-review permanently, so this scoped exemption is
+          # durable infrastructure rather than a temporary workaround.
+          allow-dependencies-licenses: pkg:pypi/typing-extensions, pkg:cargo/sqlite-vec
 
   wasm-parity:
     name: wasm-parity (khive-changeset)
