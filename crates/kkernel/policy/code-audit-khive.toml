@@ -77,8 +77,9 @@ kkernel = 8
 # platform-native kernel binaries are leaves, the `khive` npm root bundles them
 # as optional platform deps (rank 1), and `@khive-ai/cli` aliases `khive`
 # (rank 2). `khive-contract` (Python contract-test harness) and
-# `khive-workspace` resolve only external PyPI specifiers, so they are leaves
-# in the project graph (rank 0).
+# `khive-workspace` have no in-map project dependencies (their specifiers
+# resolve outside the code map), so they are leaves in the project graph
+# (rank 0).
 "@khive-ai/kernel-darwin-arm64" = 0
 "@khive-ai/kernel-darwin-x64" = 0
 "@khive-ai/kernel-linux-arm64" = 0
