@@ -768,3 +768,142 @@ policy for GitHub issues is unchanged and orthogonal to this amendment: it
 still runs after pass 3 against the verify-dedupe-rank policy, never a bulk
 file-everything pass, and is not affected by whether a finding has also been
 ingested into khive.
+
+## Amendment 4 (2026-07-17): analysis verbs over the map database
+
+D1 declared the code pack "verbless-by-design, domain-ontology only," and
+Amendment 2 added exactly one verb, `code.ingest`, without changing that
+posture: ingest writes a map database, it does not read one back. Amendment
+2's L1 and L1.5 tiers shipped in PR #1039; L2 (declaration-granularity
+Scanner/Extractor ingest) remains unimplemented. Across all three tiers,
+nothing in the pack analyzes the structure it has ingested — the original
+one-line ask that opened this ADR's Context ("we need a pack-code") included
+analysis, and the pack has shipped none. This amendment adds the pack's
+first analysis verbs: three read-only operations over the same map databases
+`code.ingest` writes.
+
+### E1: Scope — D1's verbless-by-design statement is superseded for reads only
+
+This amendment supersedes D1's "registers zero verbs" scope statement for
+read verbs. The write surface is unchanged: `code.ingest` remains the pack's
+only mutating verb, and no new entity kind, note kind, or edge relation is
+introduced here. The three verbs below are pure readers: each opens a map
+database, computes over its stored entities and edges, and returns a
+result. None of them writes to any database, production or map.
+
+### E2: `code.coupling(db?, level?, limit?, offset?)`
+
+Fan-in/fan-out over `depends_on` edges, per module by default
+(`level="module"`), or per project when `level="project"` — aggregating the
+same edges up to the `project contains module` containment rule (D3 #9).
+Results are sorted by total degree (fan_in + fan_out) descending. Each
+result row carries the entity id, its name, `fan_in` (incoming `depends_on`
+edge count), and `fan_out` (outgoing `depends_on` edge count). `limit` and
+`offset` paginate the sorted result the same way `list` does elsewhere in
+the pack surface.
+
+### E3: `code.health(db?)`
+
+A single summary object over one map database:
+
+- entity and edge counts, broken down by kind (mirroring `stats()`'s shape
+  for the KG substrate, scoped to the target map database);
+- the top-N coupling outliers, reusing E2's computation rather than a
+  separate query;
+- the count of modules with zero incoming `depends_on` edges — dead-module
+  candidates, scoped to modules actually present in the ingested set, the
+  same scoping Amendment 2's B8 acceptance property 1 uses for dead symbols;
+- the cycle count, reusing E4's computation rather than a separate query.
+
+`code.health` is a composition of `code.coupling` and `code.cycles` plus
+counting; it introduces no computation beyond what those two verbs already
+define.
+
+### E4: `code.cycles(db?, limit?)`
+
+Enumerates module-level `depends_on` cycles: strongly connected components
+of size two or more over the `concept/module -> depends_on -> concept/module`
+edge set (D3 #8), plus self-loops (a module depending on itself). Each
+cycle is returned as an ordered list of module ids and names. `limit`
+bounds the number of cycles returned, not the traversal itself — the
+underlying SCC computation always runs over the full module graph of the
+target database.
+
+### E5: Cycle detection is in-process, not a query recipe
+
+`code.cycles` is implemented as an in-process graph traversal (Tarjan's
+algorithm or an equivalent strongly-connected-components computation) over
+the map database's `depends_on` edges, not as a `query()` pattern the caller
+composes themselves. This is a normative consequence of the query layer's
+own design, not a convenience choice: `khive-query`'s validator
+(`crates/khive-query/src/validate.rs`) rejects any GQL or SPARQL pattern
+that repeats a node variable, with the rejection reason stated in the error
+text itself as cycle/self-reachability detection, and the rejection is
+locked by regression tests. A pattern that walks a module back to itself —
+the shape a cycle query needs — cannot be expressed in either query
+language today. `code.cycles` exists because the gap is structural, not
+because in-process computation was preferred over a documented query recipe
+that could have been written instead.
+
+### E6: Non-goals
+
+- No declaration-level (L2) analysis semantics are defined here. `code.ingest`'s
+  L2 tier remains unimplemented; once it ships, `code.coupling` and
+  `code.cycles` extend naturally to the D2 subtypes (`function`, `datatype`,
+  `interface`) without a further ADR, because both verbs already operate on
+  arbitrary `depends_on` edges rather than a module-only special case. This
+  amendment does not specify that extension's exact shape.
+- No mutation. All three verbs are read-only, per E1.
+- No scheduled or background analysis. Every call computes fresh over the
+  database's current state at call time; there is no cached or
+  incrementally-maintained analysis result.
+- No default-pack-set change. The `code` pack's default-load status is
+  unchanged from Amendment 3 (C1).
+- No schema change. `SCHEMA_PLAN` remains `None`, as declared in D5.
+
+### E7: Target database posture — the production-db fence is restated, not relaxed
+
+`code.coupling`, `code.health`, and `code.cycles` resolve their `db`
+parameter through the same db-target resolution `code.ingest` uses (B1,
+B7), and each refuses the shared production database exactly as
+`code.ingest` does: analysis over `khive.db` is rejected with no override
+available on any of the three verbs. The D6.1 granularity fence exists to
+keep exhaustive symbol/call graphs out of the shared production graph;
+letting analysis verbs read the production database would not itself
+violate that fence's storage rule, but it would create a second path that
+depends on the fence never being violated elsewhere, which is exactly the
+posture B7 already rejected once for writes. Restating the same fence for
+reads keeps the rule uniform across the pack's entire verb surface: `db`
+always means a dedicated map database.
+
+### E8: Acceptance
+
+An implementation of this amendment is acceptance-tested against four
+properties:
+
+1. **Coupling correctness.** `code.coupling` run against a small fixture
+   database with hand-counted `depends_on` edges returns fan_in/fan_out
+   values matching the hand count, at both `level="module"` and
+   `level="project"`.
+2. **Cycle detection, positive and negative.** `code.cycles` run against a
+   synthetic fixture containing a 3-module cycle (`A depends_on B
+   depends_on C depends_on A`) returns exactly that cycle; run against a
+   synthetic fixture whose module graph is a DAG, it returns an empty
+   result.
+3. **Production-db fence.** All three verbs, called with `db` unset or
+   explicitly pointed at the shared production database, are rejected with
+   the same error class `code.ingest` uses for the same condition (B7).
+4. **Idempotent reads.** Two consecutive calls to the same verb with the
+   same `db` and the same other parameters, with no intervening write,
+   return identical results.
+
+### E9: Interface note — verb count delta
+
+The MCP verb table in ADR-023 and the verb counts in `AGENTS.md` and this
+repository's `CLAUDE.md` change when the implementation PR for this
+amendment lands, not in this docs-only PR. The expected delta is **+3**
+verbs (`code.coupling`, `code.health`, `code.cycles`) added to the pack's
+existing one (`code.ingest`), against the count current as of Amendment 2's
+acceptance (79 verbs on the default pack set) — the implementation PR
+should cite the then-current count at merge time, since intervening PRs may
+have changed it.
