@@ -843,8 +843,8 @@ async fn invalidate_vamana_snapshots(rt: &KhiveRuntime, namespace: &str) -> anyh
 
 /// Remove per-namespace memory Vamana snapshot rows (legacy `{ns}::memory_vamana::*` format).
 /// After FTS+ANN consolidation the active, retained key is `global::memory_vamana::{model}`
-/// (ADR-062, corrected by ADR-116); old per-ns rows are orphaned. Best-effort — missing table
-/// or SQL failure is logged and ignored.
+/// (ADR-062, corrected by ADR-116 (PR #1080)); old per-ns rows are orphaned. Best-effort —
+/// missing table or SQL failure is logged and ignored.
 async fn purge_stale_memory_vamana_snapshots(rt: &KhiveRuntime) {
     use khive_storage::types::SqlStatement;
     let sql = rt.sql();
@@ -857,12 +857,16 @@ async fn purge_stale_memory_vamana_snapshots(rt: &KhiveRuntime) {
             // `ann::snapshot_key` (`"global::memory_vamana::{model}"`), not a bare
             // namespace — `namespace != 'global'` never matches that literal string and
             // so purged every memory_vamana row unconditionally, including current,
-            // still-valid `global::memory_vamana::*` snapshots (ADR-116 condition 4).
-            // Match the retained key's prefix instead, mirroring
-            // `invalidate_active_memory_vamana_snapshot`'s LIKE pattern below.
+            // still-valid `global::memory_vamana::*` snapshots (ADR-116 (PR #1080)
+            // condition 4). Match the retained key's prefix instead, mirroring
+            // `invalidate_active_memory_vamana_snapshot`'s LIKE pattern below — but with
+            // GLOB, not LIKE: SQLite's LIKE is ASCII case-insensitive, so a legacy
+            // `GLOBAL::memory_vamana::*` row (a valid namespace per namespace validation)
+            // would otherwise be treated as the retained lowercase key and never purged.
+            // GLOB is case-sensitive (uses `*`/`?` globbing, not `%`/`_`).
             sql: "DELETE FROM retrieval_snapshots \
                   WHERE index_type = 'memory_vamana' \
-                    AND namespace NOT LIKE 'global::memory_vamana::%'"
+                    AND namespace NOT GLOB 'global::memory_vamana::*'"
                 .into(),
             params: vec![],
             label: Some("purge_stale_memory_vamana_snapshots".into()),
@@ -1467,7 +1471,7 @@ mod tests {
         );
     }
 
-    /// Regression test (ADR-116 condition 4): `purge_stale_memory_vamana_snapshots` must
+    /// Regression test (ADR-116 (PR #1080) condition 4): `purge_stale_memory_vamana_snapshots` must
     /// keep the current, retained `global::memory_vamana::{model}` key (ADR-062) and purge
     /// only legacy per-namespace `{ns}::memory_vamana::*` rows. The prior predicate
     /// (`namespace != 'global'`) matched every row unconditionally, since the namespace
@@ -1548,6 +1552,80 @@ mod tests {
         assert!(
             remaining.contains(&"local::vamana::model-a".to_string()),
             "unrelated knowledge Vamana rows must survive: {remaining:?}"
+        );
+    }
+
+    /// Regression test (PR #1081 review): SQLite `LIKE` is ASCII case-insensitive, so
+    /// `NOT LIKE 'global::memory_vamana::%'` treated a legacy `GLOBAL::memory_vamana::*`
+    /// row (a valid namespace per namespace validation) as the retained lowercase key and
+    /// never purged it. `GLOB` is case-sensitive and must tell the two apart.
+    #[tokio::test]
+    async fn test_purge_stale_memory_vamana_snapshots_is_case_sensitive() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let sql = rt.sql();
+
+        let mut w = sql.writer().await.expect("writer");
+        w.execute_script(
+            "CREATE TABLE IF NOT EXISTS retrieval_snapshots (\
+             namespace TEXT NOT NULL, \
+             index_type TEXT NOT NULL, \
+             snapshot BLOB NOT NULL, \
+             created_at INTEGER NOT NULL, \
+             PRIMARY KEY (namespace, index_type));"
+                .into(),
+        )
+        .await
+        .expect("create table");
+
+        for (ns, idx_type) in &[
+            ("global::memory_vamana::model-a", "memory_vamana"),
+            ("GLOBAL::memory_vamana::model-a", "memory_vamana"),
+        ] {
+            w.execute(SqlStatement {
+                sql: "INSERT INTO retrieval_snapshots \
+                      (namespace, index_type, snapshot, created_at) \
+                      VALUES (?1, ?2, ?3, 0)"
+                    .into(),
+                params: vec![
+                    SqlValue::Text(ns.to_string()),
+                    SqlValue::Text(idx_type.to_string()),
+                    SqlValue::Blob(b"{}".to_vec()),
+                ],
+                label: None,
+            })
+            .await
+            .expect("insert row");
+        }
+        drop(w);
+
+        purge_stale_memory_vamana_snapshots(&rt).await;
+
+        let mut r = sql.reader().await.expect("reader");
+        let rows = r
+            .query_all(SqlStatement {
+                sql: "SELECT namespace FROM retrieval_snapshots ORDER BY namespace".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("query");
+
+        let remaining: Vec<String> = rows
+            .iter()
+            .filter_map(|row| match row.get("namespace") {
+                Some(SqlValue::Text(s)) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            remaining.contains(&"global::memory_vamana::model-a".to_string()),
+            "current-key lowercase global memory Vamana snapshot must be retained: {remaining:?}"
+        );
+        assert!(
+            !remaining.contains(&"GLOBAL::memory_vamana::model-a".to_string()),
+            "legacy uppercase GLOBAL::memory_vamana snapshot must be purged, not mistaken for \
+             the retained lowercase key: {remaining:?}"
         );
     }
 
