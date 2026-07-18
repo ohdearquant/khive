@@ -1,0 +1,25 @@
+# Explicit allowlist for scripts/lint-stub-markers.sh (#560).
+#
+# The scanner has no reachability/cfg analysis -- it scans every .rs file
+# under crates/ (source, tests, benches, examples) and flags any
+# panic!/unreachable! call whose decoded string-literal message reads as a
+# placeholder. A small number of matches are legitimate (a test mock whose
+# type or method name happens to contain a placeholder word); those are
+# suppressed here, one line per exception, never by loosening the scanner
+# itself.
+#
+# Format: one entry per line, a path-substring and a decoded-message-
+# substring separated by a single TAB. A finding is suppressed iff its file
+# path contains the path-substring AND its decoded message contains the
+# message-substring. Keep both substrings as specific as the real match to
+# avoid over-suppressing unrelated findings. An entry that matches nothing
+# in a given run is not an error. Blank lines and lines starting with `#`
+# are ignored. Adding a line here is a reviewed code change, not a blanket
+# exemption -- justify it in the PR.
+
+# crates/kkernel/src/reindex.rs: a #[cfg(test)] EmbeddingService mock named
+# StubService whose guard message names the mock's own type/method, not a
+# real placeholder. Currently inert under the scanner's word-boundary
+# PLACEHOLDER_RE ("StubService" has no isolated "stub" word), seeded here
+# for the case the mock's naming or the regex broadens later.
+crates/kkernel/src/reindex.rs	StubService::embed must not be called in this test

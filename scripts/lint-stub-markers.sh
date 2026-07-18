@@ -1,5 +1,5 @@
 #!/bin/sh
-# Detect placeholder-string `panic!`/`unreachable!` calls in shipping source
+# Detect placeholder-string `panic!`/`unreachable!` calls in crate source
 # (#560, closes the gap in the clippy-based No-Stub Guard).
 #
 # `-Dclippy::todo`/`-Dclippy::unimplemented` (scripts/ci.sh phase_no_stubs)
@@ -8,14 +8,17 @@
 # invariant violations) -- denying them outright would fail hundreds of
 # existing, correct call sites. The actual stub signal is the MESSAGE: a
 # `panic!("not implemented yet")` or `unreachable!("stub")` is a placeholder
-# wearing a real macro. This scans the string literal argument of every
+# wearing a real macro. This scans the string literal argument(s) of every
 # panic!/unreachable! call for that language, not the macro itself.
 #
-# Scope mirrors phase_no_stubs (`--lib --bins`): only crates/*/src (workspace +
-# the forward-deployed khive-merge crate), never crates/*/tests, benches, or
-# examples. Within src, a `#[cfg(test)]`-gated item is source clippy never
-# type-checks under `--lib --bins` (no `--cfg test`), so this scanner skips
-# those blocks the same way.
+# Scans every `.rs` file under crates/ -- source, tests, benches, and
+# examples alike (build-artifact `target`/`.cargo-target` dirs excluded,
+# same as .gitignore). There is no reachability/cfg analysis: a placeholder
+# message is a placeholder message whether or not the code compiling it is
+# test-gated. The small number of legitimate matches (a test mock whose
+# type/method name happens to contain a placeholder word) are suppressed via
+# the explicit, in-diff reviewed allowlist at stub-marker-allowlist.txt --
+# see that file's header for the format.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -26,6 +29,7 @@ self_test() {
     trap 'rm -rf "$tmp"' EXIT
 
     mkdir -p "$tmp/case-fail/crates/fixture-crate/src"
+    mkdir -p "$tmp/case-fail/crates/fixture-crate/tests"
     mkdir -p "$tmp/case-pass/crates/fixture-crate/src"
 
     cat > "$tmp/case-fail/crates/fixture-crate/src/lib.rs" <<'FIXTURE'
@@ -55,16 +59,6 @@ const NOTE: &str = "warning: #[cfg(test)] { this is not a real attribute }";
 pub fn after_lookalike_string(flag: bool) -> u32 {
     if !flag {
         panic!("not implemented for this flag");
-    }
-    1
-}
-
-#[cfg(test)]
-const GREETING: &str = "x";
-
-pub fn after_nonbraced_cfg_test_item(flag: bool) -> u32 {
-    if !flag {
-        panic!("not implemented after a non-braced cfg(test) item");
     }
     1
 }
@@ -106,45 +100,66 @@ pub fn after_concat_stub(flag: bool) -> u32 {
     1
 }
 
-#[cfg(any(test, feature = "test-support"))]
-pub fn composite_test_gated_stub() -> u32 {
-    panic!("todo: still a stub behind a cfg(any(test, feature)) composite, must never reach shipping scan")
+pub fn unicode_escape_stub(flag: bool) -> u32 {
+    if !flag {
+        panic!("t\u{6f}do: only catches via unicode escape decoding");
+    }
+    1
 }
 
-#[cfg(not(test))]
-pub fn after_not_test_cfg_stub(flag: bool) -> u32 {
+pub fn hex_escape_stub(flag: bool) -> u32 {
     if !flag {
-        panic!("todo: still not implemented behind a cfg(not(test)) attribute, must always be scanned");
+        panic!("s\x74ub: only catches via hex escape decoding");
+    }
+    1
+}
+
+pub fn sql_with_line_continuation() -> &'static str {
+    // Rust's backslash-newline string continuation (used throughout this
+    // codebase for long multi-line SQL literals) strips the newline and
+    // following whitespace from the string value -- it must not desync the
+    // lexer for whatever code follows it.
+    "SELECT * FROM widgets \
+     WHERE active = 1"
+}
+
+pub fn after_line_continuation_string(flag: bool) -> u32 {
+    if !flag {
+        panic!("todo: still not implemented after a backslash-newline string continuation");
     }
     1
 }
 
 #[cfg(test)]
-mod ext_tests;
+fn const_generic_default_guard<const N: usize = { 4 }>() -> usize {
+    if N == 0 {
+        panic!("todo: a placeholder inside a #[cfg(test)] item must now be caught");
+    }
+    N
+}
 FIXTURE
 
     # Appended via printf (not the quoted heredoc above) so the fixture can
     # carry a real ESC byte and a real embedded newline inside the panic
-    # message -- the exact CI-log-forgery shape blocking fix 2 sanitizes.
+    # message -- the exact CI-log-forgery shape this scanner sanitizes.
     printf '\npub fn ci_log_forgery_stub(flag: bool) -> u32 {\n    if !flag {\n        panic!("todo: stub \033[31m::error::forged\nmid-message newline injection");\n    }\n    1\n}\n' \
         >> "$tmp/case-fail/crates/fixture-crate/src/lib.rs"
 
-    # External test module (blocking fix 3): `src/lib.rs` above declares
-    # `#[cfg(test)] mod ext_tests;` -- Rust's external-module-file form.
-    # Nothing inside ext_tests.rs itself carries a #[cfg(test)] attribute; the
-    # gate lives entirely in the parent's mod declaration. clippy --lib --bins
-    # never compiles it, so this placeholder must never be scanned.
-    cat > "$tmp/case-fail/crates/fixture-crate/src/ext_tests.rs" <<'EXTFIXTURE'
-pub fn only_reachable_from_cfg_test_mod_decl() {
-    panic!("todo: external test module content must never be scanned because it is only reachable via a cfg(test)-gated external mod declaration");
+    # A placeholder panic living under tests/ (previously pruned from
+    # discovery entirely) must now be caught -- nothing is excluded by
+    # location anymore, only by the explicit allowlist.
+    cat > "$tmp/case-fail/crates/fixture-crate/tests/integration.rs" <<'TESTFIXTURE'
+#[test]
+fn placeholder_inside_tests_dir() {
+    panic!("todo: a placeholder inside a tests/ directory file must now be caught");
 }
-EXTFIXTURE
+TESTFIXTURE
 
-    # Filename-injection fixture (blocking fix 1): the filename itself -- not
-    # the panic message -- carries a real newline and an unbroken
-    # `::error::forged` sequence. If a rendered finding line ever echoes this
-    # path unsanitized, it forges a GitHub Actions workflow command the same
-    # way an unsanitized message would.
+    # Filename-injection fixture: the filename itself -- not the panic
+    # message -- carries a real newline and an unbroken `::error::forged`
+    # sequence. If a rendered finding line ever echoes this path
+    # unsanitized, it forges a GitHub Actions workflow command the same way
+    # an unsanitized message would.
     newline_filename="exploit$(printf '\n')::error::forged.rs"
     cat > "$tmp/case-fail/crates/fixture-crate/src/$newline_filename" <<'NLFIXTURE'
 pub fn newline_filename_stub() -> u32 {
@@ -193,6 +208,10 @@ pub fn concat_arg_dispatch(kind: &str) -> u32 {
     }
 }
 
+// Mirrors the real crates/kkernel/src/reindex.rs mock pattern (a #[cfg(test)]
+// EmbeddingService mock named StubService whose guard message names the
+// mock's own type/method, not a real placeholder) -- the reason
+// stub-marker-allowlist.txt exists.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,22 +229,14 @@ mod tests {
         assert_eq!(dispatch("a"), 1);
     }
 }
-
-#[cfg(test)]
-fn const_generic_default_guard<const N: usize = { 4 }>() -> usize {
-    if N == 0 {
-        panic!("todo: still a stub guarded by cfg(test), must never reach shipping scan");
-    }
-    N
-}
 FIXTURE
 
     status=0
 
-    # Exactly 12 markers are seeded in case-fail above; asserting the count
+    # Exactly 15 markers are seeded in case-fail above; asserting the count
     # (not just substring presence) catches a parser-overmatch regression
     # that would otherwise slip through as an unnoticed extra finding.
-    expected_marker_count=12
+    expected_marker_count=15
 
     if scan "$tmp/case-fail" > "$tmp/fail.log" 2>&1; then
         echo "self-test FAILED: expected placeholder call sites were not caught"
@@ -243,14 +254,17 @@ FIXTURE
             "not implemented for other kinds yet" \
             "todo: handle the false branch" \
             "not implemented for this flag" \
-            "not implemented after a non-braced cfg(test) item" \
             "todo: still not implemented after a long comment gap" \
             "todo: still not implemented after a byte-raw string literal" \
-            "mid-message newline injection" \
             "todo: not implemented for the format-arg case" \
             "concat-assembled stub message" \
-            "todo: still not implemented behind a cfg(not(test)) attribute" \
-            "carries a newline and a forged CI workflow command sequence"
+            "only catches via unicode escape decoding" \
+            "only catches via hex escape decoding" \
+            "still not implemented after a backslash-newline string continuation" \
+            "a placeholder inside a #[cfg(test)] item must now be caught" \
+            "mid-message newline injection" \
+            "carries a newline and a forged CI workflow command sequence" \
+            "a placeholder inside a tests/ directory file must now be caught"
         do
             if ! grep -qF "$marker" "$tmp/fail.log"; then
                 echo "self-test FAILED: expected finding missing: $marker"
@@ -259,24 +273,9 @@ FIXTURE
             fi
         done
 
-        # blocking fix 3: an external test module (only reachable via a
-        # cfg(test)-gated `mod ext_tests;` in lib.rs) and a same-file
-        # cfg(any(test, ...)) composite must never surface as findings --
-        # clippy --lib --bins never compiles either.
-        if grep -qF 'external test module content' "$tmp/fail.log"; then
-            echo "self-test FAILED: content only reachable via a cfg(test)-gated external mod declaration was scanned"
-            cat "$tmp/fail.log"
-            status=1
-        fi
-        if grep -qF 'cfg(any(test, feature)) composite' "$tmp/fail.log"; then
-            echo "self-test FAILED: an item gated by a cfg(any(test, ...)) composite was scanned"
-            cat "$tmp/fail.log"
-            status=1
-        fi
-
-        # blocking fix 2: the ci_log_forgery_stub message above carries a raw
-        # ANSI escape, a literal "::error::forged" workflow-command shape, and
-        # an embedded newline -- none of the three may survive into CI stdout.
+        # the ci_log_forgery_stub message above carries a raw ANSI escape, a
+        # literal "::error::forged" workflow-command shape, and an embedded
+        # newline -- none of the three may survive into CI stdout.
         esc="$(printf '\033')"
         if grep -qF "$esc" "$tmp/fail.log"; then
             echo "self-test FAILED: a raw ANSI escape byte leaked into CI output"
@@ -299,10 +298,10 @@ FIXTURE
             status=1
         fi
 
-        # blocking fix 1: the fixture filename itself (not its content)
-        # carries a real newline and an unbroken "::error::forged" sequence
-        # -- the rendered path must be sanitized the same way a message is,
-        # and the whole finding must survive as a single, unbroken CI line.
+        # the fixture filename itself (not its content) carries a real
+        # newline and an unbroken "::error::forged" sequence -- the rendered
+        # path must be sanitized the same way a message is, and the whole
+        # finding must survive as a single, unbroken CI line.
         if ! grep -Eq 'exploit.*forged\.rs.*reads as a placeholder stub' "$tmp/fail.log"; then
             echo "self-test FAILED: the embedded newline in the fixture filename split the CI finding line in two, or the sanitized path did not render as expected"
             cat "$tmp/fail.log"
@@ -311,9 +310,41 @@ FIXTURE
     fi
 
     if ! scan "$tmp/case-pass" > "$tmp/pass.log" 2>&1; then
-        echo "self-test FAILED: legitimate panic!/unreachable! messages (raw strings, lookalike text inside strings, a #[cfg(test)] helper named StubService, a #[cfg(test)] item with a signature brace before its body) false-positived:"
+        echo "self-test FAILED: legitimate panic!/unreachable! messages (raw strings, lookalike text inside strings, a #[cfg(test)] helper named StubService) false-positived:"
         cat "$tmp/pass.log"
         status=1
+    fi
+
+    # Allowlist suppression: one fixture finding matches an allowlist entry
+    # (by path substring AND decoded-message substring) and must be
+    # suppressed; a sibling finding that does not match must still surface.
+    mkdir -p "$tmp/case-allowlist/crates/fixture-crate/src"
+    cat > "$tmp/case-allowlist/crates/fixture-crate/src/lib.rs" <<'ALWFIXTURE'
+pub fn allowlisted_stub() -> u32 {
+    panic!("todo: this one is allowlisted and must be suppressed")
+}
+
+pub fn not_allowlisted_stub() -> u32 {
+    panic!("todo: this one is NOT allowlisted and must still be caught")
+}
+ALWFIXTURE
+    printf 'fixture-crate/src/lib.rs\tthis one is allowlisted\n' > "$tmp/self-test-allowlist.txt"
+
+    if STUB_MARKER_ALLOWLIST="$tmp/self-test-allowlist.txt" scan "$tmp/case-allowlist" > "$tmp/allowlist.log" 2>&1; then
+        echo "self-test FAILED: the non-allowlisted sibling finding should have failed the scan"
+        cat "$tmp/allowlist.log"
+        status=1
+    else
+        if grep -qF 'this one is allowlisted' "$tmp/allowlist.log"; then
+            echo "self-test FAILED: an allowlisted finding was not suppressed"
+            cat "$tmp/allowlist.log"
+            status=1
+        fi
+        if ! grep -qF 'this one is NOT allowlisted' "$tmp/allowlist.log"; then
+            echo "self-test FAILED: a sibling non-allowlisted finding was incorrectly suppressed"
+            cat "$tmp/allowlist.log"
+            status=1
+        fi
     fi
 
     if [ "$status" -eq 0 ]; then
@@ -329,31 +360,35 @@ scan() {
     # NUL-delimited discovery and transport end-to-end: a filename may
     # legally contain a newline (or any byte but NUL and `/`), and this
     # scanner's own findings later echo filenames straight into CI stdout.
-    # Word/newline-splitting a file list (the previous `$(find ...)` capture
-    # into a newline-joined string) lets such a filename inject extra,
-    # bogus list entries -- or, once rendered, forge GitHub Actions
-    # workflow-command lines. `-print0` + a NUL-delimited transport file
-    # sidesteps splitting entirely; `sanitize_for_ci` (applied to every
-    # rendered path below, the same function already used on messages)
-    # handles the render side.
+    # `-print0` + a NUL-delimited transport file sidesteps splitting
+    # entirely; `sanitize_for_ci` (applied to every rendered path below, the
+    # same function already used on messages) handles the render side.
+    #
+    # Only `target`/`.cargo-target` (build-artifact dirs, per .gitignore)
+    # are pruned -- everything else under crates/, including tests/,
+    # benches/, and examples/, is in scan scope.
     find "$root/crates" \
-        \( -name 'target' -o -name 'target-wt' -o -name 'tests' -o -name 'benches' -o -name 'examples' \) -type d -prune \
-        -o -path '*/src/*.rs' -type f -print0 \
+        \( -name 'target' -o -name '.cargo-target' \) -type d -prune \
+        -o -name '*.rs' -type f -print0 \
         > "$file_list"
 
     if [ ! -s "$file_list" ]; then
         rm -f "$file_list"
-        echo "no source files matched crates/*/src/**/*.rs under $root/crates (excluding target*/tests/benches/examples) -- the scanner would silently be a no-op; fix the file-layout selection" >&2
+        echo "no .rs files matched under $root/crates (excluding target/.cargo-target build-artifact dirs) -- the scanner would silently be a no-op; fix the file-layout selection" >&2
         return 1
     fi
 
-    python3 - "$file_list" <<'PY'
+    allowlist="${STUB_MARKER_ALLOWLIST:-$SCRIPT_DIR/stub-marker-allowlist.txt}"
+
+    python3 - "$file_list" "$allowlist" <<'PY'
 import os
 import re
 import sys
 
 with open(sys.argv[1], "rb") as fh:
     files = sorted(os.fsdecode(f) for f in fh.read().split(b"\0") if f)
+
+ALLOWLIST_PATH = sys.argv[2]
 
 PLACEHOLDER_RE = re.compile(
     r"\b(stub|todo|fixme|placeholder|unimplemented|not\s*yet\s*implemented|"
@@ -364,15 +399,21 @@ PLACEHOLDER_RE = re.compile(
 # (`panic!(...)`, `panic!{...}`, `panic![...]`) -- all three are legal macro
 # call syntax, not just parens.
 MACRO_CALL_RE = re.compile(r"\b(panic|unreachable)\s*!\s*([(\{\[])")
-STRING_LIT_RE = re.compile(r'"((?:[^"\\]|\\.)*)"')
-CFG_ATTR_START_RE = re.compile(r"#\s*\[\s*cfg\s*\(")
-ATTR_RE = re.compile(r"#\s*!?\s*\[[^\[\]]*\]\s*")
-MOD_DECL_RE = re.compile(r"mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;")
-NOT_TEST_RE = re.compile(r"not\s*\(\s*test\s*\)")
-TEST_IDENT_RE = re.compile(r"\btest\b")
-WHITESPACE_RE = re.compile(r"\s*")
+# re.DOTALL: Rust's backslash-newline string continuation (`"...\<newline>
+# ..."`, used throughout this codebase for long multi-line SQL literals)
+# puts a literal `\` immediately before a `\n` inside a plain string. Without
+# DOTALL, `\.` in the escaped-char alternative never matches that `\n`, so
+# the literal never finds its closing quote here -- and the next real `"`
+# anywhere later in the file gets mistaken for a fresh opening quote,
+# silently blanking arbitrary code (including real panic!/unreachable!
+# calls) as if it were string content. `[^"\\]` already matches newlines
+# regardless of DOTALL (character classes aren't affected by the flag); this
+# only changes what `\.` matches.
+STRING_LIT_RE = re.compile(r'"((?:[^"\\]|\\.)*)"', re.DOTALL)
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b.")
 CLOSERS = {"(": ")", "{": "}", "[": "]"}
+ESCAPE_RE = re.compile(r"\\(n|r|t|\\|\"|'|0|x[0-9A-Fa-f]{2}|u\{[0-9A-Fa-f]+\})")
+SIMPLE_ESCAPES = {"n": "\n", "r": "\r", "t": "\t", "\\": "\\", '"': '"', "'": "'", "0": "\0"}
 
 
 def sanitize_for_ci(raw):
@@ -505,12 +546,12 @@ def strip_comments_and_char_lits(text):
 def match_string_literal(text, pos):
     """Match a plain or raw string literal beginning at pos in `text` (which
     must have string content intact, i.e. `clean`, never the strings-blanked
-    variant). Returns (end_offset, inner_content) or None."""
+    variant). Returns (end_offset, inner_content, is_raw) or None."""
     if pos >= len(text):
         return None
     if text[pos] == '"':
         m = STRING_LIT_RE.match(text, pos)
-        return None if m is None else (m.end(), m.group(1))
+        return None if m is None else (m.end(), m.group(1), False)
     rs_end = raw_string_end(text, pos)
     if rs_end is None:
         return None
@@ -519,14 +560,14 @@ def match_string_literal(text, pos):
     while text[j] == "#":
         hashes += 1
         j += 1
-    return rs_end, text[j + 1 : rs_end - 1 - hashes]
+    return rs_end, text[j + 1 : rs_end - 1 - hashes], True
 
 
 def blank_strings(clean_text):
     """Given `clean` (comments/char-lits stripped, strings intact), replace
     every plain and raw string literal's content with spaces (newlines kept)
-    so downstream scans (cfg(test) attribute detection, macro-call matching)
-    never mistake text living inside a string literal for real code."""
+    so downstream macro-call matching never mistakes text living inside a
+    string literal for real code."""
     out = list(clean_text)
     i = 0
     n = len(clean_text)
@@ -549,54 +590,6 @@ def blank_strings(clean_text):
     return "".join(out)
 
 
-def find_item_head_end(code_only, start):
-    """Scan an item's head (from just after its `#[cfg(test)]` attribute) for
-    the item's own body-opening `{` or, for a non-braced item, its
-    terminating `;` -- both counted only at signature level, i.e. outside any
-    `()`, `[]`, or `<>` nesting. A brace living inside the signature (a
-    generic const default's block, e.g. `<const N: usize = { 4 }>`, or an
-    array-length const block in a where-clause bound, e.g.
-    `where [(); { 1 }]: Sized`) is not the item body -- it is skipped as a
-    balanced, opaque unit so it can never be mistaken for the body opener.
-    Returns `("brace", offset)` / `("semi", offset)`, or None if the head
-    runs off the end of the file unterminated."""
-    n = len(code_only)
-    i = start
-    paren = bracket = angle = 0
-    while i < n:
-        c = code_only[i]
-        if c == "(":
-            paren += 1
-        elif c == ")":
-            paren = max(0, paren - 1)
-        elif c == "[":
-            bracket += 1
-        elif c == "]":
-            bracket = max(0, bracket - 1)
-        elif c == "<":
-            angle += 1
-        elif c == ">":
-            if angle > 0:
-                angle -= 1
-        elif c == "{":
-            if paren == 0 and bracket == 0 and angle == 0:
-                return ("brace", i)
-            depth = 1
-            i += 1
-            while i < n and depth > 0:
-                if code_only[i] == "{":
-                    depth += 1
-                elif code_only[i] == "}":
-                    depth -= 1
-                i += 1
-            continue
-        elif c == ";":
-            if paren == 0 and bracket == 0 and angle == 0:
-                return ("semi", i)
-        i += 1
-    return None
-
-
 def find_matching_close(code_only, open_pos):
     """code_only[open_pos] is an opening `(`/`{`/`[`; return the offset of its
     same-type-nesting-depth matching close, or len(code_only) if
@@ -617,170 +610,8 @@ def find_matching_close(code_only, open_pos):
     return i - 1 if depth == 0 else n
 
 
-def is_test_gated_predicate(predicate):
-    """True if this #[cfg(...)] predicate can only be satisfied when --cfg
-    test is set -- matching what `cargo clippy --lib --bins` never compiles
-    (it never passes --cfg test). Covers the bare `test` predicate and any
-    any(...)/all(...) composite carrying `test` as a direct operand
-    (`any(test, feature = "x")`, `all(test, feature = "x")`) -- in this
-    codebase both shapes gate test-only helpers behind a feature that is
-    never active in a plain --lib --bins build, so treating either as
-    test-gated matches actual clippy behavior. `not(test)` is stripped
-    before the check: an item gated by `not(test)` (or `all(not(test), ...)`)
-    compiles precisely when test is ABSENT, i.e. always under --lib --bins,
-    so it must stay in scan scope, never be excluded."""
-    stripped = NOT_TEST_RE.sub(" ", predicate)
-    return bool(TEST_IDENT_RE.search(stripped))
-
-
-def find_test_gated_cfg_attrs(code_only):
-    """[(attr_start, attr_end), ...] for every #[cfg(...)] attribute in
-    code_only whose predicate is_test_gated_predicate. attr_end is the
-    offset just past the attribute's closing `]`. Balanced-paren parsing
-    (via find_matching_close) means a composite predicate's own nested
-    parens -- any(test, ...), all(test, ...) -- are captured whole, unlike
-    the old fixed `#[cfg(test)]`-only regex."""
-    results = []
-    n = len(code_only)
-    for m in CFG_ATTR_START_RE.finditer(code_only):
-        paren_start = m.end() - 1
-        close = find_matching_close(code_only, paren_start)
-        if close >= n:
-            continue
-        predicate = code_only[paren_start + 1 : close]
-        j = close + 1
-        while j < n and code_only[j].isspace():
-            j += 1
-        if j >= n or code_only[j] != "]":
-            continue
-        attr_end = j + 1
-        if is_test_gated_predicate(predicate):
-            results.append((m.start(), attr_end))
-    return results
-
-
-def test_gated_spans(code_only):
-    """Byte-offset [start, end) spans of every item gated by a test-shaped
-    #[cfg(...)] attribute (is_test_gated_predicate) -- clippy --lib --bins
-    never compiles these, so the scanner must not flag placeholder messages
-    living only in such code. Runs on the strings-blanked `code_only` text
-    so a cfg-attribute-shaped substring living inside a string literal is
-    never mistaken for a real attribute. For a non-braced item (e.g.
-    `#[cfg(test)] const X: u32 = 1;`) the span ends at the terminating `;`;
-    for a braced item (including `#[cfg(test)] mod tests { ... }`, whose
-    entire body is covered by the balanced brace count) it ends at the
-    body's balanced close, per find_item_head_end above."""
-    spans = []
-    n = len(code_only)
-    for attr_start, attr_end in find_test_gated_cfg_attrs(code_only):
-        head = find_item_head_end(code_only, attr_end)
-        if head is None:
-            continue
-        kind, pos = head
-        if kind == "semi":
-            spans.append((attr_start, pos + 1))
-            continue
-        depth = 1
-        i = pos + 1
-        while i < n and depth > 0:
-            if code_only[i] == "{":
-                depth += 1
-            elif code_only[i] == "}":
-                depth -= 1
-            i += 1
-        spans.append((attr_start, i))
-    return spans
-
-
-def skip_attrs_and_ws(code_only, pos):
-    """Advance past a run of `#[...]`/`#![...]` attributes and whitespace
-    starting at pos, so a cfg-gated `mod name;` declaration is still found
-    even when other attributes (`#[allow(dead_code)]`, doc comments already
-    blanked by strip_comments_and_char_lits, ...) sit between the cfg
-    attribute and the mod keyword."""
-    n = len(code_only)
-    while True:
-        m = ATTR_RE.match(code_only, pos)
-        if m is None:
-            break
-        pos = m.end()
-    ws = WHITESPACE_RE.match(code_only, pos)
-    return ws.end()
-
-
-def find_test_gated_external_mod_decls(parent_code_only):
-    """Module names declared as `#[cfg(test)] mod NAME;` (or an any/all-over-
-    test composite, is_test_gated_predicate) in this already
-    comments/strings-stripped parent-module source. Only the semicolon
-    (external-file) mod form matters here -- a braced `mod NAME { ... }` is
-    an inline module already covered by test_gated_spans' own balanced span
-    for that same file."""
-    names = set()
-    for attr_start, attr_end in find_test_gated_cfg_attrs(parent_code_only):
-        j = skip_attrs_and_ws(parent_code_only, attr_end)
-        m = MOD_DECL_RE.match(parent_code_only, j)
-        if m:
-            names.add(m.group(1))
-    return names
-
-
-def compute_externally_test_gated_files(files):
-    """Path set of every file reachable ONLY via a `#[cfg(test)] mod NAME;`
-    declaration in its parent module file -- Rust's external-module-file
-    form (e.g. `src/foo.rs` declaring `#[cfg(test)] mod tests;` for a
-    sibling `src/foo/tests.rs` or `src/foo/tests/mod.rs`). Nothing INSIDE
-    such a file carries a #[cfg(test)] attribute itself -- the gate lives in
-    the parent -- so test_gated_spans (which only looks within a single
-    file) cannot see it; clippy --lib --bins still never compiles it, since
-    the mod statement pulling it in is itself test-gated. Best-effort:
-    resolves only the single-parent-candidate cases Rust's module system
-    actually allows (`X.rs` or `X/mod.rs` declaring `mod Y;` for `X/Y.rs` or
-    `X/Y/mod.rs`, or `src/lib.rs`/`src/main.rs` for a crate-root `mod Y;`)."""
-    by_norm = {os.path.normpath(f): f for f in files}
-    parent_cache = {}
-    excluded = set()
-    for f in files:
-        norm = os.path.normpath(f)
-        d, base = os.path.split(norm)
-        stem, ext = os.path.splitext(base)
-        if ext != ".rs":
-            continue
-        if base == "mod.rs":
-            mod_name = os.path.basename(d)
-            owning_dir = os.path.dirname(d)
-        else:
-            mod_name = stem
-            owning_dir = d
-        if os.path.basename(owning_dir) == "src":
-            candidates = [
-                os.path.join(owning_dir, "lib.rs"),
-                os.path.join(owning_dir, "main.rs"),
-            ]
-        else:
-            candidates = [
-                os.path.join(os.path.dirname(owning_dir), os.path.basename(owning_dir) + ".rs"),
-                os.path.join(owning_dir, "mod.rs"),
-            ]
-        for cand in candidates:
-            cand_norm = os.path.normpath(cand)
-            if cand_norm == norm or cand_norm not in by_norm:
-                continue
-            if cand_norm not in parent_cache:
-                with open(by_norm[cand_norm], "r", encoding="utf-8") as fh:
-                    parent_text = fh.read()
-                parent_cache[cand_norm] = blank_strings(strip_comments_and_char_lits(parent_text))
-            if mod_name in find_test_gated_external_mod_decls(parent_cache[cand_norm]):
-                excluded.add(f)
-                break
-    return excluded
-
-
-def in_span(offset, spans):
-    return any(start <= offset < end for start, end in spans)
-
-
 def collect_string_literals(clean, start, end):
-    """All string-literal contents (plain or raw) found anywhere in
+    """All (content, is_raw) string-literal pairs found anywhere in
     clean[start:end], in source order. Used to scan a panic!/unreachable!
     macro's full balanced argument list -- not just the token immediately
     after the opening delimiter -- so a placeholder message hiding behind a
@@ -794,14 +625,63 @@ def collect_string_literals(clean, start, end):
     while i < end:
         lit = match_string_literal(clean, i)
         if lit is not None and lit[0] <= end:
-            parts.append(lit[1])
+            parts.append((lit[1], lit[2]))
             i = lit[0]
             continue
         i += 1
     return parts
 
 
-externally_gated_files = compute_externally_test_gated_files(files)
+def decode_rust_escapes(body, is_raw):
+    """Decode the Rust string-literal escapes a PLACEHOLDER_RE match needs
+    to see through (\\n \\r \\t \\\\ \\" \\' \\0, \\xNN, \\u{...}) so an
+    escape-obfuscated placeholder (e.g. `panic!("t\\u{6f}do: ...")`) is
+    still caught. Raw literals (`r"..."`, `r#"..."#`) have no escapes --
+    returned unchanged. Any other backslash sequence is left as-is."""
+    if is_raw:
+        return body
+
+    def repl(m):
+        tok = m.group(1)
+        if tok in SIMPLE_ESCAPES:
+            return SIMPLE_ESCAPES[tok]
+        if tok[0] == "x":
+            return chr(int(tok[1:], 16))
+        return chr(int(tok[2:-1], 16))  # u{...}
+
+    return ESCAPE_RE.sub(repl, body)
+
+
+def load_allowlist(path):
+    """Parse `<path-substring>\\t<message-substring>` entries from the
+    allowlist file at `path`. Blank lines and lines starting with `#` (after
+    stripping leading whitespace) are ignored. A missing file (e.g. a caller
+    override pointing at a path that does not exist) is an empty allowlist,
+    not an error."""
+    entries = []
+    if not os.path.isfile(path):
+        return entries
+    with open(path, "r", encoding="utf-8") as fh:
+        for raw_line in fh:
+            line = raw_line.rstrip("\n")
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            if "\t" not in line:
+                continue
+            path_sub, message_sub = line.split("\t", 1)
+            entries.append((path_sub, message_sub))
+    return entries
+
+
+def is_allowlisted(path, message, entries):
+    """A finding is suppressed iff some entry's path-substring is contained
+    in the file path AND its message-substring is contained in the decoded
+    panic!/unreachable! message. An entry that matches nothing in a given
+    run is not an error."""
+    return any(path_sub in path and message_sub in message for path_sub, message_sub in entries)
+
+
+allowlist = load_allowlist(ALLOWLIST_PATH)
 
 findings = []
 for path in files:
@@ -809,18 +689,8 @@ for path in files:
         text = fh.read()
     clean = strip_comments_and_char_lits(text)
     code_only = blank_strings(clean)
-    if path in externally_gated_files:
-        # The whole file is reachable only via a test-gated external `mod
-        # NAME;` declaration in its parent -- see
-        # compute_externally_test_gated_files. Nothing in it ever compiles
-        # under --lib --bins, so none of its content is in scan scope.
-        test_spans = [(0, len(code_only))]
-    else:
-        test_spans = test_gated_spans(code_only)
 
     for m in MACRO_CALL_RE.finditer(code_only):
-        if in_span(m.start(), test_spans):
-            continue
         call_start = m.end() - 1  # the opening delimiter char (`(`/`{`/`[`)
         # Scan every string literal within the macro's own balanced argument
         # list (in source order), not just the token immediately after the
@@ -831,13 +701,16 @@ for path in files:
         parts = collect_string_literals(clean, call_start + 1, close_pos)
         if not parts:
             continue
-        message = "".join(parts)
-        if PLACEHOLDER_RE.search(message):
-            line_no = clean.count("\n", 0, m.start()) + 1
-            macro_name = m.group(1)
-            safe_path = sanitize_for_ci(path)
-            safe_message = sanitize_for_ci(message)
-            findings.append(f"{safe_path}:{line_no}: {macro_name}!(\"{safe_message}\") reads as a placeholder stub, not a real error path")
+        message = "".join(decode_rust_escapes(content, is_raw) for content, is_raw in parts)
+        if not PLACEHOLDER_RE.search(message):
+            continue
+        if is_allowlisted(path, message, allowlist):
+            continue
+        line_no = clean.count("\n", 0, m.start()) + 1
+        macro_name = m.group(1)
+        safe_path = sanitize_for_ci(path)
+        safe_message = sanitize_for_ci(message)
+        findings.append(f"{safe_path}:{line_no}: {macro_name}!(\"{safe_message}\") reads as a placeholder stub, not a real error path")
 
 if findings:
     for f in findings:
