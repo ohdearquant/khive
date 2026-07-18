@@ -579,8 +579,8 @@ fn describe_quoted_string_parse_error(
     format!(
         "{base} — byte {idx} of the value is {c:?} (U+{:04X}). DSL string escapes follow JSON: \
          \\n, \\t, \\\", \\\\ (raw newline/CR/tab are also accepted literally; other control \
-         bytes must be escaped). If `ops` is sent through a JSON transport (every MCP client), \
-         the transport decodes one escape level before the DSL parser runs, so a literal \
+         bytes must be escaped). If `ops` is sent through a JSON transport, the transport \
+         decodes one escape level before the DSL parser runs, so a literal \
          backslash-escape must be doubled on the wire — e.g. send \\\\n to produce \\n here.",
         c as u32
     )

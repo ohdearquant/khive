@@ -383,6 +383,42 @@ fn short_unicode_escape_backslash_adjacent_control_byte_not_misattributed() {
 }
 
 #[test]
+fn leading_surrogate_escape_followed_by_control_byte_not_misattributed() {
+    // #491 round-5: a well-formed high-surrogate `\u` escape (U+D800-U+DBFF)
+    // must be followed by a `\u` low-surrogate escape. When the byte after the
+    // continuation backslash is a raw control byte instead, `serde_json` fails
+    // on the malformed surrogate continuation, not on a broken `\<ctrl>`
+    // escape. Scan's general backslash-pair walk resets after the high
+    // surrogate's 4 hex slots, so without the surrogate-continuation guard it
+    // would record that `\<ctrl>` as a genuine broken pair
+    // (`preceded_by_backslash: true`) and land the double-escape teaching on a
+    // failure it does not explain. The continuation control byte must not be
+    // recorded, so the error stays serde's own surrogate message.
+    let src = format!("gtd.assign(title=\"bad \\uD800\\{}tail\")", '\u{c}');
+    let err = parse_request(&src).unwrap_err();
+    let msg = err.to_string();
+    assert!(matches!(err, DslError::InvalidValue { .. }));
+    assert!(
+        !msg.to_lowercase().contains("double"),
+        "a control byte on a surrogate-continuation path must not be enriched \
+         with the control-char double-escape diagnostic, got: {msg}"
+    );
+
+    // A broken `\<ctrl>` pair AFTER a complete surrogate pair (high + low) is a
+    // real broken escape and still gets the teaching; the suppression is scoped
+    // to the immediate continuation, not to everything after any `\u`.
+    let after_pair = format!("gtd.assign(title=\"ok \\uD800\\uDC00\\{}tail\")", '\u{c}');
+    let after_pair_err = parse_request(&after_pair).unwrap_err();
+    let after_pair_msg = after_pair_err.to_string();
+    assert!(matches!(after_pair_err, DslError::InvalidValue { .. }));
+    assert!(
+        after_pair_msg.to_lowercase().contains("double"),
+        "a broken \\<ctrl> pair after a complete surrogate pair must still get \
+         the double-escape guidance, got: {after_pair_msg}"
+    );
+}
+
+#[test]
 fn raw_newline_immediately_after_backslash_caught_as_control_char_cause() {
     // #491 round-2 blocking fix 1(b): a raw LF directly following a
     // backslash is not a valid two-byte JSON escape (valid escapes are

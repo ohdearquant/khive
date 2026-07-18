@@ -101,6 +101,14 @@ pub(crate) struct NormalizedQuotedString<'a> {
 /// them — only ever `ErrorCode::InvalidEscape`, the same code (and `Display`
 /// text) a genuine broken pair produces, which is why scan-time origin, not
 /// the error text, has to be the source of truth.
+///
+/// A completed `\u` escape whose value is a high surrogate (U+D800-U+DBFF)
+/// must be followed by a `\u` low-surrogate escape; `serde_json` consumes the
+/// next `\` as that continuation and fails on the malformed pair when a `\u`
+/// does not follow. The control byte it lands on there belongs to that
+/// surrogate failure, not to a fresh broken `\<ctrl>` pair, so it is likewise
+/// not recorded as a [`ControlByteHit`]: recording it would attach the
+/// double-escape teaching to a malformed-surrogate error it does not explain.
 pub(crate) fn normalize_quoted_string(raw: &str) -> NormalizedQuotedString<'_> {
     if !raw.bytes().any(|b| b < 0x20) {
         return NormalizedQuotedString {
@@ -112,12 +120,27 @@ pub(crate) fn normalize_quoted_string(raw: &str) -> NormalizedQuotedString<'_> {
     let mut first_control_byte = None;
     let mut chars = raw.char_indices().peekable();
     let mut hex_slots_remaining = 0u32;
+    let mut hex_acc = 0u32;
+    let mut hex_valid = true;
+    let mut after_high_surrogate = false;
     while let Some((pos, c)) = chars.next() {
         if hex_slots_remaining > 0 {
             hex_slots_remaining -= 1;
+            match c.to_digit(16) {
+                Some(d) => hex_acc = (hex_acc << 4) | d,
+                None => hex_valid = false,
+            }
             out.push(c);
+            if hex_slots_remaining == 0 {
+                after_high_surrogate = hex_valid && (0xD800..=0xDBFF).contains(&hex_acc);
+            }
             continue;
         }
+        // True for exactly the one position after a completed high-surrogate
+        // `\u` escape; consumed here so it gates only the immediate surrogate
+        // continuation, never anything later.
+        let prev_was_high_surrogate = after_high_surrogate;
+        after_high_surrogate = false;
         if c == '\\' {
             out.push(c);
             if let Some(&(next_pos, next_c)) = chars.peek() {
@@ -125,9 +148,14 @@ pub(crate) fn normalize_quoted_string(raw: &str) -> NormalizedQuotedString<'_> {
                 if next_c == 'u' {
                     out.push(next_c);
                     hex_slots_remaining = 4;
+                    hex_acc = 0;
+                    hex_valid = true;
                     continue;
                 }
-                if (next_c as u32) < 0x20 && first_control_byte.is_none() {
+                if (next_c as u32) < 0x20
+                    && !prev_was_high_surrogate
+                    && first_control_byte.is_none()
+                {
                     first_control_byte = Some(ControlByteHit {
                         normalized_pos: out.len(),
                         raw_pos: next_pos,
