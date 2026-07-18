@@ -170,6 +170,381 @@ impl MemoryPack {
     }
 }
 
+// ── #533: memory.prune must not surface stale rows via any recall retrieval
+// path (FTS lexical, sqlite-vec/ANN vector, or the default hybrid fusion) ────
+
+#[cfg(test)]
+mod prune_recall_visibility_tests {
+    use async_trait::async_trait;
+    use khive_pack_kg::KgPack;
+    use khive_runtime::{EmbedderProvider, KhiveRuntime, Namespace, VerbRegistryBuilder};
+    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
+    use serial_test::serial;
+
+    /// Deterministic embedding service: distinct vector per unique text via FNV hash.
+    /// Not semantically meaningful, but reproducible — enough for a cosine-similarity
+    /// vector leg to find the seeded note by exact content match.
+    struct HashVecService {
+        dims: usize,
+    }
+
+    fn fnv_to_vec(text: &str, dims: usize) -> Vec<f32> {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in text.bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0001_0000_01b3);
+        }
+        let mut v = Vec::with_capacity(dims);
+        let mut s = h;
+        for _ in 0..dims {
+            s = s
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            v.push(((s >> 33) as f32) / (0x7fff_ffff_u32 as f32) - 1.0);
+        }
+        v
+    }
+
+    #[async_trait]
+    impl EmbeddingService for HashVecService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> Result<Vec<Vec<f32>>, EmbedError> {
+            Ok(texts.iter().map(|t| fnv_to_vec(t, self.dims)).collect())
+        }
+
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "hash-vec"
+        }
+    }
+
+    struct HashVecProvider {
+        model_name: String,
+        dims: usize,
+    }
+
+    #[async_trait]
+    impl EmbedderProvider for HashVecProvider {
+        fn name(&self) -> &str {
+            &self.model_name
+        }
+
+        fn dimensions(&self) -> usize {
+            self.dims
+        }
+
+        async fn build(
+            &self,
+        ) -> Result<std::sync::Arc<dyn EmbeddingService>, khive_runtime::RuntimeError> {
+            Ok(std::sync::Arc::new(HashVecService { dims: self.dims }))
+        }
+    }
+
+    /// A pruned memory must not be returned by `memory.recall` through the lexical
+    /// (`keyword_only`), vector (`vector_only`), or default hybrid fusion path —
+    /// and each leg must be shown to actually see the note both before and after
+    /// pruning, not just asserted absent.
+    ///
+    /// `memory.prune` soft-deletes via `NoteStore::delete_note` (sets `deleted_at`,
+    /// rows remain — ADR-014) and bumps the per-model ANN generation so a background
+    /// rebuild drops stale vectors. It does not touch the FTS5 index or the
+    /// sqlite-vec store directly. Correctness for `memory.recall` is expected to
+    /// come from `load_memory_candidate_notes`'s post-hydration `deleted_at IS NULL`
+    /// filter (`handlers/common.rs`), which applies uniformly to text and vector
+    /// candidates before either leg reaches the caller — plus the vector store's own
+    /// `deleted_at IS NULL` anti-join (`khive-db/src/stores/vectors.rs`) exercised
+    /// only by the exact sqlite-vec search, never the warm ANN bridge.
+    ///
+    /// A single live note is always corpus enough for `ensure_ann_for_model` to build
+    /// and install a warm ANN graph on its very first cold-miss search, so an
+    /// ordinary `vector_only` recall after seeding never reaches the exact
+    /// sqlite-vec fallback (`handlers/common.rs:1100-1129`) — it always takes the
+    /// warm-route branch instead (`ann::search_loaded` returning `Some`, counted by
+    /// `warm_route_count`). To force the fallback deterministically, the warm graph
+    /// for this model is evicted (`ann::clear_key`) right after pruning: the note is
+    /// now soft-deleted, so `load_and_build_from_vector_store`'s corpus scan (which
+    /// joins `notes` and filters `deleted_at IS NULL`) finds zero live rows, the
+    /// rebuild attempt resolves to `EmptyCorpus` without installing a graph, and the
+    /// recall loop in `handlers/common.rs` falls through to the exact sqlite-vec
+    /// search for every subsequent call on this model.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn prune_excludes_pruned_memory_across_fts_vector_and_hybrid_recall() {
+        const MODEL: &str = "prune-533-visibility-model";
+        const DIMS: usize = 16;
+        const NOTE_TEXT: &str = "issue 533 prune stale fts vector ann visibility regression note";
+
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        rt.register_embedder(HashVecProvider {
+            model_name: MODEL.to_owned(),
+            dims: DIMS,
+        });
+
+        let ns = Namespace::parse("local").expect("local namespace");
+        rt.authorize(ns).expect("authorize local");
+
+        let pack = crate::MemoryPack::new(rt.clone());
+        let ann = pack.ann_for_test();
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(pack);
+        let registry = builder.build().expect("registry");
+
+        // memory_type=semantic writes to the token's own namespace ("local"),
+        // matching memory.prune's default namespace filter.
+        let remember_result = registry
+            .dispatch(
+                "memory.remember",
+                serde_json::json!({
+                    "content": NOTE_TEXT,
+                    "salience": 0.1,
+                    "memory_type": "semantic",
+                }),
+            )
+            .await
+            .expect("memory.remember");
+        let note_id = remember_result["id"]
+            .as_str()
+            .expect("remember response carries id")
+            .to_string();
+
+        // Sanity: the note is recallable before prune, via each leg independently —
+        // a leg that returns empty both before and after prune would satisfy the
+        // post-prune absence assertion vacuously.
+        for (label, fusion_strategy) in [
+            ("keyword_only (FTS lexical leg)", "keyword_only"),
+            ("vector_only (sqlite-vec/ANN leg)", "vector_only"),
+        ] {
+            let mut params = serde_json::json!({
+                "query": NOTE_TEXT,
+                "limit": 10,
+                "fusion_strategy": fusion_strategy,
+            });
+            if fusion_strategy == "vector_only" {
+                params["embedding_model"] = serde_json::json!(MODEL);
+            }
+            let result = registry
+                .dispatch("memory.recall", params)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("memory.recall [{label}] before prune must not error: {e:?}")
+                });
+            let hits = result.as_array().expect("bare array result");
+            assert!(
+                hits.iter().any(|h| h["id"] == note_id),
+                "seeded note must be recallable via {label} before prune: {hits:?}"
+            );
+        }
+
+        let prune_result = registry
+            .dispatch("memory.prune", serde_json::json!({ "min_salience": 0.5 }))
+            .await
+            .expect("memory.prune");
+        assert_eq!(
+            prune_result["pruned"], 1,
+            "the single seeded note (salience 0.1 < 0.5) must be pruned: {prune_result:?}"
+        );
+
+        // The warm graph built during the pre-prune vector_only check above is still
+        // installed at this point: `memory.prune` bumps the per-model generation
+        // (`ann::bump_generation`) but never evicts the graph itself, and the
+        // background rebuild it triggers finds zero live rows post-prune (the
+        // corpus scan filters `deleted_at IS NULL`), so it resolves to
+        // `AnnEnsureStatus::EmptyCorpus` and leaves the stale graph installed
+        // rather than replacing it. A `vector_only` recall right now must
+        // therefore take the warm route (`ann::search_loaded` hits the still-
+        // installed bridge) and still exclude the pruned note, proving the
+        // post-hydration `deleted_at IS NULL` filter in `load_memory_candidate_notes`
+        // (`handlers/common.rs`) covers the stale-warm-graph path, not just the
+        // exact sqlite-vec fallback exercised below.
+        ann.reset_warm_route_count();
+        let stale_warm_result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "query": NOTE_TEXT,
+                    "limit": 10,
+                    "fusion_strategy": "vector_only",
+                    "embedding_model": MODEL,
+                }),
+            )
+            .await
+            .expect("memory.recall [vector_only, stale warm graph] must not error");
+        let stale_warm_hits = stale_warm_result.as_array().expect("bare array result");
+        assert!(
+            stale_warm_hits.iter().all(|h| h["id"] != note_id),
+            "pruned note must not be returned via vector_only recall against \
+             the stale-but-still-installed warm ANN graph, got: {stale_warm_hits:?}"
+        );
+        assert!(
+            ann.warm_route_count() > 0,
+            "the stale warm graph must still be installed and hit by \
+             ann::search_loaded — a warm_route_count of 0 means this assertion \
+             is vacuously exercising the sqlite-vec fallback instead"
+        );
+
+        // Evict the warm graph now, so the recalls below rebuild against the
+        // now-pruned corpus and fall through to the exact sqlite-vec search
+        // instead of the warm ANN route.
+        let key = crate::ann::AnnKey::new("local", MODEL);
+        crate::ann::clear_key(&ann, &key).await;
+        ann.reset_warm_route_count();
+
+        // `fusion_strategy: None` omits the param entirely rather than passing
+        // "weighted" explicitly, so this leg exercises `RecallConfig::default()`
+        // (`config.rs` — `FusionStrategy::Weighted { weights: [0.7, 0.3] }`), the
+        // strategy an ordinary caller actually hits, not just the named strategy.
+        for (label, fusion_strategy) in [
+            ("keyword_only (FTS lexical leg)", Some("keyword_only")),
+            ("vector_only (sqlite-vec/ANN leg)", Some("vector_only")),
+            ("rrf (non-default fusion, explicit)", Some("rrf")),
+            ("weighted (default fusion, fusion_strategy omitted)", None),
+        ] {
+            let mut params = serde_json::json!({
+                "query": NOTE_TEXT,
+                "limit": 10,
+            });
+            if let Some(fs) = fusion_strategy {
+                params["fusion_strategy"] = serde_json::json!(fs);
+            }
+            if fusion_strategy == Some("vector_only") {
+                params["embedding_model"] = serde_json::json!(MODEL);
+            }
+            let result = registry
+                .dispatch("memory.recall", params)
+                .await
+                .unwrap_or_else(|e| panic!("memory.recall [{label}] must not error: {e:?}"));
+            let hits = result.as_array().expect("bare array result");
+            assert!(
+                hits.iter().all(|h| h["id"] != note_id),
+                "pruned note must not be returned via {label}, got: {hits:?}"
+            );
+        }
+
+        // Prove the vector legs above actually took the exact sqlite-vec fallback
+        // (handlers/common.rs:1100-1129), not the warm ANN route: the corpus scan
+        // that would install a warm graph sees zero live rows post-prune, so
+        // `ann::search_loaded` must never have found a cached bridge for this model.
+        assert_eq!(
+            ann.warm_route_count(),
+            0,
+            "post-prune vector recall must route through the exact sqlite-vec \
+             fallback, not the warm ANN bridge"
+        );
+    }
+
+    /// #533 follow-up: `RecallConfig::default()` fuses via `FusionStrategy::Weighted
+    /// { weights: [0.7, 0.3] }` (`config.rs`), not `rrf` — the shipped default is
+    /// reached by omitting `fusion_strategy` from the recall params entirely, not by
+    /// passing `"rrf"`. This test exercises that exact omitted-param path: seed a
+    /// low-salience note, confirm it is recallable pre-prune via the FTS, vector, and
+    /// default (fusion_strategy omitted) legs — proving each leg actually sees the
+    /// note, not just vacuously agreeing on absence — then prune and confirm all
+    /// three legs exclude it post-prune.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn prune_excludes_pruned_memory_via_default_weighted_fusion_recall() {
+        const MODEL: &str = "prune-533-visibility-model-weighted-default";
+        const DIMS: usize = 16;
+        const NOTE_TEXT: &str = "issue 533 prune stale weighted default fusion regression note";
+
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        rt.register_embedder(HashVecProvider {
+            model_name: MODEL.to_owned(),
+            dims: DIMS,
+        });
+
+        let ns = Namespace::parse("local").expect("local namespace");
+        rt.authorize(ns).expect("authorize local");
+
+        let pack = crate::MemoryPack::new(rt.clone());
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(pack);
+        let registry = builder.build().expect("registry");
+
+        let remember_result = registry
+            .dispatch(
+                "memory.remember",
+                serde_json::json!({
+                    "content": NOTE_TEXT,
+                    "salience": 0.1,
+                    "memory_type": "semantic",
+                }),
+            )
+            .await
+            .expect("memory.remember");
+        let note_id = remember_result["id"]
+            .as_str()
+            .expect("remember response carries id")
+            .to_string();
+
+        let recall_params = |fusion_strategy: Option<&str>| {
+            let mut params = serde_json::json!({ "query": NOTE_TEXT, "limit": 10 });
+            if let Some(fs) = fusion_strategy {
+                params["fusion_strategy"] = serde_json::json!(fs);
+            }
+            if fusion_strategy == Some("vector_only") {
+                params["embedding_model"] = serde_json::json!(MODEL);
+            }
+            params
+        };
+
+        // Sanity: recallable pre-prune via each leg — a leg empty both before and
+        // after prune would satisfy the post-prune absence assertion vacuously.
+        for (label, fusion_strategy) in [
+            ("keyword_only (FTS lexical leg)", Some("keyword_only")),
+            ("vector_only (sqlite-vec/ANN leg)", Some("vector_only")),
+            ("weighted (default fusion, fusion_strategy omitted)", None),
+        ] {
+            let result = registry
+                .dispatch("memory.recall", recall_params(fusion_strategy))
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("memory.recall [{label}] before prune must not error: {e:?}")
+                });
+            let hits = result.as_array().expect("bare array result");
+            assert!(
+                hits.iter().any(|h| h["id"] == note_id),
+                "seeded note must be recallable via {label} before prune: {hits:?}"
+            );
+        }
+
+        let prune_result = registry
+            .dispatch("memory.prune", serde_json::json!({ "min_salience": 0.5 }))
+            .await
+            .expect("memory.prune");
+        assert_eq!(
+            prune_result["pruned"], 1,
+            "the single seeded note (salience 0.1 < 0.5) must be pruned: {prune_result:?}"
+        );
+
+        for (label, fusion_strategy) in [
+            ("keyword_only (FTS lexical leg)", Some("keyword_only")),
+            ("vector_only (sqlite-vec/ANN leg)", Some("vector_only")),
+            ("weighted (default fusion, fusion_strategy omitted)", None),
+        ] {
+            let result = registry
+                .dispatch("memory.recall", recall_params(fusion_strategy))
+                .await
+                .unwrap_or_else(|e| panic!("memory.recall [{label}] must not error: {e:?}"));
+            let hits = result.as_array().expect("bare array result");
+            assert!(
+                hits.iter().all(|h| h["id"] != note_id),
+                "pruned note must not be returned via {label}, got: {hits:?}"
+            );
+        }
+    }
+}
+
 // ── ADR-067 Fork C slice 2: memory.vacuum under the write
 // queue ──────────────────────────────────────────────────────────────────────
 
