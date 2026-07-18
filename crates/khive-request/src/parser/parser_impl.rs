@@ -531,14 +531,15 @@ fn serde_error_byte_offset(e: &serde_json::Error, text: &str) -> Option<usize> {
 
 /// Enriches a `serde_json` string-decode failure with the ADR-016 escape
 /// grammar and the MCP double-escape gotcha (ADR-084 §3c). Enrichment is
-/// gated on the failure being AT a recorded [`ControlByteHit`]: the serde
+/// gated on the failure being AT the recorded [`ControlByteHit`]: the serde
 /// error's `(line, column)` is mapped to a byte offset in `normalized.text`
-/// via [`serde_error_byte_offset`], then matched against
-/// `normalized.control_bytes` (collected during the same pass that built
-/// `text` — no re-scan of the span). A failure whose offset lands elsewhere
-/// (e.g. an invalid `\q` escape, even with an unrelated control byte later
-/// in the span) falls through to the plain serde message unchanged, so a
-/// control byte is never misattributed as the cause of a different failure.
+/// via [`serde_error_byte_offset`], then compared against
+/// `normalized.first_control_byte` (collected during the same pass that
+/// built `text` — no re-scan of the span). A failure whose offset lands
+/// elsewhere (e.g. an invalid `\q` escape, even with an unrelated control
+/// byte later in the span) falls through to the plain serde message
+/// unchanged, so a control byte is never misattributed as the cause of a
+/// different failure.
 fn describe_quoted_string_parse_error(
     e: &serde_json::Error,
     normalized: &NormalizedQuotedString<'_>,
@@ -548,9 +549,9 @@ fn describe_quoted_string_parse_error(
         return base;
     };
     let Some(hit) = normalized
-        .control_bytes
-        .iter()
-        .find(|h| h.normalized_pos == offset)
+        .first_control_byte
+        .as_ref()
+        .filter(|h| h.normalized_pos == offset)
     else {
         return base;
     };

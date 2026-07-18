@@ -193,7 +193,7 @@ fn raw_newline_immediately_after_escaped_quote_boundary() {
 fn raw_control_char_in_bareword_position_rejected() {
     // The literal-control-char exception only applies inside a
     // double-quoted string value (`parse_value` only calls
-    // `escape_literal_control_chars` when the trimmed slice starts with
+    // `normalize_quoted_string` when the trimmed slice starts with
     // `"`). A raw NUL embedded in an unquoted (bareword) numeric value must
     // still fail to parse as JSON, exactly as before this PR.
     let src = format!("gtd.assign(weight=1{}0)", '\u{0}');
@@ -320,6 +320,30 @@ fn raw_newline_immediately_after_backslash_caught_as_control_char_cause() {
 fn raw_carriage_return_and_tab_after_backslash_also_caught() {
     // Same defect as the LF case above, for CR and TAB.
     for raw in ['\r', '\t'] {
+        let src = format!("gtd.assign(title=\"before\\{raw}after\")");
+        let err = parse_request(&src).unwrap_err();
+        assert!(
+            matches!(err, DslError::InvalidValue { .. }),
+            "expected InvalidValue for backslash + raw {:#04x}, got {err:?}",
+            raw as u32
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.to_lowercase().contains("double"),
+            "error should call out the MCP double-escape requirement for {:#04x}, got: {msg}",
+            raw as u32
+        );
+    }
+}
+
+#[test]
+fn backslash_followed_by_other_raw_control_bytes_also_caught() {
+    // #491 round-2 blocking fix 2: the post-backslash branch previously
+    // recorded a hit only for `\n`/`\r`/`\t`. A backslash followed by any
+    // OTHER raw U+0000-U+001F byte — NUL, form feed, and ESC here — is
+    // equally not a valid JSON escape and must reach the same teaching
+    // diagnostic instead of the bare serde message.
+    for raw in ['\u{0}', '\u{c}', '\u{1b}'] {
         let src = format!("gtd.assign(title=\"before\\{raw}after\")");
         let err = parse_request(&src).unwrap_err();
         assert!(

@@ -23,12 +23,13 @@ pub(crate) fn scan_string_end(src: &[u8], start: usize) -> Result<usize, DslErro
 }
 
 /// A control byte (U+0000-U+001F) that survives verbatim into
-/// [`NormalizedQuotedString::text`] — either a non-`\n`/`\r`/`\t` byte, which
-/// is never rewritten, or a raw `\n`/`\r`/`\t` immediately following a
-/// backslash, which [`normalize_quoted_string`] leaves untouched because it
-/// is not eligible for the standalone rewrite (see that function's doc).
-/// `normalized_pos` is its byte offset in `text`; `raw_pos` is its byte
-/// offset in the original quoted span, for user-facing diagnostics.
+/// [`NormalizedQuotedString::text`] — either a raw control byte outside a
+/// backslash pair, which is never rewritten, or a raw control byte
+/// immediately following a backslash, which [`normalize_quoted_string`]
+/// leaves untouched because backslash plus a literal control byte is never
+/// a valid two-byte JSON escape (see that function's doc). `normalized_pos`
+/// is its byte offset in `text`; `raw_pos` is its byte offset in the
+/// original quoted span, for user-facing diagnostics.
 pub(crate) struct ControlByteHit {
     pub(crate) normalized_pos: usize,
     pub(crate) raw_pos: usize,
@@ -36,11 +37,16 @@ pub(crate) struct ControlByteHit {
 }
 
 /// Result of [`normalize_quoted_string`]: the text to hand to `serde_json`,
-/// plus every literal control byte it still contains (so a subsequent parse
-/// failure can be attributed without re-scanning the span).
+/// plus the first literal control byte it still contains, if any. A
+/// subsequent `serde_json` parse failure always occurs at the *earliest*
+/// invalid byte, so the first hit in scan order is the only one whose
+/// offset can ever match — retaining just that one hit (instead of every
+/// occurrence) bounds diagnostic metadata to O(1) regardless of how many
+/// control bytes a malformed span contains, while still letting a parse
+/// failure be attributed without re-scanning the span.
 pub(crate) struct NormalizedQuotedString<'a> {
     pub(crate) text: Cow<'a, str>,
-    pub(crate) control_bytes: Vec<ControlByteHit>,
+    pub(crate) first_control_byte: Option<ControlByteHit>,
 }
 
 /// Rewrites raw literal newline, carriage return, and tab bytes inside a
@@ -50,10 +56,11 @@ pub(crate) struct NormalizedQuotedString<'a> {
 /// backslash-escape pairs are copied through untouched: this walks the same
 /// `\` + next-byte pairing [`scan_string_end`] uses, so an already-escaped
 /// sequence is never reinterpreted — EXCEPT that a backslash directly
-/// followed by a raw `\n`/`\r`/`\t` byte is not a valid two-byte JSON escape
-/// (a valid escape is backslash plus an ASCII escape letter, never backslash
-/// plus a literal control byte), so that byte is recorded as a
-/// [`ControlByteHit`] even though it is copied through unrewritten; the
+/// followed by any raw U+0000-U+001F control byte is not a valid two-byte
+/// JSON escape (a valid escape is backslash plus an ASCII escape letter,
+/// never backslash plus a literal control byte), so that byte is recorded
+/// as [`NormalizedQuotedString::first_control_byte`] (when no earlier hit
+/// was already recorded) even though it is copied through unrewritten; the
 /// resulting `serde_json` failure is the "real control-char cause" for that
 /// case (#491 round-2).
 ///
@@ -67,19 +74,19 @@ pub(crate) fn normalize_quoted_string(raw: &str) -> NormalizedQuotedString<'_> {
     if !raw.bytes().any(|b| b < 0x20) {
         return NormalizedQuotedString {
             text: Cow::Borrowed(raw),
-            control_bytes: Vec::new(),
+            first_control_byte: None,
         };
     }
     let mut out = String::with_capacity(raw.len() + 8);
-    let mut control_bytes = Vec::new();
+    let mut first_control_byte = None;
     let mut chars = raw.char_indices().peekable();
     while let Some((pos, c)) = chars.next() {
         if c == '\\' {
             out.push(c);
             if let Some(&(next_pos, next_c)) = chars.peek() {
                 chars.next();
-                if matches!(next_c, '\n' | '\r' | '\t') {
-                    control_bytes.push(ControlByteHit {
+                if (next_c as u32) < 0x20 && first_control_byte.is_none() {
+                    first_control_byte = Some(ControlByteHit {
                         normalized_pos: out.len(),
                         raw_pos: next_pos,
                         byte: next_c as u8,
@@ -94,11 +101,13 @@ pub(crate) fn normalize_quoted_string(raw: &str) -> NormalizedQuotedString<'_> {
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
             c if (c as u32) < 0x20 => {
-                control_bytes.push(ControlByteHit {
-                    normalized_pos: out.len(),
-                    raw_pos: pos,
-                    byte: c as u8,
-                });
+                if first_control_byte.is_none() {
+                    first_control_byte = Some(ControlByteHit {
+                        normalized_pos: out.len(),
+                        raw_pos: pos,
+                        byte: c as u8,
+                    });
+                }
                 out.push(c);
             }
             c => out.push(c),
@@ -106,7 +115,7 @@ pub(crate) fn normalize_quoted_string(raw: &str) -> NormalizedQuotedString<'_> {
     }
     NormalizedQuotedString {
         text: Cow::Owned(out),
-        control_bytes,
+        first_control_byte,
     }
 }
 
@@ -197,5 +206,24 @@ fn arg_value_has_prev_ref(av: &ArgValue) -> bool {
         ArgValue::Array(els) => els.iter().any(arg_value_has_prev_ref),
         ArgValue::Object(pairs) => pairs.iter().any(|(_, v)| arg_value_has_prev_ref(v)),
         ArgValue::Value(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn many_control_bytes_retain_only_the_first_hit() {
+        let raw = "\u{0}".repeat(4096);
+        let normalized = normalize_quoted_string(&raw);
+        let hit = normalized
+            .first_control_byte
+            .expect("first control byte must be recorded");
+        assert_eq!(
+            hit.raw_pos, 0,
+            "must record the earliest hit, not a later one"
+        );
+        assert_eq!(hit.byte, 0);
     }
 }
