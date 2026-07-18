@@ -4,7 +4,7 @@ use serde_json::Value;
 
 use crate::types::{ArgValue, DslError, ParsedOp, NESTING_DEPTH_LIMIT};
 
-use super::scan::{char_label, escape_literal_control_chars, scan_string_end};
+use super::scan::{char_label, normalize_quoted_string, scan_string_end, NormalizedQuotedString};
 
 /// Byte-slice cursor for the DSL input.
 pub(crate) struct Parser<'a> {
@@ -495,36 +495,67 @@ impl<'a> Parser<'a> {
     }
 }
 
-/// Finds the first byte in a quoted-string DSL source span that could not
-/// have been normalized away by [`escape_literal_control_chars`] and would
-/// therefore reach `serde_json` as a literal control byte. Raw `\n`/`\r`/`\t`
-/// are rewritten to JSON escapes before parsing (ADR-016), so they are never
-/// the cause of a "control character" decode failure; any other byte below
-/// 0x20 (NUL, form feed, ESC, ...) is. Scanning `raw` directly bounds the
-/// search to the already-known quoted span, rather than the full (up to
-/// 1 MiB) `ops` source.
-fn find_offending_control_byte(raw: &str) -> Option<(usize, char)> {
-    raw.bytes().enumerate().find_map(|(idx, b)| {
-        if b < 0x20 && !matches!(b, b'\n' | b'\r' | b'\t') {
-            Some((idx, b as char))
-        } else {
-            None
+/// Maps a `serde_json::Error`'s 1-indexed `(line, column)` to a 0-indexed
+/// byte offset into `text` — the exact string `serde_json` was parsing —
+/// pointing AT the offending byte itself. `line`/`column` count raw bytes
+/// (including any literal control byte a [`NormalizedQuotedString`] left
+/// unrewritten inside a would-be escape pair, which is the failure case a
+/// `line > 1` report handles: consuming that raw `\n` itself advances the
+/// tracker to `(line + 1, column 0)`, so `column` can legitimately be `0`
+/// — it is not an error sentinel). A `line > 1` failure is resolved by
+/// walking `text` for the `line - 1`-th `\n` byte at index `i`; the
+/// offending byte sits at `i + column` in both the "it's the newline
+/// itself" case (`column == 0`) and the "N more bytes were consumed on the
+/// new line first" case. Returns `None` only if `text` has fewer `\n` bytes
+/// than the error claims (never observed from `serde_json` in practice) or
+/// `line <= 1` with `column == 0` (no valid 0-indexed byte before column 1
+/// on the first line), in which case the caller falls back to the plain
+/// serde message.
+fn serde_error_byte_offset(e: &serde_json::Error, text: &str) -> Option<usize> {
+    let line = e.line();
+    let column = e.column();
+    if line <= 1 {
+        return column.checked_sub(1);
+    }
+    let mut newlines_seen = 0usize;
+    for (i, b) in text.bytes().enumerate() {
+        if b == b'\n' {
+            newlines_seen += 1;
+            if newlines_seen == line - 1 {
+                return Some(i + column);
+            }
         }
-    })
+    }
+    None
 }
 
 /// Enriches a `serde_json` string-decode failure with the ADR-016 escape
-/// grammar and the MCP double-escape gotcha (ADR-084 §3c). Classification
-/// and byte location come from scanning the known quoted source span
-/// directly (`raw`) via [`find_offending_control_byte`], never from matching
-/// `serde_json::Error`'s message text, which is not a stable contract.
-/// Failures with no control byte in `raw` (e.g. an invalid `\q` escape) fall
-/// through to the plain serde message unchanged.
-fn describe_quoted_string_parse_error(e: &serde_json::Error, raw: &str) -> String {
+/// grammar and the MCP double-escape gotcha (ADR-084 §3c). Enrichment is
+/// gated on the failure being AT a recorded [`ControlByteHit`]: the serde
+/// error's `(line, column)` is mapped to a byte offset in `normalized.text`
+/// via [`serde_error_byte_offset`], then matched against
+/// `normalized.control_bytes` (collected during the same pass that built
+/// `text` — no re-scan of the span). A failure whose offset lands elsewhere
+/// (e.g. an invalid `\q` escape, even with an unrelated control byte later
+/// in the span) falls through to the plain serde message unchanged, so a
+/// control byte is never misattributed as the cause of a different failure.
+fn describe_quoted_string_parse_error(
+    e: &serde_json::Error,
+    normalized: &NormalizedQuotedString<'_>,
+) -> String {
     let base = e.to_string();
-    let Some((idx, c)) = find_offending_control_byte(raw) else {
+    let Some(offset) = serde_error_byte_offset(e, normalized.text.as_ref()) else {
         return base;
     };
+    let Some(hit) = normalized
+        .control_bytes
+        .iter()
+        .find(|h| h.normalized_pos == offset)
+    else {
+        return base;
+    };
+    let idx = hit.raw_pos;
+    let c = hit.byte as char;
     format!(
         "{base} — byte {idx} of the value is {c:?} (U+{:04X}). DSL string escapes follow JSON: \
          \\n, \\t, \\\", \\\\ (raw newline/CR/tab are also accepted literally; other control \
@@ -543,10 +574,10 @@ fn describe_quoted_string_parse_error(e: &serde_json::Error, raw: &str) -> Strin
 /// (`parse_object_arg_body`) and quoted string values (`parse_value`) so the
 /// diagnostic cannot drift between the two paths.
 fn decode_quoted_json_string(raw: &str, pos: usize) -> Result<String, DslError> {
-    let normalized = escape_literal_control_chars(raw);
-    serde_json::from_str(&normalized).map_err(|e| DslError::InvalidValue {
+    let normalized = normalize_quoted_string(raw);
+    serde_json::from_str(normalized.text.as_ref()).map_err(|e| DslError::InvalidValue {
         pos,
-        error: describe_quoted_string_parse_error(&e, raw),
+        error: describe_quoted_string_parse_error(&e, &normalized),
     })
 }
 

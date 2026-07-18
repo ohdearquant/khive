@@ -278,6 +278,65 @@ fn invalid_backslash_escape_in_quoted_string_rejected() {
 }
 
 #[test]
+fn invalid_escape_with_unrelated_control_byte_not_misattributed() {
+    // #491 round-2 blocking fix 1(a): a `\q` invalid escape occurs before an
+    // unrelated form-feed later in the same span. The failure is the `\q`,
+    // not the control byte, so the control-char teaching diagnostic must NOT
+    // fire — misattributing the error to the wrong byte would send a caller
+    // chasing the wrong fix.
+    let src = format!("gtd.assign(title=\"bad \\q escape{}tail\")", '\u{c}');
+    let err = parse_request(&src).unwrap_err();
+    let msg = err.to_string();
+    assert!(matches!(err, DslError::InvalidValue { .. }));
+    assert!(
+        !msg.to_lowercase().contains("double"),
+        "an invalid \\q escape must not be enriched with the control-char diagnostic, got: {msg}"
+    );
+}
+
+#[test]
+fn raw_newline_immediately_after_backslash_caught_as_control_char_cause() {
+    // #491 round-2 blocking fix 1(b): a raw LF directly following a
+    // backslash is not a valid two-byte JSON escape (valid escapes are
+    // backslash + an ASCII letter, never backslash + a literal control
+    // byte). This must be caught as a control-char cause and receive the
+    // teaching diagnostic, not silently fall through to the bare serde
+    // message.
+    let src = "gtd.assign(title=\"before\\\nafter\")";
+    let err = parse_request(src).unwrap_err();
+    let msg = err.to_string();
+    assert!(matches!(err, DslError::InvalidValue { .. }));
+    assert!(
+        msg.contains(r#"\n"#) && msg.contains(r#"\t"#) && msg.contains(r#"\""#),
+        "error should name the JSON escape grammar, got: {msg}"
+    );
+    assert!(
+        msg.to_lowercase().contains("double"),
+        "error should call out the MCP double-escape requirement, got: {msg}"
+    );
+}
+
+#[test]
+fn raw_carriage_return_and_tab_after_backslash_also_caught() {
+    // Same defect as the LF case above, for CR and TAB.
+    for raw in ['\r', '\t'] {
+        let src = format!("gtd.assign(title=\"before\\{raw}after\")");
+        let err = parse_request(&src).unwrap_err();
+        assert!(
+            matches!(err, DslError::InvalidValue { .. }),
+            "expected InvalidValue for backslash + raw {:#04x}, got {err:?}",
+            raw as u32
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.to_lowercase().contains("double"),
+            "error should call out the MCP double-escape requirement for {:#04x}, got: {msg}",
+            raw as u32
+        );
+    }
+}
+
+#[test]
 fn batch_ops_separated_by_raw_newlines() {
     // The top-level batch `,` separator may be split across literal
     // newlines between ops, since `skip_ws` treats `\n` as ordinary
