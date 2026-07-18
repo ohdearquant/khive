@@ -146,6 +146,18 @@ pub struct ConnectionPool {
     /// `pool.rs`'s and `entity_tests.rs`'s one-writer-per-pool tests assert.
     #[cfg(test)]
     writer_task_spawn_count: std::sync::atomic::AtomicUsize,
+    /// On-disk file identity captured by [`bind_verified_identity`](Self::bind_verified_identity)
+    /// immediately after a caller's fence (e.g. `code.ingest`'s
+    /// production-database check) approved this pool's configured path.
+    /// Once set, every [`open_standalone_writer`](Self::open_standalone_writer)
+    /// and [`open_standalone_reader`](Self::open_standalone_reader) call
+    /// re-stats the configured path and refuses to open when the identity no
+    /// longer matches -- closing the gap where a fence checks the pathname
+    /// once at construction, but every later standalone connection reopens
+    /// the same mutable pathname unconditionally (#1087). `None`
+    /// (the default) is a no-op: pools nobody binds behave exactly as
+    /// before.
+    verified_identity: OnceLock<(u64, u64)>,
 }
 
 enum ReaderLease<'pool> {
@@ -274,6 +286,7 @@ impl ConnectionPool {
             writer_task: OnceLock::new(),
             #[cfg(test)]
             writer_task_spawn_count: std::sync::atomic::AtomicUsize::new(0),
+            verified_identity: OnceLock::new(),
         };
 
         for _ in 0..pool.max_readers {
@@ -511,6 +524,8 @@ impl ConnectionPool {
             ));
         }
 
+        self.check_verified_identity(path)?;
+
         let conn = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -534,6 +549,8 @@ impl ConnectionPool {
             )
         })?;
 
+        self.check_verified_identity(path)?;
+
         let conn = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -544,6 +561,50 @@ impl ConnectionPool {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         Ok(conn)
+    }
+
+    /// Bind this pool to the on-disk identity of its configured path, as of
+    /// right now. Callers that ran a path-based fence against this same path
+    /// (e.g. `code.ingest`'s production-database check) call this
+    /// immediately after the fence approves, so every later standalone
+    /// connection re-checks against the identity the fence actually saw,
+    /// not just the pathname. A no-op for in-memory pools (`config.path ==
+    /// None`) — there is no on-disk identity to bind. Idempotent: only the
+    /// first call's identity sticks, matching the "verified once, checked
+    /// forever after" intent; a pool is bound at most once in practice
+    /// (constructed fresh per verified target).
+    pub fn bind_verified_identity(&self) -> Result<(), SqliteError> {
+        let Some(path) = self.config.path.as_ref() else {
+            return Ok(());
+        };
+        let identity = file_identity(path)?;
+        let _ = self.verified_identity.set(identity);
+        Ok(())
+    }
+
+    /// Re-check the configured path's on-disk identity against whatever
+    /// [`bind_verified_identity`](Self::bind_verified_identity) captured, if
+    /// anything. A no-op when the pool was never bound (`verified_identity`
+    /// unset) — pools nobody fenced behave exactly as before this existed.
+    ///
+    /// `pub(crate)` so `sql_bridge`'s own standalone-connection open path can
+    /// re-run the same check before it opens a raw `rusqlite::Connection`
+    /// against `pool.config().path`, rather than only guarding the copies on
+    /// `ConnectionPool` itself.
+    pub(crate) fn check_verified_identity(&self, path: &Path) -> Result<(), SqliteError> {
+        let Some(expected) = self.verified_identity.get() else {
+            return Ok(());
+        };
+        let actual = file_identity(path)?;
+        if actual != *expected {
+            return Err(SqliteError::InvalidData(format!(
+                "database file at {} no longer matches the identity verified when this pool \
+                 was bound (expected {expected:?}, found {actual:?}); refusing to open a \
+                 standalone connection against a swapped file",
+                path.display()
+            )));
+        }
+        Ok(())
     }
 
     fn return_reader(&self, conn: Connection) {
@@ -727,6 +788,44 @@ fn pool_exhausted_error(timeout: Duration, max_readers: usize) -> SqliteError {
     .into()
 }
 
+/// A cross-platform on-disk file identity: `(device, inode)` on Unix,
+/// `(volume_serial_number, file_index)` on Windows — the same identity pair
+/// `khive-pack-code`'s production-database fence already uses to catch
+/// hard-link aliases (`crates/khive-pack-code/src/db_target.rs`). Used by
+/// [`ConnectionPool::bind_verified_identity`] and its paired check so a
+/// verified path can be re-confirmed later without depending on the
+/// pathname staying stable on disk.
+#[cfg(unix)]
+fn file_identity(path: &Path) -> Result<(u64, u64), SqliteError> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path)?;
+    Ok((meta.dev(), meta.ino()))
+}
+
+#[cfg(windows)]
+fn file_identity(path: &Path) -> Result<(u64, u64), SqliteError> {
+    use std::os::windows::fs::MetadataExt;
+    let meta = std::fs::metadata(path)?;
+    let volume = meta.volume_serial_number().ok_or_else(|| {
+        SqliteError::InvalidData(format!(
+            "no volume serial number available for {}",
+            path.display()
+        ))
+    })?;
+    let index = meta.file_index().ok_or_else(|| {
+        SqliteError::InvalidData(format!("no file index available for {}", path.display()))
+    })?;
+    Ok((volume as u64, index))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn file_identity(path: &Path) -> Result<(u64, u64), SqliteError> {
+    Err(SqliteError::InvalidData(format!(
+        "file identity verification is unsupported on this platform for {}",
+        path.display()
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -868,6 +967,49 @@ mod tests {
         };
         let pool = ConnectionPool::new(cfg).expect("in-memory pool should open");
         assert_eq!(pool.max_readers(), 0);
+    }
+
+    /// `bind_verified_identity` + `check_verified_identity` must actually
+    /// refuse a standalone open once the on-disk file at the
+    /// bound path has been swapped for a different file (e.g. an attacker
+    /// hard-linking the path onto the production database after a fence
+    /// approved the original file). Mirrors
+    /// `khive-pack-code::db_target::reverification_catches_a_post_verify_swap_to_alias_the_configured_db`.
+    #[test]
+    #[cfg(unix)]
+    fn standalone_open_refuses_a_post_bind_file_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bound.db");
+        let swapped_in = dir.path().join("other.db");
+
+        let cfg = PoolConfig {
+            path: Some(path.clone()),
+            ..PoolConfig::default()
+        };
+        let pool = ConnectionPool::new(cfg).expect("file-backed pool should open");
+        pool.bind_verified_identity()
+            .expect("bind should succeed against the just-opened file");
+
+        // Sanity: identity unchanged yet, standalone opens still succeed.
+        pool.open_standalone_writer()
+            .expect("standalone writer should open before any swap");
+        pool.open_standalone_reader()
+            .expect("standalone reader should open before any swap");
+
+        // Simulate a swap: replace the bound path with a different file.
+        std::fs::write(&swapped_in, b"").expect("create distinct swapped-in file");
+        std::fs::remove_file(&path).expect("remove pre-swap file");
+        std::fs::hard_link(&swapped_in, &path).expect("swap in a different file");
+
+        let writer_err = pool
+            .open_standalone_writer()
+            .expect_err("standalone writer must refuse a swapped file");
+        assert!(writer_err.to_string().contains("no longer matches"));
+
+        let reader_err = pool
+            .open_standalone_reader()
+            .expect_err("standalone reader must refuse a swapped file");
+        assert!(reader_err.to_string().contains("no longer matches"));
     }
 
     #[test]

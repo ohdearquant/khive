@@ -148,6 +148,9 @@ async fn two_package_fixture_converges_regardless_of_ingest_order() {
                 path: &root.path().join(pkg),
                 languages: all_languages(),
                 sweep_time: Utc::now(),
+                enable_l1: true,
+                enable_l1_5: true,
+                enable_l2: false,
             },
         )
         .await
@@ -166,6 +169,9 @@ async fn two_package_fixture_converges_regardless_of_ingest_order() {
                 path: &root.path().join(pkg),
                 languages: all_languages(),
                 sweep_time: Utc::now(),
+                enable_l1: true,
+                enable_l1_5: true,
+                enable_l2: false,
             },
         )
         .await
@@ -209,6 +215,9 @@ async fn reingesting_same_fixture_is_idempotent() {
         path: root.path(),
         languages: all_languages(),
         sweep_time: Utc::now(),
+        enable_l1: true,
+        enable_l1_5: true,
+        enable_l2: false,
     };
 
     let first = run_code_ingest(&rt, &token, opts())
@@ -232,9 +241,9 @@ async fn reingesting_same_fixture_is_idempotent() {
         "re-ingesting the same fixture must not create duplicate or divergent edges"
     );
     assert_eq!(
-        first.projects_created + first.modules_created,
-        second.projects_updated + second.modules_updated,
-        "everything created on the first pass must be reported as updated on the second"
+        first.projects_created, second.projects_updated,
+        "every project created on the first pass must be reported as updated on the second \
+         (projects carry no content_hash, so they always rewrite)"
     );
     assert_eq!(
         second.projects_created, 0,
@@ -244,13 +253,18 @@ async fn reingesting_same_fixture_is_idempotent() {
         second.modules_created, 0,
         "second pass must create zero new modules"
     );
+    assert_eq!(
+        second.modules_updated, 0,
+        "an unchanged module's content_hash must match on the second pass, so it gets a \
+         last_seen_at-only touch, not a reported update"
+    );
 }
 
 /// `src/lib.rs` importing `crate::foo::Thing`, an item declared in
 /// `src/foo.rs`, must resolve to a `crate -> foo` `depends_on` edge with
 /// `dependency_kinds=["import"]` — not stay unresolved because the raw
 /// import target (`foo::Thing`) names an item inside `foo`, not a nested
-/// module `foo::Thing` (codex PR #1039 review, finding 3).
+/// module `foo::Thing`.
 fn write_item_import_fixture(root: &Path) {
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::write(
@@ -282,6 +296,9 @@ async fn rust_item_import_resolves_to_containing_module_after_reingest() {
         path: root.path(),
         languages: all_languages(),
         sweep_time: Utc::now(),
+        enable_l1: true,
+        enable_l1_5: true,
+        enable_l2: false,
     };
 
     // First pass records the item import as unresolved (module `foo` did
@@ -309,8 +326,7 @@ async fn rust_item_import_resolves_to_containing_module_after_reingest() {
 /// A manifestless folder (no `Cargo.toml`/`pyproject.toml`/`package.json`
 /// anywhere above its source files) must still produce project/module
 /// entities and import edges under the basename-fallback identity rule
-/// (ADR-085 Amendment 2 B4), not be silently skipped for lack of a manifest
-/// (codex PR #1039 review, finding 4).
+/// (ADR-085 Amendment 2 B4), not be silently skipped for lack of a manifest.
 #[tokio::test]
 async fn manifestless_rust_folder_uses_basename_fallback() {
     let root = TempDir::new().expect("tempdir");
@@ -334,6 +350,9 @@ async fn manifestless_rust_folder_uses_basename_fallback() {
             path: &proj,
             languages: all_languages(),
             sweep_time: Utc::now(),
+            enable_l1: true,
+            enable_l1_5: true,
+            enable_l2: false,
         },
     )
     .await
@@ -347,6 +366,9 @@ async fn manifestless_rust_folder_uses_basename_fallback() {
             path: &proj,
             languages: all_languages(),
             sweep_time: Utc::now(),
+            enable_l1: true,
+            enable_l1_5: true,
+            enable_l2: false,
         },
     )
     .await
@@ -387,6 +409,9 @@ async fn rejects_nonexistent_path() {
             path: &root.path().join("does-not-exist"),
             languages: all_languages(),
             sweep_time: Utc::now(),
+            enable_l1: true,
+            enable_l1_5: true,
+            enable_l2: false,
         },
     )
     .await
@@ -395,4 +420,61 @@ async fn rejects_nonexistent_path() {
         err,
         khive_pack_code::CodeSourceIngestError::InvalidPath(_)
     ));
+}
+
+/// `code.ingest(path="pkg/src")` must attribute files to `pkg`'s
+/// own `Cargo.toml` package name, walking up past the ingest root to find
+/// it — not fall back to the basename of the ingested subfolder.
+#[tokio::test]
+async fn subtree_ingest_attributes_to_ancestor_manifest_package_name() {
+    let root = TempDir::new().expect("tempdir");
+    let pkg = root.path().join("pkg");
+    std::fs::create_dir_all(pkg.join("src")).unwrap();
+    std::fs::write(pkg.join("Cargo.toml"), "[package]\nname = \"pkg\"\n").unwrap();
+    std::fs::write(pkg.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+
+    let db = root.path().join("subtree.db");
+    let rt = rt_at(&db);
+    let token = rt.authorize(Namespace::local()).expect("token");
+
+    run_code_ingest(
+        &rt,
+        &token,
+        CodeSourceIngestOptions {
+            path: &pkg.join("src"),
+            languages: all_languages(),
+            sweep_time: Utc::now(),
+            enable_l1: false,
+            enable_l1_5: true,
+            enable_l2: false,
+        },
+    )
+    .await
+    .expect("subtree ingest succeeds");
+
+    let sql = rt.sql();
+    let mut reader = sql.reader().await.expect("reader");
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: "SELECT name, kind FROM entities WHERE deleted_at IS NULL ORDER BY name".into(),
+            params: vec![],
+            label: Some("test_subtree_entities".into()),
+        })
+        .await
+        .expect("query entities");
+    let names: Vec<String> = rows
+        .into_iter()
+        .filter_map(|r| match r.get("name") {
+            Some(SqlValue::Text(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        names.contains(&"pkg".to_string()),
+        "expected a project entity named 'pkg' (from the ancestor Cargo.toml), got: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n == "src"),
+        "must not fall back to the basename of the ingested subfolder, got: {names:?}"
+    );
 }

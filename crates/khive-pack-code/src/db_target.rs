@@ -51,27 +51,86 @@ fn normalize(path: &Path) -> PathBuf {
     base
 }
 
-fn same_path(a: &Path, b: &Path) -> bool {
-    normalize(a) == normalize(b)
+/// `(device, inode)` for `path` and, when present, its SQLite WAL/SHM
+/// companion files — a hard link to a protected database shares the target's
+/// inode even though `normalize`'s canonicalized *path* differs (hard links
+/// are distinct directory entries pointing at one inode; there is no
+/// symlink for `canonicalize` to resolve through). Absent files are simply
+/// omitted, not an error: a not-yet-created candidate has no identity to
+/// compare here and falls back to `normalize`'s path-alias check instead.
+#[cfg(unix)]
+fn file_identities(path: &Path) -> Vec<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut ids = Vec::new();
+    let mut probe = |p: &Path| {
+        if let Ok(meta) = std::fs::metadata(p) {
+            ids.push((meta.dev(), meta.ino()));
+        }
+    };
+    probe(path);
+    for suffix in ["-wal", "-shm"] {
+        let mut companion = path.as_os_str().to_os_string();
+        companion.push(suffix);
+        probe(Path::new(&companion));
+    }
+    ids
 }
 
-/// Resolve the `db` verb argument into a concrete target database path,
-/// defaulting to `<path>/.khive/code-map.db` when absent, and rejecting a
-/// target that resolves to the shared production database — either its
-/// well-known `$HOME/.khive/khive.db` default, or `runtime_db_path`, the
-/// database the calling `KhiveRuntime` was actually constructed against
-/// (`self.runtime.config().db_path` at the call site), so an operator running
-/// a non-default production location (`--db` / `KHIVE_DB`) is covered too.
-pub(crate) fn resolve_target_db(
-    db_param: Option<&str>,
-    ingest_path: &Path,
-    runtime_db_path: Option<&Path>,
-) -> Result<PathBuf, String> {
-    let candidate = match db_param {
-        Some(p) => PathBuf::from(p),
-        None => ingest_path.join(".khive").join("code-map.db"),
-    };
+/// Windows equivalent of the Unix `(dev, ino)` pair: `(volume_serial_number,
+/// file_index)` uniquely identifies a file on NTFS the same way `(dev, ino)`
+/// does on Unix, so a hard-linked alias of a protected database is caught
+/// here the same way -- a distinct pathname with matching `(volume, index)`
+/// still shares one on-disk file.
+#[cfg(windows)]
+fn file_identities(path: &Path) -> Vec<(u64, u64)> {
+    use std::os::windows::fs::MetadataExt;
 
+    let mut ids = Vec::new();
+    let mut probe = |p: &Path| {
+        if let Ok(meta) = std::fs::metadata(p) {
+            if let (Some(vol), Some(idx)) = (meta.volume_serial_number(), meta.file_index()) {
+                ids.push((vol as u64, idx));
+            }
+        }
+    };
+    probe(path);
+    for suffix in ["-wal", "-shm"] {
+        let mut companion = path.as_os_str().to_os_string();
+        companion.push(suffix);
+        probe(Path::new(&companion));
+    }
+    ids
+}
+
+#[cfg(not(any(unix, windows)))]
+fn file_identities(_path: &Path) -> Vec<(u64, u64)> {
+    Vec::new()
+}
+
+/// True when `a` and `b` name the same database file: either the same path
+/// once symlinked-parent aliasing is normalized away, or — the hard-link
+/// case `normalize` cannot see, since a hard link introduces no symlink for
+/// canonicalization to follow — the same `(device, inode)` identity on disk,
+/// checked against both files' main path and any present `-wal`/`-shm`
+/// companion.
+fn same_path(a: &Path, b: &Path) -> bool {
+    if normalize(a) == normalize(b) {
+        return true;
+    }
+    let a_ids = file_identities(a);
+    if a_ids.is_empty() {
+        return false;
+    }
+    let b_ids = file_identities(b);
+    a_ids.iter().any(|id| b_ids.contains(id))
+}
+
+/// The production-database paths a target must never alias: the well-known
+/// `$HOME/.khive/khive.db` default plus whichever of `runtime_db_path` or
+/// `KHIVE_DB` names the actually-configured production database (see
+/// `resolve_target_db`'s doc comment for why both are needed).
+fn forbidden_db_paths(runtime_db_path: Option<&Path>) -> Vec<PathBuf> {
     let mut forbidden: Vec<PathBuf> = Vec::new();
     if let Some(prod) = default_production_db_path() {
         forbidden.push(prod);
@@ -91,9 +150,12 @@ pub(crate) fn resolve_target_db(
             }
         }
     }
+    forbidden
+}
 
-    for forbidden_path in &forbidden {
-        if same_path(&candidate, forbidden_path) {
+fn reject_if_forbidden(candidate: &Path, forbidden: &[PathBuf]) -> Result<(), String> {
+    for forbidden_path in forbidden {
+        if same_path(candidate, forbidden_path) {
             return Err(format!(
                 "code.ingest refuses to target the shared production database ({}); pass \
                  db=<path> pointing at a dedicated map database, or omit db to use the \
@@ -102,7 +164,144 @@ pub(crate) fn resolve_target_db(
             ));
         }
     }
+    Ok(())
+}
+
+/// True when `raw` is (or could plausibly be interpreted by SQLite as) a
+/// `file:` URI target. The connection pool unconditionally sets
+/// `SQLITE_OPEN_URI` on every open (`crates/khive-db/src/pool.rs`), so a
+/// `db` string SQLite parses as a URI is opened at whatever filesystem path
+/// that URI names -- never the literal string a `PathBuf`-based comparison
+/// sees. `?`-bearing strings without a `file:` prefix are flagged too, since
+/// they read as URI-shaped input even though SQLite itself would not parse
+/// them as one; treating them as "needs URI resolution, fail closed if it
+/// doesn't parse" is strictly more conservative than passing them through.
+fn looks_like_sqlite_uri(raw: &str) -> bool {
+    raw.starts_with("file:") || raw.contains('?')
+}
+
+/// Decode a percent-encoded UTF-8 string, per the escaping SQLite URIs use
+/// for path bytes outside the unreserved set (https://sqlite.org/uri.html).
+/// Malformed `%`-escapes are passed through as literal bytes rather than
+/// rejected -- callers only use this to derive the path a *successful* parse
+/// will compare against the forbidden set, so a caller string that neither
+/// parses cleanly nor happens to alias a forbidden target is still safely
+/// rejected downstream if it does alias one, and otherwise this is best-effort.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(byte) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Parse a SQLite `file:` URI down to the filesystem path it names. Per
+/// https://sqlite.org/uri.html, `file:path`, `file:/path`, and
+/// `file://authority/path` (authority ignored) all name a filesystem path;
+/// everything from the first `?` or `#` is URI parameters, not path. Returns
+/// `None` when `raw` has no `file:` prefix to parse, or decodes to an empty
+/// path -- both cases the caller treats as unparseable and fails closed on,
+/// rather than falling back to comparing the raw literal (which would let a
+/// malformed URI dodge the identity check the way the un-decoded literal did
+/// before this fence existed).
+fn sqlite_uri_path(raw: &str) -> Option<PathBuf> {
+    let rest = raw.strip_prefix("file:")?;
+    let rest = rest.split(['?', '#']).next().unwrap_or("");
+    let rest = match rest.strip_prefix("//") {
+        Some(after_slashes) => match after_slashes.find('/') {
+            Some(idx) => &after_slashes[idx..],
+            None => after_slashes,
+        },
+        None => rest,
+    };
+    if rest.is_empty() {
+        return None;
+    }
+    let mut decoded = percent_decode(rest);
+    if has_leading_slash_before_drive_letter(&decoded) {
+        decoded.remove(0);
+    }
+    Some(PathBuf::from(decoded))
+}
+
+/// True when `s` is a POSIX-style absolute path whose first segment is a
+/// Windows drive letter (`/C:/...`) -- the shape `file:///C:/...` and
+/// `file://localhost/C:/...` decode to per RFC 8089, while SQLite's own URI
+/// parser strips that leading slash before opening the file, landing on
+/// `C:/...` (https://sqlite.org/uri.html). Left unstripped, the fence
+/// compares against a path SQLite never actually opens, so a `db` target
+/// aimed at the production database under a `file:///C:/...` URI slips past
+/// the comparison (#1087).
+fn has_leading_slash_before_drive_letter(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':'
+}
+
+/// Resolve `raw` to the path the fence must actually check identity
+/// against: the URI-decoded target when `raw` is URI-shaped (erroring if it
+/// does not parse), otherwise the literal path unchanged.
+fn resolve_candidate_for_check(raw: &str) -> Result<PathBuf, String> {
+    if looks_like_sqlite_uri(raw) {
+        sqlite_uri_path(raw).ok_or_else(|| {
+            format!(
+                "code.ingest refuses an unparseable SQLite URI db target ({raw:?}); pass a \
+                 plain filesystem path, or a well-formed file: URI"
+            )
+        })
+    } else {
+        Ok(PathBuf::from(raw))
+    }
+}
+
+/// Resolve the `db` verb argument into a concrete target database path,
+/// defaulting to `<path>/.khive/code-map.db` when absent, and rejecting a
+/// target that resolves to the shared production database — either its
+/// well-known `$HOME/.khive/khive.db` default, or `runtime_db_path`, the
+/// database the calling `KhiveRuntime` was actually constructed against
+/// (`self.runtime.config().db_path` at the call site), so an operator running
+/// a non-default production location (`--db` / `KHIVE_DB`) is covered too.
+pub(crate) fn resolve_target_db(
+    db_param: Option<&str>,
+    ingest_path: &Path,
+    runtime_db_path: Option<&Path>,
+) -> Result<PathBuf, String> {
+    let (candidate, check_path) = match db_param {
+        Some(p) => (PathBuf::from(p), resolve_candidate_for_check(p)?),
+        None => {
+            let default = ingest_path.join(".khive").join("code-map.db");
+            (default.clone(), default)
+        }
+    };
+    reject_if_forbidden(&check_path, &forbidden_db_paths(runtime_db_path))?;
     Ok(candidate)
+}
+
+/// Re-verify `opened_db_path` against the same forbidden set immediately
+/// after the target `KhiveRuntime` has been opened (or created), before any
+/// write runs against it. `resolve_target_db`'s check and the actual open are
+/// two separate filesystem operations with a window between them (create a
+/// fresh `db_path` after the check observed no existing file, alias it to a
+/// protected database in that window); re-stating the now-guaranteed-to-exist
+/// path closes most of that window by adding a metadata-identity check the
+/// first pass could not perform against a not-yet-created file. This is a
+/// narrowing, not a full close — a true race-resistant fence requires a
+/// VFS-level check (ADR-085 Amendment 4, in review).
+pub(crate) fn verify_opened_target(
+    opened_db_path: &Path,
+    runtime_db_path: Option<&Path>,
+) -> Result<(), String> {
+    let check_path = resolve_candidate_for_check(&opened_db_path.to_string_lossy())?;
+    reject_if_forbidden(&check_path, &forbidden_db_paths(runtime_db_path))
 }
 
 #[cfg(test)]
@@ -176,6 +375,105 @@ mod tests {
             Some(&configured),
         )
         .expect_err("symlinked-parent alias of the configured db must be rejected");
+        assert!(err.contains("shared production database"));
+    }
+
+    /// Same hard-link-alias scenario as the Unix test below, exercising the
+    /// Windows `(volume_serial_number, file_index)` identity path instead of
+    /// `(dev, ino)` -- the CI Windows matrix job (ci.yml `check-windows`)
+    /// compiles and runs this.
+    #[test]
+    #[cfg(windows)]
+    fn hard_link_to_configured_db_is_rejected_on_windows() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let configured = tmp.path().join("main.db");
+        std::fs::write(&configured, b"").expect("create sentinel file");
+        let candidate = tmp.path().join("map.db");
+        std::fs::hard_link(&configured, &candidate).expect("hard link");
+
+        let err = resolve_target_db(
+            Some(candidate.to_str().unwrap()),
+            Path::new("/tmp/some-repo"),
+            Some(&configured),
+        )
+        .expect_err("hard-linked alias of the configured db must be rejected on Windows");
+        assert!(err.contains("shared production database"));
+    }
+
+    /// #1087 item 1: `SQLITE_OPEN_URI` is set unconditionally by the pool
+    /// (`crates/khive-db/src/pool.rs`), so a `db=file:...?...` target is
+    /// opened by SQLite at the URI's decoded path, not the literal string a
+    /// PathBuf-only comparison would see. The fence must decode the URI
+    /// before comparing.
+    #[test]
+    fn sqlite_uri_target_aliasing_configured_db_is_rejected() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let configured = tmp.path().join("main.db");
+        std::fs::write(&configured, b"").expect("create sentinel file");
+        let uri = format!("file:{}?mode=rw", configured.display());
+        let err = resolve_target_db(Some(&uri), Path::new("/tmp/some-repo"), Some(&configured))
+            .expect_err("file: URI aliasing the configured db must be rejected");
+        assert!(err.contains("shared production database"));
+    }
+
+    /// Same as above with a bare `file:` URI carrying no query parameters at
+    /// all -- the URI-detection must not depend on a `?` being present.
+    #[test]
+    fn bare_sqlite_uri_target_aliasing_configured_db_is_rejected() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let configured = tmp.path().join("main.db");
+        std::fs::write(&configured, b"").expect("create sentinel file");
+        let uri = format!("file:{}", configured.display());
+        let err = resolve_target_db(Some(&uri), Path::new("/tmp/some-repo"), Some(&configured))
+            .expect_err("bare file: URI aliasing the configured db must be rejected");
+        assert!(err.contains("shared production database"));
+    }
+
+    /// A distinct, non-forbidden `file:` URI target must still work -- the
+    /// fence must not reject every URI-shaped input outright.
+    #[test]
+    fn sqlite_uri_target_to_dedicated_db_is_accepted() {
+        let db = resolve_target_db(
+            Some("file:/tmp/code-ingest-uri-map.db?mode=rwc"),
+            Path::new("/tmp/some-repo"),
+            None,
+        )
+        .expect("dedicated file: URI target accepted");
+        assert_eq!(
+            db,
+            PathBuf::from("file:/tmp/code-ingest-uri-map.db?mode=rwc")
+        );
+    }
+
+    /// An unparseable `file:` URI (empty path component) must fail closed
+    /// rather than silently falling back to comparing the raw literal.
+    #[test]
+    fn unparseable_sqlite_uri_target_is_rejected() {
+        let err = resolve_target_db(Some("file:?mode=rw"), Path::new("/tmp/some-repo"), None)
+            .expect_err("unparseable file: URI must be refused, not passed through");
+        assert!(err.contains("unparseable"), "unexpected error: {err}");
+    }
+
+    /// A hard link to the configured production database file
+    /// has a DIFFERENT literal path from the original (no symlink involved,
+    /// so `normalize`'s canonicalize-based comparison sees two distinct,
+    /// already-canonical paths) but shares its `(device, inode)` identity —
+    /// the fence must catch this via metadata, not path text.
+    #[test]
+    #[cfg(unix)]
+    fn hard_link_to_configured_db_is_rejected() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let configured = tmp.path().join("main.db");
+        std::fs::write(&configured, b"").expect("create sentinel file");
+        let candidate = tmp.path().join("map.db");
+        std::fs::hard_link(&configured, &candidate).expect("hard link");
+
+        let err = resolve_target_db(
+            Some(candidate.to_str().unwrap()),
+            Path::new("/tmp/some-repo"),
+            Some(&configured),
+        )
+        .expect_err("hard-linked alias of the configured db must be rejected");
         assert!(err.contains("shared production database"));
     }
 
@@ -254,6 +552,38 @@ mod tests {
         }
     }
 
+    /// #1087 item 2 (TOCTOU) regression: the fence's own open-time check
+    /// (`verify_opened_target`, run once right after open) cannot see a swap
+    /// that happens AFTER it ran -- this is exactly why `code.ingest`'s
+    /// handler re-verifies a second time immediately before the write-heavy
+    /// ingest phase begins. This test proves that second re-verification
+    /// mechanism actually catches the swap: the target path passes an
+    /// initial check as a distinct file, is then replaced with a hard link
+    /// to the forbidden configured database, and a second check on the same
+    /// path must now reject it.
+    #[test]
+    #[cfg(unix)]
+    fn reverification_catches_a_post_verify_swap_to_alias_the_configured_db() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let configured = tmp.path().join("main.db");
+        std::fs::write(&configured, b"").expect("create sentinel file");
+        let target = tmp.path().join("map.db");
+        std::fs::write(&target, b"").expect("create distinct dedicated file");
+
+        verify_opened_target(&target, Some(&configured))
+            .expect("distinct dedicated file passes the first check");
+
+        // Simulate an attacker swapping the target path, between the
+        // open-time check above and the write phase, into a hard-linked
+        // alias of the forbidden database.
+        std::fs::remove_file(&target).expect("remove pre-swap target");
+        std::fs::hard_link(&configured, &target).expect("swap in a hard-linked alias");
+
+        let err = verify_opened_target(&target, Some(&configured))
+            .expect_err("re-verification must catch the post-swap alias and fail closed");
+        assert!(err.contains("shared production database"));
+    }
+
     /// #1062 H2 regression: with `HOME` unset AND no `KHIVE_DB` override, the
     /// canonical resolver (`khive_runtime::config::resolve_db_anchor(None)`)
     /// still falls back to `./.khive/khive.db` — the fence's default
@@ -306,5 +636,60 @@ mod tests {
         let err = result
             .expect_err("must reject the canonical production db with HOME unset + empty KHIVE_DB");
         assert!(err.contains("shared production database"));
+    }
+
+    /// `file:///C:/...` and `file://localhost/C:/...` both
+    /// decode (per RFC 8089) to a POSIX-shaped `/C:/...` path, but SQLite's
+    /// own URI parser strips the leading slash before a drive letter and
+    /// opens `C:/...` -- the fence must compare against that same stripped
+    /// form, or a `db=file:///C:/...` target aliasing the configured
+    /// production database slips through uncaught.
+    #[test]
+    fn windows_drive_letter_file_uri_forms_resolve_to_the_same_path_sqlite_opens() {
+        let expected = PathBuf::from("C:/Users/khive/.khive/khive.db");
+        for raw in [
+            "file:///C:/Users/khive/.khive/khive.db",
+            "file://localhost/C:/Users/khive/.khive/khive.db",
+        ] {
+            let resolved =
+                sqlite_uri_path(raw).unwrap_or_else(|| panic!("{raw:?} must parse to a path"));
+            assert_eq!(
+                resolved, expected,
+                "{raw:?} must resolve to the drive-rooted path SQLite actually opens"
+            );
+        }
+    }
+
+    /// End-to-end fence-equality proof for the same bypass: a `db=` target
+    /// spelled as a `file:///C:/...` URI aliasing the configured production
+    /// database must be rejected exactly like the plain-path form is.
+    #[test]
+    fn windows_drive_letter_file_uri_aliasing_configured_db_is_rejected() {
+        let configured = Path::new("C:/Users/khive/.khive/khive.db");
+        for raw in [
+            "file:///C:/Users/khive/.khive/khive.db",
+            "file://localhost/C:/Users/khive/.khive/khive.db",
+        ] {
+            let err = resolve_target_db(Some(raw), Path::new("/tmp/some-repo"), Some(configured))
+                .expect_err(
+                    "windows drive-letter file: URI aliasing the configured db must be rejected",
+                );
+            assert!(
+                err.contains("shared production database"),
+                "unexpected error for {raw:?}: {err}"
+            );
+        }
+    }
+
+    /// A POSIX path must never be mistaken for the Windows drive-letter URI
+    /// shape -- only exercised for `sqlite_uri_path`, which only ever sees
+    /// URI-prefixed input, but pins the boundary of the drive-letter check
+    /// itself.
+    #[test]
+    fn non_windows_uri_paths_are_left_unstripped() {
+        assert_eq!(
+            sqlite_uri_path("file:/tmp/code-ingest-map.db"),
+            Some(PathBuf::from("/tmp/code-ingest-map.db"))
+        );
     }
 }

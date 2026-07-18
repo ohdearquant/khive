@@ -4,7 +4,7 @@
 //! walks skip common non-source, non-manifest-bearing trees (`.git`, `target`,
 //! `node_modules`, `__pycache__`, `.venv`) to keep discovery bounded.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -211,17 +211,38 @@ pub(crate) fn parse_package_json(root: &Path, text: &str) -> Option<ManifestProj
     })
 }
 
-/// Find the nearest governing manifest at or above `file_dir`, never walking
-/// above `ingest_root` (B4: "the nearest governing manifest at or above that
-/// file"; this ingest run only has visibility into `ingest_root`'s subtree).
-/// Returns `(project_root, project_name)`.
-pub(crate) fn find_governing_manifest(
+/// Per-ingest memo cache for `find_governing_manifest_memoized`: a directory
+/// to its governing-manifest result, once known. Every file under the same
+/// directory re-probing and re-parsing the identical ancestor chain of
+/// manifests would be O(files x depth) over a whole-tree ingest; caching by
+/// directory means each unique directory is probed once regardless of how
+/// many files it (or its descendants) contain.
+pub(crate) type ManifestMemo = HashMap<PathBuf, Option<(PathBuf, String)>>;
+
+/// Find the nearest governing manifest at or above `file_dir` (B4: "the
+/// nearest governing manifest at or above that file", read literally — the
+/// walk is not bounded by the ingested folder; `code.ingest(path="pkg/src")`
+/// must still attribute files to `pkg`'s own manifest one level above the
+/// ingest root), walking up to the filesystem root before giving up. Caches
+/// every ancestor
+/// directory visited along the walk, not just `file_dir` itself: once one
+/// leaf's lookup has walked up through and parsed N ancestors to find (or
+/// fail to find) a manifest, every one of those N ancestor directories is
+/// cached too, so a sibling leaf elsewhere under the same ancestor chain
+/// reuses the cached result instead of re-walking and re-parsing manifests
+/// its own lookup never directly visited before.
+pub(crate) fn find_governing_manifest_memoized(
     file_dir: &Path,
-    ingest_root: &Path,
     language: &str,
+    memo: &mut ManifestMemo,
 ) -> Option<(PathBuf, String)> {
+    let mut unresolved: Vec<PathBuf> = Vec::new();
     let mut dir = Some(file_dir);
-    while let Some(d) = dir {
+    let result = loop {
+        let Some(d) = dir else { break None };
+        if let Some(cached) = memo.get(d) {
+            break cached.clone();
+        }
         let found = match language {
             "rust" => fs::read_to_string(d.join("Cargo.toml"))
                 .ok()
@@ -234,20 +255,56 @@ pub(crate) fn find_governing_manifest(
                 .and_then(|t| parse_package_json(d, &t)),
             _ => None,
         };
+        unresolved.push(d.to_path_buf());
         if let Some(project) = found {
-            return Some((project.root, project.name));
-        }
-        if d == ingest_root {
-            break;
+            break Some((project.root, project.name));
         }
         dir = d.parent();
+    };
+    for d in unresolved {
+        memo.insert(d, result.clone());
     }
-    None
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1087 item 6 regression: two sibling leaf directories under the same
+    /// ancestor manifest must resolve identically, and the shared ancestors
+    /// visited by the first lookup must end up cached so the second lookup
+    /// does not have to walk (or re-parse) them itself.
+    #[test]
+    fn memoized_lookup_caches_shared_ancestor_for_sibling_leaves() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"root\"\n",
+        )
+        .expect("write manifest");
+        let leaf_a = tmp.path().join("src/a");
+        let leaf_b = tmp.path().join("src/b");
+        std::fs::create_dir_all(&leaf_a).expect("mkdir a");
+        std::fs::create_dir_all(&leaf_b).expect("mkdir b");
+
+        let mut memo = ManifestMemo::new();
+        let (root_a, name_a) = find_governing_manifest_memoized(&leaf_a, "rust", &mut memo)
+            .expect("leaf_a resolves to the root manifest");
+        assert_eq!(root_a, tmp.path().to_path_buf());
+        assert_eq!(name_a, "root");
+        // The shared `src/` ancestor (and the root itself) are cached after
+        // leaf_a's walk, even though only leaf_a's own lookup visited them --
+        // leaf_b's lookup below reuses them instead of re-walking.
+        assert!(memo.contains_key(tmp.path().join("src").as_path()));
+        assert!(memo.contains_key(tmp.path()));
+
+        let (root_b, name_b) = find_governing_manifest_memoized(&leaf_b, "rust", &mut memo)
+            .expect("leaf_b resolves to the same root manifest");
+        assert_eq!(root_a, root_b);
+        assert_eq!(name_a, name_b);
+        assert!(memo.contains_key(leaf_b.as_path()));
+    }
 
     #[test]
     fn cargo_toml_without_package_is_not_governing() {

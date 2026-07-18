@@ -11,7 +11,8 @@ pub(crate) static CODE_HANDLERS: [HandlerDef; 1] = [HandlerDef {
     name: "code.ingest",
     description: "Ingest L1 manifest edges and L1.5 regex import-scan edges from a source \
                    folder into a dedicated map database (never the shared production graph). \
-                   L2 Scanner/Extractor symbol-tier ingest is not implemented by this call.",
+                   The L2 Scanner/Extractor symbol tier (Rust only) is available via \
+                   tiers=[\"l2\"] but not run by default.",
     visibility: Visibility::Verb,
     category: VerbCategory::Commissive,
     params: &[
@@ -35,6 +36,15 @@ pub(crate) static CODE_HANDLERS: [HandlerDef; 1] = [HandlerDef {
             required: false,
             description: "Restrict ingest to a subset of rust | python | typescript. Defaults \
                            to all three (auto-detected from manifests found under path).",
+        },
+        ParamDef {
+            name: "tiers",
+            param_type: "array of string",
+            required: false,
+            description: "Subset of l1 | l1.5 | l2 to run. Defaults to running l1 (manifest \
+                           edges) and l1.5 (import-scan edges) only, matching pre-l2 behavior. \
+                           l2 additionally runs the Scanner/Extractor symbol tier (Rust only \
+                           in this release) over declaration-level entities and edges.",
         },
     ],
 }];

@@ -2,12 +2,14 @@
 
 mod db_target;
 mod error;
+pub(crate) mod extractor;
 mod handlers;
 mod hook;
 pub mod imports;
 pub mod ingest;
 pub mod manifest;
 mod pack;
+pub(crate) mod scanner_rust;
 pub mod source_ingest;
 pub(crate) mod vocab;
 

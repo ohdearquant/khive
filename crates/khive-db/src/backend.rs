@@ -601,6 +601,12 @@ impl StorageBackend {
         self.path.as_ref()?.parent().map(|p| p.to_path_buf())
     }
 
+    /// Return the backend's full database file path, or `None` for an
+    /// in-memory backend.
+    pub fn db_path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
     /// Access the underlying pool (escape hatch).
     pub fn pool(&self) -> &ConnectionPool {
         &self.pool
