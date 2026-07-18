@@ -208,7 +208,12 @@ pub trait Pack: Send + Sync {
 
 `ServiceSchemaPlan` already exists in `khive-db::migrations` per ADR-015. Each pack's plan
 is applied to its assigned backend at boot, idempotently, with per-pack version tracking
-via the existing `_schema_migrations` table (one row per pack-versioned migration).
+via the `_schema_versions` table (one row per pack-versioned migration, keyed by
+`(service, migration_id)`). This is a distinct ledger from the core `_schema_migrations` table
+that ADR-015's base V1-VN migration pipeline uses (keyed by `version`); the two track two separate
+migration mechanisms, and `_schema_versions` is the table the shipped `apply_schema_plan` runner in
+`khive-db::migrations` reads and writes. (An earlier revision of this ADR named `_schema_migrations`
+here; that was a documentation error against the implementation.)
 
 The substrate / pack-extension boundary:
 

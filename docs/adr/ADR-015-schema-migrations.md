@@ -135,7 +135,26 @@ above remains the historical pre-consolidation record.
 |      V6 | ADR-081            | brain_retune_driver                | shipped |
 |      V7 | #827               | notes_seq                          | shipped |
 |      V8 | #827               | notes_seq_repair                   | shipped |
-|      V9 | ADR-104            | entities_name_ci_index             | claimed |
+|      V9 | ADR-104            | entities_name_ci_index             | shipped |
+|     V10 | ADR-111            | entities_content_ref               | shipped |
+|     V11 | ADR-056            | comm_channel_cursor_source_key     | claimed |
+
+> **V9 record (2026-07-18)**: `entities_name_ci_index` (ADR-104) ships in the `MIGRATIONS`
+> array as `009-entities-name-ci-index.sql`; its status here was `claimed`, stale from ADR-104,
+> and is corrected to `shipped` to match the code. With the V10 backfill below, the live
+> ledger's status column now agrees with the shipped `MIGRATIONS` array.
+
+> **V10 record (2026-07-18)**: `entities_content_ref` (ADR-111 BlobStore `content_ref`
+> column, khive#292) shipped in the `MIGRATIONS` array but was not recorded here; it is
+> backfilled so the live sequence is contiguous through the V11 claim below.
+
+> **V11 claim (2026-07-18, ADR-056)**: `comm_channel_cursor_source_key` widens
+> `comm_channel_cursor` to the three-column key `(channel_kind, channel_slug, source)` and adds
+> the `anchor` column (ADR-056 Amendment 2026-07-17, §Migration: owner and sequence). Status is
+> `claimed`: this is a docs-first ADR PR, and the `011-comm-channel-cursor-source-key.sql` file
+> ships with the implementation that follows the accepted spec. Like V20/V21 in the
+> pre-consolidation ledger, it is pack-owned logical state whose
+> shipped schema is a core `khive-db` versioned migration, so the ledger records it.
 
 > **Invariant**: ADR number order and migration version order are independent. Migration versions reflect schema ledger assignment order. A migration may only depend on schema created by earlier versions.
 
