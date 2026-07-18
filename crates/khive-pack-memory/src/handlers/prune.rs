@@ -170,6 +170,180 @@ impl MemoryPack {
     }
 }
 
+// ── #533: memory.prune must not surface stale rows via any recall retrieval
+// path (FTS lexical, sqlite-vec/ANN vector, or the default hybrid fusion) ────
+
+#[cfg(test)]
+mod prune_recall_visibility_tests {
+    use async_trait::async_trait;
+    use khive_pack_kg::KgPack;
+    use khive_runtime::{EmbedderProvider, KhiveRuntime, Namespace, VerbRegistryBuilder};
+    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
+    use serial_test::serial;
+
+    /// Deterministic embedding service: distinct vector per unique text via FNV hash.
+    /// Not semantically meaningful, but reproducible — enough for a cosine-similarity
+    /// vector leg to find the seeded note by exact content match.
+    struct HashVecService {
+        dims: usize,
+    }
+
+    fn fnv_to_vec(text: &str, dims: usize) -> Vec<f32> {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in text.bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0001_0000_01b3);
+        }
+        let mut v = Vec::with_capacity(dims);
+        let mut s = h;
+        for _ in 0..dims {
+            s = s
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            v.push(((s >> 33) as f32) / (0x7fff_ffff_u32 as f32) - 1.0);
+        }
+        v
+    }
+
+    #[async_trait]
+    impl EmbeddingService for HashVecService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> Result<Vec<Vec<f32>>, EmbedError> {
+            Ok(texts.iter().map(|t| fnv_to_vec(t, self.dims)).collect())
+        }
+
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "hash-vec"
+        }
+    }
+
+    struct HashVecProvider {
+        model_name: String,
+        dims: usize,
+    }
+
+    #[async_trait]
+    impl EmbedderProvider for HashVecProvider {
+        fn name(&self) -> &str {
+            &self.model_name
+        }
+
+        fn dimensions(&self) -> usize {
+            self.dims
+        }
+
+        async fn build(
+            &self,
+        ) -> Result<std::sync::Arc<dyn EmbeddingService>, khive_runtime::RuntimeError> {
+            Ok(std::sync::Arc::new(HashVecService { dims: self.dims }))
+        }
+    }
+
+    /// A pruned memory must not be returned by `memory.recall` through the lexical
+    /// (`keyword_only`), vector (`vector_only`), or default hybrid fusion path.
+    ///
+    /// `memory.prune` soft-deletes via `NoteStore::delete_note` (sets `deleted_at`,
+    /// rows remain — ADR-014) and bumps the per-model ANN generation so a background
+    /// rebuild drops stale vectors. It does not touch the FTS5 index or the
+    /// sqlite-vec store directly. Correctness for `memory.recall` is expected to
+    /// come from `load_memory_candidate_notes`'s post-hydration `deleted_at IS NULL`
+    /// filter (`handlers/common.rs`), which applies uniformly to text and vector
+    /// candidates before either leg reaches the caller.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn prune_excludes_pruned_memory_across_fts_vector_and_hybrid_recall() {
+        const MODEL: &str = "prune-533-visibility-model";
+        const DIMS: usize = 16;
+        const NOTE_TEXT: &str = "issue 533 prune stale fts vector ann visibility regression note";
+
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        rt.register_embedder(HashVecProvider {
+            model_name: MODEL.to_owned(),
+            dims: DIMS,
+        });
+
+        let ns = Namespace::parse("local").expect("local namespace");
+        rt.authorize(ns).expect("authorize local");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(crate::MemoryPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+
+        // memory_type=semantic writes to the token's own namespace ("local"),
+        // matching memory.prune's default namespace filter.
+        let remember_result = registry
+            .dispatch(
+                "memory.remember",
+                serde_json::json!({
+                    "content": NOTE_TEXT,
+                    "salience": 0.1,
+                    "memory_type": "semantic",
+                }),
+            )
+            .await
+            .expect("memory.remember");
+        let note_id = remember_result["id"]
+            .as_str()
+            .expect("remember response carries id")
+            .to_string();
+
+        // Sanity: the note is recallable before prune.
+        let before = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({ "query": NOTE_TEXT, "limit": 10 }),
+            )
+            .await
+            .expect("memory.recall before prune");
+        let before_hits = before.as_array().expect("bare array result");
+        assert!(
+            before_hits.iter().any(|h| h["id"] == note_id),
+            "seeded note must be recallable before prune: {before_hits:?}"
+        );
+
+        let prune_result = registry
+            .dispatch("memory.prune", serde_json::json!({ "min_salience": 0.5 }))
+            .await
+            .expect("memory.prune");
+        assert_eq!(
+            prune_result["pruned"], 1,
+            "the single seeded note (salience 0.1 < 0.5) must be pruned: {prune_result:?}"
+        );
+
+        for (label, fusion_strategy) in [
+            ("keyword_only (FTS lexical leg)", "keyword_only"),
+            ("vector_only (sqlite-vec/ANN leg)", "vector_only"),
+            ("rrf (default hybrid fusion)", "rrf"),
+        ] {
+            let mut params = serde_json::json!({
+                "query": NOTE_TEXT,
+                "limit": 10,
+                "fusion_strategy": fusion_strategy,
+            });
+            if fusion_strategy == "vector_only" {
+                params["embedding_model"] = serde_json::json!(MODEL);
+            }
+            let result = registry
+                .dispatch("memory.recall", params)
+                .await
+                .unwrap_or_else(|e| panic!("memory.recall [{label}] must not error: {e:?}"));
+            let hits = result.as_array().expect("bare array result");
+            assert!(
+                hits.iter().all(|h| h["id"] != note_id),
+                "pruned note must not be returned via {label}, got: {hits:?}"
+            );
+        }
+    }
+}
+
 // ── ADR-067 Fork C slice 2: memory.vacuum under the write
 // queue ──────────────────────────────────────────────────────────────────────
 
