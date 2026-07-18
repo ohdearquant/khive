@@ -112,14 +112,10 @@ echo "    CRATES ladder OK (${#CRATES[@]} publishable workspace members all pres
 # version bump. This runs at the publish boundary — where the version actually
 # bumps — because mid-cycle on a fixed dev version the check is permanently red
 # (which is why it is NOT a per-PR CI gate). Runs in preflight and live alike so
-# `make publish-dry` validates SemVer before any real publish. Crates with no
-# crates.io baseline yet (never published) have nothing to diff against and are
-# excluded until their first publish. As of the 0.5.0 cycle that is exactly
-# khive-channel-telegram (added since 0.4.0 via #1048). The four crates first
-# published in 0.4.0 — khive-changeset, khive-pack-code, khive-pack-git,
-# khive-pack-workspace — now have a 0.4.0 baseline and are checked again. Every
-# other workspace crate has a published baseline and MUST be checked. Drop an
-# exclusion once that crate has one published version.
+# `make publish-dry` validates SemVer before any real publish. The exclude list
+# (crates with no crates.io baseline yet) lives in scripts/lib/semver_excludes.txt
+# (#568) — also consumed by .github/workflows/release.yml's semver-gate job, so
+# the two gates cannot drift out of sync with each other.
 echo ""
 echo "--- SemVer gate (cargo-semver-checks vs crates.io baseline) ---"
 if ! command -v cargo-semver-checks >/dev/null 2>&1; then
@@ -127,8 +123,12 @@ if ! command -v cargo-semver-checks >/dev/null 2>&1; then
     echo "       Install it:  cargo install cargo-semver-checks --locked" >&2
     exit 1
 fi
-cargo semver-checks check-release --workspace \
-    --exclude khive-channel-telegram
+mapfile -t SEMVER_EXCLUDES < <(grep -v '^[[:space:]]*#' "$SCRIPT_DIR/lib/semver_excludes.txt" | grep -v '^[[:space:]]*$')
+SEMVER_EXCLUDE_ARGS=()
+for crate in "${SEMVER_EXCLUDES[@]}"; do
+    SEMVER_EXCLUDE_ARGS+=(--exclude "$crate")
+done
+cargo semver-checks check-release --workspace "${SEMVER_EXCLUDE_ARGS[@]}"
 echo "    SemVer gate OK"
 
 for crate in "${CRATES[@]}"; do

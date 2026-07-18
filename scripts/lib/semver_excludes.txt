@@ -1,0 +1,9 @@
+# Crates with no crates.io baseline yet (never published), so cargo-semver-checks
+# has nothing to diff against and excludes them until their first publish. Drop
+# an entry here once that crate has one published version.
+#
+# Single source of truth (#568) for the `cargo semver-checks check-release
+# --exclude` list — consumed by both scripts/publish.sh (publish-boundary
+# preflight/live gate) and .github/workflows/release.yml (release SemVer gate).
+# One blank-/comment-filtered crate name per line.
+khive-channel-telegram
