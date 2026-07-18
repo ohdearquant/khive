@@ -12,8 +12,15 @@
 # panic!/unreachable! call for that language, not the macro itself.
 #
 # Scans every `.rs` file under crates/ -- source, tests, benches, and
-# examples alike. Production discovery is git-tracked-file based (`git
-# ls-files -s -z -- crates/`): untracked build-artifact output (target/,
+# examples alike. Production discovery is git-tracked-tree based (`git
+# ls-tree -r -z HEAD -- crates/`): the COMMITTED TREE, not the mutable
+# index. `scripts/ci.sh` runs clippy/build (executing PR-controlled
+# build.rs / proc-macros) before this guard runs; a build step can `git rm
+# --cached` a stub-bearing path to mutate the index while leaving the
+# working-tree file in place, and index-based discovery (`git ls-files`)
+# would then omit it. The HEAD tree object cannot be mutated by anything
+# running after checkout, so this scan always reflects what was actually
+# committed and compiled. Untracked build-artifact output (target/,
 # .cargo-target/, anything gitignored) is never listed by git, so no
 # name-based directory pruning is needed and, unlike a name-pruning `find`,
 # a TRACKED Rust module nested under a dir literally named `target` (e.g.
@@ -36,9 +43,9 @@
 # walks, and the symlink handling applied to each:
 #
 #   script self-location     | `cd $(dirname $0) && pwd`         | trusted; resolved once at startup
-#   crates/ regular .rs      | `git ls-files -s` mode 100644/100755, self-test fallback `find -type f` | only tracked-regular/self-test-real files scanned
-#   crates/ any symlink      | `git ls-files -s` mode 120000, self-test fallback `find -type l` | HARD-FAIL, named via sanitize_for_ci, before scanning
-#   discovered .rs reads     | `os.open(O_RDONLY|O_NOFOLLOW)` in the scan loop | binds the read to the exact discovered path; a post-discovery swap to a symlink (a build step/proc-macro racing the guard, or a working-tree file diverging from a clean git index entry) raises ELOOP and hard-fails that path by name, rather than silently following or reading a replacement
+#   crates/ regular .rs      | `git ls-tree -r HEAD` mode 100644/100755, self-test fallback `find -type f` | only tracked-regular/self-test-real files scanned; committed-tree, not index, state
+#   crates/ any symlink      | `git ls-tree -r HEAD` mode 120000, self-test fallback `find -type l` | HARD-FAIL, named via sanitize_for_ci, before scanning
+#   discovered .rs reads     | per-component `os.open(O_RDONLY|O_NOFOLLOW, dir_fd=...)` walk from a root fd, in the scan loop | proves every path component from the scan root down to the file -- not just the final one -- is not a symlink at read time; a post-discovery swap of the file OR any parent directory (a build step/proc-macro racing the guard, or a working-tree entry diverging from its clean git tree entry) raises ELOOP and hard-fails that path by name, rather than silently following or reading a replacement
 #   allowlist file            | `os.open(O_RDONLY|O_NOFOLLOW)`    | symlink refused atomically; in-repo default must also resolve under the scan root; env override is containment-exempt but still symlink-refused
 #   temp transport files      | `mktemp`                          | mktemp regular files (O_EXCL); not attacker-controlled
 #   self-test fixture trees   | self-authored under `mktemp -d`   | test-authored real files (find-mode discovery; not git-tracked)
@@ -330,7 +337,7 @@ FIXTURE
 
     status=0
 
-    # Exactly 19 markers are seeded in case-fail above; asserting the count
+    # Exactly 20 markers are seeded in case-fail above; asserting the count
     # (not just substring presence) catches a parser-overmatch regression
     # that would otherwise slip through as an unnoticed extra finding.
     expected_marker_count=20
@@ -671,6 +678,102 @@ GITTARGETFIXTURE
         fi
     fi
 
+    # Parent-directory symlink swap: git-tree discovery only reads the
+    # COMMITTED tree, so a file committed under a real `src/` directory is
+    # still discovered as a plain 100644 entry even after the working-tree
+    # `src` directory is swapped to a symlink post-commit -- the same
+    # decoupling the git-TOCTOU fixture above exercises for the file itself.
+    # The per-component openat walk must refuse the symlinked PARENT
+    # directory (ELOOP) before ever reaching the file, naming the full
+    # discovered path.
+    mkdir -p "$tmp/case-parent-symlink/crates/fixture-crate/src"
+    cat > "$tmp/case-parent-symlink/crates/fixture-crate/src/f.rs" <<'PARENTFIXTURE'
+pub fn parent_symlink_stub() -> u32 {
+    panic!("todo: this file rode in behind a parent directory swapped to a symlink after discovery")
+}
+PARENTFIXTURE
+    (
+        cd "$tmp/case-parent-symlink" && git init -q . \
+            && git config user.email "test@example.com" && git config user.name "test" \
+            && git add -A && git commit -q -m seed
+    )
+    rm -rf "$tmp/case-parent-symlink/crates/fixture-crate/src"
+    mkdir -p "$tmp/parent-symlink-target"
+    ln -s "$tmp/parent-symlink-target" "$tmp/case-parent-symlink/crates/fixture-crate/src"
+    if STUB_MARKER_ALLOWLIST="$empty_allowlist" scan "$tmp/case-parent-symlink" git > "$tmp/parent-symlink.log" 2>&1; then
+        echo "self-test FAILED: a parent directory swapped to a symlink after discovery should have hard-failed the scan"
+        cat "$tmp/parent-symlink.log"
+        status=1
+    else
+        if ! grep -qF 'crates/fixture-crate/src/f.rs' "$tmp/parent-symlink.log"; then
+            echo "self-test FAILED: the parent-directory-symlink error did not name the offending path"
+            cat "$tmp/parent-symlink.log"
+            status=1
+        fi
+    fi
+
+    # Index-mutation immunity: `git rm --cached` unstages a committed file
+    # (removing it from the index) while leaving the working-tree copy in
+    # place and HEAD unchanged. `git ls-tree HEAD` reads the commit's tree
+    # object, not the index, so it still lists the file and the stub is
+    # still scanned and flagged -- the exact gap index-based `git ls-files`
+    # discovery had.
+    mkdir -p "$tmp/case-index-mutation/crates/fixture-crate/src"
+    cat > "$tmp/case-index-mutation/crates/fixture-crate/src/lib.rs" <<'IDXFIXTURE'
+pub fn index_mutation_stub() -> u32 {
+    panic!("todo: this stub must still be caught after git rm --cached unstages it")
+}
+IDXFIXTURE
+    (
+        cd "$tmp/case-index-mutation" && git init -q . \
+            && git config user.email "test@example.com" && git config user.name "test" \
+            && git add -A && git commit -q -m seed \
+            && git rm --cached -q crates/fixture-crate/src/lib.rs
+    )
+    if STUB_MARKER_ALLOWLIST="$empty_allowlist" scan "$tmp/case-index-mutation" git > "$tmp/index-mutation.log" 2>&1; then
+        echo "self-test FAILED: a stub still present in the committed HEAD tree (after git rm --cached unstaged it from the index) should have been caught, not skipped"
+        cat "$tmp/index-mutation.log"
+        status=1
+    else
+        if ! grep -qF 'this stub must still be caught after git rm --cached unstages it' "$tmp/index-mutation.log"; then
+            echo "self-test FAILED: the index-mutation-immunity finding was not reported"
+            cat "$tmp/index-mutation.log"
+            status=1
+        fi
+    fi
+
+    # Producer-failure fail-closed: corrupt the committed tree object itself
+    # (delete its loose object file) so `git ls-tree -r HEAD` fails even
+    # though `git rev-parse --verify HEAD` succeeds (the commit object is
+    # still intact). The scan must fail loud and non-zero, never silently
+    # scan an empty or partial listing as if it were a clean pass.
+    mkdir -p "$tmp/case-ls-tree-fail/crates/fixture-crate/src"
+    cat > "$tmp/case-ls-tree-fail/crates/fixture-crate/src/lib.rs" <<'LSTREEFAILFIXTURE'
+pub fn ok() -> u32 {
+    1
+}
+LSTREEFAILFIXTURE
+    (
+        cd "$tmp/case-ls-tree-fail" && git init -q . \
+            && git config user.email "test@example.com" && git config user.name "test" \
+            && git add -A && git commit -q -m seed
+    )
+    tree_sha="$(cd "$tmp/case-ls-tree-fail" && git rev-parse 'HEAD^{tree}')"
+    obj_dir="${tree_sha%"${tree_sha#??}"}"
+    obj_file="${tree_sha#??}"
+    rm -f "$tmp/case-ls-tree-fail/.git/objects/$obj_dir/$obj_file"
+    if STUB_MARKER_ALLOWLIST="$empty_allowlist" scan "$tmp/case-ls-tree-fail" git > "$tmp/ls-tree-fail.log" 2>&1; then
+        echo "self-test FAILED: a git ls-tree HEAD failure (corrupted tree object) should have hard-failed the scan, not passed"
+        cat "$tmp/ls-tree-fail.log"
+        status=1
+    else
+        if ! grep -qF 'ls-tree' "$tmp/ls-tree-fail.log"; then
+            echo "self-test FAILED: the git-producer-failure error did not name the failing command"
+            cat "$tmp/ls-tree-fail.log"
+            status=1
+        fi
+    fi
+
     if [ "$status" -eq 0 ]; then
         echo "lint-stub-markers self-test: OK"
     fi
@@ -684,31 +787,59 @@ scan() {
     symlink_list="$(mktemp)"
 
     if [ "$mode" = "git" ]; then
-        # Tracked-file discovery (production): `git ls-files` lists only
-        # what git actually tracks under crates/, so untracked build-artifact
-        # output (target/, .cargo-target/, anything gitignored) is never
-        # listed -- no name-based pruning needed, and a TRACKED module nested
-        # under a dir literally named `target` is no longer invisible the way
-        # `find -prune` made it. `-s -z` reports each entry's INDEX mode
-        # ("<mode> <object> <stage>\t<path>", NUL-terminated); mode 120000 is
-        # a tracked symlink, the same filesystem-indirection hazard the
-        # find-mode -type l pass catches below. This is index state, not a
-        # live stat of the working tree: an entry staged as 100644 whose
-        # on-disk file was swapped to a symlink AFTER checkout (by a prior
-        # build step/proc-macro, without re-staging) still reports 100644
-        # here -- the O_NOFOLLOW read guard in the python scan loop is what
-        # catches that swap; this check and that one are complementary.
+        # Tracked-tree discovery (production): `git ls-tree -r HEAD` reads
+        # the HEAD COMMIT's tree object, which is immutable once committed --
+        # unlike `git ls-files -s` (index state), nothing running after
+        # checkout (a build step or proc-macro executed earlier in
+        # scripts/ci.sh, which runs clippy/build before this guard) can
+        # mutate it via `git rm --cached` or any other index surgery.
+        # Untracked build-artifact output (target/, .cargo-target/, anything
+        # gitignored) is still never listed -- no name-based pruning needed
+        # -- and a TRACKED module nested under a dir literally named `target`
+        # is still not invisible the way `find -prune` made it. `-r -z`
+        # recurses fully (only blob/commit entries are emitted, never
+        # intermediate tree entries) and NUL-terminates each entry
+        # ("<mode> <type> <object>\t<path>"); mode 120000 is a tracked
+        # symlink, the same filesystem-indirection hazard the find-mode
+        # -type l pass catches below. This is the COMMITTED tree, not a live
+        # stat of the working tree: a working-tree entry that diverges from
+        # its clean HEAD entry (a prior build step/proc-macro swapping the
+        # file, or a parent directory, to a symlink after checkout, without
+        # re-staging) is what the per-component O_NOFOLLOW read guard in the
+        # python scan loop catches; this check and that one are
+        # complementary.
         if ! git -C "$root" rev-parse --is-inside-work-tree > /dev/null 2>&1; then
             rm -f "$file_list" "$symlink_list"
-            echo "stub-marker scan: $root is not inside a git working tree -- tracked-file discovery requires git; refusing to fall back to a raw filesystem walk" >&2
+            echo "stub-marker scan: $root is not inside a git working tree -- tracked-tree discovery requires git; refusing to fall back to a raw filesystem walk" >&2
             return 1
         fi
-        git -C "$root" ls-files -s -z -- crates/ | python3 -c '
+        if ! git -C "$root" rev-parse --verify HEAD > /dev/null 2>&1; then
+            rm -f "$file_list" "$symlink_list"
+            echo "stub-marker scan: $root has no valid HEAD commit -- tracked-tree discovery requires a committed HEAD; refusing to fall back to the mutable index or a raw filesystem walk" >&2
+            return 1
+        fi
+
+        # Capture git's own exit code explicitly (`|| git_rc=$?` keeps set -e
+        # from aborting before the check runs) and write its output to a temp
+        # file rather than piping straight into python3: a pipe lets python's
+        # exit status mask git's, so a partial listing followed by git's own
+        # non-zero exit would otherwise still read as an overall success and
+        # scan only a subset of files. Fail closed on any non-zero rc.
+        tree_list="$(mktemp)"
+        git_rc=0
+        git -C "$root" ls-tree -r -z HEAD -- crates/ > "$tree_list" || git_rc=$?
+        if [ "$git_rc" -ne 0 ]; then
+            rm -f "$file_list" "$symlink_list" "$tree_list"
+            echo "stub-marker scan: git ls-tree -r HEAD -- crates/ failed (exit $git_rc) -- refusing to scan a partial or absent tree listing" >&2
+            return 1
+        fi
+        python3 -c '
 import os
 import sys
 
-root, out_files, out_symlinks = sys.argv[1], sys.argv[2], sys.argv[3]
-raw = sys.stdin.buffer.read()
+root, out_files, out_symlinks, tree_list_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+with open(tree_list_path, "rb") as fh:
+    raw = fh.read()
 files = []
 symlinks = []
 for entry in raw.split(b"\0"):
@@ -717,6 +848,8 @@ for entry in raw.split(b"\0"):
     meta, sep, relpath = entry.partition(b"\t")
     if not sep:
         continue
+    # ls-tree metadata is "<mode> <type> <object>" (no index stage field,
+    # unlike ls-files -s).
     file_mode = meta.split(b" ", 1)[0]
     relpath_s = os.fsdecode(relpath)
     abspath = os.path.join(root, relpath_s)
@@ -732,7 +865,8 @@ with open(out_symlinks, "wb") as fh:
     fh.write(b"\0".join(os.fsencode(p) for p in symlinks))
     if symlinks:
         fh.write(b"\0")
-' "$root" "$file_list" "$symlink_list"
+' "$root" "$file_list" "$symlink_list" "$tree_list"
+        rm -f "$tree_list"
     else
         # find-mode discovery: self-test fixture trees only (mktemp -d
         # trees, never git repos) -- production always uses git mode above.
@@ -1331,6 +1465,36 @@ def allowlist_match_index(rel_path, message, entries):
     return None
 
 
+def open_no_indirection(scan_root, rel_path):
+    """Open `rel_path` (forward-slash separated, relative to `scan_root`) for
+    reading, refusing a symlink at EVERY path component -- not just the
+    final one. `os.open(path, O_NOFOLLOW)` on a full path string only binds
+    the LAST component: a PARENT directory swapped to a symlink after
+    discovery (e.g. a build step racing this guard) redirects the read to
+    wherever that symlink points, and a final-component-only O_NOFOLLOW
+    never sees it. Walk component-by-component with `dir_fd=` (openat(2)
+    semantics) starting from a root directory fd opened once with
+    O_DIRECTORY|O_NOFOLLOW, refusing a symlink -- ELOOP -- at each step, so
+    every component from the scan root down to the file is proven a
+    non-symlink at read time. Raises OSError (ELOOP/EMLINK on a symlinked
+    component, ENOENT/ENOTDIR on a vanished or non-directory component) --
+    the caller handles these the same way it handled a final-component
+    O_NOFOLLOW failure."""
+    parts = rel_path.split("/")
+    if not parts or any(p in ("", ".", "..") for p in parts):
+        raise OSError(errno.ELOOP, "path has an empty, '.', or '..' component: " + rel_path)
+    dir_fd = os.open(scan_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for part in parts[:-1]:
+            next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
+            os.close(dir_fd)
+            dir_fd = next_fd
+        file_fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+    finally:
+        os.close(dir_fd)
+    return file_fd
+
+
 # Filesystem-indirection class: the scan() find already collected EVERY symlink
 # under crates/ (any name, file or directory), excluding pruned build-artifact
 # dirs, into SYMLINK_LIST_PATH. A symlinked .rs rides past the -type f discovery
@@ -1374,20 +1538,29 @@ allowlist_used = [False] * len(allowlist)
 findings = []
 for path in files:
     rel_path = os.path.relpath(path, SCAN_ROOT).replace(os.sep, "/")
-    # Bind the read to the exact path discovery found, atomically: O_NOFOLLOW
-    # refuses to open through a symlink, so a path that was a real regular
-    # file at discovery time (a `find -type f` hit, or a git-index 100644/
-    # 100755 entry) but has since been swapped to a symlink -- by a
+    # Bind the read to the exact path discovery found, atomically, at EVERY
+    # path component (not just the final one): a path that was a real
+    # regular file under a real directory tree at discovery time (a
+    # `find -type f` hit, or a git-tree 100644/100755 entry) but has since
+    # had itself OR any parent directory swapped to a symlink -- by a
     # PR-controlled build script or proc-macro racing this guard, or simply
-    # because a git-tracked working-tree file diverged from its clean index
-    # entry -- raises ELOOP here instead of silently following the
+    # because a git-tracked working-tree entry diverged from its clean
+    # HEAD-tree entry -- raises ELOOP here instead of silently following the
     # replacement or reading different content than what was discovered.
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = open_no_indirection(SCAN_ROOT, rel_path)
     except OSError as exc:
-        if exc.errno in (errno.ELOOP, errno.EMLINK):
+        # ENOTDIR joins ELOOP/EMLINK here: opening a symlinked directory
+        # component with O_DIRECTORY|O_NOFOLLOW raises ELOOP on Linux but
+        # ENOTDIR on macOS/BSD (O_NOFOLLOW refuses to dereference it, so the
+        # kernel reports the un-dereferenced node -- a symlink -- as not a
+        # directory rather than as a symlink loop). Both mean the same thing
+        # here: a parent component that should be a directory is not one at
+        # read time.
+        if exc.errno in (errno.ELOOP, errno.EMLINK, errno.ENOTDIR):
             sys.stderr.write(
-                "stub-marker scan: discovered path is a symlink at read time "
+                "stub-marker scan: a path component (the discovered file "
+                "itself, or a PARENT directory) is a symlink at read time "
                 "(swapped after discovery) -- refusing to follow a "
                 f"post-discovery filesystem indirection: {sanitize_for_ci(rel_path)}\n"
             )
