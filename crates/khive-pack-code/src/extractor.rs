@@ -84,6 +84,18 @@ pub(crate) struct ExtractedDeclaration {
     /// ingest pipeline appends these onto the file's module path to get the
     /// declaration's full module path.
     pub module_segments: Vec<String>,
+    /// Named-type paths this declaration references (D3 rules 2-7).
+    /// Resolution against the project's own declaration set, and
+    /// disambiguating a real project type from a built-in like `Vec`,
+    /// happens in the ingest pipeline, same as `calls`.
+    pub type_refs: Vec<TypeRef>,
+}
+
+/// A type-reference path as written at the reference site, e.g. `["a", "T"]`
+/// for `a::T`. Same shape and resolution split as `CallRef`.
+#[derive(Debug, Clone)]
+pub(crate) struct TypeRef {
+    pub segments: Vec<String>,
 }
 
 /// A syntactically resolvable `datatype implements interface` relationship
@@ -136,6 +148,11 @@ pub(crate) fn from_rust_scan(scan: RustFileScan) -> ExtractedFile {
                 .map(|segments| CallRef { segments })
                 .collect(),
             module_segments: d.module_segments,
+            type_refs: d
+                .type_refs
+                .into_iter()
+                .map(|segments| TypeRef { segments })
+                .collect(),
         })
         .collect();
     let impls = scan

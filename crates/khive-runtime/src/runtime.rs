@@ -181,7 +181,7 @@ impl KhiveRuntime {
                 // instead of trusting the pathname unconditionally, closing
                 // the gap where a fence checks a path once and every later
                 // writer reopens the same mutable pathname forever after
-                // (#1087 items 2/7).
+                // (#1087).
                 backend.pool().bind_verified_identity().map_err(|e| {
                     RuntimeError::InvalidInput(format!(
                         "binding verified identity for {}: {e}",

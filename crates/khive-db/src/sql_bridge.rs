@@ -1318,8 +1318,8 @@ mod tests {
         );
     }
 
-    /// #1087 blocker A gap: `open_standalone_reader`/`open_standalone_writer`
-    /// in THIS file open their own raw `rusqlite::Connection` against
+    /// `open_standalone_reader`/`open_standalone_writer` in THIS file open
+    /// their own raw `rusqlite::Connection` against
     /// `pool.config().path` and, before this fix, never consulted
     /// `ConnectionPool::check_verified_identity` -- so a post-fence file
     /// swap at the bound path reopened straight into the swapped-in file via

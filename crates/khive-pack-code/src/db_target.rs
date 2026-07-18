@@ -241,7 +241,7 @@ fn sqlite_uri_path(raw: &str) -> Option<PathBuf> {
 /// `C:/...` (https://sqlite.org/uri.html). Left unstripped, the fence
 /// compares against a path SQLite never actually opens, so a `db` target
 /// aimed at the production database under a `file:///C:/...` URI slips past
-/// the comparison (#1087 item 3/8).
+/// the comparison (#1087).
 fn has_leading_slash_before_drive_letter(s: &str) -> bool {
     let bytes = s.as_bytes();
     bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':'
@@ -638,7 +638,7 @@ mod tests {
         assert!(err.contains("shared production database"));
     }
 
-    /// #1087 item 3/8: `file:///C:/...` and `file://localhost/C:/...` both
+    /// `file:///C:/...` and `file://localhost/C:/...` both
     /// decode (per RFC 8089) to a POSIX-shaped `/C:/...` path, but SQLite's
     /// own URI parser strips the leading slash before a drive letter and
     /// opens `C:/...` -- the fence must compare against that same stripped

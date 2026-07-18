@@ -154,7 +154,7 @@ pub struct ConnectionPool {
     /// re-stats the configured path and refuses to open when the identity no
     /// longer matches -- closing the gap where a fence checks the pathname
     /// once at construction, but every later standalone connection reopens
-    /// the same mutable pathname unconditionally (#1087 items 2/7). `None`
+    /// the same mutable pathname unconditionally (#1087). `None`
     /// (the default) is a no-op: pools nobody binds behave exactly as
     /// before.
     verified_identity: OnceLock<(u64, u64)>,
@@ -969,8 +969,8 @@ mod tests {
         assert_eq!(pool.max_readers(), 0);
     }
 
-    /// #1087 blocker A: `bind_verified_identity` + `check_verified_identity`
-    /// must actually refuse a standalone open once the on-disk file at the
+    /// `bind_verified_identity` + `check_verified_identity` must actually
+    /// refuse a standalone open once the on-disk file at the
     /// bound path has been swapped for a different file (e.g. an attacker
     /// hard-linking the path onto the production database after a fence
     /// approved the original file). Mirrors

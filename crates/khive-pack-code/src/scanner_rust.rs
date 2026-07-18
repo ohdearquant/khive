@@ -40,6 +40,13 @@ pub(crate) struct RustDeclaration {
     /// file's own module root: empty at top level, `["inner"]`
     /// inside `mod inner { .. }`.
     pub module_segments: Vec<String>,
+    /// Named-type paths this declaration references (D3 rules 2-7: function
+    /// signature parameter/return types and bounds, struct/enum field
+    /// types, a type alias's target, trait supertraits) -- resolved against
+    /// the project's own declaration set by the ingest pipeline, same as
+    /// `calls`. Each entry is the full path as written (e.g. `["a", "T"]`
+    /// for `a::T`).
+    pub type_refs: Vec<Vec<String>>,
 }
 
 /// A syntactically resolvable `impl Trait for Type` relationship (D3 rule 13:
@@ -105,8 +112,12 @@ fn span_text<T: quote::ToTokens>(node: &T) -> String {
     quote::ToTokens::to_token_stream(node).to_string()
 }
 
+/// The qualified `::`-joined path of a type reference as written at the impl
+/// site (e.g. `"a::T"` for `impl a::T { .. }`), not just its last segment --
+/// two distinct types that happen to share a final segment name (`a::T` and
+/// `b::T`) must not collapse onto the same `T::method` declaration name.
 fn type_name_of(ty: &Type) -> Option<String> {
-    type_path_segments(ty).and_then(|segs| segs.last().cloned())
+    type_path_segments(ty).map(|segs| segs.join("::"))
 }
 
 /// The full path segments of a type reference, e.g. `["types", "S"]` for
@@ -140,6 +151,7 @@ fn scan_item(item: &Item, module_segments: &[String], out: &mut RustFileScan) {
             span_text: span_text(f),
             calls: collect_calls(&f.block),
             module_segments: module_segments.to_vec(),
+            type_refs: collect_type_refs_from_signature(&f.sig),
         }),
         Item::Struct(s) => out.declarations.push(RustDeclaration {
             kind: RustDeclKind::Datatype,
@@ -148,6 +160,7 @@ fn scan_item(item: &Item, module_segments: &[String], out: &mut RustFileScan) {
             span_text: span_text(s),
             calls: Vec::new(),
             module_segments: module_segments.to_vec(),
+            type_refs: collect_type_refs_from_fields(&s.fields),
         }),
         Item::Enum(e) => out.declarations.push(RustDeclaration {
             kind: RustDeclKind::Datatype,
@@ -156,6 +169,20 @@ fn scan_item(item: &Item, module_segments: &[String], out: &mut RustFileScan) {
             span_text: span_text(e),
             calls: Vec::new(),
             module_segments: module_segments.to_vec(),
+            type_refs: e
+                .variants
+                .iter()
+                .flat_map(|v| collect_type_refs_from_fields(&v.fields))
+                .collect(),
+        }),
+        Item::Union(u) => out.declarations.push(RustDeclaration {
+            kind: RustDeclKind::Datatype,
+            name: u.ident.to_string(),
+            doc: doc_from_attrs(&u.attrs),
+            span_text: span_text(u),
+            calls: Vec::new(),
+            module_segments: module_segments.to_vec(),
+            type_refs: Vec::new(),
         }),
         Item::Type(t) => out.declarations.push(RustDeclaration {
             kind: RustDeclKind::Datatype,
@@ -164,6 +191,7 @@ fn scan_item(item: &Item, module_segments: &[String], out: &mut RustFileScan) {
             span_text: span_text(t),
             calls: Vec::new(),
             module_segments: module_segments.to_vec(),
+            type_refs: collect_type_refs_from_type(&t.ty),
         }),
         Item::Trait(tr) => {
             out.declarations.push(RustDeclaration {
@@ -173,6 +201,7 @@ fn scan_item(item: &Item, module_segments: &[String], out: &mut RustFileScan) {
                 span_text: span_text(tr),
                 calls: Vec::new(),
                 module_segments: module_segments.to_vec(),
+                type_refs: collect_type_refs_from_bounds(&tr.supertraits),
             });
             // Trait methods: a default-body method hashes and scans calls
             // from its body; a signature-only method (`fn sig(&self);`, no
@@ -190,25 +219,34 @@ fn scan_item(item: &Item, module_segments: &[String], out: &mut RustFileScan) {
                         span_text: span_text(m),
                         calls,
                         module_segments: module_segments.to_vec(),
+                        type_refs: collect_type_refs_from_signature(&m.sig),
                     });
                 }
             }
         }
         Item::Impl(imp) => {
             // `impl Trait for Type` only — an inherent `impl Type { .. }`
-            // (imp.trait_ is None) has no D3 rule 13 target.
+            // (imp.trait_ is None) has no D3 rule 13 target. The qualified
+            // (`::`-joined) trait path is used, not just its last segment,
+            // for the same collision reason as `type_name_of`.
             let trait_name = imp
                 .trait_
                 .as_ref()
-                .and_then(|(_, path, _)| path.segments.last())
-                .map(|s| s.ident.to_string());
-            if let Some((_, path, _)) = &imp.trait_ {
-                if let Some(type_path) = type_path_segments(&imp.self_ty) {
-                    out.impls.push(RustImplRelation {
-                        type_path,
-                        trait_path: trait_path_segments(path),
-                        module_segments: module_segments.to_vec(),
-                    });
+                .map(|(_, path, _)| trait_path_segments(path).join("::"));
+            // `impl !Trait for Type` (negative impl, first tuple element
+            // `Some(bang)`) asserts the ABSENCE of the relation, not its
+            // presence — recording it as a positive `implements` edge would
+            // be factually backwards. The ADR-085 D3 contract has no
+            // negative-impl relation, so it is skipped rather than modeled.
+            if let Some((bang, path, _)) = &imp.trait_ {
+                if bang.is_none() {
+                    if let Some(type_path) = type_path_segments(&imp.self_ty) {
+                        out.impls.push(RustImplRelation {
+                            type_path,
+                            trait_path: trait_path_segments(path),
+                            module_segments: module_segments.to_vec(),
+                        });
+                    }
                 }
             }
             // Methods: both inherent and trait impls, named `Type::method`.
@@ -236,6 +274,7 @@ fn scan_item(item: &Item, module_segments: &[String], out: &mut RustFileScan) {
                             span_text: span_text(m),
                             calls: collect_calls(&m.block),
                             module_segments: module_segments.to_vec(),
+                            type_refs: collect_type_refs_from_signature(&m.sig),
                         });
                     }
                 }
@@ -254,6 +293,7 @@ fn scan_item(item: &Item, module_segments: &[String], out: &mut RustFileScan) {
                     span_text: span_text(m),
                     calls: Vec::new(),
                     module_segments: module_segments.to_vec(),
+                    type_refs: Vec::new(),
                 });
                 let mut nested = module_segments.to_vec();
                 nested.push(name);
@@ -296,6 +336,78 @@ fn collect_calls(block: &Block) -> Vec<Vec<String>> {
     let mut collector = CallCollector { calls: Vec::new() };
     collector.visit_block(block);
     collector.calls
+}
+
+/// Named-type-path extraction (D3 rules 2-7): every `Type::Path` node
+/// reachable from the visited syntax node, including inside generic
+/// arguments (`Vec<T>` yields both `Vec` and `T`) -- resolving which of
+/// those paths are real project declarations (versus a built-in like `Vec`
+/// or `Option`) happens in the ingest pipeline's project-wide symbol index,
+/// the same division of labor `CallCollector` uses for call targets.
+struct TypeRefCollector {
+    type_refs: Vec<Vec<String>>,
+}
+
+impl<'ast> Visit<'ast> for TypeRefCollector {
+    fn visit_type_path(&mut self, node: &'ast syn::TypePath) {
+        let segments: Vec<String> = node
+            .path
+            .segments
+            .iter()
+            .map(|s| s.ident.to_string())
+            .collect();
+        if !segments.is_empty() {
+            self.type_refs.push(segments);
+        }
+        visit::visit_type_path(self, node);
+    }
+}
+
+/// Type references in a function/method signature: parameter types, the
+/// return type, and generic bounds (`Signature::generics` carries both the
+/// `<T: Bound>` params and the trailing `where` clause) -- D3 rules 2, 3,
+/// 5, 6, 7 depending on what the source/target declarations turn out to be,
+/// which only the ingest pipeline's project-wide symbol index can resolve.
+fn collect_type_refs_from_signature(sig: &syn::Signature) -> Vec<Vec<String>> {
+    let mut collector = TypeRefCollector {
+        type_refs: Vec::new(),
+    };
+    collector.visit_signature(sig);
+    collector.type_refs
+}
+
+/// Type references in a struct/enum-variant's fields (D3 rule 4/5:
+/// `datatype depends_on datatype`/`interface`, "field / composition").
+fn collect_type_refs_from_fields(fields: &syn::Fields) -> Vec<Vec<String>> {
+    let mut collector = TypeRefCollector {
+        type_refs: Vec::new(),
+    };
+    collector.visit_fields(fields);
+    collector.type_refs
+}
+
+/// Type references in a single `Type` node (a type alias's own target).
+fn collect_type_refs_from_type(ty: &Type) -> Vec<Vec<String>> {
+    let mut collector = TypeRefCollector {
+        type_refs: Vec::new(),
+    };
+    collector.visit_type(ty);
+    collector.type_refs
+}
+
+/// Type references in a trait's supertrait bound list (D3 rule 6:
+/// `interface depends_on interface`, "supertrait / bound") -- `trait T:
+/// Super1 + Super2 { .. }`.
+fn collect_type_refs_from_bounds(
+    bounds: &syn::punctuated::Punctuated<syn::TypeParamBound, syn::Token![+]>,
+) -> Vec<Vec<String>> {
+    let mut collector = TypeRefCollector {
+        type_refs: Vec::new(),
+    };
+    for bound in bounds {
+        collector.visit_type_param_bound(bound);
+    }
+    collector.type_refs
 }
 
 #[cfg(test)]
@@ -470,6 +582,57 @@ mod tests {
             .find(|d| d.name == "S")
             .expect("nested struct extracted");
         assert_eq!(s.module_segments, vec!["inner".to_string()]);
+    }
+
+    /// Two types that share a final path segment name (`a::T`, `b::T`) but
+    /// differ in their full qualified path must not collapse impl method
+    /// declarations onto the same `T::method` name.
+    #[test]
+    fn qualified_impl_types_with_same_final_segment_do_not_collide() {
+        let src = r#"
+            impl a::T { pub fn m() {} }
+            impl b::T { pub fn m() {} }
+        "#;
+        let scan = scan_rust_source(src).expect("parses");
+        let names: Vec<&str> = scan.declarations.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"a::T::m"));
+        assert!(names.contains(&"b::T::m"));
+        assert!(
+            !names.contains(&"T::m"),
+            "qualified impl types must keep their full path in the method identity"
+        );
+    }
+
+    /// `impl !Trait for T` (negative impl) asserts absence of the relation
+    /// and must never be recorded as a positive `implements` edge.
+    #[test]
+    fn negative_impl_is_not_recorded_as_a_positive_implements_relation() {
+        let src = r#"
+            pub struct S;
+            pub trait T {}
+            impl !T for S {}
+        "#;
+        let scan = scan_rust_source(src).expect("parses");
+        assert!(
+            scan.impls.is_empty(),
+            "a negative impl must not produce an implements relation"
+        );
+    }
+
+    /// `union` declarations extract as datatype entities alongside
+    /// struct/enum.
+    #[test]
+    fn extracts_union_as_datatype() {
+        let src = r#"
+            pub union U { a: i32, b: f32 }
+        "#;
+        let scan = scan_rust_source(src).expect("parses");
+        let decl = scan
+            .declarations
+            .iter()
+            .find(|d| d.name == "U")
+            .expect("union extracted");
+        assert_eq!(decl.kind, RustDeclKind::Datatype);
     }
 
     /// Impls inside inline modules compose both rules.

@@ -1102,3 +1102,202 @@ impl crate::traits::T for crate::types::S {}
         "qualified impl across sibling modules must resolve to an implements edge, got: {edges:?}"
     );
 }
+
+/// D3 rules 2-7 (type references): a function's parameter/return types and a
+/// struct's own field type must resolve to `depends_on` edges against the
+/// project's own declaration set, the same way call targets do.
+#[tokio::test]
+async fn l2_creates_type_reference_depends_on_edges() {
+    let root = TempDir::new().expect("tempdir");
+    std::fs::create_dir_all(root.path().join("src")).unwrap();
+    std::fs::write(
+        root.path().join("Cargo.toml"),
+        "[package]\nname = \"typerefcrate\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("src/lib.rs"),
+        r#"
+pub struct Inner;
+
+pub struct Outer {
+    pub inner: Inner,
+}
+
+pub trait Bound {}
+
+pub fn takes_and_returns(x: Inner, y: Outer) -> Inner {
+    x
+}
+"#,
+    )
+    .unwrap();
+
+    let db = root.path().join("type_refs.db");
+    let rt = rt_at(&db);
+    let token = rt.authorize(Namespace::local()).expect("token");
+    run_code_ingest(
+        &rt,
+        &token,
+        CodeSourceIngestOptions {
+            path: root.path(),
+            languages: rust_only(),
+            sweep_time: Utc::now(),
+            enable_l1: true,
+            enable_l1_5: true,
+            enable_l2: true,
+        },
+    )
+    .await
+    .expect("ingest succeeds");
+
+    let edges = edge_triples(&rt).await;
+    assert!(
+        edges
+            .iter()
+            .any(|(rel, src, tgt)| rel == "depends_on" && src == "Outer" && tgt == "Inner"),
+        "a struct field's type must produce a depends_on edge to that type, got: {edges:?}"
+    );
+    assert!(
+        edges.iter().any(|(rel, src, tgt)| rel == "depends_on"
+            && src == "takes_and_returns"
+            && tgt == "Inner"),
+        "a function signature's parameter/return type must produce a depends_on edge, got: {edges:?}"
+    );
+    assert!(
+        edges.iter().any(|(rel, src, tgt)| rel == "depends_on"
+            && src == "takes_and_returns"
+            && tgt == "Outer"),
+        "every distinct signature type reference must produce its own depends_on edge, got: {edges:?}"
+    );
+}
+
+/// A file-backed module nested under another file-backed module
+/// (`src/sub.rs`, declared via `pub mod sub;` in `src/lib.rs`) must be
+/// contained by its PARENT module ("crate"), not directly by the project --
+/// the project only directly contains the crate root.
+#[tokio::test]
+async fn l2_nested_file_backed_module_is_contained_by_its_parent_module_not_the_project() {
+    let root = TempDir::new().expect("tempdir");
+    std::fs::create_dir_all(root.path().join("src")).unwrap();
+    std::fs::write(
+        root.path().join("Cargo.toml"),
+        "[package]\nname = \"nestedmodcrate\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("src/lib.rs"),
+        "pub mod sub;\n\npub fn top() {}\n",
+    )
+    .unwrap();
+    std::fs::write(root.path().join("src/sub.rs"), "pub fn nested() {}\n").unwrap();
+
+    let db = root.path().join("nested_module.db");
+    let rt = rt_at(&db);
+    let token = rt.authorize(Namespace::local()).expect("token");
+    run_code_ingest(
+        &rt,
+        &token,
+        CodeSourceIngestOptions {
+            path: root.path(),
+            languages: rust_only(),
+            sweep_time: Utc::now(),
+            enable_l1: true,
+            enable_l1_5: true,
+            enable_l2: true,
+        },
+    )
+    .await
+    .expect("ingest succeeds");
+
+    let edges = edge_triples(&rt).await;
+    assert!(
+        edges
+            .iter()
+            .any(|(rel, src, tgt)| rel == "contains" && src == "crate" && tgt == "sub"),
+        "the crate-root module must contain the nested file-backed module \"sub\", got: {edges:?}"
+    );
+    assert!(
+        !edges.iter().any(|(rel, src, tgt)| rel == "contains"
+            && src == "nestedmodcrate"
+            && tgt == "sub"),
+        "the project must NOT directly contain a module nested under another module, got: {edges:?}"
+    );
+    assert!(
+        edges
+            .iter()
+            .any(|(rel, src, tgt)| rel == "contains" && src == "nestedmodcrate" && tgt == "crate"),
+        "the project must directly contain the crate-root module, got: {edges:?}"
+    );
+}
+
+/// Reads back the `sweep_clock` property of the single `project` entity in
+/// the store, or `None` if no project entity exists. `entity_rows` only
+/// selects `entity_type IN ('function','datatype','interface')`, so this
+/// queries the `project` row directly.
+async fn project_sweep_clock(rt: &KhiveRuntime) -> Option<serde_json::Value> {
+    let sql = rt.sql();
+    let mut reader = sql.reader().await.expect("reader");
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: "SELECT properties FROM entities \
+                  WHERE deleted_at IS NULL AND kind = 'project' \
+                  ORDER BY name LIMIT 1"
+                .into(),
+            params: vec![],
+            label: Some("test_l2_project_sweep_clock".into()),
+        })
+        .await
+        .expect("query project entity");
+    let props = match rows.first().and_then(|r| r.get("properties")) {
+        Some(SqlValue::Text(s)) => s.clone(),
+        _ => return None,
+    };
+    let parsed: serde_json::Value = serde_json::from_str(&props).expect("properties is JSON");
+    Some(parsed["sweep_clock"].clone())
+}
+
+/// Two languages sharing the same fallback (manifest-less, basename-derived)
+/// project name must both stamp the shared project entity's `sweep_clock`
+/// in the same sweep -- one language's L1.5/L2 pass upserting the project
+/// first must not suppress the other language's own `sweep_clock[language]`
+/// stamp just because `project_ids` already has a cache hit.
+#[tokio::test]
+async fn multi_language_sweep_stamps_sweep_clock_for_every_language_sharing_a_project_name() {
+    let root = TempDir::new().expect("tempdir");
+    // No manifest files: both languages fall back to the same
+    // `basename_project_name(ingest_root)`, so they share one project id.
+    std::fs::write(root.path().join("lib.rs"), "pub fn f() {}\n").unwrap();
+    std::fs::write(root.path().join("mod.py"), "def g():\n    pass\n").unwrap();
+
+    let db = root.path().join("shared_project.db");
+    let rt = rt_at(&db);
+    let token = rt.authorize(Namespace::local()).expect("token");
+
+    run_code_ingest(
+        &rt,
+        &token,
+        CodeSourceIngestOptions {
+            path: root.path(),
+            languages: all_languages(),
+            sweep_time: Utc::now(),
+            enable_l1: false,
+            enable_l1_5: true,
+            enable_l2: true,
+        },
+    )
+    .await
+    .expect("multi-language ingest succeeds");
+
+    let sweep_clock = project_sweep_clock(&rt)
+        .await
+        .expect("project entity exists");
+    assert!(
+        sweep_clock.get("rust").is_some(),
+        "expected a rust sweep_clock entry, got: {sweep_clock:?}"
+    );
+    assert!(
+        sweep_clock.get("python").is_some(),
+        "expected a python sweep_clock entry alongside rust, got: {sweep_clock:?}"
+    );
+}
