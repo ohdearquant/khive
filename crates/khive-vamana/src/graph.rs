@@ -17,22 +17,18 @@ const BUILD_BATCH_SIZE: usize = 1024;
 const MEDOID_SAMPLE_K: usize = 1000;
 const BUILD_SEED: u64 = 0x5641_4d41_4e41;
 
-// Test-only observability for the alpha-pass count in `build`/`build_sq8`, so the
-// alpha==1.0 skip-second-pass optimization can be asserted directly rather than
-// inferred from graph output.
+// Test-only override to cap how many of the [1.0, config.alpha] refinement
+// passes `build`/`build_sq8` run, so a test can build a single-pass graph to
+// compare against the normal two-pass build (see
+// build_alpha_one_two_passes_are_not_idempotent_at_scale).
 #[cfg(test)]
 thread_local! {
-    static BUILD_PASS_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static MAX_PASSES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]
-fn reset_build_pass_count() {
-    BUILD_PASS_COUNT.with(|c| c.set(0));
-}
-
-#[cfg(test)]
-fn build_pass_count() -> usize {
-    BUILD_PASS_COUNT.with(|c| c.get())
+fn set_max_passes(v: Option<usize>) {
+    MAX_PASSES.with(|c| c.set(v));
 }
 
 /// Output of a single greedy-search traversal over the Vamana graph.
@@ -181,16 +177,22 @@ impl VamanaGraph {
         let mut order: Vec<u32> = (0..num_vectors as u32).collect();
         order.shuffle(&mut rng);
 
-        // When alpha == 1.0, the second pass is a no-op rerun of the first (identical
-        // pass_alpha), so skip it to avoid a full extra prune pass over the graph.
-        let alphas: &[f64] = if (config.alpha - 1.0).abs() < f64::EPSILON {
-            &[1.0]
-        } else {
-            &[1.0, config.alpha]
+        // Two refinement passes always run, even at alpha == 1.0: the second pass
+        // reruns greedy search and robust_prune over the graph the first pass just
+        // produced, and a more-connected graph changes which candidates survive
+        // pruning. This is not idempotent — differential testing at production scale
+        // (n>=500, 384-dim normalized vectors) shows the two-pass and skip-second-pass
+        // adjacency diverge, so a run with only the first pass is a materially
+        // different (and less-refined) graph, not a redundant rerun.
+        let all_alphas: &[f64] = &[1.0f64, config.alpha];
+        #[cfg(test)]
+        let alphas = {
+            let cap = MAX_PASSES.with(|c| c.get()).unwrap_or(all_alphas.len());
+            &all_alphas[..cap.min(all_alphas.len())]
         };
+        #[cfg(not(test))]
+        let alphas = all_alphas;
         for &pass_alpha in alphas {
-            #[cfg(test)]
-            BUILD_PASS_COUNT.with(|c| c.set(c.get() + 1));
             for batch in order.chunks(batch_size) {
                 // L1: capture only the current neighbors of the batch nodes (O(batch*R))
                 // instead of cloning the full adjacency (O(N)). The greedy search reads
@@ -333,16 +335,22 @@ impl VamanaGraph {
         let mut order: Vec<u32> = (0..num_vectors as u32).collect();
         order.shuffle(&mut rng);
 
-        // When alpha == 1.0, the second pass is a no-op rerun of the first (identical
-        // pass_alpha), so skip it to avoid a full extra prune pass over the graph.
-        let alphas: &[f64] = if (config.alpha - 1.0).abs() < f64::EPSILON {
-            &[1.0]
-        } else {
-            &[1.0, config.alpha]
+        // Two refinement passes always run, even at alpha == 1.0: the second pass
+        // reruns greedy search and robust_prune over the graph the first pass just
+        // produced, and a more-connected graph changes which candidates survive
+        // pruning. This is not idempotent — differential testing at production scale
+        // (n>=500, 384-dim normalized vectors) shows the two-pass and skip-second-pass
+        // adjacency diverge, so a run with only the first pass is a materially
+        // different (and less-refined) graph, not a redundant rerun.
+        let all_alphas: &[f64] = &[1.0f64, config.alpha];
+        #[cfg(test)]
+        let alphas = {
+            let cap = MAX_PASSES.with(|c| c.get()).unwrap_or(all_alphas.len());
+            &all_alphas[..cap.min(all_alphas.len())]
         };
+        #[cfg(not(test))]
+        let alphas = all_alphas;
         for &pass_alpha in alphas {
-            #[cfg(test)]
-            BUILD_PASS_COUNT.with(|c| c.set(c.get() + 1));
             for batch in order.chunks(batch_size) {
                 let batch_prior: Vec<Vec<u32>> = batch
                     .iter()
@@ -1402,73 +1410,37 @@ mod tests {
     }
 
     #[test]
-    fn build_skips_second_pass_when_alpha_is_one() {
-        use rand::SeedableRng;
-        let mut rng = StdRng::seed_from_u64(11);
-        let n = 30usize;
-        let dim = 4usize;
-        let raw: Vec<f32> = (0..n * dim).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+    fn build_alpha_one_two_passes_are_not_idempotent_at_scale() {
+        // Regression guard for #559: an earlier revision skipped the second
+        // refinement pass when config.alpha == 1.0, reasoning that a second pass
+        // at an identical alpha reruns pruning over an already-converged graph and
+        // reproduces the same adjacency. That reasoning does not hold once the
+        // graph is large enough for the first pass to leave real refinement on
+        // the table: the second pass runs greedy search over the *now more
+        // connected* graph the first pass produced and finds different pruning
+        // candidates. This test pins that divergence down directly so the skip
+        // is not silently reintroduced.
+        let dim = 384usize;
+        let n = 500usize;
+        let mut rng = StdRng::seed_from_u64(1000);
+        let mut raw: Vec<f32> = (0..n * dim).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+        normalize_rows(&mut raw, dim);
 
         let cfg = VamanaConfig::with_dimensions(dim)
-            .with_max_degree(6)
-            .with_search_list_size(12)
+            .with_max_degree(32)
+            .with_search_list_size(64)
             .with_alpha(1.0);
 
-        reset_build_pass_count();
-        VamanaGraph::build(&raw, &cfg).unwrap();
-        assert_eq!(build_pass_count(), 1);
-    }
+        set_max_passes(Some(1));
+        let one_pass = VamanaGraph::build(&raw, &cfg).unwrap();
+        set_max_passes(None);
+        let two_pass = VamanaGraph::build(&raw, &cfg).unwrap();
 
-    #[test]
-    fn build_runs_two_passes_when_alpha_above_one() {
-        use rand::SeedableRng;
-        let mut rng = StdRng::seed_from_u64(11);
-        let n = 30usize;
-        let dim = 4usize;
-        let raw: Vec<f32> = (0..n * dim).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
-
-        let cfg = VamanaConfig::with_dimensions(dim)
-            .with_max_degree(6)
-            .with_search_list_size(12)
-            .with_alpha(1.2);
-
-        reset_build_pass_count();
-        VamanaGraph::build(&raw, &cfg).unwrap();
-        assert_eq!(build_pass_count(), 2);
-    }
-
-    #[test]
-    fn build_sq8_skips_second_pass_when_alpha_is_one() {
-        let dim = 4usize;
-        let n = 20usize;
-        let vectors: Vec<f32> = (0..n * dim).map(|i| ((i % 7) as f32 - 3.0) / 3.0).collect();
-        let cfg = VamanaConfig::with_dimensions(dim)
-            .with_max_degree(6)
-            .with_search_list_size(12)
-            .with_alpha(1.0);
-        let codec = GsSq8Codec::train_flat(&vectors, dim);
-        let encoded = codec.encode_flat_par(&vectors, dim);
-
-        reset_build_pass_count();
-        VamanaGraph::build_sq8(&vectors, &encoded, &codec, &cfg).unwrap();
-        assert_eq!(build_pass_count(), 1);
-    }
-
-    #[test]
-    fn build_sq8_runs_two_passes_when_alpha_above_one() {
-        let dim = 4usize;
-        let n = 20usize;
-        let vectors: Vec<f32> = (0..n * dim).map(|i| ((i % 7) as f32 - 3.0) / 3.0).collect();
-        let cfg = VamanaConfig::with_dimensions(dim)
-            .with_max_degree(6)
-            .with_search_list_size(12)
-            .with_alpha(1.2);
-        let codec = GsSq8Codec::train_flat(&vectors, dim);
-        let encoded = codec.encode_flat_par(&vectors, dim);
-
-        reset_build_pass_count();
-        VamanaGraph::build_sq8(&vectors, &encoded, &codec, &cfg).unwrap();
-        assert_eq!(build_pass_count(), 2);
+        assert_ne!(
+            one_pass, two_pass,
+            "second alpha==1.0 pass changed adjacency vs a single pass; it is not \
+             a redundant no-op at this scale and must not be skipped"
+        );
     }
 
     fn normalize_rows(v: &mut [f32], dim: usize) {
