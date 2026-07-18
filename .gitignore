@@ -122,3 +122,9 @@ scripts/perf/calibration/
 # main or a feature branch.
 bench-data/
 .perf-data-worktree/
+
+# khive-merge declares its own [workspace] table so it stays standalone-compilable
+# while excluded from the root workspace (ADR-039). That arrangement generates a
+# second lock file here. The root workspace lock at crates/Cargo.lock is committed
+# as usual; only this standalone byproduct is ignored.
+crates/khive-merge/Cargo.lock
