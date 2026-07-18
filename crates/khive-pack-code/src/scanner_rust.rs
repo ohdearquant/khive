@@ -4,11 +4,12 @@
 //! is synthesized.
 //!
 //! Scope of this slice: top-level items, inline `mod { .. }` blocks (recursed
-//! into, at nested module paths — finding-3a), `impl` methods (named
-//! `Type::method` — finding-3b), and trait default-body methods (named
-//! `Trait::method` — finding-3c). A `mod foo;` file-backed module declaration
-//! has no inline content to recurse into — that file is discovered and
-//! scanned independently by the ingest pipeline's own file walk.
+//! into, at nested module paths), `impl` methods (inherent methods named
+//! `Type::method`, trait-impl methods named `<Type as Trait>::method`), and
+//! every trait method — default-bodied or signature-only — named
+//! `Trait::method`. A `mod foo;` file-backed module declaration has no inline
+//! content to recurse into — that file is discovered and scanned
+//! independently by the ingest pipeline's own file walk.
 
 use syn::visit::{self, Visit};
 use syn::{Attribute, Block, Expr, ExprCall, Item, Type};
@@ -36,18 +37,23 @@ pub(crate) struct RustDeclaration {
     /// Empty for non-callable kinds.
     pub calls: Vec<Vec<String>>,
     /// Module path segments this declaration lives under, relative to the
-    /// file's own module root (finding-3a): empty at top level, `["inner"]`
+    /// file's own module root: empty at top level, `["inner"]`
     /// inside `mod inner { .. }`.
     pub module_segments: Vec<String>,
 }
 
 /// A syntactically resolvable `impl Trait for Type` relationship (D3 rule 13:
-/// `datatype implements interface`). Both names are unqualified idents; the
-/// caller resolves them against the project's own declaration set.
+/// `datatype implements interface`). Both sides are the FULL path as written
+/// at the impl site (e.g. `["traits", "T"]` for `impl traits::T for ..`),
+/// not just the last segment — a qualified path can name a type or trait
+/// declared in a different module than the impl block itself, and only the
+/// caller (which has the project-wide symbol index and the same
+/// `crate`/`self`/`super`-aware resolver used for call targets) can resolve
+/// that.
 #[derive(Debug, Clone)]
 pub(crate) struct RustImplRelation {
-    pub type_name: String,
-    pub trait_name: String,
+    pub type_path: Vec<String>,
+    pub trait_path: Vec<String>,
     pub module_segments: Vec<String>,
 }
 
@@ -100,10 +106,29 @@ fn span_text<T: quote::ToTokens>(node: &T) -> String {
 }
 
 fn type_name_of(ty: &Type) -> Option<String> {
+    type_path_segments(ty).and_then(|segs| segs.last().cloned())
+}
+
+/// The full path segments of a type reference, e.g. `["types", "S"]` for
+/// `types::S` — `None` for a non-path type (`&T`, tuples, etc.), which has
+/// no D3 rule 13 target regardless.
+fn type_path_segments(ty: &Type) -> Option<Vec<String>> {
     match ty {
-        Type::Path(p) => p.path.segments.last().map(|s| s.ident.to_string()),
+        Type::Path(p) => Some(
+            p.path
+                .segments
+                .iter()
+                .map(|s| s.ident.to_string())
+                .collect(),
+        ),
         _ => None,
     }
+}
+
+/// The full path segments of a trait reference, e.g. `["traits", "T"]` for
+/// `impl traits::T for ..`.
+fn trait_path_segments(path: &syn::Path) -> Vec<String> {
+    path.segments.iter().map(|s| s.ident.to_string()).collect()
 }
 
 fn scan_item(item: &Item, module_segments: &[String], out: &mut RustFileScan) {
@@ -149,50 +174,64 @@ fn scan_item(item: &Item, module_segments: &[String], out: &mut RustFileScan) {
                 calls: Vec::new(),
                 module_segments: module_segments.to_vec(),
             });
-            // Trait default-body methods (finding-3c): a signature-only
-            // trait method has no body to hash or scan calls from, so only
-            // methods carrying a default implementation become declarations.
+            // Trait methods: a default-body method hashes and scans calls
+            // from its body; a signature-only method (`fn sig(&self);`, no
+            // default) still becomes its own `Trait::method` declaration —
+            // same as a default-bodied one, just with an empty call list
+            // since there is no body to scan.
             let trait_name = tr.ident.to_string();
             for trait_item in &tr.items {
                 if let syn::TraitItem::Fn(m) = trait_item {
-                    if let Some(block) = &m.default {
-                        out.declarations.push(RustDeclaration {
-                            kind: RustDeclKind::Function,
-                            name: format!("{trait_name}::{}", m.sig.ident),
-                            doc: doc_from_attrs(&m.attrs),
-                            span_text: span_text(m),
-                            calls: collect_calls(block),
-                            module_segments: module_segments.to_vec(),
-                        });
-                    }
+                    let calls = m.default.as_ref().map(collect_calls).unwrap_or_default();
+                    out.declarations.push(RustDeclaration {
+                        kind: RustDeclKind::Function,
+                        name: format!("{trait_name}::{}", m.sig.ident),
+                        doc: doc_from_attrs(&m.attrs),
+                        span_text: span_text(m),
+                        calls,
+                        module_segments: module_segments.to_vec(),
+                    });
                 }
             }
         }
         Item::Impl(imp) => {
             // `impl Trait for Type` only — an inherent `impl Type { .. }`
             // (imp.trait_ is None) has no D3 rule 13 target.
+            let trait_name = imp
+                .trait_
+                .as_ref()
+                .and_then(|(_, path, _)| path.segments.last())
+                .map(|s| s.ident.to_string());
             if let Some((_, path, _)) = &imp.trait_ {
-                if let (Some(trait_name), Some(type_name)) = (
-                    path.segments.last().map(|s| s.ident.to_string()),
-                    type_name_of(&imp.self_ty),
-                ) {
+                if let Some(type_path) = type_path_segments(&imp.self_ty) {
                     out.impls.push(RustImplRelation {
-                        type_name,
-                        trait_name,
+                        type_path,
+                        trait_path: trait_path_segments(path),
                         module_segments: module_segments.to_vec(),
                     });
                 }
             }
-            // Methods (finding-3b): both inherent and trait impls, named
-            // `Type::method`. Call edges from a method use the enclosing
-            // module (not the type) as caller module path — achieved simply
-            // by not nesting `module_segments` under the type name.
+            // Methods: both inherent and trait impls, named `Type::method`.
+            // Call edges from a method use the enclosing module (not the
+            // type) as caller module path — achieved simply by not nesting
+            // `module_segments` under the type name.
+            //
+            // Trait-impl methods are named `<Type as Trait>::method`, Rust's
+            // own canonical qualified form — two trait impls on the same
+            // type with the same method name (`impl A for S { fn f() }` and
+            // `impl B for S { fn f() }`) would otherwise both reduce to
+            // `S::f` and silently overwrite one another. Inherent methods
+            // keep the plain `Type::method` form.
             if let Some(type_name) = type_name_of(&imp.self_ty) {
                 for impl_item in &imp.items {
                     if let syn::ImplItem::Fn(m) = impl_item {
+                        let name = match &trait_name {
+                            Some(t) => format!("<{type_name} as {t}>::{}", m.sig.ident),
+                            None => format!("{type_name}::{}", m.sig.ident),
+                        };
                         out.declarations.push(RustDeclaration {
                             kind: RustDeclKind::Function,
-                            name: format!("{type_name}::{}", m.sig.ident),
+                            name,
                             doc: doc_from_attrs(&m.attrs),
                             span_text: span_text(m),
                             calls: collect_calls(&m.block),
@@ -203,9 +242,9 @@ fn scan_item(item: &Item, module_segments: &[String], out: &mut RustFileScan) {
             }
         }
         Item::Mod(m) => {
-            // `mod foo { .. }` with inline content only (finding-3a);
-            // `mod foo;` (file-backed) has no `content` and is discovered by
-            // the ingest pipeline's own per-file walk instead.
+            // `mod foo { .. }` with inline content only; `mod foo;`
+            // (file-backed) has no `content` and is discovered by the
+            // ingest pipeline's own per-file walk instead.
             if let Some((_, items)) = &m.content {
                 let name = m.ident.to_string();
                 out.declarations.push(RustDeclaration {
@@ -300,8 +339,8 @@ mod tests {
         "#;
         let scan = scan_rust_source(src).expect("parses");
         assert_eq!(scan.impls.len(), 1, "inherent impl must not be captured");
-        assert_eq!(scan.impls[0].type_name, "S");
-        assert_eq!(scan.impls[0].trait_name, "T");
+        assert_eq!(scan.impls[0].type_path, vec!["S".to_string()]);
+        assert_eq!(scan.impls[0].trait_path, vec!["T".to_string()]);
     }
 
     #[test]
@@ -340,8 +379,10 @@ mod tests {
         assert!(!err.to_string().is_empty());
     }
 
-    /// finding-3: inherent + trait impl methods become `Type::method`
-    /// declarations; trait default bodies become `Trait::method`.
+    /// Inherent impl methods become `Type::method` declarations; trait-impl
+    /// methods become `<Type as Trait>::method` (Rust's own qualified form);
+    /// trait default bodies become `Trait::method`; a signature-only trait
+    /// method extracts too, just with no call list to scan.
     #[test]
     fn extracts_impl_and_trait_default_methods() {
         let src = r#"
@@ -359,10 +400,13 @@ mod tests {
         let names: Vec<&str> = scan.declarations.iter().map(|d| d.name.as_str()).collect();
         assert!(names.contains(&"S::m"));
         assert!(names.contains(&"T::provided"));
-        assert!(names.contains(&"S::required"));
         assert!(
-            !names.contains(&"T::required"),
-            "signature-only trait method must not become a declaration"
+            names.contains(&"T::required"),
+            "signature-only trait method must extract as its own declaration"
+        );
+        assert!(
+            names.contains(&"<S as T>::required"),
+            "a trait-impl method must use the qualified <Type as Trait> form, not bare Type::method"
         );
         let provided = scan
             .declarations
@@ -375,8 +419,30 @@ mod tests {
             .any(|c| c == &vec!["helper".to_string()]));
     }
 
-    /// finding-3a: inline `mod inner { .. }` recurses at a nested module
-    /// path; a module declaration itself is emitted too.
+    /// Two trait impls on one type with the same method name must produce
+    /// two distinct symbols (`<S as A>::f` and `<S as B>::f`), never both
+    /// collapsing onto bare `S::f`.
+    #[test]
+    fn two_trait_impls_with_same_method_name_produce_distinct_symbols() {
+        let src = r#"
+            pub struct S;
+            pub trait A { fn f(&self) {} }
+            pub trait B { fn f(&self) {} }
+            impl A for S { fn f(&self) {} }
+            impl B for S { fn f(&self) {} }
+        "#;
+        let scan = scan_rust_source(src).expect("parses");
+        let names: Vec<&str> = scan.declarations.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"<S as A>::f"));
+        assert!(names.contains(&"<S as B>::f"));
+        assert!(
+            !names.contains(&"S::f"),
+            "trait-impl methods must never collapse onto the bare Type::method form"
+        );
+    }
+
+    /// Inline `mod inner { .. }` recurses at a nested module path; a module
+    /// declaration itself is emitted too.
     #[test]
     fn recurses_into_inline_modules() {
         let src = r#"
@@ -406,7 +472,7 @@ mod tests {
         assert_eq!(s.module_segments, vec!["inner".to_string()]);
     }
 
-    /// finding-3d: impls inside inline modules compose both rules.
+    /// Impls inside inline modules compose both rules.
     #[test]
     fn impl_inside_inline_module_gets_nested_module_segments() {
         let src = r#"

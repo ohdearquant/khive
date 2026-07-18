@@ -25,6 +25,20 @@ impl DeclKind {
             DeclKind::Module => "module",
         }
     }
+
+    /// Inverse of `code_token`: recovers the `DeclKind` a
+    /// previously-stored entity's `entity_type` column encodes, so a
+    /// declaration loaded back from the database (rather than freshly
+    /// extracted) can still key into `symbol_index` correctly.
+    pub(crate) fn from_code_token(token: &str) -> Option<Self> {
+        match token {
+            "function" => Some(DeclKind::Function),
+            "datatype" => Some(DeclKind::Datatype),
+            "interface" => Some(DeclKind::Interface),
+            "module" => Some(DeclKind::Module),
+            _ => None,
+        }
+    }
 }
 
 impl From<RustDeclKind> for DeclKind {
@@ -40,7 +54,7 @@ impl From<RustDeclKind> for DeclKind {
 
 /// A call-target path as written at the call site, e.g. `["helper"]` for a
 /// bare `helper()` or `["crate", "foo", "bar"]` for `crate::foo::bar()`.
-/// Language-neutral (finding-10): kept as raw segments rather than
+/// Language-neutral: kept as raw segments rather than
 /// pre-resolved, since resolving `crate`/`self`/`super` qualifiers requires
 /// the calling declaration's own module path, which lives in
 /// `source_ingest::resolve_call_target`, not any per-language Scanner.
@@ -65,7 +79,7 @@ pub(crate) struct ExtractedDeclaration {
     /// project-wide view a single file's Extractor pass does not.
     pub calls: Vec<CallRef>,
     /// Module path segments this declaration lives under, relative to the
-    /// declaring file's own module root (finding-3): empty for a top-level
+    /// declaring file's own module root: empty for a top-level
     /// file item, `["inner"]` for an item inside `mod inner { .. }`. The
     /// ingest pipeline appends these onto the file's module path to get the
     /// declaration's full module path.
@@ -73,11 +87,15 @@ pub(crate) struct ExtractedDeclaration {
 }
 
 /// A syntactically resolvable `datatype implements interface` relationship
-/// (D3 rule 13), language-agnostic once past the adapter.
+/// (D3 rule 13), language-agnostic once past the adapter. Both `type_path`
+/// and `trait_path` are the full path as written at the impl site —
+/// resolution against the project's own declaration set (which may live in
+/// a different module than the impl block) happens in the ingest pipeline,
+/// the same `crate`/`self`/`super`-aware resolver call resolution uses.
 #[derive(Debug, Clone)]
 pub(crate) struct ExtractedImpl {
-    pub type_name: String,
-    pub trait_name: String,
+    pub type_path: Vec<String>,
+    pub trait_path: Vec<String>,
     /// Same convention as `ExtractedDeclaration::module_segments` — the
     /// `impl` block's own module, relative to the file's module root.
     pub module_segments: Vec<String>,
@@ -124,8 +142,8 @@ pub(crate) fn from_rust_scan(scan: RustFileScan) -> ExtractedFile {
         .impls
         .into_iter()
         .map(|i| ExtractedImpl {
-            type_name: i.type_name,
-            trait_name: i.trait_name,
+            type_path: i.type_path,
+            trait_path: i.trait_path,
             module_segments: i.module_segments,
         })
         .collect();
@@ -154,8 +172,8 @@ mod tests {
         let extracted = from_rust_scan(scan);
         assert_eq!(extracted.declarations.len(), 3);
         assert_eq!(extracted.impls.len(), 1);
-        assert_eq!(extracted.impls[0].type_name, "S");
-        assert_eq!(extracted.impls[0].trait_name, "T");
+        assert_eq!(extracted.impls[0].type_path, vec!["S".to_string()]);
+        assert_eq!(extracted.impls[0].trait_path, vec!["T".to_string()]);
         let f = extracted
             .declarations
             .iter()

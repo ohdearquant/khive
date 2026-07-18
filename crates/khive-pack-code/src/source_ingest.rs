@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
-use khive_storage::{DeleteMode, Edge, EdgeFilter, Entity, LinkId, PageRequest};
+use khive_storage::{Edge, Entity, LinkId};
 use khive_types::EdgeRelation;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -31,19 +31,6 @@ use crate::scanner_rust;
 /// SQLite `SQLITE_MAX_VARIABLE_NUMBER` defaults to 999; chunk at 900 to stay
 /// safe (precedent: `khive-db/src/stores/graph.rs`).
 const SQL_ID_CHUNK: usize = 900;
-
-/// Provenance marker stamped on every edge this L2 pass writes, distinguishing
-/// L2-derived edges from edges any other tier or caller might create between
-/// the same endpoints — the reconciliation scope for finding-1.
-const L2_PROVENANCE_KEY: &str = "l2_derived";
-
-fn is_l2_derived(edge: &Edge) -> bool {
-    edge.metadata
-        .as_ref()
-        .and_then(|m| m.get(L2_PROVENANCE_KEY))
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-}
 
 /// Outcome counters for one `code.ingest` call, mirroring `git.digest`'s
 /// `IngestReport` shape (ADR-088 Amendment 1 precedent).
@@ -66,12 +53,14 @@ pub struct CodeSourceIngestReport {
     /// floor, analogous to L1.5's unresolved-specifier queue but without a
     /// deferred re-resolve pass in this slice — see ADR-085 PR body).
     pub symbol_dependencies_unresolved: u64,
-    /// L2-derived edges (call `depends_on`, `implements`) soft-deleted this
-    /// sweep because the declaration that originally produced them was
-    /// re-extracted and no longer resolves to that target (finding-1
-    /// reconciliation — never applied to a declaration absent from this
-    /// scan; B5's no-automatic-deletion-on-absence rule is unaffected).
-    pub symbol_edges_reconciled: u64,
+    /// L2-derived `depends_on`/`implements` edges whose `last_seen_at` was
+    /// stamped to this sweep's time because the current scan re-resolved
+    /// them (B5 extended to L2 edges — see `resolved_edges` below). An edge
+    /// whose source declaration was re-scanned but which no longer resolves
+    /// is never counted here, never deleted, and never otherwise mutated:
+    /// its `last_seen_at` simply keeps its last-resolved value, exactly like
+    /// B5's entity staleness rule.
+    pub symbol_edges_stamped: u64,
     pub languages: Vec<String>,
     /// Per-manifest / per-file failures that did not abort the pass (fail
     /// loud without silently dropping the rest of the run).
@@ -232,7 +221,7 @@ async fn upsert_entity(
         .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))
 }
 
-/// Batched entity upsert (B5/finding-5): every declaration-tier write in one
+/// Batched entity upsert (ADR-085 B5): every declaration-tier write in one
 /// call per file instead of one awaited `upsert_entity` per declaration.
 async fn upsert_entities_batch(
     rt: &KhiveRuntime,
@@ -269,7 +258,7 @@ async fn upsert_edges_batch(
 }
 
 /// Batched last-seen-at stamp for declarations whose `content_hash` matched
-/// the prior sweep (finding-4/B5): a direct `UPDATE ... WHERE id IN (...)`
+/// the prior sweep (ADR-085 B5): a direct `UPDATE ... WHERE id IN (...)`
 /// against only the `last_seen_at` property, so an unchanged declaration
 /// gets no entity rewrite (no reindex, no FTS/vector churn) while still
 /// satisfying B5's every-sweep staleness stamp.
@@ -419,7 +408,7 @@ async fn upsert_project(
 /// Upserts (or, on an unchanged `content_hash`, no-ops) the module entity for
 /// `module_path` and returns `(id, changed)`. `changed = false` means this
 /// file's content matched the prior sweep exactly — the caller records `id`
-/// for a batched `last_seen_at`-only touch (finding-4/B5) instead of
+/// for a batched `last_seen_at`-only touch (ADR-085 B5) instead of
 /// rewriting the row.
 #[allow(clippy::too_many_arguments)]
 async fn upsert_module(
@@ -431,7 +420,7 @@ async fn upsert_module(
     content_hash: &str,
     sweep_time: DateTime<Utc>,
     report: &mut CodeSourceIngestReport,
-) -> Result<(Uuid, bool), CodeSourceIngestError> {
+) -> Result<(Uuid, bool, Option<Entity>), CodeSourceIngestError> {
     let id = module_uuid(source_project, language, module_path);
     let existing = get_entity_opt(rt, token, id).await?;
     let is_new = existing.is_none();
@@ -442,7 +431,10 @@ async fn upsert_module(
         .and_then(|p| p.get("content_hash"))
         .and_then(Value::as_str);
     if !is_new && existing_hash == Some(content_hash) {
-        return Ok((id, false));
+        // The caller uses `existing` to load this module's already-known
+        // declarations into the resolution symbol index WITHOUT re-parsing —
+        // the whole point of the hash-before-parse fast path.
+        return Ok((id, false, existing));
     }
 
     let unresolved = existing
@@ -478,7 +470,99 @@ async fn upsert_module(
     } else {
         report.modules_updated += 1;
     }
-    Ok((id, true))
+    Ok((id, true, existing))
+}
+
+/// Read back `declaration_ids` previously stamped on a module entity — the
+/// ids of every L2 declaration this module produced the last time it was
+/// actually parsed.
+fn read_declaration_ids(properties: &Value) -> Vec<Uuid> {
+    properties
+        .get("declaration_ids")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .filter_map(|s| Uuid::parse_str(s).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Stamp `decl_ids` onto a just-(re)parsed module entity's
+/// `declaration_ids` property so a future sweep that finds this
+/// module's content unchanged can seed the resolution symbol index from
+/// these ids directly, without re-parsing.
+async fn stamp_module_declaration_ids(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    module_id: Uuid,
+    decl_ids: &[Uuid],
+) -> Result<(), CodeSourceIngestError> {
+    let Some(mut entity) = get_entity_opt(rt, token, module_id).await? else {
+        return Ok(());
+    };
+    let mut props = entity
+        .properties
+        .clone()
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    props.insert(
+        "declaration_ids".into(),
+        json!(decl_ids.iter().map(Uuid::to_string).collect::<Vec<_>>()),
+    );
+    entity.properties = Some(Value::Object(props));
+    upsert_entity(rt, token, entity).await
+}
+
+/// Batched load of previously-known declarations for an unchanged module:
+/// one `get_entities_by_ids` call (already 900-chunked
+/// internally, matching the repository's SQL parameter-limit precedent)
+/// rather than a per-declaration fetch, seeding `symbol_index` so a changed
+/// module elsewhere in the same pass can still resolve a call/impl into any
+/// of these declarations. Every loaded id is also queued onto `touch_ids`:
+/// the module's file WAS read and hashed this sweep (that is how "unchanged"
+/// was established), so its declarations count as observed and get the same
+/// last_seen_at bump B5 gives the module itself.
+async fn load_unchanged_declarations(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    decl_ids: &[Uuid],
+    symbol_index: &mut HashMap<(String, String, String, DeclKind), Uuid>,
+    touch_ids: &mut Vec<Uuid>,
+) -> Result<(), CodeSourceIngestError> {
+    if decl_ids.is_empty() {
+        return Ok(());
+    }
+    let entities = rt.get_entities_by_ids(token, decl_ids).await?;
+    for entity in entities {
+        let Some(props) = entity.properties.as_ref() else {
+            continue;
+        };
+        let Some(module_path) = props.get("module_path").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(kind) = entity
+            .entity_type
+            .as_deref()
+            .and_then(DeclKind::from_code_token)
+        else {
+            continue;
+        };
+        let key = (
+            props
+                .get("source_project")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            module_path.to_string(),
+            entity.name.clone(),
+            kind,
+        );
+        symbol_index.insert(key, entity.id);
+        touch_ids.push(entity.id);
+    }
+    Ok(())
 }
 
 /// Append `spec` to `entity_id`'s `unresolved_specifiers` (deduped), without
@@ -856,7 +940,7 @@ pub async fn run_code_ingest(
     // Only L1 (project-level manifest deps) and L1.5 (module/project import
     // scan) ever record `unresolved_specifiers`; L2 resolves synchronously
     // against its own in-pass `symbol_index` and never uses this queue.
-    // Gating on their disjunction (finding-5b) means an L2-only call never
+    // Gating on their disjunction means an L2-only call never
     // replays and materializes an L1.5 import edge left pending by some
     // earlier, differently-tiered ingest of the same database, while an
     // L1-only call still resolves its own manifest-declared dependency
@@ -893,11 +977,15 @@ struct PendingCall {
 
 struct PendingImpl {
     project_name: String,
-    /// The `impl` block's own module — same-module-only resolution (no
-    /// per-file `use`-alias map at this tier; see `resolve_call_target`).
+    /// The `impl` block's own module — the base a bare name or a
+    /// `crate`/`self`/`super`-qualified path resolves against (the same
+    /// resolver `resolve_call_target` uses for call targets).
     module_path: String,
-    type_name: String,
-    trait_name: String,
+    /// Full path as written at the impl site (e.g. `["crate", "types",
+    /// "S"]`), not just the last segment — a qualified path can name a type
+    /// declared outside the impl block's own module.
+    type_segments: Vec<String>,
+    trait_segments: Vec<String>,
 }
 
 /// The parent module path of `module_path` (one level up), or the crate
@@ -929,7 +1017,7 @@ fn join_module_path(base: &str, extra: &[String]) -> String {
 /// Resolve a Rust call-site path (`CallRef::segments`) into a `(module_path,
 /// name)` candidate against the same-project symbol index, using only the
 /// syntactic context available at the call site: `crate`/`self`/`super`
-/// qualifiers plus the calling declaration's own module path (finding-3).
+/// qualifiers plus the calling declaration's own module path.
 ///
 /// A bare name resolves within the caller's own module only — this tier
 /// does not build a per-file `use`-alias map, so a bare name absent from the
@@ -951,7 +1039,7 @@ fn resolve_call_target(caller_module_path: &str, segments: &[String]) -> Option<
             name.clone(),
         )),
         "super" => {
-            // Consume ALL consecutive leading `super` segments (finding-4):
+            // Consume ALL consecutive leading `super` segments:
             // `super::super::helper` from `a::b::c` must resolve against
             // `a`, not `a::super::helper` (the old first-only bug). Walking
             // above the crate root returns `None` — unresolved is always
@@ -971,12 +1059,44 @@ fn resolve_call_target(caller_module_path: &str, segments: &[String]) -> Option<
     }
 }
 
-/// L2 scanner dispatch table (finding-11): the one place that maps a
-/// language to its Scanner+Extractor adapter. Adding a new language's L2
-/// support means adding one match arm here, not expanding
-/// `run_import_scan`'s control flow.
+/// L2 language adapter table: the single place mapping a language to
+/// EVERYTHING its L2 support requires — whether it is
+/// supported at all, its Scanner+Extractor dispatch, and its call/impl
+/// target resolver. One `L2Language` variant carries all three (an
+/// `l2_scanner_supported`-style check that only gated the scanner dispatch,
+/// separately from whatever resolver got applied to its calls regardless of
+/// source language, could add a language's scan support and silently keep
+/// resolving its calls with another language's rules, or add "support" that
+/// dispatches to no scanner at all — a match on this enum forces both to
+/// move together).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum L2Language {
+    Rust,
+}
+
+impl L2Language {
+    fn for_language(language: &str) -> Option<Self> {
+        match language {
+            "rust" => Some(Self::Rust),
+            _ => None,
+        }
+    }
+
+    /// The `crate`/`self`/`super`-aware call/impl-target resolver for this
+    /// language. Rust-only in this slice.
+    fn resolve_target(
+        self,
+        caller_module_path: &str,
+        segments: &[String],
+    ) -> Option<(String, String)> {
+        match self {
+            Self::Rust => resolve_call_target(caller_module_path, segments),
+        }
+    }
+}
+
 fn l2_scanner_supported(language: &str) -> bool {
-    matches!(language, "rust")
+    L2Language::for_language(language).is_some()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -994,11 +1114,10 @@ async fn dispatch_l2_scan(
     pending_calls: &mut Vec<PendingCall>,
     pending_impls: &mut Vec<PendingImpl>,
     touch_ids: &mut Vec<Uuid>,
-    scanned_decl_ids: &mut BTreeSet<Uuid>,
     report: &mut CodeSourceIngestReport,
-) -> Result<(), CodeSourceIngestError> {
-    match language {
-        "rust" => {
+) -> Result<Vec<Uuid>, CodeSourceIngestError> {
+    match L2Language::for_language(language) {
+        Some(L2Language::Rust) => {
             scan_rust_l2(
                 rt,
                 token,
@@ -1013,12 +1132,11 @@ async fn dispatch_l2_scan(
                 pending_calls,
                 pending_impls,
                 touch_ids,
-                scanned_decl_ids,
                 report,
             )
             .await
         }
-        _ => Ok(()),
+        None => Ok(Vec::new()),
     }
 }
 
@@ -1034,9 +1152,9 @@ async fn run_import_scan(
     project_ids: &mut HashMap<String, Uuid>,
     report: &mut CodeSourceIngestReport,
 ) -> Result<(), CodeSourceIngestError> {
-    // finding-5a: a language with no L2 scanner and no L1.5 request does
-    // zero work for this call — no file walk, no read, no hash, no module
-    // upsert. Must be checked before `collect_source_files` runs at all.
+    // A language with no L2 scanner and no L1.5 request does zero work for
+    // this call — no file walk, no read, no hash, no module upsert. Must be
+    // checked before `collect_source_files` runs at all.
     let l2_here = enable_l2 && l2_scanner_supported(language);
     if !enable_l1_5 && !l2_here {
         return Ok(());
@@ -1054,7 +1172,7 @@ async fn run_import_scan(
     }
 
     // L2 project-wide symbol index ((project, module_path, name, kind) ->
-    // entity id — finding-3: module_path is part of the key so two
+    // entity id — module_path is part of the key so two
     // same-named declarations in different modules never collapse onto one
     // entry) and deferred call/impl resolution, populated as files are
     // scanned below and resolved once after the whole file loop completes.
@@ -1064,26 +1182,26 @@ async fn run_import_scan(
     let mut pending_calls: Vec<PendingCall> = Vec::new();
     let mut pending_impls: Vec<PendingImpl> = Vec::new();
     // Declaration/module ids whose content_hash matched the prior sweep
-    // exactly (finding-4): stamped with a single batched last_seen_at-only
+    // exactly: stamped with a single batched last_seen_at-only
     // UPDATE at the end of this language pass instead of a full rewrite.
     let mut touch_ids: Vec<Uuid> = Vec::new();
-    // Every L2 declaration id re-extracted this scan, across every file of
-    // this language pass — the reconciliation scope for finding-1. A
-    // declaration NOT in this set (an unscanned file, an unsupported
-    // language) is never touched by reconciliation.
-    let mut scanned_decl_ids: BTreeSet<Uuid> = BTreeSet::new();
+    // Memoized across every file of this language pass — a
+    // directory with many files (or many descendants sharing an ancestor
+    // manifest) probes and parses that manifest chain once, not once per file.
+    let mut manifest_memo = manifest::ManifestMemo::new();
 
     for file in files {
         let Some(file_dir) = file.parent() else {
             continue;
         };
-        let (proj_root, proj_name) = manifest::find_governing_manifest(file_dir, language)
-            .unwrap_or_else(|| {
-                (
-                    ingest_root.to_path_buf(),
-                    basename_project_name(ingest_root),
-                )
-            });
+        let (proj_root, proj_name) =
+            manifest::find_governing_manifest_memoized(file_dir, language, &mut manifest_memo)
+                .unwrap_or_else(|| {
+                    (
+                        ingest_root.to_path_buf(),
+                        basename_project_name(ingest_root),
+                    )
+                });
         let Some(module_path) = imports::module_path_for_file(&file, &proj_root, language) else {
             continue;
         };
@@ -1108,7 +1226,7 @@ async fn run_import_scan(
             }
         };
         let hash = extractor::fnv1a(&content);
-        let (module_id, module_changed) = upsert_module(
+        let (module_id, module_changed, existing_module) = upsert_module(
             rt,
             token,
             &proj_name,
@@ -1143,24 +1261,50 @@ async fn run_import_scan(
         }
 
         if l2_here {
-            dispatch_l2_scan(
-                language,
-                rt,
-                token,
-                &proj_name,
-                &module_path,
-                module_id,
-                &content,
-                &file,
-                sweep_time,
-                &mut symbol_index,
-                &mut pending_calls,
-                &mut pending_impls,
-                &mut touch_ids,
-                &mut scanned_decl_ids,
-                report,
-            )
-            .await?;
+            if module_changed {
+                // Hash-before-parse: this file's whole-content hash
+                // (computed above, before any syn parsing) already told us
+                // it changed, so only a changed-or-new module ever reaches
+                // the actual parse+extract path.
+                let decl_ids = dispatch_l2_scan(
+                    language,
+                    rt,
+                    token,
+                    &proj_name,
+                    &module_path,
+                    module_id,
+                    &content,
+                    &file,
+                    sweep_time,
+                    &mut symbol_index,
+                    &mut pending_calls,
+                    &mut pending_impls,
+                    &mut touch_ids,
+                    report,
+                )
+                .await?;
+                stamp_module_declaration_ids(rt, token, module_id, &decl_ids).await?;
+            } else {
+                // No parse, no extraction, no edge writes — just
+                // load this module's already-known declarations (from its
+                // own `declaration_ids` property, stamped the last time it
+                // actually changed) into the resolution symbol index, so a
+                // changed module elsewhere in this pass can still resolve a
+                // call/impl into one of them.
+                let decl_ids = existing_module
+                    .as_ref()
+                    .and_then(|e| e.properties.as_ref())
+                    .map(read_declaration_ids)
+                    .unwrap_or_default();
+                load_unchanged_declarations(
+                    rt,
+                    token,
+                    &decl_ids,
+                    &mut symbol_index,
+                    &mut touch_ids,
+                )
+                .await?;
+            }
         }
 
         if enable_l1_5 {
@@ -1200,12 +1344,18 @@ async fn run_import_scan(
     // file of this language pass is now in `symbol_index`, so calls/impls
     // recorded against a declaration that appeared later in file-walk order
     // than its caller still resolve here. Resolved targets are deduped per
-    // caller (finding-6: N calls to one helper yield one edge) and batched
-    // into a single `upsert_edges` call (finding-5).
+    // caller (N calls to one helper yield one edge) and batched
+    // into a single `upsert_edges` call. Both loops resolve
+    // through the language's own adapter rather than calling
+    // the Rust resolver directly — `pending_calls`/`pending_impls` are only
+    // ever populated when `L2Language::for_language(language)` is `Some`
+    // (`dispatch_l2_scan`'s gate), so `adapter` is always `Some` in practice
+    // here; the `and_then` is defensive, not load-bearing.
+    let adapter = L2Language::for_language(language);
     let mut call_targets: HashMap<Uuid, BTreeSet<Uuid>> = HashMap::new();
     for call in &pending_calls {
         let Some((module_path, name)) =
-            resolve_call_target(&call.caller_module_path, &call.segments)
+            adapter.and_then(|a| a.resolve_target(&call.caller_module_path, &call.segments))
         else {
             report.symbol_dependencies_unresolved += 1;
             continue;
@@ -1226,18 +1376,31 @@ async fn run_import_scan(
             None => report.symbol_dependencies_unresolved += 1,
         }
     }
+    // Both sides resolve through the same `crate`/`self`/`super`
+    // -aware module resolution call targets use, rather than the previous
+    // bare-last-segment lookup scoped only to the impl's own module — a
+    // qualifier that resolver doesn't understand (an external module name)
+    // leaves the relation unresolved rather than guessing the impl's own
+    // module is right.
     let mut impl_targets: HashMap<Uuid, BTreeSet<Uuid>> = HashMap::new();
     for imp in &pending_impls {
+        let resolved = adapter
+            .and_then(|a| a.resolve_target(&imp.module_path, &imp.type_segments))
+            .zip(adapter.and_then(|a| a.resolve_target(&imp.module_path, &imp.trait_segments)));
+        let Some(((type_module, type_name), (trait_module, trait_name))) = resolved else {
+            report.symbol_dependencies_unresolved += 1;
+            continue;
+        };
         let type_key = (
             imp.project_name.clone(),
-            imp.module_path.clone(),
-            imp.type_name.clone(),
+            type_module,
+            type_name,
             DeclKind::Datatype,
         );
         let trait_key = (
             imp.project_name.clone(),
-            imp.module_path.clone(),
-            imp.trait_name.clone(),
+            trait_module,
+            trait_name,
             DeclKind::Interface,
         );
         match (symbol_index.get(&type_key), symbol_index.get(&trait_key)) {
@@ -1260,7 +1423,7 @@ async fn run_import_scan(
         }
     }
 
-    // finding-8: one batched existence lookup instead of N serial awaited
+    // One batched existence lookup instead of N serial awaited
     // `get_edge` reads — `get_edges` already chunks internally at 900
     // (khive-db `graph.rs` precedent), so this stays safe at any scale.
     let desired_ids: Vec<LinkId> = desired
@@ -1278,14 +1441,27 @@ async fn run_import_scan(
         .map(|e| e.id)
         .collect();
 
+    // B5 extended to L2 edges: every edge this scan re-resolves gets its
+    // `last_seen_at` stamped to this sweep's time, the same way declaration
+    // entities are stamped. An edge whose source declaration was re-scanned
+    // but no longer resolves to that target simply is not in `desired` this
+    // pass, so it is never touched here — it keeps its previous
+    // `last_seen_at` untouched, never deleted or mutated. Currency is a
+    // view-layer decision: an L2 edge is current iff its `last_seen_at`
+    // equals the latest sweep time for its source declaration's
+    // `(source_project, language)` pair (the project entity's
+    // `sweep_clock`), never a data-layer deletion.
+    let stamp = sweep_time.to_rfc3339();
     let mut resolved_edges: Vec<Edge> = Vec::with_capacity(desired.len());
     for ((source_id, target_id, relation), edge_id) in
         desired.iter().copied().zip(desired_ids.iter().copied())
     {
         let existed = existing_ids.contains(&edge_id);
         let metadata = match relation {
-            EdgeRelation::DependsOn => json!({ "dependency_kind": "build", "l2_derived": true }),
-            _ => json!({ "l2_derived": true }),
+            EdgeRelation::DependsOn => {
+                json!({ "dependency_kind": "build", "l2_derived": true, "last_seen_at": stamp })
+            }
+            _ => json!({ "l2_derived": true, "last_seen_at": stamp }),
         };
         resolved_edges.push(Edge {
             id: edge_id,
@@ -1305,91 +1481,17 @@ async fn run_import_scan(
         } else {
             report.edges_created += 1;
         }
+        report.symbol_edges_stamped += 1;
     }
     upsert_edges_batch(rt, token, resolved_edges).await?;
-
-    reconcile_stale_l2_edges(
-        rt,
-        token,
-        &scanned_decl_ids,
-        &call_targets,
-        &impl_targets,
-        report,
-    )
-    .await?;
 
     touch_last_seen_at(rt, token, &touch_ids, sweep_time).await?;
 
     Ok(())
 }
 
-/// finding-1: for every declaration re-extracted this scan, soft-delete any
-/// of its existing outgoing L2-derived `depends_on`/`implements` edges whose
-/// target this scan did not re-resolve.
-///
-/// Scoped strictly to `scanned_decl_ids`: a declaration this scan never
-/// touched (an unscanned file, an unsupported language) is never examined,
-/// so ADR-085 B5's absence-based no-automatic-deletion rule is untouched —
-/// this only corrects edges whose own source declaration this scan
-/// positively re-observed with a different outgoing edge set, distinct from
-/// inferring staleness from a declaration simply not appearing in a sweep.
-/// Only edges carrying the `l2_derived` provenance marker are ever
-/// considered, so an edge some other tier or caller created between the
-/// same two entities is never touched.
-async fn reconcile_stale_l2_edges(
-    rt: &KhiveRuntime,
-    token: &NamespaceToken,
-    scanned_decl_ids: &BTreeSet<Uuid>,
-    call_targets: &HashMap<Uuid, BTreeSet<Uuid>>,
-    impl_targets: &HashMap<Uuid, BTreeSet<Uuid>>,
-    report: &mut CodeSourceIngestReport,
-) -> Result<(), CodeSourceIngestError> {
-    if scanned_decl_ids.is_empty() {
-        return Ok(());
-    }
-    let empty: BTreeSet<Uuid> = BTreeSet::new();
-    let ids: Vec<Uuid> = scanned_decl_ids.iter().copied().collect();
-    let graph = rt.graph(token)?;
-    for chunk in ids.chunks(SQL_ID_CHUNK) {
-        let filter = EdgeFilter {
-            source_ids: chunk.to_vec(),
-            relations: vec![EdgeRelation::DependsOn, EdgeRelation::Implements],
-            ..Default::default()
-        };
-        let page = graph
-            .query_edges(
-                filter,
-                vec![],
-                PageRequest {
-                    offset: 0,
-                    limit: u32::MAX,
-                },
-            )
-            .await
-            .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?;
-        for edge in page.items {
-            if !is_l2_derived(&edge) {
-                continue;
-            }
-            let new_targets = match edge.relation {
-                EdgeRelation::DependsOn => call_targets.get(&edge.source_id).unwrap_or(&empty),
-                EdgeRelation::Implements => impl_targets.get(&edge.source_id).unwrap_or(&empty),
-                _ => &empty,
-            };
-            if !new_targets.contains(&edge.target_id) {
-                graph
-                    .delete_edge(edge.id, DeleteMode::Soft)
-                    .await
-                    .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?;
-                report.symbol_edges_reconciled += 1;
-            }
-        }
-    }
-    Ok(())
-}
-
 /// The immediate containing entity for a declaration at `module_segments`
-/// relative to the file's own `module_path` (finding-3a/d): the file-level
+/// relative to the file's own `module_path`: the file-level
 /// `module_id` when the declaration is at top level, or the nested inline
 /// module's own `symbol_uuid` (D2 `module` token) otherwise — the same id
 /// that declaration's own `RustDeclKind::Module` entry resolves to.
@@ -1414,12 +1516,12 @@ fn contains_parent_id(
 
 /// L2 declaration scan for one already-read Rust file (ADR-085 Amendment 2
 /// B2-B4): upserts a subtype `concept` entity per declaration (including
-/// inline-module, method, and trait-default-method declarations — finding-3)
+/// inline-module, method, and trait-default-method declarations)
 /// links it to its containing module via `contains`, and queues its
 /// call/impl targets for same-project resolution once the whole language
 /// pass's `symbol_index` is complete.
 ///
-/// Batched and incremental (findings 4 and 5): every declaration's prior
+/// Batched and incremental: every declaration's prior
 /// content_hash is fetched in one `get_entities_by_ids` call, unchanged
 /// declarations are stamped into `touch_ids` for a last_seen_at-only sweep
 /// and never rewritten, and every changed-or-new declaration's entity and
@@ -1440,21 +1542,20 @@ async fn scan_rust_l2(
     pending_calls: &mut Vec<PendingCall>,
     pending_impls: &mut Vec<PendingImpl>,
     touch_ids: &mut Vec<Uuid>,
-    scanned_decl_ids: &mut BTreeSet<Uuid>,
     report: &mut CodeSourceIngestReport,
-) -> Result<(), CodeSourceIngestError> {
+) -> Result<Vec<Uuid>, CodeSourceIngestError> {
     let scan = match scanner_rust::scan_rust_source(content) {
         Ok(scan) => scan,
         Err(e) => {
             report
                 .warnings
                 .push(format!("L2 scanning {}: {e}", file.display()));
-            return Ok(());
+            return Ok(Vec::new());
         }
     };
     let extracted = extractor::from_rust_scan(scan);
 
-    // Each declaration's own full module path (finding-3a): a top-level item
+    // Each declaration's own full module path: a top-level item
     // uses the file's `module_path` unchanged; an item nested inside `mod
     // inner { .. }` (or deeper) uses `module_path` joined with its
     // `module_segments`. This is the path stored on the entity, used as the
@@ -1496,7 +1597,6 @@ async fn scan_rust_l2(
         .zip(decl_module_paths.iter())
         .zip(decl_ids.iter().copied())
     {
-        scanned_decl_ids.insert(decl_id);
         symbol_index.insert(
             (
                 proj_name.to_string(),
@@ -1588,12 +1688,12 @@ async fn scan_rust_l2(
         pending_impls.push(PendingImpl {
             project_name: proj_name.to_string(),
             module_path: join_module_path(module_path, &imp.module_segments),
-            type_name: imp.type_name.clone(),
-            trait_name: imp.trait_name.clone(),
+            type_segments: imp.type_path.clone(),
+            trait_segments: imp.trait_path.clone(),
         });
     }
 
-    Ok(())
+    Ok(decl_ids)
 }
 
 #[cfg(test)]
@@ -1634,7 +1734,7 @@ mod resolve_call_target_tests {
         parts.iter().map(|s| s.to_string()).collect()
     }
 
-    /// finding-4: every consecutive leading `super` is consumed, not just
+    /// Every consecutive leading `super` is consumed, not just
     /// the first — from `a::b::c`, `super::super::helper` resolves to `a`.
     #[test]
     fn multi_super_walks_up_one_level_per_segment() {

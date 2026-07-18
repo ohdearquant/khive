@@ -13,7 +13,7 @@ use serde_json::Value;
 
 use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig, RuntimeError};
 
-use crate::db_target::resolve_target_db;
+use crate::db_target::{resolve_target_db, verify_opened_target};
 use crate::manifest::LANGUAGES;
 use crate::source_ingest::{run_code_ingest, CodeSourceIngestOptions};
 use crate::CodePack;
@@ -106,6 +106,11 @@ impl CodePack {
         let target_rt = KhiveRuntime::new(config).map_err(|e| {
             RuntimeError::InvalidInput(format!("opening target db {db_path:?}: {e}"))
         })?;
+        // Re-verify identity on the just-opened handle before any write —
+        // narrows the TOCTOU window between `resolve_target_db`'s check
+        // (against a path that may not have existed yet) and this open.
+        verify_opened_target(&db_path, runtime_db_path.as_deref())
+            .map_err(RuntimeError::InvalidInput)?;
         let token = target_rt
             .authorize(Namespace::local())
             .map_err(|e| RuntimeError::InvalidInput(format!("authorizing target db: {e}")))?;

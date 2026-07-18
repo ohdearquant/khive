@@ -256,7 +256,7 @@ async fn reingesting_same_fixture_is_idempotent() {
     assert_eq!(
         second.modules_updated, 0,
         "an unchanged module's content_hash must match on the second pass, so it gets a \
-         last_seen_at-only touch, not a reported update (finding-4)"
+         last_seen_at-only touch, not a reported update"
     );
 }
 
@@ -264,7 +264,7 @@ async fn reingesting_same_fixture_is_idempotent() {
 /// `src/foo.rs`, must resolve to a `crate -> foo` `depends_on` edge with
 /// `dependency_kinds=["import"]` — not stay unresolved because the raw
 /// import target (`foo::Thing`) names an item inside `foo`, not a nested
-/// module `foo::Thing` (codex PR #1039 review, finding 3).
+/// module `foo::Thing`.
 fn write_item_import_fixture(root: &Path) {
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::write(
@@ -326,8 +326,7 @@ async fn rust_item_import_resolves_to_containing_module_after_reingest() {
 /// A manifestless folder (no `Cargo.toml`/`pyproject.toml`/`package.json`
 /// anywhere above its source files) must still produce project/module
 /// entities and import edges under the basename-fallback identity rule
-/// (ADR-085 Amendment 2 B4), not be silently skipped for lack of a manifest
-/// (codex PR #1039 review, finding 4).
+/// (ADR-085 Amendment 2 B4), not be silently skipped for lack of a manifest.
 #[tokio::test]
 async fn manifestless_rust_folder_uses_basename_fallback() {
     let root = TempDir::new().expect("tempdir");
@@ -423,7 +422,7 @@ async fn rejects_nonexistent_path() {
     ));
 }
 
-/// finding-2: `code.ingest(path="pkg/src")` must attribute files to `pkg`'s
+/// `code.ingest(path="pkg/src")` must attribute files to `pkg`'s
 /// own `Cargo.toml` package name, walking up past the ingest root to find
 /// it — not fall back to the basename of the ingested subfolder.
 #[tokio::test]

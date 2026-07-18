@@ -4,7 +4,7 @@
 //! walks skip common non-source, non-manifest-bearing trees (`.git`, `target`,
 //! `node_modules`, `__pycache__`, `.venv`) to keep discovery bounded.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -241,6 +241,32 @@ pub(crate) fn find_governing_manifest(
         dir = d.parent();
     }
     None
+}
+
+/// Per-ingest memo cache for `find_governing_manifest`: a directory to its
+/// governing-manifest result, once known. Every file under the same directory
+/// re-probes and re-parses the identical ancestor chain of manifests when
+/// called directly, which is O(files x depth) over a whole-tree ingest; caching
+/// by directory means each unique directory is probed once regardless of how
+/// many files it (or its descendants) contain.
+pub(crate) type ManifestMemo = HashMap<PathBuf, Option<(PathBuf, String)>>;
+
+/// Memoized wrapper around `find_governing_manifest`. Only `file_dir` itself is
+/// cached (not every ancestor visited along the way): a directory whose lookup
+/// walked up through N ancestors to find (or fail to find) a manifest still
+/// only probes those N ancestors once, on the first file from that directory —
+/// every subsequent file in the same directory hits the cache in O(1).
+pub(crate) fn find_governing_manifest_memoized(
+    file_dir: &Path,
+    language: &str,
+    memo: &mut ManifestMemo,
+) -> Option<(PathBuf, String)> {
+    if let Some(cached) = memo.get(file_dir) {
+        return cached.clone();
+    }
+    let result = find_governing_manifest(file_dir, language);
+    memo.insert(file_dir.to_path_buf(), result.clone());
+    result
 }
 
 #[cfg(test)]

@@ -320,8 +320,7 @@ async fn l2_reingest_is_idempotent_no_duplicate_symbol_entities() {
     assert_eq!(
         second.symbols_updated, 0,
         "every declaration's content_hash matches the prior sweep unchanged, so the second \
-         pass reports zero symbol updates — a last_seen_at-only touch, not a rewrite \
-         (finding-4)"
+         pass reports zero symbol updates — a last_seen_at-only touch, not a rewrite"
     );
 }
 
@@ -358,7 +357,7 @@ async fn l2_disabled_by_default_creates_no_symbol_entities() {
     );
 }
 
-/// finding-1: a doc comment carrying a credential-shaped string must not
+/// A doc comment carrying a credential-shaped string must not
 /// reach storage — L2 entity writes go through the same secret gate
 /// `KhiveRuntime::create_entity` applies (ADR-085 D6), not a raw
 /// `EntityStore::upsert_entity` call that bypasses it.
@@ -403,7 +402,7 @@ async fn l2_rejects_declaration_whose_doc_comment_carries_a_secret() {
     );
 }
 
-/// finding-3: the same-named function in two different modules must resolve
+/// The same-named function in two different modules must resolve
 /// its `helper()` call only within its own module — the symbol index is
 /// keyed by `(project, module_path, name, kind)`, not `(project, name,
 /// kind)`, so the two `helper` declarations never collapse onto one entry.
@@ -464,7 +463,7 @@ async fn l2_same_named_function_in_different_modules_resolves_within_own_module_
     );
 }
 
-/// finding-6: two calls to the same helper from one function must collapse
+/// Two calls to the same helper from one function must collapse
 /// onto a single `depends_on` edge, not one edge operation per call site.
 #[tokio::test]
 async fn l2_dedups_repeated_calls_to_the_same_helper_into_one_edge() {
@@ -511,7 +510,7 @@ async fn l2_dedups_repeated_calls_to_the_same_helper_into_one_edge() {
     );
 }
 
-/// finding-2: `tiers=["l1"]`/`["l1.5"]`/`["l2"]` each run only their own
+/// `tiers=["l1"]`/`["l1.5"]`/`["l2"]` each run only their own
 /// tier, and combinations compose.
 #[tokio::test]
 async fn tiers_are_independently_selectable_and_compose() {
@@ -617,7 +616,7 @@ fn write_polyglot_fixture(root: &Path) {
     std::fs::write(root.join("tspkg/index.ts"), "export function h() {}\n").unwrap();
 }
 
-/// finding-5a: an L2-only ingest over a polyglot tree must not walk, read,
+/// An L2-only ingest over a polyglot tree must not walk, read,
 /// hash, or upsert modules for languages L2 doesn't support (python,
 /// typescript) — only the rust project/module gets touched.
 #[tokio::test]
@@ -654,7 +653,7 @@ async fn l2_only_polyglot_ingest_touches_only_rust() {
     assert!(report.symbols_created > 0);
 }
 
-/// finding-5c: an ingest with every tier disabled performs zero writes.
+/// An ingest with every tier disabled performs zero writes.
 #[tokio::test]
 async fn all_tiers_disabled_performs_zero_writes() {
     let root = TempDir::new().expect("tempdir");
@@ -685,30 +684,72 @@ async fn all_tiers_disabled_performs_zero_writes() {
     assert_eq!(report.unresolved_recorded, 0);
 }
 
-/// finding-1: a declaration re-extracted this scan whose freshly extracted
-/// call list no longer includes a previously recorded target must have that
-/// stale `depends_on` edge reconciled away, while a still-valid edge (and
-/// the newly resolved one) survives.
+/// Reads back an edge's `last_seen_at` metadata stamp for the given relation
+/// and endpoint names, or `None` if no such edge exists.
+async fn edge_last_seen(
+    rt: &KhiveRuntime,
+    relation: &str,
+    src_name: &str,
+    tgt_name: &str,
+) -> Option<String> {
+    let sql = rt.sql();
+    let mut reader = sql.reader().await.expect("reader");
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: "SELECT e.metadata AS metadata \
+                  FROM graph_edges e \
+                  JOIN entities s ON s.id = e.source_id \
+                  JOIN entities t ON t.id = e.target_id \
+                  WHERE e.deleted_at IS NULL AND e.relation = ?1 \
+                  AND s.name = ?2 AND t.name = ?3"
+                .into(),
+            params: vec![
+                SqlValue::Text(relation.to_string()),
+                SqlValue::Text(src_name.to_string()),
+                SqlValue::Text(tgt_name.to_string()),
+            ],
+            label: Some("test_l2_edge_last_seen".into()),
+        })
+        .await
+        .expect("query edge metadata");
+    let row = rows.into_iter().next()?;
+    let metadata: serde_json::Value = match row.get("metadata") {
+        Some(SqlValue::Text(s)) => serde_json::from_str(s).ok()?,
+        _ => return None,
+    };
+    metadata
+        .get("last_seen_at")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+/// ADR-085 B5 extended to L2 edges: a declaration re-extracted this scan
+/// whose freshly extracted call list no longer includes a previously
+/// recorded target must NOT have that edge deleted or mutated — it simply
+/// keeps its old `last_seen_at` stamp, while the newly resolved edge gets the
+/// new sweep's stamp. Currency is a view-layer filter, never a data-layer
+/// deletion.
 #[tokio::test]
-async fn stale_call_edge_is_reconciled_when_declaration_changes() {
+async fn stale_call_edge_keeps_old_stamp_when_declaration_changes() {
     let root = TempDir::new().expect("tempdir");
     write_fixture(root.path());
-    let db = root.path().join("reconcile.db");
+    let db = root.path().join("b5_edges.db");
     let rt = rt_at(&db);
     let token = rt.authorize(Namespace::local()).expect("token");
 
-    let opts = || CodeSourceIngestOptions {
+    let first_sweep = Utc::now();
+    let opts = |sweep_time| CodeSourceIngestOptions {
         path: root.path(),
         languages: rust_only(),
-        sweep_time: Utc::now(),
+        sweep_time,
         enable_l1: true,
         enable_l1_5: true,
         enable_l2: true,
     };
-    let first = run_code_ingest(&rt, &token, opts())
+    let first = run_code_ingest(&rt, &token, opts(first_sweep))
         .await
         .expect("first ingest");
-    assert_eq!(first.symbol_edges_reconciled, 0);
+    assert!(first.symbol_edges_stamped > 0);
     let edges = edge_triples(&rt).await;
     assert!(
         edges
@@ -716,6 +757,9 @@ async fn stale_call_edge_is_reconciled_when_declaration_changes() {
             .any(|(rel, src, tgt)| rel == "depends_on" && src == "caller" && tgt == "helper"),
         "expected initial caller->helper edge, got: {edges:?}"
     );
+    let helper_stamp_first = edge_last_seen(&rt, "depends_on", "caller", "helper")
+        .await
+        .expect("caller->helper edge carries a last_seen_at stamp");
 
     // `caller` now calls `other` instead of `helper`.
     std::fs::write(
@@ -754,26 +798,47 @@ pub fn orphan() -> u32 {
     )
     .unwrap();
 
-    let second = run_code_ingest(&rt, &token, opts())
+    let second_sweep = first_sweep + chrono::Duration::seconds(1);
+    let second = run_code_ingest(&rt, &token, opts(second_sweep))
         .await
-        .expect("second ingest reconciles the stale edge");
-    assert_eq!(
-        second.symbol_edges_reconciled, 1,
-        "expected exactly the stale caller->helper edge to be reconciled"
-    );
-    let edges = edge_triples(&rt).await;
+        .expect("second ingest");
     assert!(
-        !edges
+        second.symbol_edges_stamped > 0,
+        "the re-resolved caller->other edge must be stamped this sweep"
+    );
+
+    let edges = edge_triples(&rt).await;
+    // B5: the stale caller->helper edge is NEVER deleted — its declaration
+    // (caller) was re-scanned, but B5's no-automatic-deletion rule applies to
+    // L2 edges exactly as it does to entities.
+    assert!(
+        edges
             .iter()
             .any(|(rel, src, tgt)| rel == "depends_on" && src == "caller" && tgt == "helper"),
-        "stale caller->helper edge must be gone after re-ingest, got: {edges:?}"
+        "stale caller->helper edge must still exist after re-ingest (B5: no deletion), got: {edges:?}"
     );
+    let helper_stamp_second = edge_last_seen(&rt, "depends_on", "caller", "helper")
+        .await
+        .expect("caller->helper edge still exists");
+    assert_eq!(
+        helper_stamp_first, helper_stamp_second,
+        "an edge this scan did not re-resolve keeps its OLD last_seen_at stamp untouched"
+    );
+
     assert!(
         edges
             .iter()
             .any(|(rel, src, tgt)| rel == "depends_on" && src == "caller" && tgt == "other"),
         "new caller->other edge must exist, got: {edges:?}"
     );
+    let other_stamp = edge_last_seen(&rt, "depends_on", "caller", "other")
+        .await
+        .expect("caller->other edge carries a last_seen_at stamp");
+    assert!(
+        other_stamp > helper_stamp_second,
+        "the re-resolved edge must carry the NEW sweep's stamp, later than the untouched stale edge"
+    );
+
     // implements edge (Hello implements Greeter) is untouched — unrelated
     // to caller's own outgoing edge set.
     assert!(edges
@@ -824,8 +889,8 @@ async fn ingest_with_over_900_declarations_does_not_exceed_sql_param_limits() {
     assert_eq!(report2.symbols_updated, 0);
 }
 
-/// finding-3: inline modules, inherent/trait impl methods, and trait
-/// default-body methods all produce declarations end to end, and a call
+/// Inline modules, inherent/trait impl methods, and trait
+/// default-body and signature-only methods all produce declarations end to end, and a call
 /// inside a nested module resolves against that module's own path.
 #[tokio::test]
 async fn l2_extracts_methods_and_inline_modules_end_to_end() {
@@ -888,7 +953,7 @@ pub mod inner {
         "trait default method: {names:?}"
     );
     assert!(
-        names.contains(&"S::required"),
+        names.contains(&"<S as T>::required"),
         "trait impl method: {names:?}"
     );
     // `inner`'s own module-kind entity is proven indirectly below (the
@@ -915,5 +980,62 @@ pub mod inner {
             .iter()
             .any(|(rel, src, tgt)| rel == "contains" && src == "inner" && tgt == "helper"),
         "inner module must contain its nested fn via `contains`, got: {edges:?}"
+    );
+}
+
+/// A qualified `impl crate::traits::T for crate::types::S {}` at the crate
+/// root, where the trait and type each live in their own sibling module, must
+/// still produce the `implements` edge: both paths resolve through the same
+/// `crate`/`self`/`super`-aware module resolution used for call targets,
+/// rather than the impl's own module alone.
+#[tokio::test]
+async fn qualified_impl_across_sibling_modules_produces_implements_edge() {
+    let root = TempDir::new().expect("tempdir");
+    std::fs::create_dir_all(root.path().join("src")).unwrap();
+    std::fs::write(
+        root.path().join("Cargo.toml"),
+        "[package]\nname = \"qualcrate\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("src/lib.rs"),
+        r#"
+pub mod traits {
+    pub trait T {}
+}
+
+pub mod types {
+    pub struct S;
+}
+
+impl crate::traits::T for crate::types::S {}
+"#,
+    )
+    .unwrap();
+
+    let db = root.path().join("qualified_impl.db");
+    let rt = rt_at(&db);
+    let token = rt.authorize(Namespace::local()).expect("token");
+    run_code_ingest(
+        &rt,
+        &token,
+        CodeSourceIngestOptions {
+            path: root.path(),
+            languages: rust_only(),
+            sweep_time: Utc::now(),
+            enable_l1: true,
+            enable_l1_5: true,
+            enable_l2: true,
+        },
+    )
+    .await
+    .expect("ingest succeeds");
+
+    let edges = edge_triples(&rt).await;
+    assert!(
+        edges
+            .iter()
+            .any(|(rel, src, tgt)| rel == "implements" && src == "S" && tgt == "T"),
+        "qualified impl across sibling modules must resolve to an implements edge, got: {edges:?}"
     );
 }
