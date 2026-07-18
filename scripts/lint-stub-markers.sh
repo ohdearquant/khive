@@ -93,6 +93,12 @@ pub fn after_byte_raw_string_literal(flag: bool) -> u32 {
 }
 FIXTURE
 
+    # Appended via printf (not the quoted heredoc above) so the fixture can
+    # carry a real ESC byte and a real embedded newline inside the panic
+    # message -- the exact CI-log-forgery shape blocking fix 2 sanitizes.
+    printf '\npub fn ci_log_forgery_stub(flag: bool) -> u32 {\n    if !flag {\n        panic!("todo: stub \033[31m::error::forged\nmid-message newline injection");\n    }\n    1\n}\n' \
+        >> "$tmp/case-fail/crates/fixture-crate/src/lib.rs"
+
     cat > "$tmp/case-pass/crates/fixture-crate/src/lib.rs" <<'FIXTURE'
 pub fn dispatch(kind: &str) -> u32 {
     match kind {
@@ -137,14 +143,22 @@ mod tests {
         assert_eq!(dispatch("a"), 1);
     }
 }
+
+#[cfg(test)]
+fn const_generic_default_guard<const N: usize = { 4 }>() -> usize {
+    if N == 0 {
+        panic!("todo: still a stub guarded by cfg(test), must never reach shipping scan");
+    }
+    N
+}
 FIXTURE
 
     status=0
 
-    # Exactly 7 markers are seeded in case-fail above; asserting the count
+    # Exactly 8 markers are seeded in case-fail above; asserting the count
     # (not just substring presence) catches a parser-overmatch regression
     # that would otherwise slip through as an unnoticed extra finding.
-    expected_marker_count=7
+    expected_marker_count=8
 
     if scan "$tmp/case-fail" > "$tmp/fail.log" 2>&1; then
         echo "self-test FAILED: expected placeholder call sites were not caught"
@@ -164,7 +178,8 @@ FIXTURE
             "not implemented for this flag" \
             "not implemented after a non-braced cfg(test) item" \
             "todo: still not implemented after a long comment gap" \
-            "todo: still not implemented after a byte-raw string literal"
+            "todo: still not implemented after a byte-raw string literal" \
+            "mid-message newline injection"
         do
             if ! grep -qF "$marker" "$tmp/fail.log"; then
                 echo "self-test FAILED: expected finding missing: $marker"
@@ -172,10 +187,35 @@ FIXTURE
                 status=1
             fi
         done
+
+        # blocking fix 2: the ci_log_forgery_stub message above carries a raw
+        # ANSI escape, a literal "::error::forged" workflow-command shape, and
+        # an embedded newline -- none of the three may survive into CI stdout.
+        esc="$(printf '\033')"
+        if grep -qF "$esc" "$tmp/fail.log"; then
+            echo "self-test FAILED: a raw ANSI escape byte leaked into CI output"
+            cat "$tmp/fail.log"
+            status=1
+        fi
+        if grep -qF '::error::forged' "$tmp/fail.log"; then
+            echo "self-test FAILED: an unbroken '::error::forged' workflow command leaked into CI output"
+            cat "$tmp/fail.log"
+            status=1
+        fi
+        if grep -n '^::' "$tmp/fail.log" | grep -q .; then
+            echo "self-test FAILED: a CI output line starts with '::' (workflow-command syntax)"
+            cat "$tmp/fail.log"
+            status=1
+        fi
+        if ! grep -q 'mid-message newline injection.*reads as a placeholder stub' "$tmp/fail.log"; then
+            echo "self-test FAILED: the embedded newline in the panic message split the CI log line in two"
+            cat "$tmp/fail.log"
+            status=1
+        fi
     fi
 
     if ! scan "$tmp/case-pass" > "$tmp/pass.log" 2>&1; then
-        echo "self-test FAILED: legitimate panic!/unreachable! messages (raw strings, lookalike text inside strings, a #[cfg(test)] helper named StubService) false-positived:"
+        echo "self-test FAILED: legitimate panic!/unreachable! messages (raw strings, lookalike text inside strings, a #[cfg(test)] helper named StubService, a #[cfg(test)] item with a signature brace before its body) false-positived:"
         cat "$tmp/pass.log"
         status=1
     fi
@@ -216,6 +256,24 @@ MACRO_CALL_RE = re.compile(r"\b(panic|unreachable)\s*!\s*([(\{\[])")
 STRING_LIT_RE = re.compile(r'"((?:[^"\\]|\\.)*)"')
 CFG_TEST_RE = re.compile(r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]")
 WHITESPACE_RE = re.compile(r"\s*")
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b.")
+
+
+def sanitize_for_ci(raw):
+    """The panic!/unreachable! message text this scanner echoes into CI
+    stdout comes straight from a PR-controlled string literal. GitHub Actions
+    parses a `::name ...::value`-shaped line as a workflow command
+    (`::error::`, `::add-mask::`, `::set-output::`, ...), so an embedded
+    newline could let attacker text start a fresh line and forge one, and
+    ANSI escapes can rewrite terminal/log-viewer state. Strip ANSI escapes,
+    collapse newlines to a literal `\\n` (never a real line break), and break
+    every `::` so no substring can be parsed as workflow-command syntax --
+    all while keeping the text readable for a human operator."""
+    s = ANSI_ESCAPE_RE.sub("", raw)
+    s = s.replace("\x1b", "")
+    s = s.replace("\r\n", "\\n").replace("\n", "\\n").replace("\r", "\\n")
+    s = s.replace("::", ": :")
+    return s
 
 
 def raw_string_end(text, i):
@@ -375,6 +433,54 @@ def blank_strings(clean_text):
     return "".join(out)
 
 
+def find_item_head_end(code_only, start):
+    """Scan an item's head (from just after its `#[cfg(test)]` attribute) for
+    the item's own body-opening `{` or, for a non-braced item, its
+    terminating `;` -- both counted only at signature level, i.e. outside any
+    `()`, `[]`, or `<>` nesting. A brace living inside the signature (a
+    generic const default's block, e.g. `<const N: usize = { 4 }>`, or an
+    array-length const block in a where-clause bound, e.g.
+    `where [(); { 1 }]: Sized`) is not the item body -- it is skipped as a
+    balanced, opaque unit so it can never be mistaken for the body opener.
+    Returns `("brace", offset)` / `("semi", offset)`, or None if the head
+    runs off the end of the file unterminated."""
+    n = len(code_only)
+    i = start
+    paren = bracket = angle = 0
+    while i < n:
+        c = code_only[i]
+        if c == "(":
+            paren += 1
+        elif c == ")":
+            paren = max(0, paren - 1)
+        elif c == "[":
+            bracket += 1
+        elif c == "]":
+            bracket = max(0, bracket - 1)
+        elif c == "<":
+            angle += 1
+        elif c == ">":
+            if angle > 0:
+                angle -= 1
+        elif c == "{":
+            if paren == 0 and bracket == 0 and angle == 0:
+                return ("brace", i)
+            depth = 1
+            i += 1
+            while i < n and depth > 0:
+                if code_only[i] == "{":
+                    depth += 1
+                elif code_only[i] == "}":
+                    depth -= 1
+                i += 1
+            continue
+        elif c == ";":
+            if paren == 0 and bracket == 0 and angle == 0:
+                return ("semi", i)
+        i += 1
+    return None
+
+
 def test_gated_spans(code_only):
     """Byte-offset [start, end) spans of every #[cfg(test)]-attributed item --
     clippy --lib --bins never compiles these (no --cfg test), so the scanner
@@ -382,21 +488,20 @@ def test_gated_spans(code_only):
     strings-blanked `code_only` text so a `#[cfg(test)]`-shaped substring
     living inside a string literal is never mistaken for a real attribute.
     For a non-braced item (e.g. `#[cfg(test)] const X: u32 = 1;`) the span
-    ends at the terminating `;`, not at some later item's `{` -- braces are
-    only brace-matched when `{` is the item's own opener (i.e. comes before
-    any `;`)."""
+    ends at the terminating `;`; for a braced item it ends at the body's
+    balanced close, per find_item_head_end above."""
     spans = []
     n = len(code_only)
     for m in CFG_TEST_RE.finditer(code_only):
-        semi = code_only.find(";", m.end())
-        brace = code_only.find("{", m.end())
-        if brace == -1 and semi == -1:
+        head = find_item_head_end(code_only, m.end())
+        if head is None:
             continue
-        if semi != -1 and (brace == -1 or semi < brace):
-            spans.append((m.start(), semi + 1))
+        kind, pos = head
+        if kind == "semi":
+            spans.append((m.start(), pos + 1))
             continue
         depth = 1
-        i = brace + 1
+        i = pos + 1
         while i < n and depth > 0:
             if code_only[i] == "{":
                 depth += 1
@@ -443,7 +548,8 @@ for path in files:
         if PLACEHOLDER_RE.search(message):
             line_no = clean.count("\n", 0, m.start()) + 1
             macro_name = m.group(1)
-            findings.append(f"{path}:{line_no}: {macro_name}!(\"{message}\") reads as a placeholder stub, not a real error path")
+            safe_message = sanitize_for_ci(message)
+            findings.append(f"{path}:{line_no}: {macro_name}!(\"{safe_message}\") reads as a placeholder stub, not a real error path")
 
 if findings:
     for f in findings:
