@@ -794,25 +794,77 @@ LSTREEFAILFIXTURE
     # does not call run_all: it invokes phases as individual workflow steps, so a
     # step reordered (or suite-gated) in the workflow bypasses the guard while
     # run_all still looks correct. That is exactly how the macOS PR lane once ran
-    # cargo with no scan at all. Assert against the workflow itself: the first
-    # ci.sh phase any job invokes must be no-stubs-scan, and it must carry no
-    # suite condition -- an `if:` on that step re-splits the lanes and leaves
-    # whichever suite it excludes unguarded.
+    # cargo with no scan at all.
+    #
+    # Decide this on the workflow's step structure, not on its text. Text cannot
+    # answer it: YAML mapping keys are unordered, so a condition may sit after the
+    # `run:` it gates, and a step may invoke cargo directly without ever naming
+    # ci.sh. Segment the compile job into steps and require that the first step
+    # able to execute cargo is the scan, carrying no condition. Scope is the `ci`
+    # job: other jobs compile deliberately narrow slices and are not the lane #560
+    # concerns.
     workflow="$SCRIPT_DIR/../.github/workflows/ci.yml"
     if [ -f "$workflow" ]; then
-        first_ci_phase="$(grep -oE 'scripts/ci\.sh [a-z-]+' "$workflow" | head -1 | awk '{print $2}')"
-        if [ "$first_ci_phase" != "no-stubs-scan" ]; then
-            echo "self-test FAILED: the first scripts/ci.sh phase invoked in .github/workflows/ci.yml must be 'no-stubs-scan'; found '$first_ci_phase'. A cargo-running step ahead of the guard executes PR-controlled build scripts against an unscanned tree (#560)."
-            status=1
-        fi
-        scan_line="$(grep -nE 'scripts/ci\.sh no-stubs-scan' "$workflow" | head -1 | cut -d: -f1)"
-        if [ -n "$scan_line" ]; then
-            guard_start="$((scan_line > 3 ? scan_line - 3 : 1))"
-            if sed -n "${guard_start},${scan_line}p" "$workflow" | grep -qE '^[[:space:]]*if:'; then
-                echo "self-test FAILED: the no-stubs-scan step in .github/workflows/ci.yml carries an 'if:' condition. The scan must run on every suite; gating it leaves the excluded lane compiling PR-controlled code unguarded (#560)."
+        workflow_verdict="$(awk '
+            function flush(   i, line, has_if, runs_cargo, is_scan) {
+                if (!in_step) { return }
+                for (i = 1; i <= n; i++) {
+                    line = buf[i]
+                    # Comment lines never execute. They must be ignored, not just
+                    # for tidiness: the ordering rationale written above the scan
+                    # step names cargo, and counting it would mark the preceding
+                    # step cargo-capable and fail a correct workflow.
+                    if (line ~ /^[ \t]*#/) { continue }
+                    if (line ~ if_re) { has_if = 1 }
+                    if (line ~ /scripts\/ci\.sh/ ||
+                        line ~ /cargo[ \t]+[a-z]/ ||
+                        line ~ /make[ \t]+[a-z]/) { runs_cargo = 1 }
+                    if (line ~ /no-stubs-scan/) { is_scan = 1 }
+                }
+                if (runs_cargo && verdict == "") {
+                    if (!is_scan)      { verdict = "NOTSCAN|" step_name }
+                    else if (has_if)   { verdict = "GATED|" step_name }
+                    else               { verdict = "OK|" step_name }
+                }
+                in_step = 0
+                n = 0
+            }
+            /^  ci:$/                { in_job = 1; next }
+            /^  [a-z0-9_-]+:$/       { flush(); in_job = 0 }
+            !in_job                  { next }
+            match($0, /^ +- /) {
+                flush()
+                # Build the key indent literally rather than with a {n} interval:
+                # interval support differs between the awk implementations on the
+                # Linux and macOS runners, and a regex that silently fails to
+                # match would turn this guard into a no-op.
+                pad = ""
+                for (i = 0; i < RLENGTH; i++) { pad = pad " " }
+                if_re = "^" pad "if:"
+                step_name = $0
+                sub(/^ +- (name|uses): */, "", step_name)
+                in_step = 1
+            }
+            in_step                  { buf[++n] = $0 }
+            END                      { flush(); print verdict }
+        ' "$workflow")"
+        workflow_state="${workflow_verdict%%|*}"
+        workflow_step="${workflow_verdict#*|}"
+        case "$workflow_state" in
+            OK) ;;
+            NOTSCAN)
+                echo "self-test FAILED: in .github/workflows/ci.yml the first step of job 'ci' that can execute cargo is '$workflow_step', not the placeholder scan. A cargo-running step ahead of the guard executes PR-controlled build scripts and proc-macros against an unscanned tree (#560)."
                 status=1
-            fi
-        fi
+                ;;
+            GATED)
+                echo "self-test FAILED: in .github/workflows/ci.yml the placeholder scan step carries an 'if:' condition. The scan must run on every suite; gating it leaves the excluded lane compiling PR-controlled code unguarded (#560)."
+                status=1
+                ;;
+            *)
+                echo "self-test FAILED: could not find any cargo-executing step in job 'ci' of .github/workflows/ci.yml. Either the job was renamed or the guard's scope no longer matches the workflow; this check must not silently pass (#560)."
+                status=1
+                ;;
+        esac
     fi
 
     if [ "$status" -eq 0 ]; then
