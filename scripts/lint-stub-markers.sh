@@ -774,6 +774,22 @@ LSTREEFAILFIXTURE
         fi
     fi
 
+    # Security-ordering regression (#560 follow-up): the placeholder scan phase
+    # must run before any cargo phase in ci.sh, so no PR-controlled build step or
+    # proc-macro runs before the guard reads the tree. A guard running after cargo
+    # could read a committed stub source, the committed allowlist, or this script
+    # itself after a build step replaced it with benign content. Extract run_all's
+    # phase order and assert no-stubs-scan is first; a reorder that moves it after
+    # a cargo phase reopens that mutable-checkout bypass and fails here.
+    ci_sh="$SCRIPT_DIR/ci.sh"
+    if [ -f "$ci_sh" ]; then
+        first_phase="$(awk '/^run_all\(\)/{f=1} f&&/for phase in/{g=1;next} g&&/do$/{exit} g{gsub(/[^a-z-]/,"");if($0!="")print}' "$ci_sh" | head -1)"
+        if [ "$first_phase" != "no-stubs-scan" ]; then
+            echo "self-test FAILED: ci.sh run_all must run 'no-stubs-scan' first (before any cargo phase); found '$first_phase'. Moving the placeholder scan after a cargo phase reopens the mutable-checkout bypass (#560)."
+            status=1
+        fi
+    fi
+
     if [ "$status" -eq 0 ]; then
         echo "lint-stub-markers self-test: OK"
     fi
