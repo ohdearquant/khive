@@ -57,6 +57,11 @@ phase_no_stubs() {
     # call sites. This scans the string literal argument of every panic!/unreachable!
     # call in shipping source for placeholder language (#560).
     sh "$SCRIPT_DIR/lint-stub-markers.sh"
+
+    echo "=== No-Stub Guard (placeholder-string scanner self-test) ==="
+    # Locks in the scanner's own fixture coverage so a future parser change
+    # cannot silently regress it without the fixtures ever running in CI.
+    sh "$SCRIPT_DIR/lint-stub-markers.sh" --self-test
 }
 
 phase_clippy() {

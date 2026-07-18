@@ -35,6 +35,39 @@ pub fn dispatch(kind: &str) -> u32 {
         _ => unreachable!("stub: not implemented for other kinds yet"),
     }
 }
+
+pub fn raw_stub(kind: &str) -> u32 {
+    match kind {
+        "a" => 1,
+        _ => panic!(r#"not implemented for other kinds yet"#),
+    }
+}
+
+pub fn braced_stub(flag: bool) -> u32 {
+    if !flag {
+        panic! { "todo: handle the false branch" }
+    }
+    1
+}
+
+const NOTE: &str = "warning: #[cfg(test)] { this is not a real attribute }";
+
+pub fn after_lookalike_string(flag: bool) -> u32 {
+    if !flag {
+        panic!("not implemented for this flag");
+    }
+    1
+}
+
+#[cfg(test)]
+const GREETING: &str = "x";
+
+pub fn after_nonbraced_cfg_test_item(flag: bool) -> u32 {
+    if !flag {
+        panic!("not implemented after a non-braced cfg(test) item");
+    }
+    1
+}
 FIXTURE
 
     cat > "$tmp/case-pass/crates/fixture-crate/src/lib.rs" <<'FIXTURE'
@@ -46,11 +79,22 @@ pub fn dispatch(kind: &str) -> u32 {
     }
 }
 
+pub fn raw_dispatch(kind: &str) -> u32 {
+    match kind {
+        "a" => 1,
+        _ => panic!(r#"dispatch: unknown kind {kind:?}"#),
+    }
+}
+
 pub fn divide(a: i32, b: i32) -> i32 {
     if b == 0 {
         panic!("divide: b must be non-zero, got {b}");
     }
     a / b
+}
+
+pub fn help_text() -> &'static str {
+    r#"call panic!("stub") to simulate a crash in the demo harness"#
 }
 
 #[cfg(test)]
@@ -75,17 +119,27 @@ FIXTURE
     status=0
 
     if scan "$tmp/case-fail" > "$tmp/fail.log" 2>&1; then
-        echo "self-test FAILED: placeholder unreachable!(\"stub: ...\") was not caught"
+        echo "self-test FAILED: expected placeholder call sites were not caught"
         cat "$tmp/fail.log"
         status=1
-    elif ! grep -q "stub" "$tmp/fail.log"; then
-        echo "self-test FAILED: scan failed, but not for the expected reason:"
-        cat "$tmp/fail.log"
-        status=1
+    else
+        for marker in \
+            "stub: not implemented for other kinds yet" \
+            "not implemented for other kinds yet" \
+            "todo: handle the false branch" \
+            "not implemented for this flag" \
+            "not implemented after a non-braced cfg(test) item"
+        do
+            if ! grep -qF "$marker" "$tmp/fail.log"; then
+                echo "self-test FAILED: expected finding missing: $marker"
+                cat "$tmp/fail.log"
+                status=1
+            fi
+        done
     fi
 
     if ! scan "$tmp/case-pass" > "$tmp/pass.log" 2>&1; then
-        echo "self-test FAILED: legitimate panic!/unreachable! messages (incl. a #[cfg(test)] helper named StubService) false-positived:"
+        echo "self-test FAILED: legitimate panic!/unreachable! messages (raw strings, lookalike text inside strings, a #[cfg(test)] helper named StubService) false-positived:"
         cat "$tmp/pass.log"
         status=1
     fi
@@ -119,16 +173,43 @@ PLACEHOLDER_RE = re.compile(
     r"not\s*implemented|coming\s*soon)\b",
     re.IGNORECASE,
 )
-MACRO_CALL_RE = re.compile(r"\b(panic|unreachable)!\s*\(")
+# Rust accepts whitespace before `!` and any of the three delimiter kinds
+# (`panic!(...)`, `panic!{...}`, `panic![...]`) -- all three are legal macro
+# call syntax, not just parens.
+MACRO_CALL_RE = re.compile(r"\b(panic|unreachable)\s*!\s*([(\{\[])")
 STRING_LIT_RE = re.compile(r'"((?:[^"\\]|\\.)*)"')
 CFG_TEST_RE = re.compile(r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]")
 
 
+def raw_string_end(text, i):
+    """If text[i] starts a raw string literal `r#*"..."#*` (word-boundary
+    checked so an identifier ending in `r` is never mistaken for one), return
+    the offset just past its closing quote+hashes (len(text) if unterminated).
+    Otherwise None."""
+    n = len(text)
+    if text[i] != "r":
+        return None
+    if i > 0 and (text[i - 1].isalnum() or text[i - 1] == "_"):
+        return None
+    j = i + 1
+    hashes = 0
+    while j < n and text[j] == "#":
+        hashes += 1
+        j += 1
+    if j >= n or text[j] != '"':
+        return None
+    closer = '"' + "#" * hashes
+    end = text.find(closer, j + 1)
+    return n if end == -1 else end + len(closer)
+
+
 def strip_comments_and_char_lits(text):
     """Blank out //, /* */ comments and char literals so brace-counting and
-    macro-matching never trip on braces/quotes living inside them. String
-    literals are left untouched -- their content is exactly what this script
-    inspects."""
+    macro-matching never trip on braces/quotes living inside them. Plain and
+    raw string literals are left untouched -- their content is exactly what
+    this script inspects. Raw strings are hand-scanned to their matching
+    "###-count closer so quotes inside them (e.g. `r#"say "hi""#`) do not
+    prematurely end the literal."""
     out = []
     i = 0
     n = len(text)
@@ -172,6 +253,11 @@ def strip_comments_and_char_lits(text):
             out.append("  ")
             i += 2
             continue
+        rs_end = raw_string_end(text, i)
+        if rs_end is not None:
+            out.append(text[i:rs_end])
+            i = rs_end
+            continue
         if c == '"':
             in_string = True
             out.append(c)
@@ -194,22 +280,79 @@ def strip_comments_and_char_lits(text):
     return "".join(out)
 
 
-def test_gated_spans(clean_text):
-    """Byte-offset [start, end) spans of every #[cfg(test)]-attributed item's
-    body -- clippy --lib --bins never compiles these (no --cfg test), so the
-    scanner must not flag placeholder messages living only in test code."""
+def match_string_literal(text, pos):
+    """Match a plain or raw string literal beginning at pos in `text` (which
+    must have string content intact, i.e. `clean`, never the strings-blanked
+    variant). Returns (end_offset, inner_content) or None."""
+    if pos >= len(text):
+        return None
+    if text[pos] == '"':
+        m = STRING_LIT_RE.match(text, pos)
+        return None if m is None else (m.end(), m.group(1))
+    rs_end = raw_string_end(text, pos)
+    if rs_end is None:
+        return None
+    j = pos + 1
+    hashes = 0
+    while text[j] == "#":
+        hashes += 1
+        j += 1
+    return rs_end, text[j + 1 : rs_end - 1 - hashes]
+
+
+def blank_strings(clean_text):
+    """Given `clean` (comments/char-lits stripped, strings intact), replace
+    every plain and raw string literal's content with spaces (newlines kept)
+    so downstream scans (cfg(test) attribute detection, macro-call matching)
+    never mistake text living inside a string literal for real code."""
+    out = list(clean_text)
+    i = 0
+    n = len(clean_text)
+    while i < n:
+        c = clean_text[i]
+        end = None
+        if c == '"':
+            m = STRING_LIT_RE.match(clean_text, i)
+            if m is not None:
+                end = m.end()
+        else:
+            end = raw_string_end(clean_text, i)
+        if end is not None:
+            for k in range(i, end):
+                if out[k] != "\n":
+                    out[k] = " "
+            i = end
+            continue
+        i += 1
+    return "".join(out)
+
+
+def test_gated_spans(code_only):
+    """Byte-offset [start, end) spans of every #[cfg(test)]-attributed item --
+    clippy --lib --bins never compiles these (no --cfg test), so the scanner
+    must not flag placeholder messages living only in test code. Runs on the
+    strings-blanked `code_only` text so a `#[cfg(test)]`-shaped substring
+    living inside a string literal is never mistaken for a real attribute.
+    For a non-braced item (e.g. `#[cfg(test)] const X: u32 = 1;`) the span
+    ends at the terminating `;`, not at some later item's `{` -- braces are
+    only brace-matched when `{` is the item's own opener (i.e. comes before
+    any `;`)."""
     spans = []
-    for m in CFG_TEST_RE.finditer(clean_text):
-        brace_open = clean_text.find("{", m.end())
-        if brace_open == -1:
+    n = len(code_only)
+    for m in CFG_TEST_RE.finditer(code_only):
+        semi = code_only.find(";", m.end())
+        brace = code_only.find("{", m.end())
+        if brace == -1 and semi == -1:
+            continue
+        if semi != -1 and (brace == -1 or semi < brace):
+            spans.append((m.start(), semi + 1))
             continue
         depth = 1
-        i = brace_open + 1
-        n = len(clean_text)
+        i = brace + 1
         while i < n and depth > 0:
-            if clean_text[i] == "{":
+            if code_only[i] == "{":
                 depth += 1
-            elif clean_text[i] == "}":
+            elif code_only[i] == "}":
                 depth -= 1
             i += 1
         spans.append((m.start(), i))
@@ -225,24 +368,27 @@ for path in files:
     with open(path, "r", encoding="utf-8") as fh:
         text = fh.read()
     clean = strip_comments_and_char_lits(text)
-    test_spans = test_gated_spans(clean)
+    code_only = blank_strings(clean)
+    test_spans = test_gated_spans(code_only)
 
-    for m in MACRO_CALL_RE.finditer(clean):
+    for m in MACRO_CALL_RE.finditer(code_only):
         if in_span(m.start(), test_spans):
             continue
-        call_start = m.end() - 1  # the '(' of the macro call
-        # Only consider a string literal immediately after the '(' (allowing
-        # whitespace) -- this is the macro's message argument, not some
-        # unrelated string buried deeper in a multi-arg call.
+        call_start = m.end() - 1  # the opening delimiter char (`(`/`{`/`[`)
+        # Only consider a string literal immediately after the delimiter
+        # (allowing whitespace) -- this is the macro's message argument, not
+        # some unrelated string buried deeper in a multi-arg call. Read the
+        # lookahead from `clean` (strings intact), never `code_only` (which
+        # has blanked exactly the string content being looked for here).
         lookahead = clean[call_start + 1 : call_start + 1 + 40]
         stripped = lookahead.lstrip()
-        if not stripped.startswith('"'):
+        if not (stripped.startswith('"') or stripped.startswith("r")):
             continue
         msg_start = call_start + 1 + (len(lookahead) - len(stripped))
-        msg_m = STRING_LIT_RE.match(clean, msg_start)
+        msg_m = match_string_literal(clean, msg_start)
         if msg_m is None:
             continue
-        message = msg_m.group(1)
+        _, message = msg_m
         if PLACEHOLDER_RE.search(message):
             line_no = clean.count("\n", 0, m.start()) + 1
             macro_name = m.group(1)
