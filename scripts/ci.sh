@@ -48,6 +48,15 @@ phase_no_stubs() {
     cargo clippy --workspace --lib --bins -- $NOSTUB_LINTS
     # shellcheck disable=SC2086
     cargo clippy --manifest-path "$SCRIPT_DIR/../crates/khive-merge/Cargo.toml" --lib --bins -- $NOSTUB_LINTS
+
+    echo "=== No-Stub Guard (placeholder-string panic!/unreachable! scan) ==="
+    # `todo!()`/`unimplemented!()` are denied unconditionally above regardless of
+    # message, but `panic!`/`unreachable!` are legitimate everywhere (assertion
+    # failures, invariant violations) -- clippy has no lint for "the message looks
+    # like a stub", and denying the macros outright would fail hundreds of correct
+    # call sites. This scans the string literal argument of every panic!/unreachable!
+    # call in shipping source for placeholder language (#560).
+    sh "$SCRIPT_DIR/lint-stub-markers.sh"
 }
 
 phase_clippy() {
