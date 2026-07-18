@@ -8,14 +8,16 @@
 # suppressed here, one line per exception, never by loosening the scanner
 # itself.
 #
-# Format: one entry per line, a path-substring and a decoded-message-
-# substring separated by a single TAB. A finding is suppressed iff its file
-# path contains the path-substring AND its decoded message contains the
-# message-substring. Keep both substrings as specific as the real match to
-# avoid over-suppressing unrelated findings. An entry that matches nothing
-# in a given run is not an error. Blank lines and lines starting with `#`
-# are ignored. Adding a line here is a reviewed code change, not a blanket
-# exemption -- justify it in the PR.
+# Format: one entry per line, a repo-relative path and a fully decoded
+# message separated by a single TAB. A finding is suppressed iff BOTH match
+# EXACTLY: the path equals the finding's repo-relative path (as rendered
+# under `crates/...`) AND the message equals the finding's fully decoded
+# panic!/unreachable! message. Matching is exact, not substring, so an entry
+# can never suppress an unrelated finding that merely shares a path prefix or
+# a message fragment. An entry that matches nothing in a given run is not an
+# error. Blank lines and lines starting with `#` are ignored. Adding a line
+# here is a reviewed code change, not a blanket exemption -- justify it in
+# the PR.
 
 # crates/kkernel/src/reindex.rs: a #[cfg(test)] EmbeddingService mock named
 # StubService whose guard message names the mock's own type/method, not a
@@ -23,3 +25,9 @@
 # PLACEHOLDER_RE ("StubService" has no isolated "stub" word), seeded here
 # for the case the mock's naming or the regex broadens later.
 crates/kkernel/src/reindex.rs	StubService::embed must not be called in this test
+
+# Self-test fixture anchor, exercised by `lint-stub-markers.sh --self-test`
+# to prove the committed allowlist loads and suppresses by exact (path,
+# message) match. Inert in a real scan: no `fixture-crate` exists under
+# crates/ in the repo.
+crates/fixture-crate/src/lib.rs	todo: this one is allowlisted and must be suppressed

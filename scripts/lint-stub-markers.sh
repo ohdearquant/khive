@@ -137,6 +137,14 @@ fn const_generic_default_guard<const N: usize = { 4 }>() -> usize {
     }
     N
 }
+
+pub fn split_marker_by_continuation_stub(flag: bool) -> u32 {
+    if !flag {
+        panic!("to\
+                do: a marker split across a backslash-newline continuation must still be caught");
+    }
+    1
+}
 FIXTURE
 
     # Appended via printf (not the quoted heredoc above) so the fixture can
@@ -236,7 +244,7 @@ FIXTURE
     # Exactly 15 markers are seeded in case-fail above; asserting the count
     # (not just substring presence) catches a parser-overmatch regression
     # that would otherwise slip through as an unnoticed extra finding.
-    expected_marker_count=15
+    expected_marker_count=16
 
     if scan "$tmp/case-fail" > "$tmp/fail.log" 2>&1; then
         echo "self-test FAILED: expected placeholder call sites were not caught"
@@ -261,6 +269,7 @@ FIXTURE
             "only catches via unicode escape decoding" \
             "only catches via hex escape decoding" \
             "still not implemented after a backslash-newline string continuation" \
+            "a marker split across a backslash-newline continuation must still be caught" \
             "a placeholder inside a #[cfg(test)] item must now be caught" \
             "mid-message newline injection" \
             "carries a newline and a forged CI workflow command sequence" \
@@ -315,9 +324,13 @@ FIXTURE
         status=1
     fi
 
-    # Allowlist suppression: one fixture finding matches an allowlist entry
-    # (by path substring AND decoded-message substring) and must be
-    # suppressed; a sibling finding that does not match must still surface.
+    # Allowlist suppression exercised against the COMMITTED allowlist file
+    # (no temp override): the committed `stub-marker-allowlist.txt` carries a
+    # self-test fixture anchor whose exact (repo-relative path, full message)
+    # pair matches the allowlisted fixture below, so a broken committed file
+    # (bad format, wrong path form) fails this test. Exact-match is checked in
+    # both directions -- the anchor-matching finding is suppressed, and a
+    # sibling with a different message at the same path still surfaces.
     mkdir -p "$tmp/case-allowlist/crates/fixture-crate/src"
     cat > "$tmp/case-allowlist/crates/fixture-crate/src/lib.rs" <<'ALWFIXTURE'
 pub fn allowlisted_stub() -> u32 {
@@ -328,15 +341,14 @@ pub fn not_allowlisted_stub() -> u32 {
     panic!("todo: this one is NOT allowlisted and must still be caught")
 }
 ALWFIXTURE
-    printf 'fixture-crate/src/lib.rs\tthis one is allowlisted\n' > "$tmp/self-test-allowlist.txt"
 
-    if STUB_MARKER_ALLOWLIST="$tmp/self-test-allowlist.txt" scan "$tmp/case-allowlist" > "$tmp/allowlist.log" 2>&1; then
+    if scan "$tmp/case-allowlist" > "$tmp/allowlist.log" 2>&1; then
         echo "self-test FAILED: the non-allowlisted sibling finding should have failed the scan"
         cat "$tmp/allowlist.log"
         status=1
     else
-        if grep -qF 'this one is allowlisted' "$tmp/allowlist.log"; then
-            echo "self-test FAILED: an allowlisted finding was not suppressed"
+        if grep -qF 'this one is allowlisted and must be suppressed' "$tmp/allowlist.log"; then
+            echo "self-test FAILED: an allowlisted finding (exact committed-allowlist match) was not suppressed"
             cat "$tmp/allowlist.log"
             status=1
         fi
@@ -380,7 +392,7 @@ scan() {
 
     allowlist="${STUB_MARKER_ALLOWLIST:-$SCRIPT_DIR/stub-marker-allowlist.txt}"
 
-    python3 - "$file_list" "$allowlist" <<'PY'
+    python3 - "$file_list" "$allowlist" "$root" <<'PY'
 import os
 import re
 import sys
@@ -389,6 +401,7 @@ with open(sys.argv[1], "rb") as fh:
     files = sorted(os.fsdecode(f) for f in fh.read().split(b"\0") if f)
 
 ALLOWLIST_PATH = sys.argv[2]
+SCAN_ROOT = sys.argv[3]
 
 PLACEHOLDER_RE = re.compile(
     r"\b(stub|todo|fixme|placeholder|unimplemented|not\s*yet\s*implemented|"
@@ -413,6 +426,12 @@ STRING_LIT_RE = re.compile(r'"((?:[^"\\]|\\.)*)"', re.DOTALL)
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b.")
 CLOSERS = {"(": ")", "{": "}", "[": "]"}
 ESCAPE_RE = re.compile(r"\\(n|r|t|\\|\"|'|0|x[0-9A-Fa-f]{2}|u\{[0-9A-Fa-f]+\})")
+# Rust string-continuation escape: a `\` immediately followed by a newline
+# removes the `\`, the newline, and the following whitespace (Rust reference,
+# "String continuation escapes"). A placeholder marker split across such a
+# continuation (`"to\<newline>    do"` == "todo") would otherwise evade
+# PLACEHOLDER_RE, so it is stripped before any other escape is decoded.
+STRING_CONTINUATION_RE = re.compile(r"\\\r?\n\s*")
 SIMPLE_ESCAPES = {"n": "\n", "r": "\r", "t": "\t", "\\": "\\", '"': '"', "'": "'", "0": "\0"}
 
 
@@ -636,10 +655,15 @@ def decode_rust_escapes(body, is_raw):
     """Decode the Rust string-literal escapes a PLACEHOLDER_RE match needs
     to see through (\\n \\r \\t \\\\ \\" \\' \\0, \\xNN, \\u{...}) so an
     escape-obfuscated placeholder (e.g. `panic!("t\\u{6f}do: ...")`) is
-    still caught. Raw literals (`r"..."`, `r#"..."#`) have no escapes --
-    returned unchanged. Any other backslash sequence is left as-is."""
+    still caught. A backslash-newline string continuation is collapsed first
+    (STRING_CONTINUATION_RE) so a placeholder split across a line
+    continuation is rejoined before matching. Raw literals (`r"..."`,
+    `r#"..."#`) have no escapes -- returned unchanged. Any other backslash
+    sequence is left as-is."""
     if is_raw:
         return body
+
+    body = STRING_CONTINUATION_RE.sub("", body)
 
     def repl(m):
         tok = m.group(1)
@@ -653,11 +677,13 @@ def decode_rust_escapes(body, is_raw):
 
 
 def load_allowlist(path):
-    """Parse `<path-substring>\\t<message-substring>` entries from the
-    allowlist file at `path`. Blank lines and lines starting with `#` (after
-    stripping leading whitespace) are ignored. A missing file (e.g. a caller
-    override pointing at a path that does not exist) is an empty allowlist,
-    not an error."""
+    """Parse `<repo-relative-path>\\t<exact-decoded-message>` entries from the
+    allowlist file at `path`. Each entry suppresses a finding only when both
+    fields match exactly (see is_allowlisted) -- the repo-relative path (as
+    rendered under `crates/...`) and the fully decoded panic!/unreachable!
+    message. Blank lines and lines starting with `#` (after stripping leading
+    whitespace) are ignored. A missing file (e.g. a caller override pointing
+    at a path that does not exist) is an empty allowlist, not an error."""
     entries = []
     if not os.path.isfile(path):
         return entries
@@ -668,23 +694,26 @@ def load_allowlist(path):
                 continue
             if "\t" not in line:
                 continue
-            path_sub, message_sub = line.split("\t", 1)
-            entries.append((path_sub, message_sub))
+            entry_path, entry_message = line.split("\t", 1)
+            entries.append((entry_path, entry_message))
     return entries
 
 
-def is_allowlisted(path, message, entries):
-    """A finding is suppressed iff some entry's path-substring is contained
-    in the file path AND its message-substring is contained in the decoded
-    panic!/unreachable! message. An entry that matches nothing in a given
-    run is not an error."""
-    return any(path_sub in path and message_sub in message for path_sub, message_sub in entries)
+def is_allowlisted(rel_path, message, entries):
+    """A finding is suppressed iff some entry matches it EXACTLY: the entry's
+    repo-relative path equals the finding's repo-relative path AND the
+    entry's message equals the finding's fully decoded panic!/unreachable!
+    message. Exact (not substring) so an allowlisted entry can never suppress
+    an unrelated NEW marker that merely shares a path prefix or a message
+    fragment. An entry that matches nothing in a given run is not an error."""
+    return any(rel_path == entry_path and message == entry_message for entry_path, entry_message in entries)
 
 
 allowlist = load_allowlist(ALLOWLIST_PATH)
 
 findings = []
 for path in files:
+    rel_path = os.path.relpath(path, SCAN_ROOT).replace(os.sep, "/")
     with open(path, "r", encoding="utf-8") as fh:
         text = fh.read()
     clean = strip_comments_and_char_lits(text)
@@ -704,11 +733,11 @@ for path in files:
         message = "".join(decode_rust_escapes(content, is_raw) for content, is_raw in parts)
         if not PLACEHOLDER_RE.search(message):
             continue
-        if is_allowlisted(path, message, allowlist):
+        if is_allowlisted(rel_path, message, allowlist):
             continue
         line_no = clean.count("\n", 0, m.start()) + 1
         macro_name = m.group(1)
-        safe_path = sanitize_for_ci(path)
+        safe_path = sanitize_for_ci(rel_path)
         safe_message = sanitize_for_ci(message)
         findings.append(f"{safe_path}:{line_no}: {macro_name}!(\"{safe_message}\") reads as a placeholder stub, not a real error path")
 
