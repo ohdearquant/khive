@@ -805,54 +805,79 @@ LSTREEFAILFIXTURE
     # no condition. Scope is the `ci` job: other jobs compile deliberately narrow
     # slices and are not the lane #560 concerns.
     #
-    # python3 is already required by this script (see the scan loop). PyYAML is the
-    # one added dependency, and its absence HARD-FAILS rather than skipping: a
-    # guard that silently downgrades to "no check" is worse than no guard, because
-    # it reports success.
+    # python3 is already required by this script (see the scan loop); no library
+    # beyond the stdlib is used, because the macOS runner's /usr/bin/python3 has
+    # no PyYAML and installing one before the guard would put a network step
+    # ahead of the thing that must run first.
+    #
+    # The parse is line-structural, so it handles only block-style steps. That is
+    # sufficient because it REFUSES what it cannot analyze: a flow-style step or a
+    # merge key inside the job fails the check rather than passing unexamined.
+    # Every construct below is therefore either understood or rejected, never
+    # silently skipped.
     workflow="$SCRIPT_DIR/../.github/workflows/ci.yml"
     if [ -f "$workflow" ]; then
         workflow_verdict="$(WORKFLOW="$workflow" python3 - <<'PYWF'
 import os, re, sys
 
-try:
-    import yaml
-except ImportError:
-    print("NOPARSER|")
-    sys.exit(0)
+lines = open(os.environ["WORKFLOW"], encoding="utf-8").read().splitlines()
 
-try:
-    with open(os.environ["WORKFLOW"], encoding="utf-8") as fh:
-        doc = yaml.safe_load(fh)
-except Exception as exc:
-    print("UNPARSEABLE|%s" % exc)
-    sys.exit(0)
-
-job = ((doc or {}).get("jobs") or {}).get("ci")
-if not isinstance(job, dict):
+# Locate the `ci` job and the extent of its block.
+job_at = None
+for i, line in enumerate(lines):
+    if re.match(r"^  ci:\s*$", line):
+        job_at = i
+        break
+if job_at is None:
     print("NOJOB|")
     sys.exit(0)
 
-# A step that shells to ci.sh runs cargo transitively; one naming a cargo or make
-# subcommand runs it directly. `rustup which cargo` prints a path and builds
-# nothing, so a bare "cargo" with no following subcommand does not count.
-runs_cargo = re.compile(r"scripts/ci\.sh|cargo[ \t]+[a-z]|make[ \t]+[a-z]")
+job = []
+for line in lines[job_at + 1:]:
+    if line.strip() and not line.startswith("   "):
+        break
+    job.append(line)
+
+# `if:`, `if :`, `"if":` and `'if':` are one key to YAML and four strings to a
+# matcher. All four gate the step, so all four must be recognized.
+IF_KEY = re.compile(r"""^\s*(?:if|"if"|'if')\s*:""")
+# ci.sh runs cargo transitively; a cargo/make subcommand runs it directly.
+# `rustup which cargo` prints a path and builds nothing, so a bare "cargo" with
+# no following subcommand does not count.
+RUNS_CARGO = re.compile(r"scripts/ci\.sh|cargo[ \t]+[a-z]|make[ \t]+[a-z]")
+STEP_START = re.compile(r"^(\s+)-\s")
+
+steps, cur, key_indent = [], None, 0
+for line in job:
+    if re.match(r"^\s*<<\s*:", line):
+        print("UNANALYZABLE|a merge key in the ci job means steps cannot be read from the text")
+        sys.exit(0)
+    m = STEP_START.match(line)
+    if m:
+        if re.match(r"^\s+-\s*[\{\[]", line):
+            print("UNANALYZABLE|a flow-style step in the ci job cannot be read from the text")
+            sys.exit(0)
+        if cur is not None:
+            steps.append((cur, key_indent))
+        cur, key_indent = [line], len(m.group(0))
+    elif cur is not None:
+        cur.append(line)
+if cur is not None:
+    steps.append((cur, key_indent))
 
 verdict = "NOCARGO|"
-for step in job.get("steps") or []:
-    if not isinstance(step, dict):
-        continue
-    run = step.get("run") or ""
+for body_lines, indent in steps:
     # Comment lines never execute, and the ordering rationale written above the
     # scan step names cargo; counting it would fail a correct workflow.
-    body = "\n".join(
-        line for line in run.splitlines() if not line.lstrip().startswith("#")
-    )
-    if not runs_cargo.search(body):
+    live = [l for l in body_lines if not l.lstrip().startswith("#")]
+    body = "\n".join(live)
+    if not RUNS_CARGO.search(body):
         continue
-    name = step.get("name") or step.get("uses") or "(unnamed step)"
+    name = body_lines[0].split(":", 1)[-1].strip() or "(unnamed step)"
+    gated = any(IF_KEY.match(l) and len(l) - len(l.lstrip()) == indent for l in live)
     if "no-stubs-scan" not in body:
         verdict = "NOTSCAN|%s" % name
-    elif "if" in step:
+    elif gated:
         verdict = "GATED|%s" % name
     else:
         verdict = "OK|%s" % name
@@ -865,12 +890,8 @@ PYWF
         workflow_step="${workflow_verdict#*|}"
         case "$workflow_state" in
             OK) ;;
-            NOPARSER)
-                echo "self-test FAILED: PyYAML is not importable, so the workflow ordering check cannot run. Install it (pip install pyyaml) -- this check must not be skipped, because a guard that silently downgrades to no check still reports success (#560)."
-                status=1
-                ;;
-            UNPARSEABLE)
-                echo "self-test FAILED: .github/workflows/ci.yml did not parse as YAML: $workflow_step"
+            UNANALYZABLE)
+                echo "self-test FAILED: the ordering check cannot read .github/workflows/ci.yml: $workflow_step. Use block-style steps in the 'ci' job so the guard can verify the placeholder scan runs first and ungated; this check refuses to pass on a shape it cannot examine (#560)."
                 status=1
                 ;;
             NOJOB)
