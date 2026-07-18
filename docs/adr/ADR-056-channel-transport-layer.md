@@ -505,19 +505,37 @@ channel-down warning and does not affect any other configured channel or fault t
 **Pinned bridge host identity.** Every `ssh` invocation this adapter makes uses a dedicated
 known-hosts file, `~/.khive/imessage_known_hosts`, provisioned during one-time setup with the
 bridge host's genuine host key, and passes strict host-key checking and batch mode
-(`-o UserKnownHostsFile=~/.khive/imessage_known_hosts -o StrictHostKeyChecking=yes
--o BatchMode=yes`) explicitly on the invocation. The adapter never inherits the operator's own
-`~/.ssh/config`, never relies on SSH agent-based host trust, and never falls back to
-trust-on-first-use for host identity: an unrecognized or changed host key is refused, not
-recorded. Without this pin, a party on the local network positioned to intercept or substitute
-the bridge connection could present its own host key, be silently trusted on first use, and then
-serve fabricated `chat.db` rows that satisfy every sender-validation check below -- a trusted
-instruction injection into the maintainer's inbox -- while also reading every outbound message
-the adapter sends. A host-key mismatch stops the channel for that invocation, is counted, and the
-resulting warning names the known-hosts file so the operator knows exactly what to inspect and,
-once the change is verified legitimate, deliberately update. Acceptance property: a bridge host
-presenting a host key that does not match the pinned entry refuses all transport until the pinned
-entry is deliberately updated; the mismatch is never auto-accepted.
+(`-F none -o UserKnownHostsFile=~/.khive/imessage_known_hosts -o GlobalKnownHostsFile=/dev/null
+-o StrictHostKeyChecking=yes -o BatchMode=yes`) explicitly on the invocation. The adapter never
+inherits the operator's own `~/.ssh/config`, never relies on SSH agent-based host trust, and
+never falls back to trust-on-first-use for host identity: an unrecognized or changed host key is
+refused, not recorded. Without this pin, a party on the local network positioned to intercept or
+substitute the bridge connection could present its own host key, be silently trusted on first
+use, and then serve fabricated `chat.db` rows that satisfy every sender-validation check below --
+a trusted instruction injection into the maintainer's inbox -- while also reading every outbound
+message the adapter sends. A host-key mismatch stops the channel for that invocation, is counted,
+and the resulting warning names the known-hosts file so the operator knows exactly what to
+inspect and, once the change is verified legitimate, deliberately update. Acceptance property: a
+bridge host presenting a host key that does not match the pinned entry refuses all transport
+until the pinned entry is deliberately updated; the mismatch is never auto-accepted.
+
+**Client-side config isolation.** `-F none` is the literal argument OpenSSH's client documents
+for suppressing configuration-file processing entirely -- both the system-wide
+`/etc/ssh/ssh_config` and the per-user `~/.ssh/config` -- rather than a path substitution, so an
+operator-controlled `~/.ssh/config` can never inject a `ProxyCommand`, a `Match exec` directive,
+or any other override into a session opened with this key. `GlobalKnownHostsFile` is a
+file-path-valued option (default `/etc/ssh/ssh_known_hosts` and `/etc/ssh/ssh_known_hosts2`), not
+a toggle, so disabling it takes a path to an empty source rather than the word "none": pointing it
+at `/dev/null` makes the dedicated `UserKnownHostsFile` above the sole host-trust source for this
+adapter's connections, with no fallback to the system-wide known-hosts database. Together these
+close the gap the pinned-host-identity pin above does not by itself: a correct
+`UserKnownHostsFile` pin still leaves a hostile local `~/.ssh/config` or a stale
+`/etc/ssh/ssh_known_hosts` entry able to redirect or pre-authorize a connection before the pin is
+even consulted. Acceptance property: a hostile `~/.ssh/config` `ProxyCommand` or `Match exec`
+directive placed on the invoking account never executes as part of this adapter's `ssh`
+invocations, and an entry in the global known-hosts database that would otherwise satisfy host
+verification does not substitute for a matching entry in the dedicated
+`~/.khive/imessage_known_hosts` file.
 
 **Transport deadlines and recovery.** Each `ssh` invocation runs under a total wall-clock
 deadline of 30 seconds enforced by the adapter itself, which kills and reaps the child process on
@@ -578,6 +596,65 @@ names the adversarial case directly: a test asserting that a `KHIVE_IMESSAGE_DB_
 containing shell metacharacters (backticks, `$( )`, semicolons, quotes) delivered through the
 configured path cannot alter the remote command the bridge host executes, distinct from and in
 addition to the local-side `KHIVE_IMESSAGE_SSH_TARGET` validation above.
+
+### Helper artifact and protocol versioning
+
+The fixed remote helper is an owned, versioned artifact, not an ad hoc script assembled at setup
+time. It ships as a small script (or binary, for environments where a shell dependency is
+undesirable) checked into the `khive-channel-imessage` crate alongside the adapter code that
+invokes it, so the helper and the adapter's expectations of it evolve in the same repository and
+the same review. One-time bridge-host setup copies this checked-in artifact to a fixed path on
+the bridge host (the same path named in the forced `command=` binding below) and records its
+embedded version alongside the other one-time provisioning steps (host-key pinning, permission
+grants) described elsewhere in this document; upgrading the helper is a deliberate, operator-run
+re-copy, never something the daemon does to the bridge host over the SSH channel it also uses for
+polling and sending.
+
+The stdin/stdout contract between the adapter and the helper is itself versioned, not an
+implicit, unversioned shape inferred from field names. Every request the adapter writes to the
+helper's stdin carries an explicit protocol version field and an operation discriminator (poll,
+send, or any future operation), and the helper's structured stdout response carries the same
+protocol version field back alongside either a result payload or a structured error. The adapter
+refuses to proceed -- treating the invocation as a transport failure under §Transport deadlines
+and recovery above -- when the version the helper reports does not match the version the adapter
+expects; a version mismatch is a hard refusal, never a silent best-effort attempt to interpret an
+unrecognized shape. Because the helper is upgraded independently of the daemon (a bridge-host-local,
+operator-run step, above), the adapter is written to tolerate the helper being one version behind
+what the adapter itself would emit as its preferred version and to refuse cleanly rather than
+guess when the gap is larger than that: the daemon's own release upgrades the adapter first, and
+the bridge-host helper is expected to follow before the adapter's minimum-supported version is
+raised past what the deployed helper reports. This versioned request/response/error contract is
+the protocol half of the trust boundary the forced-command binding below establishes on the server
+side: the boundary is not just "only this one binary can run" but "only this one binary, speaking
+a version it explicitly negotiates, can run." Acceptance property: an adapter invocation against a
+helper reporting a protocol version the adapter does not support fails closed as a transport
+failure, without attempting to parse the mismatched response as if it were a supported shape.
+
+### Server-side key confinement: forced command and `restrict`
+
+Pinning the client to a fixed remote helper and data-only stdin (above) constrains what the
+daemon's own `ssh` invocations can do, but by itself says nothing about what the bridge host will
+accept from that key if the key is ever exfiltrated. The bridge account carries Full Disk Access
+and Automation permission for the Messages application (§Host requirements below), so a stolen key
+usable for an arbitrary interactive session is arbitrary remote code execution against those
+grants. This adapter therefore requires a matching server-side constraint on the same key, not
+merely a client-side convention: the daemon's SSH public key, as provisioned in the bridge
+account's `authorized_keys` during one-time setup, carries the `restrict` option together with a
+forced command binding it to the fixed remote helper's absolute installed path --
+`restrict,command="/absolute/path/to/imessage-bridge-helper" ssh-ed25519 AAAA...` in
+`authorized_keys` shape. `restrict` disables PTY allocation, port forwarding, agent forwarding,
+X11 forwarding, and tunneling for sessions opened with that key; the forced `command=` binding
+means the bridge host's `sshd` runs the named helper for every session opened with that key
+regardless of what command the client requests, so the client-side fixed-invocation convention
+above is backed by a server-side guarantee rather than trusted as client behavior alone. Forced
+command (server side) and data-only structured stdin (client and protocol side, above) are the two
+halves of one trust boundary: even a fully compromised daemon holding this key, free to send
+`ssh` whatever remote command string it chooses, cannot cause the bridge host to run anything but
+the fixed helper, and the helper's own versioned protocol (above) is the only channel through
+which that compromised daemon could attempt to make the helper misbehave. Acceptance property:
+using this key to request an arbitrary remote command, a PTY, or any form of forwarding or
+tunneling fails at the bridge host's `sshd`; only the fixed helper ever executes, regardless of
+what remote command the client requests.
 
 ### Outbound: the fixed remote helper, no text interpolation
 
@@ -734,12 +811,21 @@ different messages. Guarding against this requires the explicit, additive schema
 above: a new optional opaque `anchor` text column on `comm_channel_cursor`, nullable, delivered
 as a schema migration alongside the corresponding `comm.cursor_get`/`comm.cursor_commit` API
 surface change to read and write it. The email and Telegram adapters leave this column null and
-are otherwise unaffected; the iMessage adapter is the first caller to populate it, storing the
-GUID of the last-ingested row at the checkpoint `ROWID` there (the same `chat.db` message GUID
-used for dedup below, applied here to a different purpose: identity of the anchor row, not
-overlap protection for retries). Before applying the stored high-water mark, each poll first
-re-reads that `ROWID` from the remote `chat.db` and verifies its GUID still matches the stored
-`anchor`:
+are otherwise unaffected; the iMessage adapter is the first caller to populate it. The anchor is
+always the GUID of the row the high-water mark points at -- the last handled row, whether it was
+ingested or terminally dropped. This is deliberate, not an approximation: §Terminal disposition
+above establishes that the checkpoint's `ROWID` floor advances past a terminally dropped row
+exactly as it does past an ingested one, so a page whose final row was dropped still leaves
+`high_water` pointing at that row, and the stored `anchor` must name that same row's GUID for the
+identity guard below to compare like against like. Storing the last-_ingested_ row's GUID instead
+would be wrong precisely in this case: when a page ends on a dropped row, `high_water` points past
+it while a last-ingested anchor would name an earlier row, so the re-read below would deterministically
+compare the wrong row's GUID against the wrong `ROWID` and misreport a mismatch on every such page
+-- forcing a spurious forward-only reset that permanently skips the valid rows between the two
+(the same `chat.db` message GUID used for dedup below is reused here for a different purpose:
+identity of the anchor row, not overlap protection for retries). Before applying the stored
+high-water mark, each poll first re-reads the row at that same `ROWID` from the remote `chat.db`
+and verifies its GUID still matches the stored `anchor`:
 
 - **Match**: the stored high-water mark is trusted; the poll proceeds as normal.
 - **Mismatch, or the `ROWID` no longer exists** (the database was replaced, reset, migrated, or
@@ -755,7 +841,9 @@ first activation, below), it is always loudly counted rather than silent, and th
 applying an old high-water `ROWID` to a database that may no longer be the one it was recorded
 against -- risks silently skipping unrelated rows or ingesting the wrong conversation's history
 under a stale mark. The guard's job is narrower than perfect continuity: a stale mark is never
-applied once the GUID check fails.
+applied once the GUID check fails. Acceptance property: a page whose final row is terminally
+dropped does not trigger a forward-only reset on the next poll; the stored anchor matches the
+dropped final row's GUID and the high-water mark is trusted.
 
 **The widened cursor contract, precisely.** The field belongs on the type the poller actually
 commits, not only on the type storage returns. `ChannelPollPage` (§Amendment 2026-07-09) carries a
@@ -790,17 +878,35 @@ same `ChannelCheckpoint` value, so the reset commits atomically with the rest of
 than as a separate write. This is the precise, API-level statement of the `cursor_get -> poll_page
 -> handle each -> cursor_commit` sequencing described in §Restart durability above.
 
-**Migration: owner and sequence.** The comm pack owns `comm_channel_cursor`, so this schema
-change ships as a versioned pack-schema migration under the pack-scoped backend rules of ADR-028,
-not a core `khive-db` migration. A `CREATE TABLE IF NOT EXISTS` statement cannot alter an
-existing table's primary key, so widening the uniqueness key to three columns requires a full
-table rebuild rather than an in-place `ALTER TABLE`. The migration: creates a new table carrying
-the three-column primary key `(channel_kind, channel_slug, source)` and the new `anchor` column;
-copies every existing row into it, backfilling `source` with each adapter's own constant source
-value (the email adapter's `imap+tls:{host}:{port}:{mailbox}:INBOX` shape); drops the old table;
-and renames the new table into its place. Acceptance property: an upgraded database preserves
-every pre-existing cursor row's progress -- no adapter's high-water mark regresses or is lost
-across the migration.
+**Migration: owner and sequence.** The comm pack owns `comm_channel_cursor`, and today ships it
+via a constant `CREATE TABLE IF NOT EXISTS` declaration (`COMM_CHANNEL_CURSOR_SCHEMA_STMT`) with a
+two-column primary key `(channel_kind, channel_slug)` -- idempotent on a fresh database, but a
+no-op against an existing table, so it cannot by itself add the `anchor` column or widen the
+primary key on a database that already has this table. Adding both requires an actual schema
+migration, and ADR-028's `ServiceSchemaPlan` mechanism -- per-pack versioned migrations applied
+idempotently at boot and tracked one row per migration in the existing `_schema_migrations` table
+-- is that vehicle for a pack-owned table: this is the general case ADR-015 deferred for v1
+("pack tables work via idempotent `CREATE IF NOT EXISTS`"), which ADR-028 later supersedes by
+introducing `ServiceSchemaPlan` for exactly the case this table now needs. This amendment
+therefore ships as a `ServiceSchemaPlan`-registered, versioned CommPack migration, not a further
+extension of the constant `CREATE TABLE IF NOT EXISTS` statement and not a core `khive-db`
+migration.
+
+Because `CREATE TABLE IF NOT EXISTS` cannot alter an existing table's primary key, widening the
+uniqueness key to three columns requires a full table rebuild rather than an in-place
+`ALTER TABLE`. The migration: creates a new table carrying the three-column primary key
+`(channel_kind, channel_slug, source)` and the new `anchor` column; copies every existing row into
+it, backfilling `source` with each adapter's own constant source value (the email adapter's
+`imap+tls:{host}:{port}:{mailbox}:INBOX` shape); drops the old table; renames the new table into
+its place; and records itself as a completed migration in `_schema_migrations`, so it runs exactly
+once per database. The pack's `COMM_CHANNEL_CURSOR_SCHEMA_STMT` constant is retired in the same
+change -- replaced by the versioned migration as the sole source of this table's schema -- so a
+fresh install and an upgraded existing database converge on the identical final three-column-PK,
+`anchor`-bearing shape rather than a fresh install landing on the old two-column shape by one path
+while an upgrade reaches the new shape by another. Acceptance property: an upgraded database
+preserves every pre-existing cursor row's progress -- no adapter's high-water mark regresses or is
+lost across the migration -- and a fresh database created after this change has the three-column
+primary key and the `anchor` column from first boot, never the retired two-column shape.
 
 **Bounded drain per tick.** The poll query is anchored on `chat.db`'s own monotone insertion
 key, the message table's `ROWID`: each poll fetches rows with `ROWID` strictly greater than the
@@ -967,6 +1073,19 @@ does not depend on the Telegram pass-through landing first.
     source B and back to A resumes source A's own checkpoint row at its own high-water mark; rows
     that arrived in source A's database while source B was active are ingested on return, never
     skipped.
+13. A page whose final row is terminally dropped (§Terminal disposition) does not trigger a
+    forward-only reset on the next poll: the stored `anchor` names that dropped row's GUID, the
+    re-read at the checkpoint `ROWID` matches it, and the stored high-water mark is trusted.
+14. Using the daemon's bridge-account SSH key to request an arbitrary remote command, a PTY, or
+    any form of port, agent, or X11 forwarding or tunneling fails at the bridge host's `sshd`;
+    only the fixed remote helper, at its forced-command path, ever executes for that key.
+15. A hostile `~/.ssh/config` (or `/etc/ssh/ssh_config`) `ProxyCommand` or `Match exec` directive
+    on the daemon's own account never executes as part of this adapter's `ssh` invocations, and an
+    entry in the global known-hosts database that would otherwise satisfy host verification does
+    not substitute for a matching entry in the dedicated `~/.khive/imessage_known_hosts` file.
+16. An adapter invocation against a helper reporting a protocol version the adapter does not
+    support fails closed as a transport failure; the mismatched response is never parsed as if it
+    were a supported shape.
 
 ### Consequences
 
