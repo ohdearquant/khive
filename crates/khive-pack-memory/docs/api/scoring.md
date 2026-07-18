@@ -46,9 +46,7 @@ Explicit caller `entity_names` take precedence over derived candidates.
 
 ## Query language routing
 
-`is_cjk_char` recognizes Unified CJK, Extensions A and B, compatibility ideographs, Hiragana, Katakana, and Hangul syllables. `contains_cjk` returns true when CJK exceeds 15% of all characters.
-
-`needs_multilingual` uses a different denominator: it routes when more than 15% of alphabetic characters are non-ASCII. Punctuation, digits, and whitespace do not dilute the ratio, so `Müller`, `Müller?`, and `Müller!!!` route identically. It covers CJK, Cyrillic, Arabic, Devanagari, Hebrew, Thai, accented Latin, and other Unicode alphabetic scripts. ASCII-only non-English text is a known limitation and continues to the primary model unless a separate language detector is introduced.
+`is_cjk_char` recognizes Unified CJK, Extensions A and B, compatibility ideographs, Hiragana, Katakana, and Hangul syllables. `contains_cjk` returns true when CJK exceeds 15% of all characters; it gates only the FTS CJK-bypass tokenizer path (see recall-pipeline.md), not vector engine selection.
 
 ## `normalize_min_score`
 
@@ -82,4 +80,4 @@ The score is `sum(weight * feature) / sum(positive weights)`. Unknown names are 
 
 `ScoringConfig::apply_dos_caps` clamps candidates to 500, token budget to 16,000, and result limit to 200. Defaults are 200 candidates, 4,000 tokens, and 10 results. MMR applies a default `0.1` penalty when the first 100 characters duplicate an earlier result.
 
-Supersedes suppression and multilingual routing are enabled by default. A configured multilingual model is preferred; otherwise registered model names containing `multilingual` or `paraphrase` are candidates.
+Supersedes suppression is enabled by default. Recall always fans out across every registered embedding engine and fuses the results (issue #1115) — there is no per-query engine selection to configure.

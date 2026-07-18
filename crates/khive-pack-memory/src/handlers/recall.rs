@@ -21,8 +21,8 @@ use khive_storage::EdgeRelation;
 use crate::config::{RecallConfig, ScoreBreakdown};
 use crate::rerank::{weighted_rerank, RerankFeatures};
 use crate::scoring::{
-    calculate_score, contains_cjk, extract_entity_candidates, needs_multilingual,
-    normalize_min_score, normalize_rank_fusion_scores, normalize_rrf_scores, ScoreInput,
+    calculate_score, contains_cjk, extract_entity_candidates, normalize_min_score,
+    normalize_rank_fusion_scores, normalize_rrf_scores, ScoreInput,
 };
 use crate::MemoryPack;
 
@@ -129,9 +129,7 @@ impl MemoryPack {
         let mut scoring_cfg = cfg.scoring.clone().unwrap_or_default();
         scoring_cfg.apply_dos_caps();
 
-        let cjk_fts_bypass = scoring_cfg.enable_multilingual_routing && contains_cjk(query_trimmed);
-        let use_multilingual =
-            scoring_cfg.enable_multilingual_routing && needs_multilingual(query_trimmed);
+        let cjk_fts_bypass = contains_cjk(query_trimmed);
 
         let candidate_limit =
             recall_candidate_count(&cfg, limit_u32).min(scoring_cfg.max_recall_candidates as u32);
@@ -224,8 +222,6 @@ impl MemoryPack {
                     candidate_limit: current_candidate_limit,
                     embedding_model: p.embedding_model.as_deref(),
                     cjk_fts_bypass,
-                    use_multilingual,
-                    scoring_cfg: &scoring_cfg,
                     snippet_policy: TextSnippetPolicy::Omit,
                     fts_gather: &effective_fts_gather,
                     ann_overfetch_max_rounds,
@@ -263,8 +259,6 @@ impl MemoryPack {
                         candidate_limit: current_candidate_limit,
                         embedding_model: p.embedding_model.as_deref(),
                         cjk_fts_bypass,
-                        use_multilingual,
-                        scoring_cfg: &scoring_cfg,
                         snippet_policy: TextSnippetPolicy::Omit,
                         fts_gather: &effective_fts_gather,
                         ann_overfetch_max_rounds,
@@ -294,7 +288,6 @@ impl MemoryPack {
             t_stage = Some(Instant::now());
         }
 
-        let actual_multilingual_routed = candidates.multilingual_routed;
         // #836: at least one embedding model's vector leg hit the bounded
         // ANN readiness wait and was served FTS-only for this recall.
         let ann_degraded = candidates.ann_degraded;
@@ -702,9 +695,6 @@ impl MemoryPack {
                 });
                 if is_verbose {
                     result["breakdown"] = json!(sn.breakdown);
-                }
-                if actual_multilingual_routed {
-                    result["multilingual_routed"] = json!(true);
                 }
                 if ann_degraded {
                     // Per-result stamp keeps degradation visible without verbose output.

@@ -119,8 +119,6 @@ impl MemoryPack {
                     candidate_limit,
                     embedding_model: p.embedding_model.as_deref(),
                     cjk_fts_bypass: false,
-                    use_multilingual: false,
-                    scoring_cfg: &scoring_cfg,
                     snippet_policy: TextSnippetPolicy::Include {
                         chars: RECALL_DIAGNOSTIC_SNIPPET_CHARS,
                     },
@@ -237,8 +235,6 @@ impl MemoryPack {
                     candidate_limit,
                     embedding_model: p.embedding_model.as_deref(),
                     cjk_fts_bypass: false,
-                    use_multilingual: false,
-                    scoring_cfg: &scoring_cfg_fuse,
                     snippet_policy: TextSnippetPolicy::Include {
                         chars: RECALL_DIAGNOSTIC_SNIPPET_CHARS,
                     },

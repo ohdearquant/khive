@@ -25,11 +25,20 @@ impl KnowledgeHandlers {
         let rebuild_ann = p.rebuild_ann.unwrap_or(false);
         let ns = token.namespace().as_str().to_owned();
 
-        if runtime.default_embedder_name().is_empty() {
+        let default_model_name = runtime.default_embedder_name();
+        if default_model_name.is_empty() {
             return Ok(
                 json!({ "indexed": 0, "skipped": 0, "failed": 0, "total": 0, "reason": "no embedding model configured" }),
             );
         }
+        // Every other registered engine gets the same batch, best-effort (issue
+        // #1115): a secondary-engine failure does not affect indexed/failed/
+        // skipped, which stay keyed on the default model as before this fix.
+        let secondary_model_names: Vec<String> = runtime
+            .registered_embedding_model_names()
+            .into_iter()
+            .filter(|m| m != default_model_name)
+            .collect();
 
         let sql = runtime.sql();
         let batch_size = p.batch_size.unwrap_or(DEFAULT_EMBED_BATCH).clamp(1, 1000);
@@ -125,7 +134,10 @@ impl KnowledgeHandlers {
                 })
                 .collect();
 
-            let embeddings = match runtime.embed_document_batch(&texts).await {
+            let embeddings = match runtime
+                .embed_document_batch_with_model(default_model_name, &texts)
+                .await
+            {
                 Ok(e) => e,
                 Err(e) => {
                     tracing::warn!(
@@ -157,7 +169,7 @@ impl KnowledgeHandlers {
             // the prior vector survives (no-worse-than-stale). A separate pre-delete
             // committed before insert would re-introduce the stranding window.
             let mut chunk_ok: Vec<bool> = vec![true; staged.len()];
-            match runtime.vectors(token) {
+            match runtime.vectors_for_model(token, default_model_name) {
                 Ok(vectors) => {
                     let ns_str = token.namespace().as_str();
                     for (i, ((id, _), emb)) in staged.iter().zip(embeddings.iter()).enumerate() {
@@ -187,6 +199,66 @@ impl KnowledgeHandlers {
             }
 
             indexed += chunk_ok.iter().filter(|ok| **ok).count();
+
+            for model_name in &secondary_model_names {
+                let secondary_embeddings = match runtime
+                    .embed_document_batch_with_model(model_name, &texts)
+                    .await
+                {
+                    Ok(e) => e,
+                    Err(e) => {
+                        tracing::warn!(
+                            model = %model_name,
+                            batch_size = staged.len(),
+                            error = %e,
+                            "knowledge secondary-engine embed_batch failed; \
+                             atoms miss a vector for this engine until backfill"
+                        );
+                        continue;
+                    }
+                };
+                if secondary_embeddings.len() != staged.len() {
+                    tracing::warn!(
+                        model = %model_name,
+                        expected = staged.len(),
+                        got = secondary_embeddings.len(),
+                        "knowledge secondary-engine embed_batch returned wrong \
+                         vector count; skipping this engine for the batch"
+                    );
+                    continue;
+                }
+                match runtime.vectors_for_model(token, model_name) {
+                    Ok(vectors) => {
+                        let ns_str = token.namespace().as_str();
+                        for ((id, _), emb) in staged.iter().zip(secondary_embeddings.iter()) {
+                            if let Err(e) = vectors
+                                .insert(
+                                    *id,
+                                    SubstrateKind::Entity,
+                                    ns_str,
+                                    "knowledge.atom",
+                                    vec![emb.clone()],
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    id = %id,
+                                    model = %model_name,
+                                    error = %e,
+                                    "knowledge secondary-engine vector insert failed"
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            model = %model_name,
+                            error = %e,
+                            "knowledge secondary-engine vector store unavailable"
+                        );
+                    }
+                }
+            }
 
             if let Some(cb) = on_progress {
                 cb(indexed as u64, total as u64);

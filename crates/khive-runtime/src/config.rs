@@ -496,13 +496,15 @@ pub(crate) fn build_embedder_registry(
 }
 
 fn configured_embedding_models(config: &RuntimeConfig) -> Vec<EmbeddingModel> {
-    let mut models = Vec::new();
+    let mut models: Vec<EmbeddingModel> = Vec::new();
     if let Some(model) = config.embedding_model {
         models.push(model);
     }
-    models.extend(config.additional_embedding_models.iter().copied());
-    models.sort_by_key(|model| model.to_string());
-    models.dedup();
+    for model in config.additional_embedding_models.iter().copied() {
+        if !models.contains(&model) {
+            models.push(model);
+        }
+    }
     models
 }
 
@@ -903,6 +905,58 @@ mod no_embeddings_tests {
             !buggy_form.additional_embedding_models.is_empty(),
             "Default's independent-field seeding must remain unchanged; \
              no_embeddings() is the fix, not a change to Default"
+        );
+    }
+}
+
+#[cfg(test)]
+mod configured_embedding_models_order_tests {
+    use super::*;
+
+    /// Issue #1115: the configured engine list must preserve declaration
+    /// order (primary first, then `additional_embedding_models` in order)
+    /// instead of alphabetizing — any consumer that treats the list as
+    /// ordered (e.g. recall fan-out) otherwise gets the wrong primary.
+    #[test]
+    fn preserves_primary_first_then_additional_in_declared_order() {
+        let config = RuntimeConfig {
+            embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
+            additional_embedding_models: vec![
+                EmbeddingModel::Qwen3Embedding4B,
+                EmbeddingModel::BgeSmallEnV15,
+            ],
+            ..RuntimeConfig::default()
+        };
+
+        assert_eq!(
+            configured_embedding_models(&config),
+            vec![
+                EmbeddingModel::AllMiniLmL6V2,
+                EmbeddingModel::Qwen3Embedding4B,
+                EmbeddingModel::BgeSmallEnV15,
+            ],
+            "order must be primary-first, then additional models as declared, \
+             not alphabetized"
+        );
+    }
+
+    /// A model repeated in both `embedding_model` and `additional_embedding_models`
+    /// must be deduped to a single entry, keeping its first (primary) position.
+    #[test]
+    fn dedupes_model_shared_between_primary_and_additional() {
+        let config = RuntimeConfig {
+            embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
+            additional_embedding_models: vec![
+                EmbeddingModel::AllMiniLmL6V2,
+                EmbeddingModel::BgeSmallEnV15,
+            ],
+            ..RuntimeConfig::default()
+        };
+
+        assert_eq!(
+            configured_embedding_models(&config),
+            vec![EmbeddingModel::AllMiniLmL6V2, EmbeddingModel::BgeSmallEnV15],
+            "the shared model must appear once, in its primary position"
         );
     }
 }

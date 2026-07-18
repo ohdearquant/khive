@@ -289,7 +289,6 @@ fn fusion_strategy_change_produces_observable_ordering_difference() {
         namespace: "local".to_string(),
         text_hits: text_hits.clone(),
         vector_hits_per_model: vec![("mock".to_string(), vector_hits.clone())],
-        multilingual_routed: false,
         visible_namespaces: vec!["local".to_string()],
         ann_degraded: false,
     };
@@ -304,7 +303,6 @@ fn fusion_strategy_change_produces_observable_ordering_difference() {
         namespace: "local".to_string(),
         text_hits,
         vector_hits_per_model: vec![("mock".to_string(), vector_hits)],
-        multilingual_routed: false,
         visible_namespaces: vec!["local".to_string()],
         ann_degraded: false,
     };
@@ -646,7 +644,6 @@ fn vector_candidates_per_model_shape_is_array_of_model_objects() {
             ("model-a".to_string(), hits_a),
             ("model-b".to_string(), hits_b),
         ],
-        multilingual_routed: false,
         visible_namespaces: vec!["test".to_string()],
         ann_degraded: false,
     };

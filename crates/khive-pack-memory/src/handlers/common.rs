@@ -370,8 +370,6 @@ pub(super) struct RecallCandidateSet {
     /// One entry per embedding model: (model_name, hits). These have already been
     /// filtered to the caller's visible namespace set via over-fetch + post-filter.
     pub(super) vector_hits_per_model: Vec<(String, Vec<VectorSearchHit>)>,
-    /// True when multilingual dense routing was requested AND a multilingual model was found.
-    pub(super) multilingual_routed: bool,
     /// The caller's full visible namespace set (primary + any explicit extras).
     pub(super) visible_namespaces: Vec<String>,
     /// #836: true when at least one model's vector leg degraded to FTS-only
@@ -433,9 +431,6 @@ pub(super) struct RecallCandidateParams<'a> {
     pub(super) embedding_model: Option<&'a str>,
     /// Route the FTS path through the CJK-bypass tokenizer. Keyed on `contains_cjk`.
     pub(super) cjk_fts_bypass: bool,
-    /// Route the dense/vector path to the multilingual model. Keyed on `needs_multilingual`.
-    pub(super) use_multilingual: bool,
-    pub(super) scoring_cfg: &'a crate::scoring::ScoringConfig,
     pub(super) snippet_policy: TextSnippetPolicy,
     pub(super) fts_gather: &'a crate::config::RecallFtsGatherConfig,
     /// Bounded ANN widening rounds, resolved before collection.
@@ -447,9 +442,6 @@ pub(super) struct RecallCandidateParams<'a> {
 pub(super) struct RecallVectorCandidateParams<'a> {
     pub(super) candidate_limit: u32,
     pub(super) embedding_model: Option<&'a str>,
-    /// Route the dense/vector path to the multilingual model. Keyed on `needs_multilingual`.
-    pub(super) use_multilingual: bool,
-    pub(super) scoring_cfg: &'a crate::scoring::ScoringConfig,
     /// Namespace set the caller is allowed to read. ANN returns global candidates;
     /// post-filter trims to this set before returning hits.
     pub(super) visible_namespaces: Vec<String>,
@@ -461,7 +453,6 @@ pub(super) struct RecallVectorCandidateParams<'a> {
 
 pub(super) struct RecallVectorCandidateResult {
     pub(super) vector_hits_per_model: Vec<(String, Vec<VectorSearchHit>)>,
-    pub(super) multilingual_routed: bool,
     /// Whether any model timed out to FTS-only while its tracked build continued.
     pub(super) ann_degraded: bool,
 }
@@ -736,8 +727,6 @@ impl MemoryPack {
             candidate_limit,
             embedding_model,
             cjk_fts_bypass,
-            use_multilingual,
-            scoring_cfg,
             snippet_policy,
             fts_gather,
             ann_overfetch_max_rounds,
@@ -769,8 +758,6 @@ impl MemoryPack {
             RecallVectorCandidateParams {
                 candidate_limit,
                 embedding_model,
-                use_multilingual,
-                scoring_cfg,
                 visible_namespaces: visible.clone(),
                 ann_overfetch_max_rounds,
                 ann_ready_timeout_ms,
@@ -781,7 +768,6 @@ impl MemoryPack {
             namespace: primary_ns,
             text_hits,
             vector_hits_per_model: vector_result.vector_hits_per_model,
-            multilingual_routed: vector_result.multilingual_routed,
             visible_namespaces: visible,
             ann_degraded: vector_result.ann_degraded,
         })
@@ -801,8 +787,6 @@ impl MemoryPack {
         let RecallVectorCandidateParams {
             candidate_limit,
             embedding_model,
-            use_multilingual,
-            scoring_cfg,
             visible_namespaces,
             ann_overfetch_max_rounds,
             ann_ready_timeout_ms,
@@ -818,35 +802,11 @@ impl MemoryPack {
         let prof = recall_profile_enabled();
         let call_id = PROF_CID.with(|c| c.get());
 
-        let mut multilingual_routed = false;
         let mut ann_degraded = false;
         let model_names: Vec<String> = if let Some(m) = embedding_model {
             vec![m.to_string()]
         } else {
-            let names = self.runtime.registered_embedding_model_names();
-            if names.is_empty() {
-                vec![]
-            } else if use_multilingual {
-                let multilingual_model = scoring_cfg
-                    .multilingual_model
-                    .as_deref()
-                    .and_then(|m| names.iter().find(|n| n.as_str() == m).cloned())
-                    .or_else(|| {
-                        names
-                            .iter()
-                            .find(|n| n.contains("multilingual") || n.contains("paraphrase"))
-                            .cloned()
-                    });
-                match multilingual_model {
-                    Some(model) => {
-                        multilingual_routed = true;
-                        vec![model]
-                    }
-                    None => names,
-                }
-            } else {
-                names
-            }
+            self.runtime.registered_embedding_model_names()
         };
 
         let vector_hits_per_model: Vec<(String, Vec<VectorSearchHit>)> = if model_names.is_empty() {
@@ -1145,7 +1105,6 @@ impl MemoryPack {
 
         Ok(RecallVectorCandidateResult {
             vector_hits_per_model,
-            multilingual_routed,
             ann_degraded,
         })
     }

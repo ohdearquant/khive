@@ -2158,6 +2158,117 @@ mod embed_failure_tests {
         );
     }
 
+    /// Issue #1115: `knowledge.index` must write a vector for every configured
+    /// engine, not just the default. Fake providers stand in for both engines
+    /// so the test doesn't load real lattice weights.
+    #[tokio::test]
+    async fn index_writes_vector_for_every_configured_engine() {
+        const SECONDARY_KEY: &str = "paraphrase-multilingual-minilm-l12-v2";
+
+        struct FixedVecService {
+            seed: f32,
+        }
+
+        #[async_trait]
+        impl EmbeddingService for FixedVecService {
+            async fn embed(
+                &self,
+                texts: &[String],
+                _model: EmbeddingModel,
+            ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+                Ok(texts.iter().map(|_| vec![self.seed; 384]).collect())
+            }
+
+            fn supports_model(&self, _model: EmbeddingModel) -> bool {
+                true
+            }
+
+            fn name(&self) -> &'static str {
+                "fixed-vec"
+            }
+        }
+
+        struct FixedVecProvider {
+            key: &'static str,
+            seed: f32,
+        }
+
+        #[async_trait]
+        impl EmbedderProvider for FixedVecProvider {
+            fn name(&self) -> &str {
+                self.key
+            }
+
+            fn dimensions(&self) -> usize {
+                384
+            }
+
+            async fn build(
+                &self,
+            ) -> std::result::Result<Arc<dyn EmbeddingService>, khive_runtime::RuntimeError>
+            {
+                Ok(Arc::new(FixedVecService { seed: self.seed }))
+            }
+        }
+
+        let rt = KhiveRuntime::new(RuntimeConfig {
+            git_write: Default::default(),
+            db_path: None,
+            default_namespace: Namespace::local(),
+            embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
+            additional_embedding_models: vec![EmbeddingModel::ParaphraseMultilingualMiniLmL12V2],
+            gate: Arc::new(AllowAllGate),
+            packs: vec!["kg".to_string(), "knowledge".to_string()],
+            backend_id: BackendId::main(),
+            brain_profile: None,
+            visible_namespaces: vec![],
+            allowed_outbound_namespaces: vec![],
+            actor_id: None,
+        })
+        .expect("runtime");
+        rt.register_embedder(FixedVecProvider {
+            key: MODEL_KEY,
+            seed: 0.5,
+        });
+        rt.register_embedder(FixedVecProvider {
+            key: SECONDARY_KEY,
+            seed: 0.6,
+        });
+
+        let f = fixture_with_two_atoms(rt).await;
+        let result = f
+            .dispatch("knowledge.index", json!({}))
+            .await
+            .expect("index ok");
+        assert_eq!(
+            result["indexed"].as_u64().unwrap_or(0),
+            2,
+            "both atoms must index via the default engine: {result:?}"
+        );
+
+        let row_primary = f
+            .sql_query_one(
+                "SELECT subject_id FROM vec_all_minilm_l6_v2 LIMIT 1",
+                vec![],
+            )
+            .await;
+        assert!(
+            row_primary.is_some(),
+            "primary engine table must have a row"
+        );
+
+        let row_secondary = f
+            .sql_query_one(
+                "SELECT subject_id FROM vec_paraphrase_multilingual_minilm_l12_v2 LIMIT 1",
+                vec![],
+            )
+            .await;
+        assert!(
+            row_secondary.is_some(),
+            "secondary engine table must have a row — issue #1115 write-path coverage"
+        );
+    }
+
     // ── Section embed failure regression ────────────────
     //
     // Mirrors the atom failure tests above but exercises the SECTION path via
