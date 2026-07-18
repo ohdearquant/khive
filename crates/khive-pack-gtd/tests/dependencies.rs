@@ -134,7 +134,7 @@ async fn scenario_gtd_c2_next_excludes_tasks_with_incomplete_deps() {
         .collect();
     assert!(
         !titles.contains(&"dependent-task"),
-        "scenario-gtd C2: next() must not return tasks with incomplete deps; got: {titles:?}"
+        "next() must not return tasks with incomplete deps; got: {titles:?}"
     );
 
     pack.dispatch(
@@ -153,7 +153,7 @@ async fn scenario_gtd_c2_next_excludes_tasks_with_incomplete_deps() {
         .collect();
     assert!(
         titles2.contains(&"dependent-task"),
-        "scenario-gtd C2: after blocker is done, next() must include dependent task; got: {titles2:?}"
+        "after blocker is done, next() must include dependent task; got: {titles2:?}"
     );
 
     let _ = dep_id;
@@ -177,7 +177,7 @@ async fn scenario_gtd_c2_next_includes_tasks_with_no_deps() {
         .collect();
     assert!(
         titles.contains(&"no-deps-task"),
-        "scenario-gtd C2: task with no deps must appear in next(); got: {titles:?}"
+        "task with no deps must appear in next(); got: {titles:?}"
     );
 }
 
@@ -217,7 +217,7 @@ async fn scenario_gtd_c2_next_includes_tasks_with_all_deps_done() {
         .collect();
     assert!(
         titles.contains(&"all-deps-done"),
-        "scenario-gtd C2: task with all deps done must appear in next(); got: {titles:?}"
+        "task with all deps done must appear in next(); got: {titles:?}"
     );
 
     let _ = dep_id;

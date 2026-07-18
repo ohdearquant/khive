@@ -7,7 +7,7 @@
 # this table degrade their layering signal to `unavailable`
 # (`POLICY_INCOMPLETE`) rather than being silently treated as rank 0 — this
 # now applies to every in-scope crate regardless of whether it appears in any
-# evaluated edge (2026-07-16 fix round 1, H4).
+# evaluated edge.
 #
 # Ranks below are the longest-path depth of each crate's PRODUCTION
 # `[dependencies]` graph (dev-dependencies excluded — several packs carry

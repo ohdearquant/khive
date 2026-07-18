@@ -313,7 +313,7 @@ mod property_tests {
     ///
     /// A document at rank 1 in a single source outscores a document at rank 1000
     /// in three sources. The correct invariant: equal-rank docs score proportionally
-    /// to source count (finding #8 — fixed from an overly broad "any rank" claim).
+    /// to source count, not to rank position.
     #[test]
     fn prop_rrf_more_sources_higher_score_equal_ranks() {
         // doc_common at rank 1 in both sources; doc_single at rank 1 in one source.
@@ -336,7 +336,7 @@ mod property_tests {
     }
 
     /// A deep-rank multi-source document can lose to a shallow-rank single-source
-    /// document — the broad "more sources always wins" property is false (finding #8).
+    /// document — the broad "more sources always wins" property is false.
     #[test]
     fn prop_rrf_deep_rank_multi_source_can_lose_to_rank1_single_source() {
         // doc_single at rank 1 in one source: 1/61 ≈ 0.01639
@@ -390,7 +390,7 @@ mod regression_tests {
             .collect()
     }
 
-    // ── Finding #2: zero-weight source must not inject docs into output ────────
+    // ── Zero-weight source must not inject docs into output ──────────────────
 
     #[test]
     fn weighted_zero_weight_source_is_excluded() {
@@ -409,7 +409,7 @@ mod regression_tests {
         );
     }
 
-    // ── Finding #3: non-finite weights must not panic ──────────────────────────
+    // ── Non-finite weights must not panic ─────────────────────────────────────
 
     #[test]
     fn weighted_inf_weight_does_not_panic() {
@@ -429,7 +429,7 @@ mod regression_tests {
         assert!(!out.is_empty(), "result must not be empty with NaN weight");
     }
 
-    // ── Finding #1: weight/source length mismatch must not mis-score ──────────
+    // ── Weight/source length mismatch must not mis-score ──────────────────────
 
     #[test]
     fn weighted_extra_weight_does_not_steal_mass() {
@@ -448,7 +448,7 @@ mod regression_tests {
         );
     }
 
-    // ── Finding #4: duplicate IDs in same RRF source count once ───────────────
+    // ── Duplicate IDs in same RRF source count once ───────────────────────────
 
     #[test]
     fn rrf_duplicate_id_in_same_source_counts_once() {
@@ -464,7 +464,7 @@ mod regression_tests {
         );
     }
 
-    // ── Finding #4: duplicate IDs in same weighted source keep max score ───────
+    // ── Duplicate IDs in same weighted source keep max score ──────────────────
 
     #[test]
     fn weighted_duplicate_id_in_same_source_keeps_max() {
@@ -485,7 +485,7 @@ mod regression_tests {
         );
     }
 
-    // ── Finding #5: VectorOnly/KeywordOnly use union_fusion ───────────────────
+    // ── VectorOnly/KeywordOnly use union_fusion ────────────────────────────────
 
     #[test]
     fn vector_only_single_source_passes_through() {
@@ -503,7 +503,7 @@ mod regression_tests {
         assert_eq!(out[0].0, "x");
     }
 
-    // ── Finding #6: top_k partial sort returns correct top results ────────────
+    // ── top_k partial sort returns correct top results ────────────────────────
 
     #[test]
     fn fuse_top_k_partial_sort_correct_results() {

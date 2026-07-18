@@ -4831,11 +4831,11 @@ async fn verbs_dispatch_pack_filter_fake_excludes_subhandler() {
     );
 }
 
-// M2 / H1 regression: three parallel singleton link() calls for the same
+// Concurrency regression: three parallel singleton link() calls for the same
 // (source, target, relation) triple must all return the same edge ID and the
 // database must contain exactly one edge row for that triple.
 //
-// Before the H1 fix, each call generated a fresh UUID before the insert; the
+// Before this fix, each call generated a fresh UUID before the insert; the
 // losing calls returned their locally-generated IDs even though the database
 // stored a different (winning) row ID.  After the fix, link() reads back the
 // persisted row by natural key so every caller receives the same stored ID.

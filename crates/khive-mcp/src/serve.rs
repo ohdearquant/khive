@@ -3655,7 +3655,7 @@ id = "lambda:project-actor"
         );
     }
 
-    // ── ADR-111 Amendment 2, H2 fix round 2: `resolve_blob_store` must
+    // ── ADR-111 Amendment 2: `resolve_blob_store` must
     // actually be reached from the real boot paths, not only its own unit
     // tests. Both tests below assert against the credential-env error
     // `S3BlobStore::new` raises with no AWS creds in the environment --
@@ -3773,7 +3773,7 @@ region = "us-east-1"
         );
     }
 
-    // ── ADR-111 Amendment 2, round-3 Medium fix: the two tests above only
+    // ── ADR-111 Amendment 2: the two tests above only
     // prove the fail-closed error path. The three tests below exercise the
     // successful construction-and-install branch of `install_resolved_blob_store`
     // (the real call site: `:1826` single-backend, `:1567` multi-backend) plus

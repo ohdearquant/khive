@@ -319,7 +319,7 @@ pub async fn run_pending_events_on(
                 // regardless of the stored string's offset. Storage itself
                 // is unchanged — only this fetch-bound comparison is
                 // normalized; the original string still round-trips
-                // faithfully (H5).
+                // faithfully.
                 //
                 // `datetime()` returns NULL for a value it cannot parse, and
                 // NULL <= anything is NULL (never true) — the OR clause below
@@ -479,7 +479,7 @@ pub async fn run_pending_events_on(
                 // `DateTime<Utc>`) so the caller's original UTC offset is
                 // retained alongside the UTC instant — `khive-pack-schedule`
                 // round-trips the caller's original `trigger_at` string
-                // verbatim, offset included (H5), and that offset must
+                // verbatim, offset included, and that offset must
                 // survive repeat advancement (issue #792): rendering the
                 // advanced `trigger_at` via a bare `DateTime<Utc>::to_rfc3339`
                 // always stamps `+00:00`, silently rewriting a non-UTC
@@ -1731,7 +1731,7 @@ mod tests {
     /// fire (PR #782).
     ///
     /// `khive-pack-schedule` round-trips the caller's original `trigger_at`
-    /// string verbatim, offset included (H5) — it is never normalized to
+    /// string verbatim, offset included — it is never normalized to
     /// UTC in storage. The candidate-page SQL predicate used to compare
     /// `trigger_at` against `now` as raw TEXT (`<=`), which is only
     /// chronologically correct when every stored string happens to share the
@@ -1923,7 +1923,7 @@ mod tests {
 
         // Chronologically a few seconds ago (in-grace), formatted at a
         // non-UTC +04:00 wall-clock offset — the exact shape
-        // `khive-pack-schedule` round-trips verbatim from the caller (H5).
+        // `khive-pack-schedule` round-trips verbatim from the caller.
         let plus_four = FixedOffset::east_opt(4 * 3600).expect("valid offset");
         let trigger_instant = Utc::now() - Duration::seconds(5);
         let past = trigger_instant.with_timezone(&plus_four).to_rfc3339();

@@ -1575,9 +1575,9 @@ async fn complete_from_active_succeeds() {
     assert_eq!(done["to"], "done");
 }
 
-// ── Wave 4 regression tests (CC-1, ue-dsl-parallel C2, scenario-gtd C2) ───────
+// ── Dependency-aware next() filtering regression tests ─────────────────────
 
-/// CC-1: complete(id, status="cancelled") must honour the status arg and
+/// complete(id, status="cancelled") must honour the status arg and
 /// transition to "cancelled", NOT silently force "done".
 #[tokio::test]
 async fn cc1_complete_with_status_cancelled_reaches_cancelled() {
@@ -1592,16 +1592,16 @@ async fn cc1_complete_with_status_cancelled_reaches_cancelled() {
 
     assert_eq!(
         result["to"], "cancelled",
-        "CC-1: complete(status=cancelled) must transition to 'cancelled', not 'done'; got: {result}"
+        "complete(status=cancelled) must transition to 'cancelled', not 'done'; got: {result}"
     );
     assert_eq!(result["completed"], true);
     assert!(
         result["is_terminal"].as_bool().unwrap_or(false),
-        "CC-1: cancelled must be a terminal state; got: {result}"
+        "cancelled must be a terminal state; got: {result}"
     );
 }
 
-/// CC-1: complete(id, status="done") must work as before.
+/// complete(id, status="done") must work as before.
 #[tokio::test]
 async fn cc1_complete_with_status_done_still_works() {
     let pack = pack(rt());
@@ -1613,10 +1613,10 @@ async fn cc1_complete_with_status_done_still_works() {
         .await
         .expect("complete(status=done) must succeed");
 
-    assert_eq!(result["to"], "done", "CC-1: explicit status=done must work");
+    assert_eq!(result["to"], "done", "explicit status=done must work");
 }
 
-/// CC-1: complete(id) with no status still defaults to "done".
+/// complete(id) with no status still defaults to "done".
 #[tokio::test]
 async fn cc1_complete_default_is_done() {
     let pack = pack(rt());
@@ -1632,10 +1632,10 @@ async fn cc1_complete_default_is_done() {
         .await
         .expect("complete() with no status must default to done");
 
-    assert_eq!(result["to"], "done", "CC-1: default status must be 'done'");
+    assert_eq!(result["to"], "done", "default status must be 'done'");
 }
 
-/// CC-1: complete(id, status="bogus") must be rejected, not silently force "done".
+/// complete(id, status="bogus") must be rejected, not silently force "done".
 #[tokio::test]
 async fn cc1_complete_invalid_status_is_rejected() {
     let pack = pack(rt());
@@ -1649,11 +1649,11 @@ async fn cc1_complete_invalid_status_is_rejected() {
     let msg = err.to_string();
     assert!(
         msg.contains("\"done\" or \"cancelled\""),
-        "CC-1: invalid status must be rejected with helpful message; got: {msg}"
+        "invalid status must be rejected with helpful message; got: {msg}"
     );
 }
 
-/// CC-1: complete(status="cancelled") must also write the audit record with to="cancelled".
+/// complete(status="cancelled") must also write the audit record with to="cancelled".
 #[tokio::test]
 async fn cc1_complete_cancelled_writes_audit_record() {
     use khive_storage::{SqlStatement, SqlValue};
@@ -1692,11 +1692,11 @@ async fn cc1_complete_cancelled_writes_audit_record() {
     assert_eq!(
         rows.len(),
         1,
-        "CC-1: complete(status=cancelled) must write audit row with to_state='cancelled'"
+        "complete(status=cancelled) must write audit row with to_state='cancelled'"
     );
 }
 
-/// ue-dsl-parallel C2 / CC-race: simulating parallel complete() via sequential
+/// simulating parallel complete() via sequential
 /// calls. After the first complete() succeeds, the second must return an error
 /// because the task is in terminal state — it must NOT return a false success.
 /// (True concurrent race requires tokio::join!, but the atomic SQL ensures the
@@ -1725,7 +1725,7 @@ async fn dsl_parallel_c2_double_complete_second_must_fail() {
     );
 }
 
-/// ue-dsl-parallel C2: true concurrent complete() race using tokio::join!.
+/// true concurrent complete() race using tokio::join!.
 /// Both tasks run concurrently; exactly ONE must succeed and ONE must fail.
 #[tokio::test]
 async fn dsl_parallel_c2_concurrent_complete_one_wins_one_loses() {
@@ -1767,7 +1767,7 @@ async fn dsl_parallel_c2_concurrent_complete_one_wins_one_loses() {
     );
 }
 
-/// scenario-gtd C2: `next()` must not return tasks whose `depends_on` includes
+/// `next()` must not return tasks whose `depends_on` includes
 /// tasks that are NOT in `done` status.
 #[tokio::test]
 async fn scenario_gtd_c2_next_excludes_tasks_with_incomplete_deps() {
@@ -1799,7 +1799,7 @@ async fn scenario_gtd_c2_next_excludes_tasks_with_incomplete_deps() {
         .collect();
     assert!(
         !titles.contains(&"dependent-task"),
-        "scenario-gtd C2: next() must not return tasks with incomplete deps; got: {titles:?}"
+        "next() must not return tasks with incomplete deps; got: {titles:?}"
     );
 
     // Now complete the blocker.
@@ -1820,13 +1820,13 @@ async fn scenario_gtd_c2_next_excludes_tasks_with_incomplete_deps() {
         .collect();
     assert!(
         titles2.contains(&"dependent-task"),
-        "scenario-gtd C2: after blocker is done, next() must include dependent task; got: {titles2:?}"
+        "after blocker is done, next() must include dependent task; got: {titles2:?}"
     );
 
     let _ = dep_id; // suppress unused warning
 }
 
-/// scenario-gtd C2: a task with NO depends_on must always appear in next().
+/// a task with NO depends_on must always appear in next().
 #[tokio::test]
 async fn scenario_gtd_c2_next_includes_tasks_with_no_deps() {
     let pack = pack(rt());
@@ -1845,11 +1845,11 @@ async fn scenario_gtd_c2_next_includes_tasks_with_no_deps() {
         .collect();
     assert!(
         titles.contains(&"no-deps-task"),
-        "scenario-gtd C2: task with no deps must appear in next(); got: {titles:?}"
+        "task with no deps must appear in next(); got: {titles:?}"
     );
 }
 
-/// scenario-gtd C2: a task whose ALL deps are done must appear in next().
+/// a task whose ALL deps are done must appear in next().
 #[tokio::test]
 async fn scenario_gtd_c2_next_includes_tasks_with_all_deps_done() {
     let pack = pack(rt());
@@ -1888,7 +1888,7 @@ async fn scenario_gtd_c2_next_includes_tasks_with_all_deps_done() {
         .collect();
     assert!(
         titles.contains(&"all-deps-done"),
-        "scenario-gtd C2: task with all deps done must appear in next(); got: {titles:?}"
+        "task with all deps done must appear in next(); got: {titles:?}"
     );
 
     let _ = dep_id;

@@ -910,7 +910,7 @@ mod tests {
     /// later, correctly-ordered event would decay mass that should still be
     /// at full weight and pass the clamp early.
     ///
-    /// Reproduces the exact scenario from the review: a fast-clock daemon has
+    /// Reproduces the exact clock-skew scenario: a fast-clock daemon has
     /// already written `mass=1.5` (at cap) with `last_event_at = t+7d`. A
     /// slow-clock daemon emits an event at `t` (`now_us < last_event_at`,
     /// negative delta): `decayed_mass` correctly returns the mass undecayed,

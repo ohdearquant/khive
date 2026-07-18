@@ -250,7 +250,7 @@ async fn reingesting_same_fixture_is_idempotent() {
 /// `src/foo.rs`, must resolve to a `crate -> foo` `depends_on` edge with
 /// `dependency_kinds=["import"]` — not stay unresolved because the raw
 /// import target (`foo::Thing`) names an item inside `foo`, not a nested
-/// module `foo::Thing` (codex PR #1039 review, finding 3).
+/// module `foo::Thing` (see #1039).
 fn write_item_import_fixture(root: &Path) {
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::write(
@@ -310,7 +310,7 @@ async fn rust_item_import_resolves_to_containing_module_after_reingest() {
 /// anywhere above its source files) must still produce project/module
 /// entities and import edges under the basename-fallback identity rule
 /// (ADR-085 Amendment 2 B4), not be silently skipped for lack of a manifest
-/// (codex PR #1039 review, finding 4).
+/// (see #1039).
 #[tokio::test]
 async fn manifestless_rust_folder_uses_basename_fallback() {
     let root = TempDir::new().expect("tempdir");

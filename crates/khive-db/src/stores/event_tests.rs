@@ -869,8 +869,8 @@ async fn read_event_rejects_negative_payload_schema_version() {
 }
 
 /// KDB-006 regression: u32::MAX + 1 must be rejected by the position conversion helper.
-/// The `as u32` truncation bug was the blocker finding — this test verifies the exact
-/// boundary that would have silently wrapped before the fix.
+/// This test verifies the exact boundary that would have silently wrapped via an
+/// `as u32` truncation before the fix.
 #[test]
 fn observation_position_u32_max_plus_one_is_rejected() {
     // usize value one past u32::MAX — this is the exact overflow boundary.

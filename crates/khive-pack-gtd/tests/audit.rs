@@ -304,6 +304,6 @@ async fn cc1_complete_cancelled_writes_audit_record() {
     assert_eq!(
         rows.len(),
         1,
-        "CC-1: complete(status=cancelled) must write audit row with to_state='cancelled'"
+        "complete(status=cancelled) must write audit row with to_state='cancelled'"
     );
 }

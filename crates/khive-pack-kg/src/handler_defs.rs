@@ -1085,7 +1085,7 @@ mod tests {
     /// edge-endpoint allowlist so batch appliers can defer to the kernel's own
     /// table instead of reimplementing (and drifting from) it.
     ///
-    /// Full-coverage drift tripwire (codex PR #1060 review): derives the
+    /// Full-coverage drift tripwire (#1060): derives the
     /// expected rows from the live rule sources (`base_entity_endpoint_rules()`
     /// and `KG_EDGE_RULES`) instead of asserting a handful of substrings, so a
     /// typo'd or dropped row in an untested relation (e.g. `derived_from`,
@@ -1178,9 +1178,9 @@ mod tests {
         );
     }
 
-    // ── ue-help-introspection C2 regressions ─────────────────────────────────
+    // ── update/help param-documentation regressions ──────────────────────────
 
-    /// update.help must document `content` for notes (C2 / H4).
+    /// update.help must document `content` for notes.
     #[test]
     fn update_params_documents_content_for_notes() {
         let h = find_handler("update");
@@ -1195,7 +1195,7 @@ mod tests {
         );
     }
 
-    /// update.name must NOT say "entities only" (C2).
+    /// update.name must NOT say "entities only".
     #[test]
     fn update_params_name_not_entities_only() {
         let h = find_handler("update");
@@ -1206,7 +1206,7 @@ mod tests {
         );
     }
 
-    /// update.help must document `salience` for notes (H4).
+    /// update.help must document `salience` for notes.
     #[test]
     fn update_params_documents_salience_for_notes() {
         let h = find_handler("update");
@@ -1216,7 +1216,7 @@ mod tests {
         );
     }
 
-    /// update.help must document `decay_factor` for notes (H4).
+    /// update.help must document `decay_factor` for notes.
     #[test]
     fn update_params_documents_decay_factor_for_notes() {
         let h = find_handler("update");

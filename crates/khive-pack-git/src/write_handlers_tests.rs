@@ -207,7 +207,7 @@ async fn commit_with_no_paths_commits_all_tracked_changes() {
     assert_eq!(String::from_utf8_lossy(&log.stdout).trim(), "update a.txt");
 }
 
-/// Regression for review round 6: the handler command used by this test
+/// Regression test: the handler command used by this test
 /// suite must not inherit a developer's global/system Git configuration.
 /// Enabling commit signing with a nonexistent signer makes that ambient
 /// configuration deterministically hostile to `git commit`.

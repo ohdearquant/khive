@@ -366,11 +366,11 @@ fn kg_commit_fails_loud_on_malformed_changeset() {
 
 // ── Projection-fidelity regressions: rules must see the full staged record ─
 
-/// H1(a): a formal typed endpoint (`concept/theorem -[depends_on]->
+/// A formal typed endpoint (`concept/theorem -[depends_on]->
 /// concept/definition`) is a pack-allowed pairing
 /// (`khive-pack-formal::vocab::FORMAL_EDGE_RULES`), but only if
 /// `project_changeset` actually carries `entity_type` into the projected
-/// `entities.ndjson` the `edge-endpoint-types` rule reads. Before the H1 fix
+/// `entities.ndjson` the `edge-endpoint-types` rule reads. Before this fix
 /// both endpoints projected as plain `concept` with no `entity_type`, so the
 /// pack rule never matched and this change-set was wrongly rejected.
 #[test]
@@ -428,8 +428,8 @@ fn kg_commit_lands_formal_typed_endpoint_with_edge_endpoint_types_enabled() {
     );
 }
 
-/// H1(b): a generic `[[rules]] require_field = "description"` rule must see
-/// the `description` a create op actually carries. Before the H1 fix
+/// A generic `[[rules]] require_field = "description"` rule must see
+/// the `description` a create op actually carries. Before this fix
 /// `project_changeset` dropped `description` entirely, so this rule always
 /// reported it missing.
 #[test]
@@ -482,10 +482,10 @@ fn kg_commit_lands_changeset_with_description_satisfying_require_field_rule() {
 
 // ── Rule-result suppression regressions: only the built-in partial-view ────
 
-/// H2(a): a malformed `[dangling_refs] severity = "catastrophic"` must still
+/// A malformed `[dangling_refs] severity = "catastrophic"` must still
 /// produce an error-severity config-validation finding and refuse the
 /// commit, even though the built-in dangling-ref evaluator itself is never
-/// invoked at commit time. Before the H2 fix, `commit.rs` filtered every
+/// invoked at commit time. Before this fix, `commit.rs` filtered every
 /// result with `id == "dangling-refs"` out of the pass/fail decision — which
 /// also silently dropped this config-error result — and the commit landed.
 #[test]
@@ -547,9 +547,9 @@ fn kg_commit_refuses_malformed_dangling_refs_severity() {
     );
 }
 
-/// H2(b): a generic `[[rules]]` entry that happens to be named
-/// `id = "dangling-refs"` must still be evaluated and enforced. Before the
-/// H2 fix, `commit.rs`'s post-hoc `id == "dangling-refs"` filter dropped
+/// A generic `[[rules]]` entry that happens to be named
+/// `id = "dangling-refs"` must still be evaluated and enforced. Before this
+/// fix, `commit.rs`'s post-hoc `id == "dangling-refs"` filter dropped
 /// this result regardless of where it came from, letting an error-severity
 /// `require_field` violation through.
 #[test]
