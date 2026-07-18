@@ -706,27 +706,25 @@ fn compile_single_condition(
 
     let col_expr = match kind {
         VarKind::Node => {
-            if cond.property == "name"
-                || cond.property == "kind"
-                || cond.property == "entity_type"
-                || cond.property == "namespace"
-            {
+            if NODE_COLUMNS.contains(&cond.property.as_str()) {
                 format!("{alias}.{}", cond.property)
             } else {
-                format!(
-                    "json_extract({alias}.properties, '$.{}')",
-                    cond.property.replace('\'', "''")
-                )
+                return Err(QueryError::Validation(format!(
+                    "unknown node property '{}' in WHERE clause. Valid: {}",
+                    cond.property,
+                    NODE_COLUMNS.join(", ")
+                )));
             }
         }
         VarKind::ObservationTargetNode => {
             if OBSERVATION_TARGET_COLUMNS.contains(&cond.property.as_str()) {
                 format!("{alias}.{}", cond.property)
             } else {
-                format!(
-                    "json_extract({alias}.properties, '$.{}')",
-                    cond.property.replace('\'', "''")
-                )
+                return Err(QueryError::Validation(format!(
+                    "unknown observation target property '{}' in WHERE clause. Valid: {}",
+                    cond.property,
+                    OBSERVATION_TARGET_COLUMNS.join(", ")
+                )));
             }
         }
         VarKind::EventNode => {
@@ -1408,14 +1406,20 @@ enum VarKind {
 
 const NODE_COLUMNS: &[&str] = &[
     "id",
-    "name",
+    "namespace",
     "kind",
     "entity_type",
-    "namespace",
-    "description",
+    "name",
     "properties",
+    "description",
+    "content",
+    "status",
+    "salience",
+    "decay_factor",
     "created_at",
     "updated_at",
+    "deleted_at",
+    "substrate_kind",
 ];
 /// Projection columns for entity/note observation targets.
 const OBSERVATION_TARGET_COLUMNS: &[&str] = &[
@@ -1423,14 +1427,16 @@ const OBSERVATION_TARGET_COLUMNS: &[&str] = &[
     "namespace",
     "kind",
     "entity_type",
-    "status",
     "name",
+    "properties",
+    "description",
     "content",
+    "status",
     "salience",
     "decay_factor",
-    "properties",
     "created_at",
     "updated_at",
+    "deleted_at",
     "referent_kind",
 ];
 /// Projection columns for synthetic event sources.
