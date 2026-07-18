@@ -796,62 +796,87 @@ LSTREEFAILFIXTURE
     # run_all still looks correct. That is exactly how the macOS PR lane once ran
     # cargo with no scan at all.
     #
-    # Decide this on the workflow's step structure, not on its text. Text cannot
-    # answer it: YAML mapping keys are unordered, so a condition may sit after the
-    # `run:` it gates, and a step may invoke cargo directly without ever naming
-    # ci.sh. Segment the compile job into steps and require that the first step
-    # able to execute cargo is the scan, carrying no condition. Scope is the `ci`
-    # job: other jobs compile deliberately narrow slices and are not the lane #560
-    # concerns.
+    # Decide this by PARSING the workflow, not by matching its text. Text cannot
+    # answer the question at all: `if:`, `if :`, `"if":` and `'if':` are the same
+    # key to YAML but four different strings, a step may invoke cargo without ever
+    # naming ci.sh, and mapping keys are unordered so a condition may follow the
+    # `run:` it gates. Each of those defeated a text scan here. Load the document
+    # and require that the first step able to execute cargo is the scan, carrying
+    # no condition. Scope is the `ci` job: other jobs compile deliberately narrow
+    # slices and are not the lane #560 concerns.
+    #
+    # python3 is already required by this script (see the scan loop). PyYAML is the
+    # one added dependency, and its absence HARD-FAILS rather than skipping: a
+    # guard that silently downgrades to "no check" is worse than no guard, because
+    # it reports success.
     workflow="$SCRIPT_DIR/../.github/workflows/ci.yml"
     if [ -f "$workflow" ]; then
-        workflow_verdict="$(awk '
-            function flush(   i, line, has_if, runs_cargo, is_scan) {
-                if (!in_step) { return }
-                for (i = 1; i <= n; i++) {
-                    line = buf[i]
-                    # Comment lines never execute. They must be ignored, not just
-                    # for tidiness: the ordering rationale written above the scan
-                    # step names cargo, and counting it would mark the preceding
-                    # step cargo-capable and fail a correct workflow.
-                    if (line ~ /^[ \t]*#/) { continue }
-                    if (line ~ if_re) { has_if = 1 }
-                    if (line ~ /scripts\/ci\.sh/ ||
-                        line ~ /cargo[ \t]+[a-z]/ ||
-                        line ~ /make[ \t]+[a-z]/) { runs_cargo = 1 }
-                    if (line ~ /no-stubs-scan/) { is_scan = 1 }
-                }
-                if (runs_cargo && verdict == "") {
-                    if (!is_scan)      { verdict = "NOTSCAN|" step_name }
-                    else if (has_if)   { verdict = "GATED|" step_name }
-                    else               { verdict = "OK|" step_name }
-                }
-                in_step = 0
-                n = 0
-            }
-            /^  ci:$/                { in_job = 1; next }
-            /^  [a-z0-9_-]+:$/       { flush(); in_job = 0 }
-            !in_job                  { next }
-            match($0, /^ +- /) {
-                flush()
-                # Build the key indent literally rather than with a {n} interval:
-                # interval support differs between the awk implementations on the
-                # Linux and macOS runners, and a regex that silently fails to
-                # match would turn this guard into a no-op.
-                pad = ""
-                for (i = 0; i < RLENGTH; i++) { pad = pad " " }
-                if_re = "^" pad "if:"
-                step_name = $0
-                sub(/^ +- (name|uses): */, "", step_name)
-                in_step = 1
-            }
-            in_step                  { buf[++n] = $0 }
-            END                      { flush(); print verdict }
-        ' "$workflow")"
+        workflow_verdict="$(WORKFLOW="$workflow" python3 - <<'PYWF'
+import os, re, sys
+
+try:
+    import yaml
+except ImportError:
+    print("NOPARSER|")
+    sys.exit(0)
+
+try:
+    with open(os.environ["WORKFLOW"], encoding="utf-8") as fh:
+        doc = yaml.safe_load(fh)
+except Exception as exc:
+    print("UNPARSEABLE|%s" % exc)
+    sys.exit(0)
+
+job = ((doc or {}).get("jobs") or {}).get("ci")
+if not isinstance(job, dict):
+    print("NOJOB|")
+    sys.exit(0)
+
+# A step that shells to ci.sh runs cargo transitively; one naming a cargo or make
+# subcommand runs it directly. `rustup which cargo` prints a path and builds
+# nothing, so a bare "cargo" with no following subcommand does not count.
+runs_cargo = re.compile(r"scripts/ci\.sh|cargo[ \t]+[a-z]|make[ \t]+[a-z]")
+
+verdict = "NOCARGO|"
+for step in job.get("steps") or []:
+    if not isinstance(step, dict):
+        continue
+    run = step.get("run") or ""
+    # Comment lines never execute, and the ordering rationale written above the
+    # scan step names cargo; counting it would fail a correct workflow.
+    body = "\n".join(
+        line for line in run.splitlines() if not line.lstrip().startswith("#")
+    )
+    if not runs_cargo.search(body):
+        continue
+    name = step.get("name") or step.get("uses") or "(unnamed step)"
+    if "no-stubs-scan" not in body:
+        verdict = "NOTSCAN|%s" % name
+    elif "if" in step:
+        verdict = "GATED|%s" % name
+    else:
+        verdict = "OK|%s" % name
+    break
+
+print(verdict)
+PYWF
+)"
         workflow_state="${workflow_verdict%%|*}"
         workflow_step="${workflow_verdict#*|}"
         case "$workflow_state" in
             OK) ;;
+            NOPARSER)
+                echo "self-test FAILED: PyYAML is not importable, so the workflow ordering check cannot run. Install it (pip install pyyaml) -- this check must not be skipped, because a guard that silently downgrades to no check still reports success (#560)."
+                status=1
+                ;;
+            UNPARSEABLE)
+                echo "self-test FAILED: .github/workflows/ci.yml did not parse as YAML: $workflow_step"
+                status=1
+                ;;
+            NOJOB)
+                echo "self-test FAILED: .github/workflows/ci.yml has no 'ci' job, so the guard's scope no longer matches the workflow. Either the job was renamed or the compile lane moved; this check must not silently pass (#560)."
+                status=1
+                ;;
             NOTSCAN)
                 echo "self-test FAILED: in .github/workflows/ci.yml the first step of job 'ci' that can execute cargo is '$workflow_step', not the placeholder scan. A cargo-running step ahead of the guard executes PR-controlled build scripts and proc-macros against an unscanned tree (#560)."
                 status=1
@@ -861,7 +886,7 @@ LSTREEFAILFIXTURE
                 status=1
                 ;;
             *)
-                echo "self-test FAILED: could not find any cargo-executing step in job 'ci' of .github/workflows/ci.yml. Either the job was renamed or the guard's scope no longer matches the workflow; this check must not silently pass (#560)."
+                echo "self-test FAILED: no step in job 'ci' of .github/workflows/ci.yml executes cargo, so the guard has nothing to order itself against. The compile lane moved or the step shape changed; this check must not silently pass (#560)."
                 status=1
                 ;;
         esac
