@@ -55,7 +55,10 @@ phase_no_stubs() {
     # failures, invariant violations) -- clippy has no lint for "the message looks
     # like a stub", and denying the macros outright would fail hundreds of correct
     # call sites. This scans the string literal argument of every panic!/unreachable!
-    # call in shipping source for placeholder language (#560).
+    # call for placeholder language across every .rs file under crates/ (source,
+    # tests, benches, examples) -- a broader scope than the clippy pass above, which
+    # is --lib --bins only: a placeholder message reads as a stub whether or not the
+    # code compiling it is test-gated (#560).
     sh "$SCRIPT_DIR/lint-stub-markers.sh"
 
     echo "=== No-Stub Guard (placeholder-string scanner self-test) ==="

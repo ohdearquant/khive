@@ -159,6 +159,28 @@ pub fn split_marker_by_continuation_stub(flag: bool) -> u32 {
     }
     1
 }
+
+pub fn mixed_positional_named_stub(flag: bool) -> u32 {
+    if !flag {
+        // Adversarial: a placeholder split across a positional and a named
+        // argument. Slot substitution fills the named slot from x and the auto
+        // slot from the positional regardless of source order, so the
+        // reconstructed message reads as a stub even though neither literal does
+        // alone.
+        panic!("{x} {}", "implemented for the mixed positional and named case", x = "not");
+    }
+    1
+}
+
+pub fn c1_csi_forgery_stub(flag: bool) -> u32 {
+    if !flag {
+        // Adversarial: a single-byte C1 CSI control decoded from a unicode
+        // escape, which no ESC-prefixed pattern would catch. The sanitizer must
+        // strip every C0 and C1 control byte from CI output.
+        panic!("todo: c1 single-byte CSI \u{9b}31m::error::forged sanitization probe");
+    }
+    1
+}
 FIXTURE
 
     # Appended via printf (not the quoted heredoc above) so the fixture can
@@ -255,10 +277,10 @@ FIXTURE
 
     status=0
 
-    # Exactly 17 markers are seeded in case-fail above; asserting the count
+    # Exactly 19 markers are seeded in case-fail above; asserting the count
     # (not just substring presence) catches a parser-overmatch regression
     # that would otherwise slip through as an unnoticed extra finding.
-    expected_marker_count=17
+    expected_marker_count=19
 
     if STUB_MARKER_ALLOWLIST="$empty_allowlist" scan "$tmp/case-fail" > "$tmp/fail.log" 2>&1; then
         echo "self-test FAILED: expected placeholder call sites were not caught"
@@ -288,7 +310,9 @@ FIXTURE
             "a placeholder inside a #[cfg(test)] item must now be caught" \
             "mid-message newline injection" \
             "carries a newline and a forged CI workflow command sequence" \
-            "a placeholder inside a tests/ directory file must now be caught"
+            "a placeholder inside a tests/ directory file must now be caught" \
+            "implemented for the mixed positional and named case" \
+            "sanitization probe"
         do
             if ! grep -qF "$marker" "$tmp/fail.log"; then
                 echo "self-test FAILED: expected finding missing: $marker"
@@ -297,13 +321,23 @@ FIXTURE
             fi
         done
 
-        # the ci_log_forgery_stub message above carries a raw ANSI escape, a
-        # literal "::error::forged" workflow-command shape, and an embedded
-        # newline -- none of the three may survive into CI stdout.
-        esc="$(printf '\033')"
-        if grep -qF "$esc" "$tmp/fail.log"; then
-            echo "self-test FAILED: a raw ANSI escape byte leaked into CI output"
-            cat "$tmp/fail.log"
+        # the ci_log_forgery_stub and c1_csi_forgery_stub messages carry raw
+        # control bytes (an ANSI ESC, a single-byte C1 CSI decoded from \u{9b}, an
+        # embedded newline) plus a literal "::error::forged" workflow-command
+        # shape. sanitize_for_ci must leave NO C0 or C1 control byte in CI output;
+        # assert the whole log is free of them. A real newline separates finding
+        # lines, so 0x0a alone is excluded from the check.
+        if ! python3 - "$tmp/fail.log" <<'PYCTL'
+import sys
+data = open(sys.argv[1], "rb").read()
+leaked = sorted({b for b in data if b < 0x0a or 0x0a < b < 0x20 or b == 0x7f or 0x80 <= b <= 0x9f})
+if leaked:
+    sys.stderr.write("leaked control bytes: " + " ".join("0x%02x" % b for b in leaked) + "\n")
+    sys.exit(1)
+PYCTL
+        then
+            echo "self-test FAILED: a raw C0/C1 control byte (e.g. the single-byte CSI 0x9b) leaked into CI output"
+            cat -v "$tmp/fail.log"
             status=1
         fi
         if grep -qF '::error::forged' "$tmp/fail.log"; then
@@ -339,29 +373,27 @@ FIXTURE
         status=1
     fi
 
-    # The committed allowlist must stay parseable and keep its one known real
-    # entry; a format drift (missing tab, wrong path form) or an accidental
-    # deletion is caught here. The committed file carries NO self-test anchor:
-    # a committed entry is a real, PR-recreatable suppression, so a fixture
-    # entry there would let a PR add that exact path+message and suppress its
-    # own stub. Suppression is therefore exercised via a temp copy below.
+    # The committed allowlist carries no active entries today (its documented
+    # state): every entry must suppress a CURRENT finding, and none exists in the
+    # tree. Assert there is no non-comment, non-blank line -- an entry sneaked in
+    # without a matching finding would fail the real scan's unused-entry guard,
+    # but catching it here names the regression directly. The committed file also
+    # carries NO self-test anchor: a committed entry is a real, PR-recreatable
+    # suppression, so a fixture there would let a PR add that exact path+message
+    # and suppress its own stub. Suppression is exercised via a temp copy below.
     committed_allowlist="$SCRIPT_DIR/stub-marker-allowlist.txt"
-    reindex_entry="$(printf 'crates/kkernel/src/reindex.rs\tStubService::embed must not be called in this test')"
-    if ! grep -Fqx "$reindex_entry" "$committed_allowlist"; then
-        echo "self-test FAILED: committed allowlist lost its expected reindex.rs entry or its format drifted"
+    if grep -qvE '^[[:space:]]*(#|$)' "$committed_allowlist"; then
+        echo "self-test FAILED: committed allowlist has an active entry; it must be comment-only unless it suppresses a current finding:"
+        grep -nvE '^[[:space:]]*(#|$)' "$committed_allowlist"
         status=1
     fi
 
     # Suppression is exercised against a TEMP allowlist: a copy of the committed
     # file (so a committed parse/format break still surfaces) with a fixture
-    # anchor appended. Every referenced path is created under the temp tree so
-    # the path-existence guard passes -- including a stand-in for the committed
-    # reindex.rs entry. Exact-match is checked both ways: the anchor-matching
-    # finding is suppressed, and a sibling with a different message at the same
-    # path still surfaces.
+    # anchor appended. The anchor entry suppresses the matching finding, so it is
+    # used and the unused-entry guard stays satisfied; a sibling with a different
+    # message at the same path still surfaces, checking exact-match both ways.
     mkdir -p "$tmp/case-allowlist/crates/fixture-crate/src"
-    mkdir -p "$tmp/case-allowlist/crates/kkernel/src"
-    : > "$tmp/case-allowlist/crates/kkernel/src/reindex.rs"
     cat > "$tmp/case-allowlist/crates/fixture-crate/src/lib.rs" <<'ALWFIXTURE'
 pub fn allowlisted_stub() -> u32 {
     panic!("todo: this one is allowlisted and must be suppressed")
@@ -393,9 +425,10 @@ ALWFIXTURE
         fi
     fi
 
-    # The scan must FAIL LOUD when an allowlist entry names a path absent from
-    # the scanned tree -- the stale or pre-planted shape that could otherwise
-    # sit ready to suppress a future finding. The offending path must be named.
+    # The scan must FAIL LOUD on an allowlist entry that suppresses no finding in
+    # the scanned tree -- stale or pre-planted, the shape that could otherwise sit
+    # ready to suppress a future finding. A path absent from the tree is the
+    # simplest such entry (it can match nothing); the offending entry is named.
     mkdir -p "$tmp/case-stale-allowlist/crates/real-crate/src"
     cat > "$tmp/case-stale-allowlist/crates/real-crate/src/lib.rs" <<'STALEFIXTURE'
 pub fn ok() -> u32 {
@@ -413,6 +446,54 @@ STALEFIXTURE
         if ! grep -qF 'crates/does-not-exist/src/lib.rs' "$tmp/stale.log"; then
             echo "self-test FAILED: the nonexistent-allowlist-path error did not name the offending entry"
             cat "$tmp/stale.log"
+            status=1
+        fi
+    fi
+
+    # An allowlist entry whose path DOES exist but whose message matches no
+    # finding is equally stale: the unused-entry guard covers it, not just the
+    # path-absent case above.
+    mkdir -p "$tmp/case-unused-allowlist/crates/real-crate/src"
+    cat > "$tmp/case-unused-allowlist/crates/real-crate/src/lib.rs" <<'UNUSEDFIXTURE'
+pub fn ok() -> u32 {
+    1
+}
+UNUSEDFIXTURE
+    unused_allowlist_file="$tmp/unused-allowlist.txt"
+    printf 'crates/real-crate/src/lib.rs\ttodo: no finding in this file matches this message\n' \
+        > "$unused_allowlist_file"
+    if STUB_MARKER_ALLOWLIST="$unused_allowlist_file" scan "$tmp/case-unused-allowlist" > "$tmp/unused.log" 2>&1; then
+        echo "self-test FAILED: an allowlist entry with a valid path but no matching finding should have failed loud"
+        cat "$tmp/unused.log"
+        status=1
+    else
+        if ! grep -qF 'crates/real-crate/src/lib.rs' "$tmp/unused.log"; then
+            echo "self-test FAILED: the unused-allowlist-entry error did not name the offending entry"
+            cat "$tmp/unused.log"
+            status=1
+        fi
+    fi
+
+    # A non-comment allowlist line with no TAB is malformed and must fail loud,
+    # naming the line -- never silently dropped (a mis-typed suppression that
+    # silently does nothing is worse than a loud rejection).
+    mkdir -p "$tmp/case-malformed-allowlist/crates/real-crate/src"
+    cat > "$tmp/case-malformed-allowlist/crates/real-crate/src/lib.rs" <<'MALFIXTURE'
+pub fn ok() -> u32 {
+    1
+}
+MALFIXTURE
+    malformed_allowlist_file="$tmp/malformed-allowlist.txt"
+    printf 'crates/real-crate/src/lib.rs no tab between path and message\n' \
+        > "$malformed_allowlist_file"
+    if STUB_MARKER_ALLOWLIST="$malformed_allowlist_file" scan "$tmp/case-malformed-allowlist" > "$tmp/malformed.log" 2>&1; then
+        echo "self-test FAILED: a malformed (no-TAB) allowlist line should have failed the scan loud"
+        cat "$tmp/malformed.log"
+        status=1
+    else
+        if ! grep -qF 'malformed' "$tmp/malformed.log"; then
+            echo "self-test FAILED: the malformed-allowlist-line error was not reported as malformed"
+            cat "$tmp/malformed.log"
             status=1
         fi
     fi
@@ -486,7 +567,7 @@ MACRO_CALL_RE = re.compile(r"\b(panic|unreachable)\s*!\s*([(\{\[])")
 # regardless of DOTALL (character classes aren't affected by the flag); this
 # only changes what `\.` matches.
 STRING_LIT_RE = re.compile(r'"((?:[^"\\]|\\.)*)"', re.DOTALL)
-ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b.")
+CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 CLOSERS = {"(": ")", "{": "}", "[": "]"}
 ESCAPE_RE = re.compile(r"\\(n|r|t|\\|\"|'|0|x[0-9A-Fa-f]{2}|u\{[0-9A-Fa-f]+\})")
 # Rust string-continuation escape: a `\` immediately followed by a newline
@@ -496,28 +577,34 @@ ESCAPE_RE = re.compile(r"\\(n|r|t|\\|\"|'|0|x[0-9A-Fa-f]{2}|u\{[0-9A-Fa-f]+\})")
 # PLACEHOLDER_RE, so it is stripped before any other escape is decoded.
 STRING_CONTINUATION_RE = re.compile(r"\\\r?\n\s*")
 SIMPLE_ESCAPES = {"n": "\n", "r": "\r", "t": "\t", "\\": "\\", '"': '"', "'": "'", "0": "\0"}
-# A placeholder phrase can be split by a format-string placeholder when a
-# panic!/unreachable! assembles its message from a format literal plus trailing
-# args -- `panic!("not {}", "implemented")` joins to "not {}implemented", and
-# the brace defeats PLACEHOLDER_RE's `not\s*implemented`. A probe copy with
-# `{...}` placeholders removed is matched instead, so the surrounding literal
-# text reads as it does at runtime; the reported message keeps the braces.
-FORMAT_BRACE_RE = re.compile(r"\{[^{}]*\}")
+# A placeholder phrase can be split across a format template and its arguments:
+# `panic!("not {}", "implemented")` renders "not implemented" at runtime, and a
+# naive scan of the template alone ("not {}") misses it. The message is instead
+# reconstructed by substituting each literal argument into its own format slot
+# (resolve_format_message), so out-of-source-order named args and mixed
+# positional/named splits cannot hide a placeholder. FORMAT_SLOT_RE matches one
+# `{...}` slot (or an escaped `{{`/`}}`); IDENT_ARG_RE matches a `name =` named
+# argument prefix (a single `=`, never `==`).
+FORMAT_SLOT_RE = re.compile(r"\{\{|\}\}|\{([^{}]*)\}")
+IDENT_ARG_RE = re.compile(r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)")
 
 
 def sanitize_for_ci(raw):
-    """The panic!/unreachable! message text this scanner echoes into CI
-    stdout comes straight from a PR-controlled string literal. GitHub Actions
-    parses a `::name ...::value`-shaped line as a workflow command
-    (`::error::`, `::add-mask::`, `::set-output::`, ...), so an embedded
-    newline could let attacker text start a fresh line and forge one, and
-    ANSI escapes can rewrite terminal/log-viewer state. Strip ANSI escapes,
-    collapse newlines to a literal `\\n` (never a real line break), and break
-    every `::` so no substring can be parsed as workflow-command syntax --
-    all while keeping the text readable for a human operator."""
-    s = ANSI_ESCAPE_RE.sub("", raw)
-    s = s.replace("\x1b", "")
-    s = s.replace("\r\n", "\\n").replace("\n", "\\n").replace("\r", "\\n")
+    """The single sanitizer every output path routes through. Both the
+    panic!/unreachable! message and the repo path this scanner echoes into CI
+    stdout/stderr come straight from PR-controlled text (a string literal, a
+    filename). GitHub Actions parses a `::name ...::value`-shaped line as a
+    workflow command (`::error::`, `::add-mask::`, `::set-output::`, ...), so
+    an embedded newline could let attacker text start a fresh line and forge
+    one; an ANSI/CSI escape can rewrite terminal and log-viewer state; and a
+    single-byte C1 CSI (U+009B) introduces a control sequence no ESC-prefixed
+    pattern would catch. Collapse every newline to a literal `\\n` (never a
+    real break), escape every remaining C0 control, DEL, and C1 control byte
+    -- ESC, the single-byte CSI, and the rest -- to a visible inert `\\xNN`
+    token, and break every `::` so no substring parses as workflow-command
+    syntax, all while staying readable for a human operator."""
+    s = raw.replace("\r\n", "\\n").replace("\n", "\\n").replace("\r", "\\n")
+    s = CONTROL_CHAR_RE.sub(lambda m: "\\x%02x" % ord(m.group()), s)
     s = s.replace("::", ": :")
     return s
 
@@ -746,60 +833,156 @@ def decode_rust_escapes(body, is_raw):
     return ESCAPE_RE.sub(repl, body)
 
 
+def split_macro_args(code_only, clean, open_pos):
+    """Scan a macro's balanced argument list in a single pass. code_only[open_pos]
+    is the opening delimiter (`(`/`{`/`[`); return (arg_spans, close_pos), where
+    arg_spans are (start, end) offsets into `clean` for each top-level,
+    comma-separated argument (empty spans dropped) and close_pos is the offset of
+    the matching closing delimiter (len(code_only) if unterminated). Folding
+    bracket matching into the split avoids a separate find_matching_close pass
+    over the same region. Commas nested inside (), {}, [] never split; string and
+    comment content is already blanked in code_only, so a comma or bracket living
+    inside a literal never desyncs the depth count."""
+    n = len(code_only)
+    depth = 1
+    i = open_pos + 1
+    arg_start = i
+    spans = []
+    while i < n and depth > 0:
+        c = code_only[i]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+            if depth == 0:
+                break
+        elif c == "," and depth == 1:
+            spans.append((arg_start, i))
+            arg_start = i + 1
+        i += 1
+    spans.append((arg_start, i))
+    close_pos = i if i < n else n
+    return [(s, e) for (s, e) in spans if clean[s:e].strip()], close_pos
+
+
+def arg_literal_value(clean, code_only, start, end):
+    """The decoded string value of the argument clean[start:end] when it is a
+    string literal (plain, raw, or byte-raw) or a concat!(...) of string
+    literals; otherwise None. A non-literal argument -- a variable, a function
+    call, a format! result assembled elsewhere -- is invisible to a static text
+    scan and returns None. Leading whitespace is skipped; a concat! call's own
+    literal arguments are joined."""
+    i = start
+    while i < end and clean[i].isspace():
+        i += 1
+    if i >= end:
+        return None
+    m = re.match(r"concat\s*!\s*[([{]", code_only[i:end])
+    if m is not None:
+        open_pos = i + m.end() - 1
+        close_pos = min(find_matching_close(code_only, open_pos), end)
+        parts = collect_string_literals(clean, open_pos + 1, close_pos)
+        if not parts:
+            return None
+        return "".join(decode_rust_escapes(content, is_raw) for content, is_raw in parts)
+    lit = match_string_literal(clean, i)
+    if lit is None:
+        return None
+    return decode_rust_escapes(lit[1], lit[2])
+
+
+def resolve_format_message(template, positionals, named):
+    """Approximate the runtime message by substituting the macro's literal
+    arguments into the format template's slots. `{{`/`}}` are literal braces; an
+    auto `{}` takes the next positional in order, `{n}` takes positional n, and
+    `{name}` takes a named argument. A slot backed by a literal argument is
+    filled with that literal's decoded text; a slot backed by a non-literal or
+    unresolved argument -- including a Rust 2021 inline-captured variable, which
+    is not among the macro's explicit args -- is vacated. That is the
+    conservative posture: it never fabricates text a static scan cannot prove,
+    while denying a literal argument any way to hide a placeholder by sitting out
+    of source order or behind a positional/named split."""
+    auto = [0]
+
+    def repl(m):
+        tok = m.group(0)
+        if tok == "{{":
+            return "{"
+        if tok == "}}":
+            return "}"
+        ref = m.group(1).split(":", 1)[0].strip()
+        if ref == "":
+            idx = auto[0]
+            auto[0] += 1
+            value = positionals[idx] if idx < len(positionals) else None
+        elif ref.isdigit():
+            idx = int(ref)
+            value = positionals[idx] if idx < len(positionals) else None
+        else:
+            value = named.get(ref)
+        return value if value is not None else ""
+
+    return FORMAT_SLOT_RE.sub(repl, template)
+
+
 def load_allowlist(path):
     """Parse `<repo-relative-path>\\t<exact-decoded-message>` entries from the
-    allowlist file at `path`. Each entry suppresses a finding only when both
-    fields match exactly (see is_allowlisted) -- the repo-relative path (as
-    rendered under `crates/...`) and the fully decoded panic!/unreachable!
-    message. Blank lines and lines starting with `#` (after stripping leading
-    whitespace) are ignored. A missing file (e.g. a caller override pointing
-    at a path that does not exist) is an empty allowlist, not an error."""
+    allowlist file at `path`, returning (entries, malformed). Each entry
+    suppresses a finding only when both fields match exactly (see
+    allowlist_match_index) -- the repo-relative path (as rendered under
+    `crates/...`) and the fully decoded panic!/unreachable! message. Blank lines
+    and lines starting with `#` (after stripping leading whitespace) are
+    ignored. A non-comment line with no TAB is malformed -- collected in
+    `malformed` with its 1-based line number so the caller can fail loud rather
+    than silently drop a mis-typed entry that would suppress nothing. A missing
+    file is an empty allowlist, not an error."""
     entries = []
+    malformed = []
     if not os.path.isfile(path):
-        return entries
+        return entries, malformed
     with open(path, "r", encoding="utf-8") as fh:
-        for raw_line in fh:
+        for lineno, raw_line in enumerate(fh, 1):
             line = raw_line.rstrip("\n")
             if not line.strip() or line.lstrip().startswith("#"):
                 continue
             if "\t" not in line:
+                malformed.append((lineno, line))
                 continue
             entry_path, entry_message = line.split("\t", 1)
             entries.append((entry_path, entry_message))
-    return entries
+    return entries, malformed
 
 
-def is_allowlisted(rel_path, message, entries):
-    """A finding is suppressed iff some entry matches it EXACTLY: the entry's
-    repo-relative path equals the finding's repo-relative path AND the
-    entry's message equals the finding's fully decoded panic!/unreachable!
-    message. Exact (not substring) so an allowlisted entry can never suppress
-    an unrelated NEW marker that merely shares a path prefix or a message
-    fragment. An entry that matches nothing in a given run is not an error."""
-    return any(rel_path == entry_path and message == entry_message for entry_path, entry_message in entries)
+def allowlist_match_index(rel_path, message, entries):
+    """The index of the allowlist entry that matches this finding EXACTLY --
+    the entry's repo-relative path equals the finding's path AND the entry's
+    message equals the finding's fully decoded panic!/unreachable! message -- or
+    None. Exact (not substring) so an entry can never suppress an unrelated NEW
+    marker that merely shares a path prefix or a message fragment. Returning the
+    index (not a bool) lets the caller record which entries actually suppressed
+    a finding, so an entry that matches nothing this run can be rejected as
+    stale."""
+    for idx, (entry_path, entry_message) in enumerate(entries):
+        if rel_path == entry_path and message == entry_message:
+            return idx
+    return None
 
 
-allowlist = load_allowlist(ALLOWLIST_PATH)
+allowlist, malformed_allowlist = load_allowlist(ALLOWLIST_PATH)
 
-# Fail loud on any allowlist entry whose path is absent from the scanned tree.
-# A stale entry (the file moved or was deleted) or a pre-planted entry (added
-# ahead of the file it would suppress) must never sit here silently disabling a
-# future finding; rejecting it keeps the committed allowlist honestly in sync
-# with the tree. Paths are checked against SCAN_ROOT, the same anchor the
-# finding's repo-relative path is rendered against.
-missing_allowlist_paths = [
-    entry_path
-    for entry_path, _ in allowlist
-    if not os.path.exists(os.path.join(SCAN_ROOT, entry_path))
-]
-if missing_allowlist_paths:
+# A non-comment allowlist line with no TAB is a mis-typed entry: it parses as
+# neither a path nor a message and would silently suppress nothing. Fail loud
+# and name it (sanitized) rather than dropping it.
+if malformed_allowlist:
     sys.stderr.write(
-        "stub-marker allowlist references path(s) that do not exist under "
-        f"{SCAN_ROOT} -- remove the stale entry or correct the path:\n"
+        "stub-marker allowlist has malformed line(s) -- a non-comment entry needs "
+        "a TAB between the repo-relative path and the message:\n"
     )
-    for entry_path in missing_allowlist_paths:
-        sys.stderr.write(f"  {entry_path}\n")
+    for lineno, line in malformed_allowlist:
+        sys.stderr.write(f"  line {lineno}: {sanitize_for_ci(line)}\n")
     sys.exit(1)
+
+allowlist_used = [False] * len(allowlist)
 
 findings = []
 for path in files:
@@ -811,31 +994,72 @@ for path in files:
 
     for m in MACRO_CALL_RE.finditer(code_only):
         call_start = m.end() - 1  # the opening delimiter char (`(`/`{`/`[`)
-        # Scan every string literal within the macro's own balanced argument
-        # list (in source order), not just the token immediately after the
-        # opening delimiter -- see collect_string_literals. Read from
-        # `clean` (strings intact), never `code_only` (which has blanked
-        # exactly the string content being looked for here).
-        close_pos = find_matching_close(code_only, call_start)
-        parts = collect_string_literals(clean, call_start + 1, close_pos)
-        if not parts:
+        # The first argument is the format template; every later argument is a
+        # positional value or a `name = value` named value. Each literal
+        # argument is substituted into its own slot (resolve_format_message), so
+        # a placeholder split across the template and its args -- in any order --
+        # is reconstructed rather than missed. Literal content is read from
+        # `clean` (strings intact), never `code_only` (which blanked it).
+        arg_spans, close_pos = split_macro_args(code_only, clean, call_start)
+        if not arg_spans:
             continue
-        message = "".join(decode_rust_escapes(content, is_raw) for content, is_raw in parts)
-        probe = FORMAT_BRACE_RE.sub("", message)
-        if not PLACEHOLDER_RE.search(probe):
+        template = arg_literal_value(clean, code_only, arg_spans[0][0], arg_spans[0][1])
+        if template is None:
+            # No static format template (the first argument is itself a variable
+            # or a runtime expression). Fall back to the bag of any string
+            # literals anywhere in the argument list so a lone literal message
+            # still surfaces.
+            parts = collect_string_literals(clean, call_start + 1, close_pos)
+            if not parts:
+                continue
+            message = "".join(decode_rust_escapes(content, is_raw) for content, is_raw in parts)
+        else:
+            positionals = []
+            named = {}
+            for span_start, span_end in arg_spans[1:]:
+                nm = IDENT_ARG_RE.match(code_only, span_start, span_end)
+                if nm is not None:
+                    named[nm.group(1)] = arg_literal_value(clean, code_only, nm.end(), span_end)
+                else:
+                    positionals.append(arg_literal_value(clean, code_only, span_start, span_end))
+            message = resolve_format_message(template, positionals, named)
+        if not PLACEHOLDER_RE.search(message):
             continue
-        if is_allowlisted(rel_path, message, allowlist):
+        idx = allowlist_match_index(rel_path, message, allowlist)
+        if idx is not None:
+            allowlist_used[idx] = True
             continue
         line_no = clean.count("\n", 0, m.start()) + 1
         macro_name = m.group(1)
-        safe_path = sanitize_for_ci(rel_path)
-        safe_message = sanitize_for_ci(message)
-        findings.append(f"{safe_path}:{line_no}: {macro_name}!(\"{safe_message}\") reads as a placeholder stub, not a real error path")
+        findings.append(
+            f'{sanitize_for_ci(rel_path)}:{line_no}: {macro_name}!("{sanitize_for_ci(message)}") '
+            "reads as a placeholder stub, not a real error path"
+        )
+
+failed = False
+
+# Every allowlist entry must suppress a CURRENT finding. An entry that matched
+# nothing this run -- its path is gone, its file no longer holds that marker, or
+# it was pre-planted ahead of the finding it would suppress -- is stale and must
+# not sit here silently disabling a future finding. This subsumes a bare
+# path-existence check: an entry whose path is absent trivially matches nothing.
+unused_allowlist = [allowlist[i] for i, used in enumerate(allowlist_used) if not used]
+if unused_allowlist:
+    sys.stderr.write(
+        "stub-marker allowlist has entr(y/ies) that suppress no current finding "
+        "-- stale or pre-planted; remove or correct:\n"
+    )
+    for entry_path, entry_message in unused_allowlist:
+        sys.stderr.write(f"  {sanitize_for_ci(entry_path)}\t{sanitize_for_ci(entry_message)}\n")
+    failed = True
 
 if findings:
     for f in findings:
         print(f)
     print(f"\nstub-marker lint: {len(findings)} issue(s)")
+    failed = True
+
+if failed:
     sys.exit(1)
 
 print(f"stub-marker lint: {len(files)} file(s) OK")

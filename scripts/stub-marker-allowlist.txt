@@ -14,17 +14,19 @@
 # under `crates/...`) AND the message equals the finding's fully decoded
 # panic!/unreachable! message. Matching is exact, not substring, so an entry
 # can never suppress an unrelated finding that merely shares a path prefix or
-# a message fragment. Blank lines and lines starting with `#` are ignored.
+# a message fragment. Blank lines and lines starting with `#` are ignored; a
+# non-comment line without a TAB is a malformed entry and fails the scan loud.
 #
-# Every entry's path MUST exist in the repo. The scanner fails loud on any
-# entry whose path is absent, so a stale entry (the file moved or was
-# deleted) or a pre-planted entry (added ahead of the file it would suppress)
-# cannot sit here silently disabling a future finding. Adding a line here is a
-# reviewed code change, not a blanket exemption -- justify it in the PR.
-
-# crates/kkernel/src/reindex.rs: a #[cfg(test)] EmbeddingService mock named
-# StubService whose guard message names the mock's own type/method, not a
-# real placeholder. Currently inert under the scanner's word-boundary
-# PLACEHOLDER_RE ("StubService" has no isolated "stub" word), seeded here
-# for the case the mock's naming or the regex broadens later.
-crates/kkernel/src/reindex.rs	StubService::embed must not be called in this test
+# Every entry must suppress a CURRENT finding. The scanner fails loud on any
+# entry that matches no finding in the scanned tree -- a stale entry (the file
+# moved, or its message changed) or a pre-planted entry (added ahead of the
+# file it would suppress) cannot sit here silently disabling a future finding.
+# An allowlist entry is therefore only ever added in the same change as the
+# finding it suppresses, and justified in the PR.
+#
+# There are no active entries today. The crates/kkernel/src/reindex.rs
+# #[cfg(test)] EmbeddingService mock named StubService (whose guard message
+# names the mock's own type/method, not a real placeholder) is inert under the
+# scanner's word-boundary PLACEHOLDER_RE -- "StubService" has no isolated
+# "stub" word -- so it produces no finding and needs no entry. An entry would
+# be added here only if a real match ever appears.
