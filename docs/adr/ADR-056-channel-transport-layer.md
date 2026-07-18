@@ -548,29 +548,64 @@ target argument, so even a target value that somehow reached the invocation unva
 be parsed as an `ssh` option. Acceptance property: an option-prefixed `KHIVE_IMESSAGE_SSH_TARGET`
 value refuses channel start.
 
-### Outbound: `osascript` via hardened argv, no text interpolation
+### Remote command boundary: a fixed helper, data-only stdin
 
-On the bridge host, delivery drives the Messages application via `osascript`. Message text is
-never interpolated into a shell string or an AppleScript source string: the text travels over
-stdin (or a temp file consumed by a fixed, pre-written script), and the `ssh`/`osascript`
-invocation argv is constructed from an allowlisted fixed form -- the daemon never assembles a
-shell command by string concatenation with caller-supplied content. This is the same
-argv-only-construction pattern ADR-108 Fork (b) B2 establishes for `git.commit`/`git.branch`/
-`git.push`: a fixed argument vector via `std::process::Command::new(...).args([...])`, no shell
-interpolation, and no caller-supplied value reaching the process boundary unvalidated. ADR-108's
-Amendment 1 requirement for a dedicated adversarial security review at implementation time
-applies equally to this shell-out surface.
+Every `ssh` invocation this adapter makes runs exactly one fixed, pre-installed remote command on
+the bridge host, never a command line assembled from configuration or runtime values. OpenSSH does
+not preserve a local argv array across the wire: the client space-joins the remote command and its
+arguments into a single string that the remote shell re-parses, so a dynamic value placed anywhere
+in that remote command line is exposed to remote shell parsing regardless of how carefully the
+local argv was constructed -- fixed local argv construction alone does not close this, because it
+governs only how the local `ssh` process is invoked, not what the string it sends across the wire
+is interpreted as once it reaches the remote shell. `KHIVE_IMESSAGE_DB_PATH` and every other
+dynamic or operator-configured value this adapter uses -- other than the SSH target itself, which
+the local `ssh` client consumes directly and never forwards into the remote command line -- is
+therefore never interpolated into the remote command line in any form, quoted or otherwise.
+
+Instead, each SSH invocation runs a single fixed remote helper: a pre-written script or small
+binary installed on the bridge host during one-time setup and invoked by a literal,
+unparameterized name. Every dynamic value the helper needs -- the database path, the poll floor,
+the outbound recipient and message text -- is delivered to it over stdin as structured, data-only
+input that the helper reads and interprets itself; none of it is ever concatenated into the
+command the remote shell parses. A fixed remote command with data-only stdin is structurally
+injection-proof: there is no remote parsing step a crafted value could influence, because the
+value never occupies a position the remote shell treats as syntax. This is preferred over
+validating `KHIVE_IMESSAGE_DB_PATH` against a path-safety grammar and passing the validated result
+as a remote argument, because an allowlist grammar is a rule that must anticipate every dangerous
+shape and rots as shell and AppleScript escaping rules shift across macOS releases; a fixed command
+with no argument position for the value at all has no such surface to rot. Regression coverage
+names the adversarial case directly: a test asserting that a `KHIVE_IMESSAGE_DB_PATH` value
+containing shell metacharacters (backticks, `$( )`, semicolons, quotes) delivered through the
+configured path cannot alter the remote command the bridge host executes, distinct from and in
+addition to the local-side `KHIVE_IMESSAGE_SSH_TARGET` validation above.
+
+### Outbound: the fixed remote helper, no text interpolation
+
+On the bridge host, delivery drives the Messages application through the fixed remote helper
+described above. The message body and recipient are never interpolated into a shell string or an
+AppleScript source string: they travel to the helper over stdin as structured, data-only input,
+and the SSH invocation's remote command is always the same literal helper invocation -- the daemon
+never assembles a remote or local shell command by string concatenation with caller-supplied
+content. On receiving that structured input, the helper drives `osascript` locally on the bridge
+host using a fixed, pre-written AppleScript that itself reads the message text from a temp file or
+stdin rather than from an interpolated source string. This extends the same class of protection
+ADR-108 Fork (b) B2 establishes for `git.commit`/`git.branch`/`git.push` -- no caller-supplied
+value reaching a command-parsing boundary unvalidated -- across both the SSH hop and the local
+`osascript` invocation. ADR-108's Amendment 1 requirement for a dedicated adversarial security
+review at implementation time applies equally to this shell-out surface.
 
 ### Inbound: read-only polling of the bridge host's Messages database
 
 Inbound messages are read by polling the bridge host's Messages database (Apple's own SQLite
 store for the Messages application, path configured by `KHIVE_IMESSAGE_DB_PATH`, default
-`~/Library/Messages/chat.db`) over the same SSH transport, at a configurable interval
+`~/Library/Messages/chat.db`) through the same fixed remote helper the outbound path uses
+(§Remote command boundary above): the configured path is delivered to the helper over stdin, never
+placed on the remote command line, and the helper alone opens the database at that path with
+read-only semantics on the bridge host. Polling runs at a configurable interval
 (`KHIVE_IMESSAGE_POLL_SECS`, default 5 seconds, mirroring §12's default inter-poll interval;
-validation rule below). The database is always opened with read-only semantics; the adapter never
-writes to `chat.db`. Delivery into `comm.ingest` is attributed as `imessage:<slug>` inbound,
-following the channel-prefixed `from` form OQ-1 established (§14; also used by the Telegram
-amendment's `from = "telegram:<maintainer-slug>"`).
+validation rule below). The adapter never writes to `chat.db`. Delivery into `comm.ingest` is
+attributed as `imessage:<slug>` inbound, following the channel-prefixed `from` form OQ-1
+established (§14; also used by the Telegram amendment's `from = "telegram:<maintainer-slug>"`).
 
 **Sender validation (ADR-056 §8 applied to this adapter).** §8 requires every adapter to
 validate the external sender identity on every inbound item before it becomes an envelope. For
@@ -722,24 +757,38 @@ against -- risks silently skipping unrelated rows or ingesting the wrong convers
 under a stale mark. The guard's job is narrower than perfect continuity: a stale mark is never
 applied once the GUID check fails.
 
-**The widened cursor contract, precisely.** The shared checkpoint type
-(`StoredChannelCheckpoint`, introduced in §Amendment 2026-07-09) gains one new field: `anchor:
-Option<String>`, nullable for every existing adapter. The cursor read and commit operations
-(`comm.cursor_get` / `comm.cursor_commit`) are widened to take `(channel_kind, channel_slug,
-source)` rather than `(channel_kind, channel_slug)` alone, and both carry `anchor` on read and on
-write. The `Channel` trait (§2) gains a source accessor -- a method returning the adapter
-instance's own `source` string -- so the daemon loop can resolve which cursor row an adapter
-reads and commits against before the first poll of a tick, not after. Stepwise, the daemon loop's
-per-tick sequence is:
+**The widened cursor contract, precisely.** The field belongs on the type the poller actually
+commits, not only on the type storage returns. `ChannelPollPage` (§Amendment 2026-07-09) carries a
+`next_checkpoint: ChannelCheckpoint` field -- the value `EmailChannel::poll_page` (and this
+adapter's `poll_page`) hands back to the daemon loop after each page, and the value the loop passes
+to `comm.cursor_commit`. `ChannelCheckpoint` gains one new field: `anchor: Option<String>`,
+nullable for every existing adapter. `StoredChannelCheckpoint` -- the type `comm.cursor_get`
+returns, which layers `source`, `generation`, and `updated_at` storage bookkeeping around the same
+checkpoint fields -- carries `anchor` because it is built on `ChannelCheckpoint`, not as a second,
+independent field; a `ChannelCheckpoint` read from storage and a `ChannelCheckpoint` produced by a
+poll page are the same shape, so the value the loop commits is exactly the value that round-trips
+through storage. The cursor read and commit operations (`comm.cursor_get` / `comm.cursor_commit`)
+are widened to take `(channel_kind, channel_slug, source)` rather than `(channel_kind,
+channel_slug)` alone, and both carry `anchor` on read and on write. The `Channel` trait (§2) gains
+a source accessor -- a method returning the adapter instance's own `source` string -- so the daemon
+loop can resolve which cursor row an adapter reads and commits against before the first poll of a
+tick, not after. Stepwise, the daemon loop's per-tick sequence is:
 
 1. Resolve the adapter's source via the trait's source accessor.
-2. Read the cursor by `(channel_kind, channel_slug, source)`.
+2. Read the cursor by `(channel_kind, channel_slug, source)`, yielding a `StoredChannelCheckpoint`.
 3. Poll pages starting from the checkpoint the read returned.
 4. For each page: handle every row -- ingest or terminal drop (§Terminal disposition above) --
-   then commit the cursor, including any `anchor` update, once the whole page is handled.
+   then commit the page's `next_checkpoint` (a `ChannelCheckpoint`, `anchor` included) via
+   `comm.cursor_commit`, once the whole page is handled.
 
-This is the precise, API-level statement of the `cursor_get -> poll_page -> handle each ->
-cursor_commit` sequencing described in §Restart durability above.
+On an empty page (no rows above the prior high-water), `poll_page` returns a `next_checkpoint`
+equal to the checkpoint it was given -- `high_water` and `anchor` unchanged -- and the loop still
+commits it, so `updated_at` advances without perturbing progress. On the forward-only reset
+described above (identity guard mismatch), the adapter's `poll_page` sets `next_checkpoint.anchor`
+to the new anchor row's GUID and `next_checkpoint.high_water` to the new maximum `ROWID` in the
+same `ChannelCheckpoint` value, so the reset commits atomically with the rest of the page rather
+than as a separate write. This is the precise, API-level statement of the `cursor_get -> poll_page
+-> handle each -> cursor_commit` sequencing described in §Restart durability above.
 
 **Migration: owner and sequence.** The comm pack owns `comm_channel_cursor`, so this schema
 change ships as a versioned pack-schema migration under the pack-scoped backend rules of ADR-028,
@@ -877,9 +926,12 @@ does not depend on the Telegram pass-through landing first.
 
 ### Acceptance properties (testable, transport mocked)
 
-1. The outbound argv passed to the SSH/`osascript` invocation contains no message text --
-   message text reaches the bridge host only via stdin or a temp file, never as an argv element
-   or an interpolated shell/AppleScript string (the injection fence).
+1. Every SSH invocation's remote command line is the fixed remote helper's literal, unparameterized
+   name; message text, the recipient, and the configured `KHIVE_IMESSAGE_DB_PATH` reach the bridge
+   host only over stdin as structured data, never as a remote-argv element or an interpolated
+   shell/AppleScript string (the injection fence). A dedicated adversarial regression test asserts
+   that a `KHIVE_IMESSAGE_DB_PATH` value containing shell metacharacters (backticks, `$( )`,
+   semicolons, quotes) cannot alter the remote command the bridge host executes.
 2. Simulating a restart mid-poll and re-delivering an already-seen `chat.db` row does not produce
    a duplicate inbound note; dedup is by GUID through `idx_comm_message_external_id`.
 3. An unreachable bridge host degrades that one channel to a channel-down warning; other
