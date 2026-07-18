@@ -790,6 +790,31 @@ LSTREEFAILFIXTURE
         fi
     fi
 
+    # The ci.sh check above constrains only run_all's phase list. GitHub Actions
+    # does not call run_all: it invokes phases as individual workflow steps, so a
+    # step reordered (or suite-gated) in the workflow bypasses the guard while
+    # run_all still looks correct. That is exactly how the macOS PR lane once ran
+    # cargo with no scan at all. Assert against the workflow itself: the first
+    # ci.sh phase any job invokes must be no-stubs-scan, and it must carry no
+    # suite condition -- an `if:` on that step re-splits the lanes and leaves
+    # whichever suite it excludes unguarded.
+    workflow="$SCRIPT_DIR/../.github/workflows/ci.yml"
+    if [ -f "$workflow" ]; then
+        first_ci_phase="$(grep -oE 'scripts/ci\.sh [a-z-]+' "$workflow" | head -1 | awk '{print $2}')"
+        if [ "$first_ci_phase" != "no-stubs-scan" ]; then
+            echo "self-test FAILED: the first scripts/ci.sh phase invoked in .github/workflows/ci.yml must be 'no-stubs-scan'; found '$first_ci_phase'. A cargo-running step ahead of the guard executes PR-controlled build scripts against an unscanned tree (#560)."
+            status=1
+        fi
+        scan_line="$(grep -nE 'scripts/ci\.sh no-stubs-scan' "$workflow" | head -1 | cut -d: -f1)"
+        if [ -n "$scan_line" ]; then
+            guard_start="$((scan_line > 3 ? scan_line - 3 : 1))"
+            if sed -n "${guard_start},${scan_line}p" "$workflow" | grep -qE '^[[:space:]]*if:'; then
+                echo "self-test FAILED: the no-stubs-scan step in .github/workflows/ci.yml carries an 'if:' condition. The scan must run on every suite; gating it leaves the excluded lane compiling PR-controlled code unguarded (#560)."
+                status=1
+            fi
+        fi
+    fi
+
     if [ "$status" -eq 0 ]; then
         echo "lint-stub-markers self-test: OK"
     fi

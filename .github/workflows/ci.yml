@@ -148,19 +148,19 @@ jobs:
           deno-version: v2.x
       - uses: astral-sh/setup-uv@v5
         if: env.CI_SUITE == 'full'
+      # SECURITY ORDERING (#560): the placeholder-stub scan runs before any cargo
+      # phase so no PR-controlled build script or proc-macro executes before the
+      # guard; it reads the pristine checkout. Keep this step ahead of every cargo
+      # step below, and ungated: both suites compile PR-controlled code, so gating
+      # the scan to one suite leaves the other lane unguarded.
+      - name: No-stub placeholder scan (before any cargo)
+        run: ../scripts/ci.sh no-stubs-scan
       - name: macOS PR compile check
         if: env.CI_SUITE == 'macos-pr'
         run: ../scripts/ci.sh macos-pr-check
       - name: macOS PR platform tests
         if: env.CI_SUITE == 'macos-pr'
         run: ../scripts/ci.sh macos-pr-tests
-      # SECURITY ORDERING (#560): the placeholder-stub scan runs before any cargo
-      # phase so no PR-controlled build script or proc-macro executes before the
-      # guard; it reads the pristine checkout. Keep this step ahead of every cargo
-      # step below.
-      - name: No-stub placeholder scan (before any cargo)
-        if: env.CI_SUITE == 'full'
-        run: ../scripts/ci.sh no-stubs-scan
       - name: Lockfile freshness
         if: env.CI_SUITE == 'full'
         run: ../scripts/ci.sh lockfile
