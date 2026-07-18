@@ -72,8 +72,20 @@ pub fn arm_vector_fail_after(n: usize) {
     VECTOR_FAIL_AFTER.with(|cell| cell.set(Some(n)));
 }
 
+// Namespace-keyed one-shot set, not a single `Option<String>` slot:
+// `create_note_inner` and `create_entity_inner` share this flag, and a
+// single-slot design let a concurrently running test's `arm_fts_fail(other_ns)`
+// overwrite this test's armed namespace before its own create call consumed
+// it, so the intended injection silently never fired (#1095). Keying by
+// namespace fixes that at the root — arming `ns_B` inserts `ns_B` without
+// evicting `ns_A`. Process-wide (not thread-local) so a caller may arm on
+// one OS thread and run the triggering `create_note`/`create_entity` on
+// another (e.g. via `tokio::spawn` on a multi-thread runtime); the
+// check-and-remove under the mutex lock keeps exactly-once semantics even
+// under concurrent same-namespace creates.
 #[cfg(any(test, feature = "fault-injection"))]
-static FTS_FAIL_NS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static FTS_FAIL_NS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 #[cfg(any(test, feature = "fault-injection"))]
 static VECTOR_FAIL_NS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 /// FTS failure injection for `create_many` — separate from `FTS_FAIL_NS` so that
@@ -94,15 +106,19 @@ static FTS_FAIL_MANY_PARTIAL_NS: std::sync::Mutex<Option<String>> = std::sync::M
 #[cfg(any(test, feature = "fault-injection"))]
 static FTS_SEARCH_FAIL_NS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
-/// Arm the FTS failure injection for `create_note_inner` targeting namespace `ns`.
+/// Arm a one-shot FTS failure injection for `create_note_inner`/`create_entity_inner`
+/// targeting namespace `ns`.
 ///
-/// The next `create_note` call whose note namespace equals `ns` returns an injected
-/// error at the FTS upsert step (after the note row is committed), then disarms.
-/// Calls on other namespaces are unaffected.
+/// The next `create_note` or `create_entity` call whose namespace equals `ns` returns
+/// an injected error at the FTS upsert step (after the row is committed), then disarms
+/// — only that namespace's entry is consumed. The arm is process-wide and thread
+/// independent: it may be set from one OS thread and consumed by a `create_note`/
+/// `create_entity` call running on another (e.g. inside `tokio::spawn`). Concurrent
+/// arms of distinct namespaces do not interfere with each other.
 /// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
 #[cfg(any(test, feature = "fault-injection"))]
 pub fn arm_fts_fail(ns: &str) {
-    *FTS_FAIL_NS.lock().unwrap() = Some(ns.to_string());
+    FTS_FAIL_NS.lock().unwrap().insert(ns.to_string());
 }
 
 /// Arm the FTS failure injection for `create_many` targeting namespace `ns`.
@@ -699,15 +715,7 @@ impl KhiveRuntime {
         // FTS step — compensate entity row on failure (mirrors create_note_inner).
         {
             #[cfg(any(test, feature = "fault-injection"))]
-            let fts_inject = {
-                let mut g = FTS_FAIL_NS.lock().unwrap();
-                if g.as_deref() == Some(ns) {
-                    *g = None;
-                    true
-                } else {
-                    false
-                }
-            };
+            let fts_inject = FTS_FAIL_NS.lock().unwrap().remove(ns);
             #[cfg(not(any(test, feature = "fault-injection")))]
             let fts_inject = false;
             let fts_result: RuntimeResult<()> = if fts_inject {
@@ -2659,20 +2667,12 @@ impl KhiveRuntime {
         // FTS step — compensate note row on failure.
         {
             // Injection: check FTS_FAIL_NS (armed by `arm_fts_fail(ns)`).
-            // Fires only when the armed namespace matches this note's namespace,
-            // then clears (one-shot).  No lock acquisition in release builds —
-            // the cfg(not) branch is a const false so the compiler eliminates
-            // the if-branch entirely.
+            // Fires only when `ns` is in the armed set, removing it on the way
+            // out (one-shot, atomic check-and-remove under the mutex). No lock
+            // acquisition in release builds — the cfg(not) branch is a const
+            // false so the compiler eliminates the if-branch entirely.
             #[cfg(any(test, feature = "fault-injection"))]
-            let fts_inject = {
-                let mut g = FTS_FAIL_NS.lock().unwrap();
-                if g.as_deref() == Some(ns) {
-                    *g = None;
-                    true
-                } else {
-                    false
-                }
-            };
+            let fts_inject = FTS_FAIL_NS.lock().unwrap().remove(ns);
             #[cfg(not(any(test, feature = "fault-injection")))]
             let fts_inject = false;
             let fts_result: RuntimeResult<()> = if fts_inject {
@@ -9375,11 +9375,10 @@ mod tests {
     #[tokio::test]
     async fn create_note_fts_failure_rolls_back_note_row() {
         let rt = rt();
-        // Unique namespace: the process-global FTS_FAIL_NS one-shot flag armed
-        // below must be consumable only by THIS test's create_note. Sharing the
-        // "local" namespace let a concurrent "local" create_note consume the
-        // armed flag, flaking this test and its victim under parallel
-        // `cargo test`.
+        // Unique namespace: FTS_FAIL_NS is a namespace-keyed set, so a
+        // concurrently running test arming a different namespace never evicts
+        // this test's arm. The namespace still guards against a same-test
+        // mismatch between the armed value and the note actually being created.
         let ns = Namespace::parse("fault-fts-rollback").unwrap();
         let tok = NamespaceToken::for_namespace(ns.clone());
 
@@ -9400,6 +9399,60 @@ mod tests {
         assert!(
             result.is_err(),
             "create_note must propagate the injected FTS failure"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("injected FTS failure"),
+            "error must carry injection message; got: {err_msg}"
+        );
+
+        // Compensation must have removed the note row.
+        let notes = rt.list_notes(&tok, None, 1000, 0).await.unwrap();
+        assert!(
+            notes.is_empty(),
+            "compensation must remove the note row after FTS failure; got {notes:?}"
+        );
+    }
+
+    // Arming FTS_FAIL_NS on one OS thread must still fire on a `create_note`
+    // call that runs on a genuinely different OS thread. Arms here on the
+    // test's own (tokio current-thread) task, then hands the triggering
+    // `create_note` call to a `std::thread::spawn` worker running its own
+    // single-threaded tokio runtime — a stronger guarantee of thread migration
+    // than `tokio::spawn`, which may schedule the spawned task back onto the
+    // same worker. Proves the process-wide, namespace-keyed `FTS_FAIL_NS` set
+    // is thread-independent.
+    #[tokio::test]
+    async fn create_note_fts_failure_fires_across_os_threads() {
+        let rt = std::sync::Arc::new(rt());
+        let ns = Namespace::parse("fault-fts-rollback-cross-thread").unwrap();
+        let tok = NamespaceToken::for_namespace(ns.clone());
+
+        arm_fts_fail(ns.as_str());
+
+        let thread_rt = std::sync::Arc::clone(&rt);
+        let thread_tok = tok.clone();
+        let result = std::thread::spawn(move || {
+            let worker = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("worker runtime must build");
+            worker.block_on(thread_rt.create_note(
+                &thread_tok,
+                "observation",
+                None,
+                "fts-fail rollback target (cross-thread)",
+                None,
+                None,
+                vec![],
+            ))
+        })
+        .join()
+        .expect("worker thread must not panic");
+
+        assert!(
+            result.is_err(),
+            "create_note on a different OS thread must still observe the injected FTS failure"
         );
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -10933,8 +10986,8 @@ mod tests {
 
     // FTS failure after entity row commit rolls back the entity row.
     // Mirrors create_note_fts_failure_rolls_back_note_row but for entities.
-    // Uses a unique namespace so the process-global FTS_FAIL_NS one-shot is
-    // consumed only by this test's create_entity call.
+    // Uses a unique namespace so this test's arm never fires for the wrong
+    // write path, even under full-suite parallelism.
     #[tokio::test]
     async fn create_entity_fts_failure_rolls_back_entity_row() {
         let rt = KhiveRuntime::memory().unwrap();
