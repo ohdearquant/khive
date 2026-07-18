@@ -247,7 +247,9 @@ mod prune_recall_visibility_tests {
     }
 
     /// A pruned memory must not be returned by `memory.recall` through the lexical
-    /// (`keyword_only`), vector (`vector_only`), or default hybrid fusion path.
+    /// (`keyword_only`), vector (`vector_only`), or default hybrid fusion path —
+    /// and each leg must be shown to actually see the note both before and after
+    /// pruning, not just asserted absent.
     ///
     /// `memory.prune` soft-deletes via `NoteStore::delete_note` (sets `deleted_at`,
     /// rows remain — ADR-014) and bumps the per-model ANN generation so a background
@@ -255,7 +257,22 @@ mod prune_recall_visibility_tests {
     /// sqlite-vec store directly. Correctness for `memory.recall` is expected to
     /// come from `load_memory_candidate_notes`'s post-hydration `deleted_at IS NULL`
     /// filter (`handlers/common.rs`), which applies uniformly to text and vector
-    /// candidates before either leg reaches the caller.
+    /// candidates before either leg reaches the caller — plus the vector store's own
+    /// `deleted_at IS NULL` anti-join (`khive-db/src/stores/vectors.rs`) exercised
+    /// only by the exact sqlite-vec search, never the warm ANN bridge.
+    ///
+    /// A single live note is always corpus enough for `ensure_ann_for_model` to build
+    /// and install a warm ANN graph on its very first cold-miss search, so an
+    /// ordinary `vector_only` recall after seeding never reaches the exact
+    /// sqlite-vec fallback (`handlers/common.rs:1100-1129`) — it always takes the
+    /// warm-route branch instead (`ann::search_loaded` returning `Some`, counted by
+    /// `warm_route_count`). To force the fallback deterministically, the warm graph
+    /// for this model is evicted (`ann::clear_key`) right after pruning: the note is
+    /// now soft-deleted, so `load_and_build_from_vector_store`'s corpus scan (which
+    /// joins `notes` and filters `deleted_at IS NULL`) finds zero live rows, the
+    /// rebuild attempt resolves to `EmptyCorpus` without installing a graph, and the
+    /// recall loop in `handlers/common.rs` falls through to the exact sqlite-vec
+    /// search for every subsequent call on this model.
     #[tokio::test]
     #[serial(background_tasks)]
     async fn prune_excludes_pruned_memory_across_fts_vector_and_hybrid_recall() {
@@ -272,9 +289,12 @@ mod prune_recall_visibility_tests {
         let ns = Namespace::parse("local").expect("local namespace");
         rt.authorize(ns).expect("authorize local");
 
+        let pack = crate::MemoryPack::new(rt.clone());
+        let ann = pack.ann_for_test();
+
         let mut builder = VerbRegistryBuilder::new();
         builder.register(KgPack::new(rt.clone()));
-        builder.register(crate::MemoryPack::new(rt.clone()));
+        builder.register(pack);
         let registry = builder.build().expect("registry");
 
         // memory_type=semantic writes to the token's own namespace ("local"),
@@ -295,19 +315,33 @@ mod prune_recall_visibility_tests {
             .expect("remember response carries id")
             .to_string();
 
-        // Sanity: the note is recallable before prune.
-        let before = registry
-            .dispatch(
-                "memory.recall",
-                serde_json::json!({ "query": NOTE_TEXT, "limit": 10 }),
-            )
-            .await
-            .expect("memory.recall before prune");
-        let before_hits = before.as_array().expect("bare array result");
-        assert!(
-            before_hits.iter().any(|h| h["id"] == note_id),
-            "seeded note must be recallable before prune: {before_hits:?}"
-        );
+        // Sanity: the note is recallable before prune, via each leg independently —
+        // a leg that returns empty both before and after prune would satisfy the
+        // post-prune absence assertion vacuously.
+        for (label, fusion_strategy) in [
+            ("keyword_only (FTS lexical leg)", "keyword_only"),
+            ("vector_only (sqlite-vec/ANN leg)", "vector_only"),
+        ] {
+            let mut params = serde_json::json!({
+                "query": NOTE_TEXT,
+                "limit": 10,
+                "fusion_strategy": fusion_strategy,
+            });
+            if fusion_strategy == "vector_only" {
+                params["embedding_model"] = serde_json::json!(MODEL);
+            }
+            let result = registry
+                .dispatch("memory.recall", params)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("memory.recall [{label}] before prune must not error: {e:?}")
+                });
+            let hits = result.as_array().expect("bare array result");
+            assert!(
+                hits.iter().any(|h| h["id"] == note_id),
+                "seeded note must be recallable via {label} before prune: {hits:?}"
+            );
+        }
 
         let prune_result = registry
             .dispatch("memory.prune", serde_json::json!({ "min_salience": 0.5 }))
@@ -317,6 +351,13 @@ mod prune_recall_visibility_tests {
             prune_result["pruned"], 1,
             "the single seeded note (salience 0.1 < 0.5) must be pruned: {prune_result:?}"
         );
+
+        // Evict the warm graph built during the pre-prune vector_only check above,
+        // so the recalls below rebuild against the now-pruned corpus and fall
+        // through to the exact sqlite-vec search instead of the warm ANN route.
+        let key = crate::ann::AnnKey::new("local", MODEL);
+        crate::ann::clear_key(&ann, &key).await;
+        ann.reset_warm_route_count();
 
         for (label, fusion_strategy) in [
             ("keyword_only (FTS lexical leg)", "keyword_only"),
@@ -341,6 +382,17 @@ mod prune_recall_visibility_tests {
                 "pruned note must not be returned via {label}, got: {hits:?}"
             );
         }
+
+        // Prove the vector legs above actually took the exact sqlite-vec fallback
+        // (handlers/common.rs:1100-1129), not the warm ANN route: the corpus scan
+        // that would install a warm graph sees zero live rows post-prune, so
+        // `ann::search_loaded` must never have found a cached bridge for this model.
+        assert_eq!(
+            ann.warm_route_count(),
+            0,
+            "post-prune vector recall must route through the exact sqlite-vec \
+             fallback, not the warm ANN bridge"
+        );
     }
 }
 
