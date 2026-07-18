@@ -12,24 +12,36 @@
 # panic!/unreachable! call for that language, not the macro itself.
 #
 # Scans every `.rs` file under crates/ -- source, tests, benches, and
-# examples alike (build-artifact `target`/`.cargo-target` dirs excluded,
-# same as .gitignore). There is no reachability/cfg analysis: a placeholder
-# message is a placeholder message whether or not the code compiling it is
-# test-gated. The small number of legitimate matches (a test mock whose
-# type/method name happens to contain a placeholder word) are suppressed via
-# the explicit, in-diff reviewed allowlist at stub-marker-allowlist.txt --
-# see that file's header for the format.
+# examples alike. Production discovery is git-tracked-file based (`git
+# ls-files -s -z -- crates/`): untracked build-artifact output (target/,
+# .cargo-target/, anything gitignored) is never listed by git, so no
+# name-based directory pruning is needed and, unlike a name-pruning `find`,
+# a TRACKED Rust module nested under a dir literally named `target` (e.g.
+# reachable via #[path]) is not invisible to the scan. There is no
+# reachability/cfg analysis: a placeholder message is a placeholder message
+# whether or not the code compiling it is test-gated. The small number of
+# legitimate matches (a test mock whose type/method name happens to contain
+# a placeholder word) are suppressed via the explicit, in-diff reviewed
+# allowlist at stub-marker-allowlist.txt -- see that file's header for the
+# format.
+#
+# SCOPE (documented non-goal): this is a placeholder-LANGUAGE net over the
+# literal spellings `panic!`/`unreachable!` only. It does not resolve macro
+# aliases, re-exports, or wrapper macros (e.g. a local `crash!` expanding to
+# panic!) -- that would require macro-expansion-aware parsing this scanner
+# does not attempt. Alias coverage is left to clippy and human review; this
+# is a known non-goal, not a silent bypass of a stated promise.
 #
 # Filesystem-indirection (symlink) policy -- every path this script opens or
 # walks, and the symlink handling applied to each:
 #
-#   script self-location     | `cd $(dirname $0) && pwd`       | trusted; resolved once at startup
-#   crates/ regular .rs      | `find -type f -name '*.rs'`     | only real files scanned; symlinks excluded by -type f
-#   crates/ any symlink      | `find -type l`                  | HARD-FAIL, named via sanitize_for_ci, before scanning
-#   discovered .rs reads     | `open(path)` in the scan loop   | guaranteed real by the -type f / -type l split; CI checkout is static (no find->read swap)
-#   allowlist file           | `os.open(O_RDONLY|O_NOFOLLOW)`  | symlink refused atomically; in-repo default must also resolve under the scan root; env override is containment-exempt but still symlink-refused
-#   temp transport files     | `mktemp`                        | mktemp regular files (O_EXCL); not attacker-controlled
-#   self-test fixture trees  | self-authored under `mktemp -d` | test-authored real files
+#   script self-location     | `cd $(dirname $0) && pwd`         | trusted; resolved once at startup
+#   crates/ regular .rs      | `git ls-files -s` mode 100644/100755, self-test fallback `find -type f` | only tracked-regular/self-test-real files scanned
+#   crates/ any symlink      | `git ls-files -s` mode 120000, self-test fallback `find -type l` | HARD-FAIL, named via sanitize_for_ci, before scanning
+#   discovered .rs reads     | `os.open(O_RDONLY|O_NOFOLLOW)` in the scan loop | binds the read to the exact discovered path; a post-discovery swap to a symlink (a build step/proc-macro racing the guard, or a working-tree file diverging from a clean git index entry) raises ELOOP and hard-fails that path by name, rather than silently following or reading a replacement
+#   allowlist file            | `os.open(O_RDONLY|O_NOFOLLOW)`    | symlink refused atomically; in-repo default must also resolve under the scan root; env override is containment-exempt but still symlink-refused
+#   temp transport files      | `mktemp`                          | mktemp regular files (O_EXCL); not attacker-controlled
+#   self-test fixture trees   | self-authored under `mktemp -d`   | test-authored real files (find-mode discovery; not git-tracked)
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -192,6 +204,17 @@ pub fn c1_csi_forgery_stub(flag: bool) -> u32 {
     }
     1
 }
+
+pub fn after_nested_format_args_stub(flag: bool) -> u32 {
+    if !flag {
+        // Adversarial: a placeholder assembled through a nested format_args!
+        // call whose own arguments are all literals -- fully statically
+        // derivable, so it must be reconstructed and caught, not treated as
+        // an opaque non-literal argument.
+        panic!("{}", format_args!("not {}", "implemented via nested format_args"));
+    }
+    1
+}
 FIXTURE
 
     # Appended via printf (not the quoted heredoc above) so the fixture can
@@ -263,6 +286,25 @@ pub fn concat_arg_dispatch(kind: &str) -> u32 {
     }
 }
 
+pub fn named_variable_slot_dispatch(stage: &str) -> u32 {
+    // Adversarial: a non-literal (runtime variable) argument filling a
+    // format slot must never be silently vacated to an empty string -- that
+    // would let "not {feature} implemented" collapse into a false-positive
+    // "not  implemented". The slot resolves to UNRESOLVED_SLOT_SENTINEL
+    // instead, which breaks the marker regex's `\s*` span.
+    panic!("not {feature} implemented", feature = stage)
+}
+
+pub fn alias_macro_not_matched(flag: bool) -> u32 {
+    if !flag {
+        // Adversarial: macro-alias resolution is a documented non-goal (see
+        // MACRO_CALL_RE's scope comment) -- only literal panic!/unreachable!
+        // spellings are matched, so an alias must not be flagged here.
+        crash!("todo: alias bypass is a documented non-goal, not a silent guard failure");
+    }
+    1
+}
+
 // Mirrors the real crates/kkernel/src/reindex.rs mock pattern (a #[cfg(test)]
 // EmbeddingService mock named StubService whose guard message names the
 // mock's own type/method, not a real placeholder) -- the reason
@@ -291,9 +333,9 @@ FIXTURE
     # Exactly 19 markers are seeded in case-fail above; asserting the count
     # (not just substring presence) catches a parser-overmatch regression
     # that would otherwise slip through as an unnoticed extra finding.
-    expected_marker_count=19
+    expected_marker_count=20
 
-    if STUB_MARKER_ALLOWLIST="$empty_allowlist" scan "$tmp/case-fail" > "$tmp/fail.log" 2>&1; then
+    if STUB_MARKER_ALLOWLIST="$empty_allowlist" scan "$tmp/case-fail" find > "$tmp/fail.log" 2>&1; then
         echo "self-test FAILED: expected placeholder call sites were not caught"
         cat "$tmp/fail.log"
         status=1
@@ -323,7 +365,8 @@ FIXTURE
             "carries a newline and a forged CI workflow command sequence" \
             "a placeholder inside a tests/ directory file must now be caught" \
             "implemented for the mixed positional and named case" \
-            "sanitization probe"
+            "sanitization probe" \
+            "implemented via nested format_args"
         do
             if ! grep -qF "$marker" "$tmp/fail.log"; then
                 echo "self-test FAILED: expected finding missing: $marker"
@@ -378,7 +421,7 @@ PYCTL
         fi
     fi
 
-    if ! STUB_MARKER_ALLOWLIST="$empty_allowlist" scan "$tmp/case-pass" > "$tmp/pass.log" 2>&1; then
+    if ! STUB_MARKER_ALLOWLIST="$empty_allowlist" scan "$tmp/case-pass" find > "$tmp/pass.log" 2>&1; then
         echo "self-test FAILED: legitimate panic!/unreachable! messages (raw strings, lookalike text inside strings, a #[cfg(test)] helper named StubService) false-positived:"
         cat "$tmp/pass.log"
         status=1
@@ -400,7 +443,7 @@ PYCTL
     # This repeats the production scan's full-tree pass; removing that duplication
     # is the self-test/production structure work tracked in #1108.
     committed_allowlist="$SCRIPT_DIR/stub-marker-allowlist.txt"
-    if ! STUB_MARKER_ALLOWLIST="$committed_allowlist" scan "$ROOT" > "$tmp/committed.log" 2>&1; then
+    if ! STUB_MARKER_ALLOWLIST="$committed_allowlist" scan "$ROOT" git > "$tmp/committed.log" 2>&1; then
         echo "self-test FAILED: the committed allowlist did not pass the scanner over the real tree -- a malformed, stale, or pre-planted allowlist entry, or an un-suppressed placeholder stub in the tree (named below):"
         cat "$tmp/committed.log"
         status=1
@@ -426,7 +469,7 @@ ALWFIXTURE
     printf 'crates/fixture-crate/src/lib.rs\ttodo: this one is allowlisted and must be suppressed\n' \
         >> "$temp_allowlist"
 
-    if STUB_MARKER_ALLOWLIST="$temp_allowlist" scan "$tmp/case-allowlist" > "$tmp/allowlist.log" 2>&1; then
+    if STUB_MARKER_ALLOWLIST="$temp_allowlist" scan "$tmp/case-allowlist" find > "$tmp/allowlist.log" 2>&1; then
         echo "self-test FAILED: the non-allowlisted sibling finding should have failed the scan"
         cat "$tmp/allowlist.log"
         status=1
@@ -456,7 +499,7 @@ STALEFIXTURE
     stale_allowlist="$tmp/stale-allowlist.txt"
     printf 'crates/does-not-exist/src/lib.rs\ttodo: entry for a path not in the tree\n' \
         > "$stale_allowlist"
-    if STUB_MARKER_ALLOWLIST="$stale_allowlist" scan "$tmp/case-stale-allowlist" > "$tmp/stale.log" 2>&1; then
+    if STUB_MARKER_ALLOWLIST="$stale_allowlist" scan "$tmp/case-stale-allowlist" find > "$tmp/stale.log" 2>&1; then
         echo "self-test FAILED: a scan with an allowlist entry for a nonexistent path should have failed loud"
         cat "$tmp/stale.log"
         status=1
@@ -480,7 +523,7 @@ UNUSEDFIXTURE
     unused_allowlist_file="$tmp/unused-allowlist.txt"
     printf 'crates/real-crate/src/lib.rs\ttodo: no finding in this file matches this message\n' \
         > "$unused_allowlist_file"
-    if STUB_MARKER_ALLOWLIST="$unused_allowlist_file" scan "$tmp/case-unused-allowlist" > "$tmp/unused.log" 2>&1; then
+    if STUB_MARKER_ALLOWLIST="$unused_allowlist_file" scan "$tmp/case-unused-allowlist" find > "$tmp/unused.log" 2>&1; then
         echo "self-test FAILED: an allowlist entry with a valid path but no matching finding should have failed loud"
         cat "$tmp/unused.log"
         status=1
@@ -504,7 +547,7 @@ MALFIXTURE
     malformed_allowlist_file="$tmp/malformed-allowlist.txt"
     printf 'crates/real-crate/src/lib.rs no tab between path and message\n' \
         > "$malformed_allowlist_file"
-    if STUB_MARKER_ALLOWLIST="$malformed_allowlist_file" scan "$tmp/case-malformed-allowlist" > "$tmp/malformed.log" 2>&1; then
+    if STUB_MARKER_ALLOWLIST="$malformed_allowlist_file" scan "$tmp/case-malformed-allowlist" find > "$tmp/malformed.log" 2>&1; then
         echo "self-test FAILED: a malformed (no-TAB) allowlist line should have failed the scan loud"
         cat "$tmp/malformed.log"
         status=1
@@ -529,7 +572,7 @@ SLFIXTURE
     printf 'SENTINEL_ALLOWLIST_SECRET_MUST_NOT_LEAK\tx\n' > "$tmp/symlink-allowlist-target.txt"
     symlink_allowlist="$tmp/symlink-allowlist.txt"
     ln -s "$tmp/symlink-allowlist-target.txt" "$symlink_allowlist"
-    if STUB_MARKER_ALLOWLIST="$symlink_allowlist" scan "$tmp/case-symlink-allowlist" > "$tmp/symlink-allow.log" 2>&1; then
+    if STUB_MARKER_ALLOWLIST="$symlink_allowlist" scan "$tmp/case-symlink-allowlist" find > "$tmp/symlink-allow.log" 2>&1; then
         echo "self-test FAILED: a symlinked allowlist file should have failed the scan loud"
         cat "$tmp/symlink-allow.log"
         status=1
@@ -562,7 +605,7 @@ pub fn hidden_stub() -> u32 {
 }
 RSHIDDEN
     ln -s "$tmp/case-symlink-rs/elsewhere.rs" "$tmp/case-symlink-rs/crates/real-crate/src/linked.rs"
-    if STUB_MARKER_ALLOWLIST="$empty_allowlist" scan "$tmp/case-symlink-rs" > "$tmp/symlink-rs.log" 2>&1; then
+    if STUB_MARKER_ALLOWLIST="$empty_allowlist" scan "$tmp/case-symlink-rs" find > "$tmp/symlink-rs.log" 2>&1; then
         echo "self-test FAILED: a symlinked .rs under crates/ should have hard-failed the scan"
         cat "$tmp/symlink-rs.log"
         status=1
@@ -570,6 +613,60 @@ RSHIDDEN
         if ! grep -qF 'linked.rs' "$tmp/symlink-rs.log"; then
             echo "self-test FAILED: the symlinked-.rs error did not name the offending link"
             cat "$tmp/symlink-rs.log"
+            status=1
+        fi
+    fi
+
+    # git-mode TOCTOU: a git index entry's mode reflects what was STAGED, not
+    # necessarily the current on-disk file. A build step that swaps a tracked
+    # regular file for a symlink AFTER checkout (without re-staging) has git
+    # ls-files -s still report 100644 -- so it lands in file_list, not
+    # symlink_list, and the O_NOFOLLOW read guard is the ONLY thing that
+    # catches the swap.
+    mkdir -p "$tmp/case-git-toctou/crates/fixture-crate/src"
+    (
+        cd "$tmp/case-git-toctou" && git init -q . \
+            && git config user.email "test@example.com" && git config user.name "test" \
+            && printf 'pub fn ok() -> u32 {\n    1\n}\n' > crates/fixture-crate/src/lib.rs \
+            && git add -A && git commit -q -m seed
+    )
+    rm "$tmp/case-git-toctou/crates/fixture-crate/src/lib.rs"
+    ln -s "/nonexistent-toctou-target" "$tmp/case-git-toctou/crates/fixture-crate/src/lib.rs"
+    if STUB_MARKER_ALLOWLIST="$empty_allowlist" scan "$tmp/case-git-toctou" git > "$tmp/git-toctou.log" 2>&1; then
+        echo "self-test FAILED: a git-tracked file swapped for a symlink after commit (index still 100644) should have hard-failed the scan"
+        cat "$tmp/git-toctou.log"
+        status=1
+    else
+        if ! grep -qF 'crates/fixture-crate/src/lib.rs' "$tmp/git-toctou.log"; then
+            echo "self-test FAILED: the post-commit symlink-swap error did not name the offending path"
+            cat "$tmp/git-toctou.log"
+            status=1
+        fi
+    fi
+
+    # git-mode discovery: a tracked Rust module nested under a directory
+    # literally named `target` (reachable via #[path], compilable) must now
+    # be scanned and flagged -- name-based `find -prune` previously made it
+    # invisible; git-tracked discovery has no such name-based exclusion.
+    mkdir -p "$tmp/case-git-target/crates/fixture-crate/target"
+    cat > "$tmp/case-git-target/crates/fixture-crate/target/tracked_via_path_attr.rs" <<'GITTARGETFIXTURE'
+pub fn tracked_under_target_dir_stub() -> u32 {
+    panic!("todo: a tracked module nested under a target/-named dir must now be caught")
+}
+GITTARGETFIXTURE
+    (
+        cd "$tmp/case-git-target" && git init -q . \
+            && git config user.email "test@example.com" && git config user.name "test" \
+            && git add -A && git commit -q -m seed
+    )
+    if STUB_MARKER_ALLOWLIST="$empty_allowlist" scan "$tmp/case-git-target" git > "$tmp/git-target.log" 2>&1; then
+        echo "self-test FAILED: a tracked Rust module under a target/-named directory should have been scanned and flagged"
+        cat "$tmp/git-target.log"
+        status=1
+    else
+        if ! grep -qF 'tracked module nested under a target' "$tmp/git-target.log"; then
+            echo "self-test FAILED: the tracked-under-target/ finding was not reported"
+            cat "$tmp/git-target.log"
             status=1
         fi
     fi
@@ -582,37 +679,92 @@ RSHIDDEN
 
 scan() {
     root="$1"
+    mode="${2:-find}"
     file_list="$(mktemp)"
-
-    # NUL-delimited discovery and transport end-to-end: a filename may
-    # legally contain a newline (or any byte but NUL and `/`), and this
-    # scanner's own findings later echo filenames straight into CI stdout.
-    # `-print0` + a NUL-delimited transport file sidesteps splitting
-    # entirely; `sanitize_for_ci` (applied to every rendered path below, the
-    # same function already used on messages) handles the render side.
-    #
-    # Only `target`/`.cargo-target` (build-artifact dirs, per .gitignore)
-    # are pruned -- everything else under crates/, including tests/,
-    # benches/, and examples/, is in scan scope.
-    find "$root/crates" \
-        \( -name 'target' -o -name '.cargo-target' \) -type d -prune \
-        -o -name '*.rs' -type f -print0 \
-        > "$file_list"
-
-    # Filesystem-indirection guard: collect EVERY symlink under crates/ (any
-    # name, file or directory), excluding the same pruned build-artifact dirs.
-    # A symlinked .rs is skipped by the -type f pass above but compiled by
-    # Cargo; a symlinked directory is not descended by find (no -L) yet Cargo
-    # builds through it. The python below hard-fails on any of them.
     symlink_list="$(mktemp)"
-    find "$root/crates" \
-        \( -name 'target' -o -name '.cargo-target' \) -type d -prune \
-        -o -type l -print0 \
-        > "$symlink_list"
+
+    if [ "$mode" = "git" ]; then
+        # Tracked-file discovery (production): `git ls-files` lists only
+        # what git actually tracks under crates/, so untracked build-artifact
+        # output (target/, .cargo-target/, anything gitignored) is never
+        # listed -- no name-based pruning needed, and a TRACKED module nested
+        # under a dir literally named `target` is no longer invisible the way
+        # `find -prune` made it. `-s -z` reports each entry's INDEX mode
+        # ("<mode> <object> <stage>\t<path>", NUL-terminated); mode 120000 is
+        # a tracked symlink, the same filesystem-indirection hazard the
+        # find-mode -type l pass catches below. This is index state, not a
+        # live stat of the working tree: an entry staged as 100644 whose
+        # on-disk file was swapped to a symlink AFTER checkout (by a prior
+        # build step/proc-macro, without re-staging) still reports 100644
+        # here -- the O_NOFOLLOW read guard in the python scan loop is what
+        # catches that swap; this check and that one are complementary.
+        if ! git -C "$root" rev-parse --is-inside-work-tree > /dev/null 2>&1; then
+            rm -f "$file_list" "$symlink_list"
+            echo "stub-marker scan: $root is not inside a git working tree -- tracked-file discovery requires git; refusing to fall back to a raw filesystem walk" >&2
+            return 1
+        fi
+        git -C "$root" ls-files -s -z -- crates/ | python3 -c '
+import os
+import sys
+
+root, out_files, out_symlinks = sys.argv[1], sys.argv[2], sys.argv[3]
+raw = sys.stdin.buffer.read()
+files = []
+symlinks = []
+for entry in raw.split(b"\0"):
+    if not entry:
+        continue
+    meta, sep, relpath = entry.partition(b"\t")
+    if not sep:
+        continue
+    file_mode = meta.split(b" ", 1)[0]
+    relpath_s = os.fsdecode(relpath)
+    abspath = os.path.join(root, relpath_s)
+    if file_mode == b"120000":
+        symlinks.append(abspath)
+    elif relpath_s.endswith(".rs"):
+        files.append(abspath)
+with open(out_files, "wb") as fh:
+    fh.write(b"\0".join(os.fsencode(p) for p in files))
+    if files:
+        fh.write(b"\0")
+with open(out_symlinks, "wb") as fh:
+    fh.write(b"\0".join(os.fsencode(p) for p in symlinks))
+    if symlinks:
+        fh.write(b"\0")
+' "$root" "$file_list" "$symlink_list"
+    else
+        # find-mode discovery: self-test fixture trees only (mktemp -d
+        # trees, never git repos) -- production always uses git mode above.
+        # NUL-delimited discovery and transport end-to-end: a filename may
+        # legally contain a newline (or any byte but NUL and `/`), and this
+        # scanner's own findings later echo filenames straight into CI
+        # stdout. `-print0` + a NUL-delimited transport file sidesteps
+        # splitting entirely; `sanitize_for_ci` (applied to every rendered
+        # path below, the same function already used on messages) handles
+        # the render side. Only `target`/`.cargo-target` (build-artifact
+        # dirs, per .gitignore) are pruned here -- fixture trees have no git
+        # index to consult.
+        find "$root/crates" \
+            \( -name 'target' -o -name '.cargo-target' \) -type d -prune \
+            -o -name '*.rs' -type f -print0 \
+            > "$file_list"
+
+        # Filesystem-indirection guard: collect EVERY symlink under crates/
+        # (any name, file or directory), excluding the same pruned
+        # build-artifact dirs. A symlinked .rs is skipped by the -type f pass
+        # above but compiled by Cargo; a symlinked directory is not descended
+        # by find (no -L) yet Cargo builds through it. The python below
+        # hard-fails on any of them.
+        find "$root/crates" \
+            \( -name 'target' -o -name '.cargo-target' \) -type d -prune \
+            -o -type l -print0 \
+            > "$symlink_list"
+    fi
 
     if [ ! -s "$file_list" ] && [ ! -s "$symlink_list" ]; then
         rm -f "$file_list" "$symlink_list"
-        echo "no .rs files matched under $root/crates (excluding target/.cargo-target build-artifact dirs) -- the scanner would silently be a no-op; fix the file-layout selection" >&2
+        echo "no .rs files matched under $root/crates -- the scanner would silently be a no-op; fix the file-layout selection" >&2
         return 1
     fi
 
@@ -654,6 +806,14 @@ PLACEHOLDER_RE = re.compile(
 # Rust accepts whitespace before `!` and any of the three delimiter kinds
 # (`panic!(...)`, `panic!{...}`, `panic![...]`) -- all three are legal macro
 # call syntax, not just parens.
+#
+# SCOPE (documented non-goal, not a silent bypass): this matches the LITERAL
+# spellings `panic!`/`unreachable!` only. A macro alias, re-export, or
+# wrapper (e.g. a local `crash!` that expands to panic!) is not resolved --
+# that requires macro-expansion-aware parsing this scanner does not attempt,
+# and expanding this regex to guess at alias names would be unreliable and
+# unmaintainable. Alias coverage is intentionally left to clippy and human
+# review; see the scanner's file-header SCOPE note.
 MACRO_CALL_RE = re.compile(r"\b(panic|unreachable)\s*!\s*([(\{\[])")
 # re.DOTALL: Rust's backslash-newline string continuation (`"...\<newline>
 # ..."`, used throughout this codebase for long multi-line SQL literals)
@@ -686,6 +846,18 @@ SIMPLE_ESCAPES = {"n": "\n", "r": "\r", "t": "\t", "\\": "\\", '"': '"', "'": "'
 # argument prefix (a single `=`, never `==`).
 FORMAT_SLOT_RE = re.compile(r"\{\{|\}\}|\{([^{}]*)\}")
 IDENT_ARG_RE = re.compile(r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)")
+# A slot backed by a non-literal argument (a variable, a function call, a
+# Rust-2021 inline-captured identifier) must never be silently vacated to an
+# empty string: `panic!("not {feature} implemented")` with `feature` a
+# runtime value would collapse to "not  implemented" and false-positive
+# through PLACEHOLDER_RE's `\s*` alternatives. Substituting a byte no
+# PLACEHOLDER_RE alternative's `\s*`/word content can match through prevents
+# the slot from bridging two unrelated neighboring words into a marker,
+# without itself ever completing one (`\b` never matches NUL, and no
+# alternative contains it). It only ever reaches CI output through
+# sanitize_for_ci (whose CONTROL_CHAR_RE already covers 0x00), so it never
+# leaks raw.
+UNRESOLVED_SLOT_SENTINEL = "\x00"
 
 
 def sanitize_for_ci(raw):
@@ -966,11 +1138,14 @@ def split_macro_args(code_only, clean, open_pos):
 
 def arg_literal_value(clean, code_only, start, end):
     """The decoded string value of the argument clean[start:end] when it is a
-    string literal (plain, raw, or byte-raw) or a concat!(...) of string
-    literals; otherwise None. A non-literal argument -- a variable, a function
-    call, a format! result assembled elsewhere -- is invisible to a static text
-    scan and returns None. Leading whitespace is skipped; a concat! call's own
-    literal arguments are joined."""
+    string literal (plain, raw, or byte-raw), a concat!(...) of string
+    literals, or a format_args!(...) call whose own arguments are ALL
+    themselves literal-derivable (recursively, via resolve_format_message_strict)
+    -- statically reconstructible end to end; otherwise None. A non-literal
+    argument -- a variable, a function call, a format_args!(...) with even one
+    non-literal slot -- is invisible to a static text scan and returns None
+    rather than a partial/fabricated reconstruction. Leading whitespace is
+    skipped; a concat! call's own literal arguments are joined."""
     i = start
     while i < end and clean[i].isspace():
         i += 1
@@ -984,10 +1159,64 @@ def arg_literal_value(clean, code_only, start, end):
         if not parts:
             return None
         return "".join(decode_rust_escapes(content, is_raw) for content, is_raw in parts)
+    m = re.match(r"format_args\s*!\s*[([{]", code_only[i:end])
+    if m is not None:
+        open_pos = i + m.end() - 1
+        inner_spans, _inner_close = split_macro_args(code_only, clean, open_pos)
+        if not inner_spans:
+            return None
+        inner_template = arg_literal_value(clean, code_only, inner_spans[0][0], inner_spans[0][1])
+        if inner_template is None:
+            return None
+        inner_positionals = []
+        inner_named = {}
+        for span_start, span_end in inner_spans[1:]:
+            nm = IDENT_ARG_RE.match(code_only, span_start, span_end)
+            if nm is not None:
+                inner_named[nm.group(1)] = arg_literal_value(clean, code_only, nm.end(), span_end)
+            else:
+                inner_positionals.append(arg_literal_value(clean, code_only, span_start, span_end))
+        return resolve_format_message_strict(inner_template, inner_positionals, inner_named)
     lit = match_string_literal(clean, i)
     if lit is None:
         return None
     return decode_rust_escapes(lit[1], lit[2])
+
+
+def resolve_format_message_strict(template, positionals, named):
+    """Like resolve_format_message, but for fully reconstructing a NESTED
+    format_args!(...) call (see arg_literal_value): returns the substituted
+    text only if EVERY slot the template references resolves to a literal
+    argument, else None. None means "not statically derivable end to end" --
+    the caller (arg_literal_value) then reports the whole format_args! call as
+    non-literal, so its slot falls back to UNRESOLVED_SLOT_SENTINEL at the
+    outer level instead of silently reconstructing a partial message."""
+    auto = [0]
+    unresolved = [False]
+
+    def repl(m):
+        tok = m.group(0)
+        if tok == "{{":
+            return "{"
+        if tok == "}}":
+            return "}"
+        ref = m.group(1).split(":", 1)[0].strip()
+        if ref == "":
+            idx = auto[0]
+            auto[0] += 1
+            value = positionals[idx] if idx < len(positionals) else None
+        elif ref.isdigit():
+            idx = int(ref)
+            value = positionals[idx] if idx < len(positionals) else None
+        else:
+            value = named.get(ref)
+        if value is None:
+            unresolved[0] = True
+            return ""
+        return value
+
+    result = FORMAT_SLOT_RE.sub(repl, template)
+    return None if unresolved[0] else result
 
 
 def resolve_format_message(template, positionals, named):
@@ -997,7 +1226,10 @@ def resolve_format_message(template, positionals, named):
     `{name}` takes a named argument. A slot backed by a literal argument is
     filled with that literal's decoded text; a slot backed by a non-literal or
     unresolved argument -- including a Rust 2021 inline-captured variable, which
-    is not among the macro's explicit args -- is vacated. That is the
+    is not among the macro's explicit args -- is filled with
+    UNRESOLVED_SLOT_SENTINEL, never an empty string (an empty-string vacate
+    would let "not {var} implemented" collapse into a false-positive "not
+    implemented" through PLACEHOLDER_RE's `\\s*` alternatives). That is the
     conservative posture: it never fabricates text a static scan cannot prove,
     while denying a literal argument any way to hide a placeholder by sitting out
     of source order or behind a positional/named split."""
@@ -1019,7 +1251,7 @@ def resolve_format_message(template, positionals, named):
             value = positionals[idx] if idx < len(positionals) else None
         else:
             value = named.get(ref)
-        return value if value is not None else ""
+        return value if value is not None else UNRESOLVED_SLOT_SENTINEL
 
     return FORMAT_SLOT_RE.sub(repl, template)
 
@@ -1142,7 +1374,26 @@ allowlist_used = [False] * len(allowlist)
 findings = []
 for path in files:
     rel_path = os.path.relpath(path, SCAN_ROOT).replace(os.sep, "/")
-    with open(path, "r", encoding="utf-8") as fh:
+    # Bind the read to the exact path discovery found, atomically: O_NOFOLLOW
+    # refuses to open through a symlink, so a path that was a real regular
+    # file at discovery time (a `find -type f` hit, or a git-index 100644/
+    # 100755 entry) but has since been swapped to a symlink -- by a
+    # PR-controlled build script or proc-macro racing this guard, or simply
+    # because a git-tracked working-tree file diverged from its clean index
+    # entry -- raises ELOOP here instead of silently following the
+    # replacement or reading different content than what was discovered.
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.EMLINK):
+            sys.stderr.write(
+                "stub-marker scan: discovered path is a symlink at read time "
+                "(swapped after discovery) -- refusing to follow a "
+                f"post-discovery filesystem indirection: {sanitize_for_ci(rel_path)}\n"
+            )
+            sys.exit(1)
+        raise
+    with os.fdopen(fd, "r", encoding="utf-8") as fh:
         text = fh.read()
     clean = strip_comments_and_char_lits(text)
     code_only = blank_strings(clean)
@@ -1228,7 +1479,7 @@ case "${1:-}" in
         self_test
         ;;
     "")
-        scan "$ROOT"
+        scan "$ROOT" git
         ;;
     *)
         echo "usage: $0 [--self-test]" >&2
