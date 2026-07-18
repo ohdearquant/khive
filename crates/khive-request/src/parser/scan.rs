@@ -29,11 +29,21 @@ pub(crate) fn scan_string_end(src: &[u8], start: usize) -> Result<usize, DslErro
 /// leaves untouched because backslash plus a literal control byte is never
 /// a valid two-byte JSON escape (see that function's doc). `normalized_pos`
 /// is its byte offset in `text`; `raw_pos` is its byte offset in the
-/// original quoted span, for user-facing diagnostics.
+/// original quoted span, for user-facing diagnostics. `preceded_by_backslash`
+/// records which of the two cases this is: `serde_json` reports a broken
+/// `\<ctrl>` pair as an invalid-escape failure at the control byte's own
+/// offset, while a genuinely standalone control byte is reported as a
+/// control-character failure at that same kind of offset — and a malformed
+/// `\u` escape whose short hex run is padded out by a *later*, unrelated
+/// standalone control byte also fails as an invalid escape at that byte's
+/// offset. Offset alone cannot tell the legitimate backslash-pair case
+/// apart from that last, spurious one; `preceded_by_backslash` is the signal
+/// the caller uses to do so.
 pub(crate) struct ControlByteHit {
     pub(crate) normalized_pos: usize,
     pub(crate) raw_pos: usize,
     pub(crate) byte: u8,
+    pub(crate) preceded_by_backslash: bool,
 }
 
 /// Result of [`normalize_quoted_string`]: the text to hand to `serde_json`,
@@ -90,6 +100,7 @@ pub(crate) fn normalize_quoted_string(raw: &str) -> NormalizedQuotedString<'_> {
                         normalized_pos: out.len(),
                         raw_pos: next_pos,
                         byte: next_c as u8,
+                        preceded_by_backslash: true,
                     });
                 }
                 out.push(next_c);
@@ -106,6 +117,7 @@ pub(crate) fn normalize_quoted_string(raw: &str) -> NormalizedQuotedString<'_> {
                         normalized_pos: out.len(),
                         raw_pos: pos,
                         byte: c as u8,
+                        preceded_by_backslash: false,
                     });
                 }
                 out.push(c);

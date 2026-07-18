@@ -540,6 +540,20 @@ fn serde_error_byte_offset(e: &serde_json::Error, text: &str) -> Option<usize> {
 /// byte later in the span) falls through to the plain serde message
 /// unchanged, so a control byte is never misattributed as the cause of a
 /// different failure.
+///
+/// Offset alone is not sufficient when the hit is *not*
+/// `preceded_by_backslash`: a malformed `\u` escape (e.g. `\u123` where the
+/// 4th hex-digit slot is consumed by a following, unrelated raw control
+/// byte) fails with the same "invalid escape" kind and can land at that
+/// byte's exact offset too — indistinguishable from a genuine standalone
+/// control-character failure by offset alone. Only a hit whose recorded
+/// origin was a broken `\<ctrl>` pair (`preceded_by_backslash`) is known —
+/// by construction, not by re-deriving it from the error text — to be an
+/// actual invalid-escape failure over that byte; a non-backslash hit is only
+/// enriched when the failure is the plain control-character kind serde
+/// reports for a standalone raw control byte, checked via the error's
+/// `Display` text since `ErrorCode` itself is private and `classify()` only
+/// returns the coarse `Category::Syntax` shared by every one of these kinds.
 fn describe_quoted_string_parse_error(
     e: &serde_json::Error,
     normalized: &NormalizedQuotedString<'_>,
@@ -555,6 +569,9 @@ fn describe_quoted_string_parse_error(
     else {
         return base;
     };
+    if !hit.preceded_by_backslash && !base.starts_with("control character") {
+        return base;
+    }
     let idx = hit.raw_pos;
     let c = hit.byte as char;
     format!(

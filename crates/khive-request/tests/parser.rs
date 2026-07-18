@@ -295,6 +295,29 @@ fn invalid_escape_with_unrelated_control_byte_not_misattributed() {
 }
 
 #[test]
+fn malformed_unicode_escape_adjacent_to_control_byte_not_misattributed() {
+    // A malformed `\u` escape (only 3 hex digits) followed immediately by a
+    // raw control byte fails with serde's `InvalidEscape`, not a
+    // control-character error — but the failure's byte offset can coincide
+    // with the recorded control-byte hit (the 4th hex-digit slot serde reads
+    // is the control byte itself). Offset alone is not enough to gate the
+    // enrichment; the error's kind must also be checked, or this lands the
+    // control-char/double-escape guidance on an invalid-escape failure.
+    let src = format!("gtd.assign(title=\"bad \\u123{}tail\")", '\u{c}');
+    let err = parse_request(&src).unwrap_err();
+    let msg = err.to_string();
+    assert!(matches!(err, DslError::InvalidValue { .. }));
+    assert!(
+        msg.contains("invalid escape"),
+        "expected the plain serde invalid-escape message, got: {msg}"
+    );
+    assert!(
+        !msg.to_lowercase().contains("double"),
+        "a malformed \\u escape must not be enriched with the control-char diagnostic, got: {msg}"
+    );
+}
+
+#[test]
 fn raw_newline_immediately_after_backslash_caught_as_control_char_cause() {
     // #491 round-2 blocking fix 1(b): a raw LF directly following a
     // backslash is not a valid two-byte JSON escape (valid escapes are
