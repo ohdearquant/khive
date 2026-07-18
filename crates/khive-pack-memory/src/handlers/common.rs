@@ -115,6 +115,38 @@ pub(super) async fn embed_query_model(
     Ok((model_name, v))
 }
 
+type NamedEmbedResult = (String, Result<(String, Vec<f32>), RuntimeError>);
+
+/// Partition per-engine embed results into successes, warning on each failure so one
+/// unhealthy embedding engine degrades recall instead of aborting it. Errors only if
+/// every engine failed.
+pub(super) fn collect_embed_results(
+    named_results: Vec<NamedEmbedResult>,
+) -> Result<Vec<(String, Vec<f32>)>, RuntimeError> {
+    let mut oks = Vec::with_capacity(named_results.len());
+    let mut failures = Vec::new();
+    for (model_name, result) in named_results {
+        match result {
+            Ok(pair) => oks.push(pair),
+            Err(e) => {
+                tracing::warn!(
+                    model = %model_name,
+                    error = %e,
+                    "recall: embedding failed for engine, degrading to remaining engines"
+                );
+                failures.push(format!("{model_name}: {e}"));
+            }
+        }
+    }
+    if oks.is_empty() {
+        return Err(RuntimeError::Internal(format!(
+            "recall: all embedding engines failed: {}",
+            failures.join("; ")
+        )));
+    }
+    Ok(oks)
+}
+
 pub(super) fn to_json<T: serde::Serialize>(v: &T) -> Result<Value, RuntimeError> {
     serde_json::to_value(v).map_err(|e| RuntimeError::InvalidInput(e.to_string()))
 }
@@ -816,15 +848,21 @@ impl MemoryPack {
             let query_vecs: Vec<(String, Vec<f32>)> = match model_names.len() {
                 1 => {
                     let m = model_names.into_iter().next().unwrap();
-                    vec![
-                        embed_query_model(
-                            self.runtime.clone(),
-                            self.query_cache.clone(),
-                            m,
-                            query.to_string(),
-                        )
-                        .await?,
-                    ]
+                    let result = embed_query_model(
+                        self.runtime.clone(),
+                        self.query_cache.clone(),
+                        m.clone(),
+                        query.to_string(),
+                    )
+                    .await;
+                    match result {
+                        Ok(pair) => vec![pair],
+                        Err(e) => {
+                            return Err(RuntimeError::Internal(format!(
+                                "recall: all embedding engines failed: {m}: {e}"
+                            )));
+                        }
+                    }
                 }
                 2 => {
                     let mut it = model_names.into_iter();
@@ -833,17 +871,17 @@ impl MemoryPack {
                     let f0 = embed_query_model(
                         self.runtime.clone(),
                         self.query_cache.clone(),
-                        m0,
+                        m0.clone(),
                         query.to_string(),
                     );
                     let f1 = embed_query_model(
                         self.runtime.clone(),
                         self.query_cache.clone(),
-                        m1,
+                        m1.clone(),
                         query.to_string(),
                     );
                     let (r0, r1) = tokio::join!(f0, f1);
-                    vec![r0?, r1?]
+                    collect_embed_results(vec![(m0, r0), (m1, r1)])?
                 }
                 _ => {
                     let mut handles = Vec::with_capacity(model_names.len());
@@ -851,18 +889,22 @@ impl MemoryPack {
                         let rt = self.runtime.clone();
                         let cache = self.query_cache.clone();
                         let q = query.to_string();
+                        let name_for_result = model_name.clone();
                         handles.push(tokio::spawn(async move {
-                            embed_query_model(rt, cache, model_name, q).await
+                            (
+                                name_for_result,
+                                embed_query_model(rt, cache, model_name, q).await,
+                            )
                         }));
                     }
-                    let mut vecs = Vec::with_capacity(handles.len());
+                    let mut named_results = Vec::with_capacity(handles.len());
                     for h in handles {
                         let pair = h.await.map_err(|e| {
                             RuntimeError::Internal(format!("recall embed task panicked: {e}"))
-                        })??;
-                        vecs.push(pair);
+                        })?;
+                        named_results.push(pair);
                     }
-                    vecs
+                    collect_embed_results(named_results)?
                 }
             };
 
