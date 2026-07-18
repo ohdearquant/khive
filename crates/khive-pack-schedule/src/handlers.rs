@@ -680,9 +680,9 @@ pub(crate) async fn handle_remind(
             "remind: `at` must not be empty".into(),
         ));
     }
-    // Validate RFC 3339 and reject past timestamps (C3).
+    // Validate RFC 3339 and reject past timestamps.
     // Preserve the caller's original string as `trigger_at` so the
-    // submitted wall time and offset are round-tripped faithfully (H5).
+    // submitted wall time and offset are round-tripped faithfully.
     // The UTC instant is used only for comparison/ordering.
     let trigger_at_original = p.at.trim().to_string();
     let _trigger_utc = validate_at("remind", &trigger_at_original)?;
@@ -742,7 +742,7 @@ pub(crate) async fn handle_schedule(
             "schedule: `at` must not be empty".into(),
         ));
     }
-    // Validate DSL parseability at write time (C4). Garbage like "x" or
+    // Validate DSL parseability at write time. Garbage like "x" or
     // "bogus-not-a-valid-verb()" is rejected before it enters storage.
     let parsed = validate_action(p.action.trim())?;
     // Validate that the action is a single, exactly-registered verb call with
@@ -753,9 +753,9 @@ pub(crate) async fn handle_schedule(
     // trigger-time replay fail as an unknown verb.
     validate_replayable_single_action(&parsed, registry)?;
 
-    // Validate RFC 3339 and reject past timestamps (C3).
+    // Validate RFC 3339 and reject past timestamps.
     // Preserve the caller's original string as `trigger_at` so the
-    // submitted wall time and offset are round-tripped faithfully (H5).
+    // submitted wall time and offset are round-tripped faithfully.
     // The UTC instant is used only for comparison/ordering.
     let trigger_at_original = p.at.trim().to_string();
     let _trigger_utc = validate_at("schedule", &trigger_at_original)?;
@@ -819,7 +819,7 @@ pub(crate) async fn handle_agenda(
     };
 
     // Parse from/to bounds as instants so comparison is correct regardless of
-    // timezone offset or DST. Reject non-RFC-3339 filter values (H1).
+    // timezone offset or DST. Reject non-RFC-3339 filter values.
     let from_instant: Option<DateTime<Utc>> = match p.from {
         Some(ref s) => {
             let ts = s.parse::<DateTime<Utc>>().map_err(|_| {
@@ -893,7 +893,7 @@ pub(crate) async fn handle_agenda(
 
         for n in &page.items {
             // Parse trigger_at as an instant. Skip rows with unparseable
-            // trigger_at — these are legacy corrupt rows (H1, H2).
+            // trigger_at — these are legacy corrupt rows.
             let trigger_at_str = n
                 .properties
                 .as_ref()
@@ -905,7 +905,7 @@ pub(crate) async fn handle_agenda(
                 Err(_) => continue,
             };
 
-            // Apply from/to window using parsed instants (H1).
+            // Apply from/to window using parsed instants.
             if let Some(from) = from_instant {
                 if instant < from {
                     continue;

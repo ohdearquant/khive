@@ -1,4 +1,4 @@
-//! Tests for remind/schedule creation and input validation (C1, C3, C4, repeat).
+//! Tests for remind/schedule creation and input validation (repeat scheduling included).
 
 use khive_pack_schedule::SchedulePack;
 use khive_runtime::{KhiveRuntime, VerbRegistry, VerbRegistryBuilder};

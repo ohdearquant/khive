@@ -1,11 +1,8 @@
 # scripts/perf/flagship_workloads.toml
 #
 # Declarative flagship workload manifest (bench-overhaul PR 1).
-# THE PLAN: .khive/workspaces/20260711/bench-overhaul/DESIGN.md
-# (Typed interfaces > Scenario contract; Coverage definition; PR 1 slice).
-# Signed decisions: .khive/workspaces/20260710/bench-program/SPEC-draft.md
-# Amendment (binding, supersedes conflicting DESIGN.md/SPEC-draft.md text):
-# .khive/workspaces/20260710/bench-program/AMENDMENT-1-flagship-measurement-contract.md
+# Typed interfaces take priority over the scenario contract for coverage
+# definition; where the two conflict, the typed interfaces govern.
 #
 # This manifest is data only. It declares every required F1-F10 scenario,
 # its measured surface, scale tier, cold/warm obligation, required

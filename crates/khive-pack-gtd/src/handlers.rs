@@ -189,7 +189,7 @@ pub struct CompleteParams {
     id: String,
     #[serde(default)]
     result: Option<String>,
-    /// CC-1: honor `status` param — accepts "done" (default) or "cancelled".
+    /// Honors `status` param — accepts "done" (default) or "cancelled".
     /// Silently ignoring an explicit status arg is the worst outcome for callers
     /// who follow the MCP server hint "complete() defaults to 'done'; pass
     /// status='cancelled' for cancellation."
@@ -197,7 +197,7 @@ pub struct CompleteParams {
     status: Option<String>,
 }
 
-/// CC-1 helper: validate the target terminal status for `complete()`.
+/// Validates the target terminal status for `complete()`.
 /// Returns the canonical target (`"done"` or `"cancelled"`) or an error.
 fn complete_target_status(status: Option<&str>) -> Result<&'static str, RuntimeError> {
     match status {
@@ -513,7 +513,7 @@ async fn load_task(
     Ok((note, current))
 }
 
-// ── atomic GTD transition (ue-dsl-parallel C2) ──────────────────────────────
+// ── atomic GTD transition ───────────────────────────────────────────────────
 
 /// Perform an atomic conditional UPDATE on a task's properties, transitioning it
 /// from `expected_current` to `target` status.
@@ -856,7 +856,7 @@ impl GtdPack {
         let notes = fetch_all_matching_tasks(self.runtime(), token, property_filters).await?;
 
         // Build a quick lookup map of task UUID → GTD status so dependency
-        // filtering (scenario-gtd C2) can check blocker states in O(1). Every
+        // filtering can check blocker states in O(1). Every
         // note here already passed the actionable(+assignee) SQL filter above
         // (and `deleted_at IS NULL`, enforced unconditionally by
         // `query_notes_filtered`).
@@ -906,7 +906,7 @@ impl GtdPack {
             }
         }
 
-        // scenario-gtd C2: exclude tasks whose `depends_on` contains any
+        // exclude tasks whose `depends_on` contains any
         // blocker that is NOT in the `done` terminal state.
         // Dangling UUIDs (not found in status_by_id even after batch fetch)
         // are treated as incomplete (blocker unknown = not done → keep blocked).
@@ -984,7 +984,7 @@ impl GtdPack {
         // at data.status in the response.
         note.updated_at = updated_at;
 
-        // ue-dsl-parallel C2: atomic transition — use a conditional SQL UPDATE
+        // atomic transition — use a conditional SQL UPDATE
         // so that a concurrent complete() on the same task loses the race
         // cleanly rather than both reporting success.
         let rows_affected = atomic_gtd_transition(
@@ -1216,7 +1216,7 @@ impl GtdPack {
                 // remap surfaces it at data.status in the response.
                 note.updated_at = updated_at;
 
-                // ue-dsl-parallel C2: atomic transition — conditional SQL
+                // atomic transition — conditional SQL
                 // UPDATE so concurrent transitions in the same parallel
                 // batch only one wins.
                 let rows_affected = atomic_gtd_transition(

@@ -17,7 +17,7 @@ constant is now the namespace the local single-tenant poll loop (`khive-mcp`'s
 param, so that loop's writes still land under `"local"` and must not follow
 `KHIVE_EMAIL_INGEST_NAMESPACE` (or any other caller-chosen namespace) even
 though that env var configures the same daemon's message-ingestion namespace
-(khive #606 design review Blocker fix, example actor 2026-07-04).
+(khive #606, 2026-07-04).
 
 `comm.health` reads via the dispatch token (`token.namespace()`) too (khive
 #877): the same explicit `namespace=` escape / `"local"` default every other
@@ -58,6 +58,7 @@ authorized per-tenant writers reach it via `dispatch_as` (see the persistence
 note below).
 
 Read-modify-write against the existing row (if any) so that:
+
 - `created_at` is preserved across updates (first-seen time), not reset every
   tick.
 - `last_error` is RETAINED across a subsequent success (design review

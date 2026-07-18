@@ -6458,7 +6458,7 @@ mod help_tests {
     ///   (`HELP_EDGE_RULES[1]`) — because the validator's special-relation
     ///   branch returns before `pack_rule_allows` is consulted, that pack
     ///   rule is never actually enforced, so advertising it would be a false
-    ///   promise (the exact codex HIGH this test guards against, issue #991).
+    ///   promise (the exact defect this test guards against, issue #991).
     #[tokio::test]
     async fn test_link_help_true_matches_special_relation_validator_set() {
         let invocations = Arc::new(AtomicUsize::new(0));

@@ -3206,7 +3206,7 @@ async fn remember_aliases_still_accepted() -> anyhow::Result<()> {
 
 /// Entity `create` must return ISO-8601 timestamps (not raw microsecond i64s).
 ///
-/// This is the Blocker C1 regression guard: the note create path was missing
+/// Regression guard: the note create path was missing
 /// normalize_entity_timestamps, causing `created_at`/`updated_at` to arrive
 /// as integer microseconds. Fixed by wrapping the note create response with
 /// normalize_entity_timestamps before remap_note_status.
@@ -3239,8 +3239,8 @@ async fn entity_create_returns_iso8601_timestamps() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Note `create` must return ISO-8601 timestamps (Blocker C1 fix: note path was missing
-/// normalize_entity_timestamps before the MCP response).
+/// Note `create` must return ISO-8601 timestamps: the note path was missing
+/// normalize_entity_timestamps before the MCP response.
 #[tokio::test]
 async fn note_create_returns_iso8601_timestamps() -> anyhow::Result<()> {
     let client = connect().await?;

@@ -16,8 +16,7 @@ two more metric sources of its own: arbitrary bench JSON (`--source json`,
 e.g. `bench_1m.sh --ci-synthetic`'s output) and Criterion's own
 `estimates.json` tree (`--source criterion`).
 
-Per the bench-program spec's blocking-promotion ladder
-(`.khive/workspaces/20260710/bench-program/SPEC-draft.md`), everything this
+Per the bench-program's blocking-promotion ladder, everything this
 script records is **Advisory**: it is measured and trended, it never asserts
 pass/fail, and it never places a threshold. Promotion to a blocking gate
 requires a separate calibration pass (`bench_calibrate.py`, `K>=10` same-SHA

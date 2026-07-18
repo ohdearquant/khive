@@ -13,8 +13,8 @@ CI-enforced check.
 
 ## Run
 
-- Date: 2026-07-16 (regenerated for the #1062 round-2 Medium fix: the round-1
-  file promised SHA-256 digests but never actually committed any)
+- Date: 2026-07-16 (regenerated after fixing this generator: an earlier version
+  promised SHA-256 digests but never actually committed any)
 - Corpus: a local read-only copy of the production `khive.db` (`notes.content`
   where `deleted_at IS NULL`, `entities.description` where `deleted_at IS
   NULL`)
@@ -182,9 +182,9 @@ and do have different actual entropy, but neither can be distinguished from
 the other by an entropy threshold alone when both sit near that shared
 ceiling).
 
-## #1062 H1 round-2 fragment-chain bridge — separately regression-tested
+## #1062 fragment-chain bridge — separately regression-tested
 
-The round-2 fix to the separator-split bridge (bounded fragment-count
+The separator-split bridge fix (bounded fragment-count
 reconstruction instead of a byte-length gap, plus a generic non-hex entropy
 path) is guarded by its own regression suite in `secret_gate.rs`, not by this
 corpus replay (a repeated-Unicode-separator or three-way split credential is

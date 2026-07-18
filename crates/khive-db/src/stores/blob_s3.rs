@@ -37,7 +37,7 @@ pub const MAX_OBJECT_BYTES: u64 = 64 * 1024 * 1024;
 pub const DEFAULT_PREFIX: &str = "blobs";
 
 /// Bounded outer-retry defaults for the idempotent content-addressed `put`
-/// (ADR-111 Amendment 2, H1 fix round). `object_store` classifies
+/// (ADR-111 Amendment 2). `object_store` classifies
 /// `PutMode::Create` as non-idempotent and therefore never retries it
 /// internally on a timeout -- a single slow request would otherwise surface
 /// immediately as `StorageError::Driver` even though the object may have been
@@ -417,7 +417,7 @@ impl BlobStore for S3BlobStore {
         }
 
         // Bounded outer retry around the conditional create (ADR-111
-        // Amendment 2, H1 fix round). `object_store` marks `PutMode::Create`
+        // Amendment 2). `object_store` marks `PutMode::Create`
         // non-idempotent and never retries it internally on a timeout, so a
         // single slow request would otherwise surface immediately as
         // `Driver` even though the service may have accepted the write. The
@@ -540,7 +540,7 @@ impl BlobStore for S3BlobStore {
     //
     // Every network step -- each `stream.next()` poll and each concurrent
     // delete -- is wrapped in `self.request_timeout`, same as `put`/`get`/
-    // `exists`/`delete` above (ADR-111 Amendment 2, H1 fix round 2): a
+    // `exists`/`delete` above (ADR-111 Amendment 2): a
     // deadline elapsing maps to `StorageError::Timeout`, and any other
     // error the provider returns keeps the `Driver` classification.
     async fn orphan_sweep(
@@ -851,7 +851,7 @@ mod tests {
         assert_eq!(store.parse_shard_key(&bad), None);
     }
 
-    // ── Fake-client error-mapping tests (ADR-111 Amendment 2, H3 fix round) ─
+    // ── Fake-client error-mapping tests (ADR-111 Amendment 2) ─
     //
     // `S3BlobStore` only ever holds an `Arc<dyn ObjectStore>` -- `ObjectStore`
     // (from the `object_store` crate, not a khive-authored trait) is already
@@ -917,7 +917,7 @@ mod tests {
         type Result<T> = std::result::Result<T, ObjectStoreError>;
 
         /// One scripted outcome for a single entry the fake's `list` stream
-        /// yields (ADR-111 Amendment 2, H1 fix round 2 -- partial-page
+        /// yields (ADR-111 Amendment 2 -- partial-page
         /// error/timeout coverage for `orphan_sweep`).
         #[derive(Clone, Debug)]
         pub enum ListOutcome {
@@ -972,7 +972,7 @@ mod tests {
                 }
             }
 
-            /// Script the fake's `list` stream (H1 fix round 2): the sweep
+            /// Script the fake's `list` stream: the sweep
             /// tests below use this to yield N valid entries then an error,
             /// or a `Hang` entry to exercise the per-page timeout.
             pub fn with_list_script(self, script: Vec<ListOutcome>) -> Self {
@@ -980,7 +980,7 @@ mod tests {
                 self
             }
 
-            /// Script the fake's `delete` outcomes (H1 fix round 2). Defaults
+            /// Script the fake's `delete` outcomes. Defaults
             /// to always-`Ok` so existing sweep behavior needs no script.
             pub fn with_delete_script(self, script: Vec<Outcome>) -> Self {
                 *self.delete_script.lock().unwrap() = script;
@@ -1225,8 +1225,7 @@ mod tests {
         assert!(matches!(err, StorageError::Timeout { .. }), "got {err:?}");
     }
 
-    // ── `orphan_sweep` timeout/error-mapping tests (ADR-111 Amendment 2,
-    // H1 fix round 2) ──────────────────────────────────────────────────────
+    // ── `orphan_sweep` timeout/error-mapping tests (ADR-111 Amendment 2) ──
 
     fn valid_shard_key(byte: char) -> String {
         let hex = byte.to_string().repeat(64);

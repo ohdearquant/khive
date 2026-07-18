@@ -20,7 +20,7 @@ fn empty_registry() -> khive_runtime::VerbRegistry {
 }
 
 /// Create a real entity in the runtime and return its UUID string.
-/// Used by feedback tests that need a valid target_id (C4 validation).
+/// Used by feedback tests that need a valid target_id.
 async fn create_test_entity(rt: &KhiveRuntime, token: &NamespaceToken) -> String {
     let entity = rt
         .create_entity(token, "concept", None, "test-target", None, None, vec![])
@@ -3213,7 +3213,7 @@ mod help_tests {
             h.params
                 .iter()
                 .any(|p| p.name == "profile_id" && p.required),
-            "brain.profile must have required profile_id param (H4 fix)"
+            "brain.profile must have required profile_id param"
         );
     }
 

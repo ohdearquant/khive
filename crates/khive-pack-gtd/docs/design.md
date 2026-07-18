@@ -40,7 +40,7 @@
 - `gtd_lifecycle_audit` table records every `transition` and `complete` invocation for
   replay and compliance. Writes are best-effort (non-fatal on failure).
 - `depends_on` property stores UUIDs of blocking tasks; `gtd.next` excludes tasks whose
-  blockers are not in `done` state (scenario-gtd C2).
+  blockers are not in `done` state.
 
 ### Illocutionary verb classification (Searle 1976) (ADR-025)
 
@@ -92,7 +92,7 @@
   a message directing the caller to transition first. `transition(status=done)` bypasses
   this gate for use cases where direct terminal transition is intended.
 
-### Atomic transition (ue-dsl-parallel C2)
+### Atomic transition
 
 - Both `complete()` and `transition()` use a conditional SQL UPDATE with a
   `json_extract(properties, '$.status') = expected_current` WHERE predicate. This ensures

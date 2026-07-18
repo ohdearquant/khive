@@ -294,12 +294,12 @@ async fn cc1_complete_with_status_cancelled_reaches_cancelled() {
 
     assert_eq!(
         result["to"], "cancelled",
-        "CC-1: complete(status=cancelled) must transition to 'cancelled', not 'done'; got: {result}"
+        "complete(status=cancelled) must transition to 'cancelled', not 'done'; got: {result}"
     );
     assert_eq!(result["completed"], true);
     assert!(
         result["is_terminal"].as_bool().unwrap_or(false),
-        "CC-1: cancelled must be a terminal state; got: {result}"
+        "cancelled must be a terminal state; got: {result}"
     );
 }
 
@@ -314,7 +314,7 @@ async fn cc1_complete_with_status_done_still_works() {
         .await
         .expect("complete(status=done) must succeed");
 
-    assert_eq!(result["to"], "done", "CC-1: explicit status=done must work");
+    assert_eq!(result["to"], "done", "explicit status=done must work");
 }
 
 #[tokio::test]
@@ -332,7 +332,7 @@ async fn cc1_complete_default_is_done() {
         .await
         .expect("complete() with no status must default to done");
 
-    assert_eq!(result["to"], "done", "CC-1: default status must be 'done'");
+    assert_eq!(result["to"], "done", "default status must be 'done'");
 }
 
 #[tokio::test]
@@ -348,7 +348,7 @@ async fn cc1_complete_invalid_status_is_rejected() {
     let msg = err.to_string();
     assert!(
         msg.contains("\"done\" or \"cancelled\""),
-        "CC-1: invalid status must be rejected with helpful message; got: {msg}"
+        "invalid status must be rejected with helpful message; got: {msg}"
     );
 }
 
