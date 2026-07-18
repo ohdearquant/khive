@@ -175,104 +175,26 @@ impl MemoryPack {
 
 #[cfg(test)]
 mod prune_recall_visibility_tests {
-    use async_trait::async_trait;
     use khive_pack_kg::KgPack;
-    use khive_runtime::{EmbedderProvider, KhiveRuntime, Namespace, VerbRegistryBuilder};
-    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
+    use khive_runtime::{KhiveRuntime, Namespace, VerbRegistryBuilder};
     use serial_test::serial;
 
-    /// Deterministic embedding service: distinct vector per unique text via FNV hash.
-    /// Not semantically meaningful, but reproducible — enough for a cosine-similarity
-    /// vector leg to find the seeded note by exact content match.
-    struct HashVecService {
-        dims: usize,
-    }
-
-    fn fnv_to_vec(text: &str, dims: usize) -> Vec<f32> {
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        for b in text.bytes() {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x0000_0001_0000_01b3);
-        }
-        let mut v = Vec::with_capacity(dims);
-        let mut s = h;
-        for _ in 0..dims {
-            s = s
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1_442_695_040_888_963_407);
-            v.push(((s >> 33) as f32) / (0x7fff_ffff_u32 as f32) - 1.0);
-        }
-        v
-    }
-
-    #[async_trait]
-    impl EmbeddingService for HashVecService {
-        async fn embed(
-            &self,
-            texts: &[String],
-            _model: EmbeddingModel,
-        ) -> Result<Vec<Vec<f32>>, EmbedError> {
-            Ok(texts.iter().map(|t| fnv_to_vec(t, self.dims)).collect())
-        }
-
-        fn supports_model(&self, _model: EmbeddingModel) -> bool {
-            true
-        }
-
-        fn name(&self) -> &'static str {
-            "hash-vec"
-        }
-    }
-
-    struct HashVecProvider {
-        model_name: String,
-        dims: usize,
-    }
-
-    #[async_trait]
-    impl EmbedderProvider for HashVecProvider {
-        fn name(&self) -> &str {
-            &self.model_name
-        }
-
-        fn dimensions(&self) -> usize {
-            self.dims
-        }
-
-        async fn build(
-            &self,
-        ) -> Result<std::sync::Arc<dyn EmbeddingService>, khive_runtime::RuntimeError> {
-            Ok(std::sync::Arc::new(HashVecService { dims: self.dims }))
-        }
-    }
+    use crate::test_support::HashVecProvider;
 
     /// A pruned memory must not be returned by `memory.recall` through the lexical
-    /// (`keyword_only`), vector (`vector_only`), or default hybrid fusion path —
+    /// (`keyword_only`), vector (`vector_only`), or default hybrid fusion path --
     /// and each leg must be shown to actually see the note both before and after
     /// pruning, not just asserted absent.
     ///
     /// `memory.prune` soft-deletes via `NoteStore::delete_note` (sets `deleted_at`,
-    /// rows remain — ADR-014) and bumps the per-model ANN generation so a background
+    /// rows remain -- ADR-014) and bumps the per-model ANN generation so a background
     /// rebuild drops stale vectors. It does not touch the FTS5 index or the
-    /// sqlite-vec store directly. Correctness for `memory.recall` is expected to
-    /// come from `load_memory_candidate_notes`'s post-hydration `deleted_at IS NULL`
-    /// filter (`handlers/common.rs`), which applies uniformly to text and vector
-    /// candidates before either leg reaches the caller — plus the vector store's own
-    /// `deleted_at IS NULL` anti-join (`khive-db/src/stores/vectors.rs`) exercised
-    /// only by the exact sqlite-vec search, never the warm ANN bridge.
+    /// sqlite-vec store directly, so correctness depends on every recall path
+    /// filtering out soft-deleted rows after retrieval, not just at the index level.
     ///
-    /// A single live note is always corpus enough for `ensure_ann_for_model` to build
-    /// and install a warm ANN graph on its very first cold-miss search, so an
-    /// ordinary `vector_only` recall after seeding never reaches the exact
-    /// sqlite-vec fallback (`handlers/common.rs:1100-1129`) — it always takes the
-    /// warm-route branch instead (`ann::search_loaded` returning `Some`, counted by
-    /// `warm_route_count`). To force the fallback deterministically, the warm graph
-    /// for this model is evicted (`ann::clear_key`) right after pruning: the note is
-    /// now soft-deleted, so `load_and_build_from_vector_store`'s corpus scan (which
-    /// joins `notes` and filters `deleted_at IS NULL`) finds zero live rows, the
-    /// rebuild attempt resolves to `EmptyCorpus` without installing a graph, and the
-    /// recall loop in `handlers/common.rs` falls through to the exact sqlite-vec
-    /// search for every subsequent call on this model.
+    /// The test also forces the exact sqlite-vec fallback path (as opposed to the
+    /// warm ANN route) by evicting the warm graph after pruning, so both retrieval
+    /// paths are exercised, not just whichever one a fresh corpus happens to take.
     #[tokio::test]
     #[serial(background_tasks)]
     async fn prune_excludes_pruned_memory_across_fts_vector_and_hybrid_recall() {

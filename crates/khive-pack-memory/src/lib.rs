@@ -12,6 +12,9 @@ pub mod scoring;
 pub mod text_gather;
 pub mod tunable;
 
+#[cfg(test)]
+mod test_support;
+
 pub use pack::MemoryPack;
 
 /// Increment and return the durable ANN corpus epoch after snapshot invalidation.
