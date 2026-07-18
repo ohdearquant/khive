@@ -245,6 +245,21 @@ fn control_char_error_teaches_escape_syntax_and_mcp_double_escape() {
 }
 
 #[test]
+fn control_char_error_reports_value_relative_byte_index() {
+    // #491: the diagnostic byte index is relative to the value, not the raw
+    // quoted span; it must not count the opening quote. A control byte that is
+    // the first byte of the value is reported as "byte 0 of the value", not
+    // "byte 1".
+    let src = format!("gtd.assign(title=\"{}b\")", '\u{c}');
+    let err = parse_request(&src).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("byte 0 of the value"),
+        "byte index must be value-relative (exclude the opening quote), got: {msg}"
+    );
+}
+
+#[test]
 fn control_char_in_object_key_rejected_with_plain_serde_message() {
     // #491: quoted object KEYS decode through a separate, strict path from
     // quoted values (`parse_object_arg_body` vs `parse_value`) — the

@@ -572,7 +572,9 @@ fn describe_quoted_string_parse_error(
     if !hit.preceded_by_backslash && !base.starts_with("control character") {
         return base;
     }
-    let idx = hit.raw_pos;
+    // `raw_pos` counts from the span's opening quote; report the index relative
+    // to the value itself (the saturating guard covers the unreachable pos-0 hit).
+    let idx = hit.raw_pos.saturating_sub(1);
     let c = hit.byte as char;
     format!(
         "{base} — byte {idx} of the value is {c:?} (U+{:04X}). DSL string escapes follow JSON: \
