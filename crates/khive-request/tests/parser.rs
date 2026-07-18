@@ -245,12 +245,13 @@ fn control_char_error_teaches_escape_syntax_and_mcp_double_escape() {
 }
 
 #[test]
-fn control_char_in_object_key_teaches_escape_syntax_and_mcp_double_escape() {
-    // #491 follow-up: quoted object KEYS decode through a separate path from
-    // quoted values (`parse_object_arg_body` vs `parse_value`) and used to
-    // bypass the enrichment entirely, returning the bare serde message. Both
-    // paths now share `decode_quoted_json_string`, so a raw control byte in
-    // a key gets the same teaching diagnostic as one in a value.
+fn control_char_in_object_key_rejected_with_plain_serde_message() {
+    // #491: quoted object KEYS decode through a separate, strict path from
+    // quoted values (`parse_object_arg_body` vs `parse_value`) — the
+    // value-path escape-grammar teaching diagnostic is scoped to values only
+    // (ADR-016, PR #957). A raw control byte in a key still fails to parse,
+    // but with the plain serde message rather than the value-path
+    // enrichment.
     let src = format!("gtd.assign(properties={{\"a{}b\":\"x\"}})", '\u{c}');
     let err = parse_request(&src).unwrap_err();
     let msg = err.to_string();
@@ -259,13 +260,26 @@ fn control_char_in_object_key_teaches_escape_syntax_and_mcp_double_escape() {
         "expected InvalidValue, got {err:?}"
     );
     assert!(
-        msg.contains(r#"\n"#) && msg.contains(r#"\t"#) && msg.contains(r#"\""#),
-        "error should name the JSON escape grammar, got: {msg}"
+        !msg.to_lowercase().contains("double"),
+        "key-path error should not carry the value-path MCP double-escape teaching, got: {msg}"
     );
-    assert!(
-        msg.to_lowercase().contains("double"),
-        "error should call out the MCP double-escape requirement, got: {msg}"
-    );
+}
+
+#[test]
+fn raw_control_byte_in_object_key_rejected() {
+    // #491: the literal-newline/CR/tab carve-out (ADR-016, PR #957) is scoped
+    // to quoted argument VALUES only. A quoted object KEY containing one of
+    // these bytes raw must still be rejected — only the escaped form (`\n`,
+    // `\r`, `\t`) is legal inside a key.
+    for raw in ['\n', '\r', '\t'] {
+        let src = format!("gtd.assign(properties={{\"a{raw}b\":\"x\"}})");
+        let err = parse_request(&src).unwrap_err();
+        assert!(
+            matches!(err, DslError::InvalidValue { .. }),
+            "expected InvalidValue for raw control byte {:#04x} in an object key, got {err:?}",
+            raw as u32
+        );
+    }
 }
 
 #[test]

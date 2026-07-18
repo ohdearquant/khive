@@ -248,7 +248,7 @@ impl<'a> Parser<'a> {
                     let start = self.pos;
                     let end = scan_string_end(self.src, start)?;
                     let raw = std::str::from_utf8(&self.src[start..end]).expect("utf8 key literal");
-                    let s = decode_quoted_json_string(raw, start)?;
+                    let s = decode_quoted_json_key(raw, start)?;
                     self.pos = end;
                     s
                 }
@@ -588,14 +588,28 @@ fn describe_quoted_string_parse_error(
 /// including its surrounding `"`) into its `String` value, normalizing raw
 /// literal newline/CR/tab bytes to JSON escapes first (ADR-016) and
 /// enriching any remaining decode failure via
-/// [`describe_quoted_string_parse_error`]. Shared by quoted object keys
-/// (`parse_object_arg_body`) and quoted string values (`parse_value`) so the
-/// diagnostic cannot drift between the two paths.
+/// [`describe_quoted_string_parse_error`]. Used by quoted string values
+/// (`parse_value`) only — the literal-newline/CR/tab carve-out is scoped to
+/// argument values, not object keys (see [`decode_quoted_json_key`]).
 fn decode_quoted_json_string(raw: &str, pos: usize) -> Result<String, DslError> {
     let normalized = normalize_quoted_string(raw);
     serde_json::from_str(normalized.text.as_ref()).map_err(|e| DslError::InvalidValue {
         pos,
         error: describe_quoted_string_parse_error(&e, &normalized),
+    })
+}
+
+/// Decodes a quoted-string DSL literal that is an object KEY (`raw`, the
+/// exact quoted span including its surrounding `"`) into its `String` value
+/// using strict `serde_json` semantics. Unlike [`decode_quoted_json_string`],
+/// no raw control byte is tolerated here: per ADR-016 / PR #957, the
+/// literal-newline/CR/tab carve-out applies to quoted argument VALUES only —
+/// a key containing one of those bytes must use its JSON escape form
+/// (`\n`, `\r`, `\t`) like any other control byte.
+fn decode_quoted_json_key(raw: &str, pos: usize) -> Result<String, DslError> {
+    serde_json::from_str(raw).map_err(|e| DslError::InvalidValue {
+        pos,
+        error: e.to_string(),
     })
 }
 
