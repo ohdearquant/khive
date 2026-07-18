@@ -32,6 +32,22 @@ use crate::scanner_rust;
 /// safe (precedent: `khive-db/src/stores/graph.rs`).
 const SQL_ID_CHUNK: usize = 900;
 
+/// Identity of one L2 declaration within a single language pass's
+/// project-wide symbol index: the project it belongs to, its full module
+/// path, its declared name, and its declaration kind -- together unique
+/// enough that two same-named declarations in different modules (or of
+/// different kinds) never collapse onto one entry. Named to replace the
+/// previous anonymous `(String, String, String, DeclKind)` tuple, whose
+/// three indistinguishable `String` positions made every construction site
+/// order-dependent and unreadable at a glance.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SymbolKey {
+    source_project: String,
+    module_path: String,
+    name: String,
+    kind: DeclKind,
+}
+
 /// Outcome counters for one `code.ingest` call, mirroring `git.digest`'s
 /// `IngestReport` shape (ADR-088 Amendment 1 precedent).
 #[derive(Debug, Default, serde::Serialize)]
@@ -528,7 +544,7 @@ async fn load_unchanged_declarations(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
     decl_ids: &[Uuid],
-    symbol_index: &mut HashMap<(String, String, String, DeclKind), Uuid>,
+    symbol_index: &mut HashMap<SymbolKey, Uuid>,
     touch_ids: &mut Vec<Uuid>,
 ) -> Result<(), CodeSourceIngestError> {
     if decl_ids.is_empty() {
@@ -549,16 +565,16 @@ async fn load_unchanged_declarations(
         else {
             continue;
         };
-        let key = (
-            props
+        let key = SymbolKey {
+            source_project: props
                 .get("source_project")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
-            module_path.to_string(),
-            entity.name.clone(),
+            module_path: module_path.to_string(),
+            name: entity.name.clone(),
             kind,
-        );
+        };
         symbol_index.insert(key, entity.id);
         touch_ids.push(entity.id);
     }
@@ -1110,7 +1126,7 @@ async fn dispatch_l2_scan(
     content: &str,
     file: &Path,
     sweep_time: DateTime<Utc>,
-    symbol_index: &mut HashMap<(String, String, String, DeclKind), Uuid>,
+    symbol_index: &mut HashMap<SymbolKey, Uuid>,
     pending_calls: &mut Vec<PendingCall>,
     pending_impls: &mut Vec<PendingImpl>,
     touch_ids: &mut Vec<Uuid>,
@@ -1178,7 +1194,7 @@ async fn run_import_scan(
     // scanned below and resolved once after the whole file loop completes.
     // Rust-only in this slice (B2's Scanner delivery order); a no-op set for
     // every other language.
-    let mut symbol_index: HashMap<(String, String, String, DeclKind), Uuid> = HashMap::new();
+    let mut symbol_index: HashMap<SymbolKey, Uuid> = HashMap::new();
     let mut pending_calls: Vec<PendingCall> = Vec::new();
     let mut pending_impls: Vec<PendingImpl> = Vec::new();
     // Declaration/module ids whose content_hash matched the prior sweep
@@ -1261,11 +1277,24 @@ async fn run_import_scan(
         }
 
         if l2_here {
-            if module_changed {
+            // `declaration_ids` is stamped onto a module entity only after
+            // it has actually gone through an L2 scan (`stamp_module_declaration_ids`);
+            // its absence means this module has never been L2-scanned -- e.g.
+            // an L1.5-only prior ingest of this exact file, followed by
+            // enabling L2 on an unchanged sweep. Without this check, an
+            // unchanged content_hash would route straight to
+            // `load_unchanged_declarations` and silently load an empty
+            // list, leaving the module's L2 symbols permanently unscanned.
+            let l2_never_scanned = existing_module
+                .as_ref()
+                .and_then(|e| e.properties.as_ref())
+                .is_none_or(|p| p.get("declaration_ids").is_none());
+            if module_changed || l2_never_scanned {
                 // Hash-before-parse: this file's whole-content hash
                 // (computed above, before any syn parsing) already told us
-                // it changed, so only a changed-or-new module ever reaches
-                // the actual parse+extract path.
+                // it changed, so only a changed-or-new module, or one that
+                // has never had an L2 pass, ever reaches the actual
+                // parse+extract path.
                 let decl_ids = dispatch_l2_scan(
                     language,
                     rt,
@@ -1360,12 +1389,12 @@ async fn run_import_scan(
             report.symbol_dependencies_unresolved += 1;
             continue;
         };
-        let key = (
-            call.project_name.clone(),
+        let key = SymbolKey {
+            source_project: call.project_name.clone(),
             module_path,
             name,
-            DeclKind::Function,
-        );
+            kind: DeclKind::Function,
+        };
         match symbol_index.get(&key) {
             Some(target_id) => {
                 call_targets
@@ -1391,18 +1420,18 @@ async fn run_import_scan(
             report.symbol_dependencies_unresolved += 1;
             continue;
         };
-        let type_key = (
-            imp.project_name.clone(),
-            type_module,
-            type_name,
-            DeclKind::Datatype,
-        );
-        let trait_key = (
-            imp.project_name.clone(),
-            trait_module,
-            trait_name,
-            DeclKind::Interface,
-        );
+        let type_key = SymbolKey {
+            source_project: imp.project_name.clone(),
+            module_path: type_module,
+            name: type_name,
+            kind: DeclKind::Datatype,
+        };
+        let trait_key = SymbolKey {
+            source_project: imp.project_name.clone(),
+            module_path: trait_module,
+            name: trait_name,
+            kind: DeclKind::Interface,
+        };
         match (symbol_index.get(&type_key), symbol_index.get(&trait_key)) {
             (Some(type_id), Some(trait_id)) => {
                 impl_targets.entry(*type_id).or_default().insert(*trait_id);
@@ -1538,7 +1567,7 @@ async fn scan_rust_l2(
     content: &str,
     file: &Path,
     sweep_time: DateTime<Utc>,
-    symbol_index: &mut HashMap<(String, String, String, DeclKind), Uuid>,
+    symbol_index: &mut HashMap<SymbolKey, Uuid>,
     pending_calls: &mut Vec<PendingCall>,
     pending_impls: &mut Vec<PendingImpl>,
     touch_ids: &mut Vec<Uuid>,
@@ -1598,12 +1627,12 @@ async fn scan_rust_l2(
         .zip(decl_ids.iter().copied())
     {
         symbol_index.insert(
-            (
-                proj_name.to_string(),
-                decl_module_path.clone(),
-                decl.name.clone(),
-                decl.kind,
-            ),
+            SymbolKey {
+                source_project: proj_name.to_string(),
+                module_path: decl_module_path.clone(),
+                name: decl.name.clone(),
+                kind: decl.kind,
+            },
             decl_id,
         );
 

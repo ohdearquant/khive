@@ -324,6 +324,69 @@ async fn l2_reingest_is_idempotent_no_duplicate_symbol_entities() {
     );
 }
 
+/// #1087 item 5 regression: enabling L2 on a sweep where the file's content
+/// is unchanged from a prior L1.5-only ingest must still scan it. Before the
+/// fix, `module_changed = false` routed straight to loading the module's
+/// (nonexistent, because L2 never ran) `declaration_ids`, silently
+/// producing zero L2 symbols for the file forever.
+#[tokio::test]
+async fn l2_scans_on_tier_upgrade_even_when_module_content_is_unchanged() {
+    let root = TempDir::new().expect("tempdir");
+    write_fixture(root.path());
+    let db = root.path().join("l2.db");
+    let rt = rt_at(&db);
+    let token = rt.authorize(Namespace::local()).expect("token");
+
+    let l1_5_only = run_code_ingest(
+        &rt,
+        &token,
+        CodeSourceIngestOptions {
+            path: root.path(),
+            languages: rust_only(),
+            sweep_time: Utc::now(),
+            enable_l1: true,
+            enable_l1_5: true,
+            enable_l2: false,
+        },
+    )
+    .await
+    .expect("L1.5-only ingest succeeds");
+    assert_eq!(
+        l1_5_only.symbols_created, 0,
+        "L2 disabled: no symbol entities from the first pass"
+    );
+    assert!(
+        entity_rows(&rt).await.is_empty(),
+        "no function/datatype/interface entities exist before L2 ever runs"
+    );
+
+    let l2_upgrade = run_code_ingest(
+        &rt,
+        &token,
+        CodeSourceIngestOptions {
+            path: root.path(),
+            languages: rust_only(),
+            sweep_time: Utc::now(),
+            enable_l1: true,
+            enable_l1_5: true,
+            enable_l2: true,
+        },
+    )
+    .await
+    .expect("L2-upgrade ingest succeeds even though file content is unchanged");
+
+    assert!(
+        l2_upgrade.symbols_created > 0,
+        "enabling L2 on an unchanged file must still scan and create its declarations, \
+         got symbols_created = {}",
+        l2_upgrade.symbols_created
+    );
+    assert!(
+        !entity_rows(&rt).await.is_empty(),
+        "function/datatype/interface entities must exist after the L2 upgrade pass"
+    );
+}
+
 /// When `enable_l2` is false (the default), no symbol-tier entities are
 /// created — the L2 tier changes nothing for existing L1/L1.5-only callers.
 #[tokio::test]

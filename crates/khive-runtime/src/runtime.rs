@@ -153,6 +153,55 @@ impl KhiveRuntime {
         })
     }
 
+    /// Like [`new`](Self::new), but runs `guard` against the just-opened
+    /// backend's file path *before* migrations (or any other write) touch
+    /// it, aborting construction if `guard` returns `Err`.
+    ///
+    /// `new` runs migrations immediately after opening the backend, before
+    /// the caller gets any chance to inspect what was actually opened --
+    /// fine for trusted config-driven paths, but wrong for a caller-supplied
+    /// target that must be checked against a forbidden set first (ADR-085
+    /// Amendment 2 B7's production-database fence). `guard` is skipped for
+    /// an in-memory backend (`config.db_path` is `None`) since there is no
+    /// file identity to check.
+    pub fn new_guarded(
+        config: RuntimeConfig,
+        guard: impl FnOnce(&std::path::Path) -> Result<(), String>,
+    ) -> RuntimeResult<Self> {
+        let backend = match &config.db_path {
+            Some(path) => {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).ok();
+                }
+                let backend = StorageBackend::sqlite(path)?;
+                guard(path).map_err(RuntimeError::InvalidInput)?;
+                backend
+            }
+            None => StorageBackend::memory()?,
+        };
+        // Migrations must run before any pack handler touches the DB; idempotent;
+        // failure aborts construction with a clear error.
+        {
+            let mut writer = backend.pool().try_writer()?;
+            khive_db::run_migrations(writer.conn_mut())?;
+        }
+        register_configured_embedding_models(&backend, &config)?;
+        let (registry, default_embedder_name) = build_embedder_registry(&config);
+        Ok(Self {
+            backend: Arc::new(backend),
+            core_backend: None,
+            config,
+            embedder_registry: Arc::new(std::sync::RwLock::new(registry)),
+            default_embedder_name,
+            edge_rules: Arc::new(RwLock::new(Vec::new())),
+            valid_entity_kinds: Arc::new(RwLock::new(Vec::new())),
+            valid_note_kinds: Arc::new(RwLock::new(Vec::new())),
+            entity_type_validator: Arc::new(RwLock::new(None)),
+            note_mutation_hook: Arc::new(RwLock::new(None)),
+            blob_store: Arc::new(RwLock::new(None)),
+        })
+    }
+
     /// Open a runtime for read-only inspection (no model registration, no DB creation).
     ///
     /// Runs migrations (idempotent) but skips `register_configured_embedding_models`,
@@ -228,6 +277,21 @@ impl KhiveRuntime {
         );
         self.core_backend = Some(core);
         self
+    }
+
+    /// The actual on-disk path of the MAIN backend `self` (or its `core()`)
+    /// is bound to, or `None` for an in-memory backend.
+    ///
+    /// `config().db_path` is only populated by the single-backend
+    /// [`new`](Self::new) constructor; a multi-backend boot
+    /// (`from_backend`) always leaves it `None`, even though the runtime is
+    /// backed by a real file. Callers that need the true configured
+    /// database file regardless of which constructor built this runtime
+    /// (e.g. a fence that must refuse the shared production database as a
+    /// target, ADR-085 Amendment 2 B7) should use this instead of
+    /// `config().db_path`.
+    pub fn main_backend_db_path(&self) -> Option<std::path::PathBuf> {
+        self.core().backend.db_path().map(|p| p.to_path_buf())
     }
 
     /// Return a runtime handle bound to the main (shared-graph) backend.
@@ -1434,6 +1498,38 @@ mod tests {
             allowed_outbound_namespaces: vec![],
             actor_id: None,
         }
+    }
+
+    /// #1087 item 4 regression: `from_backend` (the multi-backend boot path)
+    /// always leaves `config().db_path` at `None`, even though the runtime
+    /// is backed by a real file -- a caller keyed off `config().db_path`
+    /// alone never sees the actual configured database in that mode.
+    /// `main_backend_db_path` must resolve the real file regardless, both
+    /// when this runtime IS the main backend and when it is a
+    /// secondary-backend runtime pointing at one via `with_core_backend`.
+    #[test]
+    fn main_backend_db_path_resolves_through_from_backend_and_core() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let main_path = tmp.path().join("main.db");
+        let main_backend = Arc::new(StorageBackend::sqlite(&main_path).expect("sqlite backend"));
+        {
+            let mut writer = main_backend.pool().try_writer().expect("writer");
+            khive_db::run_migrations(writer.conn_mut()).expect("migrations");
+        }
+
+        let mut main_config = secondary_config();
+        main_config.backend_id = BackendId::main();
+        let main_rt = KhiveRuntime::from_backend(main_backend.clone(), main_config);
+        assert!(
+            main_rt.config().db_path.is_none(),
+            "from_backend must leave config().db_path at None per its own contract"
+        );
+        assert_eq!(main_rt.main_backend_db_path(), Some(main_path.clone()));
+
+        let secondary_backend = migrated_memory_backend();
+        let secondary_rt = KhiveRuntime::from_backend(secondary_backend, secondary_config())
+            .with_core_backend(main_backend);
+        assert_eq!(secondary_rt.main_backend_db_path(), Some(main_path));
     }
 
     #[test]

@@ -60,7 +60,12 @@ impl CodePack {
         };
 
         let db_param = params.get("db").and_then(Value::as_str);
-        let runtime_db_path = self.runtime.config().db_path.clone();
+        // `main_backend_db_path` resolves the real configured database file
+        // in BOTH the single-backend (`KhiveRuntime::new`) and multi-backend
+        // (`from_backend`, where `config().db_path` is always `None`) boot
+        // paths, so a caller cannot dodge the fence by naming the
+        // multi-backend deployment's actual main backend file (#1087 item 4).
+        let runtime_db_path = self.runtime.main_backend_db_path();
         let db_path = resolve_target_db(db_param, &path, runtime_db_path.as_deref())
             .map_err(RuntimeError::InvalidInput)?;
 
@@ -103,12 +108,22 @@ impl CodePack {
             packs: vec!["kg".to_string(), "code".to_string()],
             ..RuntimeConfig::no_embeddings()
         };
-        let target_rt = KhiveRuntime::new(config).map_err(|e| {
-            RuntimeError::InvalidInput(format!("opening target db {db_path:?}: {e}"))
-        })?;
-        // Re-verify identity on the just-opened handle before any write —
-        // narrows the TOCTOU window between `resolve_target_db`'s check
-        // (against a path that may not have existed yet) and this open.
+        // `new_guarded` runs `verify_opened_target` against the just-opened
+        // backend's file BEFORE migrations (or any other write) touch it --
+        // `new` runs migrations immediately on open, which would otherwise
+        // let a swapped-in production database get migrated before this
+        // fence ever sees it (#1087 item 2).
+        let target_rt = KhiveRuntime::new_guarded(config, |opened_path| {
+            verify_opened_target(opened_path, runtime_db_path.as_deref())
+        })
+        .map_err(|e| RuntimeError::InvalidInput(format!("opening target db {db_path:?}: {e}")))?;
+        // Re-verify immediately before the write-heavy ingest phase begins --
+        // narrows the window between the open-time check above and the
+        // first actual write, the most exploitable point in the TOCTOU: an
+        // attacker who swaps the file at `db_path` after the open-time check
+        // but before ingest starts is still caught here, closed. This is a
+        // narrowing, not a full close -- a true race-resistant fence requires
+        // a VFS-level check (ADR-085 Amendment 4, in review).
         verify_opened_target(&db_path, runtime_db_path.as_deref())
             .map_err(RuntimeError::InvalidInput)?;
         let token = target_rt
