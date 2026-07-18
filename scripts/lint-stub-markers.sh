@@ -68,6 +68,29 @@ pub fn after_nonbraced_cfg_test_item(flag: bool) -> u32 {
     }
     1
 }
+
+pub fn after_long_comment_gap(flag: bool) -> u32 {
+    if !flag {
+        panic!(
+            /* this block comment is deliberately long so that the gap of
+               whitespace and comment text between the macro's opening
+               delimiter and its message argument exceeds forty characters,
+               /* nested comments are legal Rust and must not end the outer
+                  comment early */
+               which used to blind a fixed-width lookahead window */
+            "todo: still not implemented after a long comment gap"
+        );
+    }
+    1
+}
+
+pub fn after_byte_raw_string_literal(flag: bool) -> u32 {
+    let _marker: &[u8] = br#"raw byte data, not a panic argument"#;
+    if !flag {
+        panic!("todo: still not implemented after a byte-raw string literal");
+    }
+    1
+}
 FIXTURE
 
     cat > "$tmp/case-pass/crates/fixture-crate/src/lib.rs" <<'FIXTURE'
@@ -118,17 +141,30 @@ FIXTURE
 
     status=0
 
+    # Exactly 7 markers are seeded in case-fail above; asserting the count
+    # (not just substring presence) catches a parser-overmatch regression
+    # that would otherwise slip through as an unnoticed extra finding.
+    expected_marker_count=7
+
     if scan "$tmp/case-fail" > "$tmp/fail.log" 2>&1; then
         echo "self-test FAILED: expected placeholder call sites were not caught"
         cat "$tmp/fail.log"
         status=1
     else
+        found_marker_count=$(grep -c 'reads as a placeholder stub' "$tmp/fail.log")
+        if [ "$found_marker_count" -ne "$expected_marker_count" ]; then
+            echo "self-test FAILED: expected exactly $expected_marker_count findings, got $found_marker_count"
+            cat "$tmp/fail.log"
+            status=1
+        fi
         for marker in \
             "stub: not implemented for other kinds yet" \
             "not implemented for other kinds yet" \
             "todo: handle the false branch" \
             "not implemented for this flag" \
-            "not implemented after a non-braced cfg(test) item"
+            "not implemented after a non-braced cfg(test) item" \
+            "todo: still not implemented after a long comment gap" \
+            "todo: still not implemented after a byte-raw string literal"
         do
             if ! grep -qF "$marker" "$tmp/fail.log"; then
                 echo "self-test FAILED: expected finding missing: $marker"
@@ -158,8 +194,8 @@ scan() {
         | sort)
 
     if [ -z "$files" ]; then
-        echo "no source files found under $root/crates"
-        return 0
+        echo "no source files matched crates/*/src/**/*.rs under $root/crates (excluding target*/tests/benches/examples) -- the scanner would silently be a no-op; fix the file-layout selection" >&2
+        return 1
     fi
 
     python3 - "$files" <<'PY'
@@ -179,19 +215,24 @@ PLACEHOLDER_RE = re.compile(
 MACRO_CALL_RE = re.compile(r"\b(panic|unreachable)\s*!\s*([(\{\[])")
 STRING_LIT_RE = re.compile(r'"((?:[^"\\]|\\.)*)"')
 CFG_TEST_RE = re.compile(r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]")
+WHITESPACE_RE = re.compile(r"\s*")
 
 
 def raw_string_end(text, i):
-    """If text[i] starts a raw string literal `r#*"..."#*` (word-boundary
-    checked so an identifier ending in `r` is never mistaken for one), return
-    the offset just past its closing quote+hashes (len(text) if unterminated).
-    Otherwise None."""
+    """If text[i] starts a raw or byte-raw string literal (`r#*"..."#*` or
+    `br#*"..."#*`, word-boundary checked at the start of the prefix so an
+    identifier ending in `r`/`br` -- e.g. `xr"..."` or `abr"..."` -- is never
+    mistaken for one), return the offset just past its closing quote+hashes
+    (len(text) if unterminated). Otherwise None."""
     n = len(text)
-    if text[i] != "r":
-        return None
     if i > 0 and (text[i - 1].isalnum() or text[i - 1] == "_"):
         return None
-    j = i + 1
+    if text[i] == "b" and i + 1 < n and text[i + 1] == "r":
+        j = i + 2
+    elif text[i] == "r":
+        j = i + 1
+    else:
+        return None
     hashes = 0
     while j < n and text[j] == "#":
         hashes += 1
@@ -204,17 +245,19 @@ def raw_string_end(text, i):
 
 
 def strip_comments_and_char_lits(text):
-    """Blank out //, /* */ comments and char literals so brace-counting and
-    macro-matching never trip on braces/quotes living inside them. Plain and
-    raw string literals are left untouched -- their content is exactly what
-    this script inspects. Raw strings are hand-scanned to their matching
+    """Blank out //, /* */ comments (nesting -- Rust block comments nest, so
+    a depth counter tracks inner `/* */` pairs rather than ending at the
+    first `*/`) and char literals, so brace-counting and macro-matching
+    never trip on braces/quotes living inside them. Plain and raw string
+    literals are left untouched -- their content is exactly what this
+    script inspects. Raw strings are hand-scanned to their matching
     "###-count closer so quotes inside them (e.g. `r#"say "hi""#`) do not
     prematurely end the literal."""
     out = []
     i = 0
     n = len(text)
     in_line_comment = False
-    in_block_comment = False
+    block_depth = 0
     in_string = False
     while i < n:
         c = text[i]
@@ -224,11 +267,16 @@ def strip_comments_and_char_lits(text):
                 in_line_comment = False
             i += 1
             continue
-        if in_block_comment:
-            if c == "*" and i + 1 < n and text[i + 1] == "/":
+        if block_depth > 0:
+            if c == "/" and i + 1 < n and text[i + 1] == "*":
+                block_depth += 1
                 out.append("  ")
                 i += 2
-                in_block_comment = False
+                continue
+            if c == "*" and i + 1 < n and text[i + 1] == "/":
+                block_depth -= 1
+                out.append("  ")
+                i += 2
                 continue
             out.append(" " if c != "\n" else "\n")
             i += 1
@@ -249,7 +297,7 @@ def strip_comments_and_char_lits(text):
             i += 2
             continue
         if c == "/" and i + 1 < n and text[i + 1] == "*":
-            in_block_comment = True
+            block_depth = 1
             out.append("  ")
             i += 2
             continue
@@ -292,7 +340,7 @@ def match_string_literal(text, pos):
     rs_end = raw_string_end(text, pos)
     if rs_end is None:
         return None
-    j = pos + 1
+    j = pos + (2 if text[pos] == "b" else 1)  # skip the `br`/`r` prefix
     hashes = 0
     while text[j] == "#":
         hashes += 1
@@ -375,16 +423,19 @@ for path in files:
         if in_span(m.start(), test_spans):
             continue
         call_start = m.end() - 1  # the opening delimiter char (`(`/`{`/`[`)
-        # Only consider a string literal immediately after the delimiter
-        # (allowing whitespace) -- this is the macro's message argument, not
-        # some unrelated string buried deeper in a multi-arg call. Read the
-        # lookahead from `clean` (strings intact), never `code_only` (which
-        # has blanked exactly the string content being looked for here).
-        lookahead = clean[call_start + 1 : call_start + 1 + 40]
-        stripped = lookahead.lstrip()
-        if not (stripped.startswith('"') or stripped.startswith("r")):
-            continue
-        msg_start = call_start + 1 + (len(lookahead) - len(stripped))
+        # Only consider a string literal immediately after the delimiter --
+        # this is the macro's message argument, not some unrelated string
+        # buried deeper in a multi-arg call. Rust allows arbitrary whitespace
+        # and comments between the delimiter and the argument; `clean` has
+        # already blanked every comment to whitespace (nesting-aware), so
+        # skipping whitespace with no length cap is a full trivia skip, not
+        # just a wider fixed window -- a placeholder message is caught no
+        # matter how much trivia precedes it. Read from `clean` (strings
+        # intact), never `code_only` (which has blanked exactly the string
+        # content being looked for here).
+        after_delim = call_start + 1
+        trivia = WHITESPACE_RE.match(clean, after_delim)
+        msg_start = trivia.end()
         msg_m = match_string_literal(clean, msg_start)
         if msg_m is None:
             continue
