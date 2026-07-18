@@ -289,10 +289,13 @@ impl Default for RuntimeConfig {
             .ok()
             .and_then(|s| s.parse().ok())
             .or(Some(EmbeddingModel::AllMiniLmL6V2));
+        // Ships single-engine. A second engine is embedded on every write and
+        // searched on every read, which is cost a deployment should opt into
+        // rather than inherit: set KHIVE_ADDITIONAL_EMBEDDING_MODELS to add one.
         let additional_embedding_models = std::env::var("KHIVE_ADDITIONAL_EMBEDDING_MODELS")
             .ok()
             .map(|s| parse_embedding_model_list(&s))
-            .unwrap_or_else(|| vec![EmbeddingModel::ParaphraseMultilingualMiniLmL12V2]);
+            .unwrap_or_default();
         let packs = std::env::var("KHIVE_PACKS")
             .ok()
             .map(|s| parse_pack_list(&s))
@@ -883,12 +886,21 @@ mod no_embeddings_tests {
 
     #[test]
     #[serial]
-    fn default_still_seeds_additional_models_when_env_unset() {
+    fn default_computes_additional_models_independently_of_no_embeddings() {
         // `Default` must keep computing `embedding_model` and
         // `additional_embedding_models` independently; `no_embeddings()` is a
         // separate opt-out constructor, not a change to `Default`'s seeding.
-        std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
+        // The env var is SET here rather than cleared: since Default now ships
+        // no secondary engine, an unset env would make Default and
+        // no_embeddings() indistinguishable and the test would stop
+        // discriminating the thing it exists to discriminate.
+        std::env::set_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS", "paraphrase");
         let config = RuntimeConfig::default();
+        let buggy_form = RuntimeConfig {
+            embedding_model: None,
+            ..RuntimeConfig::default()
+        };
+        std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
 
         assert_eq!(
             config.additional_embedding_models,
@@ -897,14 +909,29 @@ mod no_embeddings_tests {
 
         // Overriding only `embedding_model` via struct-update syntax does not
         // clear `additional_embedding_models`.
-        let buggy_form = RuntimeConfig {
-            embedding_model: None,
-            ..RuntimeConfig::default()
-        };
         assert!(
             !buggy_form.additional_embedding_models.is_empty(),
             "Default's independent-field seeding must remain unchanged; \
              no_embeddings() is the fix, not a change to Default"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn default_ships_a_single_engine_when_env_unset() {
+        // A secondary engine is embedded on every write and searched on every
+        // read. That cost is opted into, not inherited.
+        std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
+        let config = RuntimeConfig::default();
+
+        assert!(
+            config.additional_embedding_models.is_empty(),
+            "shipped default must register one engine; a second is opt-in via \
+             KHIVE_ADDITIONAL_EMBEDDING_MODELS"
+        );
+        assert_eq!(
+            configured_embedding_models(&config),
+            vec![EmbeddingModel::AllMiniLmL6V2]
         );
     }
 }
