@@ -352,9 +352,47 @@ mod prune_recall_visibility_tests {
             "the single seeded note (salience 0.1 < 0.5) must be pruned: {prune_result:?}"
         );
 
-        // Evict the warm graph built during the pre-prune vector_only check above,
-        // so the recalls below rebuild against the now-pruned corpus and fall
-        // through to the exact sqlite-vec search instead of the warm ANN route.
+        // The warm graph built during the pre-prune vector_only check above is still
+        // installed at this point: `memory.prune` bumps the per-model generation
+        // (`ann::bump_generation`) but never evicts the graph itself, and the
+        // background rebuild it triggers finds zero live rows post-prune (the
+        // corpus scan filters `deleted_at IS NULL`), so it resolves to
+        // `AnnEnsureStatus::EmptyCorpus` and leaves the stale graph installed
+        // rather than replacing it. A `vector_only` recall right now must
+        // therefore take the warm route (`ann::search_loaded` hits the still-
+        // installed bridge) and still exclude the pruned note, proving the
+        // post-hydration `deleted_at IS NULL` filter in `load_memory_candidate_notes`
+        // (`handlers/common.rs`) covers the stale-warm-graph path, not just the
+        // exact sqlite-vec fallback exercised below.
+        ann.reset_warm_route_count();
+        let stale_warm_result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "query": NOTE_TEXT,
+                    "limit": 10,
+                    "fusion_strategy": "vector_only",
+                    "embedding_model": MODEL,
+                }),
+            )
+            .await
+            .expect("memory.recall [vector_only, stale warm graph] must not error");
+        let stale_warm_hits = stale_warm_result.as_array().expect("bare array result");
+        assert!(
+            stale_warm_hits.iter().all(|h| h["id"] != note_id),
+            "pruned note must not be returned via vector_only recall against \
+             the stale-but-still-installed warm ANN graph, got: {stale_warm_hits:?}"
+        );
+        assert!(
+            ann.warm_route_count() > 0,
+            "the stale warm graph must still be installed and hit by \
+             ann::search_loaded — a warm_route_count of 0 means this assertion \
+             is vacuously exercising the sqlite-vec fallback instead"
+        );
+
+        // Evict the warm graph now, so the recalls below rebuild against the
+        // now-pruned corpus and fall through to the exact sqlite-vec search
+        // instead of the warm ANN route.
         let key = crate::ann::AnnKey::new("local", MODEL);
         crate::ann::clear_key(&ann, &key).await;
         ann.reset_warm_route_count();
