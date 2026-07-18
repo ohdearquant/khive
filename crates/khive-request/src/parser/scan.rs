@@ -38,7 +38,10 @@ pub(crate) fn scan_string_end(src: &[u8], start: usize) -> Result<usize, DslErro
 /// standalone control byte also fails as an invalid escape at that byte's
 /// offset. Offset alone cannot tell the legitimate backslash-pair case
 /// apart from that last, spurious one; `preceded_by_backslash` is the signal
-/// the caller uses to do so.
+/// the caller uses to do so. A control byte that lands inside a `\u`
+/// escape's own 4-hex-digit slot run is never recorded at all, even when
+/// the byte immediately preceding it happens to be a backslash — see
+/// [`normalize_quoted_string`] for why that adjacency is not real.
 pub(crate) struct ControlByteHit {
     pub(crate) normalized_pos: usize,
     pub(crate) raw_pos: usize,
@@ -80,6 +83,24 @@ pub(crate) struct NormalizedQuotedString<'a> {
 /// same behavior as before this exception existed. When the span has no
 /// control byte at all (the common case), `text` borrows `raw` directly —
 /// no allocation.
+///
+/// A `\u` escape is handled separately from the general backslash-pair walk:
+/// once the `u` is seen, the following 4 characters are copied through
+/// verbatim as a single unit, exactly mirroring how `serde_json`'s
+/// `decode_hex_escape` consumes its 4-byte candidate-digit slice — as raw
+/// bytes, never reinterpreted as introducing a new escape, even when one of
+/// them is itself a backslash. Without this, a short `\u` run (e.g. 2 hex
+/// digits followed by a backslash and then a raw control byte) would have
+/// its 3rd slot — the backslash — re-enter the general branch above and get
+/// misread as a fresh, genuine `\<ctrl>` pair, even though `serde_json` never
+/// treats it as one; the resulting hit would carry `preceded_by_backslash:
+/// true` for a failure that is actually a malformed unicode escape, not a
+/// broken control-byte pair. Bytes inside the 4-slot window are therefore
+/// never recorded as a [`ControlByteHit`], matching the fact that
+/// `decode_hex_escape` never reports a control-character-style failure for
+/// them — only ever `ErrorCode::InvalidEscape`, the same code (and `Display`
+/// text) a genuine broken pair produces, which is why scan-time origin, not
+/// the error text, has to be the source of truth.
 pub(crate) fn normalize_quoted_string(raw: &str) -> NormalizedQuotedString<'_> {
     if !raw.bytes().any(|b| b < 0x20) {
         return NormalizedQuotedString {
@@ -90,11 +111,22 @@ pub(crate) fn normalize_quoted_string(raw: &str) -> NormalizedQuotedString<'_> {
     let mut out = String::with_capacity(raw.len() + 8);
     let mut first_control_byte = None;
     let mut chars = raw.char_indices().peekable();
+    let mut hex_slots_remaining = 0u32;
     while let Some((pos, c)) = chars.next() {
+        if hex_slots_remaining > 0 {
+            hex_slots_remaining -= 1;
+            out.push(c);
+            continue;
+        }
         if c == '\\' {
             out.push(c);
             if let Some(&(next_pos, next_c)) = chars.peek() {
                 chars.next();
+                if next_c == 'u' {
+                    out.push(next_c);
+                    hex_slots_remaining = 4;
+                    continue;
+                }
                 if (next_c as u32) < 0x20 && first_control_byte.is_none() {
                     first_control_byte = Some(ControlByteHit {
                         normalized_pos: out.len(),

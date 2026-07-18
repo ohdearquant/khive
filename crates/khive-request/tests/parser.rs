@@ -318,6 +318,42 @@ fn malformed_unicode_escape_adjacent_to_control_byte_not_misattributed() {
 }
 
 #[test]
+fn short_unicode_escape_backslash_adjacent_control_byte_not_misattributed() {
+    // A `\u` escape short by exactly 2 hex digits has its 3rd slot land on a
+    // raw backslash and its 4th slot land on a raw control byte — so the
+    // control byte IS physically adjacent to a backslash, unlike the
+    // 3-hex-digit case above. That adjacency is spurious: both bytes are
+    // consumed as `\u`'s own hex-digit slots, never reinterpreted as a fresh
+    // `\<ctrl>` escape pair. The failure must stay the plain malformed
+    // unicode-escape message with no double-escape guidance.
+    let src = format!("gtd.assign(title=\"bad \\u12\\{}tail\")", '\u{c}');
+    let err = parse_request(&src).unwrap_err();
+    let msg = err.to_string();
+    assert!(matches!(err, DslError::InvalidValue { .. }));
+    assert!(
+        msg.contains("invalid escape"),
+        "expected the plain serde invalid-escape message, got: {msg}"
+    );
+    assert!(
+        !msg.to_lowercase().contains("double"),
+        "a short \\u escape landing on a backslash+control-byte pair must not be \
+         enriched with the control-char diagnostic, got: {msg}"
+    );
+
+    // A genuine broken `\<ctrl>` pair with no preceding `\u` run still gets
+    // the teaching diagnostic — the fix must not blind the guard to the
+    // legitimate case.
+    let genuine_src = format!("gtd.assign(title=\"before\\{}after\")", '\u{c}');
+    let genuine_err = parse_request(&genuine_src).unwrap_err();
+    let genuine_msg = genuine_err.to_string();
+    assert!(matches!(genuine_err, DslError::InvalidValue { .. }));
+    assert!(
+        genuine_msg.to_lowercase().contains("double"),
+        "a genuine broken \\<ctrl> pair must still get the double-escape guidance, got: {genuine_msg}"
+    );
+}
+
+#[test]
 fn raw_newline_immediately_after_backslash_caught_as_control_char_cause() {
     // #491 round-2 blocking fix 1(b): a raw LF directly following a
     // backslash is not a valid two-byte JSON escape (valid escapes are
