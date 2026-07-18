@@ -332,6 +332,57 @@ fn fusion_strategy_change_produces_observable_ordering_difference() {
 }
 
 #[test]
+fn vector_only_fusion_unions_hits_across_every_engine() {
+    use khive_storage::types::VectorSearchHit;
+    use std::collections::HashSet;
+    use uuid::Uuid;
+
+    let id_first_engine_only = Uuid::from_u128(0x1111);
+    let id_second_engine_only = Uuid::from_u128(0x2222);
+
+    let hits_engine_a = vec![VectorSearchHit {
+        subject_id: id_first_engine_only,
+        score: 0.9_f64.into(),
+        rank: 1,
+    }];
+    let hits_engine_b = vec![VectorSearchHit {
+        subject_id: id_second_engine_only,
+        score: 0.8_f64.into(),
+        rank: 1,
+    }];
+    let memory_ids: HashSet<Uuid> = [id_first_engine_only, id_second_engine_only]
+        .into_iter()
+        .collect();
+
+    let candidates = RecallCandidateSet {
+        namespace: "local".to_string(),
+        text_hits: vec![],
+        vector_hits_per_model: vec![
+            ("engine-a".to_string(), hits_engine_a),
+            ("engine-b".to_string(), hits_engine_b),
+        ],
+        visible_namespaces: vec!["local".to_string()],
+        ann_degraded: false,
+    };
+    let cfg = RecallConfig {
+        fuse_strategy: FusionStrategy::VectorOnly,
+        ..RecallConfig::default()
+    };
+
+    let results = fuse_candidates(&candidates, &memory_ids, &cfg, 10);
+    let ids: Vec<Uuid> = results.iter().map(|h| h.entity_id).collect();
+
+    assert!(
+        ids.contains(&id_second_engine_only),
+        "vector-only fusion must keep hits from every configured engine, not just the first; got {ids:?}"
+    );
+    assert!(
+        ids.contains(&id_first_engine_only),
+        "vector-only fusion must still keep the first engine's hits too; got {ids:?}"
+    );
+}
+
+#[test]
 fn compute_score_weighted_strategy_formula() {
     let cfg = RecallConfig {
         fuse_strategy: FusionStrategy::Weighted {
