@@ -28,6 +28,13 @@ self_test() {
     tmp="$(mktemp -d)"
     trap 'rm -rf "$tmp"' EXIT
 
+    # case-fail and case-pass assert detection and false-positive avoidance,
+    # not suppression; they scan against an empty allowlist so the committed
+    # file's real-repo paths are never validated against these temp trees (the
+    # path-existence guard would otherwise fail loud on them).
+    empty_allowlist="$tmp/empty-allowlist.txt"
+    : > "$empty_allowlist"
+
     mkdir -p "$tmp/case-fail/crates/fixture-crate/src"
     mkdir -p "$tmp/case-fail/crates/fixture-crate/tests"
     mkdir -p "$tmp/case-pass/crates/fixture-crate/src"
@@ -89,6 +96,13 @@ pub fn after_byte_raw_string_literal(flag: bool) -> u32 {
 pub fn after_format_arg_stub(flag: bool) -> u32 {
     if !flag {
         panic!("{}", "todo: not implemented for the format-arg case");
+    }
+    1
+}
+
+pub fn after_format_split_arg_stub(flag: bool) -> u32 {
+    if !flag {
+        panic!("not {}", "implemented for the format-split case");
     }
     1
 }
@@ -241,12 +255,12 @@ FIXTURE
 
     status=0
 
-    # Exactly 15 markers are seeded in case-fail above; asserting the count
+    # Exactly 17 markers are seeded in case-fail above; asserting the count
     # (not just substring presence) catches a parser-overmatch regression
     # that would otherwise slip through as an unnoticed extra finding.
-    expected_marker_count=16
+    expected_marker_count=17
 
-    if scan "$tmp/case-fail" > "$tmp/fail.log" 2>&1; then
+    if STUB_MARKER_ALLOWLIST="$empty_allowlist" scan "$tmp/case-fail" > "$tmp/fail.log" 2>&1; then
         echo "self-test FAILED: expected placeholder call sites were not caught"
         cat "$tmp/fail.log"
         status=1
@@ -265,6 +279,7 @@ FIXTURE
             "todo: still not implemented after a long comment gap" \
             "todo: still not implemented after a byte-raw string literal" \
             "todo: not implemented for the format-arg case" \
+            "implemented for the format-split case" \
             "concat-assembled stub message" \
             "only catches via unicode escape decoding" \
             "only catches via hex escape decoding" \
@@ -318,20 +333,35 @@ FIXTURE
         fi
     fi
 
-    if ! scan "$tmp/case-pass" > "$tmp/pass.log" 2>&1; then
+    if ! STUB_MARKER_ALLOWLIST="$empty_allowlist" scan "$tmp/case-pass" > "$tmp/pass.log" 2>&1; then
         echo "self-test FAILED: legitimate panic!/unreachable! messages (raw strings, lookalike text inside strings, a #[cfg(test)] helper named StubService) false-positived:"
         cat "$tmp/pass.log"
         status=1
     fi
 
-    # Allowlist suppression exercised against the COMMITTED allowlist file
-    # (no temp override): the committed `stub-marker-allowlist.txt` carries a
-    # self-test fixture anchor whose exact (repo-relative path, full message)
-    # pair matches the allowlisted fixture below, so a broken committed file
-    # (bad format, wrong path form) fails this test. Exact-match is checked in
-    # both directions -- the anchor-matching finding is suppressed, and a
-    # sibling with a different message at the same path still surfaces.
+    # The committed allowlist must stay parseable and keep its one known real
+    # entry; a format drift (missing tab, wrong path form) or an accidental
+    # deletion is caught here. The committed file carries NO self-test anchor:
+    # a committed entry is a real, PR-recreatable suppression, so a fixture
+    # entry there would let a PR add that exact path+message and suppress its
+    # own stub. Suppression is therefore exercised via a temp copy below.
+    committed_allowlist="$SCRIPT_DIR/stub-marker-allowlist.txt"
+    reindex_entry="$(printf 'crates/kkernel/src/reindex.rs\tStubService::embed must not be called in this test')"
+    if ! grep -Fqx "$reindex_entry" "$committed_allowlist"; then
+        echo "self-test FAILED: committed allowlist lost its expected reindex.rs entry or its format drifted"
+        status=1
+    fi
+
+    # Suppression is exercised against a TEMP allowlist: a copy of the committed
+    # file (so a committed parse/format break still surfaces) with a fixture
+    # anchor appended. Every referenced path is created under the temp tree so
+    # the path-existence guard passes -- including a stand-in for the committed
+    # reindex.rs entry. Exact-match is checked both ways: the anchor-matching
+    # finding is suppressed, and a sibling with a different message at the same
+    # path still surfaces.
     mkdir -p "$tmp/case-allowlist/crates/fixture-crate/src"
+    mkdir -p "$tmp/case-allowlist/crates/kkernel/src"
+    : > "$tmp/case-allowlist/crates/kkernel/src/reindex.rs"
     cat > "$tmp/case-allowlist/crates/fixture-crate/src/lib.rs" <<'ALWFIXTURE'
 pub fn allowlisted_stub() -> u32 {
     panic!("todo: this one is allowlisted and must be suppressed")
@@ -341,20 +371,48 @@ pub fn not_allowlisted_stub() -> u32 {
     panic!("todo: this one is NOT allowlisted and must still be caught")
 }
 ALWFIXTURE
+    temp_allowlist="$tmp/case-allowlist-allowlist.txt"
+    cp "$committed_allowlist" "$temp_allowlist"
+    printf 'crates/fixture-crate/src/lib.rs\ttodo: this one is allowlisted and must be suppressed\n' \
+        >> "$temp_allowlist"
 
-    if scan "$tmp/case-allowlist" > "$tmp/allowlist.log" 2>&1; then
+    if STUB_MARKER_ALLOWLIST="$temp_allowlist" scan "$tmp/case-allowlist" > "$tmp/allowlist.log" 2>&1; then
         echo "self-test FAILED: the non-allowlisted sibling finding should have failed the scan"
         cat "$tmp/allowlist.log"
         status=1
     else
         if grep -qF 'this one is allowlisted and must be suppressed' "$tmp/allowlist.log"; then
-            echo "self-test FAILED: an allowlisted finding (exact committed-allowlist match) was not suppressed"
+            echo "self-test FAILED: an allowlisted finding (exact temp-allowlist match) was not suppressed"
             cat "$tmp/allowlist.log"
             status=1
         fi
         if ! grep -qF 'this one is NOT allowlisted' "$tmp/allowlist.log"; then
             echo "self-test FAILED: a sibling non-allowlisted finding was incorrectly suppressed"
             cat "$tmp/allowlist.log"
+            status=1
+        fi
+    fi
+
+    # The scan must FAIL LOUD when an allowlist entry names a path absent from
+    # the scanned tree -- the stale or pre-planted shape that could otherwise
+    # sit ready to suppress a future finding. The offending path must be named.
+    mkdir -p "$tmp/case-stale-allowlist/crates/real-crate/src"
+    cat > "$tmp/case-stale-allowlist/crates/real-crate/src/lib.rs" <<'STALEFIXTURE'
+pub fn ok() -> u32 {
+    1
+}
+STALEFIXTURE
+    stale_allowlist="$tmp/stale-allowlist.txt"
+    printf 'crates/does-not-exist/src/lib.rs\ttodo: entry for a path not in the tree\n' \
+        > "$stale_allowlist"
+    if STUB_MARKER_ALLOWLIST="$stale_allowlist" scan "$tmp/case-stale-allowlist" > "$tmp/stale.log" 2>&1; then
+        echo "self-test FAILED: a scan with an allowlist entry for a nonexistent path should have failed loud"
+        cat "$tmp/stale.log"
+        status=1
+    else
+        if ! grep -qF 'crates/does-not-exist/src/lib.rs' "$tmp/stale.log"; then
+            echo "self-test FAILED: the nonexistent-allowlist-path error did not name the offending entry"
+            cat "$tmp/stale.log"
             status=1
         fi
     fi
@@ -392,7 +450,12 @@ scan() {
 
     allowlist="${STUB_MARKER_ALLOWLIST:-$SCRIPT_DIR/stub-marker-allowlist.txt}"
 
-    python3 - "$file_list" "$allowlist" "$root" <<'PY'
+    # `|| rc=$?` keeps set -e from exiting the script the moment python3 returns
+    # non-zero (findings present, or the allowlist-path guard failing): the temp
+    # file_list below must still be removed on that path, and the caller needs
+    # the real exit code, not a set-e-induced abort.
+    rc=0
+    python3 - "$file_list" "$allowlist" "$root" <<'PY' || rc=$?
 import os
 import re
 import sys
@@ -433,6 +496,13 @@ ESCAPE_RE = re.compile(r"\\(n|r|t|\\|\"|'|0|x[0-9A-Fa-f]{2}|u\{[0-9A-Fa-f]+\})")
 # PLACEHOLDER_RE, so it is stripped before any other escape is decoded.
 STRING_CONTINUATION_RE = re.compile(r"\\\r?\n\s*")
 SIMPLE_ESCAPES = {"n": "\n", "r": "\r", "t": "\t", "\\": "\\", '"': '"', "'": "'", "0": "\0"}
+# A placeholder phrase can be split by a format-string placeholder when a
+# panic!/unreachable! assembles its message from a format literal plus trailing
+# args -- `panic!("not {}", "implemented")` joins to "not {}implemented", and
+# the brace defeats PLACEHOLDER_RE's `not\s*implemented`. A probe copy with
+# `{...}` placeholders removed is matched instead, so the surrounding literal
+# text reads as it does at runtime; the reported message keeps the braces.
+FORMAT_BRACE_RE = re.compile(r"\{[^{}]*\}")
 
 
 def sanitize_for_ci(raw):
@@ -711,6 +781,26 @@ def is_allowlisted(rel_path, message, entries):
 
 allowlist = load_allowlist(ALLOWLIST_PATH)
 
+# Fail loud on any allowlist entry whose path is absent from the scanned tree.
+# A stale entry (the file moved or was deleted) or a pre-planted entry (added
+# ahead of the file it would suppress) must never sit here silently disabling a
+# future finding; rejecting it keeps the committed allowlist honestly in sync
+# with the tree. Paths are checked against SCAN_ROOT, the same anchor the
+# finding's repo-relative path is rendered against.
+missing_allowlist_paths = [
+    entry_path
+    for entry_path, _ in allowlist
+    if not os.path.exists(os.path.join(SCAN_ROOT, entry_path))
+]
+if missing_allowlist_paths:
+    sys.stderr.write(
+        "stub-marker allowlist references path(s) that do not exist under "
+        f"{SCAN_ROOT} -- remove the stale entry or correct the path:\n"
+    )
+    for entry_path in missing_allowlist_paths:
+        sys.stderr.write(f"  {entry_path}\n")
+    sys.exit(1)
+
 findings = []
 for path in files:
     rel_path = os.path.relpath(path, SCAN_ROOT).replace(os.sep, "/")
@@ -731,7 +821,8 @@ for path in files:
         if not parts:
             continue
         message = "".join(decode_rust_escapes(content, is_raw) for content, is_raw in parts)
-        if not PLACEHOLDER_RE.search(message):
+        probe = FORMAT_BRACE_RE.sub("", message)
+        if not PLACEHOLDER_RE.search(probe):
             continue
         if is_allowlisted(rel_path, message, allowlist):
             continue
@@ -749,7 +840,6 @@ if findings:
 
 print(f"stub-marker lint: {len(files)} file(s) OK")
 PY
-    rc=$?
     rm -f "$file_list"
     return "$rc"
 }
