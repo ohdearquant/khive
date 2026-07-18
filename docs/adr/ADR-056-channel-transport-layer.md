@@ -2,15 +2,18 @@
 
 **Status**: Accepted (amended 2026-07-02 -- inbound authentication hardening; amended 2026-07-03
 -- Exchange Online no-authserv-id boundary; amended 2026-07-05 -- Telegram adapter
-implementation and two-way chat; amended 2026-07-09 -- durable IMAP UID cursor; see
+implementation and two-way chat; amended 2026-07-09 -- durable IMAP UID cursor; amended
+2026-07-17 -- iMessage channel over an SSH bridge; see
 [§Amendment 2026-07-02](#amendment-2026-07-02----inbound-authentication-hardening),
 [§Amendment 2026-07-03](#amendment-2026-07-03----exchange-online-no-authserv-id-boundary),
 [§Amendment 2026-07-05](#amendment-2026-07-05----telegram-adapter-implementation-and-two-way-chat),
-[§Amendment 2026-07-09](#amendment-2026-07-09----durable-imap-uid-cursor))\
-**Date**: 2026-06-14 (amended 2026-07-02, 2026-07-03, 2026-07-05, 2026-07-09)\
+[§Amendment 2026-07-09](#amendment-2026-07-09----durable-imap-uid-cursor),
+[§Amendment 2026-07-17](#amendment-2026-07-17----imessage-channel-over-an-ssh-bridge))\
+**Date**: 2026-06-14 (amended 2026-07-02, 2026-07-03, 2026-07-05, 2026-07-09, 2026-07-17)\
 **Authors**: khive maintainers
 **Depends on**: ADR-017 (Pack Standard), ADR-018 (Authorization Gate), ADR-040 (Communication
-and Schedule Packs), ADR-053 (ActorStore / SessionStore -- extends ADR-018's actor model)\
+and Schedule Packs), ADR-053 (ActorStore / SessionStore -- extends ADR-018's actor model),
+ADR-108 (Git Write Surface -- hardened shell-out argv pattern reused by this amendment)\
 **Related issues**: #112 (khive-channel umbrella), #113 (Telegram adapter), #114 (email adapter),
 #448 (inbound header spoofing -- resolved by this amendment), #449 (IMAP UID progress -- resolved
 by the 2026-07-09 amendment)
@@ -452,6 +455,673 @@ Telegram's offset remains in-memory as originally documented.
 - Telegram's in-memory offset watermark and its restart-durability rationale (Amendment
   2026-07-05) are unchanged by this amendment.
 
+## Amendment 2026-07-17 -- iMessage channel over an SSH bridge
+
+### Motivation
+
+The maintainer wants a chat channel reachable through iMessage, alongside the existing email and
+Telegram adapters. Unlike those two, no directly reachable protocol endpoint exists: sending and
+reading iMessage requires the Messages application on a macOS host signed into a dedicated bridge
+Apple ID that can exchange iMessages with the maintainer's own handle. The daemon host is not, in
+general, that host. This amendment specifies a
+`khive-channel-imessage` adapter that bridges to a remote macOS host over SSH and implements the
+same `Channel` trait (§2) the email and Telegram adapters implement, so `comm.send`,
+`comm.inbox`, `comm.reply`, and `comm.thread` are unchanged for agents.
+
+### The `khive-channel-imessage` crate
+
+A new sibling crate `crates/khive-channel-imessage`, at the same platform layer as
+`khive-channel-telegram` and `khive-channel-email`:
+
+- `kind()` -> `"imessage"`.
+- Registered in the `ChannelRegistry` keyed by `(kind, slug)` (#606), coexisting with any other
+  configured adapter, matching the Telegram and email precedent.
+- Spawned only under the daemon role, via a `channel-imessage`-feature-gated
+  `spawn_imessage_channel_loops` mirroring `spawn_email_channel_loops` and
+  `spawn_telegram_channel_loops`: one inbound poll task and one outbound task per adapter
+  instance, not the abstract `ChannelRegistry::poll_all` sweep §§4, 6, and 12 describe in the
+  original decision text. The 2026-07-05 Telegram amendment established the per-adapter
+  `spawn_*_channel_loops` task pair as the shipped mechanism, but its supersession claim was
+  scoped narrowly to §5c/§5d (the outbound-path and reply-routing DEFERRED labels) -- it did not
+  supersede §6's `poll_all` lifecycle description. This amendment corrects that gap directly: it
+  supersedes the `poll_all` lifecycle prescriptions of §§4, 6, and 12. The authoritative
+  lifecycle model, matching the shipped email and Telegram adapters, is per-adapter loop pairs
+  spawned by the daemon role and registered through the `ChannelRegistry` keyed by `(kind,
+  slug)`. Every future adapter ships its own daemon-spawned loop pair; `poll_all` is retired and
+  MUST NOT be implemented.
+- When configuration is absent, `ImessageChannelConfig::from_env()` returns `ChannelError::Config`
+  and the server logs a warning and skips the adapter without crashing, matching Telegram and
+  email `from_env()` behavior (§14, §Amendment 2026-07-05).
+
+### Transport: SSH to a bridge host
+
+The daemon reaches the bridge host by shelling `ssh` to a configured target
+(`KHIVE_IMESSAGE_SSH_TARGET`, `user@host`) on the local network. The bridge host needs no
+resident service beyond macOS's built-in `sshd`. The client keypair used to authenticate to the
+bridge host is never stored in any khive store, consistent with §9 ("no secrets in the store").
+An unreachable bridge host is a transport failure local to this one channel: it degrades to a
+channel-down warning and does not affect any other configured channel or fault the daemon.
+
+**Pinned bridge host identity.** Every `ssh` invocation this adapter makes uses a dedicated
+known-hosts file, `~/.khive/imessage_known_hosts`, provisioned during one-time setup with the
+bridge host's genuine host key, and passes strict host-key checking and batch mode
+(`-F none -o UserKnownHostsFile=~/.khive/imessage_known_hosts -o GlobalKnownHostsFile=/dev/null
+-o StrictHostKeyChecking=yes -o BatchMode=yes`) explicitly on the invocation. The adapter never
+inherits the operator's own `~/.ssh/config`, never relies on SSH agent-based host trust, and
+never falls back to trust-on-first-use for host identity: an unrecognized or changed host key is
+refused, not recorded. Without this pin, a party on the local network positioned to intercept or
+substitute the bridge connection could present its own host key, be silently trusted on first
+use, and then serve fabricated `chat.db` rows that satisfy every sender-validation check below --
+a trusted instruction injection into the maintainer's inbox -- while also reading every outbound
+message the adapter sends. A host-key mismatch stops the channel for that invocation, is counted,
+and the resulting warning names the known-hosts file so the operator knows exactly what to
+inspect and, once the change is verified legitimate, deliberately update. Acceptance property: a
+bridge host presenting a host key that does not match the pinned entry refuses all transport
+until the pinned entry is deliberately updated; the mismatch is never auto-accepted.
+
+**Client-side config isolation.** `-F none` is the literal argument OpenSSH's client documents
+for suppressing configuration-file processing entirely -- both the system-wide
+`/etc/ssh/ssh_config` and the per-user `~/.ssh/config` -- rather than a path substitution, so an
+operator-controlled `~/.ssh/config` can never inject a `ProxyCommand`, a `Match exec` directive,
+or any other override into a session opened with this key. `GlobalKnownHostsFile` is a
+file-path-valued option (default `/etc/ssh/ssh_known_hosts` and `/etc/ssh/ssh_known_hosts2`), not
+a toggle, so disabling it takes a path to an empty source rather than the word "none": pointing it
+at `/dev/null` makes the dedicated `UserKnownHostsFile` above the sole host-trust source for this
+adapter's connections, with no fallback to the system-wide known-hosts database. Together these
+close the gap the pinned-host-identity pin above does not by itself: a correct
+`UserKnownHostsFile` pin still leaves a hostile local `~/.ssh/config` or a stale
+`/etc/ssh/ssh_known_hosts` entry able to redirect or pre-authorize a connection before the pin is
+even consulted. Acceptance property: a hostile `~/.ssh/config` `ProxyCommand` or `Match exec`
+directive placed on the invoking account never executes as part of this adapter's `ssh`
+invocations, and an entry in the global known-hosts database that would otherwise satisfy host
+verification does not substitute for a matching entry in the dedicated
+`~/.khive/imessage_known_hosts` file.
+
+**Transport deadlines and recovery.** Each `ssh` invocation runs under a total wall-clock
+deadline of 30 seconds enforced by the adapter itself, which kills and reaps the child process on
+expiry rather than allowing a hung invocation to accumulate indefinitely. Connection
+establishment is separately bounded by a 10-second connect timeout passed as an `ssh` option
+(`-o ConnectTimeout=10`), so a bridge host that is up but not accepting connections fails fast
+instead of consuming the whole 30-second deadline waiting on a connection that will never
+establish.
+
+Consecutive transport failures back off exponentially between poll ticks, doubling from a
+1-second floor and capped at 5 minutes; a transport failure increments the consecutive-failure
+counter, and the counter resets to zero on the next success. Acceptance property: an invocation
+that hangs past its deadline is killed and reaped at the deadline, and the adapter's next tick
+proceeds only after the backoff interval for the current consecutive-failure count has elapsed.
+
+**SSH target validation and the end-of-options delimiter.** `KHIVE_IMESSAGE_SSH_TARGET` is
+validated fail-closed at config load, not at first use: it must match a restrictive shape, an
+optional `user@` prefix followed by a hostname or address, and a value beginning with `-`, or
+containing whitespace or a control character, is rejected -- `ImessageChannelConfig::from_env`
+returns `ChannelError::Config` and the channel does not start. This closes a specific attack: an
+option-prefixed target such as `-oProxyCommand=...` would otherwise be parsed by the `ssh` client
+as an option rather than a destination, and a `ProxyCommand` override executes an arbitrary local
+command under the daemon account. Fixed argv construction alone does not close this, because argv
+construction fixes how arguments are assembled, not what the target string itself is interpreted
+as once `ssh` parses it. As defense in depth beyond the validation gate, every `ssh` invocation
+this adapter makes additionally passes the `--` end-of-options delimiter immediately before the
+target argument, so even a target value that somehow reached the invocation unvalidated can never
+be parsed as an `ssh` option. Acceptance property: an option-prefixed `KHIVE_IMESSAGE_SSH_TARGET`
+value refuses channel start.
+
+### Remote command boundary: a fixed helper, data-only stdin
+
+Every `ssh` invocation this adapter makes runs exactly one fixed, pre-installed remote command on
+the bridge host, never a command line assembled from configuration or runtime values. OpenSSH does
+not preserve a local argv array across the wire: the client space-joins the remote command and its
+arguments into a single string that the remote shell re-parses, so a dynamic value placed anywhere
+in that remote command line is exposed to remote shell parsing regardless of how carefully the
+local argv was constructed -- fixed local argv construction alone does not close this, because it
+governs only how the local `ssh` process is invoked, not what the string it sends across the wire
+is interpreted as once it reaches the remote shell. `KHIVE_IMESSAGE_DB_PATH` and every other
+dynamic or operator-configured value this adapter uses -- other than the SSH target itself, which
+the local `ssh` client consumes directly and never forwards into the remote command line -- is
+therefore never interpolated into the remote command line in any form, quoted or otherwise.
+
+Instead, each SSH invocation runs a single fixed remote helper: a pre-written script or small
+binary installed on the bridge host during one-time setup and invoked by a literal,
+unparameterized name. Every dynamic value the helper needs -- the database path, the poll floor,
+the outbound recipient and message text -- is delivered to it over stdin as structured, data-only
+input that the helper reads and interprets itself; none of it is ever concatenated into the
+command the remote shell parses. A fixed remote command with data-only stdin is structurally
+injection-proof: there is no remote parsing step a crafted value could influence, because the
+value never occupies a position the remote shell treats as syntax. This is preferred over
+validating `KHIVE_IMESSAGE_DB_PATH` against a path-safety grammar and passing the validated result
+as a remote argument, because an allowlist grammar is a rule that must anticipate every dangerous
+shape and rots as shell and AppleScript escaping rules shift across macOS releases; a fixed command
+with no argument position for the value at all has no such surface to rot. Regression coverage
+names the adversarial case directly: a test asserting that a `KHIVE_IMESSAGE_DB_PATH` value
+containing shell metacharacters (backticks, `$( )`, semicolons, quotes) delivered through the
+configured path cannot alter the remote command the bridge host executes, distinct from and in
+addition to the local-side `KHIVE_IMESSAGE_SSH_TARGET` validation above.
+
+### Helper artifact and protocol versioning
+
+The fixed remote helper is an owned, versioned artifact, not an ad hoc script assembled at setup
+time. It ships as a small script (or binary, for environments where a shell dependency is
+undesirable) checked into the `khive-channel-imessage` crate alongside the adapter code that
+invokes it, so the helper and the adapter's expectations of it evolve in the same repository and
+the same review. One-time bridge-host setup copies this checked-in artifact to a fixed path on
+the bridge host (the same path named in the forced `command=` binding below) and records its
+embedded version alongside the other one-time provisioning steps (host-key pinning, permission
+grants) described elsewhere in this document; upgrading the helper is a deliberate, operator-run
+re-copy, never something the daemon does to the bridge host over the SSH channel it also uses for
+polling and sending.
+
+The stdin/stdout contract between the adapter and the helper is itself versioned, not an
+implicit, unversioned shape inferred from field names. Every request the adapter writes to the
+helper's stdin carries an explicit protocol version field and an operation discriminator (poll,
+send, or any future operation), and the helper's structured stdout response carries the same
+protocol version field back alongside either a result payload or a structured error. The adapter
+refuses to proceed -- treating the invocation as a transport failure under §Transport deadlines
+and recovery above -- when the version the helper reports does not match the version the adapter
+expects; a version mismatch is a hard refusal, never a silent best-effort attempt to interpret an
+unrecognized shape. Because the helper is upgraded independently of the daemon (a bridge-host-local,
+operator-run step, above), the adapter is written to tolerate the helper being one version behind
+what the adapter itself would emit as its preferred version and to refuse cleanly rather than
+guess when the gap is larger than that: the daemon's own release upgrades the adapter first, and
+the bridge-host helper is expected to follow before the adapter's minimum-supported version is
+raised past what the deployed helper reports. This versioned request/response/error contract is
+the protocol half of the trust boundary the forced-command binding below establishes on the server
+side: the boundary is not just "only this one binary can run" but "only this one binary, speaking
+a version it explicitly negotiates, can run." Acceptance property: an adapter invocation against a
+helper reporting a protocol version the adapter does not support fails closed as a transport
+failure, without attempting to parse the mismatched response as if it were a supported shape.
+
+### Server-side key confinement: forced command and `restrict`
+
+Pinning the client to a fixed remote helper and data-only stdin (above) constrains what the
+daemon's own `ssh` invocations can do, but by itself says nothing about what the bridge host will
+accept from that key if the key is ever exfiltrated. The bridge account carries Full Disk Access
+and Automation permission for the Messages application (§Host requirements below), so a stolen key
+usable for an arbitrary interactive session is arbitrary remote code execution against those
+grants. This adapter therefore requires a matching server-side constraint on the same key, not
+merely a client-side convention: the daemon's SSH public key, as provisioned in the bridge
+account's `authorized_keys` during one-time setup, carries the `restrict` option together with a
+forced command binding it to the fixed remote helper's absolute installed path --
+`restrict,command="/absolute/path/to/imessage-bridge-helper" ssh-ed25519 AAAA...` in
+`authorized_keys` shape. `restrict` disables PTY allocation, port forwarding, agent forwarding,
+X11 forwarding, and tunneling for sessions opened with that key; the forced `command=` binding
+means the bridge host's `sshd` runs the named helper for every session opened with that key
+regardless of what command the client requests, so the client-side fixed-invocation convention
+above is backed by a server-side guarantee rather than trusted as client behavior alone. Forced
+command (server side) and data-only structured stdin (client and protocol side, above) are the two
+halves of one trust boundary: even a fully compromised daemon holding this key, free to send
+`ssh` whatever remote command string it chooses, cannot cause the bridge host to run anything but
+the fixed helper, and the helper's own versioned protocol (above) is the only channel through
+which that compromised daemon could attempt to make the helper misbehave. Acceptance property:
+using this key to request an arbitrary remote command, a PTY, or any form of forwarding or
+tunneling fails at the bridge host's `sshd`; only the fixed helper ever executes, regardless of
+what remote command the client requests.
+
+### Outbound: the fixed remote helper, no text interpolation
+
+On the bridge host, delivery drives the Messages application through the fixed remote helper
+described above. The message body and recipient are never interpolated into a shell string or an
+AppleScript source string: they travel to the helper over stdin as structured, data-only input,
+and the SSH invocation's remote command is always the same literal helper invocation -- the daemon
+never assembles a remote or local shell command by string concatenation with caller-supplied
+content. On receiving that structured input, the helper drives `osascript` locally on the bridge
+host using a fixed, pre-written AppleScript that itself reads the message text from a temp file or
+stdin rather than from an interpolated source string. This extends the same class of protection
+ADR-108 Fork (b) B2 establishes for `git.commit`/`git.branch`/`git.push` -- no caller-supplied
+value reaching a command-parsing boundary unvalidated -- across both the SSH hop and the local
+`osascript` invocation. ADR-108's Amendment 1 requirement for a dedicated adversarial security
+review at implementation time applies equally to this shell-out surface.
+
+### Inbound: read-only polling of the bridge host's Messages database
+
+Inbound messages are read by polling the bridge host's Messages database (Apple's own SQLite
+store for the Messages application, path configured by `KHIVE_IMESSAGE_DB_PATH`, default
+`~/Library/Messages/chat.db`) through the same fixed remote helper the outbound path uses
+(§Remote command boundary above): the configured path is delivered to the helper over stdin, never
+placed on the remote command line, and the helper alone opens the database at that path with
+read-only semantics on the bridge host. Polling runs at a configurable interval
+(`KHIVE_IMESSAGE_POLL_SECS`, default 5 seconds, mirroring §12's default inter-poll interval;
+validation rule below). The adapter never writes to `chat.db`. Delivery into `comm.ingest` is
+attributed as `imessage:<slug>` inbound, following the channel-prefixed `from` form OQ-1
+established (§14; also used by the Telegram amendment's `from = "telegram:<maintainer-slug>"`).
+
+**Sender validation (ADR-056 §8 applied to this adapter).** §8 requires every adapter to
+validate the external sender identity on every inbound item before it becomes an envelope. For
+iMessage, that requirement is met by four checks, all mandatory: `message.is_from_me` must be
+`0`, the row must belong to the configured maintainer conversation, the row's sender handle must
+equal the configured `KHIVE_IMESSAGE_MAINTAINER_HANDLE`, and the row's service must be iMessage.
+A row failing any check is dropped -- it is never ingested and never attributed -- and the drop
+is counted, mirroring the Telegram adapter's `UnauthorizedSender` drop-and-count behavior (§8)
+rather than the email adapter's quarantine disposition, since (unlike inbound email) the bridge
+host's Messages database has no open-relay exposure: only the maintainer's own conversation is
+polled.
+
+**Terminal disposition.** A drained row is HANDLED when it reaches either of two terminal
+outcomes: it is ingested, or it is dropped by one of the four checks above. Both outcomes are
+terminal and both count toward page completion; a dropped row is not left pending or retried on
+the next poll. The page checkpoint (§Restart durability below) commits once every row in the page
+has been handled, so the `ROWID` floor advances past dropped rows exactly as it does past
+ingested ones. Acceptance property: a rejected row below the checkpoint floor never blocks or
+re-selects on a later poll, so it can never stall the rows that follow it in `ROWID` order.
+
+The `is_from_me` check exists because the adapter's own outbound sends (via `osascript`, above)
+land in the same one-to-one conversation the inbound poll reads, and, being part of that
+conversation, can carry the maintainer's own handle on the row. Without excluding
+`is_from_me = 1` rows, the adapter would read back its own outbound sends as trusted inbound
+maintainer input: for a chat channel feeding an autonomous loop, that is a self-echo path -- the
+daemon replying to its own prior message and re-ingesting that reply in turn. The other checks
+(conversation membership, handle match, service) do not catch this case, because an adapter-sent
+row satisfies all three. Acceptance property: an adapter-sent row in the maintainer conversation
+is never ingested as inbound.
+
+The service check exists because `chat.db` records a service discriminator per message, and a
+row carried over SMS, MMS, or RCS is not an iMessage-authenticated delivery: a forwarded SMS
+message's sender number is spoofable in a way a delivery tied to a signed-in Apple ID is not.
+Without this check, a spoofed SMS sender number matching the configured handle could be
+attributed as trusted maintainer input. Rows carried over SMS, MMS, or RCS are dropped and
+counted, never ingested -- the same disposition as the other three checks. This check also makes
+structural a property this deployment model otherwise leaves incidental: the bridge Mac signs
+into a dedicated bridge Apple ID that is email-only, with no phone number and no paired SMS
+forwarding path (§Two-identity model below), so every row in the bridge's Messages database is
+iMessage-service by construction -- there is no SMS-forwarding path through which an SMS message
+could reach that database at all. The maintainer's own handle, by contrast, may be a phone number
+or an email address; only whichever form is configured in `KHIVE_IMESSAGE_MAINTAINER_HANDLE` is
+trusted. The service check therefore enforces a structural property of the bridge account, not an
+incidental side effect of the maintainer's handle choice. Acceptance property: a `chat.db` row
+carried over SMS, MMS, or RCS that otherwise matches the maintainer handle and conversation is
+never ingested.
+
+### Restart durability: a persisted ROWID checkpoint
+
+The iMessage adapter does not use an in-memory poll offset. It uses the same durability
+mechanism class Amendment 2026-07-09 established for email: a durable per-channel checkpoint,
+committed to the daemon's store only after a batch has fully and successfully ingested. That
+amendment introduced this pattern for exactly this reason -- issue #449 showed that an
+in-memory or window-bounded cursor can permanently skip rows once a page limit or time window
+moves past them, and that a dedup index alone cannot recover a row that polling never fetched in
+the first place. The iMessage adapter adopts the pattern rather than repeating the email
+adapter's earlier mistake.
+
+Concretely:
+
+- The checkpoint reuses the pack-owned `comm_channel_cursor` table and the `comm.cursor_get` /
+  `comm.cursor_commit` subhandlers Amendment 2026-07-09 added to `khive-pack-comm`: the iMessage
+  adapter is a second caller of the same checkpoint mechanism the email adapter's
+  `channel_poll_loop` already drives, not a parallel implementation of it. Reuse here is not
+  unchanged reuse, though: Amendment 2026-07-09's `comm_channel_cursor` table persists only
+  `source`, `generation`, `high_water`, and `updated_at`, keyed on `(channel_kind,
+  channel_slug)`, and has neither a field for the anchor-row identity guard this adapter's
+  checkpoint needs nor a key that supports per-source cursor history (both below). This amendment
+  therefore specifies an explicit, additive extension of the shared checkpoint contract -- a
+  schema migration plus the corresponding `comm.cursor_get`/`comm.cursor_commit` API surface
+  change -- not a claim that the existing mechanism already covers this case unmodified.
+- The checkpoint commits only after every row in a drained page has been handled -- ingested, or
+  terminally dropped by one of the four sender-validation checks above (§Terminal disposition) --
+  mirroring `channel_poll_loop`'s `cursor_get -> poll_page -> handle each -> cursor_commit`
+  sequencing for email (§Amendment 2026-07-09), with dropped rows added as a second terminal
+  outcome alongside ingestion. A row that fails to reach `comm.ingest` for a transport or storage
+  reason (as opposed to a terminal sender-validation drop) leaves the checkpoint at its prior
+  value, so the next poll re-selects the whole page; GUID dedup through
+  `idx_comm_message_external_id` (§11) then skips re-storing the rows that already succeeded, and
+  only the unhandled row is effectively retried.
+- GUID dedup is retained, but its role changes: it is overlap protection for the re-selected
+  page on a partial-failure retry, not the primary durability mechanism. The `ROWID` checkpoint
+  is what prevents rows from being skipped; GUID dedup is what prevents an already-ingested row
+  in a re-fetched page from being written twice.
+
+**Cursor identity: source and generation.** The `comm_channel_cursor` table (Amendment
+2026-07-09) stores `source` and `generation` alongside the `high_water` mark, and this amendment
+defines both for iMessage. `source` is a non-secret stable identity string composed of the
+configured `KHIVE_IMESSAGE_SSH_TARGET` and the configured `KHIVE_IMESSAGE_DB_PATH`, in the
+form `imessage-ssh:{ssh_target}:{db_path}`, mirroring the shape of the email adapter's
+`imap+tls:{host}:{port}:{mailbox}:INBOX` source string (§Amendment 2026-07-09). Both components
+are configuration values, not credentials, and the cursor row itself lives only in the daemon's
+own local store, never on the bridge host. Because `source` is built from `KHIVE_IMESSAGE_DB_PATH`
+directly, changing that variable changes the source identity and therefore selects a different
+cursor row (§Source-keyed cursor history below), exactly as changing `KHIVE_IMESSAGE_SSH_TARGET`
+does. `generation` starts at `1` when the cursor row is
+first created for a given `(channel_kind, channel_slug, source)` and increments by one on every
+checkpoint reset (below).
+
+**Source-keyed cursor history.** Amendment 2026-07-09's `comm_channel_cursor` table carries a
+`source` column, but its uniqueness key is `(channel_kind, channel_slug)` alone, so a commit
+under a new `source` value would overwrite the existing row rather than create a new one --
+incompatible with this adapter's retention need that a changed source produce a new row while
+the old row is left intact. The same migration that adds the `anchor` column (below) extends the
+uniqueness key to `(channel_kind, channel_slug, source)`: `comm.cursor_get` and
+`comm.cursor_commit` look up and commit on all three fields, not two, and existing rows migrate
+forward preserving their current `source` value, so the email adapter -- whose `source` is
+constant per slug -- is semantically unchanged. Telegram keeps its own in-memory `offset`
+watermark (§Amendment 2026-07-05, "Poll offset and restart durability") and has never used
+`comm_channel_cursor`; this migration touches the email adapter's existing row and establishes
+the shape future adapters, including iMessage, use going forward. It does not add, change, or
+remove any Telegram row, because none exists. Under this key, a configuration
+change that alters the source identity -- a different `KHIVE_IMESSAGE_SSH_TARGET` or a different
+remote database path -- produces a different `source` string and therefore a new cursor row
+keyed by that new source; the prior row is left intact, untouched and unreferenced, never
+overwritten or migrated. Reverting to a previously used source therefore resumes that source's
+own row at its own high-water mark, and the poll drains whatever backlog accumulated in that
+source's database while a different source was active: no message received under a configured
+source is ever skipped by switching away from it and back. Acceptance property: switching from
+source A to source B and back to source A ingests the rows that arrived in source A's database
+during the period source B was active.
+
+**Identity guard and forward-only reset.** A `ROWID` alone is not a stable identity across a
+replaced or migrated `chat.db`: a new database can reuse the same `ROWID` values for entirely
+different messages. Guarding against this requires the explicit, additive schema extension named
+above: a new optional opaque `anchor` text column on `comm_channel_cursor`, nullable, delivered
+as a schema migration alongside the corresponding `comm.cursor_get`/`comm.cursor_commit` API
+surface change to read and write it. The email and Telegram adapters leave this column null and
+are otherwise unaffected; the iMessage adapter is the first caller to populate it. The anchor is
+always the GUID of the row the high-water mark points at -- the last handled row, whether it was
+ingested or terminally dropped. This is deliberate, not an approximation: §Terminal disposition
+above establishes that the checkpoint's `ROWID` floor advances past a terminally dropped row
+exactly as it does past an ingested one, so a page whose final row was dropped still leaves
+`high_water` pointing at that row, and the stored `anchor` must name that same row's GUID for the
+identity guard below to compare like against like. Storing the last-_ingested_ row's GUID instead
+would be wrong precisely in this case: when a page ends on a dropped row, `high_water` points past
+it while a last-ingested anchor would name an earlier row, so the re-read below would deterministically
+compare the wrong row's GUID against the wrong `ROWID` and misreport a mismatch on every such page
+-- forcing a spurious forward-only reset that permanently skips the valid rows between the two
+(the same `chat.db` message GUID used for dedup below is reused here for a different purpose:
+identity of the anchor row, not overlap protection for retries). Before applying the stored
+high-water mark, each poll first re-reads the row at that same `ROWID` from the remote `chat.db`
+and verifies its GUID still matches the stored `anchor`:
+
+- **Match**: the stored high-water mark is trusted; the poll proceeds as normal.
+- **Mismatch, or the `ROWID` no longer exists** (the database was replaced, reset, migrated, or
+  the anchor row was deleted): the adapter does not trust the stale mark. It resets
+  forward-only -- the checkpoint becomes the current maximum `ROWID` in the database, `anchor`
+  updates to that row's GUID, `generation` increments, and the reset is logged and counted as a
+  distinct, observable event.
+
+This is a deliberate trade-off, stated explicitly: a deleted anchor row forces a forward-only
+reset that can skip rows that arrived between the old checkpoint and the new one. That is
+accepted because it matches this adapter's own activation semantic (history is not imported on
+first activation, below), it is always loudly counted rather than silent, and the alternative --
+applying an old high-water `ROWID` to a database that may no longer be the one it was recorded
+against -- risks silently skipping unrelated rows or ingesting the wrong conversation's history
+under a stale mark. The guard's job is narrower than perfect continuity: a stale mark is never
+applied once the GUID check fails. Acceptance property: a page whose final row is terminally
+dropped does not trigger a forward-only reset on the next poll; the stored anchor matches the
+dropped final row's GUID and the high-water mark is trusted.
+
+**The widened cursor contract, precisely.** The field belongs on the type the poller actually
+commits, not only on the type storage returns. `ChannelPollPage` (§Amendment 2026-07-09) carries a
+`next_checkpoint: ChannelCheckpoint` field -- the value `EmailChannel::poll_page` (and this
+adapter's `poll_page`) hands back to the daemon loop after each page, and the value the loop passes
+to `comm.cursor_commit`. `ChannelCheckpoint` gains one new field: `anchor: Option<String>`,
+nullable for every existing adapter. `StoredChannelCheckpoint` -- the type `comm.cursor_get`
+returns, which layers `source`, `generation`, and `updated_at` storage bookkeeping around the same
+checkpoint fields -- carries `anchor` because it is built on `ChannelCheckpoint`, not as a second,
+independent field; a `ChannelCheckpoint` read from storage and a `ChannelCheckpoint` produced by a
+poll page are the same shape, so the value the loop commits is exactly the value that round-trips
+through storage. The cursor read and commit operations (`comm.cursor_get` / `comm.cursor_commit`)
+are widened to take `(channel_kind, channel_slug, source)` rather than `(channel_kind,
+channel_slug)` alone, and both carry `anchor` on read and on write. The `Channel` trait (§2) gains
+a source accessor -- a method returning the adapter instance's own `source` string -- so the daemon
+loop can resolve which cursor row an adapter reads and commits against before the first poll of a
+tick, not after. Stepwise, the daemon loop's per-tick sequence is:
+
+1. Resolve the adapter's source via the trait's source accessor.
+2. Read the cursor by `(channel_kind, channel_slug, source)`, yielding a `StoredChannelCheckpoint`.
+3. Poll pages starting from the checkpoint the read returned.
+4. For each page: handle every row -- ingest or terminal drop (§Terminal disposition above) --
+   then commit the page's `next_checkpoint` (a `ChannelCheckpoint`, `anchor` included) via
+   `comm.cursor_commit`, once the whole page is handled.
+
+On an empty page (no rows above the prior high-water), `poll_page` returns a `next_checkpoint`
+equal to the checkpoint it was given -- `high_water` and `anchor` unchanged -- and the loop still
+commits it, so `updated_at` advances without perturbing progress. On the forward-only reset
+described above (identity guard mismatch), the adapter's `poll_page` sets `next_checkpoint.anchor`
+to the new anchor row's GUID and `next_checkpoint.high_water` to the new maximum `ROWID` in the
+same `ChannelCheckpoint` value, so the reset commits atomically with the rest of the page rather
+than as a separate write. This is the precise, API-level statement of the `cursor_get -> poll_page
+-> handle each -> cursor_commit` sequencing described in §Restart durability above.
+
+**Migration: owner and sequence.** The comm pack owns `comm_channel_cursor`, and today ships it
+via a constant `CREATE TABLE IF NOT EXISTS` declaration (`COMM_CHANNEL_CURSOR_SCHEMA_STMT`) with a
+two-column primary key `(channel_kind, channel_slug)` -- idempotent on a fresh database, but a
+no-op against an existing table, so it cannot by itself add the `anchor` column or widen the
+primary key on a database that already has this table. Adding both requires an actual schema
+migration, and ADR-028's `ServiceSchemaPlan` mechanism -- per-pack versioned migrations applied
+idempotently at boot and tracked one row per migration in the existing `_schema_migrations` table
+-- is that vehicle for a pack-owned table: this is the general case ADR-015 deferred for v1
+("pack tables work via idempotent `CREATE IF NOT EXISTS`"), which ADR-028 later supersedes by
+introducing `ServiceSchemaPlan` for exactly the case this table now needs. This amendment
+therefore ships as a `ServiceSchemaPlan`-registered, versioned CommPack migration, not a further
+extension of the constant `CREATE TABLE IF NOT EXISTS` statement and not a core `khive-db`
+migration.
+
+Because `CREATE TABLE IF NOT EXISTS` cannot alter an existing table's primary key, widening the
+uniqueness key to three columns requires a full table rebuild rather than an in-place
+`ALTER TABLE`. The migration: creates a new table carrying the three-column primary key
+`(channel_kind, channel_slug, source)` and the new `anchor` column; copies every existing row into
+it, backfilling `source` with each adapter's own constant source value (the email adapter's
+`imap+tls:{host}:{port}:{mailbox}:INBOX` shape); drops the old table; renames the new table into
+its place; and records itself as a completed migration in `_schema_migrations`, so it runs exactly
+once per database. The pack's `COMM_CHANNEL_CURSOR_SCHEMA_STMT` constant is retired in the same
+change -- replaced by the versioned migration as the sole source of this table's schema -- so a
+fresh install and an upgraded existing database converge on the identical final three-column-PK,
+`anchor`-bearing shape rather than a fresh install landing on the old two-column shape by one path
+while an upgrade reaches the new shape by another. Acceptance property: an upgraded database
+preserves every pre-existing cursor row's progress -- no adapter's high-water mark regresses or is
+lost across the migration -- and a fresh database created after this change has the three-column
+primary key and the `anchor` column from first boot, never the retired two-column shape.
+
+**Bounded drain per tick.** The poll query is anchored on `chat.db`'s own monotone insertion
+key, the message table's `ROWID`: each poll fetches rows with `ROWID` strictly greater than the
+committed checkpoint, ordered ascending, in pages of at most **200 rows** each. A tick drains
+pages until either a page returns short of the page size (the signal that the poll has caught up)
+or a fixed cap of **10 full pages** is reached -- at most **2000 rows per tick** -- whichever
+comes first; both the 200-row page size and the 10-page cap are normative amendment text, not
+configuration or a new environment variable. The checkpoint commits after every successfully
+ingested page, not only at the end of the tick. When the 10-page cap is reached before catching
+up, the task does not keep draining: it sleeps its normal `KHIVE_IMESSAGE_POLL_SECS` interval and
+resumes on the next tick from the checkpoint the last page committed. This bounds each tick's
+SSH/query/ingest work under sustained arrivals -- a conversation receiving messages faster than a
+200-row page drains cannot pin the task in a continuous poll loop -- while the per-page commit
+means no row is lost or re-skipped across the sleep boundary: the next tick continues from
+exactly where the last page left off. No row between polls can fall outside a bounded window and
+be skipped, because the query has no window -- only a floor -- and the 200-row-page/10-page-cap
+bound (2000 rows per tick) bounds duty cycle, not correctness.
+
+**Activation semantic.** On first activation for a given `(kind, slug)` -- no prior checkpoint
+row exists -- the checkpoint initializes to the current maximum `ROWID` in `chat.db`, not to
+zero, and `generation` initializes to `1` (§Cursor identity above). The channel is forward-only
+from the moment it is activated: message history that predates activation is never imported,
+matching the Telegram and email adapters' first-poll behavior. This also bounds the very first
+drain to new messages only, so activation on an established `chat.db` does not attempt to ingest
+years of prior conversation history.
+
+This resolves the query-shape question the original decision text of this amendment left open:
+the windowed `SELECT ... WHERE date > T LIMIT N` form is prohibited -- it is exactly the shape
+issue #449 fixed for email -- and the `ROWID`-floor, bounded-drain form above (§Bounded drain
+per tick) is the normative query.
+
+### Outbound addressing
+
+The routable address is `imessage:<slug>` (default slug `maintainer`, overridable by
+`KHIVE_IMESSAGE_MAINTAINER_SLUG`), following the Telegram amendment's precedent exactly:
+`<slug>` is a stable local name that resolves via config to the transport identifier, here
+`KHIVE_IMESSAGE_MAINTAINER_HANDLE`. The raw handle -- a phone number or Apple ID email, and
+comparably sensitive transport-identifying material to Telegram's numeric `chat_id` -- is
+config-only and never appears in a `ChannelEnvelope`, a note property, or any content verb.
+`imessage:<handle>` is not a supported address form in v1; `imessage:<slug>` is the only
+normative form.
+
+v1 is single-maintainer, matching Telegram and email: an outbound note addressed to any
+`imessage:` slug other than the configured maintainer slug is unroutable and is logged and
+dropped, never sent to the maintainer chat by default.
+
+### Configuration (env-only, canonical config home `~/.khive/.env`)
+
+| Variable                           | Required | Default                      | Description                                                                                                                                                                                                    |
+| ---------------------------------- | -------- | ---------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `KHIVE_IMESSAGE_SSH_TARGET`        | yes      | --                           | SSH target for the bridge host (`user@host`). Credentials resolve via the SSH client, not this config. Validated fail-closed at config load (SSH target validation above).                                     |
+| `KHIVE_IMESSAGE_MAINTAINER_HANDLE` | yes      | --                           | The maintainer's own iMessage handle (phone number or email) -- the remote counterparty, never the bridge account's own handle (§Two-identity model above). Config-only; never appears in an envelope or note. |
+| `KHIVE_IMESSAGE_MAINTAINER_SLUG`   | no       | `maintainer`                 | The slug in `imessage:<slug>` that maps to the maintainer handle.                                                                                                                                              |
+| `KHIVE_IMESSAGE_DB_PATH`           | no       | `~/Library/Messages/chat.db` | Path to the Messages database on the bridge host. Part of the cursor `source` identity (§Cursor identity above): changing it selects a different cursor row.                                                   |
+| `KHIVE_IMESSAGE_POLL_SECS`         | no       | `5`                          | Inbound poll interval against the bridge host's Messages database. Must parse as an integer >= 1 (validation rule below).                                                                                      |
+| `KHIVE_IMESSAGE_INGEST_NAMESPACE`  | no       | `local`                      | Target namespace for ingested inbound messages (passed as `namespace` to `comm.ingest`).                                                                                                                       |
+
+No secret material beyond what the SSH client already manages is configured here, and nothing
+above is written to any khive store, matching §9.
+
+**Poll-interval validation.** `KHIVE_IMESSAGE_POLL_SECS` is validated at config load, not at
+first use: it must parse as an integer greater than or equal to 1. A zero value, a negative
+value, or a value that fails to parse as an integer is rejected: `ImessageChannelConfig::from_env`
+returns `ChannelError::Config`, the channel does not start, and the logged warning names the
+variable. This matches the fail-loud posture the rest of this adapter's configuration already
+has (`KHIVE_IMESSAGE_SSH_TARGET` and `KHIVE_IMESSAGE_MAINTAINER_HANDLE` fail construction the
+same way when absent) rather than silently clamping to the default or to 1. Regression coverage
+is named in the acceptance properties below.
+
+### Two-identity model
+
+The bridge Mac signs into the Messages application under a dedicated bridge Apple ID: a new
+account, created solely for this purpose, that carries only an email address and no phone
+number. `KHIVE_IMESSAGE_MAINTAINER_HANDLE` is the maintainer's own handle -- the remote
+counterparty the bridge account exchanges messages with -- and is never the bridge account's own
+handle.
+
+Distinct identities are a functional requirement, not a preference. The bridge's read side
+(§Sender validation below) enforces `message.is_from_me = 0` on every row it ingests, precisely
+to exclude the adapter's own outbound sends from being re-ingested as inbound. If the bridge Mac
+signed into the same account as the maintainer's own handle, every message the maintainer sent
+would sync into that shared account's conversation as a row carrying `is_from_me = 1` on the
+bridge side (Messages syncs sent-from-any-device state across all devices signed into one Apple
+ID) and would be rejected by that same mandatory filter -- the maintainer's real replies would be
+silently dropped, not the adapter's own echoes. Two distinct Apple IDs are what makes
+`is_from_me` a correct discriminator between "the bridge sent this" and "the maintainer sent
+this" in the first place.
+
+The bridge account's email-only, no-phone-number shape is also what the SMS/MMS/RCS service check
+(§Sender validation below) depends on structurally: an Apple ID with no paired phone number has
+no SMS forwarding path, so every row that lands in the bridge's own `chat.db` is iMessage-service
+by construction, not merely by the configured handle's shape.
+
+### Host requirements (informative)
+
+The bridge host must be signed into the Messages application under the dedicated bridge Apple ID
+described above. The SSH-invoked processes need two one-time macOS permission grants on the
+bridge host: Full Disk Access (for the `chat.db` reads) and Automation permission for the
+Messages application (for the `osascript` sends). Both are host-local, one-time grants made by
+whoever administers that Mac; this amendment names the requirement without prescribing the exact
+System Settings click path, which drifts across macOS releases.
+
+### Feature gating
+
+`khive-mcp/Cargo.toml` gains `channel-imessage = ["khive-channel", "khive-channel-imessage"]`
+with `khive-channel-imessage` an optional dependency, mirroring `channel-email` and
+`channel-telegram`. Default build excludes it. `channel-email`, `channel-telegram`, and
+`channel-imessage` can all be enabled together; the `ChannelRegistry` keys by `(kind, slug)`, so
+all three adapters coexist. Shipping the adapter through the product executable additionally
+requires a kkernel `channel-imessage` pass-through feature. The kkernel `channel-email`
+pass-through already exists; the `channel-telegram` pass-through is pending in a separate build
+change not yet merged. This amendment's `channel-imessage` pass-through is its own addition and
+does not depend on the Telegram pass-through landing first.
+
+### Out of scope (v1)
+
+- Group chats.
+- Attachments and rich content (text only).
+- Multiple maintainer handles / a general `imessage:<slug>` address book beyond the single
+  maintainer slug.
+- Writing to `chat.db` in any form. This is a permanent prohibition, not a v1 deferral: the
+  adapter never writes to Apple's own database, in any future version.
+
+### Acceptance properties (testable, transport mocked)
+
+1. Every SSH invocation's remote command line is the fixed remote helper's literal, unparameterized
+   name; message text, the recipient, and the configured `KHIVE_IMESSAGE_DB_PATH` reach the bridge
+   host only over stdin as structured data, never as a remote-argv element or an interpolated
+   shell/AppleScript string (the injection fence). A dedicated adversarial regression test asserts
+   that a `KHIVE_IMESSAGE_DB_PATH` value containing shell metacharacters (backticks, `$( )`,
+   semicolons, quotes) cannot alter the remote command the bridge host executes.
+2. Simulating a restart mid-poll and re-delivering an already-seen `chat.db` row does not produce
+   a duplicate inbound note; dedup is by GUID through `idx_comm_message_external_id`.
+3. An unreachable bridge host degrades that one channel to a channel-down warning; other
+   configured channels are unaffected and the daemon does not fault.
+4. Every `chat.db` open the adapter performs is asserted read-only by the test double (no write
+   flags requested).
+5. A poll after a simulated restart resumes strictly above the committed `ROWID` checkpoint, not
+   from an in-memory default; a `chat.db` row with `ROWID` at or below the checkpoint is never
+   re-ingested and a row above it is never skipped, across a page-limit boundary.
+6. On first activation for a `(kind, slug)` with no prior checkpoint row, the checkpoint
+   initializes to the current maximum `ROWID`; a `chat.db` row inserted before activation is
+   never ingested.
+7. `KHIVE_IMESSAGE_POLL_SECS` set to `0`, a negative integer, or a non-integer string fails
+   channel construction with a warning naming the variable; the channel does not start.
+8. A `chat.db` row with `is_from_me = 1`, a sender handle that does not equal
+   `KHIVE_IMESSAGE_MAINTAINER_HANDLE`, a conversation outside the maintainer conversation, or a
+   service other than iMessage (SMS, MMS, or RCS), is not ingested; the drop is counted. An
+   adapter-sent row in the maintainer conversation is never ingested as inbound.
+9. Under sustained arrivals exceeding the bound of 10 pages of 200 rows each (2000 rows per
+   tick), the inbound task sleeps its normal poll interval between ticks rather than draining
+   continuously, and no row is skipped across that sleep boundary -- the next tick resumes from
+   the checkpoint the last page committed.
+10. When the GUID at the stored checkpoint `ROWID` no longer matches the remote database (row
+    deleted, database replaced), the next poll resets forward-only to the current maximum
+    `ROWID`, increments `generation`, and logs and counts the reset; a stale high-water mark is
+    never applied once the GUID check fails.
+11. `KHIVE_IMESSAGE_SSH_TARGET` values beginning with `-`, or containing whitespace or a control
+    character, fail channel construction with a warning naming the variable and the channel does
+    not start; every outbound `ssh` invocation additionally passes `--` immediately before the
+    target so a value that reached the invocation unvalidated can still never be parsed as an
+    `ssh` option.
+12. Switching `KHIVE_IMESSAGE_SSH_TARGET` (or the remote `chat.db` path) from a source A to a
+    source B and back to A resumes source A's own checkpoint row at its own high-water mark; rows
+    that arrived in source A's database while source B was active are ingested on return, never
+    skipped.
+13. A page whose final row is terminally dropped (§Terminal disposition) does not trigger a
+    forward-only reset on the next poll: the stored `anchor` names that dropped row's GUID, the
+    re-read at the checkpoint `ROWID` matches it, and the stored high-water mark is trusted.
+14. Using the daemon's bridge-account SSH key to request an arbitrary remote command, a PTY, or
+    any form of port, agent, or X11 forwarding or tunneling fails at the bridge host's `sshd`;
+    only the fixed remote helper, at its forced-command path, ever executes for that key.
+15. A hostile `~/.ssh/config` (or `/etc/ssh/ssh_config`) `ProxyCommand` or `Match exec` directive
+    on the daemon's own account never executes as part of this adapter's `ssh` invocations, and an
+    entry in the global known-hosts database that would otherwise satisfy host verification does
+    not substitute for a matching entry in the dedicated `~/.khive/imessage_known_hosts` file.
+16. An adapter invocation against a helper reporting a protocol version the adapter does not
+    support fails closed as a transport failure; the mismatched response is never parsed as if it
+    were a supported shape.
+
+### Consequences
+
+- `comm.inbox`/`read`/`reply`/`thread` unchanged for agents; a new channel-prefixed address
+  space (`imessage:<slug>`) reuses `comm.ingest`, the dispatch gate, the dedup index, and the
+  envelope exactly as email and Telegram do.
+- A new `khive-channel-imessage` crate at the platform layer; a `channel-imessage`-gated
+  `spawn_imessage_channel_loops` in `khive-mcp`. This amendment corrects and extends the
+  per-adapter loop pair pattern to a fleet-wide rule: it supersedes the `poll_all` lifecycle
+  prescriptions of §§4, 6, and 12, and every future adapter is required to ship its own
+  daemon-spawned loop pair.
+- No credentials in any note, entity, or KG store; the SSH keypair and the maintainer handle are
+  env/SSH-client configuration only.
+- The inbound poll cursor is durable, not in-memory: it reuses the `comm_channel_cursor`
+  checkpoint mechanism Amendment 2026-07-09 introduced for email, anchored on `chat.db`'s `ROWID`
+  rather than a time window, so the missed-ingest failure class issue #449 fixed for email cannot
+  recur here. Reuse required an explicit, additive schema migration: a new optional `anchor`
+  column (null for existing adapters) and a uniqueness key widened from `(channel_kind,
+  channel_slug)` to `(channel_kind, channel_slug, source)`, plus the matching
+  `comm.cursor_get`/`comm.cursor_commit` API surface change. The cursor's `source` identifies the
+  configured bridge target and database path and, under the widened key, gives each source its
+  own persistent row, so switching sources and back resumes the original source's backlog rather
+  than losing it. Its `generation` tracks resets, and a GUID identity guard on the `anchor` row
+  forces a loudly counted, forward-only reset rather than silently applying a stale mark to a
+  replaced database. Each poll tick is bounded to 10 pages of 200 rows each (2000 rows), sleeping
+  between ticks under sustained arrivals rather than draining continuously.
+- Inbound rows sent by the adapter itself (`is_from_me = 1`) are excluded at ingest, preventing
+  the adapter from re-ingesting its own outbound sends as trusted maintainer input, and rows
+  carried over SMS, MMS, or RCS are excluded regardless of sender handle, since only an
+  iMessage-service row is treated as an authenticated delivery from the signed-in Apple ID.
+- `KHIVE_IMESSAGE_SSH_TARGET` is validated fail-closed at config load against a restrictive
+  shape, and every `ssh` invocation passes `--` before the target, closing the option-injection
+  path an unvalidated or malformed target value would otherwise open.
+- The address form (`imessage:<slug>`, normative) and the poll-interval and sender-validation
+  rules are settled by this amendment text; no open items remain for design sign-off.
+
 ## Context
 
 The autonomous build loop blocks regularly on the maintainer. Merge approvals and ADR
@@ -633,6 +1303,11 @@ impl ChannelRegistry {
 }
 ```
 
+> **Lifecycle amended 2026-07-17.** The `poll_all` sweep above is a design description, not the
+> shipped mechanism. It is superseded by per-adapter loop pairs registered through
+> `ChannelRegistry` and spawned individually by the daemon role. See
+> [§Amendment 2026-07-17](#amendment-2026-07-17----imessage-channel-over-an-ssh-bridge).
+
 ### 5. Comm-pack integration: the `comm.ingest` verb
 
 The channel layer integrates with the comm store through the single public gated dispatch path:
@@ -753,6 +1428,11 @@ which writes the note into the correct namespace. This is what makes the inbound
 
 The loop sleeps a fixed 5-second interval between `poll_all` calls.
 
+> **Superseded 2026-07-17.** The single-loop, `poll_all`-driven model above is superseded by
+> per-adapter loop pairs (`spawn_*_channel_loops`), one inbound task and one outbound task per
+> configured channel, matching the shipped email and Telegram adapters. See
+> [§Amendment 2026-07-17](#amendment-2026-07-17----imessage-channel-over-an-ssh-bridge).
+
 ### 7. Inbound polling vs webhook
 
 Long-poll is the default. The embedded deployment runs with no routable public URL.
@@ -842,6 +1522,10 @@ The index is PARTIAL UNIQUE: the `WHERE` clause excludes rows with a null or emp
 
 The ingest loop enforces a configurable minimum inter-poll interval (default 5 seconds) via
 `tokio::time::sleep` between `poll_all` calls.
+
+> **Superseded 2026-07-17.** The interval is unchanged in shape, but it now governs the sleep
+> inside each adapter's own inbound loop rather than a shared `poll_all` sweep. See
+> [§Amendment 2026-07-17](#amendment-2026-07-17----imessage-channel-over-an-ssh-bridge).
 
 ### 13. Alternatives considered
 
@@ -998,3 +1682,6 @@ attributed. See [§Amendment 2026-07-02](#amendment-2026-07-02----inbound-authen
   2026-07-02 amendment: attribution requires the two-part authentication gate, and quarantined
   mail is written without a trusted actor identity.
 - ADR-028: Pack-Scoped Backends -- offset/cursor persistence pattern for channel adapters.
+- ADR-108: Git Write Surface -- the hardened, allowlisted argv-construction pattern for shelling
+  out to an external process, reused by the 2026-07-17 amendment's `ssh`/`osascript` outbound
+  path.
