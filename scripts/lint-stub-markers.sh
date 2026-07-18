@@ -19,6 +19,17 @@
 # type/method name happens to contain a placeholder word) are suppressed via
 # the explicit, in-diff reviewed allowlist at stub-marker-allowlist.txt --
 # see that file's header for the format.
+#
+# Filesystem-indirection (symlink) policy -- every path this script opens or
+# walks, and the symlink handling applied to each:
+#
+#   script self-location     | `cd $(dirname $0) && pwd`       | trusted; resolved once at startup
+#   crates/ regular .rs      | `find -type f -name '*.rs'`     | only real files scanned; symlinks excluded by -type f
+#   crates/ any symlink      | `find -type l`                  | HARD-FAIL, named via sanitize_for_ci, before scanning
+#   discovered .rs reads     | `open(path)` in the scan loop   | guaranteed real by the -type f / -type l split; CI checkout is static (no find->read swap)
+#   allowlist file           | `os.open(O_RDONLY|O_NOFOLLOW)`  | symlink refused atomically; in-repo default must also resolve under the scan root; env override is containment-exempt but still symlink-refused
+#   temp transport files     | `mktemp`                        | mktemp regular files (O_EXCL); not attacker-controlled
+#   self-test fixture trees  | self-authored under `mktemp -d` | test-authored real files
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -505,6 +516,64 @@ MALFIXTURE
         fi
     fi
 
+    # Filesystem-indirection: a symlinked allowlist must be refused (never
+    # followed), and the target's content must NOT be echoed into output. The
+    # target holds a sentinel that would only appear if the scanner followed the
+    # link and read it.
+    mkdir -p "$tmp/case-symlink-allowlist/crates/real-crate/src"
+    cat > "$tmp/case-symlink-allowlist/crates/real-crate/src/lib.rs" <<'SLFIXTURE'
+pub fn ok() -> u32 {
+    1
+}
+SLFIXTURE
+    printf 'SENTINEL_ALLOWLIST_SECRET_MUST_NOT_LEAK\tx\n' > "$tmp/symlink-allowlist-target.txt"
+    symlink_allowlist="$tmp/symlink-allowlist.txt"
+    ln -s "$tmp/symlink-allowlist-target.txt" "$symlink_allowlist"
+    if STUB_MARKER_ALLOWLIST="$symlink_allowlist" scan "$tmp/case-symlink-allowlist" > "$tmp/symlink-allow.log" 2>&1; then
+        echo "self-test FAILED: a symlinked allowlist file should have failed the scan loud"
+        cat "$tmp/symlink-allow.log"
+        status=1
+    else
+        if ! grep -qF 'symlink' "$tmp/symlink-allow.log"; then
+            echo "self-test FAILED: the symlinked-allowlist error did not report a symlink"
+            cat "$tmp/symlink-allow.log"
+            status=1
+        fi
+        if grep -qF 'SENTINEL_ALLOWLIST_SECRET_MUST_NOT_LEAK' "$tmp/symlink-allow.log"; then
+            echo "self-test FAILED: the symlinked allowlist's TARGET content leaked into CI output"
+            cat "$tmp/symlink-allow.log"
+            status=1
+        fi
+    fi
+
+    # Filesystem-indirection: a symlinked .rs under crates/ must hard-fail the
+    # scan (Cargo compiles it; -type f discovery would skip it). A real sibling
+    # .rs keeps the discovery list non-empty so the failure is the symlink, not
+    # an empty tree.
+    mkdir -p "$tmp/case-symlink-rs/crates/real-crate/src"
+    cat > "$tmp/case-symlink-rs/crates/real-crate/src/real.rs" <<'RSREAL'
+pub fn ok() -> u32 {
+    1
+}
+RSREAL
+    cat > "$tmp/case-symlink-rs/elsewhere.rs" <<'RSHIDDEN'
+pub fn hidden_stub() -> u32 {
+    panic!("todo: this stub rode in behind a symlinked .rs")
+}
+RSHIDDEN
+    ln -s "$tmp/case-symlink-rs/elsewhere.rs" "$tmp/case-symlink-rs/crates/real-crate/src/linked.rs"
+    if STUB_MARKER_ALLOWLIST="$empty_allowlist" scan "$tmp/case-symlink-rs" > "$tmp/symlink-rs.log" 2>&1; then
+        echo "self-test FAILED: a symlinked .rs under crates/ should have hard-failed the scan"
+        cat "$tmp/symlink-rs.log"
+        status=1
+    else
+        if ! grep -qF 'linked.rs' "$tmp/symlink-rs.log"; then
+            echo "self-test FAILED: the symlinked-.rs error did not name the offending link"
+            cat "$tmp/symlink-rs.log"
+            status=1
+        fi
+    fi
+
     if [ "$status" -eq 0 ]; then
         echo "lint-stub-markers self-test: OK"
     fi
@@ -530,22 +599,43 @@ scan() {
         -o -name '*.rs' -type f -print0 \
         > "$file_list"
 
-    if [ ! -s "$file_list" ]; then
-        rm -f "$file_list"
+    # Filesystem-indirection guard: collect EVERY symlink under crates/ (any
+    # name, file or directory), excluding the same pruned build-artifact dirs.
+    # A symlinked .rs is skipped by the -type f pass above but compiled by
+    # Cargo; a symlinked directory is not descended by find (no -L) yet Cargo
+    # builds through it. The python below hard-fails on any of them.
+    symlink_list="$(mktemp)"
+    find "$root/crates" \
+        \( -name 'target' -o -name '.cargo-target' \) -type d -prune \
+        -o -type l -print0 \
+        > "$symlink_list"
+
+    if [ ! -s "$file_list" ] && [ ! -s "$symlink_list" ]; then
+        rm -f "$file_list" "$symlink_list"
         echo "no .rs files matched under $root/crates (excluding target/.cargo-target build-artifact dirs) -- the scanner would silently be a no-op; fix the file-layout selection" >&2
         return 1
     fi
 
     allowlist="${STUB_MARKER_ALLOWLIST:-$SCRIPT_DIR/stub-marker-allowlist.txt}"
+    # Whether the allowlist path came from the env override (a deliberate
+    # operator choice, containment-exempt) or the in-repo default (must resolve
+    # under the scan root). Symlink refusal applies to BOTH; see load_allowlist.
+    if [ -n "${STUB_MARKER_ALLOWLIST:-}" ]; then
+        allowlist_is_override=1
+    else
+        allowlist_is_override=0
+    fi
 
     # `|| rc=$?` keeps set -e from exiting the script the moment python3 returns
     # non-zero (findings present, or the allowlist-path guard failing): the temp
     # file_list below must still be removed on that path, and the caller needs
     # the real exit code, not a set-e-induced abort.
     rc=0
-    python3 - "$file_list" "$allowlist" "$root" <<'PY' || rc=$?
+    python3 - "$file_list" "$allowlist" "$root" "$symlink_list" "$allowlist_is_override" <<'PY' || rc=$?
+import errno
 import os
 import re
+import stat
 import sys
 
 with open(sys.argv[1], "rb") as fh:
@@ -553,6 +643,8 @@ with open(sys.argv[1], "rb") as fh:
 
 ALLOWLIST_PATH = sys.argv[2]
 SCAN_ROOT = sys.argv[3]
+SYMLINK_LIST_PATH = sys.argv[4]
+ALLOWLIST_IS_OVERRIDE = sys.argv[5] == "1"
 
 PLACEHOLDER_RE = re.compile(
     r"\b(stub|todo|fixme|placeholder|unimplemented|not\s*yet\s*implemented|"
@@ -932,7 +1024,7 @@ def resolve_format_message(template, positionals, named):
     return FORMAT_SLOT_RE.sub(repl, template)
 
 
-def load_allowlist(path):
+def load_allowlist(path, scan_root, is_override):
     """Parse `<repo-relative-path>\\t<exact-decoded-message>` entries from the
     allowlist file at `path`, returning (entries, malformed). Each entry
     suppresses a finding only when both fields match exactly (see
@@ -942,12 +1034,44 @@ def load_allowlist(path):
     ignored. A non-comment line with no TAB is malformed -- collected in
     `malformed` with its 1-based line number so the caller can fail loud rather
     than silently drop a mis-typed entry that would suppress nothing. A missing
-    file is an empty allowlist, not an error."""
+    file is an empty allowlist, not an error.
+
+    Filesystem-indirection policy: the allowlist is opened with O_NOFOLLOW, so a
+    symlinked allowlist file is refused atomically (no check-then-open gap) --
+    a symlink could point at a sensitive out-of-tree file whose content the
+    malformed-line reporter would otherwise echo into CI. For the in-repo
+    DEFAULT allowlist (no env override) the resolved path must additionally
+    stay under the scan root; an env override is a deliberate operator choice
+    and is containment-exempt, but is still symlink-refused."""
     entries = []
     malformed = []
-    if not os.path.isfile(path):
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        if exc.errno == errno.ENOENT:
+            return entries, malformed
+        if exc.errno in (errno.ELOOP, errno.EMLINK):
+            sys.stderr.write(
+                "stub-marker allowlist path is a symlink; refusing to follow it "
+                "(a symlinked allowlist could disclose an out-of-tree file's "
+                f"content into CI): {sanitize_for_ci(path)}\n"
+            )
+            sys.exit(1)
+        raise
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
         return entries, malformed
-    with open(path, "r", encoding="utf-8") as fh:
+    if not is_override:
+        real = os.path.realpath(path)
+        root_real = os.path.realpath(scan_root)
+        if real != root_real and not real.startswith(root_real + os.sep):
+            os.close(fd)
+            sys.stderr.write(
+                "stub-marker default allowlist resolves outside the scan root; "
+                f"refusing: {sanitize_for_ci(path)}\n"
+            )
+            sys.exit(1)
+    with os.fdopen(fd, "r", encoding="utf-8") as fh:
         for lineno, raw_line in enumerate(fh, 1):
             line = raw_line.rstrip("\n")
             if not line.strip() or line.lstrip().startswith("#"):
@@ -975,7 +1099,31 @@ def allowlist_match_index(rel_path, message, entries):
     return None
 
 
-allowlist, malformed_allowlist = load_allowlist(ALLOWLIST_PATH)
+# Filesystem-indirection class: the scan() find already collected EVERY symlink
+# under crates/ (any name, file or directory), excluding pruned build-artifact
+# dirs, into SYMLINK_LIST_PATH. A symlinked .rs rides past the -type f discovery
+# while Cargo compiles it; a symlinked directory is not descended by find (no -L)
+# yet Cargo builds through it. Either way a placeholder stub could ride past this
+# guard, so refuse to scan through any of them -- named via sanitize_for_ci --
+# before doing anything else.
+with open(SYMLINK_LIST_PATH, "rb") as fh:
+    symlinked = sorted(os.fsdecode(f) for f in fh.read().split(b"\0") if f)
+if symlinked:
+    sys.stderr.write(
+        "stub-marker scan found symlink(s) under crates/ -- a symlinked source "
+        "file is compiled by Cargo but skipped by -type f discovery, and a "
+        "symlinked directory hides its source from the scan while Cargo still "
+        "builds it; either way a placeholder stub could ride past this guard. "
+        "Refusing to scan through them; replace each with a real file or dir:\n"
+    )
+    for entry in symlinked:
+        rel = os.path.relpath(entry, SCAN_ROOT).replace(os.sep, "/")
+        sys.stderr.write(f"  {sanitize_for_ci(rel)}\n")
+    sys.exit(1)
+
+allowlist, malformed_allowlist = load_allowlist(
+    ALLOWLIST_PATH, SCAN_ROOT, ALLOWLIST_IS_OVERRIDE
+)
 
 # A non-comment allowlist line with no TAB is a mis-typed entry: it parses as
 # neither a path nor a message and would silently suppress nothing. Fail loud
@@ -1071,7 +1219,7 @@ if failed:
 
 print(f"stub-marker lint: {len(files)} file(s) OK")
 PY
-    rm -f "$file_list"
+    rm -f "$file_list" "$symlink_list"
     return "$rc"
 }
 
