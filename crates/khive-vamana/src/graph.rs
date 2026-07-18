@@ -17,6 +17,24 @@ const BUILD_BATCH_SIZE: usize = 1024;
 const MEDOID_SAMPLE_K: usize = 1000;
 const BUILD_SEED: u64 = 0x5641_4d41_4e41;
 
+// Test-only observability for the alpha-pass count in `build`/`build_sq8`, so the
+// alpha==1.0 skip-second-pass optimization can be asserted directly rather than
+// inferred from graph output.
+#[cfg(test)]
+thread_local! {
+    static BUILD_PASS_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_build_pass_count() {
+    BUILD_PASS_COUNT.with(|c| c.set(0));
+}
+
+#[cfg(test)]
+fn build_pass_count() -> usize {
+    BUILD_PASS_COUNT.with(|c| c.get())
+}
+
 /// Output of a single greedy-search traversal over the Vamana graph.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GreedySearchResult {
@@ -163,7 +181,16 @@ impl VamanaGraph {
         let mut order: Vec<u32> = (0..num_vectors as u32).collect();
         order.shuffle(&mut rng);
 
-        for &pass_alpha in &[1.0f64, config.alpha] {
+        // When alpha == 1.0, the second pass is a no-op rerun of the first (identical
+        // pass_alpha), so skip it to avoid a full extra prune pass over the graph.
+        let alphas: &[f64] = if (config.alpha - 1.0).abs() < f64::EPSILON {
+            &[1.0]
+        } else {
+            &[1.0, config.alpha]
+        };
+        for &pass_alpha in alphas {
+            #[cfg(test)]
+            BUILD_PASS_COUNT.with(|c| c.set(c.get() + 1));
             for batch in order.chunks(batch_size) {
                 // L1: capture only the current neighbors of the batch nodes (O(batch*R))
                 // instead of cloning the full adjacency (O(N)). The greedy search reads
@@ -306,7 +333,16 @@ impl VamanaGraph {
         let mut order: Vec<u32> = (0..num_vectors as u32).collect();
         order.shuffle(&mut rng);
 
-        for &pass_alpha in &[1.0f64, config.alpha] {
+        // When alpha == 1.0, the second pass is a no-op rerun of the first (identical
+        // pass_alpha), so skip it to avoid a full extra prune pass over the graph.
+        let alphas: &[f64] = if (config.alpha - 1.0).abs() < f64::EPSILON {
+            &[1.0]
+        } else {
+            &[1.0, config.alpha]
+        };
+        for &pass_alpha in alphas {
+            #[cfg(test)]
+            BUILD_PASS_COUNT.with(|c| c.set(c.get() + 1));
             for batch in order.chunks(batch_size) {
                 let batch_prior: Vec<Vec<u32>> = batch
                     .iter()
@@ -1363,6 +1399,76 @@ mod tests {
         let g1 = VamanaGraph::build(&raw, &cfg).unwrap();
         let g2 = VamanaGraph::build(&raw, &cfg).unwrap();
         assert_eq!(g1, g2);
+    }
+
+    #[test]
+    fn build_skips_second_pass_when_alpha_is_one() {
+        use rand::SeedableRng;
+        let mut rng = StdRng::seed_from_u64(11);
+        let n = 30usize;
+        let dim = 4usize;
+        let raw: Vec<f32> = (0..n * dim).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+
+        let cfg = VamanaConfig::with_dimensions(dim)
+            .with_max_degree(6)
+            .with_search_list_size(12)
+            .with_alpha(1.0);
+
+        reset_build_pass_count();
+        VamanaGraph::build(&raw, &cfg).unwrap();
+        assert_eq!(build_pass_count(), 1);
+    }
+
+    #[test]
+    fn build_runs_two_passes_when_alpha_above_one() {
+        use rand::SeedableRng;
+        let mut rng = StdRng::seed_from_u64(11);
+        let n = 30usize;
+        let dim = 4usize;
+        let raw: Vec<f32> = (0..n * dim).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+
+        let cfg = VamanaConfig::with_dimensions(dim)
+            .with_max_degree(6)
+            .with_search_list_size(12)
+            .with_alpha(1.2);
+
+        reset_build_pass_count();
+        VamanaGraph::build(&raw, &cfg).unwrap();
+        assert_eq!(build_pass_count(), 2);
+    }
+
+    #[test]
+    fn build_sq8_skips_second_pass_when_alpha_is_one() {
+        let dim = 4usize;
+        let n = 20usize;
+        let vectors: Vec<f32> = (0..n * dim).map(|i| ((i % 7) as f32 - 3.0) / 3.0).collect();
+        let cfg = VamanaConfig::with_dimensions(dim)
+            .with_max_degree(6)
+            .with_search_list_size(12)
+            .with_alpha(1.0);
+        let codec = GsSq8Codec::train_flat(&vectors, dim);
+        let encoded = codec.encode_flat_par(&vectors, dim);
+
+        reset_build_pass_count();
+        VamanaGraph::build_sq8(&vectors, &encoded, &codec, &cfg).unwrap();
+        assert_eq!(build_pass_count(), 1);
+    }
+
+    #[test]
+    fn build_sq8_runs_two_passes_when_alpha_above_one() {
+        let dim = 4usize;
+        let n = 20usize;
+        let vectors: Vec<f32> = (0..n * dim).map(|i| ((i % 7) as f32 - 3.0) / 3.0).collect();
+        let cfg = VamanaConfig::with_dimensions(dim)
+            .with_max_degree(6)
+            .with_search_list_size(12)
+            .with_alpha(1.2);
+        let codec = GsSq8Codec::train_flat(&vectors, dim);
+        let encoded = codec.encode_flat_par(&vectors, dim);
+
+        reset_build_pass_count();
+        VamanaGraph::build_sq8(&vectors, &encoded, &codec, &cfg).unwrap();
+        assert_eq!(build_pass_count(), 2);
     }
 
     fn normalize_rows(v: &mut [f32], dim: usize) {
