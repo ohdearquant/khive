@@ -17,6 +17,40 @@ const BUILD_BATCH_SIZE: usize = 1024;
 const MEDOID_SAMPLE_K: usize = 1000;
 const BUILD_SEED: u64 = 0x5641_4d41_4e41;
 
+// Test-only override to cap how many of the [1.0, config.alpha] refinement
+// passes `build`/`build_sq8` run, so a test can build a single-pass graph to
+// compare against the normal two-pass build (see
+// build_alpha_one_two_passes_are_not_idempotent_at_scale).
+#[cfg(test)]
+thread_local! {
+    static MAX_PASSES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn set_max_passes(v: Option<usize>) {
+    MAX_PASSES.with(|c| c.set(v));
+}
+
+/// Two refinement passes always run, even at alpha == 1.0: the second pass
+/// reruns greedy search and robust_prune over the graph the first pass just
+/// produced, and a more-connected graph changes which candidates survive
+/// pruning. This is not idempotent — differential testing at production scale
+/// (n>=250, 384-dim normalized vectors) shows the two-pass and skip-second-pass
+/// adjacency diverge, so a run with only the first pass is a materially
+/// different (and less-refined) graph, not a redundant rerun.
+fn refinement_alpha_schedule(config_alpha: f64) -> Vec<f64> {
+    let all_alphas = [1.0f64, config_alpha];
+    #[cfg(test)]
+    {
+        let cap = MAX_PASSES.with(|c| c.get()).unwrap_or(all_alphas.len());
+        all_alphas[..cap.min(all_alphas.len())].to_vec()
+    }
+    #[cfg(not(test))]
+    {
+        all_alphas.to_vec()
+    }
+}
+
 /// Output of a single greedy-search traversal over the Vamana graph.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GreedySearchResult {
@@ -163,7 +197,8 @@ impl VamanaGraph {
         let mut order: Vec<u32> = (0..num_vectors as u32).collect();
         order.shuffle(&mut rng);
 
-        for &pass_alpha in &[1.0f64, config.alpha] {
+        let alphas = refinement_alpha_schedule(config.alpha);
+        for &pass_alpha in &alphas {
             for batch in order.chunks(batch_size) {
                 // L1: capture only the current neighbors of the batch nodes (O(batch*R))
                 // instead of cloning the full adjacency (O(N)). The greedy search reads
@@ -306,7 +341,8 @@ impl VamanaGraph {
         let mut order: Vec<u32> = (0..num_vectors as u32).collect();
         order.shuffle(&mut rng);
 
-        for &pass_alpha in &[1.0f64, config.alpha] {
+        let alphas = refinement_alpha_schedule(config.alpha);
+        for &pass_alpha in &alphas {
             for batch in order.chunks(batch_size) {
                 let batch_prior: Vec<Vec<u32>> = batch
                     .iter()
@@ -1363,6 +1399,75 @@ mod tests {
         let g1 = VamanaGraph::build(&raw, &cfg).unwrap();
         let g2 = VamanaGraph::build(&raw, &cfg).unwrap();
         assert_eq!(g1, g2);
+    }
+
+    #[test]
+    fn build_alpha_one_two_passes_are_not_idempotent_at_scale() {
+        // Regression guard for #559: an earlier revision skipped the second
+        // refinement pass when config.alpha == 1.0, reasoning that a second pass
+        // at an identical alpha reruns pruning over an already-converged graph and
+        // reproduces the same adjacency. That reasoning does not hold once the
+        // graph is large enough for the first pass to leave real refinement on
+        // the table: the second pass runs greedy search over the *now more
+        // connected* graph the first pass produced and finds different pruning
+        // candidates. This test pins that divergence down directly so the skip
+        // is not silently reintroduced.
+        // n=250 is the smallest size (of 150/200/250/300/384 probed at this dim,
+        // max_degree, and search_list_size) at which the two builds diverge;
+        // below it the first pass already converges to a fixed point.
+        let dim = 384usize;
+        let n = 250usize;
+        let mut rng = StdRng::seed_from_u64(1000);
+        let mut raw: Vec<f32> = (0..n * dim).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+        normalize_rows(&mut raw, dim);
+
+        let cfg = VamanaConfig::with_dimensions(dim)
+            .with_max_degree(32)
+            .with_search_list_size(64)
+            .with_alpha(1.0);
+
+        set_max_passes(Some(1));
+        let one_pass = VamanaGraph::build(&raw, &cfg).unwrap();
+        set_max_passes(None);
+        let two_pass = VamanaGraph::build(&raw, &cfg).unwrap();
+
+        assert_ne!(
+            one_pass, two_pass,
+            "second alpha==1.0 pass changed adjacency vs a single pass; it is not \
+             a redundant no-op at this scale and must not be skipped"
+        );
+    }
+
+    #[test]
+    fn build_sq8_alpha_one_two_passes_are_not_idempotent_at_scale() {
+        // SQ8 counterpart of build_alpha_one_two_passes_are_not_idempotent_at_scale:
+        // build_sq8 runs the same two-pass alpha schedule as build, so it needs the
+        // same regression guard against a reintroduced alpha==1.0 skip. Same n=250
+        // divergence point established there.
+        let dim = 384usize;
+        let n = 250usize;
+        let mut rng = StdRng::seed_from_u64(1000);
+        let mut raw: Vec<f32> = (0..n * dim).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+        normalize_rows(&mut raw, dim);
+
+        let codec = GsSq8Codec::train_flat(&raw, dim);
+        let encoded = codec.encode_flat_par(&raw, dim);
+
+        let cfg = VamanaConfig::with_dimensions(dim)
+            .with_max_degree(32)
+            .with_search_list_size(64)
+            .with_alpha(1.0);
+
+        set_max_passes(Some(1));
+        let one_pass = VamanaGraph::build_sq8(&raw, &encoded, &codec, &cfg).unwrap();
+        set_max_passes(None);
+        let two_pass = VamanaGraph::build_sq8(&raw, &encoded, &codec, &cfg).unwrap();
+
+        assert_ne!(
+            one_pass, two_pass,
+            "second alpha==1.0 pass changed adjacency vs a single pass for build_sq8; \
+             it is not a redundant no-op at this scale and must not be skipped"
+        );
     }
 
     fn normalize_rows(v: &mut [f32], dim: usize) {
