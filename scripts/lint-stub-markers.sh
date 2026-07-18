@@ -373,18 +373,25 @@ PYCTL
         status=1
     fi
 
-    # The committed allowlist carries no active entries today (its documented
-    # state): every entry must suppress a CURRENT finding, and none exists in the
-    # tree. Assert there is no non-comment, non-blank line -- an entry sneaked in
-    # without a matching finding would fail the real scan's unused-entry guard,
-    # but catching it here names the regression directly. The committed file also
-    # carries NO self-test anchor: a committed entry is a real, PR-recreatable
-    # suppression, so a fixture there would let a PR add that exact path+message
-    # and suppress its own stub. Suppression is exercised via a temp copy below.
+    # The committed allowlist is validated by running the scanner over the real
+    # tree with it: the unused-entry guard fails loud on any entry that suppresses
+    # no current finding (stale, moved, or pre-planted), and the malformed-line
+    # guard fails loud on a no-TAB entry. That is the scanner's own contract, so a
+    # comment-only file (its state today) passes and a legitimate committed
+    # suppression -- one that matches a current finding -- passes too, where a
+    # blunt "no active line" assertion would wrongly reject it. Any offending
+    # entry is named through the scanner's own sanitize_for_ci output, never
+    # echoed raw from the file. The committed file carries NO self-test fixture
+    # anchor: a committed entry is a real, PR-recreatable suppression, so a fixture
+    # there would let a PR add that exact path+message and suppress its own stub.
+    # Suppression is exercised via a temp copy below.
+    #
+    # This repeats the production scan's full-tree pass; removing that duplication
+    # is the self-test/production structure work tracked in #1108.
     committed_allowlist="$SCRIPT_DIR/stub-marker-allowlist.txt"
-    if grep -qvE '^[[:space:]]*(#|$)' "$committed_allowlist"; then
-        echo "self-test FAILED: committed allowlist has an active entry; it must be comment-only unless it suppresses a current finding:"
-        grep -nvE '^[[:space:]]*(#|$)' "$committed_allowlist"
+    if ! STUB_MARKER_ALLOWLIST="$committed_allowlist" scan "$ROOT" > "$tmp/committed.log" 2>&1; then
+        echo "self-test FAILED: the committed allowlist did not pass the scanner over the real tree -- a malformed, stale, or pre-planted allowlist entry, or an un-suppressed placeholder stub in the tree (named below):"
+        cat "$tmp/committed.log"
         status=1
     fi
 
