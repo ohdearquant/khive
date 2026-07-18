@@ -245,6 +245,30 @@ fn control_char_error_teaches_escape_syntax_and_mcp_double_escape() {
 }
 
 #[test]
+fn control_char_in_object_key_teaches_escape_syntax_and_mcp_double_escape() {
+    // #491 follow-up: quoted object KEYS decode through a separate path from
+    // quoted values (`parse_object_arg_body` vs `parse_value`) and used to
+    // bypass the enrichment entirely, returning the bare serde message. Both
+    // paths now share `decode_quoted_json_string`, so a raw control byte in
+    // a key gets the same teaching diagnostic as one in a value.
+    let src = format!("gtd.assign(properties={{\"a{}b\":\"x\"}})", '\u{c}');
+    let err = parse_request(&src).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        matches!(err, DslError::InvalidValue { .. }),
+        "expected InvalidValue, got {err:?}"
+    );
+    assert!(
+        msg.contains(r#"\n"#) && msg.contains(r#"\t"#) && msg.contains(r#"\""#),
+        "error should name the JSON escape grammar, got: {msg}"
+    );
+    assert!(
+        msg.to_lowercase().contains("double"),
+        "error should call out the MCP double-escape requirement, got: {msg}"
+    );
+}
+
+#[test]
 fn invalid_backslash_escape_in_quoted_string_rejected() {
     // A negative invalid-escape case: `\q` is not a JSON escape sequence.
     // This must fail regardless of the literal-newline carve-out.

@@ -248,11 +248,7 @@ impl<'a> Parser<'a> {
                     let start = self.pos;
                     let end = scan_string_end(self.src, start)?;
                     let raw = std::str::from_utf8(&self.src[start..end]).expect("utf8 key literal");
-                    let s: String =
-                        serde_json::from_str(raw).map_err(|e| DslError::InvalidValue {
-                            pos: start,
-                            error: e.to_string(),
-                        })?;
+                    let s = decode_quoted_json_string(raw, start)?;
                     self.pos = end;
                     s
                 }
@@ -389,20 +385,18 @@ impl<'a> Parser<'a> {
         let trimmed = slice.trim();
         // A quoted string literal may contain raw control bytes (newline, CR,
         // tab) verbatim in the DSL source; JSON proper forbids that, so
-        // rewrite them to JSON escapes before handing the slice to
-        // `serde_json`. Non-string values (numbers, bool, null) never
-        // legitimately contain such bytes, so this only touches strings.
-        let normalized;
-        let json_src: &str = if trimmed.starts_with('"') {
-            normalized = escape_literal_control_chars(trimmed);
-            &normalized
+        // `decode_quoted_json_string` rewrites them to JSON escapes before
+        // handing the slice to `serde_json`. Non-string values (numbers,
+        // bool, null) never legitimately contain such bytes, so this only
+        // touches strings.
+        let value = if trimmed.starts_with('"') {
+            Value::String(decode_quoted_json_string(trimmed, start)?)
         } else {
-            trimmed
+            serde_json::from_str(trimmed).map_err(|e| DslError::InvalidValue {
+                pos: start,
+                error: e.to_string(),
+            })?
         };
-        let value: Value = serde_json::from_str(json_src).map_err(|e| DslError::InvalidValue {
-            pos: start,
-            error: describe_value_parse_error(&e, json_src),
-        })?;
         self.pos = end;
         Ok(value)
     }
@@ -501,34 +495,63 @@ impl<'a> Parser<'a> {
     }
 }
 
-/// Validates quoted-reference brackets before promoting a string to `PrevRef`.
-/// A malformed segment keeps the entire value literal.
+/// Finds the first byte in a quoted-string DSL source span that could not
+/// have been normalized away by [`escape_literal_control_chars`] and would
+/// therefore reach `serde_json` as a literal control byte. Raw `\n`/`\r`/`\t`
+/// are rewritten to JSON escapes before parsing (ADR-016), so they are never
+/// the cause of a "control character" decode failure; any other byte below
+/// 0x20 (NUL, form feed, ESC, ...) is. Scanning `raw` directly bounds the
+/// search to the already-known quoted span, rather than the full (up to
+/// 1 MiB) `ops` source.
+fn find_offending_control_byte(raw: &str) -> Option<(usize, char)> {
+    raw.bytes().enumerate().find_map(|(idx, b)| {
+        if b < 0x20 && !matches!(b, b'\n' | b'\r' | b'\t') {
+            Some((idx, b as char))
+        } else {
+            None
+        }
+    })
+}
+
 /// Enriches a `serde_json` string-decode failure with the ADR-016 escape
-/// grammar and the MCP double-escape gotcha. Raw newline/CR/tab bytes are
-/// already normalized before `json_src` reaches `serde_json` (see
-/// `escape_literal_control_chars`), so any remaining control-character
-/// failure here is a byte outside that carve-out (NUL, form feed, ESC, ...);
-/// the bare serde message alone ("control character ... found while parsing
-/// a string") does not tell a caller what to do about it.
-fn describe_value_parse_error(e: &serde_json::Error, json_src: &str) -> String {
+/// grammar and the MCP double-escape gotcha (ADR-084 §3c). Classification
+/// and byte location come from scanning the known quoted source span
+/// directly (`raw`) via [`find_offending_control_byte`], never from matching
+/// `serde_json::Error`'s message text, which is not a stable contract.
+/// Failures with no control byte in `raw` (e.g. an invalid `\q` escape) fall
+/// through to the plain serde message unchanged.
+fn describe_quoted_string_parse_error(e: &serde_json::Error, raw: &str) -> String {
     let base = e.to_string();
-    if !base.contains("control character") {
+    let Some((idx, c)) = find_offending_control_byte(raw) else {
         return base;
-    }
-    let offending = json_src
-        .char_indices()
-        .find(|&(_, c)| (c as u32) < 0x20)
-        .map(|(idx, c)| format!(" — byte {idx} of the value is {c:?} (U+{:04X})", c as u32))
-        .unwrap_or_default();
+    };
     format!(
-        "{base}{offending}. DSL string escapes follow JSON: \\n, \\t, \\\", \\\\ (raw \
-         newline/CR/tab are also accepted literally; other control bytes must be escaped). \
-         If `ops` is sent through a JSON transport (every MCP client), the transport decodes \
-         one escape level before the DSL parser runs, so a literal backslash-escape must be \
-         doubled on the wire — e.g. send \\\\n to produce \\n here."
+        "{base} — byte {idx} of the value is {c:?} (U+{:04X}). DSL string escapes follow JSON: \
+         \\n, \\t, \\\", \\\\ (raw newline/CR/tab are also accepted literally; other control \
+         bytes must be escaped). If `ops` is sent through a JSON transport (every MCP client), \
+         the transport decodes one escape level before the DSL parser runs, so a literal \
+         backslash-escape must be doubled on the wire — e.g. send \\\\n to produce \\n here.",
+        c as u32
     )
 }
 
+/// Decodes a quoted-string DSL literal (`raw`, the exact quoted span
+/// including its surrounding `"`) into its `String` value, normalizing raw
+/// literal newline/CR/tab bytes to JSON escapes first (ADR-016) and
+/// enriching any remaining decode failure via
+/// [`describe_quoted_string_parse_error`]. Shared by quoted object keys
+/// (`parse_object_arg_body`) and quoted string values (`parse_value`) so the
+/// diagnostic cannot drift between the two paths.
+fn decode_quoted_json_string(raw: &str, pos: usize) -> Result<String, DslError> {
+    let normalized = escape_literal_control_chars(raw);
+    serde_json::from_str(&normalized).map_err(|e| DslError::InvalidValue {
+        pos,
+        error: describe_quoted_string_parse_error(&e, raw),
+    })
+}
+
+/// Validates quoted-reference brackets before promoting a string to `PrevRef`.
+/// A malformed segment keeps the entire value literal.
 fn quoted_prev_path_is_valid(path: &str) -> bool {
     let bytes = path.as_bytes();
     let mut i = 0;
