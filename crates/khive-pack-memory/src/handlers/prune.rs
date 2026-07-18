@@ -397,17 +397,24 @@ mod prune_recall_visibility_tests {
         crate::ann::clear_key(&ann, &key).await;
         ann.reset_warm_route_count();
 
+        // `fusion_strategy: None` omits the param entirely rather than passing
+        // "weighted" explicitly, so this leg exercises `RecallConfig::default()`
+        // (`config.rs` — `FusionStrategy::Weighted { weights: [0.7, 0.3] }`), the
+        // strategy an ordinary caller actually hits, not just the named strategy.
         for (label, fusion_strategy) in [
-            ("keyword_only (FTS lexical leg)", "keyword_only"),
-            ("vector_only (sqlite-vec/ANN leg)", "vector_only"),
-            ("rrf (default hybrid fusion)", "rrf"),
+            ("keyword_only (FTS lexical leg)", Some("keyword_only")),
+            ("vector_only (sqlite-vec/ANN leg)", Some("vector_only")),
+            ("rrf (non-default fusion, explicit)", Some("rrf")),
+            ("weighted (default fusion, fusion_strategy omitted)", None),
         ] {
             let mut params = serde_json::json!({
                 "query": NOTE_TEXT,
                 "limit": 10,
-                "fusion_strategy": fusion_strategy,
             });
-            if fusion_strategy == "vector_only" {
+            if let Some(fs) = fusion_strategy {
+                params["fusion_strategy"] = serde_json::json!(fs);
+            }
+            if fusion_strategy == Some("vector_only") {
                 params["embedding_model"] = serde_json::json!(MODEL);
             }
             let result = registry
@@ -431,6 +438,110 @@ mod prune_recall_visibility_tests {
             "post-prune vector recall must route through the exact sqlite-vec \
              fallback, not the warm ANN bridge"
         );
+    }
+
+    /// #533 follow-up: `RecallConfig::default()` fuses via `FusionStrategy::Weighted
+    /// { weights: [0.7, 0.3] }` (`config.rs`), not `rrf` — the shipped default is
+    /// reached by omitting `fusion_strategy` from the recall params entirely, not by
+    /// passing `"rrf"`. This test exercises that exact omitted-param path: seed a
+    /// low-salience note, confirm it is recallable pre-prune via the FTS, vector, and
+    /// default (fusion_strategy omitted) legs — proving each leg actually sees the
+    /// note, not just vacuously agreeing on absence — then prune and confirm all
+    /// three legs exclude it post-prune.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn prune_excludes_pruned_memory_via_default_weighted_fusion_recall() {
+        const MODEL: &str = "prune-533-visibility-model-weighted-default";
+        const DIMS: usize = 16;
+        const NOTE_TEXT: &str = "issue 533 prune stale weighted default fusion regression note";
+
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        rt.register_embedder(HashVecProvider {
+            model_name: MODEL.to_owned(),
+            dims: DIMS,
+        });
+
+        let ns = Namespace::parse("local").expect("local namespace");
+        rt.authorize(ns).expect("authorize local");
+
+        let pack = crate::MemoryPack::new(rt.clone());
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(pack);
+        let registry = builder.build().expect("registry");
+
+        let remember_result = registry
+            .dispatch(
+                "memory.remember",
+                serde_json::json!({
+                    "content": NOTE_TEXT,
+                    "salience": 0.1,
+                    "memory_type": "semantic",
+                }),
+            )
+            .await
+            .expect("memory.remember");
+        let note_id = remember_result["id"]
+            .as_str()
+            .expect("remember response carries id")
+            .to_string();
+
+        let recall_params = |fusion_strategy: Option<&str>| {
+            let mut params = serde_json::json!({ "query": NOTE_TEXT, "limit": 10 });
+            if let Some(fs) = fusion_strategy {
+                params["fusion_strategy"] = serde_json::json!(fs);
+            }
+            if fusion_strategy == Some("vector_only") {
+                params["embedding_model"] = serde_json::json!(MODEL);
+            }
+            params
+        };
+
+        // Sanity: recallable pre-prune via each leg — a leg empty both before and
+        // after prune would satisfy the post-prune absence assertion vacuously.
+        for (label, fusion_strategy) in [
+            ("keyword_only (FTS lexical leg)", Some("keyword_only")),
+            ("vector_only (sqlite-vec/ANN leg)", Some("vector_only")),
+            ("weighted (default fusion, fusion_strategy omitted)", None),
+        ] {
+            let result = registry
+                .dispatch("memory.recall", recall_params(fusion_strategy))
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("memory.recall [{label}] before prune must not error: {e:?}")
+                });
+            let hits = result.as_array().expect("bare array result");
+            assert!(
+                hits.iter().any(|h| h["id"] == note_id),
+                "seeded note must be recallable via {label} before prune: {hits:?}"
+            );
+        }
+
+        let prune_result = registry
+            .dispatch("memory.prune", serde_json::json!({ "min_salience": 0.5 }))
+            .await
+            .expect("memory.prune");
+        assert_eq!(
+            prune_result["pruned"], 1,
+            "the single seeded note (salience 0.1 < 0.5) must be pruned: {prune_result:?}"
+        );
+
+        for (label, fusion_strategy) in [
+            ("keyword_only (FTS lexical leg)", Some("keyword_only")),
+            ("vector_only (sqlite-vec/ANN leg)", Some("vector_only")),
+            ("weighted (default fusion, fusion_strategy omitted)", None),
+        ] {
+            let result = registry
+                .dispatch("memory.recall", recall_params(fusion_strategy))
+                .await
+                .unwrap_or_else(|e| panic!("memory.recall [{label}] must not error: {e:?}"));
+            let hits = result.as_array().expect("bare array result");
+            assert!(
+                hits.iter().all(|h| h["id"] != note_id),
+                "pruned note must not be returned via {label}, got: {hits:?}"
+            );
+        }
     }
 }
 
