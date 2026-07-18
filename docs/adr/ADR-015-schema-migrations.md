@@ -177,9 +177,24 @@ need. Pack schema declarations add pack-specific tables that depend on a backend
 but don't belong to the core substrate (e.g., GTD lifecycle audit, memory pack
 indices, brain pack posterior state).
 
-The two never overlap. Core tables (`entities`, `graph_edges`, `notes`, `events`,
+The two never overlap, with one recorded exception: a core-lane versioned migration MAY carry
+pack-owned logical state when that state lives inside a table the core migration ledger already
+owns end to end. Core tables (`entities`, `graph_edges`, `notes`, `events`,
 plus per-namespace FTS5 / vector tables) are owned by `khive-db` migrations.
 Pack-auxiliary tables are owned by the pack.
+
+**The pack-owned-state-in-a-core-migration exception.** V5 (`unique_comm_message_external_id`) and V6
+(`brain_retune_driver`) established the precedent: both are core `khive-db` versioned migrations that
+evolve schema a pack -- comm, brain -- logically owns, because that schema was placed inside a table
+the core ledger already versions rather than in a boot-time pack declaration of its own. V11
+(`comm_channel_cursor_source_key`, ADR-056 Amendment 2026-07-17) follows the same precedent: it widens
+the pack-owned `comm_channel_cursor` table's key and adds a column, shipped as a core `khive-db`
+versioned migration rather than a pack schema declaration, because `comm_channel_cursor` already
+carries a forward-only version history in the core ledger and a boot-time `CREATE TABLE IF NOT EXISTS`
+cannot express a widened uniqueness key or a backward-compatible column add against existing rows the
+way a versioned migration can. The exception is narrow: it applies only to evolving a table's shape
+that a core migration already owns, never to introducing a wholly new pack-auxiliary table through the
+core lane, which remains the pack's own boot-time declaration to make.
 
 ### Versioned migration model
 

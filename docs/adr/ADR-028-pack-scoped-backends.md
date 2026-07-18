@@ -381,8 +381,8 @@ catches both cases at boot, immediately.
 
 Keep one SQLite file; use the existing `namespace` field on every row. Pros: simplest
 mental model. Cons: cannot isolate VACUUM, cannot read-only one slice, cannot backup
-independently, hot/cold data interleave on disk. khive-internal explicitly rejected this
-for the lore use case for these reasons.
+independently, hot/cold data interleave on disk. The lore pack's backend design explicitly
+rejected this for these reasons.
 
 Rejected. Namespace is for tenancy; backend is for storage profile.
 

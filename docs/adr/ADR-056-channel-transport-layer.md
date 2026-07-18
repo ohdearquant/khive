@@ -526,18 +526,26 @@ entry is deliberately updated; the mismatch is never auto-accepted.
 
 **Pinned known-hosts file integrity.** The host-key pin is only as trustworthy as the file that
 holds it. `/etc/khive/imessage/known_hosts` is a fixed absolute path provisioned during one-time setup
-and belongs to the same boundary as the client key file below: it must not be writable by the daemon
-account -- so a compromised daemon cannot append or substitute a host-key entry to pre-trust a bridge
-host it controls -- and must resolve as a non-symlink so the path cannot be redirected to an
-attacker-controlled known-hosts file after setup. Non-writability of the file alone is insufficient:
+and belongs to the same boundary as the client key file below: it must be root-owned and writable by
+root alone -- mode carrying no group- or other-write bit (`mode & 022 == 0`) -- rather than merely
+non-writable by the daemon account, because non-writability checked only against the daemon account
+leaves the file open to any other non-root local principal on the host: a second local account, or a
+group the file's mode happens to grant write to, could substitute a host-key entry just as effectively
+as a compromised daemon could. The file must also resolve as a non-symlink so the path cannot be
+redirected to an attacker-controlled known-hosts file after setup. Root ownership and a
+no-group/other-write mode on the file alone are insufficient:
 the containing directory chain up to the provisioning root -- the root-owned `/etc/khive/imessage/`
 established by privileged setup, outside the daemon account's own home (§Provisioned files) -- must
-also be non-writable by the daemon account, since replacing a name within a writable directory needs no
-write permission on the file it named. Were the daemon able to rewrite this file, it could record its own intercepting host key as
+carry the same root-owned, root-only-writable shape at every level, since replacing a name within a
+directory writable by any non-root principal needs no write permission on the file it named. Were any
+non-root local principal able to rewrite this file or redirect it through a writable ancestor
+directory, that principal could record its own intercepting host key as
 the pinned entry, and every subsequent `StrictHostKeyChecking=yes` invocation would silently accept
 the substituted bridge host -- the exact instruction-injection path the host pin exists to close.
 Acceptance property: the adapter refuses to start when `/etc/khive/imessage/known_hosts` is a symlink,
-is writable by the daemon account, or resolves through any directory writable by the daemon account.
+is not owned by root, carries a group- or other-write permission bit, or resolves through any
+directory that is not similarly root-owned and root-only-writable at every level up to the
+provisioning root.
 
 **Pinned client identity.** Pinning the host key constrains which bridge host the client will
 trust; it says nothing about which private key the client authenticates _with_. Without an
@@ -576,10 +584,12 @@ let a root-owned file stay unwritable by the daemon while the daemon still reads
 both loads under `ssh` and grants the daemon the read it needs. Because the daemon owns the file it
 can in principle rewrite its contents; the substitution resistance does not come from file
 immutability but from two other properties. First, the key lives inside the root-owned
-`/etc/khive/imessage/` provisioning root, and that directory and every directory up to it are not
-writable by the daemon account, so the daemon can neither unlink and recreate the file at the same
-path nor redirect the path through a symlink -- replacing a name within a directory is a directory
-permission, and the daemon has none here. Second, and more fundamentally, substituting the client key
+`/etc/khive/imessage/` provisioning root, and that directory and every directory up to it are
+root-owned and writable by root alone -- not merely unwritable by the daemon account, which would
+still leave the ancestor chain open to some other non-root local principal -- so neither the daemon
+nor any other non-root account can unlink and recreate the file at the same
+path or redirect the path through a symlink -- replacing a name within a directory is a directory
+permission, and no non-root principal has any here. Second, and more fundamentally, substituting the client key
 gains a compromised daemon nothing: any key it installs must still appear in the bridge account's
 `authorized_keys` (which lives on the bridge host, unwritable from the daemon) to authenticate at all,
 and even then it authenticates only as the forced-command, single-account-confined bridge account
@@ -589,7 +599,7 @@ cannot be redirected to a substituted key after setup. This provisioned absolute
 source for the `-i` invocation; the adapter does not discover the key location dynamically at runtime.
 Acceptance property: the adapter refuses to start when the bridge key at its provisioned absolute path
 is a symlink, is not owned by the daemon account, carries any group or other permission bit (a shape
-`ssh` would itself refuse), or resolves through any directory writable by the daemon account.
+`ssh` would itself refuse), or resolves through any directory that is not root-owned and root-only-writable.
 
 **Client-side config isolation.** `-F none` is the literal argument OpenSSH's client documents
 for suppressing configuration-file processing entirely -- both the system-wide
@@ -610,18 +620,18 @@ verification does not substitute for a matching entry in the dedicated
 `/etc/khive/imessage/known_hosts` file.
 
 **Transport deadlines and recovery.** Each `ssh` invocation runs under a total wall-clock
-deadline of 30 seconds enforced by the adapter itself, which kills and reaps the child process on
+deadline of 35 seconds enforced by the adapter itself, which kills and reaps the child process on
 expiry rather than allowing a hung invocation to accumulate indefinitely. Connection
 establishment is separately bounded by a 10-second connect timeout passed as an `ssh` option
 (`-o ConnectTimeout=10`), so a bridge host that is up but not accepting connections fails fast
-instead of consuming the whole 30-second deadline waiting on a connection that will never
+instead of consuming the whole 35-second deadline waiting on a connection that will never
 establish.
 
 A tick that drains multiple pages MAY pipeline those `poll` operations over a single SSH session
 rather than opening one session per page -- the wire framing permits both (§Typed wire schema) -- so
 a multi-page drain amortizes the connection handshake across its pages instead of paying one
 handshake per page. Session reuse is a transport optimization only and changes no correctness
-property: the 30-second invocation deadline still bounds each session and each `poll` still runs
+property: the 35-second invocation deadline still bounds each session and each `poll` still runs
 under its own scan budget, so a session carries as many pages as fit its deadline and any page
 beyond that resumes from the last committed checkpoint -- the same page-granular resumption the
 10-page cap and `budget_truncated` paths already define (§Bounded drain per tick).
@@ -655,8 +665,13 @@ be parsed as an `ssh` option. Acceptance property: an option-prefixed `KHIVE_IME
 value refuses channel start.
 
 Presence and shape of the `user@` prefix are necessary but not sufficient: the adapter also pins the
-username to a specific value. One-time setup records the provisioned bridge-account name as a fixed
-adapter-side value, and config-load validation requires the username parsed from
+username to a specific value. One-time setup records the provisioned bridge-account name in a
+dedicated provisioned file, `/etc/khive/imessage/bridge_account`, holding the bare account name as its
+entire contents: a fixed absolute path under the same root-owned `/etc/khive/imessage/` provisioning
+root as the pinned known-hosts and bridge-key files (§Provisioned files), carrying the same integrity
+shape -- root-owned, writable by root alone, non-symlink, resolved through a root-owned and
+root-only-writable directory chain (§Pinned known-hosts file integrity) -- so a compromised daemon
+cannot rewrite its own comparator target. Config-load reads this file once and requires the username parsed from
 `KHIVE_IMESSAGE_SSH_TARGET` to equal that pinned account exactly -- any other username, even a
 syntactically valid one, returns `ChannelError::Config` and the channel does not start. This is the
 client-side complement to the server-side single-account key confinement (§Server-side key
@@ -723,14 +738,18 @@ load-bearing as the pinned key: if the bridge account could replace the helper b
 replace the program the forced command runs. One-time setup therefore installs the helper binary, its
 containing directory chain up to root, its root-owned provisioning configuration (the database path,
 maintainer handle, and recipient pins the helper reads, §Helper-side authority pinning), and the
-`/etc/khive/imessage/scan_floors` ledger (§Floor storage) all root-owned, non-symlink, and not
-writable by the bridge account or any group it belongs to -- the same integrity shape the pinned key
-and known-hosts files carry. A bridge account that could write any of these could redirect the forced
+`/etc/khive/imessage/scan_floors` ledger (§Floor storage) all root-owned, mode carrying no group- or
+other-write bit -- writable by root alone, not merely unwritable by the bridge account, since a mode
+that excludes only the bridge account can still admit some other non-root local principal on the
+host -- the same integrity shape the pinned known-hosts file carries (§Pinned known-hosts file
+integrity). A bridge account, or any other non-root local principal, that could write any of these
+could redirect the forced
 command, relax the helper's authority pins, or move a scan floor from the account the forced command
-already runs as; rooting them outside that account's reach is what keeps the helper's own authority
+already runs as; rooting them outside every non-root account's reach is what keeps the helper's own authority
 pins meaningful against a compromised bridge account, not only against a compromised daemon. Setup
-verifies each and refuses to complete when any is a symlink, is writable by the bridge account, or
-resolves through a directory writable by it (acceptance property 35).
+verifies each and refuses to complete when any is a symlink, is not root-owned, carries a group- or
+other-write permission bit, or
+resolves through a directory that is not similarly root-owned and root-only-writable (acceptance property 35).
 
 **Helper execution hygiene.** The server-side directive-family table (§Directive family) closes the
 paths by which the SSH server itself could inject an environment or substitute a command into the
@@ -765,8 +784,9 @@ this launcher shape.
 
 The stdin/stdout contract between the adapter and the helper is itself versioned, not an
 implicit, unversioned shape inferred from field names. Every request the adapter writes to the
-helper's stdin carries an explicit protocol version field and an operation discriminator (poll,
-send, or any future operation), and the helper's structured stdout response carries the same
+helper's stdin carries an explicit protocol version field and an operation discriminator --
+`activation`, `poll`, `identity`, `send`, or any future operation (§The concrete operation set) --
+and the helper's structured stdout response carries the same
 protocol version field back alongside either a result payload or a structured error. The adapter
 refuses to proceed -- treating the invocation as a transport failure under §Transport deadlines
 and recovery above -- when the version the helper reports falls outside the adapter's supported
@@ -1280,21 +1300,38 @@ configuration of _every_ account that can be an authentication principal on the 
 enumerated from the host's own account directory rather than a curated list -- on macOS every user
 `dscl . -list /Users` returns, system and role accounts included, since an audit that skipped the
 unattended service accounts would leave exactly the account an attacker would target -- each resolved
-through `sshd -T -C user=<account>` (which expands `%u`/`%h` tokens and applies every `Match`
-block for that account), and enforces one host-wide invariant: the pinned key authenticates as exactly
+through `sshd -T -C user=<account>,addr=<daemon-source-address>,host=<daemon-source-host>` -- the
+daemon's real connection tuple, not a user-only enumeration -- which expands `%u`/`%h` tokens and
+applies every `Match` block reachable under that tuple, including a block scoped on `Address` or
+`Host` rather than `User`. A `Match` block keyed on the daemon's source address or host, rather than
+on any account name, can set its own `AuthorizedKeysFile` for the connection regardless of which
+account it authenticates: resolving each account with a bare `user=<account>` query evaluates the
+config as though the connection originated from an unspecified peer, and so can miss exactly the
+`Match Address`/`Match Host` block that applies when the daemon actually connects, letting it
+authorize the pinned key into a different, unconstrained account under the daemon's real connection
+tuple without the audit ever seeing it. Resolving under the full tuple for every account closes this:
+the audit enforces one host-wide invariant, evaluated fail-closed across every reachable `Match`
+context rather than only the ones a per-account, tuple-less query would surface: the pinned key
+authenticates as exactly
 one principal -- the bridge account -- through exactly one entry -- the single root-owned, `command=`-
 and `restrict`-bearing `authorized_keys` line (property 35). Concretely, for every non-bridge account
-the audit reads each file its effective `AuthorizedKeysFile` resolves to and refuses setup if the
+the audit reads, under the daemon's real connection tuple, each file its effective `AuthorizedKeysFile`
+resolves to and refuses setup if the
 pinned public key appears in any of them, requires its `AuthorizedKeysCommand` and
 `AuthorizedPrincipalsCommand` to be `none` (a non-`none` command could return the pinned key
 dynamically and cannot be statically cleared, so any non-`none` value on any account fails the audit),
 and requires its certificate-principal and CA sources to be `none` so no CA-signed path can vouch the
-key either; for the bridge account it confirms the pinned key appears only in the one root-owned
-forced-command entry and in no bare entry. Acceptance property: presenting the provisioned private key
-to the bridge host authenticates only as the bridge account and only into the forced command -- an
+key either; for the bridge account, resolved under the same tuple, it confirms the pinned key appears
+only in the one root-owned
+forced-command entry and in no bare entry, and that no `Address`- or `Host`-scoped `Match` block
+reachable under that tuple names an alternate `AuthorizedKeysFile` path or admits the key without the
+forced-command binding. Acceptance property: presenting the provisioned private key
+to the bridge host, from the daemon's actual source address and host, authenticates only as the
+bridge account and only into the forced command -- an
 attempt to authenticate as any other account with that key, or as the bridge account through any entry
 lacking the forced command, is refused, and setup fails closed if any account's effective key or
-principal sources could admit the pinned key outside that single confined entry.
+principal sources, resolved under the daemon's connection tuple and across every reachable `Match`
+context, could admit the pinned key outside that single confined entry.
 
 **Appendix -- complete `sshd_config(5)` directive disposition.** The enumeration is every directive
 the `sshd_config(5)` OPTIONS section documents -- the keyword heading each option entry -- which on the
@@ -1411,7 +1448,11 @@ window between provisioning and that first activation therefore sits above the s
 below the activation checkpoint, and is intentionally not imported -- it is exactly the
 pre-activation history the forward-only start declines to ingest. What this floor underwrites is "no
 history before activation, and nothing below the provisioning maximum for a compromised daemon to
-reach", never "every message after provisioning is delivered". The confidentiality this provides is
+reach", never "every message after provisioning is delivered". The provisioning floor is scoped as an
+adapter import boundary -- which rows can ever be ingested -- not a confidentiality boundary against a
+compromised daemon; a compromised daemon that can invoke the helper at all can already request any row
+at or above the floor, so the floor's guarantee is about what history is excluded, not about who may
+read what is included. The confidentiality this provides is
 bounded precisely at the provisioning floor: rows below it are unreachable by any daemon-supplied
 poll, while rows above it are readable by a compromised daemon exactly as they are by the cooperative
 adapter. The floor is a reachability boundary on old history, not a general secrecy guarantee over the
@@ -1606,7 +1647,7 @@ destined for the channel under bounds that keep one slow or failing send from mo
 mirroring the inbound drain (§Bounded drain per tick) and the poll transport recovery (§Transport
 deadlines and recovery). Each outbound tick carries a per-tick wall-clock budget (default one
 `KHIVE_IMESSAGE_POLL_SECS` interval) checked after each send, plus a secondary per-tick note-count
-cap. Because every `Channel::send` runs under the same 30-second SSH invocation deadline as a poll, a
+cap. Because every `Channel::send` runs under the same 35-second SSH invocation deadline as a poll, a
 single slow or timed-out send already exceeds the per-tick budget, so the task yields after that one
 send and re-drains on the next tick: an unbounded serial drain of a full 200-note backlog whose every
 send hit the deadline would otherwise occupy the task for roughly 100 minutes, and the per-tick budget
@@ -1636,7 +1677,17 @@ database its provisioning configuration names, with read-only semantics on the b
 verifies that database's content identity before use (§Helper-side authority pinning, §Floor
 storage). Polling runs at a configurable interval
 (`KHIVE_IMESSAGE_POLL_SECS`, default 5 seconds, mirroring §12's default inter-poll interval;
-validation rule below). The adapter never writes to `chat.db`. Delivery into `comm.ingest` is
+validation rule below). This interval is the target gap between the end of one tick's work and the
+start of the next, not a bound on how long a single tick may run: the inbound task is a single
+sequential loop, so ticks never overlap, and a tick whose own SSH invocation and drain take longer
+than the interval is followed immediately by the next tick with no additional sleep, rather than the
+two running concurrently. The interval therefore does not, and is not intended to, bound end-to-end
+poll latency or how long the poll task is occupied on a given tick -- that occupancy is bounded
+separately and explicitly by the 35-second SSH invocation deadline (§Transport deadlines and
+recovery) plus the per-tick drain wall-clock cap (§Bounded drain per tick): a sparse or poorly
+indexed `chat.db` can legitimately hold a tick for close to the helper's 20-second scan budget before
+returning any candidate, and that is expected, bounded behavior, not a violation of the configured
+5-second interval. The adapter never writes to `chat.db`. Delivery into `comm.ingest` is
 attributed as `imessage:<slug>` inbound, following the channel-prefixed `from` form OQ-1
 established (§14; also used by the Telegram amendment's `from = "telegram:<maintainer-slug>"`).
 
@@ -1674,7 +1725,16 @@ adapter check rejected them -- silently dropping all inbound as an unauthorized 
 continued reaching the provisioned recipient, a one-way break with no error surfaced. The env var is
 therefore a bootstrap and display value only; activation performs an equality check between it and the
 helper-reported provisioned handle and fails loud on a mismatch, rather than degrading to silent
-inbound loss. Conversation membership is not among the defense-in-depth checks: the helper
+inbound loss. This equality check normalizes both sides with the same `normalized_handle` reduction
+used for `handle_token` derivation (§Canonical encoding of `db_identity`, `handle_token`, and the
+`source` string below) before comparing them, rather than comparing the raw strings: without that
+shared normalization, two textually different but equivalent handles -- `+1 (555) 123-4567` against
+`+15551234567`, or an Apple ID email that differs only in case or surrounding whitespace -- would
+derive the identical `handle_token` and so the identical cursor `source`, yet fail this raw-string
+equality check and refuse to start, even though the handle they name is the one the helper actually
+filters on. Normalizing both sides of the check the same way `handle_token` normalizes its input
+closes that gap: equivalent handles validate and start correctly, and only a handle that is genuinely
+different after normalization fails loud. Conversation membership is not among the defense-in-depth checks: the helper
 withholds non-member rows and `MessageRow` exposes no conversation field, so it is a helper-side
 boundary only. Acceptance property: a `chat.db` row
 outside the setup-time-fixed maintainer conversation, or bearing a sender handle other than the
@@ -1776,8 +1836,11 @@ configured `KHIVE_IMESSAGE_SSH_TARGET`, the provisioned database's `db_identity`
 content-lineage token the helper returns in its `activation` response (§Floor storage) -- and a
 `handle_token` derived from the setup-fixed provisioned maintainer handle the same `activation`
 response returns (§Sender validation), in the
-form `imessage-ssh:{ssh_target}:{db_identity}:{handle_token}`, mirroring the shape of the email adapter's
-`imap+tls:{host}:{port}:{mailbox}:INBOX` source string (§Amendment 2026-07-09). The `handle_token`
+form `imessage-ssh-v1:{pct(ssh_target)}:{db_identity}:{handle_token}` (§Canonical encoding below
+defines `pct()`), mirroring the shape of the email adapter's
+`imap+tls:{host}:{port}:{mailbox}:INBOX` source string (§Amendment 2026-07-09). `imessage-ssh-v1:` is
+the sole normative encoding of this source key; no unversioned `imessage-ssh:` form exists or is ever
+written or accepted. The `handle_token`
 is a stable non-reversible digest of the provisioned handle, never the raw handle: it keeps the raw
 phone number or Apple ID out of the cursor identity string, and -- being a function of the handle
 alone, not of provisioning time -- it is identical across every re-provisioning that keeps the same
@@ -1818,7 +1881,12 @@ match its own row. The encodings are therefore fixed, not opaque:
   own canonical handle form before hashing: a phone number to E.164 (leading `+`, digits only, no
   spaces or punctuation), an Apple ID to its address lowercased with surrounding whitespace stripped.
   Normalizing before the digest is what makes `+1 (555) 123-4567` and `+15551234567` yield one token;
-  the digest is non-reversible, keeping the raw number or address out of the key. The result is 64
+  the digest is non-reversible, keeping the raw number or address out of the key. This is a
+  preimage-resistance guarantee, not a secrecy one: the input space of phone numbers and email
+  addresses is small enough for offline dictionary search to recover a specific handle from its
+  token without a salt, so `handle_token` guarantees the raw handle is omitted from the cursor
+  store, not that the handle is unrecoverable to an attacker willing to search that space. The
+  result is 64
   lowercase hex characters and contains no `:`.
 - **The `source` string** is `imessage-ssh-v1:{pct(ssh_target)}:{db_identity}:{handle_token}`, four
   `:`-delimited fields. Only `ssh_target` can contain a `:` (an IPv6 literal such as `user@[::1]`, or
@@ -2160,7 +2228,7 @@ ingested, never the rows the engine examines to find them. The helper therefore
 MUST impose a per-invocation wall-clock budget on the scan -- a mandatory bound, not the optional one
 an earlier form of this section allowed -- together with a maximum serialized response size in bytes.
 Both carry normative defaults tied to the transport envelope rather than left to the deployment: the
-scan wall-clock budget defaults to 20 seconds and MUST in all cases stay strictly below the 30-second
+scan wall-clock budget defaults to 20 seconds and MUST in all cases stay strictly below the 35-second
 SSH invocation deadline (§Transport deadlines and recovery), so the helper returns a `budget_truncated`
 partial page -- preserving forward progress -- before the adapter's own deadline kills the child and
 loses the page to a transport failure; the response-byte budget defaults to 8 MiB -- a size a single
@@ -2171,14 +2239,18 @@ is ingested, attachment blobs are never carried). The byte budget is not claimed
 independent and whichever binds first truncates the page, so a page whose accumulated serialized bytes
 reach 8 MiB before 200 candidates are gathered is returned as a byte-`budget_truncated` partial page
 carrying fewer rows, exactly as the scan budget truncates on time, and the response a caller must
-receive within the deadline is bounded to 8 MiB regardless of row count. The 20-second scan default is
-in turn set below the 30-second deadline by a margin sized for the bounded post-scan stages the
-deadline must also cover -- serializing the byte-capped response, framing it, moving it over the SSH
-session, and the adapter reading and deserializing it: because the response is byte-bounded and the
-scan time-bounded, that residual covers moving at most 8 MiB plus framing, so scan, serialization,
-transport, and response handling together complete within the invocation deadline rather than the scan
-alone consuming it. Setup verifies the configured scan budget plus this transport margin stays under
-the invocation deadline, refusing a scan budget raised so high it leaves no room to return the page.
+receive within the deadline is bounded to 8 MiB regardless of row count. The budget arithmetic is
+explicit and additive, not merely each term staying individually under the deadline: the 10-second
+connect timeout and the 20-second scan default are both worst-case phases of the same invocation, so
+together they can consume 30 of the 35-second deadline before any response leaves the bridge host,
+leaving a 5-second reserve for the bounded post-scan stages the deadline must also cover --
+serializing the byte-capped response, framing it, moving it over the SSH session, and the adapter
+reading and deserializing it. Because the response is byte-bounded and the scan time-bounded, that
+5-second reserve covers moving at most 8 MiB plus framing, so connect, scan, transport, and response
+handling together complete within the invocation deadline rather than the scan alone consuming what
+the connect phase leaves. Setup verifies `connect_timeout + scan_budget + transport_margin <=
+invocation_deadline` with the margin sized for the 8 MiB response-byte budget, refusing a connect
+timeout or scan budget raised so high that no reserve remains to return the page.
 When either budget is reached before a page completes, the helper returns the candidates gathered so
 far as a **partial page** with status `budget_truncated`: it sets the scan floor to the greatest
 `ROWID` below which it has examined every row this page, so no candidate at or below that floor is
@@ -2305,11 +2377,13 @@ variable -- the daemon never names a database at runtime, so there is no `KHIVE_
 a compromised daemon to repoint. The helper opens only the database its provisioning configuration
 names, conventionally `~/Library/Messages/chat.db`.
 
-**Provisioned files (fixed paths, not environment variables).** Two files the transport depends on
+**Provisioned files (fixed paths, not environment variables).** Three files the transport depends on
 are deliberately not configurable through the environment, because the adapter must not discover
 their location dynamically at runtime (§Transport: the pinned key file above): the pinned known-hosts
-file `/etc/khive/imessage/known_hosts` and the pinned bridge key file `/etc/khive/imessage/bridge_key`
-(the `<pinned_bridge_key>` named in every `ssh` invocation above). Both are fixed absolute paths
+file `/etc/khive/imessage/known_hosts`, the pinned bridge key file `/etc/khive/imessage/bridge_key`
+(the `<pinned_bridge_key>` named in every `ssh` invocation above), and the pinned bridge-account name
+file `/etc/khive/imessage/bridge_account` (§SSH target validation and the end-of-options delimiter)
+that the mandatory bridge-account username comparison reads. All three are fixed absolute paths
 under the `/etc/khive/imessage/` provisioning root -- a root-owned system directory outside the daemon
 account's home, deliberately not under the daemon's own state root. The non-writability the transport
 section requires of the pin files and every directory up to the provisioning root could never hold
@@ -2324,11 +2398,13 @@ cannot instead be root-owned and group-readable), inside the root-owned provisio
 daemon cannot write -- so the daemon can read the key but can neither redirect its resolved path nor
 replace the file at that path, and rewriting the contents in place gains nothing against the
 server-side confinement (§Transport: the pinned key file above).
-Both are subject to the integrity checks the transport section states -- non-symlink, non-writable by
-the daemon account, reached only through non-daemon-writable directories -- with the adapter refusing
-to start when either check fails. Fixing these paths rather than deriving them from the environment removes the
+All three are subject to the integrity checks the transport section states -- non-symlink, root-owned
+and root-only-writable (the bridge key file itself excepted, per its OpenSSH-constrained shape
+above), reached only through root-owned, root-only-writable directories -- with the adapter refusing
+to start when any check fails. Fixing these paths rather than deriving them from the environment removes the
 substitution surface an env-configured path would open: a compromised daemon cannot point the
-transport at a different key or a rewritten known-hosts file by altering its own environment.
+transport at a different key, a rewritten known-hosts file, or a different pinned bridge-account name
+by altering its own environment.
 
 **Poll-interval validation.** `KHIVE_IMESSAGE_POLL_SECS` is validated at config load, not at
 first use: it must parse as an integer greater than or equal to 1. A zero value, a negative
@@ -2404,7 +2480,7 @@ require a real bridge host -- a live `sshd`, the installed helper binary, real f
 migration crash-injection, or `sshd -T -C` -- and cannot be proven by a mock, because a mock would
 merely assert the behavior it is standing in for; they constrain the bridge-side and server-side
 controls the adapter depends on but does not itself implement. Properties 1-13, 16, 23, and 28-30 are
-Tier A; properties 14, 15, 17-22, 24-27, and 31-36 are Tier B. The header on an earlier revision of
+Tier A; properties 14, 15, 17-22, 24-27, and 31-39 are Tier B. The header on an earlier revision of
 this section, which labeled the whole set "transport mocked," was inaccurate for the Tier B
 properties and is corrected here.
 
@@ -2488,8 +2564,9 @@ properties and is corrected here.
     commits the rebuild DDL and the `_schema_migrations` record in one transaction, and the version
     guard skips the migration once it is recorded (§Atomicity and crash-idempotency).
 21. The adapter refuses to start when `/etc/khive/imessage/known_hosts` or the pinned bridge key at
-    `/etc/khive/imessage/bridge_key` is a symlink or resolves through a directory writable by the
-    daemon account, when the known-hosts file is writable by the daemon account, or when the pinned
+    `/etc/khive/imessage/bridge_key` is a symlink or resolves through a directory that is not
+    root-owned and root-only-writable, when the known-hosts file is not root-owned or carries a
+    group- or other-write permission bit, or when the pinned
     bridge key is not owned by the daemon account or carries any group or other permission bit -- a
     key shape `ssh` would itself refuse to load.
 22. Authentication to the bridge account by any method other than the single provisioned restricted
@@ -2544,11 +2621,14 @@ properties and is corrected here.
     presented against any other account on the bridge host it is refused. One-time setup establishes
     this by auditing every account the host's own directory enumerates (`dscl . -list /Users` on
     macOS, system and role accounts included, never a curated list), resolving each account's
-    effective configuration with `sshd -T -C user=<account>`, and failing closed if any non-bridge
+    effective configuration with `sshd -T -C user=<account>,addr=<daemon-source-address>,host=<daemon-source-host>`
+    -- the daemon's real connection tuple, so an `Address`- or `Host`-scoped `Match` block a bare
+    `user=<account>` query would miss is still evaluated -- and failing closed if any non-bridge
     account's resolved `AuthorizedKeysFile` contains the pinned key, if any account's
     `AuthorizedKeysCommand` or `AuthorizedPrincipalsCommand` is other than `none`, or if the bridge
     account admits the key through any entry lacking the forced command -- so a daemon-chosen `user@`
-    naming a different account cannot escape the forced-command and `Match`-block confinement
+    naming a different account, or a `Match` block scoped to the daemon's address or host rather than
+    to a user, cannot escape the forced-command and `Match`-block confinement
     (§Audit scope: every account, not only the bridge account).
 33. **[integration]** No `poll`, and no daemon-supplied floor value, ever lowers a recorded scan
     floor; the recorded floor decreases only after an explicit root-run floor-reset re-provisioning,
@@ -2556,19 +2636,22 @@ properties and is corrected here.
     cleanup yields `below_scan_floor` on every poll until that ceremony runs, never a silent history
     rescan (§Floor storage, and recovery from a database that legitimately shrinks).
 34. **[integration]** The helper enforces its own per-invocation wall-clock and response-byte budgets,
-    each with a normative default (scan budget 20 seconds, strictly below the 30-second SSH invocation
+    each with a normative default (scan budget 20 seconds, strictly below the 35-second SSH invocation
     deadline; response-byte budget 8 MiB) and neither raisable nor lowerable by any caller-supplied
     value: a page whose scan or serialization would exceed either budget returns `budget_truncated`
     with `next_floor` set to the greatest fully-examined `ROWID`, before the adapter's transport
     deadline can kill the invocation. Separately, the adapter bounds each poll tick's drain phase by a
-    wall-clock budget (default one `KHIVE_IMESSAGE_POLL_SECS` interval), stopping at a 200-row page
-    boundary and committing there, so a slow ingest backend cannot make a single tick run for an
-    unbounded duration.
+    wall-clock budget (default one `KHIVE_IMESSAGE_POLL_SECS` interval), checked after each candidate
+    row's ingest rather than only at a page boundary: when the cap fires mid-page, the adapter stops
+    after the row it just ingested and commits the checkpoint at that row's `ROWID`, a mid-page floor,
+    rather than waiting for the 200-row page to complete, so a slow ingest backend cannot make a
+    single tick run for an unbounded duration (§Bounded drain per tick).
 35. **[integration]** One-time setup fails, and no key is provisioned, when the helper binary at its
     forced-command path, any directory up to root on that path, the helper's root-owned provisioning
     configuration, the bridge account's `AuthorizedKeysFile` or any directory up to root on its path,
-    or the `/etc/khive/imessage/scan_floors` ledger is a symlink, is writable by the bridge account,
-    or resolves through a bridge-account-writable directory.
+    or the `/etc/khive/imessage/scan_floors` ledger is a symlink, is not root-owned, carries a group- or
+    other-write permission bit,
+    or resolves through a directory that is not similarly root-owned and root-only-writable.
 36. **[integration]** One-time setup fails, and no key is provisioned, on a bridge host whose
     effective `sshd` configuration files -- the main `sshd_config` and every file reached through an
     `Include` -- set `AuthorizedKeysCommand` or `AuthorizedPrincipalsCommand` to any value other than
@@ -2967,6 +3050,17 @@ result, reads
 `channel_registry.send_outbound` for the reply. The comm-pack handler is unchanged.
 
 ### 6. The polling loop lives in the binary, not in a pack
+
+**Lifecycle model superseded.** This section describes the original single shared `poll_all`-driven
+task; that model is retired. The 2026-07-17 amendment's per-adapter loop pairs
+(`spawn_*_channel_loops`, §The `khive-channel-imessage` crate) are the sole authoritative lifecycle
+model, correcting the 2026-07-05 amendment's narrower supersession claim that scoped itself only to
+the outbound path and reply routing (§5c, §5d) without retiring this section's single-task
+description. Every subsequent reference below to "the polling loop" as a single task -- what it
+holds, its startup pre-flight, its per-dispatch namespace handling -- describes mechanics that still
+apply, individually, to each adapter's own inbound loop; it is retained for that mechanical detail,
+not as a description of a currently-live shared task. Where this section and the per-adapter model
+disagree on how many tasks run, the per-adapter model governs.
 
 The polling loop is a `tokio::task::spawn` inside `kkernel`'s startup sequence, after the
 `VerbRegistry` is built and before the MCP server begins accepting connections.
