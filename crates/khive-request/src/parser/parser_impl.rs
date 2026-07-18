@@ -401,7 +401,7 @@ impl<'a> Parser<'a> {
         };
         let value: Value = serde_json::from_str(json_src).map_err(|e| DslError::InvalidValue {
             pos: start,
-            error: e.to_string(),
+            error: describe_value_parse_error(&e, json_src),
         })?;
         self.pos = end;
         Ok(value)
@@ -503,6 +503,32 @@ impl<'a> Parser<'a> {
 
 /// Validates quoted-reference brackets before promoting a string to `PrevRef`.
 /// A malformed segment keeps the entire value literal.
+/// Enriches a `serde_json` string-decode failure with the ADR-016 escape
+/// grammar and the MCP double-escape gotcha. Raw newline/CR/tab bytes are
+/// already normalized before `json_src` reaches `serde_json` (see
+/// `escape_literal_control_chars`), so any remaining control-character
+/// failure here is a byte outside that carve-out (NUL, form feed, ESC, ...);
+/// the bare serde message alone ("control character ... found while parsing
+/// a string") does not tell a caller what to do about it.
+fn describe_value_parse_error(e: &serde_json::Error, json_src: &str) -> String {
+    let base = e.to_string();
+    if !base.contains("control character") {
+        return base;
+    }
+    let offending = json_src
+        .char_indices()
+        .find(|&(_, c)| (c as u32) < 0x20)
+        .map(|(idx, c)| format!(" — byte {idx} of the value is {c:?} (U+{:04X})", c as u32))
+        .unwrap_or_default();
+    format!(
+        "{base}{offending}. DSL string escapes follow JSON: \\n, \\t, \\\", \\\\ (raw \
+         newline/CR/tab are also accepted literally; other control bytes must be escaped). \
+         If `ops` is sent through a JSON transport (every MCP client), the transport decodes \
+         one escape level before the DSL parser runs, so a literal backslash-escape must be \
+         doubled on the wire — e.g. send \\\\n to produce \\n here."
+    )
+}
+
 fn quoted_prev_path_is_valid(path: &str) -> bool {
     let bytes = path.as_bytes();
     let mut i = 0;
