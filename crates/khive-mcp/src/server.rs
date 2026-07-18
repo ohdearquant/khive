@@ -2363,7 +2363,7 @@ mod tests {
         // `ops` argument as a JSON string using the standard JSON `\n`
         // escape. Deserializing `RequestParams` decodes that escape into an
         // actual raw LF byte inside the DSL source — the exact shape
-        // `escape_literal_control_chars` (crates/khive-request/src/parser/scan.rs)
+        // `normalize_quoted_string` (crates/khive-request/src/parser/scan.rs)
         // exists to accept. This confirms the decoded raw newline survives
         // parsing and dispatch all the way to the pack handler's result.
         let wire = "{\"ops\":\"create(kind=\\\"entity\\\", entity_kind=\\\"concept\\\", name=\\\"line1\\nline2\\\")\"}";
