@@ -175,6 +175,19 @@ impl KhiveRuntime {
                 }
                 let backend = StorageBackend::sqlite(path)?;
                 guard(path).map_err(RuntimeError::InvalidInput)?;
+                // Bind the pool to the on-disk identity `guard` just approved
+                // -- from this point on, every standalone graph/SQL writer
+                // that reopens `path` re-checks against THIS identity
+                // instead of trusting the pathname unconditionally, closing
+                // the gap where a fence checks a path once and every later
+                // writer reopens the same mutable pathname forever after
+                // (#1087 items 2/7).
+                backend.pool().bind_verified_identity().map_err(|e| {
+                    RuntimeError::InvalidInput(format!(
+                        "binding verified identity for {}: {e}",
+                        path.display()
+                    ))
+                })?;
                 backend
             }
             None => StorageBackend::memory()?,

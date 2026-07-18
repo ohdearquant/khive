@@ -227,7 +227,24 @@ fn sqlite_uri_path(raw: &str) -> Option<PathBuf> {
     if rest.is_empty() {
         return None;
     }
-    Some(PathBuf::from(percent_decode(rest)))
+    let mut decoded = percent_decode(rest);
+    if has_leading_slash_before_drive_letter(&decoded) {
+        decoded.remove(0);
+    }
+    Some(PathBuf::from(decoded))
+}
+
+/// True when `s` is a POSIX-style absolute path whose first segment is a
+/// Windows drive letter (`/C:/...`) -- the shape `file:///C:/...` and
+/// `file://localhost/C:/...` decode to per RFC 8089, while SQLite's own URI
+/// parser strips that leading slash before opening the file, landing on
+/// `C:/...` (https://sqlite.org/uri.html). Left unstripped, the fence
+/// compares against a path SQLite never actually opens, so a `db` target
+/// aimed at the production database under a `file:///C:/...` URI slips past
+/// the comparison (#1087 item 3/8).
+fn has_leading_slash_before_drive_letter(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':'
 }
 
 /// Resolve `raw` to the path the fence must actually check identity
@@ -619,5 +636,60 @@ mod tests {
         let err = result
             .expect_err("must reject the canonical production db with HOME unset + empty KHIVE_DB");
         assert!(err.contains("shared production database"));
+    }
+
+    /// #1087 item 3/8: `file:///C:/...` and `file://localhost/C:/...` both
+    /// decode (per RFC 8089) to a POSIX-shaped `/C:/...` path, but SQLite's
+    /// own URI parser strips the leading slash before a drive letter and
+    /// opens `C:/...` -- the fence must compare against that same stripped
+    /// form, or a `db=file:///C:/...` target aliasing the configured
+    /// production database slips through uncaught.
+    #[test]
+    fn windows_drive_letter_file_uri_forms_resolve_to_the_same_path_sqlite_opens() {
+        let expected = PathBuf::from("C:/Users/khive/.khive/khive.db");
+        for raw in [
+            "file:///C:/Users/khive/.khive/khive.db",
+            "file://localhost/C:/Users/khive/.khive/khive.db",
+        ] {
+            let resolved =
+                sqlite_uri_path(raw).unwrap_or_else(|| panic!("{raw:?} must parse to a path"));
+            assert_eq!(
+                resolved, expected,
+                "{raw:?} must resolve to the drive-rooted path SQLite actually opens"
+            );
+        }
+    }
+
+    /// End-to-end fence-equality proof for the same bypass: a `db=` target
+    /// spelled as a `file:///C:/...` URI aliasing the configured production
+    /// database must be rejected exactly like the plain-path form is.
+    #[test]
+    fn windows_drive_letter_file_uri_aliasing_configured_db_is_rejected() {
+        let configured = Path::new("C:/Users/khive/.khive/khive.db");
+        for raw in [
+            "file:///C:/Users/khive/.khive/khive.db",
+            "file://localhost/C:/Users/khive/.khive/khive.db",
+        ] {
+            let err = resolve_target_db(Some(raw), Path::new("/tmp/some-repo"), Some(configured))
+                .expect_err(
+                    "windows drive-letter file: URI aliasing the configured db must be rejected",
+                );
+            assert!(
+                err.contains("shared production database"),
+                "unexpected error for {raw:?}: {err}"
+            );
+        }
+    }
+
+    /// A POSIX path must never be mistaken for the Windows drive-letter URI
+    /// shape -- only exercised for `sqlite_uri_path`, which only ever sees
+    /// URI-prefixed input, but pins the boundary of the drive-letter check
+    /// itself.
+    #[test]
+    fn non_windows_uri_paths_are_left_unstripped() {
+        assert_eq!(
+            sqlite_uri_path("file:/tmp/code-ingest-map.db"),
+            Some(PathBuf::from("/tmp/code-ingest-map.db"))
+        );
     }
 }

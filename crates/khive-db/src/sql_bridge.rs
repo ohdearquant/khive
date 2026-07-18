@@ -113,6 +113,9 @@ fn open_standalone_reader(pool: &ConnectionPool) -> Result<rusqlite::Connection,
         message: "in-memory databases do not support standalone readers; use pool-backed".into(),
     })?;
 
+    pool.check_verified_identity(path)
+        .map_err(|e| StorageError::driver(StorageCapability::Sql, "open_reader", e))?;
+
     let conn = rusqlite::Connection::open_with_flags(
         path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -137,6 +140,9 @@ fn open_standalone_writer(pool: &ConnectionPool) -> Result<rusqlite::Connection,
         operation: "writer".into(),
         message: "in-memory databases do not support standalone writer; use pool-backed".into(),
     })?;
+
+    pool.check_verified_identity(path)
+        .map_err(|e| StorageError::driver(StorageCapability::Sql, "open_writer", e))?;
 
     let conn = rusqlite::Connection::open_with_flags(
         path,
@@ -1310,5 +1316,56 @@ mod tests {
             "the well-behaved atomic_unit call after the Pending misuse must \
              have actually committed its write; got {count:?}"
         );
+    }
+
+    /// #1087 blocker A gap: `open_standalone_reader`/`open_standalone_writer`
+    /// in THIS file open their own raw `rusqlite::Connection` against
+    /// `pool.config().path` and, before this fix, never consulted
+    /// `ConnectionPool::check_verified_identity` -- so a post-fence file
+    /// swap at the bound path reopened straight into the swapped-in file via
+    /// `SqlBridge::reader()`/`writer()`, bypassing the pool-level guard
+    /// entirely. Proves the bridge-level open paths now refuse it too.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn bridge_reader_and_writer_refuse_a_post_bind_file_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bridge_bound.db");
+        let swapped_in = dir.path().join("bridge_other.db");
+
+        let config = PoolConfig {
+            path: Some(path.clone()),
+            ..PoolConfig::default()
+        };
+        let pool = Arc::new(ConnectionPool::new(config).unwrap());
+        pool.bind_verified_identity()
+            .expect("bind should succeed against the just-opened file");
+
+        let bridge = SqlBridge::new(Arc::clone(&pool), true);
+
+        // Sanity: identity unchanged yet, bridge opens still succeed.
+        bridge
+            .reader()
+            .await
+            .expect("bridge reader should open before any swap");
+        bridge
+            .writer()
+            .await
+            .expect("bridge writer should open before any swap");
+
+        std::fs::write(&swapped_in, b"").expect("create distinct swapped-in file");
+        std::fs::remove_file(&path).expect("remove pre-swap file");
+        std::fs::hard_link(&swapped_in, &path).expect("swap in a different file");
+
+        let reader_err = match bridge.reader().await {
+            Ok(_) => panic!("bridge reader must refuse a swapped file"),
+            Err(e) => e,
+        };
+        assert!(format!("{reader_err}").contains("no longer matches"));
+
+        let writer_err = match bridge.writer().await {
+            Ok(_) => panic!("bridge writer must refuse a swapped file"),
+            Err(e) => e,
+        };
+        assert!(format!("{writer_err}").contains("no longer matches"));
     }
 }
