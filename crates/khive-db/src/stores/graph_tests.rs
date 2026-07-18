@@ -751,6 +751,101 @@ async fn test_neighbors_both_directions_direction_then_edge_id_is_a_forward_cont
     );
 }
 
+/// Real cycle: A→B→C→A. Traversal must terminate rather than loop forever,
+/// and the cycle edge back to A must not re-expand or duplicate A (#562).
+#[tokio::test]
+async fn test_traverse_terminates_on_real_cycle() {
+    let store = setup_memory_store();
+
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    let c = Uuid::new_v4();
+
+    store
+        .upsert_edge(make_edge(a, b, EdgeRelation::Extends, 1.0))
+        .await
+        .unwrap();
+    store
+        .upsert_edge(make_edge(b, c, EdgeRelation::Extends, 1.0))
+        .await
+        .unwrap();
+    store
+        .upsert_edge(make_edge(c, a, EdgeRelation::Extends, 1.0))
+        .await
+        .unwrap();
+
+    let request = TraversalRequest {
+        roots: vec![a],
+        options: TraversalOptions::new(10).with_direction(Direction::Out),
+        include_roots: true,
+        include_properties: false,
+    };
+
+    let paths = store.traverse(request).await.unwrap();
+    assert_eq!(paths.len(), 1);
+    let node_ids: Vec<Uuid> = paths[0].nodes.iter().map(|n| n.node_id).collect();
+
+    assert_eq!(node_ids.len(), 3, "A, B, C each visited exactly once");
+    assert_eq!(node_ids.iter().filter(|&&id| id == a).count(), 1);
+    assert_eq!(node_ids.iter().filter(|&&id| id == b).count(), 1);
+    assert_eq!(node_ids.iter().filter(|&&id| id == c).count(), 1);
+}
+
+/// Cycle detection must be exact set membership, not string containment.
+/// `near` and `near_prefixed` are two distinct UUIDs whose canonical string
+/// forms share every character except the last: this is the closest a
+/// legal, fixed-width UUID string can come to being a substring of another
+/// (true substring containment between two distinct 36-char UUID strings is
+/// structurally impossible — same length implies substring means equal).
+/// A path-string-containment check that only approximately anchors on
+/// delimiters would be at risk of treating these as the same visited node;
+/// the JSON-array membership check must not (#562).
+#[tokio::test]
+async fn test_traverse_near_colliding_ids_not_confused() {
+    let store = setup_memory_store();
+
+    let root = Uuid::new_v4();
+    let near = Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
+    let near_prefixed = Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaab").unwrap();
+    let tail = Uuid::new_v4();
+
+    store
+        .upsert_edge(make_edge(root, near, EdgeRelation::Extends, 1.0))
+        .await
+        .unwrap();
+    store
+        .upsert_edge(make_edge(root, near_prefixed, EdgeRelation::Extends, 1.0))
+        .await
+        .unwrap();
+    store
+        .upsert_edge(make_edge(near_prefixed, tail, EdgeRelation::Extends, 1.0))
+        .await
+        .unwrap();
+
+    let request = TraversalRequest {
+        roots: vec![root],
+        options: TraversalOptions::new(3).with_direction(Direction::Out),
+        include_roots: true,
+        include_properties: false,
+    };
+
+    let paths = store.traverse(request).await.unwrap();
+    assert_eq!(paths.len(), 1);
+    let node_ids: Vec<Uuid> = paths[0].nodes.iter().map(|n| n.node_id).collect();
+
+    assert!(node_ids.contains(&root));
+    assert!(node_ids.contains(&near));
+    assert!(
+        node_ids.contains(&near_prefixed),
+        "near_prefixed must not be pruned as if it were `near`"
+    );
+    assert!(
+        node_ids.contains(&tail),
+        "the valid path through near_prefixed must not be wrongly cut off"
+    );
+    assert_eq!(node_ids.len(), 4);
+}
+
 #[tokio::test]
 async fn test_traverse_depth_2() {
     let store = setup_memory_store();

@@ -1934,15 +1934,22 @@ impl GraphStore for SqlGraphStore {
                 }
 
                 // Seed rows: one per root in this chunk, each referencing its own
-                // param 3× (root_id, node_id, and the initial path string).
+                // param 3× (root_id, node_id, and the initial path — a JSON array
+                // containing just the root id).
                 let seed_rows: Vec<String> = (1..=n_chunk)
-                    .map(|i| format!("(?{i}, ?{i}, NULL, 0, ?{i}, 0.0)"))
+                    .map(|i| format!("(?{i}, ?{i}, NULL, 0, json_array(?{i}), 0.0)"))
                     .collect();
                 let seeds = seed_rows.join(", ");
 
                 // CTE covering the chunk's roots.  CROSS JOIN forces SQLite to put
                 // the frontier (t) as the outer loop and seek graph_edges by index,
                 // avoiding the O(edges × frontier) plan (#250, #251).
+                //
+                // `path` is a JSON array of visited node-id strings rather than a
+                // comma-joined string: cycle detection needs exact set membership,
+                // and a LIKE-based substring test over a delimited string false-
+                // matches whenever one node id is a substring of another (#562).
+                // `json_each` gives an exact per-element equality check instead.
                 let cte_sql = format!(
                     "WITH RECURSIVE traversal(\
                          root_id, node_id, edge_id, depth, path, total_weight\
@@ -1950,14 +1957,16 @@ impl GraphStore for SqlGraphStore {
                          VALUES {seeds} \
                          UNION ALL \
                          SELECT t.root_id, {next_node}, e.id, t.depth + 1, \
-                                t.path || ',' || {next_node}, \
+                                json_insert(t.path, '$[#]', {next_node}), \
                                 t.total_weight + e.weight \
                          FROM traversal t CROSS JOIN graph_edges e \
                              ON {join_condition} \
                          WHERE e.namespace = ?{ns} \
                            AND e.deleted_at IS NULL \
                            AND t.depth < ?{depth} \
-                           AND (',' || t.path || ',') NOT LIKE '%,' || {next_node} || ',%'\
+                           AND NOT EXISTS (\
+                               SELECT 1 FROM json_each(t.path) WHERE value = {next_node}\
+                           )\
                            {rel_cond}{wt_cond} \
                      ) \
                      SELECT root_id, node_id, edge_id, depth, total_weight \
