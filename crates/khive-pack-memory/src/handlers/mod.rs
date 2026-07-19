@@ -2,6 +2,8 @@
 
 mod common;
 mod feedback;
+#[cfg(test)]
+mod fresh_tail_tests;
 mod prune;
 mod recall;
 mod remember;

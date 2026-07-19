@@ -122,6 +122,8 @@ const V10_UP: &str = include_str!("../sql/010-entities-content-ref.sql");
 
 const V11_UP: &str = include_str!("../sql/011-ann-write-log.sql");
 
+const V12_UP: &str = include_str!("../sql/012-ann-write-log-model-seq-index.sql");
+
 /// DDL for the `ann_write_log` delta table.
 ///
 /// Shared between migration V11 and the belt-and-suspenders creation in
@@ -130,6 +132,12 @@ const V11_UP: &str = include_str!("../sql/011-ann-write-log.sql");
 /// also have the write log, or vector writes would fail on databases opened
 /// without `run_migrations()`. The `.sql` file is `IF NOT EXISTS`-idempotent.
 pub const ANN_WRITE_LOG_DDL: &str = V11_UP;
+
+/// DDL for the `ann_write_log` model/kind/field-leading index (ADR-118 §"Cost
+/// bound"), shared between migration V12 and the belt-and-suspenders creation
+/// in `StorageBackend::vectors_for_namespace` for the same reason as
+/// [`ANN_WRITE_LOG_DDL`].
+pub const ANN_WRITE_LOG_MODEL_SEQ_INDEX_DDL: &str = V12_UP;
 
 /// DDL for the `_embedding_models` registry table.
 ///
@@ -194,6 +202,11 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         version: 11,
         name: "ann_write_log",
         up: V11_UP,
+    },
+    VersionedMigration {
+        version: 12,
+        name: "ann_write_log_model_seq_index",
+        up: V12_UP,
     },
 ];
 
