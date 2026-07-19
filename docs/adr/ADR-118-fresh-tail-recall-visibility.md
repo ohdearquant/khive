@@ -48,12 +48,15 @@ which log prefix the serving segment reflects. The set of committed-but-unindexe
 Each per-model vector leg of recall is augmented with a **fresh-tail exact leg**: an exact
 similarity scan over the vector rows in the leg's scope whose `ann_write_log` seq is above
 the serving index's watermark. Tail hits are merged into that model's existing candidate
-list **before** fusion. The guarantee is two-tier: while a serving index exists, recall is
-read-your-writes for every committed write; while none exists (Cold rebuild in flight, or
-Empty), recall guarantees visibility of the newest threshold-sized window of writes — which
-by construction contains the caller's most recent writes — with full-corpus visibility
-returning when the rebuild lands (§3). The per-query cost is proportional to the tail
-length, which the checkpoint lifecycle already bounds.
+list **before** fusion. The guarantee is two-tier. While a serving index exists, recall is
+read-your-writes for every write covered by the serving index **or newer than the pair's
+registry minimum** — a set that includes every committed write except, transiently, writes
+inside the cross-process mismatch window of §1, which is empty for same-process checkpoints
+and closed by re-adoption. While no index is serving (Cold rebuild in flight, or Empty), a
+committed write is visible to the vector legs iff fewer than threshold-many writes committed
+after it in scope; ADR-107 governs anything older until the rebuild lands (§3). The
+per-query cost is proportional to the tail length, which the checkpoint lifecycle already
+bounds.
 
 ### 1. Tail enumeration
 
@@ -82,8 +85,14 @@ therefore validate coverage **in the same read snapshot**: read the pair's wildc
 registry minimum alongside the log scan; if that minimum exceeds `S`, the snapshot cannot
 prove tail completeness for the bridge in hand, and the leg must re-resolve the currently
 published segment (whose watermark is at least the minimum) and use its watermark instead —
-or, if re-resolution is not possible within the query, serve without the exact leg for that
-query (degrading to the ADR-107 contract) while triggering re-adoption. Implementations
+or, when re-resolution is not possible within the query, run the exact leg **floored at the
+same-snapshot registry minimum** rather than dropping it: coverage above the minimum is
+provable in the same snapshot (compaction never passes the minimum), and the uncovered gap
+`(S_bridge, minimum]` contains only writes that every registered consumer — including this
+one — has durably checkpointed past, i.e. writes already reflected in the newer published
+segment the stale bridge lacks; they become visible on the re-adoption the mismatch
+triggers. Either way, the exact leg never silently disappears on a serving-index path — the
+mismatch narrows what it covers, never whether it runs. Implementations
 SHOULD additionally order same-process checkpoint publication so the in-process bridge is
 replaced before the durable watermark is raised, making the mismatch window empty for the
 process's own checkpoints; the snapshot check remains mandatory because another process can
@@ -144,11 +153,13 @@ newest writes) so the freshest writes stay visible while FTS covers the rest, an
 defers to the existing Cold-path behavior (FTS-only serving while the rebuild runs). The leg
 restores freshness on a serving index; it is not a general exact-search fallback. This is
 the second tier of the §"Decision" guarantee stated precisely: with no serving index, a
-committed write older than the capped suffix may be invisible to the vector legs until the
-rebuild lands — the read-your-writes property in that state covers the newest
-threshold-sized window, not the entire corpus. The regression this ADR fixes (#1143) lives
-entirely in the first tier; the Cold window is the pre-existing ADR-107 behavior, narrowed
-by the guaranteed-fresh suffix rather than contradicted by it.
+committed write is visible to the vector legs **iff fewer than threshold-many writes
+committed after it in scope** — under concurrent load, later commits can push an earlier
+write outside the newest suffix, so recency of the caller's own write is not guaranteed by
+construction. Anything outside the suffix is governed by ADR-107 until the rebuild lands.
+The regression this ADR fixes (#1143) lives entirely in the first tier; the Cold window is
+the pre-existing ADR-107 behavior, narrowed by the guaranteed-fresh suffix rather than
+contradicted by it.
 
 No new tuning knob is introduced. One escape hatch is added for operational isolation:
 `KHIVE_ANN_FRESH_TAIL=0` disables the exact leg (default enabled). Values other than `0`
@@ -182,10 +193,12 @@ an index behind the caller's latest write by up to the causal rebuild latency �
 govern the ANN **candidate generator**: graph adjacency, quantized codes, and the candidate
 pool for older corpus remain eventually consistent exactly as specified. What the bound no
 longer governs is **result visibility while a serving index exists**: there, a committed
-write is eligible for recall results on the next query, independent of rebuild progress.
-In the no-index states (Cold, Empty) the §3 second tier applies — guaranteed visibility of
-the newest threshold-sized suffix, ADR-107 behavior for anything older — so ADR-107 §1
-continues to describe the verb's observable freshness in exactly and only those states.
+write is eligible for recall results on the next query, independent of rebuild progress,
+subject only to the §1 cross-process mismatch window (empty for same-process checkpoints,
+closed by re-adoption). In the no-index states (Cold, Empty) the §3 second tier applies —
+visibility iff fewer than threshold-many writes committed after it in scope, ADR-107
+behavior for anything older — so ADR-107 §1 continues to describe the verb's observable
+freshness in exactly and only those states and that window.
 Statements in ADR-107 §1 that recall "may serve results computed from an ANN index that is
 behind the caller's own most recent write" remain true of the index and cease to describe
 the verb's observable freshness whenever an index is serving.
