@@ -1412,7 +1412,8 @@ fn log_walpin_sidecar_report(pool: &ConnectionPool) {
                 .chain(report.registered_silent_pids())
                 .chain(unknown_pids.iter().copied())
                 .collect();
-            let mut census_only: Vec<u32> = census.difference(&sidecar_known).copied().collect();
+            let mut census_only: Vec<u32> =
+                census.holders.difference(&sidecar_known).copied().collect();
             if !census_only.is_empty() {
                 census_only.sort_unstable();
                 tracing::warn!(
@@ -1422,6 +1423,18 @@ fn log_walpin_sidecar_report(pool: &ConnectionPool) {
                      sidecar disabled, or wedged before its first write)"
                 );
                 unknown_pids.extend(census_only);
+            }
+            if !census.is_complete() {
+                let mut uninspectable = census.uninspectable_pids.clone();
+                uninspectable.sort_unstable();
+                tracing::warn!(
+                    ?uninspectable,
+                    "ADR-091 Amendment 2 review follow-up: the OS-derived holder census could \
+                     not inspect these PIDs' open file descriptors (permission denied, or a \
+                     listing race) — the census is INCOMPLETE and cannot rule out one of them \
+                     holding the database file open"
+                );
+                unknown_pids.extend(uninspectable);
             }
         }
         Err(e) => {

@@ -751,12 +751,46 @@ mod windows_impl {
     }
 }
 
+/// Outcome of one OS-derived holder census pass (ADR-091 Amendment 2 review,
+/// item a). A PID the census positively determined does NOT hold the
+/// database file is simply absent from `holders` — that is a normal,
+/// complete result. A PID whose inspection FAILED (permission denied, or a
+/// races-away process) instead of succeeding-with-a-negative-answer is
+/// recorded in `uninspectable_pids`: the census as a whole is then
+/// INCOMPLETE, and callers must treat that exactly like an `unknown` sidecar
+/// PID — inconclusive, never silently folded into "no unregistered holder."
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CensusResult {
+    pub holders: std::collections::HashSet<u32>,
+    pub uninspectable_pids: Vec<u32>,
+}
+
+impl CensusResult {
+    /// Every discovered PID was either confirmed as a holder or positively
+    /// ruled out — no PID's inspection failed outright.
+    pub fn is_complete(&self) -> bool {
+        self.uninspectable_pids.is_empty()
+    }
+}
+
+/// macOS: classify a `proc_pidinfo`/`proc_pidfdinfo` failure by errno.
+/// `ESRCH` means the target process exited between `proc_listpids` and this
+/// call — a genuine "positively gone" race, safe to skip. Any other errno
+/// (most commonly `EPERM`/`EACCES`, inspecting another user's open files)
+/// means the inspection itself failed: the census cannot say whether this
+/// PID holds the database file, so it must be reported as uninspectable
+/// rather than silently excluded.
+#[cfg(target_os = "macos")]
+fn macos_pid_genuinely_gone(errno: Option<i32>) -> bool {
+    errno == Some(libc::ESRCH)
+}
+
 /// macOS OS-derived census (ADR-091 Amendment 2 review, item a): every PID
 /// on the system that currently holds `db_path` open, via `libproc`'s
 /// `PROC_PIDLISTFDS`/`PROC_PIDFDVNODEPATHINFO` — never the sidecar directory
 /// listing, which only sees PIDs that already wrote something there.
 #[cfg(target_os = "macos")]
-pub fn census_holders(db_path: &Path) -> io::Result<std::collections::HashSet<u32>> {
+pub fn census_holders(db_path: &Path) -> io::Result<CensusResult> {
     use std::ffi::CStr;
     use std::os::raw::{c_int, c_void};
     use std::os::unix::ffi::OsStrExt;
@@ -869,6 +903,7 @@ pub fn census_holders(db_path: &Path) -> io::Result<std::collections::HashSet<u3
     let pid_count = (bytes as usize / std::mem::size_of::<i32>()).min(pid_buf.len());
 
     let mut holders = std::collections::HashSet::new();
+    let mut uninspectable: Vec<u32> = Vec::new();
     let mut fd_buf: Vec<ProcFdInfo> = (0..4096)
         .map(|_| ProcFdInfo {
             proc_fd: 0,
@@ -889,10 +924,18 @@ pub fn census_holders(db_path: &Path) -> io::Result<std::collections::HashSet<u3
                 (fd_buf.len() * std::mem::size_of::<ProcFdInfo>()) as c_int,
             )
         };
-        // A negative/zero return means the PID exited or we lack permission
-        // to inspect it (unprivileged processes cannot list another user's
-        // fds) — skip rather than error the whole census over one PID.
+        // A negative/zero return means either the PID exited between
+        // `proc_listpids` and here (ESRCH — positively gone, safe to skip)
+        // or the inspection itself failed (most commonly permission denied
+        // to list another user's fds). Only the former is excluded cleanly;
+        // the latter means we could not determine whether this PID holds
+        // the db, so it marks the whole census incomplete rather than being
+        // silently treated as "not a holder."
         if fd_bytes <= 0 {
+            let errno = io::Error::last_os_error().raw_os_error();
+            if !macos_pid_genuinely_gone(errno) {
+                uninspectable.push(pid as u32);
+            }
             continue;
         }
         let fd_count = (fd_bytes as usize / std::mem::size_of::<ProcFdInfo>()).min(fd_buf.len());
@@ -925,18 +968,33 @@ pub fn census_holders(db_path: &Path) -> io::Result<std::collections::HashSet<u3
             }
         }
     }
-    Ok(holders)
+    Ok(CensusResult {
+        holders,
+        uninspectable_pids: uninspectable,
+    })
+}
+
+/// Linux: classify a `/proc/<pid>/fd` open failure. `NotFound` means the
+/// process exited between the `/proc` directory listing and this call — a
+/// genuine "positively gone" race, safe to skip. Any other error (most
+/// commonly `PermissionDenied`, inspecting another user's fds) means the
+/// inspection itself failed and the PID must be reported as uninspectable.
+#[cfg(target_os = "linux")]
+fn linux_proc_gone(err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::NotFound
 }
 
 /// Linux OS-derived census (ADR-091 Amendment 2 review, item a): scan
 /// `/proc/<pid>/fd/*` for every live PID and resolve each fd symlink,
-/// comparing against `db_path`'s canonical form. `/proc` enumeration
-/// necessarily skips PIDs this process cannot read (permission denied) —
-/// same "skip, don't fail the whole census" posture as the macOS path.
+/// comparing against `db_path`'s canonical form. A PID whose `fd` directory
+/// cannot be opened at all (most commonly permission denied) is reported as
+/// uninspectable rather than silently excluded — only a PID confirmed gone
+/// (`NotFound`, a listing/inspection race) is skipped cleanly.
 #[cfg(target_os = "linux")]
-pub fn census_holders(db_path: &Path) -> io::Result<std::collections::HashSet<u32>> {
+pub fn census_holders(db_path: &Path) -> io::Result<CensusResult> {
     let target = fs::canonicalize(db_path)?;
     let mut holders = std::collections::HashSet::new();
+    let mut uninspectable: Vec<u32> = Vec::new();
 
     for proc_entry in fs::read_dir("/proc")?.flatten() {
         let Some(pid) = proc_entry
@@ -947,8 +1005,13 @@ pub fn census_holders(db_path: &Path) -> io::Result<std::collections::HashSet<u3
             continue;
         };
         let fd_dir = proc_entry.path().join("fd");
-        let Ok(fds) = fs::read_dir(&fd_dir) else {
-            continue; // process gone, or no permission to inspect its fds
+        let fds = match fs::read_dir(&fd_dir) {
+            Ok(fds) => fds,
+            Err(e) if linux_proc_gone(&e) => continue,
+            Err(_) => {
+                uninspectable.push(pid);
+                continue;
+            }
         };
         for fd_entry in fds.flatten() {
             let Ok(resolved) = fs::read_link(fd_entry.path()) else {
@@ -962,7 +1025,10 @@ pub fn census_holders(db_path: &Path) -> io::Result<std::collections::HashSet<u3
             }
         }
     }
-    Ok(holders)
+    Ok(CensusResult {
+        holders,
+        uninspectable_pids: uninspectable,
+    })
 }
 
 /// Any other Unix (khive ships macOS/Linux/Windows only; this is a
@@ -972,7 +1038,7 @@ pub fn census_holders(db_path: &Path) -> io::Result<std::collections::HashSet<u3
 /// census failure — the same "cannot rule out an unregistered holder"
 /// posture as a real enumeration error, not false reassurance.
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
-pub fn census_holders(_db_path: &Path) -> io::Result<std::collections::HashSet<u32>> {
+pub fn census_holders(_db_path: &Path) -> io::Result<CensusResult> {
     Err(io_other(
         "OS-derived holder census has no implementation on this Unix target",
     ))
@@ -1841,12 +1907,31 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let db_path = root.path().join("test.db");
         let file = fs::File::create(&db_path).unwrap();
-        let holders = census_holders(&db_path).expect("census must succeed for a live target");
+        let census = census_holders(&db_path).expect("census must succeed for a live target");
         assert!(
-            holders.contains(&std::process::id()),
+            census.holders.contains(&std::process::id()),
             "this process holds {db_path:?} open and must appear in its own OS-derived census"
         );
+        // Not asserting `is_complete()` here: an unprivileged process
+        // legitimately cannot inspect every other PID's open fds on a real,
+        // busy machine (other users' / root's processes), so
+        // `uninspectable_pids` is realistically non-empty — that's exactly
+        // the condition this fix now surfaces instead of silently ignoring.
         drop(file);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_pid_genuinely_gone_only_true_for_esrch() {
+        // ADR-091 Amendment 2 review follow-up: ESRCH (the target process
+        // exited between listing and inspection) is a genuine "positively
+        // gone" race, safe to skip. Every other errno — most commonly
+        // EPERM/EACCES from trying to list another user's open files — means
+        // the inspection itself failed, not that the PID is absent.
+        assert!(macos_pid_genuinely_gone(Some(libc::ESRCH)));
+        assert!(!macos_pid_genuinely_gone(Some(libc::EPERM)));
+        assert!(!macos_pid_genuinely_gone(Some(libc::EACCES)));
+        assert!(!macos_pid_genuinely_gone(None));
     }
 
     #[test]
@@ -1855,11 +1940,45 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let db_path = root.path().join("test.db");
         let file = fs::File::create(&db_path).unwrap();
-        let holders = census_holders(&db_path).expect("census must succeed for a live target");
+        let census = census_holders(&db_path).expect("census must succeed for a live target");
         assert!(
-            holders.contains(&std::process::id()),
+            census.holders.contains(&std::process::id()),
             "this process holds {db_path:?} open and must appear in its own OS-derived census"
         );
+        // Not asserting `is_complete()` here: an unprivileged process
+        // legitimately cannot inspect every other PID's open fds on a real,
+        // busy machine (other users' / root's processes), so
+        // `uninspectable_pids` is realistically non-empty — that's exactly
+        // the condition this fix now surfaces instead of silently ignoring.
         drop(file);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_proc_gone_only_true_for_not_found() {
+        // ADR-091 Amendment 2 review follow-up: NotFound (the process's
+        // /proc/<pid>/fd directory raced away between listing and open) is a
+        // genuine "positively gone" race, safe to skip. PermissionDenied
+        // (inspecting another user's fds) means the inspection itself
+        // failed, not that the PID is absent.
+        assert!(linux_proc_gone(&io::Error::from(io::ErrorKind::NotFound)));
+        assert!(!linux_proc_gone(&io::Error::from(
+            io::ErrorKind::PermissionDenied
+        )));
+    }
+
+    #[test]
+    fn census_result_is_complete_reflects_uninspectable_pids() {
+        let complete = CensusResult {
+            holders: std::collections::HashSet::from([1, 2]),
+            uninspectable_pids: Vec::new(),
+        };
+        assert!(complete.is_complete());
+
+        let incomplete = CensusResult {
+            holders: std::collections::HashSet::from([1]),
+            uninspectable_pids: vec![7],
+        };
+        assert!(!incomplete.is_complete());
     }
 }
