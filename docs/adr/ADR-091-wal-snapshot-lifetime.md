@@ -680,7 +680,7 @@ the daemon" alternative this ADR already deferred.
 
 ### 2026-07-19 amendment (Amendment 2): the pin is cross-process — per-session observability and attribution
 
-**Telemetry conclusion (Plank 0 delivered its purpose).** A third recurrence
+**Plank 0 telemetry summary.** A third recurrence
 (2026-07-19) provided the discriminating evidence Plank 0 was built to capture.
 `wal_pages` sat at 84,000-85,000 (14x `high_water_pages`, 4x
 `truncate_high_water_pages`) for at least ten hours. Three TRUNCATE attempts
