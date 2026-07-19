@@ -370,3 +370,96 @@ testable. Step 0 is the precondition; steps 1–2 land the #322 root-cause fix a
 - [ADR-067](ADR-067-write-owner-daemon.md) — per-tenant write-owner model; ANN segments are per-tenant
 - [#322](https://github.com/ohdearquant/khive/issues/322) / [PR #335](https://github.com/ohdearquant/khive/pull/335)
   — the warm-degrade symptom and its safety-net fix, subsumed by §2 and §5
+
+---
+
+## Amendment 1 — Delta-log restart classifier and mmap re-adoption (2026-07-19)
+
+**Status**: Proposed
+
+### Context
+
+Production measurement of the warm daemon at ~553K entity/note vectors + ~358K knowledge sections
+surfaced two costs the base ADR leaves in place:
+
+1. **The restart-time classifier is a full-corpus scan.** §2 classifies Hot/Stale/Cold by an
+   explicit content-hash check: `scan_corpus_raw` reads every vector row from sqlite-vec, L2-
+   normalizes the full flat buffer, and hashes it — at every daemon start, per `(namespace, model)`,
+   even when the segment is perfectly fresh. Measured: minutes of multi-core CPU and a transient
+   multi-GB heap spike before a single request is served. Worse, a single vector write since the
+   last checkpoint flips the class to Stale, whose background rebuild reads the full corpus into
+   heap again.
+2. **The served index never returns to file-backed memory.** A background rebuild (or any build)
+   produces `VectorStorage::Owned` — the full f32 corpus resident in anonymous heap. §4's
+   checkpoint writes a durable segment but nothing re-adopts it: the daemon serves the Owned copy
+   indefinitely (~2.5-3 GB anonymous at current corpus size, vs a 185 MB on-disk segment). The
+   mmap fast path (`load_v2_fast` → `mmap_vectors`) is reachable only on the rare clean-load
+   start, so in practice it is dead code on an active system.
+
+### Decision
+
+#### A. `ann_write_log` — a persisted per-write delta log replaces the content-hash classifier
+
+A new ordinary SQLite table (migration; not a vec0 table):
+
+```sql
+CREATE TABLE ann_write_log (
+  seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+  namespace  TEXT NOT NULL,
+  embedding_model TEXT NOT NULL,
+  subject_id TEXT NOT NULL,
+  op         TEXT NOT NULL CHECK (op IN ('upsert','delete'))
+);
+CREATE INDEX idx_ann_write_log_ns_model_seq ON ann_write_log(namespace, embedding_model, seq);
+```
+
+- Every vector write path (insert, batch insert, delete, merge-cleanup) appends one row per
+  affected `(namespace, model, subject_id)` in the same transaction as the vector mutation.
+- `save_atomic`'s commit record gains a `last_applied_seq` field (per segment).
+- **Restart classification becomes one indexed SQL read**: `SELECT MAX(seq) FROM ann_write_log
+  WHERE namespace=? AND embedding_model=?` compared against the segment's `last_applied_seq`:
+  - equal → **Hot**: mmap load, zero corpus IO;
+  - greater → **Stale-tail**: mmap load, then fetch only the logged tail subjects' embeddings by
+    primary key and apply them through ADR-052 `insert`/`tombstone`. No full rebuild, no corpus
+    scan. Serve-stale semantics of §2 apply while the tail applies;
+  - segment absent/corrupt, dimension change, or tail longer than `ann_rebuild_threshold`
+    (default: 20% of `vector_count`) → **Cold**: full rebuild as today.
+- `live_content_hash` / `scan_corpus_raw` leave the warm path entirely. The content hash remains
+  in the commit record as a corruption check over segment files (blake3 of the files, as today),
+  not as a liveness classifier.
+- **Log compaction**: after a successful `save_atomic` at `last_applied_seq = S`, delete log rows
+  with `seq <= S` for that `(namespace, model)`. The log's steady size is the write volume since
+  the last checkpoint.
+
+#### B. Checkpoint re-adopts the segment as mmap
+
+After any successful `save_atomic` — background-rebuild completion or §4 periodic checkpoint — the
+bridge reopens the just-written segment via the mmap load path and swaps it in for the Owned build
+product (same hot-swap seam §2 already requires for rebuild completion). Steady-state served
+vectors are therefore file-backed: resident memory follows actual access, the kernel reclaims
+under pressure, and the anonymous-heap footprint drops from O(corpus) to the graph + id-map +
+lifecycle structures. `promote_to_owned` remains the entry path for mutation (ADR-052 insert needs
+owned storage); the bridge oscillates Owned-during-write-burst → mmap-after-checkpoint, bounded by
+the checkpoint cadence.
+
+### Consequences
+
+- Restart cost: minutes of rebuild + transient GBs → one indexed SQL read + point reads for the
+  tail. A restart after a quiet period serves Hot with zero corpus IO.
+- Steady-state anonymous footprint at current corpus size: ~2.5-3 GB → graph/id-map/lifecycle only
+  (order 100-300 MB), vectors file-backed.
+- Write path gains one same-transaction log append per vector mutation (one indexed insert; the
+  vec0 write dominates).
+- The delta log is the first durable record of per-write ANN drift; it also gives §4's checkpoint
+  task a precise dirtiness signal (`MAX(seq) - last_applied_seq`) replacing in-memory op counters
+  for the persistence decision.
+- ADR-052's incremental-insert trade-off (§3 note) now also governs the restart tail-apply window;
+  the same consolidation-cadence mitigation applies.
+
+### References (amendment)
+
+- Measurements: issues #1126/#1127 companion daemon-resource investigation (2026-07-19); read-only
+  concurrency probe (footprint peak 3.9 GB), differential path probe, mirror-off cold-start rebuild
+  observation.
+- `VectorStorage::Mmap` + `load_v2_fast`/`mmap_vectors`: the existing fast path this amendment
+  makes the steady state.
