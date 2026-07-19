@@ -2514,17 +2514,20 @@ mod tests {
     #[test]
     #[serial]
     fn resolver_uses_config_file_engines_over_defaults() {
-        // Ensure env vars cannot leak into either branch.
+        // Ensure a stale ambient value cannot leak into either branch.
         std::env::remove_var("KHIVE_EMBEDDING_MODEL");
-        std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
+        // The shipped default is single-engine, so leaving the additional list
+        // unset would make "the config file overrode the default" and "there
+        // was nothing to override" produce the same empty result, and the
+        // final assertion below would stop discriminating. Declare one
+        // deliberately so the override remains observable.
+        std::env::set_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS", "paraphrase");
 
         let default_cfg = RuntimeConfig::default();
         let default_primary = format!("{:?}", default_cfg.embedding_model);
-        // Default ships a non-empty additional-engine list (the multilingual
-        // model). The single-engine config file below must override it.
         assert!(
             !default_cfg.additional_embedding_models.is_empty(),
-            "precondition: default config has additional engines"
+            "precondition: default config must carry an additional engine for this test to discriminate"
         );
 
         let dir = tempfile::tempdir().expect("temp dir");
@@ -2565,6 +2568,8 @@ default = true
             "config file declares one engine; additional list must be empty (not the default's)"
         );
         assert_eq!(resolved.db_path, None, ":memory: must map to in-memory db");
+
+        std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
     }
 
     /// Regression for #379: when the loaded config file has NO `[[engines]]`
