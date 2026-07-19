@@ -880,9 +880,8 @@ fn negotiate_buffer<T: Default + Clone>(
 /// listing, which only sees PIDs that already wrote something there.
 #[cfg(target_os = "macos")]
 pub fn census_holders(db_path: &Path) -> io::Result<CensusResult> {
-    use std::ffi::CStr;
     use std::os::raw::{c_int, c_void};
-    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
 
     const PROC_ALL_PIDS: u32 = 1;
     const PROC_PIDLISTFDS: c_int = 1;
@@ -970,7 +969,11 @@ pub fn census_holders(db_path: &Path) -> io::Result<CensusResult> {
         ) -> c_int;
     }
 
-    let target = fs::canonicalize(db_path)?;
+    // File-identity target, not a path target: holders are matched on
+    // (device, inode) so a process that opened the database through a hard
+    // link (or any alternate name for the same file) is still discovered.
+    let target_meta = fs::metadata(db_path)?;
+    let target_ident = (target_meta.dev() as u32, target_meta.ino());
 
     // SAFETY: `negotiate_buffer` hands `proc_listpids` a buffer sized from
     // its own reported byte count, growing on retry; the extern call writes
@@ -1052,21 +1055,15 @@ pub fn census_holders(db_path: &Path) -> io::Result<CensusResult> {
                 }
                 continue;
             }
-            // SAFETY: `vip_path` is NUL-terminated by the kernel on success.
-            let path_cstr = unsafe { CStr::from_ptr(vinfo.pvip.vip_path.as_ptr() as *const i8) };
-            let path = PathBuf::from(std::ffi::OsStr::from_bytes(path_cstr.to_bytes()));
-            match fs::canonicalize(&path) {
-                Ok(canon) => {
-                    if canon == target {
-                        holders.insert(pid as u32);
-                        break;
-                    }
-                }
-                // The backing file was removed/renamed since the kernel
-                // reported this vnode path — genuinely not our (still
-                // extant) target, safe to skip.
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(_) => uninspectable.push(pid as u32),
+            // Identity comparison on the kernel-reported (device, inode)
+            // rather than the vnode's path string: a holder that opened the
+            // database through a hard link (or any alternate name for the
+            // same file) reports a different path, and a path comparison
+            // would silently omit it without marking the census incomplete.
+            let vstat = &vinfo.pvip.vip_vi.vi_stat;
+            if (vstat.vst_dev, vstat.vst_ino) == target_ident {
+                holders.insert(pid as u32);
+                break;
             }
         }
     }
@@ -1196,8 +1193,9 @@ fn proc_mounts_restricted_in(mountinfo: &str) -> Option<bool> {
 }
 
 /// Linux OS-derived census (ADR-091 Amendment 2 review, item a): scan
-/// `/proc/<pid>/fd/*` for every live PID and resolve each fd symlink,
-/// comparing against `db_path`'s canonical form. A PID whose `fd` directory
+/// `/proc/<pid>/fd/*` for every live PID and stat each fd through its proc
+/// magic link, comparing `(device, inode)` identity against `db_path`'s. A
+/// PID whose `fd` directory
 /// cannot be opened at all (most commonly permission denied) is reported as
 /// uninspectable rather than silently excluded — only a PID confirmed gone
 /// (`NotFound`, a listing/inspection race) is skipped cleanly.
@@ -1225,7 +1223,11 @@ fn proc_mounts_restricted_in(mountinfo: &str) -> Option<bool> {
 pub fn census_holders(db_path: &Path) -> io::Result<CensusResult> {
     use std::os::unix::fs::MetadataExt;
 
-    let target = fs::canonicalize(db_path)?;
+    // File-identity target, not a path target: holders are matched on
+    // (device, inode) so a process that opened the database through a hard
+    // link or a bind-mounted alternate path is still discovered.
+    let target_meta = fs::metadata(db_path)?;
+    let target_ident = (target_meta.dev(), target_meta.ino());
     let mut holders = std::collections::HashSet::new();
     let mut uninspectable: Vec<u32> = Vec::new();
     let mut truncated = false;
@@ -1280,26 +1282,23 @@ pub fn census_holders(db_path: &Path) -> io::Result<CensusResult> {
                     continue;
                 }
             };
-            let resolved = match fs::read_link(fd_entry.path()) {
-                Ok(r) => r,
-                // The fd itself closed between listing and this read — a
-                // genuine "positively gone" race, safe to skip.
-                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                Err(_) => {
-                    uninspectable.push(pid);
-                    continue;
-                }
-            };
-            match fs::canonicalize(&resolved) {
-                Ok(canon) => {
-                    if canon == target {
+            // Identity comparison via a stat *through* the proc fd magic
+            // link — it resolves to the open file itself, so the match is
+            // on (device, inode) rather than a readlink'd path string. A
+            // holder that opened the database through a hard link or a
+            // bind-mounted alternate path reports a different path, and a
+            // path comparison would silently omit it without marking the
+            // census incomplete. Non-file fd targets (sockets, pipes,
+            // anon inodes) stat fine and simply never match the target.
+            match fs::metadata(fd_entry.path()) {
+                Ok(meta) => {
+                    if (meta.dev(), meta.ino()) == target_ident {
                         holders.insert(pid);
                         break;
                     }
                 }
-                // Non-file fd targets (sockets, pipes, anon_inodes) and
-                // since-removed paths canonicalize-fail with NotFound —
-                // genuinely not our (still extant) target, safe to skip.
+                // The fd itself closed between listing and this stat — a
+                // genuine "positively gone" race, safe to skip.
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(_) => uninspectable.push(pid),
             }
@@ -1739,6 +1738,36 @@ pub fn enumerate_live(dir: &Path, sweep_interval: Duration) -> io::Result<Walpin
     Ok(WalpinReport { entries })
 }
 
+/// Restores a possibly-unset env var on drop, including on panic — so an
+/// assertion failure mid-test can never leak a mutated `KHIVE_WALPIN_SIDECAR`
+/// into a sibling test (minor, ADR-091 Amendment 2 review: env-mutating
+/// tests must serialize with cleanup on panic). Shared with the checkpoint
+/// session-sweep test, which mutates the same variable and must serialize
+/// under the same `khive_walpin_sidecar_env` key.
+#[cfg(test)]
+pub(crate) struct EnvVarGuard {
+    key: &'static str,
+    saved: Option<String>,
+}
+#[cfg(test)]
+impl EnvVarGuard {
+    pub(crate) fn capture(key: &'static str) -> Self {
+        Self {
+            key,
+            saved: std::env::var(key).ok(),
+        }
+    }
+}
+#[cfg(test)]
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match &self.saved {
+            Some(v) => std::env::set_var(self.key, v),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1766,31 +1795,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("khive.db");
         assert_eq!(sidecar_dir_for(&db), dir.path().join("khive.db.walpin"));
-    }
-
-    /// Restores a possibly-unset env var on drop, including on panic — so an
-    /// assertion failure mid-test can never leak a mutated `KHIVE_WALPIN_SIDECAR`
-    /// into a sibling test (minor, ADR-091 Amendment 2 review: env-mutating
-    /// tests must serialize with cleanup on panic).
-    struct EnvVarGuard {
-        key: &'static str,
-        saved: Option<String>,
-    }
-    impl EnvVarGuard {
-        fn capture(key: &'static str) -> Self {
-            Self {
-                key,
-                saved: std::env::var(key).ok(),
-            }
-        }
-    }
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match &self.saved {
-                Some(v) => std::env::set_var(self.key, v),
-                None => std::env::remove_var(self.key),
-            }
-        }
     }
 
     #[test]
@@ -2209,6 +2213,28 @@ mod tests {
         // busy machine (other users' / root's processes), so
         // `uninspectable_pids` is realistically non-empty — that's exactly
         // the condition this fix now surfaces instead of silently ignoring.
+        drop(file);
+    }
+
+    /// Identity-comparison regression: a holder that opened the database
+    /// through a hard link (a different path to the same file) must still be
+    /// discovered — a path-string comparison would silently omit it while
+    /// leaving the census marked complete.
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn census_holders_discovers_holder_through_hard_link_path() {
+        let root = tempfile::tempdir().unwrap();
+        let db_path = root.path().join("test.db");
+        fs::File::create(&db_path).unwrap();
+        let link_path = root.path().join("test-link.db");
+        fs::hard_link(&db_path, &link_path).unwrap();
+
+        let file = fs::File::open(&link_path).unwrap();
+        let census = census_holders(&db_path).expect("census must succeed for a live target");
+        assert!(
+            census.holders.contains(&std::process::id()),
+            "this process holds the db open via hard link {link_path:?} and must appear in the census for {db_path:?}"
+        );
         drop(file);
     }
 

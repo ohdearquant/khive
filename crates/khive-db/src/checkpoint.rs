@@ -3673,12 +3673,27 @@ mod tests {
             .expect("session sweep task panicked");
     }
 
+    /// Bounded condition poll for filesystem effects of the async sweep
+    /// task — fixed sleeps flake under parallel test load because sidecar
+    /// writes fsync.
+    async fn wait_for(deadline: Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let start = std::time::Instant::now();
+        while start.elapsed() < deadline {
+            if cond() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        cond()
+    }
+
     #[tokio::test]
-    #[serial(tx_registry)]
+    #[serial(tx_registry, khive_walpin_sidecar_env)]
     async fn session_sweep_task_writes_and_clears_walpin_heartbeat() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("session_sweep.db");
         let sidecar_dir = crate::walpin::sidecar_dir_for(&db_path);
+        let _env_guard = crate::walpin::EnvVarGuard::capture("KHIVE_WALPIN_SIDECAR");
         std::env::set_var("KHIVE_WALPIN_SIDECAR", "1");
 
         let cfg = SessionSweepConfig {
@@ -3693,29 +3708,28 @@ mod tests {
             shutdown_rx,
         ));
 
-        // No open span yet: a quiet process must write no *heartbeat* for a
-        // few ticks, but it DOES register its one-time beacon at startup
-        // (ADR-091 Amendment 2 sidecar-health attribution) — the sidecar
-        // dir is not empty, only heartbeat-free.
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        // No open span yet: a quiet process must write no *heartbeat*, but
+        // it DOES register its one-time beacon at startup (ADR-091
+        // Amendment 2 sidecar-health attribution) — the sidecar dir is not
+        // empty, only heartbeat-free. Poll-wait rather than a fixed sleep:
+        // the first tick fsyncs the beacon, and under parallel test load
+        // that write can take longer than any small fixed window.
         let pid = std::process::id();
+        let beacon = crate::walpin::beacon_path(&sidecar_dir, pid);
+        assert!(
+            wait_for(Duration::from_secs(2), || beacon.exists()).await,
+            "a quiet process must still register its one-time beacon"
+        );
         assert!(
             !sidecar_dir.join(format!("{pid}.json")).exists(),
             "a quiet process must not write a walpin heartbeat"
         );
-        assert!(
-            crate::walpin::beacon_path(&sidecar_dir, pid).exists(),
-            "a quiet process must still register its one-time beacon"
-        );
 
         let tx_handle =
             khive_storage::tx_registry::register(Some("session_sweep_walpin_test".to_string()));
-        // Long enough to cross `tx_warn_secs` across at least one 10ms tick.
-        tokio::time::sleep(Duration::from_millis(60)).await;
-
         let heartbeat_path = sidecar_dir.join(format!("{pid}.json"));
         assert!(
-            heartbeat_path.exists(),
+            wait_for(Duration::from_secs(2), || heartbeat_path.exists()).await,
             "expected a walpin heartbeat once the span crossed tx_warn_secs"
         );
         let body = std::fs::read_to_string(&heartbeat_path).unwrap();
@@ -3728,10 +3742,8 @@ mod tests {
         );
 
         drop(tx_handle);
-        // A few more ticks so the sweep observes the registry going empty.
-        tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(
-            !heartbeat_path.exists(),
+            wait_for(Duration::from_secs(2), || !heartbeat_path.exists()).await,
             "heartbeat must be removed once the stale span clears"
         );
 
@@ -3740,8 +3752,6 @@ mod tests {
             .await
             .expect("session sweep task should exit within 1s")
             .expect("session sweep task panicked");
-
-        std::env::remove_var("KHIVE_WALPIN_SIDECAR");
     }
 
     #[test]
