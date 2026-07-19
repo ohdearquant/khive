@@ -140,7 +140,7 @@ impl MemoryPack {
         // Keep the stale graph intact while a live-row scan builds its replacement.
         if pruned > 0 {
             for model in self.runtime.registered_embedding_model_names() {
-                let key = ann::AnnKey::new(namespace.as_str(), model.as_str());
+                let key = ann::AnnKey::new(model.as_str());
                 ann::bump_generation(&self.ann, &key).await;
                 ann::ensure_ann_background(&self.runtime, token, &self.ann, &model).await;
             }
@@ -315,7 +315,7 @@ mod prune_recall_visibility_tests {
         // Evict the warm graph now, so the recalls below rebuild against the
         // now-pruned corpus and fall through to the exact sqlite-vec search
         // instead of the warm ANN route.
-        let key = crate::ann::AnnKey::new("local", MODEL);
+        let key = crate::ann::AnnKey::new(MODEL);
         crate::ann::clear_key(&ann, &key).await;
         ann.reset_warm_route_count();
 

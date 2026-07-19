@@ -28,13 +28,13 @@ pub(crate) struct AnnKey {
 }
 
 impl AnnKey {
-    pub(crate) fn new(_namespace: impl Into<String>, model: impl Into<String>) -> Self {
+    pub(crate) fn new(model: impl Into<String>) -> Self {
         Self {
             model: model.into(),
         }
     }
 
-    pub(crate) fn from_token(_token: &NamespaceToken, model: &str) -> Self {
+    pub(crate) fn from_token(model: &str) -> Self {
         Self {
             model: model.to_owned(),
         }
@@ -584,14 +584,14 @@ pub(crate) async fn wait_until_warm_idle(ann: &SharedAnn, key: &AnnKey) {
 /// Fire-once per-model background warm. Returns `true` if a new task was started.
 pub(crate) async fn ensure_ann_background(
     rt: &KhiveRuntime,
-    token: &NamespaceToken,
+    _token: &NamespaceToken,
     ann: &SharedAnn,
     model: &str,
 ) -> bool {
     if model.is_empty() {
         return false;
     }
-    let key = AnnKey::from_token(token, model);
+    let key = AnnKey::from_token(model);
 
     // Capture the generation before the fast path so the caller observes prior writes.
     let target_generation = current_generation(ann, &key).await;
@@ -740,7 +740,7 @@ pub(crate) async fn ensure_ann_for_model(
     if model.is_empty() {
         return Ok(AnnEnsureStatus::EmptyCorpus);
     }
-    let key = AnnKey::from_token(token, model);
+    let key = AnnKey::from_token(model);
 
     // Read generation BEFORE any fast path or corpus snapshot to close the write race.
     let target_generation = current_generation(ann, &key).await;
@@ -870,7 +870,7 @@ async fn ensure_ann_for_model_inner(
     target_generation: u64,
 ) -> Result<AnnEnsureStatus, RuntimeError> {
     let ns = "global";
-    let key = AnnKey::new(ns, model);
+    let key = AnnKey::new(model);
 
     if installed_is_fresh(ann, &key, target_generation).await {
         return Ok(AnnEnsureStatus::AlreadyLoaded);
@@ -1727,9 +1727,9 @@ mod tests {
     #[test]
     fn ann_key_is_model_only() {
         // After FTS+ANN consolidation AnnKey is model-only; namespace is ignored.
-        let k1 = AnnKey::new("ns:a", "model-x");
-        let k2 = AnnKey::new("ns:b", "model-x"); // same model, different ns → same key
-        let k3 = AnnKey::new("ns:a", "model-y"); // different model → different key
+        let k1 = AnnKey::new("model-x");
+        let k2 = AnnKey::new("model-x"); // same model, different ns → same key
+        let k3 = AnnKey::new("model-y"); // different model → different key
         assert_eq!(
             k1, k2,
             "same model, different namespace must produce the same key"
@@ -1788,7 +1788,7 @@ mod tests {
     #[tokio::test]
     async fn bump_generation_does_not_evict_installed_index_or_segment() {
         let ann = new_shared();
-        let key = AnnKey::new("global", "model-x");
+        let key = AnnKey::new("model-x");
         let id = Uuid::new_v4();
 
         install_replacing(&ann, &key, tiny_bridge(id, 1)).await;
@@ -1820,7 +1820,7 @@ mod tests {
     #[tokio::test]
     async fn search_loaded_serves_stale_installed_entry_without_rebuild() {
         let ann = new_shared();
-        let key = AnnKey::new("global", "model-x");
+        let key = AnnKey::new("model-x");
         let id = Uuid::new_v4();
 
         install_replacing(&ann, &key, tiny_bridge(id, 1)).await;
@@ -1857,7 +1857,7 @@ mod tests {
     #[tokio::test]
     async fn install_replacing_rejects_older_generation_candidate() {
         let ann = new_shared();
-        let key = AnnKey::new("any-ns", "model-x");
+        let key = AnnKey::new("model-x");
         let newer_id = Uuid::new_v4();
         let older_id = Uuid::new_v4();
 
@@ -1878,7 +1878,7 @@ mod tests {
     #[tokio::test]
     async fn install_replacing_replaces_older_installed_entry() {
         let ann = new_shared();
-        let key = AnnKey::new("any-ns", "model-x");
+        let key = AnnKey::new("model-x");
         let older_id = Uuid::new_v4();
         let newer_id = Uuid::new_v4();
 
@@ -1897,7 +1897,7 @@ mod tests {
     #[tokio::test]
     async fn install_replacing_replaces_on_equal_generation() {
         let ann = new_shared();
-        let key = AnnKey::new("any-ns", "model-x");
+        let key = AnnKey::new("model-x");
         let first_id = Uuid::new_v4();
         let second_id = Uuid::new_v4();
 
@@ -1917,7 +1917,7 @@ mod tests {
     #[tokio::test]
     async fn is_current_false_when_installed_generation_behind_counter() {
         let ann = new_shared();
-        let key = AnnKey::new("any-ns", "model-x");
+        let key = AnnKey::new("model-x");
 
         // Install a bridge stamped with generation 1 (as if built before any
         // write bumped the counter further).
@@ -1949,7 +1949,7 @@ mod tests {
     #[tokio::test]
     async fn is_current_false_when_absent() {
         let ann = new_shared();
-        let key = AnnKey::new("any-ns", "model-x");
+        let key = AnnKey::new("model-x");
         assert!(!is_current(&ann, &key).await);
     }
 
@@ -2122,7 +2122,7 @@ mod tests {
             ann.indexes
                 .read()
                 .await
-                .contains_key(&AnnKey::from_token(&token, MODEL)),
+                .contains_key(&AnnKey::from_token(MODEL)),
             "the model must end up warm regardless of which caller built it"
         );
 
@@ -2376,7 +2376,7 @@ mod tests {
         }
 
         let ann = new_shared();
-        let key = AnnKey::from_token(&token, MODEL);
+        let key = AnnKey::from_token(MODEL);
 
         assert!(
             ensure_ann_background(&rt, &token, &ann, MODEL).await,
@@ -2510,7 +2510,7 @@ mod tests {
         // The replacement note's write left a tail row, so a Hot adoption of
         // the pre-change segment (which would report LoadedSnapshot WITHOUT
         // containing the replacement) is ruled out by searching for it.
-        let key = AnnKey::from_token(&token, MODEL);
+        let key = AnnKey::from_token(MODEL);
         let query = fnv_to_vec("restart signal note REPLACEMENT", DIMS);
         let hits = search_loaded(&ann2, &key, &query, 5)
             .await
@@ -2618,7 +2618,7 @@ mod tests {
         );
         // The replayed index must serve the NEW embedding for the re-embedded
         // note — a Hot adoption of the stale segment would miss it.
-        let key = AnnKey::from_token(&token, MODEL);
+        let key = AnnKey::from_token(MODEL);
         let replacement: Vec<f32> = (0..DIMS).map(|i| (i as f32 + 100.0) / 7.0).collect();
         let hits = search_loaded(&ann2, &key, &replacement, 1)
             .await
@@ -2713,7 +2713,7 @@ mod tests {
             "a predicate-failing final upsert must replay as a delete within \
              Stale-tail adoption, not force a Cold rebuild, got: {status:?}"
         );
-        let key = AnnKey::from_token(&token, MODEL);
+        let key = AnnKey::from_token(MODEL);
         let query = fnv_to_vec("join predicate note 0", DIMS);
         let hits = search_loaded(&ann2, &key, &query, 4)
             .await
@@ -2848,7 +2848,7 @@ mod tests {
         }
 
         let ann1 = new_shared();
-        let key = AnnKey::from_token(&token1, MODEL);
+        let key = AnnKey::from_token(MODEL);
         let status = ensure_ann_for_model(&rt1, &token1, &ann1, MODEL)
             .await
             .expect("first warm");
@@ -2974,7 +2974,7 @@ mod tests {
         }
 
         let ann = new_shared();
-        let key = AnnKey::from_token(&token, MODEL);
+        let key = AnnKey::from_token(MODEL);
 
         // The two-way barrier orders the write after the task captures its first floor.
         ann.attempt_floor_barrier

@@ -421,7 +421,7 @@ impl PackRuntime for MemoryPack {
                     return;
                 };
                 for model in runtime.registered_embedding_model_names() {
-                    let key = crate::ann::AnnKey::new("local", model.as_str());
+                    let key = crate::ann::AnnKey::new(model.as_str());
                     crate::ann::bump_generation(&ann, &key).await;
                     crate::ann::ensure_ann_background(&runtime, &token, &ann, &model).await;
                 }
@@ -747,7 +747,7 @@ mod note_mutation_hook_tests {
     }
 
     fn mutation_hook_ann_key() -> ann::AnnKey {
-        ann::AnnKey::new("local", FR1_MODEL)
+        ann::AnnKey::new(FR1_MODEL)
     }
 
     /// Seeds one note, warms ANN through recall, and verifies the pre-mutation state.
