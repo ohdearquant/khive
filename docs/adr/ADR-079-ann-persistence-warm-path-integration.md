@@ -407,47 +407,100 @@ CREATE TABLE ann_write_log (
   seq        INTEGER PRIMARY KEY AUTOINCREMENT,
   namespace  TEXT NOT NULL,
   embedding_model TEXT NOT NULL,
+  kind       TEXT NOT NULL,
+  field      TEXT NOT NULL,
   subject_id TEXT NOT NULL,
   op         TEXT NOT NULL CHECK (op IN ('upsert','delete'))
 );
 CREATE INDEX idx_ann_write_log_ns_model_seq ON ann_write_log(namespace, embedding_model, seq);
 ```
 
-- Every vector write path (insert, batch insert, delete, merge-cleanup) appends one row per
-  affected `(namespace, model, subject_id)` in the same transaction as the vector mutation.
-- `save_atomic`'s commit record gains a `last_applied_seq` field (per segment).
-- **Restart classification becomes one indexed SQL read**: `SELECT MAX(seq) FROM ann_write_log
-  WHERE namespace=? AND embedding_model=?` compared against the segment's `last_applied_seq`:
-  - equal → **Hot**: mmap load, zero corpus IO;
-  - greater → **Stale-tail**: mmap load, then fetch only the logged tail subjects' embeddings by
-    primary key and apply them through ADR-052 `insert`/`tombstone`. No full rebuild, no corpus
-    scan. Serve-stale semantics of §2 apply while the tail applies;
-  - segment absent/corrupt, dimension change, or tail longer than `ann_rebuild_threshold`
-    (default: 20% of `vector_count`) → **Cold**: full rebuild as today.
+- Every vector write path (insert, batch insert, delete, merge-cleanup, orphan sweep) appends one
+  row per affected vector row — carrying the row's own `namespace`, `embedding_model`, `kind`, and
+  `field` — in the same transaction as the vector mutation.
+- **Scope rule.** All vector corpora share the `vec_{model}` storage funnel, so a log row alone
+  does not identify which index it dirties. Every consumer classifies and tail-reads with the
+  **same scope predicate its corpus scan uses** — at minimum `namespace` + `embedding_model`, plus
+  the consumer's `kind`/`field` restriction where its corpus is a subset of the table (for
+  example, the memory index's note-scope). Tail replay validates ownership of each fetched row
+  against that predicate; a row outside the consumer's scope is skipped for that consumer (it
+  belongs to a sibling index's tail).
+- `save_atomic`'s commit record gains a `last_applied_seq` watermark (per segment). The record
+  format is versioned by length: exactly two lengths are valid — the pre-amendment base record
+  (no watermark, no codes checksum) and the extended record (watermark trailer + codes-segment
+  checksum, §B). Any other length is corrupt.
+- **Restart classification is a total, versioned decision table**, evaluated per index scope:
+
+  | # | Condition (first match wins)                                                                               | Class                                                                                                                                                                                                                                                                                                    |
+  | - | ---------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+  | 1 | commit record absent, corrupt, or not a valid record length                                                | **Cold**                                                                                                                                                                                                                                                                                                 |
+  | 2 | record readable but pre-amendment (no watermark)                                                           | **Cold**, and log compaction is FORBIDDEN until an extended-format checkpoint commits                                                                                                                                                                                                                    |
+  | 3 | configured embedder dimensions for the model (the durable embedder-registry contract) ≠ segment dimensions | **Cold**                                                                                                                                                                                                                                                                                                 |
+  | 4 | `NOT EXISTS (SELECT 1 FROM ann_write_log WHERE <scope> AND seq > S)`                                       | **Hot**: mmap load, zero corpus IO. This is the post-compaction steady state — an empty scope (`MAX(seq)` NULL) with a valid watermark `S` is Hot, because every post-migration write logs a row and compaction only ever removes rows `<= S`                                                            |
+  | 5 | tail rows exist, tail count ≤ `ceil(ann_rebuild_threshold × live vector_count)`                            | **Stale-tail**: mmap load, then final-state tail replay (below). §2 serve-stale applies while the tail applies                                                                                                                                                                                           |
+  | 6 | tail count above threshold                                                                                 | **Stale-rebuild** (amends the §2 state table): the checksum-valid segment loads and serves under the existing `ann_serve_stale` gate while a full rebuild runs in the background. The threshold is a cost decision, not evidence of unreadability — it never demotes a loadable segment to Cold/FTS-only |
+
+- **Tail replay is a final-state delta, not an event replay.** Coalesce the tail to the highest
+  `seq` per `subject_id`; only the final op is applied. A final `upsert` resolves the subject's
+  existing ordinal through the bridge's uuid→ordinal reverse map, tombstones it when present, then
+  performs exactly one ADR-052 `insert` of the current embedding (point-read by primary key under
+  the scope predicate). A final `delete` tombstones the mapped ordinal, and is a no-op for an
+  unmapped subject. A contradiction — a final `upsert` whose source row is missing, or id-map
+  state that disagrees with the log — escalates that index to **Cold**; events are never silently
+  skipped. This covers repeated upsert, delete-then-upsert, upsert-then-delete, batch, and
+  merge-cleanup sequences: historical intermediate values are unavailable by design and never
+  needed.
+- **Watermark capture and publication are linearized per index scope.** The corpus (or tail) read
+  and the watermark read execute inside one SQLite read snapshot; `S = MAX(seq)` within that
+  snapshot, so the serialized state contains exactly the scope's writes `<= S` — never a watermark
+  stamped ahead of (or behind) the state it describes. `save_atomic` persists that `S`.
 - `live_content_hash` / `scan_corpus_raw` leave the warm path entirely. The content hash remains
   in the commit record as a corruption check over segment files (blake3 of the files, as today),
-  not as a liveness classifier.
-- **Log compaction**: after a successful `save_atomic` at `last_applied_seq = S`, delete log rows
-  with `seq <= S` for that `(namespace, model)`. The log's steady size is the write volume since
-  the last checkpoint.
+  not as a liveness classifier. Vector writes no longer delete persisted segments: with the log,
+  a stale segment is recoverable state, not poison.
+- **Log compaction**: only after a successful extended-format `save_atomic` at watermark `S` is
+  durable, delete log rows with `seq <= S` for that scope. Never above the persisted watermark;
+  never while the durable segment lacks a watermark (rule 2).
+- **Configuration (§5 amendment)**: `ann_rebuild_threshold` joins the `[retrieval]` table —
+  fraction of the index's live vector count, `f64` in `(0, 1]`, default `0.20`, env
+  `KHIVE_ANN_REBUILD_THRESHOLD`, CLI `--ann-rebuild-threshold`, precedence per ADR-035. The tail
+  comparison is `tail_count <= ceil(threshold × live_count)`; an empty corpus never reaches the
+  comparison (rule 4 or the build path handles it).
 
-#### B. Checkpoint re-adopts the segment as mmap
+#### B. Checkpoint re-adopts the segment as mmap; SQ8 codes persist alongside it
 
 After any successful `save_atomic` — background-rebuild completion or §4 periodic checkpoint — the
 bridge reopens the just-written segment via the mmap load path and swaps it in for the Owned build
-product (same hot-swap seam §2 already requires for rebuild completion). Steady-state served
-vectors are therefore file-backed: resident memory follows actual access, the kernel reclaims
-under pressure, and the anonymous-heap footprint drops from O(corpus) to the graph + id-map +
-lifecycle structures. `promote_to_owned` remains the entry path for mutation (ADR-052 insert needs
-owned storage); the bridge oscillates Owned-during-write-burst → mmap-after-checkpoint, bounded by
-the checkpoint cadence.
+product (same hot-swap seam §2 already requires for rebuild completion), under a publication
+guard:
+
+- **Publication guard.** The reopened candidate carries watermark `S`. It is published only if the
+  bridge's current applied watermark still equals `S`, checked under the bridge's write
+  lock/generation counter. If newer deltas were applied while the segment was being reopened, the
+  bridge either replays `S+1..current` onto the candidate before publishing or retains the newer
+  Owned index and defers mmap adoption to the next checkpoint — a newer served state is never
+  replaced by an older snapshot. In-flight queries pin their index `Arc` and are unaffected by the
+  swap.
+- **SQ8 codes become a persisted segment.** The ADR-052 acquisition-tier codec and per-vector
+  codes (`gs_codec`/`gs_codes`) are written by `save_atomic` as a fifth checksummed segment file
+  (`codes.bin`) whose blake3 hash rides the extended commit record, and are memory-mapped on load.
+  Without this, every mmap load retrains and re-encodes the codec over the full corpus — an O(N)
+  touch of every vector page at adoption plus corpus-sized anonymous codes (~350 MB at current
+  scale) — which would defeat both the O(load) and the residency goals. Segments predating
+  `codes.bin` are pre-amendment records and classify Cold (rule 2).
+
+Steady-state served vectors and codes are therefore file-backed: resident memory follows actual
+access, the kernel reclaims under pressure, and the anonymous-heap footprint drops from O(corpus)
+to the graph + id-map + lifecycle structures. `promote_to_owned` remains the entry path for
+mutation (ADR-052 insert needs owned storage); the bridge oscillates
+Owned-during-write-burst → mmap-after-checkpoint, bounded by the checkpoint cadence.
 
 ### Consequences
 
 - Restart cost: minutes of rebuild + transient GBs → one indexed SQL read + point reads for the
   tail. A restart after a quiet period serves Hot with zero corpus IO.
 - Steady-state anonymous footprint at current corpus size: ~2.5-3 GB → graph/id-map/lifecycle only
-  (order 100-300 MB), vectors file-backed.
+  (order 100-300 MB); vectors and SQ8 codes both file-backed (`vectors.bin`, `codes.bin`).
 - Write path gains one same-transaction log append per vector mutation (one indexed insert; the
   vec0 write dominates).
 - The delta log is the first durable record of per-write ANN drift; it also gives §4's checkpoint
@@ -458,7 +511,7 @@ the checkpoint cadence.
 
 ### Crash-consistency ordering
 
-The design admits exactly three failure windows; each degrades to a cheaper-or-equal recovery,
+The design admits exactly four failure windows; each degrades to a cheaper-or-equal recovery,
 never to serving a stale-but-adopted index.
 
 1. **Vector write vs. log append**: same SQLite transaction, so no window exists. A rolled-back
@@ -473,9 +526,16 @@ never to serving a stale-but-adopted index.
    harmless.
 3. **Crash between `save_atomic` and mmap re-adoption**: adoption reopens the segment that was
    just committed, so a crash before the swap simply means the next start classifies that same
-   segment Hot and mmaps it then. Adoption never runs ahead of commit, so "stale-but-adopted" is
-   unreachable by construction: the swap replaces an Owned index whose logical content is
-   identical to the committed segment.
+   segment per the decision table (Hot when no later writes landed, Stale-tail otherwise) and
+   mmaps it then. Adoption never runs ahead of commit.
+4. **Concurrent write between snapshot capture and publication**: a write at `T > S` may commit
+   (and update the served Owned bridge) while the checkpoint at `S` is serializing or reopening.
+   The §B publication guard makes this window safe: the candidate publishes only if the bridge's
+   applied watermark still equals `S`; otherwise the newer Owned state is retained (or the
+   `S+1..T` tail is replayed onto the candidate first). "Stale-but-adopted" is therefore
+   unreachable: no path replaces a newer served state with an older snapshot, and because `S` is
+   captured in the same read snapshot as the serialized corpus, compaction at `<= S` never deletes
+   a row that is in neither the segment nor the remaining log.
 
 File-replacement safety: `save_atomic` stages and renames; a previously established mapping pins
 the old inode (POSIX) until the old index Arc drops, so in-flight queries on the prior map never
@@ -503,7 +563,8 @@ Levers named per review request, including rejected ones, at current corpus (~55
 | ---------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Mmap re-adoption (this amendment, §B)                            | ~1.4 GB anonymous → file-backed                                                                                               | swap seam only; machinery exists                                                                 | **Phase 1 (this amendment)**                                                                                                                                                              |
 | Write-log classifier (this amendment, §A)                        | restart: minutes of rebuild CPU + transient GBs → one SQL read                                                                | one log append per vector write                                                                  | **Phase 1 (this amendment)**                                                                                                                                                              |
-| SQ8/int8 resident tier (`GsSq8Codec`, already in-tree)           | 4× on vector bytes: ~1.4 GB → ~350 MB of page-cache working set post-mmap                                                     | recall-quality regression must be benchmarked against current baselines; full re-index per model | **Phase 2, benchmark-gated; must not block phase 1**                                                                                                                                      |
+| Persist + mmap SQ8 codes (`codes.bin`, §B)                       | ~350 MB anonymous codes → file-backed, and adoption stops touching every vector page to retrain the codec                     | fifth segment file + checksum in the commit record                                               | **Phase 1 (this amendment)** — without it, every mmap load re-encodes the full corpus and the residency projection fails                                                                  |
+| SQ8/int8 as the SERVING tier (replace f32 search reads)          | 4× on the vector working set actually paged in during search: ~1.4 GB → ~350 MB                                               | recall-quality regression must be benchmarked against current baselines; full re-index per model | **Phase 2, benchmark-gated; must not block phase 1**                                                                                                                                      |
 | SQLite per-connection budgets                                    | 64 MB page cache × up to 9 connections × N databases authorizes >1 GB; dropping `cache_size` to 16 MB bounds it at ~150 MB/DB | possible hit-rate regression on hot query shapes; needs measurement, not guesswork               | **Follow-up (#1129)**; independent of Vamana. Note `mmap_size=1GB` is file-backed/clean and is not the problem                                                                            |
 | Lazy knowledge warm (defer `warm_all` knowledge until first use) | pre-amendment: ~550 MB + rebuild CPU at boot                                                                                  | first-query latency spike; complexity in serving gates                                           | **Rejected — obsoleted by phase 1**: post-amendment, warm is an mmap open + graph load (sub-second, tens of MB anonymous), so eager warm keeps first-query latency flat at near-zero cost |
 | Mmap `graph.bin` adjacency as well as vectors                    | ~100-150 MB (adjacency + id maps stay anonymous in phase 1)                                                                   | graph access pattern is pointer-chasing — page-fault sensitivity needs benchmarking              | **Deferred**; noted for a later phase if the post-phase-1 profile still warrants it                                                                                                       |
