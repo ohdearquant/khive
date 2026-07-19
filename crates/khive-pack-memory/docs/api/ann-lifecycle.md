@@ -92,6 +92,29 @@ Graph construction trains SQ8 quantization and builds Vamana synchronously, so i
 
 `warm_existing_memory_indexes` schedules indexes for registered embedding models at pack warm time. ANN search remains global, then recall post-filters hydrated hits to the token's visible namespaces. The namespace-aware over-fetch algorithm is documented in `crates/khive-pack-memory/docs/api/recall-pipeline.md`.
 
+## Segment-root migration (legacy `data_dir/ann` cleanup)
+
+ADR-079 Amendment 1 moved the ANN segment root from a directory shared by every database in a
+data directory to a database-scoped root: `<db-file>.ann/<hex>` beside the database file itself
+(`ann_root_for` in `crates/khive-db/src/backend.rs`), rather than `<data_dir>/ann/<hex>`. This
+applies to both consumers that persist through `backend_ann_root()` — the memory pack's own
+global-scope index (`crates/khive-pack-memory/src/ann.rs`) and the knowledge pack's
+per-namespace index (`crates/khive-pack-knowledge/src/knowledge/vamana.rs`).
+
+The move is not an in-place migration. A segment persisted under the old shared root is not
+copied or relinked to the new database-scoped root:
+
+- On the first warm after upgrading past this change, the restart classifier looks for a commit
+  record at the new `<db-file>.ann/<hex>` path, finds nothing, and classifies Cold (decision
+  rule 1) — the index rebuilds from the corpus and persists under the new root. This is a
+  one-time cost per `(namespace/global, model)` scope; every subsequent restart is Hot again
+  once the new segment exists.
+- The old `<data_dir>/ann/` tree is not read by any code path after the upgrade. It is safe to
+  remove once the new-root rebuild has completed (confirm the corresponding
+  `<db-file>.ann/<hex>` directory exists with a valid `metadata.bin`); nothing sweeps it
+  automatically today, so cleanup is a manual `rm -rf <data_dir>/ann` once you've verified the
+  new root is populated.
+
 ## Ordering and atomicity guarantees
 
 - Generation is captured before a build or fast-path decision.

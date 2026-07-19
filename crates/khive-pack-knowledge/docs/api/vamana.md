@@ -8,12 +8,16 @@ Source: `crates/khive-pack-knowledge/src/knowledge/vamana.rs` (entire module is
 Wraps `khive_vamana::VamanaIndex` with an ID map (u32 → UUID) so search results can be
 fused with FTS5 candidates via RRF.
 
-Persistence (ADR-079): v2 binary segments are written to `data_dir/ann/<hex>/` on every
-cold-start rebuild or explicit reindex. `ensure_ann_for_model` checks the v2 segment
-directory first (content-hash gated), falling back to legacy v1 JSON rows in
-`retrieval_snapshots` for in-place upgrades, then rebuilds from the full sqlite-vec corpus
-on cache-miss. `kkernel reindex` re-persists v2 segments and calls `invalidate_snapshot` to
-clean up stale v1 rows.
+Persistence (ADR-079, Amendment 1): v2 binary segments are written to
+`<db-file>.ann/<hex>/` — a database-scoped root beside the backing database file, so
+co-located databases can never adopt each other's segments — on every cold-start rebuild
+or explicit reindex. `ensure_ann_for_model` checks the v2 segment directory first, gated
+by the write-log restart classifier (`classify_and_adopt_segment`: commit-record and
+watermark checks, then a log-table tail probe, ahead of any corpus read — see the
+ADR-079 Amendment 1 decision table for the full rule order), falling back to legacy v1
+JSON rows in `retrieval_snapshots` for in-place upgrades, then rebuilds from the full
+sqlite-vec corpus on cache-miss. `kkernel reindex` re-persists v2 segments and calls
+`invalidate_snapshot` to clean up stale v1 rows.
 
 This module exceeds the 700-line soft target because it owns the complete Vamana ANN
 lifecycle for knowledge search: `SharedAnn` type, `AnnKey`, snapshot persistence
@@ -48,10 +52,14 @@ corpus `content_hash` taken from the v2 commit record.
 First hit wins:
 
 1. **Fast path** — already in the in-memory cache; return immediately.
-2. **v2 segment path** — if a `data_dir/ann/<hex>/` directory exists with a valid
-   `metadata.bin`, compare its `content_hash` against a freshly computed
-   `live_content_hash`. On match, load the Vamana binary segments directly via
-   `AnnBridge::load` (O(load), no rebuild). On mismatch, fall through.
+2. **v2 segment path** — if a `<db-file>.ann/<hex>/` directory exists with a valid
+   `metadata.bin`, run the ADR-079 Amendment 1 restart classifier
+   (`classify_and_adopt_segment`): a per-write delta log (`ann_write_log`) plus each
+   consumer's durable watermark replace the old full-corpus content-hash check, so a
+   Hot classification loads the Vamana binary segments directly via `AnnBridge::load`
+   (O(load), zero corpus I/O) instead of hashing the live corpus on every restart. A
+   short tail replays incrementally (Stale-tail); a long tail serves the existing
+   segment while rebuilding in the background (Stale-rebuild). On Cold, fall through.
 3. **v1 JSON snapshot path** — try `retrieval_snapshots`; on hit, validate the
    `CorpusFingerprint` (count + dims) and restore from JSON. On miss / stale / corrupt,
    fall through.
