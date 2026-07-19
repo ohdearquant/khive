@@ -120,6 +120,17 @@ const V9_UP: &str = include_str!("../sql/009-entities-name-ci-index.sql");
 
 const V10_UP: &str = include_str!("../sql/010-entities-content-ref.sql");
 
+const V11_UP: &str = include_str!("../sql/011-ann-write-log.sql");
+
+/// DDL for the `ann_write_log` delta table.
+///
+/// Shared between migration V11 and the belt-and-suspenders creation in
+/// `StorageBackend::vectors_for_namespace` (same pattern as
+/// [`EMBEDDING_MODELS_DDL`]): every database that hosts `vec_*` tables must
+/// also have the write log, or vector writes would fail on databases opened
+/// without `run_migrations()`. The `.sql` file is `IF NOT EXISTS`-idempotent.
+pub const ANN_WRITE_LOG_DDL: &str = V11_UP;
+
 /// DDL for the `_embedding_models` registry table.
 ///
 /// Shared between the V1 schema and the belt-and-suspenders creation in
@@ -178,6 +189,11 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         version: 10,
         name: "entities_content_ref",
         up: V10_UP,
+    },
+    VersionedMigration {
+        version: 11,
+        name: "ann_write_log",
+        up: V11_UP,
     },
 ];
 

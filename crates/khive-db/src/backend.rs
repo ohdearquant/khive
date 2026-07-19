@@ -392,6 +392,13 @@ impl StorageBackend {
             .conn()
             .execute_batch(crate::migrations::EMBEDDING_MODELS_DDL)?;
 
+        // Same guarantee for the ANN write log: vector write paths append to it
+        // in the same transaction as the vec0 mutation, so it must exist in any
+        // database that hosts vec_* tables.
+        writer
+            .conn()
+            .execute_batch(crate::migrations::ANN_WRITE_LOG_DDL)?;
+
         // Create the vec0 virtual table. Idempotent on fresh databases and after the
         // old-schema rebuild above.
         let ddl = format!(
@@ -601,6 +608,17 @@ impl StorageBackend {
         self.path.as_ref()?.parent().map(|p| p.to_path_buf())
     }
 
+    /// Root directory for this database's ANN segment tree, or `None` for an
+    /// in-memory backend. Derived from the database file name itself
+    /// (`<db-file>.ann/` beside the file), so two databases sharing a parent
+    /// directory can never adopt each other's segments or UUID maps. The
+    /// suffix is appended at the `OsString` byte level — a lossy UTF-8
+    /// conversion would collapse distinct non-UTF-8 filenames into one
+    /// replacement-character root, breaking exactly that isolation.
+    pub fn ann_root(&self) -> Option<std::path::PathBuf> {
+        ann_root_for(self.path.as_ref()?)
+    }
+
     /// Access the underlying pool (escape hatch).
     pub fn pool(&self) -> &ConnectionPool {
         &self.pool
@@ -610,6 +628,16 @@ impl StorageBackend {
     pub fn pool_arc(&self) -> Arc<ConnectionPool> {
         Arc::clone(&self.pool)
     }
+}
+
+/// `<db-file>.ann` sibling of a database file, appended at the `OsString`
+/// byte level: a lossy UTF-8 conversion would collapse distinct non-UTF-8
+/// filenames into one replacement-character root, breaking the per-database
+/// segment isolation that `ann_root` exists to guarantee.
+fn ann_root_for(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut file = path.file_name()?.to_os_string();
+    file.push(".ann");
+    path.parent().map(|p| p.join(file))
 }
 
 #[cfg(test)]
@@ -645,6 +673,35 @@ mod tests {
         let backend = StorageBackend::sqlite(&path).expect("file backend");
         let got = backend.data_dir().expect("file backend must return Some");
         assert_eq!(got, dir.path());
+    }
+
+    #[test]
+    fn ann_root_is_database_scoped_sibling_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.db");
+        let backend = StorageBackend::sqlite(&path).expect("file backend");
+        let got = backend.ann_root().expect("file backend must return Some");
+        assert_eq!(got, dir.path().join("data.db.ann"));
+        assert!(StorageBackend::memory().unwrap().ann_root().is_none());
+    }
+
+    /// Two distinct non-UTF-8 database filenames must never share an ANN
+    /// root: a lossy UTF-8 conversion collapses both to the replacement
+    /// character, letting one database adopt the other's segments. Exercised
+    /// on the path derivation directly — APFS (macOS CI) refuses to create
+    /// files with non-UTF-8 names, so a real backend cannot be opened there.
+    #[cfg(unix)]
+    #[test]
+    fn ann_root_distinct_for_non_utf8_filenames() {
+        use std::os::unix::ffi::OsStrExt;
+        let path_a = std::path::Path::new("/data").join(std::ffi::OsStr::from_bytes(b"\xff.db"));
+        let path_b = std::path::Path::new("/data").join(std::ffi::OsStr::from_bytes(b"\xfe.db"));
+        let root_a = ann_root_for(&path_a).expect("Some for a file path");
+        let root_b = ann_root_for(&path_b).expect("Some for a file path");
+        assert_ne!(
+            root_a, root_b,
+            "distinct database files must map to distinct ANN roots"
+        );
     }
 
     #[tokio::test]

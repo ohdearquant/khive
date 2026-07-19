@@ -317,6 +317,14 @@ impl KhiveRuntime {
         self.backend.data_dir()
     }
 
+    /// Root directory for this database's ANN segment tree (`<db-file>.ann/`
+    /// beside the file), or `None` for an in-memory backend. Scoped to the
+    /// database file itself so two databases sharing a parent directory can
+    /// never adopt each other's segments.
+    pub fn backend_ann_root(&self) -> Option<std::path::PathBuf> {
+        self.backend.ann_root()
+    }
+
     // ---- Store accessors (token-scoped) ----
 
     /// Get an EntityStore scoped to the token's namespace.
@@ -404,6 +412,31 @@ impl KhiveRuntime {
             dims,
             token.namespace().as_str(),
         )?)
+    }
+
+    /// Output dimensions for a named embedding model, resolved from the
+    /// embedder registry alone — no storage access. Mirrors
+    /// [`vectors_for_model`](Self::vectors_for_model)'s resolution order:
+    /// lattice aliases route through the enum when registered, otherwise the
+    /// custom provider's declared `dimensions()`. `None` when no such model
+    /// is registered.
+    pub fn embedder_dimensions(&self, model_name: &str) -> Option<usize> {
+        if let Some(model) = parse_embedding_model_alias(model_name) {
+            let key = model.to_string();
+            let in_registry = self
+                .embedder_registry
+                .read()
+                .map(|reg| reg.contains(&key))
+                .unwrap_or(false);
+            if in_registry {
+                return Some(model.dimensions());
+            }
+        }
+        self.embedder_registry
+            .read()
+            .ok()?
+            .get_provider(model_name)
+            .map(|p| p.dimensions())
     }
 
     fn vectors_for_embedding_model(

@@ -21,7 +21,7 @@ use std::sync::Arc;
 use khive_runtime::{KhiveRuntime, Namespace, NamespaceToken, RuntimeError};
 use khive_storage::types::{SqlStatement, SqlValue};
 use khive_vamana::{
-    corpus_content_hash, read_commit_fingerprint, CorpusFingerprint, VamanaConfig, VamanaIndex,
+    read_commit_fingerprint, read_commit_info, CorpusFingerprint, VamanaConfig, VamanaIndex,
     VamanaSnapshot,
 };
 use tokio::sync::RwLock;
@@ -157,6 +157,32 @@ pub(crate) async fn install_if_fresher(ann: &SharedAnn, key: &AnnKey, candidate:
             unavailable_guard(&ann.unavailable).remove(key);
         }
     }
+}
+
+/// Install `candidate`, replacing an equal-generation incumbent.
+///
+/// Same namespace-generation fence as `install_if_fresher` (a candidate that
+/// predates the namespace's current generation is rejected), but ties REPLACE
+/// instead of keeping the incumbent. Only two ordered-within-one-warm-task
+/// paths use it: swapping a just-persisted segment's mmap reopen in for the
+/// Owned build product (identical content), and replacing a served stale
+/// segment with its completed rebuild (rule 8 → rebuild completion). The
+/// A/B-race protection that motivates tie-keeps-incumbent in
+/// `install_if_fresher` does not apply inside a single single-flight task.
+pub(crate) async fn install_replacing(ann: &SharedAnn, key: &AnnKey, candidate: AnnBridge) {
+    let mut idxs = ann.indexes.write().await;
+    let ns_generation = current_generation(ann, &key.namespace);
+    if candidate.generation < ns_generation {
+        tracing::debug!(
+            key = ?key,
+            candidate_generation = candidate.generation,
+            namespace_generation = ns_generation,
+            "knowledge ANN replace skipped: candidate predates namespace's current generation"
+        );
+        return;
+    }
+    idxs.insert(key.clone(), candidate);
+    unavailable_guard(&ann.unavailable).remove(key);
 }
 
 // Recover a poisoned warming Mutex rather than aborting: the guarded HashSet<AnnKey>
@@ -370,6 +396,74 @@ impl AnnBridge {
     pub(crate) fn with_generation(mut self, generation: u64) -> Self {
         self.generation = generation;
         self
+    }
+
+    /// Stamp the ann_write_log watermark this bridge's corpus state reflects
+    /// (ADR-079 Amendment 1). Persisted by `save_atomic` into the extended
+    /// commit record.
+    pub(crate) fn set_applied_seq(&mut self, seq: u64) {
+        self.index.set_last_applied_seq(Some(seq));
+    }
+
+    /// Ordinal lookup for streamed tail replay. Built once per replay so
+    /// batches can apply incrementally without rescanning the id-map.
+    /// Highest ordinal wins for a repeated uuid: inserts append, so the
+    /// latest slot is the live one; earlier slots are tombstoned.
+    pub(crate) fn reverse_map(&self) -> HashMap<Uuid, u32> {
+        let mut reverse: HashMap<Uuid, u32> = HashMap::with_capacity(self.id_map.len());
+        for (ordinal, uuid) in self.id_map.iter().enumerate() {
+            reverse.insert(*uuid, ordinal as u32);
+        }
+        reverse
+    }
+
+    /// Apply one subject's coalesced final state (ADR-079 Amendment 1):
+    /// `Some(embedding)` replays a final upsert (tombstone the mapped old
+    /// ordinal, then exactly one insert); `None` replays a final delete
+    /// (tombstone if mapped, no-op otherwise). `reverse` is the map from
+    /// [`reverse_map`](Self::reverse_map), kept current across calls. Any
+    /// id-map contradiction returns `Err` — the caller escalates to Cold.
+    pub(crate) fn apply_final_op(
+        &mut self,
+        reverse: &mut HashMap<Uuid, u32>,
+        uuid: Uuid,
+        op: Option<Vec<f32>>,
+    ) -> Result<(), String> {
+        match op {
+            None => {
+                if let Some(&ordinal) = reverse.get(&uuid) {
+                    self.index
+                        .tombstone(ordinal)
+                        .map_err(|e| format!("replay tombstone({ordinal}): {e}"))?;
+                    reverse.remove(&uuid);
+                }
+            }
+            Some(mut embedding) => {
+                l2_normalize(&mut embedding);
+                if let Some(&old) = reverse.get(&uuid) {
+                    self.index
+                        .tombstone(old)
+                        .map_err(|e| format!("replay tombstone({old}): {e}"))?;
+                }
+                let ordinal = self
+                    .index
+                    .insert(&embedding)
+                    .map_err(|e| format!("replay insert: {e}"))?;
+                let slot = ordinal as usize;
+                match slot.cmp(&self.id_map.len()) {
+                    std::cmp::Ordering::Less => self.id_map[slot] = uuid,
+                    std::cmp::Ordering::Equal => self.id_map.push(uuid),
+                    std::cmp::Ordering::Greater => {
+                        return Err(format!(
+                            "replay insert returned ordinal {ordinal} beyond id_map len {}",
+                            self.id_map.len()
+                        ));
+                    }
+                }
+                reverse.insert(uuid, ordinal);
+            }
+        }
+        Ok(())
     }
 
     pub fn search(&self, query: &[f32], k: usize) -> Vec<(Uuid, f32)> {
@@ -617,10 +711,10 @@ pub(crate) fn snapshot_key(namespace: &str, model: &str) -> String {
 /// the bytes of `snapshot_key(ns, model)`. Hex encoding is injective, filesystem-safe,
 /// and reversible via `decode_ann_dir_name`. Returns `None` for in-memory backends.
 fn ann_segment_dir(rt: &KhiveRuntime, ns: &str, model: &str) -> Option<std::path::PathBuf> {
-    let data_dir = rt.backend_data_dir()?;
+    let ann_root = rt.backend_ann_root()?;
     let key = snapshot_key(ns, model);
     let hex: String = key.bytes().map(|b| format!("{b:02x}")).collect();
-    Some(data_dir.join("ann").join(hex))
+    Some(ann_root.join(hex))
 }
 
 /// Decode a hex-encoded ann directory name back to `(namespace, model)`.
@@ -669,6 +763,382 @@ pub(crate) fn persist_ann_v2(
     match ann_segment_dir(rt, ns, model) {
         Some(dir) => bridge.save_atomic(&dir),
         None => Ok(()), // in-memory backend — no filesystem, skip silently
+    }
+}
+
+/// Stable, scope-bearing consumer identity for the knowledge atom index
+/// (ADR-079 Amendment 1): pack name plus the corpus predicate's field value,
+/// so the same predicate always maps to the same `ann_consumer_watermark`
+/// row across restarts.
+const ANN_CONSUMER: &str = "knowledge:knowledge.atom";
+
+const ANN_REBUILD_THRESHOLD_DEFAULT: f64 = 0.20;
+
+/// `ann_rebuild_threshold` (ADR-079 Amendment 1 §5): the tail fraction of the
+/// live vector count above which replay costs more than a full rebuild.
+/// Values outside `(0, 1]` fall back to the default.
+fn ann_rebuild_threshold() -> f64 {
+    std::env::var("KHIVE_ANN_REBUILD_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| *v > 0.0 && *v <= 1.0)
+        .unwrap_or(ANN_REBUILD_THRESHOLD_DEFAULT)
+}
+
+/// Durably register this consumer's watermark row at 0 (`INSERT OR IGNORE`).
+///
+/// MUST run before the consumer persists or serves any extended-format
+/// segment for the scope: a row at 0 blocks pair-wide compaction instead of
+/// hiding this consumer from the registry `MIN` (ADR-079 Amendment 1 §A
+/// step 1).
+async fn register_consumer(rt: &KhiveRuntime, ns: &str, model: &str) -> Result<(), String> {
+    let sql = rt.sql();
+    let mut w = sql.writer().await.map_err(|e| e.to_string())?;
+    w.execute(SqlStatement {
+        sql: "INSERT OR IGNORE INTO ann_consumer_watermark \
+              (consumer, namespace, embedding_model, watermark) VALUES (?1, ?2, ?3, 0)"
+            .into(),
+        params: vec![
+            SqlValue::Text(ANN_CONSUMER.into()),
+            SqlValue::Text(ns.to_owned()),
+            SqlValue::Text(model.to_owned()),
+        ],
+        label: Some("ann_register_consumer".into()),
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Read this consumer's own registry watermark. `None` = no row (decision
+/// rule 4: Cold after re-registering at 0).
+async fn read_own_watermark(
+    rt: &KhiveRuntime,
+    ns: &str,
+    model: &str,
+) -> Result<Option<i64>, String> {
+    let sql = rt.sql();
+    let mut reader = sql.reader().await.map_err(|e| e.to_string())?;
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: "SELECT watermark FROM ann_consumer_watermark \
+                  WHERE consumer = ?1 AND namespace = ?2 AND embedding_model = ?3"
+                .into(),
+            params: vec![
+                SqlValue::Text(ANN_CONSUMER.into()),
+                SqlValue::Text(ns.to_owned()),
+                SqlValue::Text(model.to_owned()),
+            ],
+            label: Some("ann_read_own_watermark".into()),
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(rows
+        .into_iter()
+        .next()
+        .and_then(|row| match row.get("watermark") {
+            Some(SqlValue::Integer(n)) => Some(*n),
+            _ => None,
+        }))
+}
+
+/// Raise this consumer's registered watermark monotonically after a durable
+/// segment commit at `s` (ADR-079 Amendment 1 §A step 2). A crash before this
+/// leaves the smaller watermark — under-compacts, never over-compacts.
+async fn raise_watermark(rt: &KhiveRuntime, ns: &str, model: &str, s: u64) -> Result<(), String> {
+    let sql = rt.sql();
+    let mut w = sql.writer().await.map_err(|e| e.to_string())?;
+    w.execute(SqlStatement {
+        sql: "UPDATE ann_consumer_watermark SET watermark = MAX(watermark, ?4) \
+              WHERE consumer = ?1 AND namespace = ?2 AND embedding_model = ?3"
+            .into(),
+        params: vec![
+            SqlValue::Text(ANN_CONSUMER.into()),
+            SqlValue::Text(ns.to_owned()),
+            SqlValue::Text(model.to_owned()),
+            SqlValue::Integer(s as i64),
+        ],
+        label: Some("ann_raise_watermark".into()),
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Compact the write log through the pair-wide registry minimum ONLY (ADR-079
+/// Amendment 1 §A step 3). The scalar subquery yields NULL when no consumer
+/// has registered, and `seq <= NULL` matches nothing — an unregistered pair
+/// never compacts.
+async fn compact_log(rt: &KhiveRuntime, ns: &str, model: &str) -> Result<(), String> {
+    let sql = rt.sql();
+    let mut w = sql.writer().await.map_err(|e| e.to_string())?;
+    w.execute(SqlStatement {
+        sql: "DELETE FROM ann_write_log \
+              WHERE namespace = ?1 AND embedding_model = ?2 \
+                AND seq <= (SELECT MIN(watermark) FROM ann_consumer_watermark \
+                             WHERE namespace = ?1 AND embedding_model = ?2)"
+            .into(),
+        params: vec![
+            SqlValue::Text(ns.to_owned()),
+            SqlValue::Text(model.to_owned()),
+        ],
+        label: Some("ann_compact_log".into()),
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Whether any tail row exists above `s` for this consumer's scope. A pure
+/// `ann_write_log` index probe (`idx_ann_write_log_ns_model_seq`) — never
+/// touches the vec0 corpus, which is what keeps Hot classification free of
+/// corpus IO (the amendment's rule 5/6 evaluation-order note).
+async fn tail_exists(rt: &KhiveRuntime, ns: &str, model: &str, s: u64) -> Result<bool, String> {
+    let sql = rt.sql();
+    let mut reader = sql.reader().await.map_err(|e| e.to_string())?;
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: "SELECT EXISTS(SELECT 1 FROM ann_write_log \
+                  WHERE namespace = ?1 AND embedding_model = ?2 \
+                    AND field = 'knowledge.atom' AND seq > ?3) AS has_tail"
+                .into(),
+            params: vec![
+                SqlValue::Text(ns.to_owned()),
+                SqlValue::Text(model.to_owned()),
+                SqlValue::Integer(s as i64),
+            ],
+            label: Some("ann_tail_probe".into()),
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    match rows.first().and_then(|r| r.get("has_tail")) {
+        Some(SqlValue::Integer(n)) => Ok(*n != 0),
+        other => Err(format!("tail probe: unexpected value {other:?}")),
+    }
+}
+
+/// Live corpus count and tail count for this consumer's scope, captured in ONE
+/// statement so both come from the same SQLite read snapshot (the decision
+/// table requires the live count and the tail to describe one state).
+async fn scope_counts(
+    rt: &KhiveRuntime,
+    ns: &str,
+    model: &str,
+    s: u64,
+) -> Result<(u64, u64), String> {
+    let table_name = format!("vec_{}", sanitize_model_key(model));
+    let sql = rt.sql();
+    let mut reader = sql.reader().await.map_err(|e| e.to_string())?;
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: format!(
+                "SELECT \
+                   (SELECT COUNT(*) FROM {table_name} \
+                     WHERE namespace = ?1 AND embedding_model = ?2 \
+                       AND field = 'knowledge.atom') AS live, \
+                   (SELECT COUNT(*) FROM ann_write_log \
+                     WHERE namespace = ?1 AND embedding_model = ?2 \
+                       AND field = 'knowledge.atom' AND seq > ?3) AS tail"
+            ),
+            params: vec![
+                SqlValue::Text(ns.to_owned()),
+                SqlValue::Text(model.to_owned()),
+                SqlValue::Integer(s as i64),
+            ],
+            label: Some("ann_scope_counts".into()),
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    let row = rows
+        .into_iter()
+        .next()
+        .ok_or("scope_counts returned no row")?;
+    let get = |col: &str| match row.get(col) {
+        Some(SqlValue::Integer(n)) => u64::try_from(*n).map_err(|_| format!("negative {col}")),
+        other => Err(format!("scope_counts {col}: unexpected value {other:?}")),
+    };
+    Ok((get("live")?, get("tail")?))
+}
+
+/// Coalesce the scope's tail (rows above `s`) to the final op per subject in
+/// ONE aggregate query — SQLite's bare-column-with-MAX guarantee makes `op`
+/// the value from each subject's max-seq row. Returns `(subject, is_delete)`
+/// pairs plus the new watermark; memory is O(distinct tail subjects), never
+/// O(tail rows). Embeddings are read separately, per batch, by
+/// [`replay_final_states`].
+async fn fetch_final_states(
+    rt: &KhiveRuntime,
+    ns: &str,
+    model: &str,
+    s: u64,
+) -> Result<(Vec<(Uuid, bool)>, u64), String> {
+    let sql = rt.sql();
+    let mut reader = sql.reader().await.map_err(|e| e.to_string())?;
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: "SELECT subject_id, op, MAX(seq) AS seq FROM ann_write_log \
+                  WHERE namespace = ?1 AND embedding_model = ?2 \
+                    AND field = 'knowledge.atom' AND seq > ?3 \
+                  GROUP BY subject_id"
+                .into(),
+            params: vec![
+                SqlValue::Text(ns.to_owned()),
+                SqlValue::Text(model.to_owned()),
+                SqlValue::Integer(s as i64),
+            ],
+            label: Some("ann_fetch_final_states".into()),
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut new_s = s;
+    let mut finals: Vec<(Uuid, bool)> = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let seq = match row.get("seq") {
+            Some(SqlValue::Integer(n)) => *n,
+            _ => return Err("ann_write_log.seq: unexpected value".into()),
+        };
+        new_s = new_s.max(u64::try_from(seq).map_err(|_| "negative seq")?);
+        let uuid = match row.get("subject_id") {
+            Some(SqlValue::Text(t)) => {
+                Uuid::parse_str(t).map_err(|e| format!("tail subject_id {t}: {e}"))?
+            }
+            _ => return Err("ann_write_log.subject_id: unexpected value".into()),
+        };
+        let is_delete = match row.get("op") {
+            Some(SqlValue::Text(t)) => t == "delete",
+            _ => return Err("ann_write_log.op: unexpected value".into()),
+        };
+        finals.push((uuid, is_delete));
+    }
+    Ok((finals, new_s))
+}
+
+/// Subjects per streamed replay batch: bounds transient replay memory at
+/// O(batch × dimensions) regardless of tail size.
+const REPLAY_BATCH: usize = 500;
+
+/// Stream the coalesced final states onto `bridge`. Each final upsert's
+/// embedding is point-read by single-key equality — the only constraint
+/// shape sqlite-vec plans as a primary-key point lookup rather than a full
+/// table scan — and the consumer scope predicate is checked in process on
+/// the returned row. Batches apply as they are read, so peak memory is one
+/// batch of embeddings, never the whole tail. A final upsert whose source
+/// row is missing or out of scope is a contradiction → `Err` (caller
+/// escalates to Cold).
+async fn replay_final_states(
+    rt: &KhiveRuntime,
+    bridge: &mut AnnBridge,
+    ns: &str,
+    model: &str,
+    finals: &[(Uuid, bool)],
+) -> Result<(), String> {
+    let table_name = format!("vec_{}", sanitize_model_key(model));
+    let point_read_sql = format!(
+        "SELECT namespace, embedding_model, field, embedding \
+         FROM {table_name} WHERE subject_id = ?1"
+    );
+    let sql = rt.sql();
+    let mut reader = sql.reader().await.map_err(|e| e.to_string())?;
+    let mut reverse = bridge.reverse_map();
+
+    for batch in finals.chunks(REPLAY_BATCH) {
+        let mut embeddings: HashMap<Uuid, Vec<f32>> = HashMap::new();
+        for (uuid, is_delete) in batch {
+            if *is_delete {
+                continue;
+            }
+            let rows = reader
+                .query_all(SqlStatement {
+                    sql: point_read_sql.clone(),
+                    params: vec![SqlValue::Text(uuid.to_string())],
+                    label: Some("ann_replay_point_read".into()),
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+            let Some(row) = rows.first() else {
+                return Err(format!(
+                    "final upsert for {uuid} has no source row (contradiction → Cold)"
+                ));
+            };
+            let in_scope = matches!(row.get("namespace"), Some(SqlValue::Text(t)) if t == ns)
+                && matches!(row.get("embedding_model"), Some(SqlValue::Text(t)) if t == model)
+                && matches!(row.get("field"), Some(SqlValue::Text(t)) if t == "knowledge.atom");
+            if !in_scope {
+                return Err(format!(
+                    "final upsert for {uuid}: source row left the consumer scope \
+                     (contradiction → Cold)"
+                ));
+            }
+            let Some(SqlValue::Blob(bytes)) = row.get("embedding") else {
+                return Err(format!("final upsert for {uuid}: embedding missing on row"));
+            };
+            let vec: Vec<f32> = bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            embeddings.insert(*uuid, vec);
+        }
+        for (uuid, is_delete) in batch {
+            let op =
+                if *is_delete {
+                    None
+                } else {
+                    Some(embeddings.remove(uuid).ok_or_else(|| {
+                        format!("final upsert for {uuid}: embedding lost in batch")
+                    })?)
+                };
+            bridge.apply_final_op(&mut reverse, *uuid, op)?;
+        }
+    }
+    Ok(())
+}
+
+/// Persist `bridge` at its applied watermark, raise this consumer's registry
+/// row, compact the pair's log through the registry MIN, then reopen the
+/// just-written segment via the mmap load path and swap it in for the Owned
+/// build product (ADR-079 Amendment 1 §B). Registration precedes the persist
+/// (§A step 1). On any persist/reopen failure the Owned bridge is installed
+/// instead — correctness first, memory second.
+pub(crate) async fn checkpoint_raise_compact_readopt(
+    rt: &KhiveRuntime,
+    ann: &SharedAnn,
+    key: &AnnKey,
+    ns: &str,
+    model: &str,
+    bridge: AnnBridge,
+    generation: u64,
+) {
+    let applied = bridge.index.last_applied_seq().unwrap_or(0);
+    if let Err(e) = register_consumer(rt, ns, model).await {
+        tracing::warn!(error = %e, "ann consumer registration failed; serving Owned, no persist");
+        install_replacing(ann, key, bridge.with_generation(generation)).await;
+        return;
+    }
+    if let Err(e) = persist_ann_v2(rt, ns, model, &bridge) {
+        tracing::error!(error = %e, "failed to persist v2 Vamana segment");
+        install_replacing(ann, key, bridge.with_generation(generation)).await;
+        return;
+    }
+    if let Err(e) = raise_watermark(rt, ns, model, applied).await {
+        tracing::warn!(error = %e, "ann watermark raise failed (under-compacts; safe)");
+    } else if let Err(e) = compact_log(rt, ns, model).await {
+        tracing::warn!(error = %e, "ann log compaction failed (retries next checkpoint)");
+    }
+    match ann_segment_dir(rt, ns, model) {
+        Some(dir) => match AnnBridge::load(&dir) {
+            Ok(mmap_bridge) => {
+                install_replacing(ann, key, mmap_bridge.with_generation(generation)).await;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "mmap re-adoption failed; serving Owned build");
+                install_replacing(ann, key, bridge.with_generation(generation)).await;
+            }
+        },
+        None => {
+            // In-memory backend: nothing was persisted; serve the Owned build.
+            install_replacing(ann, key, bridge.with_generation(generation)).await;
+        }
     }
 }
 
@@ -731,7 +1201,7 @@ async fn scan_corpus_raw(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
     model: &str,
-) -> Result<Option<(Vec<f32>, Vec<Uuid>)>, RuntimeError> {
+) -> Result<Option<(Vec<f32>, Vec<Uuid>, u64)>, RuntimeError> {
     let store = rt
         .vectors_for_model(token, model)
         .map_err(|e| RuntimeError::Internal(e.to_string()))?;
@@ -758,10 +1228,18 @@ async fn scan_corpus_raw(
         .await
         .map_err(|e| RuntimeError::Internal(e.to_string()))?;
 
+    // The uncorrelated scalar subquery evaluates inside the SAME statement —
+    // and therefore the same SQLite read snapshot — as the corpus rows, so
+    // the captured watermark S describes exactly this scan's state (ADR-079
+    // Amendment 1: watermark capture and corpus read are linearized).
     let rows = reader
         .query_all(SqlStatement {
             sql: format!(
-                "SELECT subject_id, embedding FROM {table_name} \
+                "SELECT subject_id, embedding, \
+                        (SELECT COALESCE(MAX(seq), 0) FROM ann_write_log \
+                          WHERE namespace = ?1 AND embedding_model = ?2 \
+                            AND field = 'knowledge.atom') AS log_s \
+                 FROM {table_name} \
                  WHERE namespace = ?1 AND embedding_model = ?2 \
                    AND field = 'knowledge.atom' \
                  ORDER BY subject_id"
@@ -778,6 +1256,13 @@ async fn scan_corpus_raw(
 
     let mut id_map: Vec<Uuid> = Vec::with_capacity(rows.len());
     let mut flat: Vec<f32> = Vec::with_capacity(rows.len() * dims);
+    let scan_watermark = rows
+        .first()
+        .and_then(|row| match row.get("log_s") {
+            Some(SqlValue::Integer(n)) => u64::try_from(*n).ok(),
+            _ => None,
+        })
+        .unwrap_or(0);
 
     for row in &rows {
         let id_str = match row.get("subject_id") {
@@ -807,7 +1292,7 @@ async fn scan_corpus_raw(
         return Ok(None);
     }
 
-    Ok(Some((flat, id_map)))
+    Ok(Some((flat, id_map, scan_watermark)))
 }
 
 /// Scan the sqlite-vec table and build a fresh `AnnBridge`.
@@ -818,36 +1303,16 @@ pub(crate) async fn load_and_build_from_vector_store(
     token: &NamespaceToken,
     model: &str,
 ) -> Result<Option<AnnBridge>, RuntimeError> {
-    let Some((flat, id_map)) = scan_corpus_raw(rt, token, model).await? else {
+    let Some((flat, id_map, scan_watermark)) = scan_corpus_raw(rt, token, model).await? else {
         return Ok(None);
     };
     let dims = flat.len() / id_map.len();
     AnnBridge::build(flat, dims, id_map)
-        .map(Some)
+        .map(|mut bridge| {
+            bridge.set_applied_seq(scan_watermark);
+            Some(bridge)
+        })
         .map_err(RuntimeError::Internal)
-}
-
-/// Hash the live corpus as it would appear inside a freshly built `AnnBridge`.
-///
-/// Scans the sqlite-vec corpus, L2-normalizes each vector in place (matching
-/// `AnnBridge::build` which calls `l2_normalize` exactly once per row), then
-/// passes the normalized flat buffer through `corpus_content_hash`.  Returns
-/// `None` when the corpus is empty or the model is not configured.
-///
-/// INVARIANT: normalize ONCE here, never re-normalize an already-normalized
-/// buffer.  Calling this on a buffer that has already been normalized produces a
-/// non-idempotent hash and causes always-stale comparisons.
-async fn live_content_hash(
-    rt: &KhiveRuntime,
-    token: &NamespaceToken,
-    model: &str,
-) -> Option<[u8; 32]> {
-    let (mut flat, id_map) = scan_corpus_raw(rt, token, model).await.ok()??;
-    let dims = flat.len() / id_map.len();
-    for row in flat.chunks_exact_mut(dims) {
-        l2_normalize(row);
-    }
-    Some(corpus_content_hash(&flat))
 }
 
 /// Delete all Vamana snapshots for `namespace` from `retrieval_snapshots`.
@@ -957,10 +1422,10 @@ pub(crate) async fn warm_known_snapshots(rt: &KhiveRuntime, ann: &SharedAnn) {
         }
     }
 
-    // Enumerate v2 segment directories in `data_dir/ann/` and warm any keys not
-    // already loaded by the v1 DB pass above.
-    let ann_root = match rt.backend_data_dir() {
-        Some(d) => d.join("ann"),
+    // Enumerate v2 segment directories under this database's own ANN root and
+    // warm any keys not already loaded by the v1 DB pass above.
+    let ann_root = match rt.backend_ann_root() {
+        Some(d) => d,
         None => return,
     };
     let read_dir = match std::fs::read_dir(&ann_root) {
@@ -1025,6 +1490,177 @@ pub(crate) fn ensure_ann_background(rt: &KhiveRuntime, token: &NamespaceToken, a
     });
 }
 
+/// Outcome of the v2-segment decision table for one `(namespace, model)` scope.
+enum SegmentOutcome {
+    /// An index was installed (Hot, Stale-tail, or a served Stale-rebuild
+    /// segment whose replacement rebuild the caller must still run — those
+    /// return Cold instead so the rebuild path fires).
+    Installed,
+    /// Live corpus is zero: no ANN candidate may be served or replayed
+    /// (decision rule 5). Caller records the terminal unavailable marker.
+    Empty,
+    /// No trustworthy segment: fall through to the v1 / rebuild paths.
+    Cold,
+}
+
+/// ADR-079 Amendment 1 restart classifier (the 8-rule first-match decision
+/// table), evaluated for one consumer scope, followed by the matching
+/// adoption action. Replaces the retired full-corpus content-hash gate.
+#[allow(clippy::too_many_arguments)]
+async fn classify_and_adopt_segment(
+    rt: &KhiveRuntime,
+    ann: &SharedAnn,
+    key: &AnnKey,
+    ns: &str,
+    model: &str,
+    seg_dir: &std::path::Path,
+    target_generation: u64,
+) -> SegmentOutcome {
+    // Rule 1: commit record absent, corrupt, or invalid length → Cold.
+    let info = match read_commit_info(seg_dir) {
+        Ok(Some(info)) => info,
+        Ok(None) => return SegmentOutcome::Cold,
+        Err(e) => {
+            tracing::warn!(error = %e, dir = %seg_dir.display(),
+                "error reading v2 commit record; Cold");
+            return SegmentOutcome::Cold;
+        }
+    };
+
+    // Rule 2: readable but pre-amendment (no watermark) → Cold. Compaction
+    // stays blocked naturally: this consumer's registry row (0 until its
+    // first extended checkpoint) holds the pair MIN at 0.
+    let Some(s) = info.last_applied_seq else {
+        tracing::info!(namespace = %ns, model = %model,
+            "pre-amendment v2 segment (no watermark); Cold rebuild");
+        return SegmentOutcome::Cold;
+    };
+
+    // Rule 3: configured embedder dimensions ≠ segment dimensions → Cold.
+    // Resolved from the embedder registry — no storage access. The corpus
+    // itself is touched by exactly one statement in the whole decision path:
+    // `scope_counts` below.
+    match rt.embedder_dimensions(model) {
+        Some(dims) if dims as u64 == info.dimensions => {}
+        Some(dims) => {
+            tracing::info!(namespace = %ns, model = %model,
+                segment_dims = info.dimensions, live_dims = dims,
+                "v2 segment dimension mismatch; Cold rebuild");
+            return SegmentOutcome::Cold;
+        }
+        None => return SegmentOutcome::Cold,
+    }
+
+    // Rule 4: own registry row absent for an extended-format state → Cold
+    // after re-registering at 0. Registration precedes every persist, so an
+    // absent row means administrative removal or registry loss — compaction
+    // may already have deleted this consumer's tail.
+    match read_own_watermark(rt, ns, model).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            tracing::info!(namespace = %ns, model = %model,
+                "ann consumer registry row absent; re-registering at 0, Cold rebuild");
+            if let Err(e) = register_consumer(rt, ns, model).await {
+                tracing::warn!(error = %e, "ann consumer re-registration failed");
+            }
+            return SegmentOutcome::Cold;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "ann registry read failed; Cold");
+            return SegmentOutcome::Cold;
+        }
+    }
+
+    // Rule 6, tested first per the amendment's evaluation-order note: the
+    // tail predicate is a log-table-only index probe, so the Hot path never
+    // touches the vec0 corpus at all. With an empty tail the committed
+    // segment already reflects every logged op at or below S, so a zero-live
+    // scope implies an empty segment and adoption serves exactly what Empty
+    // serves.
+    match tail_exists(rt, ns, model, s).await {
+        Ok(false) => {
+            return match AnnBridge::load(seg_dir) {
+                Ok(bridge) => {
+                    install_if_fresher(ann, key, bridge.with_generation(target_generation)).await;
+                    SegmentOutcome::Installed
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, dir = %seg_dir.display(),
+                        "Hot segment load failed; Cold rebuild");
+                    SegmentOutcome::Cold
+                }
+            };
+        }
+        Ok(true) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, "ann tail probe failed; Cold");
+            return SegmentOutcome::Cold;
+        }
+    }
+
+    // A tail exists — corpus-scale work is inherent from here. Rules 5, 7,
+    // and 8 read (live, tail) from one snapshot.
+    let (live, tail) = match scope_counts(rt, ns, model, s).await {
+        Ok(counts) => counts,
+        Err(e) => {
+            tracing::warn!(error = %e, "ann scope-count read failed; Cold");
+            return SegmentOutcome::Cold;
+        }
+    };
+
+    // Rule 5: zero live corpus → Empty, regardless of tail contents.
+    if live == 0 {
+        tracing::info!(namespace = %ns, model = %model,
+            "zero live corpus for scope; Empty (FTS/degraded path)");
+        return SegmentOutcome::Empty;
+    }
+
+    // Rule 7: tail within threshold → Stale-tail: mmap load + final-state
+    // replay, then checkpoint so the next restart's tail starts empty and the
+    // served bridge returns to mmap backing.
+    let threshold = (ann_rebuild_threshold() * live as f64).ceil() as u64;
+    if tail <= threshold {
+        let mut bridge = match AnnBridge::load(seg_dir) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(error = %e, dir = %seg_dir.display(),
+                    "Stale-tail segment load failed; Cold rebuild");
+                return SegmentOutcome::Cold;
+            }
+        };
+        let (finals, new_s) = match fetch_final_states(rt, ns, model, s).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(error = %e, "tail replay contradiction; Cold rebuild");
+                return SegmentOutcome::Cold;
+            }
+        };
+        if let Err(e) = replay_final_states(rt, &mut bridge, ns, model, &finals).await {
+            tracing::warn!(error = %e, "tail replay failed; Cold rebuild");
+            return SegmentOutcome::Cold;
+        }
+        bridge.set_applied_seq(new_s);
+        checkpoint_raise_compact_readopt(rt, ann, key, ns, model, bridge, target_generation).await;
+        return SegmentOutcome::Installed;
+    }
+
+    // Rule 8: tail above threshold → Stale-rebuild: serve the checksum-valid
+    // segment while the caller's rebuild path replaces it (`install_replacing`
+    // on completion). Cost decision, never a demotion to Cold/FTS-only.
+    match AnnBridge::load(seg_dir) {
+        Ok(bridge) => {
+            tracing::info!(namespace = %ns, model = %model, tail, live,
+                "tail above rebuild threshold; serving stale segment during rebuild");
+            install_if_fresher(ann, key, bridge.with_generation(target_generation)).await;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, dir = %seg_dir.display(),
+                "Stale-rebuild segment load failed; rebuilding without serve-stale");
+        }
+    }
+    SegmentOutcome::Cold
+}
+
 /// Lazy warm-load for a specific `model`. Load order (first hit wins): (1)
 /// in-memory cache fast path, (2) v2 segment directory (content-hash gated),
 /// (3) legacy v1 JSON snapshot, (4) full corpus rebuild, atomically persisted
@@ -1074,64 +1710,19 @@ pub(crate) async fn ensure_ann_for_model(
         );
     }
 
-    // 2. v2 segment path.
+    // 2. v2 segment path — ADR-079 Amendment 1 watermark classifier. Total,
+    // first-match decision table over the persisted commit record, this
+    // consumer's registry row, and one same-snapshot (live, tail) read.
     if let Some(seg_dir) = ann_segment_dir(rt, &ns, model) {
-        match read_commit_fingerprint(&seg_dir) {
-            Ok(Some(persisted)) => {
-                // Cheap count+dims gate before hashing the full corpus.
-                let current_fp = compute_fingerprint(rt, token, model).await;
-                let count_dims_ok = current_fp.is_some_and(|fp| {
-                    fp.vector_count == persisted.vector_count
-                        && fp.dimensions as u64 == persisted.dimensions
-                });
-                if count_dims_ok {
-                    // Full content-hash check (normalizes corpus once).
-                    if let Some(live_hash) = live_content_hash(rt, token, model).await {
-                        if live_hash == persisted.content_hash {
-                            match AnnBridge::load(&seg_dir) {
-                                Ok(bridge) => {
-                                    install_if_fresher(
-                                        ann,
-                                        &key,
-                                        bridge.with_generation(target_generation),
-                                    )
-                                    .await;
-                                    return;
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        error = %e,
-                                        dir = %seg_dir.display(),
-                                        "v2 segment load failed; falling through to rebuild"
-                                    );
-                                }
-                            }
-                        } else {
-                            tracing::info!(
-                                namespace = %ns,
-                                model = %model,
-                                "stale v2 segment (content-hash mismatch); rebuilding"
-                            );
-                        }
-                    }
-                } else {
-                    tracing::info!(
-                        namespace = %ns,
-                        model = %model,
-                        "stale v2 segment (count/dims mismatch); rebuilding"
-                    );
-                }
+        match classify_and_adopt_segment(rt, ann, &key, &ns, model, &seg_dir, target_generation)
+            .await
+        {
+            SegmentOutcome::Installed => return,
+            SegmentOutcome::Empty => {
+                mark_unavailable(ann, &key, target_generation);
+                return;
             }
-            Ok(None) => {
-                // No v2 segments yet (or torn write) — fall through to v1 / rebuild.
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    dir = %seg_dir.display(),
-                    "error reading v2 segment fingerprint; falling through"
-                );
-            }
+            SegmentOutcome::Cold => {} // fall through to v1 / rebuild
         }
     }
 
@@ -1160,13 +1751,12 @@ pub(crate) async fn ensure_ann_for_model(
         }
     }
 
-    // 4. Rebuild fallthrough — build from vector store and persist v2 segments.
+    // 4. Rebuild fallthrough — build from vector store, persist v2 segments,
+    // raise the registry watermark, compact the log, and re-adopt as mmap.
     match load_and_build_from_vector_store(rt, token, model).await {
         Ok(Some(bridge)) => {
-            if let Err(e) = persist_ann_v2(rt, &ns, model, &bridge) {
-                tracing::error!(error = %e, "failed to persist v2 Vamana segment after rebuild");
-            }
-            install_if_fresher(ann, &key, bridge.with_generation(target_generation)).await;
+            checkpoint_raise_compact_readopt(rt, ann, &key, &ns, model, bridge, target_generation)
+                .await;
         }
         Ok(None) => {
             // Empty corpus: this scan (at target_generation) proves nothing is
@@ -2117,6 +2707,13 @@ mod tests {
     /// Calls `rt.vectors_for_model` first so the virtual table is created, then
     /// inserts raw f32 LE blobs directly via SQL.
     async fn seed_warm_corpus(rt: &KhiveRuntime, token: &NamespaceToken, n: usize) {
+        seed_warm_corpus_opts(rt, token, n, true).await;
+    }
+
+    /// `log = false` seeds vec rows WITHOUT write-log rows — constructs the
+    /// empty-log zero-watermark baseline state (a corpus that predates the
+    /// migration's first logged write).
+    async fn seed_warm_corpus_opts(rt: &KhiveRuntime, token: &NamespaceToken, n: usize, log: bool) {
         let _store = rt
             .vectors_for_model(token, WARM_TEST_MODEL)
             .expect("vec store");
@@ -2148,6 +2745,27 @@ mod tests {
             })
             .await
             .expect("insert corpus row");
+            if !log {
+                continue;
+            }
+            // Mirror the production write path: every vector mutation appends
+            // a write-log row in the same funnel (ADR-079 Amendment 1).
+            w.execute(SqlStatement {
+                sql: "INSERT INTO ann_write_log \
+                      (namespace, embedding_model, kind, field, subject_id, op) \
+                      VALUES (?1, ?2, ?3, ?4, ?5, 'upsert')"
+                    .into(),
+                params: vec![
+                    SqlValue::Text(ns.clone()),
+                    SqlValue::Text(WARM_TEST_MODEL.to_string()),
+                    SqlValue::Text("concept".to_string()),
+                    SqlValue::Text("knowledge.atom".to_string()),
+                    SqlValue::Text(id.to_string()),
+                ],
+                label: None,
+            })
+            .await
+            .expect("append write-log row");
         }
     }
 
@@ -2170,12 +2788,13 @@ mod tests {
         assert_eq!(decoded_ns, "local");
         assert_eq!(decoded_model, WARM_TEST_MODEL);
 
-        // Parent directory is `data_dir/ann/`.
+        // Parent directory is the database's own ANN root (`<db-file>.ann/`
+        // beside the file), so co-located databases never share segments.
         let parent = seg_dir.parent().expect("seg_dir must have a parent");
         assert_eq!(
             parent.file_name().unwrap().to_string_lossy(),
-            "ann",
-            "seg_dir parent must be named 'ann'"
+            "test.db.ann",
+            "seg_dir parent must be the database-scoped ANN root"
         );
     }
 
@@ -2196,8 +2815,9 @@ mod tests {
 
     /// Cold-start build persists v2 segments; a second call restores from disk.
     ///
-    /// Also gates the normalize-once invariant: `live_content_hash` must equal the
-    /// persisted commit hash, proving the Hot branch can fire without double-normalization.
+    /// Also gates the watermark contract: the persisted commit record must carry
+    /// `last_applied_seq` covering the seeded writes, so the second call's
+    /// classifier sees an empty tail and takes the Hot branch.
     #[tokio::test]
     async fn ensure_ann_round_trip_hot() {
         let dir = TempDir::new().expect("tempdir");
@@ -2214,23 +2834,28 @@ mod tests {
             "first call must build the ANN index"
         );
 
-        // Normalize-once invariant: the live corpus hash must equal the persisted
-        // commit hash.  A double-normalize bug produces always-stale hashes here.
+        // Watermark contract: the extended commit record must carry a numeric
+        // watermark covering every seeded write, so the tail above it is empty
+        // and the Hot branch can fire.
         let seg_dir = ann_segment_dir(&rt, "local", WARM_TEST_MODEL)
             .expect("file backend must have a seg_dir");
         assert!(
             seg_dir.join("metadata.bin").exists(),
             "first call must persist v2 segments (metadata.bin missing)"
         );
-        let persisted = read_commit_fingerprint(&seg_dir)
-            .expect("read_commit_fingerprint must not err")
-            .expect("metadata.bin must carry a v2 fingerprint");
-        let live = live_content_hash(&rt, &token, WARM_TEST_MODEL)
+        let info = read_commit_info(&seg_dir)
+            .expect("read_commit_info must not err")
+            .expect("metadata.bin must carry a v2 commit record");
+        let s = info
+            .last_applied_seq
+            .expect("checkpoint must persist an extended record with a watermark");
+        let (live, tail) = scope_counts(&rt, "local", WARM_TEST_MODEL, s)
             .await
-            .expect("live_content_hash must return Some for a seeded corpus");
+            .expect("scope_counts must succeed");
+        assert!(live > 0, "seeded corpus must be live");
         assert_eq!(
-            live, persisted.content_hash,
-            "live_content_hash must equal persisted content_hash (normalize-once invariant)"
+            tail, 0,
+            "watermark must cover every seeded write (empty tail)"
         );
 
         // Hot path: load from persisted v2 segments without rebuilding. A rebuild
@@ -2257,10 +2882,9 @@ mod tests {
         );
     }
 
-    /// After a corpus mutation the persisted v2 segment is stale and triggers a rebuild.
-    ///
-    /// Proves the stale branch is actually exercised (not silently falling through to rebuild),
-    /// and that the rebuild re-persists v2 segments matching the mutated corpus.
+    /// After a corpus mutation the persisted segment has a non-empty tail and the
+    /// classifier replays it (Stale-tail), re-persisting a checkpoint that
+    /// reflects the mutated corpus.
     #[tokio::test]
     async fn ensure_ann_stale_rebuild() {
         let dir = TempDir::new().expect("tempdir");
@@ -2277,43 +2901,266 @@ mod tests {
         // Mutate corpus: add one more row.
         seed_warm_corpus(&rt, &token, 1).await;
 
-        // Gate: after mutation, live hash must DIFFER from persisted — proves the stale
-        // branch will fire (not silently succeed with the same hash).
+        // Gate: the mutation's logged write must sit above the persisted
+        // watermark — the Stale-tail pre-condition.
         let seg_dir = ann_segment_dir(&rt, "local", WARM_TEST_MODEL)
             .expect("file backend must have a seg_dir");
-        let persisted_before = read_commit_fingerprint(&seg_dir)
-            .expect("read_commit_fingerprint must not err")
-            .expect("v2 fingerprint must be present after initial build");
-        let live_after_mutation = live_content_hash(&rt, &token, WARM_TEST_MODEL)
+        let info_before = read_commit_info(&seg_dir)
+            .expect("read_commit_info must not err")
+            .expect("v2 commit record must be present after initial build");
+        let s_before = info_before
+            .last_applied_seq
+            .expect("initial checkpoint must carry a watermark");
+        let (_, tail) = scope_counts(&rt, "local", WARM_TEST_MODEL, s_before)
             .await
-            .expect("live_content_hash must return Some");
-        assert_ne!(
-            live_after_mutation, persisted_before.content_hash,
-            "mutation must make live hash differ from persisted (stale-branch pre-condition)"
+            .expect("scope_counts must succeed");
+        assert!(
+            tail > 0,
+            "mutation must appear as a tail row above the watermark"
         );
 
-        // Fresh SharedAnn: stale v2 detected → rebuild from corpus.
+        // Fresh SharedAnn: non-empty tail detected → replay + checkpoint.
         let ann2 = new_shared();
         ensure_ann_for_model(&rt, &token, &ann2, WARM_TEST_MODEL).await;
         assert!(
             ann2.indexes.read().await.contains_key(&key),
-            "must rebuild the index after corpus mutation (stale v2 segment rejected)"
+            "must serve an index after corpus mutation (tail replayed)"
         );
 
-        // Rebuild must re-persist v2 segments matching the mutated (5-row) corpus.
-        let persisted_after = read_commit_fingerprint(&seg_dir)
-            .expect("read_commit_fingerprint after rebuild must not err")
-            .expect("v2 fingerprint must be present after rebuild");
-        let live_final = live_content_hash(&rt, &token, WARM_TEST_MODEL)
-            .await
-            .expect("live_content_hash must return Some after rebuild");
+        // The post-replay checkpoint must reflect the mutated (5-row) corpus
+        // and advance the watermark past the mutation's log row.
+        let info_after = read_commit_info(&seg_dir)
+            .expect("read_commit_info after replay must not err")
+            .expect("v2 commit record must be present after replay checkpoint");
         assert_eq!(
-            live_final, persisted_after.content_hash,
-            "rebuild must re-persist v2 matching the mutated corpus"
+            info_after.vector_count, 5,
+            "checkpoint must reflect the 5-row corpus (4 initial + 1 replayed)"
         );
+        let s_after = info_after
+            .last_applied_seq
+            .expect("replay checkpoint must carry a watermark");
+        assert!(s_after > s_before, "checkpoint must advance the watermark");
+        let (_, tail_after) = scope_counts(&rt, "local", WARM_TEST_MODEL, s_after)
+            .await
+            .expect("scope_counts must succeed");
         assert_eq!(
-            persisted_after.vector_count, 5,
-            "re-persisted segment must reflect the 5-row corpus (4 initial + 1 mutation)"
+            tail_after, 0,
+            "replayed tail must be covered by the new watermark"
+        );
+    }
+
+    /// Review-mandated case: a checkpoint taken over an EMPTY log persists the
+    /// zero watermark (the defined empty-log baseline), and the first logged
+    /// write afterwards classifies Stale-tail — never Hot.
+    #[tokio::test]
+    async fn ensure_ann_zero_watermark_then_first_write_is_stale_tail() {
+        let dir = TempDir::new().expect("tempdir");
+        let rt = file_rt_with_embedder(dir.path().join("test.db"));
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        // Corpus WITHOUT log rows: the log is empty at checkpoint time.
+        seed_warm_corpus_opts(&rt, &token, 4, false).await;
+
+        let ann = new_shared();
+        ensure_ann_for_model(&rt, &token, &ann, WARM_TEST_MODEL).await;
+        let seg_dir = ann_segment_dir(&rt, "local", WARM_TEST_MODEL).expect("seg_dir");
+        let info = read_commit_info(&seg_dir)
+            .expect("read_commit_info")
+            .expect("v2 commit record");
+        assert_eq!(
+            info.last_applied_seq,
+            Some(0),
+            "empty-log checkpoint must persist the numeric zero baseline, not a missing watermark"
+        );
+
+        // First logged write after the zero-watermark checkpoint.
+        seed_warm_corpus_opts(&rt, &token, 1, true).await;
+        let ann2 = new_shared();
+        ensure_ann_for_model(&rt, &token, &ann2, WARM_TEST_MODEL).await;
+        let key = AnnKey::new("local", WARM_TEST_MODEL);
+        let n = ann2
+            .indexes
+            .read()
+            .await
+            .get(&key)
+            .map(AnnBridge::num_vectors)
+            .expect("index must be served after the first logged write");
+        assert_eq!(
+            n, 5,
+            "Stale-tail must replay the logged write (Hot would serve 4)"
+        );
+        let info2 = read_commit_info(&seg_dir)
+            .expect("read_commit_info")
+            .expect("v2 commit record after replay");
+        assert!(
+            info2.last_applied_seq.unwrap_or(0) > 0,
+            "replay checkpoint must advance past the zero baseline"
+        );
+    }
+
+    /// Review-mandated case: deleting every live vector classifies Empty — no
+    /// ANN is served or replayed, and the terminal unavailable marker is set.
+    #[tokio::test]
+    async fn ensure_ann_delete_all_is_empty() {
+        let dir = TempDir::new().expect("tempdir");
+        let rt = file_rt_with_embedder(dir.path().join("test.db"));
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        seed_warm_corpus(&rt, &token, 3).await;
+
+        let ann = new_shared();
+        ensure_ann_for_model(&rt, &token, &ann, WARM_TEST_MODEL).await;
+        let key = AnnKey::new("local", WARM_TEST_MODEL);
+        assert!(ann.indexes.read().await.contains_key(&key), "initial build");
+
+        // Delete every corpus row, logging each delete (production funnel shape).
+        let table = format!("vec_{}", sanitize_model_key(WARM_TEST_MODEL));
+        let sql = rt.sql();
+        let mut w = sql.writer().await.expect("writer");
+        w.execute(SqlStatement {
+            sql: format!(
+                "INSERT INTO ann_write_log \
+                 (namespace, embedding_model, kind, field, subject_id, op) \
+                 SELECT namespace, embedding_model, kind, field, subject_id, 'delete' \
+                 FROM {table} WHERE namespace = ?1 AND embedding_model = ?2"
+            ),
+            params: vec![
+                SqlValue::Text("local".into()),
+                SqlValue::Text(WARM_TEST_MODEL.into()),
+            ],
+            label: None,
+        })
+        .await
+        .expect("log deletes");
+        w.execute(SqlStatement {
+            sql: format!("DELETE FROM {table} WHERE namespace = ?1 AND embedding_model = ?2"),
+            params: vec![
+                SqlValue::Text("local".into()),
+                SqlValue::Text(WARM_TEST_MODEL.into()),
+            ],
+            label: None,
+        })
+        .await
+        .expect("delete corpus");
+        drop(w);
+
+        let ann2 = new_shared();
+        ensure_ann_for_model(&rt, &token, &ann2, WARM_TEST_MODEL).await;
+        assert!(
+            !ann2.indexes.read().await.contains_key(&key),
+            "zero live corpus must classify Empty — no ANN served (rule 5 precedes Hot)"
+        );
+        assert!(
+            is_terminally_unavailable(&ann2, &key),
+            "Empty must set the terminal unavailable marker for wait_for_ann"
+        );
+    }
+
+    /// Review-mandated interleaving: consumer A registers at 0, checkpoints at
+    /// S, and crashes before its raise — the pair MIN stays 0 and another
+    /// consumer's compaction cannot delete A's tail. After A's row is raised
+    /// (or an overlapping row removed), compaction advances to the pair MIN.
+    #[tokio::test]
+    async fn compact_log_bounded_by_pair_minimum() {
+        let dir = TempDir::new().expect("tempdir");
+        let rt = file_rt_with_embedder(dir.path().join("test.db"));
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        seed_warm_corpus(&rt, &token, 4).await; // seqs 1..=4 in the log
+
+        register_consumer(&rt, "local", WARM_TEST_MODEL)
+            .await
+            .expect("register at 0");
+        // Overlapping consumer B durably checkpointed past every row.
+        {
+            let sql = rt.sql();
+            let mut w = sql.writer().await.expect("writer");
+            w.execute(SqlStatement {
+                sql: "INSERT INTO ann_consumer_watermark \
+                      (consumer, namespace, embedding_model, watermark) VALUES (?1, ?2, ?3, 99)"
+                    .into(),
+                params: vec![
+                    SqlValue::Text("other:test".into()),
+                    SqlValue::Text("local".into()),
+                    SqlValue::Text(WARM_TEST_MODEL.into()),
+                ],
+                label: None,
+            })
+            .await
+            .expect("insert B row");
+        }
+
+        // A crashed before its raise: row is 0 → MIN(0, 99) = 0 → nothing deletes.
+        compact_log(&rt, "local", WARM_TEST_MODEL)
+            .await
+            .expect("compact");
+        let (_, tail_at_zero) = scope_counts(&rt, "local", WARM_TEST_MODEL, 0)
+            .await
+            .expect("scope_counts");
+        assert_eq!(
+            tail_at_zero, 4,
+            "a zero-watermark row must block pair compaction"
+        );
+
+        // A raises to 2 → MIN(2, 99) = 2 → rows 1-2 compact, 3-4 remain.
+        raise_watermark(&rt, "local", WARM_TEST_MODEL, 2)
+            .await
+            .expect("raise");
+        compact_log(&rt, "local", WARM_TEST_MODEL)
+            .await
+            .expect("compact");
+        let (_, tail_after) = scope_counts(&rt, "local", WARM_TEST_MODEL, 0)
+            .await
+            .expect("scope_counts");
+        assert_eq!(
+            tail_after, 2,
+            "compaction must advance exactly to the pair MIN"
+        );
+    }
+
+    /// Review-mandated case: a pre-amendment commit record (base length, no
+    /// watermark trailer) classifies Cold and rebuilds — never serves Hot.
+    #[tokio::test]
+    async fn ensure_ann_pre_amendment_record_is_cold() {
+        let dir = TempDir::new().expect("tempdir");
+        let rt = file_rt_with_embedder(dir.path().join("test.db"));
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        seed_warm_corpus(&rt, &token, 4).await;
+
+        let ann = new_shared();
+        ensure_ann_for_model(&rt, &token, &ann, WARM_TEST_MODEL).await;
+        let seg_dir = ann_segment_dir(&rt, "local", WARM_TEST_MODEL).expect("seg_dir");
+
+        // Truncate the 41-byte extended trailer: the record parses at the base
+        // length — a legitimate pre-amendment commit with no watermark.
+        let meta_path = seg_dir.join("metadata.bin");
+        let bytes = std::fs::read(&meta_path).expect("read metadata.bin");
+        std::fs::write(&meta_path, &bytes[..bytes.len() - 41]).expect("truncate trailer");
+        let info = read_commit_info(&seg_dir)
+            .expect("read_commit_info")
+            .expect("base-length record must still parse");
+        assert_eq!(
+            info.last_applied_seq, None,
+            "trailer removed → no watermark"
+        );
+
+        use std::os::unix::fs::MetadataExt;
+        let ino_before = std::fs::metadata(&meta_path).expect("meta").ino();
+        let ann2 = new_shared();
+        ensure_ann_for_model(&rt, &token, &ann2, WARM_TEST_MODEL).await;
+        let key = AnnKey::new("local", WARM_TEST_MODEL);
+        assert!(
+            ann2.indexes.read().await.contains_key(&key),
+            "Cold rebuild must still produce a served index"
+        );
+        let ino_after = std::fs::metadata(&meta_path).expect("meta").ino();
+        assert_ne!(
+            ino_before, ino_after,
+            "pre-amendment record must force a rebuild (metadata.bin rewritten), not a Hot load"
+        );
+        let info2 = read_commit_info(&seg_dir)
+            .expect("read_commit_info")
+            .expect("rebuilt record");
+        assert!(
+            info2.last_applied_seq.is_some(),
+            "rebuild must restore the extended watermark record"
         );
     }
 
