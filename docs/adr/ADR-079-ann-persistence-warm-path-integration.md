@@ -113,6 +113,16 @@ pair, decoded by the warm-path filesystem enumeration:
     {metadata.bin, graph.bin, vectors.bin, lifecycle.bin, external_ids.bin}
 ```
 
+**Segment root superseded (shipped with Amendment 1).** The root shown above changed from a
+directory shared by every database in `<backend_data_dir>` to a database-scoped
+`<db-file>.ann/<hex(...)>` root beside the database file itself (`ann_root_for` in
+`khive-db/src/backend.rs`), so two databases sharing a parent directory can never adopt each
+other's segments or UUID maps. Pre-existing segments under the old shared root are not migrated
+in place: the classifier finds no commit record at the new root, Colds, and rebuilds — a one-time
+cost after upgrade. The old `<backend_data_dir>/ann/` tree is then inert and safe to remove; see
+[ann-lifecycle.md](../../crates/khive-pack-memory/docs/api/ann-lifecycle.md#segment-root-migration-legacy-data_dirann-cleanup)
+for the migration/cleanup note.
+
 The four Vamana segment files are ADR-052's crash-safe commit set, inherited unchanged: `metadata.bin`
 is the commit record (written last, via tmp-then-rename), alongside `graph.bin`, `vectors.bin`, and
 `lifecycle.bin` (tombstones, free slots, reverse adjacency, and the consolidation counter).
@@ -467,6 +477,19 @@ CREATE TABLE ann_consumer_watermark (
   vectors and adoption serves exactly what Empty serves. This ordering is what makes the Hot
   path's zero-corpus-IO property literal — the live corpus count is executed only when a tail
   exists (rules 5, 7, and 8), where corpus-scale work is already inherent.
+
+- **Rule 5 qualification for join-filtered corpora.** "Live corpus row count for the scope" is
+  read under the consumer's own scope predicate (§"Scope rule" above), which for a join-filtered
+  corpus (for example the memory index's note-scope) can exclude rows that a plain vec0 row-count
+  would still include: a soft delete on the joined table (not a vector delete) removes a subject
+  from the predicate without emitting an `ann_write_log` row or removing its vector row. A live
+  count of zero under that predicate therefore means _no row currently satisfies the join
+  predicate_, not that the persisted segment file is byte-empty — the segment's vectors.bin may
+  still contain filtered-out candidates from before the soft delete. Rule 5 still classifies this
+  case Empty and drops the index rather than serving it: adoption is decided by the predicate-scoped
+  live count, never by a raw segment/tail inspection. This is why the case is safe even though the
+  segment is not content-empty — recall never sees it, and if it were ever served, recall
+  post-filters hydrated hits against the same join predicate before returning them.
 
 - **Tail replay is a final-state delta, not an event replay.** Coalesce the tail to the highest
   `seq` per `subject_id`; only the final op is applied. A final `upsert` resolves the subject's

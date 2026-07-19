@@ -9,8 +9,9 @@
 //! Vamana ANN bridge — parallel semantic signal for `knowledge.search`.
 //!
 //! Wraps `khive_vamana::VamanaIndex` with an ID map (u32 → UUID) so search
-//! results can be fused with FTS5 candidates via RRF. Persistence (ADR-079):
-//! v2 binary segments under `data_dir/ann/<hex>/`, falling back to legacy v1
+//! results can be fused with FTS5 candidates via RRF. Persistence (ADR-079,
+//! Amendment 1): v2 binary segments under `<db-file>.ann/<hex>/`, restored
+//! through the write-log restart classifier, falling back to legacy v1
 //! JSON snapshot rows, then a full corpus rebuild on cache-miss. See
 //! crates/khive-pack-knowledge/docs/api/vamana.md for the persistence
 //! fallback chain and the file-size/module-coupling rationale.
@@ -615,9 +616,11 @@ pub(crate) fn snapshot_key(namespace: &str, model: &str) -> String {
 
 /// Filesystem directory for v2 Vamana segment files for a given `(ns, model)` pair.
 ///
-/// Returns `Some(data_dir/ann/<hex>)` where `<hex>` is the lowercase hex encoding of
-/// the bytes of `snapshot_key(ns, model)`. Hex encoding is injective, filesystem-safe,
-/// and reversible via `decode_ann_dir_name`. Returns `None` for in-memory backends.
+/// Returns `Some(<db-file>.ann/<hex>)` where `<hex>` is the lowercase hex encoding of
+/// the bytes of `snapshot_key(ns, model)`, rooted beside the backing database file
+/// (`backend_ann_root`) so co-located databases can never adopt each other's segments.
+/// Hex encoding is injective, filesystem-safe, and reversible via
+/// `decode_ann_dir_name`. Returns `None` for in-memory backends.
 fn ann_segment_dir(rt: &KhiveRuntime, ns: &str, model: &str) -> Option<std::path::PathBuf> {
     let ann_root = rt.backend_ann_root()?;
     let key = snapshot_key(ns, model);
@@ -656,10 +659,10 @@ pub(crate) fn sanitize_model_key(s: &str) -> String {
         .collect()
 }
 
-/// Persist `bridge` as v2 Vamana segments under `data_dir/ann/<hex>/`.
+/// Persist `bridge` as v2 Vamana segments under `<db-file>.ann/<hex>/`.
 ///
 /// Resolves the segment directory via `ann_segment_dir`. Returns `Ok(())` when the
-/// backend is in-memory (no `data_dir`) — skipping persistence is not an error.
+/// backend is in-memory (no database file) — skipping persistence is not an error.
 /// `save_atomic` binds the id-map sidecar to the commit-record digest internally;
 /// callers do not need to supply a `CorpusFingerprint`.
 pub(crate) fn persist_ann_v2(
@@ -1573,8 +1576,9 @@ async fn classify_and_adopt_segment(
 }
 
 /// Lazy warm-load for a specific `model`. Load order (first hit wins): (1)
-/// in-memory cache fast path, (2) v2 segment directory (content-hash gated),
-/// (3) legacy v1 JSON snapshot, (4) full corpus rebuild, atomically persisted
+/// in-memory cache fast path, (2) v2 segment directory (ADR-079 Amendment 1
+/// write-log restart classifier — see `classify_and_adopt_segment`), (3)
+/// legacy v1 JSON snapshot, (4) full corpus rebuild, atomically persisted
 /// as v2 for next restart. See
 /// crates/khive-pack-knowledge/docs/api/vamana.md#ensure_ann_for_model-load-order
 /// for the per-step detail.
