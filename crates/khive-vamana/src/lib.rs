@@ -3,11 +3,17 @@
 pub mod config;
 pub mod distance;
 pub mod error;
+#[cfg(feature = "mmap")]
+pub mod external_ids;
 pub mod graph;
 pub mod index;
 
 pub use config::VamanaConfig;
 pub use error::{Result, VamanaError};
+#[cfg(feature = "mmap")]
+pub use external_ids::{
+    read_external_ids_sidecar, segment_commit_digest, write_external_ids_sidecar,
+};
 pub use graph::{GreedySearchResult, VamanaGraph, VisitedSet};
 #[cfg(feature = "mmap")]
 pub use index::read_commit_fingerprint;

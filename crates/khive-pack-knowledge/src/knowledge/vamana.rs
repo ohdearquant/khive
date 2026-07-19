@@ -21,8 +21,8 @@ use std::sync::Arc;
 use khive_runtime::{KhiveRuntime, Namespace, NamespaceToken, RuntimeError};
 use khive_storage::types::{SqlStatement, SqlValue};
 use khive_vamana::{
-    read_commit_fingerprint, read_commit_info, CorpusFingerprint, VamanaConfig, VamanaIndex,
-    VamanaSnapshot,
+    read_commit_fingerprint, read_commit_info, read_external_ids_sidecar, segment_commit_digest,
+    write_external_ids_sidecar, CorpusFingerprint, VamanaConfig, VamanaIndex, VamanaSnapshot,
 };
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -507,13 +507,13 @@ impl AnnBridge {
     }
 
     /// Save this bridge to `dir` atomically: writes v2 Vamana segments (commits
-    /// `metadata.bin` with a `content_hash`), then the id-map sidecar
-    /// (`external_ids.bin`, tmp-then-rename) stamped with that same
-    /// `content_hash`. Crash-safety invariant: a crash between the two writes
-    /// leaves the sidecar's stamped hash mismatched against the commit's
-    /// hash, so the load-time cross-check detects the torn pair and the
-    /// caller rebuilds -- ordering alone is not the guarantee, the hash
-    /// cross-check is. See crates/khive-pack-knowledge/docs/api/vamana.md#save_atomic.
+    /// `metadata.bin`), then the id-map sidecar (`external_ids.bin`,
+    /// tmp-then-rename) bound to the blake3 digest of the just-committed record.
+    /// Crash-safety invariant: a crash between the two writes leaves the
+    /// sidecar's stored digest mismatched against the on-disk commit record, so
+    /// the load-time cross-check detects the torn pair and the caller
+    /// rebuilds -- ordering alone is not the guarantee, the digest cross-check
+    /// is. See crates/khive-pack-knowledge/docs/api/vamana.md#save_atomic.
     #[allow(dead_code)]
     pub fn save_atomic(&self, dir: &std::path::Path) -> Result<(), String> {
         let count = self.id_map.len();
@@ -529,31 +529,30 @@ impl AnnBridge {
             .save_atomic(dir)
             .map_err(|e| format!("VamanaIndex::save_atomic: {e}"))?;
 
-        // Step 2: read back the v2 commit fingerprint to obtain the content_hash.
-        // Must be Some — we just committed it. None means an unexpected v1/torn state.
-        let fp = read_commit_fingerprint(dir)
-            .map_err(|e| format!("read_commit_fingerprint after save: {e}"))?
+        // Step 2: digest the just-committed record. Must be Some — we committed it.
+        let digest = segment_commit_digest(dir)
+            .map_err(|e| format!("segment_commit_digest after save: {e}"))?
             .ok_or_else(|| {
-                "save_atomic succeeded but read_commit_fingerprint returned None \
-                 (unexpected v1 or torn commit)"
-                    .to_string()
+                "save_atomic succeeded but metadata.bin is absent (torn commit)".to_string()
             })?;
 
-        // Step 3: write the id-map sidecar atomically (tmp rename), stamped with
-        // the commit's content_hash so a torn pair is self-detecting at load time.
-        write_external_ids_sidecar(dir, &fp.content_hash, &self.id_map)
+        // Step 3: write the id-map sidecar atomically (tmp rename), bound to the
+        // commit-record digest so any segment/sidecar pairing from different
+        // saves is self-detecting at load time.
+        write_external_ids_sidecar(dir, &digest, &self.id_map)
     }
 
     /// Load a bridge from a segment directory previously written by
     /// [`AnnBridge::save_atomic`].
     ///
     /// Both the Vamana v2 commit record and the id-map sidecar must be present and
-    /// self-consistent (matching `content_hash` and vector count). Any mismatch returns
-    /// `Err`; the caller should treat that as a Cold signal and rebuild from the corpus.
+    /// self-consistent (sidecar bound to the exact commit-record digest, matching
+    /// vector count). Any mismatch returns `Err`; the caller should treat that as a
+    /// Cold signal and rebuild from the corpus.
     #[allow(dead_code)]
     pub fn load(dir: &std::path::Path) -> Result<Self, String> {
         // Step 1: require a v2 commit fingerprint. Absent/v1/torn → Cold.
-        let fp = read_commit_fingerprint(dir)
+        read_commit_fingerprint(dir)
             .map_err(|e| format!("read_commit_fingerprint: {e}"))?
             .ok_or_else(|| {
                 "no v2 commit fingerprint: segment dir is absent, v1, or has a torn commit"
@@ -567,14 +566,17 @@ impl AnnBridge {
         let index = VamanaIndex::load(dir).map_err(|e| format!("VamanaIndex::load: {e}"))?;
 
         // Step 3: read the external_ids sidecar and run cross-checks.
-        let (sidecar_hash, id_map) = read_external_ids_sidecar(dir)?;
+        let (sidecar_digest, id_map) = read_external_ids_sidecar(dir)?;
 
-        // Cross-check: sidecar content_hash must match the v2 commit's content_hash.
-        // A mismatch means a torn segment/sidecar pair (crash between the segment
-        // commit and the sidecar write in save_atomic).
-        if sidecar_hash != fp.content_hash {
+        // Cross-check: the sidecar must be bound to the exact commit record on
+        // disk. A mismatch means a segment/sidecar pairing from different saves
+        // (crash between the segment commit and the sidecar write, either order).
+        let commit_digest = segment_commit_digest(dir)
+            .map_err(|e| format!("segment_commit_digest: {e}"))?
+            .ok_or_else(|| "metadata.bin vanished between fingerprint and digest".to_string())?;
+        if sidecar_digest != commit_digest {
             return Err(
-                "external_ids.bin content_hash mismatch: torn segment/sidecar pair".to_string(),
+                "external_ids.bin commit-digest mismatch: torn segment/sidecar pair".to_string(),
             );
         }
 
@@ -602,100 +604,6 @@ fn l2_normalize(v: &mut [f32]) {
             *x /= norm;
         }
     }
-}
-
-// ── external-id sidecar helpers (slice 1b-i, ADR-079) ────────────────────────
-//
-// Binary format for `external_ids.bin`:
-//   magic       8 bytes   b"KHVANIDS"
-//   content_hash 32 bytes corpus blake3 hash (from v2 commit fingerprint)
-//   count        8 bytes  u64 little-endian — number of UUIDs
-//   ids          16 × count bytes — UUIDs as raw big-endian bytes (uuid_to_bytes_le)
-
-#[allow(dead_code)]
-const SIDECAR_MAGIC: &[u8; 8] = b"KHVANIDS";
-
-/// Write `ids` to `dir/external_ids.bin` using a tmp-then-rename pattern.
-///
-/// The sidecar is stamped with `content_hash` so `AnnBridge::load` can detect
-/// a torn segment/sidecar pair (segments committed with hash A, sidecar still
-/// holding hash B from a prior save, or vice versa).
-#[allow(dead_code)]
-fn write_external_ids_sidecar(
-    dir: &std::path::Path,
-    content_hash: &[u8; 32],
-    ids: &[Uuid],
-) -> Result<(), String> {
-    use std::io::Write as _;
-
-    let tmp_path = dir.join("external_ids.bin.tmp");
-    let final_path = dir.join("external_ids.bin");
-
-    let count = ids.len() as u64;
-    let mut buf: Vec<u8> = Vec::with_capacity(8 + 32 + 8 + ids.len() * 16);
-    buf.extend_from_slice(SIDECAR_MAGIC);
-    buf.extend_from_slice(content_hash);
-    buf.extend_from_slice(&count.to_le_bytes());
-    for id in ids {
-        buf.extend_from_slice(id.as_bytes());
-    }
-
-    let mut f = std::fs::File::create(&tmp_path)
-        .map_err(|e| format!("create external_ids.bin.tmp: {e}"))?;
-    f.write_all(&buf)
-        .map_err(|e| format!("write external_ids.bin.tmp: {e}"))?;
-    f.sync_all()
-        .map_err(|e| format!("sync external_ids.bin.tmp: {e}"))?;
-    drop(f);
-    std::fs::rename(&tmp_path, &final_path)
-        .map_err(|e| format!("rename external_ids.bin.tmp -> external_ids.bin: {e}"))
-}
-
-/// Read `dir/external_ids.bin` and return `(content_hash, ids)`.
-///
-/// Returns `Err` on any I/O error, wrong magic, truncated header, or count/size mismatch.
-#[allow(dead_code)]
-fn read_external_ids_sidecar(dir: &std::path::Path) -> Result<([u8; 32], Vec<Uuid>), String> {
-    let bytes = std::fs::read(dir.join("external_ids.bin"))
-        .map_err(|e| format!("read external_ids.bin: {e}"))?;
-
-    // magic (8) + content_hash (32) + count (8) = 48 bytes minimum header
-    if bytes.len() < 48 {
-        return Err(format!(
-            "external_ids.bin too short: {} bytes (need at least 48)",
-            bytes.len()
-        ));
-    }
-
-    let magic = &bytes[0..8];
-    if magic != SIDECAR_MAGIC {
-        return Err(format!(
-            "external_ids.bin bad magic: got {:?}, expected {:?}",
-            magic, SIDECAR_MAGIC
-        ));
-    }
-
-    let mut content_hash = [0u8; 32];
-    content_hash.copy_from_slice(&bytes[8..40]);
-
-    let count = u64::from_le_bytes(bytes[40..48].try_into().unwrap()) as usize;
-    let expected_len = 48 + count * 16;
-    if bytes.len() != expected_len {
-        return Err(format!(
-            "external_ids.bin length mismatch: got {} bytes, expected {} for {count} UUIDs",
-            bytes.len(),
-            expected_len
-        ));
-    }
-
-    let mut ids = Vec::with_capacity(count);
-    for i in 0..count {
-        let start = 48 + i * 16;
-        let raw: [u8; 16] = bytes[start..start + 16].try_into().unwrap();
-        ids.push(Uuid::from_bytes(raw));
-    }
-
-    Ok((content_hash, ids))
 }
 
 // ── persistence helpers ───────────────────────────────────────────────────────
@@ -752,8 +660,8 @@ pub(crate) fn sanitize_model_key(s: &str) -> String {
 ///
 /// Resolves the segment directory via `ann_segment_dir`. Returns `Ok(())` when the
 /// backend is in-memory (no `data_dir`) — skipping persistence is not an error.
-/// `save_atomic` computes and stamps the `content_hash` internally; callers do not
-/// need to supply a `CorpusFingerprint`.
+/// `save_atomic` binds the id-map sidecar to the commit-record digest internally;
+/// callers do not need to supply a `CorpusFingerprint`.
 pub(crate) fn persist_ann_v2(
     rt: &KhiveRuntime,
     ns: &str,
@@ -866,9 +774,11 @@ async fn raise_watermark(rt: &KhiveRuntime, ns: &str, model: &str, s: u64) -> Re
 }
 
 /// Compact the write log through the pair-wide registry minimum ONLY (ADR-079
-/// Amendment 1 §A step 3). The scalar subquery yields NULL when no consumer
-/// has registered, and `seq <= NULL` matches nothing — an unregistered pair
-/// never compacts.
+/// Amendment 1 §A step 3, universal wildcard-inclusive form). Wildcard rows
+/// (`namespace = '*'`) are global-scope consumers whose corpus spans every
+/// namespace; their watermark bounds this pair's compaction too. The scalar
+/// subquery yields NULL when no consumer has registered, and `seq <= NULL`
+/// matches nothing — an unregistered pair never compacts.
 async fn compact_log(rt: &KhiveRuntime, ns: &str, model: &str) -> Result<(), String> {
     let sql = rt.sql();
     let mut w = sql.writer().await.map_err(|e| e.to_string())?;
@@ -876,7 +786,8 @@ async fn compact_log(rt: &KhiveRuntime, ns: &str, model: &str) -> Result<(), Str
         sql: "DELETE FROM ann_write_log \
               WHERE namespace = ?1 AND embedding_model = ?2 \
                 AND seq <= (SELECT MIN(watermark) FROM ann_consumer_watermark \
-                             WHERE namespace = ?1 AND embedding_model = ?2)"
+                             WHERE (namespace = ?1 OR namespace = '*') \
+                               AND embedding_model = ?2)"
             .into(),
         params: vec![
             SqlValue::Text(ns.to_owned()),
@@ -2571,16 +2482,17 @@ mod tests {
             .save_atomic(dir.path())
             .expect("save_atomic B segments");
 
-        // Now: metadata.bin carries B's content_hash, external_ids.bin still has A's hash.
+        // Now: metadata.bin is B's commit record, external_ids.bin is still bound
+        // to A's commit-record digest.
         let result = AnnBridge::load(dir.path());
         assert!(
             result.is_err(),
-            "load must fail when segment content_hash != sidecar content_hash (torn pair)"
+            "load must fail when sidecar commit digest != on-disk commit record (torn pair)"
         );
         let err = result.err().expect("already asserted is_err");
         assert!(
-            err.contains("content_hash mismatch") || err.contains("torn"),
-            "error message must mention hash mismatch or torn pair, got: {err}"
+            err.contains("commit-digest mismatch") || err.contains("torn"),
+            "error message must mention digest mismatch or torn pair, got: {err}"
         );
     }
 
@@ -2590,17 +2502,14 @@ mod tests {
         let (bridge, _) = build_test_bridge(4, 2);
         bridge.save_atomic(dir.path()).expect("save_atomic");
 
-        // Read back the sidecar, parse content_hash, then rewrite with wrong count.
-        let sidecar_bytes =
-            std::fs::read(dir.path().join("external_ids.bin")).expect("read sidecar");
-        // content_hash lives at bytes[8..40]; reuse it. Write count=99 instead of 2.
-        let mut new_sidecar: Vec<u8> = Vec::with_capacity(48 + 99 * 16);
-        new_sidecar.extend_from_slice(b"KHVANIDS");
-        new_sidecar.extend_from_slice(&sidecar_bytes[8..40]); // original content_hash
-        new_sidecar.extend_from_slice(&99u64.to_le_bytes()); // wrong count
-        new_sidecar.extend(std::iter::repeat_n(0u8, 99 * 16)); // 99 zero UUIDs
-        std::fs::write(dir.path().join("external_ids.bin"), &new_sidecar)
-            .expect("write patched sidecar");
+        // Rewrite the sidecar via the codec itself: correctly bound to the
+        // on-disk commit record, internally consistent, but carrying 99 UUIDs
+        // instead of the index's 2 — only the count cross-check can catch it.
+        let digest = segment_commit_digest(dir.path())
+            .expect("digest ok")
+            .expect("commit record present");
+        let wrong_ids: Vec<uuid::Uuid> = (0..99).map(|_| uuid::Uuid::new_v4()).collect();
+        write_external_ids_sidecar(dir.path(), &digest, &wrong_ids).expect("write patched sidecar");
 
         let result = AnnBridge::load(dir.path());
         assert!(

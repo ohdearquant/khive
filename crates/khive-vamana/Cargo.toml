@@ -16,7 +16,7 @@ bench = false
 [features]
 default = ["parallel", "mmap"]
 parallel = ["dep:rayon", "khive-quant/parallel"]
-mmap = ["dep:memmap2"]
+mmap = ["dep:memmap2", "dep:uuid"]
 
 [dependencies]
 rayon = { workspace = true, optional = true }
@@ -26,6 +26,7 @@ rand = { version = "0.8", default-features = false, features = ["std_rng"] }
 serde = { workspace = true }
 thiserror = { workspace = true }
 blake3 = { workspace = true }
+uuid = { workspace = true, optional = true }
 khive-quant = { version = "0.5.0", path = "../khive-quant", default-features = false }
 
 [dev-dependencies]
