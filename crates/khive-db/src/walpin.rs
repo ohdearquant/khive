@@ -811,6 +811,17 @@ fn macos_pid_genuinely_gone(errno: Option<i32>) -> bool {
     errno == Some(libc::ESRCH)
 }
 
+/// macOS: classify a `proc_pidfdinfo` return against the expected struct
+/// size. Only an exact match is a successful inspection. A positive but
+/// short byte count (review round 5, item 2) means the kernel wrote a
+/// truncated/partial struct rather than the full `VnodeFdInfoWithPath` —
+/// that is an inspection failure exactly like a non-positive return, not a
+/// successful call that merely returned less data than expected.
+#[cfg(target_os = "macos")]
+fn proc_pidfdinfo_returned_expected_size(returned_bytes: i32, expected_size: usize) -> bool {
+    returned_bytes > 0 && returned_bytes as usize == expected_size
+}
+
 /// Bounded attempts for the macOS buffer-size negotiation below — enough to
 /// absorb the live-set growing between the sizing call and the data call a
 /// couple of times without looping forever on a pathologically fast-growing
@@ -1019,7 +1030,10 @@ pub fn census_holders(db_path: &Path) -> io::Result<CensusResult> {
                     std::mem::size_of::<VnodeFdInfoWithPath>() as c_int,
                 )
             };
-            if vsize as usize != std::mem::size_of::<VnodeFdInfoWithPath>() {
+            if !proc_pidfdinfo_returned_expected_size(
+                vsize,
+                std::mem::size_of::<VnodeFdInfoWithPath>(),
+            ) {
                 // A non-positive return is a failed inspection call for
                 // this fd: ESRCH-equivalent (the fd/process raced away) is
                 // genuinely gone, safe to skip; any other errno means we
@@ -1030,6 +1044,11 @@ pub fn census_holders(db_path: &Path) -> io::Result<CensusResult> {
                     if !macos_pid_genuinely_gone(errno) {
                         uninspectable.push(pid as u32);
                     }
+                } else {
+                    // Positive but short: the call itself succeeded (no
+                    // errno to classify), it just wrote less data than the
+                    // struct requires — an inspection failure regardless.
+                    uninspectable.push(pid as u32);
                 }
                 continue;
             }
@@ -1072,6 +1091,31 @@ fn linux_proc_gone(err: &io::Error) -> bool {
     err.kind() == io::ErrorKind::NotFound
 }
 
+/// The fixed inode number the kernel assigns to the *init* PID namespace —
+/// the one namespace that exists for the lifetime of the machine, created
+/// at boot before any container/unshare call can create another (Linux
+/// `include/linux/proc_ns.h`, `PROC_PID_INIT_INO`). Every non-init PID
+/// namespace — including a container's own, self-consistent one — gets a
+/// dynamically allocated inode instead, so this exact value is a positive,
+/// unspoofable proof that `/proc/self/ns/pid` refers to the host's own
+/// root namespace (review round 5, item 1: a same-namespace readlink
+/// comparison against `/proc/1/ns/pid` cannot tell "the host" apart from
+/// "a container that is its own root," because both are internally
+/// self-consistent).
+#[cfg(target_os = "linux")]
+const PROC_PID_INIT_INO: u64 = 0xEFFFFFFC;
+
+/// Linux: classify a `/proc/self/ns/pid` inode against
+/// [`PROC_PID_INIT_INO`]. Only an exact match is positive proof this
+/// process shares the host's own (init) PID namespace; anything else means
+/// external holders outside this namespace may be invisible to the
+/// `/proc` walk below, so the census must be marked incomplete rather than
+/// trusted as global.
+#[cfg(target_os = "linux")]
+fn pid_ns_is_init(ino: u64) -> bool {
+    ino == PROC_PID_INIT_INO
+}
+
 /// Linux OS-derived census (ADR-091 Amendment 2 review, item a): scan
 /// `/proc/<pid>/fd/*` for every live PID and resolve each fd symlink,
 /// comparing against `db_path`'s canonical form. A PID whose `fd` directory
@@ -1084,28 +1128,26 @@ fn linux_proc_gone(err: &io::Error) -> bool {
 /// make `read_dir("/proc")` succeed while silently showing only a subset of
 /// the host's live PIDs — with no per-entry error to catch. Two checks
 /// widen the net rather than trust a clean-looking iteration outright: (1)
-/// `/proc/1/ns/pid` vs `/proc/self/ns/pid` — differing or unreadable means
-/// this process cannot assume it shares the visible PID namespace; NOTE
-/// this does not detect a PID namespace whose own `/proc` mount makes
-/// `/proc/1` resolve to that namespace's own init (a container's own procfs
-/// is internally self-consistent), so it is a real-but-partial defense, not
-/// a complete one — it is the `hidepid`/hard-restricted-mount case named in
-/// the review that it reliably catches. (2) any error surfacing from the
-/// `/proc` or per-PID `fd` directory ITERATORS themselves (not a single
-/// entry's own error) marks the walk incomplete rather than being dropped
-/// via `.flatten()`.
+/// a positive proof that this process itself is running in the *host's*
+/// init PID namespace — see [`pid_ns_is_init`]; a container's own procfs is
+/// internally self-consistent (its `/proc/1` resolves to its own init), so
+/// merely comparing `/proc/1/ns/pid` against `/proc/self/ns/pid` cannot
+/// distinguish "the host" from "a container that is its own root," and was
+/// replaced with this inode check (review round 5, item 1). (2) any error
+/// surfacing from the `/proc` or per-PID `fd` directory ITERATORS
+/// themselves (not a single entry's own error) marks the walk incomplete
+/// rather than being dropped via `.flatten()`.
 #[cfg(target_os = "linux")]
 pub fn census_holders(db_path: &Path) -> io::Result<CensusResult> {
+    use std::os::unix::fs::MetadataExt;
+
     let target = fs::canonicalize(db_path)?;
     let mut holders = std::collections::HashSet::new();
     let mut uninspectable: Vec<u32> = Vec::new();
     let mut truncated = false;
 
-    match (
-        fs::read_link("/proc/1/ns/pid"),
-        fs::read_link("/proc/self/ns/pid"),
-    ) {
-        (Ok(init_ns), Ok(self_ns)) if init_ns == self_ns => {}
+    match fs::metadata("/proc/self/ns/pid") {
+        Ok(meta) if pid_ns_is_init(meta.ino()) => {}
         _ => truncated = true,
     }
 
@@ -2158,6 +2200,31 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
+    fn proc_pidfdinfo_returned_expected_size_boundary() {
+        // Review round 5, item 2: a positive-but-short byte count must
+        // classify as an inspection failure, not a successful call — only
+        // an exact match on the expected struct size is `ok`.
+        let expected = std::mem::size_of::<u64>(); // stand-in fixed-size struct
+        assert!(
+            proc_pidfdinfo_returned_expected_size(expected as i32, expected),
+            "an exact match on the expected struct size must be ok"
+        );
+        assert!(
+            !proc_pidfdinfo_returned_expected_size(expected as i32 - 1, expected),
+            "a positive but short byte count must be an inspection failure"
+        );
+        assert!(
+            !proc_pidfdinfo_returned_expected_size(0, expected),
+            "a zero return must be an inspection failure"
+        );
+        assert!(
+            !proc_pidfdinfo_returned_expected_size(-1, expected),
+            "a negative return must be an inspection failure"
+        );
+    }
+
+    #[test]
     #[cfg(target_os = "linux")]
     fn census_holders_linux_discovers_self_as_a_holder_of_an_open_db_file() {
         let root = tempfile::tempdir().unwrap();
@@ -2196,6 +2263,21 @@ mod tests {
         assert!(!linux_proc_gone(&io::Error::from(
             io::ErrorKind::PermissionDenied
         )));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn pid_ns_is_init_only_true_for_the_fixed_kernel_inode() {
+        // Review round 5, item 1: only the exact kernel-assigned init
+        // namespace inode (`include/linux/proc_ns.h`) is complete-eligible.
+        // A container's own, internally self-consistent PID namespace gets
+        // a different, dynamically allocated inode and must classify as
+        // incomplete — that is precisely the self-consistent-container gap
+        // the old readlink comparison could not detect.
+        assert!(pid_ns_is_init(PROC_PID_INIT_INO));
+        assert!(!pid_ns_is_init(PROC_PID_INIT_INO + 1));
+        assert!(!pid_ns_is_init(0));
+        assert!(!pid_ns_is_init(12345));
     }
 
     #[test]
