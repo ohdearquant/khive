@@ -1,28 +1,42 @@
 //! External-id sidecar codec for ANN segment directories (ADR-079).
 //!
-//! `external_ids.bin` maps segment ordinals back to caller UUIDs and is
-//! stamped with the v2 commit's `content_hash` so a torn segment/sidecar pair
-//! (crash between the segment commit and the sidecar write) is self-detecting
-//! at load time. One codec shared by every pack that persists a segment.
+//! `external_ids.bin` maps segment ordinals back to caller UUIDs. It is bound
+//! to one specific segment commit by storing the blake3 digest of the commit
+//! record (`metadata.bin`) it was written against — the commit record carries
+//! every segment file hash plus the fingerprint and watermark, so a
+//! segment/sidecar pairing from different saves (crash between the segment
+//! commit and the sidecar write, in either order) is self-detecting at load
+//! time. A second digest over the id bytes themselves makes the mapping
+//! corruption-evident independent of its length. One codec shared by every
+//! pack that persists a segment.
 //!
 //! Binary format:
-//!   magic        8 bytes   b"KHVANIDS"
-//!   content_hash 32 bytes  corpus blake3 hash (from the v2 commit fingerprint)
-//!   count        8 bytes   u64 little-endian — number of UUIDs
-//!   ids          16 × count bytes — raw UUID bytes
+//!   magic         8 bytes   b"KHVANID2"
+//!   commit_digest 32 bytes  blake3 of the metadata.bin bytes at write time
+//!   ids_hash      32 bytes  blake3 of the raw id bytes that follow
+//!   count         8 bytes   u64 little-endian — number of UUIDs
+//!   ids           16 × count bytes — raw UUID bytes
 
 use uuid::Uuid;
 
-const SIDECAR_MAGIC: &[u8; 8] = b"KHVANIDS";
+const SIDECAR_MAGIC: &[u8; 8] = b"KHVANID2";
+const HEADER_LEN: usize = 8 + 32 + 32 + 8;
 
-/// Write `ids` to `dir/external_ids.bin` using a tmp-then-rename pattern.
-///
-/// The sidecar is stamped with `content_hash` so a loader can detect a torn
-/// segment/sidecar pair (segments committed with hash A, sidecar still holding
-/// hash B from a prior save, or vice versa).
+/// Blake3 digest of `dir/metadata.bin` — the identity of one specific segment
+/// commit. `Ok(None)` when the file is absent (no committed segment).
+pub fn segment_commit_digest(dir: &std::path::Path) -> Result<Option<[u8; 32]>, String> {
+    match std::fs::read(dir.join("metadata.bin")) {
+        Ok(bytes) => Ok(Some(*blake3::hash(&bytes).as_bytes())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("read metadata.bin: {e}")),
+    }
+}
+
+/// Write `ids` to `dir/external_ids.bin` using a tmp-then-rename pattern,
+/// bound to the commit record identified by `commit_digest`.
 pub fn write_external_ids_sidecar(
     dir: &std::path::Path,
-    content_hash: &[u8; 32],
+    commit_digest: &[u8; 32],
     ids: &[Uuid],
 ) -> Result<(), String> {
     use std::io::Write as _;
@@ -30,14 +44,19 @@ pub fn write_external_ids_sidecar(
     let tmp_path = dir.join("external_ids.bin.tmp");
     let final_path = dir.join("external_ids.bin");
 
-    let count = ids.len() as u64;
-    let mut buf: Vec<u8> = Vec::with_capacity(8 + 32 + 8 + ids.len() * 16);
-    buf.extend_from_slice(SIDECAR_MAGIC);
-    buf.extend_from_slice(content_hash);
-    buf.extend_from_slice(&count.to_le_bytes());
+    let mut id_bytes: Vec<u8> = Vec::with_capacity(ids.len() * 16);
     for id in ids {
-        buf.extend_from_slice(id.as_bytes());
+        id_bytes.extend_from_slice(id.as_bytes());
     }
+    let ids_hash = blake3::hash(&id_bytes);
+
+    let count = ids.len() as u64;
+    let mut buf: Vec<u8> = Vec::with_capacity(HEADER_LEN + id_bytes.len());
+    buf.extend_from_slice(SIDECAR_MAGIC);
+    buf.extend_from_slice(commit_digest);
+    buf.extend_from_slice(ids_hash.as_bytes());
+    buf.extend_from_slice(&count.to_le_bytes());
+    buf.extend_from_slice(&id_bytes);
 
     let mut f = std::fs::File::create(&tmp_path)
         .map_err(|e| format!("create external_ids.bin.tmp: {e}"))?;
@@ -50,18 +69,18 @@ pub fn write_external_ids_sidecar(
         .map_err(|e| format!("rename external_ids.bin.tmp -> external_ids.bin: {e}"))
 }
 
-/// Read `dir/external_ids.bin` and return `(content_hash, ids)`.
+/// Read `dir/external_ids.bin` and return `(commit_digest, ids)`.
 ///
-/// Returns `Err` on any I/O error, wrong magic, truncated header, or
-/// count/size mismatch.
+/// Returns `Err` on any I/O error, wrong magic, truncated header, count/size
+/// mismatch (checked arithmetic — a hostile count cannot wrap), or an ids
+/// digest that does not match the id bytes.
 pub fn read_external_ids_sidecar(dir: &std::path::Path) -> Result<([u8; 32], Vec<Uuid>), String> {
     let bytes = std::fs::read(dir.join("external_ids.bin"))
         .map_err(|e| format!("read external_ids.bin: {e}"))?;
 
-    // magic (8) + content_hash (32) + count (8) = 48 bytes minimum header
-    if bytes.len() < 48 {
+    if bytes.len() < HEADER_LEN {
         return Err(format!(
-            "external_ids.bin too short: {} bytes (need at least 48)",
+            "external_ids.bin too short: {} bytes (need at least {HEADER_LEN})",
             bytes.len()
         ));
     }
@@ -74,27 +93,37 @@ pub fn read_external_ids_sidecar(dir: &std::path::Path) -> Result<([u8; 32], Vec
         ));
     }
 
-    let mut content_hash = [0u8; 32];
-    content_hash.copy_from_slice(&bytes[8..40]);
+    let mut commit_digest = [0u8; 32];
+    commit_digest.copy_from_slice(&bytes[8..40]);
+    let mut ids_hash = [0u8; 32];
+    ids_hash.copy_from_slice(&bytes[40..72]);
 
-    let count = u64::from_le_bytes(bytes[40..48].try_into().unwrap()) as usize;
-    let expected_len = 48 + count * 16;
+    let count = u64::from_le_bytes(bytes[72..80].try_into().unwrap());
+    let count =
+        usize::try_from(count).map_err(|_| "external_ids.bin count exceeds usize".to_string())?;
+    let expected_len = count
+        .checked_mul(16)
+        .and_then(|n| n.checked_add(HEADER_LEN))
+        .ok_or_else(|| format!("external_ids.bin count {count} overflows length arithmetic"))?;
     if bytes.len() != expected_len {
         return Err(format!(
-            "external_ids.bin length mismatch: got {} bytes, expected {} for {count} UUIDs",
+            "external_ids.bin length mismatch: got {} bytes, expected {expected_len} for {count} UUIDs",
             bytes.len(),
-            expected_len
         ));
     }
 
+    let id_bytes = &bytes[HEADER_LEN..];
+    if *blake3::hash(id_bytes).as_bytes() != ids_hash {
+        return Err("external_ids.bin ids digest mismatch (corrupt or truncated mapping)".into());
+    }
+
     let mut ids = Vec::with_capacity(count);
-    for i in 0..count {
-        let start = 48 + i * 16;
-        let raw: [u8; 16] = bytes[start..start + 16].try_into().unwrap();
+    for chunk in id_bytes.chunks_exact(16) {
+        let raw: [u8; 16] = chunk.try_into().unwrap();
         ids.push(Uuid::from_bytes(raw));
     }
 
-    Ok((content_hash, ids))
+    Ok((commit_digest, ids))
 }
 
 #[cfg(test)]
@@ -104,11 +133,11 @@ mod tests {
     #[test]
     fn sidecar_round_trip() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let hash = [7u8; 32];
+        let digest = [7u8; 32];
         let ids: Vec<Uuid> = (0..5).map(|_| Uuid::new_v4()).collect();
-        write_external_ids_sidecar(dir.path(), &hash, &ids).expect("write");
-        let (read_hash, read_ids) = read_external_ids_sidecar(dir.path()).expect("read");
-        assert_eq!(read_hash, hash);
+        write_external_ids_sidecar(dir.path(), &digest, &ids).expect("write");
+        let (read_digest, read_ids) = read_external_ids_sidecar(dir.path()).expect("read");
+        assert_eq!(read_digest, digest);
         assert_eq!(read_ids, ids);
     }
 
@@ -121,5 +150,47 @@ mod tests {
         let bytes = std::fs::read(&path).expect("read back");
         std::fs::write(&path, &bytes[..bytes.len() - 1]).expect("truncate");
         assert!(read_external_ids_sidecar(dir.path()).is_err());
+    }
+
+    #[test]
+    fn sidecar_rejects_overflowing_count() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_external_ids_sidecar(dir.path(), &[0u8; 32], &[]).expect("write");
+        let path = dir.path().join("external_ids.bin");
+        let mut bytes = std::fs::read(&path).expect("read back");
+        // count = 2^60: count * 16 wraps to 0 under unchecked u64 arithmetic,
+        // which would let a header-only file pass a naive length equality.
+        bytes[72..80].copy_from_slice(&(1u64 << 60).to_le_bytes());
+        std::fs::write(&path, &bytes).expect("write hostile count");
+        let err = read_external_ids_sidecar(dir.path()).expect_err("must reject");
+        assert!(
+            err.contains("overflow") || err.contains("length mismatch"),
+            "hostile count must fail arithmetic or length validation, got: {err}"
+        );
+    }
+
+    #[test]
+    fn sidecar_rejects_flipped_id_byte() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ids: Vec<Uuid> = (0..4).map(|_| Uuid::new_v4()).collect();
+        write_external_ids_sidecar(dir.path(), &[0u8; 32], &ids).expect("write");
+        let path = dir.path().join("external_ids.bin");
+        let mut bytes = std::fs::read(&path).expect("read back");
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        std::fs::write(&path, &bytes).expect("write corrupted");
+        let err = read_external_ids_sidecar(dir.path()).expect_err("must reject");
+        assert!(err.contains("ids digest mismatch"), "got: {err}");
+    }
+
+    #[test]
+    fn segment_commit_digest_absent_and_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(segment_commit_digest(dir.path()).expect("absent ok"), None);
+        std::fs::write(dir.path().join("metadata.bin"), b"commit-bytes").expect("write");
+        let digest = segment_commit_digest(dir.path())
+            .expect("present ok")
+            .expect("must be Some");
+        assert_eq!(digest, *blake3::hash(b"commit-bytes").as_bytes());
     }
 }

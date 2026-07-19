@@ -27,9 +27,9 @@ An `AnnBridge` contains the Vamana index, the UUID position map, the set of name
 - `generation` is the in-process write-generation floor captured before scanning.
 - `epoch_baseline` is the durable database epoch observed when the graph was built or restored.
 
-The namespace set lets the recall over-fetch loop skip widening when the global graph contains no namespaces outside the caller's visible set. Search returns cosine-like scores and rejects dimension mismatches through the underlying index contract.
+The namespace set lets the recall over-fetch loop skip widening when the global graph contains no namespaces outside the caller's visible set. An empty set is the conservative default: recall assumes non-visible namespaces may be present and keeps its widening behavior. Bridges built from a corpus scan collect the set for free during the scan; bridges adopted from a persisted segment start empty rather than paying a distinct-namespace corpus scan on the restart path. Search returns cosine-like scores and rejects dimension mismatches through the underlying index contract.
 
-`install_if_fresher` replaces an existing entry only when the candidate generation is strictly newer. Equal generations keep the existing entry; an older build can never overwrite a newer one, while a later build that covers more writes always wins. This replaced `or_insert`, whose winner depended on lock acquisition order rather than corpus freshness.
+`install_replacing` replaces an existing entry when the candidate generation is equal or newer. All install sites run under the per-model single-flight lock, so an equal generation means an ordered step within one warm task (for example the mmap reopen of a just-persisted build), and the later product is the right one to keep. A strictly newer incumbent survives a slow candidate finishing late.
 
 ## `bump_generation` and stale serving
 
@@ -67,9 +67,9 @@ The RAII `WarmingGuard` owns guard release on every exit path. Benign shutdown c
 2. Returns `AlreadyLoaded` when the installed graph satisfies that floor.
 3. Acquires the per-model single-flight lock and repeats the freshness check.
 4. Emits one ANN-warm phase span for the caller that actually warms.
-5. Restores a valid snapshot or rebuilds from the vector store.
+5. Runs the restart classifier over the persisted v2 segment, or rebuilds from the vector store when the classifier reports Cold.
 
-Only one concurrent caller emits the phase start/completion pair. Resource accounting snapshots cumulative CPU at entry and exit and reports the delta, while an RAII active-phase guard lets health reporting observe `ann_warm` during execution. Corpus size is diagnostic and best effort; failure to count does not fail warming. Phase-event append failures are also best effort and never change the warm result.
+Only one concurrent caller emits the phase start/completion pair. Resource accounting snapshots cumulative CPU at entry and exit and reports the delta, while an RAII active-phase guard lets health reporting observe `ann_warm` during execution. The phase-start event carries no corpus count: the Hot adoption path performs zero corpus I/O, and a diagnostic COUNT on every warm would defeat that; vector counts are attributed at build completion. Phase-event append failures are best effort and never change the warm result.
 
 The function returns an `AnnEnsureStatus` distinguishing already loaded, restored snapshot, built graph, empty corpus, and a build discarded because the corpus changed during scanning.
 

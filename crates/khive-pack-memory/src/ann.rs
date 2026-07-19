@@ -13,7 +13,7 @@ use khive_runtime::{
 use khive_storage::types::{SqlStatement, SqlValue};
 use khive_storage::StorageError;
 use khive_vamana::{
-    read_commit_fingerprint, read_commit_info, read_external_ids_sidecar,
+    read_commit_fingerprint, read_commit_info, read_external_ids_sidecar, segment_commit_digest,
     write_external_ids_sidecar, CorpusFingerprint, VamanaConfig, VamanaIndex,
 };
 use tokio::sync::{Mutex, RwLock};
@@ -408,9 +408,10 @@ impl AnnBridge {
     }
 
     /// Save this bridge to `dir` atomically: v2 Vamana segments (the commit
-    /// record is the gate), then the id-map sidecar stamped with the commit's
-    /// `content_hash`. A crash between the two writes leaves a mismatched
-    /// sidecar hash, which `load` detects as a torn pair.
+    /// record is the gate), then the id-map sidecar bound to the blake3 digest
+    /// of the just-committed record. A crash between the two writes leaves the
+    /// sidecar's stored digest mismatched against the on-disk commit record,
+    /// which `load` detects as a torn pair.
     pub(crate) fn save_atomic(&self, dir: &std::path::Path) -> Result<(), String> {
         let count = self.id_map.len();
         if count != self.index.num_vectors() {
@@ -422,14 +423,12 @@ impl AnnBridge {
         self.index
             .save_atomic(dir)
             .map_err(|e| format!("VamanaIndex::save_atomic: {e}"))?;
-        let fp = read_commit_fingerprint(dir)
-            .map_err(|e| format!("read_commit_fingerprint after save: {e}"))?
+        let digest = segment_commit_digest(dir)
+            .map_err(|e| format!("segment_commit_digest after save: {e}"))?
             .ok_or_else(|| {
-                "save_atomic succeeded but read_commit_fingerprint returned None \
-                 (unexpected v1 or torn commit)"
-                    .to_string()
+                "save_atomic succeeded but metadata.bin is absent (torn commit)".to_string()
             })?;
-        write_external_ids_sidecar(dir, &fp.content_hash, &self.id_map)
+        write_external_ids_sidecar(dir, &digest, &self.id_map)
     }
 
     /// Load a bridge from a segment directory written by `save_atomic`. Any
@@ -438,17 +437,20 @@ impl AnnBridge {
     /// (conservative — recall assumes non-visible namespaces may exist) until
     /// the caller populates it.
     pub(crate) fn load(dir: &std::path::Path) -> Result<Self, String> {
-        let fp = read_commit_fingerprint(dir)
+        read_commit_fingerprint(dir)
             .map_err(|e| format!("read_commit_fingerprint: {e}"))?
             .ok_or_else(|| {
                 "no v2 commit fingerprint: segment dir is absent, v1, or has a torn commit"
                     .to_string()
             })?;
         let index = VamanaIndex::load(dir).map_err(|e| format!("VamanaIndex::load: {e}"))?;
-        let (sidecar_hash, id_map) = read_external_ids_sidecar(dir)?;
-        if sidecar_hash != fp.content_hash {
+        let (sidecar_digest, id_map) = read_external_ids_sidecar(dir)?;
+        let commit_digest = segment_commit_digest(dir)
+            .map_err(|e| format!("segment_commit_digest: {e}"))?
+            .ok_or_else(|| "metadata.bin vanished between fingerprint and digest".to_string())?;
+        if sidecar_digest != commit_digest {
             return Err(
-                "external_ids.bin content_hash mismatch: torn segment/sidecar pair".to_string(),
+                "external_ids.bin commit-digest mismatch: torn segment/sidecar pair".to_string(),
             );
         }
         if id_map.len() != index.num_vectors() {
@@ -761,10 +763,10 @@ pub(crate) async fn ensure_ann_for_model(
     let cpu_start = khive_runtime::process_resource_usage();
     // RAII keeps `ann_warm` visible to health reporting on every exit path.
     let _phase_guard = khive_runtime::register_active_phase("ann_warm");
-    // Corpus size is diagnostic; failure to count must not fail warming.
-    let corpus_size = compute_memory_fingerprint(rt, token, model)
-        .await
-        .map(|fp| fp.vector_count);
+    // No corpus count here: the Hot adoption path performs zero corpus I/O
+    // (ADR-079 Amendment 1), and an O(N) diagnostic COUNT on every warm would
+    // defeat that. Vector counts are attributed at build completion instead.
+    let corpus_size = None;
     emit_ann_warm_phase_event(
         rt,
         token,
@@ -884,7 +886,6 @@ async fn ensure_ann_for_model_inner(
     if let Some(seg_dir) = ann_segment_dir(rt, model) {
         match classify_and_adopt_segment(
             rt,
-            token,
             ann,
             &key,
             model,
@@ -951,46 +952,6 @@ async fn ensure_ann_for_model_inner(
 }
 
 // ── corpus loading ────────────────────────────────────────────────────────────
-
-/// Query the set of distinct `namespace` values present in the vector corpus for `model`.
-/// Used after snapshot restore to populate the in-memory namespace set.
-async fn query_distinct_namespaces(
-    rt: &KhiveRuntime,
-    token: &NamespaceToken,
-    model: &str,
-) -> Option<HashSet<String>> {
-    let store = rt.vectors_for_model(token, model).ok()?;
-    let _ = store; // ensure store is accessible; actual query goes to SQL layer
-    let model_key = sanitize_model_key(model);
-    let table_name = format!("vec_{model_key}");
-    let sql = rt.sql();
-    let mut reader = sql.reader().await.ok()?;
-    let rows = reader
-        .query_all(SqlStatement {
-            sql: format!(
-                "SELECT DISTINCT n.namespace FROM {table_name} v \
-                 JOIN notes n ON n.id = v.subject_id \
-                 WHERE v.embedding_model = ?1 \
-                   AND v.kind = 'note' AND v.field = 'note.content' \
-                   AND n.deleted_at IS NULL"
-            ),
-            params: vec![SqlValue::Text(model.to_owned())],
-            label: Some("memory_ann_distinct_namespaces".into()),
-        })
-        .await
-        .ok()?;
-    let set: HashSet<String> = rows
-        .into_iter()
-        .filter_map(|row| {
-            if let Some(SqlValue::Text(ns)) = row.get("namespace") {
-                Some(ns.clone())
-            } else {
-                None
-            }
-        })
-        .collect();
-    Some(set)
-}
 
 /// Compute a fingerprint for all non-deleted memory note vectors for `model` (all namespaces).
 async fn compute_memory_fingerprint(
@@ -1138,14 +1099,16 @@ async fn load_and_build_from_vector_store(
 // ── ADR-079 Amendment 1: segments, registry, classifier (global scope) ────────
 
 /// Filesystem directory for v2 Vamana segment files for this consumer's
-/// global-scope index for `model`: `data_dir/ann/<hex(snapshot_key)>`. The
-/// `memory_vamana` marker in the key keeps memory segment dirs disjoint from
-/// knowledge's `{ns}::vamana::{model}` dirs. `None` for in-memory backends.
+/// global-scope index for `model`: `<db-file>.ann/<hex(snapshot_key)>`, rooted
+/// beside the backing database file so co-located databases can never adopt
+/// each other's segments. The `memory_vamana` marker in the key keeps memory
+/// segment dirs disjoint from knowledge's `{ns}::vamana::{model}` dirs.
+/// `None` for in-memory backends.
 fn ann_segment_dir(rt: &KhiveRuntime, model: &str) -> Option<std::path::PathBuf> {
-    let data_dir = rt.backend_data_dir()?;
+    let ann_root = rt.backend_ann_root()?;
     let key = snapshot_key("global", model);
     let hex: String = key.bytes().map(|b| format!("{b:02x}")).collect();
-    Some(data_dir.join("ann").join(hex))
+    Some(ann_root.join(hex))
 }
 
 /// Install `candidate`, replacing an equal-generation incumbent but never a
@@ -1336,12 +1299,43 @@ async fn scope_counts(rt: &KhiveRuntime, model: &str, s: u64) -> Result<(u64, u6
     Ok((get("live")?, get("tail")?))
 }
 
+/// Log-table-only probe: does any write-log row exist above `s` for this
+/// consumer's scope? Touches no corpus table, so the Hot path (empty tail)
+/// adopts with zero corpus I/O (ADR-079 Amendment 1, rule 5/6 evaluation
+/// order: with an empty tail the committed segment reflects every op ≤ S, so
+/// adoption serves exactly what Empty would serve even when live = 0).
+async fn tail_exists(rt: &KhiveRuntime, model: &str, s: u64) -> Result<bool, String> {
+    let sql = rt.sql();
+    let mut reader = sql.reader().await.map_err(|e| e.to_string())?;
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: "SELECT EXISTS(SELECT 1 FROM ann_write_log \
+                    WHERE embedding_model = ?1 \
+                      AND kind = 'note' AND field = 'note.content' \
+                      AND seq > ?2) AS has_tail"
+                .into(),
+            params: vec![
+                SqlValue::Text(model.to_owned()),
+                SqlValue::Integer(s as i64),
+            ],
+            label: Some("memory_ann_tail_exists".into()),
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    match rows.first().and_then(|row| row.get("has_tail")) {
+        Some(SqlValue::Integer(n)) => Ok(*n != 0),
+        other => Err(format!("tail_exists: unexpected value {other:?}")),
+    }
+}
+
 /// Fetch the scope's tail (rows above `s`, all namespaces, ordered), coalesce
-/// to the final op per subject, and point-read embeddings for final upserts
-/// under the FULL corpus predicate — join included. A final upsert whose
-/// subject no longer satisfies the join-filtered predicate (soft-deleted, or
-/// gone) replays as a delete: its final corpus state is absence (ADR-079
-/// Amendment 1, join-filtered corpora). Returns the ops and the new watermark.
+/// to the final op per subject, and point-read embeddings for final upserts.
+/// Two distinct outcomes for a final upsert (ADR-079 Amendment 1,
+/// join-filtered corpora): a vec row that is absent or out of scope
+/// contradicts the committed log (same-transaction writes) → `Err` → Cold;
+/// a row that is present but whose note fails the join predicate
+/// (soft-deleted, or gone) replays as a delete — its final corpus state is
+/// absence. Returns the ops and the new watermark.
 async fn fetch_final_tail(
     rt: &KhiveRuntime,
     model: &str,
@@ -1399,42 +1393,79 @@ async fn fetch_final_tail(
         .filter(|(_, is_delete)| !is_delete)
         .map(|(u, _)| *u)
         .collect();
-    let mut embeddings: HashMap<Uuid, Vec<f32>> = HashMap::with_capacity(upsert_ids.len());
+
+    // Per-subject point reads: the vec0 vtable plans a point lookup only for a
+    // single PRIMARY KEY equality constraint — an `IN (...)` batch or any extra
+    // predicate degrades to a full scan. Scope is therefore checked in Rust.
+    // A vec row that is absent, or present but out of this consumer's scope,
+    // contradicts the log's committed final upsert (vec writes and log appends
+    // are same-transaction) → Err, which the caller treats as Cold.
     let table_name = format!("vec_{}", sanitize_model_key(model));
-    for chunk in upsert_ids.chunks(500) {
-        let placeholders: Vec<String> = (0..chunk.len()).map(|i| format!("?{}", i + 2)).collect();
-        let mut params = vec![SqlValue::Text(model.to_owned())];
-        params.extend(chunk.iter().map(|u| SqlValue::Text(u.to_string())));
+    let mut embeddings: HashMap<Uuid, Vec<f32>> = HashMap::with_capacity(upsert_ids.len());
+    for subject in &upsert_ids {
         let rows = reader
             .query_all(SqlStatement {
                 sql: format!(
-                    "SELECT v.subject_id, v.embedding FROM {table_name} v \
-                     JOIN notes n ON n.id = v.subject_id \
-                     WHERE v.embedding_model = ?1 \
-                       AND v.kind = 'note' AND v.field = 'note.content' \
-                       AND n.deleted_at IS NULL \
-                       AND v.subject_id IN ({})",
-                    placeholders.join(", ")
+                    "SELECT embedding_model, kind, field, embedding \
+                     FROM {table_name} WHERE subject_id = ?1"
                 ),
-                params,
+                params: vec![SqlValue::Text(subject.to_string())],
                 label: Some("memory_ann_tail_point_read".into()),
             })
             .await
             .map_err(|e| e.to_string())?;
+        let Some(row) = rows.first() else {
+            return Err(format!(
+                "tail upsert {subject}: vector row absent (log/corpus contradiction)"
+            ));
+        };
+        let in_scope = matches!(row.get("embedding_model"), Some(SqlValue::Text(m)) if m == model)
+            && matches!(row.get("kind"), Some(SqlValue::Text(k)) if k == "note")
+            && matches!(row.get("field"), Some(SqlValue::Text(f)) if f == "note.content");
+        if !in_scope {
+            return Err(format!(
+                "tail upsert {subject}: vector row out of consumer scope (log/corpus contradiction)"
+            ));
+        }
+        let Some(SqlValue::Blob(bytes)) = row.get("embedding") else {
+            return Err(format!("tail upsert {subject}: embedding is not a blob"));
+        };
+        let vec: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        embeddings.insert(*subject, vec);
+    }
+
+    // Join-predicate check on the regular notes table (batched IN is fine
+    // there). A subject whose vec row exists but whose note fails the
+    // join-filtered corpus predicate (soft-deleted, or gone) is not a
+    // contradiction: its final corpus state is absence → replay as delete
+    // (ADR-079 Amendment 1, join-filtered corpora).
+    let mut live_notes: HashSet<Uuid> = HashSet::with_capacity(upsert_ids.len());
+    for chunk in upsert_ids.chunks(500) {
+        let placeholders: Vec<String> = (0..chunk.len()).map(|i| format!("?{}", i + 1)).collect();
+        let params: Vec<SqlValue> = chunk
+            .iter()
+            .map(|u| SqlValue::Text(u.to_string()))
+            .collect();
+        let rows = reader
+            .query_all(SqlStatement {
+                sql: format!(
+                    "SELECT id FROM notes WHERE deleted_at IS NULL AND id IN ({})",
+                    placeholders.join(", ")
+                ),
+                params,
+                label: Some("memory_ann_tail_live_notes".into()),
+            })
+            .await
+            .map_err(|e| e.to_string())?;
         for row in &rows {
-            let (Some(SqlValue::Text(id_str)), Some(SqlValue::Blob(bytes))) =
-                (row.get("subject_id"), row.get("embedding"))
-            else {
-                continue;
-            };
-            let Ok(uuid) = Uuid::parse_str(id_str) else {
-                continue;
-            };
-            let vec: Vec<f32> = bytes
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect();
-            embeddings.insert(uuid, vec);
+            if let Some(SqlValue::Text(id_str)) = row.get("id") {
+                if let Ok(uuid) = Uuid::parse_str(id_str) {
+                    live_notes.insert(uuid);
+                }
+            }
         }
     }
 
@@ -1442,13 +1473,13 @@ async fn fetch_final_tail(
     for (uuid, is_delete) in finals {
         if is_delete {
             ops.push((uuid, None));
+        } else if live_notes.contains(&uuid) {
+            let embedding = embeddings
+                .remove(&uuid)
+                .ok_or_else(|| format!("tail upsert {uuid}: embedding vanished mid-replay"))?;
+            ops.push((uuid, Some(embedding)));
         } else {
-            match embeddings.remove(&uuid) {
-                Some(embedding) => ops.push((uuid, Some(embedding))),
-                // The join-filtered predicate no longer admits the subject:
-                // final corpus state is absence — replay as delete, not Cold.
-                None => ops.push((uuid, None)),
-            }
+            ops.push((uuid, None));
         }
     }
     Ok((ops, new_s))
@@ -1524,10 +1555,8 @@ enum SegmentOutcome {
 /// table) for the memory pack's global-scope note index, followed by the
 /// matching adoption action. Replaces the retired JSON-snapshot
 /// content-hash gate.
-#[allow(clippy::too_many_arguments)]
 async fn classify_and_adopt_segment(
     rt: &KhiveRuntime,
-    token: &NamespaceToken,
     ann: &SharedAnn,
     key: &AnnKey,
     model: &str,
@@ -1554,11 +1583,12 @@ async fn classify_and_adopt_segment(
     };
 
     // Rule 3: configured embedder dimensions ≠ segment dimensions → Cold.
-    match compute_memory_fingerprint(rt, token, model).await {
-        Some(fp) if fp.dimensions as u64 == info.dimensions => {}
-        Some(fp) => {
+    // Read from embedder configuration, not the corpus — no storage I/O.
+    match rt.embedder_dimensions(model) {
+        Some(dims) if dims as u64 == info.dimensions => {}
+        Some(dims) => {
             tracing::info!(model = %model,
-                segment_dims = info.dimensions, live_dims = fp.dimensions,
+                segment_dims = info.dimensions, live_dims = dims,
                 "memory v2 segment dimension mismatch; Cold rebuild");
             return SegmentOutcome::Cold;
         }
@@ -1583,7 +1613,39 @@ async fn classify_and_adopt_segment(
         }
     }
 
-    // Rules 5-8 read (live, tail) from one snapshot.
+    // Rule 6, tested first (ADR-079 Amendment 1, "Evaluation order of rules 5
+    // and 6"): no tail above S → Hot: mmap load with zero corpus I/O. The
+    // probe touches only the log table; with an empty tail the committed
+    // segment reflects every op ≤ S, so live = 0 would imply an empty segment
+    // and adoption serves exactly what Empty serves. The namespace set stays
+    // empty — the documented conservative default (recall assumes non-visible
+    // namespaces may exist) — rather than paying an O(N) DISTINCT corpus scan.
+    match tail_exists(rt, model, s).await {
+        Ok(false) => {
+            return match AnnBridge::load(seg_dir) {
+                Ok(bridge) => {
+                    let bridge = bridge
+                        .with_generation(target_generation)
+                        .with_epoch_baseline(target_epoch);
+                    install_replacing(ann, key, bridge).await;
+                    tracing::debug!(model = %model, "memory ANN loaded Hot from v2 segment");
+                    SegmentOutcome::Installed(AnnEnsureStatus::LoadedSnapshot)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, dir = %seg_dir.display(),
+                        "memory Hot segment load failed; Cold rebuild");
+                    SegmentOutcome::Cold
+                }
+            };
+        }
+        Ok(true) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, "memory ann tail probe failed; Cold");
+            return SegmentOutcome::Cold;
+        }
+    }
+
+    // A tail exists: rules 5, 7, and 8 need (live, tail) from one snapshot.
     let (live, tail) = match scope_counts(rt, model, s).await {
         Ok(counts) => counts,
         Err(e) => {
@@ -1595,29 +1657,6 @@ async fn classify_and_adopt_segment(
     // Rule 5: zero live corpus → Empty, regardless of tail contents.
     if live == 0 {
         return SegmentOutcome::Empty;
-    }
-
-    // Rule 6: no tail above S → Hot: mmap load, zero corpus IO.
-    if tail == 0 {
-        return match AnnBridge::load(seg_dir) {
-            Ok(mut bridge) => {
-                let ns_set = query_distinct_namespaces(rt, token, model)
-                    .await
-                    .unwrap_or_default();
-                bridge.set_namespace_set(ns_set);
-                let bridge = bridge
-                    .with_generation(target_generation)
-                    .with_epoch_baseline(target_epoch);
-                install_replacing(ann, key, bridge).await;
-                tracing::debug!(model = %model, "memory ANN loaded Hot from v2 segment");
-                SegmentOutcome::Installed(AnnEnsureStatus::LoadedSnapshot)
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, dir = %seg_dir.display(),
-                    "memory Hot segment load failed; Cold rebuild");
-                SegmentOutcome::Cold
-            }
-        };
     }
 
     // Rule 7: tail within threshold → Stale-tail: mmap load + final-state
@@ -1644,10 +1683,6 @@ async fn classify_and_adopt_segment(
             tracing::warn!(error = %e, "memory tail replay failed; Cold rebuild");
             return SegmentOutcome::Cold;
         }
-        let ns_set = query_distinct_namespaces(rt, token, model)
-            .await
-            .unwrap_or_default();
-        bridge.set_namespace_set(ns_set);
         checkpoint_raise_compact_readopt(
             rt,
             ann,
@@ -1666,13 +1701,9 @@ async fn classify_and_adopt_segment(
     // segment while the caller's rebuild path replaces it. Cost decision,
     // never a demotion to FTS-only.
     match AnnBridge::load(seg_dir) {
-        Ok(mut bridge) => {
+        Ok(bridge) => {
             tracing::info!(model = %model, tail, live,
                 "memory tail above rebuild threshold; serving stale segment during rebuild");
-            let ns_set = query_distinct_namespaces(rt, token, model)
-                .await
-                .unwrap_or_default();
-            bridge.set_namespace_set(ns_set);
             let bridge = bridge
                 .with_generation(target_generation)
                 .with_epoch_baseline(target_epoch);
@@ -2602,6 +2633,168 @@ mod tests {
             hits[0].1 > 0.99,
             "the served vector must be the re-embedded bytes, got score {}",
             hits[0].1
+        );
+    }
+
+    /// A final tail upsert whose note fails the join-filtered corpus predicate
+    /// (soft-deleted without vector cleanup) is NOT a contradiction: its final
+    /// corpus state is absence, so replay tombstones it instead of going Cold.
+    #[tokio::test]
+    async fn restart_tail_upsert_for_soft_deleted_note_replays_as_delete() {
+        const MODEL: &str = "ann-warm-restart-join-predicate-model";
+        const DIMS: usize = 8;
+        let rt = test_runtime_with_hash_embedder(MODEL, DIMS);
+
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+        let mut note_ids = Vec::new();
+        for i in 0..4u32 {
+            let note = rt
+                .create_note_with_decay_for_embedding_model(
+                    &token,
+                    "memory",
+                    None,
+                    &format!("join predicate note {i}"),
+                    Some(0.7),
+                    0.01,
+                    None,
+                    vec![],
+                    None,
+                )
+                .await
+                .expect("create note");
+            note_ids.push(note.id);
+        }
+
+        let ann1 = new_shared();
+        let status = ensure_ann_for_model(&rt, &token, &ann1, MODEL)
+            .await
+            .expect("first warm");
+        assert!(
+            matches!(status, AnnEnsureStatus::Built { vectors: 4 }),
+            "expected a fresh build over 4 vectors, got: {status:?}"
+        );
+
+        // A re-embed logs its upsert, then the note is soft-deleted by a path
+        // that never cleans the vector row: the vec row and the final upsert
+        // both survive while the join predicate now excludes the note.
+        {
+            let sql = rt.sql();
+            let mut w = sql.writer().await.expect("writer");
+            w.execute(SqlStatement {
+                sql: "INSERT INTO ann_write_log \
+                      (namespace, embedding_model, kind, field, subject_id, op) \
+                      SELECT n.namespace, ?2, 'note', 'note.content', ?1, 'upsert' \
+                      FROM notes n WHERE n.id = ?1"
+                    .into(),
+                params: vec![
+                    SqlValue::Text(note_ids[0].to_string()),
+                    SqlValue::Text(MODEL.to_string()),
+                ],
+                label: Some("test_join_predicate_log".into()),
+            })
+            .await
+            .expect("append upsert log row");
+            w.execute(SqlStatement {
+                sql: "UPDATE notes SET deleted_at = created_at WHERE id = ?1".into(),
+                params: vec![SqlValue::Text(note_ids[0].to_string())],
+                label: Some("test_join_predicate_soft_delete".into()),
+            })
+            .await
+            .expect("soft-delete note row without vector cleanup");
+        }
+
+        // Restart: live = 3, tail = 1 ≤ ceil(0.20 × 3) → Stale-tail replay.
+        let ann2 = new_shared();
+        let status = ensure_ann_for_model(&rt, &token, &ann2, MODEL)
+            .await
+            .expect("post-restart warm");
+        assert!(
+            matches!(status, AnnEnsureStatus::LoadedSnapshot),
+            "a predicate-failing final upsert must replay as a delete within \
+             Stale-tail adoption, not force a Cold rebuild, got: {status:?}"
+        );
+        let key = AnnKey::from_token(&token, MODEL);
+        let query = fnv_to_vec("join predicate note 0", DIMS);
+        let hits = search_loaded(&ann2, &key, &query, 4)
+            .await
+            .expect("search must succeed")
+            .expect("index must be installed");
+        assert!(
+            !hits
+                .iter()
+                .any(|(id, score)| *id == note_ids[0] && *score > 0.99),
+            "the soft-deleted note must be tombstoned by the replayed delete, got: {hits:?}"
+        );
+    }
+
+    /// A final tail upsert with NO vector row at all contradicts the committed
+    /// log (vec writes and log appends are same-transaction), so replay must
+    /// refuse and the classifier must fall through to a Cold rebuild.
+    #[tokio::test]
+    async fn restart_tail_upsert_with_absent_vector_row_goes_cold() {
+        const MODEL: &str = "ann-warm-restart-contradiction-model";
+        const DIMS: usize = 8;
+        let rt = test_runtime_with_hash_embedder(MODEL, DIMS);
+
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+        for i in 0..4u32 {
+            rt.create_note_with_decay_for_embedding_model(
+                &token,
+                "memory",
+                None,
+                &format!("contradiction note {i}"),
+                Some(0.7),
+                0.01,
+                None,
+                vec![],
+                None,
+            )
+            .await
+            .expect("create note");
+        }
+
+        let ann1 = new_shared();
+        let status = ensure_ann_for_model(&rt, &token, &ann1, MODEL)
+            .await
+            .expect("first warm");
+        assert!(
+            matches!(status, AnnEnsureStatus::Built { vectors: 4 }),
+            "expected a fresh build over 4 vectors, got: {status:?}"
+        );
+
+        // A committed final upsert for a subject with no vector row anywhere —
+        // impossible under the same-transaction write contract, so it can only
+        // mean corruption. Replay must not fabricate or skip it.
+        {
+            let phantom = Uuid::new_v4();
+            let sql = rt.sql();
+            let mut w = sql.writer().await.expect("writer");
+            w.execute(SqlStatement {
+                sql: "INSERT INTO ann_write_log \
+                      (namespace, embedding_model, kind, field, subject_id, op) \
+                      VALUES ('local', ?2, 'note', 'note.content', ?1, 'upsert')"
+                    .into(),
+                params: vec![
+                    SqlValue::Text(phantom.to_string()),
+                    SqlValue::Text(MODEL.to_string()),
+                ],
+                label: Some("test_contradiction_log".into()),
+            })
+            .await
+            .expect("append phantom upsert log row");
+        }
+
+        // Restart: live = 4, tail = 1 ≤ ceil(0.20 × 4) → Stale-tail is
+        // attempted, the point read finds no vector row, replay errs, and the
+        // classifier falls through Cold to a full rebuild.
+        let ann2 = new_shared();
+        let status = ensure_ann_for_model(&rt, &token, &ann2, MODEL)
+            .await
+            .expect("post-restart warm");
+        assert!(
+            matches!(status, AnnEnsureStatus::Built { vectors: 4 }),
+            "a log/corpus contradiction must force a Cold rebuild, never a \
+             segment adoption, got: {status:?}"
         );
     }
 

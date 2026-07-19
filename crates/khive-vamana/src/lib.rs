@@ -9,7 +9,9 @@ pub mod index;
 
 pub use config::VamanaConfig;
 pub use error::{Result, VamanaError};
-pub use external_ids::{read_external_ids_sidecar, write_external_ids_sidecar};
+pub use external_ids::{
+    read_external_ids_sidecar, segment_commit_digest, write_external_ids_sidecar,
+};
 pub use graph::{GreedySearchResult, VamanaGraph, VisitedSet};
 #[cfg(feature = "mmap")]
 pub use index::read_commit_fingerprint;
