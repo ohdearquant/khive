@@ -4,6 +4,49 @@ use std::collections::{BTreeMap, HashSet};
 
 use khive_quant::{GsEncodedVector, GsSq8Codec};
 use rand::prelude::*;
+
+/// Read-only view over per-node SQ8 codes, decoupling graph algorithms from
+/// how the codes are stored: per-vector heap allocations (build/mutation
+/// paths) or one flat, possibly memory-mapped buffer (segment load paths).
+#[derive(Clone, Copy)]
+pub enum CodesView<'a> {
+    /// One `GsEncodedVector` per node.
+    Owned(&'a [GsEncodedVector]),
+    /// Flat row-major code bytes, `dims` bytes per node.
+    Flat { bytes: &'a [u8], dims: usize },
+}
+
+impl<'a> CodesView<'a> {
+    /// Code bytes for node `i`.
+    #[inline]
+    pub fn code(&self, i: usize) -> &'a [u8] {
+        match self {
+            CodesView::Owned(v) => &v[i].codes,
+            CodesView::Flat { bytes, dims } => &bytes[i * dims..(i + 1) * dims],
+        }
+    }
+
+    /// Number of encoded nodes.
+    #[inline]
+    pub fn len(&self) -> usize {
+        match self {
+            CodesView::Owned(v) => v.len(),
+            CodesView::Flat { bytes, dims } => {
+                if *dims == 0 {
+                    0
+                } else {
+                    bytes.len() / dims
+                }
+            }
+        }
+    }
+
+    /// True when no nodes are encoded.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
@@ -311,7 +354,7 @@ impl VamanaGraph {
     /// `vectors` into `encoded` first (see crates/khive-vamana/docs/api/algorithm.md#sq8-acquisition-tier).
     pub fn build_sq8(
         vectors: &[f32],
-        encoded: &[GsEncodedVector],
+        encoded: CodesView<'_>,
         codec: &GsSq8Codec,
         config: &VamanaConfig,
     ) -> Result<Self> {
@@ -352,7 +395,7 @@ impl VamanaGraph {
                 let propose = |(&node, prior_neighbors): (&u32, &Vec<u32>)| {
                     let mut visited = VisitedSet::new(num_vectors);
                     let query = row(vectors, config.dimensions, node);
-                    let query_enc = &encoded[node as usize];
+                    let query_enc = encoded.code(node as usize);
                     let search = greedy_search_inner_sq8(
                         vectors,
                         config.dimensions,
@@ -837,11 +880,11 @@ pub(crate) fn robust_prune_inner(
 pub(crate) fn greedy_search_inner_sq8(
     vectors: &[f32],
     dimensions: usize,
-    encoded: &[GsEncodedVector],
+    encoded: CodesView<'_>,
     codec: &GsSq8Codec,
     adjacency: &[Vec<u32>],
     query: &[f32],
-    query_enc: &GsEncodedVector,
+    query_enc: &[u8],
     start: u32,
     k: usize,
     search_list_size: usize,
@@ -860,7 +903,7 @@ pub(crate) fn greedy_search_inner_sq8(
         }
     }
 
-    let start_dist = codec.l2_sq(query_enc, &encoded[start as usize]);
+    let start_dist = codec.l2_sq_codes(query_enc, encoded.code(start as usize));
     visited.mark_if_new(start as usize);
 
     let mut frontier = vec![Candidate {
@@ -898,7 +941,7 @@ pub(crate) fn greedy_search_inner_sq8(
             if !visited.mark_if_new(neighbor as usize) {
                 continue;
             }
-            let d = codec.l2_sq(query_enc, &encoded[neighbor as usize]);
+            let d = codec.l2_sq_codes(query_enc, encoded.code(neighbor as usize));
             frontier.push(Candidate {
                 id: neighbor,
                 distance: d,
@@ -958,14 +1001,14 @@ pub(crate) fn greedy_search_inner_sq8(
 pub(crate) fn robust_prune_inner_sq8(
     vectors: &[f32],
     dimensions: usize,
-    encoded: &[GsEncodedVector],
+    encoded: CodesView<'_>,
     codec: &GsSq8Codec,
     node: u32,
     candidates: Vec<u32>,
     alpha: f64,
     max_degree: usize,
 ) -> Vec<u32> {
-    let node_enc = &encoded[node as usize];
+    let node_enc = encoded.code(node as usize);
     let mut seen = HashSet::new();
     let mut pool: Vec<(u32, f32)> = Vec::new();
 
@@ -976,7 +1019,7 @@ pub(crate) fn robust_prune_inner_sq8(
         if !seen.insert(candidate) {
             continue;
         }
-        let d2 = codec.l2_sq(node_enc, &encoded[candidate as usize]);
+        let d2 = codec.l2_sq_codes(node_enc, encoded.code(candidate as usize));
         pool.push((candidate, d2));
     }
 
@@ -1459,9 +1502,11 @@ mod tests {
             .with_alpha(1.0);
 
         set_max_passes(Some(1));
-        let one_pass = VamanaGraph::build_sq8(&raw, &encoded, &codec, &cfg).unwrap();
+        let one_pass =
+            VamanaGraph::build_sq8(&raw, CodesView::Owned(&encoded), &codec, &cfg).unwrap();
         set_max_passes(None);
-        let two_pass = VamanaGraph::build_sq8(&raw, &encoded, &codec, &cfg).unwrap();
+        let two_pass =
+            VamanaGraph::build_sq8(&raw, CodesView::Owned(&encoded), &codec, &cfg).unwrap();
 
         assert_ne!(
             one_pass, two_pass,
@@ -1791,8 +1836,9 @@ mod tests {
         let mut encoded = codec.encode_flat_par(&vectors, dim);
         encoded.truncate(0); // malformed: expected 2 encoded rows, actual 0
 
-        let result =
-            std::panic::catch_unwind(|| VamanaGraph::build_sq8(&vectors, &encoded, &codec, &cfg));
+        let result = std::panic::catch_unwind(|| {
+            VamanaGraph::build_sq8(&vectors, CodesView::Owned(&encoded), &codec, &cfg)
+        });
         assert!(matches!(
             result,
             Ok(Err(VamanaError::DimensionMismatch {

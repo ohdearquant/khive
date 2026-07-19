@@ -785,6 +785,13 @@ impl GsSq8Codec {
         self.gs_sq * u8_l2sq_u32(&a.codes, &b.codes) as f32
     }
 
+    /// [`Self::l2_sq`] over raw code slices, for callers that store codes in a
+    /// flat (possibly memory-mapped) buffer rather than per-vector allocations.
+    #[inline]
+    pub fn l2_sq_codes(&self, a: &[u8], b: &[u8]) -> f32 {
+        self.gs_sq * u8_l2sq_u32(a, b) as f32
+    }
+
     /// Number of dimensions.
     pub fn dims(&self) -> usize {
         self.min.len()

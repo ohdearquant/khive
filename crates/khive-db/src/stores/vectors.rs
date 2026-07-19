@@ -379,11 +379,13 @@ fn replace_vector_row_dml(
     // Delta record for the ANN restart classifier; rides the caller's
     // savepoint/transaction so a rolled-back upsert leaves no log row.
     conn.execute(
-        "INSERT INTO ann_write_log (namespace, embedding_model, subject_id, op) \
-         VALUES (?1, ?2, ?3, 'upsert')",
+        "INSERT INTO ann_write_log (namespace, embedding_model, kind, field, subject_id, op) \
+         VALUES (?1, ?2, ?3, ?4, ?5, 'upsert')",
         rusqlite::params![
             row.namespace,
             row.embedding_model,
+            row.kind,
+            row.field,
             row.subject_id.to_string()
         ],
     )?;
@@ -402,8 +404,8 @@ fn log_vector_deletes(
     params: &[&dyn rusqlite::ToSql],
 ) -> Result<(), rusqlite::Error> {
     let sql = format!(
-        "INSERT INTO ann_write_log (namespace, embedding_model, subject_id, op) \
-         SELECT namespace, embedding_model, subject_id, 'delete' \
+        "INSERT INTO ann_write_log (namespace, embedding_model, kind, field, subject_id, op) \
+         SELECT namespace, embedding_model, kind, field, subject_id, 'delete' \
          FROM {table} WHERE {where_clause}"
     );
     conn.execute(&sql, params)?;
@@ -1537,6 +1539,10 @@ mod batch_exists_tests {
             model_key, dims
         );
         writer.conn().execute_batch(&ddl).expect("create vec table");
+        writer
+            .conn()
+            .execute_batch(crate::migrations::ANN_WRITE_LOG_DDL)
+            .expect("create ann_write_log");
     }
 
     /// Valid (underscored) model key: batch_exists returns the exact set of IDs
@@ -1953,6 +1959,10 @@ mod atomic_replace_tests {
             model_key, dims
         );
         writer.conn().execute_batch(&ddl).expect("create vec table");
+        writer
+            .conn()
+            .execute_batch(crate::migrations::ANN_WRITE_LOG_DDL)
+            .expect("create ann_write_log");
     }
 
     /// insert_batch: a record with wrong dimensions fails its INSERT but must not
@@ -2734,11 +2744,12 @@ mod orphan_sweep_tests {
              embedding float[{}] distance_metric=cosine)",
             model_key, dims
         );
-        pool.try_writer()
-            .expect("writer")
+        let writer = pool.try_writer().expect("writer");
+        writer.conn().execute_batch(&ddl).expect("create vec table");
+        writer
             .conn()
-            .execute_batch(&ddl)
-            .expect("create vec table");
+            .execute_batch(crate::migrations::ANN_WRITE_LOG_DDL)
+            .expect("create ann_write_log");
     }
 
     fn make_store(
@@ -3339,11 +3350,12 @@ mod write_queue_tests {
              embedding float[{}] distance_metric=cosine)",
             model_key, dims
         );
-        pool.writer()
-            .expect("writer")
+        let writer = pool.writer().expect("writer");
+        writer.conn().execute_batch(&ddl).expect("create vec table");
+        writer
             .conn()
-            .execute_batch(&ddl)
-            .expect("create vec table");
+            .execute_batch(crate::migrations::ANN_WRITE_LOG_DDL)
+            .expect("create ann_write_log");
     }
 
     /// Constructed via a `PoolConfig` literal (`write_queue_enabled: true`),
