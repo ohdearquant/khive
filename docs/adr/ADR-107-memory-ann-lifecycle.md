@@ -1,6 +1,6 @@
 # ADR-107: Memory ANN Lifecycle — Eventual Consistency Contract
 
-**Status**: Accepted (restart-validation and scope provisions superseded — see Supersession note)
+**Status**: Accepted; partially superseded by the ADR-079 Amendment 1 addendum
 **Date**: 2026-07-10
 **Depends on**: [ADR-021](ADR-021-memory-pack.md) (Memory Pack), [ADR-079](ADR-079-ann-persistence-warm-path-integration.md) (ANN persistence warm-path integration, knowledge pack scope)
 **References**: issue #791, PR #812
