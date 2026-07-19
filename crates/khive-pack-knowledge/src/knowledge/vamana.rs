@@ -711,10 +711,10 @@ pub(crate) fn snapshot_key(namespace: &str, model: &str) -> String {
 /// the bytes of `snapshot_key(ns, model)`. Hex encoding is injective, filesystem-safe,
 /// and reversible via `decode_ann_dir_name`. Returns `None` for in-memory backends.
 fn ann_segment_dir(rt: &KhiveRuntime, ns: &str, model: &str) -> Option<std::path::PathBuf> {
-    let data_dir = rt.backend_data_dir()?;
+    let ann_root = rt.backend_ann_root()?;
     let key = snapshot_key(ns, model);
     let hex: String = key.bytes().map(|b| format!("{b:02x}")).collect();
-    Some(data_dir.join("ann").join(hex))
+    Some(ann_root.join(hex))
 }
 
 /// Decode a hex-encoded ann directory name back to `(namespace, model)`.
@@ -887,6 +887,34 @@ async fn compact_log(rt: &KhiveRuntime, ns: &str, model: &str) -> Result<(), Str
     .await
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Whether any tail row exists above `s` for this consumer's scope. A pure
+/// `ann_write_log` index probe (`idx_ann_write_log_ns_model_seq`) — never
+/// touches the vec0 corpus, which is what keeps Hot classification free of
+/// corpus IO (the amendment's rule 5/6 evaluation-order note).
+async fn tail_exists(rt: &KhiveRuntime, ns: &str, model: &str, s: u64) -> Result<bool, String> {
+    let sql = rt.sql();
+    let mut reader = sql.reader().await.map_err(|e| e.to_string())?;
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: "SELECT EXISTS(SELECT 1 FROM ann_write_log \
+                  WHERE namespace = ?1 AND embedding_model = ?2 \
+                    AND field = 'knowledge.atom' AND seq > ?3) AS has_tail"
+                .into(),
+            params: vec![
+                SqlValue::Text(ns.to_owned()),
+                SqlValue::Text(model.to_owned()),
+                SqlValue::Integer(s as i64),
+            ],
+            label: Some("ann_tail_probe".into()),
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    match rows.first().and_then(|r| r.get("has_tail")) {
+        Some(SqlValue::Integer(n)) => Ok(*n != 0),
+        other => Err(format!("tail probe: unexpected value {other:?}")),
+    }
 }
 
 /// Live corpus count and tail count for this consumer's scope, captured in ONE
@@ -1394,10 +1422,10 @@ pub(crate) async fn warm_known_snapshots(rt: &KhiveRuntime, ann: &SharedAnn) {
         }
     }
 
-    // Enumerate v2 segment directories in `data_dir/ann/` and warm any keys not
-    // already loaded by the v1 DB pass above.
-    let ann_root = match rt.backend_data_dir() {
-        Some(d) => d.join("ann"),
+    // Enumerate v2 segment directories under this database's own ANN root and
+    // warm any keys not already loaded by the v1 DB pass above.
+    let ann_root = match rt.backend_ann_root() {
+        Some(d) => d,
         None => return,
     };
     let read_dir = match std::fs::read_dir(&ann_root) {
@@ -1543,7 +1571,35 @@ async fn classify_and_adopt_segment(
         }
     }
 
-    // Rules 5-8 read (live, tail) from one snapshot.
+    // Rule 6, tested first per the amendment's evaluation-order note: the
+    // tail predicate is a log-table-only index probe, so the Hot path never
+    // touches the vec0 corpus at all. With an empty tail the committed
+    // segment already reflects every logged op at or below S, so a zero-live
+    // scope implies an empty segment and adoption serves exactly what Empty
+    // serves.
+    match tail_exists(rt, ns, model, s).await {
+        Ok(false) => {
+            return match AnnBridge::load(seg_dir) {
+                Ok(bridge) => {
+                    install_if_fresher(ann, key, bridge.with_generation(target_generation)).await;
+                    SegmentOutcome::Installed
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, dir = %seg_dir.display(),
+                        "Hot segment load failed; Cold rebuild");
+                    SegmentOutcome::Cold
+                }
+            };
+        }
+        Ok(true) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, "ann tail probe failed; Cold");
+            return SegmentOutcome::Cold;
+        }
+    }
+
+    // A tail exists — corpus-scale work is inherent from here. Rules 5, 7,
+    // and 8 read (live, tail) from one snapshot.
     let (live, tail) = match scope_counts(rt, ns, model, s).await {
         Ok(counts) => counts,
         Err(e) => {
@@ -1557,23 +1613,6 @@ async fn classify_and_adopt_segment(
         tracing::info!(namespace = %ns, model = %model,
             "zero live corpus for scope; Empty (FTS/degraded path)");
         return SegmentOutcome::Empty;
-    }
-
-    // Rule 6: no tail above S → Hot: mmap load. The only corpus access on
-    // this path is the single `scope_counts` statement above — no embedding
-    // bytes are read.
-    if tail == 0 {
-        return match AnnBridge::load(seg_dir) {
-            Ok(bridge) => {
-                install_if_fresher(ann, key, bridge.with_generation(target_generation)).await;
-                SegmentOutcome::Installed
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, dir = %seg_dir.display(),
-                    "Hot segment load failed; Cold rebuild");
-                SegmentOutcome::Cold
-            }
-        };
     }
 
     // Rule 7: tail within threshold → Stale-tail: mmap load + final-state
@@ -2749,12 +2788,13 @@ mod tests {
         assert_eq!(decoded_ns, "local");
         assert_eq!(decoded_model, WARM_TEST_MODEL);
 
-        // Parent directory is `data_dir/ann/`.
+        // Parent directory is the database's own ANN root (`<db-file>.ann/`
+        // beside the file), so co-located databases never share segments.
         let parent = seg_dir.parent().expect("seg_dir must have a parent");
         assert_eq!(
             parent.file_name().unwrap().to_string_lossy(),
-            "ann",
-            "seg_dir parent must be named 'ann'"
+            "test.db.ann",
+            "seg_dir parent must be the database-scoped ANN root"
         );
     }
 

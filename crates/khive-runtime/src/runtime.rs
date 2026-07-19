@@ -317,6 +317,14 @@ impl KhiveRuntime {
         self.backend.data_dir()
     }
 
+    /// Root directory for this database's ANN segment tree (`<db-file>.ann/`
+    /// beside the file), or `None` for an in-memory backend. Scoped to the
+    /// database file itself so two databases sharing a parent directory can
+    /// never adopt each other's segments.
+    pub fn backend_ann_root(&self) -> Option<std::path::PathBuf> {
+        self.backend.ann_root()
+    }
+
     // ---- Store accessors (token-scoped) ----
 
     /// Get an EntityStore scoped to the token's namespace.

@@ -608,6 +608,16 @@ impl StorageBackend {
         self.path.as_ref()?.parent().map(|p| p.to_path_buf())
     }
 
+    /// Root directory for this database's ANN segment tree, or `None` for an
+    /// in-memory backend. Derived from the database file name itself
+    /// (`<db-file>.ann/` beside the file), so two databases sharing a parent
+    /// directory can never adopt each other's segments or UUID maps.
+    pub fn ann_root(&self) -> Option<std::path::PathBuf> {
+        let path = self.path.as_ref()?;
+        let file = path.file_name()?.to_string_lossy();
+        path.parent().map(|p| p.join(format!("{file}.ann")))
+    }
+
     /// Access the underlying pool (escape hatch).
     pub fn pool(&self) -> &ConnectionPool {
         &self.pool
