@@ -48,9 +48,12 @@ which log prefix the serving segment reflects. The set of committed-but-unindexe
 Each per-model vector leg of recall is augmented with a **fresh-tail exact leg**: an exact
 similarity scan over the vector rows in the leg's scope whose `ann_write_log` seq is above
 the serving index's watermark. Tail hits are merged into that model's existing candidate
-list **before** fusion. Recall becomes read-your-writes for every committed write, at a
-per-query cost proportional to the tail length, which the checkpoint lifecycle already
-bounds.
+list **before** fusion. The guarantee is two-tier: while a serving index exists, recall is
+read-your-writes for every committed write; while none exists (Cold rebuild in flight, or
+Empty), recall guarantees visibility of the newest threshold-sized window of writes — which
+by construction contains the caller's most recent writes — with full-corpus visibility
+returning when the rebuild lands (§3). The per-query cost is proportional to the tail
+length, which the checkpoint lifecycle already bounds.
 
 ### 1. Tail enumeration
 
@@ -70,6 +73,32 @@ serving bridge at build/adoption time; `S = 0` when no index is serving):
 The read runs in a single snapshot (log scan + row point-reads in one read transaction), so
 a write committing mid-query is either entirely visible or entirely invisible — never a torn
 log/row pair.
+
+_Compaction linearization (review follow-up, 2026-07-19)._ A tail scan above `S` proves
+completeness only if the log still retains every row above `S` — and ADR-079 permits
+compaction through the registry minimum, which can advance past a stale in-memory bridge's
+`S` the moment the consumer's durable watermark is raised for a newer segment. The leg must
+therefore validate coverage **in the same read snapshot**: read the pair's wildcard-inclusive
+registry minimum alongside the log scan; if that minimum exceeds `S`, the snapshot cannot
+prove tail completeness for the bridge in hand, and the leg must re-resolve the currently
+published segment (whose watermark is at least the minimum) and use its watermark instead —
+or, if re-resolution is not possible within the query, serve without the exact leg for that
+query (degrading to the ADR-107 contract) while triggering re-adoption. Implementations
+SHOULD additionally order same-process checkpoint publication so the in-process bridge is
+replaced before the durable watermark is raised, making the mismatch window empty for the
+process's own checkpoints; the snapshot check remains mandatory because another process can
+raise and compact independently.
+
+_Registration precondition (review follow-up, 2026-07-19)._ `S = 0` establishes an
+entire-scope tail only if no compaction has ever run for the pair — which ADR-079 guarantees
+for an _unregistered pair_, not an unregistered _consumer_: a registered peer consumer on the
+same `(namespace, model)` pair legitimately compacts rows the unregistered consumer never
+saw. The exact leg is therefore permitted only after the consumer's durable registration row
+exists. ADR-079's "register before persist" rule is extended for tail consumers: register
+before any **tail-dependent read path**, not merely before the first segment persist. A
+consumer that finds its registration row absent must register at 0 and treat the log as
+untrusted until rows accumulate under the new registration (the existing Cold classification
+already produces the correct serving behavior for that window).
 
 ### 2. Merge semantics — one source, not a fourth
 
@@ -113,7 +142,13 @@ watermark is 0 and the tail is the entire scope. The exact leg does **not** abso
 it caps its scan at the threshold-sized tail, taking the highest-seq suffix of the log (the
 newest writes) so the freshest writes stay visible while FTS covers the rest, and otherwise
 defers to the existing Cold-path behavior (FTS-only serving while the rebuild runs). The leg
-restores freshness on a serving index; it is not a general exact-search fallback.
+restores freshness on a serving index; it is not a general exact-search fallback. This is
+the second tier of the §"Decision" guarantee stated precisely: with no serving index, a
+committed write older than the capped suffix may be invisible to the vector legs until the
+rebuild lands — the read-your-writes property in that state covers the newest
+threshold-sized window, not the entire corpus. The regression this ADR fixes (#1143) lives
+entirely in the first tier; the Cold window is the pre-existing ADR-107 behavior, narrowed
+by the guaranteed-fresh suffix rather than contradicted by it.
 
 No new tuning knob is introduced. One escape hatch is added for operational isolation:
 `KHIVE_ANN_FRESH_TAIL=0` disables the exact leg (default enabled). Values other than `0`
@@ -146,11 +181,14 @@ ADR-107 §1 ("Stale bound") is **narrowed, not retired**. Its bound — recall m
 an index behind the caller's latest write by up to the causal rebuild latency — continues to
 govern the ANN **candidate generator**: graph adjacency, quantized codes, and the candidate
 pool for older corpus remain eventually consistent exactly as specified. What the bound no
-longer governs is **result visibility**: with the fresh-tail leg, a committed write is
-eligible for recall results on the next query, regardless of rebuild state. Statements in
-ADR-107 §1 that recall "may serve results computed from an ANN index that is behind the
-caller's own most recent write" remain true of the index and cease to describe the verb's
-observable freshness.
+longer governs is **result visibility while a serving index exists**: there, a committed
+write is eligible for recall results on the next query, independent of rebuild progress.
+In the no-index states (Cold, Empty) the §3 second tier applies — guaranteed visibility of
+the newest threshold-sized suffix, ADR-107 behavior for anything older — so ADR-107 §1
+continues to describe the verb's observable freshness in exactly and only those states.
+Statements in ADR-107 §1 that recall "may serve results computed from an ANN index that is
+behind the caller's own most recent write" remain true of the index and cease to describe
+the verb's observable freshness whenever an index is serving.
 
 ADR-107 §2 (generation bump, non-eviction), §3 (Cold), §4 (epoch invalidation), and §5
 (deletion filtering) are unchanged. Deletion filtering in particular remains the correctness
@@ -159,10 +197,13 @@ deletes that write no log rows — see ADR-079's rule 5 qualification).
 
 ## Consequences
 
-- Write-then-recall returns to millisecond visibility, matching the pre-Vamana behavior and
-  the synchronous write path's implicit promise.
-- Recall pays a small per-query cost (log-tail scan + exact scoring) that is zero when the
-  tail is empty and bounded by the rebuild threshold when it is not.
+- Write-then-recall returns to millisecond visibility whenever a serving index exists —
+  the overwhelmingly common state — matching the pre-Vamana behavior and the synchronous
+  write path's implicit promise; the Cold/Empty window keeps the newest-suffix guarantee
+  only (§3).
+- Recall pays a small per-query cost (log-tail scan + registry-minimum coverage check +
+  exact scoring) that is near zero when the tail is empty and bounded by the rebuild
+  threshold when it is not.
 - The tail query adds read traffic on `ann_write_log`; its index must serve
   `(embedding_model, seq)`-shaped scans efficiently (the existing namespace-first index
   shape is a known follow-up).
