@@ -1081,6 +1081,26 @@ impl VamanaIndex {
                 return Ok(index);
             }
 
+            // codes.bin is checksum-gated exactly like the other segments whenever the
+            // commit record carries a codes_hash: a missing or altered codes segment
+            // must never reach load_v2_fast's mmap parse, which trusts its header.
+            if let Some(expected) = commit.codes_hash {
+                let codes_ok = fs::read(path.join("codes.bin"))
+                    .map(|d| *blake3::hash(&d).as_bytes() == expected)
+                    .unwrap_or(false);
+                if !codes_ok {
+                    let config = VamanaConfig {
+                        dimensions: commit.index_meta.dimensions,
+                        max_degree: commit.index_meta.max_degree,
+                        search_list_size: commit.index_meta.search_list_size,
+                        alpha: commit.index_meta.alpha,
+                    };
+                    let index = Self::rebuild_from_corpus(corpus_vectors, config)?;
+                    index.save_atomic(path)?;
+                    return Ok(index);
+                }
+            }
+
             // Verify corpus fingerprint: dimensions, count, and content hash.
             let dim = commit.index_meta.dimensions;
             if dim == 0 || !corpus_vectors.len().is_multiple_of(dim) {
