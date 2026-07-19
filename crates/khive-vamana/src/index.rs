@@ -316,7 +316,9 @@ impl VectorStorage {
     }
 }
 
+#[cfg(feature = "mmap")]
 const CODES_MAGIC: &[u8; 8] = b"KHVCODE1";
+#[cfg(feature = "mmap")]
 const CODES_HEADER_LEN: usize = 8 + 8 + 8 + 4 + 4;
 
 /// Storage for the per-node SQ8 code table: owned per-vector allocations
@@ -382,6 +384,7 @@ impl CodeStore {
 /// Serialize the SQ8 codec parameters and per-node codes into the `codes.bin`
 /// segment layout: magic, dims, count, gs, anisotropy_ratio, per-dimension
 /// minima, then `count * dims` code bytes in ordinal order.
+#[cfg(feature = "mmap")]
 fn encode_codes_bin(codec: &GsSq8Codec, codes: CodesView<'_>) -> Vec<u8> {
     let dims = codec.dims();
     let count = codes.len();
@@ -403,6 +406,7 @@ fn encode_codes_bin(codec: &GsSq8Codec, codes: CodesView<'_>) -> Vec<u8> {
 /// Parse and validate a `codes.bin` header, returning the reconstructed codec.
 /// The code bytes themselves stay in the caller's buffer/mapping at offset
 /// `CODES_HEADER_LEN + dims * 4`.
+#[cfg(feature = "mmap")]
 fn parse_codes_bin(data: &[u8], expected_dims: usize, expected_count: usize) -> Result<GsSq8Codec> {
     if data.len() < CODES_HEADER_LEN || &data[..8] != CODES_MAGIC {
         return Err(VamanaError::invalid_format(
@@ -2731,7 +2735,10 @@ struct V2Commit {
     /// so a legitimate watermark of 0 (empty log at save time) round-trips.
     last_applied_seq: Option<u64>,
     /// blake3 checksum of the `codes.bin` segment; `None` on pre-trailer
-    /// records and on containers that omit the codes segment.
+    /// records and on containers that omit the codes segment. Read only by
+    /// the mmap load path; parsed unconditionally so record validation stays
+    /// identical across feature sets.
+    #[cfg_attr(not(feature = "mmap"), allow(dead_code))]
     codes_hash: Option<[u8; 32]>,
 }
 
@@ -3475,25 +3482,10 @@ fn mmap_vectors(path: &Path, expected_len_f32: usize) -> Result<VectorStorage> {
     })
 }
 
-/// Read the v2 commit fingerprint from a persisted segment directory without
-/// loading the graph or vectors.
-///
-/// `path` is the segment directory; this function joins `metadata.bin`
-/// internally, matching the convention used by [`VamanaIndex::load`] and
-/// [`VamanaIndex::load_or_build`].
-///
-/// Returns `Ok(None)` when:
-/// - `path/metadata.bin` is absent (clean first run)
-/// - the record does not begin with the KHVVAMG2 magic (v1 format or
-///   unrelated file)
-/// - the record is too short or otherwise cannot be parsed (torn write)
-///
-/// In the `None` cases the caller should treat the segment as Cold and proceed
-/// to build. Returns `Err` only for unexpected IO failures (not `NotFound`).
-#[cfg(feature = "mmap")]
 /// Extended commit metadata: the corpus fingerprint plus the write-log
 /// watermark trailer. `last_applied_seq` is `None` for pre-amendment (short
 /// layout) records — the ADR-079 Amendment 1 classifier treats that as Cold.
+#[cfg(feature = "mmap")]
 pub struct PersistedCommitInfo {
     pub vector_count: u64,
     pub dimensions: u64,
@@ -3505,6 +3497,7 @@ pub struct PersistedCommitInfo {
 ///
 /// Same absence/corruption semantics as [`read_commit_fingerprint`]:
 /// `Ok(None)` for a missing file, v1 magic, or an unparseable record.
+#[cfg(feature = "mmap")]
 pub fn read_commit_info(path: &Path) -> Result<Option<PersistedCommitInfo>> {
     let metadata_path = path.join("metadata.bin");
     let bytes = match fs::read(&metadata_path) {
@@ -3526,6 +3519,22 @@ pub fn read_commit_info(path: &Path) -> Result<Option<PersistedCommitInfo>> {
     }
 }
 
+/// Read the v2 commit fingerprint from a persisted segment directory without
+/// loading the graph or vectors.
+///
+/// `path` is the segment directory; this function joins `metadata.bin`
+/// internally, matching the convention used by [`VamanaIndex::load`] and
+/// [`VamanaIndex::load_or_build`].
+///
+/// Returns `Ok(None)` when:
+/// - `path/metadata.bin` is absent (clean first run)
+/// - the record does not begin with the KHVVAMG2 magic (v1 format or
+///   unrelated file)
+/// - the record is too short or otherwise cannot be parsed (torn write)
+///
+/// In the `None` cases the caller should treat the segment as Cold and proceed
+/// to build. Returns `Err` only for unexpected IO failures (not `NotFound`).
+#[cfg(feature = "mmap")]
 pub fn read_commit_fingerprint(path: &Path) -> Result<Option<PersistedFingerprint>> {
     let metadata_path = path.join("metadata.bin");
     let bytes = match fs::read(&metadata_path) {
