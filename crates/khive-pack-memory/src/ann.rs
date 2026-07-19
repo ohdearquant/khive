@@ -378,8 +378,16 @@ impl AnnBridge {
         ops: Vec<(Uuid, Option<Vec<f32>>)>,
         new_s: u64,
     ) -> Result<(), String> {
+        // A tombstoned ordinal has no owner (ADR-079 Amendment 1 id-map
+        // ownership rule) — `id_map` entries for already-tombstoned slots
+        // are stale (tombstoning never clears them) and must be excluded
+        // here, or a reused slot's new owner can be tombstoned by a replay
+        // op for the old, already-deleted subject (#1150).
         let mut reverse: HashMap<Uuid, u32> = HashMap::with_capacity(self.id_map.len());
         for (ordinal, uuid) in self.id_map.iter().enumerate() {
+            if self.index.is_tombstoned(ordinal as u32) {
+                continue;
+            }
             reverse.insert(*uuid, ordinal as u32);
         }
 
@@ -387,6 +395,20 @@ impl AnnBridge {
             match op {
                 None => {
                     if let Some(&ordinal) = reverse.get(&uuid) {
+                        // Fail closed on ownership contradictions: if the
+                        // slot's current id-map owner is no longer this
+                        // subject (a same-batch upsert already reused the
+                        // slot), skip the tombstone rather than delete
+                        // someone else's live vector.
+                        if self.id_map.get(ordinal as usize) != Some(&uuid) {
+                            tracing::warn!(
+                                subject = %uuid,
+                                ordinal,
+                                "replay delete: ordinal reassigned within batch, skipping tombstone"
+                            );
+                            reverse.remove(&uuid);
+                            continue;
+                        }
                         self.index
                             .tombstone(ordinal)
                             .map_err(|e| format!("replay tombstone({ordinal}): {e}"))?;
@@ -2313,6 +2335,57 @@ mod tests {
         // query with wrong dimension (2 instead of 3)
         let result = bridge.search(&[1.0, 0.0], 1);
         assert!(result.is_err(), "wrong dimension must return Err");
+    }
+
+    /// #1150 regression: a tombstoned ordinal's stale id-map entry must not
+    /// let a later replay op for the old (already-deleted) subject tombstone
+    /// the slot a same-batch upsert just reused for a different subject.
+    #[test]
+    fn replay_does_not_tombstone_slot_reused_by_same_batch_upsert() {
+        let id_a = Uuid::new_v4();
+        let id_b = Uuid::new_v4();
+        let id_c = Uuid::new_v4();
+
+        let vectors = vec![
+            1.0f32, 0.0, 0.0, // id_a, ordinal 0
+            0.0, 1.0, 0.0, // id_b, ordinal 1
+        ];
+        let mut bridge =
+            AnnBridge::build(vectors, 3, vec![id_a, id_b], HashSet::new()).expect("build");
+
+        // Simulate a PRIOR tombstone of id_a that left the id-map entry
+        // stale (tombstoning never clears it) — exactly the persisted state
+        // #1150 describes, without going through a save/load round trip.
+        bridge.index.tombstone(0).expect("tombstone id_a");
+        assert_eq!(
+            bridge.id_map[0], id_a,
+            "id-map entry stays stale after tombstone"
+        );
+
+        // Coalesced final tail: id_c's upsert (which recycles id_a's freed
+        // ordinal 0) is processed BEFORE id_a's own final delete — a legal
+        // op order since coalescing only guarantees per-subject dedup, not
+        // cross-subject sequencing.
+        let ops = vec![(id_c, Some(vec![0.0f32, 0.0, 1.0])), (id_a, None)];
+        bridge.apply_final_ops(ops, 1).expect("apply replay tail");
+
+        assert_eq!(
+            bridge.id_map[0], id_c,
+            "ordinal 0 must be owned by id_c after the replay"
+        );
+        assert!(
+            !bridge.index.is_tombstoned(0),
+            "id_a's stale delete must not tombstone the slot id_c now owns"
+        );
+        let hits = bridge.search(&[0.0, 0.0, 1.0], 2).expect("search");
+        assert!(
+            hits.iter().any(|(id, score)| *id == id_c && *score > 0.9),
+            "id_c must remain live and searchable, got: {hits:?}"
+        );
+        assert!(
+            !hits.iter().any(|(id, _)| *id == id_a),
+            "id_a must not resurface as a search hit, got: {hits:?}"
+        );
     }
 
     #[test]
