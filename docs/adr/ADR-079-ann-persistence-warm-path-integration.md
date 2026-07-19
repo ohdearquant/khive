@@ -496,11 +496,15 @@ CREATE TABLE ann_consumer_watermark (
      `S`, the consumer raises its row monotonically
      (`UPDATE ... SET watermark = MAX(watermark, S)`); a crash in between leaves the smaller
      registered watermark, which under-compacts — safe.
-  3. **Compact through the registry minimum only.** Compaction deletes rows with
-     `seq <= (SELECT MIN(watermark) FROM ann_consumer_watermark WHERE namespace=? AND
-     embedding_model=?)` for the pair — never a checkpoint-local `seq <= S`. An empty row set
-     yields no deletion (consistent with rule 2's compaction ban). Never above any registered
-     watermark.
+  3. **Compact through the registry minimum only.** Compaction for a pair
+     `(namespace, embedding_model)` deletes rows with
+     `seq <= (SELECT MIN(watermark) FROM ann_consumer_watermark WHERE (namespace = ?ns OR
+     namespace = '*') AND embedding_model = ?model)` — never a checkpoint-local `seq <= S`. This
+     wildcard-inclusive form is the universal pair-compaction query: wildcard rows are global-scope
+     consumers' registrations (see "Global-scope consumers" below), and a database with none
+     reduces the query to the per-namespace minimum. An empty row set yields NULL, `seq <= NULL`
+     matches nothing, so an unregistered pair never compacts (consistent with rule 2's compaction
+     ban). Never above any registered watermark.
 
   Operational note: a decommissioned consumer's registry row pins the pair's `MIN` at its last
   watermark, so the log for that `(namespace, embedding_model)` grows unbounded until an operator
@@ -517,12 +521,11 @@ CREATE TABLE ann_consumer_watermark (
      `(consumer, '*', embedding_model, watermark)`. `'*'` is not a valid namespace value, so
      wildcard rows cannot collide with per-namespace rows. The register-at-0-before-persist and
      monotonic post-commit raise rules apply unchanged.
-  2. **Compaction minimum includes wildcard rows.** Step 3's minimum for a pair
-     `(namespace, embedding_model)` is computed over rows matching
-     `(namespace = ?ns OR namespace = '*') AND embedding_model = ?model`. A global consumer
-     thereby bounds compaction in every namespace its scope contains — including a namespace
-     whose first row appears after registration, because the wildcard row is durable before the
-     global consumer's first persist and therefore before any compaction its tail must survive.
+  2. **Compaction minimum includes wildcard rows.** Step 3's universal query already includes
+     wildcard rows in the pair's minimum. A global consumer thereby bounds compaction in every
+     namespace its scope contains — including a namespace whose first row appears after
+     registration, because the wildcard row is durable before the global consumer's first persist
+     and therefore before any compaction its tail must survive.
   3. **Classification is otherwise unchanged.** A global consumer classifies and tail-reads under
      its own corpus predicate (no namespace restriction); `seq` is a single database-wide
      monotone sequence, so watermark comparisons are well-defined across namespaces, and decision
@@ -600,8 +603,8 @@ never to serving a stale-but-adopted index.
 2. **Crash between `save_atomic` and log compaction**: the segment commits (staged files, fsync,
    rename, commit magic — existing v2 semantics) carrying `last_applied_seq = S` atomically
    inside its commit record. The registry raise and compaction
-   (`DELETE ... WHERE seq <= MIN(watermark)` over the pair's registered consumers, §A step 3)
-   run only after the commit, in that order. A crash before the raise leaves the smaller
+   (`DELETE ... WHERE seq <= MIN(watermark)` over the pair's registered rows, wildcard rows
+   included, §A step 3) run only after the commit, in that order. A crash before the raise leaves the smaller
    registered watermark (under-compacts); a crash before compaction leaves log rows with
    `seq <= S`, which the classifier's strict `seq > last_applied_seq` filter ignores; the next
    checkpoint re-raises and re-compacts. Idempotent, harmless.
