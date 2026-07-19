@@ -9,7 +9,7 @@
 //! pin to a specific process rather than only naming its own in-process
 //! registry.
 //!
-//! Filesystem trust boundary (binding, gate ruling 2026-07-19): the sidecar
+//! Filesystem trust boundary (binding): the sidecar
 //! directory is created mode 0700 and validated as owned by the current user
 //! before any use — a non-compliant existing directory is refused, never
 //! chmod/chown'd into compliance. Heartbeat writes go through exclusive
@@ -17,7 +17,7 @@
 //! the target. Enumeration refuses symlinks and validates per-entry ownership
 //! before reading or deleting anything.
 //!
-//! **Platform split (2026-07-19 review follow-up).** Only the write path
+//! **Platform split.** Only the write path
 //! (`ensure_sidecar_dir`/`write_heartbeat`/`write_beacon`/`remove_heartbeat`/
 //! `touch_beacon`) and the identity primitives (`is_process_alive`/
 //! `process_start_time_secs`) need to run on every platform — a Windows
@@ -86,7 +86,7 @@ pub struct WalpinBeacon {
 
 /// Three-state sidecar-health classification for one PID observed in the
 /// sidecar directory (ADR-091 Amendment 2 "Sidecar-health attribution"
-/// paragraph, gate ruling 2026-07-19).
+/// paragraph).
 #[derive(Debug, Clone, PartialEq)]
 pub enum WalpinPidHealth {
     /// A live, identity-matched, fresh heartbeat exists: this PID currently
@@ -171,7 +171,7 @@ pub fn sidecar_enabled(is_file_backed: bool) -> bool {
     }
 }
 
-/// Unix sidecar internals (ADR-091 Amendment 2 review, item c: handle-bound
+/// Unix sidecar internals (ADR-091 Amendment 2: handle-bound
 /// filesystem operations). The sidecar directory is opened exactly once per
 /// call with `O_DIRECTORY | O_NOFOLLOW`, validated (type/mode/owner) on that
 /// descriptor, and every create/rename/unlink/read is `*at()`-relative to it
@@ -262,7 +262,7 @@ mod unix_impl {
                 let err = io::Error::last_os_error();
                 // The `O_NOFOLLOW` open above already made the refusal
                 // decision (a symlink at `dir` cannot have produced a live
-                // fd) — this is a diagnostic-only follow-up, not a second
+                // fd) — this is diagnostic-only, not a second
                 // security check, so it carries no TOCTOU risk. It exists
                 // because the raw OS errno for a symlinked path
                 // (`ELOOP`/`ENOTDIR`, platform-dependent) doesn't say
@@ -568,7 +568,7 @@ mod unix_impl {
     }
 }
 
-/// Windows sidecar internals (ADR-091 Amendment 2 review, item 1: "Windows
+/// Windows sidecar internals (ADR-091 Amendment 2: "Windows
 /// is a supported target"). Uses plain `std::fs` path-based primitives —
 /// `std` has no `openat`/`fstat`-bound-validation equivalent on Windows, so
 /// the handle-bound contract ([`unix_impl`]) is Unix-normative only. Refuses
@@ -751,7 +751,7 @@ mod windows_impl {
     }
 }
 
-/// Outcome of one OS-derived holder census pass (ADR-091 Amendment 2 review,
+/// Outcome of one OS-derived holder census pass (ADR-091 Amendment 2,
 /// item a). A PID the census positively determined does NOT hold the
 /// database file is simply absent from `holders` — that is a normal,
 /// complete result. A PID whose inspection FAILED (permission denied, or a
@@ -760,8 +760,7 @@ mod windows_impl {
 /// INCOMPLETE, and callers must treat that exactly like an `unknown` sidecar
 /// PID — inconclusive, never silently folded into "no unregistered holder."
 ///
-/// `truncated` is a second, independent incompleteness signal (review round
-/// 4): set when the enumeration walk itself has positive evidence it did
+/// `truncated` is a second, independent incompleteness signal: set when the enumeration walk itself has positive evidence it did
 /// not see the full live-process universe even though no single PID's
 /// inspection outright failed — a `/proc` directory-iterator error or a
 /// PID-namespace mismatch on Linux, or a libproc buffer whose returned byte
@@ -783,7 +782,7 @@ impl CensusResult {
         self.uninspectable_pids.is_empty() && !self.truncated
     }
 
-    /// ADR-091 Amendment 2 review round 4 self-canary: the sole caller
+    /// ADR-091 Amendment 2 self-canary: the sole caller
     /// (`log_walpin_sidecar_report`) always runs inside the process whose
     /// own SQLite connection pool holds `db_path` open, so a correct,
     /// complete census must find `std::process::id()` among the holders it
@@ -813,7 +812,7 @@ fn macos_pid_genuinely_gone(errno: Option<i32>) -> bool {
 
 /// macOS: classify a `proc_pidfdinfo` return against the expected struct
 /// size. Only an exact match is a successful inspection. A positive but
-/// short byte count (review round 5, item 2) means the kernel wrote a
+/// short byte count (ADR-091 Amendment 2) means the kernel wrote a
 /// truncated/partial struct rather than the full `VnodeFdInfoWithPath` —
 /// that is an inspection failure exactly like a non-positive return, not a
 /// successful call that merely returned less data than expected.
@@ -830,7 +829,7 @@ fn proc_pidfdinfo_returned_expected_size(returned_bytes: i32, expected_size: usi
 const CENSUS_BUFFER_NEGOTIATION_ATTEMPTS: usize = 4;
 
 /// Bounded buffer-size negotiation shared by `proc_listpids` and
-/// `proc_pidinfo(PROC_PIDLISTFDS)` (ADR-091 Amendment 2 review round 4,
+/// `proc_pidinfo(PROC_PIDLISTFDS)` (ADR-091 Amendment 2,
 /// item c — the fixed 8192-PID/4096-FD buffers used to truncate silently).
 /// Both libproc calls return the needed byte count when handed a null
 /// buffer (`size_call`); this allocates with headroom and re-invokes
@@ -874,7 +873,7 @@ fn negotiate_buffer<T: Default + Clone>(
     unreachable!("loop always returns or errors within CENSUS_BUFFER_NEGOTIATION_ATTEMPTS")
 }
 
-/// macOS OS-derived census (ADR-091 Amendment 2 review, item a): every PID
+/// macOS OS-derived census (ADR-091 Amendment 2): every PID
 /// on the system that currently holds `db_path` open, via `libproc`'s
 /// `PROC_PIDLISTFDS`/`PROC_PIDFDVNODEPATHINFO` — never the sidecar directory
 /// listing, which only sees PIDs that already wrote something there.
@@ -1095,7 +1094,7 @@ fn linux_proc_gone(err: &io::Error) -> bool {
 /// namespace — including a container's own, self-consistent one — gets a
 /// dynamically allocated inode instead, so this exact value is a positive,
 /// unspoofable proof that `/proc/self/ns/pid` refers to the host's own
-/// root namespace (review round 5, item 1: a same-namespace readlink
+/// root namespace (ADR-091 Amendment 2: a same-namespace readlink
 /// comparison against `/proc/1/ns/pid` cannot tell "the host" apart from
 /// "a container that is its own root," because both are internally
 /// self-consistent).
@@ -1192,7 +1191,7 @@ fn proc_mounts_restricted_in(mountinfo: &str) -> Option<bool> {
     }
 }
 
-/// Linux OS-derived census (ADR-091 Amendment 2 review, item a): scan
+/// Linux OS-derived census (ADR-091 Amendment 2): scan
 /// `/proc/<pid>/fd/*` for every live PID and stat each fd through its proc
 /// magic link, comparing `(device, inode)` identity against `db_path`'s. A
 /// PID whose `fd` directory
@@ -1200,7 +1199,7 @@ fn proc_mounts_restricted_in(mountinfo: &str) -> Option<bool> {
 /// uninspectable rather than silently excluded — only a PID confirmed gone
 /// (`NotFound`, a listing/inspection race) is skipped cleanly.
 ///
-/// Before trusting the walk as a GLOBAL census (review round 4, item a):
+/// Before trusting the walk as a GLOBAL census (ADR-091 Amendment 2):
 /// `hidepid` mounts, restricted `/proc`, and non-init PID namespaces can all
 /// make `read_dir("/proc")` succeed while silently showing only a subset of
 /// the host's live PIDs — with no per-entry error to catch. Three checks
@@ -1210,13 +1209,12 @@ fn proc_mounts_restricted_in(mountinfo: &str) -> Option<bool> {
 /// internally self-consistent (its `/proc/1` resolves to its own init), so
 /// merely comparing `/proc/1/ns/pid` against `/proc/self/ns/pid` cannot
 /// distinguish "the host" from "a container that is its own root," and was
-/// replaced with this inode check (review round 5, item 1). (2) a positive
+/// replaced with this inode check (ADR-091 Amendment 2). (2) a positive
 /// proof the procfs mount backing `/proc` carries no `hidepid`/`subset`
 /// restriction — see [`proc_mount_is_visibility_restricted`]; a
 /// `hidepid`-restricted mount hides other users' `/proc/<pid>` directories
 /// from `readdir` with no per-entry error, so the init-namespace check
-/// alone (self stays visible, self-canary passes) cannot detect it (review
-/// round 6). (3) any error surfacing from the `/proc` or per-PID `fd`
+/// alone (self stays visible, self-canary passes) cannot detect it. (3) any error surfacing from the `/proc` or per-PID `fd`
 /// directory ITERATORS themselves (not a single entry's own error) marks
 /// the walk incomplete rather than being dropped via `.flatten()`.
 #[cfg(target_os = "linux")]
@@ -1565,7 +1563,7 @@ fn now_epoch_secs() -> i64 {
 }
 
 /// Enumerate the sidecar directory, applying the three-test liveness gate
-/// (gate ruling, 2026-07-19) to every heartbeat/beacon entry found and
+/// to every heartbeat/beacon entry found and
 /// classifying each PID's sidecar health three ways (ADR-091 Amendment 2
 /// "Sidecar-health attribution"): [`WalpinPidHealth::Reporting`] (live,
 /// identity-matched, fresh heartbeat), [`WalpinPidHealth::RegisteredSilent`]
@@ -1574,14 +1572,14 @@ fn now_epoch_secs() -> i64 {
 /// refused it, failed to parse, or went stale — sidecar health for that PID
 /// is unestablished).
 ///
-/// Trust boundary (binding, gate ruling 2026-07-19): the directory itself is
+/// Trust boundary (binding): the directory itself is
 /// validated (type/owner/mode) BEFORE any entry is read — a non-compliant
 /// directory returns `Err`, a health *failure*, never a partial/empty
 /// result that could otherwise masquerade as "no live entries." Per entry,
 /// symlinks and non-owned files are refused BEFORE their contents are read
 /// (contributing an `Unknown` classification, not silently skipped).
 ///
-/// Beacon refresh rule (ADR-091 Amendment 2 review, item b): registration at
+/// Beacon refresh rule (ADR-091 Amendment 2): registration at
 /// initialization alone never licenses `RegisteredSilent` — a beacon (or
 /// heartbeat) that fails the identity gate (dead PID, reused PID) is genuine
 /// absence (deleted, no entry at all: there is no evidence of THIS process),
@@ -1606,7 +1604,7 @@ pub fn enumerate_live(dir: &Path, sweep_interval: Duration) -> io::Result<Walpin
 
     let now = now_epoch_secs();
     // Subsecond intervals must not collapse the freshness window to zero
-    // (minor, ADR-091 Amendment 2 review): a window of 0s would make any
+    // (minor, ADR-091 Amendment 2): a window of 0s would make any
     // `updated_at`/refresh timestamp other than the current wall-clock
     // second appear stale.
     let stale_after_secs = sweep_interval
@@ -1740,7 +1738,7 @@ pub fn enumerate_live(dir: &Path, sweep_interval: Duration) -> io::Result<Walpin
 
 /// Restores a possibly-unset env var on drop, including on panic — so an
 /// assertion failure mid-test can never leak a mutated `KHIVE_WALPIN_SIDECAR`
-/// into a sibling test (minor, ADR-091 Amendment 2 review: env-mutating
+/// into a sibling test (minor, ADR-091 Amendment 2: env-mutating
 /// tests must serialize with cleanup on panic). Shared with the checkpoint
 /// session-sweep test, which mutates the same variable and must serialize
 /// under the same `khive_walpin_sidecar_env` key.
@@ -1801,7 +1799,7 @@ mod tests {
     #[serial_test::serial(khive_walpin_sidecar_env)]
     fn sidecar_enabled_defaults_to_file_backed() {
         // Deterministic regardless of the ambient environment (minor,
-        // ADR-091 Amendment 2 review: the prior version was vacuously true
+        // ADR-091 Amendment 2: the prior version was vacuously true
         // whenever `KHIVE_WALPIN_SIDECAR` happened to be set already).
         let _guard = EnvVarGuard::capture("KHIVE_WALPIN_SIDECAR");
         std::env::remove_var("KHIVE_WALPIN_SIDECAR");
@@ -1979,7 +1977,7 @@ mod tests {
         write_heartbeat(&dir, &hb).unwrap();
 
         let report = enumerate_live(&dir, Duration::from_secs(5)).unwrap();
-        // ADR-091 Amendment 2 review item b: a stale-but-identity-valid
+        // ADR-091 Amendment 2: a stale-but-identity-valid
         // heartbeat is wedged, not absent — it classifies `Unknown` rather
         // than silently vanishing from the report.
         assert_eq!(report.reporting().count(), 0);
@@ -1990,7 +1988,7 @@ mod tests {
 
     #[test]
     fn enumerate_live_subsecond_sweep_interval_does_not_collapse_freshness_window() {
-        // Minor (ADR-091 Amendment 2 review): a sub-second
+        // Minor (ADR-091 Amendment 2): a sub-second
         // KHIVE_SESSION_SWEEP_INTERVAL_MS must not yield a zero-second
         // freshness window that treats every heartbeat as instantly stale.
         let root = tempfile::tempdir().unwrap();
@@ -2053,7 +2051,7 @@ mod tests {
 
     #[test]
     fn enumerate_live_refuses_non_compliant_directory_wholesale() {
-        // Item 3 (ADR-091 Amendment 2 review): a directory that fails the
+        // Item 3 (ADR-091 Amendment 2): a directory that fails the
         // trust-boundary check must return a health *failure*, not a
         // silently empty/partial report that could masquerade as "no live
         // entries" evidence.
@@ -2140,7 +2138,7 @@ mod tests {
 
     #[test]
     fn enumerate_live_classifies_stale_beacon_as_unknown() {
-        // ADR-091 Amendment 2 review item b: a beacon that is identity-valid
+        // ADR-091 Amendment 2: a beacon that is identity-valid
         // (live PID, matching start time) but whose refresh mtime has fallen
         // outside the freshness window is a wedged sidecar, not evidence of
         // registration — it must classify `Unknown`, not `RegisteredSilent`.
@@ -2168,7 +2166,7 @@ mod tests {
 
     #[test]
     fn enumerate_live_stale_heartbeat_with_fresh_beacon_stays_unknown_not_registered_silent() {
-        // ADR-091 Amendment 2 review item b: a PID whose heartbeat was
+        // ADR-091 Amendment 2: a PID whose heartbeat was
         // deleted as stale must classify `Unknown`, even when a co-existing
         // FRESH beacon for the same PID would otherwise resolve it to
         // `RegisteredSilent`.
@@ -2303,7 +2301,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn macos_pid_genuinely_gone_only_true_for_esrch() {
-        // ADR-091 Amendment 2 review follow-up: ESRCH (the target process
+        // ADR-091 Amendment 2: ESRCH (the target process
         // exited between listing and inspection) is a genuine "positively
         // gone" race, safe to skip. Every other errno — most commonly
         // EPERM/EACCES from trying to list another user's open files — means
@@ -2317,7 +2315,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn proc_pidfdinfo_returned_expected_size_boundary() {
-        // Review round 5, item 2: a positive-but-short byte count must
+        // ADR-091 Amendment 2: a positive-but-short byte count must
         // classify as an inspection failure, not a successful call — only
         // an exact match on the expected struct size is `ok`.
         let expected = std::mem::size_of::<u64>(); // stand-in fixed-size struct
@@ -2369,7 +2367,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn linux_proc_gone_only_true_for_not_found() {
-        // ADR-091 Amendment 2 review follow-up: NotFound (the process's
+        // ADR-091 Amendment 2: NotFound (the process's
         // /proc/<pid>/fd directory raced away between listing and open) is a
         // genuine "positively gone" race, safe to skip. PermissionDenied
         // (inspecting another user's fds) means the inspection itself
@@ -2383,7 +2381,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn pid_ns_is_init_only_true_for_the_fixed_kernel_inode() {
-        // Review round 5, item 1: only the exact kernel-assigned init
+        // ADR-091 Amendment 2: only the exact kernel-assigned init
         // namespace inode (`include/linux/proc_ns.h`) is complete-eligible.
         // A container's own, internally self-consistent PID namespace gets
         // a different, dynamically allocated inode and must classify as
@@ -2398,7 +2396,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn proc_mount_restricts_visibility_classifies_hidepid_and_subset() {
-        // Review round 6: a clean options string never restricts.
+        // ADR-091 Amendment 2: a clean options string never restricts.
         assert!(!proc_mount_restricts_visibility(
             "rw,nosuid,nodev,noexec,relatime"
         ));
@@ -2482,7 +2480,7 @@ mod tests {
 
     #[test]
     fn census_result_is_complete_reflects_truncated() {
-        // ADR-091 Amendment 2 review round 4: `truncated` is a second,
+        // ADR-091 Amendment 2: `truncated` is a second,
         // independent incompleteness signal — a census can have an empty
         // `uninspectable_pids` (no single PID's inspection failed) and
         // still be incomplete because the walk itself has positive evidence

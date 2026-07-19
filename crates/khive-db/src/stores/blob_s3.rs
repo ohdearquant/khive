@@ -496,13 +496,13 @@ impl BlobStore for S3BlobStore {
         // response that reports a small size while streaming a larger body
         // would otherwise be collected in full by `result.bytes()` before
         // this function ever gets to inspect the length. Bound the cap on
-        // the bytes actually consumed instead (ADR-111 Amendment 2 review):
+        // the bytes actually consumed instead (ADR-111 Amendment 2):
         // read the stream chunk by chunk, keep a running total, and abort as
         // soon as it exceeds `MAX_OBJECT_BYTES` rather than trusting the
         // reported metadata size to hold.
         let size_hint = result.meta.size.min(MAX_OBJECT_BYTES) as usize;
         let mut stream = result.into_stream();
-        // ONE end-to-end deadline for the whole hydration (review follow-up):
+        // ONE end-to-end deadline for the whole hydration:
         // a fresh `self.request_timeout` per `stream.next()` call let a peer
         // trickling bytes just under that per-chunk cadence hold one of the
         // bounded hydration permits open indefinitely, since no single call
@@ -994,7 +994,7 @@ mod tests {
             /// `get_opts`: `(reported_meta_size, pre-chunked stream body,
             /// per-chunk delay)`. Lets tests simulate an object store whose
             /// response metadata under-reports the real body length
-            /// (ADR-111 Amendment 2 review: `get` must bound the actual
+            /// (ADR-111 Amendment 2: `get` must bound the actual
             /// stream, not trust this), control exactly how many
             /// `stream.next()` calls the body arrives over (e.g. one
             /// oversized chunk vs many small ones), and — via the delay —
@@ -1318,7 +1318,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_rejects_body_larger_than_reported_metadata_size() {
-        // ADR-111 Amendment 2 review follow-up: `get` must check the
+        // ADR-111 Amendment 2: `get` must check the
         // running total against the cap BEFORE appending a chunk, not
         // after — otherwise a single oversized chunk is copied into the
         // local buffer in full before the ceiling is ever enforced. Script
@@ -1374,10 +1374,9 @@ mod tests {
 
     #[tokio::test]
     async fn get_enforces_one_end_to_end_deadline_across_slow_chunks() {
-        // Review follow-up: before the fix, a fresh `request_timeout` was
-        // applied to each `stream.next()` call, so a peer trickling bytes
-        // just under that per-chunk cadence could hold the hydration open
-        // indefinitely. Script three small chunks, each individually well
+        // A fresh `request_timeout` applied per `stream.next()` call would
+        // let a peer trickling bytes just under that per-chunk cadence
+        // hold the hydration open indefinitely. Script three small chunks, each individually well
         // within `request_timeout`, but whose combined delay exceeds it —
         // under the old per-chunk timeout this would have succeeded; under
         // the fixed single end-to-end deadline it must time out.

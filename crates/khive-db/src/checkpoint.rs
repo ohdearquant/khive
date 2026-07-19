@@ -326,7 +326,7 @@ impl CheckpointConfig {
 
 /// Parse `KHIVE_TX_WARN_SECS`/`KHIVE_TX_MAX_AGE_SECS` against the given
 /// defaults, applying the same ordering guard both [`CheckpointConfig`] and
-/// [`SessionSweepConfig`] need (minor, ADR-091 Amendment 2 review: this was
+/// [`SessionSweepConfig`] need (minor, ADR-091 Amendment 2: this was
 /// previously duplicated verbatim in both `from_env` methods).
 ///
 /// The severity ladder assumes `tx_warn_secs < tx_max_age_secs` (Warn fires
@@ -663,8 +663,8 @@ impl WalpinSidecarState {
     /// 2 sidecar-health attribution). Called once, right after construction,
     /// before the sweep loop starts — never per tick, so it adds no
     /// steady-state filesystem traffic beyond this single write. The
-    /// blocking fs I/O runs on `spawn_blocking` (perf, ADR-091 Amendment 2
-    /// review): this is invoked from an async context and must not run
+    /// blocking fs I/O runs on `spawn_blocking` (perf, ADR-091
+    /// Amendment 2): this is invoked from an async context and must not run
     /// synchronous I/O inline on the async runtime's worker thread.
     async fn register_beacon(&self) {
         let dir = self.dir.clone();
@@ -724,7 +724,7 @@ impl WalpinSidecarState {
     }
 
     /// Blocking heartbeat write/removal runs on `spawn_blocking` (perf,
-    /// ADR-091 Amendment 2 review) — this async sweep task must not block its
+    /// ADR-091 Amendment 2) — this async sweep task must not block its
     /// executor thread on synchronous filesystem I/O.
     async fn observe(
         &mut self,
@@ -845,7 +845,7 @@ impl SessionSweepConfig {
             }
         }
         // Shares `tx_age_thresholds_from_env` with `CheckpointConfig::from_env`
-        // (minor, ADR-091 Amendment 2 review) so a session and the daemon
+        // (minor, ADR-091 Amendment 2) so a session and the daemon
         // parse and validate `KHIVE_TX_WARN_SECS`/`KHIVE_TX_MAX_AGE_SECS`
         // identically from one source, not two hand-copied blocks.
         (cfg.tx_warn_secs, cfg.tx_max_age_secs) =
@@ -1345,7 +1345,7 @@ fn note_truncate_outcome(
 /// registry. A no-op if the sidecar is disabled or this backend has no
 /// on-disk path.
 ///
-/// Sidecar-health attribution (ADR-091 Amendment 2 gate ruling, 2026-07-19):
+/// Sidecar-health attribution (ADR-091 Amendment 2):
 /// the sharper "unregistered/native mechanism" conclusion is licensed only
 /// when every discovered PID is `reporting` or `registered-silent`
 /// (`WalpinReport::fully_attributed`); any `unknown` PID — including the
@@ -1396,7 +1396,7 @@ fn log_walpin_sidecar_report(pool: &ConnectionPool) {
     }
     let mut unknown_pids: Vec<u32> = report.unknown_pids().collect();
 
-    // ADR-091 Amendment 2 review item a (OS-derived census): the sidecar
+    // ADR-091 Amendment 2 (OS-derived census): the sidecar
     // directory alone can only speak for PIDs that wrote SOMETHING there —
     // a database holder that never registered a beacon at all (pre-feature
     // binary, sidecar disabled, wedged before its first write) would
@@ -1418,7 +1418,7 @@ fn log_walpin_sidecar_report(pool: &ConnectionPool) {
                 census_only.sort_unstable();
                 tracing::warn!(
                     ?census_only,
-                    "ADR-091 Amendment 2 review item a: these PIDs hold the database file open \
+                    "ADR-091 Amendment 2: these PIDs hold the database file open \
                      at the OS level but have no sidecar data at all (pre-feature binary, \
                      sidecar disabled, or wedged before its first write)"
                 );
@@ -1430,7 +1430,7 @@ fn log_walpin_sidecar_report(pool: &ConnectionPool) {
                 tracing::warn!(
                     ?uninspectable,
                     truncated = census.truncated,
-                    "ADR-091 Amendment 2 review follow-up: the OS-derived holder census is \
+                    "ADR-091 Amendment 2: the OS-derived holder census is \
                      INCOMPLETE — either specific PIDs' open file descriptors could not be \
                      inspected (permission denied, or a listing race), or the enumeration walk \
                      itself has positive evidence it did not see the full live-process universe \
@@ -1454,7 +1454,7 @@ fn log_walpin_sidecar_report(pool: &ConnectionPool) {
         Err(e) => {
             tracing::warn!(
                 error = %e,
-                "ADR-091 Amendment 2 review item a: OS-derived holder census failed; \
+                "ADR-091 Amendment 2: OS-derived holder census failed; \
                  attribution cannot rule out an unregistered database holder this tick"
             );
             // A failed census is itself a health failure for the sharper

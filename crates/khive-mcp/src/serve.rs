@@ -126,7 +126,7 @@ fn is_daemon_role(args: &Args) -> bool {
 
 /// Handle for the ADR-091 Amendment 2 Plank A session sweep task. Dropping
 /// the sender alone is NOT a sufficient shutdown contract (minor, ADR-091
-/// Amendment 2 review): the sweep task's own clean-shutdown heartbeat
+/// Amendment 2): the sweep task's own clean-shutdown heartbeat
 /// removal runs asynchronously after observing the channel close, and the
 /// tokio runtime is not guaranteed to poll it to completion before the
 /// process exits. [`Self::shutdown`] holds the `JoinHandle` and awaits it
@@ -159,12 +159,12 @@ impl SessionSweepHandle {
 /// `run_checkpoint_task`'s shutdown-channel contract on the daemon side.
 ///
 /// Called from BOTH non-daemon serve entrypoints (`run` and `serve_server`,
-/// item: sweep coverage, ADR-091 Amendment 2 review) — `serve_server` is the
+/// item: sweep coverage, ADR-091 Amendment 2) — `serve_server` is the
 /// ADR-029 multi-backend coordinator boot path, and previously never started
 /// this sweep at all, leaving every multi-backend session permanently
 /// invisible to cross-process WAL-pin attribution.
 ///
-/// Platform-independent (ADR-091 Amendment 2 review, item 1: "Windows is a
+/// Platform-independent (ADR-091 Amendment 2: "Windows is a
 /// supported target"): the tx_registry age check and the walpin sidecar
 /// write path (`khive_db::walpin`) both run on every platform now — only
 /// sidecar-directory *enumeration* (the daemon's TRUNCATE-time attribution
@@ -1472,10 +1472,9 @@ pub async fn serve_server(
 
     // ADR-091 Amendment 2 Plank A: every non-daemon process runs the
     // observe-only session sweep — including this ADR-029 multi-backend
-    // coordinator boot path (item: sweep coverage, ADR-091 Amendment 2
-    // review). Before this fix, `serve_server` never spawned the sweep at
-    // all, so every multi-backend session was permanently invisible to
-    // cross-process WAL-pin attribution.
+    // coordinator boot path (sweep coverage, ADR-091 Amendment 2).
+    // Without this spawn, every multi-backend session is permanently
+    // invisible to cross-process WAL-pin attribution.
     let session_sweep = spawn_session_walpin_sweep(&server);
 
     let transport_name = args.transport.as_deref().unwrap_or("stdio");
