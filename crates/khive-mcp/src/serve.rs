@@ -82,6 +82,16 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
         );
     }
 
+    // ADR-091 Amendment 2 Plank A: every non-daemon process runs the
+    // observe-only session sweep (never PASSIVE/TRUNCATE checkpointing —
+    // that stays daemon-owned). Held for the remainder of `run`'s scope so
+    // the task keeps running for the life of this session; dropping it here
+    // (this binding's scope ending, i.e. `run` returning) is this process's
+    // "clean shutdown" signal, which removes its own walpin heartbeat if one
+    // was written.
+    #[cfg(unix)]
+    let _session_sweep_shutdown_tx = spawn_session_walpin_sweep(&server);
+
     let transport_name = args.transport.as_deref().unwrap_or("stdio");
     let transport = registry.get(transport_name).ok_or_else(|| {
         anyhow::anyhow!(
@@ -111,6 +121,28 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
 #[cfg(feature = "channel-email")]
 fn is_daemon_role(args: &Args) -> bool {
     args.daemon
+}
+
+/// Spawn the ADR-091 Amendment 2 Plank A observe-only session sweep task for
+/// this process's checkpoint pool, if it has one (a checkpoint pool is only
+/// wired for file-backed backends — see `checkpoint_pool_for`). Returns the
+/// paired shutdown `Sender`; the caller MUST hold it for the session's run
+/// scope (dropping it is the task's "clean shutdown" signal, which removes
+/// this process's own walpin heartbeat if one was written — mirrors
+/// `run_checkpoint_task`'s shutdown-channel contract on the daemon side).
+#[cfg(unix)]
+fn spawn_session_walpin_sweep(server: &KhiveMcpServer) -> Option<tokio::sync::watch::Sender<()>> {
+    let pool = server.pool()?;
+    let db_path = pool.config().path.clone();
+    let config = khive_db::SessionSweepConfig::from_env();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+    tokio::spawn(khive_db::run_session_sweep_task(
+        db_path,
+        config,
+        shutdown_rx,
+    ));
+    tracing::info!("ADR-091 Amendment 2 Plank A: session WAL-registry sweep started");
+    Some(shutdown_tx)
 }
 
 /// Spawn the email channel loops if — and only if — `args` indicates this

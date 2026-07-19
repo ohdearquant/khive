@@ -23,6 +23,7 @@
 //! from ordinary ticks, the single-writer-checkout invariant, and why Plank 1
 //! is a sweep rather than the ADR's originally-described per-statement guard).
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -611,6 +612,217 @@ fn log_tx_age_emission(emission: &TxAgeEmission) {
     }
 }
 
+/// ADR-091 Amendment 2 Plank B: per-process walpin sidecar state, carried
+/// across ticks by whichever sweep owns it (the daemon's `run_checkpoint_task`
+/// or a session's `run_session_sweep_task`). Writes this process's heartbeat
+/// on every tick the registry's oldest span exceeds `tx_warn_secs`, and
+/// removes it once on the tick the condition clears (and on shutdown) — a
+/// process that never crosses the threshold writes nothing.
+#[cfg(unix)]
+struct WalpinSidecarState {
+    dir: PathBuf,
+    pid: u32,
+    role: &'static str,
+    started_at: i64,
+    wrote: bool,
+}
+
+#[cfg(unix)]
+impl WalpinSidecarState {
+    /// `None` when the sidecar is disabled for this backend/env, or the
+    /// backend has no on-disk path (in-memory).
+    fn new(db_path: Option<&Path>, is_file_backed: bool, role: &'static str) -> Option<Self> {
+        let path = db_path?;
+        if !crate::walpin::sidecar_enabled(is_file_backed) {
+            return None;
+        }
+        let pid = std::process::id();
+        Some(Self {
+            dir: crate::walpin::sidecar_dir_for(path),
+            pid,
+            role,
+            started_at: crate::walpin::process_start_time_secs(pid).unwrap_or(0),
+            wrote: false,
+        })
+    }
+
+    fn observe(
+        &mut self,
+        oldest: Option<(khive_storage::tx_registry::TxId, Duration, Option<String>)>,
+        tx_warn_secs: Duration,
+    ) {
+        match oldest {
+            Some((_, age, label)) if age >= tx_warn_secs => {
+                let heartbeat = crate::walpin::WalpinHeartbeat {
+                    pid: self.pid,
+                    process_role: self.role.to_string(),
+                    started_at: self.started_at,
+                    oldest_tx_age_secs: age.as_secs_f64(),
+                    oldest_tx_label: label,
+                    updated_at: now_epoch_secs(),
+                };
+                if let Err(e) = crate::walpin::write_heartbeat(&self.dir, &heartbeat) {
+                    tracing::warn!(
+                        error = %e,
+                        "ADR-091 Amendment 2 Plank B: failed to write walpin heartbeat"
+                    );
+                }
+                self.wrote = true;
+            }
+            _ => {
+                if self.wrote {
+                    if let Err(e) = crate::walpin::remove_heartbeat(&self.dir, self.pid) {
+                        tracing::warn!(
+                            error = %e,
+                            "ADR-091 Amendment 2 Plank B: failed to remove walpin heartbeat"
+                        );
+                    }
+                    self.wrote = false;
+                }
+            }
+        }
+    }
+
+    fn shutdown(&mut self) {
+        if self.wrote {
+            let _ = crate::walpin::remove_heartbeat(&self.dir, self.pid);
+            self.wrote = false;
+        }
+    }
+}
+
+#[cfg(unix)]
+fn now_epoch_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// ADR-091 Amendment 2 Plank A: config for the observe-only per-session
+/// sweep. Sessions never checkpoint — that stays daemon-owned so N session
+/// processes never compete for the writer mutex — this only watches
+/// `tx_registry` (and, Plank B, refreshes this process's walpin heartbeat).
+#[derive(Clone, Debug)]
+pub struct SessionSweepConfig {
+    /// How often a session polls the registry. Coarser than the daemon's
+    /// tick: sessions do not need the daemon's 500ms checkpoint cadence.
+    ///
+    /// Overridable via `KHIVE_SESSION_SWEEP_INTERVAL_MS`. Default: 5000 ms.
+    pub interval: Duration,
+    /// Same semantics and default as [`CheckpointConfig::tx_warn_secs`].
+    pub tx_warn_secs: Duration,
+    /// Same semantics and default as [`CheckpointConfig::tx_max_age_secs`].
+    pub tx_max_age_secs: Duration,
+}
+
+impl Default for SessionSweepConfig {
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_secs(5),
+            tx_warn_secs: Duration::from_secs(30),
+            tx_max_age_secs: Duration::from_secs(120),
+        }
+    }
+}
+
+impl SessionSweepConfig {
+    /// Build from the environment. Reuses `KHIVE_TX_WARN_SECS` /
+    /// `KHIVE_TX_MAX_AGE_SECS` (the same knobs the daemon's checkpoint task
+    /// reads) so a session and the daemon agree on the same thresholds.
+    pub fn from_env() -> Self {
+        let mut cfg = Self::default();
+
+        if let Ok(ms) = std::env::var("KHIVE_SESSION_SWEEP_INTERVAL_MS") {
+            if let Ok(v) = ms.parse::<u64>() {
+                if v > 0 {
+                    cfg.interval = Duration::from_millis(v);
+                }
+            }
+        }
+        if let Ok(v) = std::env::var("KHIVE_TX_WARN_SECS") {
+            if let Ok(n) = v.parse::<u64>() {
+                if n > 0 {
+                    cfg.tx_warn_secs = Duration::from_secs(n);
+                }
+            }
+        }
+        if let Ok(v) = std::env::var("KHIVE_TX_MAX_AGE_SECS") {
+            if let Ok(n) = v.parse::<u64>() {
+                if n > 0 {
+                    cfg.tx_max_age_secs = Duration::from_secs(n);
+                }
+            }
+        }
+
+        // Same ordering guard as `CheckpointConfig::from_env` — see its
+        // comment for the rationale.
+        if cfg.tx_warn_secs >= cfg.tx_max_age_secs {
+            let default = Self::default();
+            tracing::warn!(
+                configured_tx_warn_secs = cfg.tx_warn_secs.as_secs_f64(),
+                configured_tx_max_age_secs = cfg.tx_max_age_secs.as_secs_f64(),
+                fallback_tx_warn_secs = default.tx_warn_secs.as_secs_f64(),
+                fallback_tx_max_age_secs = default.tx_max_age_secs.as_secs_f64(),
+                "KHIVE_TX_WARN_SECS must be strictly less than KHIVE_TX_MAX_AGE_SECS; \
+                 both transaction-age thresholds were rejected and reset to their defaults"
+            );
+            cfg.tx_warn_secs = default.tx_warn_secs;
+            cfg.tx_max_age_secs = default.tx_max_age_secs;
+        }
+
+        cfg
+    }
+}
+
+/// ADR-091 Amendment 2 Plank A: run the observe-only per-session sweep.
+///
+/// Every non-daemon `kkernel mcp` process runs this instead of the daemon's
+/// `run_checkpoint_task`: same `tx_registry` age check and Plank B heartbeat
+/// refresh, but no PASSIVE/TRUNCATE checkpointing — checkpointing stays
+/// daemon-owned. Loops until `shutdown_rx` observes a change (or its sender
+/// is dropped), removing this process's walpin heartbeat (if written) on the
+/// way out.
+#[cfg(unix)]
+pub async fn run_session_sweep_task(
+    db_path: Option<PathBuf>,
+    config: SessionSweepConfig,
+    mut shutdown_rx: tokio::sync::watch::Receiver<()>,
+) {
+    let mut interval = tokio::time::interval(config.interval);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut tx_age_state = TxAgeSweepState::default();
+    // `TxAgeSweepState::observe` takes a `&CheckpointConfig` purely to read
+    // its two threshold fields; the WAL/TRUNCATE fields are irrelevant here
+    // and left at their defaults.
+    let sweep_thresholds = CheckpointConfig {
+        tx_warn_secs: config.tx_warn_secs,
+        tx_max_age_secs: config.tx_max_age_secs,
+        ..CheckpointConfig::default()
+    };
+    let mut sidecar =
+        db_path.and_then(|p| WalpinSidecarState::new(Some(p.as_path()), true, "session"));
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {}
+            _ = shutdown_rx.changed() => break,
+        }
+
+        let oldest = khive_storage::tx_registry::oldest();
+        for emission in tx_age_state.observe(oldest.clone(), &sweep_thresholds) {
+            log_tx_age_emission(&emission);
+        }
+        if let Some(sidecar) = sidecar.as_mut() {
+            sidecar.observe(oldest, config.tx_warn_secs);
+        }
+    }
+
+    if let Some(sidecar) = sidecar.as_mut() {
+        sidecar.shutdown();
+    }
+}
+
 /// Run the WAL checkpoint background task.
 ///
 /// Long-running async task — spawn with `tokio::spawn`. Loops until
@@ -648,6 +860,11 @@ pub async fn run_checkpoint_task(
     // elevated" edge the ADR-094 event emission needs, so the event path
     // never has to reach into the severity state machine's private fields.
     let mut event_was_elevated = false;
+    // ADR-091 Amendment 2 Plank B: the checkpoint pool is only ever wired for
+    // file-backed backends (`checkpoint_pool_for`), so `is_file_backed: true`
+    // is always correct here.
+    #[cfg(unix)]
+    let mut walpin_state = WalpinSidecarState::new(pool.config().path.as_deref(), true, "daemon");
 
     loop {
         // A closed sender (the daemon returning without an explicit send)
@@ -676,8 +893,16 @@ pub async fn run_checkpoint_task(
         // tick. Edge-triggered per rung, same debounce idiom as the severity
         // ladder below, so a sustained stale span logs once per rung rather
         // than once per tick.
-        for emission in tx_age_state.observe(khive_storage::tx_registry::oldest(), &config) {
+        let oldest_tx = khive_storage::tx_registry::oldest();
+        for emission in tx_age_state.observe(oldest_tx.clone(), &config) {
             log_tx_age_emission(&emission);
+        }
+        // ADR-091 Amendment 2 Plank B: refresh (or clear) this daemon
+        // process's own walpin heartbeat on the same cadence, so its own
+        // pin — if any — is attributable the same way a session's is.
+        #[cfg(unix)]
+        if let Some(sidecar) = walpin_state.as_mut() {
+            sidecar.observe(oldest_tx, config.tx_warn_secs);
         }
 
         // Skipped ticks leave crossing state unchanged — a busy tick must not
@@ -758,6 +983,11 @@ pub async fn run_checkpoint_task(
             .await;
         }
         event_was_elevated = above_warn;
+    }
+
+    #[cfg(unix)]
+    if let Some(sidecar) = walpin_state.as_mut() {
+        sidecar.shutdown();
     }
 }
 
@@ -975,6 +1205,9 @@ fn maybe_truncate(
                      a long-lived reader may still be pinning the WAL snapshot"
                 );
                 log_tx_registry_snapshot_warn(wal_pages_after);
+                #[cfg(unix)]
+                log_walpin_sidecar_report(pool);
+                log_wal_pin_depth(conn);
             }
 
             note_truncate_outcome(config, wal_pages_after, truncate_state);
@@ -1017,6 +1250,73 @@ fn note_truncate_outcome(
     }
 
     TRUNCATE_CONSECUTIVE_FAILURES.store(state.consecutive_failures as u64, Ordering::Relaxed);
+}
+
+/// ADR-091 Amendment 2 Plank B: on a TRUNCATE no-progress event, enumerate
+/// the walpin sidecar directory and log every entry that survives the
+/// three-test liveness gate, attributing the pin to a specific cross-process
+/// PID rather than only this process's own registry. A no-op if the sidecar
+/// is disabled or this backend has no on-disk path.
+#[cfg(unix)]
+fn log_walpin_sidecar_report(pool: &ConnectionPool) {
+    let Some(path) = pool.config().path.as_deref() else {
+        return;
+    };
+    if !crate::walpin::sidecar_enabled(true) {
+        return;
+    }
+    let dir = crate::walpin::sidecar_dir_for(path);
+    // The daemon does not know any individual session's configured sweep
+    // interval; re-reading `KHIVE_SESSION_SWEEP_INTERVAL_MS` here (the same
+    // knob a session's own `SessionSweepConfig::from_env` reads) is a
+    // reasonable staleness heuristic across a deployment that shares one env.
+    let sweep_interval = SessionSweepConfig::from_env().interval;
+    for entry in crate::walpin::enumerate_live(&dir, sweep_interval) {
+        let hb = entry.heartbeat;
+        tracing::warn!(
+            walpin_pid = hb.pid,
+            walpin_role = %hb.process_role,
+            walpin_oldest_tx_age_secs = hb.oldest_tx_age_secs,
+            walpin_oldest_tx_label = hb.oldest_tx_label.as_deref().unwrap_or("<unlabeled>"),
+            "ADR-091 Amendment 2 Plank B: live cross-process WAL-pin attribution report"
+        );
+    }
+}
+
+/// ADR-091 Amendment 2 Plank C: on a TRUNCATE no-progress event, run a fresh
+/// `PRAGMA wal_checkpoint(PASSIVE)` (never blocks readers or writers) and
+/// report pin depth as `log` minus `checkpointed` from its 3-column return
+/// row — the number of frames pinned behind the backfill boundary. Zero
+/// dependence on SQLite's shm WAL-index layout.
+fn log_wal_pin_depth(conn: &rusqlite::Connection) {
+    match query_wal_pin_depth(conn) {
+        Ok((log, checkpointed)) => {
+            tracing::warn!(
+                wal_log_frames = log,
+                wal_checkpointed_frames = checkpointed,
+                wal_pin_depth = (log - checkpointed).max(0),
+                "ADR-091 Amendment 2 Plank C: WAL pin depth after TRUNCATE no-progress"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "ADR-091 Amendment 2 Plank C: failed to query WAL pin depth"
+            );
+        }
+    }
+}
+
+/// ADR-091 Amendment 2 Plank C: issue `PRAGMA wal_checkpoint(PASSIVE)` and
+/// return its `(log, checkpointed)` columns (index 1 and 2 of the 3-column
+/// return row). PASSIVE never blocks readers or writers. Pin depth is
+/// `log - checkpointed`; extracted as its own pure query so the arithmetic is
+/// unit-testable against a real SQLite connection without depending on
+/// `tracing` capture.
+fn query_wal_pin_depth(conn: &rusqlite::Connection) -> rusqlite::Result<(i64, i64)> {
+    conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+        Ok((row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
+    })
 }
 
 /// Evaluate whether a threshold-crossing WARN should fire and advance the
@@ -3154,5 +3454,138 @@ mod tests {
             "expected the age sweep to fire even though every tick's writer checkout \
              was skipped, got: {events:?}"
         );
+    }
+
+    // ── ADR-091 Amendment 2: Plank A (session sweep), Plank B (walpin
+    // sidecar), Plank C (pin-depth probe) ────────────────────────────────
+
+    #[tokio::test]
+    async fn session_sweep_task_exits_on_shutdown_signal() {
+        let cfg = SessionSweepConfig {
+            interval: Duration::from_millis(10),
+            ..SessionSweepConfig::default()
+        };
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+        let handle = tokio::spawn(run_session_sweep_task(None, cfg, shutdown_rx));
+
+        shutdown_tx.send(()).expect("send shutdown signal");
+
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("session sweep task should exit within 1s")
+            .expect("session sweep task panicked");
+    }
+
+    #[tokio::test]
+    #[serial(tx_registry)]
+    async fn session_sweep_task_writes_and_clears_walpin_heartbeat() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("session_sweep.db");
+        let sidecar_dir = crate::walpin::sidecar_dir_for(&db_path);
+        std::env::set_var("KHIVE_WALPIN_SIDECAR", "1");
+
+        let cfg = SessionSweepConfig {
+            interval: Duration::from_millis(10),
+            tx_warn_secs: Duration::from_millis(20),
+            tx_max_age_secs: Duration::from_millis(500),
+        };
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+        let handle = tokio::spawn(run_session_sweep_task(
+            Some(db_path.clone()),
+            cfg,
+            shutdown_rx,
+        ));
+
+        // No open span yet: a quiet process must write nothing for a few ticks.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            !sidecar_dir.exists() || fs_dir_is_empty(&sidecar_dir),
+            "a quiet process must not write a walpin heartbeat"
+        );
+
+        let tx_handle =
+            khive_storage::tx_registry::register(Some("session_sweep_walpin_test".to_string()));
+        // Long enough to cross `tx_warn_secs` across at least one 10ms tick.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        let pid = std::process::id();
+        let heartbeat_path = sidecar_dir.join(format!("{pid}.json"));
+        assert!(
+            heartbeat_path.exists(),
+            "expected a walpin heartbeat once the span crossed tx_warn_secs"
+        );
+        let body = std::fs::read_to_string(&heartbeat_path).unwrap();
+        let hb: crate::walpin::WalpinHeartbeat = serde_json::from_str(&body).unwrap();
+        assert_eq!(hb.pid, pid);
+        assert_eq!(hb.process_role, "session");
+        assert_eq!(
+            hb.oldest_tx_label.as_deref(),
+            Some("session_sweep_walpin_test")
+        );
+
+        drop(tx_handle);
+        // A few more ticks so the sweep observes the registry going empty.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            !heartbeat_path.exists(),
+            "heartbeat must be removed once the stale span clears"
+        );
+
+        shutdown_tx.send(()).expect("send shutdown signal");
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("session sweep task should exit within 1s")
+            .expect("session sweep task panicked");
+
+        std::env::remove_var("KHIVE_WALPIN_SIDECAR");
+    }
+
+    fn fs_dir_is_empty(dir: &std::path::Path) -> bool {
+        std::fs::read_dir(dir)
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(true)
+    }
+
+    #[test]
+    fn wal_pin_depth_arithmetic_against_real_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pin_depth.db");
+        let pool = file_pool(&path);
+        let writer = pool.try_writer().expect("acquire writer");
+        let conn = writer.conn();
+
+        conn.execute_batch("CREATE TABLE t (v INTEGER)").unwrap();
+        conn.execute_batch("INSERT INTO t (v) VALUES (1)").unwrap();
+
+        let (log, checkpointed) =
+            query_wal_pin_depth(conn).expect("PRAGMA wal_checkpoint(PASSIVE) must succeed");
+        // Nothing pins the WAL open in this test (no concurrent reader), so a
+        // PASSIVE checkpoint must fully drain what it just wrote: pin depth
+        // (log - checkpointed) is zero.
+        assert!(
+            log >= checkpointed,
+            "checkpointed frames cannot exceed log frames"
+        );
+        assert_eq!(
+            log - checkpointed,
+            0,
+            "an unpinned WAL must fully checkpoint under PASSIVE"
+        );
+    }
+
+    #[test]
+    fn wal_pin_depth_arithmetic_on_in_memory_pool_errors_cleanly() {
+        // In-memory databases report `log = -1` (no WAL); the pragma read
+        // itself does not panic and the caller (`log_wal_pin_depth`) treats
+        // any error as a logged warning, never a crash.
+        let cfg = PoolConfig {
+            path: None,
+            ..PoolConfig::default()
+        };
+        let pool = ConnectionPool::new(cfg).expect("in-memory pool");
+        let writer = pool.try_writer().expect("acquire writer");
+        // Either an explicit error or a nonsensical negative `log` value is
+        // acceptable here — the requirement is just "does not panic".
+        let _ = query_wal_pin_depth(writer.conn());
     }
 }

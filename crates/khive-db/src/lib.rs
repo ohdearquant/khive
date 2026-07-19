@@ -19,11 +19,16 @@ pub mod pool;
 pub mod sql_bridge;
 /// Per-substrate store implementations (entity, note, graph, event, text, vectors, sparse).
 pub mod stores;
+/// Cross-process WAL-pin attribution sidecar (ADR-091 Amendment 2 Plank B).
+#[cfg(unix)]
+pub mod walpin;
 /// Single-writer task and bounded write queue (ADR-067 Component A).
 pub mod writer_task;
 
 pub use backend::StorageBackend;
 pub use checkpoint::{checkpoint_once, run_checkpoint_task, CheckpointConfig, CheckpointTick};
+#[cfg(unix)]
+pub use checkpoint::{run_session_sweep_task, SessionSweepConfig};
 pub use error::SqliteError;
 pub use migrations::{
     inspect_schema_version, query_embedding_models, read_schema_version, run_migrations,
