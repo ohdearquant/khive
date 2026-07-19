@@ -692,3 +692,44 @@ missed by a request using the alias form.
   dispatch path already pays elsewhere.
 - Policies authored against alias forms (if any) must be re-authored against
   canonical ids: a one-time migration cost at adoption.
+
+---
+
+## Amendment 2 (2026-07-19) — Fail-closed verb class
+
+Specified by [ADR-117a](ADR-117a-session-identity-tenant-isolation.md); recorded here so this ADR
+remains the source of truth for its own contract.
+
+### Context
+
+The base contract fails open on gate infrastructure `Err` (§"Fail-open on gate Err"): a gate that
+errors before producing a decision proceeds, and only an explicit `Deny` blocks. Amendment 1 §4
+already carved one fail-closed exception — a wire verb that resolves to no registered canonical id is
+denied before dispatch. Some verbs return rows so sensitive that their safety must not depend on the
+Gate at all — the Gate is pre-dispatch and row-blind, so it can neither see nor isolate matched rows,
+and its fail-open default must not become a data-leak path for them.
+
+### Decision
+
+A verb may declare membership in a **fail-closed verb class**. A member carries a handler-seam
+requirement of a **positive authenticated tenant scope**: its handler must refuse to execute without
+one. For a member, the Gate's fail-open default cannot leak data, because the handler's
+construction-primary refusal stands independently of the Gate decision — a failed-open allow still
+yields no scope, and no scope yields no rows, not a widened query.
+
+The amendment is a contract-level codification of a property the member's handler seam already
+guarantees by construction. It does **not** move enforcement into the Gate: the Gate stays pre-dispatch,
+row-blind, and fail-open on infra error. It names the class of verbs whose row-isolation is a
+construction-primary handler-seam predicate rather than a Gate decision.
+
+`session.search` (ADR-117a) is the first member. Future verbs that return cross-tenant-sensitive rows
+join by the same handler-seam contract.
+
+### Consequences
+
+- The Gate model is unchanged; this adds a named handler-seam obligation, not a new Gate mode.
+- A fail-closed-class member is safe under `AllowAllGate` and under a gate `Err`, because its isolation
+  never depended on the Gate returning `Deny`.
+- Membership is a per-verb contract a pack declares; the enforcement lives in the member's handler and
+  is proven by that verb's isolation and no-scope-refusal tests (ADR-117a discharges both for
+  `session.search`).
