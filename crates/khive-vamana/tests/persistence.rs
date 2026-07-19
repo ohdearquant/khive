@@ -406,9 +406,13 @@ fn v2_truncated_extended_trailer_is_invalid() {
     let meta = fs::read(&meta_path).unwrap();
     fs::write(&meta_path, &meta[..meta.len() - 1]).unwrap();
 
-    // The commit-record reader must reject the malformed length outright.
+    // The commit-record reader must reject the malformed length: it reports
+    // an unparseable record as None (torn write), never as a valid base or
+    // extended record.
     assert!(
-        khive_vamana::read_commit_info(dir.path()).is_err(),
+        khive_vamana::read_commit_info(dir.path())
+            .expect("reading a present but malformed record is not an IO error")
+            .is_none(),
         "a base+40-byte record must not parse as either base or extended"
     );
 
