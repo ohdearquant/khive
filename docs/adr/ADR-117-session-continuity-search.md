@@ -291,10 +291,10 @@ single-machine case; the remote sink is an added ingestion mode, not a replaceme
 
 **One mega-ADR that specifies all mechanisms inline.** Rejected. Isolation, deletion, and continuity
 each carry a proof obligation — a schema migration, a deletion lifecycle, a resolved identity bridge —
-that a reviewer can and should check at source. Bundling all three into one document made each promise
-a claim the review could disprove against the actual schema and Gate contract, which is a structural
-reject loop, not a drafting problem. Splitting each mechanism to a focused follow-on with its own gate
-lets the direction land on requirement-coherence while each mechanism is proven where its proof lives.
+that must be checked against the actual schema and Gate contract. Bundling all three into one document
+couples every mechanism's acceptance to the slowest-to-prove one. Splitting each mechanism into a
+focused follow-on lets the direction land on requirement-coherence while each mechanism is proven
+where its proof lives.
 
 **Content-hash message identity.** Rejected as incorrect (D2): it collides identical messages across
 tenants and collapses legitimate repeated events. The hash is retained as an integrity/dedup adjunct on

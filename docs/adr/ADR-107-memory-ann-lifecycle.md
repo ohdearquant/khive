@@ -10,7 +10,9 @@
 
 [ADR-079](ADR-079-ann-persistence-warm-path-integration.md) Amendment 1's global-scope-consumer
 addendum extends the delta-log/watermark restart classifier to the memory pack's note index. Two
-provisions of this ADR are superseded by it:
+provisions of this ADR are superseded by it. The supersession takes effect when the Amendment 1
+implementation for this consumer lands; until then the hash-based restart validation specified
+here remains the operative mechanism in shipped code:
 
 - **The scope exclusion.** The Context statement that ADR-079 "explicitly excludes memory-pack
   migration" and that this ADR "does not extend ADR-079's scope to the memory pack" no longer

@@ -146,9 +146,10 @@ snapshot store (`khive-retrieval/src/persist/core.rs`), the admin reindex invali
 knowledge pack's own rows** (`index_type='vamana'` under the `{ns}::vamana::{model}` key): the bridge
 stops _writing_ them and, on first warm after upgrade, ignores any present-but-orphaned knowledge row
 (a rebuild produces v2 segments instead). The table itself and every other consumer's rows are
-untouched. **No table-drop migration is in scope.** Migrating the memory pack and the
-retrieval-persist layer onto v2 segments — if ever desired — is a separate ADR coordinating all
-consumers and all create sites.
+untouched. **No table-drop migration is in scope.** The memory pack's migration onto v2 segments
+is now specified by Amendment 1's global-scope-consumer addendum below (coordinated through the
+ADR-107 supersession note); the retrieval-persist layer remains out of scope and would need its
+own coordination across consumers and create sites.
 
 This is consistent with khive's data-vs-view principle: the authoritative vectors remain in the
 vector store; the ANN segment directory is a rebuildable index over them, not a second source of
@@ -375,7 +376,8 @@ testable. Step 0 is the precondition; steps 1–2 land the #322 root-cause fix a
 
 ## Amendment 1 — Delta-log restart classifier and mmap re-adoption (2026-07-19)
 
-**Status**: Proposed
+**Status**: Accepted (design; the implementation is tracked separately, and prior mechanisms
+remain operative until it lands)
 
 ### Context
 
@@ -497,8 +499,10 @@ CREATE TABLE ann_consumer_watermark (
      (`UPDATE ... SET watermark = MAX(watermark, S)`); a crash in between leaves the smaller
      registered watermark, which under-compacts — safe.
   3. **Compact through the registry minimum only.** Compaction for a pair
-     `(namespace, embedding_model)` deletes rows with
-     `seq <= (SELECT MIN(watermark) FROM ann_consumer_watermark WHERE (namespace = ?ns OR
+     `(namespace, embedding_model)` constrains the delete to that pair explicitly — `seq` values
+     are database-global, so an unconstrained delete would erase other pairs' tails:
+     `DELETE FROM ann_write_log WHERE namespace = ?ns AND embedding_model = ?model AND
+     seq <= (SELECT MIN(watermark) FROM ann_consumer_watermark WHERE (namespace = ?ns OR
      namespace = '*') AND embedding_model = ?model)` — never a checkpoint-local `seq <= S`. This
      wildcard-inclusive form is the universal pair-compaction query: wildcard rows are global-scope
      consumers' registrations (see "Global-scope consumers" below), and a database with none
@@ -603,8 +607,9 @@ never to serving a stale-but-adopted index.
 2. **Crash between `save_atomic` and log compaction**: the segment commits (staged files, fsync,
    rename, commit magic — existing v2 semantics) carrying `last_applied_seq = S` atomically
    inside its commit record. The registry raise and compaction
-   (`DELETE ... WHERE seq <= MIN(watermark)` over the pair's registered rows, wildcard rows
-   included, §A step 3) run only after the commit, in that order. A crash before the raise leaves the smaller
+   (the pair-constrained delete of §A step 3 — outer `WHERE namespace = ?ns AND
+   embedding_model = ?model`, subquery over the pair's registered rows, wildcard rows
+   included) run only after the commit, in that order. A crash before the raise leaves the smaller
    registered watermark (under-compacts); a crash before compaction leaves log rows with
    `seq <= S`, which the classifier's strict `seq > last_applied_seq` filter ignores; the next
    checkpoint re-raises and re-compacts. Idempotent, harmless.
@@ -640,7 +645,7 @@ The expected case is orders of magnitude smaller: a typical restart tail is one 
 
 ### Lever inventory (full residency budget, with projections)
 
-Levers named per review request, including rejected ones, at current corpus (~553K entity/note +
+Levers considered, including rejected ones, at current corpus (~553K entity/note +
 ~358K knowledge-section vectors, 384-d f32):
 
 | Lever                                                            | Projected saving                                                                                                              | Cost / risk                                                                                      | Disposition                                                                                                                                                                               |
