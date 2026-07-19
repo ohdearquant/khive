@@ -638,13 +638,23 @@ struct WalpinSidecarState {
     pid: u32,
     role: &'static str,
     started_at: i64,
+    /// This sweep's own tick cadence, recorded into every beacon and
+    /// heartbeat so the enumerating daemon judges freshness against the
+    /// PRODUCER's interval — a session on an independently slower configured
+    /// cadence must not be misread as stale.
+    interval_ms: u64,
     wrote: bool,
 }
 
 impl WalpinSidecarState {
     /// `None` when the sidecar is disabled for this backend/env, or the
     /// backend has no on-disk path (in-memory).
-    fn new(db_path: Option<&Path>, is_file_backed: bool, role: &'static str) -> Option<Self> {
+    fn new(
+        db_path: Option<&Path>,
+        is_file_backed: bool,
+        role: &'static str,
+        interval: Duration,
+    ) -> Option<Self> {
         let path = db_path?;
         if !crate::walpin::sidecar_enabled(is_file_backed) {
             return None;
@@ -655,6 +665,7 @@ impl WalpinSidecarState {
             pid,
             role,
             started_at: crate::walpin::process_start_time_secs(pid).unwrap_or(0),
+            interval_ms: interval.as_millis().min(u64::MAX as u128) as u64,
             wrote: false,
         })
     }
@@ -672,6 +683,7 @@ impl WalpinSidecarState {
             pid: self.pid,
             process_role: self.role.to_string(),
             started_at: self.started_at,
+            interval_ms: self.interval_ms,
         };
         let result =
             tokio::task::spawn_blocking(move || crate::walpin::write_beacon(&dir, &beacon)).await;
@@ -741,6 +753,7 @@ impl WalpinSidecarState {
                     oldest_tx_age_secs: age.as_secs_f64(),
                     oldest_tx_label: label,
                     updated_at: now_epoch_secs(),
+                    interval_ms: self.interval_ms,
                 };
                 let dir = self.dir.clone();
                 let result = tokio::task::spawn_blocking(move || {
@@ -879,8 +892,8 @@ pub async fn run_session_sweep_task(
         tx_max_age_secs: config.tx_max_age_secs,
         ..CheckpointConfig::default()
     };
-    let mut sidecar =
-        db_path.and_then(|p| WalpinSidecarState::new(Some(p.as_path()), true, "session"));
+    let mut sidecar = db_path
+        .and_then(|p| WalpinSidecarState::new(Some(p.as_path()), true, "session", config.interval));
     if let Some(sidecar) = sidecar.as_ref() {
         sidecar.register_beacon().await;
     }
@@ -946,7 +959,12 @@ pub async fn run_checkpoint_task(
     // file-backed backends (`checkpoint_pool_for`), so `is_file_backed: true`
     // is always correct here.
     #[cfg(unix)]
-    let mut walpin_state = WalpinSidecarState::new(pool.config().path.as_deref(), true, "daemon");
+    let mut walpin_state = WalpinSidecarState::new(
+        pool.config().path.as_deref(),
+        true,
+        "daemon",
+        config.interval,
+    );
     #[cfg(unix)]
     if let Some(sidecar) = walpin_state.as_ref() {
         sidecar.register_beacon().await;
@@ -1361,10 +1379,9 @@ fn log_walpin_sidecar_report(pool: &ConnectionPool) {
         return;
     }
     let dir = crate::walpin::sidecar_dir_for(path);
-    // The daemon does not know any individual session's configured sweep
-    // interval; re-reading `KHIVE_SESSION_SWEEP_INTERVAL_MS` here (the same
-    // knob a session's own `SessionSweepConfig::from_env` reads) is a
-    // reasonable staleness heuristic across a deployment that shares one env.
+    // Each record carries its producer's own sweep cadence (`interval_ms`),
+    // which is what freshness is judged against; the interval passed here is
+    // only the fallback for records written before that field existed.
     let sweep_interval = SessionSweepConfig::from_env().interval;
     let report = match crate::walpin::enumerate_live(&dir, sweep_interval) {
         Ok(report) => report,

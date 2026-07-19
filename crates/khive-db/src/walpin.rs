@@ -64,6 +64,14 @@ pub struct WalpinHeartbeat {
     pub oldest_tx_age_secs: f64,
     pub oldest_tx_label: Option<String>,
     pub updated_at: i64,
+    /// The producer's own sweep cadence in milliseconds. Freshness at
+    /// enumeration is judged against THIS cadence, not the enumerating
+    /// daemon's — two processes with independently configured sweep
+    /// intervals must not misread each other as stale. `0` (absent in a
+    /// record written before this field existed) falls back to the
+    /// enumerator's own interval.
+    #[serde(default)]
+    pub interval_ms: u64,
 }
 
 /// A heartbeat that survived the three-test liveness gate at enumeration time.
@@ -82,6 +90,11 @@ pub struct WalpinBeacon {
     pub pid: u32,
     pub process_role: String,
     pub started_at: i64,
+    /// The producer's own sweep cadence in milliseconds — the beacon's
+    /// refresh mtime is judged against this cadence at enumeration, not the
+    /// enumerating daemon's. `0` falls back to the enumerator's interval.
+    #[serde(default)]
+    pub interval_ms: u64,
 }
 
 /// Three-state sidecar-health classification for one PID observed in the
@@ -186,6 +199,12 @@ mod unix_impl {
     use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
     use std::path::Path;
     use std::time::{Duration, SystemTime};
+
+    /// Hard cap on one sidecar entry's byte size. Real heartbeat/beacon
+    /// JSON bodies are well under 1 KiB; anything larger is not a record
+    /// this module wrote, and reading it unboundedly would let a same-uid
+    /// process balloon checkpoint-time enumeration.
+    pub(super) const MAX_SIDECAR_ENTRY_BYTES: u64 = 64 * 1024;
 
     pub(super) fn current_uid() -> u32 {
         // SAFETY: `geteuid()` takes no arguments and cannot fail.
@@ -442,17 +461,28 @@ mod unix_impl {
                 )));
             }
             let c_name = name_cstring(name)?;
-            // SAFETY: `c_name` is NUL-terminated; `O_NOFOLLOW` is defense in
-            // depth alongside the `stat_entry` symlink check above.
+            // SAFETY: `c_name` is NUL-terminated; `O_NOFOLLOW` refuses a
+            // symlink at open time, `O_NONBLOCK` keeps a FIFO planted at
+            // this name from blocking the open waiting for a reader (a
+            // reader-less FIFO fails the open with `ENXIO` instead — an
+            // error, never a hang).
             let fd = unsafe {
                 libc::openat(
                     self.raw(),
                     c_name.as_ptr(),
-                    libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
                 )
             };
             if fd < 0 {
                 return Err(io::Error::last_os_error());
+            }
+            // SAFETY: `fd` was just returned by the successful `openat`;
+            // the `File` owns and closes it exactly once.
+            let file = unsafe { fs::File::from_raw_fd(fd) };
+            if !file.metadata()?.file_type().is_file() {
+                return Err(io_other(format!(
+                    "walpin sidecar entry {name:?} is not a regular file"
+                )));
             }
             let times = [
                 libc::timespec {
@@ -464,53 +494,76 @@ mod unix_impl {
                     tv_nsec: libc::UTIME_NOW,
                 },
             ];
-            // SAFETY: `fd` is a live, just-opened descriptor; `times` is a
-            // valid 2-element array as `futimens` requires.
-            let rc = unsafe { libc::futimens(fd, times.as_ptr()) };
-            let err = (rc != 0).then(io::Error::last_os_error);
-            // SAFETY: `fd` was opened above and is closed exactly once here.
-            unsafe { libc::close(fd) };
-            match err {
-                Some(e) => Err(e),
-                None => Ok(()),
+            // SAFETY: the fd is live (owned by `file`); `times` is a valid
+            // 2-element array as `futimens` requires.
+            let rc = unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) };
+            if rc != 0 {
+                return Err(io::Error::last_os_error());
             }
+            Ok(())
         }
 
-        /// Read `name`'s contents plus its owner uid and mtime, all sourced
-        /// from ONE `stat_entry` pass plus the read itself — never a second
-        /// path-based lookup. `Ok(None)` for a missing entry (raced away
-        /// between listing and reading); refuses a symlink.
+        /// Read `name`'s contents plus its owner uid and mtime. `Ok(None)`
+        /// for a missing entry (raced away between listing and reading).
+        /// Refuses symlinks, non-regular files, and oversized entries: the
+        /// open carries `O_NONBLOCK` so a FIFO planted at the entry's name
+        /// can never block this call waiting for a peer, the opened fd is
+        /// `fstat`'d and must be a regular file before any byte is read,
+        /// and the read itself is bounded — a same-uid process must not be
+        /// able to stall or balloon checkpoint-time enumeration. Owner uid
+        /// and mtime come from the same `fstat`, so every trust decision is
+        /// made against the exact object that was read.
         pub(super) fn read_checked(
             &self,
             name: &str,
         ) -> io::Result<Option<(Vec<u8>, u32, SystemTime)>> {
-            let Some(st) = self.stat_entry(name)? else {
+            use std::os::unix::fs::MetadataExt;
+
+            if self.stat_entry(name)?.is_none() {
                 return Ok(None);
-            };
-            if is_symlink_mode(st.st_mode) {
-                return Err(io_other(format!(
-                    "walpin sidecar entry {name:?} is a symlink"
-                )));
             }
             let c_name = name_cstring(name)?;
-            // SAFETY: `c_name` is NUL-terminated; `O_NOFOLLOW` is defense in
-            // depth alongside the `stat_entry` symlink check above.
+            // SAFETY: `c_name` is NUL-terminated; `O_NOFOLLOW` refuses a
+            // symlink at open time, `O_NONBLOCK` makes a FIFO open return
+            // immediately instead of blocking for a writer.
             let fd = unsafe {
                 libc::openat(
                     self.raw(),
                     c_name.as_ptr(),
-                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
                 )
             };
             if fd < 0 {
-                return Err(io::Error::last_os_error());
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::NotFound {
+                    return Ok(None);
+                }
+                return Err(err);
             }
             // SAFETY: `fd` was just returned by the successful `openat`.
-            let mut file = unsafe { fs::File::from_raw_fd(fd) };
+            let file = unsafe { fs::File::from_raw_fd(fd) };
+            let meta = file.metadata()?;
+            if !meta.file_type().is_file() {
+                return Err(io_other(format!(
+                    "walpin sidecar entry {name:?} is not a regular file"
+                )));
+            }
+            if meta.len() > MAX_SIDECAR_ENTRY_BYTES {
+                return Err(io_other(format!(
+                    "walpin sidecar entry {name:?} exceeds {MAX_SIDECAR_ENTRY_BYTES} bytes"
+                )));
+            }
             let mut buf = Vec::new();
-            file.read_to_end(&mut buf)?;
-            let mtime = SystemTime::UNIX_EPOCH + Duration::new(st.st_mtime.max(0) as u64, 0);
-            Ok(Some((buf, st.st_uid, mtime)))
+            (&file)
+                .take(MAX_SIDECAR_ENTRY_BYTES + 1)
+                .read_to_end(&mut buf)?;
+            if buf.len() as u64 > MAX_SIDECAR_ENTRY_BYTES {
+                return Err(io_other(format!(
+                    "walpin sidecar entry {name:?} exceeds {MAX_SIDECAR_ENTRY_BYTES} bytes"
+                )));
+            }
+            let mtime = SystemTime::UNIX_EPOCH + Duration::new(meta.mtime().max(0) as u64, 0);
+            Ok(Some((buf, meta.uid(), mtime)))
         }
 
         /// List entry names via `fdopendir` on a DUPLICATE of this fd (the
@@ -1562,6 +1615,30 @@ fn now_epoch_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// Staleness window for a producer sweeping at `interval`: three missed
+/// ticks, floored at one second — subsecond intervals must not collapse the
+/// window to zero, which would make any timestamp other than the current
+/// wall-clock second appear stale.
+#[cfg(unix)]
+fn stale_window_from(interval: Duration) -> i64 {
+    interval
+        .saturating_mul(3)
+        .max(Duration::from_secs(1))
+        .as_secs() as i64
+}
+
+/// Per-record staleness window: the producer's own recorded cadence wins;
+/// `0` (a record written before `interval_ms` existed) falls back to the
+/// enumerator's window.
+#[cfg(unix)]
+fn stale_window_secs(producer_interval_ms: u64, fallback_secs: i64) -> i64 {
+    if producer_interval_ms == 0 {
+        fallback_secs
+    } else {
+        stale_window_from(Duration::from_millis(producer_interval_ms))
+    }
+}
+
 /// Enumerate the sidecar directory, applying the three-test liveness gate
 /// to every heartbeat/beacon entry found and
 /// classifying each PID's sidecar health three ways (ADR-091 Amendment 2
@@ -1603,14 +1680,12 @@ pub fn enumerate_live(dir: &Path, sweep_interval: Duration) -> io::Result<Walpin
     };
 
     let now = now_epoch_secs();
-    // Subsecond intervals must not collapse the freshness window to zero
-    // (minor, ADR-091 Amendment 2): a window of 0s would make any
-    // `updated_at`/refresh timestamp other than the current wall-clock
-    // second appear stale.
-    let stale_after_secs = sweep_interval
-        .saturating_mul(3)
-        .max(Duration::from_secs(1))
-        .as_secs() as i64;
+    // Fallback window for records that predate the `interval_ms` field —
+    // records carrying their producer's own cadence are judged against it
+    // instead (see `stale_window_secs`), so a session sweeping on an
+    // independently slower configured interval is not misread as stale by
+    // a faster-ticking daemon.
+    let fallback_window_secs = stale_window_from(sweep_interval);
 
     let mut heartbeats: std::collections::HashMap<u32, WalpinHeartbeat> = Default::default();
     let mut beacon_pids: std::collections::HashSet<u32> = Default::default();
@@ -1644,7 +1719,10 @@ pub fn enumerate_live(dir: &Path, sweep_interval: Duration) -> io::Result<Walpin
             Ok(Some(v)) => v,
             Ok(None) => continue, // raced away between listing and reading
             Err(_) => {
-                unknown.push((pid, "refused: symlinked sidecar entry"));
+                unknown.push((
+                    pid,
+                    "refused: untrusted sidecar entry (symlink, non-regular, or oversized)",
+                ));
                 continue;
             }
         };
@@ -1656,13 +1734,17 @@ pub fn enumerate_live(dir: &Path, sweep_interval: Duration) -> io::Result<Walpin
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        let fresh = (now - mtime_secs).abs() <= stale_after_secs;
 
         if is_heartbeat {
             let heartbeat: WalpinHeartbeat = match serde_json::from_slice(&body) {
                 Ok(hb) => hb,
                 Err(_) => {
+                    // Fail closed: a malformed entry is removed so it cannot
+                    // wedge future ticks, but THIS tick's attribution for
+                    // the PID stays inconclusive — deletion is cleanup,
+                    // never exoneration.
                     let _ = handle.unlink_tolerant(&name);
+                    unknown.push((pid, "malformed walpin heartbeat entry"));
                     continue;
                 }
             };
@@ -1678,21 +1760,25 @@ pub fn enumerate_live(dir: &Path, sweep_interval: Duration) -> io::Result<Walpin
             // `updated_at` is the heartbeat's own field (refreshed every
             // tick the warn condition persists); the entry's mtime tracks
             // it closely, but the JSON field is the authoritative source
-            // the ADR specifies for heartbeat freshness.
-            let hb_fresh = (now - heartbeat.updated_at).abs() <= stale_after_secs;
+            // the ADR specifies for heartbeat freshness. The window is the
+            // PRODUCER's recorded cadence, not the enumerator's.
+            let window = stale_window_secs(heartbeat.interval_ms, fallback_window_secs);
+            let hb_fresh = (now - heartbeat.updated_at).abs() <= window;
             if !hb_fresh {
                 let _ = handle.unlink_tolerant(&name);
                 wedged.insert(pid);
                 unknown.push((pid, "stale walpin heartbeat"));
                 continue;
             }
-            let _ = fresh; // heartbeat freshness is `updated_at`-sourced, not mtime
             heartbeats.insert(heartbeat.pid, heartbeat);
         } else {
             let beacon: WalpinBeacon = match serde_json::from_slice(&body) {
                 Ok(b) => b,
                 Err(_) => {
+                    // Fail closed, as for a malformed heartbeat: cleanup,
+                    // never exoneration.
                     let _ = handle.unlink_tolerant(&name);
+                    unknown.push((pid, "malformed walpin beacon entry"));
                     continue;
                 }
             };
@@ -1707,7 +1793,10 @@ pub fn enumerate_live(dir: &Path, sweep_interval: Duration) -> io::Result<Walpin
             }
             // Beacon refresh rule: freshness is the entry's mtime (the
             // metadata-only touch), not any JSON field — the beacon's body
-            // is written once and never refreshed.
+            // is written once and never refreshed. The window is the
+            // producer's recorded cadence, not the enumerator's.
+            let window = stale_window_secs(beacon.interval_ms, fallback_window_secs);
+            let fresh = (now - mtime_secs).abs() <= window;
             if !fresh {
                 let _ = handle.unlink_tolerant(&name);
                 wedged.insert(pid);
@@ -1785,6 +1874,7 @@ mod tests {
             oldest_tx_age_secs: 45.0,
             oldest_tx_label: Some("test_span".to_string()),
             updated_at: now_epoch_secs(),
+            interval_ms: 5_000,
         }
     }
 
@@ -1916,6 +2006,7 @@ mod tests {
             pid,
             process_role: "session".to_string(),
             started_at: process_start_time_secs(std::process::id()).unwrap_or(0),
+            interval_ms: 5_000,
         }
     }
 
@@ -2212,6 +2303,93 @@ mod tests {
         // `uninspectable_pids` is realistically non-empty — that's exactly
         // the condition this fix now surfaces instead of silently ignoring.
         drop(file);
+    }
+
+    /// Producer-cadence regression: freshness is judged against the cadence
+    /// RECORDED in the entry, not the enumerating daemon's interval — a
+    /// session sweeping on an independently slower configured interval must
+    /// not be misread as stale by a faster-ticking daemon.
+    #[test]
+    #[cfg(unix)]
+    fn heartbeat_freshness_uses_producer_cadence_not_enumerator_interval() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("khive.db.walpin");
+        let pid = std::process::id();
+
+        let mut slow = heartbeat(pid);
+        slow.interval_ms = 60_000;
+        slow.updated_at = now_epoch_secs() - 30;
+        write_heartbeat(&dir, &slow).unwrap();
+
+        // Enumerator ticking at 500ms: its own window would be 1.5s and the
+        // 30s-old heartbeat would look stale, but the producer's recorded
+        // 60s cadence keeps it fresh.
+        let report = enumerate_live(&dir, Duration::from_millis(500)).unwrap();
+        assert_eq!(
+            report.reporting().count(),
+            1,
+            "a heartbeat 30s old under a recorded 60s cadence is fresh: {report:?}"
+        );
+
+        // Control: the same 30s-old timestamp under a recorded 1s cadence
+        // IS stale — the recorded cadence cuts both ways.
+        let mut fast = heartbeat(pid);
+        fast.interval_ms = 1_000;
+        fast.updated_at = now_epoch_secs() - 30;
+        write_heartbeat(&dir, &fast).unwrap();
+        let report = enumerate_live(&dir, Duration::from_secs(60)).unwrap();
+        assert_eq!(report.reporting().count(), 0);
+        assert_eq!(report.unknown_pids().collect::<Vec<_>>(), vec![pid]);
+    }
+
+    /// A FIFO planted at a sidecar entry name must be refused as `Unknown`
+    /// without blocking enumeration — a plain `open(O_RDONLY)` on a
+    /// writer-less FIFO would hang the daemon's checkpoint task forever.
+    #[test]
+    #[cfg(unix)]
+    fn fifo_sidecar_entry_is_refused_without_blocking() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("khive.db.walpin");
+        let pid = std::process::id();
+        write_beacon(&dir, &beacon(pid)).unwrap();
+
+        use std::os::unix::ffi::OsStrExt;
+        let fifo = dir.join("999999941.json");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c_path` is NUL-terminated; mkfifo creates a new node.
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed: {}", io::Error::last_os_error());
+
+        let report = enumerate_live(&dir, Duration::from_secs(5)).unwrap();
+        assert!(
+            report.unknown_pids().any(|p| p == 999_999_941),
+            "a FIFO entry must classify its PID as unknown: {report:?}"
+        );
+        assert_eq!(
+            report.registered_silent_pids().collect::<Vec<_>>(),
+            vec![pid]
+        );
+    }
+
+    /// An oversized sidecar entry must be refused as `Unknown` with a
+    /// bounded read — this module never writes bodies anywhere near the
+    /// cap, so an oversized entry is foreign, and reading it unboundedly
+    /// would let a same-uid process balloon enumeration.
+    #[test]
+    #[cfg(unix)]
+    fn oversized_sidecar_entry_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("khive.db.walpin");
+        let pid = std::process::id();
+        write_beacon(&dir, &beacon(pid)).unwrap();
+
+        fs::write(dir.join("999999942.json"), vec![b'x'; 128 * 1024]).unwrap();
+
+        let report = enumerate_live(&dir, Duration::from_secs(5)).unwrap();
+        assert!(
+            report.unknown_pids().any(|p| p == 999_999_942),
+            "an oversized entry must classify its PID as unknown: {report:?}"
+        );
     }
 
     /// Identity-comparison regression: a holder that opened the database
