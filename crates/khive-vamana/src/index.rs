@@ -3471,6 +3471,41 @@ fn mmap_vectors(path: &Path, expected_len_f32: usize) -> Result<VectorStorage> {
 /// In the `None` cases the caller should treat the segment as Cold and proceed
 /// to build. Returns `Err` only for unexpected IO failures (not `NotFound`).
 #[cfg(feature = "mmap")]
+/// Extended commit metadata: the corpus fingerprint plus the write-log
+/// watermark trailer. `last_applied_seq` is `None` for pre-amendment (short
+/// layout) records — the ADR-079 Amendment 1 classifier treats that as Cold.
+pub struct PersistedCommitInfo {
+    pub vector_count: u64,
+    pub dimensions: u64,
+    pub content_hash: [u8; 32],
+    pub last_applied_seq: Option<u64>,
+}
+
+/// Read the full v2 commit record from `path/metadata.bin`.
+///
+/// Same absence/corruption semantics as [`read_commit_fingerprint`]:
+/// `Ok(None)` for a missing file, v1 magic, or an unparseable record.
+pub fn read_commit_info(path: &Path) -> Result<Option<PersistedCommitInfo>> {
+    let metadata_path = path.join("metadata.bin");
+    let bytes = match fs::read(&metadata_path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    if bytes.len() < 8 || &bytes[..8] != V2_COMMIT_MAGIC {
+        return Ok(None);
+    }
+    match parse_v2_commit(&bytes) {
+        Ok(commit) => Ok(Some(PersistedCommitInfo {
+            vector_count: commit.fingerprint.vector_count,
+            dimensions: commit.fingerprint.dimensions,
+            content_hash: commit.fingerprint.content_hash,
+            last_applied_seq: commit.last_applied_seq,
+        })),
+        Err(_) => Ok(None),
+    }
+}
+
 pub fn read_commit_fingerprint(path: &Path) -> Result<Option<PersistedFingerprint>> {
     let metadata_path = path.join("metadata.bin");
     let bytes = match fs::read(&metadata_path) {

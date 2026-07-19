@@ -225,15 +225,19 @@ impl KnowledgeHandlers {
             // atom-iteration order persists a hash the warm path always reads as stale.
             match vamana::load_and_build_from_vector_store(runtime, token, model_name).await {
                 Ok(Some(bridge)) => {
-                    let bridge = bridge.with_generation(build_generation);
                     let n = bridge.num_vectors();
                     ann_count = Some(n);
-                    if let Err(e) = vamana::persist_ann_v2(runtime, &ns, model_name, &bridge) {
-                        tracing::error!(error = %e, "failed to persist v2 Vamana segments");
-                        ann_failed = true;
-                    }
                     let key = vamana::AnnKey::new(&ns, model_name);
-                    vamana::install_if_fresher(ann, &key, bridge).await;
+                    vamana::checkpoint_raise_compact_readopt(
+                        runtime,
+                        ann,
+                        &key,
+                        &ns,
+                        model_name,
+                        bridge,
+                        build_generation,
+                    )
+                    .await;
                     eprintln!("  Vamana ANN built ({n} vectors)");
                 }
                 Ok(None) => {}

@@ -15,6 +15,7 @@ pub use index::{
     corpus_content_hash, CorpusFingerprint, PersistedFingerprint, VamanaIndex, VamanaIndexSnapshot,
     VamanaSnapshot, VAMANA_SNAPSHOT_FORMAT, VAMANA_SNAPSHOT_VERSION,
 };
+pub use index::{read_commit_info, PersistedCommitInfo};
 
 /// Build a Vamana index from a flat row-major vector slice.
 pub fn build(vectors: &[f32], config: VamanaConfig) -> Result<VamanaIndex> {
