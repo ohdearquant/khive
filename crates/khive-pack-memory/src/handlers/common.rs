@@ -1222,7 +1222,7 @@ async fn collect_model_ann_hits_inner(
     ann_overfetch_max_rounds: usize,
     ann_ready_timeout_ms: u64,
 ) -> Result<PerModelAnnHits, RuntimeError> {
-    let key = AnnKey::new(ns, &model_name);
+    let key = AnnKey::new(&model_name);
 
     // Global ANN search widens only when namespace post-filtering leaves too few hits.
     // A stale installed graph remains the immediate fallback and triggers background

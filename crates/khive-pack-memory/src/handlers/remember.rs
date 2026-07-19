@@ -136,7 +136,7 @@ impl MemoryPack {
             };
             for model in affected_models {
                 // Bump BEFORE warming so this write is included in the required generation floor.
-                let key = ann::AnnKey::from_token(write_token, &model);
+                let key = ann::AnnKey::from_token(&model);
                 ann::bump_generation(&self.ann, &key).await;
                 ann::ensure_ann_background(&self.runtime, write_token, &self.ann, &model).await;
             }

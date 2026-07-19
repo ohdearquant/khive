@@ -1105,7 +1105,7 @@ mod tests {
         // Simulate the daemon's boot-time background warm holding the
         // per-model single-flight lock mid-build (ann.rs `model_warm_lock`),
         // exactly the contention #836 diagnosed.
-        let key = crate::ann::AnnKey::new("local", MODEL);
+        let key = crate::ann::AnnKey::new(MODEL);
         let _held = crate::ann::hold_model_warm_lock_for_test(&ann_handle, &key).await;
 
         let start = std::time::Instant::now();
@@ -1214,7 +1214,7 @@ mod tests {
         builder.register(pack);
         let registry = builder.build().expect("registry");
 
-        let key = crate::ann::AnnKey::new("local", MODEL);
+        let key = crate::ann::AnnKey::new(MODEL);
         let _held = crate::ann::hold_model_warm_lock_for_test(&ann_handle, &key).await;
 
         let result = registry
@@ -1298,7 +1298,7 @@ mod tests {
         // The detached build must keep running after the timed-out recall
         // returns — poll the ANN cache directly (mirrors ann.rs's own
         // #812/#844 convergence tests) rather than sleeping a fixed amount.
-        let key = crate::ann::AnnKey::new("local", MODEL);
+        let key = crate::ann::AnnKey::new(MODEL);
         let mut warmed = false;
         for _ in 0..300 {
             if crate::ann::is_current(&ann_handle, &key).await {
