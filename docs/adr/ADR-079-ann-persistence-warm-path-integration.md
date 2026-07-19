@@ -456,6 +456,62 @@ the checkpoint cadence.
 - ADR-052's incremental-insert trade-off (§3 note) now also governs the restart tail-apply window;
   the same consolidation-cadence mitigation applies.
 
+### Crash-consistency ordering
+
+The design admits exactly three failure windows; each degrades to a cheaper-or-equal recovery,
+never to serving a stale-but-adopted index.
+
+1. **Vector write vs. log append**: same SQLite transaction, so no window exists. A rolled-back
+   transaction leaves neither the vector nor the log row. `AUTOINCREMENT` (not bare rowid) is
+   specified because it guarantees strictly monotone, never-reused `seq` values even across
+   deletes — the watermark comparison depends on that monotonicity.
+2. **Crash between `save_atomic` and log compaction**: the segment commits (staged files, fsync,
+   rename, commit magic — existing v2 semantics) carrying `last_applied_seq = S` atomically
+   inside its commit record. Compaction (`DELETE ... WHERE seq <= S`) runs only after the commit.
+   A crash in between leaves log rows with `seq <= S`, which the classifier's strict
+   `seq > last_applied_seq` filter ignores; the next checkpoint re-compacts. Idempotent,
+   harmless.
+3. **Crash between `save_atomic` and mmap re-adoption**: adoption reopens the segment that was
+   just committed, so a crash before the swap simply means the next start classifies that same
+   segment Hot and mmaps it then. Adoption never runs ahead of commit, so "stale-but-adopted" is
+   unreachable by construction: the swap replaces an Owned index whose logical content is
+   identical to the committed segment.
+
+File-replacement safety: `save_atomic` stages and renames; a previously established mapping pins
+the old inode (POSIX) until the old index Arc drops, so in-flight queries on the prior map never
+observe torn bytes.
+
+### `ann_rebuild_threshold` default — why 20%
+
+Tail replay is per-row: one primary-key embedding read plus one ADR-052 incremental insert
+(greedy-search dominated, single-threaded, ~2-3 ms/vector at the current ~553K-vector scale).
+Full rebuild amortizes the same greedy inserts with batch locality and parallelism at roughly
+0.5-0.7 ms/vector (the measured 4-6 minute rebuild). The cost crossover therefore sits near
+20-25% of `vector_count`; past it, replay approaches rebuild latency while yielding a
+worse-conditioned graph (accumulated tombstones, no consolidation). 20% is the conservative side
+of that crossover. Worst-case replay just under threshold at current scale: ~110K rows ≈ 3-4
+minutes — bounded by the same ceiling as today's rebuild, and §2 serve-stale applies throughout.
+The expected case is orders of magnitude smaller: a typical restart tail is one session's writes
+(hundreds to low thousands of rows), i.e. seconds.
+
+### Lever inventory (full residency budget, with projections)
+
+Levers named per review request, including rejected ones, at current corpus (~553K entity/note +
+~358K knowledge-section vectors, 384-d f32):
+
+| Lever                                                            | Projected saving                                                                                                              | Cost / risk                                                                                      | Disposition                                                                                                                                                                               |
+| ---------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Mmap re-adoption (this amendment, §B)                            | ~1.4 GB anonymous → file-backed                                                                                               | swap seam only; machinery exists                                                                 | **Phase 1 (this amendment)**                                                                                                                                                              |
+| Write-log classifier (this amendment, §A)                        | restart: minutes of rebuild CPU + transient GBs → one SQL read                                                                | one log append per vector write                                                                  | **Phase 1 (this amendment)**                                                                                                                                                              |
+| SQ8/int8 resident tier (`GsSq8Codec`, already in-tree)           | 4× on vector bytes: ~1.4 GB → ~350 MB of page-cache working set post-mmap                                                     | recall-quality regression must be benchmarked against current baselines; full re-index per model | **Phase 2, benchmark-gated; must not block phase 1**                                                                                                                                      |
+| SQLite per-connection budgets                                    | 64 MB page cache × up to 9 connections × N databases authorizes >1 GB; dropping `cache_size` to 16 MB bounds it at ~150 MB/DB | possible hit-rate regression on hot query shapes; needs measurement, not guesswork               | **Follow-up (#1129)**; independent of Vamana. Note `mmap_size=1GB` is file-backed/clean and is not the problem                                                                            |
+| Lazy knowledge warm (defer `warm_all` knowledge until first use) | pre-amendment: ~550 MB + rebuild CPU at boot                                                                                  | first-query latency spike; complexity in serving gates                                           | **Rejected — obsoleted by phase 1**: post-amendment, warm is an mmap open + graph load (sub-second, tens of MB anonymous), so eager warm keeps first-query latency flat at near-zero cost |
+| Mmap `graph.bin` adjacency as well as vectors                    | ~100-150 MB (adjacency + id maps stay anonymous in phase 1)                                                                   | graph access pattern is pointer-chasing — page-fault sensitivity needs benchmarking              | **Deferred**; noted for a later phase if the post-phase-1 profile still warrants it                                                                                                       |
+| Embedder cache                                                   | ~6 MB (capacity 4000)                                                                                                         | none                                                                                             | Not worth touching                                                                                                                                                                        |
+
+Projected steady-state anonymous footprint after phase 1: graph + id-map + lifecycle ≈ 100-300 MB
+(from ~2.5-3 GB). Phase 2 then shrinks the file-backed working set itself.
+
 ### References (amendment)
 
 - Measurements: issues #1126/#1127 companion daemon-resource investigation (2026-07-19); read-only
