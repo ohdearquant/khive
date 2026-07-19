@@ -16,9 +16,12 @@ phase_forward_deployed() {
     echo "=== Forward-Deployed Crates Check ==="
     # Excluded workspace crates (forward-deployed infrastructure) must still compile,
     # pass clippy under -D warnings across all targets, and pass their test suite.
-    RUSTFLAGS="-D warnings" cargo check --manifest-path "$SCRIPT_DIR/../crates/khive-merge/Cargo.toml" --all-targets
-    cargo clippy --manifest-path "$SCRIPT_DIR/../crates/khive-merge/Cargo.toml" --all-targets -- -D warnings
-    cargo test --manifest-path "$SCRIPT_DIR/../crates/khive-merge/Cargo.toml"
+    # khive-merge declares its own [workspace] table, so it resolves a separate
+    # dependency graph from crates/Cargo.lock and needs its own committed lock and
+    # its own --locked for the phase_lockfile guarantee above to cover it too.
+    RUSTFLAGS="-D warnings" cargo check --manifest-path "$SCRIPT_DIR/../crates/khive-merge/Cargo.toml" --all-targets --locked
+    cargo clippy --manifest-path "$SCRIPT_DIR/../crates/khive-merge/Cargo.toml" --all-targets --locked -- -D warnings
+    cargo test --manifest-path "$SCRIPT_DIR/../crates/khive-merge/Cargo.toml" --locked
 }
 
 phase_lint() {
@@ -47,7 +50,7 @@ phase_no_stubs() {
     # shellcheck disable=SC2086
     cargo clippy --workspace --lib --bins -- $NOSTUB_LINTS
     # shellcheck disable=SC2086
-    cargo clippy --manifest-path "$SCRIPT_DIR/../crates/khive-merge/Cargo.toml" --lib --bins -- $NOSTUB_LINTS
+    cargo clippy --manifest-path "$SCRIPT_DIR/../crates/khive-merge/Cargo.toml" --lib --bins --locked -- $NOSTUB_LINTS
 }
 
 phase_clippy() {
@@ -130,7 +133,7 @@ phase_macos_pr_check() {
     # release, and end-to-end suite twice. The excluded khive-merge crate needs an
     # explicit check because it is not a workspace member.
     cargo check --workspace --all-targets --all-features
-    RUSTFLAGS="-D warnings" cargo check --manifest-path "$SCRIPT_DIR/../crates/khive-merge/Cargo.toml" --all-targets
+    RUSTFLAGS="-D warnings" cargo check --manifest-path "$SCRIPT_DIR/../crates/khive-merge/Cargo.toml" --all-targets --locked
 }
 
 phase_macos_pr_tests() {
