@@ -26,6 +26,7 @@ rand = { version = "0.8", default-features = false, features = ["std_rng"] }
 serde = { workspace = true }
 thiserror = { workspace = true }
 blake3 = { workspace = true }
+uuid = { workspace = true }
 khive-quant = { version = "0.5.0", path = "../khive-quant", default-features = false }
 
 [dev-dependencies]
