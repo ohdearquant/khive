@@ -161,6 +161,16 @@ pub trait BlobStore: Send + Sync + std::fmt::Debug + 'static {
     /// Whether an object currently exists for `content_ref`.
     async fn exists(&self, content_ref: &ContentRef) -> StorageResult<bool>;
 
+    /// The size in bytes of the object stored under `content_ref`, without
+    /// hydrating its bytes.
+    ///
+    /// Returns `Ok(None)` when no object exists for this reference — this is
+    /// the existence check and the size read in one call, so a caller never
+    /// pays for a full read just to answer "does this exist and how big is
+    /// it". On the filesystem backend this maps to a file metadata stat; on
+    /// an object-storage backend it maps to a `HEAD Object` request.
+    async fn size(&self, content_ref: &ContentRef) -> StorageResult<Option<u64>>;
+
     /// Remove the object stored under `content_ref`.
     ///
     /// Returns `true` when an object was actually removed, `false` when

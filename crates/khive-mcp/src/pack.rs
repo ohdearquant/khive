@@ -10,6 +10,8 @@ pub use khive_runtime::{KhiveRuntime, PackRegistry, VerbRegistryBuilder};
 // included by the linker. These are the only direct references to the pack
 // crate types inside `khive-mcp`.
 #[doc(hidden)]
+pub use khive_pack_blob::BlobPack as _BlobPack;
+#[doc(hidden)]
 pub use khive_pack_brain::BrainPack as _BrainPack;
 #[doc(hidden)]
 pub use khive_pack_code::CodePack as _CodePack;
