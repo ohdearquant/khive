@@ -1140,17 +1140,29 @@ fn proc_mount_restricts_visibility(options: &str) -> bool {
     })
 }
 
-/// Linux: locate the procfs mount backing `/proc` in `/proc/self/mountinfo`
-/// and classify whether its options restrict per-PID visibility. Returns
-/// `None` when the mountinfo file can't be read, no `/proc` entry with
-/// `fstype proc` is found, or a line can't be parsed into the expected
-/// `mountinfo` shape (`man 5 proc`) — the caller treats `None` the same as
+/// Linux: locate every procfs mount backing `/proc` in
+/// `/proc/self/mountinfo` and classify whether any of them restricts
+/// per-PID visibility. Mounts stack: a later `/proc` mount shadows an
+/// earlier one while both records remain in mountinfo, and picking a single
+/// record would let a clean shadowed mount mask a restricted visible one.
+/// Selection is therefore ANY-restrictive across every matching record —
+/// ordering-independent and fail-closed against stacking. Returns `None`
+/// when the mountinfo file can't be read or no `/proc` entry with
+/// `fstype proc` is found — the caller treats `None` the same as
 /// "restricted": an unparsable mountinfo carries no positive proof the
 /// walk saw every host PID either, so it fails closed rather than assuming
 /// a clean mount.
 #[cfg(target_os = "linux")]
 fn proc_mount_is_visibility_restricted() -> Option<bool> {
     let mountinfo = fs::read_to_string("/proc/self/mountinfo").ok()?;
+    proc_mounts_restricted_in(&mountinfo)
+}
+
+/// Pure classification over mountinfo content, split out so the
+/// any-restrictive selection is testable without a live `/proc`.
+#[cfg(target_os = "linux")]
+fn proc_mounts_restricted_in(mountinfo: &str) -> Option<bool> {
+    let mut found_any = false;
     for line in mountinfo.lines() {
         // mountinfo line shape:
         //   <id> <parent-id> <major:minor> <root> <mount-point>
@@ -1169,12 +1181,18 @@ fn proc_mount_is_visibility_restricted() -> Option<bool> {
             continue;
         }
         let super_options = super_fields.get(2).copied().unwrap_or("");
-        return Some(
-            proc_mount_restricts_visibility(mount_options)
-                || proc_mount_restricts_visibility(super_options),
-        );
+        found_any = true;
+        if proc_mount_restricts_visibility(mount_options)
+            || proc_mount_restricts_visibility(super_options)
+        {
+            return Some(true);
+        }
     }
-    None
+    if found_any {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 /// Linux OS-derived census (ADR-091 Amendment 2 review, item a): scan
@@ -2372,6 +2390,34 @@ mod tests {
         // A bare `hidepid` flag with no value is treated as restricting —
         // the kernel's default nonzero behavior, not a proven-clean mount.
         assert!(proc_mount_restricts_visibility("rw,hidepid"));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn proc_mounts_restricted_in_is_any_restrictive_across_stacked_mounts() {
+        // Mounts stack: a later /proc mount shadows an earlier one while
+        // both records stay in mountinfo. Selection must be ANY-restrictive
+        // across every matching record — a clean shadowed mount must not
+        // mask a restricted visible one, in either record order.
+        let clean = "36 25 0:16 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw";
+        let restricted = "99 25 0:34 / /proc rw,relatime - proc proc rw,hidepid=2";
+        let clean_then_restricted = format!("{clean}\n{restricted}");
+        let restricted_then_clean = format!("{restricted}\n{clean}");
+        assert_eq!(proc_mounts_restricted_in(clean), Some(false));
+        assert_eq!(proc_mounts_restricted_in(restricted), Some(true));
+        assert_eq!(
+            proc_mounts_restricted_in(&clean_then_restricted),
+            Some(true)
+        );
+        assert_eq!(
+            proc_mounts_restricted_in(&restricted_then_clean),
+            Some(true)
+        );
+        // No /proc procfs record at all → None (caller fails closed).
+        assert_eq!(
+            proc_mounts_restricted_in("36 25 0:16 / /sys rw - sysfs sysfs rw"),
+            None
+        );
     }
 
     #[test]
