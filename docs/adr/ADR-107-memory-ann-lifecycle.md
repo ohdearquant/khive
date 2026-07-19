@@ -5,6 +5,40 @@
 **Depends on**: [ADR-021](ADR-021-memory-pack.md) (Memory Pack), [ADR-079](ADR-079-ann-persistence-warm-path-integration.md) (ANN persistence warm-path integration, knowledge pack scope)
 **References**: issue #791, PR #812
 
+## Supersession note (2026-07-19)
+
+[ADR-079](ADR-079-ann-persistence-warm-path-integration.md) Amendment 1's global-scope-consumer
+addendum extends the delta-log/watermark restart classifier to the memory pack's note index. Two
+provisions of this ADR are superseded by it. The supersession takes effect when the Amendment 1
+implementation for this consumer lands; until then the hash-based restart validation specified
+here remains the operative mechanism in shipped code:
+
+- **The scope exclusion.** The Context statement that ADR-079 "explicitly excludes memory-pack
+  migration" and that this ADR "does not extend ADR-079's scope to the memory pack" no longer
+  holds: the memory note index is Amendment 1's canonical global-scope consumer, registering one
+  wildcard `(consumer, '*', embedding_model, watermark)` row.
+- **§4 Restart validation.** The persisted `CorpusContentHash` and its full restart re-scan are
+  replaced by Amendment 1's decision table: restart freshness is established by comparing the
+  segment's committed `last_applied_seq` watermark against the `ann_write_log` tail under the
+  consumer's own corpus predicate, with final-state tail replay for small tails. The two gaps §4's
+  hash closed remain closed by construction — same-cardinality replacement appends log rows (tail
+  non-empty → Stale, never Hot), and the watermark is captured in the same SQLite read snapshot as
+  the build's corpus scan, so no separately-sampled-signal race exists. §4's requirement is
+  retired, not weakened: a restart never trusts a segment on count/dimension agreement alone.
+
+One consequence of the replacement is a new obligation on §4's reindex discussion: Amendment 1's
+write-path rule (every vector mutation appends a log row in the same transaction) now binds every
+write path, including `kkernel reindex`'s direct embedding overwrites. A re-embed that bypassed the
+log would classify Hot on stale bytes at the next restart; the reindex path must therefore append
+`upsert` log rows for every row it overwrites (its snapshot-row deletion becomes moot once the
+JSON snapshot path is retired).
+
+Everything else in this ADR remains normative and unchanged: the stale bound (§1), the
+write-generation bump / high-water re-enqueue rebuild trigger and non-eviction contract (§2), Cold
+behavior (§3), the durable-epoch cross-process invalidation for warm daemons (§4's epoch
+paragraphs), and deletion filtering (§5). The classifier replaces only what a restart validates
+against — not the in-process eventual-consistency contract.
+
 ## Context
 
 [ADR-021](ADR-021-memory-pack.md) specifies `memory.recall`'s scoring and candidate-scoping
@@ -234,9 +268,9 @@ leaking through.
   documented) are not served by this contract and must poll `memory.recall` or wait
   for the rebuild to observably complete via `memory.feedback`/index inspection; this
   ADR does not add a synchronous variant.
-- Future work extending ADR-079's v2 segment format to the memory pack would supersede
-  §4's memory-pack-specific hash with ADR-079's own content-hash mechanism; that
-  migration is out of scope for this ADR.
+- ADR-079 Amendment 1's global-scope addendum has since extended its delta-log/watermark
+  classifier to the memory index, superseding §4's memory-pack-specific hash — see the
+  Supersession note at the top of this ADR.
 - A write that lands after the self-driving re-enqueue loop (§2) has already fully
   exited — whether by converging or by hitting its 3-attempt cap — does not need a
   normal write-path call to `ensure_ann_background` to be picked up: if the

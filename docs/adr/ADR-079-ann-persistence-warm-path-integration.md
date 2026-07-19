@@ -146,9 +146,10 @@ snapshot store (`khive-retrieval/src/persist/core.rs`), the admin reindex invali
 knowledge pack's own rows** (`index_type='vamana'` under the `{ns}::vamana::{model}` key): the bridge
 stops _writing_ them and, on first warm after upgrade, ignores any present-but-orphaned knowledge row
 (a rebuild produces v2 segments instead). The table itself and every other consumer's rows are
-untouched. **No table-drop migration is in scope.** Migrating the memory pack and the
-retrieval-persist layer onto v2 segments — if ever desired — is a separate ADR coordinating all
-consumers and all create sites.
+untouched. **No table-drop migration is in scope.** The memory pack's migration onto v2 segments
+is now specified by Amendment 1's global-scope-consumer addendum below (coordinated through the
+ADR-107 supersession note); the retrieval-persist layer remains out of scope and would need its
+own coordination across consumers and create sites.
 
 This is consistent with khive's data-vs-view principle: the authoritative vectors remain in the
 vector store; the ANN segment directory is a rebuildable index over them, not a second source of
@@ -375,7 +376,11 @@ testable. Step 0 is the precondition; steps 1–2 land the #322 root-cause fix a
 
 ## Amendment 1 — Delta-log restart classifier and mmap re-adoption (2026-07-19)
 
-**Status**: Proposed
+**Status**: Accepted
+
+This acceptance covers the design. Prior mechanisms remain operative in shipped code until the
+implementation lands; the ADR-107 supersession note carries the same boundary for the memory
+consumer.
 
 ### Context
 
@@ -455,6 +460,14 @@ CREATE TABLE ann_consumer_watermark (
   | 7 | tail rows exist, tail count ≤ `ceil(ann_rebuild_threshold × live vector_count)`                            | **Stale-tail**: mmap load, then final-state tail replay (below). §2 serve-stale applies while the tail applies. Rules 7-8 are reachable only with live vector count > 0 (rule 5 matched first otherwise)                                                                                                                              |
   | 8 | tail count above threshold                                                                                 | **Stale-rebuild** (amends the §2 state table): the checksum-valid segment loads and serves under the existing `ann_serve_stale` gate while a full rebuild runs in the background. The threshold is a cost decision, not evidence of unreadability — it never demotes a loadable segment to Cold/FTS-only                              |
 
+- **Evaluation order of rules 5 and 6.** An implementation may test rule 6's tail predicate (a
+  log-table-only query) before rule 5's live count, and adopt Hot without ever running the live
+  count. The outcomes coincide: with an empty tail, the committed segment already reflects every
+  logged op at or below `S`, so a zero-live scope implies the segment itself holds zero live
+  vectors and adoption serves exactly what Empty serves. This ordering is what makes the Hot
+  path's zero-corpus-IO property literal — the live corpus count is executed only when a tail
+  exists (rules 5, 7, and 8), where corpus-scale work is already inherent.
+
 - **Tail replay is a final-state delta, not an event replay.** Coalesce the tail to the highest
   `seq` per `subject_id`; only the final op is applied. A final `upsert` resolves the subject's
   existing ordinal through the bridge's uuid→ordinal reverse map, tombstones it when present, then
@@ -496,17 +509,55 @@ CREATE TABLE ann_consumer_watermark (
      `S`, the consumer raises its row monotonically
      (`UPDATE ... SET watermark = MAX(watermark, S)`); a crash in between leaves the smaller
      registered watermark, which under-compacts — safe.
-  3. **Compact through the registry minimum only.** Compaction deletes rows with
-     `seq <= (SELECT MIN(watermark) FROM ann_consumer_watermark WHERE namespace=? AND
-     embedding_model=?)` for the pair — never a checkpoint-local `seq <= S`. An empty row set
-     yields no deletion (consistent with rule 2's compaction ban). Never above any registered
-     watermark.
+  3. **Compact through the registry minimum only.** Compaction for a pair
+     `(namespace, embedding_model)` constrains the delete to that pair explicitly — `seq` values
+     are database-global, so an unconstrained delete would erase other pairs' tails:
+     `DELETE FROM ann_write_log WHERE namespace = ?ns AND embedding_model = ?model AND
+     seq <= (SELECT MIN(watermark) FROM ann_consumer_watermark WHERE (namespace = ?ns OR
+     namespace = '*') AND embedding_model = ?model)` — never a checkpoint-local `seq <= S`. This
+     wildcard-inclusive form is the universal pair-compaction query: wildcard rows are global-scope
+     consumers' registrations (see "Global-scope consumers" below), and a database with none
+     reduces the query to the per-namespace minimum. An empty row set yields NULL, `seq <= NULL`
+     matches nothing, so an unregistered pair never compacts (consistent with rule 2's compaction
+     ban). Never above any registered watermark.
 
   Operational note: a decommissioned consumer's registry row pins the pair's `MIN` at its last
   watermark, so the log for that `(namespace, embedding_model)` grows unbounded until an operator
   removes the row. Removal is an administrative action and is safe precisely because of decision
   rule 4: a returning consumer finds its row absent, re-registers at 0, and rebuilds Cold instead
   of trusting a segment whose tail may have been compacted away.
+
+- **Global-scope consumers.** Some consumers index one corpus across ALL namespaces for a model —
+  the memory pack's note index is the canonical case (a single graph over every namespace's
+  `kind = 'note' AND field = 'note.content'` rows). Per-namespace registry rows cannot represent
+  that scope: registering under any single namespace leaves the consumer's tail in every other
+  namespace unprotected, and namespaces can appear after registration. Instead:
+  1. **Wildcard registration.** A global-scope consumer registers exactly one row per model:
+     `(consumer, '*', embedding_model, watermark)`. `'*'` is not a valid namespace value, so
+     wildcard rows cannot collide with per-namespace rows. The register-at-0-before-persist and
+     monotonic post-commit raise rules apply unchanged.
+  2. **Compaction minimum includes wildcard rows.** Step 3's universal query already includes
+     wildcard rows in the pair's minimum. A global consumer thereby bounds compaction in every
+     namespace its scope contains — including a namespace whose first row appears after
+     registration, because the wildcard row is durable before the global consumer's first persist
+     and therefore before any compaction its tail must survive.
+  3. **Classification is otherwise unchanged.** A global consumer classifies and tail-reads under
+     its own corpus predicate (no namespace restriction); `seq` is a single database-wide
+     monotone sequence, so watermark comparisons are well-defined across namespaces, and decision
+     rule 4 applies to the wildcard row exactly as to a per-namespace row.
+
+  **Soft-delete visibility (join-filtered corpora).** The memory corpus excludes soft-deleted
+  notes via a join on `notes.deleted_at IS NULL`, but a note soft-delete mutates the notes row,
+  not the vector row — no log row is appended. A Hot-classified segment may therefore retain
+  soft-deleted subjects as candidates until the next vector mutation or checkpoint. This is a
+  candidate-hygiene lag, not a correctness gap: the memory recall path post-filters every ANN
+  candidate on `deleted_at IS NULL` (plus namespace visibility and expiry) before serving, so
+  deleted content is never returned. A consumer whose serve path lacks such a filter MUST NOT
+  adopt this amendment for a join-filtered corpus. For such corpora, tail replay measures "source
+  row missing" under the full corpus predicate (join included): a final `upsert` whose subject no
+  longer satisfies the predicate replays as a delete — the subject's final corpus state is
+  absence — rather than escalating to Cold, which is reserved for id-map/log state that
+  contradicts a subject the predicate still admits.
 - **Configuration (§5 amendment)**: `ann_rebuild_threshold` joins the `[retrieval]` table —
   fraction of the index's live vector count, `f64` in `(0, 1]`, default `0.20`, env
   `KHIVE_ANN_REBUILD_THRESHOLD`, CLI `--ann-rebuild-threshold`, precedence per ADR-035. The tail
@@ -567,8 +618,9 @@ never to serving a stale-but-adopted index.
 2. **Crash between `save_atomic` and log compaction**: the segment commits (staged files, fsync,
    rename, commit magic — existing v2 semantics) carrying `last_applied_seq = S` atomically
    inside its commit record. The registry raise and compaction
-   (`DELETE ... WHERE seq <= MIN(watermark)` over the pair's registered consumers, §A step 3)
-   run only after the commit, in that order. A crash before the raise leaves the smaller
+   (the pair-constrained delete of §A step 3 — outer `WHERE namespace = ?ns AND
+   embedding_model = ?model`, subquery over the pair's registered rows, wildcard rows
+   included) run only after the commit, in that order. A crash before the raise leaves the smaller
    registered watermark (under-compacts); a crash before compaction leaves log rows with
    `seq <= S`, which the classifier's strict `seq > last_applied_seq` filter ignores; the next
    checkpoint re-raises and re-compacts. Idempotent, harmless.
@@ -604,7 +656,7 @@ The expected case is orders of magnitude smaller: a typical restart tail is one 
 
 ### Lever inventory (full residency budget, with projections)
 
-Levers named per review request, including rejected ones, at current corpus (~553K entity/note +
+Levers considered, including rejected ones, at current corpus (~553K entity/note +
 ~358K knowledge-section vectors, 384-d f32):
 
 | Lever                                                            | Projected saving                                                                                                              | Cost / risk                                                                                      | Disposition                                                                                                                                                                               |
