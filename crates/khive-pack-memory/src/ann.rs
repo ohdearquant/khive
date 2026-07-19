@@ -549,8 +549,7 @@ pub(crate) async fn search_loaded(
 /// fresh-tail watermark (ADR-118), captured from the SAME read-lock guard as
 /// the search itself — one lock acquisition, so a concurrent bridge swap
 /// (a checkpoint installing a replacement) cannot pair these candidates with
-/// a different bridge's watermark (review finding: the two were previously
-/// read via separate lock acquisitions).
+/// a different bridge's watermark.
 pub(crate) async fn search_loaded_with_seq(
     ann: &SharedAnn,
     key: &AnnKey,
@@ -2005,7 +2004,7 @@ async fn fresh_tail_reresolve(
 /// Fixed ceiling for the Cold/Empty-tier capped scan (ADR-118 §3). Deriving
 /// a corpus-proportional cap (`ann_rebuild_threshold() * live`) needs an
 /// O(corpus) live-count join — appropriate for the background restart
-/// classifier, not for this per-query path (review finding). The ceiling is
+/// classifier, not for this per-query path. The ceiling is
 /// a fixed, conservative match to the ADR's own worked example (a 0.20
 /// threshold on a 68k-row corpus is ~13.6k comparisons).
 const FRESH_TAIL_CAPPED_MAX_ROWS: u64 = 20_000;
