@@ -1839,6 +1839,16 @@ async fn fresh_tail_serving(
     }
 }
 
+/// Bound on the re-resolution convergence loop below. Compaction through a
+/// registry minimum implies every registered watermark — including this
+/// consumer's own — is at or above it, so the currently published segment
+/// is always re-available at (or past) a newly observed minimum: reloading
+/// it converges. Three peers landing a checkpoint back-to-back inside a
+/// single query's read window would be pathological; the bound exists so a
+/// pathological run degrades to the ADR's floored fallback instead of
+/// looping unboundedly.
+const FRESH_TAIL_RERESOLVE_MAX_ROUNDS: u32 = 3;
+
 /// Real mismatch re-resolution (ADR-118 §1 "mismatch re-resolution"): load
 /// the currently published segment, search IT for candidates, and merge in
 /// ITS own tail above ITS own watermark — a self-consistent pair that never
@@ -1846,6 +1856,22 @@ async fn fresh_tail_serving(
 /// This load is local to the query (not installed into `ann`'s served map);
 /// `bump_generation` still forces the existing background machinery to
 /// adopt this segment for future queries.
+///
+/// A peer checkpoint can advance the registry minimum past the just-loaded
+/// segment's own watermark in the window between the load and the
+/// re-validation read below — the same compaction race the primary path
+/// (`fresh_tail_serving`) already guards against for its own tail fetch.
+/// Unlike that primary-path guard, this one can *reload*: the segment this
+/// function loads is always the currently published one, and compaction
+/// through a minimum M implies the published segment already covers M (see
+/// [`FRESH_TAIL_RERESOLVE_MAX_ROUNDS`]). So a mismatch here re-loops instead
+/// of immediately falling back to a floored scan — flooring on the first
+/// mismatch would leave the (old watermark, new minimum] window in neither
+/// the (stale) candidate set nor the (floored) tail, silently dropping
+/// committed writes. Only [`FRESH_TAIL_RERESOLVE_MAX_ROUNDS`] consecutive
+/// mismatches — peers advancing the minimum faster than this leg can load a
+/// segment for it, which should not happen at normal checkpoint cadence —
+/// fall back to that floor.
 async fn fresh_tail_reresolve(
     rt: &KhiveRuntime,
     ann: &SharedAnn,
@@ -1855,85 +1881,125 @@ async fn fresh_tail_reresolve(
     k: usize,
     new_s: u64,
 ) -> FreshTailOutcome {
-    let Some(dir) = ann_segment_dir(rt, model) else {
+    let mut expected_s = new_s;
+    for round in 1..=FRESH_TAIL_RERESOLVE_MAX_ROUNDS {
+        let Some(dir) = ann_segment_dir(rt, model) else {
+            bump_generation(ann, key).await;
+            return FreshTailOutcome::Skipped;
+        };
+        let bridge = match AnnBridge::load(&dir) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(error = %e, model, "fresh-tail: re-resolved segment load failed; skipping exact leg");
+                bump_generation(ann, key).await;
+                return FreshTailOutcome::Skipped;
+            }
+        };
+        let s_loaded = bridge.index.last_applied_seq().unwrap_or(expected_s);
+        let candidates = match bridge.search(query, k) {
+            Ok(hits) => hits,
+            Err(e) => {
+                tracing::warn!(error = %e, model, "fresh-tail: re-resolved segment search failed; skipping exact leg");
+                bump_generation(ann, key).await;
+                return FreshTailOutcome::Skipped;
+            }
+        };
+        // Force re-adoption so the background warm path installs this segment
+        // for future queries too — this load served only the current query.
         bump_generation(ann, key).await;
-        return FreshTailOutcome::Skipped;
-    };
-    let bridge = match AnnBridge::load(&dir) {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::warn!(error = %e, model, "fresh-tail: re-resolved segment load failed; skipping exact leg");
-            bump_generation(ann, key).await;
-            return FreshTailOutcome::Skipped;
-        }
-    };
-    let candidates = match bridge.search(query, k) {
-        Ok(hits) => hits,
-        Err(e) => {
-            tracing::warn!(error = %e, model, "fresh-tail: re-resolved segment search failed; skipping exact leg");
-            bump_generation(ann, key).await;
-            return FreshTailOutcome::Skipped;
-        }
-    };
-    // Force re-adoption so the background warm path installs this segment
-    // for future queries too — this load served only the current query.
-    bump_generation(ann, key).await;
 
-    #[cfg(test)]
-    {
-        if ann
-            .reresolve_race_barrier
-            .load(std::sync::atomic::Ordering::SeqCst)
+        #[cfg(test)]
         {
-            ann.reresolve_race_notify.notify_one();
-            ann.reresolve_race_release.notified().await;
+            if ann
+                .reresolve_race_barrier
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                ann.reresolve_race_notify.notify_one();
+                ann.reresolve_race_release.notified().await;
+            }
         }
-    }
 
-    // The filesystem commit-info read that produced `new_s` and this tail
-    // scan are not otherwise ordered against a concurrent checkpoint: a
-    // peer can raise the registry watermark past `new_s` and compact the
-    // now-covered log rows in between, silently dropping a committed write
-    // from a `> new_s` scan — the same compaction race the primary path
-    // (`fresh_tail_serving`) already guards against for its own tail fetch.
-    // Re-validate the registry minimum and run the tail scan inside one
-    // snapshot so no compaction can strike between the guard and the fetch.
-    let mut reader = match rt.sql().reader().await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(error = %e, model, "fresh-tail: re-resolved reader open failed; serving re-resolved candidates without further tail");
+        // The filesystem commit-info read that produced this segment and
+        // the tail scan below are not otherwise ordered against a
+        // concurrent checkpoint: a peer can raise the registry watermark
+        // past `s_loaded` and compact the now-covered log rows in between,
+        // silently dropping a committed write from a `> s_loaded` scan.
+        // Re-validate the registry minimum and run the tail scan inside one
+        // snapshot so no compaction can strike between the guard and the
+        // fetch.
+        let mut reader = match rt.sql().reader().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, model, "fresh-tail: re-resolved reader open failed; serving re-resolved candidates without further tail");
+                return FreshTailOutcome::Replace(candidates);
+            }
+        };
+        if let Err(e) = begin_read_snapshot(reader.as_mut()).await {
+            tracing::warn!(error = %e, model, "fresh-tail: re-resolved snapshot begin failed; serving re-resolved candidates without further tail");
             return FreshTailOutcome::Replace(candidates);
         }
-    };
-    if let Err(e) = begin_read_snapshot(reader.as_mut()).await {
-        tracing::warn!(error = %e, model, "fresh-tail: re-resolved snapshot begin failed; serving re-resolved candidates without further tail");
-        return FreshTailOutcome::Replace(candidates);
-    }
 
-    let floor = match registry_min_watermark_on(reader.as_mut(), model).await {
-        Ok(Some(m)) if m as u64 > new_s => m as u64,
-        Ok(_) => new_s,
-        Err(e) => {
+        let registry_min = match registry_min_watermark_on(reader.as_mut(), model).await {
+            Ok(v) => v.map(|m| m as u64),
+            Err(e) => {
+                end_read_snapshot(reader.as_mut()).await;
+                tracing::warn!(error = %e, model, "fresh-tail: re-resolved registry-min read failed; serving re-resolved candidates without further tail");
+                return FreshTailOutcome::Replace(candidates);
+            }
+        };
+
+        let coherent = match registry_min {
+            Some(m) => m <= s_loaded,
+            None => true,
+        };
+        if coherent {
+            // Coherent (these candidates, this watermark) pair: the log
+            // still retains every row above `s_loaded`, so the tail scan
+            // needs no floor beyond it.
+            let outcome = fetch_final_tail_on(reader.as_mut(), model, s_loaded, None).await;
             end_read_snapshot(reader.as_mut()).await;
-            tracing::warn!(error = %e, model, "fresh-tail: re-resolved registry-min read failed; serving re-resolved candidates without further tail");
-            return FreshTailOutcome::Replace(candidates);
+            return match outcome {
+                Ok((ops, _)) => FreshTailOutcome::Replace(merge_fresh_tail(candidates, query, ops)),
+                Err(e) => {
+                    tracing::warn!(error = %e, model, "fresh-tail: re-resolved tail fetch failed; serving re-resolved candidates without further tail");
+                    FreshTailOutcome::Replace(candidates)
+                }
+            };
         }
-    };
-    // `floor > new_s` is the ADR's floored fallback (mirrors
-    // `fresh_tail_serving`'s own mismatch floor): the registry minimum
-    // advanced again after this segment was loaded, so its (new_s, floor]
-    // window is not provably retained in the log. Scan from `floor` instead
-    // — a coherent (these candidates, this floor) pair — rather than
-    // re-resolving again; one re-validation is the terminal branch.
-    let outcome = fetch_final_tail_on(reader.as_mut(), model, floor, None).await;
-    end_read_snapshot(reader.as_mut()).await;
-    match outcome {
-        Ok((ops, _)) => FreshTailOutcome::Replace(merge_fresh_tail(candidates, query, ops)),
-        Err(e) => {
-            tracing::warn!(error = %e, model, "fresh-tail: re-resolved tail fetch failed; serving re-resolved candidates without further tail");
-            FreshTailOutcome::Replace(candidates)
+        let m = registry_min.expect("coherent=false implies registry_min is Some");
+
+        if round == FRESH_TAIL_RERESOLVE_MAX_ROUNDS {
+            // ADR-118 §1 terminal mismatch-window branch: peers advanced
+            // the registry minimum faster than this leg could converge on
+            // a published segment for it. Serve the last loaded candidates
+            // with the scan floored at the last observed minimum — a
+            // coherent (these candidates, this floor) pair, at the cost of
+            // the (s_loaded, m] window not being provably retained in the
+            // log — and force re-adoption so a future query closes it.
+            tracing::warn!(
+                model,
+                rounds = round,
+                floor = m,
+                "fresh-tail: re-resolution did not converge within {round} rounds; \
+                 serving the ADR-118 floored fallback"
+            );
+            let outcome = fetch_final_tail_on(reader.as_mut(), model, m, None).await;
+            end_read_snapshot(reader.as_mut()).await;
+            return match outcome {
+                Ok((ops, _)) => FreshTailOutcome::Replace(merge_fresh_tail(candidates, query, ops)),
+                Err(e) => {
+                    tracing::warn!(error = %e, model, "fresh-tail: floored-fallback tail fetch failed; serving re-resolved candidates without further tail");
+                    FreshTailOutcome::Replace(candidates)
+                }
+            };
         }
+
+        end_read_snapshot(reader.as_mut()).await;
+        // Reload the currently published segment next round — by the
+        // compaction invariant above it is now at or past `m`.
+        expected_s = m;
     }
+    unreachable!("the loop always returns on or before its terminal round")
 }
 
 /// Fixed ceiling for the Cold/Empty-tier capped scan (ADR-118 §3). Deriving
@@ -3898,12 +3964,16 @@ mod tests {
     /// a peer checkpoint can advance the registry minimum PAST the segment
     /// `fresh_tail_reresolve` just loaded, in the window between that load
     /// and its tail scan. The fix re-validates the registry minimum inside a
-    /// fresh snapshot before scanning and floors the scan at the new minimum
-    /// when it has moved — the same terminal floor `fresh_tail_serving`
-    /// already takes on its own mismatch. A write committed above that new
-    /// floor must still surface through the floored scan, not be silently
-    /// dropped the way it would be by a plain, unvalidated `> new_s` scan
-    /// racing against the interleaved compaction.
+    /// fresh snapshot before scanning and, on a mismatch, RELOADS the
+    /// currently published segment instead of immediately flooring the scan
+    /// — flooring on the first mismatch would leave the (old watermark, new
+    /// minimum] window in neither the stale candidate set nor the floored
+    /// tail, silently dropping a committed write in exactly that range. The
+    /// reload converges because compaction through the new minimum implies
+    /// the published segment already covers it. A write compacted into the
+    /// interleaved window must surface via the reloaded segment's own
+    /// search, and a write committed above the (now coherent) watermark
+    /// must still surface through its tail scan.
     #[tokio::test]
     #[serial(adr118_fresh_tail)]
     async fn fresh_tail_reresolve_revalidates_registry_minimum_against_interleaved_compaction() {
@@ -4006,19 +4076,20 @@ mod tests {
         // removes the (s2, s3] log window — including the write below — from
         // `ann_write_log`, and is exactly the interleaving the fix must
         // detect via its re-validated registry-minimum read.
-        rt.create_note_with_decay_for_embedding_model(
-            &token,
-            "memory",
-            None,
-            "interleave second-checkpoint write",
-            Some(0.7),
-            0.01,
-            None,
-            vec![],
-            None,
-        )
-        .await
-        .expect("create second-checkpoint note");
+        let second_checkpoint_write = rt
+            .create_note_with_decay_for_embedding_model(
+                &token,
+                "memory",
+                None,
+                "interleave second-checkpoint write",
+                Some(0.7),
+                0.01,
+                None,
+                vec![],
+                None,
+            )
+            .await
+            .expect("create second-checkpoint note");
         let (_live, tail2) = scope_counts(&rt, MODEL, s2)
             .await
             .expect("scope counts before second peer checkpoint");
@@ -4042,8 +4113,9 @@ mod tests {
             .await
             .expect("compact log through s3");
 
-        // A write above the new floor — still present in the log, not
-        // compacted away — must survive the floored scan.
+        // A write above s3 — still present in the log, not compacted away —
+        // must survive the coherent tail scan once the loop converges on
+        // the s3 segment.
         let post = rt
             .create_note_with_decay_for_embedding_model(
                 &token,
@@ -4073,19 +4145,285 @@ mod tests {
                  just return ops to merge into the stale bridge's candidates"
             ),
             FreshTailOutcome::Skipped => {
-                panic!("expected the interleaved-compaction floor fallback, not a skip")
+                panic!("expected the interleaved-compaction re-resolution to converge, not a skip")
             }
         };
         assert!(
+            candidates
+                .iter()
+                .any(|(id, _)| *id == second_checkpoint_write.id),
+            "a write compacted into the interleaved (s2, s3] window must be \
+             recovered by reloading the >= s3 segment on the second round, \
+             not silently dropped by a scan floored at s3 with candidates \
+             still pinned to the stale s2 segment: {candidates:?}"
+        );
+        assert!(
             candidates.iter().any(|(id, _)| *id == post.id),
-            "a write committed above the re-validated registry minimum must \
-             survive the floored tail scan, not be silently dropped by a \
-             scan still anchored at the stale re-resolved watermark: {candidates:?}"
+            "a write committed above the converged s3 watermark must \
+             survive the coherent tail scan: {candidates:?}"
         );
         assert!(
             current_generation(&ann, &key).await > generation_before,
-            "the interleaved-compaction floor must still force re-adoption \
-             so a future query gets a fresh bridge"
+            "re-resolution must still force re-adoption so a future query \
+             gets a fresh bridge"
+        );
+    }
+
+    /// [`FRESH_TAIL_RERESOLVE_MAX_ROUNDS`]'s terminal branch: three peer
+    /// checkpoints land back-to-back, one inside each round's pause, so the
+    /// registry minimum keeps outrunning the reload before it can converge.
+    /// The first two mismatches must still recover via reload (their gap
+    /// writes are compacted INTO the next reloaded segment); only the third
+    /// — exhausting the bound — falls back to the floored scan, which
+    /// cannot see its own round's gap write but must still surface a write
+    /// that lands above the final floor.
+    #[tokio::test]
+    #[serial(adr118_fresh_tail)]
+    async fn fresh_tail_reresolve_falls_back_to_floor_after_max_rounds() {
+        const MODEL: &str = "adr118-reresolve-exhaustion-test-model";
+        const DIMS: usize = 8;
+        let rt = test_runtime_with_hash_embedder(MODEL, DIMS);
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+
+        for i in 0..3u32 {
+            rt.create_note_with_decay_for_embedding_model(
+                &token,
+                "memory",
+                None,
+                &format!("exhaustion seed note {i}"),
+                Some(0.7),
+                0.01,
+                None,
+                vec![],
+                None,
+            )
+            .await
+            .expect("create seed note");
+        }
+
+        let ann = new_shared();
+        let key = AnnKey::from_token(MODEL);
+        ensure_ann_for_model(&rt, &token, &ann, MODEL)
+            .await
+            .expect("warm");
+        let s1 = bridge_applied_seq(&ann, &key)
+            .await
+            .expect("bridge watermark after initial warm");
+
+        // First checkpoint (pre-spawn, mirrors the two-round interleave
+        // test): this is what `fresh_tail_serving` resolves `new_s` to
+        // before ever calling `fresh_tail_reresolve`.
+        let write_a = rt
+            .create_note_with_decay_for_embedding_model(
+                &token,
+                "memory",
+                None,
+                "exhaustion round-1 write",
+                Some(0.7),
+                0.01,
+                None,
+                vec![],
+                None,
+            )
+            .await
+            .expect("create round-1 write");
+        let dir = ann_segment_dir(&rt, MODEL).expect("segment dir (file-backed test runtime)");
+        let (_live, tail1) = scope_counts(&rt, MODEL, s1)
+            .await
+            .expect("scope counts before first checkpoint");
+        assert!(tail1 > 0, "sanity: a tail must exist above s1");
+        let s2 = s1 + tail1;
+        {
+            let mut peer_bridge = AnnBridge::load(&dir).expect("load persisted segment");
+            let (ops, applied) = fetch_final_tail(&rt, MODEL, s1, None)
+                .await
+                .expect("fetch tail for first checkpoint");
+            peer_bridge
+                .apply_final_ops(ops, applied)
+                .expect("apply first checkpoint");
+            peer_bridge
+                .save_atomic(&dir)
+                .expect("persist first checkpoint");
+        }
+        raise_watermark(&rt, MODEL, s2)
+            .await
+            .expect("raise registry watermark to s2");
+        compact_log(&rt, MODEL)
+            .await
+            .expect("compact log through s2");
+
+        ann.reresolve_race_barrier
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut paused = ann.reresolve_race_notify.notified();
+
+        let generation_before = current_generation(&ann, &key).await;
+        let query = fnv_to_vec("exhaustion beyond-floor write", DIMS);
+        let handle = tokio::spawn({
+            let rt = rt.clone();
+            let ann = ann.clone();
+            let key = key.clone();
+            async move { fresh_tail_leg(&rt, &ann, &key, MODEL, &query, 10, Some(s1)).await }
+        });
+
+        // Two more checkpoints, one per round's pause, each removing that
+        // round's gap write from `ann_write_log` — but each gap write is
+        // carried forward because the peer checkpoint that compacts it away
+        // also folds it into the segment this loop reloads next round.
+        let mut prev_s = s2;
+        let mut gap_writes = Vec::new();
+        for round_idx in 1..=2u32 {
+            paused.await;
+            let gap_write = rt
+                .create_note_with_decay_for_embedding_model(
+                    &token,
+                    "memory",
+                    None,
+                    &format!("exhaustion round-{} gap write", round_idx + 1),
+                    Some(0.7),
+                    0.01,
+                    None,
+                    vec![],
+                    None,
+                )
+                .await
+                .expect("create gap write");
+            let (_live, tail) = scope_counts(&rt, MODEL, prev_s)
+                .await
+                .expect("scope counts before interleaved checkpoint");
+            assert!(
+                tail > 0,
+                "sanity: a tail must exist above the prior watermark"
+            );
+            let next_s = prev_s + tail;
+            {
+                let mut peer_bridge = AnnBridge::load(&dir).expect("load segment for checkpoint");
+                let (ops, applied) = fetch_final_tail(&rt, MODEL, prev_s, None)
+                    .await
+                    .expect("fetch tail for interleaved checkpoint");
+                peer_bridge
+                    .apply_final_ops(ops, applied)
+                    .expect("apply interleaved checkpoint");
+                peer_bridge
+                    .save_atomic(&dir)
+                    .expect("persist interleaved checkpoint");
+            }
+            raise_watermark(&rt, MODEL, next_s)
+                .await
+                .expect("raise registry watermark");
+            compact_log(&rt, MODEL).await.expect("compact log");
+
+            let next_paused = ann.reresolve_race_notify.notified();
+            ann.reresolve_race_release.notify_one();
+            paused = next_paused;
+            gap_writes.push(gap_write);
+            prev_s = next_s;
+        }
+
+        // Third (terminal-round) checkpoint: its gap write lands in the
+        // window the floored fallback cannot see (round == MAX exhausts the
+        // loop before it can reload past this checkpoint).
+        paused.await;
+        let lost_write = rt
+            .create_note_with_decay_for_embedding_model(
+                &token,
+                "memory",
+                None,
+                "exhaustion round-4 lost write",
+                Some(0.7),
+                0.01,
+                None,
+                vec![],
+                None,
+            )
+            .await
+            .expect("create terminal-round gap write");
+        let (_live, tail) = scope_counts(&rt, MODEL, prev_s)
+            .await
+            .expect("scope counts before terminal checkpoint");
+        assert!(
+            tail > 0,
+            "sanity: a tail must exist above the prior watermark"
+        );
+        let s_final = prev_s + tail;
+        {
+            let mut peer_bridge = AnnBridge::load(&dir).expect("load segment for checkpoint");
+            let (ops, applied) = fetch_final_tail(&rt, MODEL, prev_s, None)
+                .await
+                .expect("fetch tail for terminal checkpoint");
+            peer_bridge
+                .apply_final_ops(ops, applied)
+                .expect("apply terminal checkpoint");
+            peer_bridge
+                .save_atomic(&dir)
+                .expect("persist terminal checkpoint");
+        }
+        raise_watermark(&rt, MODEL, s_final)
+            .await
+            .expect("raise registry watermark to s_final");
+        compact_log(&rt, MODEL)
+            .await
+            .expect("compact log through s_final");
+
+        // A write above the terminal floor must still surface through the
+        // floored fallback's own (still-real) tail scan.
+        let beyond_floor = rt
+            .create_note_with_decay_for_embedding_model(
+                &token,
+                "memory",
+                None,
+                "exhaustion beyond-floor write",
+                Some(0.7),
+                0.01,
+                None,
+                vec![],
+                None,
+            )
+            .await
+            .expect("create beyond-floor write");
+
+        ann.reresolve_race_barrier
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        ann.reresolve_race_release.notify_one();
+
+        let outcome = handle.await.expect("fresh_tail_leg task");
+        let candidates = match outcome {
+            FreshTailOutcome::Replace(candidates) => candidates,
+            FreshTailOutcome::Ops(_) => panic!(
+                "expected the terminal round to replace candidates outright, \
+                 not just return ops to merge into the stale bridge's candidates"
+            ),
+            FreshTailOutcome::Skipped => {
+                panic!("expected the bound-exhaustion floored fallback, not a skip")
+            }
+        };
+        assert!(
+            candidates.iter().any(|(id, _)| *id == write_a.id),
+            "the pre-spawn checkpoint's write must survive every reload: {candidates:?}"
+        );
+        for gap_write in &gap_writes {
+            assert!(
+                candidates.iter().any(|(id, _)| *id == gap_write.id),
+                "a gap write compacted into a NON-terminal round's reloaded \
+                 segment must be recovered, not dropped: {candidates:?}"
+            );
+        }
+        assert!(
+            !candidates.iter().any(|(id, _)| *id == lost_write.id),
+            "the terminal round's own gap write is the documented \
+             ADR-118 mismatch-window loss (its segment is never reloaded \
+             once the bound is exhausted) — it must NOT silently reappear \
+             here, or this assertion is guarding a fix that changed \
+             behavior without updating this test: {candidates:?}"
+        );
+        assert!(
+            candidates.iter().any(|(id, _)| *id == beyond_floor.id),
+            "a write committed above the terminal floor must survive the \
+             floored fallback's own tail scan: {candidates:?}"
+        );
+        assert!(
+            current_generation(&ann, &key).await > generation_before,
+            "the bound-exhaustion floored fallback must still force \
+             re-adoption so a future query gets a fresh bridge"
         );
     }
 
