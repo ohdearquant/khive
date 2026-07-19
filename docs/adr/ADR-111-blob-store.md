@@ -604,7 +604,7 @@ rejects an object exceeding its hydration ceiling before any bytes are read.
 
 ## Amendment 4 (2026-07-19): capability-by-hash authorization model
 
-**Status:** accepted. Tracked in issue #1145.
+**Status:** accepted.
 
 ### Context
 
@@ -630,24 +630,43 @@ systems, and it is the deliberate composition of three accepted contracts:
    one object regardless of who stored it; a namespace-partitioned blob keyspace would
    forfeit that property.
 
-A caller cannot enumerate or guess refs: learning a valid `ContentRef` requires either
-having stored the content, having been handed the ref, or already possessing the exact
-bytes (from which the ref is computable). `blob.get` therefore reveals nothing its caller
-could not already produce.
+A caller cannot enumerate refs: learning a valid `ContentRef` requires having stored the
+content, having been handed the ref, or possessing candidate bytes from which the ref is
+computable. For **high-entropy content** this last path requires already possessing the
+exact bytes, so `blob.get` reveals nothing its caller could not produce. For
+**low-entropy content** the derivation path is weaker — a caller can hash a dictionary of
+candidate payloads and probe each ref — and the model's guarantees are correspondingly
+weaker; the residue analysis below treats this case explicitly rather than claiming
+unguessability where none exists.
 
 ### The `blob.stat` existence residue
 
-Under global dedup, `blob.stat` is an existence oracle with a precisely bounded residue: a
-caller who already fully possesses some content can compute its ref and learn one bit —
-whether the store also holds those bytes (plus their size, which the caller already knows).
-It confirms; it never discloses. For a single-user local deployment this residue is
-accepted as-is.
+Under global dedup, `blob.stat` is an existence oracle. For **high-entropy content** the
+residue is precisely bounded: a caller who already fully possesses the bytes can learn one
+bit — whether the store also holds them (plus their size, which the caller already knows).
+It confirms; it never discloses.
 
-For multi-tenant hosted deployments where even that confirmation bit is unacceptable, the
-enforcement seam is the gate, per ADR-053: record a `(namespace, ContentRef)` ledger row at
-`blob.put` and consult it as policy input for `get`/`stat`, scoping visibility per tenant
-while the storage layer keeps physical dedup. That is deployment-tier policy configuration,
-not a local-runtime handler change, and no handler-level check may be added in its place.
+For **low-entropy content** the residue is materially larger, and this amendment names it
+rather than defining it away: a caller holding a candidate dictionary (form letters, small
+structured records, enumerable identifiers) can hash each candidate and probe `blob.stat`,
+and confirmation across a candidate set _is_ disclosure — the caller learns which
+candidate was stored. This is the confirmation-of-content attack known from cross-user
+deduplication systems, and `blob.get` on a confirmed guessable ref retrieves the object.
+Two rules follow:
+
+1. **Single-user local deployment**: the residue is accepted — there is one principal, and
+   every object in the store was placed there by that principal's own runtime.
+2. **Multi-tenant hosted deployment**: the `(namespace, ContentRef)` put-ledger at the
+   gate (ADR-053) is **mandatory at that tier, not optional**: `blob.get` and `blob.stat`
+   answer only for refs the calling tenant has put (or been granted), which closes both
+   the retrieval and the confirmation channel for guessable content while the storage
+   layer keeps physical dedup. This remains gate policy — no handler-level check may be
+   added in its place.
+
+Additionally, callers storing **sensitive low-entropy content** in any deployment should
+envelope it (client-side encryption or keyed salting) before `blob.put` — which also makes
+the resulting ref high-entropy and restores the bounded residue. This is a documented
+usage rule for consumers, not a runtime enforcement point.
 
 ### Ref-leak hygiene (binding)
 
@@ -658,10 +677,14 @@ unauthenticated callers, or telemetry that leaves the deployment boundary.
 
 ### Consequences
 
-- `blob.get`/`blob.stat` remain namespace-agnostic by design; reviews should evaluate them
-  against this model, not against a per-namespace isolation expectation.
-- Multi-tenant visibility scoping, where required, is a gate-policy deployment concern
-  (`(namespace, ContentRef)` put-ledger), preserving storage-level dedup.
+- `blob.get`/`blob.stat` remain namespace-agnostic by design in single-user local
+  deployment; reviews should evaluate them against this model, not against a
+  per-namespace isolation expectation.
+- Multi-tenant hosted deployment REQUIRES the gate-level `(namespace, ContentRef)`
+  put-ledger — the capability-by-hash model alone is insufficient there because
+  low-entropy refs are derivable from candidate dictionaries. Storage-level dedup is
+  preserved either way.
+- Sensitive low-entropy content is enveloped client-side before `blob.put` (usage rule).
 - No trait, schema, or wire change; this amendment is documentation of intent.
 
 ---
