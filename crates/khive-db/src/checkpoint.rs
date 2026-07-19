@@ -1429,12 +1429,26 @@ fn log_walpin_sidecar_report(pool: &ConnectionPool) {
                 uninspectable.sort_unstable();
                 tracing::warn!(
                     ?uninspectable,
-                    "ADR-091 Amendment 2 review follow-up: the OS-derived holder census could \
-                     not inspect these PIDs' open file descriptors (permission denied, or a \
-                     listing race) — the census is INCOMPLETE and cannot rule out one of them \
-                     holding the database file open"
+                    truncated = census.truncated,
+                    "ADR-091 Amendment 2 review follow-up: the OS-derived holder census is \
+                     INCOMPLETE — either specific PIDs' open file descriptors could not be \
+                     inspected (permission denied, or a listing race), or the enumeration walk \
+                     itself has positive evidence it did not see the full live-process universe \
+                     (namespace/visibility check, directory-iterator error, self-canary, or a \
+                     libproc buffer that stayed at capacity after bounded retries) — cannot \
+                     rule out an unregistered holder"
                 );
-                unknown_pids.extend(uninspectable);
+                if uninspectable.is_empty() {
+                    // `truncated` fired with no specific PID list (a
+                    // namespace/visibility or buffer-truncation signal, not
+                    // a per-PID inspection failure) — still makes
+                    // attribution inconclusive. Mirror the census-failure
+                    // arm below with the same non-PID sentinel rather than
+                    // silently trusting a walk we know was incomplete.
+                    unknown_pids.push(0);
+                } else {
+                    unknown_pids.extend(uninspectable);
+                }
             }
         }
         Err(e) => {

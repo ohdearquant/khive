@@ -759,17 +759,43 @@ mod windows_impl {
 /// recorded in `uninspectable_pids`: the census as a whole is then
 /// INCOMPLETE, and callers must treat that exactly like an `unknown` sidecar
 /// PID — inconclusive, never silently folded into "no unregistered holder."
+///
+/// `truncated` is a second, independent incompleteness signal (review round
+/// 4): set when the enumeration walk itself has positive evidence it did
+/// not see the full live-process universe even though no single PID's
+/// inspection outright failed — a `/proc` directory-iterator error or a
+/// PID-namespace mismatch on Linux, or a libproc buffer whose returned byte
+/// count still equalled its negotiated capacity after bounded retries on
+/// macOS. `is_complete()` folds both signals together.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CensusResult {
     pub holders: std::collections::HashSet<u32>,
     pub uninspectable_pids: Vec<u32>,
+    pub truncated: bool,
 }
 
 impl CensusResult {
     /// Every discovered PID was either confirmed as a holder or positively
-    /// ruled out — no PID's inspection failed outright.
+    /// ruled out (no PID's inspection failed outright), AND the walk itself
+    /// carries no positive evidence that it missed part of the live-process
+    /// universe.
     pub fn is_complete(&self) -> bool {
-        self.uninspectable_pids.is_empty()
+        self.uninspectable_pids.is_empty() && !self.truncated
+    }
+
+    /// ADR-091 Amendment 2 review round 4 self-canary: the sole caller
+    /// (`log_walpin_sidecar_report`) always runs inside the process whose
+    /// own SQLite connection pool holds `db_path` open, so a correct,
+    /// complete census must find `std::process::id()` among the holders it
+    /// discovered. Not finding it is positive proof the walk missed at
+    /// least one live holder. This is necessary but not sufficient — a
+    /// census that is complete apart from a *different* missed PID still
+    /// passes it — so every platform's `census_holders` applies this on top
+    /// of, never instead of, its own per-step incompleteness markers.
+    fn apply_self_canary(&mut self) {
+        if !self.holders.contains(&std::process::id()) {
+            self.truncated = true;
+        }
     }
 }
 
@@ -783,6 +809,58 @@ impl CensusResult {
 #[cfg(target_os = "macos")]
 fn macos_pid_genuinely_gone(errno: Option<i32>) -> bool {
     errno == Some(libc::ESRCH)
+}
+
+/// Bounded attempts for the macOS buffer-size negotiation below — enough to
+/// absorb the live-set growing between the sizing call and the data call a
+/// couple of times without looping forever on a pathologically fast-growing
+/// process/fd table.
+#[cfg(target_os = "macos")]
+const CENSUS_BUFFER_NEGOTIATION_ATTEMPTS: usize = 4;
+
+/// Bounded buffer-size negotiation shared by `proc_listpids` and
+/// `proc_pidinfo(PROC_PIDLISTFDS)` (ADR-091 Amendment 2 review round 4,
+/// item c — the fixed 8192-PID/4096-FD buffers used to truncate silently).
+/// Both libproc calls return the needed byte count when handed a null
+/// buffer (`size_call`); this allocates with headroom and re-invokes
+/// (`data_call`). The set being listed (all live PIDs, or one PID's open
+/// fds) can grow between the two calls, so this retries a bounded number of
+/// times; if the returned byte count still equals the buffer's capacity on
+/// the final attempt, the true set may be larger than what was captured —
+/// the second return value is `true` and the caller must not trust the
+/// result as complete.
+#[cfg(target_os = "macos")]
+fn negotiate_buffer<T: Default + Clone>(
+    size_call: impl Fn() -> std::os::raw::c_int,
+    data_call: impl Fn(*mut std::os::raw::c_void, std::os::raw::c_int) -> std::os::raw::c_int,
+) -> io::Result<(Vec<T>, bool)> {
+    let item_size = std::mem::size_of::<T>();
+    for attempt in 0..CENSUS_BUFFER_NEGOTIATION_ATTEMPTS {
+        let needed = size_call();
+        if needed <= 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let needed_items = needed as usize / item_size + 1;
+        let item_count = needed_items + needed_items / 4 + 8;
+        let mut buf: Vec<T> = vec![T::default(); item_count];
+        let cap_bytes = (buf.len() * item_size) as std::os::raw::c_int;
+        let bytes = data_call(buf.as_mut_ptr() as *mut std::os::raw::c_void, cap_bytes);
+        if bytes <= 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let filled_capacity = bytes as usize >= cap_bytes as usize;
+        let is_last_attempt = attempt + 1 == CENSUS_BUFFER_NEGOTIATION_ATTEMPTS;
+        if filled_capacity && !is_last_attempt {
+            // The live set grew to fill (or exceed) our snapshot — retry
+            // with a freshly sized buffer rather than trust a possibly
+            // partial one.
+            continue;
+        }
+        let count = (bytes as usize / item_size).min(buf.len());
+        buf.truncate(count);
+        return Ok((buf, filled_capacity));
+    }
+    unreachable!("loop always returns or errors within CENSUS_BUFFER_NEGOTIATION_ATTEMPTS")
 }
 
 /// macOS OS-derived census (ADR-091 Amendment 2 review, item a): every PID
@@ -802,6 +880,7 @@ pub fn census_holders(db_path: &Path) -> io::Result<CensusResult> {
     const MAXPATHLEN: usize = 1024;
 
     #[repr(C)]
+    #[derive(Clone, Default)]
     struct ProcFdInfo {
         proc_fd: i32,
         proc_fdtype: u32,
@@ -882,64 +961,50 @@ pub fn census_holders(db_path: &Path) -> io::Result<CensusResult> {
 
     let target = fs::canonicalize(db_path)?;
 
-    // A fixed 8k-PID buffer is pragmatic rather than growth-looped: this
-    // runs only on a TRUNCATE no-progress event (rare), and a system with
-    // >8k live PIDs exceeding this snapshot is itself out of scope for a
-    // local dev/single-tenant deployment.
-    let mut pid_buf = vec![0i32; 8192];
-    // SAFETY: `pid_buf` is a valid, appropriately-sized buffer;
-    // `proc_listpids` writes at most its byte capacity into it.
-    let bytes = unsafe {
-        proc_listpids(
-            PROC_ALL_PIDS,
-            0,
-            pid_buf.as_mut_ptr() as *mut c_void,
-            (pid_buf.len() * std::mem::size_of::<i32>()) as c_int,
-        )
-    };
-    if bytes <= 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let pid_count = (bytes as usize / std::mem::size_of::<i32>()).min(pid_buf.len());
+    // SAFETY: `negotiate_buffer` hands `proc_listpids` a buffer sized from
+    // its own reported byte count, growing on retry; the extern call writes
+    // at most the byte capacity passed to it.
+    let (pid_buf, pid_list_truncated): (Vec<i32>, bool) = negotiate_buffer(
+        || unsafe { proc_listpids(PROC_ALL_PIDS, 0, std::ptr::null_mut(), 0) },
+        |buf_ptr, buf_bytes| unsafe { proc_listpids(PROC_ALL_PIDS, 0, buf_ptr, buf_bytes) },
+    )?;
 
     let mut holders = std::collections::HashSet::new();
     let mut uninspectable: Vec<u32> = Vec::new();
-    let mut fd_buf: Vec<ProcFdInfo> = (0..4096)
-        .map(|_| ProcFdInfo {
-            proc_fd: 0,
-            proc_fdtype: 0,
-        })
-        .collect();
-    for &pid in &pid_buf[..pid_count] {
+    for &pid in &pid_buf {
         if pid <= 0 {
             continue;
         }
-        // SAFETY: `fd_buf` is a valid, appropriately-sized buffer.
-        let fd_bytes = unsafe {
-            proc_pidinfo(
-                pid,
-                PROC_PIDLISTFDS,
-                0,
-                fd_buf.as_mut_ptr() as *mut c_void,
-                (fd_buf.len() * std::mem::size_of::<ProcFdInfo>()) as c_int,
-            )
-        };
-        // A negative/zero return means either the PID exited between
-        // `proc_listpids` and here (ESRCH — positively gone, safe to skip)
-        // or the inspection itself failed (most commonly permission denied
-        // to list another user's fds). Only the former is excluded cleanly;
-        // the latter means we could not determine whether this PID holds
-        // the db, so it marks the whole census incomplete rather than being
-        // silently treated as "not a holder."
-        if fd_bytes <= 0 {
-            let errno = io::Error::last_os_error().raw_os_error();
-            if !macos_pid_genuinely_gone(errno) {
-                uninspectable.push(pid as u32);
+        // SAFETY: `negotiate_buffer` hands `proc_pidinfo` a buffer sized
+        // from its own reported byte count, growing on retry.
+        let (fd_buf, fd_list_truncated): (Vec<ProcFdInfo>, bool) = match negotiate_buffer(
+            || unsafe { proc_pidinfo(pid, PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) },
+            |buf_ptr, buf_bytes| unsafe {
+                proc_pidinfo(pid, PROC_PIDLISTFDS, 0, buf_ptr, buf_bytes)
+            },
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                // A failed sizing/listing call means either the PID exited
+                // between `proc_listpids` and here (ESRCH — positively
+                // gone, safe to skip) or the inspection itself failed (most
+                // commonly permission denied to list another user's fds).
+                // Only the former is excluded cleanly; the latter means we
+                // could not determine whether this PID holds the db, so it
+                // marks the whole census incomplete rather than being
+                // silently treated as "not a holder."
+                if !macos_pid_genuinely_gone(e.raw_os_error()) {
+                    uninspectable.push(pid as u32);
+                }
+                continue;
             }
-            continue;
+        };
+        if fd_list_truncated {
+            // This PID's fd table may be larger than what fit even after
+            // bounded retries — its inspection cannot be trusted complete.
+            uninspectable.push(pid as u32);
         }
-        let fd_count = (fd_bytes as usize / std::mem::size_of::<ProcFdInfo>()).min(fd_buf.len());
-        for fdinfo in &fd_buf[..fd_count] {
+        for fdinfo in &fd_buf {
             if fdinfo.proc_fdtype != PROX_FDTYPE_VNODE {
                 continue;
             }
@@ -955,23 +1020,46 @@ pub fn census_holders(db_path: &Path) -> io::Result<CensusResult> {
                 )
             };
             if vsize as usize != std::mem::size_of::<VnodeFdInfoWithPath>() {
+                // A non-positive return is a failed inspection call for
+                // this fd: ESRCH-equivalent (the fd/process raced away) is
+                // genuinely gone, safe to skip; any other errno means we
+                // could not determine whether THIS fd is our target, so the
+                // PID's census is incomplete rather than a clean negative.
+                if vsize <= 0 {
+                    let errno = io::Error::last_os_error().raw_os_error();
+                    if !macos_pid_genuinely_gone(errno) {
+                        uninspectable.push(pid as u32);
+                    }
+                }
                 continue;
             }
             // SAFETY: `vip_path` is NUL-terminated by the kernel on success.
             let path_cstr = unsafe { CStr::from_ptr(vinfo.pvip.vip_path.as_ptr() as *const i8) };
             let path = PathBuf::from(std::ffi::OsStr::from_bytes(path_cstr.to_bytes()));
-            if let Ok(canon) = fs::canonicalize(&path) {
-                if canon == target {
-                    holders.insert(pid as u32);
-                    break;
+            match fs::canonicalize(&path) {
+                Ok(canon) => {
+                    if canon == target {
+                        holders.insert(pid as u32);
+                        break;
+                    }
                 }
+                // The backing file was removed/renamed since the kernel
+                // reported this vnode path — genuinely not our (still
+                // extant) target, safe to skip.
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(_) => uninspectable.push(pid as u32),
             }
         }
     }
-    Ok(CensusResult {
+    uninspectable.sort_unstable();
+    uninspectable.dedup();
+    let mut census = CensusResult {
         holders,
         uninspectable_pids: uninspectable,
-    })
+        truncated: pid_list_truncated,
+    };
+    census.apply_self_canary();
+    Ok(census)
 }
 
 /// Linux: classify a `/proc/<pid>/fd` open failure. `NotFound` means the
@@ -990,13 +1078,49 @@ fn linux_proc_gone(err: &io::Error) -> bool {
 /// cannot be opened at all (most commonly permission denied) is reported as
 /// uninspectable rather than silently excluded — only a PID confirmed gone
 /// (`NotFound`, a listing/inspection race) is skipped cleanly.
+///
+/// Before trusting the walk as a GLOBAL census (review round 4, item a):
+/// `hidepid` mounts, restricted `/proc`, and non-init PID namespaces can all
+/// make `read_dir("/proc")` succeed while silently showing only a subset of
+/// the host's live PIDs — with no per-entry error to catch. Two checks
+/// widen the net rather than trust a clean-looking iteration outright: (1)
+/// `/proc/1/ns/pid` vs `/proc/self/ns/pid` — differing or unreadable means
+/// this process cannot assume it shares the visible PID namespace; NOTE
+/// this does not detect a PID namespace whose own `/proc` mount makes
+/// `/proc/1` resolve to that namespace's own init (a container's own procfs
+/// is internally self-consistent), so it is a real-but-partial defense, not
+/// a complete one — it is the `hidepid`/hard-restricted-mount case named in
+/// the review that it reliably catches. (2) any error surfacing from the
+/// `/proc` or per-PID `fd` directory ITERATORS themselves (not a single
+/// entry's own error) marks the walk incomplete rather than being dropped
+/// via `.flatten()`.
 #[cfg(target_os = "linux")]
 pub fn census_holders(db_path: &Path) -> io::Result<CensusResult> {
     let target = fs::canonicalize(db_path)?;
     let mut holders = std::collections::HashSet::new();
     let mut uninspectable: Vec<u32> = Vec::new();
+    let mut truncated = false;
 
-    for proc_entry in fs::read_dir("/proc")?.flatten() {
+    match (
+        fs::read_link("/proc/1/ns/pid"),
+        fs::read_link("/proc/self/ns/pid"),
+    ) {
+        (Ok(init_ns), Ok(self_ns)) if init_ns == self_ns => {}
+        _ => truncated = true,
+    }
+
+    let proc_dir = fs::read_dir("/proc")?;
+    for entry_result in proc_dir {
+        let proc_entry = match entry_result {
+            Ok(e) => e,
+            Err(_) => {
+                // The directory iterator itself failed mid-walk (not one
+                // entry's own error) — the walk is no longer provably a
+                // complete enumeration of live PIDs.
+                truncated = true;
+                continue;
+            }
+        };
         let Some(pid) = proc_entry
             .file_name()
             .to_str()
@@ -1013,22 +1137,52 @@ pub fn census_holders(db_path: &Path) -> io::Result<CensusResult> {
                 continue;
             }
         };
-        for fd_entry in fds.flatten() {
-            let Ok(resolved) = fs::read_link(fd_entry.path()) else {
-                continue;
-            };
-            if let Ok(canon) = fs::canonicalize(&resolved) {
-                if canon == target {
-                    holders.insert(pid);
-                    break;
+        for fd_result in fds {
+            let fd_entry = match fd_result {
+                Ok(e) => e,
+                Err(_) => {
+                    // The fd-directory iterator failed on this PID mid-walk
+                    // — its set of open fds cannot be trusted complete, so
+                    // this PID's census is incomplete rather than "no
+                    // match found."
+                    uninspectable.push(pid);
+                    continue;
                 }
+            };
+            let resolved = match fs::read_link(fd_entry.path()) {
+                Ok(r) => r,
+                // The fd itself closed between listing and this read — a
+                // genuine "positively gone" race, safe to skip.
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(_) => {
+                    uninspectable.push(pid);
+                    continue;
+                }
+            };
+            match fs::canonicalize(&resolved) {
+                Ok(canon) => {
+                    if canon == target {
+                        holders.insert(pid);
+                        break;
+                    }
+                }
+                // Non-file fd targets (sockets, pipes, anon_inodes) and
+                // since-removed paths canonicalize-fail with NotFound —
+                // genuinely not our (still extant) target, safe to skip.
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(_) => uninspectable.push(pid),
             }
         }
     }
-    Ok(CensusResult {
+    uninspectable.sort_unstable();
+    uninspectable.dedup();
+    let mut census = CensusResult {
         holders,
         uninspectable_pids: uninspectable,
-    })
+        truncated,
+    };
+    census.apply_self_canary();
+    Ok(census)
 }
 
 /// Any other Unix (khive ships macOS/Linux/Windows only; this is a
@@ -1912,12 +2066,81 @@ mod tests {
             census.holders.contains(&std::process::id()),
             "this process holds {db_path:?} open and must appear in its own OS-derived census"
         );
+        // The self-canary must NOT fire when self genuinely is discovered —
+        // it only forces `truncated` on a missing self-PID, never clears an
+        // already-set flag from something else.
+        assert!(
+            !census.truncated,
+            "self was found; the self-canary must not report truncation on its own"
+        );
         // Not asserting `is_complete()` here: an unprivileged process
         // legitimately cannot inspect every other PID's open fds on a real,
         // busy machine (other users' / root's processes), so
         // `uninspectable_pids` is realistically non-empty — that's exactly
         // the condition this fix now surfaces instead of silently ignoring.
         drop(file);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn negotiate_buffer_converges_when_the_set_stops_growing() {
+        // Simulates a live set that "grows" for the first two size probes
+        // (the data call keeps filling capacity) and then stabilizes —
+        // negotiate_buffer must retry rather than report the first,
+        // possibly-truncated snapshot as final.
+        let probe = std::cell::Cell::new(0usize);
+        let sizes = [4usize, 8, 8]; // bytes needed per size_call invocation
+        let (items, truncated) = negotiate_buffer::<i32>(
+            || {
+                let i = probe.get().min(sizes.len() - 1);
+                sizes[i] as std::os::raw::c_int
+            },
+            |_buf_ptr, buf_bytes| {
+                let i = probe.get();
+                probe.set(i + 1);
+                // First two attempts: report the buffer as exactly full
+                // (looks truncated); third attempt: report fewer bytes
+                // than capacity (a clean, complete snapshot).
+                if i < 2 {
+                    buf_bytes
+                } else {
+                    (buf_bytes as usize - 4) as std::os::raw::c_int
+                }
+            },
+        )
+        .expect("negotiation must succeed once the set stabilizes");
+        assert!(
+            !truncated,
+            "a snapshot that ends up strictly under capacity must not be marked truncated"
+        );
+        assert!(!items.is_empty());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn negotiate_buffer_reports_truncated_after_exhausting_retries() {
+        // The data call always reports the buffer as exactly full, no
+        // matter how many times negotiate_buffer retries with a larger
+        // buffer — this must give up after CENSUS_BUFFER_NEGOTIATION_ATTEMPTS
+        // and report `truncated = true` rather than loop forever or lie.
+        let (items, truncated) =
+            negotiate_buffer::<i32>(|| 4 as std::os::raw::c_int, |_buf_ptr, buf_bytes| buf_bytes)
+                .expect("negotiation must still return a (possibly truncated) result, not error");
+        assert!(
+            truncated,
+            "a buffer that stays exactly full across every retry must be reported truncated"
+        );
+        assert!(!items.is_empty());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn negotiate_buffer_propagates_a_failed_size_call() {
+        let result = negotiate_buffer::<i32>(
+            || -1 as std::os::raw::c_int,
+            |_buf_ptr, buf_bytes| buf_bytes,
+        );
+        assert!(result.is_err(), "a non-positive size probe must error out");
     }
 
     #[test]
@@ -1944,6 +2167,14 @@ mod tests {
         assert!(
             census.holders.contains(&std::process::id()),
             "this process holds {db_path:?} open and must appear in its own OS-derived census"
+        );
+        // The self-canary must NOT fire when self genuinely is discovered —
+        // it only forces `truncated` on a missing self-PID, never clears an
+        // already-set flag from something else.
+        assert!(
+            !census.truncated,
+            "self was found; the self-canary (and the namespace check, when this test runs \
+             in the host's own PID namespace) must not report truncation on its own"
         );
         // Not asserting `is_complete()` here: an unprivileged process
         // legitimately cannot inspect every other PID's open fds on a real,
@@ -1972,13 +2203,74 @@ mod tests {
         let complete = CensusResult {
             holders: std::collections::HashSet::from([1, 2]),
             uninspectable_pids: Vec::new(),
+            truncated: false,
         };
         assert!(complete.is_complete());
 
         let incomplete = CensusResult {
             holders: std::collections::HashSet::from([1]),
             uninspectable_pids: vec![7],
+            truncated: false,
         };
         assert!(!incomplete.is_complete());
+    }
+
+    #[test]
+    fn census_result_is_complete_reflects_truncated() {
+        // ADR-091 Amendment 2 review round 4: `truncated` is a second,
+        // independent incompleteness signal — a census can have an empty
+        // `uninspectable_pids` (no single PID's inspection failed) and
+        // still be incomplete because the walk itself has positive evidence
+        // it missed part of the process universe.
+        let truncated = CensusResult {
+            holders: std::collections::HashSet::from([1]),
+            uninspectable_pids: Vec::new(),
+            truncated: true,
+        };
+        assert!(!truncated.is_complete());
+    }
+
+    #[test]
+    fn self_canary_marks_truncated_when_own_pid_missing() {
+        let mut census = CensusResult {
+            holders: std::collections::HashSet::from([std::process::id().wrapping_add(1)]),
+            uninspectable_pids: Vec::new(),
+            truncated: false,
+        };
+        census.apply_self_canary();
+        assert!(
+            census.truncated,
+            "a census that discovered other holders but not the calling process itself is \
+             positive proof of a missed enumeration and must be marked incomplete"
+        );
+    }
+
+    #[test]
+    fn self_canary_leaves_a_correct_census_untouched() {
+        let mut census = CensusResult {
+            holders: std::collections::HashSet::from([std::process::id()]),
+            uninspectable_pids: Vec::new(),
+            truncated: false,
+        };
+        census.apply_self_canary();
+        assert!(
+            !census.truncated,
+            "self was found; the canary must not fire"
+        );
+    }
+
+    #[test]
+    fn self_canary_does_not_clear_an_existing_truncated_flag() {
+        let mut census = CensusResult {
+            holders: std::collections::HashSet::from([std::process::id()]),
+            uninspectable_pids: Vec::new(),
+            truncated: true,
+        };
+        census.apply_self_canary();
+        assert!(
+            census.truncated,
+            "the self-canary only ever sets `truncated`; it must never clear a flag another \
+             step already raised"
+        );
     }
 }
