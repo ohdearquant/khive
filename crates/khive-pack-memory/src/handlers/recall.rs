@@ -129,7 +129,7 @@ impl MemoryPack {
         let mut scoring_cfg = cfg.scoring.clone().unwrap_or_default();
         scoring_cfg.apply_dos_caps();
 
-        let cjk_fts_bypass = contains_cjk(query_trimmed);
+        let cjk_fts_bypass = scoring_cfg.enable_cjk_fts_bypass && contains_cjk(query_trimmed);
 
         let candidate_limit =
             recall_candidate_count(&cfg, limit_u32).min(scoring_cfg.max_recall_candidates as u32);

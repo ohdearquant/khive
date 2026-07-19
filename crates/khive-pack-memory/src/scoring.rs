@@ -514,6 +514,11 @@ pub struct ScoringConfig {
     /// When true, suppress memories whose `properties.supersedes` value matches
     /// the ID of another memory in the result set. Default: true.
     pub enable_supersedes_suppression: bool,
+    /// When true, a CJK-majority query bypasses the FTS5 leg (whose trigram
+    /// tokenizer does not segment CJK well) and relies on the vector leg
+    /// instead. Default: true.
+    #[serde(alias = "enable_multilingual_routing")]
+    pub enable_cjk_fts_bypass: bool,
 
     // ── Conditional adjustments ────────────────────────────────────────────
     /// Score adjustments applied after the base formula. Default: episodic bonus,
@@ -541,6 +546,7 @@ impl Default for ScoringConfig {
             mmr_prefix_len: 100,
 
             enable_supersedes_suppression: true,
+            enable_cjk_fts_bypass: true,
 
             adjustments: default_adjustments(),
         }
@@ -890,6 +896,23 @@ mod tests {
     fn contains_cjk_ignores_latin() {
         assert!(!contains_cjk("hello world"));
         assert!(!contains_cjk(""));
+    }
+
+    #[test]
+    fn scoring_config_old_multilingual_routing_key_still_disables_cjk_bypass() {
+        let cfg: ScoringConfig =
+            serde_json::from_value(serde_json::json!({ "enable_multilingual_routing": false }))
+                .expect("old key must still deserialize via the alias");
+        assert!(
+            !cfg.enable_cjk_fts_bypass,
+            "a config that disabled the old enable_multilingual_routing key must still \
+             disable the CJK FTS bypass under its new name"
+        );
+    }
+
+    #[test]
+    fn scoring_config_default_enables_cjk_bypass() {
+        assert!(ScoringConfig::default().enable_cjk_fts_bypass);
     }
 
     #[test]
