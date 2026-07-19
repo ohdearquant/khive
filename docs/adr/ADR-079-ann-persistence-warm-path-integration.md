@@ -507,6 +507,39 @@ CREATE TABLE ann_consumer_watermark (
   removes the row. Removal is an administrative action and is safe precisely because of decision
   rule 4: a returning consumer finds its row absent, re-registers at 0, and rebuilds Cold instead
   of trusting a segment whose tail may have been compacted away.
+
+- **Global-scope consumers.** Some consumers index one corpus across ALL namespaces for a model —
+  the memory pack's note index is the canonical case (a single graph over every namespace's
+  `kind = 'note' AND field = 'note.content'` rows). Per-namespace registry rows cannot represent
+  that scope: registering under any single namespace leaves the consumer's tail in every other
+  namespace unprotected, and namespaces can appear after registration. Instead:
+  1. **Wildcard registration.** A global-scope consumer registers exactly one row per model:
+     `(consumer, '*', embedding_model, watermark)`. `'*'` is not a valid namespace value, so
+     wildcard rows cannot collide with per-namespace rows. The register-at-0-before-persist and
+     monotonic post-commit raise rules apply unchanged.
+  2. **Compaction minimum includes wildcard rows.** Step 3's minimum for a pair
+     `(namespace, embedding_model)` is computed over rows matching
+     `(namespace = ?ns OR namespace = '*') AND embedding_model = ?model`. A global consumer
+     thereby bounds compaction in every namespace its scope contains — including a namespace
+     whose first row appears after registration, because the wildcard row is durable before the
+     global consumer's first persist and therefore before any compaction its tail must survive.
+  3. **Classification is otherwise unchanged.** A global consumer classifies and tail-reads under
+     its own corpus predicate (no namespace restriction); `seq` is a single database-wide
+     monotone sequence, so watermark comparisons are well-defined across namespaces, and decision
+     rule 4 applies to the wildcard row exactly as to a per-namespace row.
+
+  **Soft-delete visibility (join-filtered corpora).** The memory corpus excludes soft-deleted
+  notes via a join on `notes.deleted_at IS NULL`, but a note soft-delete mutates the notes row,
+  not the vector row — no log row is appended. A Hot-classified segment may therefore retain
+  soft-deleted subjects as candidates until the next vector mutation or checkpoint. This is a
+  candidate-hygiene lag, not a correctness gap: the memory recall path post-filters every ANN
+  candidate on `deleted_at IS NULL` (plus namespace visibility and expiry) before serving, so
+  deleted content is never returned. A consumer whose serve path lacks such a filter MUST NOT
+  adopt this amendment for a join-filtered corpus. For such corpora, tail replay measures "source
+  row missing" under the full corpus predicate (join included): a final `upsert` whose subject no
+  longer satisfies the predicate replays as a delete — the subject's final corpus state is
+  absence — rather than escalating to Cold, which is reserved for id-map/log state that
+  contradicts a subject the predicate still admits.
 - **Configuration (§5 amendment)**: `ann_rebuild_threshold` joins the `[retrieval]` table —
   fraction of the index's live vector count, `f64` in `(0, 1]`, default `0.20`, env
   `KHIVE_ANN_REBUILD_THRESHOLD`, CLI `--ann-rebuild-threshold`, precedence per ADR-035. The tail
