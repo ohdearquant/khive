@@ -392,6 +392,13 @@ impl StorageBackend {
             .conn()
             .execute_batch(crate::migrations::EMBEDDING_MODELS_DDL)?;
 
+        // Same guarantee for the ANN write log: vector write paths append to it
+        // in the same transaction as the vec0 mutation, so it must exist in any
+        // database that hosts vec_* tables.
+        writer
+            .conn()
+            .execute_batch(crate::migrations::ANN_WRITE_LOG_DDL)?;
+
         // Create the vec0 virtual table. Idempotent on fresh databases and after the
         // old-schema rebuild above.
         let ddl = format!(

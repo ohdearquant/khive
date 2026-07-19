@@ -340,6 +340,11 @@ pub struct VamanaIndex {
     gs_codec: GsSq8Codec,
     /// Pre-encoded corpus vectors (one `GsEncodedVector` per node, ordinal-stable).
     gs_codes: Vec<GsEncodedVector>,
+    /// External write-log watermark carried in the v2 commit record. `None` on
+    /// indexes built or loaded from segments that predate the field; the
+    /// storage layer that owns the log sets it before `save_atomic` and reads
+    /// it back after load to classify restart state.
+    last_applied_seq: Option<u64>,
 }
 
 struct IndexMetadata {
@@ -407,6 +412,7 @@ impl VamanaIndex {
             consolidation_tau: DEFAULT_CONSOLIDATION_TAU,
             gs_codec,
             gs_codes,
+            last_applied_seq: None,
         })
     }
 
@@ -503,6 +509,7 @@ impl VamanaIndex {
             self.config.max_degree,
             self.config.search_list_size,
             self.config.alpha,
+            self.last_applied_seq,
         );
 
         let mut segments = vec![
@@ -627,6 +634,7 @@ impl VamanaIndex {
             consolidation_tau: DEFAULT_CONSOLIDATION_TAU,
             gs_codec,
             gs_codes,
+            last_applied_seq: commit.last_applied_seq,
         })
     }
 
@@ -704,6 +712,7 @@ impl VamanaIndex {
             consolidation_tau: DEFAULT_CONSOLIDATION_TAU,
             gs_codec,
             gs_codes,
+            last_applied_seq: None,
         })
     }
 
@@ -778,6 +787,7 @@ impl VamanaIndex {
             self.config.max_degree,
             self.config.search_list_size,
             self.config.alpha,
+            self.last_applied_seq,
         )?;
         fs::rename(&metadata_tmp, &metadata_path)?;
 
@@ -1120,6 +1130,7 @@ impl VamanaIndex {
             consolidation_tau: DEFAULT_CONSOLIDATION_TAU,
             gs_codec,
             gs_codes,
+            last_applied_seq: commit.last_applied_seq,
         })
     }
 
@@ -1345,6 +1356,7 @@ impl VamanaIndex {
             consolidation_tau: DEFAULT_CONSOLIDATION_TAU,
             gs_codec,
             gs_codes,
+            last_applied_seq: None,
         })
     }
 
@@ -1371,6 +1383,19 @@ impl VamanaIndex {
     /// Return the flat row-major vector data as a slice.
     pub fn vectors(&self) -> Result<&[f32]> {
         self.vectors.as_slice()
+    }
+
+    /// Write-log watermark carried by the v2 commit record. `None` on indexes
+    /// built in-memory or loaded from segments predating the field.
+    pub fn last_applied_seq(&self) -> Option<u64> {
+        self.last_applied_seq
+    }
+
+    /// Set the write-log watermark to persist with the next [`Self::save_atomic`].
+    /// The caller owns the log and must pass the highest sequence whose write is
+    /// reflected in this index's current state.
+    pub fn set_last_applied_seq(&mut self, seq: Option<u64>) {
+        self.last_applied_seq = seq;
     }
 
     // ---- PR2: lifecycle API (ADR-052 §2) ----
@@ -2483,6 +2508,10 @@ struct V2Commit {
     lifecycle_hash: [u8; 32],
     fingerprint: V2CorpusFingerprint,
     index_meta: IndexMetadata,
+    /// Write-log watermark trailer. `None` when the record predates the field
+    /// (short layout) — the record length, not a sentinel value, discriminates,
+    /// so a legitimate watermark of 0 (empty log at save time) round-trips.
+    last_applied_seq: Option<u64>,
 }
 
 /// Parsed lifecycle.bin content.
@@ -2507,6 +2536,7 @@ fn write_v2_commit_full(
     max_degree: usize,
     search_list_size: usize,
     alpha: f64,
+    last_applied_seq: Option<u64>,
 ) -> Result<()> {
     let buf = encode_v2_commit_full(
         vectors_hash,
@@ -2518,6 +2548,7 @@ fn write_v2_commit_full(
         max_degree,
         search_list_size,
         alpha,
+        last_applied_seq,
     );
     let file = File::create(path)?;
     let mut w = std::io::BufWriter::new(file);
@@ -2538,8 +2569,9 @@ fn encode_v2_commit_full(
     max_degree: usize,
     search_list_size: usize,
     alpha: f64,
+    last_applied_seq: Option<u64>,
 ) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(200);
+    let mut buf = Vec::with_capacity(220);
     buf.extend_from_slice(V2_COMMIT_MAGIC);
     buf.extend_from_slice(vectors_hash);
     buf.extend_from_slice(graph_hash);
@@ -2552,6 +2584,19 @@ fn encode_v2_commit_full(
     buf.extend_from_slice(&(max_degree as u64).to_le_bytes());
     buf.extend_from_slice(&(search_list_size as u64).to_le_bytes());
     buf.extend_from_slice(&alpha.to_le_bytes());
+    // Watermark trailer: presence byte + value. Written unconditionally so all
+    // new records share one length; readers of the short (pre-trailer) layout
+    // reject on length and rebuild, readers of this layout parse both.
+    match last_applied_seq {
+        Some(seq) => {
+            buf.push(1);
+            buf.extend_from_slice(&seq.to_le_bytes());
+        }
+        None => {
+            buf.push(0);
+            buf.extend_from_slice(&0u64.to_le_bytes());
+        }
+    }
     buf
 }
 
@@ -2559,10 +2604,12 @@ fn encode_v2_commit_full(
 fn parse_v2_commit(data: &[u8]) -> Result<V2Commit> {
     // magic(8) + 3 hashes(96) + fp.vector_count(8) + fp.dimensions(8) + fp.content_hash(32)
     // + num_vectors(8) + dimensions(8) + max_degree(8) + search_list_size(8) + alpha(8)
-    let expected_len = 8 + 32 + 32 + 32 + 8 + 8 + 32 + 8 + 8 + 8 + 8 + 8;
-    if data.len() != expected_len {
+    // + optional watermark trailer: presence(1) + last_applied_seq(8)
+    let base_len = 8 + 32 + 32 + 32 + 8 + 8 + 32 + 8 + 8 + 8 + 8 + 8;
+    let trailer_len = base_len + 9;
+    if data.len() != base_len && data.len() != trailer_len {
         return Err(VamanaError::invalid_format(format!(
-            "v2 commit record length {} != {expected_len}",
+            "v2 commit record length {} != {base_len} or {trailer_len}",
             data.len()
         )));
     }
@@ -2616,6 +2663,16 @@ fn parse_v2_commit(data: &[u8]) -> Result<V2Commit> {
     .map_err(|_| VamanaError::invalid_format("v2 commit search_list_size overflow".into()))?;
     offset += 8;
     let alpha = f64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+    offset += 8;
+
+    let last_applied_seq = if data.len() == trailer_len {
+        let present = data[offset] == 1;
+        offset += 1;
+        let value = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+        present.then_some(value)
+    } else {
+        None
+    };
 
     if num_vectors == 0 {
         return Err(VamanaError::invalid_format(
@@ -2658,6 +2715,7 @@ fn parse_v2_commit(data: &[u8]) -> Result<V2Commit> {
             search_list_size,
             alpha,
         },
+        last_applied_seq,
     })
 }
 
