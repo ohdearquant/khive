@@ -415,8 +415,10 @@ CREATE TABLE ann_write_log (
 CREATE INDEX idx_ann_write_log_ns_model_seq ON ann_write_log(namespace, embedding_model, seq);
 
 -- Durable per-consumer watermark registry, required by the cross-consumer
--- compaction invariant below. Updated after each consumer's segment commit;
--- a stale row under-compacts (safe), never over-compacts.
+-- compaction invariant below. A consumer registers its row (watermark 0)
+-- BEFORE persisting or serving any extended-format segment, and raises it
+-- monotonically after each segment commit; a stale row under-compacts
+-- (safe), never over-compacts.
 CREATE TABLE ann_consumer_watermark (
   consumer   TEXT NOT NULL,
   namespace  TEXT NOT NULL,
@@ -442,15 +444,16 @@ CREATE TABLE ann_consumer_watermark (
   checksum, §B). Any other length is corrupt.
 - **Restart classification is a total, versioned decision table**, evaluated per index scope:
 
-  | # | Condition (first match wins)                                                                               | Class                                                                                                                                                                                                                                                                                                    |
-  | - | ---------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-  | 1 | commit record absent, corrupt, or not a valid record length                                                | **Cold**                                                                                                                                                                                                                                                                                                 |
-  | 2 | record readable but pre-amendment (no watermark)                                                           | **Cold**, and log compaction is FORBIDDEN until an extended-format checkpoint commits                                                                                                                                                                                                                    |
-  | 3 | configured embedder dimensions for the model (the durable embedder-registry contract) ≠ segment dimensions | **Cold**                                                                                                                                                                                                                                                                                                 |
-  | 4 | `NOT EXISTS (SELECT 1 FROM ann_write_log WHERE <scope> AND seq > S)`                                       | **Hot**: mmap load, zero corpus IO. This is the post-compaction steady state — an empty scope (`MAX(seq)` NULL) with a valid watermark `S` is Hot, because every post-migration write logs a row and compaction only ever removes rows `<= S`                                                            |
-  | 5 | live corpus row count for the scope (from the same read snapshot) = 0                                      | **Empty**: no ANN candidate is served or replayed — the index is dropped and the existing FTS/degraded path answers; no buildable index is recorded. Covers delete-everything tails, which ADR-052's tombstone op cannot replay down to zero live nodes                                                  |
-  | 6 | tail rows exist, tail count ≤ `ceil(ann_rebuild_threshold × live vector_count)`                            | **Stale-tail**: mmap load, then final-state tail replay (below). §2 serve-stale applies while the tail applies. Rules 6-7 are reachable only with live vector count > 0 (rule 5 matched first otherwise)                                                                                                 |
-  | 7 | tail count above threshold                                                                                 | **Stale-rebuild** (amends the §2 state table): the checksum-valid segment loads and serves under the existing `ann_serve_stale` gate while a full rebuild runs in the background. The threshold is a cost decision, not evidence of unreadability — it never demotes a loadable segment to Cold/FTS-only |
+  | # | Condition (first match wins)                                                                               | Class                                                                                                                                                                                                                                                                                                                                 |
+  | - | ---------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+  | 1 | commit record absent, corrupt, or not a valid record length                                                | **Cold**                                                                                                                                                                                                                                                                                                                              |
+  | 2 | record readable but pre-amendment (no watermark)                                                           | **Cold**, and log compaction is FORBIDDEN until an extended-format checkpoint commits                                                                                                                                                                                                                                                 |
+  | 3 | configured embedder dimensions for the model (the durable embedder-registry contract) ≠ segment dimensions | **Cold**                                                                                                                                                                                                                                                                                                                              |
+  | 4 | the consumer's own `ann_consumer_watermark` row is absent (record is extended-format)                      | **Cold**, after re-registering the row at watermark 0. Registration precedes every persist (below), so a durable extended segment implies a row was written; absence means administrative removal or registry loss, after which compaction may already have deleted this consumer's tail — the segment cannot be trusted Hot or Stale |
+  | 5 | live corpus row count for the scope (from the same read snapshot) = 0                                      | **Empty**, regardless of tail contents: no ANN candidate is served or replayed — the index is dropped and the existing FTS/degraded path answers; no buildable index is recorded. Covers delete-everything tails, which ADR-052's tombstone op cannot replay down to zero live nodes, and the no-tail zero-live checkpoint            |
+  | 6 | `NOT EXISTS (SELECT 1 FROM ann_write_log WHERE <scope> AND seq > S)`                                       | **Hot**: mmap load, zero corpus IO. This is the post-compaction steady state — an empty scope (`MAX(seq)` NULL) with a valid watermark `S` is Hot, because every post-migration write logs a row and compaction only ever removes rows `<= S`                                                                                         |
+  | 7 | tail rows exist, tail count ≤ `ceil(ann_rebuild_threshold × live vector_count)`                            | **Stale-tail**: mmap load, then final-state tail replay (below). §2 serve-stale applies while the tail applies. Rules 7-8 are reachable only with live vector count > 0 (rule 5 matched first otherwise)                                                                                                                              |
+  | 8 | tail count above threshold                                                                                 | **Stale-rebuild** (amends the §2 state table): the checksum-valid segment loads and serves under the existing `ann_serve_stale` gate while a full rebuild runs in the background. The threshold is a cost decision, not evidence of unreadability — it never demotes a loadable segment to Cold/FTS-only                              |
 
 - **Tail replay is a final-state delta, not an event replay.** Coalesce the tail to the highest
   `seq` per `subject_id`; only the final op is applied. A final `upsert` resolves the subject's
@@ -479,19 +482,36 @@ CREATE TABLE ann_consumer_watermark (
   a narrow note-scoped index legitimately overlap), so deleting rows behind one consumer's
   watermark could erase another overlapping consumer's tail evidence and falsely classify it Hot.
   The invariant: a log row is deletable only when every consumer whose scope contains it has
-  durably checkpointed past it. Mechanism: after each successful extended-format `save_atomic` at
-  watermark `S`, the consumer upserts `(consumer, namespace, embedding_model, S)` into
-  `ann_consumer_watermark` (post-commit; a crash in between leaves a smaller registered watermark,
-  which under-compacts — safe). Compaction then deletes rows with
-  `seq <= (SELECT MIN(watermark) FROM ann_consumer_watermark WHERE namespace=? AND
-  embedding_model=?)` for the pair; a consumer that has never registered an extended-format
-  watermark contributes no row and an absent row set yields no deletion (consistent with rule 2's
-  compaction ban). Never above any persisted watermark.
+  durably checkpointed past it. Mechanism, in three ordered steps per consumer:
+  1. **Register before persist.** A consumer durably writes
+     `(consumer, namespace, embedding_model, 0)` (`INSERT OR IGNORE`) before it persists or
+     serves any extended-format segment for the scope. `consumer` is a stable, scope-bearing
+     identity: a string that deterministically encodes the pack and its corpus predicate (for
+     example `knowledge:{namespace}:{model}` or `memory-notes:{namespace}:{model}`), so the same
+     predicate always maps to the same row across restarts. Because registration precedes the
+     first persist, a consumer that holds a durable extended segment always has a registry row —
+     a crash after its first commit but before its first watermark raise leaves the row at 0,
+     which blocks compaction of its tail rather than hiding it from the `MIN`.
+  2. **Raise after commit.** After each successful extended-format `save_atomic` at watermark
+     `S`, the consumer raises its row monotonically
+     (`UPDATE ... SET watermark = MAX(watermark, S)`); a crash in between leaves the smaller
+     registered watermark, which under-compacts — safe.
+  3. **Compact through the registry minimum only.** Compaction deletes rows with
+     `seq <= (SELECT MIN(watermark) FROM ann_consumer_watermark WHERE namespace=? AND
+     embedding_model=?)` for the pair — never a checkpoint-local `seq <= S`. An empty row set
+     yields no deletion (consistent with rule 2's compaction ban). Never above any registered
+     watermark.
+
+  Operational note: a decommissioned consumer's registry row pins the pair's `MIN` at its last
+  watermark, so the log for that `(namespace, embedding_model)` grows unbounded until an operator
+  removes the row. Removal is an administrative action and is safe precisely because of decision
+  rule 4: a returning consumer finds its row absent, re-registers at 0, and rebuilds Cold instead
+  of trusting a segment whose tail may have been compacted away.
 - **Configuration (§5 amendment)**: `ann_rebuild_threshold` joins the `[retrieval]` table —
   fraction of the index's live vector count, `f64` in `(0, 1]`, default `0.20`, env
   `KHIVE_ANN_REBUILD_THRESHOLD`, CLI `--ann-rebuild-threshold`, precedence per ADR-035. The tail
   comparison is `tail_count <= ceil(threshold × live_count)`; an empty corpus never reaches the
-  comparison (rule 4 or the build path handles it).
+  comparison (rule 5 or the build path handles it).
 
 #### B. Checkpoint re-adopts the segment as mmap; SQ8 codes persist alongside it
 
@@ -546,10 +566,12 @@ never to serving a stale-but-adopted index.
    deletes — the watermark comparison depends on that monotonicity.
 2. **Crash between `save_atomic` and log compaction**: the segment commits (staged files, fsync,
    rename, commit magic — existing v2 semantics) carrying `last_applied_seq = S` atomically
-   inside its commit record. Compaction (`DELETE ... WHERE seq <= S`) runs only after the commit.
-   A crash in between leaves log rows with `seq <= S`, which the classifier's strict
-   `seq > last_applied_seq` filter ignores; the next checkpoint re-compacts. Idempotent,
-   harmless.
+   inside its commit record. The registry raise and compaction
+   (`DELETE ... WHERE seq <= MIN(watermark)` over the pair's registered consumers, §A step 3)
+   run only after the commit, in that order. A crash before the raise leaves the smaller
+   registered watermark (under-compacts); a crash before compaction leaves log rows with
+   `seq <= S`, which the classifier's strict `seq > last_applied_seq` filter ignores; the next
+   checkpoint re-raises and re-compacts. Idempotent, harmless.
 3. **Crash between `save_atomic` and mmap re-adoption**: adoption reopens the segment that was
    just committed, so a crash before the swap simply means the next start classifies that same
    segment per the decision table (Hot when no later writes landed, Stale-tail otherwise) and
