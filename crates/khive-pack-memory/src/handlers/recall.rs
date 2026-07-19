@@ -5187,4 +5187,134 @@ mod tests {
              return empty results: {result:?}"
         );
     }
+
+    // ── #1116: one engine's ANN/sqlite-vec retrieval failing must degrade that
+    // engine to FTS-only, not abort recall across every engine ──────────────
+
+    use super::super::common::retrieval_failpoints;
+
+    /// One engine's ANN retrieval failing must degrade recall to the healthy engine.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn recall_1116_one_engine_ann_retrieval_failure_still_serves_healthy() {
+        const HEALTHY_MODEL: &str = "recall-1116-ann-healthy-model";
+        const FAILING_MODEL: &str = "recall-1116-ann-failing-model";
+        const NOTE_TEXT: &str = "issue 1116 ann retrieval failure recall note";
+
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        rt.register_embedder(HashVecProvider {
+            model_name: HEALTHY_MODEL.to_owned(),
+            dims: 16,
+        });
+        rt.register_embedder(HashVecProvider {
+            model_name: FAILING_MODEL.to_owned(),
+            dims: 16,
+        });
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+
+        registry
+            .dispatch(
+                "memory.remember",
+                serde_json::json!({
+                    "content": NOTE_TEXT,
+                    "memory_type": "semantic",
+                }),
+            )
+            .await
+            .expect("remember note under both models");
+
+        retrieval_failpoints::fail_ann(FAILING_MODEL);
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "query": NOTE_TEXT,
+                    "fusion_strategy": "vector_only",
+                    "limit": 10,
+                }),
+            )
+            .await;
+        retrieval_failpoints::clear_ann(FAILING_MODEL);
+
+        let result = result.unwrap_or_else(|e| {
+            panic!(
+                "recall must still serve the healthy engine when one engine's \
+                 ANN retrieval fails, got error: {e:?}"
+            )
+        });
+        let hits = result.as_array().expect("recall result must be an array");
+        assert!(
+            !hits.is_empty(),
+            "recall must surface the healthy engine's hits despite the other \
+             engine's ANN retrieval failing; got {result:?}"
+        );
+    }
+
+    /// One engine's sqlite-vec retrieval failing must degrade recall to the healthy engine.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn recall_1116_one_engine_sqlite_vec_retrieval_failure_still_serves_healthy() {
+        const HEALTHY_MODEL: &str = "recall-1116-vec-healthy-model";
+        const FAILING_MODEL: &str = "recall-1116-vec-failing-model";
+        const NOTE_TEXT: &str = "issue 1116 sqlite-vec retrieval failure recall note";
+
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        // Register the failing-retrieval model before the remember so a real
+        // index exists to search — the failpoint forces the sqlite-vec
+        // fallback route and fails it, not an empty/never-built index.
+        rt.register_embedder(HashVecProvider {
+            model_name: FAILING_MODEL.to_owned(),
+            dims: 16,
+        });
+        rt.register_embedder(HashVecProvider {
+            model_name: HEALTHY_MODEL.to_owned(),
+            dims: 16,
+        });
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+
+        registry
+            .dispatch(
+                "memory.remember",
+                serde_json::json!({
+                    "content": NOTE_TEXT,
+                    "memory_type": "semantic",
+                }),
+            )
+            .await
+            .expect("remember note under both models");
+
+        retrieval_failpoints::fail_vec(FAILING_MODEL);
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "query": NOTE_TEXT,
+                    "fusion_strategy": "vector_only",
+                    "limit": 10,
+                }),
+            )
+            .await;
+        retrieval_failpoints::clear_vec(FAILING_MODEL);
+
+        let result = result.unwrap_or_else(|e| {
+            panic!(
+                "recall must still serve the healthy engine when one engine's \
+                 sqlite-vec retrieval fails, got error: {e:?}"
+            )
+        });
+        let hits = result.as_array().expect("recall result must be an array");
+        assert!(
+            !hits.is_empty(),
+            "recall must surface the healthy engine's hits despite the other \
+             engine's sqlite-vec retrieval failing; got {result:?}"
+        );
+    }
 }

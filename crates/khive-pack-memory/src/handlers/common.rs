@@ -28,6 +28,48 @@ use crate::config::{RecallConfig, ScoreBreakdown, WeightedContributions};
 use crate::query_cache::QueryEmbeddingCache;
 use crate::MemoryPack;
 
+/// Test-only per-model retrieval failpoints for exercising `collect_model_ann_hits`'
+/// engine-failure isolation (ADR-031) without a real ANN or sqlite-vec outage.
+#[cfg(test)]
+pub(super) mod retrieval_failpoints {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+
+    fn ann() -> &'static Mutex<HashSet<String>> {
+        static S: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+        S.get_or_init(Default::default)
+    }
+
+    fn vec() -> &'static Mutex<HashSet<String>> {
+        static S: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+        S.get_or_init(Default::default)
+    }
+
+    pub fn fail_ann(model: &str) {
+        ann().lock().unwrap().insert(model.to_owned());
+    }
+
+    pub fn clear_ann(model: &str) {
+        ann().lock().unwrap().remove(model);
+    }
+
+    pub fn fail_vec(model: &str) {
+        vec().lock().unwrap().insert(model.to_owned());
+    }
+
+    pub fn clear_vec(model: &str) {
+        vec().lock().unwrap().remove(model);
+    }
+
+    pub(super) fn ann_flagged(model: &str) -> bool {
+        ann().lock().unwrap().contains(model)
+    }
+
+    pub(super) fn vec_flagged(model: &str) -> bool {
+        vec().lock().unwrap().contains(model)
+    }
+}
+
 // KHIVE_RECALL_PROFILE emits per-call stage JSON to stderr.
 pub(super) static RECALL_CALL_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -918,218 +960,114 @@ impl MemoryPack {
 
             let t_ann_total = if prof { Some(Instant::now()) } else { None };
             let mut ann_route = "ann";
-            let mut results = Vec::with_capacity(query_vecs.len());
-            for (model_name, vec) in query_vecs {
-                let key = AnnKey::new(ns, &model_name);
 
-                // Global ANN search widens only when namespace post-filtering leaves too few hits.
-                // A stale installed graph remains the immediate fallback and triggers background
-                // replacement; only a genuine miss waits for ensure. Durable epoch checking adds
-                // cross-process reindex visibility beyond in-process generations.
-                ann::maybe_check_durable_epoch(&self.runtime, &self.ann, &key).await;
-                let cache_fresh = ann::is_current(&self.ann, &key).await;
-                let search_result =
-                    ann::search_loaded(&self.ann, &key, &vec, ann_fetch_limit).await;
-                if !cache_fresh && matches!(search_result, Ok(Some(_))) {
-                    ann::ensure_ann_background(&self.runtime, token, &self.ann, &model_name).await;
+            // Per-model ANN/sqlite-vec resolution is independent I/O (durable-epoch
+            // check, warm-cache search, possible detached ensure-wait, possible
+            // exact-scan fallback) — fan the models out concurrently instead of
+            // paying their latency serially. Mirrors the embed step's 1/2/N
+            // dispatch immediately above.
+            let per_model_results: Vec<PerModelAnnHits> = match query_vecs.len() {
+                0 => Vec::new(),
+                1 => {
+                    let (model_name, vec) = query_vecs.into_iter().next().unwrap();
+                    let r = collect_model_ann_hits(
+                        &self.runtime,
+                        &self.ann,
+                        token,
+                        ns,
+                        &visible_namespaces,
+                        model_name,
+                        vec,
+                        candidate_limit,
+                        ann_fetch_limit,
+                        ann_overfetch_max_rounds,
+                        ann_ready_timeout_ms,
+                    )
+                    .await?;
+                    vec![r]
                 }
-                // Bound genuine-miss readiness, but never drop the build itself: a tracked task
-                // owns ensure and its phase span while this request races only the result channel.
-                // Per-model single flight prevents duplicate detached builds.
-                let mut model_ann_timed_out = false;
-                let initial_raw_hits: Option<Vec<(Uuid, f32)>> = match search_result {
-                    Ok(Some(hits)) => Some(hits),
-                    Ok(None) => {
-                        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-                        let rt_detached = self.runtime.clone();
-                        let token_detached = token.clone();
-                        let ann_detached = self.ann.clone();
-                        let model_detached = model_name.clone();
-                        khive_runtime::track_background_task(async move {
-                            let result = ann::ensure_ann_for_model(
-                                &rt_detached,
-                                &token_detached,
-                                &ann_detached,
-                                &model_detached,
-                            )
-                            .await;
-                            let _ = done_tx.send(result);
-                        });
-                        match tokio::time::timeout(
-                            std::time::Duration::from_millis(ann_ready_timeout_ms),
-                            done_rx,
-                        )
-                        .await
-                        {
-                            Ok(Ok(Ok(status))) => {
-                                tracing::debug!(
-                                    ?status,
-                                    model = %model_name,
-                                    namespace = %ns,
-                                    "memory ANN ensured on recall miss"
-                                );
-                                ann::search_loaded(&self.ann, &key, &vec, ann_fetch_limit).await?
-                            }
-                            Ok(Ok(Err(e))) => return Err(e),
-                            Ok(Err(_sender_dropped)) => {
-                                // A detached-task panic degrades this model instead of failing recall.
-                                tracing::warn!(
-                                    model = %model_name,
-                                    namespace = %ns,
-                                    "memory ANN detached build task ended \
-                                     without a result; degrading recall to \
-                                     FTS-only for this model (#836)"
-                                );
-                                model_ann_timed_out = true;
-                                ann_degraded = true;
-                                None
-                            }
-                            Err(_elapsed) => {
-                                tracing::warn!(
-                                    model = %model_name,
-                                    namespace = %ns,
-                                    timeout_ms = ann_ready_timeout_ms,
-                                    "memory ANN not ready within bounded wait; \
-                                     degrading recall to FTS-only for this \
-                                     model and detaching the build to finish \
-                                     in the background (#836)"
-                                );
-                                model_ann_timed_out = true;
-                                ann_degraded = true;
-                                None
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            namespace = %ns,
-                            model = %model_name,
-                            "memory ANN search failed; falling back to exact sqlite-vec"
-                        );
-                        ann::clear_key(&self.ann, &key).await;
-                        None
-                    }
-                };
-
-                if model_ann_timed_out {
-                    // Do not replace a bounded timeout with an O(corpus) exact scan.
-                    results.push((model_name, Vec::new()));
-                    continue;
-                }
-
-                if let Some(first_raw) = initial_raw_hits {
-                    // Widen until enough visible hits survive or ANN reports corpus exhaustion.
-                    let note_store = self.runtime.notes(token)?;
-                    let visible_set: std::collections::HashSet<&str> =
-                        visible_namespaces.iter().map(String::as_str).collect();
-
-                    // Empty namespace metadata is conservative; a visible-only set skips retry.
-                    let index_has_non_visible =
-                        match ann::index_namespace_set(&self.ann, &key).await {
-                            Some(index_ns) if !index_ns.is_empty() => {
-                                !index_ns.iter().all(|ns| visible_set.contains(ns.as_str()))
-                            }
-                            // Empty set (snapshot-restored without population yet) or cache miss:
-                            // be conservative — assume non-visible namespaces may be present.
-                            _ => true,
-                        };
-
-                    let mut best_raw = first_raw;
-                    let mut current_fetch_limit = ann_fetch_limit;
-
-                    // Visible-only indexes incur no hydration or extra ANN searches here.
-                    if index_has_non_visible {
-                        for _round in 1..ann_overfetch_max_rounds {
-                            let corpus_exhausted = best_raw.len() < current_fetch_limit;
-                            if corpus_exhausted {
-                                break;
-                            }
-                            // Count visible-namespace survivors via a lightweight note batch fetch.
-                            let candidate_ids: Vec<Uuid> =
-                                best_raw.iter().map(|(id, _)| *id).collect();
-                            let notes = note_store.get_notes_batch(&candidate_ids).await?;
-                            let visible_count = notes
-                                .iter()
-                                .filter(|n| {
-                                    n.deleted_at.is_none()
-                                        && n.kind == "memory"
-                                        && visible_set.contains(n.namespace.as_str())
-                                })
-                                .count();
-                            if visible_count >= candidate_limit as usize {
-                                break;
-                            }
-                            // Widen and retry.
-                            current_fetch_limit *= 2;
-                            tracing::debug!(
-                                model = %model_name,
-                                namespace = %ns,
-                                visible_count,
-                                candidate_limit,
-                                new_fetch_limit = current_fetch_limit,
-                                "memory ANN: widening over-fetch (visible survivors short)"
-                            );
-                            if let Ok(Some(wider)) =
-                                ann::search_loaded(&self.ann, &key, &vec, current_fetch_limit).await
-                            {
-                                best_raw = wider;
-                            } else {
-                                break;
-                            }
-                        }
-                    }
-
-                    tracing::debug!(
-                        model = %model_name,
-                        namespace = %ns,
-                        hits = best_raw.len(),
-                        "memory recall via warm ANN"
+                2 => {
+                    let mut it = query_vecs.into_iter();
+                    let (m0, v0) = it.next().unwrap();
+                    let (m1, v1) = it.next().unwrap();
+                    let f0 = collect_model_ann_hits(
+                        &self.runtime,
+                        &self.ann,
+                        token,
+                        ns,
+                        &visible_namespaces,
+                        m0,
+                        v0,
+                        candidate_limit,
+                        ann_fetch_limit,
+                        ann_overfetch_max_rounds,
+                        ann_ready_timeout_ms,
                     );
-                    let hits: Vec<VectorSearchHit> = best_raw
-                        .into_iter()
-                        .enumerate()
-                        .map(|(idx, (uuid, score))| VectorSearchHit {
-                            subject_id: uuid,
-                            score: khive_score::DeterministicScore::from_f64(score as f64),
-                            rank: (idx + 1) as u32,
-                        })
-                        .collect();
-                    results.push((model_name, hits));
-                    continue;
+                    let f1 = collect_model_ann_hits(
+                        &self.runtime,
+                        &self.ann,
+                        token,
+                        ns,
+                        &visible_namespaces,
+                        m1,
+                        v1,
+                        candidate_limit,
+                        ann_fetch_limit,
+                        ann_overfetch_max_rounds,
+                        ann_ready_timeout_ms,
+                    );
+                    let (r0, r1) = tokio::join!(f0, f1);
+                    vec![r0?, r1?]
                 }
+                _ => {
+                    let mut handles = Vec::with_capacity(query_vecs.len());
+                    for (model_name, vec) in query_vecs {
+                        let rt = self.runtime.clone();
+                        let ann_shared = self.ann.clone();
+                        let token_owned = token.clone();
+                        let ns_owned = ns.to_string();
+                        let visible_owned = visible_namespaces.clone();
+                        handles.push(tokio::spawn(async move {
+                            collect_model_ann_hits(
+                                &rt,
+                                &ann_shared,
+                                &token_owned,
+                                &ns_owned,
+                                &visible_owned,
+                                model_name,
+                                vec,
+                                candidate_limit,
+                                ann_fetch_limit,
+                                ann_overfetch_max_rounds,
+                                ann_ready_timeout_ms,
+                            )
+                            .await
+                        }));
+                    }
+                    let mut out = Vec::with_capacity(handles.len());
+                    for h in handles {
+                        let r = h.await.map_err(|e| {
+                            RuntimeError::Internal(format!("recall ann task panicked: {e}"))
+                        })??;
+                        out.push(r);
+                    }
+                    out
+                }
+            };
 
-                // sqlite-vec fallback: the query includes namespace IN (...) so it
-                // respects the caller's visible set directly without over-fetch.
-                // When visible_namespaces has multiple entries we fan out one search
-                // per namespace and union the results, since VectorSearchRequest
-                // accepts a single namespace string.
-                tracing::debug!(model = %model_name, namespace = %ns, "memory recall via exact sqlite-vec");
-                ann_route = "sqlite_vec";
-                let store = self.runtime.vectors_for_model(token, &model_name)?;
-                let mut all_hits: Vec<VectorSearchHit> = Vec::new();
-                for search_ns in &visible_namespaces {
-                    let ns_hits = store
-                        .search(VectorSearchRequest {
-                            query_vectors: vec![vec.clone()],
-                            top_k: candidate_limit,
-                            namespace: Some(search_ns.clone()),
-                            kind: Some(SubstrateKind::Note),
-                            embedding_model: Some(model_name.clone()),
-                            filter: None,
-                            backend_hints: None,
-                        })
-                        .await?;
-                    all_hits.extend(ns_hits);
+            for r in &per_model_results {
+                if r.degraded {
+                    ann_degraded = true;
                 }
-                // Merge + re-rank by score descending.
-                all_hits.sort_by_key(|hit| std::cmp::Reverse(hit.score));
-                all_hits.truncate(candidate_limit as usize);
-                for (idx, hit) in all_hits.iter_mut().enumerate() {
-                    hit.rank = (idx + 1) as u32;
+                if r.used_sqlite_vec_fallback {
+                    ann_route = "sqlite_vec";
                 }
-                results.push((model_name, all_hits));
             }
+            let results: Vec<(String, Vec<VectorSearchHit>)> = per_model_results
+                .into_iter()
+                .map(|r| (r.model_name, r.hits))
+                .collect();
+
             if prof {
                 if let Some(t) = t_ann_total {
                     let total_hits: usize = results.iter().map(|(_, h)| h.len()).sum();
@@ -1200,4 +1138,325 @@ impl MemoryPack {
 
         Ok((memory_ids, notes_by_id))
     }
+}
+
+/// One embedding model's outcome from [`collect_model_ann_hits`].
+pub(super) struct PerModelAnnHits {
+    model_name: String,
+    hits: Vec<VectorSearchHit>,
+    /// This model's warm ANN wait was bounded out (#836); recall degraded to FTS-only for it.
+    degraded: bool,
+    /// This model fell through to the exact sqlite-vec scan instead of warm ANN.
+    used_sqlite_vec_fallback: bool,
+}
+
+/// Resolve one embedding model's vector candidates via warm ANN or the exact sqlite-vec
+/// fallback, degrading this model to FTS-only on any retrieval error instead of aborting
+/// recall across every engine (ADR-031 engine-failure isolation). Takes owned/cloned
+/// inputs (rather than `&self`) so the multi-model case can dispatch it via `tokio::spawn`.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn collect_model_ann_hits(
+    runtime: &khive_runtime::KhiveRuntime,
+    ann: &ann::SharedAnn,
+    token: &NamespaceToken,
+    ns: &str,
+    visible_namespaces: &[String],
+    model_name: String,
+    vec: Vec<f32>,
+    candidate_limit: u32,
+    ann_fetch_limit: usize,
+    ann_overfetch_max_rounds: usize,
+    ann_ready_timeout_ms: u64,
+) -> Result<PerModelAnnHits, RuntimeError> {
+    let degrade_name = model_name.clone();
+    match collect_model_ann_hits_inner(
+        runtime,
+        ann,
+        token,
+        ns,
+        visible_namespaces,
+        model_name,
+        vec,
+        candidate_limit,
+        ann_fetch_limit,
+        ann_overfetch_max_rounds,
+        ann_ready_timeout_ms,
+    )
+    .await
+    {
+        Ok(hits) => Ok(hits),
+        Err(e) => {
+            tracing::warn!(
+                model = %degrade_name,
+                namespace = %ns,
+                error = %e,
+                "per-model recall retrieval failed; degrading this engine to \
+                 FTS-only (empty vector hits) so healthy engines still serve (ADR-031)"
+            );
+            Ok(PerModelAnnHits {
+                model_name: degrade_name,
+                hits: Vec::new(),
+                degraded: true,
+                used_sqlite_vec_fallback: false,
+            })
+        }
+    }
+}
+
+/// Split out of `collect_recall_vector_hits` so per-model units — each with independent
+/// durable-epoch checks, warm-cache search, possible detached ensure-wait, and possible
+/// exact-scan fallback — can run concurrently instead of serially. All error paths
+/// propagate via `?`; the [`collect_model_ann_hits`] wrapper converts them into a
+/// degraded outcome for this model rather than aborting every engine's recall.
+#[allow(clippy::too_many_arguments)]
+async fn collect_model_ann_hits_inner(
+    runtime: &khive_runtime::KhiveRuntime,
+    ann: &ann::SharedAnn,
+    token: &NamespaceToken,
+    ns: &str,
+    visible_namespaces: &[String],
+    model_name: String,
+    vec: Vec<f32>,
+    candidate_limit: u32,
+    ann_fetch_limit: usize,
+    ann_overfetch_max_rounds: usize,
+    ann_ready_timeout_ms: u64,
+) -> Result<PerModelAnnHits, RuntimeError> {
+    let key = AnnKey::new(ns, &model_name);
+
+    // Global ANN search widens only when namespace post-filtering leaves too few hits.
+    // A stale installed graph remains the immediate fallback and triggers background
+    // replacement; only a genuine miss waits for ensure. Durable epoch checking adds
+    // cross-process reindex visibility beyond in-process generations.
+    ann::maybe_check_durable_epoch(runtime, ann, &key).await;
+    let cache_fresh = ann::is_current(ann, &key).await;
+    let search_result = ann::search_loaded(ann, &key, &vec, ann_fetch_limit).await;
+    if !cache_fresh && matches!(search_result, Ok(Some(_))) {
+        ann::ensure_ann_background(runtime, token, ann, &model_name).await;
+    }
+    // Bound genuine-miss readiness, but never drop the build itself: a tracked task
+    // owns ensure and its phase span while this request races only the result channel.
+    // Per-model single flight prevents duplicate detached builds.
+    let mut model_ann_timed_out = false;
+    let initial_raw_hits: Option<Vec<(Uuid, f32)>> = match search_result {
+        Ok(Some(hits)) => Some(hits),
+        Ok(None) => {
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+            let rt_detached = runtime.clone();
+            let token_detached = token.clone();
+            let ann_detached = ann.clone();
+            let model_detached = model_name.clone();
+            khive_runtime::track_background_task(async move {
+                let result = ann::ensure_ann_for_model(
+                    &rt_detached,
+                    &token_detached,
+                    &ann_detached,
+                    &model_detached,
+                )
+                .await;
+                let _ = done_tx.send(result);
+            });
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(ann_ready_timeout_ms),
+                done_rx,
+            )
+            .await
+            {
+                Ok(Ok(Ok(status))) => {
+                    tracing::debug!(
+                        ?status,
+                        model = %model_name,
+                        namespace = %ns,
+                        "memory ANN ensured on recall miss"
+                    );
+                    ann::search_loaded(ann, &key, &vec, ann_fetch_limit).await?
+                }
+                Ok(Ok(Err(e))) => return Err(e),
+                Ok(Err(_sender_dropped)) => {
+                    // A detached-task panic degrades this model instead of failing recall.
+                    tracing::warn!(
+                        model = %model_name,
+                        namespace = %ns,
+                        "memory ANN detached build task ended \
+                         without a result; degrading recall to \
+                         FTS-only for this model (#836)"
+                    );
+                    model_ann_timed_out = true;
+                    None
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        model = %model_name,
+                        namespace = %ns,
+                        timeout_ms = ann_ready_timeout_ms,
+                        "memory ANN not ready within bounded wait; \
+                         degrading recall to FTS-only for this \
+                         model and detaching the build to finish \
+                         in the background (#836)"
+                    );
+                    model_ann_timed_out = true;
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                namespace = %ns,
+                model = %model_name,
+                "memory ANN search failed; falling back to exact sqlite-vec"
+            );
+            ann::clear_key(ann, &key).await;
+            None
+        }
+    };
+
+    if model_ann_timed_out {
+        // Do not replace a bounded timeout with an O(corpus) exact scan.
+        return Ok(PerModelAnnHits {
+            model_name,
+            hits: Vec::new(),
+            degraded: true,
+            used_sqlite_vec_fallback: false,
+        });
+    }
+
+    #[cfg(test)]
+    let initial_raw_hits = if retrieval_failpoints::vec_flagged(&model_name) {
+        None
+    } else {
+        initial_raw_hits
+    };
+
+    if let Some(first_raw) = initial_raw_hits {
+        #[cfg(test)]
+        if retrieval_failpoints::ann_flagged(&model_name) {
+            return Err(RuntimeError::Internal(format!(
+                "test-injected ANN retrieval failure for {model_name}"
+            )));
+        }
+
+        // Widen until enough visible hits survive or ANN reports corpus exhaustion.
+        let note_store = runtime.notes(token)?;
+        let visible_set: HashSet<&str> = visible_namespaces.iter().map(String::as_str).collect();
+
+        // Empty namespace metadata is conservative; a visible-only set skips retry.
+        let index_has_non_visible = match ann::index_namespace_set(ann, &key).await {
+            Some(index_ns) if !index_ns.is_empty() => {
+                !index_ns.iter().all(|ns| visible_set.contains(ns.as_str()))
+            }
+            // Empty set (snapshot-restored without population yet) or cache miss:
+            // be conservative — assume non-visible namespaces may be present.
+            _ => true,
+        };
+
+        let mut best_raw = first_raw;
+        let mut current_fetch_limit = ann_fetch_limit;
+
+        // Visible-only indexes incur no hydration or extra ANN searches here.
+        if index_has_non_visible {
+            for _round in 1..ann_overfetch_max_rounds {
+                let corpus_exhausted = best_raw.len() < current_fetch_limit;
+                if corpus_exhausted {
+                    break;
+                }
+                // Count visible-namespace survivors via a lightweight note batch fetch.
+                let candidate_ids: Vec<Uuid> = best_raw.iter().map(|(id, _)| *id).collect();
+                let notes = note_store.get_notes_batch(&candidate_ids).await?;
+                let visible_count = notes
+                    .iter()
+                    .filter(|n| {
+                        n.deleted_at.is_none()
+                            && n.kind == "memory"
+                            && visible_set.contains(n.namespace.as_str())
+                    })
+                    .count();
+                if visible_count >= candidate_limit as usize {
+                    break;
+                }
+                // Widen and retry.
+                current_fetch_limit *= 2;
+                tracing::debug!(
+                    model = %model_name,
+                    namespace = %ns,
+                    visible_count,
+                    candidate_limit,
+                    new_fetch_limit = current_fetch_limit,
+                    "memory ANN: widening over-fetch (visible survivors short)"
+                );
+                if let Ok(Some(wider)) =
+                    ann::search_loaded(ann, &key, &vec, current_fetch_limit).await
+                {
+                    best_raw = wider;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        tracing::debug!(
+            model = %model_name,
+            namespace = %ns,
+            hits = best_raw.len(),
+            "memory recall via warm ANN"
+        );
+        let hits: Vec<VectorSearchHit> = best_raw
+            .into_iter()
+            .enumerate()
+            .map(|(idx, (uuid, score))| VectorSearchHit {
+                subject_id: uuid,
+                score: khive_score::DeterministicScore::from_f64(score as f64),
+                rank: (idx + 1) as u32,
+            })
+            .collect();
+        return Ok(PerModelAnnHits {
+            model_name,
+            hits,
+            degraded: false,
+            used_sqlite_vec_fallback: false,
+        });
+    }
+
+    // sqlite-vec fallback: the query includes namespace IN (...) so it
+    // respects the caller's visible set directly without over-fetch.
+    // When visible_namespaces has multiple entries we fan out one search
+    // per namespace and union the results, since VectorSearchRequest
+    // accepts a single namespace string.
+    tracing::debug!(model = %model_name, namespace = %ns, "memory recall via exact sqlite-vec");
+
+    #[cfg(test)]
+    if retrieval_failpoints::vec_flagged(&model_name) {
+        return Err(RuntimeError::Internal(format!(
+            "test-injected sqlite-vec retrieval failure for {model_name}"
+        )));
+    }
+
+    let store = runtime.vectors_for_model(token, &model_name)?;
+    let mut all_hits: Vec<VectorSearchHit> = Vec::new();
+    for search_ns in visible_namespaces {
+        let ns_hits = store
+            .search(VectorSearchRequest {
+                query_vectors: vec![vec.clone()],
+                top_k: candidate_limit,
+                namespace: Some(search_ns.clone()),
+                kind: Some(SubstrateKind::Note),
+                embedding_model: Some(model_name.clone()),
+                filter: None,
+                backend_hints: None,
+            })
+            .await?;
+        all_hits.extend(ns_hits);
+    }
+    // Merge + re-rank by score descending.
+    all_hits.sort_by_key(|hit| std::cmp::Reverse(hit.score));
+    all_hits.truncate(candidate_limit as usize);
+    for (idx, hit) in all_hits.iter_mut().enumerate() {
+        hit.rank = (idx + 1) as u32;
+    }
+    Ok(PerModelAnnHits {
+        model_name,
+        hits: all_hits,
+        degraded: false,
+        used_sqlite_vec_fallback: true,
+    })
 }
