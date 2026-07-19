@@ -702,6 +702,43 @@ Levers considered, including rejected ones, at current corpus (~553K entity/note
 Projected steady-state anonymous footprint after phase 1: graph + id-map + lifecycle ≈ 100-300 MB
 (from ~2.5-3 GB). Phase 2 then shrinks the file-backed working set itself.
 
+### Residency invariant (post-implementation note, 2026-07-19)
+
+Follow-up measurement of the shipped phase-1 daemon found the anonymous residue above the
+projected band: roughly 794 MB of small-allocation heap attributable to the state
+`load_v2_fast` does not map — graph adjacency, lifecycle state, and the bridge id map remain
+owned-heap on the mmap path, which maps vectors and codes only. Two consequences are
+normative:
+
+1. **The residency guarantee this amendment provides is precisely bounded**: it covers state
+   that is either file-backed or _bounded and consumed fresh_ — owned allocations whose size
+   is independent of corpus scale, or which are rebuilt and released within a serve cycle.
+   Owned state that scales with the corpus and persists across serves (adjacency, id maps,
+   lifecycle) sits outside the guarantee and erodes the projection as the corpus grows. Any
+   future lever must preserve this invariant to count toward the residency budget:
+   copy-on-write delta overlays and immutable delta segments preserve it (deltas stay
+   bounded by the write rate and collapse into the next file-backed segment); an owned
+   full-copy rebuild does not.
+2. **Attribution before optimization.** The residue figure above is a macOS allocator-lens
+   observation; before any lever targets it, re-derive the attribution on Linux via
+   `/proc/<pid>/smaps_rollup` against a production-scale corpus so the fix targets measured
+   bytes, not an allocator artifact. Tracked with the daemon-resource follow-up in #1129;
+   the deferred mmap-`graph.bin` lever in the inventory above is the natural candidate once
+   attribution confirms adjacency dominates.
+
+### Id-map ownership at replay (post-implementation note, 2026-07-19)
+
+Tail replay resolves subjects to index ordinals through a reverse map built from the
+persisted id map. The binding rule, made explicit after a defect was found in both shipped
+consumers (#1150): **a tombstoned ordinal has no owner** — the reverse map must exclude
+tombstoned entries (equivalently, id-map ownership is cleared at tombstone time), because
+the index recycles tombstoned slots on insert. A reverse map that retains a tombstoned
+subject's entry lets a later coalesced delete for that subject resolve to a recycled slot
+and tombstone a different, live vector — replay must never allow a stale subject mapping to
+target a slot it no longer owns. Regression coverage for the
+tombstone-recycle-then-stale-delete interleaving is required in every consumer that
+implements this replay.
+
 ### References (amendment)
 
 - Measurements: issues #1126/#1127 companion daemon-resource investigation (2026-07-19); read-only
