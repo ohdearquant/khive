@@ -2182,6 +2182,63 @@ async fn test_weighted_fusion_multi_model_text_not_zeroed() {
     );
 }
 
+/// Issue #1115 regression: a CJK query must fuse across every configured
+/// embedding engine rather than narrowing to a single model. A note embedded
+/// only through the primary engine must still be found by a CJK query, even
+/// though FTS5 has no CJK tokenizer and cannot rescue it via the text leg.
+#[tokio::test]
+async fn test_cjk_query_finds_note_embedded_by_primary_engine() {
+    const PRIMARY: &str = "enc-primary";
+    const SECONDARY: &str = "enc-multilingual-b";
+    const DIMS: usize = 4;
+
+    let rt = KhiveRuntime::new(RuntimeConfig {
+        db_path: None,
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        ..RuntimeConfig::default()
+    })
+    .expect("runtime");
+    // Only the primary engine is registered when the note is written — this
+    // mirrors a secondary engine being added to config after existing notes
+    // were already embedded, before any backfill runs.
+    rt.register_embedder(ConstVecProvider::new(PRIMARY, DIMS, 0.5));
+
+    let registry = make_registry(rt.clone());
+
+    let result = registry
+        .dispatch(
+            "memory.remember",
+            json!({
+                "content": "cjk fusion regression note embedded via primary engine only",
+                "salience": 0.7,
+            }),
+        )
+        .await
+        .expect("remember with only the primary engine registered");
+    let note_id = result["id"].as_str().expect("note_id");
+
+    // The secondary engine becomes available only now — this note has no
+    // vector row in its table.
+    rt.register_embedder(ConstVecProvider::new(SECONDARY, DIMS, 0.6));
+
+    let recall = registry
+        .dispatch(
+            "memory.recall",
+            json!({ "query": "你好世界的中文查询", "limit": 10 }),
+        )
+        .await
+        .expect("recall with cjk query");
+
+    let hits = recall.as_array().expect("array");
+    let ids: Vec<&str> = hits.iter().map(|h| h["id"].as_str().unwrap()).collect();
+    assert!(
+        ids.contains(&note_id),
+        "cjk query must fuse across every configured engine and find a note \
+         embedded only via the primary engine; got: {ids:?}"
+    );
+}
+
 // ── Wave-2 regression tests (M-C1..M-C4) ──────────────────────────────────────
 
 /// M-C1: memory_type="procedural" must be rejected with a clear error listing

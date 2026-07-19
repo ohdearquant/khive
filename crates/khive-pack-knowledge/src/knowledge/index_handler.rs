@@ -1,9 +1,11 @@
 //! Index handler: embed atoms and build/persist the Vamana ANN index.
 
+use std::sync::Arc;
+
 use serde_json::{json, Value};
 
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
-use khive_storage::types::{SqlStatement, SqlValue};
+use khive_storage::types::{SqlStatement, SqlValue, VectorRecord};
 use khive_types::SubstrateKind;
 
 use super::schema::{Atom, IndexParams};
@@ -25,11 +27,20 @@ impl KnowledgeHandlers {
         let rebuild_ann = p.rebuild_ann.unwrap_or(false);
         let ns = token.namespace().as_str().to_owned();
 
-        if runtime.default_embedder_name().is_empty() {
+        let default_model_name = runtime.default_embedder_name();
+        if default_model_name.is_empty() {
             return Ok(
                 json!({ "indexed": 0, "skipped": 0, "failed": 0, "total": 0, "reason": "no embedding model configured" }),
             );
         }
+        // Every other registered engine gets the same batch, best-effort (issue
+        // #1115): a secondary-engine failure does not affect indexed/failed/
+        // skipped, which stay keyed on the default model as before this fix.
+        let secondary_model_names: Vec<String> = runtime
+            .registered_embedding_model_names()
+            .into_iter()
+            .filter(|m| m != default_model_name)
+            .collect();
 
         let sql = runtime.sql();
         let batch_size = p.batch_size.unwrap_or(DEFAULT_EMBED_BATCH).clamp(1, 1000);
@@ -125,68 +136,64 @@ impl KnowledgeHandlers {
                 })
                 .collect();
 
-            let embeddings = match runtime.embed_document_batch(&texts).await {
-                Ok(e) => e,
-                Err(e) => {
-                    tracing::warn!(
-                        batch_size = staged.len(),
-                        error = %e,
-                        "embed_batch failed; atoms cannot be recalled until reindexed"
-                    );
-                    failed += staged.len();
-                    continue;
-                }
-            };
-            if embeddings.len() != staged.len() {
-                tracing::warn!(
-                    expected = staged.len(),
-                    got = embeddings.len(),
-                    "embed_batch returned wrong number of vectors; atoms cannot be recalled until reindexed"
-                );
-                failed += staged.len();
-                continue;
-            }
+            // Every configured engine embeds and writes its own batch independently
+            // (issue #1115): a secondary-engine failure does not affect `indexed`/
+            // `failed`, which stay keyed on the default model, as before this fix.
+            // Fan the models out concurrently — each is an independent embed call
+            // plus vector write, so serializing them only adds up their latencies.
+            let staged = Arc::new(staged);
+            let texts = Arc::new(texts);
+
+            let default_handle = tokio::spawn(embed_and_insert_model(
+                runtime.clone(),
+                token.clone(),
+                default_model_name.to_string(),
+                true,
+                Arc::clone(&staged),
+                Arc::clone(&texts),
+            ));
+            let secondary_handles: Vec<_> = secondary_model_names
+                .iter()
+                .map(|model_name| {
+                    tokio::spawn(embed_and_insert_model(
+                        runtime.clone(),
+                        token.clone(),
+                        model_name.clone(),
+                        false,
+                        Arc::clone(&staged),
+                        Arc::clone(&texts),
+                    ))
+                })
+                .collect();
 
             // Track which atoms in this chunk had their vector persisted, so a
             // failed insert is reported as `failed` rather than silently counted
             // as `indexed`. A failed vector write means recall cannot retrieve
             // that atom — that is a failure, not a success.
             //
-            // No pre-delete loop: SqliteVecStore::insert wraps its own DELETE+INSERT
-            // in a single transaction, so a failed INSERT rolls back the DELETE and
-            // the prior vector survives (no-worse-than-stale). A separate pre-delete
-            // committed before insert would re-introduce the stranding window.
-            let mut chunk_ok: Vec<bool> = vec![true; staged.len()];
-            match runtime.vectors(token) {
-                Ok(vectors) => {
-                    let ns_str = token.namespace().as_str();
-                    for (i, ((id, _), emb)) in staged.iter().zip(embeddings.iter()).enumerate() {
-                        if let Err(e) = vectors
-                            .insert(
-                                *id,
-                                SubstrateKind::Entity,
-                                ns_str,
-                                "knowledge.atom",
-                                vec![emb.clone()],
-                            )
-                            .await
-                        {
-                            tracing::warn!(id = %id, error = %e, "knowledge vector insert failed");
-                            chunk_ok[i] = false;
-                            failed += 1;
-                        }
-                    }
+            // No pre-delete loop: SqliteVecStore::insert_batch wraps each record's
+            // own DELETE+INSERT in a savepoint, so a failed INSERT rolls back only
+            // that record's DELETE and the prior vector survives (no-worse-than-
+            // stale). A separate pre-delete committed before insert would
+            // re-introduce the stranding window.
+            match default_handle.await {
+                Ok(outcome) => {
+                    indexed += outcome.affected as usize;
+                    failed += outcome.failed as usize;
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "knowledge vector store unavailable");
-                    for ok in chunk_ok.iter_mut() {
-                        *ok = false;
-                    }
+                    tracing::warn!(error = %e, "knowledge index default-model task panicked");
                     failed += staged.len();
                 }
             }
-
-            indexed += chunk_ok.iter().filter(|ok| **ok).count();
+            for handle in secondary_handles {
+                // Secondary-engine failures are best-effort (logged inside the
+                // task) and never affect `indexed`/`failed`; only a task panic
+                // needs handling here.
+                if let Err(e) = handle.await {
+                    tracing::warn!(error = %e, "knowledge index secondary-model task panicked");
+                }
+            }
 
             if let Some(cb) = on_progress {
                 cb(indexed as u64, total as u64);
@@ -246,5 +253,149 @@ impl KnowledgeHandlers {
             "ann_vectors": ann_count,
             "ann_failed": ann_failed,
         }))
+    }
+}
+
+/// One embedding model's outcome from [`embed_and_insert_model`], counted in vectors.
+struct ModelIndexOutcome {
+    affected: u64,
+    failed: u64,
+}
+
+/// Embed one chunk's staged atoms with `model_name` and batch-insert the resulting
+/// vectors. Split out of `index` so the default model and every secondary model
+/// (issue #1115) can run as independent `tokio::spawn` tasks instead of embedding
+/// and writing serially, one model at a time. `is_default` only selects tracing
+/// wording — the default model's outcome is applied to the caller's `indexed`/
+/// `failed` counters; secondary-model outcomes are best-effort and only logged.
+async fn embed_and_insert_model(
+    runtime: KhiveRuntime,
+    token: NamespaceToken,
+    model_name: String,
+    is_default: bool,
+    staged: Arc<Vec<(uuid::Uuid, String)>>,
+    texts: Arc<Vec<String>>,
+) -> ModelIndexOutcome {
+    let embeddings = match runtime
+        .embed_document_batch_with_model(&model_name, &texts)
+        .await
+    {
+        Ok(e) => e,
+        Err(e) => {
+            if is_default {
+                tracing::warn!(
+                    batch_size = staged.len(),
+                    error = %e,
+                    "embed_batch failed; atoms cannot be recalled until reindexed"
+                );
+            } else {
+                tracing::warn!(
+                    model = %model_name,
+                    batch_size = staged.len(),
+                    error = %e,
+                    "knowledge secondary-engine embed_batch failed; \
+                     atoms miss a vector for this engine until backfill"
+                );
+            }
+            return ModelIndexOutcome {
+                affected: 0,
+                failed: if is_default { staged.len() as u64 } else { 0 },
+            };
+        }
+    };
+    if embeddings.len() != staged.len() {
+        if is_default {
+            tracing::warn!(
+                expected = staged.len(),
+                got = embeddings.len(),
+                "embed_batch returned wrong number of vectors; atoms cannot be recalled until reindexed"
+            );
+        } else {
+            tracing::warn!(
+                model = %model_name,
+                expected = staged.len(),
+                got = embeddings.len(),
+                "knowledge secondary-engine embed_batch returned wrong \
+                 vector count; skipping this engine for the batch"
+            );
+        }
+        return ModelIndexOutcome {
+            affected: 0,
+            failed: if is_default { staged.len() as u64 } else { 0 },
+        };
+    }
+
+    let vectors = match runtime.vectors_for_model(&token, &model_name) {
+        Ok(v) => v,
+        Err(e) => {
+            if is_default {
+                tracing::warn!(error = %e, "knowledge vector store unavailable");
+            } else {
+                tracing::warn!(
+                    model = %model_name,
+                    error = %e,
+                    "knowledge secondary-engine vector store unavailable"
+                );
+            }
+            return ModelIndexOutcome {
+                affected: 0,
+                failed: if is_default { staged.len() as u64 } else { 0 },
+            };
+        }
+    };
+
+    let ns_str = token.namespace().as_str().to_string();
+    let records: Vec<VectorRecord> = staged
+        .iter()
+        .zip(embeddings.iter())
+        .map(|((id, _), emb)| VectorRecord {
+            subject_id: *id,
+            kind: SubstrateKind::Entity,
+            namespace: ns_str.clone(),
+            field: "knowledge.atom".to_string(),
+            embedding_model: Some(model_name.clone()),
+            vectors: vec![emb.clone()],
+            updated_at: chrono::Utc::now(),
+        })
+        .collect();
+
+    match vectors.insert_batch(records).await {
+        Ok(summary) => {
+            if summary.failed > 0 {
+                if is_default {
+                    tracing::warn!(
+                        failed = summary.failed,
+                        error = %summary.first_error,
+                        "knowledge vector batch insert had failures"
+                    );
+                } else {
+                    tracing::warn!(
+                        model = %model_name,
+                        failed = summary.failed,
+                        error = %summary.first_error,
+                        "knowledge secondary-engine vector batch insert had failures"
+                    );
+                }
+            }
+            ModelIndexOutcome {
+                affected: summary.affected,
+                failed: summary.failed,
+            }
+        }
+        Err(e) => {
+            if is_default {
+                tracing::warn!(error = %e, "knowledge vector store unavailable");
+            } else {
+                tracing::warn!(
+                    model = %model_name,
+                    error = %e,
+                    "knowledge secondary-engine vector store unavailable"
+                );
+            }
+            ModelIndexOutcome {
+                affected: 0,
+                failed: if is_default { staged.len() as u64 } else { 0 },
+            }
+        }
     }
 }

@@ -22,7 +22,7 @@ This deadline differs from `ann_ready_timeout_ms`: the former returns a typed `D
 
 Noise-only queries are rejected before expensive embedding work. `is_meaningful_query` requires alphabetic or CJK content, rejects empty/symbol-only input, rejects a lone non-CJK meaningful character, and filters repeated-character gibberish.
 
-FTS CJK bypass uses `contains_cjk`, while dense multilingual routing uses the broader `needs_multilingual` signal. If multilingual routing is requested but no multilingual model is registered, recall falls back to the registered model set rather than returning no results.
+FTS CJK bypass uses `contains_cjk` to route the text leg through the CJK-bypass tokenizer. The dense/vector leg has no separate query-language routing: it always searches every configured embedding engine and fuses the results (issue #1115), whether or not the query contains CJK.
 
 `embed_query_model` checks the pack-local LRU by `(model, query)` and embeds on the blocking pool when absent. It uses the runtime's query-side instruction prefix, which preserves the trained retrieval space for instruction-tuned models such as multilingual-e5. Cache hits clone the stored vector result.
 

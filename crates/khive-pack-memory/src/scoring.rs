@@ -514,14 +514,11 @@ pub struct ScoringConfig {
     /// When true, suppress memories whose `properties.supersedes` value matches
     /// the ID of another memory in the result set. Default: true.
     pub enable_supersedes_suppression: bool,
-    /// When true and a multilingual embedding model is registered, route
-    /// non-ASCII-script queries (CJK, Cyrillic, Arabic, accented-Latin, …) to
-    /// it as the primary dense model. Default: true.
-    pub enable_multilingual_routing: bool,
-    /// Name of the multilingual embedding model to prefer for dense routing.
-    /// When None, the handler checks registered model names for substrings
-    /// "multilingual" or "paraphrase". Default: None.
-    pub multilingual_model: Option<String>,
+    /// When true, a CJK-majority query bypasses the FTS5 leg (whose trigram
+    /// tokenizer does not segment CJK well) and relies on the vector leg
+    /// instead. Default: true.
+    #[serde(alias = "enable_multilingual_routing")]
+    pub enable_cjk_fts_bypass: bool,
 
     // ── Conditional adjustments ────────────────────────────────────────────
     /// Score adjustments applied after the base formula. Default: episodic bonus,
@@ -549,8 +546,7 @@ impl Default for ScoringConfig {
             mmr_prefix_len: 100,
 
             enable_supersedes_suppression: true,
-            enable_multilingual_routing: true,
-            multilingual_model: None,
+            enable_cjk_fts_bypass: true,
 
             adjustments: default_adjustments(),
         }
@@ -600,22 +596,6 @@ pub fn contains_cjk(text: &str) -> bool {
     }
     let cjk = chars.iter().filter(|&&c| is_cjk_char(c)).count();
     (cjk as f32) / (chars.len() as f32) > 0.15
-}
-
-/// Return whether more than 15% of alphabetic characters are non-ASCII.
-///
-/// Punctuation and digits do not dilute the ratio. ASCII-only non-English Latin remains
-/// undetected and uses the primary model. See `crates/khive-pack-memory/docs/api/scoring.md`.
-pub fn needs_multilingual(text: &str) -> bool {
-    let alpha_chars: Vec<char> = text.chars().filter(|c| c.is_alphabetic()).collect();
-    if alpha_chars.is_empty() {
-        return false;
-    }
-    let non_ascii_alpha = alpha_chars
-        .iter()
-        .filter(|&&c| !c.is_ascii_alphabetic())
-        .count();
-    (non_ascii_alpha as f32) / (alpha_chars.len() as f32) > 0.15
 }
 
 /// Normalize `min_score`: 0–1 passes through, 1–100 divides by 100, others return Err.
@@ -919,6 +899,23 @@ mod tests {
     }
 
     #[test]
+    fn scoring_config_old_multilingual_routing_key_still_disables_cjk_bypass() {
+        let cfg: ScoringConfig =
+            serde_json::from_value(serde_json::json!({ "enable_multilingual_routing": false }))
+                .expect("old key must still deserialize via the alias");
+        assert!(
+            !cfg.enable_cjk_fts_bypass,
+            "a config that disabled the old enable_multilingual_routing key must still \
+             disable the CJK FTS bypass under its new name"
+        );
+    }
+
+    #[test]
+    fn scoring_config_default_enables_cjk_bypass() {
+        assert!(ScoringConfig::default().enable_cjk_fts_bypass);
+    }
+
+    #[test]
     fn normalize_min_score_fraction_passthrough() {
         let v = normalize_min_score(0.5).unwrap();
         assert!((v - 0.5f32).abs() < 1e-6);
@@ -1087,91 +1084,6 @@ mod tests {
         let s2 = output[&ids[2]];
         assert!(s0 > s1 && s1 > s2, "ordering must be preserved");
         assert!(s0 <= 1.0 && s2 >= 0.0, "scores must be in [0,1]");
-    }
-
-    // ── needs_multilingual ────────────────────────────────────────────────────
-
-    #[test]
-    fn needs_multilingual_ascii_english_routes_primary() {
-        assert!(!needs_multilingual("hello world"));
-        assert!(!needs_multilingual("rust programming language"));
-        assert!(!needs_multilingual(""));
-        assert!(!needs_multilingual("42 items in the list"));
-    }
-
-    #[test]
-    fn needs_multilingual_cjk_routes_multilingual() {
-        // Pure CJK: 4/4 = 100% non-ASCII alpha → well above 15%.
-        assert!(needs_multilingual("你好世界"));
-        // Mixed: 2 CJK out of 5 chars = 40%.
-        assert!(needs_multilingual("abc你好"));
-    }
-
-    #[test]
-    fn needs_multilingual_cyrillic_routes_multilingual() {
-        // "Привет мир" (Hello world in Russian): all Cyrillic alphabetic.
-        assert!(needs_multilingual("Привет мир"));
-        // Single Cyrillic word mixed with Latin — Г alone is 1/7 ≈ 14% (below threshold).
-        // Verify with a word that has enough Cyrillic chars to cross 15%.
-        assert!(needs_multilingual("Привет hello")); // Привет = 6 non-ASCII alpha, total chars including space = 12 → 6/12 = 50%
-    }
-
-    #[test]
-    fn needs_multilingual_arabic_routes_multilingual() {
-        // "مرحبا" (Hello in Arabic): all Arabic alphabetic.
-        assert!(needs_multilingual("مرحبا بالعالم"));
-    }
-
-    #[test]
-    fn needs_multilingual_devanagari_routes_multilingual() {
-        // "नमस्ते" (Namaste in Hindi/Devanagari).
-        assert!(needs_multilingual("नमस्ते दुनिया"));
-    }
-
-    #[test]
-    fn needs_multilingual_accented_latin_routes_multilingual() {
-        // French: "café résumé" — é is alphabetic and non-ASCII.
-        // Alphabetic chars: c,a,f,é,r,é,s,u,m,é = 10; non-ASCII alpha: 3; 3/10 = 30% > 15%.
-        assert!(needs_multilingual("café résumé"));
-        // German: "Müller" — ü is 1/6 alpha = 16.7% > 15%.
-        assert!(needs_multilingual("Müller"));
-        // Spanish: "niño" — ñ is 1/4 alpha = 25% > 15%.
-        assert!(needs_multilingual("niño"));
-    }
-
-    #[test]
-    fn needs_multilingual_alphabetic_denominator_is_stable_under_punctuation() {
-        // INVARIANT 2: punctuation/digits must not change routing decision.
-        // "Müller" alpha: M,ü,l,l,e,r = 6; non-ASCII alpha: ü = 1; 1/6 = 16.7% > 15%.
-        assert!(needs_multilingual("Müller"));
-        // "Müller?" — same 6 alpha chars; ? is not alphabetic; 1/6 = 16.7% → still routes.
-        assert!(needs_multilingual("Müller?"));
-        // "Müller!!!" — same 6 alpha chars; 1/6 = 16.7% → still routes.
-        assert!(needs_multilingual("Müller!!!"));
-        // Digit-heavy short accented query: "42 Ü" — alpha: Ü = 1; non-ASCII: 1; 1/1 = 100%.
-        assert!(needs_multilingual("42 Ü"));
-        // Empty / no-alpha: must return false without divide-by-zero.
-        assert!(!needs_multilingual(""));
-        assert!(!needs_multilingual("42 100 ???"));
-    }
-
-    #[test]
-    fn needs_multilingual_pure_ascii_accented_below_threshold_routes_primary() {
-        // "hello naïve" — ï is 1 non-ASCII alpha out of 10 alpha = 10% < 15% → primary.
-        // (Deliberate design decision: a single diacritic in an otherwise English
-        // sentence does not warrant multilingual routing.)
-        assert!(!needs_multilingual("hello naive")); // no diacritics, definitely primary
-                                                     // "über" — ü is 1/4 alpha = 25% → routes multilingual (German word).
-        assert!(needs_multilingual("über"));
-    }
-
-    #[test]
-    fn needs_multilingual_ascii_only_non_english_latin_routes_primary_known_limitation() {
-        // INVARIANT 4: ASCII-only non-English Latin is NOT detected here.
-        // Real language detection is tracked as a follow-up to issue #101.
-        assert!(!needs_multilingual("bonjour le monde"));
-        assert!(!needs_multilingual("como estas"));
-        assert!(!needs_multilingual("ich suche einen buchhalter"));
     }
 
     // ── extract_entity_candidates ─────────────────────────────────────────────
