@@ -53,8 +53,9 @@ read-your-writes for every write covered by the serving index **or newer than th
 registry minimum** — a set that includes every committed write except, transiently, writes
 inside the cross-process mismatch window of §1, which is empty for same-process checkpoints
 and closed by re-adoption. While no index is serving (Cold rebuild in flight, or Empty), a
-committed write is visible to the vector legs iff fewer than threshold-many writes committed
-after it in scope; ADR-107 governs anything older until the rebuild lands (§3). The
+committed write is visible to the vector legs iff its log row is still retained and fewer
+than threshold-many retained writes committed after it in scope (§3 states the precise
+condition); ADR-107 governs everything else until the rebuild lands. The
 per-query cost is proportional to the tail length, which the checkpoint lifecycle already
 bounds.
 
@@ -153,10 +154,16 @@ newest writes) so the freshest writes stay visible while FTS covers the rest, an
 defers to the existing Cold-path behavior (FTS-only serving while the rebuild runs). The leg
 restores freshness on a serving index; it is not a general exact-search fallback. This is
 the second tier of the §"Decision" guarantee stated precisely: with no serving index, a
-committed write is visible to the vector legs **iff fewer than threshold-many writes
-committed after it in scope** — under concurrent load, later commits can push an earlier
-write outside the newest suffix, so recency of the caller's own write is not guaranteed by
-construction. Anything outside the suffix is governed by ADR-107 until the rebuild lands.
+committed write is visible to the vector legs **iff its `ann_write_log` row is still
+retained — compaction has not passed it — and fewer than threshold-many retained writes
+committed after it in scope**. Both conjuncts are load-bearing. Under concurrent load,
+later commits can push an earlier write outside the newest suffix, so recency of the
+caller's own write is not guaranteed by construction. And a write already compacted out of
+the log — possible only after every registered consumer durably checkpointed past it —
+depends on the persisted segment that reflected it; if that segment is now absent or
+corrupt (the Cold trigger itself), the write sits outside both the log suffix and any
+vector leg despite its later-write count. Everything failing either conjunct is governed by
+ADR-107 until the rebuild lands.
 The regression this ADR fixes (#1143) lives entirely in the first tier; the Cold window is
 the pre-existing ADR-107 behavior, narrowed by the guaranteed-fresh suffix rather than
 contradicted by it.
@@ -196,9 +203,9 @@ longer governs is **result visibility while a serving index exists**: there, a c
 write is eligible for recall results on the next query, independent of rebuild progress,
 subject only to the §1 cross-process mismatch window (empty for same-process checkpoints,
 closed by re-adoption). In the no-index states (Cold, Empty) the §3 second tier applies —
-visibility iff fewer than threshold-many writes committed after it in scope, ADR-107
-behavior for anything older — so ADR-107 §1 continues to describe the verb's observable
-freshness in exactly and only those states and that window.
+visibility under the retained-row iff of §3, ADR-107 behavior for everything else — so
+ADR-107 §1 continues to describe the verb's observable freshness in exactly and only those
+states and that window.
 Statements in ADR-107 §1 that recall "may serve results computed from an ANN index that is
 behind the caller's own most recent write" remain true of the index and cease to describe
 the verb's observable freshness whenever an index is serving.
