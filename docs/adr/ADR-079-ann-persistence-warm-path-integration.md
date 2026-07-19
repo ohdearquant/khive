@@ -376,8 +376,11 @@ testable. Step 0 is the precondition; steps 1–2 land the #322 root-cause fix a
 
 ## Amendment 1 — Delta-log restart classifier and mmap re-adoption (2026-07-19)
 
-**Status**: Accepted (design; the implementation is tracked separately, and prior mechanisms
-remain operative until it lands)
+**Status**: Accepted
+
+This acceptance covers the design. Prior mechanisms remain operative in shipped code until the
+implementation lands; the ADR-107 supersession note carries the same boundary for the memory
+consumer.
 
 ### Context
 
@@ -456,6 +459,14 @@ CREATE TABLE ann_consumer_watermark (
   | 6 | `NOT EXISTS (SELECT 1 FROM ann_write_log WHERE <scope> AND seq > S)`                                       | **Hot**: mmap load, zero corpus IO. This is the post-compaction steady state — an empty scope (`MAX(seq)` NULL) with a valid watermark `S` is Hot, because every post-migration write logs a row and compaction only ever removes rows `<= S`                                                                                         |
   | 7 | tail rows exist, tail count ≤ `ceil(ann_rebuild_threshold × live vector_count)`                            | **Stale-tail**: mmap load, then final-state tail replay (below). §2 serve-stale applies while the tail applies. Rules 7-8 are reachable only with live vector count > 0 (rule 5 matched first otherwise)                                                                                                                              |
   | 8 | tail count above threshold                                                                                 | **Stale-rebuild** (amends the §2 state table): the checksum-valid segment loads and serves under the existing `ann_serve_stale` gate while a full rebuild runs in the background. The threshold is a cost decision, not evidence of unreadability — it never demotes a loadable segment to Cold/FTS-only                              |
+
+- **Evaluation order of rules 5 and 6.** An implementation may test rule 6's tail predicate (a
+  log-table-only query) before rule 5's live count, and adopt Hot without ever running the live
+  count. The outcomes coincide: with an empty tail, the committed segment already reflects every
+  logged op at or below `S`, so a zero-live scope implies the segment itself holds zero live
+  vectors and adoption serves exactly what Empty serves. This ordering is what makes the Hot
+  path's zero-corpus-IO property literal — the live corpus count is executed only when a tail
+  exists (rules 5, 7, and 8), where corpus-scale work is already inherent.
 
 - **Tail replay is a final-state delta, not an event replay.** Coalesce the tail to the highest
   `seq` per `subject_id`; only the final op is applied. A final `upsert` resolves the subject's

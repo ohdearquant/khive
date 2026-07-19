@@ -2,7 +2,6 @@
 
 **Status**: Accepted
 **Date**: 2026-07-10
-**Superseded in part**: restart validation and scope provisions, by the [ADR-079](ADR-079-ann-persistence-warm-path-integration.md) Amendment 1 addendum (details in the Supersession note below)
 **Depends on**: [ADR-021](ADR-021-memory-pack.md) (Memory Pack), [ADR-079](ADR-079-ann-persistence-warm-path-integration.md) (ANN persistence warm-path integration, knowledge pack scope)
 **References**: issue #791, PR #812
 
