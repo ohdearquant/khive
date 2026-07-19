@@ -768,3 +768,657 @@ policy for GitHub issues is unchanged and orthogonal to this amendment: it
 still runs after pass 3 against the verify-dedupe-rank policy, never a bulk
 file-everything pass, and is not affected by whether a finding has also been
 ingested into khive.
+
+## Amendment 4 (2026-07-17): analysis verbs over the map database
+
+D1 declared the code pack "verbless-by-design, domain-ontology only," and
+Amendment 2 added exactly one verb, `code.ingest`, without changing that
+posture: ingest writes a map database, it does not read one back. Amendment
+2's L1 and L1.5 tiers shipped in PR #1039; L2 (declaration-granularity
+Scanner/Extractor ingest) remains unimplemented. Across all three tiers,
+nothing in the pack analyzes the structure it has ingested — the original
+one-line ask that opened this ADR's Context ("we need a pack-code") included
+analysis, and the pack has shipped none. This amendment adds the pack's
+first analysis verbs: three read-only operations over the same map databases
+`code.ingest` writes.
+
+### E1: Scope — D1's verbless-by-design statement is superseded for reads only
+
+This amendment supersedes D1's "registers zero verbs" scope statement for
+read verbs. The write surface is unchanged: `code.ingest` remains the pack's
+only mutating verb, and no new entity kind, note kind, or edge relation is
+introduced here. The three verbs below are pure readers: each opens a map
+database, computes over its stored entities and edges, and returns a
+result. None of them writes to any database, production or map: no
+entity, edge, or note row is created, updated, or deleted by any of the
+three. E7 describes the narrow filesystem side effect a read-only
+WAL-mode open can still have on a target database's own `-wal`/`-shm`
+sidecars — a storage-engine artifact of opening the file for read, not a
+row-level write this scope statement speaks to.
+
+All three verbs additionally observe soft-delete state. Every query
+underlying `code.coupling`, `code.health`, and `code.cycles` participates
+only rows with `deleted_at IS NULL` — entities, `depends_on` edges, and
+`contains` (containment) edges alike. This is khive's ordinary soft-delete
+convention (a deleted row stays in storage; every reader filters it out at
+query time), restated here because these three verbs compute aggregates and
+graph structure rather than returning individual rows, and an aggregate has
+no obvious place to apply a filter unless every underlying query does it
+consistently. A soft-deleted module, or a soft-deleted edge between two
+otherwise-live modules, contributes to no coupling number, no dead-module
+count, no aggregation, and no cyclic component. The same tombstone rule
+governs every aggregate by endpoint liveness, not by edge-row liveness
+alone: an edge row can be live while one of its endpoint entities is
+soft-deleted, and such an edge contributes to no coupling number, no
+`edges_by_relation` count, no dead-module count, no aggregation, and no
+cyclic component, exactly as a soft-deleted edge row would. Both endpoints
+of an edge must be live entities for that edge to participate in anything
+these three verbs compute.
+
+### E2: `code.coupling(db, level?, top_n?)`
+
+Fan-in/fan-out over `depends_on` edges, per module by default
+(`level="module"`), or per project when `level="project"` — aggregating the
+same edges up to the `project contains module` containment rule (D3 #9).
+`level` is a closed enum, `module` or `project`; see E6 for why
+declaration-level coupling is out of scope for this amendment. `db` is
+required (E7) — there is no `path`-derived default for analysis verbs the
+way `code.ingest` has one for `path` itself (B1).
+
+Each result row carries the entity id, its name, `fan_in` (incoming
+`depends_on` edge count), and `fan_out` (outgoing `depends_on` edge count).
+Rows are ordered by total degree (fan_in + fan_out) descending; ties break
+by entity id ascending at `level="module"`, and by project name ascending
+at `level="project"` (see the project row eligibility rule below) — a
+total order at either level, so two identical calls return rows in the
+same sequence (E9). The result is bounded by `top_n`
+(integer, minimum 1, maximum 500, default 50 — validation contract in E8) rather than offset-paginated: degree ranking cannot be
+sliced without first aggregating every row's total degree, so an
+offset-based page over the map-database scale this pack targets would redo
+that full aggregation on every page for no benefit over asking for a larger
+`top_n` once. There is no `offset` parameter in v1. When fewer than `top_n`
+rows exist — including an empty or newly-ingested database with no modules
+at all — `code.coupling` returns every available row, or an empty array; it
+never invents rows to reach `top_n` and never errors for having fewer rows
+than requested. A materialized-cursor contract — one that lets a caller
+resume a coupling listing without re-aggregating from scratch — is
+deferred until a consumer demonstrates an actual need for it; nothing here
+forecloses adding one later.
+
+At `level="project"`, `fan_out` counts the number of _distinct_ neighbor
+projects this project depends on, and `fan_in` counts the number of
+distinct neighbor projects that depend on it — not edge counts. A
+dependency from project A to project B counts as one neighbor relationship
+if there is a direct project-to-project `depends_on` edge from A to B, or
+at least one module-to-module `depends_on` edge whose source module
+belongs (via `contains`) to A and whose target module belongs to B; A and
+B count as neighbors once regardless of how many edges — direct or
+module-mediated — witness the relationship.
+
+Intra-project module dependencies do not contribute to project-level
+`fan_in`/`fan_out`. A `depends_on` edge whose source and target modules
+both belong (via `contains`) to the same project describes structure
+inside that project, not a relationship between projects, so it is
+excluded from the neighbor count entirely: it neither makes the project a
+neighbor of itself nor inflates either total. Project-level coupling
+counts only edges, direct project-to-project or module-mediated, whose
+endpoint modules resolve to two different projects. A project whose
+modules import only each other therefore reports zero fan_in and zero
+fan_out at `level="project"`, even though the same modules carry nonzero
+fan_in/fan_out at `level="module"`.
+
+A project is eligible to appear as a row at `level="project"` only if it
+contains at least one live (non-soft-deleted) module; a project with no
+live modules — none ever ingested, or all since soft-deleted — is excluded
+from the result entirely rather than reported with zero degrees. A project
+that does have live modules, but no qualifying `depends_on` relationship to
+any other project, still appears, with `fan_in=0` and `fan_out=0`, exactly
+as the intra-project-only case above illustrates. Ties in total degree at
+`level="project"` order deterministically by project name ascending,
+because a project's entity id is not the identifier callers reason about
+the way a module's declared name is.
+
+`code.coupling` returns an envelope, not a bare array: `level` echoes the
+requested level, and `rows` carries the ordered result. Each row's
+`entity_id` is the module's or project's entity UUID as a string; `name`
+is its entity name as stored. Field names are fixed regardless of level:
+
+```json
+{
+  "level": "module",
+  "rows": [
+    {
+      "entity_id": "3f9a1c2e-8b7d-4e21-9c4a-6d1f2a8b5c30",
+      "name": "khive_pack_code::vocab",
+      "fan_in": 4,
+      "fan_out": 2
+    },
+    {
+      "entity_id": "9a2b7e10-4c5f-4d8a-8e2b-1f3c6a7d9e40",
+      "name": "khive_pack_code::hook",
+      "fan_in": 1,
+      "fan_out": 3
+    }
+  ]
+}
+```
+
+### E3: `code.health(db, top_n?)`
+
+A single summary object over one map database, computed directly against
+that database — not a call to the existing `stats()` verb, which reports
+KG-substrate counts and has no target-database parameter:
+
+- `entities_by_kind` — a map from entity-kind token to count, over the
+  target database's own entities.
+- `edges_by_relation` — a map from edge-relation token to count, over the
+  target database's own edges.
+- `coupling_outliers` — an array of coupling rows in E2's row shape
+  (`entity_id`, `name`, `fan_in`, `fan_out`), reusing E2's computation at
+  `level="module"` rather than a separate query; `code.health` takes no
+  `level` parameter, so this array is always module-level. Its length is
+  `min(top_n, available rows)`, `top_n` (integer, minimum 1, maximum 100,
+  default 10 — validation contract in E8), the
+  same availability-bounded behavior as `code.coupling` itself (E2).
+- `dead_module_candidate_count` — the count of modules with zero incoming
+  `depends_on` edges, scoped to modules actually present in the ingested
+  set, the same scoping Amendment 2's B8 acceptance property 1 uses for dead
+  symbols.
+- `cyclic_component_count` — the number of cyclic components (E4), reusing
+  E4's computation rather than a separate query.
+
+`code.health` is a composition of `code.coupling` and `code.cycles` plus
+counting; it introduces no computation beyond what those two verbs already
+define, and its work is bounded the same way theirs is. `code.health`
+opens one short read-only transaction and does two kinds of work inside
+it, and nothing else: it runs `entities_by_kind` and `edges_by_relation` as
+grouped SQL aggregates (`COUNT(*) ... GROUP BY` over every non-deleted
+entity row and every non-deleted edge row respectively, filtered by E1's
+soft-delete rule), and it loads a single compact module-graph projection,
+module entity ids and names and module-to-module `depends_on` pairs, into
+memory. `code.health` declares no output that needs project-to-module
+containment (`coupling_outliers` is always module-level, per this
+section), so the projection carries no `project contains module` pairs.
+Neither step materializes
+individual entity or edge rows beyond that projection: the aggregates
+return only the small per-kind and per-relation count maps, never the rows
+being counted, and the projection is small by construction (module-level
+structure only, never declaration-level rows). The transaction commits as
+soon as both the aggregates and the projection have been read. Every
+subsequent step, the coupling-outlier ranking and the Tarjan pass behind
+`cyclic_component_count`, runs entirely against that in-memory projection,
+with no further database reads and no open transaction during the
+CPU-heavy work. Because `entities_by_kind` and `edges_by_relation` are
+grouped aggregates over every non-deleted row in the same reader, not
+restricted to the relations `code.coupling` or `code.cycles` happen to
+traverse, `edges_by_relation` counts every edge relation present in the
+database, including ones neither of those two verbs ever visits (`extends`,
+`implements`, or any relation added to the ontology after this amendment
+ships), and does so from the same snapshot as every other field in the
+response. Every field in the returned summary therefore derives from that
+one transaction's snapshot: no field can reflect a write that landed after
+the snapshot was taken, and the summary describes one coherent state,
+never a mix, without holding a reader open across the aggregation and
+cycle-detection work that follows. `db` is required, per E7.
+
+A per-database guard admits at most one running analysis call at a time,
+and covers all three analysis verbs alike: `code.coupling`, `code.health`,
+and `code.cycles` each acquire the same guard before starting work, and a
+second call against a database whose guard is already held fails
+immediately with a busy error naming the database, rather than queuing
+behind the first. The guard is keyed on the target database's main file
+(device, inode) identity, read off the opened descriptor, not on the `db`
+pathname the caller supplied: two calls that name the same underlying
+file through different paths, a hard link or any other alias, resolve to
+one guard slot and contend with each other exactly as two calls against
+the identical path would. This is deliberate admission control, not a
+`code.health`/`code.cycles`-only cost-sharing detail: `code.coupling` at
+`level="project"` still aggregates over every module-to-module edge in
+the database to compute its degree totals, so a caller who fans out
+repeated `code.coupling` scans against the same database needs the same
+fail-fast contention signal `code.health` and `code.cycles` already give.
+`top_n` bounds only how many aggregated rows a `code.coupling` call
+serializes in its response, never how much of the database the
+aggregation itself must scan, which is why admission control lives at
+the guard rather than at `top_n`. The MCP `request` surface can dispatch
+up to 100 ops concurrently in one batch, and a caller who fans out
+several analysis calls at once against the same database needs to see
+that contention immediately rather than have it silently absorbed by a
+queue. The guard releases as soon as the call it is holding for returns,
+success or error alike.
+
+`code.health`'s JSON response nests the two computed sub-results under
+their own field names, matching each verb's own envelope shape where one
+exists:
+
+```json
+{
+  "entities_by_kind": { "module": 12, "function": 340, "datatype": 58, "interface": 9 },
+  "edges_by_relation": { "depends_on": 512, "contains": 419, "implements": 61 },
+  "coupling_outliers": [
+    {
+      "entity_id": "3f9a1c2e-8b7d-4e21-9c4a-6d1f2a8b5c30",
+      "name": "khive_pack_code::vocab",
+      "fan_in": 4,
+      "fan_out": 2
+    }
+  ],
+  "dead_module_candidate_count": 3,
+  "cyclic_component_count": 1
+}
+```
+
+### E4: `code.cycles(db, limit?, max_members?)`
+
+`code.cycles` returns **cyclic components**, not enumerated simple cycles.
+Each result item is one strongly connected component of size two or more
+over the `concept/module -> depends_on -> concept/module` edge set (D3 #8),
+or a self-loop component of size one (a module depending on itself).
+Simple-cycle enumeration — every distinct cycle through a component's
+members — is exponential in the worst case and is out of scope; a
+component's presence proves at least one directed cycle runs through its
+members, without claiming to enumerate all of them.
+
+Each component is returned as an ordered list of module ids and names,
+members ordered by entity id ascending. The top-level result list is
+ordered by member_count descending, then by the smallest member id
+ascending — a total order, for the same pagination-determinism reason as
+E2.
+
+Detection cost is linear in the size of the target database's module
+graph — a single Tarjan pass over its `depends_on` edges, run once
+regardless of how many components exist or how the caller bounds the
+response. `limit` (integer, minimum 1, maximum 100, default 20 —
+validation contract in E8) and `max_members` (integer, minimum 1,
+maximum 1000, default 100 — validation contract in E8) bound only the
+response's size, not detection: `limit` caps the
+number of components serialized, and `max_members` caps how many members a
+single component's member list serializes before truncating. A component
+whose true member count exceeds `max_members` still reports its full
+`member_count` and sets `truncated: true`; its serialized member list is
+cut to the first `max_members` members in the component's own id-ascending
+order.
+
+`code.cycles`, called directly rather than through `code.health`, follows
+the same transaction shape E3 describes: it opens one short read-only
+transaction, loads the compact module-graph projection (module ids, names,
+and `depends_on` pairs), commits, and runs Tarjan over the in-memory
+projection with no open transaction during the pass. This is the same
+projection E3 loads for its own `cyclic_component_count`, not a second
+materialization strategy.
+
+Each component in the response is an object, not a bare list, so
+`truncated` and `member_count` can sit alongside the (possibly truncated)
+member array:
+
+```json
+{
+  "components": [
+    {
+      "member_count": 3,
+      "truncated": false,
+      "members": [
+        { "entity_id": "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d", "name": "khive_pack_code::a" },
+        { "entity_id": "2b3c4d5e-6f70-4b8c-9d0e-1f2a3b4c5d6e", "name": "khive_pack_code::b" },
+        { "entity_id": "3c4d5e6f-7081-4c9d-0e1f-2a3b4c5d6e7f", "name": "khive_pack_code::c" }
+      ]
+    }
+  ]
+}
+```
+
+### E5: Cycle detection is in-process, not a query recipe
+
+`code.cycles` is implemented as an in-process graph traversal (Tarjan's
+algorithm or an equivalent strongly-connected-components computation) over
+the map database's `depends_on` edges, not as a `query()` pattern the caller
+composes themselves. This is a normative consequence of the query layer's
+own design, not a convenience choice: `khive-query`'s validator
+(`crates/khive-query/src/validate.rs`) rejects any GQL or SPARQL pattern
+that repeats a node variable, with the rejection reason stated in the error
+text itself as cycle/self-reachability detection, and the rejection is
+locked by regression tests. A pattern that walks a module back to itself —
+the shape a cyclic-component query needs — cannot be expressed in either
+query language today. `code.cycles` exists because the gap is structural,
+not because in-process computation was preferred over a documented query
+recipe that could have been written instead.
+
+### E6: Non-goals
+
+- No declaration-level (L2) analysis semantics are defined here. `level` is
+  a closed enum, `module` or `project`, on `code.coupling` only. `code.cycles`
+  takes no `level` parameter at all: it is module-level only in v1 (E4), full
+  stop. A `level` parameter for `code.cycles`, if ever wanted, is not this
+  amendment's decision to make — it belongs to the future declaration-level
+  amendment below, alongside the rest of that amendment's eligibility,
+  aggregation, selectors, and health semantics for declaration entities.
+  `code.ingest`'s L2 tier remains unimplemented; declaration-level analysis
+  is deferred to that future amendment once L2 ships. Nothing here implies
+  what that shape will be. Regardless of what else a target map database
+  contains (a future L2's declaration-level entities, or ordinary `finding`
+  notes), `code.coupling` filters to module-to-module `depends_on` edges
+  only in v1 at `level="module"` — plus the project-to-project and
+  module-mediated project handling defined in E2 for `level="project"` — and
+  `code.cycles` filters to module-to-module `depends_on` edges only, with no
+  project-level variant.
+- No mutation. All three verbs are read-only, per E1.
+- No scheduled or background analysis. Every call computes fresh over the
+  database's current state at call time; there is no cached or
+  incrementally-maintained analysis result.
+- No default-pack-set change. The `code` pack's default-load status is
+  unchanged from Amendment 3 (C1).
+- No schema change. `SCHEMA_PLAN` remains `None`, as declared in D5.
+
+### E7: Target database posture — the production-db fence is restated, hardened, not relaxed
+
+`code.coupling`, `code.health`, and `code.cycles` resolve their `db`
+parameter through the same db-target resolution `code.ingest` uses (B1,
+B7), and each refuses the shared production database exactly as
+`code.ingest` does: analysis over `khive.db` is rejected with no override
+available on any of the three verbs. `db` is required on all three analysis
+verbs — there is no `path`-derived default the way `code.ingest` has one
+for `path` itself (B1), so an omitted `db` has nothing to derive a target
+from and is rejected outright; resolution reuse with `code.ingest`
+therefore applies to explicit caller-supplied values only.
+
+The `db` parameter, on `code.ingest` and on all three analysis verbs
+alike, must be an absolute, plain filesystem path. A value that begins
+with the `file:` scheme prefix, or that contains a `?` character, is
+rejected at parameter validation, before any filesystem probe and before
+any identity comparison. This check exists because the storage layer's
+backend constructors, general and read-only alike, open paths with
+SQLite's URI interpretation available, so `file:/path/to/production.db`,
+with or without a trailing `?mode=rw`-style query string, is a second,
+equally valid way to name the production database that a plain-path
+identity check would never see spelled that way. Rejecting the syntax
+outright, rather than parsing or canonicalizing it, removes that alias
+from consideration before the identity machinery below ever has to reason
+about it, on every one of the four verbs that accept `db`.
+
+The fence's boundary is the open call itself, not the checks that precede
+it. Every file this fence governs, the target's main database file and any
+`-journal`, `-wal`, or `-shm` companion, opens through a thin VFS wrapper
+layered over the platform's default VFS, used for every one of these opens
+without exception, on the analysis verbs and on `code.ingest` alike. Two
+things happen at the moment that wrapper opens a file, both against the
+open itself rather than against a path resolved earlier: the open uses
+no-follow semantics, so a path that resolves through a symlink at open
+time fails outright instead of transparently following it, and the
+resulting file descriptor's (device, inode) identity is read directly off
+that descriptor and compared against the production identity set (the
+production database's own main file, plus whichever of its `-journal`,
+`-wal`, and `-shm` companions presently exist). A match on any pairing
+aborts the open before the caller's connection sees a byte of the file.
+Because the check runs against the handle the connection is about to use,
+not against a path string resolved at some earlier moment, there is no
+window between validating a target and using it: no-follow closes the
+symlink-swap variant of that window, and the descriptor identity check
+closes the hard-link variant, since a hard link has no symlink for
+no-follow to reject and would otherwise pass under a different name.
+
+A read-only WAL-mode open can still create or update a `-shm` file, and
+can create a `-wal` file, for the database being opened, even though no
+logical write occurs; the identity check above does not depend on those
+side effects being absent, only on the opened file's identity never
+matching the production set. This is why the fence's byte-level
+immutability guarantee, verified by E9's acceptance properties, applies to
+the production database's own files, never to the target being analyzed:
+the target's `-wal`/`-shm` sidecars may legitimately change as an ordinary
+consequence of being opened for read, while the production database's main
+file and sidecars must never change as a result of any analysis call,
+because the open-time identity check guarantees the production files are
+never the ones an analysis call actually opens.
+
+A path-level identity probe, checking a resolved path's (device, inode)
+identity before any open is attempted, remains in the sequence below, but
+only as a fast-fail courtesy: rejecting
+an obviously protected target before paying for a VFS-level open attempt
+is cheap and surfaces the same error sooner in the common case. It is no
+longer the mechanism the fence's correctness depends on. Opening a
+resolved `db` target for analysis now follows a fixed sequence, and every
+step is a rejection point:
+
+1. The `db` value must be an absolute, plain filesystem path, not a URI,
+   per the plain-path rule above.
+2. The target file must already exist. A `db` path that resolves to
+   nothing is rejected outright, an analysis call never creates the
+   database it was asked to read.
+3. As a fast-fail courtesy, the target's main file and each present
+   `-wal`/`-shm` sidecar are checked by path, before any file is opened:
+   each must be a regular file, a symlink is rejected outright, not
+   resolved and compared, and each file's (device, inode) identity is
+   probed directly off the filesystem path and compared against the
+   production database's own main-file and sidecar identities. A match on
+   any pairing, main-to-main, main-to-sidecar, or sidecar-to-sidecar,
+   aborts with the fence error before any connection is attempted.
+4. The file, and every `-journal`/`-wal`/`-shm` companion SQLite opens
+   alongside it, is opened through the no-follow VFS wrapper described
+   above, which re-runs the regular-file and (device, inode) checks
+   against the opened descriptor regardless of what step 3 already
+   concluded, catching a target swapped to a symlink or a hard link of a
+   protected file after step 3 passed. The open goes through the storage
+   layer's read-only backend constructor class, the one that opens with
+   `SQLITE_OPEN_READ_ONLY` plus `query_only`, refuses to create a missing
+   file, and runs no migrations, never through the general runtime
+   constructor. That general constructor is create-capable (a missing
+   path is created, not rejected) and unconditionally runs migrations
+   against whatever it opens; migrations are schema writes, and a
+   read-only analysis call has no business mutating a map database's
+   schema. Migrations are prohibited on the analysis path for exactly this
+   reason: the read-only backend constructor neither creates a missing
+   file nor runs migrations, which is the posture steps 2 and 4 both need,
+   and the general constructor provides neither guarantee.
+5. Any file the connection may create or write on the target's behalf,
+   its `-wal`, `-shm`, or `-journal` companion, is rejected if it already
+   exists with a hard-link count greater than one, regardless of what
+   that link names. This is a distinct check from steps 3-4's
+   production-identity match: a sidecar hard-linked to some file that has
+   nothing to do with the production database passes every identity
+   comparison above, since it is not the production file, yet a
+   read-only WAL-mode open still writes through that sidecar as an
+   ordinary consequence of being opened (the same side effect the
+   paragraph above this list describes), and a hard-linked sidecar would
+   carry that write to whatever else the link names. The rule applies
+   only to files the connection may create or write, the target's own
+   `-wal`, `-shm`, and `-journal` companions, never to the main database
+   file itself, which every one of these verbs opens strictly read-only;
+   production-identity matching (steps 3-4) remains the sole check
+   governing the main file and is unchanged by this rule. The link-count
+   check runs at the same open-time moment as step 4, against the same
+   opened descriptor.
+
+Because path resolution, the plain-path rule, and the no-follow VFS
+wrapper are shared with `code.ingest` (B1, B7), `code.ingest` gains the
+same hardening: its `db` parameter is rejected at the same URI-syntax
+check, and every file it opens for its own writes goes through the same
+no-follow, identity-checked wrapper. This amendment does not introduce a
+second resolution path, it strengthens the one B7 already established. The
+existence check (step 2) is analysis-only: `code.ingest` remains
+create-capable and never requires its target to pre-exist, and it still
+opens its target through the general, create-capable constructor class for
+its own writes, only the three analysis verbs are constrained to the
+read-only backend constructor class.
+
+The D6.1 granularity fence exists to keep exhaustive symbol/call graphs out
+of the shared production graph; letting analysis verbs read the production
+database would not itself violate that fence's storage rule, but it would
+create a second path that depends on the fence never being violated
+elsewhere, which is exactly the posture B7 already rejected once for
+writes. Restating the same fence for reads, with the plain-path rule and
+the open-time VFS identity check as the boundary, keeps the rule uniform
+across the pack's entire verb surface: `db` always means a dedicated map
+database, spelled as a plain path and verified by identity at the moment
+it is actually opened, not just inferred from the path the caller happened
+to supply.
+
+### E8: Numeric parameter validation
+
+Every bounded numeric parameter accepted by the three analysis verbs is a
+non-negative integer with an explicit closed range; there is no clamping
+to a bound and no silent coercion of an out-of-range or non-integer
+value. A JSON value that is not an integer (a float such as `50.5`, or a
+numeral encoded as a string), or that is below the stated minimum or
+above the stated maximum, produces a per-op validation error naming the
+parameter and its valid range, before any database is opened.
+
+| Verb            | Parameter     | Minimum | Maximum | Default |
+| --------------- | ------------- | ------- | ------- | ------- |
+| `code.coupling` | `top_n`       | 1       | 500     | 50      |
+| `code.health`   | `top_n`       | 1       | 100     | 10      |
+| `code.cycles`   | `limit`       | 1       | 100     | 20      |
+| `code.cycles`   | `max_members` | 1       | 1000    | 100     |
+
+- `code.coupling`'s `top_n` bounds the coupling result to at most 500
+  ordered rows, defaulting to 50 when omitted (E2).
+- `code.health`'s `top_n` bounds `coupling_outliers` to at most 100 rows,
+  defaulting to 10 when omitted (E3).
+- `code.cycles`'s `limit` bounds the number of serialized cyclic
+  components to at most 100, defaulting to 20 when omitted (E4).
+- `code.cycles`'s `max_members` bounds a single component's serialized
+  member list to at most 1000, defaulting to 100 when omitted (E4).
+
+### E9: Acceptance
+
+An implementation of this amendment is acceptance-tested against eighteen
+properties:
+
+1. **Coupling correctness.** `code.coupling` run against a small fixture
+   database with hand-counted `depends_on` edges returns fan_in/fan_out
+   values matching the hand count, at both `level="module"` and
+   `level="project"`.
+2. **Project self-coupling exclusion.** A fixture project whose modules
+   depend only on each other, with no `depends_on` edge crossing to
+   another project's modules, reports `fan_in=0` and `fan_out=0` for that
+   project at `level="project"`, even though the same modules report
+   nonzero fan_in/fan_out at `level="module"` (E2).
+3. **Cycle detection, positive and negative.** `code.cycles` run against a
+   synthetic fixture containing a 3-module cyclic component (`A depends_on
+   B depends_on C depends_on A`) returns exactly that component; run
+   against a synthetic fixture whose module graph is a DAG, it returns an
+   empty result.
+4. **Production-db fence.** All three verbs, called with `db` explicitly
+   pointed at the shared production database, are rejected with the same
+   error class `code.ingest` uses for the same condition (B7). An omitted
+   `db` is a separate, ordinary missing-required-parameter rejection (see
+   E7), not this fence error.
+5. **Plain-path rejection.** All four verbs that accept `db`
+   (`code.ingest` included), called with a `db` value that begins with the
+   `file:` scheme prefix or contains a `?` character and names the
+   production database under that spelling, are rejected at parameter
+   validation, before any filesystem probe, with the same fence error as
+   property 4 (E7).
+6. **Hard-link rejection.** A hard link to the production database file,
+   opened as an explicit `db` target under a different path, is rejected
+   with the same fence error as property 4, the opened-file (device,
+   inode) identity check (E7) catches what the path-based courtesy check
+   alone would miss. The same rejection applies when only a sidecar is
+   linked: a fixture whose target's `-shm` file is hard-linked or
+   symlinked to the production database's `-shm` file is rejected before
+   any connection is made, even though the target's own main `.db` file is
+   a distinct, unlinked file (E7 step 3).
+7. **Open-time closure of the preflight window.** A fixture whose `db`
+   target passes the path-level courtesy check (E7 step 3) cleanly, and
+   whose `-wal` or `-shm` sidecar is then replaced with a symlink or a
+   hard link to the corresponding production sidecar before the file is
+   actually opened, is still rejected with the fence error: the no-follow
+   VFS wrapper's open-time identity check (E7 step 4) runs against the
+   opened descriptor regardless of what the courtesy check already
+   concluded, so a target that mutates between the two steps does not slip
+   through.
+8. **Missing-file rejection.** All three analysis verbs, called with `db`
+   pointed at a path that does not exist, are rejected outright, and no
+   file is created at that path as a side effect of the call (E7 step 2).
+9. **Byte identity of the production database across an analysis call.**
+   For the production database plus its `-wal` and `-shm` sidecars, a
+   byte-for-byte snapshot taken immediately before and immediately after a
+   `code.coupling`, `code.health`, or `code.cycles` call against an
+   unrelated target database is identical across all three production
+   files. This property is scoped to the production database's own files,
+   not the target's: E7 permits a read-only WAL-mode open to create or
+   update the _target's own_ `-wal`/`-shm` sidecars as an ordinary side
+   effect of opening it, so byte-for-byte identity cannot be demanded of
+   the target across a call. What the fence guarantees, and what this
+   property verifies, is that the production database's files never
+   change, regardless of which map database a given call analyzes.
+10. **Tombstone exclusion.** A fixture containing one soft-deleted edge and
+    one soft-deleted entity, each of which would otherwise participate in
+    a coupling number, a dead-module count, an aggregation, or a cyclic
+    component, is confirmed to influence none of them, across all three
+    verbs (E1).
+11. **Health snapshot coherence under concurrent ingest.** `code.health` run
+    against a database that a concurrent `code.ingest` call is actively
+    mutating returns a summary whose fields all agree with one database
+    state: none of `entities_by_kind`, `edges_by_relation`,
+    `coupling_outliers`, `dead_module_candidate_count`, or
+    `cyclic_component_count` reflects a partial mix of pre- and mid-ingest
+    state (E3).
+12. **Busy error on concurrent analysis, including aliased paths.** A call
+    to any of `code.coupling`, `code.health`, or `code.cycles` issued
+    against a `db` while another call to any of the three against that
+    same underlying database is still in flight fails immediately with a
+    busy error naming the database, rather than blocking until the first
+    call finishes. This holds even when the two calls spell `db` as two
+    different paths that resolve to the same (device, inode) identity, a
+    hard link being the concrete case: both calls share one guard slot
+    (E3, E4). A concurrent call against a genuinely _different_ database
+    is unaffected.
+13. **`edges_by_relation` completeness for an untraversed relation.** A
+    fixture database containing an edge relation that neither
+    `code.coupling` nor `code.cycles` ever visits in their own traversals
+    (for example, an `implements` edge) still contributes to
+    `code.health`'s `edges_by_relation` count for that relation, because
+    the field is a grouped aggregate over every non-deleted edge row in
+    the same reader, not limited to the relations the other two verbs
+    traverse (E3).
+14. **Deterministic ordering and top-N prefix extension.** Two consecutive
+    calls to the same verb with the same `db` and the same other
+    parameters, with no intervening write, return identical,
+    identically-ordered results (idempotent reads); and for
+    `code.coupling`, a call with a larger `top_n` returns, as a prefix,
+    exactly the ordered rows a call with a smaller `top_n` returned over
+    the same rows, up to the number of rows actually available, verifying
+    the total order defined in E2 together with its min(requested,
+    available) bound. The prefix relation is non-strict: when the number
+    of rows available is at or below the smaller `top_n`, the two calls
+    return the identical full set of available rows, and that equality
+    satisfies the property without requiring the larger call to surface
+    additional rows that do not exist. A fixture with fewer modules than
+    the smaller `top_n` returns every available row from both calls, with
+    no invented rows and no error.
+15. **Truncated giant component.** `code.cycles` run against a fixture whose
+    cyclic component exceeds `max_members` returns that component with
+    `truncated: true`, a member list capped at `max_members`, and a
+    `member_count` equal to the component's true, untruncated size.
+16. **Numeric parameter validation.** Each of `code.coupling`'s and
+    `code.health`'s `top_n`, and `code.cycles`'s `limit` and
+    `max_members`, called with a value that is not an integer, or that is
+    below its stated minimum or above its stated maximum, is rejected
+    with a per-op validation error naming the parameter and its valid
+    range (E8); the call is never clamped to the nearest bound and never
+    silently coerced.
+17. **Hard-linked sidecar rejected regardless of what it aliases.** A
+    fixture whose target database's `-wal` or `-shm` sidecar is
+    hard-linked to some file that is not the production database, or any
+    part of it, is still rejected at open, because the link-count check
+    (E7) rejects any writable companion with more than one hard link
+    independent of what that link names; the main database file itself,
+    opened strictly read-only, is unaffected by this check and continues
+    to be governed solely by production-identity matching (property 6).
+18. **Project row eligibility at `level="project"`.** A fixture project
+    with no live (non-soft-deleted) modules is absent from the
+    `level="project"` result entirely, never present with zero degrees; a
+    fixture project with live modules but no qualifying cross-project
+    `depends_on` edges appears in the result with `fan_in=0` and
+    `fan_out=0` (E2); and two projects tied on total degree are ordered
+    by project name ascending.
+
+### E10: Interface note — verb count delta
+
+The MCP verb table in ADR-023 and the verb counts in `AGENTS.md` and this
+repository's `CLAUDE.md` change when the implementation PR for this
+amendment lands, not in this docs-only PR. The expected delta is **+3**
+verbs (`code.coupling`, `code.health`, `code.cycles`) added to the pack's
+existing one (`code.ingest`), against the count current as of Amendment 2's
+acceptance (79 verbs on the default pack set) — the implementation PR
+should cite the then-current count at merge time, since intervening PRs may
+have changed it.
