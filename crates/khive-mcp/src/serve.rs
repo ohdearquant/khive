@@ -84,13 +84,10 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
 
     // ADR-091 Amendment 2 Plank A: every non-daemon process runs the
     // observe-only session sweep (never PASSIVE/TRUNCATE checkpointing —
-    // that stays daemon-owned). Held for the remainder of `run`'s scope so
-    // the task keeps running for the life of this session; dropping it here
-    // (this binding's scope ending, i.e. `run` returning) is this process's
-    // "clean shutdown" signal, which removes its own walpin heartbeat if one
-    // was written.
-    #[cfg(unix)]
-    let _session_sweep_shutdown_tx = spawn_session_walpin_sweep(&server);
+    // that stays daemon-owned). Explicit shutdown (not just a dropped
+    // sender) runs after `serve` returns, below, so the task's heartbeat
+    // removal has actually completed before this function does.
+    let session_sweep = spawn_session_walpin_sweep(&server);
 
     let transport_name = args.transport.as_deref().unwrap_or("stdio");
     let transport = registry.get(transport_name).ok_or_else(|| {
@@ -102,7 +99,11 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
     let opts = ServeOptions {
         bind: args.bind.clone(),
     };
-    transport.serve(server, &opts).await
+    let result = transport.serve(server, &opts).await;
+    if let Some(sweep) = session_sweep {
+        sweep.shutdown().await;
+    }
+    result
 }
 
 /// Whether this process owns the email channel loops (#602).
@@ -123,26 +124,76 @@ fn is_daemon_role(args: &Args) -> bool {
     args.daemon
 }
 
+/// Handle for the ADR-091 Amendment 2 Plank A session sweep task. Dropping
+/// the sender alone is NOT a sufficient shutdown contract (minor, ADR-091
+/// Amendment 2 review): the sweep task's own clean-shutdown heartbeat
+/// removal runs asynchronously after observing the channel close, and the
+/// tokio runtime is not guaranteed to poll it to completion before the
+/// process exits. [`Self::shutdown`] holds the `JoinHandle` and awaits it
+/// (bounded) so the removal has actually run before `serve`/`run` returns.
+struct SessionSweepHandle {
+    shutdown_tx: tokio::sync::watch::Sender<()>,
+    join: tokio::task::JoinHandle<()>,
+}
+
+impl SessionSweepHandle {
+    async fn shutdown(self) {
+        drop(self.shutdown_tx);
+        if tokio::time::timeout(std::time::Duration::from_secs(2), self.join)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                "ADR-091 Amendment 2 Plank A: session sweep task did not exit within 2s of \
+                 the shutdown signal; its walpin heartbeat removal may not have completed"
+            );
+        }
+    }
+}
+
 /// Spawn the ADR-091 Amendment 2 Plank A observe-only session sweep task for
 /// this process's checkpoint pool, if it has one (a checkpoint pool is only
-/// wired for file-backed backends — see `checkpoint_pool_for`). Returns the
-/// paired shutdown `Sender`; the caller MUST hold it for the session's run
-/// scope (dropping it is the task's "clean shutdown" signal, which removes
-/// this process's own walpin heartbeat if one was written — mirrors
-/// `run_checkpoint_task`'s shutdown-channel contract on the daemon side).
+/// wired for file-backed backends — see `checkpoint_pool_for`). Returns a
+/// [`SessionSweepHandle`] the caller MUST hold for the session's run scope
+/// and shut down explicitly (see [`SessionSweepHandle::shutdown`]) — mirrors
+/// `run_checkpoint_task`'s shutdown-channel contract on the daemon side.
+///
+/// Called from BOTH non-daemon serve entrypoints (`run` and `serve_server`,
+/// item: sweep coverage, ADR-091 Amendment 2 review) — `serve_server` is the
+/// ADR-029 multi-backend coordinator boot path, and previously never started
+/// this sweep at all, leaving every multi-backend session permanently
+/// invisible to cross-process WAL-pin attribution.
 #[cfg(unix)]
-fn spawn_session_walpin_sweep(server: &KhiveMcpServer) -> Option<tokio::sync::watch::Sender<()>> {
+fn spawn_session_walpin_sweep(server: &KhiveMcpServer) -> Option<SessionSweepHandle> {
     let pool = server.pool()?;
     let db_path = pool.config().path.clone();
     let config = khive_db::SessionSweepConfig::from_env();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
-    tokio::spawn(khive_db::run_session_sweep_task(
+    let join = tokio::spawn(khive_db::run_session_sweep_task(
         db_path,
         config,
         shutdown_rx,
     ));
     tracing::info!("ADR-091 Amendment 2 Plank A: session WAL-registry sweep started");
-    Some(shutdown_tx)
+    Some(SessionSweepHandle { shutdown_tx, join })
+}
+
+/// Non-Unix builds have no session sweep implementation (`is_process_alive`,
+/// the walpin sidecar, and Plank A all rely on `libc`/proc APIs that are
+/// Unix-only). Rather than leaving this coverage gap silent (ADR-091
+/// Amendment 2 review: "do not leave silent gaps"), this documents the gap
+/// loudly at startup: every PID on a non-Unix host is permanently `unknown`
+/// to cross-process WAL-pin attribution, never `reporting`/`registered-silent`,
+/// because no beacon-equivalent state can be written here at all.
+#[cfg(not(unix))]
+fn spawn_session_walpin_sweep(_server: &KhiveMcpServer) -> Option<SessionSweepHandle> {
+    tracing::warn!(
+        "ADR-091 Amendment 2: this platform has no session WAL-registry sweep \
+         implementation; cross-process WAL-pin attribution cannot establish this \
+         process's sidecar health (neither reporting nor registered-silent) — treat \
+         it as an unresolved/unknown PID for attribution purposes"
+    );
+    None
 }
 
 /// Spawn the email channel loops if — and only if — `args` indicates this
@@ -1429,6 +1480,14 @@ pub async fn serve_server(
         );
     }
 
+    // ADR-091 Amendment 2 Plank A: every non-daemon process runs the
+    // observe-only session sweep — including this ADR-029 multi-backend
+    // coordinator boot path (item: sweep coverage, ADR-091 Amendment 2
+    // review). Before this fix, `serve_server` never spawned the sweep at
+    // all, so every multi-backend session was permanently invisible to
+    // cross-process WAL-pin attribution.
+    let session_sweep = spawn_session_walpin_sweep(&server);
+
     let transport_name = args.transport.as_deref().unwrap_or("stdio");
     let transport = registry.get(transport_name).ok_or_else(|| {
         anyhow::anyhow!(
@@ -1439,7 +1498,11 @@ pub async fn serve_server(
     let opts = ServeOptions {
         bind: args.bind.clone(),
     };
-    transport.serve(server, &opts).await
+    let result = transport.serve(server, &opts).await;
+    if let Some(sweep) = session_sweep {
+        sweep.shutdown().await;
+    }
+    result
 }
 
 /// Build the VerbRegistry and per-pack runtimes for a multi-backend deployment

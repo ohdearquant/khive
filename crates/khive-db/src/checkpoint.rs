@@ -317,47 +317,62 @@ impl CheckpointConfig {
             }
         }
 
-        if let Ok(v) = std::env::var("KHIVE_TX_WARN_SECS") {
-            if let Ok(n) = v.parse::<u64>() {
-                if n > 0 {
-                    cfg.tx_warn_secs = Duration::from_secs(n);
-                }
-            }
-        }
-
-        if let Ok(v) = std::env::var("KHIVE_TX_MAX_AGE_SECS") {
-            if let Ok(n) = v.parse::<u64>() {
-                if n > 0 {
-                    cfg.tx_max_age_secs = Duration::from_secs(n);
-                }
-            }
-        }
-
-        // The severity ladder assumes tx_warn_secs < tx_max_age_secs (Warn
-        // fires before Stale as an entry ages). A reversed or equal pair —
-        // whether from one misconfigured var or the interaction of both —
-        // would invert or collapse that ordering (e.g. WARN_SECS=120,
-        // MAX_AGE_SECS=30 emits Stale at 30s and never reaches the Warn
-        // crossing until 120s), so both are rejected together rather than
-        // silently honored. Resetting both to their defaults (rather than
-        // just clamping one) avoids guessing which of the two the operator
-        // actually meant to change.
-        if cfg.tx_warn_secs >= cfg.tx_max_age_secs {
-            let default = Self::default();
-            tracing::warn!(
-                configured_tx_warn_secs = cfg.tx_warn_secs.as_secs_f64(),
-                configured_tx_max_age_secs = cfg.tx_max_age_secs.as_secs_f64(),
-                fallback_tx_warn_secs = default.tx_warn_secs.as_secs_f64(),
-                fallback_tx_max_age_secs = default.tx_max_age_secs.as_secs_f64(),
-                "KHIVE_TX_WARN_SECS must be strictly less than KHIVE_TX_MAX_AGE_SECS; \
-                 both transaction-age thresholds were rejected and reset to their defaults"
-            );
-            cfg.tx_warn_secs = default.tx_warn_secs;
-            cfg.tx_max_age_secs = default.tx_max_age_secs;
-        }
+        (cfg.tx_warn_secs, cfg.tx_max_age_secs) =
+            tx_age_thresholds_from_env(cfg.tx_warn_secs, cfg.tx_max_age_secs);
 
         cfg
     }
+}
+
+/// Parse `KHIVE_TX_WARN_SECS`/`KHIVE_TX_MAX_AGE_SECS` against the given
+/// defaults, applying the same ordering guard both [`CheckpointConfig`] and
+/// [`SessionSweepConfig`] need (minor, ADR-091 Amendment 2 review: this was
+/// previously duplicated verbatim in both `from_env` methods).
+///
+/// The severity ladder assumes `tx_warn_secs < tx_max_age_secs` (Warn fires
+/// before Stale as an entry ages). A reversed or equal pair — whether from
+/// one misconfigured var or the interaction of both — would invert or
+/// collapse that ordering (e.g. WARN_SECS=120, MAX_AGE_SECS=30 emits Stale at
+/// 30s and never reaches the Warn crossing until 120s), so both are rejected
+/// together rather than silently honored. Resetting both to the caller's
+/// defaults (rather than just clamping one) avoids guessing which of the two
+/// the operator actually meant to change.
+fn tx_age_thresholds_from_env(
+    default_warn: Duration,
+    default_max: Duration,
+) -> (Duration, Duration) {
+    let mut warn_secs = default_warn;
+    let mut max_age_secs = default_max;
+
+    if let Ok(v) = std::env::var("KHIVE_TX_WARN_SECS") {
+        if let Ok(n) = v.parse::<u64>() {
+            if n > 0 {
+                warn_secs = Duration::from_secs(n);
+            }
+        }
+    }
+
+    if let Ok(v) = std::env::var("KHIVE_TX_MAX_AGE_SECS") {
+        if let Ok(n) = v.parse::<u64>() {
+            if n > 0 {
+                max_age_secs = Duration::from_secs(n);
+            }
+        }
+    }
+
+    if warn_secs >= max_age_secs {
+        tracing::warn!(
+            configured_tx_warn_secs = warn_secs.as_secs_f64(),
+            configured_tx_max_age_secs = max_age_secs.as_secs_f64(),
+            fallback_tx_warn_secs = default_warn.as_secs_f64(),
+            fallback_tx_max_age_secs = default_max.as_secs_f64(),
+            "KHIVE_TX_WARN_SECS must be strictly less than KHIVE_TX_MAX_AGE_SECS; \
+             both transaction-age thresholds were rejected and reset to their defaults"
+        );
+        return (default_warn, default_max);
+    }
+
+    (warn_secs, max_age_secs)
 }
 
 /// Mutable escalation state carried across ticks by the caller (ADR-091 Plank 2).
@@ -646,7 +661,44 @@ impl WalpinSidecarState {
         })
     }
 
-    fn observe(
+    /// Write this process's one-time registration beacon (ADR-091 Amendment
+    /// 2 sidecar-health attribution). Called once, right after construction,
+    /// before the sweep loop starts — never per tick, so it adds no
+    /// steady-state filesystem traffic beyond this single write. The
+    /// blocking fs I/O runs on `spawn_blocking` (perf, ADR-091 Amendment 2
+    /// review): this is invoked from an async context and must not run
+    /// synchronous I/O inline on the async runtime's worker thread.
+    async fn register_beacon(&self) {
+        let dir = self.dir.clone();
+        let beacon = crate::walpin::WalpinBeacon {
+            pid: self.pid,
+            process_role: self.role.to_string(),
+            started_at: self.started_at,
+        };
+        let result =
+            tokio::task::spawn_blocking(move || crate::walpin::write_beacon(&dir, &beacon)).await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    error = %e,
+                    "ADR-091 Amendment 2: failed to write walpin registration beacon; \
+                     this process's sidecar health will read as unknown, not registered-silent"
+                );
+            }
+            Err(join_err) => {
+                tracing::warn!(
+                    error = %join_err,
+                    "ADR-091 Amendment 2: walpin beacon write task panicked"
+                );
+            }
+        }
+    }
+
+    /// Blocking heartbeat write/removal runs on `spawn_blocking` (perf,
+    /// ADR-091 Amendment 2 review) — this async sweep task must not block its
+    /// executor thread on synchronous filesystem I/O.
+    async fn observe(
         &mut self,
         oldest: Option<(khive_storage::tx_registry::TxId, Duration, Option<String>)>,
         tx_warn_secs: Duration,
@@ -661,21 +713,42 @@ impl WalpinSidecarState {
                     oldest_tx_label: label,
                     updated_at: now_epoch_secs(),
                 };
-                if let Err(e) = crate::walpin::write_heartbeat(&self.dir, &heartbeat) {
-                    tracing::warn!(
+                let dir = self.dir.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    crate::walpin::write_heartbeat(&dir, &heartbeat)
+                })
+                .await;
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => tracing::warn!(
                         error = %e,
                         "ADR-091 Amendment 2 Plank B: failed to write walpin heartbeat"
-                    );
+                    ),
+                    Err(join_err) => tracing::warn!(
+                        error = %join_err,
+                        "ADR-091 Amendment 2 Plank B: walpin heartbeat write task panicked"
+                    ),
                 }
                 self.wrote = true;
             }
             _ => {
                 if self.wrote {
-                    if let Err(e) = crate::walpin::remove_heartbeat(&self.dir, self.pid) {
-                        tracing::warn!(
+                    let dir = self.dir.clone();
+                    let pid = self.pid;
+                    let result = tokio::task::spawn_blocking(move || {
+                        crate::walpin::remove_heartbeat(&dir, pid)
+                    })
+                    .await;
+                    match result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => tracing::warn!(
                             error = %e,
                             "ADR-091 Amendment 2 Plank B: failed to remove walpin heartbeat"
-                        );
+                        ),
+                        Err(join_err) => tracing::warn!(
+                            error = %join_err,
+                            "ADR-091 Amendment 2 Plank B: walpin heartbeat removal task panicked"
+                        ),
                     }
                     self.wrote = false;
                 }
@@ -683,9 +756,12 @@ impl WalpinSidecarState {
         }
     }
 
-    fn shutdown(&mut self) {
+    async fn shutdown(&mut self) {
         if self.wrote {
-            let _ = crate::walpin::remove_heartbeat(&self.dir, self.pid);
+            let dir = self.dir.clone();
+            let pid = self.pid;
+            let _ = tokio::task::spawn_blocking(move || crate::walpin::remove_heartbeat(&dir, pid))
+                .await;
             self.wrote = false;
         }
     }
@@ -740,36 +816,12 @@ impl SessionSweepConfig {
                 }
             }
         }
-        if let Ok(v) = std::env::var("KHIVE_TX_WARN_SECS") {
-            if let Ok(n) = v.parse::<u64>() {
-                if n > 0 {
-                    cfg.tx_warn_secs = Duration::from_secs(n);
-                }
-            }
-        }
-        if let Ok(v) = std::env::var("KHIVE_TX_MAX_AGE_SECS") {
-            if let Ok(n) = v.parse::<u64>() {
-                if n > 0 {
-                    cfg.tx_max_age_secs = Duration::from_secs(n);
-                }
-            }
-        }
-
-        // Same ordering guard as `CheckpointConfig::from_env` — see its
-        // comment for the rationale.
-        if cfg.tx_warn_secs >= cfg.tx_max_age_secs {
-            let default = Self::default();
-            tracing::warn!(
-                configured_tx_warn_secs = cfg.tx_warn_secs.as_secs_f64(),
-                configured_tx_max_age_secs = cfg.tx_max_age_secs.as_secs_f64(),
-                fallback_tx_warn_secs = default.tx_warn_secs.as_secs_f64(),
-                fallback_tx_max_age_secs = default.tx_max_age_secs.as_secs_f64(),
-                "KHIVE_TX_WARN_SECS must be strictly less than KHIVE_TX_MAX_AGE_SECS; \
-                 both transaction-age thresholds were rejected and reset to their defaults"
-            );
-            cfg.tx_warn_secs = default.tx_warn_secs;
-            cfg.tx_max_age_secs = default.tx_max_age_secs;
-        }
+        // Shares `tx_age_thresholds_from_env` with `CheckpointConfig::from_env`
+        // (minor, ADR-091 Amendment 2 review) so a session and the daemon
+        // parse and validate `KHIVE_TX_WARN_SECS`/`KHIVE_TX_MAX_AGE_SECS`
+        // identically from one source, not two hand-copied blocks.
+        (cfg.tx_warn_secs, cfg.tx_max_age_secs) =
+            tx_age_thresholds_from_env(cfg.tx_warn_secs, cfg.tx_max_age_secs);
 
         cfg
     }
@@ -802,6 +854,9 @@ pub async fn run_session_sweep_task(
     };
     let mut sidecar =
         db_path.and_then(|p| WalpinSidecarState::new(Some(p.as_path()), true, "session"));
+    if let Some(sidecar) = sidecar.as_ref() {
+        sidecar.register_beacon().await;
+    }
 
     loop {
         tokio::select! {
@@ -814,12 +869,12 @@ pub async fn run_session_sweep_task(
             log_tx_age_emission(&emission);
         }
         if let Some(sidecar) = sidecar.as_mut() {
-            sidecar.observe(oldest, config.tx_warn_secs);
+            sidecar.observe(oldest, config.tx_warn_secs).await;
         }
     }
 
     if let Some(sidecar) = sidecar.as_mut() {
-        sidecar.shutdown();
+        sidecar.shutdown().await;
     }
 }
 
@@ -865,6 +920,10 @@ pub async fn run_checkpoint_task(
     // is always correct here.
     #[cfg(unix)]
     let mut walpin_state = WalpinSidecarState::new(pool.config().path.as_deref(), true, "daemon");
+    #[cfg(unix)]
+    if let Some(sidecar) = walpin_state.as_ref() {
+        sidecar.register_beacon().await;
+    }
 
     loop {
         // A closed sender (the daemon returning without an explicit send)
@@ -902,7 +961,7 @@ pub async fn run_checkpoint_task(
         // pin — if any — is attributable the same way a session's is.
         #[cfg(unix)]
         if let Some(sidecar) = walpin_state.as_mut() {
-            sidecar.observe(oldest_tx, config.tx_warn_secs);
+            sidecar.observe(oldest_tx, config.tx_warn_secs).await;
         }
 
         // Skipped ticks leave crossing state unchanged — a busy tick must not
@@ -987,7 +1046,7 @@ pub async fn run_checkpoint_task(
 
     #[cfg(unix)]
     if let Some(sidecar) = walpin_state.as_mut() {
-        sidecar.shutdown();
+        sidecar.shutdown().await;
     }
 }
 
@@ -1253,10 +1312,19 @@ fn note_truncate_outcome(
 }
 
 /// ADR-091 Amendment 2 Plank B: on a TRUNCATE no-progress event, enumerate
-/// the walpin sidecar directory and log every entry that survives the
-/// three-test liveness gate, attributing the pin to a specific cross-process
-/// PID rather than only this process's own registry. A no-op if the sidecar
-/// is disabled or this backend has no on-disk path.
+/// the walpin sidecar directory and log every entry's sidecar-health
+/// classification (reporting / registered-silent / unknown), attributing the
+/// pin to a specific cross-process PID rather than only this process's own
+/// registry. A no-op if the sidecar is disabled or this backend has no
+/// on-disk path.
+///
+/// Sidecar-health attribution (ADR-091 Amendment 2 gate ruling, 2026-07-19):
+/// the sharper "unregistered/native mechanism" conclusion is licensed only
+/// when every discovered PID is `reporting` or `registered-silent`
+/// (`WalpinReport::fully_attributed`); any `unknown` PID — including the
+/// directory itself failing the trust-boundary check — makes attribution
+/// inconclusive, and the WARN below names exactly which PIDs are unresolved
+/// instead of silently exonerating them.
 #[cfg(unix)]
 fn log_walpin_sidecar_report(pool: &ConnectionPool) {
     let Some(path) = pool.config().path.as_deref() else {
@@ -1271,14 +1339,47 @@ fn log_walpin_sidecar_report(pool: &ConnectionPool) {
     // knob a session's own `SessionSweepConfig::from_env` reads) is a
     // reasonable staleness heuristic across a deployment that shares one env.
     let sweep_interval = SessionSweepConfig::from_env().interval;
-    for entry in crate::walpin::enumerate_live(&dir, sweep_interval) {
-        let hb = entry.heartbeat;
+    let report = match crate::walpin::enumerate_live(&dir, sweep_interval) {
+        Ok(report) => report,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "ADR-091 Amendment 2 Plank B: sidecar directory failed the trust-boundary \
+                 check; cross-process WAL-pin attribution is unestablished for this tick"
+            );
+            return;
+        }
+    };
+    for hb in report.reporting() {
         tracing::warn!(
             walpin_pid = hb.pid,
             walpin_role = %hb.process_role,
             walpin_oldest_tx_age_secs = hb.oldest_tx_age_secs,
             walpin_oldest_tx_label = hb.oldest_tx_label.as_deref().unwrap_or("<unlabeled>"),
+            walpin_health = "reporting",
             "ADR-091 Amendment 2 Plank B: live cross-process WAL-pin attribution report"
+        );
+    }
+    for pid in report.registered_silent_pids() {
+        tracing::debug!(
+            walpin_pid = pid,
+            walpin_health = "registered_silent",
+            "ADR-091 Amendment 2 Plank B: process affirmatively reports no over-threshold span"
+        );
+    }
+    let unknown_pids: Vec<u32> = report.unknown_pids().collect();
+    if !unknown_pids.is_empty() {
+        tracing::warn!(
+            ?unknown_pids,
+            "ADR-091 Amendment 2 Plank B: sidecar health unestablished for these PIDs; \
+             attribution is inconclusive and the native/unregistered-mechanism conclusion \
+             is NOT licensed this tick"
+        );
+    } else if report.reporting().next().is_none() {
+        tracing::info!(
+            "ADR-091 Amendment 2 Plank B: every live PID is reporting or registered-silent \
+             with none pinning; the WAL pin is not attributable to any in-process registry \
+             span this sidecar covers"
         );
     }
 }
@@ -3496,11 +3597,19 @@ mod tests {
             shutdown_rx,
         ));
 
-        // No open span yet: a quiet process must write nothing for a few ticks.
+        // No open span yet: a quiet process must write no *heartbeat* for a
+        // few ticks, but it DOES register its one-time beacon at startup
+        // (ADR-091 Amendment 2 sidecar-health attribution) — the sidecar
+        // dir is not empty, only heartbeat-free.
         tokio::time::sleep(Duration::from_millis(30)).await;
+        let pid = std::process::id();
         assert!(
-            !sidecar_dir.exists() || fs_dir_is_empty(&sidecar_dir),
+            !sidecar_dir.join(format!("{pid}.json")).exists(),
             "a quiet process must not write a walpin heartbeat"
+        );
+        assert!(
+            crate::walpin::beacon_path(&sidecar_dir, pid).exists(),
+            "a quiet process must still register its one-time beacon"
         );
 
         let tx_handle =
@@ -3508,7 +3617,6 @@ mod tests {
         // Long enough to cross `tx_warn_secs` across at least one 10ms tick.
         tokio::time::sleep(Duration::from_millis(60)).await;
 
-        let pid = std::process::id();
         let heartbeat_path = sidecar_dir.join(format!("{pid}.json"));
         assert!(
             heartbeat_path.exists(),
@@ -3538,12 +3646,6 @@ mod tests {
             .expect("session sweep task panicked");
 
         std::env::remove_var("KHIVE_WALPIN_SIDECAR");
-    }
-
-    fn fs_dir_is_empty(dir: &std::path::Path) -> bool {
-        std::fs::read_dir(dir)
-            .map(|mut entries| entries.next().is_none())
-            .unwrap_or(true)
     }
 
     #[test]
