@@ -1,12 +1,13 @@
 //! ADR-091 Amendment 2 Plank B: cross-process WAL-pin attribution sidecar.
 //!
-//! Every `kkernel mcp` process (daemon or session) that observes its own
-//! `tx_registry` oldest span exceed `KHIVE_TX_WARN_SECS` writes a per-PID
-//! heartbeat file under `<db-file>.walpin/<pid>.json`. On a TRUNCATE
-//! no-progress event, the daemon enumerates this directory and applies a
-//! three-test liveness gate (PID alive, `started_at` matches the OS-reported
-//! process start time, `updated_at` fresh) to attribute the WAL pin to a
-//! specific process rather than only naming its own in-process registry.
+//! Every `kkernel mcp` process (daemon or session, any supported platform)
+//! that observes its own `tx_registry` oldest span exceed `KHIVE_TX_WARN_SECS`
+//! writes a per-PID heartbeat file under `<db-file>.walpin/<pid>.json`. On a
+//! TRUNCATE no-progress event, the daemon enumerates this directory and
+//! applies a three-test liveness gate (PID alive, `started_at` matches the
+//! OS-reported process start time, `updated_at` fresh) to attribute the WAL
+//! pin to a specific process rather than only naming its own in-process
+//! registry.
 //!
 //! Filesystem trust boundary (binding, gate ruling 2026-07-19): the sidecar
 //! directory is created mode 0700 and validated as owned by the current user
@@ -15,10 +16,30 @@
 //! create with `O_NOFOLLOW` semantics to a temp file, then atomic rename over
 //! the target. Enumeration refuses symlinks and validates per-entry ownership
 //! before reading or deleting anything.
+//!
+//! **Platform split (2026-07-19 review follow-up).** Only the write path
+//! (`ensure_sidecar_dir`/`write_heartbeat`/`write_beacon`/`remove_heartbeat`/
+//! `touch_beacon`) and the identity primitives (`is_process_alive`/
+//! `process_start_time_secs`) need to run on every platform — a Windows
+//! session still needs to report itself into the sidecar. Directory
+//! enumeration (`enumerate_live`, and the OS-derived holder census it
+//! anchors to) is Unix-only: its sole caller is the daemon's checkpoint task,
+//! and daemon mode itself requires Unix (`khive-mcp/src/serve.rs` refuses
+//! `--daemon` on non-Unix). The Unix write path is additionally
+//! **handle-bound**: the sidecar directory is opened once with
+//! `O_DIRECTORY | O_NOFOLLOW`, validated on that file descriptor, and every
+//! create/rename/unlink/enumeration read is performed `*at()`-relative to it
+//! — the path is never re-resolved per operation, closing the window where a
+//! path component swapped between a path-based validation and the subsequent
+//! operation could redirect a rename or deletion outside the sidecar. Windows
+//! has no equivalent of `openat`/`fstat`-bound ownership validation in `std`;
+//! it uses plain `std::fs` path-based primitives with symlink refusal via
+//! `symlink_metadata` and no uid/mode check (documented residual gap: a
+//! Windows sidecar directory is only as protected as its inherited ACL, not
+//! actively narrowed by this code).
 
 use std::fs;
 use std::io;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -150,148 +171,907 @@ pub fn sidecar_enabled(is_file_backed: bool) -> bool {
     }
 }
 
-fn current_uid() -> u32 {
-    // SAFETY: `geteuid()` takes no arguments and cannot fail.
-    unsafe { libc::geteuid() }
-}
+/// Unix sidecar internals (ADR-091 Amendment 2 review, item c: handle-bound
+/// filesystem operations). The sidecar directory is opened exactly once per
+/// call with `O_DIRECTORY | O_NOFOLLOW`, validated (type/mode/owner) on that
+/// descriptor, and every create/rename/unlink/read is `*at()`-relative to it
+/// — the path is never re-resolved between validation and use.
+#[cfg(unix)]
+mod unix_impl {
+    use super::io_other;
+    use std::ffi::{CStr, CString};
+    use std::fs;
+    use std::io::{self, Read, Write};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+    use std::path::Path;
+    use std::time::{Duration, SystemTime};
 
-fn validate_dir_metadata(dir: &Path, meta: &fs::Metadata) -> io::Result<()> {
-    if meta.file_type().is_symlink() {
-        return Err(io_other(format!(
-            "walpin sidecar path {dir:?} is a symlink; refusing"
-        )));
+    pub(super) fn current_uid() -> u32 {
+        // SAFETY: `geteuid()` takes no arguments and cannot fail.
+        unsafe { libc::geteuid() }
     }
-    if !meta.is_dir() {
-        return Err(io_other(format!(
-            "walpin sidecar path {dir:?} exists and is not a directory"
-        )));
-    }
-    let mode = meta.permissions().mode() & 0o777;
-    if mode != 0o700 {
-        return Err(io_other(format!(
-            "walpin sidecar dir {dir:?} has mode {mode:o}, expected 0700; \
-             refusing rather than chmod"
-        )));
-    }
-    if meta.uid() != current_uid() {
-        return Err(io_other(format!(
-            "walpin sidecar dir {dir:?} is not owned by the current user; refusing"
-        )));
-    }
-    Ok(())
-}
 
-/// Ensure `dir` exists, is a real directory (never a symlink), mode `0700`,
-/// and owned by the current user. Refuses — never chmod/chown — a
-/// non-compliant existing directory.
-pub fn ensure_sidecar_dir(dir: &Path) -> io::Result<()> {
-    match fs::symlink_metadata(dir) {
-        Ok(meta) => validate_dir_metadata(dir, &meta),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            let mut builder = fs::DirBuilder::new();
-            builder.mode(0o700);
-            builder.create(dir)?;
-            // Re-validate post-creation: a concurrent process could have raced
-            // this creation (e.g. replaced it with a symlink between our
-            // `create` and this check), so the freshly-created directory is
-            // held to the same standard as a pre-existing one rather than
-            // trusted blindly.
-            let meta = fs::symlink_metadata(dir)?;
-            validate_dir_metadata(dir, &meta)
+    fn path_cstring(path: &Path) -> io::Result<CString> {
+        CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| io_other(format!("path {path:?} contains an interior NUL byte")))
+    }
+
+    fn name_cstring(name: &str) -> io::Result<CString> {
+        CString::new(name)
+            .map_err(|_| io_other(format!("sidecar entry name {name:?} contains a NUL byte")))
+    }
+
+    fn is_symlink_mode(mode: libc::mode_t) -> bool {
+        (mode & libc::S_IFMT) == libc::S_IFLNK
+    }
+
+    pub(super) struct SidecarDirHandle(fs::File);
+
+    impl SidecarDirHandle {
+        fn raw(&self) -> RawFd {
+            self.0.as_raw_fd()
         }
-        Err(e) => Err(e),
+
+        /// Open the sidecar dir, creating it (mode 0700) if absent. The
+        /// freshly-created (or already-existing) directory is validated on
+        /// the OPENED descriptor, never trusted from the `mkdir` call alone
+        /// — a concurrent process could have raced the creation.
+        pub(super) fn open_or_create(dir: &Path) -> io::Result<Self> {
+            match Self::open_validated(dir) {
+                Ok(handle) => Ok(handle),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    let c_path = path_cstring(dir)?;
+                    // SAFETY: `c_path` is NUL-terminated for the call.
+                    let rc = unsafe { libc::mkdir(c_path.as_ptr(), 0o700) };
+                    if rc != 0 {
+                        let err = io::Error::last_os_error();
+                        if err.kind() != io::ErrorKind::AlreadyExists {
+                            return Err(err);
+                        }
+                    }
+                    Self::open_validated(dir)
+                }
+                Err(e) => Err(e),
+            }
+        }
+
+        /// Same as [`Self::open_or_create`] but never creates: `Ok(None)`
+        /// for a missing directory (a sidecar that was never used yet is
+        /// not an error, and must not have the side effect of creating one
+        /// — e.g. a stray `remove_heartbeat`/`touch_beacon` call).
+        pub(super) fn open_if_exists(dir: &Path) -> io::Result<Option<Self>> {
+            match Self::open_validated(dir) {
+                Ok(handle) => Ok(Some(handle)),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(e),
+            }
+        }
+
+        fn open_validated(dir: &Path) -> io::Result<Self> {
+            let c_path = path_cstring(dir)?;
+            // SAFETY: `c_path` is NUL-terminated for the call; the returned
+            // fd is uniquely owned by this call and wrapped immediately.
+            let fd = unsafe {
+                libc::open(
+                    c_path.as_ptr(),
+                    libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                let err = io::Error::last_os_error();
+                // The `O_NOFOLLOW` open above already made the refusal
+                // decision (a symlink at `dir` cannot have produced a live
+                // fd) — this is a diagnostic-only follow-up, not a second
+                // security check, so it carries no TOCTOU risk. It exists
+                // because the raw OS errno for a symlinked path
+                // (`ELOOP`/`ENOTDIR`, platform-dependent) doesn't say
+                // "symlink" on its own.
+                if err.kind() != io::ErrorKind::NotFound {
+                    if let Ok(meta) = fs::symlink_metadata(dir) {
+                        if meta.file_type().is_symlink() {
+                            return Err(io_other(format!(
+                                "walpin sidecar path {dir:?} is a symlink; refusing"
+                            )));
+                        }
+                    }
+                }
+                return Err(err);
+            }
+            // SAFETY: `fd` was just returned by the successful `open` above.
+            let handle = Self(unsafe { fs::File::from_raw_fd(fd) });
+            handle.validate(dir)?;
+            Ok(handle)
+        }
+
+        fn validate(&self, dir: &Path) -> io::Result<()> {
+            let st = self.fstat_self()?;
+            if (st.st_mode & libc::S_IFMT) != libc::S_IFDIR {
+                return Err(io_other(format!(
+                    "walpin sidecar path {dir:?} is not a directory"
+                )));
+            }
+            let mode = st.st_mode & 0o777;
+            if mode != 0o700 {
+                return Err(io_other(format!(
+                    "walpin sidecar dir {dir:?} has mode {mode:o}, expected 0700; \
+                     refusing rather than chmod"
+                )));
+            }
+            if st.st_uid != current_uid() {
+                return Err(io_other(format!(
+                    "walpin sidecar dir {dir:?} is not owned by the current user; refusing"
+                )));
+            }
+            Ok(())
+        }
+
+        fn fstat_self(&self) -> io::Result<libc::stat> {
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            // SAFETY: `st` is a valid, appropriately-sized zeroed buffer.
+            let rc = unsafe { libc::fstat(self.raw(), &mut st) };
+            if rc != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(st)
+        }
+
+        /// `fstatat(dirfd, name, AT_SYMLINK_NOFOLLOW)` relative to this
+        /// directory's own fd. `Ok(None)` for a missing entry.
+        fn stat_entry(&self, name: &str) -> io::Result<Option<libc::stat>> {
+            let c_name = name_cstring(name)?;
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            // SAFETY: `st` is a valid, zeroed buffer; `self.raw()` is a
+            // live, open directory descriptor for the call's duration.
+            let rc = unsafe {
+                libc::fstatat(
+                    self.raw(),
+                    c_name.as_ptr(),
+                    &mut st,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if rc != 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::NotFound {
+                    return Ok(None);
+                }
+                return Err(err);
+            }
+            Ok(Some(st))
+        }
+
+        /// Exclusive-create `tmp_name`, write `body`, fsync, then atomically
+        /// `renameat` it over `target_name`. Refuses a pre-existing symlink
+        /// at `target_name` (checked via `stat_entry` on the SAME fd, never
+        /// a fresh path lookup) before writing anything.
+        pub(super) fn write_atomic(
+            &self,
+            target_name: &str,
+            tmp_name: &str,
+            body: &[u8],
+        ) -> io::Result<()> {
+            if let Some(st) = self.stat_entry(target_name)? {
+                if is_symlink_mode(st.st_mode) {
+                    return Err(io_other(format!(
+                        "walpin sidecar entry {target_name:?} is a symlink; refusing to write \
+                         through it"
+                    )));
+                }
+            }
+            // Best-effort: a stale temp file from a prior crashed write
+            // must not block this one via O_EXCL.
+            let _ = self.unlink_tolerant(tmp_name);
+
+            let c_tmp = name_cstring(tmp_name)?;
+            // SAFETY: `c_tmp` is NUL-terminated for the call; the returned
+            // fd is uniquely owned and wrapped immediately below.
+            let fd = unsafe {
+                libc::openat(
+                    self.raw(),
+                    c_tmp.as_ptr(),
+                    libc::O_WRONLY
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC,
+                    0o600,
+                )
+            };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            {
+                // SAFETY: `fd` was just returned by the successful `openat`.
+                let mut file = unsafe { fs::File::from_raw_fd(fd) };
+                file.write_all(body)?;
+                file.sync_all()?;
+            }
+            self.rename_over(tmp_name, target_name)
+        }
+
+        fn rename_over(&self, from: &str, to: &str) -> io::Result<()> {
+            let c_from = name_cstring(from)?;
+            let c_to = name_cstring(to)?;
+            // SAFETY: both names are NUL-terminated for the call; both are
+            // relative to this same, live directory fd.
+            let rc =
+                unsafe { libc::renameat(self.raw(), c_from.as_ptr(), self.raw(), c_to.as_ptr()) };
+            if rc != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
+
+        pub(super) fn unlink_tolerant(&self, name: &str) -> io::Result<()> {
+            let c_name = name_cstring(name)?;
+            // SAFETY: `c_name` is NUL-terminated for the call.
+            let rc = unsafe { libc::unlinkat(self.raw(), c_name.as_ptr(), 0) };
+            if rc != 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() != io::ErrorKind::NotFound {
+                    return Err(err);
+                }
+            }
+            Ok(())
+        }
+
+        /// Refuse-then-remove, matching the historical `remove_heartbeat`
+        /// contract: a symlinked entry is refused rather than unlinked, even
+        /// though `unlink` itself never follows symlinks — removing a
+        /// suspicious entry is left for a human to look at.
+        pub(super) fn remove_checked(&self, name: &str) -> io::Result<()> {
+            match self.stat_entry(name)? {
+                None => Ok(()),
+                Some(st) if is_symlink_mode(st.st_mode) => Err(io_other(format!(
+                    "refusing to remove symlinked walpin sidecar entry {name:?}"
+                ))),
+                Some(_) => self.unlink_tolerant(name),
+            }
+        }
+
+        /// Metadata-only mtime refresh (ADR-091 Amendment 2 beacon refresh
+        /// rule) — `futimens` with `UTIME_NOW`/`UTIME_OMIT`, no data write.
+        pub(super) fn touch_mtime(&self, name: &str) -> io::Result<()> {
+            let st = self
+                .stat_entry(name)?
+                .ok_or_else(|| io_other(format!("walpin sidecar entry {name:?} does not exist")))?;
+            if is_symlink_mode(st.st_mode) {
+                return Err(io_other(format!(
+                    "walpin sidecar entry {name:?} is a symlink; refusing to touch it"
+                )));
+            }
+            let c_name = name_cstring(name)?;
+            // SAFETY: `c_name` is NUL-terminated; `O_NOFOLLOW` is defense in
+            // depth alongside the `stat_entry` symlink check above.
+            let fd = unsafe {
+                libc::openat(
+                    self.raw(),
+                    c_name.as_ptr(),
+                    libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let times = [
+                libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: libc::UTIME_OMIT,
+                },
+                libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: libc::UTIME_NOW,
+                },
+            ];
+            // SAFETY: `fd` is a live, just-opened descriptor; `times` is a
+            // valid 2-element array as `futimens` requires.
+            let rc = unsafe { libc::futimens(fd, times.as_ptr()) };
+            let err = (rc != 0).then(io::Error::last_os_error);
+            // SAFETY: `fd` was opened above and is closed exactly once here.
+            unsafe { libc::close(fd) };
+            match err {
+                Some(e) => Err(e),
+                None => Ok(()),
+            }
+        }
+
+        /// Read `name`'s contents plus its owner uid and mtime, all sourced
+        /// from ONE `stat_entry` pass plus the read itself — never a second
+        /// path-based lookup. `Ok(None)` for a missing entry (raced away
+        /// between listing and reading); refuses a symlink.
+        pub(super) fn read_checked(
+            &self,
+            name: &str,
+        ) -> io::Result<Option<(Vec<u8>, u32, SystemTime)>> {
+            let Some(st) = self.stat_entry(name)? else {
+                return Ok(None);
+            };
+            if is_symlink_mode(st.st_mode) {
+                return Err(io_other(format!(
+                    "walpin sidecar entry {name:?} is a symlink"
+                )));
+            }
+            let c_name = name_cstring(name)?;
+            // SAFETY: `c_name` is NUL-terminated; `O_NOFOLLOW` is defense in
+            // depth alongside the `stat_entry` symlink check above.
+            let fd = unsafe {
+                libc::openat(
+                    self.raw(),
+                    c_name.as_ptr(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: `fd` was just returned by the successful `openat`.
+            let mut file = unsafe { fs::File::from_raw_fd(fd) };
+            let mut buf = Vec::new();
+            file.read_to_end(&mut buf)?;
+            let mtime = SystemTime::UNIX_EPOCH + Duration::new(st.st_mtime.max(0) as u64, 0);
+            Ok(Some((buf, st.st_uid, mtime)))
+        }
+
+        /// List entry names via `fdopendir` on a DUPLICATE of this fd (the
+        /// original stays owned by `self`) — never re-resolves the
+        /// directory by path.
+        pub(super) fn list_names(&self) -> io::Result<Vec<String>> {
+            // SAFETY: duplicates a live, open fd; the duplicate is uniquely
+            // owned by this call and handed to `fdopendir` below.
+            let dup_fd = unsafe { libc::dup(self.raw()) };
+            if dup_fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: `dup_fd` is valid and uniquely owned; `fdopendir`
+            // takes ownership of it on success.
+            let dirp = unsafe { libc::fdopendir(dup_fd) };
+            if dirp.is_null() {
+                let err = io::Error::last_os_error();
+                // SAFETY: `dup_fd` is still owned by us since `fdopendir` failed.
+                unsafe { libc::close(dup_fd) };
+                return Err(err);
+            }
+            let mut names = Vec::new();
+            loop {
+                // SAFETY: `dirp` is a valid, open `DIR*` for this whole loop.
+                let entry = unsafe { libc::readdir(dirp) };
+                if entry.is_null() {
+                    break;
+                }
+                // SAFETY: `entry` is valid until the next `readdir`/
+                // `closedir` call; the name is copied out before either.
+                let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }
+                    .to_string_lossy()
+                    .into_owned();
+                names.push(name);
+            }
+            // SAFETY: `dirp` was successfully opened above and not yet closed.
+            unsafe { libc::closedir(dirp) };
+            Ok(names)
+        }
+    }
+
+    pub(super) fn is_process_alive(pid: u32) -> bool {
+        let Ok(pid) = i32::try_from(pid) else {
+            return false;
+        };
+        if pid <= 0 {
+            return false;
+        }
+        // SAFETY: signal 0 sends no signal; it only probes existence/permission.
+        let rc = unsafe { libc::kill(pid, 0) };
+        if rc == 0 {
+            return true;
+        }
+        io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+}
+
+/// Windows sidecar internals (ADR-091 Amendment 2 review, item 1: "Windows
+/// is a supported target"). Uses plain `std::fs` path-based primitives —
+/// `std` has no `openat`/`fstat`-bound-validation equivalent on Windows, so
+/// the handle-bound contract ([`unix_impl`]) is Unix-normative only. Refuses
+/// symlinks via `symlink_metadata` before any read/write, exclusive
+/// `create_new(true)` for temp files, atomic `fs::rename`, plain
+/// `fs::create_dir` (no uid/mode-equivalent narrowing — see the module doc's
+/// platform-split note: a Windows sidecar directory is only as protected as
+/// its inherited ACL).
+#[cfg(windows)]
+mod windows_impl {
+    use super::io_other;
+    use std::fs;
+    use std::io::{self, Write};
+    use std::os::raw::c_void;
+    use std::path::Path;
+    use std::time::SystemTime;
+
+    pub(super) fn ensure_sidecar_dir(dir: &Path) -> io::Result<()> {
+        match fs::symlink_metadata(dir) {
+            Ok(meta) => validate(dir, &meta),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                fs::create_dir(dir)?;
+                // Re-validate post-creation the same way the Unix path
+                // does: a concurrent process could have raced this create.
+                let meta = fs::symlink_metadata(dir)?;
+                validate(dir, &meta)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn validate(dir: &Path, meta: &fs::Metadata) -> io::Result<()> {
+        if meta.file_type().is_symlink() {
+            return Err(io_other(format!(
+                "walpin sidecar path {dir:?} is a symlink; refusing"
+            )));
+        }
+        if !meta.is_dir() {
+            return Err(io_other(format!(
+                "walpin sidecar path {dir:?} exists and is not a directory"
+            )));
+        }
+        Ok(())
+    }
+
+    pub(super) fn write_atomic(
+        dir: &Path,
+        target_name: &str,
+        tmp_name: &str,
+        body: &[u8],
+    ) -> io::Result<()> {
+        let target = dir.join(target_name);
+        if let Ok(meta) = fs::symlink_metadata(&target) {
+            if meta.file_type().is_symlink() {
+                return Err(io_other(format!(
+                    "walpin sidecar path {target:?} is a symlink; refusing to write through it"
+                )));
+            }
+        }
+        let tmp = dir.join(tmp_name);
+        let _ = fs::remove_file(&tmp);
+        {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)?;
+            file.write_all(body)?;
+            file.sync_all()?;
+        }
+        fs::rename(&tmp, &target)
+    }
+
+    pub(super) fn remove_checked(dir: &Path, name: &str) -> io::Result<()> {
+        let target = dir.join(name);
+        match fs::symlink_metadata(&target) {
+            Ok(meta) if meta.file_type().is_symlink() => Err(io_other(format!(
+                "refusing to remove symlinked walpin sidecar entry {target:?}"
+            ))),
+            Ok(_) => fs::remove_file(&target),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub(super) fn touch_mtime(dir: &Path, name: &str) -> io::Result<()> {
+        let target = dir.join(name);
+        let meta = fs::symlink_metadata(&target)
+            .map_err(|_| io_other(format!("walpin sidecar entry {target:?} does not exist")))?;
+        if meta.file_type().is_symlink() {
+            return Err(io_other(format!(
+                "walpin sidecar entry {target:?} is a symlink; refusing to touch it"
+            )));
+        }
+        let file = fs::OpenOptions::new().write(true).open(&target)?;
+        file.set_modified(SystemTime::now())
+    }
+
+    type Handle = *mut c_void;
+
+    #[repr(C)]
+    struct FileTime {
+        dw_low_date_time: u32,
+        dw_high_date_time: u32,
+    }
+
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const STILL_ACTIVE: u32 = 259;
+
+    // `kernel32` is implicitly linked on every Windows target (same as
+    // `std` itself relies on); no explicit `#[link(...)]` is needed, mirroring
+    // how `windows-sys`/`winapi` declare these `extern "system"` blocks.
+    extern "system" {
+        fn OpenProcess(dw_desired_access: u32, b_inherit_handle: i32, dw_process_id: u32)
+            -> Handle;
+        fn CloseHandle(h_object: Handle) -> i32;
+        fn GetExitCodeProcess(h_process: Handle, lp_exit_code: *mut u32) -> i32;
+        fn GetProcessTimes(
+            h_process: Handle,
+            lp_creation_time: *mut FileTime,
+            lp_exit_time: *mut FileTime,
+            lp_kernel_time: *mut FileTime,
+            lp_user_time: *mut FileTime,
+        ) -> i32;
+    }
+
+    pub(super) fn is_process_alive(pid: u32) -> bool {
+        // SAFETY: `OpenProcess` is a pure query; the handle (if non-null) is
+        // closed before returning.
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            return false;
+        }
+        let mut exit_code: u32 = 0;
+        // SAFETY: `handle` is a valid, just-opened process handle; `exit_code`
+        // is a valid output buffer.
+        let ok = unsafe { GetExitCodeProcess(handle, &mut exit_code) };
+        // SAFETY: `handle` was opened above and is closed exactly once here.
+        unsafe { CloseHandle(handle) };
+        ok != 0 && exit_code == STILL_ACTIVE
+    }
+
+    pub(super) fn process_start_time_secs(pid: u32) -> Option<i64> {
+        // SAFETY: pure query; the handle is closed before returning.
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            return None;
+        }
+        let mut creation = FileTime {
+            dw_low_date_time: 0,
+            dw_high_date_time: 0,
+        };
+        let mut exit = FileTime {
+            dw_low_date_time: 0,
+            dw_high_date_time: 0,
+        };
+        let mut kernel = FileTime {
+            dw_low_date_time: 0,
+            dw_high_date_time: 0,
+        };
+        let mut user = FileTime {
+            dw_low_date_time: 0,
+            dw_high_date_time: 0,
+        };
+        // SAFETY: `handle` is valid; all four output buffers are valid
+        // `FILETIME`-shaped structs for the call's duration.
+        let ok =
+            unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
+        // SAFETY: `handle` was opened above and closed exactly once here.
+        unsafe { CloseHandle(handle) };
+        if ok == 0 {
+            return None;
+        }
+        // FILETIME: 100ns intervals since 1601-01-01 UTC. Convert to a Unix
+        // epoch (1970-01-01) second count via the well-known offset between
+        // the two epochs.
+        let ticks = ((creation.dw_high_date_time as u64) << 32) | creation.dw_low_date_time as u64;
+        const EPOCH_DIFF_100NS: u64 = 116_444_736_000_000_000;
+        let unix_100ns = ticks.checked_sub(EPOCH_DIFF_100NS)?;
+        Some((unix_100ns / 10_000_000) as i64)
+    }
+}
+
+/// macOS OS-derived census (ADR-091 Amendment 2 review, item a): every PID
+/// on the system that currently holds `db_path` open, via `libproc`'s
+/// `PROC_PIDLISTFDS`/`PROC_PIDFDVNODEPATHINFO` — never the sidecar directory
+/// listing, which only sees PIDs that already wrote something there.
+#[cfg(target_os = "macos")]
+pub fn census_holders(db_path: &Path) -> io::Result<std::collections::HashSet<u32>> {
+    use std::ffi::CStr;
+    use std::os::raw::{c_int, c_void};
+    use std::os::unix::ffi::OsStrExt;
+
+    const PROC_ALL_PIDS: u32 = 1;
+    const PROC_PIDLISTFDS: c_int = 1;
+    const PROC_PIDFDVNODEPATHINFO: c_int = 2;
+    const PROX_FDTYPE_VNODE: u32 = 1;
+    const MAXPATHLEN: usize = 1024;
+
+    #[repr(C)]
+    struct ProcFdInfo {
+        proc_fd: i32,
+        proc_fdtype: u32,
+    }
+    #[repr(C)]
+    struct ProcFileInfo {
+        fi_openflags: u32,
+        fi_status: u32,
+        fi_offset: i64,
+        fi_type: i32,
+        fi_guardflags: u32,
+    }
+    #[repr(C)]
+    struct FsId {
+        val: [i32; 2],
+    }
+    #[repr(C)]
+    struct VinfoStat {
+        vst_dev: u32,
+        vst_mode: u16,
+        vst_nlink: u16,
+        vst_ino: u64,
+        vst_uid: u32,
+        vst_gid: u32,
+        vst_atime: i64,
+        vst_atimensec: i64,
+        vst_mtime: i64,
+        vst_mtimensec: i64,
+        vst_ctime: i64,
+        vst_ctimensec: i64,
+        vst_birthtime: i64,
+        vst_birthtimensec: i64,
+        vst_size: i64,
+        vst_blocks: i64,
+        vst_blksize: i32,
+        vst_flags: u32,
+        vst_gen: u32,
+        vst_rdev: u32,
+        vst_qspare: [i64; 2],
+    }
+    #[repr(C)]
+    struct VnodeInfo {
+        vi_stat: VinfoStat,
+        vi_type: i32,
+        vi_pad: i32,
+        vi_fsid: FsId,
+    }
+    #[repr(C)]
+    struct VnodeInfoPath {
+        vip_vi: VnodeInfo,
+        vip_path: [u8; MAXPATHLEN],
+    }
+    #[repr(C)]
+    struct VnodeFdInfoWithPath {
+        pfi: ProcFileInfo,
+        pvip: VnodeInfoPath,
+    }
+
+    #[link(name = "proc")]
+    extern "C" {
+        fn proc_listpids(kind: u32, typeinfo: u32, buffer: *mut c_void, buffersize: c_int)
+            -> c_int;
+        fn proc_pidinfo(
+            pid: c_int,
+            flavor: c_int,
+            arg: u64,
+            buffer: *mut c_void,
+            buffersize: c_int,
+        ) -> c_int;
+        fn proc_pidfdinfo(
+            pid: c_int,
+            fd: c_int,
+            flavor: c_int,
+            buffer: *mut c_void,
+            buffersize: c_int,
+        ) -> c_int;
+    }
+
+    let target = fs::canonicalize(db_path)?;
+
+    // A fixed 8k-PID buffer is pragmatic rather than growth-looped: this
+    // runs only on a TRUNCATE no-progress event (rare), and a system with
+    // >8k live PIDs exceeding this snapshot is itself out of scope for a
+    // local dev/single-tenant deployment.
+    let mut pid_buf = vec![0i32; 8192];
+    // SAFETY: `pid_buf` is a valid, appropriately-sized buffer;
+    // `proc_listpids` writes at most its byte capacity into it.
+    let bytes = unsafe {
+        proc_listpids(
+            PROC_ALL_PIDS,
+            0,
+            pid_buf.as_mut_ptr() as *mut c_void,
+            (pid_buf.len() * std::mem::size_of::<i32>()) as c_int,
+        )
+    };
+    if bytes <= 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let pid_count = (bytes as usize / std::mem::size_of::<i32>()).min(pid_buf.len());
+
+    let mut holders = std::collections::HashSet::new();
+    let mut fd_buf: Vec<ProcFdInfo> = (0..4096)
+        .map(|_| ProcFdInfo {
+            proc_fd: 0,
+            proc_fdtype: 0,
+        })
+        .collect();
+    for &pid in &pid_buf[..pid_count] {
+        if pid <= 0 {
+            continue;
+        }
+        // SAFETY: `fd_buf` is a valid, appropriately-sized buffer.
+        let fd_bytes = unsafe {
+            proc_pidinfo(
+                pid,
+                PROC_PIDLISTFDS,
+                0,
+                fd_buf.as_mut_ptr() as *mut c_void,
+                (fd_buf.len() * std::mem::size_of::<ProcFdInfo>()) as c_int,
+            )
+        };
+        // A negative/zero return means the PID exited or we lack permission
+        // to inspect it (unprivileged processes cannot list another user's
+        // fds) — skip rather than error the whole census over one PID.
+        if fd_bytes <= 0 {
+            continue;
+        }
+        let fd_count = (fd_bytes as usize / std::mem::size_of::<ProcFdInfo>()).min(fd_buf.len());
+        for fdinfo in &fd_buf[..fd_count] {
+            if fdinfo.proc_fdtype != PROX_FDTYPE_VNODE {
+                continue;
+            }
+            let mut vinfo: VnodeFdInfoWithPath = unsafe { std::mem::zeroed() };
+            // SAFETY: `vinfo` is a valid, zeroed, appropriately-sized buffer.
+            let vsize = unsafe {
+                proc_pidfdinfo(
+                    pid,
+                    fdinfo.proc_fd,
+                    PROC_PIDFDVNODEPATHINFO,
+                    &mut vinfo as *mut _ as *mut c_void,
+                    std::mem::size_of::<VnodeFdInfoWithPath>() as c_int,
+                )
+            };
+            if vsize as usize != std::mem::size_of::<VnodeFdInfoWithPath>() {
+                continue;
+            }
+            // SAFETY: `vip_path` is NUL-terminated by the kernel on success.
+            let path_cstr = unsafe { CStr::from_ptr(vinfo.pvip.vip_path.as_ptr() as *const i8) };
+            let path = PathBuf::from(std::ffi::OsStr::from_bytes(path_cstr.to_bytes()));
+            if let Ok(canon) = fs::canonicalize(&path) {
+                if canon == target {
+                    holders.insert(pid as u32);
+                    break;
+                }
+            }
+        }
+    }
+    Ok(holders)
+}
+
+/// Linux OS-derived census (ADR-091 Amendment 2 review, item a): scan
+/// `/proc/<pid>/fd/*` for every live PID and resolve each fd symlink,
+/// comparing against `db_path`'s canonical form. `/proc` enumeration
+/// necessarily skips PIDs this process cannot read (permission denied) —
+/// same "skip, don't fail the whole census" posture as the macOS path.
+#[cfg(target_os = "linux")]
+pub fn census_holders(db_path: &Path) -> io::Result<std::collections::HashSet<u32>> {
+    let target = fs::canonicalize(db_path)?;
+    let mut holders = std::collections::HashSet::new();
+
+    for proc_entry in fs::read_dir("/proc")?.flatten() {
+        let Some(pid) = proc_entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let fd_dir = proc_entry.path().join("fd");
+        let Ok(fds) = fs::read_dir(&fd_dir) else {
+            continue; // process gone, or no permission to inspect its fds
+        };
+        for fd_entry in fds.flatten() {
+            let Ok(resolved) = fs::read_link(fd_entry.path()) else {
+                continue;
+            };
+            if let Ok(canon) = fs::canonicalize(&resolved) {
+                if canon == target {
+                    holders.insert(pid);
+                    break;
+                }
+            }
+        }
+    }
+    Ok(holders)
+}
+
+/// Any other Unix (khive ships macOS/Linux/Windows only; this is a
+/// documented-gap fallback for a hypothetical build on anything else, not a
+/// real deployment target) has no holder-enumeration implementation here.
+/// An error (never a silently-empty `Ok`) so the caller treats it as a
+/// census failure — the same "cannot rule out an unregistered holder"
+/// posture as a real enumeration error, not false reassurance.
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+pub fn census_holders(_db_path: &Path) -> io::Result<std::collections::HashSet<u32>> {
+    Err(io_other(
+        "OS-derived holder census has no implementation on this Unix target",
+    ))
+}
+
+/// Ensure `dir` exists and is trustworthy: a real directory (never a
+/// symlink), and on Unix mode `0700` owned by the current user (Windows has
+/// no uid/mode-equivalent narrowing — see the module doc's platform-split
+/// note). Refuses — never chmod/chown/otherwise repair — a non-compliant
+/// existing directory.
+pub fn ensure_sidecar_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        unix_impl::SidecarDirHandle::open_or_create(dir)?;
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        windows_impl::ensure_sidecar_dir(dir)
     }
 }
 
 /// Write (or refresh) this process's heartbeat file. Exclusive-create a temp
-/// file with `O_NOFOLLOW` in the sidecar dir, then atomically rename it over
-/// the target — never an in-place open of a possibly attacker-placed path.
+/// file (`O_NOFOLLOW` on Unix), then atomically rename it over the target —
+/// never an in-place open of a possibly attacker-placed path.
 pub fn write_heartbeat(dir: &Path, heartbeat: &WalpinHeartbeat) -> io::Result<()> {
-    ensure_sidecar_dir(dir)?;
-
-    let target = dir.join(format!("{}.json", heartbeat.pid));
-    if let Ok(meta) = fs::symlink_metadata(&target) {
-        if meta.file_type().is_symlink() {
-            return Err(io_other(format!(
-                "walpin heartbeat path {target:?} is a symlink; refusing to write through it"
-            )));
-        }
-    }
-
-    let tmp = dir.join(format!(".{}.json.tmp", heartbeat.pid));
-    // Best-effort: a stale temp file from a prior crashed write must not block
-    // this one via O_EXCL: the ADR ordering (register at BEGIN, gone on
-    // Drop) has no analogue for the sidecar, so shed it before excl-creating.
-    let _ = fs::remove_file(&tmp);
-
     let body =
         serde_json::to_vec(heartbeat).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let target = format!("{}.json", heartbeat.pid);
+    let tmp = format!(".{}.json.tmp", heartbeat.pid);
+    #[cfg(unix)]
     {
-        use std::io::Write;
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&tmp)?;
-        file.write_all(&body)?;
-        file.sync_all()?;
+        let handle = unix_impl::SidecarDirHandle::open_or_create(dir)?;
+        handle.write_atomic(&target, &tmp, &body)
     }
-    fs::rename(&tmp, &target)?;
-    Ok(())
+    #[cfg(windows)]
+    {
+        windows_impl::ensure_sidecar_dir(dir)?;
+        windows_impl::write_atomic(dir, &target, &tmp, &body)
+    }
 }
 
 /// Remove this process's heartbeat file, if present. Never follows a
-/// symlink at the target path.
+/// symlink at the target path. A missing sidecar directory is a no-op — it
+/// must NOT be created as a side effect of a removal.
 pub fn remove_heartbeat(dir: &Path, pid: u32) -> io::Result<()> {
-    let target = dir.join(format!("{pid}.json"));
-    match fs::symlink_metadata(&target) {
-        Ok(meta) if meta.file_type().is_symlink() => Err(io_other(format!(
-            "refusing to remove symlinked walpin heartbeat path {target:?}"
-        ))),
-        Ok(_) => fs::remove_file(&target),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
+    let target = format!("{pid}.json");
+    #[cfg(unix)]
+    {
+        match unix_impl::SidecarDirHandle::open_if_exists(dir)? {
+            Some(handle) => handle.remove_checked(&target),
+            None => Ok(()),
+        }
+    }
+    #[cfg(windows)]
+    {
+        windows_impl::remove_checked(dir, &target)
     }
 }
 
 /// Write this process's one-time registration beacon (ADR-091 Amendment 2
-/// sidecar-health attribution). Idempotent: called once at sidecar
-/// initialization, never refreshed — the atomic rename over any pre-existing
-/// target makes a second call (e.g. a PID reused far in the future) a benign
-/// overwrite rather than an error. Same trust-boundary rules as
-/// [`write_heartbeat`]: exclusive-create `O_NOFOLLOW` temp file, then atomic
-/// rename over the target.
+/// sidecar-health attribution). Written once at sidecar initialization; see
+/// [`touch_beacon`] for the required per-tick freshness refresh — a beacon
+/// that is never refreshed again classifies as stale, never
+/// `registered-silent` (beacon refresh rule).
 pub fn write_beacon(dir: &Path, beacon: &WalpinBeacon) -> io::Result<()> {
-    ensure_sidecar_dir(dir)?;
-
-    let target = beacon_path(dir, beacon.pid);
-    if let Ok(meta) = fs::symlink_metadata(&target) {
-        if meta.file_type().is_symlink() {
-            return Err(io_other(format!(
-                "walpin beacon path {target:?} is a symlink; refusing to write through it"
-            )));
-        }
-    }
-
-    let tmp = dir.join(format!(".{}.beacon.tmp", beacon.pid));
-    let _ = fs::remove_file(&tmp);
-
     let body =
         serde_json::to_vec(beacon).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let target = format!("{}.beacon", beacon.pid);
+    let tmp = format!(".{}.beacon.tmp", beacon.pid);
+    #[cfg(unix)]
     {
-        use std::io::Write;
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&tmp)?;
-        file.write_all(&body)?;
-        file.sync_all()?;
+        let handle = unix_impl::SidecarDirHandle::open_or_create(dir)?;
+        handle.write_atomic(&target, &tmp, &body)
     }
-    fs::rename(&tmp, &target)?;
-    Ok(())
+    #[cfg(windows)]
+    {
+        windows_impl::ensure_sidecar_dir(dir)?;
+        windows_impl::write_atomic(dir, &target, &tmp, &body)
+    }
+}
+
+/// ADR-091 Amendment 2 beacon refresh rule: a metadata-only mtime touch of
+/// this process's already-written beacon — no data write, preserving the
+/// zero-steady-state-data-traffic property. Must run on every sweep tick
+/// while the beacon exists: `registered-silent` classification requires the
+/// refresh timestamp (not just the original write) to stay within the
+/// freshness window.
+pub fn touch_beacon(dir: &Path, pid: u32) -> io::Result<()> {
+    let name = format!("{pid}.beacon");
+    #[cfg(unix)]
+    {
+        let handle = unix_impl::SidecarDirHandle::open_or_create(dir)?;
+        handle.touch_mtime(&name)
+    }
+    #[cfg(windows)]
+    {
+        windows_impl::touch_mtime(dir, &name)
+    }
 }
 
 /// Path of `pid`'s one-time registration beacon under `dir`.
@@ -299,22 +1079,19 @@ pub fn beacon_path(dir: &Path, pid: u32) -> PathBuf {
     dir.join(format!("{pid}.beacon"))
 }
 
-/// Is `pid` alive (right now)? `kill(pid, 0)` is a pure existence/permission
-/// probe with no side effects; `EPERM` (a live PID owned by someone else)
-/// still counts as alive.
+/// Is `pid` alive (right now)? On Unix, `kill(pid, 0)` is a pure
+/// existence/permission probe with no side effects (`EPERM` — a live PID
+/// owned by someone else — still counts as alive). On Windows,
+/// `OpenProcess` + `GetExitCodeProcess` checking for `STILL_ACTIVE`.
 pub fn is_process_alive(pid: u32) -> bool {
-    let Ok(pid) = i32::try_from(pid) else {
-        return false;
-    };
-    if pid <= 0 {
-        return false;
+    #[cfg(unix)]
+    {
+        unix_impl::is_process_alive(pid)
     }
-    // SAFETY: signal 0 sends no signal; it only probes existence/permission.
-    let rc = unsafe { libc::kill(pid, 0) };
-    if rc == 0 {
-        return true;
+    #[cfg(windows)]
+    {
+        windows_impl::is_process_alive(pid)
     }
-    io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// The OS-reported start time of `pid`, in epoch seconds, or `None` if it
@@ -418,7 +1195,14 @@ pub fn process_start_time_secs(pid: u32) -> Option<i64> {
     Some(btime + secs_since_boot as i64)
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+/// Windows: `OpenProcess` + `GetProcessTimes`' creation-time `FILETIME`,
+/// converted from 100ns-since-1601 to Unix epoch seconds.
+#[cfg(windows)]
+pub fn process_start_time_secs(pid: u32) -> Option<i64> {
+    windows_impl::process_start_time_secs(pid)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 pub fn process_start_time_secs(_pid: u32) -> Option<i64> {
     None
 }
@@ -435,34 +1219,46 @@ fn now_epoch_secs() -> i64 {
 /// classifying each PID's sidecar health three ways (ADR-091 Amendment 2
 /// "Sidecar-health attribution"): [`WalpinPidHealth::Reporting`] (live,
 /// identity-matched, fresh heartbeat), [`WalpinPidHealth::RegisteredSilent`]
-/// (live, identity-matched beacon, no live heartbeat), or
+/// (live, identity-matched, FRESHLY-REFRESHED beacon, no live heartbeat), or
 /// [`WalpinPidHealth::Unknown`] (an entry exists but the trust-boundary check
-/// refused it, or it failed to parse — sidecar health for that PID is
-/// unestablished).
+/// refused it, failed to parse, or went stale — sidecar health for that PID
+/// is unestablished).
 ///
 /// Trust boundary (binding, gate ruling 2026-07-19): the directory itself is
 /// validated (type/owner/mode) BEFORE any entry is read — a non-compliant
 /// directory returns `Err`, a health *failure*, never a partial/empty
 /// result that could otherwise masquerade as "no live entries." Per entry,
 /// symlinks and non-owned files are refused BEFORE their contents are read
-/// (contributing an `Unknown` classification, not silently skipped) —
-/// unreadable/unparseable owned entries are deleted as before (a genuinely
-/// dead or crashed process's orphan, not an unresolved health question).
-/// A missing directory (sidecar never used yet) is `Ok` with an empty
-/// report, distinct from an existing-but-untrustworthy one.
+/// (contributing an `Unknown` classification, not silently skipped).
+///
+/// Beacon refresh rule (ADR-091 Amendment 2 review, item b): registration at
+/// initialization alone never licenses `RegisteredSilent` — a beacon (or
+/// heartbeat) that fails the identity gate (dead PID, reused PID) is genuine
+/// absence (deleted, no entry at all: there is no evidence of THIS process),
+/// but one that passes identity and STILL goes stale (its refresh mtime
+/// falls outside the freshness window) is a wedged sidecar: classified
+/// `Unknown`, deleted, and — critically — that PID is barred from later
+/// resolving to `RegisteredSilent` off a co-existing beacon/heartbeat, per
+/// "a PID whose heartbeat was deleted as stale classifies as unknown, never
+/// registered-silent."
+///
+/// This function is Unix-only: its sole caller is the daemon's checkpoint
+/// task, and daemon mode itself requires Unix. A missing directory (sidecar
+/// never used yet) is `Ok` with an empty report, distinct from an
+/// existing-but-untrustworthy one.
+#[cfg(unix)]
 pub fn enumerate_live(dir: &Path, sweep_interval: Duration) -> io::Result<WalpinReport> {
-    let dir_meta = match fs::symlink_metadata(dir) {
-        Ok(meta) => meta,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(WalpinReport::default()),
+    let handle = match unix_impl::SidecarDirHandle::open_if_exists(dir) {
+        Ok(Some(h)) => h,
+        Ok(None) => return Ok(WalpinReport::default()),
         Err(e) => return Err(e),
     };
-    validate_dir_metadata(dir, &dir_meta)?;
 
-    let entries = fs::read_dir(dir)?;
     let now = now_epoch_secs();
     // Subsecond intervals must not collapse the freshness window to zero
     // (minor, ADR-091 Amendment 2 review): a window of 0s would make any
-    // `updated_at` other than the current wall-clock second appear stale.
+    // `updated_at`/refresh timestamp other than the current wall-clock
+    // second appear stale.
     let stale_after_secs = sweep_interval
         .saturating_mul(3)
         .max(Duration::from_secs(1))
@@ -471,12 +1267,12 @@ pub fn enumerate_live(dir: &Path, sweep_interval: Duration) -> io::Result<Walpin
     let mut heartbeats: std::collections::HashMap<u32, WalpinHeartbeat> = Default::default();
     let mut beacon_pids: std::collections::HashSet<u32> = Default::default();
     let mut unknown: Vec<(u32, &'static str)> = Vec::new();
+    // PIDs whose heartbeat or beacon passed the identity gate but failed
+    // freshness — these are wedged, not absent, and must never resolve to
+    // `RegisteredSilent` off a co-existing entry (item b).
+    let mut wedged: std::collections::HashSet<u32> = Default::default();
 
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
+    for name in handle.list_names()? {
         if name.starts_with('.') {
             continue;
         }
@@ -496,28 +1292,29 @@ pub fn enumerate_live(dir: &Path, sweep_interval: Duration) -> io::Result<Walpin
         // content read, and contributes `Unknown` rather than being
         // silently dropped — the entry's health is unestablished, not
         // exonerating.
-        let meta = match fs::symlink_metadata(&path) {
-            Ok(m) => m,
-            Err(_) => continue,
+        let (body, owner_uid, mtime) = match handle.read_checked(&name) {
+            Ok(Some(v)) => v,
+            Ok(None) => continue, // raced away between listing and reading
+            Err(_) => {
+                unknown.push((pid, "refused: symlinked sidecar entry"));
+                continue;
+            }
         };
-        if meta.file_type().is_symlink() {
-            unknown.push((pid, "refused: symlinked sidecar entry"));
-            continue;
-        }
-        let owned_by_us = meta.uid() == current_uid();
-        if !owned_by_us {
+        if owner_uid != unix_impl::current_uid() {
             unknown.push((pid, "refused: sidecar entry not owned by current user"));
             continue;
         }
+        let mtime_secs = mtime
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let fresh = (now - mtime_secs).abs() <= stale_after_secs;
 
         if is_heartbeat {
-            let heartbeat: WalpinHeartbeat = match fs::read_to_string(&path)
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
-            {
-                Some(hb) => hb,
-                None => {
-                    let _ = fs::remove_file(&path);
+            let heartbeat: WalpinHeartbeat = match serde_json::from_slice(&body) {
+                Ok(hb) => hb,
+                Err(_) => {
+                    let _ = handle.unlink_tolerant(&name);
                     continue;
                 }
             };
@@ -526,21 +1323,28 @@ pub fn enumerate_live(dir: &Path, sweep_interval: Duration) -> io::Result<Walpin
                 && process_start_time_secs(heartbeat.pid)
                     .map(|actual| (actual - heartbeat.started_at).abs() <= START_TIME_EPSILON_SECS)
                     .unwrap_or(false);
-            let fresh = (now - heartbeat.updated_at).abs() <= stale_after_secs;
-
-            if alive && identity_ok && fresh {
-                heartbeats.insert(heartbeat.pid, heartbeat);
-            } else {
-                let _ = fs::remove_file(&path);
+            if !identity_ok {
+                let _ = handle.unlink_tolerant(&name);
+                continue;
             }
+            // `updated_at` is the heartbeat's own field (refreshed every
+            // tick the warn condition persists); the entry's mtime tracks
+            // it closely, but the JSON field is the authoritative source
+            // the ADR specifies for heartbeat freshness.
+            let hb_fresh = (now - heartbeat.updated_at).abs() <= stale_after_secs;
+            if !hb_fresh {
+                let _ = handle.unlink_tolerant(&name);
+                wedged.insert(pid);
+                unknown.push((pid, "stale walpin heartbeat"));
+                continue;
+            }
+            let _ = fresh; // heartbeat freshness is `updated_at`-sourced, not mtime
+            heartbeats.insert(heartbeat.pid, heartbeat);
         } else {
-            let beacon: WalpinBeacon = match fs::read_to_string(&path)
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
-            {
-                Some(b) => b,
-                None => {
-                    let _ = fs::remove_file(&path);
+            let beacon: WalpinBeacon = match serde_json::from_slice(&body) {
+                Ok(b) => b,
+                Err(_) => {
+                    let _ = handle.unlink_tolerant(&name);
                     continue;
                 }
             };
@@ -549,11 +1353,20 @@ pub fn enumerate_live(dir: &Path, sweep_interval: Duration) -> io::Result<Walpin
                 && process_start_time_secs(beacon.pid)
                     .map(|actual| (actual - beacon.started_at).abs() <= START_TIME_EPSILON_SECS)
                     .unwrap_or(false);
-            if alive && identity_ok {
-                beacon_pids.insert(beacon.pid);
-            } else {
-                let _ = fs::remove_file(&path);
+            if !identity_ok {
+                let _ = handle.unlink_tolerant(&name);
+                continue;
             }
+            // Beacon refresh rule: freshness is the entry's mtime (the
+            // metadata-only touch), not any JSON field — the beacon's body
+            // is written once and never refreshed.
+            if !fresh {
+                let _ = handle.unlink_tolerant(&name);
+                wedged.insert(pid);
+                unknown.push((pid, "stale walpin beacon"));
+                continue;
+            }
+            beacon_pids.insert(beacon.pid);
         }
     }
 
@@ -563,6 +1376,9 @@ pub fn enumerate_live(dir: &Path, sweep_interval: Duration) -> io::Result<Walpin
         beacon_pids.remove(&pid);
     }
     for pid in beacon_pids {
+        if wedged.contains(&pid) {
+            continue; // already carried as `Unknown` via `unknown` above
+        }
         entries.push(WalpinPidHealth::RegisteredSilent { pid });
     }
     for (pid, reason) in unknown {
@@ -575,6 +1391,13 @@ pub fn enumerate_live(dir: &Path, sweep_interval: Duration) -> io::Result<Walpin
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    #[cfg(unix)]
+    fn current_uid() -> u32 {
+        unix_impl::current_uid()
+    }
 
     fn heartbeat(pid: u32) -> WalpinHeartbeat {
         WalpinHeartbeat {
@@ -801,10 +1624,12 @@ mod tests {
         write_heartbeat(&dir, &hb).unwrap();
 
         let report = enumerate_live(&dir, Duration::from_secs(5)).unwrap();
-        assert!(
-            report.entries.is_empty(),
-            "stale updated_at must fail the gate"
-        );
+        // ADR-091 Amendment 2 review item b: a stale-but-identity-valid
+        // heartbeat is wedged, not absent — it classifies `Unknown` rather
+        // than silently vanishing from the report.
+        assert_eq!(report.reporting().count(), 0);
+        assert_eq!(report.unknown_pids().collect::<Vec<_>>(), vec![hb.pid]);
+        assert!(!report.fully_attributed());
         assert!(!dir.join(format!("{}.json", hb.pid)).exists());
     }
 
@@ -956,5 +1781,85 @@ mod tests {
         let err = write_beacon(&dir, &b).expect_err("symlinked target must be refused");
         assert!(err.to_string().contains("symlink"));
         assert_eq!(fs::read_to_string(&real).unwrap(), "nope");
+    }
+
+    #[test]
+    fn enumerate_live_classifies_stale_beacon_as_unknown() {
+        // ADR-091 Amendment 2 review item b: a beacon that is identity-valid
+        // (live PID, matching start time) but whose refresh mtime has fallen
+        // outside the freshness window is a wedged sidecar, not evidence of
+        // registration — it must classify `Unknown`, not `RegisteredSilent`.
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("khive.db.walpin");
+        let pid = std::process::id();
+        write_beacon(&dir, &beacon(pid)).unwrap();
+        let beacon_file = fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join(format!("{pid}.beacon")))
+            .unwrap();
+        beacon_file
+            .set_modified(SystemTime::now() - Duration::from_secs(3600))
+            .unwrap();
+
+        let report = enumerate_live(&dir, Duration::from_secs(5)).unwrap();
+        assert_eq!(report.registered_silent_pids().count(), 0);
+        assert_eq!(report.unknown_pids().collect::<Vec<_>>(), vec![pid]);
+        assert!(!report.fully_attributed());
+        assert!(
+            !beacon_path(&dir, pid).exists(),
+            "a stale beacon must be deleted, not left to re-classify next sweep"
+        );
+    }
+
+    #[test]
+    fn enumerate_live_stale_heartbeat_with_fresh_beacon_stays_unknown_not_registered_silent() {
+        // ADR-091 Amendment 2 review item b: a PID whose heartbeat was
+        // deleted as stale must classify `Unknown`, even when a co-existing
+        // FRESH beacon for the same PID would otherwise resolve it to
+        // `RegisteredSilent`.
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("khive.db.walpin");
+        let pid = std::process::id();
+        write_beacon(&dir, &beacon(pid)).unwrap();
+        let mut hb = heartbeat(pid);
+        hb.updated_at = now_epoch_secs() - 3600;
+        write_heartbeat(&dir, &hb).unwrap();
+
+        let report = enumerate_live(&dir, Duration::from_secs(5)).unwrap();
+        assert_eq!(report.reporting().count(), 0);
+        assert_eq!(
+            report.registered_silent_pids().collect::<Vec<_>>(),
+            Vec::<u32>::new(),
+            "a co-existing fresh beacon must not rescue a PID with a stale heartbeat"
+        );
+        assert_eq!(report.unknown_pids().collect::<Vec<_>>(), vec![pid]);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn census_holders_macos_discovers_self_as_a_holder_of_an_open_db_file() {
+        let root = tempfile::tempdir().unwrap();
+        let db_path = root.path().join("test.db");
+        let file = fs::File::create(&db_path).unwrap();
+        let holders = census_holders(&db_path).expect("census must succeed for a live target");
+        assert!(
+            holders.contains(&std::process::id()),
+            "this process holds {db_path:?} open and must appear in its own OS-derived census"
+        );
+        drop(file);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn census_holders_linux_discovers_self_as_a_holder_of_an_open_db_file() {
+        let root = tempfile::tempdir().unwrap();
+        let db_path = root.path().join("test.db");
+        let file = fs::File::create(&db_path).unwrap();
+        let holders = census_holders(&db_path).expect("census must succeed for a live target");
+        assert!(
+            holders.contains(&std::process::id()),
+            "this process holds {db_path:?} open and must appear in its own OS-derived census"
+        );
+        drop(file);
     }
 }

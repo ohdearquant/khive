@@ -507,8 +507,7 @@ impl BlobStore for S3BlobStore {
             let next = tokio::time::timeout(self.request_timeout, stream.next()).await;
             match next {
                 Ok(Some(Ok(chunk))) => {
-                    buf.extend_from_slice(&chunk);
-                    if buf.len() as u64 > MAX_OBJECT_BYTES {
+                    if buf.len() as u64 + chunk.len() as u64 > MAX_OBJECT_BYTES {
                         return Err(StorageError::InvalidInput {
                             capability: StorageCapability::Blob,
                             operation: "get".into(),
@@ -519,6 +518,7 @@ impl BlobStore for S3BlobStore {
                             ),
                         });
                     }
+                    buf.extend_from_slice(&chunk);
                 }
                 Ok(Some(Err(e))) => return Err(map_object_store_err(e, "get")),
                 Ok(None) => break,
@@ -981,11 +981,13 @@ mod tests {
             list_script: Arc<Mutex<Vec<ListOutcome>>>,
             delete_script: Arc<Mutex<Vec<Outcome>>>,
             /// Overrides the default empty-body `Outcome::Ok` response for
-            /// `get_opts`: `(reported_meta_size, actual_streamed_body)`. Lets
-            /// tests simulate an object store whose response metadata
+            /// `get_opts`: `(reported_meta_size, pre-chunked stream body)`.
+            /// Lets tests simulate an object store whose response metadata
             /// under-reports the real body length (ADR-111 Amendment 2
-            /// review: `get` must bound the actual stream, not trust this).
-            get_body_override: Mutex<Option<(u64, Bytes)>>,
+            /// review: `get` must bound the actual stream, not trust this),
+            /// and control exactly how many `stream.next()` calls the body
+            /// arrives over (e.g. one oversized chunk vs many small ones).
+            get_body_override: Mutex<Option<(u64, Vec<Bytes>)>>,
             pub put_calls: AtomicUsize,
             pub get_calls: AtomicUsize,
             pub delete_calls: Arc<AtomicUsize>,
@@ -1036,9 +1038,13 @@ mod tests {
             /// Override the body an `Outcome::Ok` `get_opts` response
             /// streams, independent of the `reported_size` its `ObjectMeta`
             /// claims — used to simulate an object store whose response
-            /// metadata under-reports the real streamed length.
-            pub fn with_get_body(self, reported_size: u64, body: Bytes) -> Self {
-                *self.get_body_override.lock().unwrap() = Some((reported_size, body));
+            /// metadata under-reports the real streamed length. `chunks`
+            /// controls exactly how many `stream.next()` calls the body
+            /// arrives over (e.g. one oversized chunk vs many small ones),
+            /// so tests can exercise the running-total bound both within a
+            /// single chunk and across several.
+            pub fn with_get_body_chunks(self, reported_size: u64, chunks: Vec<Bytes>) -> Self {
+                *self.get_body_override.lock().unwrap() = Some((reported_size, chunks));
                 self
             }
 
@@ -1087,15 +1093,8 @@ mod tests {
                 }
                 let override_body = self.get_body_override.lock().unwrap().clone();
                 outcome_to_result(&outcome, || {
-                    let (reported_size, body) = override_body.unwrap_or((0, Bytes::new()));
-                    // Split into multiple chunks (rather than one) so tests
-                    // exercise the running-total bound across several
-                    // `stream.next()` calls, not just a single-chunk read.
-                    const CHUNK_LEN: usize = 64 * 1024;
-                    let chunks: Vec<Result<Bytes>> = body
-                        .chunks(CHUNK_LEN)
-                        .map(|c| Ok(Bytes::copy_from_slice(c)))
-                        .collect();
+                    let (reported_size, body_chunks) = override_body.unwrap_or((0, Vec::new()));
+                    let chunks: Vec<Result<Bytes>> = body_chunks.into_iter().map(Ok).collect();
                     GetResult {
                         payload: GetResultPayload::Stream(stream::iter(chunks).boxed()),
                         meta: ObjectMeta {
@@ -1277,16 +1276,19 @@ mod tests {
 
     #[tokio::test]
     async fn get_rejects_body_larger_than_reported_metadata_size() {
-        // ADR-111 Amendment 2 review: `get` must bound the actual streamed
-        // body, not just trust `meta.size`. Script a response that reports a
-        // tiny size but streams a body over `MAX_OBJECT_BYTES` -- the read
-        // must abort once the running total crosses the cap rather than
-        // materializing the full oversized body in memory on the strength
-        // of a small reported size.
+        // ADR-111 Amendment 2 review follow-up: `get` must check the
+        // running total against the cap BEFORE appending a chunk, not
+        // after — otherwise a single oversized chunk is copied into the
+        // local buffer in full before the ceiling is ever enforced. Script
+        // a response that reports a tiny size but streams the *entire*
+        // over-cap body as ONE chunk (a single `stream.next()` call): with
+        // the check-before-append ordering, that chunk must be rejected
+        // without ever being appended, so the local buffer never grows
+        // past `MAX_OBJECT_BYTES`.
         let oversized = vec![b'x'; (MAX_OBJECT_BYTES as usize) + 1024];
         let fake = Arc::new(
             FakeObjectStore::new(vec![], vec![Outcome::Ok])
-                .with_get_body(1, Bytes::from(oversized)),
+                .with_get_body_chunks(1, vec![Bytes::from(oversized)]),
         );
         let store = S3BlobStore::from_client_for_test(
             Arc::clone(&fake) as Arc<dyn ObjectStore>,
@@ -1302,6 +1304,30 @@ mod tests {
             matches!(err, StorageError::InvalidInput { .. }),
             "got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn get_accepts_single_chunk_body_exactly_at_the_cap() {
+        // Boundary companion to the oversized-single-chunk test above:
+        // a body of exactly `MAX_OBJECT_BYTES`, delivered as one chunk,
+        // must succeed — confirming the check-before-append reorder didn't
+        // shift the ceiling off-by-one.
+        let exact = vec![b'x'; MAX_OBJECT_BYTES as usize];
+        let fake = Arc::new(
+            FakeObjectStore::new(vec![], vec![Outcome::Ok])
+                .with_get_body_chunks(MAX_OBJECT_BYTES, vec![Bytes::from(exact.clone())]),
+        );
+        let store = S3BlobStore::from_client_for_test(
+            Arc::clone(&fake) as Arc<dyn ObjectStore>,
+            "blobs",
+            3,
+            Duration::from_millis(50),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let content_ref = ContentRef::from_hex("e".repeat(64)).unwrap();
+        let bytes = store.get(&content_ref).await.unwrap();
+        assert_eq!(bytes.len(), exact.len());
     }
 
     #[tokio::test]

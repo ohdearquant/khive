@@ -633,7 +633,6 @@ fn log_tx_age_emission(emission: &TxAgeEmission) {
 /// on every tick the registry's oldest span exceeds `tx_warn_secs`, and
 /// removes it once on the tick the condition clears (and on shutdown) — a
 /// process that never crosses the threshold writes nothing.
-#[cfg(unix)]
 struct WalpinSidecarState {
     dir: PathBuf,
     pid: u32,
@@ -642,7 +641,6 @@ struct WalpinSidecarState {
     wrote: bool,
 }
 
-#[cfg(unix)]
 impl WalpinSidecarState {
     /// `None` when the sidecar is disabled for this backend/env, or the
     /// backend has no on-disk path (in-memory).
@@ -695,6 +693,36 @@ impl WalpinSidecarState {
         }
     }
 
+    /// ADR-091 Amendment 2 beacon refresh rule: a metadata-only mtime touch
+    /// of this process's already-registered beacon, performed on EVERY
+    /// sweep tick (not just while over-threshold) — `registered-silent`
+    /// classification requires this refresh to stay within the freshness
+    /// window, not just the beacon's original write. Best-effort: a failure
+    /// here degrades this process to `unknown` at the next enumeration, not
+    /// a sweep-task error.
+    async fn refresh_beacon(&self) {
+        let dir = self.dir.clone();
+        let pid = self.pid;
+        let result =
+            tokio::task::spawn_blocking(move || crate::walpin::touch_beacon(&dir, pid)).await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    error = %e,
+                    "ADR-091 Amendment 2: failed to refresh walpin registration beacon; \
+                     this process's sidecar health will read as unknown, not registered-silent"
+                );
+            }
+            Err(join_err) => {
+                tracing::warn!(
+                    error = %join_err,
+                    "ADR-091 Amendment 2: walpin beacon refresh task panicked"
+                );
+            }
+        }
+    }
+
     /// Blocking heartbeat write/removal runs on `spawn_blocking` (perf,
     /// ADR-091 Amendment 2 review) — this async sweep task must not block its
     /// executor thread on synchronous filesystem I/O.
@@ -703,6 +731,7 @@ impl WalpinSidecarState {
         oldest: Option<(khive_storage::tx_registry::TxId, Duration, Option<String>)>,
         tx_warn_secs: Duration,
     ) {
+        self.refresh_beacon().await;
         match oldest {
             Some((_, age, label)) if age >= tx_warn_secs => {
                 let heartbeat = crate::walpin::WalpinHeartbeat {
@@ -767,7 +796,6 @@ impl WalpinSidecarState {
     }
 }
 
-#[cfg(unix)]
 fn now_epoch_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -835,7 +863,6 @@ impl SessionSweepConfig {
 /// daemon-owned. Loops until `shutdown_rx` observes a change (or its sender
 /// is dropped), removing this process's walpin heartbeat (if written) on the
 /// way out.
-#[cfg(unix)]
 pub async fn run_session_sweep_task(
     db_path: Option<PathBuf>,
     config: SessionSweepConfig,
@@ -1367,7 +1394,49 @@ fn log_walpin_sidecar_report(pool: &ConnectionPool) {
             "ADR-091 Amendment 2 Plank B: process affirmatively reports no over-threshold span"
         );
     }
-    let unknown_pids: Vec<u32> = report.unknown_pids().collect();
+    let mut unknown_pids: Vec<u32> = report.unknown_pids().collect();
+
+    // ADR-091 Amendment 2 review item a (OS-derived census): the sidecar
+    // directory alone can only speak for PIDs that wrote SOMETHING there —
+    // a database holder that never registered a beacon at all (pre-feature
+    // binary, sidecar disabled, wedged before its first write) would
+    // otherwise be invisible. Widen the universe to every PID the OS
+    // reports as currently holding the database file open; any such PID
+    // absent from `report` entirely is `unknown` for the same reason a
+    // stale/unowned sidecar entry is.
+    match crate::walpin::census_holders(path) {
+        Ok(census) => {
+            let sidecar_known: std::collections::HashSet<u32> = report
+                .reporting()
+                .map(|hb| hb.pid)
+                .chain(report.registered_silent_pids())
+                .chain(unknown_pids.iter().copied())
+                .collect();
+            let mut census_only: Vec<u32> = census.difference(&sidecar_known).copied().collect();
+            if !census_only.is_empty() {
+                census_only.sort_unstable();
+                tracing::warn!(
+                    ?census_only,
+                    "ADR-091 Amendment 2 review item a: these PIDs hold the database file open \
+                     at the OS level but have no sidecar data at all (pre-feature binary, \
+                     sidecar disabled, or wedged before its first write)"
+                );
+                unknown_pids.extend(census_only);
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "ADR-091 Amendment 2 review item a: OS-derived holder census failed; \
+                 attribution cannot rule out an unregistered database holder this tick"
+            );
+            // A failed census is itself a health failure for the sharper
+            // conclusion below — treat it as if at least one PID were
+            // unresolved, without fabricating a specific PID number.
+            unknown_pids.push(0);
+        }
+    }
+
     if !unknown_pids.is_empty() {
         tracing::warn!(
             ?unknown_pids,

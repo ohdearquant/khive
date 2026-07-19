@@ -163,7 +163,15 @@ impl SessionSweepHandle {
 /// ADR-029 multi-backend coordinator boot path, and previously never started
 /// this sweep at all, leaving every multi-backend session permanently
 /// invisible to cross-process WAL-pin attribution.
-#[cfg(unix)]
+///
+/// Platform-independent (ADR-091 Amendment 2 review, item 1: "Windows is a
+/// supported target"): the tx_registry age check and the walpin sidecar
+/// write path (`khive_db::walpin`) both run on every platform now — only
+/// sidecar-directory *enumeration* (the daemon's TRUNCATE-time attribution
+/// read) is Unix-only, and daemon mode itself already requires Unix. A
+/// Windows session still registers its beacon and writes heartbeats, so it
+/// classifies as `reporting`/`registered-silent` (not a permanent `unknown`)
+/// whenever a Unix daemon does enumerate the shared sidecar directory.
 fn spawn_session_walpin_sweep(server: &KhiveMcpServer) -> Option<SessionSweepHandle> {
     let pool = server.pool()?;
     let db_path = pool.config().path.clone();
@@ -176,24 +184,6 @@ fn spawn_session_walpin_sweep(server: &KhiveMcpServer) -> Option<SessionSweepHan
     ));
     tracing::info!("ADR-091 Amendment 2 Plank A: session WAL-registry sweep started");
     Some(SessionSweepHandle { shutdown_tx, join })
-}
-
-/// Non-Unix builds have no session sweep implementation (`is_process_alive`,
-/// the walpin sidecar, and Plank A all rely on `libc`/proc APIs that are
-/// Unix-only). Rather than leaving this coverage gap silent (ADR-091
-/// Amendment 2 review: "do not leave silent gaps"), this documents the gap
-/// loudly at startup: every PID on a non-Unix host is permanently `unknown`
-/// to cross-process WAL-pin attribution, never `reporting`/`registered-silent`,
-/// because no beacon-equivalent state can be written here at all.
-#[cfg(not(unix))]
-fn spawn_session_walpin_sweep(_server: &KhiveMcpServer) -> Option<SessionSweepHandle> {
-    tracing::warn!(
-        "ADR-091 Amendment 2: this platform has no session WAL-registry sweep \
-         implementation; cross-process WAL-pin attribution cannot establish this \
-         process's sidecar health (neither reporting nor registered-silent) — treat \
-         it as an unresolved/unknown PID for attribution purposes"
-    );
-    None
 }
 
 /// Spawn the email channel loops if — and only if — `args` indicates this
