@@ -2655,6 +2655,13 @@ mod tests {
     /// Calls `rt.vectors_for_model` first so the virtual table is created, then
     /// inserts raw f32 LE blobs directly via SQL.
     async fn seed_warm_corpus(rt: &KhiveRuntime, token: &NamespaceToken, n: usize) {
+        seed_warm_corpus_opts(rt, token, n, true).await;
+    }
+
+    /// `log = false` seeds vec rows WITHOUT write-log rows — constructs the
+    /// empty-log zero-watermark baseline state (a corpus that predates the
+    /// migration's first logged write).
+    async fn seed_warm_corpus_opts(rt: &KhiveRuntime, token: &NamespaceToken, n: usize, log: bool) {
         let _store = rt
             .vectors_for_model(token, WARM_TEST_MODEL)
             .expect("vec store");
@@ -2686,6 +2693,9 @@ mod tests {
             })
             .await
             .expect("insert corpus row");
+            if !log {
+                continue;
+            }
             // Mirror the production write path: every vector mutation appends
             // a write-log row in the same funnel (ADR-079 Amendment 1).
             w.execute(SqlStatement {
@@ -2883,6 +2893,221 @@ mod tests {
         assert_eq!(
             tail_after, 0,
             "replayed tail must be covered by the new watermark"
+        );
+    }
+
+    /// Review-mandated case: a checkpoint taken over an EMPTY log persists the
+    /// zero watermark (the defined empty-log baseline), and the first logged
+    /// write afterwards classifies Stale-tail — never Hot.
+    #[tokio::test]
+    async fn ensure_ann_zero_watermark_then_first_write_is_stale_tail() {
+        let dir = TempDir::new().expect("tempdir");
+        let rt = file_rt_with_embedder(dir.path().join("test.db"));
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        // Corpus WITHOUT log rows: the log is empty at checkpoint time.
+        seed_warm_corpus_opts(&rt, &token, 4, false).await;
+
+        let ann = new_shared();
+        ensure_ann_for_model(&rt, &token, &ann, WARM_TEST_MODEL).await;
+        let seg_dir = ann_segment_dir(&rt, "local", WARM_TEST_MODEL).expect("seg_dir");
+        let info = read_commit_info(&seg_dir)
+            .expect("read_commit_info")
+            .expect("v2 commit record");
+        assert_eq!(
+            info.last_applied_seq,
+            Some(0),
+            "empty-log checkpoint must persist the numeric zero baseline, not a missing watermark"
+        );
+
+        // First logged write after the zero-watermark checkpoint.
+        seed_warm_corpus_opts(&rt, &token, 1, true).await;
+        let ann2 = new_shared();
+        ensure_ann_for_model(&rt, &token, &ann2, WARM_TEST_MODEL).await;
+        let key = AnnKey::new("local", WARM_TEST_MODEL);
+        let n = ann2
+            .indexes
+            .read()
+            .await
+            .get(&key)
+            .map(AnnBridge::num_vectors)
+            .expect("index must be served after the first logged write");
+        assert_eq!(
+            n, 5,
+            "Stale-tail must replay the logged write (Hot would serve 4)"
+        );
+        let info2 = read_commit_info(&seg_dir)
+            .expect("read_commit_info")
+            .expect("v2 commit record after replay");
+        assert!(
+            info2.last_applied_seq.unwrap_or(0) > 0,
+            "replay checkpoint must advance past the zero baseline"
+        );
+    }
+
+    /// Review-mandated case: deleting every live vector classifies Empty — no
+    /// ANN is served or replayed, and the terminal unavailable marker is set.
+    #[tokio::test]
+    async fn ensure_ann_delete_all_is_empty() {
+        let dir = TempDir::new().expect("tempdir");
+        let rt = file_rt_with_embedder(dir.path().join("test.db"));
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        seed_warm_corpus(&rt, &token, 3).await;
+
+        let ann = new_shared();
+        ensure_ann_for_model(&rt, &token, &ann, WARM_TEST_MODEL).await;
+        let key = AnnKey::new("local", WARM_TEST_MODEL);
+        assert!(ann.indexes.read().await.contains_key(&key), "initial build");
+
+        // Delete every corpus row, logging each delete (production funnel shape).
+        let table = format!("vec_{}", sanitize_model_key(WARM_TEST_MODEL));
+        let sql = rt.sql();
+        let mut w = sql.writer().await.expect("writer");
+        w.execute(SqlStatement {
+            sql: format!(
+                "INSERT INTO ann_write_log \
+                 (namespace, embedding_model, kind, field, subject_id, op) \
+                 SELECT namespace, embedding_model, kind, field, subject_id, 'delete' \
+                 FROM {table} WHERE namespace = ?1 AND embedding_model = ?2"
+            ),
+            params: vec![
+                SqlValue::Text("local".into()),
+                SqlValue::Text(WARM_TEST_MODEL.into()),
+            ],
+            label: None,
+        })
+        .await
+        .expect("log deletes");
+        w.execute(SqlStatement {
+            sql: format!("DELETE FROM {table} WHERE namespace = ?1 AND embedding_model = ?2"),
+            params: vec![
+                SqlValue::Text("local".into()),
+                SqlValue::Text(WARM_TEST_MODEL.into()),
+            ],
+            label: None,
+        })
+        .await
+        .expect("delete corpus");
+        drop(w);
+
+        let ann2 = new_shared();
+        ensure_ann_for_model(&rt, &token, &ann2, WARM_TEST_MODEL).await;
+        assert!(
+            !ann2.indexes.read().await.contains_key(&key),
+            "zero live corpus must classify Empty — no ANN served (rule 5 precedes Hot)"
+        );
+        assert!(
+            is_terminally_unavailable(&ann2, &key),
+            "Empty must set the terminal unavailable marker for wait_for_ann"
+        );
+    }
+
+    /// Review-mandated interleaving: consumer A registers at 0, checkpoints at
+    /// S, and crashes before its raise — the pair MIN stays 0 and another
+    /// consumer's compaction cannot delete A's tail. After A's row is raised
+    /// (or an overlapping row removed), compaction advances to the pair MIN.
+    #[tokio::test]
+    async fn compact_log_bounded_by_pair_minimum() {
+        let dir = TempDir::new().expect("tempdir");
+        let rt = file_rt_with_embedder(dir.path().join("test.db"));
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        seed_warm_corpus(&rt, &token, 4).await; // seqs 1..=4 in the log
+
+        register_consumer(&rt, "local", WARM_TEST_MODEL)
+            .await
+            .expect("register at 0");
+        // Overlapping consumer B durably checkpointed past every row.
+        {
+            let sql = rt.sql();
+            let mut w = sql.writer().await.expect("writer");
+            w.execute(SqlStatement {
+                sql: "INSERT INTO ann_consumer_watermark \
+                      (consumer, namespace, embedding_model, watermark) VALUES (?1, ?2, ?3, 99)"
+                    .into(),
+                params: vec![
+                    SqlValue::Text("other:test".into()),
+                    SqlValue::Text("local".into()),
+                    SqlValue::Text(WARM_TEST_MODEL.into()),
+                ],
+                label: None,
+            })
+            .await
+            .expect("insert B row");
+        }
+
+        // A crashed before its raise: row is 0 → MIN(0, 99) = 0 → nothing deletes.
+        compact_log(&rt, "local", WARM_TEST_MODEL)
+            .await
+            .expect("compact");
+        let (_, tail_at_zero) = scope_counts(&rt, "local", WARM_TEST_MODEL, 0)
+            .await
+            .expect("scope_counts");
+        assert_eq!(
+            tail_at_zero, 4,
+            "a zero-watermark row must block pair compaction"
+        );
+
+        // A raises to 2 → MIN(2, 99) = 2 → rows 1-2 compact, 3-4 remain.
+        raise_watermark(&rt, "local", WARM_TEST_MODEL, 2)
+            .await
+            .expect("raise");
+        compact_log(&rt, "local", WARM_TEST_MODEL)
+            .await
+            .expect("compact");
+        let (_, tail_after) = scope_counts(&rt, "local", WARM_TEST_MODEL, 0)
+            .await
+            .expect("scope_counts");
+        assert_eq!(
+            tail_after, 2,
+            "compaction must advance exactly to the pair MIN"
+        );
+    }
+
+    /// Review-mandated case: a pre-amendment commit record (base length, no
+    /// watermark trailer) classifies Cold and rebuilds — never serves Hot.
+    #[tokio::test]
+    async fn ensure_ann_pre_amendment_record_is_cold() {
+        let dir = TempDir::new().expect("tempdir");
+        let rt = file_rt_with_embedder(dir.path().join("test.db"));
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        seed_warm_corpus(&rt, &token, 4).await;
+
+        let ann = new_shared();
+        ensure_ann_for_model(&rt, &token, &ann, WARM_TEST_MODEL).await;
+        let seg_dir = ann_segment_dir(&rt, "local", WARM_TEST_MODEL).expect("seg_dir");
+
+        // Truncate the 41-byte extended trailer: the record parses at the base
+        // length — a legitimate pre-amendment commit with no watermark.
+        let meta_path = seg_dir.join("metadata.bin");
+        let bytes = std::fs::read(&meta_path).expect("read metadata.bin");
+        std::fs::write(&meta_path, &bytes[..bytes.len() - 41]).expect("truncate trailer");
+        let info = read_commit_info(&seg_dir)
+            .expect("read_commit_info")
+            .expect("base-length record must still parse");
+        assert_eq!(
+            info.last_applied_seq, None,
+            "trailer removed → no watermark"
+        );
+
+        use std::os::unix::fs::MetadataExt;
+        let ino_before = std::fs::metadata(&meta_path).expect("meta").ino();
+        let ann2 = new_shared();
+        ensure_ann_for_model(&rt, &token, &ann2, WARM_TEST_MODEL).await;
+        let key = AnnKey::new("local", WARM_TEST_MODEL);
+        assert!(
+            ann2.indexes.read().await.contains_key(&key),
+            "Cold rebuild must still produce a served index"
+        );
+        let ino_after = std::fs::metadata(&meta_path).expect("meta").ino();
+        assert_ne!(
+            ino_before, ino_after,
+            "pre-amendment record must force a rebuild (metadata.bin rewritten), not a Hot load"
+        );
+        let info2 = read_commit_info(&seg_dir)
+            .expect("read_commit_info")
+            .expect("rebuilt record");
+        assert!(
+            info2.last_applied_seq.is_some(),
+            "rebuild must restore the extended watermark record"
         );
     }
 
