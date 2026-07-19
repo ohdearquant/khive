@@ -677,3 +677,84 @@ possibility this ADR's own Alternatives section already named — the pin is out
 entirely (a separate `kkernel mcp` stdio session's own connection; `tx_registry` is
 process-local and cannot see it) — remains unruled-out and is exactly the "route reads through
 the daemon" alternative this ADR already deferred.
+
+### 2026-07-19 amendment (Amendment 2): the pin is cross-process — per-session observability and attribution
+
+**Telemetry conclusion (Plank 0 delivered its purpose).** A third recurrence
+(2026-07-19) provided the discriminating evidence Plank 0 was built to capture.
+`wal_pages` sat at 84,000-85,000 (14x `high_water_pages`, 4x
+`truncate_high_water_pages`) for at least ten hours. Three TRUNCATE attempts
+(22:15, 02:00, 05:58) each made zero progress (`wal_pages_before ==
+wal_pages_after`). Across every checkpoint-tick observation in that window, the
+in-process registry's oldest open span was **milliseconds to sub-second old**
+(`writer_task_tx`, `text_upsert_document` — ordinary bounded writes). The
+in-process inventory this ADR audited is therefore exonerated for this
+recurrence: no registered span in the daemon held the pin. The pin lives in
+another process. Corroborating: a full process-set cycle later that morning (a
+binary reinstall killed the daemon; stdio sessions re-exec'd) dropped the WAL
+from ~85,000 pages to under 1,000 — the same "killing processes frees the WAL"
+signature as #580's original incident.
+
+**Topology fact the original ADR under-weighted.** At observation time, 13
+processes held `khive.db` open directly: the daemon plus 12 `kkernel mcp` stdio
+sessions (ages minutes to 10+ hours). Session reads do not route through the
+daemon; every session runs its own connection pool against the shared file. The
+checkpoint task — and with it the entire Plank 0/Plank 1 sweep — runs **only in
+the daemon** (`khive-runtime/src/daemon.rs`, daemon boot path). The processes
+most likely to hold the pin are exactly the processes with zero WAL
+observability. Channel poll loops are already daemon-gated (#602), so sessions
+are pure request-servers; their read/write spans use the same bounded patterns
+inventoried above, but nothing observes them, and the `vec0` native cursor
+question (Inventory item 4) remains unverified precisely there.
+
+**Decision (additive, observability-first — same posture as Plank 0).**
+
+- **Plank A: per-session registry sweep.** Every `kkernel mcp` process (stdio
+  session or daemon) runs the lightweight tx-registry age sweep, not only the
+  daemon. For sessions this is observe-only (no PASSIVE/TRUNCATE checkpointing —
+  checkpointing stays daemon-owned to avoid N processes competing for the writer
+  mutex): a coarse tick (default 5s; sessions do not need the daemon's 500ms
+  cadence) checks `tx_registry::oldest()` against the existing
+  `KHIVE_TX_WARN_SECS`/`KHIVE_TX_MAX_AGE_SECS` thresholds with the same
+  edge-triggered logging.
+- **Plank B: cross-process attribution sidecar.** Each process maintains a
+  per-PID heartbeat file under `<db-file>.walpin/<pid>.json` containing
+  `{pid, process_role, started_at, oldest_tx_age_secs, oldest_tx_label,
+  updated_at}`. Written on the sweep tick only when an open span exceeds
+  `KHIVE_TX_WARN_SECS` (plus one removal on clean shutdown and on the first tick
+  after the condition clears) — quiet processes write nothing, so steady-state
+  filesystem traffic is zero. On a TRUNCATE no-progress event, the daemon
+  enumerates the sidecar directory, discards entries whose PID is no longer
+  alive, and logs every live report alongside its existing no-progress WARN. The
+  next recurrence therefore names the pinning process directly — or, if the WAL
+  is pinned while no sidecar reports an old span, yields the sharper conclusion
+  that the pin is an unregistered/native mechanism (`vec0` cursor, or a span the
+  registry does not cover) in one of the live PIDs, which is exactly the
+  fork needed to justify or reject the deferred route-reads-through-the-daemon
+  alternative with evidence.
+- **Plank C (optional, gate may strike): WAL-index read-mark depth probe.** On a
+  TRUNCATE no-progress event, additionally report how far behind the oldest
+  reader mark sits (frames pinned behind the boundary), derived from the shm
+  WAL-index. This quantifies pin depth even when no process self-reports.
+  Flagged optional because the WAL-index layout is an SQLite implementation
+  detail; if a stable probe (e.g. an additional `PRAGMA wal_checkpoint(PASSIVE)`
+  return-column analysis, which already yields `log` vs `checkpointed` counts)
+  provides equivalent signal, prefer that and drop shm parsing entirely.
+
+**Deployment-shape note.** The hosted khive-cloud topology is single-process:
+the in-process registry already sees every span there, and this amendment adds
+nothing to that path (the sidecar is a no-op with one process, and its
+enumeration output is trivially self-attributing). The multi-process shape this
+amendment instruments is local multi-seat operation — which is also the
+many-agents-one-substrate deployment khivedb ships as, so the gap is a product
+defect class, not a dev-environment quirk.
+
+**Non-goals.** No enforcement changes: thresholds, TRUNCATE policy, and the
+visibility-not-reclamation posture are unchanged. No read-routing migration
+(Alternative 4) is designed here; Plank B exists to produce the attribution that
+decision needs. `vec0` internals remain unverified; Plank B is designed to
+implicate or exonerate them without reading native code.
+
+**Config.** `KHIVE_SESSION_SWEEP_INTERVAL_MS` (default 5000, sessions only);
+`KHIVE_WALPIN_SIDECAR` (default on for file-backed backends, off for in-memory).
+Existing threshold keys are reused unchanged.
