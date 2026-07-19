@@ -138,6 +138,7 @@ For historical context, see [v0 archive](../_archive/adr_v0/README.md). v0 ADRs 
 | [ADR-115](ADR-115-secret-gate-content-manifest-exemption.md) | Exact-Content Manifest Exemption for the Write Secret Gate                                            |
 | [ADR-117](ADR-117-session-continuity-search.md)              | Session Continuity — Cross-Session Search and Remote Ingestion                                        |
 | [ADR-118](ADR-118-fresh-tail-recall-visibility.md)           | Fresh-Tail Exact Leg — Read-Your-Writes Visibility for Vector Recall                                  |
+| [ADR-119](ADR-119-daemon-component-supervision.md)           | Host-Supervised Daemon Components Beside the Verb Plane                                               |
 
 ## Closed Taxonomies — Quick Reference
 
