@@ -266,9 +266,9 @@ leaking through.
   documented) are not served by this contract and must poll `memory.recall` or wait
   for the rebuild to observably complete via `memory.feedback`/index inspection; this
   ADR does not add a synchronous variant.
-- Future work extending ADR-079's v2 segment format to the memory pack would supersede
-  §4's memory-pack-specific hash with ADR-079's own content-hash mechanism; that
-  migration is out of scope for this ADR.
+- ADR-079 Amendment 1's global-scope addendum has since extended its delta-log/watermark
+  classifier to the memory index, superseding §4's memory-pack-specific hash — see the
+  Supersession note at the top of this ADR.
 - A write that lands after the self-driving re-enqueue loop (§2) has already fully
   exited — whether by converging or by hitting its 3-attempt cap — does not need a
   normal write-path call to `ensure_ann_background` to be picked up: if the
