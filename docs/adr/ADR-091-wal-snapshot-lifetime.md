@@ -695,7 +695,7 @@ binary reinstall killed the daemon; stdio sessions re-exec'd) dropped the WAL
 from ~85,000 pages to under 1,000 — the same "killing processes frees the WAL"
 signature as #580's original incident.
 
-**Topology fact the original ADR under-weighted.** At observation time, 13
+**Cross-process topology.** At observation time, 13
 processes held `khive.db` open directly: the daemon plus 12 `kkernel mcp` stdio
 sessions (ages minutes to 10+ hours). Session reads do not route through the
 daemon; every session runs its own connection pool against the shared file. The
