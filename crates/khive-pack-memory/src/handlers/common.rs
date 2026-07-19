@@ -1230,7 +1230,10 @@ async fn collect_model_ann_hits_inner(
     // cross-process reindex visibility beyond in-process generations.
     ann::maybe_check_durable_epoch(runtime, ann, &key).await;
     let cache_fresh = ann::is_current(ann, &key).await;
-    let search_result = ann::search_loaded(ann, &key, &vec, ann_fetch_limit).await;
+    // ADR-118: candidates and the bridge's fresh-tail watermark are captured
+    // together from `search_loaded_with_seq`'s single lock acquisition (never
+    // paired via a separate later read — see the merge below).
+    let search_result = ann::search_loaded_with_seq(ann, &key, &vec, ann_fetch_limit).await;
     if !cache_fresh && matches!(search_result, Ok(Some(_))) {
         ann::ensure_ann_background(runtime, token, ann, &model_name).await;
     }
@@ -1238,8 +1241,8 @@ async fn collect_model_ann_hits_inner(
     // owns ensure and its phase span while this request races only the result channel.
     // Per-model single flight prevents duplicate detached builds.
     let mut model_ann_timed_out = false;
-    let initial_raw_hits: Option<Vec<(Uuid, f32)>> = match search_result {
-        Ok(Some(hits)) => Some(hits),
+    let initial_raw_hits: Option<(Vec<(Uuid, f32)>, u64)> = match search_result {
+        Ok(Some(hits_and_seq)) => Some(hits_and_seq),
         Ok(None) => {
             let (done_tx, done_rx) = tokio::sync::oneshot::channel();
             let rt_detached = runtime.clone();
@@ -1269,7 +1272,7 @@ async fn collect_model_ann_hits_inner(
                         namespace = %ns,
                         "memory ANN ensured on recall miss"
                     );
-                    ann::search_loaded(ann, &key, &vec, ann_fetch_limit).await?
+                    ann::search_loaded_with_seq(ann, &key, &vec, ann_fetch_limit).await?
                 }
                 Ok(Ok(Err(e))) => return Err(e),
                 Ok(Err(_sender_dropped)) => {
@@ -1316,10 +1319,13 @@ async fn collect_model_ann_hits_inner(
         // wait. Rather than replace it with an O(corpus) exact scan, ADR-118
         // §3's second tier guarantees visibility of the newest
         // rebuild-threshold-sized suffix of writes while FTS covers the rest.
-        let tail_ops = match ann::fresh_tail_leg(runtime, ann, &key, &model_name, None).await {
-            ann::FreshTailOutcome::Merged(ops) => ops,
-            ann::FreshTailOutcome::Skipped => Vec::new(),
-        };
+        let tail_ops =
+            match ann::fresh_tail_leg(runtime, ann, &key, &model_name, &vec, ann_fetch_limit, None)
+                .await
+            {
+                ann::FreshTailOutcome::Ops(ops) => ops,
+                ann::FreshTailOutcome::Replace(_) | ann::FreshTailOutcome::Skipped => Vec::new(),
+            };
         let merged = ann::merge_fresh_tail(Vec::new(), &vec, tail_ops);
         let hits: Vec<VectorSearchHit> = merged
             .into_iter()
@@ -1345,7 +1351,7 @@ async fn collect_model_ann_hits_inner(
         initial_raw_hits
     };
 
-    if let Some(first_raw) = initial_raw_hits {
+    if let Some((first_raw, first_seq)) = initial_raw_hits {
         #[cfg(test)]
         if retrieval_failpoints::ann_flagged(&model_name) {
             return Err(RuntimeError::Internal(format!(
@@ -1368,6 +1374,7 @@ async fn collect_model_ann_hits_inner(
         };
 
         let mut best_raw = first_raw;
+        let mut best_seq = first_seq;
         let mut current_fetch_limit = ann_fetch_limit;
 
         // Visible-only indexes incur no hydration or extra ANN searches here.
@@ -1401,10 +1408,14 @@ async fn collect_model_ann_hits_inner(
                     new_fetch_limit = current_fetch_limit,
                     "memory ANN: widening over-fetch (visible survivors short)"
                 );
-                if let Ok(Some(wider)) =
-                    ann::search_loaded(ann, &key, &vec, current_fetch_limit).await
+                // ADR-118: re-pair candidates and watermark from this same
+                // wider search (never keep the earlier round's watermark
+                // against these new candidates).
+                if let Ok(Some((wider, wider_seq))) =
+                    ann::search_loaded_with_seq(ann, &key, &vec, current_fetch_limit).await
                 {
                     best_raw = wider;
+                    best_seq = wider_seq;
                 } else {
                     break;
                 }
@@ -1412,19 +1423,25 @@ async fn collect_model_ann_hits_inner(
         }
 
         // ADR-118: merge the fresh-tail exact leg into this model's warm-ANN
-        // candidates before fusion. The watermark is read adjacent to the
-        // search that produced `best_raw` to minimize the window for a
-        // concurrent bridge swap; a swap widening the window only makes the
-        // tail scan more conservative (wider), never less complete.
-        let applied_seq = ann::bridge_applied_seq(ann, &key).await;
-        let tail_ops = match applied_seq {
-            Some(s) => match ann::fresh_tail_leg(runtime, ann, &key, &model_name, Some(s)).await {
-                ann::FreshTailOutcome::Merged(ops) => ops,
-                ann::FreshTailOutcome::Skipped => Vec::new(),
-            },
-            None => Vec::new(),
+        // candidates before fusion. `best_seq` was captured atomically with
+        // `best_raw` (from the same bridge instance, same lock acquisition)
+        // by whichever search produced it, so the pair is always coherent —
+        // never a newer watermark paired with an older search's candidates.
+        let outcome = ann::fresh_tail_leg(
+            runtime,
+            ann,
+            &key,
+            &model_name,
+            &vec,
+            current_fetch_limit,
+            Some(best_seq),
+        )
+        .await;
+        let best_raw = match outcome {
+            ann::FreshTailOutcome::Ops(ops) => ann::merge_fresh_tail(best_raw, &vec, ops),
+            ann::FreshTailOutcome::Replace(candidates) => candidates,
+            ann::FreshTailOutcome::Skipped => best_raw,
         };
-        let best_raw = ann::merge_fresh_tail(best_raw, &vec, tail_ops);
 
         tracing::debug!(
             model = %model_name,

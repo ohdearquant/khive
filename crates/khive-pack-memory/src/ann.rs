@@ -515,19 +515,41 @@ pub(crate) enum AnnEnsureStatus {
 
 /// Search the already-loaded index for `key`. Returns `Ok(None)` on cache miss,
 /// `Ok(Some(hits))` on success, `Err` on ANN search failure (caller falls back).
+/// Test-only: production call sites need the watermark paired atomically with
+/// the search (ADR-118) and use [`search_loaded_with_seq`] directly.
+#[cfg(test)]
 pub(crate) async fn search_loaded(
     ann: &SharedAnn,
     key: &AnnKey,
     query: &[f32],
     k: usize,
 ) -> Result<Option<Vec<(Uuid, f32)>>, RuntimeError> {
+    search_loaded_with_seq(ann, key, query, k)
+        .await
+        .map(|opt| opt.map(|(hits, _seq)| hits))
+}
+
+/// Same as [`search_loaded`], but also returns the searched bridge's
+/// fresh-tail watermark (ADR-118), captured from the SAME read-lock guard as
+/// the search itself — one lock acquisition, so a concurrent bridge swap
+/// (a checkpoint installing a replacement) cannot pair these candidates with
+/// a different bridge's watermark (review finding: the two were previously
+/// read via separate lock acquisitions).
+pub(crate) async fn search_loaded_with_seq(
+    ann: &SharedAnn,
+    key: &AnnKey,
+    query: &[f32],
+    k: usize,
+) -> Result<Option<(Vec<(Uuid, f32)>, u64)>, RuntimeError> {
     let guard = ann.indexes.read().await;
     match guard.get(key) {
         None => Ok(None),
         Some(bridge) => {
             #[cfg(test)]
             ann.warm_route_count.fetch_add(1, Ordering::SeqCst);
-            bridge.search(query, k).map(Some)
+            let hits = bridge.search(query, k)?;
+            let seq = bridge.index.last_applied_seq().unwrap_or(0);
+            Ok(Some((hits, seq)))
         }
     }
 }
@@ -1344,6 +1366,19 @@ pub(crate) async fn fetch_final_tail(
 ) -> Result<(Vec<(Uuid, Option<Vec<f32>>)>, u64), String> {
     let sql = rt.sql();
     let mut reader = sql.reader().await.map_err(|e| e.to_string())?;
+    fetch_final_tail_on(reader.as_mut(), model, s, limit).await
+}
+
+/// Same as [`fetch_final_tail`] but runs every read through a caller-supplied
+/// reader instead of acquiring its own connection — used by the ADR-118 §1
+/// "Compaction linearization" fix to keep the registry-minimum guard and this
+/// scan inside one read snapshot (see [`fresh_tail_serving`]).
+async fn fetch_final_tail_on(
+    reader: &mut dyn khive_storage::SqlReader,
+    model: &str,
+    s: u64,
+    limit: Option<u64>,
+) -> Result<(Vec<(Uuid, Option<Vec<f32>>)>, u64), String> {
     // `limit` (ADR-118 §3, Cold/Empty tier): cap the scan to the newest
     // `limit` log rows instead of the entire scope, taking the highest-seq
     // suffix so the freshest writes stay visible. The DESC+LIMIT rows are
@@ -1512,8 +1547,10 @@ fn fresh_tail_enabled() -> bool {
 
 /// Read the currently-installed bridge's fresh-tail watermark for `key`: the
 /// `ann_write_log` seq its corpus state reflects, or `None` if no bridge is
-/// installed. Call this immediately adjacent to a `search_loaded` call that
-/// returned `Some` to minimize the window for a concurrent bridge swap.
+/// installed. Test-only: production call sites need this paired atomically
+/// with the search that produced their candidates (ADR-118) and get it from
+/// [`search_loaded_with_seq`] directly instead of a second lock acquisition.
+#[cfg(test)]
 pub(crate) async fn bridge_applied_seq(ann: &SharedAnn, key: &AnnKey) -> Option<u64> {
     let guard = ann.indexes.read().await;
     guard
@@ -1526,9 +1563,10 @@ pub(crate) async fn bridge_applied_seq(ann: &SharedAnn, key: &AnnKey) -> Option<
 /// evaluated at this consumer's own registered namespace (`'*'`). If this
 /// exceeds a bridge's watermark, the log may no longer retain every row
 /// above that watermark — completeness above it is unprovable.
-async fn registry_min_watermark(rt: &KhiveRuntime, model: &str) -> Result<Option<i64>, String> {
-    let sql = rt.sql();
-    let mut reader = sql.reader().await.map_err(|e| e.to_string())?;
+async fn registry_min_watermark_on(
+    reader: &mut dyn khive_storage::SqlReader,
+    model: &str,
+) -> Result<Option<i64>, String> {
     let rows = reader
         .query_all(SqlStatement {
             sql: "SELECT MIN(watermark) AS m FROM ann_consumer_watermark \
@@ -1546,6 +1584,40 @@ async fn registry_min_watermark(rt: &KhiveRuntime, model: &str) -> Result<Option
         Some(SqlValue::Integer(n)) => Some(*n),
         _ => None,
     }))
+}
+
+/// Open an explicit read transaction so every subsequent query through
+/// `reader` observes one consistent snapshot (ADR-118 §1 "Compaction
+/// linearization") instead of each `query_all` call taking its own implicit
+/// per-statement snapshot (the default for a connection with no open
+/// transaction). `BEGIN DEFERRED` is valid on a read-only connection: it
+/// starts a read transaction, not a write.
+async fn begin_read_snapshot(reader: &mut dyn khive_storage::SqlReader) -> Result<(), String> {
+    reader
+        .query_all(SqlStatement {
+            sql: "BEGIN DEFERRED".into(),
+            params: vec![],
+            label: Some("memory_ann_fresh_tail_snapshot_begin".into()),
+        })
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// Close the snapshot opened by [`begin_read_snapshot`]. The transaction is
+/// read-only (no DML issued inside it), so `COMMIT` and `ROLLBACK` are
+/// equivalent — `COMMIT` is used for symmetry with a normal transaction end.
+async fn end_read_snapshot(reader: &mut dyn khive_storage::SqlReader) {
+    if let Err(e) = reader
+        .query_all(SqlStatement {
+            sql: "COMMIT".into(),
+            params: vec![],
+            label: Some("memory_ann_fresh_tail_snapshot_end".into()),
+        })
+        .await
+    {
+        tracing::warn!(error = %e, "fresh-tail: snapshot COMMIT failed (read-only transaction; the connection is dropped regardless, so no lock is leaked)");
+    }
 }
 
 /// Exact cosine similarity between a raw query vector and a raw stored
@@ -1600,10 +1672,21 @@ pub(crate) fn merge_fresh_tail(
     merged
 }
 
-/// Outcome of [`fresh_tail_leg`]: either coalesced final ops ready to merge
-/// via [`merge_fresh_tail`], or a signal that the leg sat out this query.
+/// Outcome of [`fresh_tail_leg`].
 pub(crate) enum FreshTailOutcome {
-    Merged(Vec<(Uuid, Option<Vec<f32>>)>),
+    /// Coalesced final tail ops (ADR-118 §1/§2), valid against the
+    /// candidate list the caller already has (`best_raw` unchanged) — merge
+    /// via [`merge_fresh_tail`]. The common case.
+    Ops(Vec<(Uuid, Option<Vec<f32>>)>),
+    /// A compaction mismatch forced re-resolution to the currently published
+    /// segment (ADR-118 §1 "mismatch re-resolution"): these candidates
+    /// REPLACE the caller's `best_raw` outright — they are already a
+    /// self-consistent (new candidates, new watermark) pair, exact-scored
+    /// against that segment's own tail. Never merge them with the stale set.
+    Replace(Vec<(Uuid, f32)>),
+    /// The leg sat out this query entirely (disabled, unregistered
+    /// consumer, or an unrecoverable read failure); the caller's candidates
+    /// are unaffected.
     Skipped,
 }
 
@@ -1611,14 +1694,19 @@ pub(crate) enum FreshTailOutcome {
 /// (and primary) tier: a serving bridge exists, and every committed write
 /// above its watermark is merged in, giving read-your-writes visibility.
 /// `s = None` is the second tier (§3): no serving index is available at all,
-/// so the leg caps its scan at the rebuild-threshold-sized newest suffix of
-/// the log instead of the entire scope, guaranteeing visibility of only the
+/// so the leg caps its scan at a fixed-ceiling newest suffix of the log
+/// instead of the entire scope, guaranteeing visibility of only the
 /// caller's most recent writes until a serving index exists again.
+/// `query`/`k` are the recall vector and fetch limit — needed only by the
+/// serving tier's mismatch re-resolution path, which must run a fresh ANN
+/// search against a newly loaded segment.
 pub(crate) async fn fresh_tail_leg(
     rt: &KhiveRuntime,
     ann: &SharedAnn,
     key: &AnnKey,
     model: &str,
+    query: &[f32],
+    k: usize,
     s: Option<u64>,
 ) -> FreshTailOutcome {
     if !fresh_tail_enabled() {
@@ -1644,56 +1732,90 @@ pub(crate) async fn fresh_tail_leg(
     }
 
     match s {
-        Some(s) => fresh_tail_serving(rt, ann, key, model, s).await,
+        Some(s) => fresh_tail_serving(rt, ann, key, model, query, k, s).await,
         None => fresh_tail_capped(rt, model).await,
     }
 }
 
-/// Tier 1: a serving bridge exists at watermark `s`.
+/// Tier 1: a serving bridge exists at watermark `s`. The registry-minimum
+/// guard, the tail scan, and the tail's embedding point-reads run inside ONE
+/// read transaction (ADR-118 §1 "Compaction linearization") so compaction
+/// cannot strike between the guard and the fetch it is meant to justify.
 async fn fresh_tail_serving(
     rt: &KhiveRuntime,
     ann: &SharedAnn,
     key: &AnnKey,
     model: &str,
+    query: &[f32],
+    k: usize,
     s: u64,
 ) -> FreshTailOutcome {
-    // Compaction linearization (ADR-118 §1): the registry minimum can
-    // advance past a stale in-memory bridge's watermark the instant another
-    // process's checkpoint raises it and compacts. A scan above `s` proves
-    // completeness only if the log still retains every row above `s`.
-    let registry_min = match registry_min_watermark(rt, model).await {
+    let mut reader = match rt.sql().reader().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, model, "fresh-tail: reader open failed; skipping exact leg");
+            return FreshTailOutcome::Skipped;
+        }
+    };
+    if let Err(e) = begin_read_snapshot(reader.as_mut()).await {
+        tracing::warn!(error = %e, model, "fresh-tail: snapshot begin failed; skipping exact leg");
+        return FreshTailOutcome::Skipped;
+    }
+
+    let registry_min = match registry_min_watermark_on(reader.as_mut(), model).await {
         Ok(v) => v,
         Err(e) => {
+            end_read_snapshot(reader.as_mut()).await;
             tracing::warn!(error = %e, model, "fresh-tail: registry-min read failed; skipping exact leg");
             return FreshTailOutcome::Skipped;
         }
     };
-    let effective_s = match registry_min {
-        Some(m) if m as u64 > s => {
-            // Re-resolve the currently published segment (its watermark is
-            // at least the registry minimum) and use its watermark instead.
-            let resolved = ann_segment_dir(rt, model)
+
+    if let Some(m) = registry_min {
+        let m = m as u64;
+        if m > s {
+            // Mismatch (ADR-118 §1): the log may no longer retain every row
+            // above `s`. Real re-resolution needs no DB read (a filesystem
+            // commit-record read), so it can be checked before deciding
+            // whether the floor fallback needs this same snapshot.
+            let resolved_new_s = ann_segment_dir(rt, model)
                 .and_then(|dir| read_commit_info(&dir).ok().flatten())
-                .and_then(|info| info.last_applied_seq);
-            match resolved {
-                Some(new_s) if new_s >= m as u64 => {
-                    // Force re-adoption so the next warm check picks up the
-                    // segment this query just resolved to.
-                    bump_generation(ann, key).await;
-                    new_s
+                .and_then(|info| info.last_applied_seq)
+                .filter(|new_s| *new_s >= m);
+            return match resolved_new_s {
+                Some(new_s) => {
+                    // Re-resolution is possible: this snapshot's floor fetch
+                    // is not needed. Close it and read fresh, self-consistent
+                    // state anchored at the re-resolved segment instead.
+                    end_read_snapshot(reader.as_mut()).await;
+                    drop(reader);
+                    fresh_tail_reresolve(rt, ann, key, model, query, k, new_s).await
                 }
-                _ => {
-                    // Re-resolution failed: degrade to ADR-107 (ANN-only)
-                    // for this query rather than serve an unprovable tail.
+                None => {
+                    // Re-resolution genuinely not possible within this
+                    // query: floor at the same-snapshot registry minimum
+                    // rather than dropping the leg (ADR-118 §1) — a
+                    // coherent (old candidates, registry minimum) pair.
+                    let outcome = fetch_final_tail_on(reader.as_mut(), model, m, None).await;
+                    end_read_snapshot(reader.as_mut()).await;
+                    // Force re-adoption so a future query gets a fresh bridge.
                     bump_generation(ann, key).await;
-                    return FreshTailOutcome::Skipped;
+                    match outcome {
+                        Ok((ops, _)) => FreshTailOutcome::Ops(ops),
+                        Err(e) => {
+                            tracing::warn!(error = %e, model, "fresh-tail: floored tail fetch failed; skipping exact leg");
+                            FreshTailOutcome::Skipped
+                        }
+                    }
                 }
-            }
+            };
         }
-        _ => s,
-    };
-    match fetch_final_tail(rt, model, effective_s, None).await {
-        Ok((ops, _new_s)) => FreshTailOutcome::Merged(ops),
+    }
+
+    let outcome = fetch_final_tail_on(reader.as_mut(), model, s, None).await;
+    end_read_snapshot(reader.as_mut()).await;
+    match outcome {
+        Ok((ops, _new_s)) => FreshTailOutcome::Ops(ops),
         Err(e) => {
             tracing::warn!(error = %e, model, "fresh-tail: tail fetch failed; skipping exact leg");
             FreshTailOutcome::Skipped
@@ -1701,28 +1823,77 @@ async fn fresh_tail_serving(
     }
 }
 
-/// Tier 2 (§3): no serving index at all. Caps the scan at the
-/// rebuild-threshold-sized newest suffix so the caller's most recent writes
-/// stay visible without absorbing the full Cold/Empty scope.
-async fn fresh_tail_capped(rt: &KhiveRuntime, model: &str) -> FreshTailOutcome {
-    let (live, tail) = match scope_counts(rt, model, 0).await {
-        Ok(counts) => counts,
+/// Real mismatch re-resolution (ADR-118 §1 "mismatch re-resolution"): load
+/// the currently published segment, search IT for candidates, and merge in
+/// ITS own tail above ITS own watermark — a self-consistent pair that never
+/// borrows a newer watermark while serving older (stale-bridge) candidates.
+/// This load is local to the query (not installed into `ann`'s served map);
+/// `bump_generation` still forces the existing background machinery to
+/// adopt this segment for future queries.
+async fn fresh_tail_reresolve(
+    rt: &KhiveRuntime,
+    ann: &SharedAnn,
+    key: &AnnKey,
+    model: &str,
+    query: &[f32],
+    k: usize,
+    new_s: u64,
+) -> FreshTailOutcome {
+    let Some(dir) = ann_segment_dir(rt, model) else {
+        bump_generation(ann, key).await;
+        return FreshTailOutcome::Skipped;
+    };
+    let bridge = match AnnBridge::load(&dir) {
+        Ok(b) => b,
         Err(e) => {
-            tracing::warn!(error = %e, model, "fresh-tail: scope-count read failed; skipping capped exact leg");
+            tracing::warn!(error = %e, model, "fresh-tail: re-resolved segment load failed; skipping exact leg");
+            bump_generation(ann, key).await;
             return FreshTailOutcome::Skipped;
         }
     };
-    if live == 0 || tail == 0 {
-        return FreshTailOutcome::Merged(Vec::new());
-    }
-    let threshold = (ann_rebuild_threshold() * live as f64).ceil() as u64;
-    let cap = if tail > threshold {
-        Some(threshold)
-    } else {
-        None
+    let candidates = match bridge.search(query, k) {
+        Ok(hits) => hits,
+        Err(e) => {
+            tracing::warn!(error = %e, model, "fresh-tail: re-resolved segment search failed; skipping exact leg");
+            bump_generation(ann, key).await;
+            return FreshTailOutcome::Skipped;
+        }
     };
-    match fetch_final_tail(rt, model, 0, cap).await {
-        Ok((ops, _new_s)) => FreshTailOutcome::Merged(ops),
+    // Force re-adoption so the background warm path installs this segment
+    // for future queries too — this load served only the current query.
+    bump_generation(ann, key).await;
+    match fetch_final_tail(rt, model, new_s, None).await {
+        Ok((ops, _)) => FreshTailOutcome::Replace(merge_fresh_tail(candidates, query, ops)),
+        Err(e) => {
+            tracing::warn!(error = %e, model, "fresh-tail: re-resolved tail fetch failed; serving re-resolved candidates without further tail");
+            FreshTailOutcome::Replace(candidates)
+        }
+    }
+}
+
+/// Fixed ceiling for the Cold/Empty-tier capped scan (ADR-118 §3). Deriving
+/// a corpus-proportional cap (`ann_rebuild_threshold() * live`) needs an
+/// O(corpus) live-count join — appropriate for the background restart
+/// classifier, not for this per-query path (review finding). The ceiling is
+/// a fixed, conservative match to the ADR's own worked example (a 0.20
+/// threshold on a 68k-row corpus is ~13.6k comparisons).
+const FRESH_TAIL_CAPPED_MAX_ROWS: u64 = 20_000;
+
+/// Tier 2 (§3): no serving index at all. A cheap, log-only existence probe
+/// (no corpus join) fast-paths the common empty-tail case; a non-empty tail
+/// is capped at a fixed ceiling rather than a live-corpus-proportional one,
+/// so this bounded fallback never itself pays an O(corpus) cost.
+async fn fresh_tail_capped(rt: &KhiveRuntime, model: &str) -> FreshTailOutcome {
+    match tail_exists(rt, model, 0).await {
+        Ok(false) => return FreshTailOutcome::Ops(Vec::new()),
+        Ok(true) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, model, "fresh-tail: tail-existence read failed; skipping capped exact leg");
+            return FreshTailOutcome::Skipped;
+        }
+    }
+    match fetch_final_tail(rt, model, 0, Some(FRESH_TAIL_CAPPED_MAX_ROWS)).await {
+        Ok((ops, _new_s)) => FreshTailOutcome::Ops(ops),
         Err(e) => {
             tracing::warn!(error = %e, model, "fresh-tail: capped tail fetch failed; skipping exact leg");
             FreshTailOutcome::Skipped
@@ -3335,8 +3506,9 @@ mod tests {
         let s = bridge_applied_seq(&ann, &key)
             .await
             .expect("bridge watermark");
-        let ops = match fresh_tail_leg(&rt, &ann, &key, MODEL, Some(s)).await {
-            FreshTailOutcome::Merged(ops) => ops,
+        let ops = match fresh_tail_leg(&rt, &ann, &key, MODEL, &query, 10, Some(s)).await {
+            FreshTailOutcome::Ops(ops) => ops,
+            FreshTailOutcome::Replace(_) => panic!("fresh-tail leg unexpectedly re-resolved"),
             FreshTailOutcome::Skipped => panic!("fresh-tail leg unexpectedly skipped"),
         };
         let merged = merge_fresh_tail(raw, &query, ops);
@@ -3426,8 +3598,9 @@ mod tests {
         let s = bridge_applied_seq(&ann, &key)
             .await
             .expect("bridge watermark");
-        let ops = match fresh_tail_leg(&rt, &ann, &key, MODEL, Some(s)).await {
-            FreshTailOutcome::Merged(ops) => ops,
+        let ops = match fresh_tail_leg(&rt, &ann, &key, MODEL, &query, 10, Some(s)).await {
+            FreshTailOutcome::Ops(ops) => ops,
+            FreshTailOutcome::Replace(_) => panic!("fresh-tail leg unexpectedly re-resolved"),
             FreshTailOutcome::Skipped => panic!("fresh-tail leg unexpectedly skipped"),
         };
         let merged = merge_fresh_tail(raw, &query, ops);
@@ -3450,11 +3623,14 @@ mod tests {
     /// The compaction-linearization guard: if the registry minimum has
     /// advanced past the serving bridge's watermark, the log may no longer
     /// retain every row above it. The leg must detect the mismatch in the
-    /// same snapshot and refuse to serve an unprovable (silently incomplete)
-    /// tail — it re-resolves the published segment or skips outright.
+    /// same snapshot and never silently drop it — it re-resolves the
+    /// published segment (not possible here: the only persisted segment is
+    /// exactly as stale as the in-memory bridge) or floors the scan at the
+    /// same-snapshot registry minimum, which here finds nothing above it
+    /// (compacted away) but still runs — never `Skipped`.
     #[tokio::test]
     #[serial(adr118_fresh_tail)]
-    async fn fresh_tail_leg_skips_when_registry_minimum_outpaces_bridge_watermark() {
+    async fn fresh_tail_leg_floors_when_registry_minimum_outpaces_bridge_watermark() {
         const MODEL: &str = "adr118-compaction-guard-test-model";
         const DIMS: usize = 8;
         let rt = test_runtime_with_hash_embedder(MODEL, DIMS);
@@ -3516,13 +3692,140 @@ mod tests {
             .expect("raise registry watermark past bridge watermark");
         compact_log(&rt, MODEL).await.expect("compact log");
 
-        let outcome = fresh_tail_leg(&rt, &ann, &key, MODEL, Some(s1)).await;
+        let generation_before = current_generation(&ann, &key).await;
+        let query = fnv_to_vec("compaction guard seed note 0", DIMS);
+        let outcome = fresh_tail_leg(&rt, &ann, &key, MODEL, &query, 10, Some(s1)).await;
+        let ops = match outcome {
+            FreshTailOutcome::Ops(ops) => ops,
+            FreshTailOutcome::Replace(_) => panic!(
+                "re-resolution must not succeed here: the only persisted \
+                 segment is exactly as stale as the in-memory bridge"
+            ),
+            FreshTailOutcome::Skipped => panic!(
+                "a mismatch must never silently drop the leg — it floors at \
+                 the same-snapshot registry minimum instead of skipping"
+            ),
+        };
         assert!(
-            matches!(outcome, FreshTailOutcome::Skipped),
-            "a bridge watermark behind the registry minimum, with the log \
-             compacted past it and no re-persisted segment to re-resolve to, \
-             must refuse to serve an unprovable tail instead of silently \
-             returning an incomplete merge"
+            ops.is_empty(),
+            "the floored scan starts at the registry minimum, above which \
+             every row was already compacted away, so it must legitimately \
+             find nothing, got: {ops:?}"
+        );
+        assert!(
+            current_generation(&ann, &key).await > generation_before,
+            "the mismatch must force re-adoption (bump_generation) so a \
+             future query gets a fresh bridge instead of repeating the \
+             floor fallback forever"
+        );
+    }
+
+    /// Real mismatch re-resolution (ADR-118 §1 "mismatch re-resolution"): a
+    /// peer process's checkpoint re-persists a NEWER segment (watermark at
+    /// least the registry minimum) that this process's in-memory bridge
+    /// never observed. The leg must load that segment, search IT directly,
+    /// and return a `Replace` outcome carrying a coherent (new candidates,
+    /// new watermark) pair — never merging the re-resolved tail into the
+    /// stale bridge's candidates.
+    #[tokio::test]
+    #[serial(adr118_fresh_tail)]
+    async fn fresh_tail_leg_reresolves_to_a_newer_persisted_segment_on_mismatch() {
+        const MODEL: &str = "adr118-reresolve-test-model";
+        const DIMS: usize = 8;
+        let rt = test_runtime_with_hash_embedder(MODEL, DIMS);
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+
+        for i in 0..3u32 {
+            rt.create_note_with_decay_for_embedding_model(
+                &token,
+                "memory",
+                None,
+                &format!("reresolve seed note {i}"),
+                Some(0.7),
+                0.01,
+                None,
+                vec![],
+                None,
+            )
+            .await
+            .expect("create seed note");
+        }
+
+        let ann = new_shared();
+        let key = AnnKey::from_token(MODEL);
+        ensure_ann_for_model(&rt, &token, &ann, MODEL)
+            .await
+            .expect("warm");
+        let s1 = bridge_applied_seq(&ann, &key)
+            .await
+            .expect("bridge watermark after initial warm");
+
+        // A new note lands after the checkpoint.
+        let fresh = rt
+            .create_note_with_decay_for_embedding_model(
+                &token,
+                "memory",
+                None,
+                "reresolve distinctive fresh note",
+                Some(0.7),
+                0.01,
+                None,
+                vec![],
+                None,
+            )
+            .await
+            .expect("create fresh note");
+
+        let (_live, tail_before) = scope_counts(&rt, MODEL, s1)
+            .await
+            .expect("scope counts before peer checkpoint");
+        assert!(tail_before > 0, "sanity: a tail must exist above s1");
+        let s2 = s1 + tail_before;
+
+        // Simulate a PEER PROCESS's real checkpoint: replay the tail into a
+        // fresh load of the persisted segment, persist it back to disk at
+        // s2, and raise+compact the registry — all WITHOUT touching this
+        // process's in-memory `ann` map, which stays pinned at the stale s1
+        // bridge (the mismatch this leg must detect and recover from).
+        let dir = ann_segment_dir(&rt, MODEL).expect("segment dir (file-backed test runtime)");
+        let mut peer_bridge = AnnBridge::load(&dir).expect("load persisted segment");
+        let (ops, new_s) = fetch_final_tail(&rt, MODEL, s1, None)
+            .await
+            .expect("fetch tail for peer replay");
+        peer_bridge
+            .apply_final_ops(ops, new_s)
+            .expect("apply peer replay");
+        peer_bridge
+            .save_atomic(&dir)
+            .expect("persist peer checkpoint");
+        raise_watermark(&rt, MODEL, s2)
+            .await
+            .expect("raise registry watermark");
+        compact_log(&rt, MODEL).await.expect("compact log");
+
+        let generation_before = current_generation(&ann, &key).await;
+        let query = fnv_to_vec("reresolve distinctive fresh note", DIMS);
+        let outcome = fresh_tail_leg(&rt, &ann, &key, MODEL, &query, 10, Some(s1)).await;
+        let candidates = match outcome {
+            FreshTailOutcome::Replace(candidates) => candidates,
+            FreshTailOutcome::Ops(_) => panic!(
+                "expected re-resolution to replace candidates outright, not \
+                 just return ops to merge into the stale bridge's candidates"
+            ),
+            FreshTailOutcome::Skipped => {
+                panic!("expected successful re-resolution, not a skip")
+            }
+        };
+        assert!(
+            candidates.iter().any(|(id, _)| *id == fresh.id),
+            "the re-resolved segment's own search must surface the note \
+             that only the peer's checkpoint (not this process's stale \
+             bridge) reflects, got: {candidates:?}"
+        );
+        assert!(
+            current_generation(&ann, &key).await > generation_before,
+            "re-resolution must still force re-adoption so a future query \
+             installs this segment as the served bridge"
         );
     }
 
@@ -3588,7 +3891,8 @@ mod tests {
             "sanity: the registry row must be gone before the leg runs"
         );
 
-        let outcome = fresh_tail_leg(&rt, &ann, &key, MODEL, Some(s)).await;
+        let query = fnv_to_vec("registration precondition seed note", DIMS);
+        let outcome = fresh_tail_leg(&rt, &ann, &key, MODEL, &query, 10, Some(s)).await;
         assert!(
             matches!(outcome, FreshTailOutcome::Skipped),
             "the exact leg must sit out a query when this consumer's durable \

@@ -398,6 +398,9 @@ impl StorageBackend {
         writer
             .conn()
             .execute_batch(crate::migrations::ANN_WRITE_LOG_DDL)?;
+        writer
+            .conn()
+            .execute_batch(crate::migrations::ANN_WRITE_LOG_MODEL_SEQ_INDEX_DDL)?;
 
         // Create the vec0 virtual table. Idempotent on fresh databases and after the
         // old-schema rebuild above.

@@ -17,20 +17,27 @@ use crate::MemoryPack;
 const MODEL: &str = "adr118-e2e-test-model";
 const DIMS: usize = 16;
 
-/// Guards a mutated `KHIVE_ANN_FRESH_TAIL` value, restoring the prior state
-/// (unset, by default) on drop even if the test panics.
-struct EnvGuard;
+/// Guards a mutated `KHIVE_ANN_FRESH_TAIL` value, restoring whatever value
+/// (present or absent) it held before the guard was created, even if the
+/// test panics.
+struct EnvGuard {
+    prior: Option<String>,
+}
 
 impl EnvGuard {
     fn disable_fresh_tail() -> Self {
+        let prior = std::env::var("KHIVE_ANN_FRESH_TAIL").ok();
         std::env::set_var("KHIVE_ANN_FRESH_TAIL", "0");
-        Self
+        Self { prior }
     }
 }
 
 impl Drop for EnvGuard {
     fn drop(&mut self) {
-        std::env::remove_var("KHIVE_ANN_FRESH_TAIL");
+        match self.prior.take() {
+            Some(v) => std::env::set_var("KHIVE_ANN_FRESH_TAIL", v),
+            None => std::env::remove_var("KHIVE_ANN_FRESH_TAIL"),
+        }
     }
 }
 
