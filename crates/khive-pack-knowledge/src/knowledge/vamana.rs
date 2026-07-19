@@ -405,61 +405,64 @@ impl AnnBridge {
         self.index.set_last_applied_seq(Some(seq));
     }
 
-    /// Apply a coalesced final-state tail (ADR-079 Amendment 1) to this
-    /// bridge: for each subject, `Some(embedding)` replays a final upsert
-    /// (tombstone the mapped old ordinal, then exactly one insert) and `None`
-    /// replays a final delete (tombstone if mapped, no-op otherwise). `new_s`
-    /// is the highest tail seq, stamped as the new applied watermark. Any
-    /// id-map contradiction returns `Err` — the caller escalates to Cold.
-    pub(crate) fn apply_final_ops(
-        &mut self,
-        ops: Vec<(Uuid, Option<Vec<f32>>)>,
-        new_s: u64,
-    ) -> Result<(), String> {
-        // Highest ordinal wins for a repeated uuid: inserts append, so the
-        // latest slot is the live one; earlier slots are tombstoned.
+    /// Ordinal lookup for streamed tail replay. Built once per replay so
+    /// batches can apply incrementally without rescanning the id-map.
+    /// Highest ordinal wins for a repeated uuid: inserts append, so the
+    /// latest slot is the live one; earlier slots are tombstoned.
+    pub(crate) fn reverse_map(&self) -> HashMap<Uuid, u32> {
         let mut reverse: HashMap<Uuid, u32> = HashMap::with_capacity(self.id_map.len());
         for (ordinal, uuid) in self.id_map.iter().enumerate() {
             reverse.insert(*uuid, ordinal as u32);
         }
+        reverse
+    }
 
-        for (uuid, op) in ops {
-            match op {
-                None => {
-                    if let Some(&ordinal) = reverse.get(&uuid) {
-                        self.index
-                            .tombstone(ordinal)
-                            .map_err(|e| format!("replay tombstone({ordinal}): {e}"))?;
-                        reverse.remove(&uuid);
-                    }
-                }
-                Some(mut embedding) => {
-                    l2_normalize(&mut embedding);
-                    if let Some(&old) = reverse.get(&uuid) {
-                        self.index
-                            .tombstone(old)
-                            .map_err(|e| format!("replay tombstone({old}): {e}"))?;
-                    }
-                    let ordinal = self
-                        .index
-                        .insert(&embedding)
-                        .map_err(|e| format!("replay insert: {e}"))?;
-                    let slot = ordinal as usize;
-                    match slot.cmp(&self.id_map.len()) {
-                        std::cmp::Ordering::Less => self.id_map[slot] = uuid,
-                        std::cmp::Ordering::Equal => self.id_map.push(uuid),
-                        std::cmp::Ordering::Greater => {
-                            return Err(format!(
-                                "replay insert returned ordinal {ordinal} beyond id_map len {}",
-                                self.id_map.len()
-                            ));
-                        }
-                    }
-                    reverse.insert(uuid, ordinal);
+    /// Apply one subject's coalesced final state (ADR-079 Amendment 1):
+    /// `Some(embedding)` replays a final upsert (tombstone the mapped old
+    /// ordinal, then exactly one insert); `None` replays a final delete
+    /// (tombstone if mapped, no-op otherwise). `reverse` is the map from
+    /// [`reverse_map`](Self::reverse_map), kept current across calls. Any
+    /// id-map contradiction returns `Err` — the caller escalates to Cold.
+    pub(crate) fn apply_final_op(
+        &mut self,
+        reverse: &mut HashMap<Uuid, u32>,
+        uuid: Uuid,
+        op: Option<Vec<f32>>,
+    ) -> Result<(), String> {
+        match op {
+            None => {
+                if let Some(&ordinal) = reverse.get(&uuid) {
+                    self.index
+                        .tombstone(ordinal)
+                        .map_err(|e| format!("replay tombstone({ordinal}): {e}"))?;
+                    reverse.remove(&uuid);
                 }
             }
+            Some(mut embedding) => {
+                l2_normalize(&mut embedding);
+                if let Some(&old) = reverse.get(&uuid) {
+                    self.index
+                        .tombstone(old)
+                        .map_err(|e| format!("replay tombstone({old}): {e}"))?;
+                }
+                let ordinal = self
+                    .index
+                    .insert(&embedding)
+                    .map_err(|e| format!("replay insert: {e}"))?;
+                let slot = ordinal as usize;
+                match slot.cmp(&self.id_map.len()) {
+                    std::cmp::Ordering::Less => self.id_map[slot] = uuid,
+                    std::cmp::Ordering::Equal => self.id_map.push(uuid),
+                    std::cmp::Ordering::Greater => {
+                        return Err(format!(
+                            "replay insert returned ordinal {ordinal} beyond id_map len {}",
+                            self.id_map.len()
+                        ));
+                    }
+                }
+                reverse.insert(uuid, ordinal);
+            }
         }
-        self.index.set_last_applied_seq(Some(new_s));
         Ok(())
     }
 
@@ -929,40 +932,39 @@ async fn scope_counts(
     Ok((get("live")?, get("tail")?))
 }
 
-/// Fetch the scope's tail (rows above `s`, ordered) and coalesce it to the
-/// final op per subject with the embeddings needed for final upserts, ready
-/// for [`AnnBridge::apply_final_ops`]. Returns the ops and the new watermark.
-/// A final upsert whose source row is missing is a contradiction → `Err`
-/// (caller escalates to Cold).
-async fn fetch_final_tail(
+/// Coalesce the scope's tail (rows above `s`) to the final op per subject in
+/// ONE aggregate query — SQLite's bare-column-with-MAX guarantee makes `op`
+/// the value from each subject's max-seq row. Returns `(subject, is_delete)`
+/// pairs plus the new watermark; memory is O(distinct tail subjects), never
+/// O(tail rows). Embeddings are read separately, per batch, by
+/// [`replay_final_states`].
+async fn fetch_final_states(
     rt: &KhiveRuntime,
     ns: &str,
     model: &str,
     s: u64,
-) -> Result<(Vec<(Uuid, Option<Vec<f32>>)>, u64), String> {
+) -> Result<(Vec<(Uuid, bool)>, u64), String> {
     let sql = rt.sql();
     let mut reader = sql.reader().await.map_err(|e| e.to_string())?;
     let rows = reader
         .query_all(SqlStatement {
-            sql: "SELECT seq, subject_id, op FROM ann_write_log \
+            sql: "SELECT subject_id, op, MAX(seq) AS seq FROM ann_write_log \
                   WHERE namespace = ?1 AND embedding_model = ?2 \
                     AND field = 'knowledge.atom' AND seq > ?3 \
-                  ORDER BY seq"
+                  GROUP BY subject_id"
                 .into(),
             params: vec![
                 SqlValue::Text(ns.to_owned()),
                 SqlValue::Text(model.to_owned()),
                 SqlValue::Integer(s as i64),
             ],
-            label: Some("ann_fetch_tail".into()),
+            label: Some("ann_fetch_final_states".into()),
         })
         .await
         .map_err(|e| e.to_string())?;
 
     let mut new_s = s;
-    // Ordered iteration + insert-overwrite = final op per subject wins.
-    let mut finals: Vec<(Uuid, bool)> = Vec::new();
-    let mut index_of: HashMap<Uuid, usize> = HashMap::new();
+    let mut finals: Vec<(Uuid, bool)> = Vec::with_capacity(rows.len());
     for row in &rows {
         let seq = match row.get("seq") {
             Some(SqlValue::Integer(n)) => *n,
@@ -979,74 +981,89 @@ async fn fetch_final_tail(
             Some(SqlValue::Text(t)) => t == "delete",
             _ => return Err("ann_write_log.op: unexpected value".into()),
         };
-        match index_of.get(&uuid) {
-            Some(&i) => finals[i].1 = is_delete,
-            None => {
-                index_of.insert(uuid, finals.len());
-                finals.push((uuid, is_delete));
-            }
-        }
+        finals.push((uuid, is_delete));
     }
+    Ok((finals, new_s))
+}
 
-    // Point-read the embeddings for final upserts, chunked under the SQLite
-    // parameter limit, always under the consumer's own scope predicate.
-    let upsert_ids: Vec<Uuid> = finals
-        .iter()
-        .filter(|(_, is_delete)| !is_delete)
-        .map(|(u, _)| *u)
-        .collect();
-    let mut embeddings: HashMap<Uuid, Vec<f32>> = HashMap::with_capacity(upsert_ids.len());
+/// Subjects per streamed replay batch: bounds transient replay memory at
+/// O(batch × dimensions) regardless of tail size.
+const REPLAY_BATCH: usize = 500;
+
+/// Stream the coalesced final states onto `bridge`. Each final upsert's
+/// embedding is point-read by single-key equality — the only constraint
+/// shape sqlite-vec plans as a primary-key point lookup rather than a full
+/// table scan — and the consumer scope predicate is checked in process on
+/// the returned row. Batches apply as they are read, so peak memory is one
+/// batch of embeddings, never the whole tail. A final upsert whose source
+/// row is missing or out of scope is a contradiction → `Err` (caller
+/// escalates to Cold).
+async fn replay_final_states(
+    rt: &KhiveRuntime,
+    bridge: &mut AnnBridge,
+    ns: &str,
+    model: &str,
+    finals: &[(Uuid, bool)],
+) -> Result<(), String> {
     let table_name = format!("vec_{}", sanitize_model_key(model));
-    for chunk in upsert_ids.chunks(500) {
-        let placeholders: Vec<String> = (0..chunk.len()).map(|i| format!("?{}", i + 3)).collect();
-        let mut params = vec![
-            SqlValue::Text(ns.to_owned()),
-            SqlValue::Text(model.to_owned()),
-        ];
-        params.extend(chunk.iter().map(|u| SqlValue::Text(u.to_string())));
-        let rows = reader
-            .query_all(SqlStatement {
-                sql: format!(
-                    "SELECT subject_id, embedding FROM {table_name} \
-                     WHERE namespace = ?1 AND embedding_model = ?2 \
-                       AND field = 'knowledge.atom' \
-                       AND subject_id IN ({})",
-                    placeholders.join(", ")
-                ),
-                params,
-                label: Some("ann_tail_point_read".into()),
-            })
-            .await
-            .map_err(|e| e.to_string())?;
-        for row in &rows {
-            let (Some(SqlValue::Text(id_str)), Some(SqlValue::Blob(bytes))) =
-                (row.get("subject_id"), row.get("embedding"))
-            else {
+    let point_read_sql = format!(
+        "SELECT namespace, embedding_model, field, embedding \
+         FROM {table_name} WHERE subject_id = ?1"
+    );
+    let sql = rt.sql();
+    let mut reader = sql.reader().await.map_err(|e| e.to_string())?;
+    let mut reverse = bridge.reverse_map();
+
+    for batch in finals.chunks(REPLAY_BATCH) {
+        let mut embeddings: HashMap<Uuid, Vec<f32>> = HashMap::new();
+        for (uuid, is_delete) in batch {
+            if *is_delete {
                 continue;
+            }
+            let rows = reader
+                .query_all(SqlStatement {
+                    sql: point_read_sql.clone(),
+                    params: vec![SqlValue::Text(uuid.to_string())],
+                    label: Some("ann_replay_point_read".into()),
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+            let Some(row) = rows.first() else {
+                return Err(format!(
+                    "final upsert for {uuid} has no source row (contradiction → Cold)"
+                ));
             };
-            let Ok(uuid) = Uuid::parse_str(id_str) else {
-                continue;
+            let in_scope = matches!(row.get("namespace"), Some(SqlValue::Text(t)) if t == ns)
+                && matches!(row.get("embedding_model"), Some(SqlValue::Text(t)) if t == model)
+                && matches!(row.get("field"), Some(SqlValue::Text(t)) if t == "knowledge.atom");
+            if !in_scope {
+                return Err(format!(
+                    "final upsert for {uuid}: source row left the consumer scope \
+                     (contradiction → Cold)"
+                ));
+            }
+            let Some(SqlValue::Blob(bytes)) = row.get("embedding") else {
+                return Err(format!("final upsert for {uuid}: embedding missing on row"));
             };
             let vec: Vec<f32> = bytes
                 .chunks_exact(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
-            embeddings.insert(uuid, vec);
+            embeddings.insert(*uuid, vec);
+        }
+        for (uuid, is_delete) in batch {
+            let op =
+                if *is_delete {
+                    None
+                } else {
+                    Some(embeddings.remove(uuid).ok_or_else(|| {
+                        format!("final upsert for {uuid}: embedding lost in batch")
+                    })?)
+                };
+            bridge.apply_final_op(&mut reverse, *uuid, op)?;
         }
     }
-
-    let mut ops: Vec<(Uuid, Option<Vec<f32>>)> = Vec::with_capacity(finals.len());
-    for (uuid, is_delete) in finals {
-        if is_delete {
-            ops.push((uuid, None));
-        } else {
-            let embedding = embeddings.remove(&uuid).ok_or_else(|| {
-                format!("final upsert for {uuid} has no source row (contradiction → Cold)")
-            })?;
-            ops.push((uuid, Some(embedding)));
-        }
-    }
-    Ok((ops, new_s))
+    Ok(())
 }
 
 /// Persist `bridge` at its applied watermark, raise this consumer's registry
@@ -1464,7 +1481,6 @@ enum SegmentOutcome {
 #[allow(clippy::too_many_arguments)]
 async fn classify_and_adopt_segment(
     rt: &KhiveRuntime,
-    token: &NamespaceToken,
     ann: &SharedAnn,
     key: &AnnKey,
     ns: &str,
@@ -1493,11 +1509,14 @@ async fn classify_and_adopt_segment(
     };
 
     // Rule 3: configured embedder dimensions ≠ segment dimensions → Cold.
-    match compute_fingerprint(rt, token, model).await {
-        Some(fp) if fp.dimensions as u64 == info.dimensions => {}
-        Some(fp) => {
+    // Resolved from the embedder registry — no storage access. The corpus
+    // itself is touched by exactly one statement in the whole decision path:
+    // `scope_counts` below.
+    match rt.embedder_dimensions(model) {
+        Some(dims) if dims as u64 == info.dimensions => {}
+        Some(dims) => {
             tracing::info!(namespace = %ns, model = %model,
-                segment_dims = info.dimensions, live_dims = fp.dimensions,
+                segment_dims = info.dimensions, live_dims = dims,
                 "v2 segment dimension mismatch; Cold rebuild");
             return SegmentOutcome::Cold;
         }
@@ -1540,7 +1559,9 @@ async fn classify_and_adopt_segment(
         return SegmentOutcome::Empty;
     }
 
-    // Rule 6: no tail above S → Hot: mmap load, zero corpus IO.
+    // Rule 6: no tail above S → Hot: mmap load. The only corpus access on
+    // this path is the single `scope_counts` statement above — no embedding
+    // bytes are read.
     if tail == 0 {
         return match AnnBridge::load(seg_dir) {
             Ok(bridge) => {
@@ -1568,17 +1589,18 @@ async fn classify_and_adopt_segment(
                 return SegmentOutcome::Cold;
             }
         };
-        let (ops, new_s) = match fetch_final_tail(rt, ns, model, s).await {
+        let (finals, new_s) = match fetch_final_states(rt, ns, model, s).await {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!(error = %e, "tail replay contradiction; Cold rebuild");
                 return SegmentOutcome::Cold;
             }
         };
-        if let Err(e) = bridge.apply_final_ops(ops, new_s) {
+        if let Err(e) = replay_final_states(rt, &mut bridge, ns, model, &finals).await {
             tracing::warn!(error = %e, "tail replay failed; Cold rebuild");
             return SegmentOutcome::Cold;
         }
+        bridge.set_applied_seq(new_s);
         checkpoint_raise_compact_readopt(rt, ann, key, ns, model, bridge, target_generation).await;
         return SegmentOutcome::Installed;
     }
@@ -1653,17 +1675,8 @@ pub(crate) async fn ensure_ann_for_model(
     // first-match decision table over the persisted commit record, this
     // consumer's registry row, and one same-snapshot (live, tail) read.
     if let Some(seg_dir) = ann_segment_dir(rt, &ns, model) {
-        match classify_and_adopt_segment(
-            rt,
-            token,
-            ann,
-            &key,
-            &ns,
-            model,
-            &seg_dir,
-            target_generation,
-        )
-        .await
+        match classify_and_adopt_segment(rt, ann, &key, &ns, model, &seg_dir, target_generation)
+            .await
         {
             SegmentOutcome::Installed => return,
             SegmentOutcome::Empty => {

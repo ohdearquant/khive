@@ -406,6 +406,31 @@ impl KhiveRuntime {
         )?)
     }
 
+    /// Output dimensions for a named embedding model, resolved from the
+    /// embedder registry alone — no storage access. Mirrors
+    /// [`vectors_for_model`](Self::vectors_for_model)'s resolution order:
+    /// lattice aliases route through the enum when registered, otherwise the
+    /// custom provider's declared `dimensions()`. `None` when no such model
+    /// is registered.
+    pub fn embedder_dimensions(&self, model_name: &str) -> Option<usize> {
+        if let Some(model) = parse_embedding_model_alias(model_name) {
+            let key = model.to_string();
+            let in_registry = self
+                .embedder_registry
+                .read()
+                .map(|reg| reg.contains(&key))
+                .unwrap_or(false);
+            if in_registry {
+                return Some(model.dimensions());
+            }
+        }
+        self.embedder_registry
+            .read()
+            .ok()?
+            .get_provider(model_name)
+            .map(|p| p.dimensions())
+    }
+
     fn vectors_for_embedding_model(
         &self,
         token: &NamespaceToken,
