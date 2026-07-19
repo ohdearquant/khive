@@ -724,14 +724,19 @@ question (Inventory item 4) remains unverified precisely there.
   `KHIVE_TX_WARN_SECS` (plus one removal on clean shutdown and on the first tick
   after the condition clears) — quiet processes write nothing, so steady-state
   filesystem traffic is zero. On a TRUNCATE no-progress event, the daemon
-  enumerates the sidecar directory and applies a two-test liveness gate (gate
-  ruling, 2026-07-19): an entry is live only if its PID is alive **and** its
-  `updated_at` falls within roughly 3 session sweep intervals (the sidecar
-  refreshes `updated_at` on every sweep tick while the warn condition persists,
-  so a stale timestamp means a crashed process's orphan file or a reused PID —
-  `started_at` remains the identity cross-check). Entries failing either test
-  are **deleted** during enumeration, not merely skipped, so orphan files cannot
-  accumulate or false-attribute. The daemon logs every live report alongside its
+  enumerates the sidecar directory and applies a three-test liveness gate (gate
+  ruling, 2026-07-19): an entry is live only if (1) its PID is alive, (2) its
+  `started_at` matches the OS-reported start time of that PID within a small
+  epsilon — a required identity validation, not an advisory cross-check, so a
+  reused PID is rejected deterministically rather than probabilistically — and
+  (3) its `updated_at` falls within roughly 3 session sweep intervals (the
+  sidecar refreshes `updated_at` on every sweep tick while the warn condition
+  persists, so a stale timestamp means a crashed process's orphan file).
+  Entries failing any test are **deleted** during enumeration, not merely
+  skipped, so orphan files cannot accumulate or false-attribute; deletion is
+  additionally conditioned on the ownership check below — the daemon removes
+  only entries it can attribute to a dead or stale process AND that pass
+  ownership validation. The daemon logs every live report alongside its
   existing no-progress WARN. The
   next recurrence therefore names the pinning process directly — or, if the WAL
   is pinned while no sidecar reports an old span, yields the sharper conclusion
@@ -739,6 +744,18 @@ question (Inventory item 4) remains unverified precisely there.
   registry does not cover) in one of the live PIDs, which is exactly the
   fork needed to justify or reject the deferred route-reads-through-the-daemon
   alternative with evidence.
+
+  _Sidecar filesystem trust boundary (gate ruling, 2026-07-19)._ The sidecar
+  path is predictable, so in a shared or attacker-writable database directory a
+  symlinked heartbeat path could otherwise redirect a khive process into
+  overwriting an arbitrary file. The write and enumeration contract is
+  therefore binding: the `<db-file>.walpin/` directory is created with mode
+  `0700` and validated as owned by the current user before any use (refuse the
+  directory otherwise — never chmod/chown an existing one into compliance);
+  heartbeat writes go through exclusive create with `O_NOFOLLOW` semantics to a
+  temporary file followed by atomic rename over the target, never an in-place
+  open of a possibly-attacker-placed path; enumeration validates per-entry
+  ownership and refuses symlinks before reading or deleting anything.
 - **Plank C: pin-depth probe via `PRAGMA wal_checkpoint(PASSIVE)` return
   columns.** On a TRUNCATE no-progress event, additionally run
   `PRAGMA wal_checkpoint(PASSIVE)` and report pin depth as `log` minus
