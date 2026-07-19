@@ -726,6 +726,19 @@ normative:
    the deferred mmap-`graph.bin` lever in the inventory above is the natural candidate once
    attribution confirms adjacency dominates.
 
+### Id-map ownership at replay (post-implementation note, 2026-07-19)
+
+Tail replay resolves subjects to index ordinals through a reverse map built from the
+persisted id map. The binding rule, made explicit after a defect was found in both shipped
+consumers (#1150): **a tombstoned ordinal has no owner** — the reverse map must exclude
+tombstoned entries (equivalently, id-map ownership is cleared at tombstone time), because
+the index recycles tombstoned slots on insert. A reverse map that retains a tombstoned
+subject's entry lets a later coalesced delete for that subject resolve to a recycled slot
+and tombstone a different, live vector — replay must never allow a stale subject mapping to
+target a slot it no longer owns. Regression coverage for the
+tombstone-recycle-then-stale-delete interleaving is required in every consumer that
+implements this replay.
+
 ### References (amendment)
 
 - Measurements: issues #1126/#1127 companion daemon-resource investigation (2026-07-19); read-only
