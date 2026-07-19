@@ -1116,6 +1116,67 @@ fn pid_ns_is_init(ino: u64) -> bool {
     ino == PROC_PID_INIT_INO
 }
 
+/// Linux: classify a single procfs mount-options string (either the
+/// per-mount options field or the super-options field of a
+/// `/proc/self/mountinfo` line) as restricting per-PID visibility.
+///
+/// The init-PID-namespace inode check ([`pid_ns_is_init`]) only rules out
+/// one way the `/proc` walk can miss processes. A host `/proc` mounted with
+/// `hidepid=1`/`hidepid=2` (or the symbolic `hidepid=noaccess` /
+/// `hidepid=invisible` / `hidepid=ptraceable` forms) or `subset=pid` hides
+/// other users' `/proc/<pid>` directories from `readdir` entirely — no
+/// per-PID error surfaces, `/proc/self` stays visible, and the self-canary
+/// still passes, so that path alone cannot detect the restriction. Only
+/// `hidepid=0` (or the symbolic `hidepid=off`) and the absence of `subset`
+/// are compatible with treating the walk as global.
+#[cfg(target_os = "linux")]
+fn proc_mount_restricts_visibility(options: &str) -> bool {
+    options.split(',').map(str::trim).any(|opt| {
+        if let Some(value) = opt.strip_prefix("hidepid=") {
+            !matches!(value, "0" | "off")
+        } else {
+            opt == "hidepid" || opt == "subset" || opt.starts_with("subset=")
+        }
+    })
+}
+
+/// Linux: locate the procfs mount backing `/proc` in `/proc/self/mountinfo`
+/// and classify whether its options restrict per-PID visibility. Returns
+/// `None` when the mountinfo file can't be read, no `/proc` entry with
+/// `fstype proc` is found, or a line can't be parsed into the expected
+/// `mountinfo` shape (`man 5 proc`) — the caller treats `None` the same as
+/// "restricted": an unparsable mountinfo carries no positive proof the
+/// walk saw every host PID either, so it fails closed rather than assuming
+/// a clean mount.
+#[cfg(target_os = "linux")]
+fn proc_mount_is_visibility_restricted() -> Option<bool> {
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo").ok()?;
+    for line in mountinfo.lines() {
+        // mountinfo line shape:
+        //   <id> <parent-id> <major:minor> <root> <mount-point>
+        //   <mount-options> <optional-fields...> - <fs-type> <mount-source>
+        //   <super-options>
+        let Some((fields_part, super_part)) = line.split_once(" - ") else {
+            continue;
+        };
+        let fields: Vec<&str> = fields_part.split(' ').collect();
+        if fields.len() < 6 || fields[4] != "/proc" {
+            continue;
+        }
+        let mount_options = fields[5];
+        let super_fields: Vec<&str> = super_part.split(' ').collect();
+        if super_fields.first().copied() != Some("proc") {
+            continue;
+        }
+        let super_options = super_fields.get(2).copied().unwrap_or("");
+        return Some(
+            proc_mount_restricts_visibility(mount_options)
+                || proc_mount_restricts_visibility(super_options),
+        );
+    }
+    None
+}
+
 /// Linux OS-derived census (ADR-091 Amendment 2 review, item a): scan
 /// `/proc/<pid>/fd/*` for every live PID and resolve each fd symlink,
 /// comparing against `db_path`'s canonical form. A PID whose `fd` directory
@@ -1126,17 +1187,22 @@ fn pid_ns_is_init(ino: u64) -> bool {
 /// Before trusting the walk as a GLOBAL census (review round 4, item a):
 /// `hidepid` mounts, restricted `/proc`, and non-init PID namespaces can all
 /// make `read_dir("/proc")` succeed while silently showing only a subset of
-/// the host's live PIDs — with no per-entry error to catch. Two checks
+/// the host's live PIDs — with no per-entry error to catch. Three checks
 /// widen the net rather than trust a clean-looking iteration outright: (1)
 /// a positive proof that this process itself is running in the *host's*
 /// init PID namespace — see [`pid_ns_is_init`]; a container's own procfs is
 /// internally self-consistent (its `/proc/1` resolves to its own init), so
 /// merely comparing `/proc/1/ns/pid` against `/proc/self/ns/pid` cannot
 /// distinguish "the host" from "a container that is its own root," and was
-/// replaced with this inode check (review round 5, item 1). (2) any error
-/// surfacing from the `/proc` or per-PID `fd` directory ITERATORS
-/// themselves (not a single entry's own error) marks the walk incomplete
-/// rather than being dropped via `.flatten()`.
+/// replaced with this inode check (review round 5, item 1). (2) a positive
+/// proof the procfs mount backing `/proc` carries no `hidepid`/`subset`
+/// restriction — see [`proc_mount_is_visibility_restricted`]; a
+/// `hidepid`-restricted mount hides other users' `/proc/<pid>` directories
+/// from `readdir` with no per-entry error, so the init-namespace check
+/// alone (self stays visible, self-canary passes) cannot detect it (review
+/// round 6). (3) any error surfacing from the `/proc` or per-PID `fd`
+/// directory ITERATORS themselves (not a single entry's own error) marks
+/// the walk incomplete rather than being dropped via `.flatten()`.
 #[cfg(target_os = "linux")]
 pub fn census_holders(db_path: &Path) -> io::Result<CensusResult> {
     use std::os::unix::fs::MetadataExt;
@@ -1149,6 +1215,11 @@ pub fn census_holders(db_path: &Path) -> io::Result<CensusResult> {
     match fs::metadata("/proc/self/ns/pid") {
         Ok(meta) if pid_ns_is_init(meta.ino()) => {}
         _ => truncated = true,
+    }
+
+    match proc_mount_is_visibility_restricted() {
+        Some(false) => {}
+        Some(true) | None => truncated = true,
     }
 
     let proc_dir = fs::read_dir("/proc")?;
@@ -2278,6 +2349,46 @@ mod tests {
         assert!(!pid_ns_is_init(PROC_PID_INIT_INO + 1));
         assert!(!pid_ns_is_init(0));
         assert!(!pid_ns_is_init(12345));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn proc_mount_restricts_visibility_classifies_hidepid_and_subset() {
+        // Review round 6: a clean options string never restricts.
+        assert!(!proc_mount_restricts_visibility(
+            "rw,nosuid,nodev,noexec,relatime"
+        ));
+        // Numeric hidepid values other than 0 restrict.
+        assert!(proc_mount_restricts_visibility("rw,hidepid=2"));
+        // Symbolic hidepid values (Linux 5.8+) restrict too.
+        assert!(proc_mount_restricts_visibility("rw,hidepid=invisible"));
+        assert!(proc_mount_restricts_visibility("rw,hidepid=ptraceable"));
+        // subset=pid (any subset=) restricts.
+        assert!(proc_mount_restricts_visibility("rw,subset=pid"));
+        // hidepid=0 is the explicit non-restricting value.
+        assert!(!proc_mount_restricts_visibility("hidepid=0"));
+        // hidepid=off is the symbolic equivalent of hidepid=0.
+        assert!(!proc_mount_restricts_visibility("rw,hidepid=off"));
+        // A bare `hidepid` flag with no value is treated as restricting —
+        // the kernel's default nonzero behavior, not a proven-clean mount.
+        assert!(proc_mount_restricts_visibility("rw,hidepid"));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn proc_mount_is_visibility_restricted_reads_this_hosts_own_proc_mount() {
+        // Live check against whatever /proc this test process actually
+        // runs under — asserts the parse succeeds (Some(_)), not a fixed
+        // verdict, since CI/dev/container hosts differ. A `None` here
+        // would mean mountinfo parsing silently failed on a real host,
+        // which the caller treats as fail-closed (`truncated = true`) —
+        // this test exists to catch that regression, not to assert which
+        // way this particular host's mount classifies.
+        assert!(
+            proc_mount_is_visibility_restricted().is_some(),
+            "expected to find and parse this process's own /proc mount entry in \
+             /proc/self/mountinfo"
+        );
     }
 
     #[test]
