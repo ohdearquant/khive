@@ -738,12 +738,32 @@ question (Inventory item 4) remains unverified precisely there.
   only entries it can attribute to a dead or stale process AND that pass
   ownership validation. The daemon logs every live report alongside its
   existing no-progress WARN. The
-  next recurrence therefore names the pinning process directly — or, if the WAL
-  is pinned while no sidecar reports an old span, yields the sharper conclusion
-  that the pin is an unregistered/native mechanism (`vec0` cursor, or a span the
-  registry does not cover) in one of the live PIDs, which is exactly the
-  fork needed to justify or reject the deferred route-reads-through-the-daemon
-  alternative with evidence.
+  next recurrence therefore names the pinning process directly when a report
+  exists. When none does, absence of evidence is attributed only through the
+  per-PID sidecar-health distinction below — silence alone never licenses a
+  conclusion.
+
+  _Sidecar-health attribution (gate ruling, 2026-07-19)._ A missing heartbeat
+  has two very different causes: the process genuinely has no old span, or its
+  sidecar never functioned (older binary without the feature, sidecar disabled,
+  heartbeat write failed, or the trust-boundary check below refused the
+  directory — note that a daemon-side refusal is itself a sidecar-health
+  failure and must not masquerade as evidence). To keep the
+  zero-steady-state-traffic property while making the two distinguishable,
+  each process writes a **one-time registration beacon** at sidecar
+  initialization (a per-PID marker written once, under the same trust-boundary
+  and liveness rules as heartbeats — not per-tick). Enumeration then classifies
+  every live database-holding PID three ways: **reporting** (heartbeat present
+  and live), **registered-silent** (beacon present, no heartbeat — the process
+  affirmatively has no over-threshold span), and **unknown** (no beacon — the
+  sidecar's health is unestablished; states: disabled, pre-feature binary,
+  write-failed, or refused). Only a pin observed while every live PID is
+  reporting or registered-silent licenses the sharper conclusion that the pin
+  is an unregistered/native mechanism (`vec0` cursor, or a span the registry
+  does not cover) — the fork needed to justify or reject the deferred
+  route-reads-through-the-daemon alternative with evidence. Any `unknown` PID
+  makes the attribution inconclusive, and the daemon's WARN names the unknown
+  PIDs as the reason.
 
   _Sidecar filesystem trust boundary (gate ruling, 2026-07-19)._ The sidecar
   path is predictable, so in a shared or attacker-writable database directory a
