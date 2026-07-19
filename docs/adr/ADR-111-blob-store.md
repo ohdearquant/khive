@@ -2,7 +2,7 @@
 
 **Status**: accepted
 **Date**: 2026-07-12 (amended 2026-07-13, PR #922; Amendment 2 proposed 2026-07-16; Amendment 3
-accepted 2026-07-17)
+accepted 2026-07-17; Amendment 4 accepted 2026-07-19)
 **Authors**: khive maintainers
 **Depends on**:
 
@@ -602,6 +602,70 @@ rejects an object exceeding its hydration ceiling before any bytes are read.
 
 ---
 
+## Amendment 4 (2026-07-19): capability-by-hash authorization model
+
+**Status:** accepted. Tracked in issue #1145.
+
+### Context
+
+`blob.get` and `blob.stat` accept a `ContentRef` and resolve it against the global
+content-addressed store; the handlers receive a `NamespaceToken` and do not consult it.
+Review raised this as an authorization gap. This amendment records the intended model so
+the behavior is normative rather than re-litigated per review.
+
+### Decision: possession of a ref is the read capability
+
+The blob surface uses **capability-by-hash**: a `ContentRef` is a 256-bit BLAKE3 digest of
+the content it names, and possession of a valid ref is the authorization to read that
+content. This is the access model of git object stores and comparable content-addressed
+systems, and it is the deliberate composition of three accepted contracts:
+
+1. **Namespace is attribution, not isolation** (ADR-007 Rev 6). The namespace stamp
+   records who wrote a record; it is never a storage boundary, and by-ref reads are
+   namespace-agnostic exactly as by-ID reads are.
+2. **Authorization lives at the single dispatch gate** (ADR-053), never inside individual
+   handlers. A per-handler namespace check on the blob path would re-introduce the
+   handler-level authorization pattern this architecture removed.
+3. **Global deduplication is a design goal of this store** (§2, §4). Identical content is
+   one object regardless of who stored it; a namespace-partitioned blob keyspace would
+   forfeit that property.
+
+A caller cannot enumerate or guess refs: learning a valid `ContentRef` requires either
+having stored the content, having been handed the ref, or already possessing the exact
+bytes (from which the ref is computable). `blob.get` therefore reveals nothing its caller
+could not already produce.
+
+### The `blob.stat` existence residue
+
+Under global dedup, `blob.stat` is an existence oracle with a precisely bounded residue: a
+caller who already fully possesses some content can compute its ref and learn one bit —
+whether the store also holds those bytes (plus their size, which the caller already knows).
+It confirms; it never discloses. For a single-user local deployment this residue is
+accepted as-is.
+
+For multi-tenant hosted deployments where even that confirmation bit is unacceptable, the
+enforcement seam is the gate, per ADR-053: record a `(namespace, ContentRef)` ledger row at
+`blob.put` and consult it as policy input for `get`/`stat`, scoping visibility per tenant
+while the storage layer keeps physical dedup. That is deployment-tier policy configuration,
+not a local-runtime handler change, and no handler-level check may be added in its place.
+
+### Ref-leak hygiene (binding)
+
+Because a ref is a bearer capability for its content, a leaked `ContentRef` is leaked
+content access. Refs are treated accordingly: they must not appear on public or
+unauthenticated surfaces — public issue text, published logs, error messages returned to
+unauthenticated callers, or telemetry that leaves the deployment boundary.
+
+### Consequences
+
+- `blob.get`/`blob.stat` remain namespace-agnostic by design; reviews should evaluate them
+  against this model, not against a per-namespace isolation expectation.
+- Multi-tenant visibility scoping, where required, is a gate-policy deployment concern
+  (`(namespace, ContentRef)` put-ledger), preserving storage-level dedup.
+- No trait, schema, or wire change; this amendment is documentation of intent.
+
+---
+
 ## Implementation Notes
 
 - `crates/khive-storage/src/blob.rs` — `ContentRef`, `BlobOrphanSweepConfig`,
@@ -634,6 +698,8 @@ rejects an object exceeding its hydration ceiling before any bytes are read.
   stale.
 - [khive#924](https://github.com/ohdearquant/khive/issues/924) — follow-up: transactional,
   DB-coordinated `BlobStore` orphan sweep.
+- [khive#1145](https://github.com/ohdearquant/khive/issues/1145) — capability-by-hash
+  authorization model and `blob.stat` oracle posture (Amendment 4).
 - [`object_store` 0.13.2 S3 builder](https://docs.rs/object_store/0.13.2/object_store/aws/struct.AmazonS3Builder.html)
   and [feature model](https://docs.rs/crate/object_store/0.13.2/features) — selected S3 client
   surface and dependency boundary for Amendment 2.
