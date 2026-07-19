@@ -137,6 +137,7 @@ For historical context, see [v0 archive](../_archive/adr_v0/README.md). v0 ADRs 
 | [ADR-114](ADR-114-code-audit-derived-report.md)              | Code-Audit Derived Report, Not Agent Findings                                                         |
 | [ADR-115](ADR-115-secret-gate-content-manifest-exemption.md) | Exact-Content Manifest Exemption for the Write Secret Gate                                            |
 | [ADR-117](ADR-117-session-continuity-search.md)              | Session Continuity — Cross-Session Search and Remote Ingestion                                        |
+| [ADR-118](ADR-118-fresh-tail-recall-visibility.md)           | Fresh-Tail Exact Leg — Read-Your-Writes Visibility for Vector Recall                                  |
 
 ## Closed Taxonomies — Quick Reference
 
