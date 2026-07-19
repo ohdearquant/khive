@@ -741,7 +741,7 @@ implements this replay.
 
 ### References (amendment)
 
-- Measurements: issues #1126/#1127 companion daemon-resource investigation (2026-07-19); read-only
+- Measurements: issues #1127/#1129 companion daemon-resource investigation (2026-07-19); read-only
   concurrency probe (footprint peak 3.9 GB), differential path probe, mirror-off cold-start rebuild
   observation.
 - `VectorStorage::Mmap` + `load_v2_fast`/`mmap_vectors`: the existing fast path this amendment
