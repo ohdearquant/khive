@@ -208,7 +208,12 @@ pub trait Pack: Send + Sync {
 
 `ServiceSchemaPlan` already exists in `khive-db::migrations` per ADR-015. Each pack's plan
 is applied to its assigned backend at boot, idempotently, with per-pack version tracking
-via the existing `_schema_migrations` table (one row per pack-versioned migration).
+via the `_schema_versions` table (one row per pack-versioned migration, keyed by
+`(service, migration_id)`). This is a distinct ledger from the core `_schema_migrations` table
+that ADR-015's base V1-VN migration pipeline uses (keyed by `version`); the two track two separate
+migration mechanisms, and `_schema_versions` is the table the shipped `apply_schema_plan` runner in
+`khive-db::migrations` reads and writes. (An earlier revision of this ADR named `_schema_migrations`
+here; that was a documentation error against the implementation.)
 
 The substrate / pack-extension boundary:
 
@@ -376,8 +381,8 @@ catches both cases at boot, immediately.
 
 Keep one SQLite file; use the existing `namespace` field on every row. Pros: simplest
 mental model. Cons: cannot isolate VACUUM, cannot read-only one slice, cannot backup
-independently, hot/cold data interleave on disk. khive-internal explicitly rejected this
-for the lore use case for these reasons.
+independently, hot/cold data interleave on disk. The lore pack's backend design explicitly
+rejected this for these reasons.
 
 Rejected. Namespace is for tenancy; backend is for storage profile.
 

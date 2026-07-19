@@ -135,7 +135,26 @@ above remains the historical pre-consolidation record.
 |      V6 | ADR-081            | brain_retune_driver                | shipped |
 |      V7 | #827               | notes_seq                          | shipped |
 |      V8 | #827               | notes_seq_repair                   | shipped |
-|      V9 | ADR-104            | entities_name_ci_index             | claimed |
+|      V9 | ADR-104            | entities_name_ci_index             | shipped |
+|     V10 | ADR-111            | entities_content_ref               | shipped |
+|     V11 | ADR-056            | comm_channel_cursor_source_key     | claimed |
+
+> **V9 record (2026-07-18)**: `entities_name_ci_index` (ADR-104) ships in the `MIGRATIONS`
+> array as `009-entities-name-ci-index.sql`; its status here was `claimed`, stale from ADR-104,
+> and is corrected to `shipped` to match the code. With the V10 backfill below, the live
+> ledger's status column now agrees with the shipped `MIGRATIONS` array.
+
+> **V10 record (2026-07-18)**: `entities_content_ref` (ADR-111 BlobStore `content_ref`
+> column, khive#292) shipped in the `MIGRATIONS` array but was not recorded here; it is
+> backfilled so the live sequence is contiguous through the V11 claim below.
+
+> **V11 claim (2026-07-18, ADR-056)**: `comm_channel_cursor_source_key` widens
+> `comm_channel_cursor` to the three-column key `(channel_kind, channel_slug, source)` and adds
+> the `anchor` column (ADR-056 Amendment 2026-07-17, §Migration: owner and sequence). Status is
+> `claimed`: this is a docs-first ADR PR, and the `011-comm-channel-cursor-source-key.sql` file
+> ships with the implementation that follows the accepted spec. Like V20/V21 in the
+> pre-consolidation ledger, it is pack-owned logical state whose
+> shipped schema is a core `khive-db` versioned migration, so the ledger records it.
 
 > **Invariant**: ADR number order and migration version order are independent. Migration versions reflect schema ledger assignment order. A migration may only depend on schema created by earlier versions.
 
@@ -158,9 +177,24 @@ need. Pack schema declarations add pack-specific tables that depend on a backend
 but don't belong to the core substrate (e.g., GTD lifecycle audit, memory pack
 indices, brain pack posterior state).
 
-The two never overlap. Core tables (`entities`, `graph_edges`, `notes`, `events`,
+The two never overlap, with one recorded exception: a core-lane versioned migration MAY carry
+pack-owned logical state when that state lives inside a table the core migration ledger already
+owns end to end. Core tables (`entities`, `graph_edges`, `notes`, `events`,
 plus per-namespace FTS5 / vector tables) are owned by `khive-db` migrations.
 Pack-auxiliary tables are owned by the pack.
+
+**The pack-owned-state-in-a-core-migration exception.** V5 (`unique_comm_message_external_id`) and V6
+(`brain_retune_driver`) established the precedent: both are core `khive-db` versioned migrations that
+evolve schema a pack -- comm, brain -- logically owns, because that schema was placed inside a table
+the core ledger already versions rather than in a boot-time pack declaration of its own. V11
+(`comm_channel_cursor_source_key`, ADR-056 Amendment 2026-07-17) follows the same precedent: it widens
+the pack-owned `comm_channel_cursor` table's key and adds a column, shipped as a core `khive-db`
+versioned migration rather than a pack schema declaration, because `comm_channel_cursor` already
+carries a forward-only version history in the core ledger and a boot-time `CREATE TABLE IF NOT EXISTS`
+cannot express a widened uniqueness key or a backward-compatible column add against existing rows the
+way a versioned migration can. The exception is narrow: it applies only to evolving a table's shape
+that a core migration already owns, never to introducing a wholly new pack-auxiliary table through the
+core lane, which remains the pack's own boot-time declaration to make.
 
 ### Versioned migration model
 
