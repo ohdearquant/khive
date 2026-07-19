@@ -38,6 +38,36 @@ phase_lint() {
     sh "$SCRIPT_DIR/lint-adr-refs.sh" --self-test
 }
 
+phase_no_stubs_scan() {
+    echo "=== No-Stub Guard (placeholder-string panic!/unreachable! scan) ==="
+    # SECURITY ORDERING (#560 follow-up): this placeholder-string scan and its
+    # self-test run as the FIRST ci phase, before phase_lockfile or any other
+    # cargo invocation. The cargo phases compile PR-controlled code (build
+    # scripts, proc-macros); if this guard ran after them, a build step could
+    # replace a committed stub source, the committed allowlist, or this scanner
+    # script itself with benign content and slip a stub past the guard. Running
+    # before any cargo compilation removes that opportunity: at this point the
+    # working tree is the pristine checkout, so the scanner reads exactly the
+    # committed sources. The scanner self-test asserts this ordering so a future
+    # reorder that moves the scan after a cargo phase fails loud.
+    #
+    # `todo!()`/`unimplemented!()` are denied unconditionally by the clippy pass
+    # in phase_no_stubs, but `panic!`/`unreachable!` are legitimate everywhere
+    # (assertion failures, invariant violations) -- clippy has no lint for "the
+    # message looks like a stub", and denying the macros outright would fail
+    # hundreds of correct call sites. This scans the string literal argument of
+    # every panic!/unreachable! call for placeholder language across every .rs
+    # file under crates/ (source, tests, benches, examples) -- a broader scope
+    # than the --lib --bins clippy pass: a placeholder message reads as a stub
+    # whether or not the code compiling it is test-gated (#560).
+    sh "$SCRIPT_DIR/lint-stub-markers.sh"
+
+    echo "=== No-Stub Guard (placeholder-string scanner self-test) ==="
+    # Locks in the scanner's own fixture coverage so a future parser change
+    # cannot silently regress it without the fixtures ever running in CI.
+    sh "$SCRIPT_DIR/lint-stub-markers.sh" --self-test
+}
+
 phase_no_stubs() {
     echo "=== No-Stub Guard (clippy restriction lints) ==="
     # AST-aware "No stubs. Ever." enforcement. clippy parses the macros, so it is
@@ -45,7 +75,9 @@ phase_no_stubs() {
     # `unimplemented!{}`, macro names inside comments or string literals). Scoped to
     # --lib --bins = shipping source only (excludes tests/benches/examples), matching
     # the prior policy. khive-merge is excluded from the workspace (forward-deployed),
-    # so it gets its own pass to preserve coverage.
+    # so it gets its own pass to preserve coverage. The placeholder-string scan that
+    # used to run here now runs first, in phase_no_stubs_scan, before any cargo
+    # compilation (see that phase's security-ordering note).
     NOSTUB_LINTS="-Dclippy::todo -Dclippy::unimplemented -Dclippy::dbg_macro"
     # shellcheck disable=SC2086
     cargo clippy --workspace --lib --bins -- $NOSTUB_LINTS
@@ -145,6 +177,7 @@ phase_macos_pr_tests() {
 
 run_phase() {
     case "$1" in
+        no-stubs-scan) phase_no_stubs_scan ;;
         lockfile) phase_lockfile ;;
         forward-deployed) phase_forward_deployed ;;
         lint) phase_lint ;;
@@ -164,7 +197,7 @@ run_phase() {
         macos-pr-tests) phase_macos_pr_tests ;;
         *)
             echo "Unknown CI phase: $1" >&2
-            echo "Valid phases: lockfile forward-deployed lint no-stubs clippy docs tests channel-email no-default-features release contract-tests deno-tests smoke-tests vector-smoke contract-suite macos-pr-check macos-pr-tests" >&2
+            echo "Valid phases: no-stubs-scan lockfile forward-deployed lint no-stubs clippy docs tests channel-email no-default-features release contract-tests deno-tests smoke-tests vector-smoke contract-suite macos-pr-check macos-pr-tests" >&2
             exit 2
             ;;
     esac
@@ -172,6 +205,7 @@ run_phase() {
 
 run_all() {
     for phase in \
+        no-stubs-scan \
         lockfile \
         forward-deployed \
         lint \

@@ -1,0 +1,32 @@
+# Explicit allowlist for scripts/lint-stub-markers.sh (#560).
+#
+# The scanner has no reachability/cfg analysis -- it scans every .rs file
+# under crates/ (source, tests, benches, examples) and flags any
+# panic!/unreachable! call whose decoded string-literal message reads as a
+# placeholder. A small number of matches are legitimate (a test mock whose
+# type or method name happens to contain a placeholder word); those are
+# suppressed here, one line per exception, never by loosening the scanner
+# itself.
+#
+# Format: one entry per line, a repo-relative path and a fully decoded
+# message separated by a single TAB. A finding is suppressed iff BOTH match
+# EXACTLY: the path equals the finding's repo-relative path (as rendered
+# under `crates/...`) AND the message equals the finding's fully decoded
+# panic!/unreachable! message. Matching is exact, not substring, so an entry
+# can never suppress an unrelated finding that merely shares a path prefix or
+# a message fragment. Blank lines and lines starting with `#` are ignored; a
+# non-comment line without a TAB is a malformed entry and fails the scan loud.
+#
+# Every entry must suppress a CURRENT finding. The scanner fails loud on any
+# entry that matches no finding in the scanned tree -- a stale entry (the file
+# moved, or its message changed) or a pre-planted entry (added ahead of the
+# file it would suppress) cannot sit here silently disabling a future finding.
+# An allowlist entry is therefore only ever added in the same change as the
+# finding it suppresses, and justified in the PR.
+#
+# There are no active entries today. The crates/kkernel/src/reindex.rs
+# #[cfg(test)] EmbeddingService mock named StubService (whose guard message
+# names the mock's own type/method, not a real placeholder) is inert under the
+# scanner's word-boundary PLACEHOLDER_RE -- "StubService" has no isolated
+# "stub" word -- so it produces no finding and needs no entry. An entry would
+# be added here only if a real match ever appears.
