@@ -1336,20 +1336,31 @@ async fn tail_exists(rt: &KhiveRuntime, model: &str, s: u64) -> Result<bool, Str
 /// a row that is present but whose note fails the join predicate
 /// (soft-deleted, or gone) replays as a delete — its final corpus state is
 /// absence. Returns the ops and the new watermark.
-async fn fetch_final_tail(
+pub(crate) async fn fetch_final_tail(
     rt: &KhiveRuntime,
     model: &str,
     s: u64,
+    limit: Option<u64>,
 ) -> Result<(Vec<(Uuid, Option<Vec<f32>>)>, u64), String> {
     let sql = rt.sql();
     let mut reader = sql.reader().await.map_err(|e| e.to_string())?;
+    // `limit` (ADR-118 §3, Cold/Empty tier): cap the scan to the newest
+    // `limit` log rows instead of the entire scope, taking the highest-seq
+    // suffix so the freshest writes stay visible. The DESC+LIMIT rows are
+    // reversed back to ascending order below so final-op-per-subject
+    // coalescing (insert-overwrite = last write wins) is unaffected.
+    let order_limit = match limit {
+        Some(n) => format!("ORDER BY seq DESC LIMIT {n}"),
+        None => "ORDER BY seq".to_string(),
+    };
     let rows = reader
         .query_all(SqlStatement {
-            sql: "SELECT seq, subject_id, op FROM ann_write_log \
+            sql: format!(
+                "SELECT seq, subject_id, op FROM ann_write_log \
                   WHERE embedding_model = ?1 \
                     AND kind = 'note' AND field = 'note.content' AND seq > ?2 \
-                  ORDER BY seq"
-                .into(),
+                  {order_limit}"
+            ),
             params: vec![
                 SqlValue::Text(model.to_owned()),
                 SqlValue::Integer(s as i64),
@@ -1358,6 +1369,10 @@ async fn fetch_final_tail(
         })
         .await
         .map_err(|e| e.to_string())?;
+    let mut rows = rows;
+    if limit.is_some() {
+        rows.reverse();
+    }
 
     let mut new_s = s;
     // Ordered iteration + insert-overwrite = final op per subject wins.
@@ -1483,6 +1498,236 @@ async fn fetch_final_tail(
         }
     }
     Ok((ops, new_s))
+}
+
+// ── ADR-118: fresh-tail exact leg (read-your-writes recall visibility) ─────────
+
+/// `KHIVE_ANN_FRESH_TAIL=0` disables the exact leg (default enabled). Any
+/// other value, including unset, leaves it enabled.
+fn fresh_tail_enabled() -> bool {
+    std::env::var("KHIVE_ANN_FRESH_TAIL")
+        .map(|v| v != "0")
+        .unwrap_or(true)
+}
+
+/// Read the currently-installed bridge's fresh-tail watermark for `key`: the
+/// `ann_write_log` seq its corpus state reflects, or `None` if no bridge is
+/// installed. Call this immediately adjacent to a `search_loaded` call that
+/// returned `Some` to minimize the window for a concurrent bridge swap.
+pub(crate) async fn bridge_applied_seq(ann: &SharedAnn, key: &AnnKey) -> Option<u64> {
+    let guard = ann.indexes.read().await;
+    guard
+        .get(key)
+        .map(|b| b.index.last_applied_seq().unwrap_or(0))
+}
+
+/// The pair's wildcard-inclusive registry minimum (ADR-118 §1 "Compaction
+/// linearization"): the same subselect `compact_log` uses to bound deletion,
+/// evaluated at this consumer's own registered namespace (`'*'`). If this
+/// exceeds a bridge's watermark, the log may no longer retain every row
+/// above that watermark — completeness above it is unprovable.
+async fn registry_min_watermark(rt: &KhiveRuntime, model: &str) -> Result<Option<i64>, String> {
+    let sql = rt.sql();
+    let mut reader = sql.reader().await.map_err(|e| e.to_string())?;
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: "SELECT MIN(watermark) AS m FROM ann_consumer_watermark \
+                  WHERE (namespace = ?1 OR namespace = '*') AND embedding_model = ?2"
+                .into(),
+            params: vec![
+                SqlValue::Text(ANN_WILDCARD_NS.into()),
+                SqlValue::Text(model.to_owned()),
+            ],
+            label: Some("memory_ann_registry_min".into()),
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(rows.into_iter().next().and_then(|row| match row.get("m") {
+        Some(SqlValue::Integer(n)) => Some(*n),
+        _ => None,
+    }))
+}
+
+/// Exact cosine similarity between a raw query vector and a raw stored
+/// embedding, using the same L2-normalization convention as
+/// [`AnnBridge::search`]: both vectors normalized, dot product, clamped to a
+/// non-negative floor.
+pub(crate) fn exact_cosine(query: &[f32], embedding: &[f32]) -> f32 {
+    let mut q = query.to_vec();
+    l2_normalize(&mut q);
+    let mut e = embedding.to_vec();
+    l2_normalize(&mut e);
+    q.iter()
+        .zip(e.iter())
+        .map(|(a, b)| a * b)
+        .sum::<f32>()
+        .max(0.0)
+}
+
+/// Merge a fresh-tail's coalesced final ops into an existing ANN candidate
+/// list (ADR-118 §2): deduplicated by `subject_id` with the tail winning
+/// (its embedding is at least as fresh as the segment's), then re-sorted by
+/// score. A `None` op (final delete) drops the subject from the merged list
+/// even if it was present in `best_raw` — the tail is authoritative for
+/// every subject it names. An empty `ops` returns `best_raw` unchanged, so
+/// fusion is byte-identical whenever there is nothing to merge.
+pub(crate) fn merge_fresh_tail(
+    best_raw: Vec<(Uuid, f32)>,
+    query: &[f32],
+    ops: Vec<(Uuid, Option<Vec<f32>>)>,
+) -> Vec<(Uuid, f32)> {
+    if ops.is_empty() {
+        return best_raw;
+    }
+    let mut deletes: HashSet<Uuid> = HashSet::new();
+    let mut upserts: HashMap<Uuid, f32> = HashMap::new();
+    for (uuid, op) in ops {
+        match op {
+            None => {
+                deletes.insert(uuid);
+            }
+            Some(embedding) => {
+                upserts.insert(uuid, exact_cosine(query, &embedding));
+            }
+        }
+    }
+    let mut merged: Vec<(Uuid, f32)> = best_raw
+        .into_iter()
+        .filter(|(u, _)| !deletes.contains(u) && !upserts.contains_key(u))
+        .collect();
+    merged.extend(upserts);
+    merged.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    merged
+}
+
+/// Outcome of [`fresh_tail_leg`]: either coalesced final ops ready to merge
+/// via [`merge_fresh_tail`], or a signal that the leg sat out this query.
+pub(crate) enum FreshTailOutcome {
+    Merged(Vec<(Uuid, Option<Vec<f32>>)>),
+    Skipped,
+}
+
+/// The ADR-118 fresh-tail exact leg. `s = Some(watermark)` is the first
+/// (and primary) tier: a serving bridge exists, and every committed write
+/// above its watermark is merged in, giving read-your-writes visibility.
+/// `s = None` is the second tier (§3): no serving index is available at all,
+/// so the leg caps its scan at the rebuild-threshold-sized newest suffix of
+/// the log instead of the entire scope, guaranteeing visibility of only the
+/// caller's most recent writes until a serving index exists again.
+pub(crate) async fn fresh_tail_leg(
+    rt: &KhiveRuntime,
+    ann: &SharedAnn,
+    key: &AnnKey,
+    model: &str,
+    s: Option<u64>,
+) -> FreshTailOutcome {
+    if !fresh_tail_enabled() {
+        return FreshTailOutcome::Skipped;
+    }
+
+    // Registration precondition (ADR-118 §1): S = 0 (or "no bridge") proves
+    // an entire-scope tail only if no compaction has ever run for this
+    // consumer's registration. Absent row: register at 0 and sit out this
+    // query — the existing Cold classification already serves correctly.
+    match read_own_watermark(rt, model).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            if let Err(e) = register_consumer(rt, model).await {
+                tracing::warn!(error = %e, model, "fresh-tail: consumer re-registration failed");
+            }
+            return FreshTailOutcome::Skipped;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, model, "fresh-tail: registry read failed; skipping exact leg");
+            return FreshTailOutcome::Skipped;
+        }
+    }
+
+    match s {
+        Some(s) => fresh_tail_serving(rt, ann, key, model, s).await,
+        None => fresh_tail_capped(rt, model).await,
+    }
+}
+
+/// Tier 1: a serving bridge exists at watermark `s`.
+async fn fresh_tail_serving(
+    rt: &KhiveRuntime,
+    ann: &SharedAnn,
+    key: &AnnKey,
+    model: &str,
+    s: u64,
+) -> FreshTailOutcome {
+    // Compaction linearization (ADR-118 §1): the registry minimum can
+    // advance past a stale in-memory bridge's watermark the instant another
+    // process's checkpoint raises it and compacts. A scan above `s` proves
+    // completeness only if the log still retains every row above `s`.
+    let registry_min = match registry_min_watermark(rt, model).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, model, "fresh-tail: registry-min read failed; skipping exact leg");
+            return FreshTailOutcome::Skipped;
+        }
+    };
+    let effective_s = match registry_min {
+        Some(m) if m as u64 > s => {
+            // Re-resolve the currently published segment (its watermark is
+            // at least the registry minimum) and use its watermark instead.
+            let resolved = ann_segment_dir(rt, model)
+                .and_then(|dir| read_commit_info(&dir).ok().flatten())
+                .and_then(|info| info.last_applied_seq);
+            match resolved {
+                Some(new_s) if new_s >= m as u64 => {
+                    // Force re-adoption so the next warm check picks up the
+                    // segment this query just resolved to.
+                    bump_generation(ann, key).await;
+                    new_s
+                }
+                _ => {
+                    // Re-resolution failed: degrade to ADR-107 (ANN-only)
+                    // for this query rather than serve an unprovable tail.
+                    bump_generation(ann, key).await;
+                    return FreshTailOutcome::Skipped;
+                }
+            }
+        }
+        _ => s,
+    };
+    match fetch_final_tail(rt, model, effective_s, None).await {
+        Ok((ops, _new_s)) => FreshTailOutcome::Merged(ops),
+        Err(e) => {
+            tracing::warn!(error = %e, model, "fresh-tail: tail fetch failed; skipping exact leg");
+            FreshTailOutcome::Skipped
+        }
+    }
+}
+
+/// Tier 2 (§3): no serving index at all. Caps the scan at the
+/// rebuild-threshold-sized newest suffix so the caller's most recent writes
+/// stay visible without absorbing the full Cold/Empty scope.
+async fn fresh_tail_capped(rt: &KhiveRuntime, model: &str) -> FreshTailOutcome {
+    let (live, tail) = match scope_counts(rt, model, 0).await {
+        Ok(counts) => counts,
+        Err(e) => {
+            tracing::warn!(error = %e, model, "fresh-tail: scope-count read failed; skipping capped exact leg");
+            return FreshTailOutcome::Skipped;
+        }
+    };
+    if live == 0 || tail == 0 {
+        return FreshTailOutcome::Merged(Vec::new());
+    }
+    let threshold = (ann_rebuild_threshold() * live as f64).ceil() as u64;
+    let cap = if tail > threshold {
+        Some(threshold)
+    } else {
+        None
+    };
+    match fetch_final_tail(rt, model, 0, cap).await {
+        Ok((ops, _new_s)) => FreshTailOutcome::Merged(ops),
+        Err(e) => {
+            tracing::warn!(error = %e, model, "fresh-tail: capped tail fetch failed; skipping exact leg");
+            FreshTailOutcome::Skipped
+        }
+    }
 }
 
 /// Persist `bridge` at its applied watermark, raise the wildcard registry row,
@@ -1672,7 +1917,7 @@ async fn classify_and_adopt_segment(
                 return SegmentOutcome::Cold;
             }
         };
-        let (ops, new_s) = match fetch_final_tail(rt, model, s).await {
+        let (ops, new_s) = match fetch_final_tail(rt, model, s, None).await {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!(error = %e, "memory tail replay read failed; Cold rebuild");
@@ -3013,6 +3258,349 @@ mod tests {
             "a write racing in during an in-flight warm must eventually be \
              picked up and converge on its own, with zero further recalls or \
              writes to retrigger it (#812)"
+        );
+    }
+
+    // ── ADR-118: fresh-tail exact leg ───────────────────────────────────────
+
+    /// A subject present in the stale warm ANN index whose final tail op is
+    /// `delete` must be dropped from the merged candidate list — the tail is
+    /// authoritative for every subject it names.
+    #[tokio::test]
+    #[serial(adr118_fresh_tail)]
+    async fn fresh_tail_leg_drops_subject_whose_final_tail_op_is_delete() {
+        const MODEL: &str = "adr118-tail-delete-test-model";
+        const DIMS: usize = 8;
+        let rt = test_runtime_with_hash_embedder(MODEL, DIMS);
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+
+        let target = rt
+            .create_note_with_decay_for_embedding_model(
+                &token,
+                "memory",
+                None,
+                "tail delete target note",
+                Some(0.7),
+                0.01,
+                None,
+                vec![],
+                None,
+            )
+            .await
+            .expect("create target note");
+        for i in 0..3u32 {
+            rt.create_note_with_decay_for_embedding_model(
+                &token,
+                "memory",
+                None,
+                &format!("tail delete filler note {i}"),
+                Some(0.7),
+                0.01,
+                None,
+                vec![],
+                None,
+            )
+            .await
+            .expect("create filler note");
+        }
+
+        let ann = new_shared();
+        let key = AnnKey::from_token(MODEL);
+        let status = ensure_ann_for_model(&rt, &token, &ann, MODEL)
+            .await
+            .expect("warm");
+        assert!(
+            matches!(status, AnnEnsureStatus::Built { vectors: 4 }),
+            "expected initial build of 4 vectors, got: {status:?}"
+        );
+
+        // Delete AFTER the bridge is warm — a write only bumps generation, it
+        // never evicts the served bridge, so its cached graph still nominates
+        // the now-deleted subject.
+        rt.delete_note(&token, target.id, false)
+            .await
+            .expect("soft delete target");
+
+        let query = fnv_to_vec("tail delete target note", DIMS);
+        let raw = search_loaded(&ann, &key, &query, 10)
+            .await
+            .expect("search")
+            .expect("bridge still warm");
+        assert!(
+            raw.iter().any(|(id, _)| *id == target.id),
+            "sanity: the stale warm bridge must still nominate the deleted \
+             subject from its cached graph before the fresh-tail leg runs"
+        );
+
+        let s = bridge_applied_seq(&ann, &key)
+            .await
+            .expect("bridge watermark");
+        let ops = match fresh_tail_leg(&rt, &ann, &key, MODEL, Some(s)).await {
+            FreshTailOutcome::Merged(ops) => ops,
+            FreshTailOutcome::Skipped => panic!("fresh-tail leg unexpectedly skipped"),
+        };
+        let merged = merge_fresh_tail(raw, &query, ops);
+        assert!(
+            !merged.iter().any(|(id, _)| *id == target.id),
+            "a subject whose final tail op is delete must be dropped from the \
+             merged candidate list even though the stale ANN index still \
+             nominates it, got: {merged:?}"
+        );
+    }
+
+    /// A subject present in both the stale ANN candidates and the tail
+    /// appears exactly once in the merged list, carrying the tail's exact
+    /// (fresher) score rather than the segment's quantized one.
+    #[tokio::test]
+    #[serial(adr118_fresh_tail)]
+    async fn fresh_tail_leg_dedups_with_tail_winning() {
+        const MODEL: &str = "adr118-tail-dedup-test-model";
+        const DIMS: usize = 8;
+        let rt = test_runtime_with_hash_embedder(MODEL, DIMS);
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+
+        let target = rt
+            .create_note_with_decay_for_embedding_model(
+                &token,
+                "memory",
+                None,
+                "tail dedup original content",
+                Some(0.7),
+                0.01,
+                None,
+                vec![],
+                None,
+            )
+            .await
+            .expect("create target note");
+        for i in 0..3u32 {
+            rt.create_note_with_decay_for_embedding_model(
+                &token,
+                "memory",
+                None,
+                &format!("tail dedup filler note {i}"),
+                Some(0.7),
+                0.01,
+                None,
+                vec![],
+                None,
+            )
+            .await
+            .expect("create filler note");
+        }
+
+        let ann = new_shared();
+        let key = AnnKey::from_token(MODEL);
+        let status = ensure_ann_for_model(&rt, &token, &ann, MODEL)
+            .await
+            .expect("warm");
+        assert!(
+            matches!(status, AnnEnsureStatus::Built { vectors: 4 }),
+            "expected initial build of 4 vectors, got: {status:?}"
+        );
+
+        const UPDATED_TEXT: &str = "tail dedup UPDATED content, unrelated to the original";
+        rt.update_note(
+            &token,
+            target.id,
+            khive_runtime::NotePatch::new(None, Some(UPDATED_TEXT.to_string()), None, None, None),
+        )
+        .await
+        .expect("update target note");
+
+        // Query the segment's stale embedding of the ORIGINAL content: the
+        // stale ANN index nominates the subject at its old (now-superseded)
+        // score, while the tail carries the exact score against the updated
+        // embedding — they must collapse to one entry, tail winning.
+        let query = fnv_to_vec("tail dedup original content", DIMS);
+        let raw = search_loaded(&ann, &key, &query, 10)
+            .await
+            .expect("search")
+            .expect("bridge still warm");
+        let stale_score = raw
+            .iter()
+            .find(|(id, _)| *id == target.id)
+            .map(|(_, score)| *score)
+            .expect("sanity: stale ANN index must still nominate the pre-update subject");
+
+        let s = bridge_applied_seq(&ann, &key)
+            .await
+            .expect("bridge watermark");
+        let ops = match fresh_tail_leg(&rt, &ann, &key, MODEL, Some(s)).await {
+            FreshTailOutcome::Merged(ops) => ops,
+            FreshTailOutcome::Skipped => panic!("fresh-tail leg unexpectedly skipped"),
+        };
+        let merged = merge_fresh_tail(raw, &query, ops);
+
+        let matches: Vec<&(Uuid, f32)> = merged.iter().filter(|(id, _)| *id == target.id).collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "the subject must appear exactly once in the merged list, got: {merged:?}"
+        );
+        let exact_score = exact_cosine(&query, &fnv_to_vec(UPDATED_TEXT, DIMS));
+        assert!(
+            (matches[0].1 - exact_score).abs() < 1e-6,
+            "the merged entry must carry the tail's exact score ({exact_score}) \
+             rather than the stale segment's score ({stale_score}), got {}",
+            matches[0].1
+        );
+    }
+
+    /// The compaction-linearization guard: if the registry minimum has
+    /// advanced past the serving bridge's watermark, the log may no longer
+    /// retain every row above it. The leg must detect the mismatch in the
+    /// same snapshot and refuse to serve an unprovable (silently incomplete)
+    /// tail — it re-resolves the published segment or skips outright.
+    #[tokio::test]
+    #[serial(adr118_fresh_tail)]
+    async fn fresh_tail_leg_skips_when_registry_minimum_outpaces_bridge_watermark() {
+        const MODEL: &str = "adr118-compaction-guard-test-model";
+        const DIMS: usize = 8;
+        let rt = test_runtime_with_hash_embedder(MODEL, DIMS);
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+
+        for i in 0..3u32 {
+            rt.create_note_with_decay_for_embedding_model(
+                &token,
+                "memory",
+                None,
+                &format!("compaction guard seed note {i}"),
+                Some(0.7),
+                0.01,
+                None,
+                vec![],
+                None,
+            )
+            .await
+            .expect("create seed note");
+        }
+
+        let ann = new_shared();
+        let key = AnnKey::from_token(MODEL);
+        ensure_ann_for_model(&rt, &token, &ann, MODEL)
+            .await
+            .expect("warm");
+        let s1 = bridge_applied_seq(&ann, &key)
+            .await
+            .expect("bridge watermark after initial warm");
+
+        // A write lands after the checkpoint: the log advances, but the
+        // served bridge is never re-persisted (only `ensure_ann_for_model`
+        // does that), so its own watermark stays pinned at `s1`.
+        rt.create_note_with_decay_for_embedding_model(
+            &token,
+            "memory",
+            None,
+            "compaction guard post-checkpoint write",
+            Some(0.7),
+            0.01,
+            None,
+            vec![],
+            None,
+        )
+        .await
+        .expect("create post-checkpoint note");
+
+        // Simulate a peer process's checkpoint: raise the shared durable
+        // registry watermark past `s1` and compact the log through it —
+        // exactly `checkpoint_raise_compact_readopt`'s raise+compact steps,
+        // without the persist/re-adopt this bridge never observes.
+        let (_live, tail_before) = scope_counts(&rt, MODEL, s1)
+            .await
+            .expect("scope counts before compaction");
+        assert!(tail_before > 0, "sanity: a tail must exist above s1");
+        let s2 = s1 + tail_before;
+        raise_watermark(&rt, MODEL, s2)
+            .await
+            .expect("raise registry watermark past bridge watermark");
+        compact_log(&rt, MODEL).await.expect("compact log");
+
+        let outcome = fresh_tail_leg(&rt, &ann, &key, MODEL, Some(s1)).await;
+        assert!(
+            matches!(outcome, FreshTailOutcome::Skipped),
+            "a bridge watermark behind the registry minimum, with the log \
+             compacted past it and no re-persisted segment to re-resolve to, \
+             must refuse to serve an unprovable tail instead of silently \
+             returning an incomplete merge"
+        );
+    }
+
+    /// Registration precondition: absent a durable registry row for this
+    /// consumer, the leg must not trust `S = 0` as an entire-scope tail (a
+    /// registered peer consumer may have already compacted rows this one
+    /// never saw) — it registers at 0 and sits out the query.
+    #[tokio::test]
+    #[serial(adr118_fresh_tail)]
+    async fn fresh_tail_leg_skips_and_reregisters_when_consumer_row_absent() {
+        const MODEL: &str = "adr118-registration-precondition-test-model";
+        const DIMS: usize = 8;
+        let rt = test_runtime_with_hash_embedder(MODEL, DIMS);
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+
+        rt.create_note_with_decay_for_embedding_model(
+            &token,
+            "memory",
+            None,
+            "registration precondition seed note",
+            Some(0.7),
+            0.01,
+            None,
+            vec![],
+            None,
+        )
+        .await
+        .expect("create seed note");
+
+        let ann = new_shared();
+        let key = AnnKey::from_token(MODEL);
+        ensure_ann_for_model(&rt, &token, &ann, MODEL)
+            .await
+            .expect("warm");
+        let s = bridge_applied_seq(&ann, &key)
+            .await
+            .expect("bridge watermark");
+
+        // Delete this consumer's durable registry row directly, simulating a
+        // process that has never registered (or whose row was reset).
+        {
+            let sql = rt.sql();
+            let mut w = sql.writer().await.expect("writer");
+            w.execute(SqlStatement {
+                sql: "DELETE FROM ann_consumer_watermark \
+                      WHERE consumer = ?1 AND namespace = ?2 AND embedding_model = ?3"
+                    .into(),
+                params: vec![
+                    SqlValue::Text(ANN_CONSUMER.into()),
+                    SqlValue::Text(ANN_WILDCARD_NS.into()),
+                    SqlValue::Text(MODEL.into()),
+                ],
+                label: Some("test_delete_consumer_watermark_row".into()),
+            })
+            .await
+            .expect("delete registry row");
+        }
+        assert!(
+            read_own_watermark(&rt, MODEL)
+                .await
+                .expect("read watermark")
+                .is_none(),
+            "sanity: the registry row must be gone before the leg runs"
+        );
+
+        let outcome = fresh_tail_leg(&rt, &ann, &key, MODEL, Some(s)).await;
+        assert!(
+            matches!(outcome, FreshTailOutcome::Skipped),
+            "the exact leg must sit out a query when this consumer's durable \
+             registration row is absent"
+        );
+        assert_eq!(
+            read_own_watermark(&rt, MODEL)
+                .await
+                .expect("read watermark"),
+            Some(0),
+            "the leg must re-register this consumer at watermark 0 before \
+             sitting out the query"
         );
     }
 }

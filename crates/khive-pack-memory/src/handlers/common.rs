@@ -1312,10 +1312,27 @@ async fn collect_model_ann_hits_inner(
     };
 
     if model_ann_timed_out {
-        // Do not replace a bounded timeout with an O(corpus) exact scan.
+        // No serving index is available for this model within the bounded
+        // wait. Rather than replace it with an O(corpus) exact scan, ADR-118
+        // §3's second tier guarantees visibility of the newest
+        // rebuild-threshold-sized suffix of writes while FTS covers the rest.
+        let tail_ops = match ann::fresh_tail_leg(runtime, ann, &key, &model_name, None).await {
+            ann::FreshTailOutcome::Merged(ops) => ops,
+            ann::FreshTailOutcome::Skipped => Vec::new(),
+        };
+        let merged = ann::merge_fresh_tail(Vec::new(), &vec, tail_ops);
+        let hits: Vec<VectorSearchHit> = merged
+            .into_iter()
+            .enumerate()
+            .map(|(idx, (uuid, score))| VectorSearchHit {
+                subject_id: uuid,
+                score: khive_score::DeterministicScore::from_f64(score as f64),
+                rank: (idx + 1) as u32,
+            })
+            .collect();
         return Ok(PerModelAnnHits {
             model_name,
-            hits: Vec::new(),
+            hits,
             degraded: true,
             used_sqlite_vec_fallback: false,
         });
@@ -1393,6 +1410,21 @@ async fn collect_model_ann_hits_inner(
                 }
             }
         }
+
+        // ADR-118: merge the fresh-tail exact leg into this model's warm-ANN
+        // candidates before fusion. The watermark is read adjacent to the
+        // search that produced `best_raw` to minimize the window for a
+        // concurrent bridge swap; a swap widening the window only makes the
+        // tail scan more conservative (wider), never less complete.
+        let applied_seq = ann::bridge_applied_seq(ann, &key).await;
+        let tail_ops = match applied_seq {
+            Some(s) => match ann::fresh_tail_leg(runtime, ann, &key, &model_name, Some(s)).await {
+                ann::FreshTailOutcome::Merged(ops) => ops,
+                ann::FreshTailOutcome::Skipped => Vec::new(),
+            },
+            None => Vec::new(),
+        };
+        let best_raw = ann::merge_fresh_tail(best_raw, &vec, tail_ops);
 
         tracing::debug!(
             model = %model_name,
