@@ -31,8 +31,9 @@ predicate, the ADR-018 amendment, and `session.search` itself)
 [ADR-117](ADR-117-session-continuity-search.md) is a direction ADR. It fixes four requirements that
 this follow-on carries with proof: message identity must be tenant-scoped (D2), tenant isolation must
 be fail-closed and enforced where rows exist (D4), and the `session.search` verb (D1) does not ship
-until both are proven in the same change. This ADR delivers the schema migration, the enforcement
-predicate, the ADR-018 amendment, the verb, and the two tests — as one PR.
+until both are proven in the same change. This ADR fixes that contract; the implementation PR it
+gates carries the schema migration, the enforcement predicate, the ADR-018 amendment, the verb, and
+the two tests as one change.
 
 Three source facts set the mechanism:
 
@@ -87,8 +88,8 @@ session.search(query, limit?, since?, source?, cwd?)
   ADR-117c bridges back to `resume`/`export`.
 
 `session.search` is registered but its handler refuses to serve unless the D2 migration and the D4
-predicate are present — it does not ship as a searchable surface before this PR's enforcement lands
-(the ADR-117 D1 hard gate, discharged here).
+predicate are present — it does not ship as a searchable surface before the implementation PR's
+enforcement lands (the ADR-117 D1 hard gate, specified here).
 
 ### D2 — Scoped-identity migration
 
@@ -99,11 +100,24 @@ A pack-level migration (a versioned step in the session pack's schema evolution,
    `sessions` and `session_messages` to the deployment's local default namespace (ADR-007), then make
    the column `NOT NULL`. Existing single-tenant local data lands under the local scope; no row is
    dropped.
-2. **Add the scoped uniqueness contract.** Uniqueness becomes tenant-scoped, per ADR-117 D2:
-   - `sessions`: `UNIQUE(namespace, provider_session_id)`.
-   - `session_messages`: `UNIQUE(namespace, session_id, id)` — the `(account, provider_session_id, event)`
+2. **Rebuild the key shape so the scoped identity is the operative key.** The scoped uniqueness contract
+   is unreachable while the bare provider-id primary key survives: two accounts ingesting the same provider
+   id collide on the `PRIMARY KEY` before any scoped `UNIQUE` can operate. Today **both** tables key on the
+   bare provider id — `session_messages.id` is the provider event id, and `sessions.id` is populated from
+   the same value as `provider_session_id` (`crates/khive-pack-session/src/mirror/ingest.rs`,
+   `INSERT INTO sessions (id, provider_session_id, …) VALUES(?1, ?1, …)`), so both need the treatment, not
+   just `session_messages`. The migration therefore changes the key shape: the bare provider-id primary key
+   **does not survive** on either table, and each row is keyed by its scoped identity — a composite primary
+   key over the scoped tuple, or a rowid surrogate primary key with the scoped `UNIQUE` as the sole
+   operative identity:
+   - `sessions`: scoped identity `(namespace, provider_session_id)`.
+   - `session_messages`: scoped identity `(namespace, session_id, id)` — the `(account, provider_session_id, event)`
      contract, where `namespace` is the account, `session_id` ties the event to its transcript, and `id`
-     is the provider event id. Two accounts producing the same provider event id no longer collide.
+     is the provider event id.
+
+   Because the provider id is no longer a key by itself on either table, two accounts producing the same
+   provider id no longer collide — the non-collision claim is now reachable rather than blocked by the
+   surviving bare primary key.
 3. **Add a content-hash adjunct — not the identity.** Add `content_hash TEXT` on `session_messages`
    (a hash of the parsed text plus raw line). Per ADR-117 D2 this is a **dedup / integrity adjunct on the
    scoped id, never the id**: it detects whether an idempotent re-stream of the same scoped event carries
@@ -113,11 +127,13 @@ A pack-level migration (a versioned step in the session pack's schema evolution,
 4. **Embedding-ready.** The scoped per-event id plus the content hash make a later vector backfill
    (ADR-117 D2, gated on khive#1121) idempotent and re-runnable. No embedding is written in v1.
 
-The migration preserves every existing row and provider event id and keeps the mirror's re-stream
-idempotency intact under the new scoped key. Enforcing `NOT NULL` and the new uniqueness constraint over
-existing rows is a table rebuild under SQLite (create-scoped, copy, swap), backfilled in the same step —
-the mechanics are the implementation's; the contract fixed here is the scoped uniqueness key, the
-non-null tenant scope, and the content-hash adjunct.
+The migration preserves every existing row and every provider id **value** — the provider id survives as a
+column, no longer as the bare primary key — and keeps the mirror's re-stream idempotency intact under the
+new scoped key. Changing the key shape, enforcing `NOT NULL`, and adding the scoped uniqueness over existing
+rows is a table rebuild under SQLite (create-scoped, copy, swap), backfilled in the same step; the SQLite
+mechanics are the implementation's, but the contract fixed here is that the bare provider-id primary key does
+not survive, the scoped identity is the operative key on both tables, the tenant scope is non-null, and the
+content hash is an adjunct that is never the identity.
 
 ### D4 — Fail-closed tenant-isolation predicate at the handler seam
 
@@ -138,10 +154,16 @@ amendment landing first.
    a filter a caller or a policy could omit.
 3. **Fail-closed by construction: no scope → no rows.** `session.search` requires a positive tenant
    scope to execute. If the request yields no resolved scope, the handler refuses (returns
-   `PermissionDenied`) rather than running an unscoped query. This is what makes ADR-018's fail-open
-   default non-leaking here: even if the Gate errored and failed open (allowed the verb), the handler still
-   cannot produce cross-tenant rows, because fail-open yields no authenticated scope and no scope yields a
-   refusal, not a widened query.
+   `PermissionDenied`) rather than running an unscoped query. Two properties then hold, and the boundary
+   between them is the point of this ADR. First, **non-widenability**: the query is never emitted without
+   the scope term, so no caller argument and no failed Gate can broaden it. Second, **the regime split for
+   ADR-018's fail-open default**: on the single-principal local socket the request identity is trusted by
+   socket ownership, the minted scope is the caller's own, and fail-open cannot cross tenants because there
+   is only one. On a shared or hosted socket the frame namespace is caller-supplied and forgeable, so a
+   positive-but-forged scope is possible — authenticating that scope is exactly what ADR-096's deferred
+   connection-identity mechanism provides. This ADR makes the predicate non-widenable and fail-closed on an
+   absent scope by construction, so it is already correct the moment that mechanism lands; it does not
+   itself authenticate a shared-socket scope, and does not claim to.
 
 **Authentication of the scope is deployment-regime-specific, and this ADR composes with ADR-096 rather
 than re-solving it.** On the single-principal `0600` socket the scope is trusted by socket-uid, and
@@ -184,17 +206,28 @@ Per ADR-117 D4's hard condition, isolation is a property proven by test, in the 
    property, exercised directly. A companion assertion drives the Gate-failed-open path (an
    `AllowAllGate`-equivalent allow with no scope) and confirms the handler still refuses.
 
-Both tests ship in this PR alongside the migration and the predicate. `session.search` does not become a
-searchable surface until they pass.
+Both tests ship in the implementation PR alongside the migration and the predicate, and they gate that
+implementation merge: `session.search` does not become a searchable surface until they pass. Per ADR-117's
+capability-consumption rule, availability additionally waits on the surrounding slices ADR-117 makes
+mandatory being live: ADR-117b (deletion), so a deleted transcript cannot surface in results, and
+ADR-117c (the resume/export continuity bridge), so every hit satisfies ADR-117 D6 — a search result that
+cannot be reopened or exported is not a deliverable surface. The tests gate the implementation merge;
+those two contracts gate the surface becoming reachable. And multi-principal or hosted exposure of
+`session.search` additionally waits on the ADR-096 connection-identity mechanism being live: an
+unauthenticated shared-socket scope must never become a reachable search surface, so satisfying ADR-117b
+and ADR-117c on a single-principal deployment does not by itself authorize hosted exposure.
 
 ---
 
 ## Consequences
 
-**Delivered.** A tenant-scoped mirror identity (scoped uniqueness + content-hash adjunct, embedding-ready);
-a `session.search` verb whose every query is scope-bound by construction; a fail-closed handler seam that
-does not leak under ADR-018's fail-open default; an ADR-018 amendment naming the fail-closed verb class; and
-the isolation + no-scope-refusal tests that prove it. This discharges ADR-117 D1/D2/D4 with proof at source.
+**Contract fixed here; delivered when the implementation PR lands.** A tenant-scoped mirror identity
+(scoped uniqueness + content-hash adjunct, embedding-ready); a `session.search` verb whose every query is
+scope-bound by construction; a non-widenable, fail-closed-on-absent-scope handler seam (single-principal-safe
+now, with shared-socket scope authentication composing with ADR-096's deferred connection-identity, not
+re-solved here); an ADR-018 amendment naming the fail-closed verb class; and the isolation + no-scope-refusal
+tests that prove it. This ADR fixes that contract to discharge ADR-117 D1/D2/D4; the implementation PR gated
+on it carries the code and tests that make it live, with proof at source.
 
 **Not delivered here.** Deletion and retention across the derived surfaces (ADR-117b); the resume/export
 continuity bridge for a hit's identity (ADR-117c); cross-machine ingestion (ADR-117d); and any vector signal
@@ -216,10 +249,12 @@ and khive#1121 are the cost levers.
 
 ## Alternatives considered
 
-**A new surrogate id column as the scoped identity.** Rejected as unnecessary churn: the existing nullable
-`namespace` column is the latent tenant scope, and promoting it (backfill → `NOT NULL` → into the uniqueness
-key) is a smaller, backfillable migration than introducing and populating a surrogate key while retaining the
-provider event id for re-stream idempotency.
+**A new column for the tenant scope, separate from `namespace`.** Rejected as unnecessary churn: the existing
+nullable `namespace` column is the latent tenant scope, and promoting it (backfill → `NOT NULL` → into the
+scoped identity) is a smaller, backfillable migration than introducing and populating a second scoping column.
+This is distinct from the key-shape rebuild in D2, which may use a rowid surrogate **primary key** — there the
+tenant scope is still `namespace`; the surrogate only carries the SQLite primary-key mechanics while the scoped
+tuple remains the sole operative identity.
 
 **Content-hash message identity.** Rejected per ADR-117 D2: it collides identical messages across tenants and
 collapses legitimate repeated events. Retained as an integrity/dedup adjunct on the scoped id only.
