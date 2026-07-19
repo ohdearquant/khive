@@ -724,22 +724,30 @@ question (Inventory item 4) remains unverified precisely there.
   `KHIVE_TX_WARN_SECS` (plus one removal on clean shutdown and on the first tick
   after the condition clears) — quiet processes write nothing, so steady-state
   filesystem traffic is zero. On a TRUNCATE no-progress event, the daemon
-  enumerates the sidecar directory, discards entries whose PID is no longer
-  alive, and logs every live report alongside its existing no-progress WARN. The
+  enumerates the sidecar directory and applies a two-test liveness gate (gate
+  ruling, 2026-07-19): an entry is live only if its PID is alive **and** its
+  `updated_at` falls within roughly 3 session sweep intervals (the sidecar
+  refreshes `updated_at` on every sweep tick while the warn condition persists,
+  so a stale timestamp means a crashed process's orphan file or a reused PID —
+  `started_at` remains the identity cross-check). Entries failing either test
+  are **deleted** during enumeration, not merely skipped, so orphan files cannot
+  accumulate or false-attribute. The daemon logs every live report alongside its
+  existing no-progress WARN. The
   next recurrence therefore names the pinning process directly — or, if the WAL
   is pinned while no sidecar reports an old span, yields the sharper conclusion
   that the pin is an unregistered/native mechanism (`vec0` cursor, or a span the
   registry does not cover) in one of the live PIDs, which is exactly the
   fork needed to justify or reject the deferred route-reads-through-the-daemon
   alternative with evidence.
-- **Plank C (optional, gate may strike): WAL-index read-mark depth probe.** On a
-  TRUNCATE no-progress event, additionally report how far behind the oldest
-  reader mark sits (frames pinned behind the boundary), derived from the shm
-  WAL-index. This quantifies pin depth even when no process self-reports.
-  Flagged optional because the WAL-index layout is an SQLite implementation
-  detail; if a stable probe (e.g. an additional `PRAGMA wal_checkpoint(PASSIVE)`
-  return-column analysis, which already yields `log` vs `checkpointed` counts)
-  provides equivalent signal, prefer that and drop shm parsing entirely.
+- **Plank C: pin-depth probe via `PRAGMA wal_checkpoint(PASSIVE)` return
+  columns.** On a TRUNCATE no-progress event, additionally run
+  `PRAGMA wal_checkpoint(PASSIVE)` and report pin depth as `log` minus
+  `checkpointed` from its 3-column return row — the number of frames pinned
+  behind the backfill boundary. Equivalent signal to reader-mark introspection
+  with zero dependence on SQLite's shm WAL-index layout, and PASSIVE never
+  blocks readers or writers. The draft's alternative of parsing the shm
+  WAL-index directly was struck at the spec gate (2026-07-19) as
+  implementation-detail-fragile; do not ship shm parsing.
 
 **Deployment-shape note.** The hosted khive-cloud topology is single-process:
 the in-process registry already sees every span there, and this amendment adds
