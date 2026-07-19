@@ -34,7 +34,7 @@ contract: ADR-017's `PackEventConsumer` reads the event log through the cursor s
 specified by [ADR-022](ADR-022-events-query-surface.md). A
 second at-least-once delivery mechanism would duplicate that authority.
 
-## Teardown: assumptions tested before the decision
+## Assumptions examined
 
 1. **“Three planes are needed now.” — Refuted.** Current failures need a host-owned
    supervisor around existing loops. They do not require a pack-trait extension or a
@@ -130,6 +130,31 @@ A shutdown timeout MAY abort the task after cooperative cancellation. If fault i
 cannot keep a hung component inside the shutdown SLO without starving unrelated work,
 the component MUST move behind a watchdog subprocess before adoption.
 
+### Shutdown handoff from the daemon runtime
+
+The registry does not invent a shutdown path; it joins the one the daemon already has.
+ADR-106 (decision point 1a and Amendment B) fixes the contract this section composes
+with: the daemon folds `SIGTERM`/`SIGINT` detection into a single shutdown future ahead
+of `drain()`, and `drain()` awaits tasks registered through the runtime's
+`track_background_task` helper.
+
+Normative ordering:
+
+1. The registry's supervisor task MUST be registered through `track_background_task`
+   (or the equivalent tracked-task mechanism), so `drain()` cannot complete while the
+   registry is alive.
+2. When the daemon's unified shutdown future resolves, the runtime MUST invoke registry
+   shutdown before or concurrently with `drain()`: cooperatively cancel every component,
+   then join each with a wait bounded by that component's `shutdown_timeout`, aborting
+   the task on expiry.
+3. Registry shutdown completes within the `drain()` wait; socket and PID cleanup happen
+   only after `drain()` returns, exactly as today.
+
+A component that ignores cancellation is therefore bounded by its own
+`shutdown_timeout`, and the daemon's total shutdown latency is bounded by the maximum
+component timeout plus the existing drain behavior. No component may register a
+shutdown path outside this handoff.
+
 ### Reference migration: ADR-106 schedule drain
 
 The schedule tick becomes the reference first registry consumer. This is a lifecycle
@@ -146,6 +171,50 @@ refactor, not a change to schedule semantics:
 - The registry replaces the bare `tokio::spawn` with tracked cancellation and bounded
   shutdown, closing ADR-106 Acceptance Criterion 5. It does not claim to satisfy the
   unimplemented `DaemonDispatch::drain_pending_events` seam in Criteria 6 and 7.
+
+### Error and restart mapping for the schedule component
+
+The registry contract above is abstract; the reference migration fixes the concrete
+mapping so its required tests are determinate. ADR-106 already distinguishes drain-level
+failures from per-event action failures; this section maps that boundary onto the
+component contract:
+
+| Outcome at the component boundary                                     | Classification                                                                       | Restart                    | Budget       | Health                                                                 |
+| --------------------------------------------------------------------- | ------------------------------------------------------------------------------------ | -------------------------- | ------------ | ---------------------------------------------------------------------- |
+| Per-event action failure (dispatch error, action-level timeout)       | Absorbed by the drain per ADR-106; recorded on the event row; NOT a `ComponentError` | none                       | not consumed | unchanged                                                              |
+| Drain-level failure (database unavailable, backend/config resolution) | `ComponentError` (retryable)                                                         | `OnFailure`, after backoff | consumed     | `Degraded` (carries last-error)                                        |
+| Panic / join error                                                    | `ComponentError` (retryable)                                                         | `OnFailure`, after backoff | consumed     | `Degraded`                                                             |
+| Cooperative cancellation                                              | clean stop                                                                           | none                       | not consumed | terminal `Stopped`                                                     |
+| Clean completion (loop exits without error outside shutdown)          | clean stop                                                                           | none                       | not consumed | terminal `Stopped`; MAY warn — the tick loop is not expected to finish |
+| Budget exhausted                                                      | —                                                                                    | none                       | —            | terminal `Unhealthy`; MUST NOT hot-loop                                |
+
+Budget-reset policy: the default is no automatic reset within a daemon process lifetime
+— the budget spans the process, and a daemon restart resets it. A time-windowed reset
+(restart intensity over a sliding period) MAY be adopted later, but it is an explicit
+implementation decision, not an assumed default.
+
+### Scheduled-action identity
+
+The component factory capturing a daemon-held `KhiveMcpServer` makes the replay
+identity contract normative content of this ADR: without it, the capture this ADR
+blesses is a confused-deputy seam. Generic scheduled actions (`schedule.schedule`)
+MUST replay under the creator's authenticated actor identity, not the daemon's own
+identity. Concretely:
+
+- The creator's authenticated actor MUST be persisted on the scheduled event at
+  schedule time.
+- Replay MUST dispatch with that persisted actor as the request identity, so any policy
+  gate evaluates the creator's authority, never the daemon's. A caller MUST NOT be able
+  to schedule an action the caller is denied but the daemon is allowed to perform.
+- Stored rows without a persisted creator identity MUST fail closed — the event
+  transitions to its failure state with a policy error and is never dispatched under
+  the daemon identity — unless a separate, explicit migration policy is adopted for
+  them.
+
+The current replay path predates this ADR and does not carry a creator identity; that
+is a defect this ADR surfaces, not one it introduces. The registry migration MUST NOT
+ship with the identity gap intact: the identity contract is an acceptance criterion
+below.
 
 Email, session-mirror, ANN, and checkpoint loops MAY migrate only after the schedule
 reference proves the registry contract. Their migrations MUST preserve their existing
@@ -272,11 +341,18 @@ In addition, ADR-119 is accepted only when:
 2. The ADR-106 schedule drain runs through the registry without semantic or wire changes.
 3. Tests cover clean completion, retryable error, permanent error, panic, poison input,
    cancellation, shutdown timeout, budget exhaustion, and independent-component
-   progress during another component's failure.
+   progress during another component's failure, each classified per the error and
+   restart mapping above.
 4. A production-shaped shutdown test proves the schedule component meets the selected
-   SLO, or Acceptance Criterion 2 selects process isolation.
+   SLO through the normative shutdown handoff (registry supervisor tracked, cancel-all,
+   bounded join inside the drain wait), or Acceptance Criterion 2 selects process
+   isolation.
 5. Golden compatibility tests prove identical `tools/list`, request parsing, and legacy
    stdio bytes.
+6. Generic scheduled-action replay dispatches under the persisted creator actor; a test
+   proves a caller cannot schedule an action the caller is denied but the daemon is
+   allowed to perform; stored rows without a creator identity fail closed or follow a
+   documented migration policy.
 
 ADR-079 Amendment 1's daemon-resource reference is corrected from issues #1126/#1127 to
 issues #1127/#1129 in the change that introduces this ADR; issue #1126 is cited here
@@ -299,6 +375,8 @@ solely as the email poison-message supervision incident.
   `tools/list`, or legacy stdio bytes.
 - Add an MCP resource, subscription, notification, event topic, or public health verb.
 - Treat restart as correctness recovery for work that has not committed durable state.
+- Dispatch a stored scheduled action under the daemon's own identity; replay carries the
+  persisted creator actor or fails closed.
 - Put blocking or unbounded work on async runtime workers.
 - Claim that supervision fixes issue #1127's scan complexity.
 - Claim complexity, memory, latency, or load benefits without measurement.
