@@ -750,20 +750,44 @@ question (Inventory item 4) remains unverified precisely there.
   directory — note that a daemon-side refusal is itself a sidecar-health
   failure and must not masquerade as evidence). To keep the
   zero-steady-state-traffic property while making the two distinguishable,
-  each process writes a **one-time registration beacon** at sidecar
-  initialization (a per-PID marker written once, under the same trust-boundary
-  and liveness rules as heartbeats — not per-tick). Enumeration then classifies
-  every live database-holding PID three ways: **reporting** (heartbeat present
-  and live), **registered-silent** (beacon present, no heartbeat — the process
-  affirmatively has no over-threshold span), and **unknown** (no beacon — the
-  sidecar's health is unestablished; states: disabled, pre-feature binary,
-  write-failed, or refused). Only a pin observed while every live PID is
+  each process writes a **registration beacon** at sidecar initialization (a
+  per-PID marker whose content is written once and thereafter only
+  timestamp-refreshed per the beacon refresh rule below, under the same
+  trust-boundary and liveness rules as heartbeats). The census universe is authoritative and
+  OS-derived, never sidecar-derived: the set of live database-holding PIDs is
+  established by enumerating the processes that hold the database file open at
+  the OS level (the same observation that produced the topology count above),
+  and sidecar states are then mapped onto that universe. The sidecar directory
+  alone cannot define the universe — a database holder that never wrote a
+  beacon would be invisible to a sidecar-only census, and the any-unknown rule
+  below could never fire for exactly the PIDs it exists to catch. Enumeration
+  classifies every PID in the OS-derived census three ways: **reporting**
+  (heartbeat present and live), **registered-silent** (live beacon per the
+  refresh rule below, no heartbeat — the process affirmatively has no
+  over-threshold span), and **unknown** (no beacon, a stale beacon, or a
+  database holder absent from all sidecar data — the sidecar's health is
+  unestablished; states: disabled, pre-feature binary, write-failed, refused,
+  or wedged after initialization). Only a pin observed while every live PID is
   reporting or registered-silent licenses the sharper conclusion that the pin
   is an unregistered/native mechanism (`vec0` cursor, or a span the registry
   does not cover) — the fork needed to justify or reject the deferred
   route-reads-through-the-daemon alternative with evidence. Any `unknown` PID
   makes the attribution inconclusive, and the daemon's WARN names the unknown
   PIDs as the reason.
+
+  _Beacon refresh rule._ Registration at initialization alone never licenses
+  `registered-silent`: the beacon proves the sidecar initialized once, not that
+  it still functions, and a wedged process whose sweep task has died would
+  otherwise hold the pin with exactly the beacon-present/heartbeat-absent
+  signature that the sharper conclusion trusts. `registered-silent` therefore
+  requires ongoing sidecar liveness: each sweep tick performs a metadata-only
+  refresh of the beacon (a timestamp touch of the existing per-PID marker — no
+  data write, preserving the zero-steady-state-data-traffic property), and
+  classification accepts a beacon only when its refresh timestamp falls within
+  the same roughly-3-sweep-interval freshness window and the owning PID passes
+  the same identity gate as heartbeats. A stale beacon — and likewise any PID
+  whose heartbeat was deleted as stale during enumeration — classifies as
+  `unknown`, never `registered-silent`.
 
   _Sidecar filesystem trust boundary (gate ruling, 2026-07-19)._ The sidecar
   path is predictable, so in a shared or attacker-writable database directory a
@@ -776,6 +800,16 @@ question (Inventory item 4) remains unverified precisely there.
   temporary file followed by atomic rename over the target, never an in-place
   open of a possibly-attacker-placed path; enumeration validates per-entry
   ownership and refuses symlinks before reading or deleting anything.
+  Validation binds to an opened handle, not a path: in the attacker-writable
+  directory this contract assumes, a path component swapped between a
+  path-based validation and the subsequent operation would redirect renames or
+  deletions outside the sidecar. The sidecar root is therefore opened once
+  with `O_DIRECTORY | O_NOFOLLOW`, its ownership and mode validated on that
+  file descriptor, and every subsequent create, rename, unlink, and
+  enumeration read performed relative to that descriptor (`openat` /
+  `renameat` / `unlinkat` semantics) — the path is never re-resolved per
+  operation, and parent components must resolve without traversing a symlink
+  at open time.
 - **Plank C: pin-depth probe via `PRAGMA wal_checkpoint(PASSIVE)` return
   columns.** On a TRUNCATE no-progress event, additionally run
   `PRAGMA wal_checkpoint(PASSIVE)` and report pin depth as `log` minus
