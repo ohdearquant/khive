@@ -86,7 +86,12 @@ lexically, the FTS leg corroborates it exactly as it would for an indexed note.
 
 Mixed precision is accepted: exact hits carry full-precision similarity while ANN hits carry
 the index's quantized approximation. Both orderings are consumed as ranks by fusion; the
-within-leg orderings are individually correct, which is all rank fusion requires.
+within-leg orderings are individually correct, which is all rank fusion requires. The named
+accepted risk (gate ruling, 2026-07-19): interleaving full-precision and quantized scores in
+one re-sorted list means quantization bias can systematically misorder fresh-vs-indexed hits
+near ties. This is bounded and accepted; if it shows up in practice, the remedy is
+full-precision re-scoring of the ANN candidates within the merge window — explicitly a
+scoring refinement inside the leg, never a fusion change.
 
 ### 3. Cost bound and the no-index case
 
@@ -96,14 +101,19 @@ The exact leg is O(|tail| × dims) per model per query. The tail is small by con
   steady-state tail is the writes since the last checkpoint.
 - The rebuild threshold (`KHIVE_ANN_REBUILD_THRESHOLD`, default 0.20) caps how long a tail
   can grow relative to the live corpus before a full rebuild is already in flight. A tail at
-  the threshold on a 68k-row corpus is ~13.6k exact comparisons — comfortably sub-millisecond
-  work per model — and that is the pathological ceiling, not the steady state.
+  the threshold on a 68k-row corpus is ~13.6k exact comparisons. The similarity arithmetic at
+  that ceiling is sub-millisecond, but the dominant cost there is the ~13.6k embedding-row
+  point-reads per model, which is not — the honest bound at the pathological ceiling is the
+  point-read I/O, and it applies only while a full rebuild is already in flight. The
+  steady-state tail (writes since the last checkpoint) is small enough that both terms are
+  negligible, and the steady state is the case the leg exists for.
 
 When no ANN index is serving at all (Cold rebuild in flight, or Empty classification), the
 watermark is 0 and the tail is the entire scope. The exact leg does **not** absorb that case:
-it caps its scan at the threshold-sized tail and otherwise defers to the existing Cold-path
-behavior (FTS-only serving while the rebuild runs). The leg restores freshness on a serving
-index; it is not a general exact-search fallback.
+it caps its scan at the threshold-sized tail, taking the highest-seq suffix of the log (the
+newest writes) so the freshest writes stay visible while FTS covers the rest, and otherwise
+defers to the existing Cold-path behavior (FTS-only serving while the rebuild runs). The leg
+restores freshness on a serving index; it is not a general exact-search fallback.
 
 No new tuning knob is introduced. One escape hatch is added for operational isolation:
 `KHIVE_ANN_FRESH_TAIL=0` disables the exact leg (default enabled). Values other than `0`
