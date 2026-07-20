@@ -61,4 +61,4 @@ it into `khive-mcp` would require adding the force-link `pub use` in
 
 ## License
 
-Apache-2.0.
+BUSL-1.1. See the repository [LICENSE](https://github.com/ohdearquant/khive/blob/main/LICENSE).

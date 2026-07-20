@@ -1,5 +1,3 @@
-// Copyright 2026 Haiyang Li. Licensed under Apache-2.0.
-//
 //! JSON array format adapter.
 
 use crate::adapter::FormatAdapter;

@@ -15,14 +15,14 @@ description = "Knowledge verb pack — lore corpus (atoms/domains), TF-IDF retri
 bench = false
 
 [dependencies]
-khive-types = { version = "0.5.0", path = "../khive-types", features = ["serde"] }
-khive-brain-core = { version = "0.5.0", path = "../khive-brain-core" }
-khive-runtime = { version = "0.5.0", path = "../khive-runtime" }
-khive-storage = { version = "0.5.0", path = "../khive-storage" }
-khive-fold = { version = "0.5.0", path = "../khive-fold" }
-khive-fusion = { version = "0.5.0", path = "../khive-fusion" }
-khive-score = { version = "0.5.0", path = "../khive-score" }
-khive-vamana = { version = "0.5.0", path = "../khive-vamana" }
+khive-types = { version = "0.6.0", path = "../khive-types", features = ["serde"] }
+khive-brain-core = { version = "0.6.0", path = "../khive-brain-core" }
+khive-runtime = { version = "0.6.0", path = "../khive-runtime" }
+khive-storage = { version = "0.6.0", path = "../khive-storage" }
+khive-fold = { version = "0.6.0", path = "../khive-fold" }
+khive-fusion = { version = "0.6.0", path = "../khive-fusion" }
+khive-score = { version = "0.6.0", path = "../khive-score" }
+khive-vamana = { version = "0.6.0", path = "../khive-vamana" }
 inventory = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
@@ -34,9 +34,9 @@ chrono = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
-khive-pack-kg = { version = "0.5.0", path = "../khive-pack-kg" }
-khive-pack-brain = { version = "0.5.0", path = "../khive-pack-brain" }
-khive-storage = { version = "0.5.0", path = "../khive-storage" }
+khive-pack-kg = { version = "0.6.0", path = "../khive-pack-kg" }
+khive-pack-brain = { version = "0.6.0", path = "../khive-pack-brain" }
+khive-storage = { version = "0.6.0", path = "../khive-storage" }
 tokio = { workspace = true, features = ["test-util"] }
 lattice-embed = { workspace = true }
 criterion = { workspace = true }

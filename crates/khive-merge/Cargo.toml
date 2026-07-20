@@ -5,21 +5,21 @@
 # [workspace.package] below declares the shared version for this standalone workspace.
 
 [workspace.package]
-version = "0.5.0"
+version = "0.6.0"
 
 [package]
 name = "khive-merge"
 version.workspace = true
 edition = "2021"
-authors = ["Ocean <ocean@lionagi.ai>"]
-license = "Apache-2.0"
+authors = ["Haiyang Li <quantocean.li@gmail.com>"]
+license = "BUSL-1.1"
 repository = "https://github.com/ohdearquant/khive"
 homepage = "https://github.com/ohdearquant"
 description = "KG three-way merge with conflict detection (ADR-039)"
 
 [dependencies]
-khive-runtime = { version = "0.5.0", path = "../khive-runtime" }
-khive-storage = { version = "0.5.0", path = "../khive-storage" }
+khive-runtime = { version = "0.6.0", path = "../khive-runtime" }
+khive-storage = { version = "0.6.0", path = "../khive-storage" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"

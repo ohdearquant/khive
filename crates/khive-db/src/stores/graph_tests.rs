@@ -1047,6 +1047,89 @@ async fn test_traverse_binary_tree_result_count() {
     }
 }
 
+/// ADR-091 Amendment 3 / design-note test plan "Traversal coverage test":
+/// the `graph_traverse_read` registration inside `traverse` (the long-lived
+/// deferred-read snapshot the whole design exists for) must carry the
+/// store's own pool origin, so it is visible through a `Secondary` filter
+/// scoped to THIS backend's identity and invisible through a `Main` filter
+/// scoped to a DIFFERENT backend's identity. Exercises the real
+/// `SqlGraphStore::traverse` call site rather than a hand-registered span —
+/// a wide root set (with real matching edges) forces the chunked traversal
+/// past `CHUNK_ROOTS` (400) more than once inside the single registered
+/// closure, giving the polling loop below a real window in which the span
+/// is observably open (registered before, dropped after, the whole chunked
+/// loop — see `traverse`'s doc comment).
+#[tokio::test]
+#[serial(tx_registry)]
+async fn graph_traverse_read_span_scoped_to_secondary_backend_visible_only_in_its_own_view() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("traverse_secondary_origin.db");
+    let pool_cfg = PoolConfig {
+        path: Some(path.clone()),
+        ..PoolConfig::default()
+    };
+    let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
+    {
+        let writer = pool.writer().unwrap();
+        writer.conn().execute_batch(GRAPH_DDL).unwrap();
+    }
+    let secondary_identity = match pool.origin() {
+        khive_storage::tx_registry::TxOrigin::Database(id) => id,
+        other => panic!("expected a file-backed pool to mint a Database origin, got {other:?}"),
+    };
+    let other_identity = khive_storage::tx_registry::DbIdentity::new(
+        pool.canonical_path()
+            .unwrap()
+            .with_file_name("unrelated-backend.db"),
+    );
+
+    let store = SqlGraphStore::new_scoped(Arc::clone(&pool), false, "default");
+    let roots: Vec<Uuid> = (0..900).map(|_| Uuid::new_v4()).collect();
+    let edges: Vec<Edge> = roots
+        .iter()
+        .map(|&root| make_edge(root, Uuid::new_v4(), EdgeRelation::Extends, 1.0))
+        .collect();
+    store.upsert_edges(edges).await.unwrap();
+
+    let request = TraversalRequest {
+        roots,
+        options: TraversalOptions::new(10).with_direction(Direction::Out),
+        include_roots: false,
+        include_properties: false,
+    };
+
+    let traverse_handle = tokio::spawn(async move { store.traverse(request).await });
+
+    let secondary_view =
+        khive_storage::tx_registry::TxOriginFilter::Secondary(secondary_identity.clone());
+    let main_view = khive_storage::tx_registry::TxOriginFilter::Main(other_identity);
+
+    let mut seen_via_secondary = false;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while std::time::Instant::now() < deadline && !traverse_handle.is_finished() {
+        if let Some(span) = khive_storage::tx_registry::oldest_for(&secondary_view) {
+            if span.label.as_deref() == Some("graph_traverse_read") {
+                seen_via_secondary = true;
+                assert!(
+                    khive_storage::tx_registry::oldest_for(&main_view).is_none(),
+                    "a secondary-origin graph_traverse_read span must never be visible \
+                     through a different backend's Main view"
+                );
+                break;
+            }
+        }
+        tokio::task::yield_now().await;
+    }
+
+    let result = traverse_handle.await.unwrap();
+    assert!(result.is_ok(), "traverse should succeed: {result:?}");
+    assert!(
+        seen_via_secondary,
+        "expected to observe a graph_traverse_read span through the secondary backend's own \
+         filtered view while the traversal's read transaction was open"
+    );
+}
+
 #[tokio::test]
 async fn test_metadata_roundtrip() {
     let store = setup_memory_store();

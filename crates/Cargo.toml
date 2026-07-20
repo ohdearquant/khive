@@ -48,13 +48,13 @@ exclude = ["khive-merge"]
 # keep this exclusion from members.
 
 [workspace.package]
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 # lattice-embed and lattice-fann 0.6 require Rust 1.93, setting the workspace MSRV.
 # The previous 1.91 floor came from floor_char_boundary use (issue #398).
 rust-version = "1.93.0"
-authors = ["Ocean <ocean@lionagi.ai>"]
-license = "Apache-2.0"
+authors = ["Haiyang Li <quantocean.li@gmail.com>"]
+license = "BUSL-1.1"
 repository = "https://github.com/ohdearquant/khive"
 homepage = "https://github.com/ohdearquant/khive"
 keywords = ["knowledge-graph", "semantic-search", "mcp", "ai-tools", "graph-database"]

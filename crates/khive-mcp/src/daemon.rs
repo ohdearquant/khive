@@ -397,6 +397,10 @@ impl daemon::DaemonDispatch for crate::server::KhiveMcpServer {
         self.pool()
     }
 
+    fn secondary_pools_for_checkpoint(&self) -> Vec<std::sync::Arc<khive_db::ConnectionPool>> {
+        self.secondary_pools()
+    }
+
     fn event_store_for_checkpoint(&self) -> Option<std::sync::Arc<dyn khive_storage::EventStore>> {
         self.event_store()
     }

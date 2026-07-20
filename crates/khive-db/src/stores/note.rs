@@ -759,9 +759,12 @@ impl NoteStore for SqlNoteStore {
         // connection. `with_writer_tx` rolls back on ANY error from `f`, on
         // both the flag-on (WriterTask, which wraps its own transaction) and
         // flag-off (pool-mutex) paths.
+        let origin = self.pool.origin();
         self.with_writer_tx("upsert_notes", move |conn| {
-            let _tx_handle =
-                khive_storage::tx_registry::register(Some("note_upsert_batch".to_string()));
+            let _tx_handle = khive_storage::tx_registry::register_scoped(
+                Some("note_upsert_batch".to_string()),
+                origin,
+            );
             batch_upsert_notes(conn, &notes, attempted)
         })
         .await

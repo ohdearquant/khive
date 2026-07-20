@@ -71,4 +71,4 @@ pack system should be accompanied by a new or updated ADR.
 
 ## License
 
-Contributions are accepted under the [Apache-2.0 license](LICENSE).
+This project is licensed under the [Business Source License 1.1](LICENSE). By submitting a contribution, you grant the Licensor a perpetual, irrevocable, worldwide, royalty-free license to use, reproduce, modify, distribute, sublicense, and relicense your contribution, including the right to license it commercially and to designate future Change Dates and Change Licenses for it under the Business Source License or any other license. You represent that you have the right to grant this license for your contribution.

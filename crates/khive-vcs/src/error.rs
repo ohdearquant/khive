@@ -1,5 +1,3 @@
-// Copyright 2026 Haiyang Li. Licensed under Apache-2.0.
-//
 //! Error types for the VCS layer.
 //!
 //! Remote-server and custom-push/pull error variants (`RemoteUnreachable`,

@@ -1,5 +1,3 @@
-// Copyright 2026 Haiyang Li. Licensed under Apache-2.0.
-//
 //! Entity-level three-way merge and field-level conflict analysis.
 //!
 //! See `crates/khive-merge/docs/api/entity-merge.md` for the decision table.
