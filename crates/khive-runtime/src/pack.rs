@@ -1021,6 +1021,19 @@ impl VerbRegistry {
         self.event_store.clone()
     }
 
+    /// Whether any loaded pack registers `verb`, at any visibility.
+    ///
+    /// Internal callers use this to skip optional cross-pack dispatches
+    /// (e.g. serving-profile resolution) when the providing pack is not in
+    /// the loaded set, instead of paying a failed dispatch plus its audit
+    /// write on every call.
+    pub fn has_verb(&self, verb: &str) -> bool {
+        self.packs
+            .iter()
+            .flat_map(|p| p.handlers().iter())
+            .any(|h| h.name == verb)
+    }
+
     /// Return the help schema envelope for a verb.
     ///
     /// Walks registered packs for the first matching `HandlerDef` and returns a

@@ -52,7 +52,7 @@ exclude = ["khive-merge"]
 [workspace.package]
 version = "0.6.0"
 edition = "2021"
-# lattice-embed and lattice-fann 0.6 require Rust 1.93, setting the workspace MSRV.
+# lattice-embed 0.6 requires Rust 1.93, setting the workspace MSRV.
 # The previous 1.91 floor came from floor_char_boundary use (issue #398).
 rust-version = "1.93.0"
 authors = ["Haiyang Li <quantocean.li@gmail.com>"]
@@ -83,10 +83,8 @@ async-trait = "0.1"
 clap = { version = "4.5", features = ["derive", "env"] }
 dotenvy = "0.15"
 lattice-embed = "0.6.0"
-lattice-fann = "0.6.0"
 parking_lot = "0.12"
 rand = "0.8"
-rand_distr = "0.4"
 toml = "0.8"
 regex = "1.10"
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }

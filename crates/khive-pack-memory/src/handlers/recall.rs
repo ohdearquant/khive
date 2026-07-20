@@ -821,21 +821,26 @@ impl MemoryPack {
         let token = token.clone();
 
         khive_runtime::track_background_task(async move {
-            let mut ledger_params = json!({
-                "namespace": namespace,
-                "consumer_kind": "recall",
-                "target_ids": target_ids,
-                "query_raw": query_raw,
-                "served_at": served_at_us,
-            });
-            if let Some(ref profile_id) = served_by_profile_id {
-                ledger_params["served_by_profile_id"] = json!(profile_id);
-            }
-            if let Err(error) = registry.dispatch("brain.record_serve", ledger_params).await {
-                tracing::warn!(
-                    error = %error,
-                    "serve ledger dispatch failed; recall result is unaffected"
-                );
+            // The serve ledger lives in the brain pack; without it loaded
+            // there is nothing to record, so skip the guaranteed-failed
+            // dispatch (and its per-recall warn) entirely.
+            if registry.has_verb("brain.record_serve") {
+                let mut ledger_params = json!({
+                    "namespace": namespace,
+                    "consumer_kind": "recall",
+                    "target_ids": target_ids,
+                    "query_raw": query_raw,
+                    "served_at": served_at_us,
+                });
+                if let Some(ref profile_id) = served_by_profile_id {
+                    ledger_params["served_by_profile_id"] = json!(profile_id);
+                }
+                if let Err(error) = registry.dispatch("brain.record_serve", ledger_params).await {
+                    tracing::warn!(
+                        error = %error,
+                        "serve ledger dispatch failed; recall result is unaffected"
+                    );
+                }
             }
 
             emit_recall_executed_event(
