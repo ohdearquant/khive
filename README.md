@@ -5,7 +5,7 @@ taxonomies, and a verb-consolidated MCP surface.
 
 [![CI](https://github.com/ohdearquant/khive/actions/workflows/ci.yml/badge.svg)](https://github.com/ohdearquant/khive/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/khive-mcp.svg)](https://crates.io/crates/khive-mcp)
-[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![License: BUSL-1.1](https://img.shields.io/badge/License-BUSL--1.1-blue.svg)](LICENSE)
 [![Docs](https://img.shields.io/badge/docs-ohdearquant.github.io%2Fkhive-0969da)](https://ohdearquant.github.io/khive/)
 [![Discord](https://img.shields.io/badge/Discord-join%20chat-5865F2?logo=discord&logoColor=white)](https://discord.gg/JDj9ENhUE8)
 
@@ -385,4 +385,12 @@ Ready for use with Claude Code and any MCP-compatible agent.
 
 ## License
 
-Apache 2.0. See [LICENSE](LICENSE).
+Business Source License 1.1. See [LICENSE](LICENSE).
+
+You may use, modify, and redistribute khive freely, including in production,
+with one restriction: offering khive itself to third parties as a competing
+hosted or embedded service requires a commercial license. On the Change Date
+(2030-07-20) each released version converts automatically to Apache 2.0.
+
+Versions through 0.5.x, as published to crates.io and npm, remain under
+Apache 2.0.

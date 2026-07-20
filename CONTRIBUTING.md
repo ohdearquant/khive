@@ -71,4 +71,4 @@ pack system should be accompanied by a new or updated ADR.
 
 ## License
 
-Contributions are accepted under the [Apache-2.0 license](LICENSE).
+Contributions are accepted under the [Business Source License 1.1](LICENSE); by contributing you agree your contribution is licensed to the Licensor under those terms.
