@@ -95,32 +95,54 @@ fn is_scp_shorthand(s: &str) -> bool {
 }
 
 /// Split `[user@]host:path` shorthand into `(host, path)`, or `None` when
-/// `s` doesn't have that shape. The host segment (whatever precedes the
-/// first `:`, minus any `user@` prefix) must contain no `/` -- this is what
-/// keeps a local path with an embedded colon, e.g. `local/path:with-colon`,
-/// from being misparsed as SCP shorthand: `local/path` fails the host check
-/// because of the `/`, so `scp_parts` returns `None` and the caller falls
-/// through to local-path handling.
-fn scp_parts(s: &str) -> Option<(&str, &str)> {
+/// `s` doesn't have that shape. A bracketed IPv6 host (`git@[::1]:path` or
+/// the bare `[::1]:path`) is handled by locating the `[...]` span and
+/// requiring the very next character to be `:` -- naively taking the first
+/// `:` in the string (as the plain-host branch below does) would land on a
+/// colon INSIDE the address instead of the host/path separator, which is
+/// what let a bracketed-IPv6 SCP origin fall through to `local:<path>`
+/// instead of converging with its remote slug (ADR-088 Amendment 2
+/// round-2 finding). For a plain (non-bracketed) host, the segment
+/// (whatever precedes the first `:`, minus any `user@` prefix) must
+/// contain no `/` -- this is what keeps a local path with an embedded
+/// colon, e.g. `local/path:with-colon`, from being misparsed as SCP
+/// shorthand: `local/path` fails the host check because of the `/`, so
+/// `scp_parts` returns `None` and the caller falls through to local-path
+/// handling.
+fn scp_parts(s: &str) -> Option<(String, &str)> {
     if s.starts_with('/') {
         return None;
     }
-    let colon = s.find(':')?;
-    let before_colon = &s[..colon];
-    let host = match before_colon.rfind('@') {
-        Some(at) => {
-            let user = &before_colon[..at];
-            if user.is_empty()
-                || !user
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
-            {
-                return None;
-            }
-            &before_colon[at + 1..]
-        }
-        None => before_colon,
+
+    let (user, rest) = match s.find('@') {
+        Some(at) => (Some(&s[..at]), &s[at + 1..]),
+        None => (None, s),
     };
+    if let Some(user) = user {
+        if user.is_empty()
+            || !user
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+        {
+            return None;
+        }
+    }
+
+    if let Some(inner) = rest.strip_prefix('[') {
+        let end = inner.find(']')?;
+        let host_inner = &inner[..end];
+        if host_inner.is_empty() {
+            return None;
+        }
+        let path = inner[end + 1..].strip_prefix(':')?;
+        if path.is_empty() {
+            return None;
+        }
+        return Some((format!("[{host_inner}]"), path));
+    }
+
+    let colon = rest.find(':')?;
+    let host = &rest[..colon];
     if host.is_empty()
         || host.contains('/')
         || !host
@@ -129,11 +151,11 @@ fn scp_parts(s: &str) -> Option<(&str, &str)> {
     {
         return None;
     }
-    let path = &s[colon + 1..];
+    let path = &rest[colon + 1..];
     if path.is_empty() {
         return None;
     }
-    Some((host, path))
+    Some((host.to_string(), path))
 }
 
 fn canonicalize_https_url(url: &str) -> String {
@@ -224,7 +246,9 @@ fn strip_port(host: &str) -> String {
 /// are preserved verbatim -- case-folding those risks collapsing two
 /// genuinely distinct repos on a case-sensitive host.
 pub fn remote_url_to_slug(url: &str) -> Option<String> {
-    let trimmed = url.trim().trim_end_matches('/');
+    let trimmed = url.trim();
+    let trimmed = strip_query_and_fragment(trimmed);
+    let trimmed = trimmed.trim_end_matches('/');
     let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
     if trimmed.is_empty() {
         return None;
@@ -239,7 +263,7 @@ pub fn remote_url_to_slug(url: &str) -> Option<String> {
     } else if let Some(rest) = trimmed.strip_prefix("ssh://") {
         split_host_path(rest)?
     } else if let Some((host, path)) = scp_parts(trimmed) {
-        (host.to_string(), path.to_string())
+        (host, path.to_string())
     } else {
         return None;
     };
@@ -252,30 +276,80 @@ pub fn remote_url_to_slug(url: &str) -> Option<String> {
     if segs.len() < 2 || segs.iter().any(|s| s.is_empty()) {
         return None;
     }
-    Some(format!("{}/{}", host.to_ascii_lowercase(), segs.join("/")))
+    let host = host.to_ascii_lowercase();
+    let host = host.strip_prefix("www.").unwrap_or(&host);
+    Some(format!("{host}/{}", segs.join("/")))
+}
+
+/// Strip a URL's query (`?...`) and fragment (`#...`) components, in that
+/// lexical order, before any path-segment splitting or `.git`-suffix
+/// stripping (ADR-088 Amendment 2) -- a caller-supplied source URL can
+/// carry an access token in its query string, and that token must never
+/// reach the derived slug (or, via `redact_repo_url`, storage).
+fn strip_query_and_fragment(s: &str) -> &str {
+    let s = match s.find('#') {
+        Some(i) => &s[..i],
+        None => s,
+    };
+    match s.find('?') {
+        Some(i) => &s[..i],
+        None => s,
+    }
+}
+
+/// Redact credential and tracking material from a URL before it is
+/// persisted as `properties.repo_url` display metadata (ADR-088 Amendment
+/// 2): userinfo (`user[:pass]@`), the query string, and the fragment are
+/// stripped. This is for the STORED value only -- the in-memory canonical
+/// URL used for cloning/gh operations is never passed through this.
+pub(crate) fn redact_repo_url(url: &str) -> String {
+    let stripped = strip_query_and_fragment(url);
+    for scheme in ["https://", "http://", "git://", "ssh://"] {
+        if let Some(rest) = stripped.strip_prefix(scheme) {
+            let authority_end = rest.find('/').unwrap_or(rest.len());
+            let (authority, path) = rest.split_at(authority_end);
+            let authority = match authority.rfind('@') {
+                Some(pos) => &authority[pos + 1..],
+                None => authority,
+            };
+            return format!("{scheme}{authority}{path}");
+        }
+    }
+    stripped.to_string()
 }
 
 /// Read the local repo's configured `origin` remote URL via `git -C <path>
 /// remote get-url origin`. Returns `None` for any failure (no `origin`
 /// remote, `git` not on PATH, not a git repo) -- a local repo with no
 /// remote is a valid, expected state (see `repo_identity`), not an error.
-fn local_origin_remote_url(canonical_repo_path: &Path) -> Option<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(canonical_repo_path)
-        .args(["remote", "get-url", "origin"])
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if url.is_empty() {
-        None
-    } else {
-        Some(url)
-    }
+///
+/// Runs the blocking `Command::output()` call on a `spawn_blocking` thread:
+/// every caller of `repo_identity` is an async handler path, and a
+/// synchronous subprocess spawn there would block the async runtime worker
+/// thread it runs on.
+async fn local_origin_remote_url(canonical_repo_path: &Path) -> Option<String> {
+    let path = canonical_repo_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&path)
+            .args(["remote", "get-url", "origin"])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if url.is_empty() {
+            None
+        } else {
+            Some(url)
+        }
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// Resolve the canonical repo-anchor identity (issue #1173) for a digest
@@ -293,14 +367,14 @@ fn local_origin_remote_url(canonical_repo_path: &Path) -> Option<String> {
 ///   that exact path: two clones of the same remote-less repo at different
 ///   paths do NOT converge (there is no remote to prove they're the same
 ///   repository).
-pub fn repo_identity(source: &DigestSource) -> String {
+pub async fn repo_identity(source: &DigestSource) -> String {
     match source {
         DigestSource::Remote { canonical, .. } => {
             remote_url_to_slug(canonical).unwrap_or_else(|| canonical.clone())
         }
         DigestSource::Local(path) => {
             let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
-            if let Some(origin) = local_origin_remote_url(&canon) {
+            if let Some(origin) = local_origin_remote_url(&canon).await {
                 if let Some(slug) = remote_url_to_slug(&origin) {
                     return slug;
                 }
@@ -390,6 +464,18 @@ mod tests {
     }
 
     #[test]
+    fn scp_shorthand_bracketed_ipv6_host_rejected_as_source() {
+        let err = parse_source("git@[::1]:group/repo.git").unwrap_err();
+        assert!(err.contains("SSH"), "{err}");
+    }
+
+    #[test]
+    fn bare_scp_shorthand_bracketed_ipv6_host_rejected_as_source() {
+        let err = parse_source("[::1]:group/repo.git").unwrap_err();
+        assert!(err.contains("SSH"), "{err}");
+    }
+
+    #[test]
     fn git_protocol_rejected() {
         let err = parse_source("git://github.com/org/repo.git").unwrap_err();
         assert!(err.contains("git://"), "{err}");
@@ -471,8 +557,22 @@ mod tests {
             // ssh:// with a port -- the port is not part of the identity.
             "ssh://git@github.com:2222/org/repo.git",
             "ssh://github.com:2222/org/repo",
+            // https/http/git:// with an authority port -- likewise not part
+            // of the identity (round-2 finding: only ssh:// was covered).
+            "https://github.com:8443/org/repo",
+            "https://github.com:8443/org/repo.git",
+            "http://github.com:8080/org/repo",
+            "git://github.com:9418/org/repo",
             // Host case is folded; owner/repo case is preserved separately below.
             "https://GitHub.com/org/repo",
+            // A leading www. host label is folded (ADR-088 Amendment 2).
+            "https://www.github.com/org/repo",
+            // A query string and/or fragment must not affect normalization
+            // and must never leak a token into the slug.
+            "https://github.com/org/repo?ref=nightly",
+            "https://github.com/org/repo.git?ref=nightly",
+            "https://github.com/org/repo#readme",
+            "https://github.com/org/repo.git?token=SECRET#section",
         ];
         for s in spellings {
             assert_eq!(
@@ -481,6 +581,46 @@ mod tests {
                 "spelling {s:?} should normalize to {expected:?}"
             );
         }
+    }
+
+    #[test]
+    fn remote_url_to_slug_strips_query_and_fragment_before_splitting() {
+        let slug = remote_url_to_slug("https://github.com/org/repo?token=SECRETTOKEN").unwrap();
+        assert_eq!(slug, "github.com/org/repo");
+        assert!(!slug.contains("SECRETTOKEN"), "{slug}");
+    }
+
+    #[test]
+    fn remote_url_to_slug_folds_leading_www_host_label() {
+        assert_eq!(
+            remote_url_to_slug("https://www.gitlab.com/org/repo").as_deref(),
+            Some("gitlab.com/org/repo")
+        );
+    }
+
+    #[test]
+    fn scp_shorthand_bracketed_ipv6_host_normalizes_directly() {
+        assert_eq!(
+            remote_url_to_slug("git@[::1]:group/repo.git").as_deref(),
+            Some("[::1]/group/repo")
+        );
+        assert_eq!(
+            remote_url_to_slug("[::1]:group/repo.git").as_deref(),
+            Some("[::1]/group/repo"),
+            "the no-user bracketed SCP variant must also normalize"
+        );
+    }
+
+    #[test]
+    fn redact_repo_url_strips_userinfo_query_and_fragment() {
+        assert_eq!(
+            redact_repo_url("https://user:tok3n@github.com/org/repo?token=SECRET#frag"),
+            "https://github.com/org/repo"
+        );
+        assert_eq!(
+            redact_repo_url("https://github.com/org/repo"),
+            "https://github.com/org/repo"
+        );
     }
 
     #[test]
@@ -557,17 +697,17 @@ mod tests {
         }
     }
 
-    #[test]
-    fn repo_identity_https_and_ssh_spellings_of_same_remote_converge() {
+    #[tokio::test]
+    async fn repo_identity_https_and_ssh_spellings_of_same_remote_converge() {
         let https = DigestSource::Remote {
             canonical: "https://github.com/org/repo".to_string(),
             gh_slug: Some(("org".to_string(), "repo".to_string())),
         };
-        assert_eq!(repo_identity(&https), "github.com/org/repo");
+        assert_eq!(repo_identity(&https).await, "github.com/org/repo");
     }
 
-    #[test]
-    fn repo_identity_local_path_with_origin_matches_remote_identity() {
+    #[tokio::test]
+    async fn repo_identity_local_path_with_origin_matches_remote_identity() {
         let dir = tempfile::tempdir().expect("tempdir");
         init_repo_with_origin(dir.path(), "git@github.com:org/repo.git");
 
@@ -576,12 +716,29 @@ mod tests {
             canonical: "https://github.com/org/repo".to_string(),
             gh_slug: Some(("org".to_string(), "repo".to_string())),
         };
-        assert_eq!(repo_identity(&local), repo_identity(&remote));
-        assert_eq!(repo_identity(&local), "github.com/org/repo");
+        assert_eq!(repo_identity(&local).await, repo_identity(&remote).await);
+        assert_eq!(repo_identity(&local).await, "github.com/org/repo");
     }
 
-    #[test]
-    fn repo_identity_local_path_without_remote_falls_back_to_path_form() {
+    /// Round-2 finding: a local clone whose `origin` is bracketed-IPv6 SCP
+    /// shorthand must converge with the equivalent `ssh://` spelling's
+    /// slug, not fall back to `local:<path>`.
+    #[tokio::test]
+    async fn repo_identity_local_path_with_bracketed_ipv6_scp_origin_converges() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_repo_with_origin(dir.path(), "git@[::1]:group/repo.git");
+
+        let local = DigestSource::Local(dir.path().to_path_buf());
+        let remote = DigestSource::Remote {
+            canonical: "https://[::1]/group/repo".to_string(),
+            gh_slug: None,
+        };
+        assert_eq!(repo_identity(&local).await, "[::1]/group/repo");
+        assert_eq!(repo_identity(&local).await, repo_identity(&remote).await);
+    }
+
+    #[tokio::test]
+    async fn repo_identity_local_path_without_remote_falls_back_to_path_form() {
         let dir = tempfile::tempdir().expect("tempdir");
         let status = Command::new("git")
             .arg("-C")
@@ -592,7 +749,7 @@ mod tests {
         assert!(status.success());
 
         let local = DigestSource::Local(dir.path().to_path_buf());
-        let identity = repo_identity(&local);
+        let identity = repo_identity(&local).await;
         assert!(identity.starts_with("local:"), "{identity}");
         let canon = std::fs::canonicalize(dir.path()).unwrap();
         assert_eq!(identity, format!("local:{}", canon.to_string_lossy()));

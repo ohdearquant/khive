@@ -19,7 +19,10 @@ use crate::ingest::{
     resolve_project_id, run_ingest, run_ingest_with_commit_recovery, CacheRepairStrategy,
     GitLogError, IngestInclude, IngestOptions, RecoveredRepo,
 };
-use crate::source::{parse_source, repo_basename, repo_identity, DigestSource, REPO_SLUG_PROPERTY};
+use crate::source::{
+    parse_source, redact_repo_url, remote_url_to_slug, repo_basename, repo_identity, DigestSource,
+    REPO_SLUG_PROPERTY,
+};
 use crate::GitPack;
 
 /// Issue #765 bounded repair policy: at most one refetch, then at most one
@@ -295,7 +298,7 @@ async fn resolve_or_create_project(
         DigestSource::Local(p) => p.to_string_lossy().to_string(),
         DigestSource::Remote { canonical, .. } => canonical.clone(),
     };
-    let identity = repo_identity(source);
+    let identity = repo_identity(source).await;
     let name = repo_basename(source);
 
     let slug_matches = find_projects_by_slug(runtime, token, &identity)
@@ -331,6 +334,44 @@ async fn resolve_or_create_project(
         });
     }
 
+    // ADR-088 Amendment 2 step 2: a legacy anchor that predates `repo_slug`
+    // entirely (so its stored `repo_url` is some other spelling of the same
+    // repository -- e.g. a bare local clone path from before this identity
+    // model existed) is reconciled by re-deriving each such anchor's own
+    // identity from its stored `repo_url` and comparing it to this source's
+    // resolved `identity`, not by a second exact-string match.
+    let legacy_candidates = find_legacy_projects_without_slug(runtime, token)
+        .await
+        .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+    let mut normalized_matches: Vec<Uuid> = Vec::new();
+    for (id, candidate_repo_url) in legacy_candidates {
+        if normalize_legacy_repo_url(&candidate_repo_url)
+            .await
+            .as_deref()
+            == Some(identity.as_str())
+        {
+            normalized_matches.push(id);
+        }
+    }
+    if let Some((selected, duplicates)) = normalized_matches.split_first() {
+        let selected = *selected;
+        registry
+            .dispatch(
+                "update",
+                json!({
+                    "id": selected.to_string(),
+                    "properties": { REPO_SLUG_PROPERTY: identity },
+                }),
+            )
+            .await?;
+        return Ok(ProjectResolution {
+            id: selected,
+            created: false,
+            orphan: None,
+            slug_duplicates: duplicates.to_vec(),
+        });
+    }
+
     let orphan = find_orphaned_anchor(runtime, token, &identity, &repo_url)
         .await
         .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
@@ -341,7 +382,10 @@ async fn resolve_or_create_project(
             json!({
                 "kind": "project",
                 "name": name,
-                "properties": { "repo_url": repo_url, REPO_SLUG_PROPERTY: identity },
+                "properties": {
+                    "repo_url": redact_repo_url(&repo_url),
+                    REPO_SLUG_PROPERTY: identity,
+                },
             }),
         )
         .await?;
@@ -424,6 +468,73 @@ async fn find_project_by_legacy_repo_url(
         Some(SqlValue::Text(s)) => Uuid::parse_str(s).ok(),
         _ => None,
     }))
+}
+
+/// Fetch every live `project` anchor in this namespace that has no
+/// `repo_slug` yet -- candidates for step-2 normalization reconciliation
+/// (ADR-088 Amendment 2). An anchor that already carries `repo_slug` was
+/// either created post-#1173 or already backfilled by the exact-match path
+/// above; it is found (if at all) via `find_projects_by_slug` instead.
+async fn find_legacy_projects_without_slug(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+) -> anyhow::Result<Vec<(Uuid, String)>> {
+    let sql = runtime.sql();
+    let mut r = sql.reader().await.map_err(|e| anyhow!("{e}"))?;
+    let rows = r
+        .query_all(SqlStatement {
+            sql: "SELECT id, json_extract(properties,'$.repo_url') AS repo_url \
+                  FROM entities WHERE kind='project' AND namespace=?1 \
+                  AND deleted_at IS NULL \
+                  AND json_extract(properties,'$.repo_slug') IS NULL \
+                  AND json_extract(properties,'$.repo_url') IS NOT NULL \
+                  ORDER BY created_at ASC, id ASC"
+                .into(),
+            params: vec![SqlValue::Text(token.namespace().as_str().to_string())],
+            label: Some("git_digest_find_legacy_projects_without_slug".into()),
+        })
+        .await
+        .map_err(|e| anyhow!("{e}"))?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| {
+            let id = match r.get("id") {
+                Some(SqlValue::Uuid(u)) => Some(*u),
+                Some(SqlValue::Text(s)) => Uuid::parse_str(s).ok(),
+                _ => None,
+            }?;
+            let url = match r.get("repo_url") {
+                Some(SqlValue::Text(s)) => Some(s.clone()),
+                _ => None,
+            }?;
+            Some((id, url))
+        })
+        .collect())
+}
+
+/// Re-derive the repo-identity slug a legacy anchor's stored `repo_url`
+/// would resolve to today (ADR-088 Amendment 2 step 2). A URL-shaped value
+/// normalizes directly via `remote_url_to_slug`. A path-shaped value (an
+/// absolute local path, stored verbatim by the pre-#1173 local-source
+/// resolution path) is treated as a local clone and resolved the same way
+/// `repo_identity` resolves a `DigestSource::Local` -- via its current
+/// `origin` remote -- so a legacy local-path anchor reconciles with a
+/// later remote-URL digest of the same repository. Returns `None` when
+/// neither path yields a URL-shaped identity (e.g. the path no longer
+/// exists, or has no matching origin -- there is nothing to reconcile
+/// against).
+async fn normalize_legacy_repo_url(repo_url: &str) -> Option<String> {
+    if let Some(slug) = remote_url_to_slug(repo_url) {
+        return Some(slug);
+    }
+    if repo_url.starts_with('/') {
+        let candidate = DigestSource::Local(std::path::PathBuf::from(repo_url));
+        let slug = repo_identity(&candidate).await;
+        if !slug.starts_with("local:") {
+            return Some(slug);
+        }
+    }
+    None
 }
 
 /// Look for a soft-deleted `project` anchor matching the resolved repo
@@ -908,5 +1019,227 @@ mod tests {
             "signal must point at the tombstone with the live corpus, not merely the most recent one"
         );
         assert_eq!(orphan.annotated_note_count, 1);
+    }
+
+    /// Persisted `repo_url` must never carry userinfo or a query-string
+    /// token (ADR-088 Amendment 2) -- the in-memory canonical (used only
+    /// for the identity slug and any clone/gh operation) is unaffected.
+    #[tokio::test]
+    async fn persisted_repo_url_is_credential_and_query_redacted() {
+        let (rt, token, registry) = fixture().await;
+
+        let source = DigestSource::Remote {
+            canonical: "https://user:tok3n@github.com/org/redact-repo?token=SECRETQUERY#frag"
+                .to_string(),
+            gh_slug: Some(("org".to_string(), "redact-repo".to_string())),
+        };
+
+        let resolution = resolve_or_create_project(&rt, &registry, &token, &source)
+            .await
+            .expect("resolve");
+        assert!(resolution.created);
+
+        let entity = rt
+            .get_entity(&token, resolution.id)
+            .await
+            .expect("fetch entity");
+        let stored_url = entity
+            .properties
+            .as_ref()
+            .and_then(|p| p.get("repo_url"))
+            .and_then(Value::as_str)
+            .expect("repo_url present");
+        assert!(!stored_url.contains("tok3n"), "{stored_url}");
+        assert!(!stored_url.contains("SECRETQUERY"), "{stored_url}");
+        assert!(!stored_url.contains('#'), "{stored_url}");
+        assert_eq!(stored_url, "https://github.com/org/redact-repo");
+
+        assert_eq!(
+            entity
+                .properties
+                .as_ref()
+                .and_then(|p| p.get("repo_slug"))
+                .and_then(Value::as_str),
+            Some("github.com/org/redact-repo")
+        );
+    }
+
+    fn init_bare_repo_with_origin(dir: &Path, origin: &str) {
+        for args in [vec!["init", "-q"], vec!["remote", "add", "origin", origin]] {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(&args)
+                .status()
+                .expect("spawn git");
+            assert!(status.success(), "git {args:?} failed");
+        }
+    }
+
+    /// Same as [`init_bare_repo_with_origin`] but with `user.*` configured
+    /// and one commit -- `git log` (and thus `git.digest`) needs a real
+    /// commit to walk; a freshly-inited repo with zero commits fails at
+    /// the `git log` step before anchor resolution is even exercised.
+    fn init_repo_with_origin_and_one_commit(dir: &Path, origin: &str) {
+        init_bare_repo_with_origin(dir, origin);
+        for args in [
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test User"],
+        ] {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(&args)
+                .status()
+                .expect("spawn git");
+            assert!(status.success(), "git {args:?} failed");
+        }
+        std::fs::write(dir.join("README.md"), "hello\n").expect("write file");
+        for args in [
+            vec!["add", "README.md"],
+            vec!["commit", "-q", "-m", "Initial commit"],
+        ] {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(&args)
+                .status()
+                .expect("spawn git");
+            assert!(status.success(), "git {args:?} failed");
+        }
+    }
+
+    /// A legacy anchor created before `repo_slug` existed at all, from a
+    /// LOCAL path source (so its `repo_url` is a bare filesystem path with
+    /// no `repo_slug`), is reconciled by a later remote-URL digest of the
+    /// same repository via step-2 normalization (ADR-088 Amendment 2).
+    #[tokio::test]
+    async fn legacy_local_path_anchor_reconciled_by_later_remote_digest() {
+        let (rt, token, registry) = fixture().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_bare_repo_with_origin(dir.path(), "https://github.com/org/legacy-local-repo");
+
+        let path_str = dir.path().to_string_lossy().to_string();
+        let legacy_id = registry
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "project",
+                    "name": "legacy-local-repo",
+                    "properties": { "repo_url": path_str },
+                }),
+            )
+            .await
+            .expect("create legacy local anchor");
+        let legacy_id = Uuid::parse_str(legacy_id["id"].as_str().unwrap()).expect("uuid");
+
+        let remote_source = DigestSource::Remote {
+            canonical: "https://github.com/org/legacy-local-repo".to_string(),
+            gh_slug: Some(("org".to_string(), "legacy-local-repo".to_string())),
+        };
+        let resolution = resolve_or_create_project(&rt, &registry, &token, &remote_source)
+            .await
+            .expect("resolve");
+        assert!(
+            !resolution.created,
+            "legacy local-path anchor must be reconciled, not re-created"
+        );
+        assert_eq!(resolution.id, legacy_id);
+
+        let entity = rt
+            .get_entity(&token, legacy_id)
+            .await
+            .expect("fetch entity");
+        assert_eq!(
+            entity
+                .properties
+                .as_ref()
+                .and_then(|p| p.get("repo_slug"))
+                .and_then(Value::as_str),
+            Some("github.com/org/legacy-local-repo"),
+            "repo_slug must be backfilled via step-2 normalization"
+        );
+    }
+
+    /// Public-surface regression (ADR-088 Amendment 2 round-2 finding): the
+    /// duplicate-anchor warning and selected id, and all three orphan
+    /// report fields (including the no-orphan defaults), must be observable
+    /// on the real `git.digest` verb's serialized `IngestReport` -- not
+    /// merely on the private `resolve_or_create_project` helper's return
+    /// value. Driven through `registry.dispatch("git.digest", ...)` over a
+    /// LOCAL (no-network) source so it needs no real remote clone.
+    #[tokio::test]
+    async fn git_digest_public_surface_reports_duplicate_and_selects_oldest_no_third_anchor() {
+        let (rt, token, registry) = fixture().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_repo_with_origin_and_one_commit(dir.path(), "https://github.com/org/pub-dup-repo");
+
+        let slug = "github.com/org/pub-dup-repo";
+        let mut ids = Vec::new();
+        for repo_url in [
+            "https://github.com/org/pub-dup-repo",
+            "git@github.com:org/pub-dup-repo.git",
+        ] {
+            let resp = registry
+                .dispatch(
+                    "create",
+                    json!({
+                        "kind": "project",
+                        "name": "pub-dup-repo",
+                        "properties": { "repo_url": repo_url, "repo_slug": slug },
+                    }),
+                )
+                .await
+                .expect("create anchor");
+            ids.push(Uuid::parse_str(resp["id"].as_str().unwrap()).expect("uuid"));
+        }
+
+        let source_path = dir.path().to_string_lossy().to_string();
+        let resp = registry
+            .dispatch(
+                "git.digest",
+                json!({
+                    "source": source_path,
+                    "include": ["commits"],
+                    "max_items": 1,
+                }),
+            )
+            .await
+            .expect("git.digest dispatch");
+
+        assert_eq!(resp["project_created"], json!(false), "{resp}");
+        let selected_id = resp["project_id"]
+            .as_str()
+            .expect("project_id present")
+            .to_string();
+        assert!(
+            ids.iter().any(|id| id.to_string() == selected_id),
+            "selected id must be one of the pre-seeded pair: {resp}"
+        );
+        assert_eq!(selected_id, ids[0].to_string(), "must select the oldest");
+
+        let warnings = resp["warnings"].as_array().expect("warnings array");
+        assert!(
+            warnings.iter().any(|w| {
+                let w = w.as_str().unwrap_or("");
+                w.contains("duplicate")
+                    && w.contains(&selected_id)
+                    && w.contains(&ids[1].to_string())
+            }),
+            "duplicate warning must name the selected and duplicate ids: {warnings:?}"
+        );
+
+        // No-orphan defaults must be present on the wire shape.
+        assert_eq!(resp["orphaned_corpus_detected"], json!(false), "{resp}");
+        assert_eq!(resp["orphaned_project_id"], json!(null), "{resp}");
+        assert_eq!(resp["orphaned_note_count"], json!(0), "{resp}");
+
+        // No third anchor was minted.
+        let live = find_projects_by_slug(&rt, &token, slug)
+            .await
+            .expect("find_projects_by_slug");
+        assert_eq!(live.len(), 2, "no third anchor should be minted: {live:?}");
     }
 }
