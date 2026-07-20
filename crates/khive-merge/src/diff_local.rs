@@ -1,5 +1,3 @@
-// Copyright 2026 Haiyang Li. Licensed under Apache-2.0.
-//
 //! Merge-specific entity and edge change classification.
 //!
 //! See `crates/khive-merge/docs/api/entity-merge.md` and `edge-merge.md`.

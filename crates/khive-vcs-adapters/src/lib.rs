@@ -1,5 +1,3 @@
-// Copyright 2026 Haiyang Li. Licensed under Apache-2.0.
-//
 //! Pure KG import format adapters and intermediate wire records.
 
 mod error;
