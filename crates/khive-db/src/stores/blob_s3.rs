@@ -466,7 +466,12 @@ impl BlobStore for S3BlobStore {
 
     async fn get(&self, content_ref: &ContentRef) -> StorageResult<Vec<u8>> {
         let key = self.shard_key(content_ref);
-        let result = match tokio::time::timeout(self.request_timeout, self.client.get(&key)).await {
+        // ONE deadline for the whole hydration, fixed before the initial
+        // request: wrapping the request and the body consume in separate
+        // full timeouts let a peer hold a bounded hydration permit for
+        // nearly twice the configured bound.
+        let deadline = tokio::time::Instant::now() + self.request_timeout;
+        let result = match tokio::time::timeout_at(deadline, self.client.get(&key)).await {
             Ok(Ok(result)) => result,
             Ok(Err(ObjectStoreError::NotFound { .. })) => {
                 return Err(StorageError::NotFound {
@@ -502,13 +507,14 @@ impl BlobStore for S3BlobStore {
         // reported metadata size to hold.
         let size_hint = result.meta.size.min(MAX_OBJECT_BYTES) as usize;
         let mut stream = result.into_stream();
-        // ONE end-to-end deadline for the whole hydration:
-        // a fresh `self.request_timeout` per `stream.next()` call let a peer
+        // The consume loop runs under the SAME deadline as the initial
+        // request (fixed above, before `client.get`): a fresh
+        // `self.request_timeout` per `stream.next()` call let a peer
         // trickling bytes just under that per-chunk cadence hold one of the
-        // bounded hydration permits open indefinitely, since no single call
-        // ever timed out. Wrapping the entire consume loop in one timeout
-        // bounds total time-to-hydrate, not just the gap between chunks; the
-        // per-chunk cumulative-size check is unchanged.
+        // bounded hydration permits open indefinitely, and a fresh full
+        // window for the consume phase still allowed nearly twice the
+        // configured bound end to end. The per-chunk cumulative-size check
+        // is unchanged.
         let consume = async {
             let mut buf: Vec<u8> = Vec::with_capacity(size_hint);
             loop {
@@ -532,7 +538,7 @@ impl BlobStore for S3BlobStore {
                 }
             }
         };
-        match tokio::time::timeout(self.request_timeout, consume).await {
+        match tokio::time::timeout_at(deadline, consume).await {
             Ok(result) => result,
             Err(_elapsed) => Err(timeout_error("get")),
         }
@@ -1003,6 +1009,12 @@ mod tests {
             /// `stream.next()` call well within it (end-to-end vs per-chunk
             /// deadline coverage).
             get_body_override: Mutex<Option<(u64, Vec<Bytes>, Duration)>>,
+            /// Sleep applied inside `get_opts` before resolving an `Ok`
+            /// outcome — simulates a slow initial request that still
+            /// resolves within `request_timeout`, so tests can prove the
+            /// hydration deadline spans request + consume rather than
+            /// granting each phase a fresh window.
+            get_pre_delay: Mutex<Option<Duration>>,
             pub put_calls: AtomicUsize,
             pub get_calls: AtomicUsize,
             pub delete_calls: Arc<AtomicUsize>,
@@ -1028,6 +1040,7 @@ mod tests {
                     list_script: Arc::new(Mutex::new(Vec::new())),
                     delete_script: Arc::new(Mutex::new(vec![Outcome::Ok])),
                     get_body_override: Mutex::new(None),
+                    get_pre_delay: Mutex::new(None),
                     put_calls: AtomicUsize::new(0),
                     get_calls: AtomicUsize::new(0),
                     delete_calls: Arc::new(AtomicUsize::new(0)),
@@ -1079,6 +1092,13 @@ mod tests {
                 self
             }
 
+            /// Sleep `delay` inside `get_opts` before resolving an `Ok`
+            /// outcome (see `get_pre_delay`).
+            pub fn with_get_pre_delay(self, delay: Duration) -> Self {
+                *self.get_pre_delay.lock().unwrap() = Some(delay);
+                self
+            }
+
             fn next_outcome(script: &Mutex<Vec<Outcome>>, calls: &AtomicUsize) -> Outcome {
                 let idx = calls.fetch_add(1, Ordering::SeqCst);
                 let script = script.lock().unwrap();
@@ -1121,6 +1141,10 @@ mod tests {
                 let outcome = Self::next_outcome(&self.get_script, &self.get_calls);
                 if matches!(outcome, Outcome::Hang) {
                     tokio::time::sleep(self.hang_delay).await;
+                }
+                let pre_delay = *self.get_pre_delay.lock().unwrap();
+                if let Some(delay) = pre_delay {
+                    tokio::time::sleep(delay).await;
                 }
                 let override_body = self.get_body_override.lock().unwrap().clone();
                 outcome_to_result(&outcome, || {
@@ -1401,6 +1425,37 @@ mod tests {
         )
         .unwrap();
         let content_ref = ContentRef::from_hex("f".repeat(64)).unwrap();
+        let err = store.get(&content_ref).await.unwrap_err();
+        assert!(matches!(err, StorageError::Timeout { .. }), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn get_deadline_spans_request_and_consume_phases() {
+        // The initial request and the body consume each fit inside
+        // `request_timeout` on their own, but their sum exceeds it. Under
+        // the previous per-phase structure (a fresh full timeout for each)
+        // this hydration succeeded, taking nearly twice the configured
+        // bound; under the single deadline fixed before `client.get` it
+        // must time out.
+        let chunks = vec![
+            Bytes::from(vec![b'x'; 8]),
+            Bytes::from(vec![b'x'; 8]),
+            Bytes::from(vec![b'x'; 8]),
+        ];
+        let fake = Arc::new(
+            FakeObjectStore::new(vec![], vec![Outcome::Ok])
+                .with_get_pre_delay(Duration::from_millis(150))
+                .with_get_body_chunks_delayed(24, chunks, Duration::from_millis(50)),
+        );
+        let store = S3BlobStore::from_client_for_test(
+            Arc::clone(&fake) as Arc<dyn ObjectStore>,
+            "blobs",
+            3,
+            Duration::from_millis(250), // > each phase, < 150ms + 3 * 50ms
+            Duration::from_millis(1),
+        )
+        .unwrap();
+        let content_ref = ContentRef::from_hex("e".repeat(64)).unwrap();
         let err = store.get(&content_ref).await.unwrap_err();
         assert!(matches!(err, StorageError::Timeout { .. }), "got {err:?}");
     }
