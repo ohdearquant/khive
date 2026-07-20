@@ -1,6 +1,7 @@
 //! kkernel — khive admin/management library.
 
 mod atomic_apply;
+pub mod cli;
 pub mod code_audit;
 pub mod code_ingest;
 pub mod coordinator;
@@ -13,6 +14,8 @@ pub mod pack_introspect;
 pub mod reindex;
 pub mod sync;
 pub mod vector;
+
+pub use cli::run;
 
 // `pending_events` (the scheduled-event drain) now lives in `khive-mcp`
 // (`khive_mcp::pending_events`), not here — the daemon-resident tick (ADR-106)
