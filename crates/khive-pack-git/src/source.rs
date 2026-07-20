@@ -370,7 +370,12 @@ async fn local_origin_remote_url(canonical_repo_path: &Path) -> Option<String> {
 pub async fn repo_identity(source: &DigestSource) -> String {
     match source {
         DigestSource::Remote { canonical, .. } => {
-            remote_url_to_slug(canonical).unwrap_or_else(|| canonical.clone())
+            // An accepted URL that does not normalize (e.g. a single path
+            // segment) falls back to the URL itself as identity -- but
+            // credential-redacted and stripped of query/fragment, so a
+            // token embedded in the source can never persist in `repo_slug`
+            // and query-only spelling variants converge on one identity.
+            remote_url_to_slug(canonical).unwrap_or_else(|| redact_repo_url(canonical))
         }
         DigestSource::Local(path) => {
             let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
@@ -393,7 +398,7 @@ pub fn repo_basename(source: &DigestSource) -> String {
             .and_then(|f| f.to_str())
             .unwrap_or("repo")
             .to_string(),
-        DigestSource::Remote { canonical, .. } => canonical
+        DigestSource::Remote { canonical, .. } => strip_query_and_fragment(canonical)
             .rsplit('/')
             .next()
             .filter(|s| !s.is_empty())
@@ -704,6 +709,35 @@ mod tests {
             gh_slug: Some(("org".to_string(), "repo".to_string())),
         };
         assert_eq!(repo_identity(&https).await, "github.com/org/repo");
+    }
+
+    #[tokio::test]
+    async fn repo_identity_unsluggable_remote_fallback_is_redacted_and_converges() {
+        // A single-path-segment URL does not normalize to a slug; the raw-URL
+        // identity fallback must never carry userinfo/query/fragment, and
+        // query-only spelling variants must converge on one identity.
+        let with_secret = DigestSource::Remote {
+            canonical: "https://user:tok3n@example.com/repo?token=SECRET#frag".to_string(),
+            gh_slug: None,
+        };
+        let identity = repo_identity(&with_secret).await;
+        assert_eq!(identity, "https://example.com/repo");
+        assert!(!identity.contains("tok3n") && !identity.contains("SECRET"));
+
+        let bare = DigestSource::Remote {
+            canonical: "https://example.com/repo".to_string(),
+            gh_slug: None,
+        };
+        assert_eq!(repo_identity(&bare).await, identity);
+    }
+
+    #[test]
+    fn repo_basename_strips_query_and_fragment() {
+        let src = DigestSource::Remote {
+            canonical: "https://example.com/org/repo?x=1#frag".to_string(),
+            gh_slug: None,
+        };
+        assert_eq!(repo_basename(&src), "repo");
     }
 
     #[tokio::test]
