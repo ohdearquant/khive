@@ -11,20 +11,15 @@ khive gives your agent:
 5. **Memory** — salience- and decay-weighted recall across sessions
 6. **Communication** — namespaced message passing between agents
 7. **Scheduling** — time-triggered reminders and future verb dispatch
-8. **Knowledge corpus** — atom/domain CRUD, FTS + embedding search, compose briefings
-9. **Brain** — Bayesian profile tuning from feedback signals
-10. **Session** — persist and resume agent-session records
-11. **Blob storage** — content-addressed put/get/stat over a BLAKE3-keyed store
+8. **Session** — persist and resume agent-session records
 
-All 11 packs load by default. **81 public verbs** across the packs: the `code`
-pack contributes one verb, `code.ingest` (L1 manifest + L1.5 import-scan source ingestion
-into a dedicated map database, ADR-085 Amendment 2); its `finding` note kind is still
-written only through the `kkernel code-ingest` admin CLI path (ADR-085 D1, Amendment 3);
-the `workspace` pack contributes zero verbs, adding only the `workspace` entity kind and
-`contains` endpoint rules to git/gtd/session notes (#873). Git provenance ingestion and
-write verbs (`git.digest`, `git.commit`, `git.branch`, `git.push`) are provided by a
-commercially licensed extension and are not part of the open-source distribution. Regenerate via
-`request(ops="verbs()")`
+All packs load by default. Verbs across the packs: the `workspace` pack contributes
+zero verbs, adding only the `workspace` entity kind and `contains` endpoint rules to
+git/gtd/session notes (#873). Git provenance ingestion and write verbs (`git.digest`,
+`git.commit`, `git.branch`, `git.push`) are provided by a commercially licensed
+extension and are not part of the open-source distribution. Code-quality and
+formal-methods (Lean) ontology packs are a commercially licensed extension and are
+not part of the open-source distribution. Regenerate via `request(ops="verbs()")`
 before editing this line.
 
 If you're working on khive itself (writing code in this repo), see `CLAUDE.md` instead.
@@ -134,25 +129,8 @@ false, id, full_id, from, to, note: "already in target status"}` — the task fi
 `memory.recall` supports `tags` and `tag_mode` ("any"|"all") for tag-based post-filtering.
 Composite scores are always in [0,1]. Typical production floor: 0.3-0.7.
 
-### Brain pack — 15 verbs (`brain.` prefix)
-
-| Verb                     | What it does                                                                             | When to use                                                     |
-| ------------------------ | ---------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
-| `brain.event_counts`     | Windowed event counts by kind/actor/verb (+ feedback by_profile split, cost_unit totals) | Flywheel metrics, feedback-coverage reporting, cost attribution |
-| `brain.profiles`         | List profiles (optionally filtered by lifecycle)                                         | See what profiles exist                                         |
-| `brain.profile`          | Full detail: metadata, snapshot, state summary                                           | Inspect a specific profile                                      |
-| `brain.create_profile`   | Create a new profile with optional seed priors                                           | Custom tuning for a new consumer                                |
-| `brain.resolve`          | Which profile serves a given consumer context?                                           | Before recall — check active tuning                             |
-| `brain.activate`         | Start live update loop for a profile                                                     | Enable feedback-driven tuning                                   |
-| `brain.deactivate`       | Stop live updates, retain state                                                          | Pause tuning without losing progress                            |
-| `brain.archive`          | Read-only, audit-retained                                                                | Retire a profile permanently                                    |
-| `brain.reset`            | Reset posteriors to priors (preserves event history)                                     | Start tuning fresh                                              |
-| `brain.feedback`         | Emit explicit feedback event                                                             | Rate a recall result as useful/not_useful/wrong                 |
-| `brain.auto_feedback`    | Emit implicit feedback for recall results                                                | Convenience: agents call after memory.recall                    |
-| `brain.bind`             | Bind a profile to an actor + consumer                                                    | Route a specific caller to a specific profile                   |
-| `brain.unbind`           | Remove a binding                                                                         | Stop routing                                                    |
-| `brain.bindings`         | List binding rows                                                                        | Audit profile routing                                           |
-| `brain.register_adapter` | Register an adapter integrity record                                                     | Gate adapter composition to the active base-model revision      |
+Brain verbs (profile-oriented feedback and learning-loop orchestration, `brain.` prefix) are
+provided by a commercial extension and are not part of the open-source distribution.
 
 ### Comm pack — 7 verbs (`comm.` prefix)
 
@@ -187,40 +165,9 @@ or `comm.thread`.
 | `schedule.agenda`   | List upcoming scheduled events                | "What's on the calendar?"                                     |
 | `schedule.cancel`   | Cancel a scheduled event                      | Remove a pending reminder/action                              |
 
-### Knowledge pack — 19 verbs (`knowledge.` prefix)
-
-| Verb                       | What it does                                            | When to use                                  |
-| -------------------------- | ------------------------------------------------------- | -------------------------------------------- |
-| `knowledge.upsert_atoms`   | Bulk insert/update atoms by slug                        | Ingesting knowledge corpus                   |
-| `knowledge.upsert_domains` | Bulk insert/update domain groupings                     | Organizing atoms into domains                |
-| `knowledge.get`            | Fetch atom/domain by UUID or slug                       | Read a specific knowledge entry              |
-| `knowledge.list`           | Paginated listing of atoms or domains                   | Browse the corpus                            |
-| `knowledge.search`         | TF-IDF search with embedding rerank (default on)        | Finding relevant knowledge                   |
-| `knowledge.suggest`        | Orient query against domains for composition            | "Which domains cover topic X?"               |
-| `knowledge.compose`        | Compose a markdown briefing from selected atoms/domains | Build a context briefing for an agent        |
-| `knowledge.edit`           | Upsert sections for an atom                             | Update part of an atom without wiping others |
-| `knowledge.import`         | Ingest markdown files as atoms                          | Batch import from filesystem                 |
-| `knowledge.delete_atoms`   | Soft-delete atoms by slug or ID                         | Retire stale knowledge                       |
-| `knowledge.stats`          | Corpus statistics: atom/domain/coverage counts          | Health check                                 |
-| `knowledge.index`          | Backfill embeddings + FTS                               | After bulk import or reindex                 |
-| `knowledge.fold`           | Budget-constrained knapsack selection                   | Token-aware subset picking                   |
-| `knowledge.challenge`      | Mark a section as disputed                              | Flag incorrect content                       |
-| `knowledge.adjudicate`     | Resolve a disputed section                              | Accept or reject a challenge                 |
-| `knowledge.learn`          | Register a concept entity with domain/tags              | Quick concept creation                       |
-| `knowledge.cite`           | Link concept → paper/person/org (introduced_by edge)    | Attribution                                  |
-| `knowledge.topic`          | List concepts by domain or free-text                    | Explore the concept graph                    |
-| `knowledge.feedback`       | Route feedback to brain for knowledge recall tuning     | Signal useful/not_useful on compose results  |
-
-`knowledge.search` supports `decompose=true` for multi-concept query splitting (avoids FTS edge
-cases). Scores are normalized to [0,1] when `rerank` is active (default).
-Pass `kind=` (`"atom"` or `"domain"`) to filter by result type; `type=` is accepted as a legacy
-alias. `knowledge.list` accepts the same `kind=`/`type=` discriminant.
-
-`knowledge.edit` takes `sections=[{section_type, content, heading?, sort_order?}]`. `section_type`
-is a **closed enum** — valid values: `overview` | `core_model` | `boundary_conditions` |
-`formalism` | `operational_guidance` | `examples` | `failure_modes` | `expert_lens` |
-`references` | `other`. Content must be **at least 80 characters**. Shorter content or an
-unrecognized `section_type` returns a validation error listing the valid values.
+`knowledge.` verbs (atom/domain corpus, TF-IDF + embedding-rerank search, composition,
+section feedback) are provided by a commercial extension and are not part of the
+open-source distribution.
 
 ### Session pack — 4 verbs (`session.` prefix)
 
@@ -340,7 +287,7 @@ _view_ for agents reading rather than parsing — they truncate long cells and a
 In a compounded request (batch/chain) the format applies **per-op** to each op's `result`; the
 `results`/`summary` envelope stays compact JSON, and error entries are never reformatted. The
 per-op override is `format_per_op` (mirrors `presentation_per_op`). Verbs whose policy is
-AlwaysVerbose (`get`, `link`, `query`, `traverse`, `neighbors`, `brain.feedback`) are exempt from
+AlwaysVerbose (`get`, `link`, `query`, `traverse`, `neighbors`) are exempt from
 the redundancy-drop even under `auto`/`table`, so agents still get their full output.
 
 **Precedence** (ADR-078 §2, highest to lowest):
@@ -671,7 +618,7 @@ If you are adding a new pack or a new verb to an existing pack:
 ## Daemon and warm startup
 
 The `kkernel` binary auto-spawns a background daemon (`kkernel mcp --daemon`) on the first request. The daemon
-keeps the ANN index and embedding model warm so `knowledge.search` and `memory.recall` are fast on
+keeps the ANN index and embedding model warm so `memory.recall` is fast on
 subsequent calls. Users do not need to configure or manage the daemon — it starts automatically and
 cleans up on exit.
 

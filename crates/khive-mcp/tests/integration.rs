@@ -10,10 +10,6 @@
 // section exercises the same server construction path and that helper changes
 // propagate to all coverage areas simultaneously.
 
-// Force the knowledge pack to be linked (inventory::submit! requires the crate
-// to be linked into the test binary for its PackRegistration to self-register).
-use khive_pack_knowledge as _;
-
 use async_trait::async_trait;
 use khive_mcp::server::KhiveMcpServer;
 use khive_runtime::{
@@ -1732,16 +1728,11 @@ fn make_full_server() -> KhiveMcpServer {
         default_namespace: Namespace::parse("test").unwrap(),
         embedding_model: None,
         additional_embedding_models: vec![],
-        packs: vec![
-            "kg".to_string(),
-            "gtd".to_string(),
-            "memory".to_string(),
-            "brain".to_string(),
-        ],
+        packs: vec!["kg".to_string(), "gtd".to_string(), "memory".to_string()],
         ..RuntimeConfig::default()
     };
     let runtime = KhiveRuntime::new(config).expect("in-memory runtime with all packs");
-    KhiveMcpServer::new(runtime).expect("server builds with kg+gtd+memory+brain")
+    KhiveMcpServer::new(runtime).expect("server builds with kg+gtd+memory")
 }
 
 async fn connect_full(
@@ -1795,25 +1786,25 @@ async fn help_recall_params_non_empty_with_query_param() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn help_brain_feedback_params_non_empty_with_target_and_signal() -> anyhow::Result<()> {
+async fn help_memory_feedback_params_non_empty_with_target_and_signal() -> anyhow::Result<()> {
     let client = connect_full().await?;
-    let schema = help_schema(&client, "brain.feedback").await?;
+    let schema = help_schema(&client, "memory.feedback").await?;
     let params = schema["params"]
         .as_array()
         .expect("params must be an array");
     assert!(
         !params.is_empty(),
-        "brain.feedback help=true must return non-empty params"
+        "memory.feedback help=true must return non-empty params"
     );
     let has_target_id = params.iter().any(|p| p["name"] == json!("target_id"));
     assert!(
         has_target_id,
-        "brain.feedback params must include 'target_id'; got: {params:?}"
+        "memory.feedback params must include 'target_id'; got: {params:?}"
     );
     let has_signal = params.iter().any(|p| p["name"] == json!("signal"));
     assert!(
         has_signal,
-        "brain.feedback params must include 'signal'; got: {params:?}"
+        "memory.feedback params must include 'signal'; got: {params:?}"
     );
     Ok(())
 }
@@ -2082,29 +2073,29 @@ async fn startup_migrations_applied_to_fresh_file_backed_db() -> anyhow::Result<
 
 // ── Fix 2: Visibility::Subhandler gate ──────────────────────────────────────
 
-/// `brain.state`, `brain.config`, `brain.events`, and `brain.emit` are
-/// tagged `Visibility::Subhandler` in the brain pack.  The MCP request
-/// surface must reject them with a per-op `{ok: false}` rather than routing
-/// to the handler.  `help=true` introspection must still work (short-circuit
-/// before the gate).
-fn make_brain_server() -> KhiveMcpServer {
+/// `memory.recall_candidates`, `memory.recall_fuse`, `memory.recall_rerank`,
+/// and `memory.recall_score` are tagged `Visibility::Subhandler` in the
+/// memory pack.  The MCP request surface must reject them with a per-op
+/// `{ok: false}` rather than routing to the handler.  `help=true`
+/// introspection must still work (short-circuit before the gate).
+fn make_subhandler_server() -> KhiveMcpServer {
     disable_daemon();
     let config = RuntimeConfig {
         db_path: None,
-        default_namespace: Namespace::parse("braintest").unwrap(),
+        default_namespace: Namespace::parse("subhtest").unwrap(),
         embedding_model: None,
         additional_embedding_models: vec![],
-        packs: vec!["kg".to_string(), "brain".to_string()],
+        packs: vec!["kg".to_string(), "memory".to_string()],
         ..RuntimeConfig::default()
     };
-    let runtime = KhiveRuntime::new(config).expect("kg+brain runtime");
-    KhiveMcpServer::new(runtime).expect("server builds with kg+brain")
+    let runtime = KhiveRuntime::new(config).expect("kg+memory runtime");
+    KhiveMcpServer::new(runtime).expect("server builds with kg+memory")
 }
 
 #[tokio::test]
 async fn subhandler_verbs_are_blocked_at_mcp_boundary() -> anyhow::Result<()> {
     let (server_transport, client_transport) = tokio::io::duplex(65536);
-    let server = make_brain_server();
+    let server = make_subhandler_server();
     tokio::spawn(async move {
         if let Ok(svc) = server.serve(server_transport).await {
             let _ = svc.waiting().await;
@@ -2113,7 +2104,12 @@ async fn subhandler_verbs_are_blocked_at_mcp_boundary() -> anyhow::Result<()> {
     let client = DummyClient.serve(client_transport).await?;
 
     // All four Subhandler verbs must be rejected.
-    for verb in &["brain.state", "brain.config", "brain.events", "brain.emit"] {
+    for verb in &[
+        "memory.recall_candidates",
+        "memory.recall_fuse",
+        "memory.recall_rerank",
+        "memory.recall_score",
+    ] {
         let result = call(&client, "request", json!({"ops": format!("{verb}()")})).await?;
         let body: Value = serde_json::from_str(&first_text(&result))?;
         let first = &body["results"][0];
@@ -2140,9 +2136,13 @@ async fn subhandler_verbs_are_blocked_at_mcp_boundary() -> anyhow::Result<()> {
 async fn subhandler_verbs_are_allowed_on_operator_path() -> anyhow::Result<()> {
     use khive_mcp::tools::request::RequestParams;
 
-    let server = make_brain_server();
+    let server = make_subhandler_server();
 
-    for verb in &["brain.state", "brain.config", "brain.events"] {
+    for verb in &[
+        "memory.recall_candidates",
+        "memory.recall_fuse",
+        "memory.recall_rerank",
+    ] {
         let raw = server
             .dispatch_request_local(RequestParams {
                 ops: format!("{verb}()"),
@@ -2172,7 +2172,7 @@ async fn subhandler_verbs_are_allowed_on_operator_path() -> anyhow::Result<()> {
 #[tokio::test]
 async fn subhandler_verb_help_introspection_still_works() -> anyhow::Result<()> {
     let (server_transport, client_transport) = tokio::io::duplex(65536);
-    let server = make_brain_server();
+    let server = make_subhandler_server();
     tokio::spawn(async move {
         if let Ok(svc) = server.serve(server_transport).await {
             let _ = svc.waiting().await;
@@ -2181,11 +2181,13 @@ async fn subhandler_verb_help_introspection_still_works() -> anyhow::Result<()> 
     let client = DummyClient.serve(client_transport).await?;
 
     // `help=true` is short-circuited before the visibility gate — must succeed.
-    let result = ok_one(&client, r#"brain.state(help=true)"#).await?;
+    let result = ok_one(&client, r#"memory.recall_candidates(help=true)"#).await?;
     // Help response includes the verb name or param list.
     let text = serde_json::to_string(&result).unwrap_or_default();
     assert!(
-        text.contains("brain.state") || text.contains("params") || text.contains("help"),
+        text.contains("memory.recall_candidates")
+            || text.contains("params")
+            || text.contains("help"),
         "help response for Subhandler verb must return introspection data: {text}"
     );
     Ok(())
@@ -3573,50 +3575,6 @@ async fn agenda_returns_iso8601_timestamps() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn connect_brain_only(
-) -> anyhow::Result<impl std::ops::Deref<Target = rmcp::service::Peer<rmcp::RoleClient>>> {
-    let (server_transport, client_transport) = tokio::io::duplex(65536);
-    let config = RuntimeConfig {
-        db_path: None,
-        default_namespace: Namespace::parse("braintest2").unwrap(),
-        embedding_model: None,
-        additional_embedding_models: vec![],
-        packs: vec!["kg".to_string(), "brain".to_string()],
-        ..RuntimeConfig::default()
-    };
-    let runtime = KhiveRuntime::new(config).expect("kg+brain runtime");
-    let server = KhiveMcpServer::new(runtime).expect("server builds");
-    tokio::spawn(async move {
-        if let Ok(svc) = server.serve(server_transport).await {
-            let _ = svc.waiting().await;
-        }
-    });
-    let client = DummyClient.serve(client_transport).await?;
-    Ok(client)
-}
-
-/// `brain.profiles` must return ISO-8601 `created_at` on profile records.
-#[tokio::test]
-async fn brain_profiles_returns_iso8601_timestamps() -> anyhow::Result<()> {
-    let client = connect_brain_only().await?;
-
-    let result = ok_one(&client, r#"brain.profiles()"#).await?;
-    let profiles = result["profiles"]
-        .as_array()
-        .expect("brain.profiles returns profiles array");
-    assert!(
-        !profiles.is_empty(),
-        "brain.profiles must return at least one profile"
-    );
-    let created_at = profiles[0]["created_at"].as_str().unwrap_or("");
-    assert!(
-        created_at.starts_with("20"),
-        "brain.profiles created_at must be ISO-8601 string, got: {:?}",
-        profiles[0]["created_at"]
-    );
-    Ok(())
-}
-
 /// `propose` + `list(kind="proposal")` must return ISO-8601 timestamps on proposal rows.
 #[tokio::test]
 async fn proposal_list_returns_iso8601_timestamps() -> anyhow::Result<()> {
@@ -3745,133 +3703,6 @@ async fn agenda_rejects_unknown_kwarg() -> anyhow::Result<()> {
         err.contains("unknownkw") || err.contains("unknown field"),
         "error must mention the unknown field; got: {err}"
     );
-    Ok(())
-}
-
-/// `brain.profile(id="balanced-recall-v1", unknownkw="x")` must return `ok: false`.
-#[tokio::test]
-async fn brain_profile_rejects_unknown_kwarg() -> anyhow::Result<()> {
-    let client = connect_brain_only().await?;
-
-    let result = call(
-        &client,
-        "request",
-        json!({ "ops": r#"brain.profile(id="balanced-recall-v1", unknownkw="oops")"# }),
-    )
-    .await?;
-    let body: Value = serde_json::from_str(&first_text(&result))?;
-    let first = &body["results"][0];
-    assert_eq!(
-        first["ok"],
-        json!(false),
-        "brain.profile with unknown kwarg must fail; got: {first}"
-    );
-    let err = first["error"].as_str().unwrap_or("");
-    assert!(
-        err.contains("unknownkw") || err.contains("unknown field"),
-        "error must mention the unknown field; got: {err}"
-    );
-    Ok(())
-}
-
-fn make_knowledge_server() -> KhiveMcpServer {
-    disable_daemon();
-    let config = RuntimeConfig {
-        db_path: None,
-        default_namespace: Namespace::parse("knowtest").unwrap(),
-        embedding_model: None,
-        additional_embedding_models: vec![],
-        packs: vec!["kg".to_string(), "knowledge".to_string()],
-        ..RuntimeConfig::default()
-    };
-    let runtime = KhiveRuntime::new(config).expect("kg+knowledge runtime");
-    KhiveMcpServer::new(runtime).expect("server builds with kg+knowledge")
-}
-
-async fn connect_knowledge(
-) -> anyhow::Result<impl std::ops::Deref<Target = rmcp::service::Peer<rmcp::RoleClient>>> {
-    let (server_transport, client_transport) = tokio::io::duplex(65536);
-    let server = make_knowledge_server();
-    tokio::spawn(async move {
-        if let Ok(svc) = server.serve(server_transport).await {
-            let _ = svc.waiting().await;
-        }
-    });
-    let client = DummyClient.serve(client_transport).await?;
-    Ok(client)
-}
-
-/// `topic(unknownkw="x")` (knowledge) must return `ok: false`.
-#[tokio::test]
-async fn topic_rejects_unknown_kwarg() -> anyhow::Result<()> {
-    let client = connect_knowledge().await?;
-
-    let result = call(
-        &client,
-        "request",
-        json!({ "ops": r#"knowledge.topic(unknownkw="oops")"# }),
-    )
-    .await?;
-    let body: Value = serde_json::from_str(&first_text(&result))?;
-    let first = &body["results"][0];
-    assert_eq!(
-        first["ok"],
-        json!(false),
-        "topic with unknown kwarg must fail; got: {first}"
-    );
-    let err = first["error"].as_str().unwrap_or("");
-    assert!(
-        err.contains("unknownkw") || err.contains("unknown field"),
-        "error must mention the unknown field; got: {err}"
-    );
-    Ok(())
-}
-
-// ── #545: brain.feedback default Agent response preserves full target_id ──────
-
-/// `brain.feedback` in default Agent mode must return `target_id` as the full
-/// 36-char UUID, not the 8-char Agent-mode prefix (#545).
-#[tokio::test]
-async fn brain_feedback_default_agent_response_preserves_full_target_id() -> anyhow::Result<()> {
-    let client = connect_brain_only().await?;
-
-    let created = ok_one(
-        &client,
-        r#"create(kind="entity", entity_kind="concept", name="BrainFeedbackTarget")"#,
-    )
-    .await?;
-    let target_id = created["id"]
-        .as_str()
-        .expect("created entity id")
-        .to_string();
-    assert_eq!(
-        target_id.len(),
-        36,
-        "entity id from verbose ok_one must be 36-char"
-    );
-
-    // Use plain `call` (not `ok_one`) so Agent mode is not forced to verbose.
-    let result = call(
-        &client,
-        "request",
-        json!({"ops": format!(r#"brain.feedback(target_id="{target_id}", signal="useful")"#)}),
-    )
-    .await?;
-    let body: Value = serde_json::from_str(&first_text(&result))?;
-    let first = &body["results"][0];
-    assert_eq!(
-        first["ok"],
-        json!(true),
-        "brain.feedback must succeed: {first}"
-    );
-
-    let returned = first["result"]["target_id"].as_str().unwrap_or("");
-    assert_eq!(
-        returned.len(),
-        36,
-        "brain.feedback Agent response target_id must be full 36-char UUID, got: {returned:?}"
-    );
-    assert_eq!(returned, target_id, "returned target_id must match input");
     Ok(())
 }
 

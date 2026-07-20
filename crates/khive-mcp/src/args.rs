@@ -53,7 +53,8 @@ pub struct Args {
     /// Pack to load into the verb registry. Repeat for multiple
     /// (e.g. `--pack kg --pack gtd`). When unset, falls back to `KHIVE_PACKS`
     /// (comma- or whitespace-separated), and if that is also unset to the full
-    /// production set: `kg,gtd,memory,brain,comm,schedule,knowledge,session,git,code,workspace`.
+    /// production set:
+    /// `kg,gtd,memory,comm,schedule,session,git,workspace,blob`.
     #[arg(long = "pack")]
     pub pack: Vec<String>,
 
@@ -92,7 +93,7 @@ pub struct Args {
 
     /// Brain profile ID for feedback routing and recall-time score boosting.
     ///
-    /// When set, `memory.feedback` and `knowledge.feedback` credit this profile.
+    /// When set, `memory.feedback` credits this profile.
     /// Takes the highest precedence in the resolution chain.
     ///
     /// Precedence (highest to lowest):

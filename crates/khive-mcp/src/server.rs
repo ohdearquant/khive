@@ -471,15 +471,6 @@ impl KhiveMcpServer {
         self
     }
 
-    /// Clone the verb registry for use by background tasks (e.g. channel polling loops).
-    ///
-    /// `VerbRegistry` is internally `Arc`-wrapped so this clone is cheap. The returned
-    /// registry shares the same packs and dispatch state as the server.
-    #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
-    pub(crate) fn verb_registry_clone(&self) -> VerbRegistry {
-        self.registry.clone()
-    }
-
     /// Route a `link` or `search` verb through the coordinator when in multi-backend mode.
     ///
     /// Returns `Some(result)` when the coordinator handled the op (caller should skip
@@ -556,10 +547,10 @@ impl KhiveMcpServer {
 
     /// This server's configured audit `EventStore`, if any (ADR-094).
     ///
-    /// Exposed so the `DaemonDispatch::event_store_for_checkpoint` impl and
-    /// the email channel poll loop can append best-effort lifecycle events
-    /// to the same sink gate-check audit rows already use, without a second
-    /// constructor argument threaded everywhere a registry is built.
+    /// Exposed so the `DaemonDispatch::event_store_for_checkpoint` impl can
+    /// append best-effort lifecycle events to the same sink gate-check audit
+    /// rows already use, without a second constructor argument threaded
+    /// everywhere a registry is built.
     pub fn event_store(&self) -> Option<Arc<dyn khive_storage::EventStore>> {
         self.registry.event_store()
     }
@@ -1855,7 +1846,7 @@ fn parse_output_format(s: Option<&str>) -> Result<Option<OutputFormat>, String> 
 ///   verb's AlwaysVerbose policy forces Verbose), apply `render_format` to the
 ///   `result` payload with the effective presentation so that both
 ///   `presentation_per_op=["verbose"]` and AlwaysVerbose verbs (get/link/query/
-///   traverse/neighbors/brain.feedback) correctly skip the redundancy-drop
+///   traverse/neighbors) correctly skip the redundancy-drop
 ///   pre-pass (ADR-078 §7 + §8.4; mirrors `run_parsed`).
 ///
 /// The outer envelope (`{results:[...], summary:{...}}`) is always compact JSON (§8.4).
@@ -1888,8 +1879,8 @@ fn render_result(
                 // Resolve per-op presentation: per-op entry overrides batch default,
                 // then the AlwaysVerbose verb policy forces Verbose — mirroring the
                 // resolution `run_parsed` applies before presentation. Without this,
-                // a policy-verbose verb (get/link/query/traverse/neighbors/
-                // brain.feedback) dispatched under format=auto/table with the default
+                // a policy-verbose verb (get/link/query/traverse/neighbors)
+                // dispatched under format=auto/table with the default
                 // Agent presentation would be redundancy-dropped at the format seam,
                 // stripping the namespace/properties it is declared AlwaysVerbose
                 // precisely to preserve.
@@ -2079,63 +2070,6 @@ mod tests {
             .map(|l| l.trim_start().split(' ').next().unwrap())
             .collect();
         assert_eq!(names, vec!["assign", "list", "search"]);
-    }
-
-    // ── #658 regression: brain dispatch hook wired into production builder ──
-
-    /// The hook (registered via `PackInstall::dispatch_hook`) and the pack
-    /// runtime the registry dispatches `brain.*` verbs to must be the same
-    /// `BrainPack` instance — otherwise the hook's posterior updates would be
-    /// invisible to `brain.state` reads. `brain.state` loads the default
-    /// namespace into the shared active slot as a side effect, so a
-    /// subsequent non-brain dispatch in the same namespace lands on
-    /// `ApplyTarget::ActiveSlot` and is immediately observable.
-    ///
-    /// Uses the `local` namespace (rather than an arbitrary one) because
-    /// ADR-007 Rule 3b always pins the implicit write token to `local`
-    /// regardless of the registry's configured default namespace; using
-    /// `local` for both keeps the dispatched event's namespace and the
-    /// token's namespace identical, so the signal lands on the active slot
-    /// instead of the cold-namespace queue.
-    #[tokio::test]
-    async fn brain_dispatch_hook_updates_state_visible_through_same_instance() {
-        let config = RuntimeConfig {
-            db_path: None,
-            default_namespace: Namespace::local(),
-            embedding_model: None,
-            additional_embedding_models: vec![],
-            packs: vec!["kg".to_string(), "brain".to_string()],
-            ..RuntimeConfig::default()
-        };
-        let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
-        let server = KhiveMcpServer::with_packs(runtime, &["kg".to_string(), "brain".to_string()])
-            .expect("server builds with kg + brain");
-
-        server
-            .registry
-            .dispatch("brain.state", serde_json::Value::Null)
-            .await
-            .expect("brain.state loads the default namespace into the active slot");
-
-        server
-            .registry
-            .dispatch("stats", serde_json::json!({}))
-            .await
-            .expect("kg.stats dispatch succeeds");
-
-        let state = server
-            .registry
-            .dispatch("brain.state", serde_json::Value::Null)
-            .await
-            .expect("brain.state dispatch");
-        let total_events = state["balanced_recall"]["total_events"]
-            .as_u64()
-            .unwrap_or(0);
-        assert!(
-            total_events > 0,
-            "dispatch hook must update the same BrainPack instance the registry \
-             dispatches brain.* verbs to; got snapshot {state:?}"
-        );
     }
 
     // ── #823: runtime `$prev` result depth guard ────────────────────────────

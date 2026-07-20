@@ -62,7 +62,7 @@ PROTOCOL_VERSION = 3
 # Default production pack set (must match RuntimeConfig::default().packs in
 # crates/khive-runtime/src/config.rs so config_id agrees between front-end
 # and daemon child).
-DEFAULT_PACKS = "kg,gtd,memory,brain,comm,schedule,knowledge,session,code,workspace,blob"
+DEFAULT_PACKS = "kg,gtd,memory,comm,schedule,session,workspace,blob"
 
 # ── Live-DB safety guard ──────────────────────────────────────────────────────
 
@@ -448,8 +448,7 @@ def join_request_ids(samples: list[dict], audit_events: list[dict]) -> list[dict
     this function does not read them, only passes them through unchanged).
 
     `audit_events`: the persisted audit rows read back for the run's
-    namespace/verb/time window (e.g. via `brain.event_counts` or a direct
-    event-store query). Each event's `resource.request_id` (if present) is
+    namespace/verb/time window (e.g. via a direct event-store query). Each event's `resource.request_id` (if present) is
     the correlation key; `duration_us` is the server-side dispatch time to
     pull across for the client/server latency decomposition.
 

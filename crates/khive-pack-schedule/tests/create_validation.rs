@@ -15,17 +15,6 @@ fn build_registry() -> (VerbRegistry, KhiveRuntime) {
     (registry, runtime)
 }
 
-fn build_registry_with_brain() -> (VerbRegistry, KhiveRuntime) {
-    let runtime = support::memory_runtime();
-    let mut builder = VerbRegistryBuilder::new();
-    builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
-    builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
-    builder.register(khive_pack_brain::BrainPack::new(runtime.clone()));
-    builder.register(SchedulePack::new(runtime.clone()));
-    let registry = builder.build().expect("registry builds");
-    (registry, runtime)
-}
-
 #[tokio::test]
 async fn remind_creates_pending_event() {
     let (registry, _rt) = build_registry();
@@ -858,13 +847,13 @@ async fn schedule_schedule_rejects_create_with_invalid_entity_kind() {
 
 #[tokio::test]
 async fn schedule_schedule_rejects_business_namespace_arg() {
-    let (registry, _rt) = build_registry_with_brain();
+    let (registry, _rt) = build_registry();
 
     let err = registry
         .dispatch(
             "schedule.schedule",
             serde_json::json!({
-                "action": "brain.bind(profile_id=\"p\", namespace=\"team-a\")",
+                "action": "comm.heartbeat(namespace=\"team-a\", channel_kind=\"email\", channel_slug=\"a\", outcome=\"success\")",
                 "at": "2099-06-01T10:00:00Z"
             }),
         )
@@ -880,24 +869,23 @@ async fn schedule_schedule_rejects_business_namespace_arg() {
 }
 
 /// Issue #462: omitting `namespace` from the stored action does NOT make
-/// `brain.bind` replayable. `dispatch_action` (`kkernel/src/pending_events.rs`)
+/// `comm.heartbeat` replayable. `dispatch_action` (`kkernel/src/pending_events.rs`)
 /// unconditionally injects the firing event's routing namespace into every
 /// op's args at trigger time, and the registry passes it straight through to
 /// any handler that declares `namespace` as a param — so an *omitted*
-/// `namespace` (which would otherwise default to `brain.bind`'s wildcard
-/// `"*"`) is silently rebound to the event's routing namespace on replay.
+/// `namespace` is silently rebound to the event's routing namespace on replay.
 /// This is exactly as unsafe as an explicitly-stored `namespace` arg, so
 /// `schedule.schedule` must reject any handler whose schema declares
 /// `namespace`, regardless of whether the stored args include the key.
 #[tokio::test]
 async fn schedule_schedule_rejects_verb_declaring_namespace_even_when_omitted() {
-    let (registry, _rt) = build_registry_with_brain();
+    let (registry, _rt) = build_registry();
 
     let err = registry
         .dispatch(
             "schedule.schedule",
             serde_json::json!({
-                "action": "brain.bind(profile_id=\"p\")",
+                "action": "comm.heartbeat(channel_kind=\"email\", channel_slug=\"a\", outcome=\"success\")",
                 "at": "2099-06-01T10:00:00Z"
             }),
         )
@@ -906,8 +894,8 @@ async fn schedule_schedule_rejects_verb_declaring_namespace_even_when_omitted() 
 
     let msg = err.to_string();
     assert!(
-        msg.contains("brain.bind") && msg.contains("namespace"),
-        "#462: brain.bind must be rejected even without an explicit `namespace` arg — the \
+        msg.contains("comm.heartbeat") && msg.contains("namespace"),
+        "#462: comm.heartbeat must be rejected even without an explicit `namespace` arg — the \
          verb declares `namespace` as a business param, and replay would inject the event's \
          routing namespace regardless of what (if anything) was stored; got: {msg}"
     );

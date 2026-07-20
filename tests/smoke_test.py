@@ -196,21 +196,16 @@ def main():
         assert "total" in verbs_result, f"verbs must return 'total' key: {verbs_result}"
         assert isinstance(verbs_result["verbs"], list), f"verbs must be a list: {verbs_result}"
         # Surface-contract tripwire: the default config (no --pack, KHIVE_PACKS
-        # unset) loads 11 production packs (kg, gtd, memory, brain, comm, schedule,
-        # knowledge, session, code, workspace, blob), so verbs() returns exactly
-        # 81 user-facing MCP-callable verbs (count what verbs() returns, not internal
+        # unset) loads 8 production packs (kg, gtd, memory, comm, schedule,
+        # session, workspace, blob), so verbs() returns exactly
+        # 46 user-facing MCP-callable verbs (count what verbs() returns, not internal
         # dispatch arms). The session pack contributes 4 agent-facing T1 verbs
         # (store/list/resume/export), promoted from internal subhandlers to
-        # Visibility::Verb per ADR-083; brain.register_adapter (#354), context
+        # Visibility::Verb per ADR-083; context
         # (ADR-089, the 17th kg-substrate bare verb), resolve (unified-verb
         # draft ADR Slice 1, the 18th kg-substrate bare verb), comm.health
-        # (#606, verified live 2026-07-04), comm.probe (#644 read-only
-        # inbound poll), and brain.event_counts (#724, ADR-103 Stage 1
-        # windowed event read) are included in the count; code contributes
-        # exactly one verb, `code.ingest` (ADR-085 Amendment 2, PR #1039 —
-        # L1 manifest + L1.5 import-scan tiers; its `finding` note kind and
-        # `findings.json` batch ingest remain reachable only via the
-        # `kkernel code-ingest` admin CLI, never this MCP verb surface);
+        # (#606, verified live 2026-07-04), and comm.probe (#644 read-only
+        # inbound poll) are included in the count;
         # workspace (#873) contributes zero verbs, adding only the
         # `workspace` entity kind and `contains` endpoint rules; blob
         # contributes three verbs (blob.put / blob.get / blob.stat, ADR-111)
@@ -218,14 +213,12 @@ def main():
         # until a backend is installed via [storage.blob] or KHIVE_BLOB_ROOT.
         # Update this number when the pack set or verb surface changes; a
         # silent drift here is the bug this assertion exists to catch.
-        assert verbs_result["total"] == 81, (
-            f"expected 81 user-facing verbs from the 11 default packs "
+        assert verbs_result["total"] == 46, (
+            f"expected 46 user-facing verbs from the 8 default packs "
             f"(session contributes 4 T1 verbs promoted to Visibility::Verb per "
             f"ADR-083; context is the 17th kg-substrate bare verb per ADR-089; "
             f"resolve is the 18th kg-substrate bare verb per the unified-verb "
             f"draft ADR Slice 1; comm.health is #606; comm.probe is #644; "
-            f"brain.event_counts is #724/ADR-103; "
-            f"code contributes code.ingest per ADR-085 Amendment 2 (PR #1039); "
             f"workspace (#873) contributes zero verbs; "
             f"blob contributes blob.put/blob.get/blob.stat per ADR-111), "
             f"got {verbs_result['total']}: {verbs_result}"
@@ -234,9 +227,6 @@ def main():
         assert "create" in verb_names, f"'create' must appear in verbs listing: {verb_names}"
         assert "stats" in verb_names, f"'stats' must appear in verbs listing: {verb_names}"
         assert "context" in verb_names, f"'context' (ADR-089) must appear in verbs listing: {verb_names}"
-        assert "code.ingest" in verb_names, (
-            f"'code.ingest' (ADR-085 Amendment 2, PR #1039) must appear in verbs listing: {verb_names}"
-        )
         # each entry carries verb, pack, description, category per handler_defs.rs:735-742
         first = verbs_result["verbs"][0]
         for key in ("verb", "pack", "description", "category"):
@@ -258,30 +248,6 @@ def main():
         assert "create" in kg_verb_names, f"'create' must appear in kg-filtered verbs: {kg_verb_names}"
         assert "stats" in kg_verb_names, f"'stats' must appear in kg-filtered verbs: {kg_verb_names}"
         print(f"  [ok] verbs — {verbs_result['total']} total verbs, {kg_verbs['total']} in kg pack")
-
-        # 3b. Zero-verb pack load tripwire (khive#848 F6): `code` contributes
-        # no MCP verbs, so a stale/dropped default-pack entry for it would
-        # not show up in the verbs() total above at all. `finding` is a note
-        # kind declared ONLY by khive-pack-code's NOTE_KIND_SPECS (ADR-085
-        # D4/Amendment 3) — if `code` were missing from the default pack set,
-        # this create would be rejected as an unknown note kind. A
-        # successful create is therefore direct proof the pack is loaded
-        # under default config, independent of the verb count.
-        code_pack_finding = call_verb(proc, "create", {
-            "kind": "note",
-            "note_kind": "finding",
-            "title": "smoke-test tripwire finding",
-            "properties": {"severity": "low", "confidence": "high"},
-        })
-        assert code_pack_finding["kind"] == "finding", (
-            f"expected kind=finding (proves the zero-verb `code` pack is loaded "
-            f"under default config), got: {code_pack_finding}"
-        )
-        assert code_pack_finding["properties"]["kind_status"] == "open", (
-            f"a finding with no producer status must default kind_status to 'open': "
-            f"{code_pack_finding}"
-        )
-        print(f"  [ok] code pack loaded — create(kind=\"finding\") succeeded under default config")
 
         # 4. Get entity via get (auto-detects substrate; flat shape per W2 #454,
         #    granular kind at top level — same shape as create/list)
@@ -685,91 +651,6 @@ def memory_smoke():
         proc.wait(timeout=5)
 
 
-def formal_smoke():
-    """Smoke test for the formal-pack EntityOfType edge rules (vocab.rs).
-
-    The formal pack (khive-pack-formal) adds 21 additive endpoint rules keyed
-    on entity_type (vocab.rs:27-137). Formal math entities are plain concept
-    entities with entity_type set to the subtype ("theorem", "definition", etc.).
-    The pair exercised here:
-
-        depends_on: theorem -> definition  (vocab.rs:37-42)
-
-    Without the formal pack, concept depends_on concept is rejected by the base
-    contract (operations.rs:298-304: depends_on is p->p, s->{p,s,a,ds}, a->{p,s}).
-    With --pack formal loaded, EndpointKind::EntityOfType matching in
-    operations.rs:231-234 (substrate=="entity" && kind==k && entity_type==Some(t))
-    permits it.
-    """
-    env = {**os.environ, "KHIVE_NO_DAEMON": "1"}
-    proc = subprocess.Popen(
-        [
-            BINARY, "mcp", "--db", ":memory:", "--no-embed", "--log", "error",
-            "--pack", "kg", "--pack", "formal",
-        ],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=env,
-    )
-    try:
-        send(proc, "initialize", {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": {"name": "formal-smoke", "version": "0.1.0"},
-        })
-        recv(proc)
-        notify = {"jsonrpc": "2.0", "method": "notifications/initialized"}
-        proc.stdin.write((json.dumps(notify) + "\n").encode())
-        proc.stdin.flush()
-
-        # Create a concept entity with entity_type="theorem".
-        # entity_type is stored via Entity::with_entity_type (operations.rs:487),
-        # making it available to the EntityOfType endpoint matcher.
-        thm = call_verb(proc, "create", {
-            "kind": "entity",
-            "entity_kind": "concept",
-            "entity_type": "theorem",
-            "name": "FormalSmokeTheorem",
-            "description": "Synthetic theorem for formal-pack smoke coverage",
-        })
-        assert thm["name"] == "FormalSmokeTheorem", f"unexpected create result: {thm}"
-        thm_id = thm["id"]
-        print(f"  [formal] create concept entity_type=theorem — {thm_id[:8]}...")
-
-        # Create a concept entity with entity_type="definition".
-        defn = call_verb(proc, "create", {
-            "kind": "entity",
-            "entity_kind": "concept",
-            "entity_type": "definition",
-            "name": "FormalSmokeDefinition",
-            "description": "Synthetic definition for formal-pack smoke coverage",
-        })
-        defn_id = defn["id"]
-        print(f"  [formal] create concept entity_type=definition — {defn_id[:8]}...")
-
-        # Link theorem -[depends_on]-> definition.
-        # Permitted by FORMAL_EDGE_RULES[1] (vocab.rs:37-42):
-        #   EdgeEndpointRule { relation: DependsOn,
-        #     source: EntityOfType { kind: "concept", entity_type: "theorem" },
-        #     target: EntityOfType { kind: "concept", entity_type: "definition" } }
-        edge = call_verb(proc, "link", {
-            "source_id": thm_id,
-            "target_id": defn_id,
-            "relation": "depends_on",
-            "weight": 1.0,
-        })
-        assert edge["relation"] == "depends_on", (
-            f"formal-pack depends_on edge must succeed: {edge}"
-        )
-        print(f"  [formal] link theorem -[depends_on]-> definition — ok")
-
-        print(f"\n  FORMAL PACK SMOKE TESTS PASSED")
-    finally:
-        proc.stdin.close()
-        proc.wait(timeout=5)
-
-
 def epistemic_smoke():
     """E2E smoke test for supports/refutes epistemic edge relations (ADR-055).
 
@@ -951,146 +832,6 @@ def epistemic_smoke():
         print(f"  [epistemic] document -[supports]-> document rejected (target not concept) — ok")
 
         print(f"\n  EPISTEMIC SMOKE TESTS PASSED (ADR-055)")
-    finally:
-        proc.stdin.close()
-        proc.wait(timeout=5)
-
-
-def brain_smoke():
-    """Optional smoke test for the brain pack -- profile lifecycle, feedback, and bindings."""
-    env = {**os.environ, "KHIVE_NO_DAEMON": "1"}
-    proc = subprocess.Popen(
-        [
-            BINARY, "mcp", "--db", ":memory:", "--no-embed", "--log", "error",
-            "--pack", "kg", "--pack", "brain",
-        ],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=env,
-    )
-    try:
-        send(proc, "initialize", {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": {"name": "brain-smoke", "version": "0.1.0"},
-        })
-        recv(proc)
-        notify = {"jsonrpc": "2.0", "method": "notifications/initialized"}
-        proc.stdin.write((json.dumps(notify) + "\n").encode())
-        proc.stdin.flush()
-
-        # brain.create_profile: create a profile in the inactive state
-        created = call_verb(proc, "brain.create_profile", {"name": "smoke-brain-v1"})
-        assert created.get("created") is True, (
-            f"brain.create_profile must return created=true: {created}"
-        )
-        profile_id = created["profile_id"]
-        print(f"  [brain] brain.create_profile -- {profile_id}")
-
-        # brain.profiles: the new profile must be listed
-        profiles_result = call_verb(proc, "brain.profiles", {})
-        # brain.profiles returns each entry with key "id" (not "profile_id")
-        profile_ids = [p["id"] for p in profiles_result.get("profiles", [])]
-        assert profile_id in profile_ids, (
-            f"created profile must appear in brain.profiles: {profile_ids}"
-        )
-        print(f"  [brain] brain.profiles -- {profiles_result['count']} profile(s)")
-
-        # brain.profile: fetch metadata; a new profile starts as inactive
-        meta = call_verb(proc, "brain.profile", {"profile_id": profile_id})
-        assert meta["lifecycle"] == "inactive", (
-            f"new profile must start in inactive lifecycle: {meta['lifecycle']}"
-        )
-        print(f"  [brain] brain.profile -- lifecycle={meta['lifecycle']}")
-
-        # brain.activate: move the profile from inactive to active
-        activated = call_verb(proc, "brain.activate", {"profile_id": profile_id})
-        assert activated["profile_id"] == profile_id, (
-            f"brain.activate must return the profile_id: {activated}"
-        )
-        print(f"  [brain] brain.activate -- ok")
-
-        # brain.resolve: must resolve a profile for the given consumer kind
-        resolved = call_verb(proc, "brain.resolve", {"consumer_kind": "recall"})
-        assert resolved.get("resolved_profile_id"), (
-            f"brain.resolve must return a resolved_profile_id: {resolved}"
-        )
-        print(f"  [brain] brain.resolve -- {resolved['resolved_profile_id']}")
-
-        # brain.feedback: requires a valid entity as the target; use a real concept entity.
-        # The create response returns the 8-char short id (Agent mode presentation),
-        # so call get() to recover the full 36-char UUID that brain.feedback requires.
-        entity = call_verb(proc, "create", {
-            "kind": "entity",
-            "entity_kind": "concept",
-            "name": "BrainSmokeTarget",
-        })
-        full_entity = call_verb(proc, "get", {"id": entity["id"]})
-        entity_full_id = full_entity["id"]
-        feedback = call_verb(proc, "brain.feedback", {
-            "target_id": entity_full_id,
-            "signal": "useful",
-        })
-        assert feedback.get("emitted") is True, (
-            f"brain.feedback must return emitted=true: {feedback}"
-        )
-        print(f"  [brain] brain.feedback(signal=useful, target={entity_full_id[:8]}...) -- ok")
-
-        # brain.deactivate: move back to inactive before archiving
-        deactivated = call_verb(proc, "brain.deactivate", {"profile_id": profile_id})
-        assert deactivated["profile_id"] == profile_id, (
-            f"brain.deactivate must return the profile_id: {deactivated}"
-        )
-        print(f"  [brain] brain.deactivate -- ok")
-
-        # brain.archive: terminal state (no further lifecycle transitions allowed)
-        archived = call_verb(proc, "brain.archive", {"profile_id": profile_id})
-        assert archived["profile_id"] == profile_id, (
-            f"brain.archive must return the profile_id: {archived}"
-        )
-        print(f"  [brain] brain.archive -- ok")
-
-        # brain.bind / brain.bindings / brain.unbind: use the always-present
-        # balanced-recall-v1 profile (Active by default) for binding coverage
-        bound = call_verb(proc, "brain.bind", {
-            "profile_id": "balanced-recall-v1",
-            "consumer_kind": "recall",
-            "actor": "smoke-actor",
-        })
-        assert bound.get("bound") is True, (
-            f"brain.bind must return bound=true: {bound}"
-        )
-        print(f"  [brain] brain.bind -- ok")
-
-        bindings = call_verb(proc, "brain.bindings", {"profile_id": "balanced-recall-v1"})
-        binding_actors = [b.get("actor") for b in bindings.get("bindings", [])]
-        assert "smoke-actor" in binding_actors, (
-            f"smoke-actor must appear in bindings after brain.bind: {binding_actors}"
-        )
-        print(f"  [brain] brain.bindings -- {bindings['count']} binding(s)")
-
-        unbound = call_verb(proc, "brain.unbind", {
-            "profile_id": "balanced-recall-v1",
-            "actor": "smoke-actor",
-        })
-        assert unbound.get("unbound", 0) >= 1, (
-            f"brain.unbind must remove at least one binding: {unbound}"
-        )
-        print(f"  [brain] brain.unbind -- removed {unbound['unbound']}")
-
-        # Confirm the binding is gone
-        after = call_verb(proc, "brain.bindings", {
-            "profile_id": "balanced-recall-v1",
-            "actor": "smoke-actor",
-        })
-        remaining_actors = [b.get("actor") for b in after.get("bindings", [])]
-        assert "smoke-actor" not in remaining_actors, (
-            f"smoke-actor must be absent after unbind: {remaining_actors}"
-        )
-        print(f"  [brain] brain.bindings post-unbind -- smoke-actor removed")
-
-        print(f"\n  BRAIN PACK SMOKE TESTS PASSED")
     finally:
         proc.stdin.close()
         proc.wait(timeout=5)
@@ -1337,26 +1078,12 @@ if __name__ == "__main__":
             print(f"  [memory FAIL] {e}")
             failed_sections.append("memory")
 
-    if os.environ.get("KHIVE_SMOKE_FORMAL", "1") != "0":
-        try:
-            formal_smoke()
-        except Exception as e:
-            print(f"  [formal FAIL] {e}")
-            failed_sections.append("formal")
-
     if os.environ.get("KHIVE_SMOKE_EPISTEMIC", "1") != "0":
         try:
             epistemic_smoke()
         except Exception as e:
             print(f"  [epistemic FAIL] {e}")
             failed_sections.append("epistemic")
-
-    if os.environ.get("KHIVE_SMOKE_BRAIN", "1") != "0":
-        try:
-            brain_smoke()
-        except Exception as e:
-            print(f"  [brain FAIL] {e}")
-            failed_sections.append("brain")
 
     if os.environ.get("KHIVE_SMOKE_COMM", "1") != "0":
         try:

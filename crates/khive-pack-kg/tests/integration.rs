@@ -7508,9 +7508,7 @@ async fn hard_delete_soft_deleted_note_cross_namespace_succeeds() {
 // tests lock in the fix: prefix resolution is now unfiltered too, matching
 // the full-UUID contract. by-ID CRUD has no visibility boundary at all; the
 // Gate is the authz seam (ADR-007 Rev 6). This shares the namespace-agnostic
-// by-ID contract that `brain.feedback` now follows
-// (`brain_feedback_accepts_foreign_namespace_target_id` in
-// `khive-pack-brain/tests/dispatch_hook.rs`, #498).
+// by-ID contract other packs' feedback-style verbs follow (#498).
 
 /// `get` by short prefix from a caller in a DIFFERENT namespace than the
 /// record must now succeed (was `NotFound` pre-#391).
@@ -8629,121 +8627,6 @@ async fn search_note_combined_property_and_tag_filter() {
         ids[0], note_a_id,
         "#223: only note_a matches both predicates; got {ids:?}"
     );
-}
-
-// ---- Formal pack gate: default-vs-formal control test ----
-//
-// These tests prove that the formal pack's EDGE_RULES are actually wired into
-// the link path — not just that the rule table is non-empty. Specifically:
-//
-// - With only `kg` loaded (default surface), `depends_on` between typed formal
-//   concept entities (theorem→definition) MUST be rejected.
-// - With `kg,formal` loaded, the same link MUST be accepted.
-//
-// This mirrors what the MCP transport does at startup (ADR-031): build the
-// VerbRegistry, then call `rt.install_edge_rules(registry.all_edge_rules())`.
-
-fn pack_kg_only() -> (Fixture, KhiveRuntime) {
-    let rt = KhiveRuntime::memory().expect("in-memory runtime must succeed");
-    let mut builder = VerbRegistryBuilder::new();
-    builder.register(KgPack::new(rt.clone()));
-    let registry = builder.build().expect("kg-only registry builds");
-    rt.install_edge_rules(registry.all_edge_rules());
-    (Fixture { registry }, rt)
-}
-
-fn pack_kg_and_formal() -> (Fixture, KhiveRuntime) {
-    use khive_pack_formal::FormalPack;
-
-    let rt = KhiveRuntime::memory().expect("in-memory runtime must succeed");
-    let mut builder = VerbRegistryBuilder::new();
-    builder.register(KgPack::new(rt.clone()));
-    builder.register(FormalPack::new(rt.clone()));
-    let registry = builder.build().expect("kg+formal registry builds");
-    rt.install_edge_rules(registry.all_edge_rules());
-    (Fixture { registry }, rt)
-}
-
-/// Without formal pack: depends_on between typed concept entities (theorem→definition)
-/// must be rejected. Proves the formal rules are not present in the default surface.
-#[tokio::test]
-async fn formal_depends_on_rejected_without_formal_pack() {
-    let (f, _rt) = pack_kg_only();
-
-    let thm = f
-        .dispatch(
-            "create",
-            json!({ "kind": "concept", "entity_type": "theorem", "name": "Nat.add_comm" }),
-        )
-        .await
-        .expect("create theorem concept");
-
-    let def = f
-        .dispatch(
-            "create",
-            json!({ "kind": "concept", "entity_type": "definition", "name": "Nat.add" }),
-        )
-        .await
-        .expect("create definition concept");
-
-    let result = f
-        .dispatch(
-            "link",
-            json!({
-                "source_id": thm["id"],
-                "target_id": def["id"],
-                "relation": "depends_on",
-            }),
-        )
-        .await;
-
-    assert!(
-        result.is_err(),
-        "depends_on between theorem→definition must be rejected without formal pack loaded; \
-         got: {result:?}"
-    );
-}
-
-/// With formal pack: depends_on between typed concept entities (theorem→definition)
-/// must be accepted. Proves the pack installs its EDGE_RULES into the link path.
-#[tokio::test]
-async fn formal_depends_on_accepted_with_formal_pack() {
-    let (f, _rt) = pack_kg_and_formal();
-
-    let thm = f
-        .dispatch(
-            "create",
-            json!({ "kind": "concept", "entity_type": "theorem", "name": "Nat.add_comm" }),
-        )
-        .await
-        .expect("create theorem concept");
-
-    let def = f
-        .dispatch(
-            "create",
-            json!({ "kind": "concept", "entity_type": "definition", "name": "Nat.add" }),
-        )
-        .await
-        .expect("create definition concept");
-
-    let result = f
-        .dispatch(
-            "link",
-            json!({
-                "source_id": thm["id"],
-                "target_id": def["id"],
-                "relation": "depends_on",
-            }),
-        )
-        .await;
-
-    assert!(
-        result.is_ok(),
-        "depends_on between theorem→definition must succeed with formal pack loaded; \
-         got: {result:?}"
-    );
-    let edge = result.unwrap();
-    assert_eq!(edge["relation"], "depends_on");
 }
 
 // ── Med-1 regression: malformed `items` must not fall through to singleton ──────

@@ -31,7 +31,7 @@ tracing = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 criterion = { workspace = true }
 serde_json = { workspace = true }
-khive-pack-formal = { version = "0.6.0", path = "../khive-pack-formal" }
+
 # Path-only: cyclic dev-dep pair with khive-pack-gtd; cargo strips it at publish.
 khive-pack-gtd = { path = "../khive-pack-gtd" }
 

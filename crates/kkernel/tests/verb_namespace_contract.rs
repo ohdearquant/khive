@@ -24,15 +24,11 @@ use khive_runtime::{KhiveRuntime, RuntimeConfig};
 // This mirrors the force-link block in kkernel::lib — the test binary is a separate
 // linking unit and needs its own anchors.
 #[allow(unused_imports)]
-use khive_pack_brain::BrainPack as _;
-#[allow(unused_imports)]
 use khive_pack_comm::CommPack as _;
 #[allow(unused_imports)]
 use khive_pack_gtd::GtdPack as _;
 #[allow(unused_imports)]
 use khive_pack_kg::KgPack as _;
-#[allow(unused_imports)]
-use khive_pack_knowledge::KnowledgePack as _;
 #[allow(unused_imports)]
 use khive_pack_memory::MemoryPack as _;
 #[allow(unused_imports)]

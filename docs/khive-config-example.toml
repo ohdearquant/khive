@@ -216,27 +216,6 @@ fusion_weight = 0.5
 #   KHIVE_MIRROR_BACKFILL=true   true → mirror existing files from offset 0; false → only new bytes
 #                                from EOF. Set false via 0/false/no.
 #
-# ── Email channel (build with feature `channel-email`; inert without these) ──────
-#   Never commit KHIVE_EMAIL_PASSWORD or KHIVE_EMAIL_OAUTH_CLIENT_SECRET.
-#   KHIVE_EMAIL_SMTP_HOST=smtp.example.com    Required. Outbound relay host.
-#   KHIVE_EMAIL_SMTP_PORT=587                 Optional. Default 587 (STARTTLS).
-#   KHIVE_EMAIL_IMAP_HOST=imap.example.com    Required. Inbound polling host.
-#   KHIVE_EMAIL_IMAP_PORT=993                 Optional. Default 993 (TLS).
-#   KHIVE_EMAIL_USERNAME=bot@example.com      Required. SMTP / IMAP login; default mailbox.
-#   KHIVE_EMAIL_PASSWORD=                     Required in Basic-auth mode (no OAuth vars set). Secret.
-#   KHIVE_EMAIL_MAILBOX=bot@example.com       Optional. Sender / XOAUTH2 user. Default: USERNAME.
-#   KHIVE_EMAIL_MAINTAINER_ADDRESS=you@example.com
-#                                Required. Comma-separated allowlist of senders whose inbound mail
-#                                is accepted; the first entry is primary.
-#   KHIVE_EMAIL_DEFAULT_ACTOR=lambda:leo      Actor for new inbound mail with no thread match.
-#   KHIVE_EMAIL_INGEST_NAMESPACE=local        Namespace stamped on channel messages.
-#   KHIVE_EMAIL_SEND_ALLOWED_RECIPIENTS=you@example.com
-#                                Comma-separated outbound allowlist. Default: the maintainer address.
-#   OAuth (Exchange Online app-only) — all three together select OAuth mode; a partial set errors:
-#   KHIVE_EMAIL_OAUTH_TENANT_ID=              Azure AD tenant GUID.
-#   KHIVE_EMAIL_OAUTH_CLIENT_ID=              Azure AD application (client) GUID. Presence selects OAuth.
-#   KHIVE_EMAIL_OAUTH_CLIENT_SECRET=          Client secret. Secret.
-#
 # ── Daemon / IPC (ADR-049; advanced) ─────────────────────────────────────────────
 #   KHIVE_NO_DAEMON=1            Disable daemon auto-spawn; dispatch every request in-process.
 #                                true = any non-empty value except "0" / "false".

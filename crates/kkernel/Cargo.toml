@@ -23,12 +23,8 @@ khive-vcs-adapters = { version = "0.6.0", path = "../khive-vcs-adapters" }
 khive-pack-kg = { version = "0.6.0", path = "../khive-pack-kg" }
 khive-pack-gtd = { version = "0.6.0", path = "../khive-pack-gtd" }
 khive-pack-memory = { version = "0.6.0", path = "../khive-pack-memory" }
-khive-pack-brain = { version = "0.6.0", path = "../khive-pack-brain" }
 khive-pack-comm = { version = "0.6.0", path = "../khive-pack-comm" }
 khive-pack-schedule = { version = "0.6.0", path = "../khive-pack-schedule" }
-khive-pack-formal = { version = "0.6.0", path = "../khive-pack-formal" }
-khive-pack-code = { version = "0.6.0", path = "../khive-pack-code" }
-khive-pack-knowledge = { version = "0.6.0", path = "../khive-pack-knowledge" }
 khive-pack-session = { version = "0.6.0", path = "../khive-pack-session" }
 khive-request = { version = "0.6.0", path = "../khive-request" }
 khive-changeset = { version = "0.6.0", path = "../khive-changeset" }
@@ -57,10 +53,6 @@ rmcp = { workspace = true, features = ["client", "transport-child-process"] }
 [features]
 # Pass-through: enables the deterministic hash embedder in the serve path (bench use only).
 bench-embedder = ["khive-mcp/bench-embedder"]
-# Pass-through: enables the SMTP/IMAP email polling loop. Inert without KHIVE_EMAIL_* env vars.
-channel-email = ["khive-mcp/channel-email"]
-# Pass-through: enables the Telegram Bot API polling + outbox loop. Inert without KHIVE_TELEGRAM_* env vars.
-channel-telegram = ["khive-mcp/channel-telegram"]
 
 [[bin]]
 name = "kkernel"

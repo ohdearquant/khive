@@ -12,17 +12,12 @@ pub use khive_runtime::{KhiveRuntime, PackRegistry, VerbRegistryBuilder};
 #[doc(hidden)]
 pub use khive_pack_blob::BlobPack as _BlobPack;
 #[doc(hidden)]
-pub use khive_pack_brain::BrainPack as _BrainPack;
-#[doc(hidden)]
-pub use khive_pack_code::CodePack as _CodePack;
 #[doc(hidden)]
 pub use khive_pack_comm::CommPack as _CommPack;
 #[doc(hidden)]
 pub use khive_pack_gtd::GtdPack as _GtdPack;
 #[doc(hidden)]
 pub use khive_pack_kg::KgPack as _KgPack;
-#[doc(hidden)]
-pub use khive_pack_knowledge::KnowledgePack as _KnowledgePack;
 #[doc(hidden)]
 pub use khive_pack_memory::MemoryPack as _MemoryPack;
 #[doc(hidden)]

@@ -305,12 +305,9 @@ impl Default for RuntimeConfig {
                     "kg",
                     "gtd",
                     "memory",
-                    "brain",
                     "comm",
                     "schedule",
-                    "knowledge",
                     "session",
-                    "code",
                     "workspace",
                     "blob",
                 ]

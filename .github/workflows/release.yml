@@ -174,7 +174,7 @@ jobs:
           # list synchronized with the semver-gate excludes in
           # scripts/publish.sh; drop each entry after its first crates.io
           # release so it is gated too.
-          exclude: khive-changeset,khive-pack-code,khive-pack-workspace
+          exclude: khive-changeset,khive-pack-workspace
 
   # ─────────────────────────────────────────────────────────────────────────
   # Phase 2: Publish all subpackages + umbrella atomically in a single job.

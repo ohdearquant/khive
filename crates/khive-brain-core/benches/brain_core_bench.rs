@@ -2,8 +2,8 @@
 //!
 //! These are micro-benchmarks of the core data structures.  They measure raw
 //! primitive throughput and are intentionally isolated from the pack dispatch
-//! path.  Do NOT cite these numbers as representative of the public `brain.*`
-//! verb API cost — use `khive-pack-brain/benches/brain_pack_bench.rs` for that.
+//! path.  Do NOT cite these numbers as representative of the `brain.*`
+//! verb API cost — that benchmark lives with the pack that dispatches those verbs.
 //!
 //! ADR-048 §"Benchmarks required" gates covered here:
 //!   1. Profile save/load round-trip timing (BalancedRecallState).

@@ -1,16 +1,16 @@
 # API Reference
 
-khive exposes exactly one MCP tool, `request`. Everything else, 81 verbs across 11
+khive exposes exactly one MCP tool, `request`. Everything else, 46 verbs across 8
 production packs, is dispatched through that single tool via a small request DSL.
 This page documents the DSL grammar, the response envelope, and every verb's full
 parameter contract, so an agent can call khive correctly without reading Rust source.
 
-This page is verified against the live registry (`request(ops="verbs()")`, run
-2026-07-17) and the pack source (`crates/khive-pack-*/src/*.rs` `HandlerDef`/`ParamDef`
-struct literals). Verb count: **81**, matching both the live registry `total` field and
-the sum of the 11 pack counts below. If your server reports a different total, your
-`KHIVE_PACKS` configuration loads a different pack set than the default — run
-`request(ops="verbs()")` against your own server to get the authoritative list.
+This page is verified against the live registry (`request(ops="verbs()")`) and the pack
+source (`crates/khive-pack-*/src/*.rs` `HandlerDef`/`ParamDef` struct literals). Verb
+count: **46**, matching both the live registry `total` field and the sum of the 8 pack
+counts below. If your server reports a different total, your `KHIVE_PACKS` configuration
+loads a different pack set than the default — run `request(ops="verbs()")` against your
+own server to get the authoritative list.
 
 An always-machine-readable copy of this page is at
 [`/md/api-reference.md`](md/api-reference.md). The site also publishes
@@ -24,12 +24,9 @@ An always-machine-readable copy of this page is at
 | `kg`        | 18    | `KHIVE_PACKS=kg` (default)             | No — base substrate |
 | `gtd`       | 5     | `KHIVE_PACKS=kg,gtd`                   | Yes                 |
 | `memory`    | 5     | `KHIVE_PACKS=kg,memory`                | Yes                 |
-| `brain`     | 15    | `KHIVE_PACKS=kg,brain`                 | Yes                 |
 | `comm`      | 7     | `KHIVE_PACKS=kg,comm`                  | Yes                 |
 | `schedule`  | 4     | `KHIVE_PACKS=kg,schedule`              | Yes                 |
-| `knowledge` | 19    | `KHIVE_PACKS=kg,knowledge`             | Yes                 |
 | `session`   | 4     | `KHIVE_PACKS=kg,session`               | Yes                 |
-| `code`      | 1     | `KHIVE_PACKS=kg,code`                  | Yes                 |
 | `workspace` | 0     | `KHIVE_PACKS=kg,gtd,session,workspace` | Yes                 |
 | `blob`      | 3     | `KHIVE_PACKS=kg,blob`                  | Yes                 |
 
@@ -46,11 +43,6 @@ declared but inert unless a pack registering those note kinds is loaded.
 creation time and persists nothing when that delivery capability is absent; the other
 three schedule verbs remain available without `comm`.
 
-`code` registers the `finding` note kind and edge rules, plus the `code.ingest` verb (L1
-manifest + L1.5 import-scan source ingest, ADR-085 Amendment 2 — see below); its
-`findings.json` batch ingest still runs only through the `kkernel code-ingest` admin CLI
-path, not the MCP verb surface.
-
 `blob` registers no note or entity kinds; its three verbs (`blob.put` / `blob.get` /
 `blob.stat`) dispatch over the `BlobStore` content-addressed storage trait (ADR-111). A
 normal file-backed boot installs a default `FsBlobStore` rooted beside the database file
@@ -58,12 +50,12 @@ even with no `[storage.blob]` section and no `KHIVE_BLOB_ROOT` set; the verbs on
 unconfigured (erroring until a backend is installed) when the server boots against an
 in-memory backend, which has no directory to default a root beside.
 
-The default binary (no `KHIVE_PACKS`/`--pack` override) loads all 11 packs: 18 + 5 + 5 +
-15 + 7 + 4 + 19 + 4 + 1 + 0 + 3 = **81 verbs**.
+The default binary (no `KHIVE_PACKS`/`--pack` override) loads all 8 packs: 18 + 5 + 5 +
+7 + 4 + 4 + 0 + 3 = **46 verbs**.
 
 Verb names in the `kg` pack are bare (`create`, `search`, `link`, …). Every other pack
 namespaces its verbs with a `pack.` prefix (`gtd.assign`, `memory.recall`,
-`brain.feedback`, `comm.send`, `schedule.remind`, `knowledge.search`, `session.store`).
+`comm.send`, `schedule.remind`, `session.store`).
 
 ---
 
@@ -638,10 +630,10 @@ request(ops="resolve(refs=[\"the old record\", \"<uuid>\"])")
 List all MCP-callable verbs registered on this server. Internal subhandlers are
 excluded.
 
-| Param      | Type   | Required | Notes                                                                                                    |
-| ---------- | ------ | -------- | -------------------------------------------------------------------------------------------------------- |
-| `category` | string | no       | Filter: `Assertive`\|`Commissive`\|`Declaration`\|`Directive`.                                           |
-| `pack`     | string | no       | Filter by pack name (`kg`, `gtd`, `memory`, `brain`, `comm`, `schedule`, `knowledge`, `session`, `git`). |
+| Param      | Type   | Required | Notes                                                                              |
+| ---------- | ------ | -------- | ---------------------------------------------------------------------------------- |
+| `category` | string | no       | Filter: `Assertive`\|`Commissive`\|`Declaration`\|`Directive`.                     |
+| `pack`     | string | no       | Filter by pack name (`kg`, `gtd`, `memory`, `comm`, `schedule`, `session`, `git`). |
 
 ```
 request(ops="verbs()")
@@ -822,236 +814,9 @@ request(ops="memory.vacuum()")
 
 ---
 
-## `brain` pack — 15 verbs
-
-Recall-tuning profiles: Beta-posterior scoring, profile lifecycle, and the actor/
-namespace/consumer-kind resolution table that picks which profile serves a given
-caller. Optional; load with `KHIVE_PACKS=kg,brain`.
-
-### `brain.event_counts` — Assertive
-
-Windowed event counts grouped by kind, actor, and verb over the event plane (ADR-103
-Stage 1, #724 Ask A). `feedback_explicit` events are additionally split by
-`served_by_profile_id`. Events carrying a `work_class` (today:
-`phase_started`/`phase_completed`/`phase_cancelled` payloads, or `payload.resource.work_class`
-on a dispatch audit row) split by `counts_by_work_class`. Events carrying
-`payload.resource.cost_unit` (ADR-103 Amendment 1, stamped on every successful verb dispatch
-since PR #927) sum into `total_cost_unit` and `cost_unit_by_verb`; both are omitted, not
-zero-filled, when no event in the window carries `cost_unit`. Events without a `cost_unit`
-(pre-Amendment-1 events, or errored/denied dispatches) simply do not contribute. When
-`truncated` is `true`, these sums are computed over the fetched page only, same as the other
-`counts_by_*` fields.
-
-| Param   | Type   | Required | Notes                                                                                                                                                       |
-| ------- | ------ | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `since` | string | yes      | Window start, ISO-8601/RFC-3339 datetime. Inclusive.                                                                                                        |
-| `until` | string | no       | Window end, ISO-8601/RFC-3339 datetime. Exclusive. Defaults to now.                                                                                         |
-| `actor` | string | no       | Filter to a single actor. Stored actor strings are prefixed (`actor:lambda:khive`); bare (`lambda:khive`) or prefixed form both match. Omit for all actors. |
-| `kind`  | string | no       | Filter to a single EventKind (e.g. `"recall_executed"`). Omit for all.                                                                                      |
-
-```
-request(ops="brain.event_counts(since=\"2026-07-01T00:00:00Z\")")
-```
-
-### `brain.profiles` — Assertive
-
-List profiles, optionally filtered by lifecycle.
-
-| Param       | Type   | Required | Notes                                           |
-| ----------- | ------ | -------- | ----------------------------------------------- |
-| `lifecycle` | string | no       | `active`\|`inactive`\|`archived`; omit for all. |
-
-```
-request(ops="brain.profiles(lifecycle=\"active\")")
-```
-
-### `brain.profile` — Assertive
-
-Profile metadata, latest snapshot, current state summary.
-
-| Param        | Type   | Required | Notes                                                         |
-| ------------ | ------ | -------- | ------------------------------------------------------------- |
-| `profile_id` | string | yes      | Profile ID string (e.g. `"balanced-recall-v1"`) — not a UUID. |
-
-```
-request(ops="brain.profile(profile_id=\"implementer-recall-v1\")")
-```
-
-### `brain.resolve` — Assertive
-
-Show which profile would serve a caller context.
-
-| Param           | Type   | Required | Notes                                                        |
-| --------------- | ------ | -------- | ------------------------------------------------------------ |
-| `consumer_kind` | string | yes      | Verb/operation type about to be performed (e.g. `"recall"`). |
-| `actor`         | string | no       | Default `*` (wildcard match).                                |
-| `namespace`     | string | no       | Default `*` (wildcard match).                                |
-
-```
-request(ops="brain.resolve(consumer_kind=\"recall\", actor=\"agent:docs\")")
-```
-
-### `brain.activate` — Commissive
-
-Move a profile to Active (starts the live update loop).
-
-| Param        | Type   | Required | Notes                |
-| ------------ | ------ | -------- | -------------------- |
-| `profile_id` | string | yes      | Profile to activate. |
-
-```
-request(ops="brain.activate(profile_id=\"implementer-recall-v1\")")
-```
-
-### `brain.deactivate` — Commissive
-
-Move a profile to Inactive (stop live updates, retain state).
-
-| Param        | Type   | Required | Notes                  |
-| ------------ | ------ | -------- | ---------------------- |
-| `profile_id` | string | yes      | Profile to deactivate. |
-
-```
-request(ops="brain.deactivate(profile_id=\"implementer-recall-v1\")")
-```
-
-### `brain.archive` — Declaration
-
-Move a profile to Archived (read-only, audit-retained).
-
-| Param        | Type   | Required | Notes               |
-| ------------ | ------ | -------- | ------------------- |
-| `profile_id` | string | yes      | Profile to archive. |
-
-```
-request(ops="brain.archive(profile_id=\"deprecated-recall-v0\")")
-```
-
-### `brain.reset` — Declaration
-
-Reset posteriors to priors (preserves event history).
-
-| Param        | Type   | Required | Notes                                                         |
-| ------------ | ------ | -------- | ------------------------------------------------------------- |
-| `profile_id` | string | no       | Must exist and be active. Defaults to `"balanced-recall-v1"`. |
-
-```
-request(ops="brain.reset(profile_id=\"implementer-recall-v1\")")
-```
-
-### `brain.feedback` — Commissive
-
-Emit a `FeedbackExplicit` event into the shared log.
-
-| Param                  | Type   | Required | Notes                                                                                                      |
-| ---------------------- | ------ | -------- | ---------------------------------------------------------------------------------------------------------- |
-| `target_id`            | uuid   | yes      | Memory note or entity the feedback applies to.                                                             |
-| `signal`               | string | yes      | Same signal set as `memory.feedback`.                                                                      |
-| `served_by_profile_id` | string | no       | Profile that served the rated result.                                                                      |
-| `section_signals`      | object | no       | Per-section signals for `knowledge_compose` profiles: `{"section_name": "useful"\|"not_useful"\|"wrong"}`. |
-| `scorer_run_id`        | string | no       | ADR-081 scorer-pass id; must pair with `serve_ledger_id`.                                                  |
-| `serve_ledger_id`      | string | no       | ADR-081 `brain_serve_ledger` row id; must pair with `scorer_run_id`.                                       |
-
-```
-request(ops="brain.feedback(target_id=\"<uuid>\", signal=\"useful\")")
-```
-
-### `brain.auto_feedback` — Commissive
-
-Emit implicit feedback for recall results supplied by an agent — the convenience verb
-to call right after `memory.recall` instead of hand-building `brain.feedback`.
-
-| Param                  | Type   | Required | Notes                                                                 |
-| ---------------------- | ------ | -------- | --------------------------------------------------------------------- |
-| `query`                | string | yes      | The recall query that produced the results.                           |
-| `results`              | array  | yes      | Recall result objects; the first object's `id` is credited.           |
-| `signal`               | string | no       | Defaults to `implicit_positive`.                                      |
-| `served_by_profile_id` | string | no       | Profile that served the recall.                                       |
-| `scorer_run_id`        | string | no       | Forwarded verbatim to `brain.feedback`; pairs with `serve_ledger_id`. |
-| `serve_ledger_id`      | string | no       | Forwarded verbatim to `brain.feedback`; pairs with `scorer_run_id`.   |
-
-```
-request(ops="memory.recall(query=\"x\", limit=5) | brain.auto_feedback(query=\"x\", results=[{\"id\": \"$prev.items[0].id\"}])")
-```
-
-### `brain.bind` — Declaration
-
-Write a row in the profile resolution table.
-
-| Param           | Type    | Required | Notes                                        |
-| --------------- | ------- | -------- | -------------------------------------------- |
-| `profile_id`    | string  | yes      | Must exist.                                  |
-| `actor`         | string  | no       | Default `*` (all actors).                    |
-| `namespace`     | string  | no       | Default `*` (all namespaces).                |
-| `consumer_kind` | string  | no       | Default `*` (all kinds).                     |
-| `priority`      | integer | no       | Higher wins on multiple matches (default 0). |
-
-```
-request(ops="brain.bind(profile_id=\"implementer-recall-v1\", actor=\"role:implementer\")")
-```
-
-### `brain.unbind` — Declaration
-
-Remove rows from the profile resolution table. At least one filter is required.
-
-| Param           | Type   | Required | Notes                            |
-| --------------- | ------ | -------- | -------------------------------- |
-| `profile_id`    | string | no       | AND-combined with other filters. |
-| `actor`         | string | no       |                                  |
-| `namespace`     | string | no       |                                  |
-| `consumer_kind` | string | no       |                                  |
-
-```
-request(ops="brain.unbind(actor=\"role:implementer\")")
-```
-
-### `brain.bindings` — Assertive
-
-List rows in the profile resolution table, optionally filtered.
-
-| Param           | Type   | Required | Notes |
-| --------------- | ------ | -------- | ----- |
-| `profile_id`    | string | no       |       |
-| `actor`         | string | no       |       |
-| `namespace`     | string | no       |       |
-| `consumer_kind` | string | no       |       |
-
-```
-request(ops="brain.bindings(consumer_kind=\"recall\")")
-```
-
-### `brain.create_profile` — Declaration
-
-Create a new brain profile with a given name and optional seed priors.
-
-| Param           | Type   | Required | Notes                                                                                                                                                               |
-| --------------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `name`          | string | yes      | Profile ID (alphanumeric + hyphens), must be unique.                                                                                                                |
-| `description`   | string | no       | Human-readable description.                                                                                                                                         |
-| `consumer_kind` | string | no       | Default `"recall"`.                                                                                                                                                 |
-| `seed_priors`   | object | no       | For `knowledge_compose`: `{"section_posteriors": {"overview": {"alpha": 2.0, "beta": 2.0}, ...}}`; for `recall`: `{"relevance": {"alpha": 7.0, "beta": 3.0}, ...}`. |
-
-```
-request(ops="brain.create_profile(name=\"implementer-recall-v2\", consumer_kind=\"recall\")")
-```
-
-### `brain.register_adapter` — Declaration
-
-Register an adapter integrity record so the router only composes adapters matching the
-active base model revision.
-
-| Param                 | Type   | Required | Notes                                                       |
-| --------------------- | ------ | -------- | ----------------------------------------------------------- |
-| `adapter_id`          | string | yes      | Stable adapter identifier (used as the entity name).        |
-| `content_hash`        | string | yes      | Content hash of the adapter weights.                        |
-| `base_model_revision` | string | yes      | Must match the active revision or registration is rejected. |
-| `metadata`            | object | no       | Merged into entity properties.                              |
-
-```
-request(ops="brain.register_adapter(adapter_id=\"lora-v3\", content_hash=\"<sha256>\", base_model_revision=\"2026-07-01\")")
-```
-
----
+The `brain` pack (`brain.*` verbs — recall-tuning profiles, Beta-posterior scoring,
+feedback-driven ranking) is a commercially licensed extension distributed separately;
+it is not part of this distribution.
 
 ## `comm` pack — 7 verbs
 
@@ -1227,286 +992,6 @@ request(ops="schedule.cancel(id=\"<event-id>\")")
 
 ---
 
-## `knowledge` pack — 19 verbs
-
-The knowledge-atom corpus: bulk ingest, TF-IDF + embedding search, domain composition,
-section-level review/dispute, and KG-sugar verbs for citing sources. Optional; load
-with `KHIVE_PACKS=kg,knowledge`.
-
-### `knowledge.upsert_atoms` — Commissive
-
-Bulk insert or update knowledge atoms by slug.
-
-| Param        | Type            | Required | Notes                                                             |
-| ------------ | --------------- | -------- | ----------------------------------------------------------------- |
-| `atoms`      | array\<object\> | yes      | `{slug, name, content, tags?, properties?, finalized?}` per atom. |
-| `chunk_size` | integer         | no       | Client-side chunking hint, max 5000.                              |
-
-```
-request(ops="[{\"tool\":\"knowledge.upsert_atoms\",\"args\":{\"atoms\":[{\"slug\":\"rope\",\"name\":\"RoPE\",\"content\":\"Rotary position embedding...\"}]}}]")
-```
-
-### `knowledge.upsert_domains` — Commissive
-
-Bulk insert or update domain groupings of atoms.
-
-| Param     | Type            | Required | Notes                                                     |
-| --------- | --------------- | -------- | --------------------------------------------------------- |
-| `domains` | array\<object\> | yes      | `{slug, name, description?, tags?, members?}` per domain. |
-
-```
-request(ops="[{\"tool\":\"knowledge.upsert_domains\",\"args\":{\"domains\":[{\"slug\":\"attention\",\"name\":\"Attention mechanisms\"}]}}]")
-```
-
-### `knowledge.get` — Assertive
-
-Fetch a single atom or domain by UUID or slug.
-
-| Param              | Type   | Required | Notes                                                                                                                                                                                                                                                                           |
-| ------------------ | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `id`               | string | yes      | Atom/domain UUID or slug.                                                                                                                                                                                                                                                       |
-| `include_sections` | bool   | no       | Include the atom's sections under a `sections` key (ignored for domains). Each section: `id, atom_id, namespace, section_type, heading, content, content_hash, status, tokens, sort_order, created_at, updated_at`, ordered by `sort_order`, `created_at`, `id`. Default false. |
-
-```
-request(ops="knowledge.get(id=\"rope\", include_sections=true)")
-```
-
-### `knowledge.list` — Assertive
-
-Paginated listing of atoms or domains.
-
-| Param    | Type    | Required | Notes                              |
-| -------- | ------- | -------- | ---------------------------------- |
-| `type`   | string  | no       | `atom`\|`domain` (default `atom`). |
-| `limit`  | integer | no       | Default 20, max 500.               |
-| `offset` | integer | no       | Pagination offset.                 |
-
-```
-request(ops="knowledge.list(type=\"domain\", limit=50)")
-```
-
-### `knowledge.delete_atoms` — Commissive
-
-Soft-delete atoms by slug or ID.
-
-| Param | Type            | Required | Notes                |
-| ----- | --------------- | -------- | -------------------- |
-| `ids` | array\<string\> | yes      | Atom slugs or UUIDs. |
-
-```
-request(ops="knowledge.delete_atoms(ids=[\"stale-atom-slug\"])")
-```
-
-### `knowledge.stats` — Assertive
-
-Corpus statistics: atom count, domain count, coverage. No params.
-
-```
-request(ops="knowledge.stats()")
-```
-
-### `knowledge.index` — Commissive
-
-Backfill embeddings + FTS for atoms/domains.
-
-| Param         | Type            | Required | Notes                                                   |
-| ------------- | --------------- | -------- | ------------------------------------------------------- |
-| `ids`         | array\<string\> | no       | Atom slugs/IDs to index; omit to index all.             |
-| `batch_size`  | integer         | no       | Default 500, max 1000.                                  |
-| `insert_only` | bool            | no       | Deprecated no-op, accepted for API compatibility only.  |
-| `rebuild_ann` | bool            | no       | Rebuild the in-memory Vamana ANN index (default false). |
-
-```
-request(ops="knowledge.index(rebuild_ann=true)")
-```
-
-### `knowledge.fold` — Assertive
-
-Budget-constrained knapsack selection of scored candidates.
-
-| Param              | Type            | Required | Notes                                                   |
-| ------------------ | --------------- | -------- | ------------------------------------------------------- |
-| `candidates`       | array\<object\> | yes      | `{id, score, size, content?, category?}` per candidate. |
-| `budget`           | integer         | yes      | Token/size budget for the selected set.                 |
-| `min_score`        | number          | no       | Default 0.0.                                            |
-| `category_weights` | object          | no       | Per-category score multipliers.                         |
-
-```
-request(ops="[{\"tool\":\"knowledge.fold\",\"args\":{\"candidates\":[{\"id\":\"a\",\"score\":0.8,\"size\":400}],\"budget\":4000}}]")
-```
-
-### `knowledge.search` — Assertive
-
-TF-IDF ranked search over the knowledge corpus with embedding rerank (default when an
-embedder is configured). Draft and deprecated atoms are excluded by default. Score
-bands: `score>=0.46` reliably on-target, `0.42<=score<0.46` mixed quality, `score<0.42`
-mostly off-target.
-
-| Param                 | Type    | Required | Notes                                                                                   |
-| --------------------- | ------- | -------- | --------------------------------------------------------------------------------------- |
-| `query`               | string  | yes      | Search query text.                                                                      |
-| `type`                | string  | no       | `atom`\|`domain` (default both).                                                        |
-| `include_drafts`      | bool    | no       | Default false; no-op when `status` is set.                                              |
-| `status`              | string  | no       | Exact status filter: `draft`\|`reviewed`\|`deprecated`; overrides `include_drafts`.     |
-| `exclude_status`      | string  | no       | Exclude an exact status; only used when `status` unset.                                 |
-| `role`                | string  | no       | Agent role hint, prepended to the query for scoring.                                    |
-| `limit`               | integer | no       | Default 10, max 100.                                                                    |
-| `min_score`           | number  | no       | Default 0.0.                                                                            |
-| `weights`             | object  | no       | `{w_name, w_tags, w_content, w_exact_name, w_bigram, expand_discount, coverage_alpha}`. |
-| `decompose`           | bool    | no       | Default false; enables query decomposition.                                             |
-| `decompose_threshold` | integer | no       | Default 4 non-stop terms to trigger decomposition.                                      |
-| `intersection_bonus`  | number  | no       | Default 0.25; score multiplier for multi-sub-query hits.                                |
-| `rerank`              | bool    | no       | Default true; embedding rerank; no-op with no embedder configured.                      |
-| `rerank_alpha`        | number  | no       | Default 0.7 (TF-IDF-dominant blend).                                                    |
-
-```
-request(ops="knowledge.search(query=\"FastAPI JWT middleware\", rerank=true, limit=10)")
-```
-
-### `knowledge.suggest` — Assertive
-
-Suggest relevant knowledge domains for a query. Draft/deprecated domain atoms excluded
-by default.
-
-| Param   | Type    | Required | Notes                   |
-| ------- | ------- | -------- | ----------------------- |
-| `query` | string  | yes      | Orientation query text. |
-| `role`  | string  | no       | Agent role hint.        |
-| `limit` | integer | no       | Default 8, max 100.     |
-
-```
-request(ops="knowledge.suggest(query=\"async middleware retry circuit breaker patterns\", role=\"implementer\")")
-```
-
-### `knowledge.compose` — Assertive
-
-Compose a markdown briefing from selected knowledge domains and atoms.
-
-| Param        | Type            | Required | Notes                                             |
-| ------------ | --------------- | -------- | ------------------------------------------------- |
-| `domain_ids` | array\<string\> | no       | Domain UUIDs/slugs whose member atoms to include. |
-| `atom_ids`   | array\<string\> | no       | Atom UUIDs/slugs to include directly.             |
-| `query`      | string          | yes      | Reranks the selected atom bodies.                 |
-
-```
-request(ops="knowledge.compose(query=\"FastAPI JWT middleware validation patterns\", domain_ids=[\"attention\"])")
-```
-
-### `knowledge.edit` — Commissive
-
-Upsert sections for an atom without wiping other sections.
-
-| Param      | Type            | Required | Notes                                                                                                                                                                                                                                                                             |
-| ---------- | --------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `id`       | string          | yes      | Atom UUID or slug.                                                                                                                                                                                                                                                                |
-| `sections` | array\<object\> | yes      | `[{section_type, content, heading?, sort_order?}]`. `section_type` is a closed enum: `overview`\|`core_model`\|`boundary_conditions`\|`formalism`\|`operational_guidance`\|`examples`\|`failure_modes`\|`expert_lens`\|`references`\|`other`. `content` must be >= 80 characters. |
-
-```
-request(ops="[{\"tool\":\"knowledge.edit\",\"args\":{\"id\":\"rope\",\"sections\":[{\"section_type\":\"overview\",\"content\":\"Rotary position embedding rotates query/key vectors by an angle proportional to position...\"}]}}]")
-```
-
-### `knowledge.import` — Commissive
-
-Ingest atlas markdown file(s) as atoms with parsed sections.
-
-| Param            | Type   | Required | Notes                                                                         |
-| ---------------- | ------ | -------- | ----------------------------------------------------------------------------- |
-| `path`           | string | yes      | Filesystem path to a markdown file or directory.                              |
-| `format`         | string | no       | Only `atlas_md` supported (default).                                          |
-| `chunk_strategy` | string | no       | `section` (default, one section per atom) or `atom` (whole file as one atom). |
-
-```
-request(ops="knowledge.import(path=\"/path/to/atlas/rope.md\")")
-```
-
-### `knowledge.challenge` — Commissive
-
-Mark a section as disputed and increment the atom's `dispute_count`.
-
-| Param          | Type   | Required | Notes                                                             |
-| -------------- | ------ | -------- | ----------------------------------------------------------------- |
-| `atom_id`      | string | yes      | Atom UUID or slug.                                                |
-| `section_type` | string | yes      | Section type to challenge.                                        |
-| `content_hash` | string | no       | Required when more than one eligible section of that type exists. |
-| `reason`       | string | no       | Optional challenge reason.                                        |
-
-```
-request(ops="knowledge.challenge(atom_id=\"rope\", section_type=\"formalism\", reason=\"formula sign error\")")
-```
-
-### `knowledge.adjudicate` — Commissive
-
-Resolve a disputed section and decrement the atom's `dispute_count`.
-
-| Param          | Type   | Required | Notes                                                             |
-| -------------- | ------ | -------- | ----------------------------------------------------------------- |
-| `atom_id`      | string | yes      | Atom UUID or slug.                                                |
-| `section_type` | string | yes      | Section type to adjudicate.                                       |
-| `content_hash` | string | no       | Required when more than one disputed section of that type exists. |
-| `resolution`   | string | yes      | `accept` (marks verified) or `reject` (marks reviewed).           |
-
-```
-request(ops="knowledge.adjudicate(atom_id=\"rope\", section_type=\"formalism\", resolution=\"accept\")")
-```
-
-### `knowledge.learn` — Commissive
-
-Register a concept entity with optional domain and tags.
-
-| Param         | Type            | Required | Notes                            |
-| ------------- | --------------- | -------- | -------------------------------- |
-| `name`        | string          | yes      | Concept name.                    |
-| `description` | string          | no       | Optional description.            |
-| `domain`      | string          | no       | Folded into `properties.domain`. |
-| `tags`        | array\<string\> | no       | Optional tag list.               |
-
-```
-request(ops="knowledge.learn(name=\"GQA\", domain=\"attention\", description=\"Grouped-query attention\")")
-```
-
-### `knowledge.cite` — Commissive
-
-Link a concept to the paper or source that introduced it.
-
-| Param        | Type  | Required | Notes                                                                                                |
-| ------------ | ----- | -------- | ---------------------------------------------------------------------------------------------------- |
-| `concept_id` | uuid  | yes      | Concept entity ID.                                                                                   |
-| `source_id`  | uuid  | yes      | Source entity ID; must be `kind=document`, `kind=person`, or `kind=org` (`introduced_by` edge rule). |
-| `weight`     | float | no       | Defaults to 1.0.                                                                                     |
-
-```
-request(ops="knowledge.cite(concept_id=\"<concept-uuid>\", source_id=\"<paper-uuid>\")")
-```
-
-### `knowledge.topic` — Assertive
-
-List concepts filtered by domain or free-text query.
-
-| Param    | Type    | Required | Notes                                       |
-| -------- | ------- | -------- | ------------------------------------------- |
-| `domain` | string  | no       | Filter to concepts tagged with this domain. |
-| `query`  | string  | no       | Free-text search across name + description. |
-| `limit`  | integer | no       | Default 20, max 100.                        |
-
-```
-request(ops="knowledge.topic(domain=\"attention\")")
-```
-
-### `knowledge.feedback` — Commissive
-
-Apply per-section feedback signals to update section posterior weights.
-
-| Param             | Type   | Required | Notes                                                                                                                         |
-| ----------------- | ------ | -------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `section_signals` | object | yes      | `{section_type: signal}`, e.g. `{"overview": "useful", "formalism": "not_useful"}`. Signals: `useful`\|`not_useful`\|`wrong`. |
-| `target_id`       | string | no       | UUID of the rated atom/entity. When paired with a configured brain profile, also forwards to `brain.feedback`.                |
-
-```
-request(ops="knowledge.feedback(target_id=\"rope\", section_signals={\"overview\": \"useful\"})")
-```
-
----
-
 ## `session` pack — 4 verbs
 
 Cross-provider agent-session continuity records. Optional; load with
@@ -1575,37 +1060,6 @@ Git-history ingestion (`git.digest`) and the hardened write surface (`git.commit
 `git.branch` / `git.push`, ADR-108), along with the `commit`/`issue`/`pull_request`
 note kinds they register, are provided by a commercially licensed extension and are
 not part of this distribution.
-
----
-
-## `code` pack — 1 verb
-
-Deterministic source-code map ingest (ADR-085 Amendment 2, PR #1039). Optional; load
-with `KHIVE_PACKS=kg,code`. Also registers the `finding` note kind used by the
-`kkernel code-ingest` admin CLI's `findings.json` batch ingest (not reachable via this
-MCP verb surface).
-
-### `code.ingest` — Commissive
-
-Walk a source folder and ingest L1 manifest-declared dependency edges
-(`Cargo.toml` / `pyproject.toml` / `package.json`) plus L1.5 regex-based import-scan
-module and project edges, into a dedicated map database — never the shared production
-graph. A folder with no governing manifest anywhere above its source files still
-ingests, using the basename of the ingested folder as its `source_project` identity.
-Idempotent: entity and edge ids are `uuid5`-derived from identity, so re-ingesting the
-same path upserts rather than duplicates, and a synchronous re-resolve pass
-materializes edges for any import that only resolves once a later-scanned file's module
-becomes known.
-
-| Param       | Type            | Required | Notes                                                                                                                                                                                                                                        |
-| ----------- | --------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `path`      | string          | yes      | Folder to ingest — a monorepo subtree (a single crate/package) is first-class, not a special case of whole-repo ingest.                                                                                                                      |
-| `db`        | string          | no       | Target map database path. Defaults to `<path>/.khive/code-map.db`. The shared production database — its default `$HOME/.khive/khive.db` location and the calling server's actual configured database — is always rejected, with no override. |
-| `languages` | array\<string\> | no       | Restrict ingest to a subset of `rust` \| `python` \| `typescript`. Defaults to all three (auto-detected from manifests found under `path`).                                                                                                  |
-
-```
-request(ops="code.ingest(path=\"/repo/crates/my-crate\")")
-```
 
 ---
 

@@ -418,11 +418,10 @@ pub fn event_insert_statements(event: &Event) -> Result<Vec<SqlStatement>, rusql
 /// vs. a `Box<dyn SqlWriter>` — so they cannot share one function body. Both
 /// build on [`event_insert_statements`] for the actual insert shape.
 /// Callers that need the event append to be part of a larger atomic unit —
-/// e.g. ADR-081's brain fold gate (`khive-pack-brain/src/fold_gate.rs`),
-/// which holds its own `BEGIN IMMEDIATE` transaction on a `SqlWriter` for
-/// the dedup claim + mass fold and needs the feedback event to land in that
-/// same transaction — call this instead of duplicating the insert shape
-/// into their own crate.
+/// e.g. a fold gate that holds its own `BEGIN IMMEDIATE` transaction on a
+/// `SqlWriter` for a dedup claim + mass fold and needs the feedback event to
+/// land in that same transaction — call this instead of duplicating the
+/// insert shape into their own crate.
 pub async fn append_event_on_writer(
     writer: &mut dyn SqlWriter,
     event: &Event,

@@ -46,9 +46,8 @@ Run a verb DSL expression directly — the same syntax the `request` tool accept
 without going through an MCP client:
 
 ```bash
-kkernel exec 'knowledge.stats()'
-kkernel exec 'knowledge.index(rebuild_ann=true)'
-kkernel exec '[knowledge.list(limit=5), knowledge.stats()]'
+kkernel exec 'stats()'
+kkernel exec '[list(kind="entity", limit=5), stats()]'
 kkernel exec --pending-events          # cron-friendly: fire due scheduled_event notes
 ```
 
@@ -64,7 +63,7 @@ kkernel exec --pending-events          # cron-friendly: fire due scheduled_event
 | `pack`     | `list` / `handler <name>` — introspect registered packs and their verb surface              |
 | `engine`   | Embedding-model lifecycle: list, status, migrate, drift-check                               |
 | `vector`   | Vector store capabilities and orphan sweep                                                  |
-| `reindex`  | Rebuild embedding vectors and FTS documents for entities, notes, and knowledge atoms        |
+| `reindex`  | Rebuild embedding vectors and FTS documents for entities and notes                          |
 | `backend`  | `list` / `info <name>` — inspect registered storage backends                                |
 
 All subcommands emit JSON on stdout by default (for piping/parsing); pass `--human`
@@ -91,15 +90,15 @@ take precedence).
 | `KHIVE_LOG`                       | Log level for stderr (JSON results on stdout are unaffected)  |
 | `KHIVE_BRAIN_PROFILE`             | Brain profile for feedback routing and recall boosting        |
 
-Two feature flags gate optional functionality, both pass-through to `khive-mcp`:
+One feature flag gates optional functionality, a pass-through to `khive-mcp`:
 `bench-embedder` (deterministic hash embedder for benchmarking, never enabled in release
-builds) and `channel-email` (SMTP/IMAP polling loop, inert without `KHIVE_EMAIL_*` env vars).
+builds).
 
 ## Where this sits
 
 `kkernel` sits at the top of the storage dependency chain — it depends on every pack crate
-(`khive-pack-kg`, `-gtd`, `-memory`, `-brain`, `-comm`, `-schedule`, `-formal`, `-knowledge`,
-`-session`), `khive-mcp` (the server library it serves), `khive-vcs` / `khive-vcs-adapters`
+(`khive-pack-kg`, `-gtd`, `-memory`, `-comm`, `-schedule`,
+`-session`, `-git`), `khive-mcp` (the server library it serves), `khive-vcs` / `khive-vcs-adapters`
 (KG versioning and import/export), and the core storage stack (`khive-runtime`,
 `khive-db`, `khive-storage`, `khive-types`, `khive-score`). Its `_pack_links` module force-
 references each pack crate so the linker keeps their `inventory::submit!` verb registrations
