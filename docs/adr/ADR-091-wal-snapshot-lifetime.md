@@ -837,3 +837,82 @@ implicate or exonerate them without reading native code.
 **Config.** `KHIVE_SESSION_SWEEP_INTERVAL_MS` (default 5000, sessions only);
 `KHIVE_WALPIN_SIDECAR` (default on for file-backed backends, off for in-memory).
 Existing threshold keys are reused unchanged.
+
+### 2026-07-20 amendment (Amendment 3): heartbeat freshness basis and the attribution-basis field
+
+**Motivation.** Two contract refinements, both surfaced by review follow-ups to
+Amendment 2's implementation (#1155 item 1; the backend-scoped attribution
+design in `docs/design/walpin-backend-scoped-attribution.md`):
+
+1. While a transaction is over-threshold, the session sweep rewrites and fsyncs
+   the full heartbeat record on every tick (exclusive-create temp file plus
+   atomic rename, per the trust-boundary contract). Freshness only needs a
+   timestamp to advance, and beacons already refresh with a metadata-only
+   mtime touch. The asymmetry is pure write churn: N ticks of one long-running
+   span produce N full record writes whose only material delta is the embedded
+   age.
+2. The backend-scoped attribution design introduces heartbeats written under a
+   fallback attribution (an unscoped-origin span observed by the main
+   backend's view). The record format needs a field that distinguishes
+   evidence-based attribution from fallback so diagnostics never read fallback
+   attribution as ground truth. This amendment is the sole source of truth for
+   that field's format; the design note consumes the definition and does not
+   restate it.
+
+**Plank F1: file mtime is the freshness basis for both record kinds.**
+
+Heartbeat liveness moves to the same basis the beacon refresh rule already
+uses: the record's freshness timestamp is the sidecar file's mtime, evaluated
+against the unchanged roughly-3-sweep-interval window. While the warn
+condition persists, each sweep tick performs a metadata-only mtime touch of
+the existing heartbeat file — the same mechanism and the same
+opened-directory-descriptor discipline as beacon refresh, preserving the
+trust-boundary contract. The full body is rewritten (exclusive-create temp
+file plus atomic rename, unchanged) only when record content changes: the
+first over-threshold observation, a change of the oldest span's identity or
+label, a change of `attribution_basis` (Plank F2), and the removal cases
+Amendment 2 already defines (clean shutdown, first tick after the condition
+clears). The body's `updated_at` field is retained and now means exactly "the
+instant of the last body write"; it no longer participates in liveness
+classification.
+
+_Age is computed at read time._ A body that is not rewritten cannot carry a
+current age. The heartbeat record gains `oldest_tx_started_at` (epoch
+timestamp of the oldest span's registration instant); enumeration computes
+the current age as now minus `oldest_tx_started_at`. The existing
+`oldest_tx_age_secs` field is retained with its documentation narrowed: the
+age as of the last body write. Readers prefer `oldest_tx_started_at` when
+present; records written by pre-amendment binaries lack it and are read
+exactly as before. The alternative — keeping age current by rewriting the
+body every tick — is the status quo this plank exists to remove.
+
+_Crash conservatism._ An mtime touch is not durability-critical: a touch lost
+to a crash makes the record look stale, and Amendment 2's liveness gate
+already deletes stale entries and classifies their PIDs as `unknown` — the
+failure direction is inconclusive attribution, never false attribution. This
+is the same conservatism the beacon refresh rule accepted.
+
+**Plank F2: the `attribution_basis` field.**
+
+The heartbeat record gains exactly one additive field:
+
+- `attribution_basis`: string with exactly two values.
+  - `"origin"` — the oldest span carried this database's own origin
+    identity.
+  - `"fallback"` — the oldest span was unscoped and is observed by the main
+    backend's view as the designed never-silently-drop fallback.
+- Absence: records written by binaries predating this field carry no
+  `attribution_basis`; readers treat absence as unspecified — neither origin
+  nor fallback may be inferred from a missing field.
+
+The origin semantics (which spans are scoped to which database, and why
+unscoped spans fall back to the main view) are specified by the
+backend-scoped attribution design note; this amendment owns only the field's
+name, type, and values. A change of `attribution_basis` is a content change
+and forces a body rewrite under Plank F1. Beacons carry no attribution and
+are unchanged.
+
+**Non-goals.** Thresholds, the enumeration liveness gate structure, census
+rules, the filesystem trust boundary, and the beacon contract are unchanged.
+This amendment adds no fields beyond the two named here
+(`oldest_tx_started_at`, `attribution_basis`).
