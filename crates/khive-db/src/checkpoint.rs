@@ -3730,14 +3730,20 @@ mod tests {
             shutdown_rx,
         ));
 
-        // Several 10ms intervals, every one of them writer-busy.
-        tokio::time::sleep(Duration::from_millis(60)).await;
-
-        assert!(
-            checkpoint_skipped_ticks() > 0,
-            "test setup must actually drive at least one Skipped tick for this \
-             regression to mean anything"
-        );
+        // Wait until the task has actually recorded a writer-busy Skipped
+        // tick rather than sleeping a fixed real-time budget: each tick also
+        // does registry queries and sidecar filesystem writes, so under
+        // instrumented (coverage) or loaded runners a fixed sleep races the
+        // first completed tick. Bounded, fail-loud.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while checkpoint_skipped_ticks() == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "test setup must actually drive at least one Skipped tick for this \
+                 regression to mean anything (none within 10s)"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
 
         shutdown_tx.send(()).expect("send shutdown signal");
         tokio::time::timeout(Duration::from_secs(1), handle)
