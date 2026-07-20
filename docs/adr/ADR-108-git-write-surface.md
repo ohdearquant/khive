@@ -462,3 +462,18 @@ would execute as a side effect of an otherwise-successful, policy-permitted writ
 - Operators who want the write verbs to work at all must maintain the `[git_write]` section
   as repos and branch conventions change; this is an explicit operational cost of the
   fail-closed default, accepted in exchange for closing the reachable-by-default gap.
+
+## Amendment 2 (2026-07-20) — Distribution boundary: commercially licensed extension
+
+The pack this ADR's write surface lives in (`khive-pack-git`, per ADR-088 Amendment 2)
+is no longer part of the open-source distribution; it ships as a commercially licensed
+extension, and the default pack set no longer registers `git.commit` / `git.branch` /
+`git.push` (see the ADR-023 amendment of the same date).
+
+This ADR's normative content — the hardened argv construction, unconditional
+force-push denial, the Amendment 1 fail-closed `[git_write]` allowlist, and the
+hooks-disabled execution contract — is unchanged and continues to govern the verbs
+wherever the extension is deployed. The runtime keeps the `[git_write]` configuration
+plumbing so a deployment that loads the extension gets Amendment 1's fail-closed
+behavior without further changes; with no git pack loaded, that configuration is
+inert.
