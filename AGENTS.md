@@ -22,7 +22,7 @@ shell to system git with hardened, allowlisted argv construction — no
 tag/merge/checkout/pull/fetch, no force-push under any argument combination; the
 `workspace` pack contributes zero verbs, adding only the `workspace` entity kind and
 `contains` endpoint rules to git/gtd/session notes (#873). Code-quality and formal-methods
-(Lean) ontology packs are provided by a commercial extension and are not part of the
+(Lean) ontology packs are a commercially licensed extension and are not part of the
 open-source distribution. Regenerate via `request(ops="verbs()")`
 before editing this line.
 
