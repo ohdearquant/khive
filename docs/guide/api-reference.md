@@ -19,23 +19,23 @@ An always-machine-readable copy of this page is at
 
 ## Packs at a glance
 
-| Pack        | Verbs | Load with                                  | Optional?           |
-| ----------- | ----- | ------------------------------------------ | ------------------- |
-| `kg`        | 18    | `KHIVE_PACKS=kg` (default)                 | No — base substrate |
-| `gtd`       | 5     | `KHIVE_PACKS=kg,gtd`                       | Yes                 |
-| `memory`    | 5     | `KHIVE_PACKS=kg,memory`                    | Yes                 |
-| `brain`     | 15    | `KHIVE_PACKS=kg,brain`                     | Yes                 |
-| `comm`      | 7     | `KHIVE_PACKS=kg,comm`                      | Yes                 |
-| `schedule`  | 4     | `KHIVE_PACKS=kg,schedule`                  | Yes                 |
-| `knowledge` | 19    | `KHIVE_PACKS=kg,knowledge`                 | Yes                 |
-| `session`   | 4     | `KHIVE_PACKS=kg,session`                   | Yes                 |
-| `code`      | 1     | `KHIVE_PACKS=kg,code`                      | Yes                 |
-| `workspace` | 0     | `KHIVE_PACKS=kg,gtd,session,workspace`     | Yes                 |
-| `blob`      | 3     | `KHIVE_PACKS=kg,blob`                      | Yes                 |
+| Pack        | Verbs | Load with                              | Optional?           |
+| ----------- | ----- | -------------------------------------- | ------------------- |
+| `kg`        | 18    | `KHIVE_PACKS=kg` (default)             | No — base substrate |
+| `gtd`       | 5     | `KHIVE_PACKS=kg,gtd`                   | Yes                 |
+| `memory`    | 5     | `KHIVE_PACKS=kg,memory`                | Yes                 |
+| `brain`     | 15    | `KHIVE_PACKS=kg,brain`                 | Yes                 |
+| `comm`      | 7     | `KHIVE_PACKS=kg,comm`                  | Yes                 |
+| `schedule`  | 4     | `KHIVE_PACKS=kg,schedule`              | Yes                 |
+| `knowledge` | 19    | `KHIVE_PACKS=kg,knowledge`             | Yes                 |
+| `session`   | 4     | `KHIVE_PACKS=kg,session`               | Yes                 |
+| `code`      | 1     | `KHIVE_PACKS=kg,code`                  | Yes                 |
+| `workspace` | 0     | `KHIVE_PACKS=kg,gtd,session,workspace` | Yes                 |
+| `blob`      | 3     | `KHIVE_PACKS=kg,blob`                  | Yes                 |
 
 Git provenance ingestion (`git.digest`, the `commit`/`issue`/`pull_request` note kinds) and
 the `git.commit` / `git.branch` / `git.push` write verbs (ADR-108) are provided by a
-commercial extension and are not part of this distribution.
+commercially licensed extension and are not part of this distribution.
 
 `workspace` requires `kg`, `gtd`, and `session` to be loaded alongside it (the runtime
 rejects a pack set that omits a declared dependency), so its minimal example lists all
@@ -1573,9 +1573,8 @@ request(ops="session.export(id=\"<session-id>\", format=\"markdown\")")
 
 Git-history ingestion (`git.digest`) and the hardened write surface (`git.commit` /
 `git.branch` / `git.push`, ADR-108), along with the `commit`/`issue`/`pull_request`
-note kinds they register, are provided by a commercial extension and are not part
-of this distribution.
-
+note kinds they register, are provided by a commercially licensed extension and are
+not part of this distribution.
 
 ---
 

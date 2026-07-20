@@ -1,7 +1,7 @@
 # Specialized Packs
 
 khive's default install loads eleven production packs
-(`kg, gtd, memory, brain, comm, schedule, knowledge, session, git, code, workspace`, per
+(`kg, gtd, memory, brain, comm, schedule, knowledge, session, code, workspace, blob`, per
 `RuntimeConfig::default()` in `crates/khive-runtime/src/config.rs`). The `code` pack contributes one verb, `code.ingest` (L1 manifest + L1.5
 import-scan source ingestion into a dedicated map database, see
 [ADR-085](../adr/ADR-085-code-pack.md)), alongside its `finding` note kind and

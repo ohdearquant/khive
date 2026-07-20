@@ -23,7 +23,7 @@ written only through the `kkernel code-ingest` admin CLI path (ADR-085 D1, Amend
 the `workspace` pack contributes zero verbs, adding only the `workspace` entity kind and
 `contains` endpoint rules to git/gtd/session notes (#873). Git provenance ingestion and
 write verbs (`git.digest`, `git.commit`, `git.branch`, `git.push`) are provided by a
-commercial extension and are not part of the open-source distribution. Regenerate via
+commercially licensed extension and are not part of the open-source distribution. Regenerate via
 `request(ops="verbs()")`
 before editing this line.
 

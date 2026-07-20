@@ -25,7 +25,7 @@ stdio, and `cargo test` finishes in 4 seconds.
 
 | Capability                  | How                                                                                                                                                      |
 | --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **81 verbs, 11 packs**      | KG, GTD, memory, brain, comm, schedule, knowledge, session, code, workspace, blob: all load by default                                                    |
+| **81 verbs, 11 packs**      | KG, GTD, memory, brain, comm, schedule, knowledge, session, code, workspace, blob: all load by default                                                   |
 | **Typed entities**          | 9 closed kinds: concept, document, dataset, project, person, org, artifact, service, resource                                                            |
 | **Typed edges**             | 17 closed relations in 9 categories (structure, derivation, provenance, temporal, dependency, impl, lateral, annotation, epistemic)                      |
 | **Typed notes**             | 5 closed kinds: observation, insight, question, decision, reference                                                                                      |
@@ -66,19 +66,19 @@ request(ops="[{\"tool\":\"v1\",\"args\":{...}}, ...]") # equivalent JSON form
 All 11 packs load by default, giving **81 verbs** out of the box (regenerate with
 `request(ops="verbs()")` before editing this table):
 
-| Pack          | Prefix       | Verbs | What it does                                                                                   |
-| ------------- | ------------ | ----- | ---------------------------------------------------------------------------------------------- |
-| **kg**        | _(bare)_     | 18    | Entities, edges, notes, graph queries, reference resolution                                    |
-| **gtd**       | `gtd.`       | 5     | Task lifecycle (inbox → next → active → done)                                                  |
-| **memory**    | `memory.`    | 5     | Salience-weighted remember / decay-ranked recall                                               |
-| **brain**     | `brain.`     | 15    | Bayesian user profiles + feedback loop                                                         |
-| **comm**      | `comm.`      | 7     | Threaded messaging                                                                             |
-| **schedule**  | `schedule.`  | 4     | Reminders and scheduled verb execution                                                         |
-| **knowledge** | `knowledge.` | 19    | Atom-based KB with embedding rerank search                                                     |
-| **session**   | `session.`   | 4     | Session record persistence (store/list/resume/export)                                          |
-| **code**      | _(none)_     | 1     | `code.ingest`: L1 manifest + L1.5 import-scan source ingest (ADR-085 Amendment 2)              |
-| **workspace** | _(none)_     | 0     | Adds the `workspace` entity kind + `contains` endpoint rules to git/gtd/session notes (#873)   |
-| **blob**      | `blob.`      | 3     | Content-addressed object put/get/stat over the `BlobStore` CAS trait (ADR-111)                 |
+| Pack          | Prefix       | Verbs | What it does                                                                                 |
+| ------------- | ------------ | ----- | -------------------------------------------------------------------------------------------- |
+| **kg**        | _(bare)_     | 18    | Entities, edges, notes, graph queries, reference resolution                                  |
+| **gtd**       | `gtd.`       | 5     | Task lifecycle (inbox → next → active → done)                                                |
+| **memory**    | `memory.`    | 5     | Salience-weighted remember / decay-ranked recall                                             |
+| **brain**     | `brain.`     | 15    | Bayesian user profiles + feedback loop                                                       |
+| **comm**      | `comm.`      | 7     | Threaded messaging                                                                           |
+| **schedule**  | `schedule.`  | 4     | Reminders and scheduled verb execution                                                       |
+| **knowledge** | `knowledge.` | 19    | Atom-based KB with embedding rerank search                                                   |
+| **session**   | `session.`   | 4     | Session record persistence (store/list/resume/export)                                        |
+| **code**      | _(none)_     | 1     | `code.ingest`: L1 manifest + L1.5 import-scan source ingest (ADR-085 Amendment 2)            |
+| **workspace** | _(none)_     | 0     | Adds the `workspace` entity kind + `contains` endpoint rules to git/gtd/session notes (#873) |
+| **blob**      | `blob.`      | 3     | Content-addressed object put/get/stat over the `BlobStore` CAS trait (ADR-111)               |
 
 `create`, `list`, `search` take `kind=entity|note` (or `kind=edge` for `list`).
 `get`, `update`, `delete`, `merge` are UUID-only: they auto-detect the record type.
