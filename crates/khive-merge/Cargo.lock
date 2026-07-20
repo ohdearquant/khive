@@ -1217,6 +1217,7 @@ dependencies = [
  "khive-score",
  "khive-storage",
  "khive-types",
+ "libc",
  "object_store",
  "parking_lot",
  "rusqlite",

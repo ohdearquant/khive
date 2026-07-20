@@ -1169,7 +1169,7 @@ fn pid_ns_is_init(ino: u64) -> bool {
 /// per-mount options field or the super-options field of a
 /// `/proc/self/mountinfo` line) as restricting per-PID visibility.
 ///
-/// The init-PID-namespace inode check ([`pid_ns_is_init`]) only rules out
+/// The init-PID-namespace inode check (`pid_ns_is_init`) only rules out
 /// one way the `/proc` walk can miss processes. A host `/proc` mounted with
 /// `hidepid=1`/`hidepid=2` (or the symbolic `hidepid=noaccess` /
 /// `hidepid=invisible` / `hidepid=ptraceable` forms) or `subset=pid` hides
@@ -1258,13 +1258,13 @@ fn proc_mounts_restricted_in(mountinfo: &str) -> Option<bool> {
 /// the host's live PIDs — with no per-entry error to catch. Three checks
 /// widen the net rather than trust a clean-looking iteration outright: (1)
 /// a positive proof that this process itself is running in the *host's*
-/// init PID namespace — see [`pid_ns_is_init`]; a container's own procfs is
+/// init PID namespace — see `pid_ns_is_init`; a container's own procfs is
 /// internally self-consistent (its `/proc/1` resolves to its own init), so
 /// merely comparing `/proc/1/ns/pid` against `/proc/self/ns/pid` cannot
 /// distinguish "the host" from "a container that is its own root," and was
 /// replaced with this inode check (ADR-091 Amendment 2). (2) a positive
 /// proof the procfs mount backing `/proc` carries no `hidepid`/`subset`
-/// restriction — see [`proc_mount_is_visibility_restricted`]; a
+/// restriction — see `proc_mount_is_visibility_restricted`; a
 /// `hidepid`-restricted mount hides other users' `/proc/<pid>` directories
 /// from `readdir` with no per-entry error, so the init-namespace check
 /// alone (self stays visible, self-canary passes) cannot detect it. (3) any error surfacing from the `/proc` or per-PID `fd`
