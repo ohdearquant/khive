@@ -67,15 +67,33 @@ The main backend's attribution view uses a filter matching
 `Database(main) | Unscoped`; a secondary backend's view matches only
 `Database(that backend)`; `Memory` matches no attribution view.
 
-- **Database identity** (`DbIdentity`) is a shared, lossless key produced at
-  exactly one canonicalization point — the pool, from the backend's resolved
-  path — and reused everywhere origin is compared. It preserves the platform
-  path encoding (`OsString`-based, never lossy UTF-8 conversion: the backend
-  layer deliberately preserves non-UTF-8 path identity to avoid database
-  collisions, and origin must not be weaker than that) and is the same input
-  the sidecar-directory key (`<db-file>.walpin/`) derives from, so a sidecar
-  directory and the spans attributed to it can never disagree about which
-  database they mean.
+- **Database identity** (`DbIdentity`) is a shared key produced at exactly
+  one minting point — the pool — and reused everywhere origin is compared.
+  Minting is defined operationally: filesystem-canonicalize the database
+  file's **parent directory** (resolving symlinks and dot segments through
+  the part of the path that exists), then append the file name unchanged.
+  The database file itself may not exist yet at open time, so only the
+  parent is canonicalized — the same pattern `FsBlobStore` uses for its
+  root-keyed write locks, and for the same reason (`Path::canonicalize`
+  requires an existing path). Canonicalization is what collapses aliased
+  spellings — symlink vs. target, relative vs. absolute — into one
+  identity, so a daemon and a session opening the same database through
+  different spellings mint the same `DbIdentity`.
+- **Canonical and lossless are reconciled explicitly**, because they pull in
+  opposite directions: _canonical_ collapses aliases; _lossless_ governs the
+  representation of the canonical path once minted (`OsString`-based, never
+  lossy UTF-8 conversion — the backend layer deliberately preserves
+  non-UTF-8 path identity to avoid database collisions, and origin must not
+  be weaker than that). Lossless does **not** mean preserving pre-canonical
+  alias spellings; those are collapsed by design.
+- **Sidecar derivation consumes the minted `DbIdentity`**, never the raw
+  configured path. Today's `sidecar_dir_for` is a purely lexical sibling
+  derivation, so two aliased openers would land on two different sidecar
+  directories; the implementation routes it through the minted identity so
+  a sidecar directory and the spans attributed to it can never disagree
+  about which database they mean. Sidecar contents are ephemeral
+  observability records (heartbeats, beacons), so re-keying the derivation
+  requires no migration.
 - **Registration sites**: every `khive_storage::tx_registry::register` call
   site is threaded in the same change — the current inventory spans
   `pool.rs` (`WriterGuard::transaction`), `writer_task.rs` (the batch-writer
@@ -117,21 +135,28 @@ provides the same partitioning with an additive API.
 
 ## Decisions folded into Fork A
 
-- **Origin identity is a lossless database identity, not the configured backend
-  name.** The resolved path is the same key the sidecar contract uses
-  (`<db-file>.walpin/`), is stable across processes that open the same database,
-  and requires no config plumbing. Backend names are per-process configuration
-  and can differ between a session and the daemon observing the same file.
-  `DbIdentity` preserves platform path encoding and is minted at one
-  canonicalization point (the pool); no other layer constructs or normalizes it.
+- **Origin identity is the minted `DbIdentity`, not the configured backend
+  name.** The canonical identity is the same key the sidecar contract uses
+  (`<db-file>.walpin/`), is stable across processes that open the same database
+  — including through aliased spellings, which minting collapses — and requires
+  no config plumbing. Backend names are per-process configuration and can
+  differ between a session and the daemon observing the same file. `DbIdentity`
+  is minted at one point (the pool, per the operational definition above); no
+  other layer constructs, normalizes, or re-canonicalizes it.
 - **Memory backends register `TxOrigin::Memory`, never `Unscoped`.** No database
   file means no WAL, no pins, and no sidecar directory. Conflating "memory" with
   "unscoped" would either drop unscoped spans from observation (exact filtering)
   or falsely attribute memory spans to the main database (fallback filtering) —
   the three-state contract exists precisely to keep these apart.
-- **`Unscoped` entries keep today's behavior.** They are observed by the main
-  backend's attribution view, exactly as every entry is today. Scoping narrows
-  attribution; it never silently drops a span from observation. All in-tree
+- **`Unscoped` entries keep today's behavior — and are labeled as such.** They
+  are observed by the main backend's attribution view, exactly as every entry
+  is today. Scoping narrows attribution; it never silently drops a span from
+  observation. A heartbeat whose oldest span carries `Unscoped` origin is
+  written with an explicit fallback-attribution marker, so diagnostics can
+  distinguish "attributed to main by evidence" from "attributed to main as the
+  fallback for unknown origin" and never read fallback attribution as ground
+  truth. The marker is one additive heartbeat-record field; the corresponding
+  record-contract text in ADR-091 Amendment 2 is amended alongside. All in-tree
   registration sites are threaded in the same change, so `Unscoped` should not
   occur from khive's own write paths; the grep gate makes any later regression a
   review defect rather than a silent hole.
@@ -145,6 +170,12 @@ provides the same partitioning with an additive API.
   appear in the main backend's filtered view and in `oldest()`; `Memory` entries
   appear in no attribution view but still in `oldest()`; `Database` entries never
   leak into a different backend's view.
+- Alias-convergence test: the same database opened via its real path, a
+  symlink, and a relative spelling mints identical `DbIdentity` values and
+  derives the identical sidecar directory.
+- Fallback-marker test: a heartbeat produced from an `Unscoped` oldest span
+  carries the fallback-attribution marker; one produced from a
+  `Database(main)` span does not.
 - Sweep integration test: two file-backed pools in one process; a long-running
   transaction on the secondary backend produces a heartbeat in the **secondary**
   database's sidecar directory and none in the main database's sidecar.
@@ -162,9 +193,13 @@ provides the same partitioning with an additive API.
 Single implementation PR after this note is accepted: additive `khive-storage`
 API (`TxOrigin`, `DbIdentity`, `register_scoped`, `oldest_for`), origin threading
 at every registry call site (the grep-gated inventory above, including
-`graph_traverse_read` and the daemon's own spans), session-sweep fan-out,
-per-file-backed-backend daemon checkpoint/enumeration ownership, and the tests
-above — producers and consumers of secondary sidecars land in the same PR. No
-schema, wire, or sidecar-format change; ADR-091 Amendment 2's sidecar contract is
-unchanged — this note closes the producer-side scoping gap and the main-only
-consumer-ownership gap against the contract's existing per-database key.
+`graph_traverse_read` and the daemon's own spans), the sidecar-derivation change
+routing `sidecar_dir_for` consumers through the minted `DbIdentity`,
+session-sweep fan-out, per-file-backed-backend daemon checkpoint/enumeration
+ownership, and the tests above — producers and consumers of secondary sidecars
+land in the same PR. No schema or wire change. The sidecar format gains exactly
+one additive heartbeat-record field (the fallback-attribution marker), with the
+matching record-contract text amended in ADR-091 Amendment 2 alongside;
+everything else in the sidecar contract is unchanged — this note closes the
+producer-side scoping gap and the main-only consumer-ownership gap against the
+contract's existing per-database key.
