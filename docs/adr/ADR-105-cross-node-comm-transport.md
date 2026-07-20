@@ -206,3 +206,12 @@ three-node star, verified by the end-to-end flow above.
    one specified here; this ADR is that shape written down.
 4. **KG-versioning snapshot push/pull as the comm transport.** Rejected: built for
    version-controlled graph state, wrong latency and granularity shape for messaging.
+
+## Amendment (2026-07-20): transport layer ships as a commercially licensed extension
+
+The ADR-056 channel-transport layer this design builds on moves out of the
+open-source repository as a commercially licensed extension (ADR-056 amendment of the
+same date; the extraction lands as a separate pull request). This ADR's design is
+unchanged; its MAY-add implementation surface (`khive-channel-node`, the hub ingress
+module) lands alongside the extension's trait crate rather than in the open-source
+tree.
