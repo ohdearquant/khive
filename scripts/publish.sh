@@ -74,7 +74,6 @@ CRATES=(
     khive-pack-code      # needs khive-runtime/storage + khive-pack-kg (all above)
     khive-pack-gtd
     khive-brain-core
-    khive-pack-brain
     khive-pack-memory
     khive-pack-comm
     khive-pack-schedule

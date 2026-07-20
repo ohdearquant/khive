@@ -1920,15 +1920,15 @@ mod tests {
         crate::server::KhiveMcpServer::new(runtime).expect("server builds with kg+gtd")
     }
 
-    /// Server whose pack set includes `brain`, which registers
-    /// `Visibility::Subhandler` verbs (`brain.state`, …). Used to exercise the
-    /// wire visibility gate through the daemon round-trip.
+    /// Server whose pack set includes `memory`, which registers
+    /// `Visibility::Subhandler` verbs (`memory.recall_candidates`, …). Used to
+    /// exercise the wire visibility gate through the daemon round-trip.
     fn make_subhandler_test_server() -> crate::server::KhiveMcpServer {
         let mut config = memory_runtime_config();
-        config.default_namespace = Namespace::parse("braintest").unwrap();
-        config.packs = vec!["kg".to_string(), "brain".to_string()];
+        config.default_namespace = Namespace::parse("subhtest").unwrap();
+        config.packs = vec!["kg".to_string(), "memory".to_string()];
         let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
-        crate::server::KhiveMcpServer::new(runtime).expect("server builds with kg+brain")
+        crate::server::KhiveMcpServer::new(runtime).expect("server builds with kg+memory")
     }
 
     /// Server whose pack set includes `comm`, whose `send` verb echoes the
@@ -3539,10 +3539,10 @@ mod tests {
         drop(_ready);
 
         let frame = |from_wire: bool| DaemonRequestFrame {
-            ops: "brain.state()".to_string(),
+            ops: "memory.recall_candidates()".to_string(),
             presentation: None,
             presentation_per_op: None,
-            namespace: "braintest".to_string(),
+            namespace: "subhtest".to_string(),
             actor_id: None,
             visible_namespaces: Vec::new(),
             config_id: config_id.clone(),
@@ -3556,7 +3556,7 @@ mod tests {
         };
 
         // (a) from_wire=true → daemon applies the wire visibility gate:
-        // `brain.state` is a Subhandler and must be blocked after the round-trip.
+        // `memory.recall_candidates` is a Subhandler and must be blocked after the round-trip.
         let resp_wire = exchange(&sock, &frame(true)).await;
         assert!(
             resp_wire.ok,
@@ -3605,7 +3605,7 @@ mod tests {
     fn wire_request_frame_sets_from_wire_true() {
         let server = make_subhandler_test_server();
         let params = RequestParams {
-            ops: "brain.state()".to_string(),
+            ops: "memory.recall_candidates()".to_string(),
             ..Default::default()
         };
         let frame = server.wire_daemon_frame(&params);
@@ -3613,8 +3613,8 @@ mod tests {
             frame.from_wire,
             "request tool must set from_wire=true on the daemon forward-frame"
         );
-        assert_eq!(frame.ops, "brain.state()");
-        assert_eq!(frame.namespace, "braintest");
+        assert_eq!(frame.ops, "memory.recall_candidates()");
+        assert_eq!(frame.namespace, "subhtest");
     }
 
     // ── new-client + old-daemon regression (fix for #98 BLOCKER) ─────────────

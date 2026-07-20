@@ -2017,9 +2017,8 @@ impl VerbRegistry {
 
 /// Output of [`PackFactory::create_install`] — bundles the pack runtime with
 /// its optional by-ID resolver and dispatch hook so a factory can hand back
-/// all three built from one shared instance (see `BrainPackFactory` for why
-/// this matters: the dispatch hook must observe the same state the runtime
-/// mutates, not a second unrelated instance).
+/// all three built from one shared instance (a dispatch hook must observe
+/// the same state the runtime mutates, not a second unrelated instance).
 pub struct PackInstall {
     /// The pack runtime, registered into the builder's pack list.
     pub runtime: Box<dyn PackRuntime>,

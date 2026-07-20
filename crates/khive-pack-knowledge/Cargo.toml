@@ -35,7 +35,6 @@ sha2 = { workspace = true }
 
 [dev-dependencies]
 khive-pack-kg = { version = "0.5.0", path = "../khive-pack-kg" }
-khive-pack-brain = { version = "0.5.0", path = "../khive-pack-brain" }
 khive-storage = { version = "0.5.0", path = "../khive-storage" }
 tokio = { workspace = true, features = ["test-util"] }
 lattice-embed = { workspace = true }
@@ -57,10 +56,6 @@ path = "tests/integration.rs"
 [[test]]
 name = "fixes"
 path = "tests/fixes.rs"
-
-[[test]]
-name = "feedback"
-path = "tests/feedback.rs"
 
 [[test]]
 name = "bench"

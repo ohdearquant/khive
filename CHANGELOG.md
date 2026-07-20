@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The brain pack (`khive-pack-brain`, `brain.*` verbs — profile lifecycle,
+  feedback ingestion, resolution/binding) moved to a commercial extension
+  distributed separately and is no longer part of this distribution's
+  default 11-pack, 70-verb surface. `khive-brain-core` (posterior math types)
+  stays public: it remains a runtime dependency of `memory.recall`'s ranking
+  hooks, which run plain when no brain-providing pack is registered. This
+  repository's git history retains the extracted crate's past commits under
+  their original license terms; this change relocates future development and
+  does not alter the status of already-published history.
+
 ## [0.5.0] - 2026-07-13
 
 ### Added

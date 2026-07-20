@@ -3634,60 +3634,6 @@ id = "lambda:project-actor"
         );
     }
 
-    /// #658 multi-backend regression: `build_registry_for_multi_backend` — the
-    /// production multi-backend wiring path — must also wire the brain
-    /// dispatch hook produced by `PackFactory::create_install`, observing the
-    /// same `BrainPack` instance the registry dispatches `brain.*` verbs to.
-    /// Mirrors `server::tests::brain_dispatch_hook_updates_state_visible_through_same_instance`
-    /// (single-backend path) using this file's multi-backend entry point instead.
-    #[tokio::test]
-    #[serial]
-    async fn multi_backend_brain_dispatch_hook_updates_state_visible_through_same_instance() {
-        let khive_cfg = KhiveConfig {
-            backends: vec![BackendConfig {
-                name: "main".to_string(),
-                kind: BackendKind::Memory,
-                path: None,
-                cache_mb: None,
-                journal_mode: None,
-                read_only: false,
-            }],
-            ..KhiveConfig::default()
-        };
-
-        let mut base_cfg = base_runtime_config_for_multi_backend();
-        base_cfg.packs = vec!["kg".to_string(), "brain".to_string()];
-
-        let multi = build_registry_for_multi_backend(base_cfg, &khive_cfg, None)
-            .expect("multi-backend registry build must succeed");
-
-        multi
-            .registry
-            .dispatch("brain.state", serde_json::Value::Null)
-            .await
-            .expect("brain.state loads the default namespace into the active slot");
-
-        multi
-            .registry
-            .dispatch("stats", serde_json::json!({}))
-            .await
-            .expect("kg.stats dispatch succeeds");
-
-        let state = multi
-            .registry
-            .dispatch("brain.state", serde_json::Value::Null)
-            .await
-            .expect("brain.state dispatch");
-        let total_events = state["balanced_recall"]["total_events"]
-            .as_u64()
-            .unwrap_or(0);
-        assert!(
-            total_events > 0,
-            "multi-backend dispatch hook must update the same BrainPack instance \
-             the registry dispatches brain.* verbs to; got snapshot {state:?}"
-        );
-    }
-
     /// Regression for #601, adapted for #603: both multi-backend boot paths —
     /// `build_server_multi_backend` (this file) and `kkernel`'s `Command::Mcp`
     /// coordinator branch — now finish through the single

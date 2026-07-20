@@ -22,7 +22,6 @@ members = [
     "khive-pack-gtd",
     "khive-pack-memory",
     "khive-brain-core",
-    "khive-pack-brain",
     "khive-pack-comm",
     "khive-pack-schedule",
     "khive-pack-formal",
