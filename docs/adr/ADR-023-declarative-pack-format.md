@@ -591,7 +591,13 @@ brain, knowledge, code, and git packs move to commercially licensed
 extensions maintained outside this repository; they are not part of the
 open-source distribution. The git pack's departure takes its note kinds
 (`commit`, `issue`, `pull_request`), its ingestion surface, and its verbs
-with it. The formal pack, which was never part of the open-source default
+with it. The workspace pack's declared pack dependency is accordingly
+relaxed from `kg, git, gtd, session` to `kg, gtd, session`: its membership
+rules targeting the git note kinds stay declared but are inert when no pack
+registers those kinds (edge endpoint rules are installed without
+kind-existence validation and can only ever match kinds a loaded pack
+provides), so the reduced default boots and workspace containment continues
+to serve task and session records. The formal pack, which was never part of the open-source default
 pack set (see below), moves alongside the code pack as part of the same
 crate departure. A small set of channel-transport crates supporting alternate
 message delivery also move out of this repository; they contribute no MCP
