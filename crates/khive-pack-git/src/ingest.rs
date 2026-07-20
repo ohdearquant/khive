@@ -124,6 +124,21 @@ pub struct IngestReport {
     /// because none was found (ADR-088 Amendment 1) — never set by
     /// `run_ingest` itself, only by the verb handler after it returns.
     pub project_created: bool,
+    /// `true` when `project_created` fired over a soft-deleted anchor that
+    /// still had a live corpus annotating it (issue #1173) — the resolved
+    /// repo identity matched no LIVE `project` entity, but did match a
+    /// soft-deleted one with `annotates` edges still pointing at it. This
+    /// distinguishes "first ingest of a new repo" from "anchor lost,
+    /// corpus about to duplicate under a fresh anchor" — never set by
+    /// `run_ingest` itself, only by the verb handler after it returns.
+    pub orphaned_corpus_detected: bool,
+    /// The dangling anchor id `orphaned_corpus_detected` was found under.
+    /// `None` unless `orphaned_corpus_detected` is `true`.
+    pub orphaned_project_id: Option<String>,
+    /// Count of `commit`/`issue`/`pull_request` notes still `annotates`-
+    /// linked to `orphaned_project_id`. `0` unless `orphaned_corpus_detected`
+    /// is `true`.
+    pub orphaned_note_count: u64,
     /// `annotates` edges created from a `Closes/Fixes/Resolves #N` or bare
     /// `#N` reference in a commit message or issue/PR body to the referenced
     /// issue/PR note (ADR-088 Amendment 1 ingest enrichment).
