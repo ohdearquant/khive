@@ -38,9 +38,6 @@ members = [
     "khive-vcs-adapters",
     "kkernel",
     "khive-retrieval",
-    "khive-channel",
-    "khive-channel-email",
-    "khive-channel-telegram",
 ]
 exclude = ["khive-merge"]
 # khive-merge is forward-deployed v2 infrastructure (ADR-039), not removed or

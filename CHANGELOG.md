@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Moved the transport channel crates (`khive-channel`, `khive-channel-email`,
+  `khive-channel-telegram`) and their `channel-email`/`channel-telegram`
+  `khive-mcp`/`kkernel` cargo features to a commercial extension; no longer
+  part of this repository or the open-source build.
+
 ## [0.5.0] - 2026-07-13
 
 ### Added

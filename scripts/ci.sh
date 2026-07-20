@@ -103,19 +103,6 @@ phase_tests() {
     cargo test --workspace
 }
 
-phase_channel_email() {
-    echo "=== Channel-Email Feature Tests (channel-email feature) ==="
-    # `--workspace` alone never runs any of the several `#[cfg(feature =
-    # "channel-email")]` test modules in khive-mcp (ADR-094 channel lifecycle
-    # sequencing, issue #449 cursor_commit gating, bootstrap-floor regressions,
-    # etc.) -- the all-features clippy pass above only type-checks them. A prior
-    # name filter here (`channel_lifecycle`) ran only one of those modules and
-    # silently skipped the rest, including the daemon's durable-cursor
-    # regression tests. Run the whole crate under the feature, unfiltered, so
-    # every one of those modules fails CI on a regression.
-    cargo test -p khive-mcp --features channel-email
-}
-
 phase_no_default_features() {
     echo "=== No-Default-Features Check ==="
     cargo check --workspace --no-default-features
@@ -172,7 +159,7 @@ phase_macos_pr_tests() {
     echo "=== macOS PR Platform Tests ==="
     # These crates own the SQLite/filesystem, daemon/process, and native CLI
     # boundaries where macOS behavior has historically differed from Linux.
-    cargo test -p khive-db -p khive-runtime -p khive-mcp -p khive-pack-git -p kkernel --features khive-mcp/channel-email
+    cargo test -p khive-db -p khive-runtime -p khive-mcp -p khive-pack-git -p kkernel
 }
 
 run_phase() {
@@ -185,7 +172,6 @@ run_phase() {
         clippy) phase_clippy ;;
         docs) phase_docs ;;
         tests) phase_tests ;;
-        channel-email) phase_channel_email ;;
         no-default-features) phase_no_default_features ;;
         release) phase_release ;;
         contract-tests) phase_contract_tests ;;
@@ -197,7 +183,7 @@ run_phase() {
         macos-pr-tests) phase_macos_pr_tests ;;
         *)
             echo "Unknown CI phase: $1" >&2
-            echo "Valid phases: no-stubs-scan lockfile forward-deployed lint no-stubs clippy docs tests channel-email no-default-features release contract-tests deno-tests smoke-tests vector-smoke contract-suite macos-pr-check macos-pr-tests" >&2
+            echo "Valid phases: no-stubs-scan lockfile forward-deployed lint no-stubs clippy docs tests no-default-features release contract-tests deno-tests smoke-tests vector-smoke contract-suite macos-pr-check macos-pr-tests" >&2
             exit 2
             ;;
     esac
@@ -213,7 +199,6 @@ run_all() {
         clippy \
         docs \
         tests \
-        channel-email \
         no-default-features \
         release \
         contract-tests \

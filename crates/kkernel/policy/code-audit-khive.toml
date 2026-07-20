@@ -31,13 +31,10 @@ coverage_floor = 0.0
 denied_pairs = []
 
 [crate_ranks]
-khive-channel = 0
 khive-quant = 0
 khive-text = 0
 khive-types = 0
 khive-changeset = 1
-khive-channel-email = 1
-khive-channel-telegram = 1
 khive-gate = 1
 khive-query = 1
 khive-request = 1
