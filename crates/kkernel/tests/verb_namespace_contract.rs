@@ -32,8 +32,6 @@ use khive_pack_gtd::GtdPack as _;
 #[allow(unused_imports)]
 use khive_pack_kg::KgPack as _;
 #[allow(unused_imports)]
-use khive_pack_knowledge::KnowledgePack as _;
-#[allow(unused_imports)]
 use khive_pack_memory::MemoryPack as _;
 #[allow(unused_imports)]
 use khive_pack_schedule::SchedulePack as _;

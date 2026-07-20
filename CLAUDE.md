@@ -96,7 +96,7 @@ not shipped.
 | `crates/khive-fusion`      | RRF, weighted, union, vector-only, and keyword-only fusion strategies                                                                                                                                                                            |
 | `crates/khive-bm25`        | BM25 keyword index                                                                                                                                                                                                                               |
 | `crates/khive-hnsw`        | HNSW vector index                                                                                                                                                                                                                                |
-| `crates/khive-vamana`      | Vamana ANN index used by knowledge search                                                                                                                                                                                                        |
+| `crates/khive-vamana`      | Vamana ANN index used by semantic recall                                                                                                                                                                                                        |
 | `crates/khive-query`       | GQL + SPARQL parsers, AST validation, SQL compiler                                                                                                                                                                                               |
 | `crates/khive-runtime`     | Service API + VerbRegistry + PackRuntime trait                                                                                                                                                                                                   |
 | `crates/khive-request`     | Request DSL parser (function-call + JSON; pipe/LNDL planned)                                                                                                                                                                                     |
@@ -168,8 +168,8 @@ request(ops="[{\"tool\":\"v1\",\"args\":{...}}, ...]")
 ```
 
 Verbs come from whichever packs are loaded via `KHIVE_PACKS` (env) or `--pack` (CLI). Default
-loads all 12 production packs: kg, gtd, memory, brain, comm, schedule, knowledge, session, git,
-code, workspace, blob (verbs at 85: the `code` pack contributes one verb, `code.ingest`
+loads all 11 production packs: kg, gtd, memory, brain, comm, schedule, session, git,
+code, workspace, blob (verbs at 66: the `code` pack contributes one verb, `code.ingest`
 (ADR-085 Amendment 2, PR #1039 — L1 manifest + L1.5 import-scan source ingest into a
 dedicated map database); its `finding` note kind and `findings.json` batch ingest are
 still reached only through the `kkernel code-ingest` admin CLI path (ADR-085 Amendment
