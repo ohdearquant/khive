@@ -25,7 +25,7 @@ stdio, and `cargo test` finishes in 4 seconds.
 
 | Capability                  | How                                                                                                                                                      |
 | --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **50 verbs, 9 packs**       | KG, GTD, memory, comm, schedule, session, git, workspace, blob: all load by default                                                                      |
+| **46 verbs, 8 packs**       | KG, GTD, memory, comm, schedule, session, workspace, blob: all load by default                                                                           |
 | **Typed entities**          | 9 closed kinds: concept, document, dataset, project, person, org, artifact, service, resource                                                            |
 | **Typed edges**             | 17 closed relations in 9 categories (structure, derivation, provenance, temporal, dependency, impl, lateral, annotation, epistemic)                      |
 | **Typed notes**             | 5 closed kinds: observation, insight, question, decision, reference                                                                                      |
@@ -63,20 +63,19 @@ request(ops="[v1(...), v2(...), v3(...)]")             # parallel batch (max 100
 request(ops="[{\"tool\":\"v1\",\"args\":{...}}, ...]") # equivalent JSON form
 ```
 
-All 9 packs load by default, giving **50 verbs** out of the box (regenerate with
+All 8 packs load by default, giving **46 verbs** out of the box (regenerate with
 `request(ops="verbs()")` before editing this table):
 
-| Pack          | Prefix      | Verbs | What it does                                                                                   |
-| ------------- | ----------- | ----- | ---------------------------------------------------------------------------------------------- |
-| **kg**        | _(bare)_    | 18    | Entities, edges, notes, graph queries, reference resolution                                    |
-| **gtd**       | `gtd.`      | 5     | Task lifecycle (inbox → next → active → done)                                                  |
-| **memory**    | `memory.`   | 5     | Salience-weighted remember / decay-ranked recall                                               |
-| **comm**      | `comm.`     | 7     | Threaded messaging                                                                             |
-| **schedule**  | `schedule.` | 4     | Reminders and scheduled verb execution                                                         |
-| **session**   | `session.`  | 4     | Session record persistence (store/list/resume/export)                                          |
-| **git**       | `git.`      | 4     | `git.digest` provenance ingestion + `git.commit`/`git.branch`/`git.push` write verbs (ADR-108) |
-| **workspace** | _(none)_    | 0     | Adds the `workspace` entity kind + `contains` endpoint rules to git/gtd/session notes (#873)   |
-| **blob**      | `blob.`     | 3     | Content-addressed object put/get/stat over the `BlobStore` CAS trait (ADR-111)                 |
+| Pack          | Prefix      | Verbs | What it does                                                                                 |
+| ------------- | ----------- | ----- | -------------------------------------------------------------------------------------------- |
+| **kg**        | _(bare)_    | 18    | Entities, edges, notes, graph queries, reference resolution                                  |
+| **gtd**       | `gtd.`      | 5     | Task lifecycle (inbox → next → active → done)                                                |
+| **memory**    | `memory.`   | 5     | Salience-weighted remember / decay-ranked recall                                             |
+| **comm**      | `comm.`     | 7     | Threaded messaging                                                                           |
+| **schedule**  | `schedule.` | 4     | Reminders and scheduled verb execution                                                       |
+| **session**   | `session.`  | 4     | Session record persistence (store/list/resume/export)                                        |
+| **workspace** | _(none)_    | 0     | Adds the `workspace` entity kind + `contains` endpoint rules to git/gtd/session notes (#873) |
+| **blob**      | `blob.`     | 3     | Content-addressed object put/get/stat over the `BlobStore` CAS trait (ADR-111)               |
 
 `create`, `list`, `search` take `kind=entity|note` (or `kind=edge` for `list`).
 `get`, `update`, `delete`, `merge` are UUID-only: they auto-detect the record type.
@@ -139,7 +138,6 @@ records what's connected, in which direction, and why.
 │  khive-pack-comm:      threaded messaging (7 verbs)           │
 │  khive-pack-schedule:  reminders + scheduled ops (4 verbs)    │
 │  khive-pack-session:   session record persistence (4 verbs)   │
-│  khive-pack-git:       provenance ingest + writes (4 verbs)   │
 └──────────────────────────────────────────────────────────────┘
                             ↕ in-process
 ┌──────────────────────────────────────────────────────────────┐
@@ -244,7 +242,7 @@ kkernel --version   # confirms the binary and version you just installed
 ```
 
 All 11 packs load by default, a background daemon auto-spawns to keep the runtime warm, and any
-MCP client discovers the `request` tool with the full 50-verb catalog.
+MCP client discovers the `request` tool with the full 46-verb catalog.
 
 ### Alternative: npm
 
@@ -371,7 +369,7 @@ Docs: [ohdearquant.github.io/khive](https://ohdearquant.github.io/khive/) (agent
 
 ## Status
 
-**v0.5.0 (publication pending; crates.io currently serves 0.4.0).** 50 verbs across 9
+**v0.5.0 (publication pending; crates.io currently serves 0.4.0).** 46 verbs across 8
 packs, 9 entity kinds, 17 edge relations, daemon warm startup (ADR-049), threaded
 messaging, scheduled verb execution.
 Ready for use with Claude Code and any MCP-compatible agent.

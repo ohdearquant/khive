@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Moved the git-lifecycle pack (`khive-pack-git`: `git.digest` provenance ingestion,
+  `git.commit` / `git.branch` / `git.push` write verbs, and the `commit`/`issue`/
+  `pull_request` note kinds) to a commercial extension, no longer part of this
+  distribution. The default pack set drops from 12 to 11 packs (85 to 81 verbs). The
+  `workspace` pack's `contains` endpoint rules naming those note kinds remain declared
+  but are inert without the pack that registers them. This repository's git history
+  retains the extracted crate's past commits under their original license terms; the
+  change relocates future development and does not alter the status of already-published
+  history.
 - The brain pack (`khive-pack-brain`, `brain.*` verbs — profile lifecycle,
   feedback ingestion, resolution/binding) moved to a commercial extension
   distributed separately and is no longer part of this distribution's

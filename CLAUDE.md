@@ -167,15 +167,13 @@ request(ops="[{\"tool\":\"v1\",\"args\":{...}}, ...]")
 ```
 
 Verbs come from whichever packs are loaded via `KHIVE_PACKS` (env) or `--pack` (CLI). Default
-loads all 9 production packs: kg, gtd, memory, comm, schedule, session, git,
+loads all 8 production packs: kg, gtd, memory, comm, schedule, session,
 workspace, blob (regenerate the verb count via `request(ops="verbs()")` before citing an exact
-figure — it drifts; git contributes
-commit/issue/pull_request note kinds, a batch ingester, the git.digest verb (ADR-088
-Amendment 1), and three write verbs — git.commit / git.branch / git.push — that shell to
-system git with hardened, allowlisted argv construction and unconditional force-push denial
-(ADR-108); comm.probe (#644) added 2026-07-07; kg.resolve added 2026-07-09; workspace (#873)
+figure — it drifts; comm.probe (#644) added 2026-07-07; kg.resolve added 2026-07-09; workspace (#873)
 contributes zero verbs, adding only the `workspace` entity kind and `contains` endpoint rules
-to git/gtd/session notes; blob contributes three verbs, blob.put/blob.get/blob.stat (ADR-111),
+to git/gtd/session notes — the commit/issue/pull_request note kinds those rules name are
+registered by a git-lifecycle pack that is a commercial extension, not part of this
+distribution; blob contributes three verbs, blob.put/blob.get/blob.stat (ADR-111),
 over the `BlobStore` content-addressed storage trait; a normal file-backed boot installs a
 default `FsBlobStore` beside the database file with no config needed, and the verbs stay
 unconfigured only against an in-memory backend; the profile-oriented feedback/learning-loop

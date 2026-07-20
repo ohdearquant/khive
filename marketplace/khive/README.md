@@ -2,7 +2,7 @@
 
 One plugin for the whole khive surface: a knowledge graph, GTD, memory, inter-agent comm,
 and scheduling, all served by a single MCP server (`kkernel mcp`)
-exposing one tool — `request` — that dispatches 50 verbs across 9 packs.
+exposing one tool — `request` — that dispatches 46 verbs across 8 packs.
 
 This plugin is **guidance, not a second runtime**. It ships the pattern skills that teach an
 agent how to use each pack well, plus the kg stewardship agents. The data and verbs live in the
@@ -48,16 +48,17 @@ Once installed, invoke them as `khive:digester`, `khive:polisher`, and so on.
 ## Requirements
 
 The `kg` pack is the base (entities, edges, notes); every other pack builds on it. The default
-server config loads all nine (`kg`, `gtd`, `memory`, `comm`, `schedule`,
-`session`, `git`, `workspace`, `blob` — `git` contributes note kinds, a batch ingester, the
-`git.digest` verb, and three write verbs — `git.commit`/`git.branch`/`git.push` — that shell to
-system git with hardened, allowlisted argv construction and unconditional force-push denial
-(ADR-108); `workspace` contributes entity/endpoint vocabulary, no verbs; `blob` contributes
-`blob.put`/`blob.get`/`blob.stat` over a content-addressed storage trait, ADR-111) —
-this plugin currently ships pattern skills for the first five; `session`, `git`, `workspace`,
+server config loads all eight (`kg`, `gtd`, `memory`, `comm`, `schedule`,
+`session`, `workspace`, `blob` — `workspace` contributes entity/endpoint vocabulary,
+no verbs; `blob` contributes `blob.put`/`blob.get`/`blob.stat` over a
+content-addressed storage trait, ADR-111) —
+this plugin currently ships pattern skills for the first five; `session`, `workspace`,
 and `blob` have no skill yet (see the Pattern skills table above).
 The `brain` pack (`brain.*` verbs — Bayesian recall-tuning profiles) is a commercially
 licensed extension distributed separately; it is not part of this distribution.
+Git provenance ingestion and write verbs (`git.digest`, `git.commit`, `git.branch`,
+`git.push`) are provided by a commercially licensed extension and are not part of
+this distribution.
 See [INSTALL.md](../INSTALL.md) for setup, the actor config, and per-pack smoke tests.
 
 ## Links

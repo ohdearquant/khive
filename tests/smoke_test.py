@@ -196,19 +196,16 @@ def main():
         assert "total" in verbs_result, f"verbs must return 'total' key: {verbs_result}"
         assert isinstance(verbs_result["verbs"], list), f"verbs must be a list: {verbs_result}"
         # Surface-contract tripwire: the default config (no --pack, KHIVE_PACKS
-        # unset) loads 9 production packs (kg, gtd, memory, comm, schedule,
-        # session, git, workspace, blob), so verbs() returns exactly
-        # 50 user-facing MCP-callable verbs (count what verbs() returns, not internal
+        # unset) loads 8 production packs (kg, gtd, memory, comm, schedule,
+        # session, workspace, blob), so verbs() returns exactly
+        # 46 user-facing MCP-callable verbs (count what verbs() returns, not internal
         # dispatch arms). The session pack contributes 4 agent-facing T1 verbs
         # (store/list/resume/export), promoted from internal subhandlers to
         # Visibility::Verb per ADR-083; context
         # (ADR-089, the 17th kg-substrate bare verb), resolve (unified-verb
         # draft ADR Slice 1, the 18th kg-substrate bare verb), comm.health
         # (#606, verified live 2026-07-04), and comm.probe (#644 read-only
-        # inbound poll) are included in the count; git contributes
-        # git.digest (ADR-088 Amendment 1) plus git.commit / git.branch /
-        # git.push (ADR-108, three thin write verbs shelling to system git
-        # with hardened argv construction);
+        # inbound poll) are included in the count;
         # workspace (#873) contributes zero verbs, adding only the
         # `workspace` entity kind and `contains` endpoint rules; blob
         # contributes three verbs (blob.put / blob.get / blob.stat, ADR-111)
@@ -216,14 +213,12 @@ def main():
         # until a backend is installed via [storage.blob] or KHIVE_BLOB_ROOT.
         # Update this number when the pack set or verb surface changes; a
         # silent drift here is the bug this assertion exists to catch.
-        assert verbs_result["total"] == 50, (
-            f"expected 50 user-facing verbs from the 9 default packs "
+        assert verbs_result["total"] == 46, (
+            f"expected 46 user-facing verbs from the 8 default packs "
             f"(session contributes 4 T1 verbs promoted to Visibility::Verb per "
             f"ADR-083; context is the 17th kg-substrate bare verb per ADR-089; "
             f"resolve is the 18th kg-substrate bare verb per the unified-verb "
             f"draft ADR Slice 1; comm.health is #606; comm.probe is #644; "
-            f"git contributes git.digest plus "
-            f"git.commit/git.branch/git.push (ADR-108); "
             f"workspace (#873) contributes zero verbs; "
             f"blob contributes blob.put/blob.get/blob.stat per ADR-111), "
             f"got {verbs_result['total']}: {verbs_result}"

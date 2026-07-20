@@ -22,5 +22,4 @@ uuid = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 khive-pack-kg = { version = "0.6.0", path = "../khive-pack-kg" }
 khive-pack-gtd = { version = "0.6.0", path = "../khive-pack-gtd" }
-khive-pack-git = { version = "0.6.0", path = "../khive-pack-git" }
 khive-pack-session = { version = "0.6.0", path = "../khive-pack-session" }

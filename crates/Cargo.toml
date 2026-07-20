@@ -27,7 +27,6 @@ members = [
     "khive-pack-blob",
     "khive-pack-template",
     "khive-pack-session",
-    "khive-pack-git",
     "khive-pack-workspace",
     "khive-mcp",
     "khive-vcs",

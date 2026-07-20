@@ -320,7 +320,7 @@ pub struct GitWriteEntryConfig {
 }
 
 /// `[git_write]` section — the closed repo/branch allowlist consulted by
-/// `khive-pack-git`'s write verbs at the handler level (ADR-108 Amendment),
+/// a git-integration pack's write verbs at the handler level (ADR-108 Amendment),
 /// independent of Gate policy. Absent or empty `allowed` is the fail-closed
 /// default: the write verbs report themselves unavailable rather than
 /// defaulting open.
@@ -390,7 +390,7 @@ pub struct KhiveConfig {
     pub packs: std::collections::HashMap<String, PackConfig>,
 
     /// Git-write policy allowlist (ADR-108 Amendment). Absent or empty
-    /// `allowed` fails closed — `khive-pack-git`'s write verbs are
+    /// `allowed` fails closed — a git-integration pack's write verbs are
     /// unavailable until this section is populated.
     #[serde(default)]
     pub git_write: GitWriteSectionConfig,

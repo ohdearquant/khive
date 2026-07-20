@@ -263,7 +263,7 @@ pub struct RuntimeConfig {
     /// Resolved `[git_write]` policy allowlist (ADR-108 Amendment), populated
     /// from `khive.toml`'s `[[git_write.allowed]]` entries by
     /// [`runtime_config_from_khive_config`]. Threaded through so
-    /// `khive-pack-git`'s write-verb handlers read an already-resolved policy
+    /// a git-integration pack's write-verb handlers read an already-resolved policy
     /// instead of re-running config discovery (which would ignore an
     /// explicit `--config` path not also exported as `KHIVE_CONFIG`).
     pub git_write: crate::engine_config::GitWriteSectionConfig,
@@ -308,7 +308,6 @@ impl Default for RuntimeConfig {
                     "comm",
                     "schedule",
                     "session",
-                    "git",
                     "workspace",
                     "blob",
                 ]

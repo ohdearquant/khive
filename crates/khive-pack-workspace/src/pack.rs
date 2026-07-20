@@ -25,7 +25,7 @@ impl Pack for WorkspacePack {
     const ENTITY_KINDS: &'static [&'static str] = ENTITY_KINDS;
     const HANDLERS: &'static [HandlerDef] = &[];
     const EDGE_RULES: &'static [EdgeEndpointRule] = &WORKSPACE_EDGE_RULES;
-    const REQUIRES: &'static [&'static str] = &["kg", "git", "gtd", "session"];
+    const REQUIRES: &'static [&'static str] = &["kg", "gtd", "session"];
 }
 
 impl WorkspacePack {
@@ -48,7 +48,7 @@ impl khive_runtime::PackFactory for WorkspacePackFactory {
     }
 
     fn requires(&self) -> &'static [&'static str] {
-        &["kg", "git", "gtd", "session"]
+        &["kg", "gtd", "session"]
     }
 
     fn create(&self, runtime: KhiveRuntime) -> Box<dyn khive_runtime::PackRuntime> {

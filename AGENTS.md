@@ -13,15 +13,13 @@ khive gives your agent:
 7. **Scheduling** — time-triggered reminders and future verb dispatch
 8. **Session** — persist and resume agent-session records
 
-All packs load by default. Verbs across the packs: the `git` pack contributes the
-`git.digest` verb plus the commit/issue/pull_request provenance note kinds and a batch
-ingester, and three write verbs, `git.commit` / `git.branch` / `git.push` (ADR-108), that
-shell to system git with hardened, allowlisted argv construction — no
-tag/merge/checkout/pull/fetch, no force-push under any argument combination; the
-`workspace` pack contributes zero verbs, adding only the `workspace` entity kind and
-`contains` endpoint rules to git/gtd/session notes (#873). Code-quality and formal-methods
-(Lean) ontology packs are a commercially licensed extension and are not part of the
-open-source distribution. Regenerate via `request(ops="verbs()")`
+All packs load by default. Verbs across the packs: the `workspace` pack contributes
+zero verbs, adding only the `workspace` entity kind and `contains` endpoint rules to
+git/gtd/session notes (#873). Git provenance ingestion and write verbs (`git.digest`,
+`git.commit`, `git.branch`, `git.push`) are provided by a commercially licensed
+extension and are not part of the open-source distribution. Code-quality and
+formal-methods (Lean) ontology packs are a commercially licensed extension and are
+not part of the open-source distribution. Regenerate via `request(ops="verbs()")`
 before editing this line.
 
 If you're working on khive itself (writing code in this repo), see `CLAUDE.md` instead.

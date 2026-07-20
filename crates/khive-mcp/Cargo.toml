@@ -23,7 +23,6 @@ khive-pack-memory = { version = "0.6.0", path = "../khive-pack-memory" }
 khive-pack-comm = { version = "0.6.0", path = "../khive-pack-comm" }
 khive-pack-schedule = { version = "0.6.0", path = "../khive-pack-schedule" }
 khive-pack-session = { version = "0.6.0", path = "../khive-pack-session" }
-khive-pack-git = { version = "0.6.0", path = "../khive-pack-git" }
 khive-pack-blob = { version = "0.6.0", path = "../khive-pack-blob" }
 khive-pack-workspace = { version = "0.6.0", path = "../khive-pack-workspace" }
 uuid = { workspace = true }

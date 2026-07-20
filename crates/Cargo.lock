@@ -1724,7 +1724,6 @@ dependencies = [
  "khive-db",
  "khive-pack-blob",
  "khive-pack-comm",
- "khive-pack-git",
  "khive-pack-gtd",
  "khive-pack-kg",
  "khive-pack-memory",
@@ -1788,29 +1787,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "khive-pack-git"
-version = "0.6.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "blake3",
- "chrono",
- "clap",
- "inventory",
- "khive-pack-kg",
- "khive-runtime",
- "khive-storage",
- "khive-types",
- "lattice-embed",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
  "tracing",
  "uuid",
 ]
@@ -1894,7 +1870,6 @@ dependencies = [
  "criterion",
  "inventory",
  "khive-pack-comm",
- "khive-pack-git",
  "khive-pack-kg",
  "khive-request",
  "khive-runtime",
@@ -1946,7 +1921,6 @@ version = "0.6.0"
 dependencies = [
  "async-trait",
  "inventory",
- "khive-pack-git",
  "khive-pack-gtd",
  "khive-pack-kg",
  "khive-pack-session",
@@ -2157,7 +2131,6 @@ dependencies = [
  "khive-db",
  "khive-mcp",
  "khive-pack-comm",
- "khive-pack-git",
  "khive-pack-gtd",
  "khive-pack-kg",
  "khive-pack-memory",

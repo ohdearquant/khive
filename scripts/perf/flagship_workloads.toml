@@ -22,12 +22,11 @@
 # both are reported in a separate admin-surface coverage class and never
 # count toward the real-MCP percentage. No other exception exists unless
 # added by signed amendment.
-oq1_admin_ingest_surface = "admin_cli/raw_daemon_control exception bounded to exactly two exception classes per Amendment 1 §2 - F6 git-ingest (admin CLI is the product surface for it, one scenario row) and the F10 daemon-control probe (one scenario row), two scenario ids total; reported as a separate admin-surface coverage class, never counted toward the real-MCP percentage"
+oq1_admin_ingest_surface = "admin_cli/raw_daemon_control exception bounded to exactly one exception class per Amendment 1 §2 - the F10 daemon-control probe (one scenario row), one scenario id total; reported as a separate admin-surface coverage class, never counted toward the real-MCP percentage"
 # Amendment 1 §2 admin-surface coverage class membership (exhaustive; every
 # other scenario_id in this manifest is real-MCP coverage by default via
 # its surface = "mcp_daemon" declaration).
 oq1_admin_surface_scenario_ids = [
-    "f6.git_ingest.cli.production",
     "f10.daemon.probe_only.floor",
 ]
 # OQ2 (production request deadline): no product SLO exists. The harness
@@ -1162,46 +1161,6 @@ required_percentiles = ["p50", "p95", "p99"]
 request_deadline_ms = 45000
 request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "hosted_hash"
-
-[[scenario]]
-scenario_id = "f6.git.digest.mcp"
-feature = "F6"
-surface = "mcp_daemon"
-operation = "git.digest"
-fixture = "git_repo_medium"
-fixture_hash = "sha256:43b4c41e628d3e95e89916ebfc6ee341712a1a6bba8e01289240bb86776e373b"
-scale = { commits = 5000 }
-embedder = "production"
-state = "warm"
-settle = "none"
-attempts = 200
-concurrency = 1
-required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 45000
-request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
-runner_class = "self_hosted_real_embedder"
-
-[[scenario]]
-# Amendment 1 §2 "Surface rule": F6 git-ingest admin-surface
-# exception (admin CLI is the product surface for it) - admin-surface
-# coverage class, excluded from real-MCP coverage (see
-# oq1_admin_surface_scenario_ids above).
-scenario_id = "f6.git_ingest.cli.production"
-feature = "F6"
-surface = "admin_cli"
-operation = "kkernel git-ingest"
-fixture = "git_repo_medium"
-fixture_hash = "sha256:43b4c41e628d3e95e89916ebfc6ee341712a1a6bba8e01289240bb86776e373b"
-scale = { commits = 5000 }
-embedder = "production"
-state = "warm"
-settle = "none"
-attempts = 20
-concurrency = 1
-required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 300000
-request_deadline_provenance = "admin_cli surface: process wall-clock safety cap for a single CLI invocation, not a product SLO (OQ2 ruling); the MCP per-request cap of 45000 ms does not apply to this surface, see [oq_rulings] above"
-runner_class = "self_hosted_real_embedder"
 
 [[scenario]]
 scenario_id = "f7.comm.send_probe_inbox.small.real"

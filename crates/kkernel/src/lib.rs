@@ -6,7 +6,6 @@ pub mod coordinator;
 pub mod dbpath;
 pub mod engine;
 pub mod exec;
-pub mod git_ingest;
 pub mod kg;
 pub mod pack_introspect;
 pub mod reindex;
@@ -33,7 +32,6 @@ pub mod vector;
 #[allow(unused_imports)]
 mod _pack_links {
     use khive_pack_comm::CommPack as _;
-    use khive_pack_git::GitPack as _;
     use khive_pack_gtd::GtdPack as _;
     use khive_pack_kg::KgPack as _;
     use khive_pack_memory::MemoryPack as _;

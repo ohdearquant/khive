@@ -1,6 +1,6 @@
 # khive
 
-A research knowledge graph runtime — 50 verbs, 9 packs, one MCP tool.
+A research knowledge graph runtime — 46 verbs, 8 packs, one MCP tool.
 
 [![GitHub](https://img.shields.io/github/stars/ohdearquant/khive?style=flat)](https://github.com/ohdearquant/khive)
 [![crates.io](https://img.shields.io/crates/v/khive-mcp.svg)](https://crates.io/crates/khive-mcp)
@@ -23,17 +23,16 @@ All 11 packs load by default. A background daemon auto-spawns to keep the runtim
 
 ## What you get
 
-| Pack          | Verbs | What it does                                                                                                                                     |
-| ------------- | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **kg**        | 18    | Entities, edges, notes, graph queries, proposals                                                                                                 |
-| **gtd**       | 5     | Task lifecycle (inbox → next → active → done)                                                                                                    |
-| **memory**    | 5     | Salience-weighted remember / decay-ranked recall                                                                                                 |
-| **comm**      | 7     | Threaded messaging                                                                                                                               |
-| **schedule**  | 4     | Reminders and scheduled verb execution                                                                                                           |
-| **session**   | 4     | Session record persistence (store/list/resume/export)                                                                                            |
-| **git**       | 4     | Git-lifecycle note kinds (commit/issue/pull_request) + batch ingester + `git.digest`; write verbs `git.commit`/`git.branch`/`git.push` (ADR-108) |
-| **workspace** | 0     | Adds the `workspace` entity kind + `contains` endpoint rules to git/gtd/session notes (#873)                                                     |
-| **blob**      | 3     | Content-addressed object put/get/stat over the `BlobStore` CAS trait (ADR-111)                                                                   |
+| Pack          | Verbs | What it does                                                                                 |
+| ------------- | ----- | -------------------------------------------------------------------------------------------- |
+| **kg**        | 18    | Entities, edges, notes, graph queries, proposals                                             |
+| **gtd**       | 5     | Task lifecycle (inbox → next → active → done)                                                |
+| **memory**    | 5     | Salience-weighted remember / decay-ranked recall                                             |
+| **comm**      | 7     | Threaded messaging                                                                           |
+| **schedule**  | 4     | Reminders and scheduled verb execution                                                       |
+| **session**   | 4     | Session record persistence (store/list/resume/export)                                        |
+| **workspace** | 0     | Adds the `workspace` entity kind + `contains` endpoint rules to git/gtd/session notes (#873) |
+| **blob**      | 3     | Content-addressed object put/get/stat over the `BlobStore` CAS trait (ADR-111)               |
 
 ## Usage
 
