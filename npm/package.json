@@ -2,7 +2,7 @@
   "name": "khive",
   "version": "0.5.0",
   "description": "Research knowledge graph runtime over MCP stdio, with typed entities, closed ontology, and hybrid search for AI research agents.",
-  "license": "Apache-2.0",
+  "license": "BUSL-1.1",
   "repository": {
     "type": "git",
     "url": "https://github.com/ohdearquant/khive"

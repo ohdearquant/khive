@@ -392,5 +392,6 @@ with one restriction: offering khive itself to third parties as a competing
 hosted or embedded service requires a commercial license. On the Change Date
 (2030-07-20) each released version converts automatically to Apache 2.0.
 
-Versions through 0.5.x, as published to crates.io and npm, remain under
-Apache 2.0.
+Versions published to crates.io and npm before 2026-07-20 remain under
+Apache 2.0; every release from this date forward ships under the Business
+Source License 1.1.
