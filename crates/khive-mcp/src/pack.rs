@@ -10,19 +10,4 @@ pub use khive_runtime::{KhiveRuntime, PackRegistry, VerbRegistryBuilder};
 // included by the linker. These are the only direct references to the pack
 // crate types inside `khive-mcp`.
 #[doc(hidden)]
-pub use khive_pack_blob::BlobPack as _BlobPack;
-#[doc(hidden)]
-#[doc(hidden)]
-pub use khive_pack_comm::CommPack as _CommPack;
-#[doc(hidden)]
-pub use khive_pack_gtd::GtdPack as _GtdPack;
-#[doc(hidden)]
 pub use khive_pack_kg::KgPack as _KgPack;
-#[doc(hidden)]
-pub use khive_pack_memory::MemoryPack as _MemoryPack;
-#[doc(hidden)]
-pub use khive_pack_schedule::SchedulePack as _SchedulePack;
-#[doc(hidden)]
-pub use khive_pack_session::SessionPack as _SessionPack;
-#[doc(hidden)]
-pub use khive_pack_workspace::WorkspacePack as _WorkspacePack;

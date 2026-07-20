@@ -110,7 +110,7 @@ class ManifestTests(unittest.TestCase):
     def test_every_feature_has_at_least_one_scenario(self):
         data, _ = coverage_validator.load_manifest(MANIFEST_PATH)
         by_feature = coverage_validator._required_scenario_ids_by_feature(data["scenario"])
-        for feature in flagship_schema.FEATURES:
+        for feature in flagship_schema.MANIFEST_FEATURES:
             self.assertTrue(by_feature.get(feature), f"{feature} has zero manifest scenarios")
 
     def test_no_duplicate_scenario_ids_in_real_manifest(self):
@@ -149,12 +149,12 @@ class ManifestTests(unittest.TestCase):
             if scenario_id not in admin_surface_ids:
                 self.assertEqual(sc["surface"], "mcp_daemon", f"{scenario_id} is not in the admin-surface exception list but is not mcp_daemon either")
 
-    def test_f1_and_f4_have_500k_cohort(self):
-        """Amendment 1 §7: F1 and F4 scenario sets gain a 500K cohort before
-        any "exact cohort" claim is made."""
+    def test_f4_has_500k_cohort(self):
+        """Amendment 1 §7: the F4 scenario set gains a 500K cohort before any
+        "exact cohort" claim is made (the F1 half of the original obligation
+        left with the memory pack extraction)."""
         data, _ = coverage_validator.load_manifest(MANIFEST_PATH)
         scale_by_id = {sc["scenario_id"]: sc["scale"] for sc in data["scenario"]}
-        self.assertEqual(scale_by_id.get("f1.recall.warm.real.n500k", {}).get("memories"), 500000)
         self.assertEqual(scale_by_id.get("f4.traverse.powerlaw.n500000.depth3.real", {}).get("nodes"), 500000)
 
     def test_f10_payload_size_curve_scenario_is_absent(self):
@@ -584,7 +584,7 @@ class CoverageStatusTests(unittest.TestCase):
         report = coverage_validator.compute_coverage(data, [], self.NOW)
         self.assertEqual(report["percent_measured"], 0.0)
         self.assertEqual(report["counts"]["missing"], report["total_scenarios"])
-        self.assertEqual(sorted(report["features_with_zero_measured"]), sorted(flagship_schema.FEATURES))
+        self.assertEqual(sorted(report["features_with_zero_measured"]), sorted(flagship_schema.MANIFEST_FEATURES))
 
     def test_fresh_matching_record_is_measured(self):
         scenario = _base_scenario()

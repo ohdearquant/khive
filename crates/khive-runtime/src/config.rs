@@ -300,21 +300,7 @@ impl Default for RuntimeConfig {
             .ok()
             .map(|s| parse_pack_list(&s))
             .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| {
-                vec![
-                    "kg",
-                    "gtd",
-                    "memory",
-                    "comm",
-                    "schedule",
-                    "session",
-                    "workspace",
-                    "blob",
-                ]
-                .into_iter()
-                .map(String::from)
-                .collect()
-            });
+            .unwrap_or_else(|| vec!["kg"].into_iter().map(String::from).collect());
         let brain_profile = std::env::var("KHIVE_BRAIN_PROFILE")
             .ok()
             .filter(|s| !s.trim().is_empty());

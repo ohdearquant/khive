@@ -188,23 +188,12 @@ struct ReindexReport {
     entities_fts_failed: u64,
     /// Note FTS upserts that failed during the backfill pass.
     notes_fts_failed: u64,
-    /// True when the completion ("settled") durable memory-ANN epoch bump
-    /// failed after entity/note mutations were already committed (#812). The
-    /// start-of-pass bump
-    /// (`begin_reindex_epoch`) aborts the whole run before any mutation on
-    /// failure, so there is nothing left to "abort" here — but a swallowed
-    /// failure at this point is exactly the bug this fix closes, so it now
-    /// surfaces as a fail-closed exit instead of a silent warning.
-    epoch_bump_failed: bool,
 }
 
 impl ReindexReport {
     /// Did any part of the run fail? Drives the fail-closed exit decision.
     fn has_failures(&self) -> bool {
-        self.errors_skipped > 0
-            || self.entities_fts_failed > 0
-            || self.notes_fts_failed > 0
-            || self.epoch_bump_failed
+        self.errors_skipped > 0 || self.entities_fts_failed > 0 || self.notes_fts_failed > 0
     }
 }
 
@@ -476,14 +465,8 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
     let mut entities_fts_failed: u64 = 0;
     let mut notes_fts_failed: u64 = 0;
 
-    let epoch_bump_failed;
-
     // ── entities + notes (graph substrate) ────────────────────────────────────
     {
-        begin_reindex_epoch(&rt)
-            .await
-            .context("aborting reindex before any vector mutation")?;
-
         let entity_total = rt.count_entities(&token, None).await.unwrap_or(0);
         let entity_bar = ProgressBar::new("entities");
         entity_bar.update(0, entity_total);
@@ -598,25 +581,6 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
             tracing::warn!(error = %e, "failed to invalidate Vamana snapshots after reindex");
         }
 
-        // Purge stale per-namespace memory Vamana snapshot rows (legacy key format
-        // `{ns}::memory_vamana::*`). After FTS+ANN consolidation the unified key is
-        // `global::memory_vamana::*`; old per-ns rows are orphaned and waste space.
-        purge_stale_memory_vamana_snapshots(&rt).await;
-
-        // Invalidate the ACTIVE global memory Vamana snapshot too (#812).
-        // Its key (`global::memory_vamana::*`)
-        // never matched `invalidate_vamana_snapshots`'s `{namespace}::vamana::%`
-        // pattern above, so the note re-embed this pass just did left that
-        // snapshot installed and untouched — the content-hash restart check in
-        // `khive-pack-memory::ann` is the primary defense against a daemon
-        // trusting it afterward, but deleting it here forces a rebuild on the
-        // very next warm regardless, without depending on that check alone.
-        //
-        // This also performs the completion ("settled") durable epoch bump
-        // (#812); see its own doc comment for
-        // why a failure here is reported rather than warned-and-ignored.
-        epoch_bump_failed = !invalidate_active_memory_vamana_snapshot(&rt).await;
-
         // Drop per-namespace FTS partition tables that survived the V4 migration
         // (tables created by the runtime before the migration ran, or on databases
         // that were migrated but not swept). The sweep is guarded: it only runs
@@ -638,7 +602,6 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
         errors_skipped,
         entities_fts_failed,
         notes_fts_failed,
-        epoch_bump_failed,
     };
 
     print_report(&report, args.human);
@@ -718,139 +681,6 @@ async fn invalidate_vamana_snapshots(rt: &KhiveRuntime, namespace: &str) -> anyh
             }
         }
     }
-}
-
-/// Remove per-namespace memory Vamana snapshot rows (legacy `{ns}::memory_vamana::*` format).
-/// After FTS+ANN consolidation the active, retained key is `global::memory_vamana::{model}`
-/// (ADR-062, corrected by ADR-116 (PR #1080)); old per-ns rows are orphaned. Best-effort —
-/// missing table or SQL failure is logged and ignored.
-async fn purge_stale_memory_vamana_snapshots(rt: &KhiveRuntime) {
-    use khive_storage::types::SqlStatement;
-    let sql = rt.sql();
-    let Ok(mut writer) = sql.writer().await else {
-        return;
-    };
-    match writer
-        .execute(SqlStatement {
-            // `retrieval_snapshots.namespace` holds the FULL composite key produced by
-            // `ann::snapshot_key` (`"global::memory_vamana::{model}"`), not a bare
-            // namespace — `namespace != 'global'` never matches that literal string and
-            // so purged every memory_vamana row unconditionally, including current,
-            // still-valid `global::memory_vamana::*` snapshots (ADR-116 (PR #1080)
-            // condition 4). Match the retained key's prefix instead, mirroring
-            // `invalidate_active_memory_vamana_snapshot`'s LIKE pattern below — but with
-            // GLOB, not LIKE: SQLite's LIKE is ASCII case-insensitive, so a legacy
-            // `GLOBAL::memory_vamana::*` row (a valid namespace per namespace validation)
-            // would otherwise be treated as the retained lowercase key and never purged.
-            // GLOB is case-sensitive (uses `*`/`?` globbing, not `%`/`_`).
-            sql: "DELETE FROM retrieval_snapshots \
-                  WHERE index_type = 'memory_vamana' \
-                    AND namespace NOT GLOB 'global::memory_vamana::*'"
-                .into(),
-            params: vec![],
-            label: Some("purge_stale_memory_vamana_snapshots".into()),
-        })
-        .await
-    {
-        Ok(deleted) => {
-            if deleted > 0 {
-                tracing::info!(deleted, "purged stale per-ns memory Vamana snapshot rows");
-            }
-        }
-        Err(e) => {
-            let msg = e.to_string();
-            if !msg.contains("no such table") {
-                tracing::warn!(error = %e, "failed to purge stale memory Vamana snapshots");
-            }
-        }
-    }
-}
-
-/// Durably marks the reindex-in-progress epoch, BEFORE any vector mutation in
-/// this pass (#812, ADR-107 §4). Fail-closed: an error here (schema creation OR
-/// the epoch write) aborts the whole reindex before any mutation runs — never
-/// warn-and-continue. See
-/// `crates/kkernel/docs/design.md#reindex-memory-vamana-epoch-protocol-812-adr-107-4`
-/// for the in-progress/completed epoch protocol this is half of.
-async fn begin_reindex_epoch(rt: &KhiveRuntime) -> Result<()> {
-    khive_pack_memory::ensure_ann_epoch_schema(rt)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))
-        .context("failed to ensure memory_ann_epoch schema before reindex")?;
-    khive_pack_memory::bump_memory_ann_epoch(rt)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))
-        .context("failed to durably mark reindex-in-progress epoch")?;
-    Ok(())
-}
-
-/// Delete the ACTIVE global memory Vamana snapshot row (`global::memory_vamana::*`),
-/// distinct from `purge_stale_memory_vamana_snapshots`'s legacy-row cleanup above
-/// (#812). Reindex rewrites note
-/// embeddings directly, bypassing `memory.remember`, so it never bumps the memory
-/// pack's in-memory write-generation counter — that daemon-side signal simply
-/// cannot see this change. The DELETE itself stays best-effort (a missing table
-/// or SQL failure is logged and ignored, matching this file's other
-/// snapshot-maintenance helpers) — it is a defense-in-depth optimization, not
-/// the correctness mechanism.
-///
-/// Returns `false` when the completion ("settled") durable epoch bump below
-/// fails — see `begin_reindex_epoch`'s doc comment for the two-phase
-/// protocol this half completes. Unlike `begin_reindex_epoch`, mutations have
-/// already committed by this point, so there is nothing left to abort; the
-/// caller instead folds this into `ReindexReport::epoch_bump_failed`, which
-/// drives a fail-closed non-zero exit instead of the old warn-and-continue.
-async fn invalidate_active_memory_vamana_snapshot(rt: &KhiveRuntime) -> bool {
-    use khive_storage::types::{SqlStatement, SqlValue};
-    let sql = rt.sql();
-    if let Ok(mut writer) = sql.writer().await {
-        // `retrieval_snapshots.namespace` holds the FULL composite key produced
-        // by `ann::snapshot_key` (`"global::memory_vamana::{model}"`), not a
-        // bare namespace — matching on `namespace = 'global'` would never
-        // match any row.
-        match writer
-            .execute(SqlStatement {
-                sql: "DELETE FROM retrieval_snapshots \
-                      WHERE index_type = 'memory_vamana' AND namespace LIKE ?1"
-                    .into(),
-                params: vec![SqlValue::Text("global::memory_vamana::%".into())],
-                label: Some("invalidate_active_memory_vamana_snapshot".into()),
-            })
-            .await
-        {
-            Ok(deleted) => {
-                if deleted > 0 {
-                    tracing::info!(
-                        deleted,
-                        "invalidated active global memory Vamana snapshot after reindex"
-                    );
-                }
-            }
-            Err(e) => {
-                let msg = e.to_string();
-                if !msg.contains("no such table") {
-                    tracing::warn!(error = %e, "failed to invalidate active memory Vamana snapshot");
-                }
-            }
-        }
-    }
-
-    // #812: the completion half of the
-    // in-progress/completed epoch protocol described on `begin_reindex_epoch`.
-    // A khive daemon that warmed its in-memory ANN index before this reindex
-    // ran shares no process, and therefore no in-memory write-generation
-    // state, with this `kkernel reindex` invocation — its `common.rs` recall
-    // path would keep trusting that cached index forever with no way to
-    // observe this mutation at all. Bumping the durable epoch here gives that
-    // daemon's amortized freshness check
-    // (`khive_pack_memory::ann::maybe_check_durable_epoch`, sampled from the
-    // recall path) a signal written to the shared database file instead of
-    // one confined to this process.
-    if let Err(e) = khive_pack_memory::bump_memory_ann_epoch(rt).await {
-        tracing::warn!(error = %e, "failed to bump durable memory ANN epoch after reindex");
-        return false;
-    }
-    true
 }
 
 /// Return the set of distinct namespaces present in base `entities` and `notes`
@@ -1243,244 +1073,6 @@ mod tests {
         );
     }
 
-    /// Regression test (#812): the active global memory Vamana snapshot row
-    /// must
-    /// be deleted by `invalidate_active_memory_vamana_snapshot`, since
-    /// `invalidate_vamana_snapshots`'s `{namespace}::vamana::%` pattern never
-    /// matches the memory pack's distinct `global::memory_vamana::*` key.
-    #[tokio::test]
-    async fn test_reindex_invalidates_active_memory_vamana_snapshot() {
-        let rt = KhiveRuntime::memory().expect("in-memory runtime");
-        let sql = rt.sql();
-
-        let mut w = sql.writer().await.expect("writer");
-        w.execute_script(
-            "CREATE TABLE IF NOT EXISTS retrieval_snapshots (\
-             namespace TEXT NOT NULL, \
-             index_type TEXT NOT NULL, \
-             snapshot BLOB NOT NULL, \
-             created_at INTEGER NOT NULL, \
-             PRIMARY KEY (namespace, index_type));"
-                .into(),
-        )
-        .await
-        .expect("create table");
-
-        for (ns, idx_type) in &[
-            ("global::memory_vamana::model-a", "memory_vamana"),
-            ("local::vamana::model-a", "vamana"),
-            ("local::memory_vamana::model-a", "memory_vamana"),
-        ] {
-            w.execute(SqlStatement {
-                sql: "INSERT INTO retrieval_snapshots \
-                      (namespace, index_type, snapshot, created_at) \
-                      VALUES (?1, ?2, ?3, 0)"
-                    .into(),
-                params: vec![
-                    SqlValue::Text(ns.to_string()),
-                    SqlValue::Text(idx_type.to_string()),
-                    SqlValue::Blob(b"{}".to_vec()),
-                ],
-                label: None,
-            })
-            .await
-            .expect("insert row");
-        }
-        drop(w);
-
-        invalidate_active_memory_vamana_snapshot(&rt).await;
-
-        let mut r = sql.reader().await.expect("reader");
-        let rows = r
-            .query_all(SqlStatement {
-                sql: "SELECT namespace FROM retrieval_snapshots ORDER BY namespace".into(),
-                params: vec![],
-                label: None,
-            })
-            .await
-            .expect("query");
-
-        let remaining: Vec<String> = rows
-            .iter()
-            .filter_map(|row| match row.get("namespace") {
-                Some(SqlValue::Text(s)) => Some(s.clone()),
-                _ => None,
-            })
-            .collect();
-
-        assert!(
-            !remaining.contains(&"global::memory_vamana::model-a".to_string()),
-            "the active global memory Vamana snapshot must be deleted: {remaining:?}"
-        );
-        assert!(
-            remaining.contains(&"local::vamana::model-a".to_string()),
-            "unrelated knowledge Vamana rows must survive: {remaining:?}"
-        );
-        assert!(
-            remaining.contains(&"local::memory_vamana::model-a".to_string()),
-            "legacy per-namespace memory Vamana rows are purge_stale_memory_vamana_snapshots's \
-             job, not this function's: {remaining:?}"
-        );
-    }
-
-    /// Regression test (ADR-116 (PR #1080) condition 4): `purge_stale_memory_vamana_snapshots` must
-    /// keep the current, retained `global::memory_vamana::{model}` key (ADR-062) and purge
-    /// only legacy per-namespace `{ns}::memory_vamana::*` rows. The prior predicate
-    /// (`namespace != 'global'`) matched every row unconditionally, since the namespace
-    /// column stores the full composite key and is never the bare string `'global'`.
-    #[tokio::test]
-    async fn test_purge_stale_memory_vamana_snapshots_keeps_current_key() {
-        let rt = KhiveRuntime::memory().expect("in-memory runtime");
-        let sql = rt.sql();
-
-        let mut w = sql.writer().await.expect("writer");
-        w.execute_script(
-            "CREATE TABLE IF NOT EXISTS retrieval_snapshots (\
-             namespace TEXT NOT NULL, \
-             index_type TEXT NOT NULL, \
-             snapshot BLOB NOT NULL, \
-             created_at INTEGER NOT NULL, \
-             PRIMARY KEY (namespace, index_type));"
-                .into(),
-        )
-        .await
-        .expect("create table");
-
-        for (ns, idx_type) in &[
-            ("global::memory_vamana::model-a", "memory_vamana"),
-            ("local::memory_vamana::model-a", "memory_vamana"),
-            ("tenant-a::memory_vamana::model-b", "memory_vamana"),
-            ("local::vamana::model-a", "vamana"),
-        ] {
-            w.execute(SqlStatement {
-                sql: "INSERT INTO retrieval_snapshots \
-                      (namespace, index_type, snapshot, created_at) \
-                      VALUES (?1, ?2, ?3, 0)"
-                    .into(),
-                params: vec![
-                    SqlValue::Text(ns.to_string()),
-                    SqlValue::Text(idx_type.to_string()),
-                    SqlValue::Blob(b"{}".to_vec()),
-                ],
-                label: None,
-            })
-            .await
-            .expect("insert row");
-        }
-        drop(w);
-
-        purge_stale_memory_vamana_snapshots(&rt).await;
-
-        let mut r = sql.reader().await.expect("reader");
-        let rows = r
-            .query_all(SqlStatement {
-                sql: "SELECT namespace FROM retrieval_snapshots ORDER BY namespace".into(),
-                params: vec![],
-                label: None,
-            })
-            .await
-            .expect("query");
-
-        let remaining: Vec<String> = rows
-            .iter()
-            .filter_map(|row| match row.get("namespace") {
-                Some(SqlValue::Text(s)) => Some(s.clone()),
-                _ => None,
-            })
-            .collect();
-
-        assert!(
-            remaining.contains(&"global::memory_vamana::model-a".to_string()),
-            "current-key global memory Vamana snapshot must be retained: {remaining:?}"
-        );
-        assert!(
-            !remaining.contains(&"local::memory_vamana::model-a".to_string()),
-            "legacy per-namespace memory Vamana snapshot must be purged: {remaining:?}"
-        );
-        assert!(
-            !remaining.contains(&"tenant-a::memory_vamana::model-b".to_string()),
-            "legacy per-namespace memory Vamana snapshot must be purged: {remaining:?}"
-        );
-        assert!(
-            remaining.contains(&"local::vamana::model-a".to_string()),
-            "unrelated knowledge Vamana rows must survive: {remaining:?}"
-        );
-    }
-
-    /// Regression test (PR #1081 review): SQLite `LIKE` is ASCII case-insensitive, so
-    /// `NOT LIKE 'global::memory_vamana::%'` treated a legacy `GLOBAL::memory_vamana::*`
-    /// row (a valid namespace per namespace validation) as the retained lowercase key and
-    /// never purged it. `GLOB` is case-sensitive and must tell the two apart.
-    #[tokio::test]
-    async fn test_purge_stale_memory_vamana_snapshots_is_case_sensitive() {
-        let rt = KhiveRuntime::memory().expect("in-memory runtime");
-        let sql = rt.sql();
-
-        let mut w = sql.writer().await.expect("writer");
-        w.execute_script(
-            "CREATE TABLE IF NOT EXISTS retrieval_snapshots (\
-             namespace TEXT NOT NULL, \
-             index_type TEXT NOT NULL, \
-             snapshot BLOB NOT NULL, \
-             created_at INTEGER NOT NULL, \
-             PRIMARY KEY (namespace, index_type));"
-                .into(),
-        )
-        .await
-        .expect("create table");
-
-        for (ns, idx_type) in &[
-            ("global::memory_vamana::model-a", "memory_vamana"),
-            ("GLOBAL::memory_vamana::model-a", "memory_vamana"),
-        ] {
-            w.execute(SqlStatement {
-                sql: "INSERT INTO retrieval_snapshots \
-                      (namespace, index_type, snapshot, created_at) \
-                      VALUES (?1, ?2, ?3, 0)"
-                    .into(),
-                params: vec![
-                    SqlValue::Text(ns.to_string()),
-                    SqlValue::Text(idx_type.to_string()),
-                    SqlValue::Blob(b"{}".to_vec()),
-                ],
-                label: None,
-            })
-            .await
-            .expect("insert row");
-        }
-        drop(w);
-
-        purge_stale_memory_vamana_snapshots(&rt).await;
-
-        let mut r = sql.reader().await.expect("reader");
-        let rows = r
-            .query_all(SqlStatement {
-                sql: "SELECT namespace FROM retrieval_snapshots ORDER BY namespace".into(),
-                params: vec![],
-                label: None,
-            })
-            .await
-            .expect("query");
-
-        let remaining: Vec<String> = rows
-            .iter()
-            .filter_map(|row| match row.get("namespace") {
-                Some(SqlValue::Text(s)) => Some(s.clone()),
-                _ => None,
-            })
-            .collect();
-
-        assert!(
-            remaining.contains(&"global::memory_vamana::model-a".to_string()),
-            "current-key lowercase global memory Vamana snapshot must be retained: {remaining:?}"
-        );
-        assert!(
-            !remaining.contains(&"GLOBAL::memory_vamana::model-a".to_string()),
-            "legacy uppercase GLOBAL::memory_vamana snapshot must be purged, not mistaken for \
-             the retained lowercase key: {remaining:?}"
-        );
-    }
-
     #[tokio::test]
     async fn stale_fts_sweep_quotes_malicious_table_name_and_preserves_entities() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
@@ -1554,7 +1146,6 @@ mod tests {
             errors_skipped: errors,
             entities_fts_failed: 0,
             notes_fts_failed: 0,
-            epoch_bump_failed: false,
         }
     }
 
@@ -1913,7 +1504,6 @@ mod tests {
             errors_skipped: 0,
             entities_fts_failed: 0,
             notes_fts_failed: 1,
-            epoch_bump_failed: false,
         };
         assert!(
             report.has_failures(),
@@ -2482,7 +2072,6 @@ mod tests {
             errors_skipped: 0,
             entities_fts_failed: 1,
             notes_fts_failed: 0,
-            epoch_bump_failed: false,
         };
         assert!(
             report.has_failures(),

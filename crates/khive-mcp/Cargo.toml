@@ -18,13 +18,6 @@ khive-storage = { version = "0.6.0", path = "../khive-storage" }
 khive-types = { version = "0.6.0", path = "../khive-types", features = ["serde"] }
 khive-request = { version = "0.6.0", path = "../khive-request" }
 khive-pack-kg = { version = "0.6.0", path = "../khive-pack-kg" }
-khive-pack-gtd = { version = "0.6.0", path = "../khive-pack-gtd" }
-khive-pack-memory = { version = "0.6.0", path = "../khive-pack-memory" }
-khive-pack-comm = { version = "0.6.0", path = "../khive-pack-comm" }
-khive-pack-schedule = { version = "0.6.0", path = "../khive-pack-schedule" }
-khive-pack-session = { version = "0.6.0", path = "../khive-pack-session" }
-khive-pack-blob = { version = "0.6.0", path = "../khive-pack-blob" }
-khive-pack-workspace = { version = "0.6.0", path = "../khive-pack-workspace" }
 uuid = { workspace = true }
 inventory = { workspace = true }
 rmcp = { workspace = true, features = ["server", "transport-io"] }

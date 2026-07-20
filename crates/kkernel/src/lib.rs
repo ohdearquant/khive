@@ -31,10 +31,5 @@ pub mod vector;
 #[doc(hidden)]
 #[allow(unused_imports)]
 mod _pack_links {
-    use khive_pack_comm::CommPack as _;
-    use khive_pack_gtd::GtdPack as _;
     use khive_pack_kg::KgPack as _;
-    use khive_pack_memory::MemoryPack as _;
-    use khive_pack_schedule::SchedulePack as _;
-    use khive_pack_session::SessionPack as _;
 }
