@@ -910,6 +910,28 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
+    /// Restores the process CWD on drop — including on panic — so a mid-test
+    /// assertion failure (or an unexpected panic from the code under test)
+    /// can never leave the process chdir'd into a `tempfile::tempdir()` that
+    /// unwinds out from under every later test sharing this process.
+    struct CwdGuard {
+        original: PathBuf,
+    }
+
+    impl CwdGuard {
+        fn enter(dir: &Path) -> Self {
+            let original = std::env::current_dir().unwrap();
+            std::env::set_current_dir(dir).unwrap();
+            Self { original }
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.original);
+        }
+    }
+
     #[test]
     #[serial]
     fn pool_config_default_values_match_constants() {
@@ -1150,10 +1172,10 @@ mod tests {
         let (via_real, canonical_real) = mint_db_identity(&db_path).unwrap();
 
         // Relative spelling: resolved against the process CWD (step 1).
-        let orig_cwd = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&real_dir).unwrap();
-        let relative_result = mint_db_identity(&PathBuf::from("khive.db"));
-        std::env::set_current_dir(&orig_cwd).unwrap();
+        let relative_result = {
+            let _cwd = CwdGuard::enter(&real_dir);
+            mint_db_identity(&PathBuf::from("khive.db"))
+        };
         let (via_relative, canonical_relative) = relative_result.unwrap();
         assert_eq!(canonical_real, canonical_relative);
         assert_eq!(via_real, via_relative);
@@ -1172,14 +1194,11 @@ mod tests {
         }
 
         // Bare file name: resolved against the current directory (step 1).
-        let orig_cwd = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&real_dir).unwrap();
-        let (via_bare_name, canonical_bare_name) = mint_db_identity(&PathBuf::from("khive.db"))
-            .inspect_err(|_| {
-                std::env::set_current_dir(&orig_cwd).unwrap();
-            })
-            .unwrap();
-        std::env::set_current_dir(orig_cwd).unwrap();
+        let bare_name_result = {
+            let _cwd = CwdGuard::enter(&real_dir);
+            mint_db_identity(&PathBuf::from("khive.db"))
+        };
+        let (via_bare_name, canonical_bare_name) = bare_name_result.unwrap();
         assert_eq!(canonical_real, canonical_bare_name);
         assert_eq!(via_real, via_bare_name);
     }
@@ -1226,10 +1245,10 @@ mod tests {
         let via_real = pool_for(&db_path);
         let sidecar_real = sidecar_of(&via_real);
 
-        let orig_cwd = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&real_dir).unwrap();
-        let via_relative = pool_for(Path::new("khive.db"));
-        std::env::set_current_dir(&orig_cwd).unwrap();
+        let via_relative = {
+            let _cwd = CwdGuard::enter(&real_dir);
+            pool_for(Path::new("khive.db"))
+        };
         assert_eq!(
             sidecar_real,
             sidecar_of(&via_relative),
@@ -1253,10 +1272,10 @@ mod tests {
             );
         }
 
-        let orig_cwd = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&real_dir).unwrap();
-        let via_bare_name = pool_for(Path::new("khive.db"));
-        std::env::set_current_dir(orig_cwd).unwrap();
+        let via_bare_name = {
+            let _cwd = CwdGuard::enter(&real_dir);
+            pool_for(Path::new("khive.db"))
+        };
         assert_eq!(
             sidecar_real,
             sidecar_of(&via_bare_name),
