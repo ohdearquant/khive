@@ -19,7 +19,7 @@ use crate::ingest::{
     resolve_project_id, run_ingest, run_ingest_with_commit_recovery, CacheRepairStrategy,
     GitLogError, IngestInclude, IngestOptions, RecoveredRepo,
 };
-use crate::source::{parse_source, repo_basename, DigestSource};
+use crate::source::{parse_source, repo_basename, repo_identity, DigestSource, REPO_SLUG_PROPERTY};
 use crate::GitPack;
 
 /// Issue #765 bounded repair policy: at most one refetch, then at most one
@@ -152,7 +152,7 @@ impl GitPack {
         };
 
         // Resolve or auto-create the repo-anchor `project` entity.
-        let (project_id, project_created) = match params.get("project").and_then(Value::as_str) {
+        let resolution = match params.get("project").and_then(Value::as_str) {
             Some(raw) => {
                 let id = resolve_project_id(self.runtime(), raw)
                     .await
@@ -162,10 +162,16 @@ impl GitPack {
                             "project {raw:?} did not resolve to an entity"
                         ))
                     })?;
-                (id, false)
+                ProjectResolution {
+                    id,
+                    created: false,
+                    orphan: None,
+                }
             }
             None => resolve_or_create_project(self.runtime(), registry, token, &source).await?,
         };
+        let project_id = resolution.id;
+        let project_created = resolution.created;
 
         let effective_include = IngestInclude {
             commits: include.commits,
@@ -198,6 +204,11 @@ impl GitPack {
         report.warnings.extend(warnings);
         report.project_id = Some(project_id.to_string());
         report.project_created = project_created;
+        if let Some(orphan) = resolution.orphan {
+            report.orphaned_corpus_detected = true;
+            report.orphaned_project_id = Some(orphan.dead_project_id.to_string());
+            report.orphaned_note_count = orphan.annotated_note_count;
+        }
 
         serde_json::to_value(&report)
             .map_err(|e| RuntimeError::InvalidInput(format!("serializing report: {e}")))
@@ -231,28 +242,79 @@ fn parse_include(v: &Value) -> Result<IngestInclude, RuntimeError> {
     Ok(include)
 }
 
-/// Find an existing `project` entity whose `properties.repo_url` matches the
-/// source's canonical URL/path, or whose `name` matches the repo basename;
-/// create the anchor when none is found (ADR-088 Amendment 1 — auto-creation
-/// is reported via `IngestReport.project_created`, never silent).
+/// Outcome of `resolve_or_create_project`'s match/create decision.
+pub(crate) struct ProjectResolution {
+    pub(crate) id: Uuid,
+    pub(crate) created: bool,
+    /// `Some` when `created` is `true` AND a soft-deleted anchor for this
+    /// repo identity was found with a live corpus still annotating it
+    /// (issue #1173) — surfaced via `IngestReport`, never silent.
+    pub(crate) orphan: Option<OrphanSignal>,
+}
+
+pub(crate) struct OrphanSignal {
+    pub(crate) dead_project_id: Uuid,
+    pub(crate) annotated_note_count: u64,
+}
+
+/// Find an existing `project` entity whose `properties.repo_slug` matches
+/// the source's canonical repo identity (issue #1173), falling back to a
+/// legacy `properties.repo_url` match for pre-existing anchors that predate
+/// the slug property (backfilling it on match so future calls converge on
+/// the slug lookup without a migration); create the anchor when neither
+/// matches (ADR-088 Amendment 1 — auto-creation is reported via
+/// `IngestReport.project_created`, never silent). The basename `name`
+/// fallback from the original v1 match is intentionally gone: it is both
+/// too weak (a differently-named legacy anchor is missed) and too broad (an
+/// unrelated `project` entity sharing the basename would capture the
+/// ingest) — see issue #1173.
 async fn resolve_or_create_project(
     runtime: &KhiveRuntime,
     registry: &VerbRegistry,
     token: &NamespaceToken,
     source: &DigestSource,
-) -> Result<(Uuid, bool), RuntimeError> {
+) -> Result<ProjectResolution, RuntimeError> {
     let repo_url = match source {
         DigestSource::Local(p) => p.to_string_lossy().to_string(),
         DigestSource::Remote { canonical, .. } => canonical.clone(),
     };
+    let identity = repo_identity(source);
     let name = repo_basename(source);
 
-    if let Some(id) = find_project_by_repo(runtime, token, &repo_url, &name)
+    if let Some(id) = find_project_by_slug(runtime, token, &identity)
         .await
         .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?
     {
-        return Ok((id, false));
+        return Ok(ProjectResolution {
+            id,
+            created: false,
+            orphan: None,
+        });
     }
+
+    if let Some(id) = find_project_by_legacy_repo_url(runtime, token, &repo_url)
+        .await
+        .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?
+    {
+        registry
+            .dispatch(
+                "update",
+                json!({
+                    "id": id.to_string(),
+                    "properties": { REPO_SLUG_PROPERTY: identity },
+                }),
+            )
+            .await?;
+        return Ok(ProjectResolution {
+            id,
+            created: false,
+            orphan: None,
+        });
+    }
+
+    let orphan = find_orphaned_anchor(runtime, token, &identity, &repo_url)
+        .await
+        .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
 
     let resp = registry
         .dispatch(
@@ -260,7 +322,7 @@ async fn resolve_or_create_project(
             json!({
                 "kind": "project",
                 "name": name,
-                "properties": { "repo_url": repo_url },
+                "properties": { "repo_url": repo_url, REPO_SLUG_PROPERTY: identity },
             }),
         )
         .await?;
@@ -271,14 +333,17 @@ async fn resolve_or_create_project(
         .ok_or_else(|| {
             RuntimeError::InvalidInput("create(kind=project) did not return an id".into())
         })?;
-    Ok((id, true))
+    Ok(ProjectResolution {
+        id,
+        created: true,
+        orphan,
+    })
 }
 
-async fn find_project_by_repo(
+async fn find_project_by_slug(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
-    repo_url: &str,
-    name: &str,
+    identity: &str,
 ) -> anyhow::Result<Option<Uuid>> {
     let sql = runtime.sql();
     let mut r = sql.reader().await.map_err(|e| anyhow!("{e}"))?;
@@ -286,15 +351,14 @@ async fn find_project_by_repo(
         .query_row(SqlStatement {
             sql: "SELECT id FROM entities WHERE kind='project' AND namespace=?1 \
                   AND deleted_at IS NULL \
-                  AND (json_extract(properties,'$.repo_url')=?2 OR name=?3) \
+                  AND json_extract(properties,'$.repo_slug')=?2 \
                   LIMIT 1"
                 .into(),
             params: vec![
                 SqlValue::Text(token.namespace().as_str().to_string()),
-                SqlValue::Text(repo_url.to_string()),
-                SqlValue::Text(name.to_string()),
+                SqlValue::Text(identity.to_string()),
             ],
-            label: Some("git_digest_find_project_by_repo".into()),
+            label: Some("git_digest_find_project_by_slug".into()),
         })
         .await
         .map_err(|e| anyhow!("{e}"))?;
@@ -302,5 +366,100 @@ async fn find_project_by_repo(
         Some(SqlValue::Uuid(u)) => Some(*u),
         Some(SqlValue::Text(s)) => Uuid::parse_str(s).ok(),
         _ => None,
+    }))
+}
+
+async fn find_project_by_legacy_repo_url(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    repo_url: &str,
+) -> anyhow::Result<Option<Uuid>> {
+    let sql = runtime.sql();
+    let mut r = sql.reader().await.map_err(|e| anyhow!("{e}"))?;
+    let row = r
+        .query_row(SqlStatement {
+            sql: "SELECT id FROM entities WHERE kind='project' AND namespace=?1 \
+                  AND deleted_at IS NULL \
+                  AND json_extract(properties,'$.repo_url')=?2 \
+                  LIMIT 1"
+                .into(),
+            params: vec![
+                SqlValue::Text(token.namespace().as_str().to_string()),
+                SqlValue::Text(repo_url.to_string()),
+            ],
+            label: Some("git_digest_find_project_by_legacy_repo_url".into()),
+        })
+        .await
+        .map_err(|e| anyhow!("{e}"))?;
+    Ok(row.and_then(|r| match r.get("id") {
+        Some(SqlValue::Uuid(u)) => Some(*u),
+        Some(SqlValue::Text(s)) => Uuid::parse_str(s).ok(),
+        _ => None,
+    }))
+}
+
+/// Look for a soft-deleted `project` anchor matching the resolved repo
+/// identity (or its legacy `repo_url` spelling) that still has a live
+/// `commit`/`issue`/`pull_request` corpus `annotates`-linked to it (issue
+/// #1173 items 2/3). A hard-deleted anchor cannot be detected this way — its
+/// row, including `properties.repo_slug`, is gone — this covers the soft
+/// delete (the default; see ADR-014) case, where the identity survives.
+async fn find_orphaned_anchor(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    identity: &str,
+    repo_url: &str,
+) -> anyhow::Result<Option<OrphanSignal>> {
+    let sql = runtime.sql();
+    let mut r = sql.reader().await.map_err(|e| anyhow!("{e}"))?;
+    let row = r
+        .query_row(SqlStatement {
+            sql: "SELECT id FROM entities WHERE kind='project' AND namespace=?1 \
+                  AND deleted_at IS NOT NULL \
+                  AND (json_extract(properties,'$.repo_slug')=?2 \
+                       OR json_extract(properties,'$.repo_url')=?3) \
+                  ORDER BY deleted_at DESC LIMIT 1"
+                .into(),
+            params: vec![
+                SqlValue::Text(token.namespace().as_str().to_string()),
+                SqlValue::Text(identity.to_string()),
+                SqlValue::Text(repo_url.to_string()),
+            ],
+            label: Some("git_digest_find_orphaned_anchor".into()),
+        })
+        .await
+        .map_err(|e| anyhow!("{e}"))?;
+    let Some(dead_project_id) = row.and_then(|r| match r.get("id") {
+        Some(SqlValue::Uuid(u)) => Some(*u),
+        Some(SqlValue::Text(s)) => Uuid::parse_str(s).ok(),
+        _ => None,
+    }) else {
+        return Ok(None);
+    };
+
+    let count = r
+        .query_scalar(SqlStatement {
+            sql: "SELECT COUNT(*) FROM notes n \
+                  JOIN graph_edges e ON e.source_id = n.id AND e.namespace = n.namespace \
+                  WHERE n.namespace = ?1 AND n.deleted_at IS NULL \
+                  AND n.kind IN ('commit', 'issue', 'pull_request') \
+                  AND e.relation = 'annotates' AND e.target_id = ?2 AND e.deleted_at IS NULL"
+                .into(),
+            params: vec![
+                SqlValue::Text(token.namespace().as_str().to_string()),
+                SqlValue::Text(dead_project_id.to_string()),
+            ],
+            label: Some("git_digest_count_orphaned_notes".into()),
+        })
+        .await
+        .map_err(|e| anyhow!("{e}"))?;
+    let annotated_note_count = match count {
+        Some(SqlValue::Integer(n)) => n as u64,
+        _ => 0,
+    };
+
+    Ok(Some(OrphanSignal {
+        dead_project_id,
+        annotated_note_count,
     }))
 }

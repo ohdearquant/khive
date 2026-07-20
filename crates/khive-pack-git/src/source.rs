@@ -1,8 +1,15 @@
 //! `git.digest` source resolution (ADR-088 Amendment 1): local paths vs.
 //! `https://` remote URLs, canonicalization, and `github.com` owner/repo
 //! slug derivation for `gh`-based issue/PR ingestion.
+//!
+//! Also owns repo-anchor identity derivation (issue #1173): a canonical
+//! `host/owner/repo` slug (or a path-derived fallback for a remote-less
+//! local repo) that the same repository resolves to regardless of which
+//! spelling — https URL, ssh/scp remote, local clone path — a given
+//! `git.digest` call used.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 /// A digest source, resolved from the `git.digest` verb's `source` argument.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,6 +133,130 @@ fn github_slug(canonical: &str) -> Option<(String, String)> {
     let owner = segs.next()?;
     let repo = segs.next()?;
     Some((owner.to_string(), repo.to_string()))
+}
+
+/// The repo-anchor identity property key (issue #1173) — the durable
+/// matching key for `resolve_or_create_project`. `repo_url` remains display
+/// metadata only; this is the one property that is matched on.
+pub const REPO_SLUG_PROPERTY: &str = "repo_slug";
+
+/// Split `host` from `path` out of a URL/remote body that has already had
+/// its scheme and any `user[:pass]@` userinfo prefix stripped -- e.g.
+/// `github.com/owner/repo` from `https://github.com/owner/repo`, or
+/// `github.com/owner/repo` from the `host/owner/repo` remainder of an
+/// `ssh://user@host/owner/repo` URL. `rfind('@')` (not the first `@`) drops
+/// userinfo because a password component can itself contain `@`.
+fn split_host_path(rest: &str) -> Option<(String, String)> {
+    let after_userinfo = match rest.rfind('@') {
+        Some(pos) => &rest[pos + 1..],
+        None => rest,
+    };
+    let (host, path) = after_userinfo.split_once('/')?;
+    if host.is_empty() || path.is_empty() {
+        return None;
+    }
+    Some((host.to_string(), path.to_string()))
+}
+
+/// Normalize ANY git remote URL spelling -- `https://`, `ssh://`, the
+/// `git://` protocol, or scp-like shorthand (`git@host:owner/repo.git`) --
+/// into a lowercase-host `host/owner/repo` slug (issue #1173). This is
+/// broader than `github_slug` (which only recognizes `github.com` and
+/// requires the caller to have already canonicalized an `https://` URL):
+/// this function accepts every spelling `git remote get-url origin` can
+/// hand back, because a local clone's configured origin is not restricted
+/// to the schemes `parse_source` accepts for the top-level `source`
+/// argument. Returns `None` when the remainder doesn't parse into a host
+/// plus at least two path segments (owner + repo).
+///
+/// The host is lowercased (DNS is case-insensitive); owner/repo segments
+/// are preserved verbatim -- case-folding those risks collapsing two
+/// genuinely distinct repos on a case-sensitive host.
+pub fn remote_url_to_slug(url: &str) -> Option<String> {
+    let trimmed = url.trim().trim_end_matches('/');
+    let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let (host, path) = if let Some(rest) = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .or_else(|| trimmed.strip_prefix("git://"))
+    {
+        split_host_path(rest)?
+    } else if let Some(rest) = trimmed.strip_prefix("ssh://") {
+        split_host_path(rest)?
+    } else if is_scp_shorthand(trimmed) {
+        let at = trimmed.find('@')?;
+        let (host, path) = trimmed[at + 1..].split_once(':')?;
+        if host.is_empty() || path.is_empty() {
+            return None;
+        }
+        (host.to_string(), path.to_string())
+    } else {
+        return None;
+    };
+
+    let mut segs = path.split('/').filter(|s| !s.is_empty());
+    let owner = segs.next()?;
+    let repo = segs.next()?;
+    Some(format!("{}/{owner}/{repo}", host.to_ascii_lowercase()))
+}
+
+/// Read the local repo's configured `origin` remote URL via `git -C <path>
+/// remote get-url origin`. Returns `None` for any failure (no `origin`
+/// remote, `git` not on PATH, not a git repo) -- a local repo with no
+/// remote is a valid, expected state (see `repo_identity`), not an error.
+fn local_origin_remote_url(canonical_repo_path: &Path) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(canonical_repo_path)
+        .args(["remote", "get-url", "origin"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if url.is_empty() {
+        None
+    } else {
+        Some(url)
+    }
+}
+
+/// Resolve the canonical repo-anchor identity (issue #1173) for a digest
+/// source -- the value stored in `properties.repo_slug` and matched on by
+/// `resolve_or_create_project`.
+///
+/// - `Remote`: the `host/owner/repo` slug of the canonical URL.
+/// - `Local`: the canonicalized path's configured `origin` remote, sluggified
+///   the same way -- so a repo digested once via `https://host/owner/repo`
+///   and once via a local clone of that same remote converge on one anchor.
+///   When the local repo has no `origin` remote (or `remote_url_to_slug`
+///   can't parse it), the identity falls back to a `local:<canonical path>`
+///   form -- clearly distinct from a `host/owner/repo` slug (no host name
+///   contains a `:`) so it can never collide with one, but scoped only to
+///   that exact path: two clones of the same remote-less repo at different
+///   paths do NOT converge (there is no remote to prove they're the same
+///   repository).
+pub fn repo_identity(source: &DigestSource) -> String {
+    match source {
+        DigestSource::Remote { canonical, .. } => {
+            remote_url_to_slug(canonical).unwrap_or_else(|| canonical.clone())
+        }
+        DigestSource::Local(path) => {
+            let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+            if let Some(origin) = local_origin_remote_url(&canon) {
+                if let Some(slug) = remote_url_to_slug(&origin) {
+                    return slug;
+                }
+            }
+            format!("local:{}", canon.to_string_lossy())
+        }
+    }
 }
 
 /// Basename used as the default `project` entity name and as a fallback
