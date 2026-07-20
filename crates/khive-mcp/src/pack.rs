@@ -22,8 +22,6 @@ pub use khive_pack_gtd::GtdPack as _GtdPack;
 #[doc(hidden)]
 pub use khive_pack_kg::KgPack as _KgPack;
 #[doc(hidden)]
-pub use khive_pack_knowledge::KnowledgePack as _KnowledgePack;
-#[doc(hidden)]
 pub use khive_pack_memory::MemoryPack as _MemoryPack;
 #[doc(hidden)]
 pub use khive_pack_schedule::SchedulePack as _SchedulePack;

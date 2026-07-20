@@ -1154,7 +1154,6 @@ mod tests {
         assert!(cfg.packs.contains(&"brain".to_string()));
         assert!(cfg.packs.contains(&"comm".to_string()));
         assert!(cfg.packs.contains(&"schedule".to_string()));
-        assert!(cfg.packs.contains(&"knowledge".to_string()));
         // session loads by default so its background mirror warm-hook runs in
         // production; its handlers are all operator-only subhandlers (0 wire verbs).
         assert!(cfg.packs.contains(&"session".to_string()));

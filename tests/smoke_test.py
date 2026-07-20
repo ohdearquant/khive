@@ -197,8 +197,8 @@ def main():
         assert isinstance(verbs_result["verbs"], list), f"verbs must be a list: {verbs_result}"
         # Surface-contract tripwire: the default config (no --pack, KHIVE_PACKS
         # unset) loads 11 production packs (kg, gtd, memory, brain, comm, schedule,
-        # knowledge, session, git, workspace, blob), so verbs() returns exactly
-        # 84 user-facing MCP-callable verbs (count what verbs() returns, not internal
+        # session, git, workspace, blob), so verbs() returns exactly
+        # 65 user-facing MCP-callable verbs (count what verbs() returns, not internal
         # dispatch arms). The session pack contributes 4 agent-facing T1 verbs
         # (store/list/resume/export), promoted from internal subhandlers to
         # Visibility::Verb per ADR-083; brain.register_adapter (#354), context
@@ -217,8 +217,8 @@ def main():
         # until a backend is installed via [storage.blob] or KHIVE_BLOB_ROOT.
         # Update this number when the pack set or verb surface changes; a
         # silent drift here is the bug this assertion exists to catch.
-        assert verbs_result["total"] == 84, (
-            f"expected 84 user-facing verbs from the 11 default packs "
+        assert verbs_result["total"] == 65, (
+            f"expected 65 user-facing verbs from the 10 default packs "
             f"(session contributes 4 T1 verbs promoted to Visibility::Verb per "
             f"ADR-083; context is the 17th kg-substrate bare verb per ADR-089; "
             f"resolve is the 18th kg-substrate bare verb per the unified-verb "

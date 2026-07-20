@@ -76,7 +76,6 @@ CRATES=(
     khive-pack-memory
     khive-pack-comm
     khive-pack-schedule
-    khive-pack-knowledge
     khive-pack-session   # needs khive-pack-kg + khive-runtime/storage/types (all above)
     khive-pack-workspace # needs khive-pack-kg/gtd/git/session (all above)
     khive-pack-template

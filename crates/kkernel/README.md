@@ -46,9 +46,8 @@ Run a verb DSL expression directly — the same syntax the `request` tool accept
 without going through an MCP client:
 
 ```bash
-kkernel exec 'knowledge.stats()'
-kkernel exec 'knowledge.index(rebuild_ann=true)'
-kkernel exec '[knowledge.list(limit=5), knowledge.stats()]'
+kkernel exec 'stats()'
+kkernel exec '[list(kind="entity", limit=5), stats()]'
 kkernel exec --pending-events          # cron-friendly: fire due scheduled_event notes
 ```
 
@@ -64,7 +63,7 @@ kkernel exec --pending-events          # cron-friendly: fire due scheduled_event
 | `pack`     | `list` / `handler <name>` — introspect registered packs and their verb surface              |
 | `engine`   | Embedding-model lifecycle: list, status, migrate, drift-check                               |
 | `vector`   | Vector store capabilities and orphan sweep                                                  |
-| `reindex`  | Rebuild embedding vectors and FTS documents for entities, notes, and knowledge atoms        |
+| `reindex`  | Rebuild embedding vectors and FTS documents for entities and notes                          |
 | `backend`  | `list` / `info <name>` — inspect registered storage backends                                |
 
 All subcommands emit JSON on stdout by default (for piping/parsing); pass `--human`

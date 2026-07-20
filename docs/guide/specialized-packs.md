@@ -1,7 +1,7 @@
 # Specialized Packs
 
 khive's default install loads eleven production packs
-(`kg, gtd, memory, brain, comm, schedule, knowledge, session, git, workspace, blob`, per
+(`kg, gtd, memory, brain, comm, schedule, session, git, workspace, blob`, per
 `RuntimeConfig::default()` in `crates/khive-runtime/src/config.rs`). `workspace`
 registers the `workspace` entity kind and five `contains` endpoint rules only,
 with no verbs; `blob` contributes content-addressed `blob.put`/`blob.get`/`blob.stat`

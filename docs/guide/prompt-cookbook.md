@@ -85,24 +85,6 @@ request(ops="search(kind=\"note\", query=\"tiling recomputation\")")
 
 Automatically excludes superseded notes.
 
-### Knowledge search with rerank
-
-```
-request(ops="knowledge.search(query=\"parameter efficient fine-tuning methods\", rerank=true)")
-```
-
-Use when: you want normalized [0,1] scores. Reranking uses a cross-encoder for
-higher quality scoring. Default is on for `knowledge.search`.
-
-### Knowledge search with decompose
-
-```
-request(ops="knowledge.search(query=\"compare LoRA and QLoRA for 7B models\", decompose=true)")
-```
-
-Use when: your query mentions multiple distinct concepts. Decomposition splits
-the query and merges results.
-
 ---
 
 ## Navigate the graph
@@ -226,38 +208,6 @@ request(ops="gtd.transition(id=\"<task_id>\", status=\"done\")")
 
 ```
 request(ops="gtd.tasks(status=\"active\", limit=10)")
-```
-
----
-
-## Knowledge corpus
-
-### Learn a concept
-
-```
-request(ops="knowledge.learn(name=\"Speculative Decoding\", description=\"Draft-then-verify inference acceleration\", domain=\"inference\", tags=[\"decoding\", \"acceleration\"])")
-```
-
-Creates a concept entity in the knowledge corpus.
-
-### Cite a source
-
-```
-request(ops="knowledge.cite(concept_id=\"<concept_uuid>\", source_id=\"<paper_uuid>\")")
-```
-
-Both must be full UUIDs. Source must be a document, person, or org entity.
-
-### Import markdown as atoms
-
-```
-request(ops="knowledge.import(path=\"/path/to/notes.md\", chunk_strategy=\"heading\")")
-```
-
-### Search the corpus
-
-```
-request(ops="knowledge.search(query=\"transformer inference optimization\", rerank=true, decompose=true)")
 ```
 
 ---

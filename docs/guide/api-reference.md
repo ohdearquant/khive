@@ -1,16 +1,16 @@
 # API Reference
 
-khive exposes exactly one MCP tool, `request`. Everything else, 84 verbs across 11
+khive exposes exactly one MCP tool, `request`. Everything else, 65 verbs across 10
 production packs, is dispatched through that single tool via a small request DSL.
 This page documents the DSL grammar, the response envelope, and every verb's full
 parameter contract, so an agent can call khive correctly without reading Rust source.
 
-This page is verified against the live registry (`request(ops="verbs()")`, run
-2026-07-17) and the pack source (`crates/khive-pack-*/src/*.rs` `HandlerDef`/`ParamDef`
-struct literals). Verb count: **84**, matching both the live registry `total` field and
-the sum of the 11 pack counts below. If your server reports a different total, your
-`KHIVE_PACKS` configuration loads a different pack set than the default — run
-`request(ops="verbs()")` against your own server to get the authoritative list.
+This page is verified against the live registry (`request(ops="verbs()")`) and the pack
+source (`crates/khive-pack-*/src/*.rs` `HandlerDef`/`ParamDef` struct literals). Verb
+count: **65**, matching both the live registry `total` field and the sum of the 10 pack
+counts below. If your server reports a different total, your `KHIVE_PACKS` configuration
+loads a different pack set than the default — run `request(ops="verbs()")` against your
+own server to get the authoritative list.
 
 An always-machine-readable copy of this page is at
 [`/md/api-reference.md`](md/api-reference.md). The site also publishes
@@ -27,7 +27,6 @@ An always-machine-readable copy of this page is at
 | `brain`     | 15    | `KHIVE_PACKS=kg,brain`                     | Yes                 |
 | `comm`      | 7     | `KHIVE_PACKS=kg,comm`                      | Yes                 |
 | `schedule`  | 4     | `KHIVE_PACKS=kg,schedule`                  | Yes                 |
-| `knowledge` | 19    | `KHIVE_PACKS=kg,knowledge`                 | Yes                 |
 | `session`   | 4     | `KHIVE_PACKS=kg,session`                   | Yes                 |
 | `git`       | 4     | `KHIVE_PACKS=kg,git`                       | Yes                 |
 | `workspace` | 0     | `KHIVE_PACKS=kg,git,gtd,session,workspace` | Yes                 |
@@ -53,11 +52,11 @@ unconfigured (erroring until a backend is installed) when the server boots again
 in-memory backend, which has no directory to default a root beside.
 
 The default binary (no `KHIVE_PACKS`/`--pack` override) loads all 11 packs: 18 + 5 + 5 +
-15 + 7 + 4 + 19 + 4 + 4 + 0 + 3 = **84 verbs**.
+15 + 7 + 4 + 4 + 4 + 0 + 3 = **65 verbs**.
 
 Verb names in the `kg` pack are bare (`create`, `search`, `link`, …). Every other pack
 namespaces its verbs with a `pack.` prefix (`gtd.assign`, `memory.recall`,
-`brain.feedback`, `comm.send`, `schedule.remind`, `knowledge.search`, `session.store`).
+`brain.feedback`, `comm.send`, `schedule.remind`, `session.store`).
 
 ---
 
@@ -632,10 +631,10 @@ request(ops="resolve(refs=[\"the old record\", \"<uuid>\"])")
 List all MCP-callable verbs registered on this server. Internal subhandlers are
 excluded.
 
-| Param      | Type   | Required | Notes                                                                                                    |
-| ---------- | ------ | -------- | -------------------------------------------------------------------------------------------------------- |
-| `category` | string | no       | Filter: `Assertive`\|`Commissive`\|`Declaration`\|`Directive`.                                           |
-| `pack`     | string | no       | Filter by pack name (`kg`, `gtd`, `memory`, `brain`, `comm`, `schedule`, `knowledge`, `session`, `git`). |
+| Param      | Type   | Required | Notes                                                                                       |
+| ---------- | ------ | -------- | ------------------------------------------------------------------------------------------- |
+| `category` | string | no       | Filter: `Assertive`\|`Commissive`\|`Declaration`\|`Directive`.                              |
+| `pack`     | string | no       | Filter by pack name (`kg`, `gtd`, `memory`, `brain`, `comm`, `schedule`, `session`, `git`). |
 
 ```
 request(ops="verbs()")
@@ -1217,286 +1216,6 @@ Cancel a scheduled event.
 
 ```
 request(ops="schedule.cancel(id=\"<event-id>\")")
-```
-
----
-
-## `knowledge` pack — 19 verbs
-
-The knowledge-atom corpus: bulk ingest, TF-IDF + embedding search, domain composition,
-section-level review/dispute, and KG-sugar verbs for citing sources. Optional; load
-with `KHIVE_PACKS=kg,knowledge`.
-
-### `knowledge.upsert_atoms` — Commissive
-
-Bulk insert or update knowledge atoms by slug.
-
-| Param        | Type            | Required | Notes                                                             |
-| ------------ | --------------- | -------- | ----------------------------------------------------------------- |
-| `atoms`      | array\<object\> | yes      | `{slug, name, content, tags?, properties?, finalized?}` per atom. |
-| `chunk_size` | integer         | no       | Client-side chunking hint, max 5000.                              |
-
-```
-request(ops="[{\"tool\":\"knowledge.upsert_atoms\",\"args\":{\"atoms\":[{\"slug\":\"rope\",\"name\":\"RoPE\",\"content\":\"Rotary position embedding...\"}]}}]")
-```
-
-### `knowledge.upsert_domains` — Commissive
-
-Bulk insert or update domain groupings of atoms.
-
-| Param     | Type            | Required | Notes                                                     |
-| --------- | --------------- | -------- | --------------------------------------------------------- |
-| `domains` | array\<object\> | yes      | `{slug, name, description?, tags?, members?}` per domain. |
-
-```
-request(ops="[{\"tool\":\"knowledge.upsert_domains\",\"args\":{\"domains\":[{\"slug\":\"attention\",\"name\":\"Attention mechanisms\"}]}}]")
-```
-
-### `knowledge.get` — Assertive
-
-Fetch a single atom or domain by UUID or slug.
-
-| Param              | Type   | Required | Notes                                                                                                                                                                                                                                                                           |
-| ------------------ | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `id`               | string | yes      | Atom/domain UUID or slug.                                                                                                                                                                                                                                                       |
-| `include_sections` | bool   | no       | Include the atom's sections under a `sections` key (ignored for domains). Each section: `id, atom_id, namespace, section_type, heading, content, content_hash, status, tokens, sort_order, created_at, updated_at`, ordered by `sort_order`, `created_at`, `id`. Default false. |
-
-```
-request(ops="knowledge.get(id=\"rope\", include_sections=true)")
-```
-
-### `knowledge.list` — Assertive
-
-Paginated listing of atoms or domains.
-
-| Param    | Type    | Required | Notes                              |
-| -------- | ------- | -------- | ---------------------------------- |
-| `type`   | string  | no       | `atom`\|`domain` (default `atom`). |
-| `limit`  | integer | no       | Default 20, max 500.               |
-| `offset` | integer | no       | Pagination offset.                 |
-
-```
-request(ops="knowledge.list(type=\"domain\", limit=50)")
-```
-
-### `knowledge.delete_atoms` — Commissive
-
-Soft-delete atoms by slug or ID.
-
-| Param | Type            | Required | Notes                |
-| ----- | --------------- | -------- | -------------------- |
-| `ids` | array\<string\> | yes      | Atom slugs or UUIDs. |
-
-```
-request(ops="knowledge.delete_atoms(ids=[\"stale-atom-slug\"])")
-```
-
-### `knowledge.stats` — Assertive
-
-Corpus statistics: atom count, domain count, coverage. No params.
-
-```
-request(ops="knowledge.stats()")
-```
-
-### `knowledge.index` — Commissive
-
-Backfill embeddings + FTS for atoms/domains.
-
-| Param         | Type            | Required | Notes                                                   |
-| ------------- | --------------- | -------- | ------------------------------------------------------- |
-| `ids`         | array\<string\> | no       | Atom slugs/IDs to index; omit to index all.             |
-| `batch_size`  | integer         | no       | Default 500, max 1000.                                  |
-| `insert_only` | bool            | no       | Deprecated no-op, accepted for API compatibility only.  |
-| `rebuild_ann` | bool            | no       | Rebuild the in-memory Vamana ANN index (default false). |
-
-```
-request(ops="knowledge.index(rebuild_ann=true)")
-```
-
-### `knowledge.fold` — Assertive
-
-Budget-constrained knapsack selection of scored candidates.
-
-| Param              | Type            | Required | Notes                                                   |
-| ------------------ | --------------- | -------- | ------------------------------------------------------- |
-| `candidates`       | array\<object\> | yes      | `{id, score, size, content?, category?}` per candidate. |
-| `budget`           | integer         | yes      | Token/size budget for the selected set.                 |
-| `min_score`        | number          | no       | Default 0.0.                                            |
-| `category_weights` | object          | no       | Per-category score multipliers.                         |
-
-```
-request(ops="[{\"tool\":\"knowledge.fold\",\"args\":{\"candidates\":[{\"id\":\"a\",\"score\":0.8,\"size\":400}],\"budget\":4000}}]")
-```
-
-### `knowledge.search` — Assertive
-
-TF-IDF ranked search over the knowledge corpus with embedding rerank (default when an
-embedder is configured). Draft and deprecated atoms are excluded by default. Score
-bands: `score>=0.46` reliably on-target, `0.42<=score<0.46` mixed quality, `score<0.42`
-mostly off-target.
-
-| Param                 | Type    | Required | Notes                                                                                   |
-| --------------------- | ------- | -------- | --------------------------------------------------------------------------------------- |
-| `query`               | string  | yes      | Search query text.                                                                      |
-| `type`                | string  | no       | `atom`\|`domain` (default both).                                                        |
-| `include_drafts`      | bool    | no       | Default false; no-op when `status` is set.                                              |
-| `status`              | string  | no       | Exact status filter: `draft`\|`reviewed`\|`deprecated`; overrides `include_drafts`.     |
-| `exclude_status`      | string  | no       | Exclude an exact status; only used when `status` unset.                                 |
-| `role`                | string  | no       | Agent role hint, prepended to the query for scoring.                                    |
-| `limit`               | integer | no       | Default 10, max 100.                                                                    |
-| `min_score`           | number  | no       | Default 0.0.                                                                            |
-| `weights`             | object  | no       | `{w_name, w_tags, w_content, w_exact_name, w_bigram, expand_discount, coverage_alpha}`. |
-| `decompose`           | bool    | no       | Default false; enables query decomposition.                                             |
-| `decompose_threshold` | integer | no       | Default 4 non-stop terms to trigger decomposition.                                      |
-| `intersection_bonus`  | number  | no       | Default 0.25; score multiplier for multi-sub-query hits.                                |
-| `rerank`              | bool    | no       | Default true; embedding rerank; no-op with no embedder configured.                      |
-| `rerank_alpha`        | number  | no       | Default 0.7 (TF-IDF-dominant blend).                                                    |
-
-```
-request(ops="knowledge.search(query=\"FastAPI JWT middleware\", rerank=true, limit=10)")
-```
-
-### `knowledge.suggest` — Assertive
-
-Suggest relevant knowledge domains for a query. Draft/deprecated domain atoms excluded
-by default.
-
-| Param   | Type    | Required | Notes                   |
-| ------- | ------- | -------- | ----------------------- |
-| `query` | string  | yes      | Orientation query text. |
-| `role`  | string  | no       | Agent role hint.        |
-| `limit` | integer | no       | Default 8, max 100.     |
-
-```
-request(ops="knowledge.suggest(query=\"async middleware retry circuit breaker patterns\", role=\"implementer\")")
-```
-
-### `knowledge.compose` — Assertive
-
-Compose a markdown briefing from selected knowledge domains and atoms.
-
-| Param        | Type            | Required | Notes                                             |
-| ------------ | --------------- | -------- | ------------------------------------------------- |
-| `domain_ids` | array\<string\> | no       | Domain UUIDs/slugs whose member atoms to include. |
-| `atom_ids`   | array\<string\> | no       | Atom UUIDs/slugs to include directly.             |
-| `query`      | string          | yes      | Reranks the selected atom bodies.                 |
-
-```
-request(ops="knowledge.compose(query=\"FastAPI JWT middleware validation patterns\", domain_ids=[\"attention\"])")
-```
-
-### `knowledge.edit` — Commissive
-
-Upsert sections for an atom without wiping other sections.
-
-| Param      | Type            | Required | Notes                                                                                                                                                                                                                                                                             |
-| ---------- | --------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `id`       | string          | yes      | Atom UUID or slug.                                                                                                                                                                                                                                                                |
-| `sections` | array\<object\> | yes      | `[{section_type, content, heading?, sort_order?}]`. `section_type` is a closed enum: `overview`\|`core_model`\|`boundary_conditions`\|`formalism`\|`operational_guidance`\|`examples`\|`failure_modes`\|`expert_lens`\|`references`\|`other`. `content` must be >= 80 characters. |
-
-```
-request(ops="[{\"tool\":\"knowledge.edit\",\"args\":{\"id\":\"rope\",\"sections\":[{\"section_type\":\"overview\",\"content\":\"Rotary position embedding rotates query/key vectors by an angle proportional to position...\"}]}}]")
-```
-
-### `knowledge.import` — Commissive
-
-Ingest atlas markdown file(s) as atoms with parsed sections.
-
-| Param            | Type   | Required | Notes                                                                         |
-| ---------------- | ------ | -------- | ----------------------------------------------------------------------------- |
-| `path`           | string | yes      | Filesystem path to a markdown file or directory.                              |
-| `format`         | string | no       | Only `atlas_md` supported (default).                                          |
-| `chunk_strategy` | string | no       | `section` (default, one section per atom) or `atom` (whole file as one atom). |
-
-```
-request(ops="knowledge.import(path=\"/path/to/atlas/rope.md\")")
-```
-
-### `knowledge.challenge` — Commissive
-
-Mark a section as disputed and increment the atom's `dispute_count`.
-
-| Param          | Type   | Required | Notes                                                             |
-| -------------- | ------ | -------- | ----------------------------------------------------------------- |
-| `atom_id`      | string | yes      | Atom UUID or slug.                                                |
-| `section_type` | string | yes      | Section type to challenge.                                        |
-| `content_hash` | string | no       | Required when more than one eligible section of that type exists. |
-| `reason`       | string | no       | Optional challenge reason.                                        |
-
-```
-request(ops="knowledge.challenge(atom_id=\"rope\", section_type=\"formalism\", reason=\"formula sign error\")")
-```
-
-### `knowledge.adjudicate` — Commissive
-
-Resolve a disputed section and decrement the atom's `dispute_count`.
-
-| Param          | Type   | Required | Notes                                                             |
-| -------------- | ------ | -------- | ----------------------------------------------------------------- |
-| `atom_id`      | string | yes      | Atom UUID or slug.                                                |
-| `section_type` | string | yes      | Section type to adjudicate.                                       |
-| `content_hash` | string | no       | Required when more than one disputed section of that type exists. |
-| `resolution`   | string | yes      | `accept` (marks verified) or `reject` (marks reviewed).           |
-
-```
-request(ops="knowledge.adjudicate(atom_id=\"rope\", section_type=\"formalism\", resolution=\"accept\")")
-```
-
-### `knowledge.learn` — Commissive
-
-Register a concept entity with optional domain and tags.
-
-| Param         | Type            | Required | Notes                            |
-| ------------- | --------------- | -------- | -------------------------------- |
-| `name`        | string          | yes      | Concept name.                    |
-| `description` | string          | no       | Optional description.            |
-| `domain`      | string          | no       | Folded into `properties.domain`. |
-| `tags`        | array\<string\> | no       | Optional tag list.               |
-
-```
-request(ops="knowledge.learn(name=\"GQA\", domain=\"attention\", description=\"Grouped-query attention\")")
-```
-
-### `knowledge.cite` — Commissive
-
-Link a concept to the paper or source that introduced it.
-
-| Param        | Type  | Required | Notes                                                                                                |
-| ------------ | ----- | -------- | ---------------------------------------------------------------------------------------------------- |
-| `concept_id` | uuid  | yes      | Concept entity ID.                                                                                   |
-| `source_id`  | uuid  | yes      | Source entity ID; must be `kind=document`, `kind=person`, or `kind=org` (`introduced_by` edge rule). |
-| `weight`     | float | no       | Defaults to 1.0.                                                                                     |
-
-```
-request(ops="knowledge.cite(concept_id=\"<concept-uuid>\", source_id=\"<paper-uuid>\")")
-```
-
-### `knowledge.topic` — Assertive
-
-List concepts filtered by domain or free-text query.
-
-| Param    | Type    | Required | Notes                                       |
-| -------- | ------- | -------- | ------------------------------------------- |
-| `domain` | string  | no       | Filter to concepts tagged with this domain. |
-| `query`  | string  | no       | Free-text search across name + description. |
-| `limit`  | integer | no       | Default 20, max 100.                        |
-
-```
-request(ops="knowledge.topic(domain=\"attention\")")
-```
-
-### `knowledge.feedback` — Commissive
-
-Apply per-section feedback signals to update section posterior weights.
-
-| Param             | Type   | Required | Notes                                                                                                                         |
-| ----------------- | ------ | -------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `section_signals` | object | yes      | `{section_type: signal}`, e.g. `{"overview": "useful", "formalism": "not_useful"}`. Signals: `useful`\|`not_useful`\|`wrong`. |
-| `target_id`       | string | no       | UUID of the rated atom/entity. When paired with a configured brain profile, also forwards to `brain.feedback`.                |
-
-```
-request(ops="knowledge.feedback(target_id=\"rope\", section_signals={\"overview\": \"useful\"})")
 ```
 
 ---
