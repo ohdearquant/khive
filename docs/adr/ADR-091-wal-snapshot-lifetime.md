@@ -840,9 +840,9 @@ Existing threshold keys are reused unchanged.
 
 ### 2026-07-20 amendment (Amendment 3): heartbeat freshness basis and the attribution-basis field
 
-**Motivation.** Two contract refinements, both surfaced by review follow-ups to
-Amendment 2's implementation (#1155 item 1; the backend-scoped attribution
-design in `docs/design/walpin-backend-scoped-attribution.md`):
+**Motivation.** Two contract refinements to Amendment 2 (#1155 item 1; the
+backend-scoped attribution design in
+`docs/design/walpin-backend-scoped-attribution.md`):
 
 1. While a transaction is over-threshold, the session sweep rewrites and fsyncs
    the full heartbeat record on every tick (exclusive-create temp file plus
@@ -919,6 +919,33 @@ present; records written by pre-amendment binaries lack it and are read
 exactly as before. The alternative — keeping age current by rewriting the
 body every tick — is the status quo this plank exists to remove.
 
+_Recovery rule._ The touch path must never assume the file still exists:
+enumeration deletes stale entries, and a slow writer's heartbeat can be
+deleted while its span is still live. On every sweep tick where the warn
+condition holds, a missing heartbeat (or a touch failing with not-found) is
+recreated by a full body write through the unchanged create path — so a
+deletion costs at most one tick of attribution gap, never permanent
+invisibility. Beacons recover the same way, fail-closed: a missing beacon is
+rewritten on the next tick, and a beacon that cannot be recreated is a
+sidecar-health failure — the process classifies `unknown`, per Amendment 2's
+rule that a daemon-side or write-side failure must never masquerade as
+affirmative evidence.
+
+_Mixed-version rule._ An enumerator predating this amendment classifies by
+body `updated_at` and would delete a live heartbeat whose new-style writer
+touches only mtime. The contract does not pretend this window away; it bounds
+it and fixes the failure direction. Deployment on a host is effectively
+single-binary (every khive process runs the installed `kkernel`; the daemon
+restarts on reinstall and sessions re-exec), so a mixed window exists only
+between binary upgrade and process restart. Inside that window, an old-reader
+deletion of a new-writer record is repaired by the recovery rule on the
+writer's next tick, and the interim classification is `unknown` —
+inconclusive, never false attribution. Readers upgraded to this amendment
+accept both generations: records carrying the new fields classify on mtime;
+records without them classify on `updated_at` exactly as before. The window
+closes when the enumerating daemon process is running the amended binary; no
+flag-day coordination is required.
+
 _Crash conservatism._ An mtime touch is not durability-critical: a touch lost
 to a crash makes the record look stale, and Amendment 2's liveness gate
 already deletes stale entries and classifies their PIDs as `unknown` — the
@@ -938,12 +965,24 @@ The heartbeat record gains exactly one additive field:
   `attribution_basis`; readers treat absence as unspecified — neither origin
   nor fallback may be inferred from a missing field.
 
+_Fail-closed reading rule (binding on every consumer)._ Classification of a
+record's attribution confidence fails closed: a missing `attribution_basis`,
+an unrecognized value, or any parse failure of the field classifies the
+record as unspecified/fallback-confidence — **never** as evidence-backed.
+Only the exact string `"origin"` licenses the evidence-backed reading. This
+rule is versioned with the field itself: mixed-version readers encountering
+records from newer writers with values this amendment does not define must
+degrade to fallback-confidence rather than guess. Without this rule a
+fallback attribution could be read as ground truth — the exact confusion the
+field exists to prevent.
+
 The origin semantics (which spans are scoped to which database, and why
 unscoped spans fall back to the main view) are specified by the
 backend-scoped attribution design note; this amendment owns only the field's
-name, type, and values. A change of `attribution_basis` is a content change
-and forces a body rewrite under Plank F1. Beacons carry no attribution and
-are unchanged.
+name, type, values, and the reading rule above. A change of
+`attribution_basis` is a content change and forces a body rewrite under
+Plank F1. Beacons carry no attribution and are unchanged beyond the cadence
+declaration.
 
 **Non-goals.** Thresholds, the enumeration liveness gate structure, census
 rules, the filesystem trust boundary, and the beacon refresh mechanism are
