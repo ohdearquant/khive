@@ -1223,8 +1223,9 @@ fn merge_entity_sql(
         let now_ts = chrono::Utc::now().timestamp();
         // Preserve the original edge ID where possible so callers can still get()
         // it by the ID returned from link(): update in-place when there's no
-        // conflict; when into_id already owns this (source,target,relation), drop
-        // the from-edge instead and refresh the existing into-edge.
+        // conflict; when into_id already owns this (source,target,relation), the
+        // incoming (from-side) duplicate is dropped and the existing into-edge is
+        // left untouched (ADR-039 `ON CONFLICT ... DO NOTHING` semantics).
         // Check for a conflict: does into_id already have this natural key?
         let conflict_id: Option<String> = {
             let conflict_src = new_src.to_string();
@@ -1244,22 +1245,13 @@ fn merge_entity_sql(
             .map_err(SqliteError::Rusqlite)?
         };
 
-        let changed = if let Some(existing_id) = conflict_id {
-            // A live or soft-deleted row already owns this natural key.
+        let changed = if conflict_id.is_some() {
+            // A live or soft-deleted row already owns this natural key: drop the
+            // incoming duplicate. The surviving row's weight/metadata/deleted_at
+            // are never mutated or resurrected.
             conn.execute(
                 khive_db::stores::graph::EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL,
                 rusqlite::params![&namespace, edge.id.to_string()],
-            )?;
-            conn.execute(
-                khive_db::stores::graph::EDGE_SYMMETRIC_REFRESH_CANONICAL_SQL,
-                rusqlite::params![
-                    edge.weight,
-                    now_ts,
-                    edge.target_backend,
-                    edge.metadata,
-                    &namespace,
-                    &existing_id,
-                ],
             )?
         } else {
             conn.execute(
@@ -1670,21 +1662,14 @@ fn merge_note_sql(
                 .map_err(SqliteError::Rusqlite)?
             };
 
-            let changed = if let Some(existing_id) = conflict_id {
+            let changed = if conflict_id.is_some() {
+                // A live or soft-deleted row already owns this natural key: drop
+                // the incoming duplicate (ADR-039 `ON CONFLICT ... DO NOTHING`).
+                // The surviving row's weight/metadata/deleted_at are never
+                // mutated or resurrected.
                 conn.execute(
                     khive_db::stores::graph::EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL,
                     rusqlite::params![&namespace, edge.id.to_string()],
-                )?;
-                conn.execute(
-                    khive_db::stores::graph::EDGE_SYMMETRIC_REFRESH_CANONICAL_SQL,
-                    rusqlite::params![
-                        edge.weight,
-                        now_ts,
-                        edge.target_backend,
-                        edge.metadata,
-                        &namespace,
-                        &existing_id,
-                    ],
                 )?
             } else {
                 conn.execute(
@@ -3311,7 +3296,7 @@ mod tests {
 
         // Both into and from annotate the same shared entity — rewiring from's
         // edge onto into during merge produces a duplicate (into, shared,
-        // annotates) triple, exercising the conflict-probe/delete/refresh arms.
+        // annotates) triple, exercising the conflict-probe/delete arms.
         rt.link(&tok, into.id, shared.id, EdgeRelation::Annotates, 1.0, None)
             .await
             .unwrap();
@@ -3646,9 +3631,10 @@ mod tests {
         assert_eq!(summary.kept_id, a.id);
         assert_eq!(summary.removed_id, b.id);
         // A already had the Extends edge to shared; rewiring B->shared onto it
-        // refreshes the existing row via ON CONFLICT DO UPDATE rather than
-        // erroring. The invariant checked below is that exactly one live edge
-        // A->shared remains.
+        // hits the natural-key conflict arm, which drops the incoming (B-side)
+        // duplicate rather than erroring or touching A's surviving row (ADR-039
+        // `ON CONFLICT ... DO NOTHING`). The invariant checked below is that
+        // exactly one live edge A->shared remains.
         let a_edges = rt
             .list_edges(
                 &tok,
@@ -3674,6 +3660,135 @@ mod tests {
         assert!(
             b_after.is_none(),
             "C3: from_entity must be tombstoned (get_entity returns None for deleted) after merge; got: {b_after:?}"
+        );
+    }
+
+    // ADR-039 conflict-arm regression (#1191): on a symmetric-edge merge collision,
+    // the surviving row's own weight/metadata must never be overwritten with the
+    // incoming (dropped) duplicate's values.
+    #[tokio::test]
+    async fn merge_entity_symmetric_conflict_preserves_survivor_fields() {
+        use khive_storage::EdgeRelation;
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        let a = rt
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(&tok, "concept", None, "B", None, None, vec![])
+            .await
+            .unwrap();
+        let shared = rt
+            .create_entity(&tok, "concept", None, "Shared", None, None, vec![])
+            .await
+            .unwrap();
+
+        let survivor_edge = rt
+            .link(
+                &tok,
+                a.id,
+                shared.id,
+                EdgeRelation::Extends,
+                1.0,
+                Some(serde_json::json!({"source": "survivor"})),
+            )
+            .await
+            .unwrap();
+        rt.link(
+            &tok,
+            b.id,
+            shared.id,
+            EdgeRelation::Extends,
+            0.3,
+            Some(serde_json::json!({"source": "loser"})),
+        )
+        .await
+        .unwrap();
+
+        rt.merge_entity_with_reason(
+            &tok,
+            a.id,
+            b.id,
+            crate::EntityDedupMergePolicy::PreferInto,
+            ContentMergeStrategy::Append,
+            false,
+            None,
+        )
+        .await
+        .expect("merge must succeed across the symmetric-edge collision");
+
+        let after = rt
+            .get_edge(&tok, survivor_edge.id.into())
+            .await
+            .unwrap()
+            .expect("survivor edge must still exist after merge");
+        assert!(
+            (after.weight - 1.0).abs() < 0.001,
+            "survivor weight must be untouched by the dropped duplicate; got {}",
+            after.weight
+        );
+        assert_eq!(
+            after.metadata.as_ref().unwrap()["source"],
+            "survivor",
+            "survivor metadata must be untouched by the dropped duplicate; got {:?}",
+            after.metadata
+        );
+    }
+
+    // ADR-039 conflict-arm regression (#1191): a soft-deleted survivor row must
+    // stay soft-deleted after a merge collision, never resurrected.
+    #[tokio::test]
+    async fn merge_entity_symmetric_conflict_does_not_resurrect_soft_deleted_survivor() {
+        use khive_storage::EdgeRelation;
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        let a = rt
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(&tok, "concept", None, "B", None, None, vec![])
+            .await
+            .unwrap();
+        let shared = rt
+            .create_entity(&tok, "concept", None, "Shared", None, None, vec![])
+            .await
+            .unwrap();
+
+        let survivor_edge = rt
+            .link(&tok, a.id, shared.id, EdgeRelation::Extends, 1.0, None)
+            .await
+            .unwrap();
+        rt.delete_edge(&tok, survivor_edge.id.into(), false)
+            .await
+            .unwrap();
+        rt.link(&tok, b.id, shared.id, EdgeRelation::Extends, 0.5, None)
+            .await
+            .unwrap();
+
+        rt.merge_entity_with_reason(
+            &tok,
+            a.id,
+            b.id,
+            crate::EntityDedupMergePolicy::PreferInto,
+            ContentMergeStrategy::Append,
+            false,
+            None,
+        )
+        .await
+        .expect("merge must succeed even when the surviving edge is soft-deleted");
+
+        let after = rt
+            .get_edge_including_deleted(&tok, survivor_edge.id.into())
+            .await
+            .unwrap()
+            .expect("survivor edge row must still exist after merge");
+        assert!(
+            after.deleted_at.is_some(),
+            "soft-deleted survivor must stay soft-deleted after merge collision; got: {after:?}"
         );
     }
 
