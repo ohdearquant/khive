@@ -2089,34 +2089,6 @@ dependencies = [
 ]
 
 [[package]]
-<<<<<<< HEAD
-=======
-name = "khive-pack-brain"
-version = "0.6.0"
-dependencies = [
- "async-trait",
- "chrono",
- "criterion",
- "inventory",
- "khive-brain-core",
- "khive-db",
- "khive-fold",
- "khive-pack-kg",
- "khive-pack-memory",
- "khive-runtime",
- "khive-storage",
- "khive-types",
- "lattice-fann",
- "serde",
- "serde_json",
- "serial_test",
- "tempfile",
- "tokio",
- "uuid",
-]
-
-[[package]]
->>>>>>> origin/main
 name = "khive-pack-code"
 version = "0.6.0"
 dependencies = [
