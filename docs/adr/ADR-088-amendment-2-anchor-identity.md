@@ -25,12 +25,17 @@ Every digest source resolves to one canonical **repo slug** stored in
 `properties.repo_slug` on the anchor entity:
 
 - A remote URL in any spelling git accepts — `https://`, `http://`, `git://`,
-  `ssh://`, or scp-style shorthand — normalizes to `host/owner/repo`:
-  scheme, userinfo credentials, a port in the authority, a `.git` suffix, and
+  `ssh://`, or scp-style shorthand — normalizes to `host/<path>`: scheme,
+  userinfo credentials, a port in the authority, a `.git` suffix, and
   trailing slashes are stripped; the host is lowercased (DNS is
-  case-insensitive); owner and repo segments are preserved verbatim. Inputs
-  that do not yield a host plus at least owner and repo segments, or that
-  contain empty segments, do not normalize (they are not silently coerced).
+  case-insensitive). **All** path segments are preserved in the slug — a
+  nested-group URL such as `host/group/subgroup/repo` keeps every segment,
+  so two repositories under one subgroup never collapse. Path segments are
+  preserved verbatim: case-folding them could merge genuinely distinct
+  repositories on a case-sensitive host, so casing variants of the same
+  path remain distinct slugs by design. Inputs that do not yield a host
+  plus at least two path segments, or that contain empty segments, do not
+  normalize (they are not silently coerced).
 - A local path derives the same slug from its configured `origin` remote.
 - A local repository with no `origin` remote (or an origin that does not
   normalize) uses the fallback identity `local:<canonicalized-path>`.
@@ -40,7 +45,12 @@ for new anchors.
 
 ### Resolution order (replaces the Amendment 1 clause)
 
-1. Match a live `project` entity on `properties.repo_slug`.
+1. Match a live `project` entity on `properties.repo_slug`. If more than one
+   live entity carries the slug (possible when two legacy anchors holding
+   different URL spellings of the same repository were each backfilled on
+   separate ingests), the handler deterministically selects the oldest by
+   `created_at` and surfaces the condition as a report warning naming the
+   duplicate anchor ids; it never picks arbitrarily or silently.
 2. Otherwise match on legacy exact `properties.repo_url`; on a hit, backfill
    `properties.repo_slug` onto the matched entity. Existing anchors therefore
    need no migration.
