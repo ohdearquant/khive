@@ -80,11 +80,13 @@ pub struct LiveWalpinEntry {
     pub heartbeat: WalpinHeartbeat,
 }
 
-/// One-time per-PID registration marker (ADR-091 Amendment 2, sidecar-health
-/// attribution). Written once at sidecar initialization — never refreshed
-/// per tick — so a live process that has no over-threshold span still has a
-/// footprint in the sidecar directory: the absence of a *heartbeat* then
-/// affirmatively means "no old span," rather than "sidecar never worked."
+/// Per-PID registration marker (ADR-091 Amendment 2, sidecar-health
+/// attribution). Written at sidecar initialization (and re-written only
+/// after a fail-closed removal — see [`remove_beacon`]); its body is never
+/// refreshed per tick, only its mtime. A live process that has no
+/// over-threshold span still has a footprint in the sidecar directory: the
+/// absence of a *heartbeat* then affirmatively means "no old span," rather
+/// than "sidecar never worked."
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WalpinBeacon {
     pub pid: u32,
@@ -569,7 +571,15 @@ mod unix_impl {
         /// List entry names via `fdopendir` on a DUPLICATE of this fd (the
         /// original stays owned by `self`) — never re-resolves the
         /// directory by path.
-        pub(super) fn list_names(&self) -> io::Result<Vec<String>> {
+        /// List up to `max` non-hidden entry names, plus whether more
+        /// remained. Bounding happens HERE, at the `readdir` loop, so
+        /// directory content cannot inflate either the allocation or the
+        /// iteration work done by an enumeration pass — a truncated listing
+        /// is reported to the caller, never silently clipped. Dot-names
+        /// (`.`, `..`, in-flight `.<pid>.*.tmp` temp files) are skipped
+        /// before counting so junk temp entries cannot consume the budget
+        /// ahead of real records.
+        pub(super) fn list_names(&self, max: usize) -> io::Result<(Vec<String>, bool)> {
             // SAFETY: duplicates a live, open fd; the duplicate is uniquely
             // owned by this call and handed to `fdopendir` below.
             let dup_fd = unsafe { libc::dup(self.raw()) };
@@ -586,6 +596,7 @@ mod unix_impl {
                 return Err(err);
             }
             let mut names = Vec::new();
+            let mut truncated = false;
             loop {
                 // SAFETY: `dirp` is a valid, open `DIR*` for this whole loop.
                 let entry = unsafe { libc::readdir(dirp) };
@@ -597,11 +608,18 @@ mod unix_impl {
                 let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }
                     .to_string_lossy()
                     .into_owned();
+                if name.starts_with('.') {
+                    continue;
+                }
+                if names.len() == max {
+                    truncated = true;
+                    break;
+                }
                 names.push(name);
             }
             // SAFETY: `dirp` was successfully opened above and not yet closed.
             unsafe { libc::closedir(dirp) };
-            Ok(names)
+            Ok((names, truncated))
         }
     }
 
@@ -1416,6 +1434,26 @@ pub fn write_heartbeat(dir: &Path, heartbeat: &WalpinHeartbeat) -> io::Result<()
     }
 }
 
+/// Remove this process's registration beacon, if present (fail-closed
+/// escalation for a failing heartbeat write path — see the sidecar
+/// `observe` logic in `khive-db`'s checkpoint module). Never follows a
+/// symlink at the target path. A missing sidecar directory is a no-op — it
+/// must NOT be created as a side effect of a removal.
+pub fn remove_beacon(dir: &Path, pid: u32) -> io::Result<()> {
+    let target = format!("{pid}.beacon");
+    #[cfg(unix)]
+    {
+        match unix_impl::SidecarDirHandle::open_if_exists(dir)? {
+            Some(handle) => handle.remove_checked(&target),
+            None => Ok(()),
+        }
+    }
+    #[cfg(windows)]
+    {
+        windows_impl::remove_checked(dir, &target)
+    }
+}
+
 /// Remove this process's heartbeat file, if present. Never follows a
 /// symlink at the target path. A missing sidecar directory is a no-op — it
 /// must NOT be created as a side effect of a removal.
@@ -1669,8 +1707,10 @@ fn epoch_abs_diff(a: i64, b: i64) -> u64 {
 /// result that could otherwise masquerade as "no live entries." Per entry,
 /// symlinks and non-owned files are refused BEFORE their contents are read
 /// (contributing an `Unknown` classification, not silently skipped). At
-/// most `MAX_SIDECAR_ENTRIES` entries are read per enumeration; entries
-/// past the cap are classified `Unknown` from their filename alone.
+/// most `MAX_SIDECAR_ENTRIES` entries are listed and read per enumeration
+/// — the bound applies at the `readdir` loop itself — and a directory
+/// holding more contributes one sentinel `Unknown` marker (PID 0) so the
+/// truncation is never silent.
 ///
 /// Beacon refresh rule (ADR-091 Amendment 2): registration at
 /// initialization alone never licenses `RegisteredSilent` — a beacon (or
@@ -1692,16 +1732,23 @@ pub fn enumerate_live(dir: &Path, sweep_interval: Duration) -> io::Result<Walpin
     enumerate_live_bounded(dir, sweep_interval, MAX_SIDECAR_ENTRIES)
 }
 
-/// Ceiling on sidecar entries read per enumeration. Each processed entry
-/// costs an open/fstat/read/parse while the checkpoint writer guard is
-/// held, so enumeration work is bounded by policy, not by directory
-/// content — the entry-count sibling of the per-entry
-/// `MAX_SIDECAR_ENTRY_BYTES` bound. A real population is one
-/// heartbeat/beacon pair per live process; entries past the cap are
-/// classified `Unknown` from their filename alone (never read, never
-/// exonerated).
+/// Ceiling on sidecar entries listed and read per enumeration. Both the
+/// `readdir` loop and the per-entry open/fstat/read/parse run while the
+/// checkpoint writer guard is held, so enumeration work is bounded by
+/// policy, not by directory content — the entry-count sibling of the
+/// per-entry `MAX_SIDECAR_ENTRY_BYTES` bound. A real population is one
+/// heartbeat/beacon pair per live process; a directory holding more than
+/// this contributes one `CAP_SENTINEL_PID` `Unknown` marker (fail-closed:
+/// unenumerated entries make the census inconclusive, never exonerated).
 #[cfg(unix)]
 const MAX_SIDECAR_ENTRIES: usize = 512;
+
+/// Sentinel PID carried by the `Unknown` marker for entries past the
+/// enumeration cap: those entries were never listed, so no real PID is
+/// available. PID 0 is the kernel scheduler on every supported Unix and can
+/// never be a sidecar producer.
+#[cfg(unix)]
+const CAP_SENTINEL_PID: u32 = 0;
 
 #[cfg(unix)]
 fn enumerate_live_bounded(
@@ -1731,11 +1778,20 @@ fn enumerate_live_bounded(
     // `RegisteredSilent` off a co-existing entry (item b).
     let mut wedged: std::collections::HashSet<u32> = Default::default();
 
-    let mut read_budget = max_entries;
-    for name in handle.list_names()? {
-        if name.starts_with('.') {
-            continue;
-        }
+    // Entry-count bound: listing itself stops at the cap (see
+    // `list_names`), so neither the readdir loop, the names allocation,
+    // nor this processing loop scales with directory content. A truncated
+    // listing contributes one sentinel `Unknown` marker below — the
+    // unlisted entries were never read, and the census stays inconclusive
+    // rather than exonerating.
+    let (names, truncated) = handle.list_names(max_entries)?;
+    if truncated {
+        unknown.push((
+            CAP_SENTINEL_PID,
+            "refused: sidecar entry count exceeds enumeration cap",
+        ));
+    }
+    for name in names {
         let is_heartbeat = name.ends_with(".json");
         let is_beacon = name.ends_with(".beacon");
         if !is_heartbeat && !is_beacon {
@@ -1747,16 +1803,6 @@ fn enumerate_live_bounded(
         else {
             continue;
         };
-
-        // Entry-count bound: past the cap, entries are classified by name
-        // alone — no open/read/parse — so directory content cannot inflate
-        // the work done under the writer guard. Unread entries stay
-        // `Unknown`, never exonerated.
-        if read_budget == 0 {
-            unknown.push((pid, "refused: sidecar entry count exceeds enumeration cap"));
-            continue;
-        }
-        read_budget -= 1;
 
         // Trust boundary: symlink/ownership refusal happens BEFORE any
         // content read, and contributes `Unknown` rather than being
@@ -2112,7 +2158,7 @@ mod tests {
     }
 
     #[test]
-    fn enumerate_live_bounded_caps_entries_read() {
+    fn enumerate_live_bounded_caps_listing_with_sentinel_marker() {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("khive.db.walpin");
         let live = heartbeat(std::process::id());
@@ -2124,20 +2170,44 @@ mod tests {
         }
 
         let report = enumerate_live_bounded(&dir, Duration::from_secs(5), 1).unwrap();
-        let capped = report
+        let markers = report
             .entries
             .iter()
             .filter(|e| {
                 matches!(
                     e,
-                    WalpinPidHealth::Unknown { reason, .. }
+                    WalpinPidHealth::Unknown { pid: 0, reason }
                         if reason.contains("enumeration cap")
                 )
             })
             .count();
         assert_eq!(
-            capped, 2,
-            "entries past the read budget must surface as Unknown, never be dropped"
+            markers, 1,
+            "a truncated listing must surface exactly one sentinel Unknown marker"
+        );
+        assert!(
+            !report.fully_attributed(),
+            "a capped enumeration can never claim full attribution"
+        );
+        // Report memory is bounded by the cap: at most one processed entry
+        // plus the sentinel, regardless of directory content.
+        assert!(report.entries.len() <= 2, "got {:?}", report.entries);
+    }
+
+    #[test]
+    fn enumerate_live_uncapped_population_has_no_sentinel() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("khive.db.walpin");
+        let live = heartbeat(std::process::id());
+        write_heartbeat(&dir, &live).unwrap();
+
+        let report = enumerate_live(&dir, Duration::from_secs(5)).unwrap();
+        assert!(
+            report
+                .entries
+                .iter()
+                .all(|e| !matches!(e, WalpinPidHealth::Unknown { pid: 0, .. })),
+            "an in-budget population must not carry the cap sentinel"
         );
     }
 

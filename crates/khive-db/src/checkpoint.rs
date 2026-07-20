@@ -644,6 +644,12 @@ struct WalpinSidecarState {
     /// cadence must not be misread as stale.
     interval_ms: u64,
     wrote: bool,
+    /// Whether this process's registration beacon is believed present on
+    /// disk. Cleared when a failed heartbeat write escalates to beacon
+    /// removal (fail-closed — see `observe`) or a beacon touch fails; the
+    /// next healthy tick then re-registers with a full write instead of a
+    /// metadata touch.
+    beacon_registered: bool,
 }
 
 impl WalpinSidecarState {
@@ -667,17 +673,19 @@ impl WalpinSidecarState {
             started_at: crate::walpin::process_start_time_secs(pid).unwrap_or(0),
             interval_ms: interval.as_millis().min(u64::MAX as u128) as u64,
             wrote: false,
+            beacon_registered: false,
         })
     }
 
-    /// Write this process's one-time registration beacon (ADR-091 Amendment
-    /// 2 sidecar-health attribution). Called once, right after construction,
-    /// before the sweep loop starts — never per tick, so it adds no
-    /// steady-state filesystem traffic beyond this single write. The
-    /// blocking fs I/O runs on `spawn_blocking` (perf, ADR-091
-    /// Amendment 2): this is invoked from an async context and must not run
-    /// synchronous I/O inline on the async runtime's worker thread.
-    async fn register_beacon(&self) {
+    /// Write this process's registration beacon (ADR-091 Amendment 2
+    /// sidecar-health attribution). Called once right after construction,
+    /// before the sweep loop starts, and again only when a fail-closed
+    /// removal or failed touch cleared `beacon_registered` — steady state
+    /// stays metadata-touch-only with no data writes. The blocking fs I/O
+    /// runs on `spawn_blocking` (perf, ADR-091 Amendment 2): this is
+    /// invoked from an async context and must not run synchronous I/O
+    /// inline on the async runtime's worker thread.
+    async fn register_beacon(&mut self) {
         let dir = self.dir.clone();
         let beacon = crate::walpin::WalpinBeacon {
             pid: self.pid,
@@ -688,7 +696,9 @@ impl WalpinSidecarState {
         let result =
             tokio::task::spawn_blocking(move || crate::walpin::write_beacon(&dir, &beacon)).await;
         match result {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => {
+                self.beacon_registered = true;
+            }
             Ok(Err(e)) => {
                 tracing::warn!(
                     error = %e,
@@ -710,9 +720,15 @@ impl WalpinSidecarState {
     /// sweep tick except one where an over-threshold heartbeat write failed
     /// (see `observe`) — `registered-silent` classification requires this
     /// refresh to stay within the freshness window, not just the beacon's
-    /// original write. Best-effort: a failure here degrades this process to
+    /// original write. After a fail-closed beacon removal (or a failed
+    /// touch), the beacon is re-registered with a full write on the next
+    /// healthy tick. Best-effort: a failure here degrades this process to
     /// `unknown` at the next enumeration, not a sweep-task error.
-    async fn refresh_beacon(&self) {
+    async fn refresh_beacon(&mut self) {
+        if !self.beacon_registered {
+            self.register_beacon().await;
+            return;
+        }
         let dir = self.dir.clone();
         let pid = self.pid;
         let result =
@@ -720,6 +736,7 @@ impl WalpinSidecarState {
         match result {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
+                self.beacon_registered = false;
                 tracing::warn!(
                     error = %e,
                     "ADR-091 Amendment 2: failed to refresh walpin registration beacon; \
@@ -727,9 +744,44 @@ impl WalpinSidecarState {
                 );
             }
             Err(join_err) => {
+                self.beacon_registered = false;
                 tracing::warn!(
                     error = %join_err,
                     "ADR-091 Amendment 2: walpin beacon refresh task panicked"
+                );
+            }
+        }
+    }
+
+    /// Fail-closed escalation for a failed heartbeat write: remove this
+    /// process's beacon so enumeration cannot classify it
+    /// `registered-silent` off the still-fresh prior refresh — skipping one
+    /// touch alone leaves the previous mtime inside the freshness window
+    /// for up to three producer ticks, an exoneration window. With the
+    /// beacon gone the process either reports (once writes recover, the
+    /// next tick re-registers and writes the heartbeat) or is caught by the
+    /// OS-level holder census as an unattributed holder. If the removal
+    /// itself fails, the beacon ages out over the freshness window — the
+    /// narrowed fallback, not the contract.
+    async fn drop_beacon_fail_closed(&mut self) {
+        let dir = self.dir.clone();
+        let pid = self.pid;
+        self.beacon_registered = false;
+        let result =
+            tokio::task::spawn_blocking(move || crate::walpin::remove_beacon(&dir, pid)).await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    error = %e,
+                    "ADR-091 Amendment 2: failed to remove walpin beacon after a failed \
+                     heartbeat write; beacon will age out of the freshness window instead"
+                );
+            }
+            Err(join_err) => {
+                tracing::warn!(
+                    error = %join_err,
+                    "ADR-091 Amendment 2: walpin beacon removal task panicked"
                 );
             }
         }
@@ -761,27 +813,34 @@ impl WalpinSidecarState {
                 .await;
                 // The beacon refresh is gated on the heartbeat write
                 // landing: a fresh beacon with no heartbeat file classifies
-                // as `registered-silent` at enumeration, so refreshing after
-                // a failed write would exonerate a process that currently
-                // holds an over-threshold transaction. Skipping the refresh
-                // instead lets the beacon age toward `unknown` while the
-                // failure persists; a transient failure self-heals on the
-                // next tick.
+                // as `registered-silent` at enumeration, so a failed write
+                // would exonerate a process that currently holds an
+                // over-threshold transaction. Skipping the refresh alone is
+                // not enough — the previous touch stays inside the freshness
+                // window for up to three producer ticks — so the failure
+                // path removes the beacon outright (`drop_beacon_fail_closed`);
+                // the next successful tick re-registers it.
                 match result {
                     Ok(Ok(())) => {
                         self.wrote = true;
                         self.refresh_beacon().await;
                     }
-                    Ok(Err(e)) => tracing::warn!(
-                        error = %e,
-                        "ADR-091 Amendment 2 Plank B: failed to write walpin heartbeat; \
-                         skipping beacon refresh so this process cannot read as \
-                         registered-silent while over threshold"
-                    ),
-                    Err(join_err) => tracing::warn!(
-                        error = %join_err,
-                        "ADR-091 Amendment 2 Plank B: walpin heartbeat write task panicked"
-                    ),
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            error = %e,
+                            "ADR-091 Amendment 2 Plank B: failed to write walpin heartbeat; \
+                             removing beacon so this process cannot read as \
+                             registered-silent while over threshold"
+                        );
+                        self.drop_beacon_fail_closed().await;
+                    }
+                    Err(join_err) => {
+                        tracing::warn!(
+                            error = %join_err,
+                            "ADR-091 Amendment 2 Plank B: walpin heartbeat write task panicked"
+                        );
+                        self.drop_beacon_fail_closed().await;
+                    }
                 }
             }
             _ => {
@@ -906,7 +965,7 @@ pub async fn run_session_sweep_task(
     };
     let mut sidecar = db_path
         .and_then(|p| WalpinSidecarState::new(Some(p.as_path()), true, "session", config.interval));
-    if let Some(sidecar) = sidecar.as_ref() {
+    if let Some(sidecar) = sidecar.as_mut() {
         sidecar.register_beacon().await;
     }
 
@@ -978,7 +1037,7 @@ pub async fn run_checkpoint_task(
         config.interval,
     );
     #[cfg(unix)]
-    if let Some(sidecar) = walpin_state.as_ref() {
+    if let Some(sidecar) = walpin_state.as_mut() {
         sidecar.register_beacon().await;
     }
 
@@ -3718,7 +3777,7 @@ mod tests {
 
     #[tokio::test]
     #[serial(khive_walpin_sidecar_env)]
-    async fn walpin_observe_skips_beacon_refresh_when_heartbeat_write_fails() {
+    async fn walpin_observe_drops_beacon_when_heartbeat_write_fails() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("observe_gate.db");
         let sidecar_dir = crate::walpin::sidecar_dir_for(&db_path);
@@ -3744,29 +3803,43 @@ mod tests {
         // permissions (which would confound with the dir-mode validation):
         // occupy the exclusive-create temp name with a directory, so the
         // tolerant unlink and the O_EXCL create both fail.
-        std::fs::create_dir(sidecar_dir.join(format!(".{pid}.json.tmp"))).unwrap();
+        let obstruction = sidecar_dir.join(format!(".{pid}.json.tmp"));
+        std::fs::create_dir(&obstruction).unwrap();
 
         tokio::time::sleep(Duration::from_millis(20)).await;
+        let over_threshold = Some((
+            khive_storage::tx_registry::TxId(1),
+            Duration::from_secs(60),
+            None,
+        ));
         state
-            .observe(
-                Some((
-                    khive_storage::tx_registry::TxId(1),
-                    Duration::from_secs(60),
-                    None,
-                )),
-                Duration::from_secs(30),
-            )
+            .observe(over_threshold.clone(), Duration::from_secs(30))
             .await;
 
         assert!(
             !sidecar_dir.join(format!("{pid}.json")).exists(),
             "heartbeat write must have failed"
         );
-        let after = std::fs::metadata(&beacon_path).unwrap().modified().unwrap();
-        assert_eq!(
-            before, after,
-            "a failed heartbeat write must not refresh the beacon — a fresh \
-             beacon with no heartbeat would classify registered-silent"
+        // Skipping the refresh alone would leave `before` fresh inside the
+        // three-tick window; the fail-closed contract removes the beacon.
+        assert!(
+            !beacon_path.exists(),
+            "a failed heartbeat write must remove the beacon — a still-fresh \
+             beacon with no heartbeat would classify registered-silent \
+             (before-mtime {before:?})"
+        );
+
+        // Recovery: clear the obstruction; the next over-threshold tick
+        // writes the heartbeat and re-registers the beacon.
+        std::fs::remove_dir(&obstruction).unwrap();
+        state.observe(over_threshold, Duration::from_secs(30)).await;
+        assert!(
+            sidecar_dir.join(format!("{pid}.json")).exists(),
+            "heartbeat must land once the write path recovers"
+        );
+        assert!(
+            beacon_path.exists(),
+            "beacon must re-register on the first healthy tick after removal"
         );
     }
 
