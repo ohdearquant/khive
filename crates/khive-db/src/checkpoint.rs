@@ -1077,12 +1077,20 @@ pub async fn run_session_sweep_task(
 /// plus one drain row when pressure falls back below `warn_pages`. `None` is
 /// a no-op. See `crates/khive-db/docs/api/checkpoint.md` for the full
 /// shutdown-mechanism and event-emission design history.
+///
+/// `is_main` (ADR-091 Amendment 3): whether `pool` is the deployment's main
+/// backend. A daemon owning several file-backed backends spawns one task per
+/// backend, each with its own pool and shutdown-channel clone (the sender
+/// broadcasts to every receiver clone alike); exactly one of those calls
+/// passes `true`. See the `tx_filter` construction below for what this
+/// selects.
 pub async fn run_checkpoint_task(
     pool: Arc<ConnectionPool>,
     config: CheckpointConfig,
     event_store: Option<Arc<dyn khive_storage::EventStore>>,
     namespace: String,
     mut shutdown_rx: tokio::sync::watch::Receiver<()>,
+    is_main: bool,
 ) {
     let mut interval = tokio::time::interval(config.interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1095,19 +1103,24 @@ pub async fn run_checkpoint_task(
     // elevated" edge the ADR-094 event emission needs, so the event path
     // never has to reach into the severity state machine's private fields.
     let mut event_was_elevated = false;
-    // ADR-091 Amendment 3: this daemon's own backend-scoped view of the
-    // registry. `Main` because the checkpoint pool is (today) always the
-    // deployment's one wired backend (`checkpoint_pool_for` requires
-    // file-backed), so it must still observe legacy `Unscoped` spans from
-    // any call site not yet threaded to an origin as the designed
-    // never-silently-drop fallback. `None` only if that invariant is ever
-    // violated (an in-memory checkpoint pool) — degrades to "no open span
-    // observed" for the tick rather than panicking a long-running daemon
-    // loop on an assumed-impossible state.
+    // ADR-091 Amendment 3: this task's own backend-scoped view of the
+    // registry. `is_main` selects which `TxOriginFilter` variant applies —
+    // the caller passes `true` for exactly the one checkpoint task covering
+    // the deployment's main backend, so only that task also observes legacy
+    // `Unscoped` spans from any call site not yet threaded to an origin, the
+    // designed never-silently-drop fallback. A secondary backend's task
+    // never falls back to `Unscoped`: those spans belong to the main view or
+    // to no view, never to a database they were never registered against.
+    // `None` only when this pool's own origin isn't `Database` (an in-memory
+    // checkpoint pool) — degrades to "no open span observed" for the tick
+    // rather than panicking a long-running daemon loop on an
+    // assumed-impossible state.
     let tx_filter = match pool.origin() {
-        khive_storage::tx_registry::TxOrigin::Database(id) => {
-            Some(khive_storage::tx_registry::TxOriginFilter::Main(id))
-        }
+        khive_storage::tx_registry::TxOrigin::Database(id) => Some(if is_main {
+            khive_storage::tx_registry::TxOriginFilter::Main(id)
+        } else {
+            khive_storage::tx_registry::TxOriginFilter::Secondary(id)
+        }),
         khive_storage::tx_registry::TxOrigin::Memory
         | khive_storage::tx_registry::TxOrigin::Unscoped => None,
     };
@@ -2054,6 +2067,7 @@ mod tests {
             None,
             "local".to_string(),
             shutdown_rx,
+            true,
         ));
 
         shutdown_tx.send(()).expect("send shutdown signal");
@@ -2098,6 +2112,7 @@ mod tests {
             Some(event_store),
             "local".to_string(),
             shutdown_rx,
+            true,
         ));
 
         // Confirm strong_count is well above 1 — the old check would spin
@@ -3576,6 +3591,7 @@ mod tests {
             Some(store_dyn),
             "local".to_string(),
             shutdown_rx,
+            true,
         ));
 
         tokio::time::sleep(Duration::from_millis(60)).await;
@@ -3626,6 +3642,7 @@ mod tests {
             Some(store_dyn),
             "local".to_string(),
             shutdown_rx,
+            true,
         ));
 
         tokio::time::sleep(Duration::from_millis(60)).await;
@@ -3661,6 +3678,7 @@ mod tests {
             None,
             "local".to_string(),
             shutdown_rx,
+            true,
         ));
 
         tokio::time::sleep(Duration::from_millis(40)).await;
@@ -3721,6 +3739,7 @@ mod tests {
             None,
             "local".to_string(),
             shutdown_rx,
+            true,
         ));
 
         tokio::time::sleep(Duration::from_millis(60)).await;
@@ -3775,6 +3794,7 @@ mod tests {
             None,
             "local".to_string(),
             shutdown_rx,
+            true,
         ));
 
         tokio::time::sleep(Duration::from_millis(40)).await;
@@ -3846,6 +3866,7 @@ mod tests {
             None,
             "local".to_string(),
             shutdown_rx,
+            true,
         ));
 
         // Several 10ms intervals, every one of them writer-busy.

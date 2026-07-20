@@ -560,6 +560,19 @@ pub trait DaemonDispatch: Clone + Send + Sync + 'static {
         None
     }
 
+    /// File-backed backend pools beyond [`Self::pool_for_checkpoint`]'s pool
+    /// (ADR-091 Amendment 3): one checkpoint task is spawned per entry here,
+    /// in addition to the one spawned for the primary pool, so a
+    /// multi-backend deployment gets PASSIVE/TRUNCATE checkpointing and
+    /// sidecar enumeration on every file-backed backend it wired, not only
+    /// the main one.
+    ///
+    /// The default implementation returns an empty `Vec` — an implementor
+    /// with only one backend (or none) needs no override.
+    fn secondary_pools_for_checkpoint(&self) -> Vec<Arc<ConnectionPool>> {
+        Vec::new()
+    }
+
     /// Return the audit `EventStore` the checkpoint task should append
     /// ADR-094 lifecycle events (`CheckpointOutcomeRecorded`) to, if any.
     ///
@@ -1051,18 +1064,34 @@ pub async fn run_daemon_with_boot_guard<D: DaemonDispatch>(
     // scope and signalled as the first action once shutdown is observed,
     // below.
     let (checkpoint_shutdown_tx, checkpoint_shutdown_rx) = tokio::sync::watch::channel(());
+    // ADR-091 Amendment 3: one checkpoint task per file-backed backend the
+    // dispatcher wired — the primary pool plus every entry
+    // `secondary_pools_for_checkpoint` returns — sharing this one shutdown
+    // channel (the sender broadcasts to every receiver clone), so the single
+    // send below stops every spawned task before `drain()`.
+    let mut checkpoint_pools: Vec<(Arc<ConnectionPool>, bool)> = Vec::new();
     if let Some(pool) = dispatcher.pool_for_checkpoint() {
+        checkpoint_pools.push((pool, true));
+    }
+    for pool in dispatcher.secondary_pools_for_checkpoint() {
+        checkpoint_pools.push((pool, false));
+    }
+    if !checkpoint_pools.is_empty() {
         let cfg = CheckpointConfig::from_env();
         let event_store = dispatcher.event_store_for_checkpoint();
         let namespace = dispatcher.namespace().to_string();
-        track_background_task(run_checkpoint_task(
-            pool,
-            cfg,
-            event_store,
-            namespace,
-            checkpoint_shutdown_rx,
-        ));
-        tracing::info!("WAL checkpoint task started");
+        let checkpoint_task_count = checkpoint_pools.len();
+        for (pool, is_main) in checkpoint_pools {
+            track_background_task(run_checkpoint_task(
+                pool,
+                cfg.clone(),
+                event_store.clone(),
+                namespace.clone(),
+                checkpoint_shutdown_rx.clone(),
+                is_main,
+            ));
+        }
+        tracing::info!(checkpoint_task_count, "WAL checkpoint task(s) started");
     }
 
     let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
