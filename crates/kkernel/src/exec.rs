@@ -90,7 +90,7 @@ use khive_mcp::pending_events;
 #[cfg(unix)]
 type LocalConstructionGuard = Option<khive_runtime::daemon::DaemonBootGuard>;
 #[cfg(not(unix))]
-type LocalConstructionGuard = ();
+type LocalConstructionGuard = Option<std::fs::File>;
 
 /// Acquire the daemon boot/recovery guard for a local (non-daemon)
 /// `kkernel exec` construction path, fatally — an unavailable lock is a hard
@@ -98,8 +98,8 @@ type LocalConstructionGuard = ();
 /// FTS race this guard exists to close (#667).
 ///
 /// In-memory databases (`cfg.db_path.is_none()`) need no guard: there is no
-/// shared file another process could be racing to initialize. Non-Unix
-/// targets have no advisory boot lock to hold in the first place.
+/// shared file another process could be racing to initialize. See the
+/// `#[cfg(not(unix))]` arm below for the non-unix equivalent.
 #[cfg(unix)]
 pub(crate) fn acquire_local_construction_guard(
     cfg: &RuntimeConfig,
@@ -115,11 +115,45 @@ pub(crate) fn acquire_local_construction_guard(
     ))
 }
 
+/// Non-unix mirror of the `#[cfg(unix)]` arm above: no daemon ever boots on
+/// this target (`khive_runtime::daemon::run_daemon` is unix-only), so this
+/// guard exists purely to serialize *concurrent local-construction* callers
+/// against each other (e.g. two overlapping `kkernel exec` invocations, or
+/// `--ops-file`/`KHIVE_NO_DAEMON=1` racing a fallback dispatch) — the same
+/// cold-boot FTS race #667 closes on unix, just without a daemon on the
+/// other end of it.
+///
+/// Uses `std::fs::File::lock()` (stabilized 1.89, workspace MSRV 1.93) on the
+/// SAME lock file path the unix guard uses
+/// ([`khive_runtime::daemon::lock_path`]) — a blocking exclusive advisory
+/// lock, released when the returned `File` is dropped. On unix this API is
+/// documented to correspond exactly to `flock(..., LOCK_EX)`, i.e. the same
+/// primitive the unix arm uses directly; here it is the platform-appropriate
+/// equivalent (`LockFileEx` w/ `LOCKFILE_EXCLUSIVE_LOCK` on Windows).
 #[cfg(not(unix))]
 pub(crate) fn acquire_local_construction_guard(
-    _cfg: &RuntimeConfig,
+    cfg: &RuntimeConfig,
 ) -> Result<LocalConstructionGuard> {
-    Ok(())
+    if cfg.db_path.is_none() {
+        return Ok(None);
+    }
+    let path = khive_runtime::daemon::lock_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!("create parent directory for construction guard lock file {path:?}")
+        })?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("open construction guard lock file {path:?}"))?;
+    file.lock().context(
+        "acquire local construction guard lock for kkernel exec construction \
+         (another process may be cold-booting the same database)",
+    )?;
+    Ok(Some(file))
 }
 
 // `khive-request` is not a direct kkernel dependency.  We use serde_json to
@@ -802,6 +836,96 @@ mod tests {
             Some(v) => std::env::set_var("HOME", v),
             None => std::env::remove_var("HOME"),
         }
+    }
+
+    // ── acquire_local_construction_guard: in-memory dbs skip the guard ────────
+
+    #[test]
+    #[serial(local_exec_boot_guard)]
+    fn acquire_local_construction_guard_is_noop_for_in_memory_db() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("KHIVE_LOCK", dir.path().join("khived.recovery.lock"));
+
+        let cfg = RuntimeConfig {
+            db_path: None,
+            ..RuntimeConfig::default()
+        };
+        let guard = acquire_local_construction_guard(&cfg).expect("in-memory db needs no guard");
+        assert!(
+            guard.is_none(),
+            "an in-memory database has no shared file to serialize construction against"
+        );
+
+        std::env::remove_var("KHIVE_LOCK");
+    }
+
+    // ── acquire_local_construction_guard: file-backed dbs serialize ──────────
+    //
+    // Two threads race to acquire the guard for the same file-backed db.
+    // Both must succeed (the guard is a blocking exclusive lock, not a
+    // try-and-fail check), but their guarded critical sections must never
+    // overlap — proven the same way
+    // `khive_runtime::daemon::tests::recovery_lock_serializes_two_concurrent_boot_sequences`
+    // proves it for the raw primitive: two threads increment/decrement a
+    // shared "inside the critical section" counter around a sleep, and a
+    // third-thread-visible max-observed-concurrency of 1 is the guarantee.
+
+    #[cfg(unix)]
+    #[test]
+    #[serial(local_exec_boot_guard)]
+    fn acquire_local_construction_guard_serializes_concurrent_file_backed_callers() {
+        acquire_local_construction_guard_serializes_concurrent_file_backed_callers_impl();
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    #[serial(local_exec_boot_guard)]
+    fn acquire_local_construction_guard_serializes_concurrent_file_backed_callers_nonunix() {
+        acquire_local_construction_guard_serializes_concurrent_file_backed_callers_impl();
+    }
+
+    fn acquire_local_construction_guard_serializes_concurrent_file_backed_callers_impl() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("KHIVE_LOCK", dir.path().join("khived.recovery.lock"));
+        let db_path = dir.path().join("cold.db3");
+
+        let concurrent = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_observed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let spawn_one = |label: &'static str| {
+            let db_path = db_path.clone();
+            let concurrent = concurrent.clone();
+            let max_observed = max_observed.clone();
+            std::thread::spawn(move || {
+                let cfg = RuntimeConfig {
+                    db_path: Some(db_path),
+                    ..RuntimeConfig::default()
+                };
+                let guard = acquire_local_construction_guard(&cfg)
+                    .unwrap_or_else(|e| panic!("{label} must acquire the guard: {e}"));
+
+                let now = concurrent.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                max_observed.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                concurrent.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+
+                drop(guard);
+            })
+        };
+
+        let t_a = spawn_one("writer-a");
+        let t_b = spawn_one("writer-b");
+        t_a.join().expect("writer-a thread must not panic");
+        t_b.join().expect("writer-b thread must not panic");
+
+        assert_eq!(
+            max_observed.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the two guarded critical sections must never overlap — the guard \
+             failed to serialize concurrent local-construction callers"
+        );
+
+        std::env::remove_var("KHIVE_LOCK");
     }
 
     // ── clap / env-binding tests ───────────────────────────────────────────────
