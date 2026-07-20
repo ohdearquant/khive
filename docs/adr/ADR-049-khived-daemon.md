@@ -243,3 +243,17 @@ The daemon remains an optimization for warm-state reuse; the thin-client archite
 socket protocol, and background warm behavior of this ADR are unaffected. Quiet local
 dispatch remains the contract for genuinely daemonless environments (`no_socket` without a
 confirmed failed recovery attempt, and the `KHIVE_NO_DAEMON=1` opt-out).
+
+## Amendment 3 (2026-07-20): knowledge warm path moves with the knowledge pack
+
+Effective with the crate-extraction change that moves `khive-pack-knowledge` to a
+commercially licensed extension (ADR-047 amendment of the same date; the change lands
+as a separate pull request), the knowledge-ANN portions of this ADR — the
+knowledge-corpus snapshot restore, the `ensure_ann_background` warm path behind
+`knowledge.search`, and the knowledge warm-state sizing in the Context — describe the
+extension's deployment rather than the open-source daemon. The daemon architecture
+itself is unchanged and remains open source: the single-binary kkernel topology
+(first amendment), the socket protocol and thin-client dispatch, and the graduated
+fail-loud fallback policy (Amendment 2) all continue to apply, as does the memory
+pack's ANN warm path. Until the extraction change lands, the in-tree pack and this
+ADR's pre-amendment text describe the tree as-is.

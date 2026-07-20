@@ -262,3 +262,28 @@ Decision text.
    unmasked secret patterns. The ingester calls the same masking helper the gate uses
    before submitting commit-message and issue/PR-body content, so ingested provenance text
    is redacted rather than rejected outright.
+
+## Amendment 3 (2026-07-20) — Distribution boundary: commercially licensed extension
+
+Effective with the accompanying crate-extraction change (which lands as a separate
+pull request; this amendment records the boundary that change produces),
+`khive-pack-git` — the `commit` / `issue` / `pull_request` note kinds, the batch
+ingester, `git.digest` (Amendment 1), and the ADR-108 write verbs — ceases to be part
+of the open-source distribution. The crate ships as a commercially licensed extension,
+and the default pack set no longer includes `git` (see the ADR-023 amendment of the
+same date for the resulting default set). Until that extraction change lands, the
+in-tree crate remains present, force-linked, and part of the default pack set, and
+this ADR's pre-amendment text describes it as-is.
+
+Nothing in this ADR's Decision, Rationale, or prior amendments is superseded: the contracts
+here remain normative for the pack wherever it is deployed. What changes is ownership
+and distribution only. Once the extraction change lands:
+
+- The open-source tree no longer contains `crates/khive-pack-git`; references to that
+  path in this ADR describe the extension's crate, not an in-tree one.
+- Pack-declared endpoint rules elsewhere in the tree that name git note kinds (for
+  example the workspace pack's `contains` rules) remain declared and are simply inert
+  when the git pack is not loaded — rule installation does not require the named kinds
+  to exist (ADR-017; ADR-023 amendment).
+- A deployment that loads the extension observes exactly the surface this ADR and its
+  prior amendments specify.

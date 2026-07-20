@@ -1422,3 +1422,27 @@ existing one (`code.ingest`), against the count current as of Amendment 2's
 acceptance (79 verbs on the default pack set) — the implementation PR
 should cite the then-current count at merge time, since intervening PRs may
 have changed it.
+
+## Amendment 5 (2026-07-20) — Distribution boundary: commercially licensed extension
+
+Effective with the accompanying crate-extraction change (which lands as a separate
+pull request; this amendment records the boundary that change produces),
+`khive-pack-code` ceases to be part of the open-source distribution. The crate ships
+as a commercially licensed extension, the default pack set no longer includes `code`,
+and the open-source admin binary no longer carries the `code-ingest` subcommand
+(Amendment 3's admin ingest path) or registers `code.ingest` (see the ADR-023
+amendment of the same date for the resulting default set). Until that extraction
+change lands, the in-tree crate remains present, force-linked, and part of the
+default pack set, and this ADR's pre-amendment text describes it as-is.
+
+Nothing in this ADR's Decision or prior amendments is superseded: the ontology,
+ingest contracts, and the Amendment 4 analysis-verb specification remain normative
+for the pack wherever it is deployed. What changes is ownership and distribution
+only. Once the extraction change lands:
+
+- The open-source tree no longer contains `crates/khive-pack-code`; references to
+  that path in this ADR describe the extension's crate, not an in-tree one.
+- The map-database contract (Amendment 2's dedicated ingest target) travels with the
+  pack; no open-source component reads or writes it.
+- A deployment that loads the extension observes exactly the surface this ADR and
+  its amendments specify, including any analysis verbs landed under Amendment 4.
