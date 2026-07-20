@@ -706,12 +706,12 @@ impl WalpinSidecarState {
     }
 
     /// ADR-091 Amendment 2 beacon refresh rule: a metadata-only mtime touch
-    /// of this process's already-registered beacon, performed on EVERY
-    /// sweep tick (not just while over-threshold) — `registered-silent`
-    /// classification requires this refresh to stay within the freshness
-    /// window, not just the beacon's original write. Best-effort: a failure
-    /// here degrades this process to `unknown` at the next enumeration, not
-    /// a sweep-task error.
+    /// of this process's already-registered beacon, performed on every
+    /// sweep tick except one where an over-threshold heartbeat write failed
+    /// (see `observe`) — `registered-silent` classification requires this
+    /// refresh to stay within the freshness window, not just the beacon's
+    /// original write. Best-effort: a failure here degrades this process to
+    /// `unknown` at the next enumeration, not a sweep-task error.
     async fn refresh_beacon(&self) {
         let dir = self.dir.clone();
         let pid = self.pid;
@@ -743,7 +743,6 @@ impl WalpinSidecarState {
         oldest: Option<(khive_storage::tx_registry::TxId, Duration, Option<String>)>,
         tx_warn_secs: Duration,
     ) {
-        self.refresh_beacon().await;
         match oldest {
             Some((_, age, label)) if age >= tx_warn_secs => {
                 let heartbeat = crate::walpin::WalpinHeartbeat {
@@ -760,20 +759,33 @@ impl WalpinSidecarState {
                     crate::walpin::write_heartbeat(&dir, &heartbeat)
                 })
                 .await;
+                // The beacon refresh is gated on the heartbeat write
+                // landing: a fresh beacon with no heartbeat file classifies
+                // as `registered-silent` at enumeration, so refreshing after
+                // a failed write would exonerate a process that currently
+                // holds an over-threshold transaction. Skipping the refresh
+                // instead lets the beacon age toward `unknown` while the
+                // failure persists; a transient failure self-heals on the
+                // next tick.
                 match result {
-                    Ok(Ok(())) => {}
+                    Ok(Ok(())) => {
+                        self.wrote = true;
+                        self.refresh_beacon().await;
+                    }
                     Ok(Err(e)) => tracing::warn!(
                         error = %e,
-                        "ADR-091 Amendment 2 Plank B: failed to write walpin heartbeat"
+                        "ADR-091 Amendment 2 Plank B: failed to write walpin heartbeat; \
+                         skipping beacon refresh so this process cannot read as \
+                         registered-silent while over threshold"
                     ),
                     Err(join_err) => tracing::warn!(
                         error = %join_err,
                         "ADR-091 Amendment 2 Plank B: walpin heartbeat write task panicked"
                     ),
                 }
-                self.wrote = true;
             }
             _ => {
+                self.refresh_beacon().await;
                 if self.wrote {
                     let dir = self.dir.clone();
                     let pid = self.pid;
@@ -3702,6 +3714,60 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         cond()
+    }
+
+    #[tokio::test]
+    #[serial(khive_walpin_sidecar_env)]
+    async fn walpin_observe_skips_beacon_refresh_when_heartbeat_write_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("observe_gate.db");
+        let sidecar_dir = crate::walpin::sidecar_dir_for(&db_path);
+        let _env_guard = crate::walpin::EnvVarGuard::capture("KHIVE_WALPIN_SIDECAR");
+        std::env::set_var("KHIVE_WALPIN_SIDECAR", "1");
+
+        let mut state = WalpinSidecarState::new(
+            Some(db_path.as_path()),
+            true,
+            "session",
+            Duration::from_millis(500),
+        )
+        .expect("sidecar enabled for a file-backed path");
+        state.register_beacon().await;
+        let pid = std::process::id();
+        let beacon_path = sidecar_dir.join(format!("{pid}.beacon"));
+        let before = std::fs::metadata(&beacon_path)
+            .expect("beacon registered")
+            .modified()
+            .unwrap();
+
+        // Force the heartbeat write to fail without touching directory
+        // permissions (which would confound with the dir-mode validation):
+        // occupy the exclusive-create temp name with a directory, so the
+        // tolerant unlink and the O_EXCL create both fail.
+        std::fs::create_dir(sidecar_dir.join(format!(".{pid}.json.tmp"))).unwrap();
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        state
+            .observe(
+                Some((
+                    khive_storage::tx_registry::TxId(1),
+                    Duration::from_secs(60),
+                    None,
+                )),
+                Duration::from_secs(30),
+            )
+            .await;
+
+        assert!(
+            !sidecar_dir.join(format!("{pid}.json")).exists(),
+            "heartbeat write must have failed"
+        );
+        let after = std::fs::metadata(&beacon_path).unwrap().modified().unwrap();
+        assert_eq!(
+            before, after,
+            "a failed heartbeat write must not refresh the beacon — a fresh \
+             beacon with no heartbeat would classify registered-silent"
+        );
     }
 
     #[tokio::test]

@@ -50,7 +50,7 @@ use serde::{Deserialize, Serialize};
 /// whole-second values sourced from different clocks (the writer's own
 /// `SystemTime::now()` vs. `proc_pidinfo`/`/proc/<pid>/stat`), so this is
 /// rounding slack, not a real identity ambiguity window.
-const START_TIME_EPSILON_SECS: i64 = 2;
+const START_TIME_EPSILON_SECS: u64 = 2;
 
 /// One process's walpin heartbeat record (ADR-091 Amendment 2 Plank B).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1639,6 +1639,20 @@ fn stale_window_secs(producer_interval_ms: u64, fallback_secs: i64) -> i64 {
     }
 }
 
+/// Absolute difference of two epoch-second stamps without overflow.
+/// Persisted `started_at`/`updated_at` fields deserialize as unrestricted
+/// i64, and plain `(a - b).abs()` wraps on extreme values in release
+/// builds — a wrapped difference can land inside a freshness window and
+/// classify a malformed entry as fresh. Saturating to `u64::MAX` on
+/// overflow keeps any extreme stamp outside every window, failing toward
+/// `Unknown` rather than exoneration.
+#[cfg(unix)]
+fn epoch_abs_diff(a: i64, b: i64) -> u64 {
+    a.checked_sub(b)
+        .map(|d| d.unsigned_abs())
+        .unwrap_or(u64::MAX)
+}
+
 /// Enumerate the sidecar directory, applying the three-test liveness gate
 /// to every heartbeat/beacon entry found and
 /// classifying each PID's sidecar health three ways (ADR-091 Amendment 2
@@ -1654,7 +1668,9 @@ fn stale_window_secs(producer_interval_ms: u64, fallback_secs: i64) -> i64 {
 /// directory returns `Err`, a health *failure*, never a partial/empty
 /// result that could otherwise masquerade as "no live entries." Per entry,
 /// symlinks and non-owned files are refused BEFORE their contents are read
-/// (contributing an `Unknown` classification, not silently skipped).
+/// (contributing an `Unknown` classification, not silently skipped). At
+/// most `MAX_SIDECAR_ENTRIES` entries are read per enumeration; entries
+/// past the cap are classified `Unknown` from their filename alone.
 ///
 /// Beacon refresh rule (ADR-091 Amendment 2): registration at
 /// initialization alone never licenses `RegisteredSilent` — a beacon (or
@@ -1673,6 +1689,26 @@ fn stale_window_secs(producer_interval_ms: u64, fallback_secs: i64) -> i64 {
 /// existing-but-untrustworthy one.
 #[cfg(unix)]
 pub fn enumerate_live(dir: &Path, sweep_interval: Duration) -> io::Result<WalpinReport> {
+    enumerate_live_bounded(dir, sweep_interval, MAX_SIDECAR_ENTRIES)
+}
+
+/// Ceiling on sidecar entries read per enumeration. Each processed entry
+/// costs an open/fstat/read/parse while the checkpoint writer guard is
+/// held, so enumeration work is bounded by policy, not by directory
+/// content — the entry-count sibling of the per-entry
+/// `MAX_SIDECAR_ENTRY_BYTES` bound. A real population is one
+/// heartbeat/beacon pair per live process; entries past the cap are
+/// classified `Unknown` from their filename alone (never read, never
+/// exonerated).
+#[cfg(unix)]
+const MAX_SIDECAR_ENTRIES: usize = 512;
+
+#[cfg(unix)]
+fn enumerate_live_bounded(
+    dir: &Path,
+    sweep_interval: Duration,
+    max_entries: usize,
+) -> io::Result<WalpinReport> {
     let handle = match unix_impl::SidecarDirHandle::open_if_exists(dir) {
         Ok(Some(h)) => h,
         Ok(None) => return Ok(WalpinReport::default()),
@@ -1695,6 +1731,7 @@ pub fn enumerate_live(dir: &Path, sweep_interval: Duration) -> io::Result<Walpin
     // `RegisteredSilent` off a co-existing entry (item b).
     let mut wedged: std::collections::HashSet<u32> = Default::default();
 
+    let mut read_budget = max_entries;
     for name in handle.list_names()? {
         if name.starts_with('.') {
             continue;
@@ -1710,6 +1747,16 @@ pub fn enumerate_live(dir: &Path, sweep_interval: Duration) -> io::Result<Walpin
         else {
             continue;
         };
+
+        // Entry-count bound: past the cap, entries are classified by name
+        // alone — no open/read/parse — so directory content cannot inflate
+        // the work done under the writer guard. Unread entries stay
+        // `Unknown`, never exonerated.
+        if read_budget == 0 {
+            unknown.push((pid, "refused: sidecar entry count exceeds enumeration cap"));
+            continue;
+        }
+        read_budget -= 1;
 
         // Trust boundary: symlink/ownership refusal happens BEFORE any
         // content read, and contributes `Unknown` rather than being
@@ -1751,7 +1798,9 @@ pub fn enumerate_live(dir: &Path, sweep_interval: Duration) -> io::Result<Walpin
             let alive = is_process_alive(heartbeat.pid);
             let identity_ok = alive
                 && process_start_time_secs(heartbeat.pid)
-                    .map(|actual| (actual - heartbeat.started_at).abs() <= START_TIME_EPSILON_SECS)
+                    .map(|actual| {
+                        epoch_abs_diff(actual, heartbeat.started_at) <= START_TIME_EPSILON_SECS
+                    })
                     .unwrap_or(false);
             if !identity_ok {
                 let _ = handle.unlink_tolerant(&name);
@@ -1763,7 +1812,7 @@ pub fn enumerate_live(dir: &Path, sweep_interval: Duration) -> io::Result<Walpin
             // the ADR specifies for heartbeat freshness. The window is the
             // PRODUCER's recorded cadence, not the enumerator's.
             let window = stale_window_secs(heartbeat.interval_ms, fallback_window_secs);
-            let hb_fresh = (now - heartbeat.updated_at).abs() <= window;
+            let hb_fresh = epoch_abs_diff(now, heartbeat.updated_at) <= window as u64;
             if !hb_fresh {
                 let _ = handle.unlink_tolerant(&name);
                 wedged.insert(pid);
@@ -1785,7 +1834,9 @@ pub fn enumerate_live(dir: &Path, sweep_interval: Duration) -> io::Result<Walpin
             let alive = is_process_alive(beacon.pid);
             let identity_ok = alive
                 && process_start_time_secs(beacon.pid)
-                    .map(|actual| (actual - beacon.started_at).abs() <= START_TIME_EPSILON_SECS)
+                    .map(|actual| {
+                        epoch_abs_diff(actual, beacon.started_at) <= START_TIME_EPSILON_SECS
+                    })
                     .unwrap_or(false);
             if !identity_ok {
                 let _ = handle.unlink_tolerant(&name);
@@ -1796,7 +1847,7 @@ pub fn enumerate_live(dir: &Path, sweep_interval: Duration) -> io::Result<Walpin
             // is written once and never refreshed. The window is the
             // producer's recorded cadence, not the enumerator's.
             let window = stale_window_secs(beacon.interval_ms, fallback_window_secs);
-            let fresh = (now - mtime_secs).abs() <= window;
+            let fresh = epoch_abs_diff(now, mtime_secs) <= window as u64;
             if !fresh {
                 let _ = handle.unlink_tolerant(&name);
                 wedged.insert(pid);
@@ -2024,6 +2075,70 @@ mod tests {
         assert!(report.fully_attributed());
         // A live, fresh, identity-matched entry must be retained on disk, not deleted.
         assert!(dir.join(format!("{}.json", hb.pid)).exists());
+    }
+
+    #[test]
+    fn epoch_abs_diff_saturates_instead_of_wrapping() {
+        assert_eq!(epoch_abs_diff(5, 3), 2);
+        assert_eq!(epoch_abs_diff(3, 5), 2);
+        assert_eq!(epoch_abs_diff(0, 0), 0);
+        // `now - i64::MIN` overflows i64; wrapped arithmetic could land
+        // inside a freshness window — saturation must push it outside all.
+        assert_eq!(epoch_abs_diff(1, i64::MIN), u64::MAX);
+        assert_eq!(epoch_abs_diff(i64::MIN, i64::MAX), u64::MAX);
+        assert_eq!(epoch_abs_diff(-1, i64::MAX), 1u64 << 63);
+    }
+
+    #[test]
+    fn enumerate_live_extreme_timestamp_classifies_unknown_not_fresh() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("khive.db.walpin");
+        let mut hb = heartbeat(std::process::id());
+        hb.updated_at = i64::MIN;
+        write_heartbeat(&dir, &hb).unwrap();
+
+        let report = enumerate_live(&dir, Duration::from_secs(5)).unwrap();
+        assert!(
+            report.reporting().next().is_none(),
+            "an extreme updated_at must never classify as fresh"
+        );
+        assert!(
+            report
+                .entries
+                .iter()
+                .any(|e| matches!(e, WalpinPidHealth::Unknown { pid, .. } if *pid == hb.pid)),
+            "the extreme-timestamp entry must stay Unknown, not vanish"
+        );
+    }
+
+    #[test]
+    fn enumerate_live_bounded_caps_entries_read() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("khive.db.walpin");
+        let live = heartbeat(std::process::id());
+        write_heartbeat(&dir, &live).unwrap();
+        for pid in [2_000_000_001u32, 2_000_000_002] {
+            let mut hb = heartbeat(std::process::id());
+            hb.pid = pid;
+            write_heartbeat(&dir, &hb).unwrap();
+        }
+
+        let report = enumerate_live_bounded(&dir, Duration::from_secs(5), 1).unwrap();
+        let capped = report
+            .entries
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    WalpinPidHealth::Unknown { reason, .. }
+                        if reason.contains("enumeration cap")
+                )
+            })
+            .count();
+        assert_eq!(
+            capped, 2,
+            "entries past the read budget must surface as Unknown, never be dropped"
+        );
     }
 
     #[test]
