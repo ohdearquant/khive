@@ -888,18 +888,26 @@ beacon content each gain a `sweep_interval_ms` field, written at record
 creation (a mid-process configuration change is a content change and forces a
 rewrite). Classification is then exact:
 
-- **live** iff `enumeration_time - mtime <= 3 x declared sweep_interval_ms`
-  (boundary inclusive);
+- **live** iff `enumeration_time - mtime <= 3 x max(declared
+  sweep_interval_ms, 1000 ms)` (boundary inclusive);
 - otherwise **stale**, with Amendment 2's consequences unchanged (stale
   entries are deleted and their PIDs classify `unknown`).
+
+The `max(..., 1000 ms)` clamp is the mtime-resolution floor: filesystem
+mtime granularity is as coarse as one second, so a sub-second declared
+cadence must never narrow the classification window below what the basis
+can resolve — without the floor, a 100 ms cadence would yield a 300 ms
+window and healthy records would classify stale on any coarse filesystem.
+Sub-second cadences remain supported on the write side; the clamp affects
+classification only, flooring the effective window at three seconds.
 
 Records written by pre-amendment binaries carry no declaration; the
 enumerator evaluates them against the default interval (5000 ms), which is
 exactly today's behavior. Both timestamps come from the same host — the
 sidecar is same-machine by construction, since every writer holds the same
 database file — so no cross-host clock skew enters the comparison; filesystem
-mtime granularity (worst case one second on coarse filesystems) is absorbed
-by the multiplier. The multiplier's operational meaning is the measurable
+mtime granularity (worst case one second on coarse filesystems) is covered
+by the mtime-resolution floor above. The multiplier's operational meaning is the measurable
 spec: a touch is a synchronous same-kernel metadata write, visible to
 enumeration the moment the tick completes, so a healthy process's record
 never exceeds one declared interval of age plus scheduling jitter, and the
