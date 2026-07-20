@@ -1,6 +1,6 @@
 # ADR-118: Fresh-Tail Exact Leg — Read-Your-Writes Visibility for Vector Recall
 
-**Status**: Proposed
+**Status**: Accepted
 **Date**: 2026-07-19
 **Depends on**: [ADR-021](ADR-021-memory-pack.md) (Memory Pack),
 [ADR-079](ADR-079-ann-persistence-warm-path-integration.md) (ANN persistence, Amendment 1
