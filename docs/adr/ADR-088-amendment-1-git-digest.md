@@ -39,6 +39,10 @@ git.digest(source, project?, max_items?, include?)
   found it CREATES the anchor entity (`kind=project`, `name=<repo basename>`,
   `properties.repo_url=<canonical url>`), returning its id in the report. Auto-creation is
   reported, never silent.
+  > **Amended by [Amendment 2](ADR-088-amendment-2-anchor-identity.md)** (issue #1173):
+  > anchor resolution is now slug-first on `properties.repo_slug` with a legacy
+  > `repo_url` fallback (exact, then normalized) and backfill; the basename
+  > fallback is removed, and an orphaned-corpus signal is added to the report.
 - `max_items` (optional, int, default 500, clamp 1..2000) — bounded work per call, counted
   across commits + issues + PRs. The existing per-repo cursors (ADR-088 §5) make the verb
   resumable: each call ingests up to `max_items` and returns `done: false` with cursor
