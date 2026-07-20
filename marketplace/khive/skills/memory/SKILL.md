@@ -87,14 +87,6 @@ fact is false. Follow with a KG search if needed:
 request(ops="search(kind=\"note\", query=\"<topic>\", limit=10)")
 ```
 
-### 6. Signal feedback after recall
-
-After using recall results, emit feedback so the brain pack can tune future ranking:
-
-```
-request(ops="brain.auto_feedback(query=\"<the recall query that produced these>\", results=[{\"id\":\"<uuid>\",\"score\":0.42}], signal=\"useful\")")
-```
-
 ## Anti-patterns
 
 - **Storing everything.** Routine scratch work crowds out durable context. Store the

@@ -264,41 +264,9 @@ request(ops="knowledge.search(query=\"transformer inference optimization\", rera
 
 ## Brain (Bayesian profiles)
 
-### Create a profile
-
-```
-request(ops="brain.create_profile(name=\"research-recall\")")
-```
-
-### Activate a profile
-
-```
-request(ops="brain.activate(profile_id=\"<profile_id>\")")
-```
-
-### Give feedback on recall quality
-
-```
-request(ops="brain.feedback(target_id=\"<full_uuid>\", signal=\"useful\")")
-```
-
-`target_id` must be a full UUID. Signals: `useful`, `not_useful`, `wrong`,
-`explicit_positive`, `explicit_negative`, `correction`.
-
-### Auto-feedback after recall
-
-```
-request(ops="brain.auto_feedback(results=[{\"id\": \"<uuid>\", \"used\": true}])")
-```
-
-Convenience verb: call after `memory.recall` to automatically feed back which
-results you actually used.
-
-### Check which profile serves you
-
-```
-request(ops="brain.resolve(consumer_kind=\"recall\")")
-```
+Bayesian profile tuning of recall ranking from feedback signals (`brain.*` verbs) is a
+commercially licensed extension distributed separately; it is not part of this
+distribution.
 
 ---
 

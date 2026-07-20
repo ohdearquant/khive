@@ -2,7 +2,7 @@
 
 One plugin for the whole khive surface: a knowledge graph, GTD, memory, inter-agent comm,
 scheduling, and a domain-knowledge corpus, all served by a single MCP server (`kkernel mcp`)
-exposing one tool — `request` — that dispatches 82 verbs across 11 packs.
+exposing one tool — `request` — that dispatches 70 verbs across 11 packs.
 
 This plugin is **guidance, not a second runtime**. It ships the pattern skills that teach an
 agent how to use each pack well, plus the kg stewardship agents. The data and verbs live in the
@@ -26,7 +26,6 @@ parameter detail is always one call away at runtime: `request(ops="<verb>(help=t
 | `kg`        | kg        | Search before you create; model as typed entities + edges; explore; propose                |
 | `gtd`       | gtd       | Capture with an assignee, process the inbox, advance the lifecycle, complete with evidence |
 | `memory`    | memory    | Store-before-recall with honest salience; recall before acting                             |
-| `brain`     | brain     | Tune adaptive recall with profiles, feedback signals, and bindings                         |
 | `comm`      | comm      | Be attributable, address by actor with a subject, triage, reply to thread                  |
 | `schedule`  | schedule  | `remind` for prompts vs `schedule` for deferred verb dispatch; agenda; cancel              |
 | `knowledge` | knowledge | Search (`rerank=true`) then suggest then compose; learn + cite to grow the corpus          |
@@ -50,15 +49,18 @@ Once installed, invoke them as `khive:digester`, `khive:polisher`, and so on.
 ## Requirements
 
 The `kg` pack is the base (entities, edges, notes); every other pack builds on it. The default
-server config loads all eleven (`kg`, `gtd`, `memory`, `brain`, `comm`, `schedule`, `knowledge`,
-`session`, `git`, `code`, `workspace` — `git` contributes note kinds, a batch ingester, the
+server config loads all eleven (`kg`, `gtd`, `memory`, `comm`, `schedule`, `knowledge`,
+`session`, `git`, `code`, `workspace`, `blob` — `git` contributes note kinds, a batch ingester, the
 `git.digest` verb, and three write verbs — `git.commit`/`git.branch`/`git.push` — that shell to
 system git with hardened, allowlisted argv construction and unconditional force-push denial
 (ADR-108); `code` contributes the `code.ingest` L1/L1.5 source-ingest verb plus a `finding`
 note kind whose `findings.json` batch ingestion is reached only through the
-`kkernel code-ingest` admin CLI; `workspace` contributes entity/endpoint vocabulary, no verbs) —
-this plugin currently ships pattern skills for the first seven; `session`, `git`, `code`, and
-`workspace` have no skill yet (see the Pattern skills table above).
+`kkernel code-ingest` admin CLI; `workspace` contributes entity/endpoint vocabulary, no verbs;
+`blob` contributes content-addressed blob storage, `blob.put`/`blob.get`/`blob.stat`) —
+this plugin currently ships pattern skills for the first six; `session`, `git`, `code`,
+`workspace`, and `blob` have no skill yet (see the Pattern skills table above).
+The `brain` pack (`brain.*` verbs — Bayesian recall-tuning profiles) is a commercially
+licensed extension distributed separately; it is not part of this distribution.
 See [INSTALL.md](../INSTALL.md) for setup, the actor config, and per-pack smoke tests.
 
 ## Links

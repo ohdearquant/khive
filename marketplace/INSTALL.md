@@ -60,8 +60,6 @@ Create or update `.mcp.json` in your project root:
         "--pack",
         "memory",
         "--pack",
-        "brain",
-        "--pack",
         "comm",
         "--pack",
         "schedule",
@@ -88,9 +86,6 @@ claude mcp add --transport stdio khive -- kkernel mcp --pack gtd
 # Memory only
 claude mcp add --transport stdio khive -- kkernel mcp --pack memory
 
-# Brain only (kg dependency resolved automatically)
-claude mcp add --transport stdio khive -- kkernel mcp --pack brain
-
 # Comm only
 claude mcp add --transport stdio khive -- kkernel mcp --pack comm
 
@@ -102,7 +97,7 @@ claude mcp add --transport stdio khive -- kkernel mcp --pack knowledge
 
 # All packs (recommended)
 claude mcp add --transport stdio khive -- kkernel mcp \
-  --pack kg --pack gtd --pack memory --pack brain \
+  --pack kg --pack gtd --pack memory \
   --pack comm --pack schedule --pack knowledge
 ```
 
@@ -177,14 +172,6 @@ request(ops="gtd.complete(id=\"<id-from-assign>\")")
 ```text
 request(ops="memory.remember(content=\"install verification note\", memory_type=\"episodic\", salience=0.1)")
 request(ops="memory.recall(query=\"install verification\", limit=1)")
-```
-
-### Brain pack smoke tests
-
-```text
-request(ops="brain.profiles()")
-request(ops="brain.profile(id=\"balanced-recall-v1\")")
-request(ops="brain.resolve(consumer_kind=\"recall\")")
 ```
 
 ### Comm pack smoke tests

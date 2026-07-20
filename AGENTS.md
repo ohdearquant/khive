@@ -12,10 +12,10 @@ khive gives your agent:
 6. **Communication** — namespaced message passing between agents
 7. **Scheduling** — time-triggered reminders and future verb dispatch
 8. **Knowledge corpus** — atom/domain CRUD, FTS + embedding search, compose briefings
-9. **Brain** — Bayesian profile tuning from feedback signals
+9. **Blob storage** — content-addressed storage for binary artifacts
 10. **Session** — persist and resume agent-session records
 
-All 11 packs load by default. **82 public verbs** across the packs: the `git` pack
+All 11 packs load by default. **70 public verbs** across the packs: the `git` pack
 contributes the `git.digest` verb plus the commit/issue/pull_request provenance note kinds
 and a batch ingester, and three write verbs, `git.commit` / `git.branch` / `git.push`
 (ADR-108), that shell to system git with hardened, allowlisted argv construction — no
@@ -193,7 +193,7 @@ or `comm.thread`.
 | `knowledge.learn`          | Register a concept entity with domain/tags              | Quick concept creation                       |
 | `knowledge.cite`           | Link concept → paper/person/org (introduced_by edge)    | Attribution                                  |
 | `knowledge.topic`          | List concepts by domain or free-text                    | Explore the concept graph                    |
-| `knowledge.feedback`       | Route feedback to brain for knowledge recall tuning     | Signal useful/not_useful on compose results  |
+| `knowledge.feedback`       | Apply per-section feedback signals to posterior weights | Signal useful/not_useful on compose results  |
 
 `knowledge.search` supports `decompose=true` for multi-concept query splitting (avoids FTS edge
 cases). Scores are normalized to [0,1] when `rerank` is active (default).
@@ -324,7 +324,7 @@ _view_ for agents reading rather than parsing — they truncate long cells and a
 In a compounded request (batch/chain) the format applies **per-op** to each op's `result`; the
 `results`/`summary` envelope stays compact JSON, and error entries are never reformatted. The
 per-op override is `format_per_op` (mirrors `presentation_per_op`). Verbs whose policy is
-AlwaysVerbose (`get`, `link`, `query`, `traverse`, `neighbors`, `brain.feedback`) are exempt from
+AlwaysVerbose (`get`, `link`, `query`, `traverse`, `neighbors`) are exempt from
 the redundancy-drop even under `auto`/`table`, so agents still get their full output.
 
 **Precedence** (ADR-078 §2, highest to lowest):

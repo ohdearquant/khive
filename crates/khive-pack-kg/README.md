@@ -77,8 +77,8 @@ Over MCP, the same call is issued as a DSL string:
 request(ops="create(kind=\"entity\", entity_kind=\"concept\", name=\"RoPE\")")
 ```
 
-`khive-mcp` loads a default set of eleven packs: `kg`, `gtd`, `memory`, `brain`,
-`comm`, `schedule`, `knowledge`, `session`, `git`, `code`, `workspace`, with `kg`
+`khive-mcp` loads a default set of eleven packs: `kg`, `gtd`, `memory`, `comm`,
+`schedule`, `knowledge`, `session`, `git`, `code`, `workspace`, `blob`, with `kg`
 always present; `KHIVE_PACKS` / `--pack` select a subset.
 
 ## Where this sits
