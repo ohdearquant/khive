@@ -398,12 +398,16 @@ pub fn repo_basename(source: &DigestSource) -> String {
             .and_then(|f| f.to_str())
             .unwrap_or("repo")
             .to_string(),
-        DigestSource::Remote { canonical, .. } => strip_query_and_fragment(canonical)
+        // Derived from the fully redacted URL: a root-path remote like
+        // `https://user:token@example.com` has no path segment to split off,
+        // so without redaction the authority -- userinfo included -- would
+        // become the persisted project name.
+        DigestSource::Remote { canonical, .. } => redact_repo_url(canonical)
             .rsplit('/')
             .next()
             .filter(|s| !s.is_empty())
-            .unwrap_or("repo")
-            .to_string(),
+            .map(str::to_string)
+            .unwrap_or_else(|| "repo".to_string()),
     }
 }
 
@@ -738,6 +742,17 @@ mod tests {
             gh_slug: None,
         };
         assert_eq!(repo_basename(&src), "repo");
+    }
+
+    #[test]
+    fn repo_basename_never_carries_userinfo_for_root_path_remotes() {
+        let src = DigestSource::Remote {
+            canonical: "https://user:tok3n@example.com".to_string(),
+            gh_slug: None,
+        };
+        let name = repo_basename(&src);
+        assert_eq!(name, "example.com");
+        assert!(!name.contains("tok3n"));
     }
 
     #[tokio::test]
