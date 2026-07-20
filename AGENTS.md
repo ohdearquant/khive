@@ -14,8 +14,9 @@ khive gives your agent:
 8. **Knowledge corpus** — atom/domain CRUD, FTS + embedding search, compose briefings
 9. **Brain** — Bayesian profile tuning from feedback signals
 10. **Session** — persist and resume agent-session records
+11. **Blob storage** — content-addressed put/get/stat over a BLAKE3-keyed store
 
-All 10 packs load by default. **78 public verbs** across the packs: the `code`
+All 11 packs load by default. **81 public verbs** across the packs: the `code`
 pack contributes one verb, `code.ingest` (L1 manifest + L1.5 import-scan source ingestion
 into a dedicated map database, ADR-085 Amendment 2); its `finding` note kind is still
 written only through the `kkernel code-ingest` admin CLI path (ADR-085 D1, Amendment 3);

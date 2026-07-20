@@ -58,8 +58,8 @@ even with no `[storage.blob]` section and no `KHIVE_BLOB_ROOT` set; the verbs on
 unconfigured (erroring until a backend is installed) when the server boots against an
 in-memory backend, which has no directory to default a root beside.
 
-The default binary (no `KHIVE_PACKS`/`--pack` override) loads all 12 packs: 18 + 5 + 5 +
-15 + 7 + 4 + 19 + 4 + 4 + 1 + 0 + 3 = **85 verbs**.
+The default binary (no `KHIVE_PACKS`/`--pack` override) loads all 11 packs: 18 + 5 + 5 +
+15 + 7 + 4 + 19 + 4 + 1 + 0 + 3 = **81 verbs**.
 
 Verb names in the `kg` pack are bare (`create`, `search`, `link`, …). Every other pack
 namespaces its verbs with a `pack.` prefix (`gtd.assign`, `memory.recall`,
