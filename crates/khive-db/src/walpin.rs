@@ -63,6 +63,17 @@ pub struct WalpinHeartbeat {
     pub started_at: i64,
     pub oldest_tx_age_secs: f64,
     pub oldest_tx_label: Option<String>,
+    /// Epoch timestamp of the oldest span's registration instant, fixed for
+    /// as long as that span stays the oldest one (ADR-091 Amendment 3 Plank
+    /// F1). `None` for records written before this field existed. Present
+    /// specifically to let readers compute a current age from a body that a
+    /// touch-only tick left otherwise unchanged.
+    #[serde(default)]
+    pub oldest_tx_started_at: Option<i64>,
+    /// The instant of the last body write. No longer part of liveness
+    /// classification for a record carrying `oldest_tx_started_at` (Plank
+    /// F1 moves that basis to the entry's mtime); records without it are
+    /// still classified on this field exactly as before Amendment 3.
     pub updated_at: i64,
     /// The producer's own sweep cadence in milliseconds. Freshness at
     /// enumeration is judged against THIS cadence, not the enumerating
@@ -71,7 +82,7 @@ pub struct WalpinHeartbeat {
     /// record written before this field existed) falls back to the
     /// enumerator's own interval.
     #[serde(default)]
-    pub interval_ms: u64,
+    pub sweep_interval_ms: u64,
     /// ADR-091 Amendment 3 Plank F2: `"origin"` when the oldest span above
     /// carried this backend's own origin identity, `"fallback"` when it was
     /// an `Unscoped` span observed only through the main view's
@@ -106,7 +117,7 @@ pub struct WalpinBeacon {
     /// refresh mtime is judged against this cadence at enumeration, not the
     /// enumerating daemon's. `0` falls back to the enumerator's interval.
     #[serde(default)]
-    pub interval_ms: u64,
+    pub sweep_interval_ms: u64,
 }
 
 /// Three-state sidecar-health classification for one PID observed in the
@@ -1464,6 +1475,28 @@ pub fn write_heartbeat(dir: &Path, heartbeat: &WalpinHeartbeat) -> io::Result<()
     }
 }
 
+/// ADR-091 Amendment 3 Plank F1: a metadata-only mtime touch of this
+/// process's already-written heartbeat — no data write, mirroring
+/// [`touch_beacon`]'s mechanism and opened-directory-descriptor discipline
+/// exactly. Must run on every sweep tick where the warn condition persists
+/// and the heartbeat's content has not changed; a content change still
+/// goes through [`write_heartbeat`]. Callers must not assume the target
+/// exists — enumeration can delete a slow writer's heartbeat while its
+/// span is still live — and must recreate via [`write_heartbeat`] on any
+/// touch failure, never treat the record as gone for good.
+pub fn touch_heartbeat(dir: &Path, pid: u32) -> io::Result<()> {
+    let name = format!("{pid}.json");
+    #[cfg(unix)]
+    {
+        let handle = unix_impl::SidecarDirHandle::open_or_create(dir)?;
+        handle.touch_mtime(&name)
+    }
+    #[cfg(windows)]
+    {
+        windows_impl::touch_mtime(dir, &name)
+    }
+}
+
 /// Remove this process's registration beacon, if present (fail-closed
 /// escalation for a failing heartbeat write path — see the sidecar
 /// `observe` logic in `khive-db`'s checkpoint module). Never follows a
@@ -1684,20 +1717,27 @@ fn now_epoch_secs() -> i64 {
 }
 
 /// Staleness window for a producer sweeping at `interval`: three missed
-/// ticks, floored at one second — subsecond intervals must not collapse the
-/// window to zero, which would make any timestamp other than the current
-/// wall-clock second appear stale.
+/// ticks of a cadence floored at one second (ADR-091 Amendment 3 Plank F1's
+/// `3 x max(interval, 1000ms)`) — a sub-second interval must not collapse
+/// the window below what mtime resolution can distinguish, which would make
+/// any timestamp other than the current wall-clock second appear stale.
 #[cfg(unix)]
 fn stale_window_from(interval: Duration) -> i64 {
+    // ADR-091 Amendment 3 Plank F1's determinate form is `3 x
+    // max(declared cadence, 1000ms)` — clamp the interval to the
+    // mtime-resolution floor FIRST, then multiply by three, so a
+    // sub-second cadence floors the effective window at three seconds
+    // rather than merely at one. `max(3*interval, 1s)` (multiplying
+    // first) would under-floor any cadence below ~333ms.
     interval
-        .saturating_mul(3)
         .max(Duration::from_secs(1))
+        .saturating_mul(3)
         .as_secs() as i64
 }
 
 /// Per-record staleness window: the producer's own recorded cadence wins;
-/// `0` (a record written before `interval_ms` existed) falls back to the
-/// enumerator's window.
+/// `0` (a record written before `sweep_interval_ms` existed) falls back to
+/// the enumerator's window.
 #[cfg(unix)]
 fn stale_window_secs(producer_interval_ms: u64, fallback_secs: i64) -> i64 {
     if producer_interval_ms == 0 {
@@ -1793,11 +1833,11 @@ fn enumerate_live_bounded(
     };
 
     let now = now_epoch_secs();
-    // Fallback window for records that predate the `interval_ms` field —
-    // records carrying their producer's own cadence are judged against it
-    // instead (see `stale_window_secs`), so a session sweeping on an
-    // independently slower configured interval is not misread as stale by
-    // a faster-ticking daemon.
+    // Fallback window for records that predate the `sweep_interval_ms`
+    // field — records carrying their producer's own cadence are judged
+    // against it instead (see `stale_window_secs`), so a session sweeping
+    // on an independently slower configured interval is not misread as
+    // stale by a faster-ticking daemon.
     let fallback_window_secs = stale_window_from(sweep_interval);
 
     let mut heartbeats: std::collections::HashMap<u32, WalpinHeartbeat> = Default::default();
@@ -1882,13 +1922,22 @@ fn enumerate_live_bounded(
                 let _ = handle.unlink_tolerant(&name);
                 continue;
             }
-            // `updated_at` is the heartbeat's own field (refreshed every
-            // tick the warn condition persists); the entry's mtime tracks
-            // it closely, but the JSON field is the authoritative source
-            // the ADR specifies for heartbeat freshness. The window is the
-            // PRODUCER's recorded cadence, not the enumerator's.
-            let window = stale_window_secs(heartbeat.interval_ms, fallback_window_secs);
-            let hb_fresh = epoch_abs_diff(now, heartbeat.updated_at) <= window as u64;
+            // ADR-091 Amendment 3 Plank F1: a record carrying
+            // `oldest_tx_started_at` is new-style — its body is only
+            // rewritten on content change, so freshness is judged against
+            // the entry's mtime (advanced by a metadata-only touch every
+            // tick), never the possibly-stale `updated_at` body field. A
+            // record without it predates this amendment and is read
+            // exactly as before: `updated_at` is its own freshness field.
+            // Either way the window is the PRODUCER's recorded cadence,
+            // not the enumerator's — the mixed-version rule (readers accept
+            // both generations; see the amendment) depends on this branch.
+            let window = stale_window_secs(heartbeat.sweep_interval_ms, fallback_window_secs);
+            let hb_fresh = if heartbeat.oldest_tx_started_at.is_some() {
+                epoch_abs_diff(now, mtime_secs) <= window as u64
+            } else {
+                epoch_abs_diff(now, heartbeat.updated_at) <= window as u64
+            };
             if !hb_fresh {
                 let _ = handle.unlink_tolerant(&name);
                 wedged.insert(pid);
@@ -1922,7 +1971,7 @@ fn enumerate_live_bounded(
             // metadata-only touch), not any JSON field — the beacon's body
             // is written once and never refreshed. The window is the
             // producer's recorded cadence, not the enumerator's.
-            let window = stale_window_secs(beacon.interval_ms, fallback_window_secs);
+            let window = stale_window_secs(beacon.sweep_interval_ms, fallback_window_secs);
             let fresh = epoch_abs_diff(now, mtime_secs) <= window as u64;
             if !fresh {
                 let _ = handle.unlink_tolerant(&name);
@@ -1994,14 +2043,16 @@ mod tests {
     }
 
     fn heartbeat(pid: u32) -> WalpinHeartbeat {
+        let now = now_epoch_secs();
         WalpinHeartbeat {
             pid,
             process_role: "session".to_string(),
             started_at: process_start_time_secs(std::process::id()).unwrap_or(0),
             oldest_tx_age_secs: 45.0,
             oldest_tx_label: Some("test_span".to_string()),
-            updated_at: now_epoch_secs(),
-            interval_ms: 5_000,
+            oldest_tx_started_at: Some(now - 45),
+            updated_at: now,
+            sweep_interval_ms: 5_000,
             attribution_basis: Some("origin".to_string()),
         }
     }
@@ -2134,7 +2185,7 @@ mod tests {
             pid,
             process_role: "session".to_string(),
             started_at: process_start_time_secs(std::process::id()).unwrap_or(0),
-            interval_ms: 5_000,
+            sweep_interval_ms: 5_000,
         }
     }
 
@@ -2171,6 +2222,9 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("khive.db.walpin");
         let mut hb = heartbeat(std::process::id());
+        // Pre-amendment (`updated_at`-basis) record: this test exercises
+        // `epoch_abs_diff`'s overflow protection on that field specifically.
+        hb.oldest_tx_started_at = None;
         hb.updated_at = i64::MIN;
         write_heartbeat(&dir, &hb).unwrap();
 
@@ -2316,6 +2370,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("khive.db.walpin");
         let mut hb = heartbeat(std::process::id());
+        // Pre-amendment record: freshness classifies on `updated_at` alone.
+        hb.oldest_tx_started_at = None;
         hb.updated_at = now_epoch_secs() - 3600; // far outside 3 sweep intervals
         write_heartbeat(&dir, &hb).unwrap();
 
@@ -2518,6 +2574,8 @@ mod tests {
         let pid = std::process::id();
         write_beacon(&dir, &beacon(pid)).unwrap();
         let mut hb = heartbeat(pid);
+        // Pre-amendment record: freshness classifies on `updated_at` alone.
+        hb.oldest_tx_started_at = None;
         hb.updated_at = now_epoch_secs() - 3600;
         write_heartbeat(&dir, &hb).unwrap();
 
@@ -2560,7 +2618,12 @@ mod tests {
     /// Producer-cadence regression: freshness is judged against the cadence
     /// RECORDED in the entry, not the enumerating daemon's interval — a
     /// session sweeping on an independently slower configured interval must
-    /// not be misread as stale by a faster-ticking daemon.
+    /// not be misread as stale by a faster-ticking daemon. Pre-amendment
+    /// records (`oldest_tx_started_at: None`) still classify on `updated_at`
+    /// (ADR-091 Amendment 3 Plank F1 mixed-version rule) — a new-style
+    /// record's `updated_at` would go stale under a touch-only tick even
+    /// while its mtime stays fresh, so this test pins the basis this
+    /// exercises to the old-style body field deliberately.
     #[test]
     #[cfg(unix)]
     fn heartbeat_freshness_uses_producer_cadence_not_enumerator_interval() {
@@ -2569,7 +2632,8 @@ mod tests {
         let pid = std::process::id();
 
         let mut slow = heartbeat(pid);
-        slow.interval_ms = 60_000;
+        slow.oldest_tx_started_at = None;
+        slow.sweep_interval_ms = 60_000;
         slow.updated_at = now_epoch_secs() - 30;
         write_heartbeat(&dir, &slow).unwrap();
 
@@ -2586,12 +2650,152 @@ mod tests {
         // Control: the same 30s-old timestamp under a recorded 1s cadence
         // IS stale — the recorded cadence cuts both ways.
         let mut fast = heartbeat(pid);
-        fast.interval_ms = 1_000;
+        fast.oldest_tx_started_at = None;
+        fast.sweep_interval_ms = 1_000;
         fast.updated_at = now_epoch_secs() - 30;
         write_heartbeat(&dir, &fast).unwrap();
         let report = enumerate_live(&dir, Duration::from_secs(60)).unwrap();
         assert_eq!(report.reporting().count(), 0);
         assert_eq!(report.unknown_pids().collect::<Vec<_>>(), vec![pid]);
+    }
+
+    /// ADR-091 Amendment 3 Plank F1 mixed-version rule: a record carrying
+    /// `oldest_tx_started_at` is new-style and classifies on the entry's
+    /// mtime, never the body's `updated_at` field — a stale `updated_at`
+    /// (as a touch-only tick would leave it) must not make a genuinely
+    /// fresh entry classify stale.
+    #[test]
+    #[cfg(unix)]
+    fn enumerate_live_new_style_heartbeat_uses_mtime_not_stale_updated_at() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("khive.db.walpin");
+        let mut hb = heartbeat(std::process::id());
+        hb.updated_at = now_epoch_secs() - 3600;
+        write_heartbeat(&dir, &hb).unwrap(); // mtime is fresh (just written)
+
+        let report = enumerate_live(&dir, Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            report.reporting().count(),
+            1,
+            "a new-style record with a fresh mtime must classify live regardless \
+             of a stale `updated_at` body field: {report:?}"
+        );
+    }
+
+    /// Complement of the above: a new-style record whose mtime has fallen
+    /// outside the declared window classifies stale even though its body's
+    /// `updated_at` field looks fresh — proving the classification basis is
+    /// genuinely the mtime, not merely "whichever of the two is fresher."
+    #[test]
+    #[cfg(unix)]
+    fn enumerate_live_new_style_heartbeat_stale_via_mtime_despite_fresh_updated_at() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("khive.db.walpin");
+        let pid = std::process::id();
+        let hb = heartbeat(pid); // updated_at freshly set by the helper
+        write_heartbeat(&dir, &hb).unwrap();
+
+        let heartbeat_path = dir.join(format!("{pid}.json"));
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(&heartbeat_path)
+            .unwrap();
+        file.set_modified(SystemTime::now() - Duration::from_secs(3600))
+            .unwrap();
+
+        let report = enumerate_live(&dir, Duration::from_secs(5)).unwrap();
+        assert_eq!(report.reporting().count(), 0);
+        assert_eq!(report.unknown_pids().collect::<Vec<_>>(), vec![pid]);
+        assert!(
+            !heartbeat_path.exists(),
+            "a new-style entry stale by mtime must be deleted, not merely unreported"
+        );
+    }
+
+    /// ADR-091 Amendment 3 Plank F1: `3 x max(interval, 1000ms)` is exact
+    /// and inclusive — not "roughly 3 intervals" — and a sub-second
+    /// declared cadence floors the effective window at three seconds
+    /// (flooring the interval at 1s BEFORE multiplying by 3), never at one.
+    #[test]
+    #[cfg(unix)]
+    fn stale_window_from_boundary_inclusive_and_floors_subsecond_cadence_at_three_seconds() {
+        assert_eq!(stale_window_from(Duration::from_secs(2)), 6);
+        assert_eq!(stale_window_from(Duration::from_millis(100)), 3);
+        assert_eq!(stale_window_from(Duration::from_millis(999)), 3);
+        assert_eq!(stale_window_from(Duration::from_secs(1)), 3);
+    }
+
+    /// Boundary inclusivity exercised end-to-end through `enumerate_live`:
+    /// an entry exactly `3 x max(interval, 1000ms)` old is still live
+    /// (`<=`, not `<`); one second older is stale.
+    #[test]
+    #[cfg(unix)]
+    fn enumerate_live_new_style_heartbeat_boundary_is_inclusive() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("khive.db.walpin");
+        let pid = std::process::id();
+        let mut hb = heartbeat(pid);
+        hb.sweep_interval_ms = 2_000; // window = 3 * 2s = 6s
+
+        write_heartbeat(&dir, &hb).unwrap();
+        let heartbeat_path = dir.join(format!("{pid}.json"));
+        let touch = |age_secs: u64| {
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .open(&heartbeat_path)
+                .unwrap();
+            file.set_modified(SystemTime::now() - Duration::from_secs(age_secs))
+                .unwrap();
+        };
+
+        touch(6);
+        let report = enumerate_live(&dir, Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            report.reporting().count(),
+            1,
+            "exactly 3x the declared interval old must still classify live: {report:?}"
+        );
+
+        // Re-write (enumeration deletes stale/live entries it processes,
+        // but a live entry is retained — reuse the same file) and push one
+        // second past the boundary.
+        touch(7);
+        let report = enumerate_live(&dir, Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            report.reporting().count(),
+            0,
+            "one second past 3x the declared interval must classify stale: {report:?}"
+        );
+    }
+
+    /// Sub-second declared cadence floors the effective window at three
+    /// seconds (not one) — exercised end-to-end, not just at the pure
+    /// `stale_window_from` function.
+    #[test]
+    #[cfg(unix)]
+    fn enumerate_live_new_style_heartbeat_subsecond_cadence_floors_at_three_seconds() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("khive.db.walpin");
+        let pid = std::process::id();
+        let mut hb = heartbeat(pid);
+        hb.sweep_interval_ms = 100; // floors to a 3s window, not 300ms/1s
+
+        write_heartbeat(&dir, &hb).unwrap();
+        let heartbeat_path = dir.join(format!("{pid}.json"));
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(&heartbeat_path)
+            .unwrap();
+        file.set_modified(SystemTime::now() - Duration::from_secs(2))
+            .unwrap();
+
+        let report = enumerate_live(&dir, Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            report.reporting().count(),
+            1,
+            "a 100ms declared cadence must floor its window at 3s, not 1s: 2s old must \
+             still classify live: {report:?}"
+        );
     }
 
     /// A FIFO planted at a sidecar entry name must be refused as `Unknown`

@@ -643,7 +643,7 @@ struct WalpinSidecarState {
     /// heartbeat so the enumerating daemon judges freshness against the
     /// PRODUCER's interval — a session on an independently slower configured
     /// cadence must not be misread as stale.
-    interval_ms: u64,
+    sweep_interval_ms: u64,
     wrote: bool,
     /// Whether this process's registration beacon is believed present on
     /// disk. Cleared when a failed heartbeat write escalates to beacon
@@ -651,6 +651,46 @@ struct WalpinSidecarState {
     /// next healthy tick then re-registers with a full write instead of a
     /// metadata touch.
     beacon_registered: bool,
+    /// The content actually on disk in the last successful heartbeat body
+    /// write, if any (ADR-091 Amendment 3 Plank F1). `None` whenever the
+    /// next tick must go through a full write — no heartbeat written yet,
+    /// the last write failed, or the threshold cleared. Compared against
+    /// each new observation to decide touch (content unchanged) vs.
+    /// rewrite (content changed).
+    last_heartbeat: Option<LastHeartbeatState>,
+}
+
+/// ADR-091 Amendment 3 Plank F1: the content signature of the heartbeat
+/// body currently on disk, plus the `oldest_tx_started_at` value that body
+/// carries — kept separate from the signature proper because it is derived
+/// (fixed for as long as the same span stays oldest), not an independent
+/// change signal.
+struct LastHeartbeatState {
+    span_id: khive_storage::tx_registry::TxId,
+    label: Option<String>,
+    attribution_basis: &'static str,
+    sweep_interval_ms: u64,
+    oldest_tx_started_at: i64,
+}
+
+impl LastHeartbeatState {
+    /// Whether a fresh observation carries exactly the content already on
+    /// disk — the licensing condition for a metadata-only touch instead of
+    /// a full body rewrite (the first over-threshold observation, a change
+    /// of the oldest span's identity or label, a change of
+    /// `attribution_basis`, or a change of the declared sweep cadence).
+    fn content_matches(
+        &self,
+        span_id: khive_storage::tx_registry::TxId,
+        label: &Option<String>,
+        attribution_basis: &str,
+        sweep_interval_ms: u64,
+    ) -> bool {
+        self.span_id == span_id
+            && self.label == *label
+            && self.attribution_basis == attribution_basis
+            && self.sweep_interval_ms == sweep_interval_ms
+    }
 }
 
 impl WalpinSidecarState {
@@ -672,8 +712,9 @@ impl WalpinSidecarState {
             pid,
             role,
             started_at: crate::walpin::process_start_time_secs(pid).unwrap_or(0),
-            interval_ms: interval.as_millis().min(u64::MAX as u128) as u64,
+            sweep_interval_ms: interval.as_millis().min(u64::MAX as u128) as u64,
             wrote: false,
+            last_heartbeat: None,
             beacon_registered: false,
         })
     }
@@ -692,7 +733,7 @@ impl WalpinSidecarState {
             pid: self.pid,
             process_role: self.role.to_string(),
             started_at: self.started_at,
-            interval_ms: self.interval_ms,
+            sweep_interval_ms: self.sweep_interval_ms,
         };
         let result =
             tokio::task::spawn_blocking(move || crate::walpin::write_beacon(&dir, &beacon)).await;
@@ -809,14 +850,77 @@ impl WalpinSidecarState {
                     khive_storage::tx_registry::TxOrigin::Unscoped
                     | khive_storage::tx_registry::TxOrigin::Memory => "fallback",
                 };
+
+                // ADR-091 Amendment 3 Plank F1: a metadata-only mtime touch
+                // advances freshness whenever nothing content-relevant has
+                // changed since the last body write; a full rewrite happens
+                // only on the first over-threshold observation or a genuine
+                // content change.
+                let content_unchanged = self.wrote
+                    && self.last_heartbeat.as_ref().is_some_and(|last| {
+                        last.content_matches(
+                            span.id,
+                            &span.label,
+                            attribution_basis,
+                            self.sweep_interval_ms,
+                        )
+                    });
+
+                if content_unchanged {
+                    let dir = self.dir.clone();
+                    let pid = self.pid;
+                    let touch_result = tokio::task::spawn_blocking(move || {
+                        crate::walpin::touch_heartbeat(&dir, pid)
+                    })
+                    .await;
+                    match touch_result {
+                        Ok(Ok(())) => {
+                            self.refresh_beacon().await;
+                            return;
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!(
+                                error = %e,
+                                "ADR-091 Amendment 3 Plank F1: walpin heartbeat touch failed; \
+                                 recreating with a full body write"
+                            );
+                        }
+                        Err(join_err) => {
+                            tracing::warn!(
+                                error = %join_err,
+                                "ADR-091 Amendment 3 Plank F1: walpin heartbeat touch task \
+                                 panicked; recreating with a full body write"
+                            );
+                        }
+                    }
+                    // Recovery rule: the touch path must never assume the
+                    // target still exists — enumeration can delete a slow
+                    // writer's heartbeat while its span is still live. Fall
+                    // through to the full write below unconditionally.
+                }
+
+                // The oldest span's registration instant is fixed for as
+                // long as it stays the SAME span: reuse the previously
+                // recorded value rather than re-deriving it from `now -
+                // age`, which would drift by measurement noise across ticks
+                // for no reason. A genuinely new oldest span (or the first
+                // observation) derives it fresh.
+                let oldest_tx_started_at = self
+                    .last_heartbeat
+                    .as_ref()
+                    .filter(|last| last.span_id == span.id)
+                    .map(|last| last.oldest_tx_started_at)
+                    .unwrap_or_else(|| now_epoch_secs().saturating_sub(span.age.as_secs() as i64));
+
                 let heartbeat = crate::walpin::WalpinHeartbeat {
                     pid: self.pid,
                     process_role: self.role.to_string(),
                     started_at: self.started_at,
                     oldest_tx_age_secs: span.age.as_secs_f64(),
-                    oldest_tx_label: span.label,
+                    oldest_tx_label: span.label.clone(),
+                    oldest_tx_started_at: Some(oldest_tx_started_at),
                     updated_at: now_epoch_secs(),
-                    interval_ms: self.interval_ms,
+                    sweep_interval_ms: self.sweep_interval_ms,
                     attribution_basis: Some(attribution_basis.to_string()),
                 };
                 let dir = self.dir.clone();
@@ -836,6 +940,13 @@ impl WalpinSidecarState {
                 match result {
                     Ok(Ok(())) => {
                         self.wrote = true;
+                        self.last_heartbeat = Some(LastHeartbeatState {
+                            span_id: span.id,
+                            label: span.label,
+                            attribution_basis,
+                            sweep_interval_ms: self.sweep_interval_ms,
+                            oldest_tx_started_at,
+                        });
                         self.refresh_beacon().await;
                     }
                     Ok(Err(e)) => {
@@ -845,6 +956,10 @@ impl WalpinSidecarState {
                              removing beacon so this process cannot read as \
                              registered-silent while over threshold"
                         );
+                        // Unknown what (if anything) is on disk now — the
+                        // next tick must go through a full write, never a
+                        // touch, until a write actually lands.
+                        self.last_heartbeat = None;
                         self.drop_beacon_fail_closed().await;
                     }
                     Err(join_err) => {
@@ -852,6 +967,7 @@ impl WalpinSidecarState {
                             error = %join_err,
                             "ADR-091 Amendment 2 Plank B: walpin heartbeat write task panicked"
                         );
+                        self.last_heartbeat = None;
                         self.drop_beacon_fail_closed().await;
                     }
                 }
@@ -877,6 +993,7 @@ impl WalpinSidecarState {
                         ),
                     }
                     self.wrote = false;
+                    self.last_heartbeat = None;
                 }
             }
         }
@@ -1563,9 +1680,10 @@ fn log_walpin_sidecar_report(pool: &ConnectionPool) {
         return;
     }
     let dir = crate::walpin::sidecar_dir_for(path);
-    // Each record carries its producer's own sweep cadence (`interval_ms`),
-    // which is what freshness is judged against; the interval passed here is
-    // only the fallback for records written before that field existed.
+    // Each record carries its producer's own sweep cadence
+    // (`sweep_interval_ms`), which is what freshness is judged against; the
+    // interval passed here is only the fallback for records written before
+    // that field existed.
     let sweep_interval = SessionSweepConfig::from_env().interval;
     let report = match crate::walpin::enumerate_live(&dir, sweep_interval) {
         Ok(report) => report,
@@ -4001,6 +4119,116 @@ mod tests {
             beacon_path.exists(),
             "beacon must re-register on the first healthy tick after removal"
         );
+    }
+
+    #[tokio::test]
+    #[serial(khive_walpin_sidecar_env)]
+    async fn walpin_observe_touches_mtime_without_rewriting_body_when_content_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("observe_touch.db");
+        let sidecar_dir = crate::walpin::sidecar_dir_for(&db_path);
+        let _env_guard = crate::walpin::EnvVarGuard::capture("KHIVE_WALPIN_SIDECAR");
+        std::env::set_var("KHIVE_WALPIN_SIDECAR", "1");
+
+        let mut state = WalpinSidecarState::new(
+            Some(db_path.as_path()),
+            true,
+            "session",
+            Duration::from_millis(500),
+        )
+        .expect("sidecar enabled for a file-backed path");
+        let pid = std::process::id();
+        let heartbeat_path = sidecar_dir.join(format!("{pid}.json"));
+        let span = khive_storage::tx_registry::OldestSpan {
+            id: khive_storage::tx_registry::TxId(1),
+            age: Duration::from_secs(60),
+            label: None,
+            origin: khive_storage::tx_registry::TxOrigin::Unscoped,
+        };
+
+        state
+            .observe(Some(span.clone()), Duration::from_secs(30))
+            .await;
+        let body_after_create = std::fs::read(&heartbeat_path).expect("heartbeat written");
+
+        // Backdate the mtime so the touch is unambiguous: if `observe`
+        // rewrote the body instead of touching it, the write would also
+        // reset the mtime, making this assertion pass for the wrong reason —
+        // the body-byte comparison below is what actually distinguishes
+        // touch from rewrite.
+        let backdated = std::time::SystemTime::now() - Duration::from_secs(120);
+        std::fs::File::open(&heartbeat_path)
+            .unwrap()
+            .set_modified(backdated)
+            .unwrap();
+
+        state.observe(Some(span), Duration::from_secs(30)).await;
+
+        let body_after_second_observe =
+            std::fs::read(&heartbeat_path).expect("heartbeat still present");
+        assert_eq!(
+            body_after_create, body_after_second_observe,
+            "unchanged oldest-span identity/label/attribution/cadence must touch mtime, \
+             not rewrite the body"
+        );
+        let mtime_after = std::fs::metadata(&heartbeat_path)
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert!(
+            mtime_after > backdated,
+            "the touch must advance mtime past the backdated value"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(khive_walpin_sidecar_env)]
+    async fn walpin_observe_recreates_heartbeat_after_it_is_deleted_while_span_still_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("observe_recreate.db");
+        let sidecar_dir = crate::walpin::sidecar_dir_for(&db_path);
+        let _env_guard = crate::walpin::EnvVarGuard::capture("KHIVE_WALPIN_SIDECAR");
+        std::env::set_var("KHIVE_WALPIN_SIDECAR", "1");
+
+        let mut state = WalpinSidecarState::new(
+            Some(db_path.as_path()),
+            true,
+            "session",
+            Duration::from_millis(500),
+        )
+        .expect("sidecar enabled for a file-backed path");
+        let pid = std::process::id();
+        let heartbeat_path = sidecar_dir.join(format!("{pid}.json"));
+        let span = khive_storage::tx_registry::OldestSpan {
+            id: khive_storage::tx_registry::TxId(1),
+            age: Duration::from_secs(60),
+            label: None,
+            origin: khive_storage::tx_registry::TxOrigin::Unscoped,
+        };
+
+        state
+            .observe(Some(span.clone()), Duration::from_secs(30))
+            .await;
+        assert!(heartbeat_path.exists(), "heartbeat written on first tick");
+
+        // Simulate enumeration deleting a slow writer's heartbeat while its
+        // span is still live: the next tick still sees unchanged content
+        // (same span, same label, same attribution, same cadence) so it
+        // takes the touch path — which must detect the missing target and
+        // fall through to a full recreate rather than silently no-op.
+        std::fs::remove_file(&heartbeat_path).unwrap();
+        assert!(!heartbeat_path.exists());
+
+        state.observe(Some(span), Duration::from_secs(30)).await;
+
+        assert!(
+            heartbeat_path.exists(),
+            "a touch failure against a deleted heartbeat must recreate it via a full write"
+        );
+        let recreated: crate::walpin::WalpinHeartbeat =
+            serde_json::from_slice(&std::fs::read(&heartbeat_path).unwrap()).unwrap();
+        assert_eq!(recreated.pid, pid);
+        assert_eq!(recreated.oldest_tx_age_secs, 60.0);
     }
 
     #[tokio::test]
