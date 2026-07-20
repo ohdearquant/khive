@@ -89,8 +89,8 @@ An `Allow` decision may carry obligations the dispatch layer should honour:
 
 | Crate             | License    | Description                               |
 | ----------------- | ---------- | ----------------------------------------- |
-| `khive-gate`      | Apache-2.0 | `AllowAllGate` — permissive local default |
-| `khive-gate-rego` | Apache-2.0 | Rego-backed via `regorus` (ADR-018)       |
+| `khive-gate`      | BUSL-1.1 | `AllowAllGate` — permissive local default |
+| `khive-gate-rego` | BUSL-1.1 | Rego-backed via `regorus` (ADR-018)       |
 
 Deployments with multi-actor isolation requirements may supply a custom `Gate` implementation
 behind the `Gate` trait without modifying this crate.

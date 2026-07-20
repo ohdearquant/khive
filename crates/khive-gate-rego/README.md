@@ -113,10 +113,10 @@ Per [ADR-018](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-018-au
 
 ## Where this sits
 
-- `khive-gate` (Apache-2.0) — the public `Gate` trait, `AllowAllGate` default, and the
+- `khive-gate` (BUSL-1.1) — the public `Gate` trait, `AllowAllGate` default, and the
   `AuditEvent` contract.
-- **`khive-gate-rego` (Apache-2.0)** — this crate; the OSS reference Rego backend.
+- **`khive-gate-rego` (BUSL-1.1)** — this crate; the OSS reference Rego backend.
 
 ## License
 
-Apache-2.0.
+BUSL-1.1. See the repository [LICENSE](https://github.com/ohdearquant/khive/blob/main/LICENSE).

@@ -1,5 +1,3 @@
-// Copyright 2026 Haiyang Li. Licensed under Apache-2.0.
-//
 //! Edge-level three-way merge and dangling-edge validation.
 //!
 //! See `crates/khive-merge/docs/api/edge-merge.md` for the decision table.

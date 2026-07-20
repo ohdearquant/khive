@@ -1,5 +1,3 @@
-// Copyright 2026 Haiyang Li. Licensed under Apache-2.0.
-//
 //! KG three-way merge.
 //!
 //! See `crates/khive-merge/docs/semantic-merge-architecture.md` for design and

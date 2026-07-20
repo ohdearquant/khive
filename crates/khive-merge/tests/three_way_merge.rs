@@ -1,5 +1,3 @@
-// Copyright 2026 Haiyang Li. Licensed under Apache-2.0.
-//
 //! Integration tests for `three_way_merge()` and `ThreeWayMergeEngine`.
 
 use chrono::Utc;
