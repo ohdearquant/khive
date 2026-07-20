@@ -72,6 +72,16 @@ pub struct WalpinHeartbeat {
     /// enumerator's own interval.
     #[serde(default)]
     pub interval_ms: u64,
+    /// ADR-091 Amendment 3 Plank F2: `"origin"` when the oldest span above
+    /// carried this backend's own origin identity, `"fallback"` when it was
+    /// an `Unscoped` span observed only through the main view's
+    /// never-silently-drop fallback. `None` for records written before this
+    /// field existed. Exactly these two values when present — a consumer
+    /// MUST fail closed (treat as fallback-confidence) on any other value,
+    /// per the amendment's reading rule; this crate does not yet have a
+    /// reader that classifies on it.
+    #[serde(default)]
+    pub attribution_basis: Option<String>,
 }
 
 /// A heartbeat that survived the three-test liveness gate at enumeration time.
@@ -1992,6 +2002,7 @@ mod tests {
             oldest_tx_label: Some("test_span".to_string()),
             updated_at: now_epoch_secs(),
             interval_ms: 5_000,
+            attribution_basis: Some("origin".to_string()),
         }
     }
 

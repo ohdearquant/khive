@@ -156,14 +156,19 @@ impl SessionSweepHandle {
 /// whenever a Unix daemon does enumerate the shared sidecar directory.
 fn spawn_session_walpin_sweep(server: &KhiveMcpServer) -> Option<SessionSweepHandle> {
     let pool = server.pool()?;
-    // ADR-091 backend-scoped attribution: the sidecar directory is keyed off
-    // the pool's minted canonical identity, not the raw configured path — the
-    // same convergence every other consumer of that identity relies on.
-    let db_path = pool.canonical_path().map(std::path::PathBuf::from);
+    // ADR-091 Amendment 3: this server exposes exactly one backend pool
+    // today, so it is always the sweep's main backend — the sidecar
+    // directory and registry view are keyed off the pool's own minted
+    // identity internally, not a raw configured path passed in here.
+    // Multi-backend discovery (a secondary pool per additional wired
+    // backend) is a separate wiring concern from this single-pool server.
     let config = khive_db::SessionSweepConfig::from_env();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
     let join = tokio::spawn(khive_db::run_session_sweep_task(
-        db_path,
+        vec![khive_db::SweepBackend {
+            pool,
+            is_main: true,
+        }],
         config,
         shutdown_rx,
     ));
