@@ -33,10 +33,11 @@ pub fn segment_commit_digest(dir: &std::path::Path) -> Result<Option<[u8; 32]>, 
 }
 
 /// Write `ids` to `dir/external_ids.bin` using a tmp-then-rename pattern,
-/// bound to the commit record identified by `commit_digest`. The tmp file is
-/// created exclusively (no-follow on unix) and the final rename is performed
-/// relative to a directory descriptor, so a symlink planted at either path
-/// cannot redirect the write.
+/// bound to the commit record identified by `commit_digest`. On unix every
+/// filesystem step runs relative to a no-follow directory descriptor pinned
+/// before any byte is written, so a symlink planted at the segment dir, the
+/// tmp path, or the final path cannot redirect the write. Symlinked
+/// ancestors of the segment dir are out of scope (see `write_via_dirfd`).
 pub fn write_external_ids_sidecar(
     dir: &std::path::Path,
     commit_digest: &[u8; 32],
@@ -59,37 +60,21 @@ pub fn write_external_ids_sidecar(
     write_via_dirfd(dir, &buf)
 }
 
-/// Exclusive no-follow tmp create, then a directory-fd-relative atomic
-/// rename over the final path (mirrors `khive-db`'s `walpin` sidecar write
-/// idiom). A pre-existing entry at the tmp path — a planted symlink or a
-/// stale tmp left by a crashed prior write — is unlinked first; `remove_file`
-/// never follows a symlink, so it cannot be redirected either.
+/// All sidecar filesystem operations run relative to a directory descriptor
+/// pinned BEFORE any byte is written (mirrors `khive-db`'s `walpin` sidecar
+/// write idiom). The descriptor is opened `O_NOFOLLOW`, so a symlink planted
+/// at the segment-dir path refuses before the tmp file exists; the tmp entry
+/// is unlinked (`unlinkat` never follows) and re-created `O_EXCL |
+/// O_NOFOLLOW` relative to that descriptor, so a symlink planted at the tmp
+/// path cannot redirect the write either. A symlinked ANCESTOR of the
+/// segment directory is deliberately out of scope: whoever controls the
+/// ancestry controls the store's files directly, and no per-write defense
+/// changes that.
 #[cfg(unix)]
 fn write_via_dirfd(dir: &std::path::Path, buf: &[u8]) -> Result<(), String> {
     use std::io::Write as _;
     use std::os::unix::ffi::OsStrExt as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
     use std::os::unix::io::FromRawFd as _;
-
-    let tmp_path = dir.join("external_ids.bin.tmp");
-
-    match std::fs::remove_file(&tmp_path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(format!("remove stale external_ids.bin.tmp: {e}")),
-    }
-
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&tmp_path)
-        .map_err(|e| format!("create external_ids.bin.tmp: {e}"))?;
-    f.write_all(buf)
-        .map_err(|e| format!("write external_ids.bin.tmp: {e}"))?;
-    f.sync_all()
-        .map_err(|e| format!("sync external_ids.bin.tmp: {e}"))?;
-    drop(f);
 
     let c_dir = std::ffi::CString::new(dir.as_os_str().as_bytes())
         .map_err(|e| format!("segment dir path: {e}"))?;
@@ -111,13 +96,50 @@ fn write_via_dirfd(dir: &std::path::Path, buf: &[u8]) -> Result<(), String> {
     // is uniquely owned by this `File`, which closes it exactly once on drop.
     let dir_file = unsafe { std::fs::File::from_raw_fd(dir_fd) };
 
-    // SAFETY: both names are NUL-terminated C string literals; `dir_fd` is a
-    // live, open directory descriptor for the call's duration, and the
-    // rename is performed relative to it rather than a re-resolved path.
+    const TMP_NAME: &std::ffi::CStr = c"external_ids.bin.tmp";
+
+    // SAFETY: both arguments are live for the call; `unlinkat` removes a
+    // planted symlink or stale tmp as a directory entry, never through it.
+    let rc = unsafe { libc::unlinkat(dir_fd, TMP_NAME.as_ptr(), 0) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::ENOENT) {
+            return Err(format!("remove stale external_ids.bin.tmp: {err}"));
+        }
+    }
+
+    // SAFETY: the name and `dir_fd` are live for the call; the fd returned
+    // on success is uniquely owned and wrapped immediately below.
+    let tmp_fd = unsafe {
+        libc::openat(
+            dir_fd,
+            TMP_NAME.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o644 as libc::c_uint,
+        )
+    };
+    if tmp_fd < 0 {
+        return Err(format!(
+            "create external_ids.bin.tmp: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: `tmp_fd` was just returned by the successful `openat` above and
+    // is uniquely owned by this `File`, which closes it exactly once on drop.
+    let mut f = unsafe { std::fs::File::from_raw_fd(tmp_fd) };
+    f.write_all(buf)
+        .map_err(|e| format!("write external_ids.bin.tmp: {e}"))?;
+    f.sync_all()
+        .map_err(|e| format!("sync external_ids.bin.tmp: {e}"))?;
+    drop(f);
+
+    // SAFETY: both names are NUL-terminated C strings; `dir_fd` is a live,
+    // open directory descriptor for the call's duration, and the rename is
+    // performed relative to it rather than a re-resolved path.
     let rc = unsafe {
         libc::renameat(
             dir_fd,
-            c"external_ids.bin.tmp".as_ptr(),
+            TMP_NAME.as_ptr(),
             dir_fd,
             c"external_ids.bin".as_ptr(),
         )
@@ -301,6 +323,56 @@ mod tests {
 
         let (read_digest, read_ids) =
             read_external_ids_sidecar(segment_dir.path()).expect("sidecar must be readable");
+        assert_eq!(read_digest, digest);
+        assert_eq!(read_ids, ids);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_external_ids_sidecar_refuses_symlinked_segment_dir() {
+        let victim_dir = tempfile::tempdir().expect("victim tempdir");
+        let link_parent = tempfile::tempdir().expect("link tempdir");
+        let dir_link = link_parent.path().join("segment");
+        std::os::unix::fs::symlink(victim_dir.path(), &dir_link).expect("symlink segment dir");
+
+        let digest = [7u8; 32];
+        let ids: Vec<Uuid> = (0..2).map(|_| Uuid::new_v4()).collect();
+        let err = write_external_ids_sidecar(&dir_link, &digest, &ids)
+            .expect_err("a symlinked segment dir must refuse before any byte is written");
+        assert!(err.contains("open segment dir"), "got: {err}");
+
+        assert!(
+            !victim_dir.path().join("external_ids.bin.tmp").exists()
+                && !victim_dir.path().join("external_ids.bin").exists(),
+            "nothing may be written through the segment-dir symlink"
+        );
+    }
+
+    /// Documents the scope boundary rather than defending it: traversal
+    /// THROUGH a symlinked ancestor succeeds and lands at the real segment
+    /// dir, because `O_NOFOLLOW` guards only the final path component and a
+    /// complete ancestor defense (openat2/RESOLVE_BENEATH) does not exist on
+    /// every supported platform. An attacker who controls the ancestry
+    /// controls the store's files directly, so this is accepted, not missed.
+    #[test]
+    #[cfg(unix)]
+    fn write_external_ids_sidecar_traverses_symlinked_ancestor_by_design() {
+        let real_parent = tempfile::tempdir().expect("real parent tempdir");
+        let real_segment = real_parent.path().join("segment");
+        std::fs::create_dir(&real_segment).expect("create real segment dir");
+
+        let link_parent = tempfile::tempdir().expect("link tempdir");
+        let parent_link = link_parent.path().join("parent");
+        std::os::unix::fs::symlink(real_parent.path(), &parent_link).expect("symlink ancestor");
+        let via_ancestor = parent_link.join("segment");
+
+        let digest = [5u8; 32];
+        let ids: Vec<Uuid> = (0..2).map(|_| Uuid::new_v4()).collect();
+        write_external_ids_sidecar(&via_ancestor, &digest, &ids)
+            .expect("ancestor traversal is in-scope for the filesystem, not this guard");
+
+        let (read_digest, read_ids) =
+            read_external_ids_sidecar(&real_segment).expect("sidecar lands at the real dir");
         assert_eq!(read_digest, digest);
         assert_eq!(read_ids, ids);
     }
