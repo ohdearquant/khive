@@ -85,8 +85,11 @@ pub struct WalpinHeartbeat {
     /// daemon's — two processes with independently configured sweep
     /// intervals must not misread each other as stale. `0` (absent in a
     /// record written before this field existed) falls back to the
-    /// enumerator's own interval.
-    #[serde(default)]
+    /// enumerator's own interval. `interval_ms` is accepted as an alias for
+    /// records written before the ADR-091 Amendment 2 review-follow-up
+    /// rename — a live writer still on the old field name must not have its
+    /// real cadence silently dropped to the enumerator's fallback.
+    #[serde(default, alias = "interval_ms")]
     pub sweep_interval_ms: u64,
     /// ADR-091 Amendment 3 Plank F2: `"origin"` when the oldest span above
     /// carried this backend's own origin identity, `"fallback"` when it was
@@ -145,7 +148,10 @@ pub struct WalpinBeacon {
     /// The producer's own sweep cadence in milliseconds — the beacon's
     /// refresh mtime is judged against this cadence at enumeration, not the
     /// enumerating daemon's. `0` falls back to the enumerator's interval.
-    #[serde(default)]
+    /// `interval_ms` is accepted as an alias — see
+    /// [`WalpinHeartbeat::sweep_interval_ms`] for why the old field name
+    /// must still deserialize correctly.
+    #[serde(default, alias = "interval_ms")]
     pub sweep_interval_ms: u64,
 }
 
@@ -295,19 +301,22 @@ mod unix_impl {
         /// the OPENED descriptor, never trusted from the `mkdir` call alone
         /// — a concurrent process could have raced the creation.
         pub(super) fn open_or_create(dir: &Path) -> io::Result<Self> {
-            match Self::open_validated(dir) {
+            let (parent_fd, c_name) = Self::open_parent_and_name(dir)?;
+            match Self::open_validated_at(&parent_fd, &c_name, dir) {
                 Ok(handle) => Ok(handle),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    let c_path = path_cstring(dir)?;
-                    // SAFETY: `c_path` is NUL-terminated for the call.
-                    let rc = unsafe { libc::mkdir(c_path.as_ptr(), 0o700) };
+                    // SAFETY: `c_name` is NUL-terminated for the call;
+                    // `parent_fd` is a live, open directory descriptor for
+                    // the call's duration.
+                    let rc =
+                        unsafe { libc::mkdirat(parent_fd.as_raw_fd(), c_name.as_ptr(), 0o700) };
                     if rc != 0 {
                         let err = io::Error::last_os_error();
                         if err.kind() != io::ErrorKind::AlreadyExists {
                             return Err(err);
                         }
                     }
-                    Self::open_validated(dir)
+                    Self::open_validated_at(&parent_fd, &c_name, dir)
                 }
                 Err(e) => Err(e),
             }
@@ -318,26 +327,73 @@ mod unix_impl {
         /// not an error, and must not have the side effect of creating one
         /// — e.g. a stray `remove_heartbeat`/`touch_beacon` call).
         pub(super) fn open_if_exists(dir: &Path) -> io::Result<Option<Self>> {
-            match Self::open_validated(dir) {
+            let (parent_fd, c_name) = Self::open_parent_and_name(dir)?;
+            match Self::open_validated_at(&parent_fd, &c_name, dir) {
                 Ok(handle) => Ok(Some(handle)),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
                 Err(e) => Err(e),
             }
         }
 
-        fn open_validated(dir: &Path) -> io::Result<Self> {
-            let c_path = path_cstring(dir)?;
-            // SAFETY: `c_path` is NUL-terminated for the call; the returned
-            // fd is uniquely owned by this call and wrapped immediately.
+        /// Open `dir`'s parent directory (`O_DIRECTORY | O_NOFOLLOW`) and
+        /// return it alongside `dir`'s final path component, so the caller
+        /// can `openat()` `dir` itself relative to an already-live
+        /// descriptor instead of re-resolving `dir`'s full path. A bare
+        /// `open(dir, O_NOFOLLOW)` only refuses a symlink at `dir`'s own,
+        /// final component — an attacker who can replace `dir`'s *parent*
+        /// between path construction and this open would still redirect the
+        /// lookup, since intermediate path components are always followed
+        /// regardless of `O_NOFOLLOW`. Anchoring on the parent's descriptor
+        /// closes that gap for `dir` the same way `SidecarDirHandle` already
+        /// closes it for every entry `dir` contains.
+        fn open_parent_and_name(dir: &Path) -> io::Result<(fs::File, CString)> {
+            let parent = match dir.parent() {
+                Some(p) if !p.as_os_str().is_empty() => p,
+                _ => Path::new("."),
+            };
+            let name = dir.file_name().ok_or_else(|| {
+                io_other(format!(
+                    "walpin sidecar path {dir:?} has no final path component"
+                ))
+            })?;
+            let c_parent = path_cstring(parent)?;
+            // SAFETY: `c_parent` is NUL-terminated for the call; the
+            // returned fd is uniquely owned by this call and wrapped
+            // immediately.
             let fd = unsafe {
                 libc::open(
-                    c_path.as_ptr(),
+                    c_parent.as_ptr(),
+                    libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: `fd` was just returned by the successful `open` above.
+            let parent_file = unsafe { fs::File::from_raw_fd(fd) };
+            let c_name = name_cstring(&name.to_string_lossy())?;
+            Ok((parent_file, c_name))
+        }
+
+        fn open_validated_at(
+            parent_fd: &fs::File,
+            c_name: &CString,
+            dir: &Path,
+        ) -> io::Result<Self> {
+            // SAFETY: `c_name` is NUL-terminated for the call; `parent_fd`
+            // is a live, open directory descriptor for the call's duration;
+            // the returned fd is uniquely owned by this call and wrapped
+            // immediately.
+            let fd = unsafe {
+                libc::openat(
+                    parent_fd.as_raw_fd(),
+                    c_name.as_ptr(),
                     libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                 )
             };
             if fd < 0 {
                 let err = io::Error::last_os_error();
-                // The `O_NOFOLLOW` open above already made the refusal
+                // The `O_NOFOLLOW` openat above already made the refusal
                 // decision (a symlink at `dir` cannot have produced a live
                 // fd) — this is diagnostic-only, not a second
                 // security check, so it carries no TOCTOU risk. It exists
@@ -355,7 +411,7 @@ mod unix_impl {
                 }
                 return Err(err);
             }
-            // SAFETY: `fd` was just returned by the successful `open` above.
+            // SAFETY: `fd` was just returned by the successful `openat` above.
             let handle = Self(unsafe { fs::File::from_raw_fd(fd) });
             handle.validate(dir)?;
             Ok(handle)
@@ -724,6 +780,7 @@ mod windows_impl {
     use std::fs;
     use std::io::{self, Write};
     use std::os::raw::c_void;
+    use std::os::windows::ffi::OsStrExt;
     use std::path::Path;
     use std::time::SystemTime;
 
@@ -794,17 +851,77 @@ mod windows_impl {
         }
     }
 
+    /// Validation-then-operation on a plain path (the `write_atomic`/
+    /// `remove_checked` pattern above) is a TOCTOU race: nothing pins the
+    /// object between `symlink_metadata` and the follow-up open. The touch
+    /// path is hardened against it — `CreateFileW` with
+    /// `FILE_FLAG_OPEN_REPARSE_POINT` opens `target` AS a reparse point
+    /// rather than following it, the reparse-point check runs against the
+    /// SAME opened handle via `GetFileInformationByHandle`, and the mtime
+    /// update (`SetFileTime`) runs on that same handle — never a
+    /// re-resolved path. Pre-existing races on the write/remove paths above
+    /// are a wider class left for a follow-up; this closes it for the
+    /// per-tick touch/recreate path only.
     pub(super) fn touch_mtime(dir: &Path, name: &str) -> io::Result<()> {
         let target = dir.join(name);
-        let meta = fs::symlink_metadata(&target)
-            .map_err(|_| io_other(format!("walpin sidecar entry {target:?} does not exist")))?;
-        if meta.file_type().is_symlink() {
+        let mut wide: Vec<u16> = target.as_os_str().encode_wide().collect();
+        wide.push(0);
+
+        // SAFETY: `wide` is a valid, NUL-terminated UTF-16 string for the
+        // call's duration; `FILE_FLAG_OPEN_REPARSE_POINT` means a
+        // symlink/junction at `target` is opened as itself, never followed.
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == invalid_handle_value() {
             return Err(io_other(format!(
-                "walpin sidecar entry {target:?} is a symlink; refusing to touch it"
+                "walpin sidecar entry {target:?} does not exist or could not be opened"
             )));
         }
-        let file = fs::OpenOptions::new().write(true).open(&target)?;
-        file.set_modified(SystemTime::now())
+        let result = (|| {
+            let mut info: ByHandleFileInformation = unsafe { std::mem::zeroed() };
+            // SAFETY: `handle` is the live handle opened above; `info` is a
+            // valid, appropriately-sized output buffer for the call.
+            if unsafe { GetFileInformationByHandle(handle, &mut info) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if info.dw_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err(io_other(format!(
+                    "walpin sidecar entry {target:?} is a reparse point; refusing to touch it"
+                )));
+            }
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_err(|e| io_other(e.to_string()))?;
+            const EPOCH_DIFF_100NS: u64 = 116_444_736_000_000_000;
+            let ticks =
+                now.as_secs() * 10_000_000 + u64::from(now.subsec_nanos()) / 100 + EPOCH_DIFF_100NS;
+            let last_write = FileTime {
+                dw_low_date_time: (ticks & 0xFFFF_FFFF) as u32,
+                dw_high_date_time: (ticks >> 32) as u32,
+            };
+            // SAFETY: `handle` is live; null creation/access-time pointers
+            // leave those fields untouched (metadata-only mtime refresh,
+            // mirroring the Unix `UTIME_OMIT` behavior); `last_write` is a
+            // valid `FILETIME`-shaped value for the call's duration.
+            if unsafe { SetFileTime(handle, std::ptr::null(), std::ptr::null(), &last_write) } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        })();
+        // SAFETY: `handle` was opened above and is closed exactly once
+        // here, regardless of the touch outcome.
+        unsafe { CloseHandle(handle) };
+        result
     }
 
     type Handle = *mut c_void;
@@ -815,8 +932,36 @@ mod windows_impl {
         dw_high_date_time: u32,
     }
 
+    /// Mirrors Win32's `BY_HANDLE_FILE_INFORMATION` layout exactly — every
+    /// field must stay present and in order even though [`touch_mtime`]
+    /// only reads `dw_file_attributes`, since `GetFileInformationByHandle`
+    /// writes the full struct.
+    #[repr(C)]
+    struct ByHandleFileInformation {
+        dw_file_attributes: u32,
+        ft_creation_time: FileTime,
+        ft_last_access_time: FileTime,
+        ft_last_write_time: FileTime,
+        dw_volume_serial_number: u32,
+        n_file_size_high: u32,
+        n_file_size_low: u32,
+        n_number_of_links: u32,
+        n_file_index_high: u32,
+        n_file_index_low: u32,
+    }
+
     const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
     const STILL_ACTIVE: u32 = 259;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const OPEN_EXISTING: u32 = 3;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+
+    fn invalid_handle_value() -> Handle {
+        usize::MAX as Handle
+    }
 
     // `kernel32` is implicitly linked on every Windows target (same as
     // `std` itself relies on); no explicit `#[link(...)]` is needed, mirroring
@@ -832,6 +977,25 @@ mod windows_impl {
             lp_exit_time: *mut FileTime,
             lp_kernel_time: *mut FileTime,
             lp_user_time: *mut FileTime,
+        ) -> i32;
+        fn CreateFileW(
+            lp_file_name: *const u16,
+            dw_desired_access: u32,
+            dw_share_mode: u32,
+            lp_security_attributes: *mut c_void,
+            dw_creation_disposition: u32,
+            dw_flags_and_attributes: u32,
+            h_template_file: Handle,
+        ) -> Handle;
+        fn GetFileInformationByHandle(
+            h_file: Handle,
+            lp_file_information: *mut ByHandleFileInformation,
+        ) -> i32;
+        fn SetFileTime(
+            h_file: Handle,
+            lp_creation_time: *const FileTime,
+            lp_last_access_time: *const FileTime,
+            lp_last_write_time: *const FileTime,
         ) -> i32;
     }
 
@@ -2162,6 +2326,38 @@ mod tests {
         let content = fs::read_to_string(dir.join(format!("{}.json", hb.pid))).unwrap();
         let read_back: WalpinHeartbeat = serde_json::from_str(&content).unwrap();
         assert_eq!(read_back, hb);
+    }
+
+    #[test]
+    fn heartbeat_deserializes_pre_rename_interval_ms_field() {
+        // Old-format sidecar body from a writer that predates the
+        // `interval_ms` -> `sweep_interval_ms` rename. A live writer still
+        // on the old field name must keep its real cadence, not silently
+        // fall back to the enumerator's default (which can misjudge a slow
+        // writer's heartbeat as stale mid-upgrade).
+        let json = r#"{
+            "pid": 4242,
+            "process_role": "session",
+            "started_at": 1000,
+            "oldest_tx_age_secs": 45.0,
+            "oldest_tx_label": "test_span",
+            "updated_at": 1045,
+            "interval_ms": 60000
+        }"#;
+        let hb: WalpinHeartbeat = serde_json::from_str(json).unwrap();
+        assert_eq!(hb.sweep_interval_ms, 60_000);
+    }
+
+    #[test]
+    fn beacon_deserializes_pre_rename_interval_ms_field() {
+        let json = r#"{
+            "pid": 4242,
+            "process_role": "session",
+            "started_at": 1000,
+            "interval_ms": 60000
+        }"#;
+        let b: WalpinBeacon = serde_json::from_str(json).unwrap();
+        assert_eq!(b.sweep_interval_ms, 60_000);
     }
 
     #[test]
