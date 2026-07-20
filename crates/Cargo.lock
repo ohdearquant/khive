@@ -2512,6 +2512,7 @@ dependencies = [
  "bytemuck",
  "criterion",
  "khive-quant",
+ "libc",
  "memmap2",
  "rand 0.8.7",
  "rayon",

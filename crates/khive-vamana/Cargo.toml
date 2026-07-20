@@ -29,6 +29,9 @@ blake3 = { workspace = true }
 uuid = { workspace = true, optional = true }
 khive-quant = { version = "0.5.0", path = "../khive-quant", default-features = false }
 
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 blake3 = { workspace = true }
 tempfile = { workspace = true }

@@ -33,17 +33,15 @@ pub fn segment_commit_digest(dir: &std::path::Path) -> Result<Option<[u8; 32]>, 
 }
 
 /// Write `ids` to `dir/external_ids.bin` using a tmp-then-rename pattern,
-/// bound to the commit record identified by `commit_digest`.
+/// bound to the commit record identified by `commit_digest`. The tmp file is
+/// created exclusively (no-follow on unix) and the final rename is performed
+/// relative to a directory descriptor, so a symlink planted at either path
+/// cannot redirect the write.
 pub fn write_external_ids_sidecar(
     dir: &std::path::Path,
     commit_digest: &[u8; 32],
     ids: &[Uuid],
 ) -> Result<(), String> {
-    use std::io::Write as _;
-
-    let tmp_path = dir.join("external_ids.bin.tmp");
-    let final_path = dir.join("external_ids.bin");
-
     let mut id_bytes: Vec<u8> = Vec::with_capacity(ids.len() * 16);
     for id in ids {
         id_bytes.extend_from_slice(id.as_bytes());
@@ -58,9 +56,105 @@ pub fn write_external_ids_sidecar(
     buf.extend_from_slice(&count.to_le_bytes());
     buf.extend_from_slice(&id_bytes);
 
-    let mut f = std::fs::File::create(&tmp_path)
+    write_via_dirfd(dir, &buf)
+}
+
+/// Exclusive no-follow tmp create, then a directory-fd-relative atomic
+/// rename over the final path (mirrors `khive-db`'s `walpin` sidecar write
+/// idiom). A pre-existing entry at the tmp path — a planted symlink or a
+/// stale tmp left by a crashed prior write — is unlinked first; `remove_file`
+/// never follows a symlink, so it cannot be redirected either.
+#[cfg(unix)]
+fn write_via_dirfd(dir: &std::path::Path, buf: &[u8]) -> Result<(), String> {
+    use std::io::Write as _;
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::os::unix::io::FromRawFd as _;
+
+    let tmp_path = dir.join("external_ids.bin.tmp");
+
+    match std::fs::remove_file(&tmp_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("remove stale external_ids.bin.tmp: {e}")),
+    }
+
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&tmp_path)
         .map_err(|e| format!("create external_ids.bin.tmp: {e}"))?;
-    f.write_all(&buf)
+    f.write_all(buf)
+        .map_err(|e| format!("write external_ids.bin.tmp: {e}"))?;
+    f.sync_all()
+        .map_err(|e| format!("sync external_ids.bin.tmp: {e}"))?;
+    drop(f);
+
+    let c_dir = std::ffi::CString::new(dir.as_os_str().as_bytes())
+        .map_err(|e| format!("segment dir path: {e}"))?;
+    // SAFETY: `c_dir` is NUL-terminated for the call; the returned fd is
+    // uniquely owned by this call and wrapped immediately below.
+    let dir_fd = unsafe {
+        libc::open(
+            c_dir.as_ptr(),
+            libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if dir_fd < 0 {
+        return Err(format!(
+            "open segment dir: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: `dir_fd` was just returned by the successful `open` above and
+    // is uniquely owned by this `File`, which closes it exactly once on drop.
+    let dir_file = unsafe { std::fs::File::from_raw_fd(dir_fd) };
+
+    // SAFETY: both names are NUL-terminated C string literals; `dir_fd` is a
+    // live, open directory descriptor for the call's duration, and the
+    // rename is performed relative to it rather than a re-resolved path.
+    let rc = unsafe {
+        libc::renameat(
+            dir_fd,
+            c"external_ids.bin.tmp".as_ptr(),
+            dir_fd,
+            c"external_ids.bin".as_ptr(),
+        )
+    };
+    if rc != 0 {
+        return Err(format!(
+            "rename external_ids.bin.tmp -> external_ids.bin: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    dir_file
+        .sync_all()
+        .map_err(|e| format!("sync segment dir: {e}"))
+}
+
+/// Non-unix fallback: exclusive tmp create (no `O_NOFOLLOW` equivalent in
+/// `std` off unix) then a plain path-based rename.
+#[cfg(not(unix))]
+fn write_via_dirfd(dir: &std::path::Path, buf: &[u8]) -> Result<(), String> {
+    use std::io::Write as _;
+
+    let tmp_path = dir.join("external_ids.bin.tmp");
+    let final_path = dir.join("external_ids.bin");
+
+    match std::fs::remove_file(&tmp_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("remove stale external_ids.bin.tmp: {e}")),
+    }
+
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_path)
+        .map_err(|e| format!("create external_ids.bin.tmp: {e}"))?;
+    f.write_all(buf)
         .map_err(|e| format!("write external_ids.bin.tmp: {e}"))?;
     f.sync_all()
         .map_err(|e| format!("sync external_ids.bin.tmp: {e}"))?;
@@ -181,6 +275,34 @@ mod tests {
         std::fs::write(&path, &bytes).expect("write corrupted");
         let err = read_external_ids_sidecar(dir.path()).expect_err("must reject");
         assert!(err.contains("ids digest mismatch"), "got: {err}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_external_ids_sidecar_refuses_symlinked_tmp_path() {
+        let segment_dir = tempfile::tempdir().expect("segment tempdir");
+        let victim_dir = tempfile::tempdir().expect("victim tempdir");
+        let victim_path = victim_dir.path().join("victim.bin");
+        std::fs::write(&victim_path, b"precious").expect("write victim");
+
+        let tmp_path = segment_dir.path().join("external_ids.bin.tmp");
+        std::os::unix::fs::symlink(&victim_path, &tmp_path).expect("symlink tmp path");
+
+        let digest = [9u8; 32];
+        let ids: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
+        write_external_ids_sidecar(segment_dir.path(), &digest, &ids)
+            .expect("write must succeed despite the planted symlink");
+
+        assert_eq!(
+            std::fs::read(&victim_path).expect("victim readable"),
+            b"precious",
+            "the symlink target must never be written through"
+        );
+
+        let (read_digest, read_ids) =
+            read_external_ids_sidecar(segment_dir.path()).expect("sidecar must be readable");
+        assert_eq!(read_digest, digest);
+        assert_eq!(read_ids, ids);
     }
 
     #[test]
