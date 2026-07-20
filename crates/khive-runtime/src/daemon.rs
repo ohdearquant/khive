@@ -16,7 +16,6 @@ use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
-#[cfg(unix)]
 use std::path::PathBuf;
 
 #[cfg(unix)]
@@ -53,7 +52,9 @@ const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 10;
 
 // ── paths ─────────────────────────────────────────────────────────────────────
 
-#[cfg(unix)]
+/// Base `.khive` directory used to anchor every advisory lock/socket/pid
+/// path below. Pure path computation — portable on every target, even
+/// though most of its callers (socket/pid paths) are unix-only.
 fn khive_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     PathBuf::from(home).join(".khive")
@@ -86,10 +87,13 @@ pub fn pid_path() -> PathBuf {
 }
 
 /// Advisory lock file used to serialize stale-daemon recovery across concurrent
-/// clients (flock on the file; released when the lock file handle is dropped).
+/// clients (flock/`File::lock` on the file; released when the lock file
+/// handle is dropped). Path computation is portable; `kkernel exec`'s
+/// non-unix local-construction guard (`kkernel::exec::acquire_local_construction_guard`)
+/// shares this exact path with the unix daemon-boot guard so the two stay
+/// mutually exclusive.
 ///
 /// Overridable via the `KHIVE_LOCK` env var (for tests).
-#[cfg(unix)]
 pub fn lock_path() -> PathBuf {
     if let Ok(p) = std::env::var("KHIVE_LOCK") {
         if !p.is_empty() {
