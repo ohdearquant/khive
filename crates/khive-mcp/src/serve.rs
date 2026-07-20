@@ -84,26 +84,8 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
 
     // ADR-091 Amendment 2 Plank A: every non-daemon process runs the
     // observe-only session sweep (never PASSIVE/TRUNCATE checkpointing —
-    // that stays daemon-owned). Explicit shutdown (not just a dropped
-    // sender) runs after `serve` returns, below, so the task's heartbeat
-    // removal has actually completed before this function does.
-    let session_sweep = spawn_session_walpin_sweep(&server);
-
-    let transport_name = args.transport.as_deref().unwrap_or("stdio");
-    let transport = registry.get(transport_name).ok_or_else(|| {
-        anyhow::anyhow!(
-            "unknown transport {transport_name:?}; registered: {}",
-            registry.names().join(", ")
-        )
-    })?;
-    let opts = ServeOptions {
-        bind: args.bind.clone(),
-    };
-    let result = transport.serve(server, &opts).await;
-    if let Some(sweep) = session_sweep {
-        sweep.shutdown().await;
-    }
-    result
+    // that stays daemon-owned).
+    serve_with_session_sweep(server, &args, registry).await
 }
 
 /// Whether this process owns the email channel loops (#602).
@@ -184,6 +166,58 @@ fn spawn_session_walpin_sweep(server: &KhiveMcpServer) -> Option<SessionSweepHan
     ));
     tracing::info!("ADR-091 Amendment 2 Plank A: session WAL-registry sweep started");
     Some(SessionSweepHandle { shutdown_tx, join })
+}
+
+/// Serve `server` on the transport resolved from `args` with the ADR-091
+/// Amendment 2 Plank A session sweep held for exactly the serve scope.
+///
+/// Both non-daemon serve entrypoints (`run` and `serve_server`) funnel
+/// through here so the sweep lifecycle exists in one place. Every serve-path
+/// early return — unknown transport, serve error, clean serve return —
+/// happens inside the inner future, upstream of the unconditional shutdown
+/// below, so a future early return cannot leak the sweep task or skip its
+/// clean-shutdown heartbeat removal. Explicit shutdown (not just a dropped
+/// sender) means the task's heartbeat removal has actually completed before
+/// this function returns.
+async fn serve_with_session_sweep(
+    server: KhiveMcpServer,
+    args: &Args,
+    registry: &TransportRegistry,
+) -> anyhow::Result<()> {
+    let session_sweep = spawn_session_walpin_sweep(&server);
+    serve_holding_sweep(session_sweep, server, args, registry).await
+}
+
+/// Inner half of [`serve_with_session_sweep`], split so tests can inject an
+/// observable [`SessionSweepHandle`] and prove the shutdown is awaited on
+/// every return path — the completion signal fires happens-before this
+/// function returns, which the spawn-composed wrapper cannot demonstrate
+/// deterministically (a dropped sender also wakes the task, just not before
+/// the caller resumes).
+async fn serve_holding_sweep(
+    session_sweep: Option<SessionSweepHandle>,
+    server: KhiveMcpServer,
+    args: &Args,
+    registry: &TransportRegistry,
+) -> anyhow::Result<()> {
+    let result = async {
+        let transport_name = args.transport.as_deref().unwrap_or("stdio");
+        let transport = registry.get(transport_name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown transport {transport_name:?}; registered: {}",
+                registry.names().join(", ")
+            )
+        })?;
+        let opts = ServeOptions {
+            bind: args.bind.clone(),
+        };
+        transport.serve(server, &opts).await
+    }
+    .await;
+    if let Some(sweep) = session_sweep {
+        sweep.shutdown().await;
+    }
+    result
 }
 
 /// Spawn the email channel loops if — and only if — `args` indicates this
@@ -1475,23 +1509,7 @@ pub async fn serve_server(
     // coordinator boot path (sweep coverage, ADR-091 Amendment 2).
     // Without this spawn, every multi-backend session is permanently
     // invisible to cross-process WAL-pin attribution.
-    let session_sweep = spawn_session_walpin_sweep(&server);
-
-    let transport_name = args.transport.as_deref().unwrap_or("stdio");
-    let transport = registry.get(transport_name).ok_or_else(|| {
-        anyhow::anyhow!(
-            "unknown transport {transport_name:?}; registered: {}",
-            registry.names().join(", ")
-        )
-    })?;
-    let opts = ServeOptions {
-        bind: args.bind.clone(),
-    };
-    let result = transport.serve(server, &opts).await;
-    if let Some(sweep) = session_sweep {
-        sweep.shutdown().await;
-    }
-    result
+    serve_with_session_sweep(server, args, registry).await
 }
 
 /// Build the VerbRegistry and per-pack runtimes for a multi-backend deployment
@@ -7801,5 +7819,115 @@ backend = "kg-backend"
                  sleep happened to cross a calendar-day boundary"
             );
         }
+    }
+
+    /// The sweep-lifecycle guard funnels every serve-path early return
+    /// through the unconditional sweep shutdown: transport-resolution
+    /// failure must still complete promptly (the sweep task is shut down
+    /// and awaited, not leaked past the error return).
+    #[tokio::test]
+    #[serial]
+    async fn serve_with_session_sweep_completes_shutdown_on_unknown_transport() {
+        use clap::Parser;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("khive.db");
+        let config_path = write_config(dir.path(), "");
+        let args = Args::parse_from([
+            "kkernel",
+            "--db",
+            db_path.to_str().expect("utf8 path"),
+            "--config",
+            config_path.to_str().expect("utf8 path"),
+            "--transport",
+            "no-such-transport",
+            "--no-embed",
+            "--pack",
+            "kg",
+        ]);
+        let (server, _schedule_rt) = build_server(&args).expect("build server");
+
+        let registry = TransportRegistry::default();
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            serve_with_session_sweep(server, &args, &registry),
+        )
+        .await
+        .expect("guard must complete promptly, including sweep shutdown")
+        .expect_err("unknown transport must fail resolution");
+        assert!(
+            err.to_string().contains("unknown transport"),
+            "unexpected error: {err}"
+        );
+
+        // No heartbeat entry may survive the guard's explicit shutdown —
+        // the sweep never went over-threshold here, and its clean-shutdown
+        // path removes any heartbeat it did write.
+        let heartbeat = dir
+            .path()
+            .join("khive.db.walpin")
+            .join(format!("{}.json", std::process::id()));
+        assert!(
+            !heartbeat.exists(),
+            "sweep heartbeat must not survive the serve guard"
+        );
+    }
+
+    /// Discriminating regression for the sweep-lifecycle guard: the old
+    /// code's early `?` return on transport resolution dropped the handle
+    /// without awaiting shutdown, so the task's exit raced the caller's
+    /// resume. The guard must await `SessionSweepHandle::shutdown` on the
+    /// error path — observed here via an injected task whose completion
+    /// flag flips only after it receives the shutdown signal, checked
+    /// synchronously the moment the guard returns.
+    #[tokio::test]
+    #[serial]
+    async fn serve_guard_awaits_sweep_shutdown_before_returning() {
+        use clap::Parser;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("khive.db");
+        let config_path = write_config(dir.path(), "");
+        let args = Args::parse_from([
+            "kkernel",
+            "--db",
+            db_path.to_str().expect("utf8 path"),
+            "--config",
+            config_path.to_str().expect("utf8 path"),
+            "--transport",
+            "no-such-transport",
+            "--no-embed",
+            "--pack",
+            "kg",
+        ]);
+        let (server, _schedule_rt) = build_server(&args).expect("build server");
+
+        let completed = Arc::new(AtomicBool::new(false));
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(());
+        let join = tokio::spawn({
+            let completed = Arc::clone(&completed);
+            async move {
+                let _ = shutdown_rx.changed().await;
+                completed.store(true, Ordering::SeqCst);
+            }
+        });
+        let handle = SessionSweepHandle { shutdown_tx, join };
+
+        let registry = TransportRegistry::default();
+        let err = serve_holding_sweep(Some(handle), server, &args, &registry)
+            .await
+            .expect_err("unknown transport must fail resolution");
+        assert!(
+            err.to_string().contains("unknown transport"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            completed.load(Ordering::SeqCst),
+            "the guard must await sweep shutdown before returning on the \
+             transport-resolution error path — an unawaited (dropped) handle \
+             leaves this flag unset at the moment the guard returns"
+        );
     }
 }
