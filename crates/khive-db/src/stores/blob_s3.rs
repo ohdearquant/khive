@@ -491,12 +491,51 @@ impl BlobStore for S3BlobStore {
             });
         }
 
-        let bytes = match tokio::time::timeout(self.request_timeout, result.bytes()).await {
-            Ok(Ok(bytes)) => bytes,
-            Ok(Err(e)) => return Err(map_object_store_err(e, "get")),
-            Err(_elapsed) => return Err(timeout_error("get")),
+        // The `meta.size` check above only bounds what the object store's
+        // (untrusted) response metadata *claims* the object is — a server or
+        // response that reports a small size while streaming a larger body
+        // would otherwise be collected in full by `result.bytes()` before
+        // this function ever gets to inspect the length. Bound the cap on
+        // the bytes actually consumed instead (ADR-111 Amendment 2):
+        // read the stream chunk by chunk, keep a running total, and abort as
+        // soon as it exceeds `MAX_OBJECT_BYTES` rather than trusting the
+        // reported metadata size to hold.
+        let size_hint = result.meta.size.min(MAX_OBJECT_BYTES) as usize;
+        let mut stream = result.into_stream();
+        // ONE end-to-end deadline for the whole hydration:
+        // a fresh `self.request_timeout` per `stream.next()` call let a peer
+        // trickling bytes just under that per-chunk cadence hold one of the
+        // bounded hydration permits open indefinitely, since no single call
+        // ever timed out. Wrapping the entire consume loop in one timeout
+        // bounds total time-to-hydrate, not just the gap between chunks; the
+        // per-chunk cumulative-size check is unchanged.
+        let consume = async {
+            let mut buf: Vec<u8> = Vec::with_capacity(size_hint);
+            loop {
+                match stream.next().await {
+                    Some(Ok(chunk)) => {
+                        if buf.len() as u64 + chunk.len() as u64 > MAX_OBJECT_BYTES {
+                            return Err(StorageError::InvalidInput {
+                                capability: StorageCapability::Blob,
+                                operation: "get".into(),
+                                message: format!(
+                                    "object body exceeded the {MAX_OBJECT_BYTES}-byte v1 ceiling \
+                                     while streaming (ADR-111 Amendment 2); reported metadata \
+                                     size cannot be trusted to bound the actual transfer"
+                                ),
+                            });
+                        }
+                        buf.extend_from_slice(&chunk);
+                    }
+                    Some(Err(e)) => return Err(map_object_store_err(e, "get")),
+                    None => return Ok(buf),
+                }
+            }
         };
-        Ok(bytes.to_vec())
+        match tokio::time::timeout(self.request_timeout, consume).await {
+            Ok(result) => result,
+            Err(_elapsed) => Err(timeout_error("get")),
+        }
     }
 
     async fn exists(&self, content_ref: &ContentRef) -> StorageResult<bool> {
@@ -951,6 +990,19 @@ mod tests {
             get_script: Mutex<Vec<Outcome>>,
             list_script: Arc<Mutex<Vec<ListOutcome>>>,
             delete_script: Arc<Mutex<Vec<Outcome>>>,
+            /// Overrides the default empty-body `Outcome::Ok` response for
+            /// `get_opts`: `(reported_meta_size, pre-chunked stream body,
+            /// per-chunk delay)`. Lets tests simulate an object store whose
+            /// response metadata under-reports the real body length
+            /// (ADR-111 Amendment 2: `get` must bound the actual
+            /// stream, not trust this), control exactly how many
+            /// `stream.next()` calls the body arrives over (e.g. one
+            /// oversized chunk vs many small ones), and — via the delay —
+            /// simulate a peer trickling bytes slower than the total
+            /// hydration deadline while still resolving each individual
+            /// `stream.next()` call well within it (end-to-end vs per-chunk
+            /// deadline coverage).
+            get_body_override: Mutex<Option<(u64, Vec<Bytes>, Duration)>>,
             pub put_calls: AtomicUsize,
             pub get_calls: AtomicUsize,
             pub delete_calls: Arc<AtomicUsize>,
@@ -975,6 +1027,7 @@ mod tests {
                     get_script: Mutex::new(get_script),
                     list_script: Arc::new(Mutex::new(Vec::new())),
                     delete_script: Arc::new(Mutex::new(vec![Outcome::Ok])),
+                    get_body_override: Mutex::new(None),
                     put_calls: AtomicUsize::new(0),
                     get_calls: AtomicUsize::new(0),
                     delete_calls: Arc::new(AtomicUsize::new(0)),
@@ -994,6 +1047,35 @@ mod tests {
             /// to always-`Ok` so existing sweep behavior needs no script.
             pub fn with_delete_script(self, script: Vec<Outcome>) -> Self {
                 *self.delete_script.lock().unwrap() = script;
+                self
+            }
+
+            /// Override the body an `Outcome::Ok` `get_opts` response
+            /// streams, independent of the `reported_size` its `ObjectMeta`
+            /// claims — used to simulate an object store whose response
+            /// metadata under-reports the real streamed length. `chunks`
+            /// controls exactly how many `stream.next()` calls the body
+            /// arrives over (e.g. one oversized chunk vs many small ones),
+            /// so tests can exercise the running-total bound both within a
+            /// single chunk and across several.
+            pub fn with_get_body_chunks(self, reported_size: u64, chunks: Vec<Bytes>) -> Self {
+                *self.get_body_override.lock().unwrap() =
+                    Some((reported_size, chunks, Duration::ZERO));
+                self
+            }
+
+            /// Same as [`Self::with_get_body_chunks`], but sleeps
+            /// `per_chunk_delay` before yielding each chunk from the stream —
+            /// lets a test drive each `stream.next()` call under a per-chunk
+            /// timeout while the whole stream still exceeds an end-to-end one.
+            pub fn with_get_body_chunks_delayed(
+                self,
+                reported_size: u64,
+                chunks: Vec<Bytes>,
+                per_chunk_delay: Duration,
+            ) -> Self {
+                *self.get_body_override.lock().unwrap() =
+                    Some((reported_size, chunks, per_chunk_delay));
                 self
             }
 
@@ -1040,20 +1122,34 @@ mod tests {
                 if matches!(outcome, Outcome::Hang) {
                     tokio::time::sleep(self.hang_delay).await;
                 }
-                outcome_to_result(&outcome, || GetResult {
-                    payload: GetResultPayload::Stream(
-                        stream::once(async { Ok(Bytes::new()) }).boxed(),
-                    ),
-                    meta: ObjectMeta {
-                        location: location.clone(),
-                        last_modified: chrono::Utc::now(),
-                        size: 0,
-                        e_tag: None,
-                        version: None,
-                    },
-                    range: 0..0,
-                    attributes: Default::default(),
-                    extensions: Default::default(),
+                let override_body = self.get_body_override.lock().unwrap().clone();
+                outcome_to_result(&outcome, || {
+                    let (reported_size, body_chunks, per_chunk_delay) =
+                        override_body.unwrap_or((0, Vec::new(), Duration::ZERO));
+                    let chunks: Vec<Result<Bytes>> = body_chunks.into_iter().map(Ok).collect();
+                    let body_stream = if per_chunk_delay.is_zero() {
+                        stream::iter(chunks).boxed()
+                    } else {
+                        stream::iter(chunks)
+                            .then(move |c| async move {
+                                tokio::time::sleep(per_chunk_delay).await;
+                                c
+                            })
+                            .boxed()
+                    };
+                    GetResult {
+                        payload: GetResultPayload::Stream(body_stream),
+                        meta: ObjectMeta {
+                            location: location.clone(),
+                            last_modified: chrono::Utc::now(),
+                            size: reported_size,
+                            e_tag: None,
+                            version: None,
+                        },
+                        range: 0..0,
+                        attributes: Default::default(),
+                        extensions: Default::default(),
+                    }
                 })
             }
 
@@ -1128,6 +1224,7 @@ mod tests {
         }
     }
 
+    use bytes::Bytes;
     use fake_client::{FakeObjectStore, ListOutcome, Outcome};
     use std::sync::atomic::Ordering;
 
@@ -1215,6 +1312,95 @@ mod tests {
     async fn get_timeout_maps_to_storage_timeout() {
         let (_fake, store) = fake_store(vec![], vec![Outcome::Hang]);
         let content_ref = ContentRef::from_hex("b".repeat(64)).unwrap();
+        let err = store.get(&content_ref).await.unwrap_err();
+        assert!(matches!(err, StorageError::Timeout { .. }), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn get_rejects_body_larger_than_reported_metadata_size() {
+        // ADR-111 Amendment 2: `get` must check the
+        // running total against the cap BEFORE appending a chunk, not
+        // after — otherwise a single oversized chunk is copied into the
+        // local buffer in full before the ceiling is ever enforced. Script
+        // a response that reports a tiny size but streams the *entire*
+        // over-cap body as ONE chunk (a single `stream.next()` call): with
+        // the check-before-append ordering, that chunk must be rejected
+        // without ever being appended, so the local buffer never grows
+        // past `MAX_OBJECT_BYTES`.
+        let oversized = vec![b'x'; (MAX_OBJECT_BYTES as usize) + 1024];
+        let fake = Arc::new(
+            FakeObjectStore::new(vec![], vec![Outcome::Ok])
+                .with_get_body_chunks(1, vec![Bytes::from(oversized)]),
+        );
+        let store = S3BlobStore::from_client_for_test(
+            Arc::clone(&fake) as Arc<dyn ObjectStore>,
+            "blobs",
+            3,
+            Duration::from_millis(50),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let content_ref = ContentRef::from_hex("e".repeat(64)).unwrap();
+        let err = store.get(&content_ref).await.unwrap_err();
+        assert!(
+            matches!(err, StorageError::InvalidInput { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_accepts_single_chunk_body_exactly_at_the_cap() {
+        // Boundary companion to the oversized-single-chunk test above:
+        // a body of exactly `MAX_OBJECT_BYTES`, delivered as one chunk,
+        // must succeed — confirming the check-before-append reorder didn't
+        // shift the ceiling off-by-one.
+        let exact = vec![b'x'; MAX_OBJECT_BYTES as usize];
+        let fake = Arc::new(
+            FakeObjectStore::new(vec![], vec![Outcome::Ok])
+                .with_get_body_chunks(MAX_OBJECT_BYTES, vec![Bytes::from(exact.clone())]),
+        );
+        let store = S3BlobStore::from_client_for_test(
+            Arc::clone(&fake) as Arc<dyn ObjectStore>,
+            "blobs",
+            3,
+            Duration::from_millis(50),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let content_ref = ContentRef::from_hex("e".repeat(64)).unwrap();
+        let bytes = store.get(&content_ref).await.unwrap();
+        assert_eq!(bytes.len(), exact.len());
+    }
+
+    #[tokio::test]
+    async fn get_enforces_one_end_to_end_deadline_across_slow_chunks() {
+        // A fresh `request_timeout` applied per `stream.next()` call would
+        // let a peer trickling bytes just under that per-chunk cadence
+        // hold the hydration open indefinitely. Script three small chunks, each individually well
+        // within `request_timeout`, but whose combined delay exceeds it —
+        // under the old per-chunk timeout this would have succeeded; under
+        // the fixed single end-to-end deadline it must time out.
+        let chunks = vec![
+            Bytes::from(vec![b'x'; 8]),
+            Bytes::from(vec![b'x'; 8]),
+            Bytes::from(vec![b'x'; 8]),
+        ];
+        let fake = Arc::new(
+            FakeObjectStore::new(vec![], vec![Outcome::Ok]).with_get_body_chunks_delayed(
+                24,
+                chunks,
+                Duration::from_millis(30),
+            ),
+        );
+        let store = S3BlobStore::from_client_for_test(
+            Arc::clone(&fake) as Arc<dyn ObjectStore>,
+            "blobs",
+            3,
+            Duration::from_millis(50), // < 3 * 30ms combined chunk delay
+            Duration::from_millis(1),
+        )
+        .unwrap();
+        let content_ref = ContentRef::from_hex("f".repeat(64)).unwrap();
         let err = store.get(&content_ref).await.unwrap_err();
         assert!(matches!(err, StorageError::Timeout { .. }), "got {err:?}");
     }
