@@ -2,7 +2,7 @@
 
 One plugin for the whole khive surface: a knowledge graph, GTD, memory, inter-agent comm,
 and scheduling, all served by a single MCP server (`kkernel mcp`)
-exposing one tool — `request` — that dispatches 66 verbs across 11 packs.
+exposing one tool — `request` — that dispatches 65 verbs across 10 packs.
 
 This plugin is **guidance, not a second runtime**. It ships the pattern skills that teach an
 agent how to use each pack well, plus the kg stewardship agents. The data and verbs live in the
@@ -49,17 +49,14 @@ Once installed, invoke them as `khive:digester`, `khive:polisher`, and so on.
 ## Requirements
 
 The `kg` pack is the base (entities, edges, notes); every other pack builds on it. The default
-server config loads all eleven (`kg`, `gtd`, `memory`, `brain`, `comm`, `schedule`,
-`session`, `git`, `code`, `workspace`, `blob` — `git` contributes note kinds, a batch ingester, the
+server config loads all ten (`kg`, `gtd`, `memory`, `brain`, `comm`, `schedule`,
+`session`, `git`, `workspace`, `blob` — `git` contributes note kinds, a batch ingester, the
 `git.digest` verb, and three write verbs — `git.commit`/`git.branch`/`git.push` — that shell to
 system git with hardened, allowlisted argv construction and unconditional force-push denial
-(ADR-108); `code` contributes the `code.ingest` L1/L1.5 source-ingest verb plus a `finding`
-note kind whose `findings.json` batch ingestion is reached only through the
-`kkernel code-ingest` admin CLI; `workspace` contributes entity/endpoint vocabulary, no verbs;
-`blob` contributes three verbs, `blob.put`/`blob.get`/`blob.stat` (ADR-111), over a
-content-addressed store) —
-this plugin currently ships pattern skills for the first six; `session`, `git`, `code`,
-`workspace`, and `blob` have no skill yet (see the Pattern skills table above).
+(ADR-108); `workspace` contributes entity/endpoint vocabulary, no verbs; `blob` contributes
+`blob.put`/`blob.get`/`blob.stat` over a content-addressed storage trait, ADR-111) —
+this plugin currently ships pattern skills for the first six; `session`, `git`, `workspace`,
+and `blob` have no skill yet (see the Pattern skills table above).
 See [INSTALL.md](../INSTALL.md) for setup, the actor config, and per-pack smoke tests.
 
 ## Links

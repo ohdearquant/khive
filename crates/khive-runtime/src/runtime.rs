@@ -1158,7 +1158,6 @@ mod tests {
         // production; its handlers are all operator-only subhandlers (0 wire verbs).
         assert!(cfg.packs.contains(&"session".to_string()));
         assert!(cfg.packs.contains(&"git".to_string()));
-        assert!(cfg.packs.contains(&"code".to_string()));
         assert!(cfg.packs.contains(&"workspace".to_string()));
         // blob loads by default; a normal file-backed boot installs a
         // default FsBlobStore beside the database file with no config

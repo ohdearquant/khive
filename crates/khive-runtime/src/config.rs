@@ -310,7 +310,6 @@ impl Default for RuntimeConfig {
                     "schedule",
                     "session",
                     "git",
-                    "code",
                     "workspace",
                     "blob",
                 ]

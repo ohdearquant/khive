@@ -25,7 +25,7 @@ stdio, and `cargo test` finishes in 4 seconds.
 
 | Capability                  | How                                                                                                                                                      |
 | --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **66 verbs, 11 packs**      | KG, GTD, memory, brain, comm, schedule, session, git, code, workspace, blob: all load by default                                                         |
+| **65 verbs, 10 packs**      | KG, GTD, memory, brain, comm, schedule, session, git, workspace, blob: all load by default                                                               |
 | **Typed entities**          | 9 closed kinds: concept, document, dataset, project, person, org, artifact, service, resource                                                            |
 | **Typed edges**             | 17 closed relations in 9 categories (structure, derivation, provenance, temporal, dependency, impl, lateral, annotation, epistemic)                      |
 | **Typed notes**             | 5 closed kinds: observation, insight, question, decision, reference                                                                                      |
@@ -63,7 +63,7 @@ request(ops="[v1(...), v2(...), v3(...)]")             # parallel batch (max 100
 request(ops="[{\"tool\":\"v1\",\"args\":{...}}, ...]") # equivalent JSON form
 ```
 
-All 11 packs load by default, giving **66 verbs** out of the box (regenerate with
+All 10 packs load by default, giving **65 verbs** out of the box (regenerate with
 `request(ops="verbs()")` before editing this table):
 
 | Pack          | Prefix      | Verbs | What it does                                                                                   |
@@ -76,7 +76,6 @@ All 11 packs load by default, giving **66 verbs** out of the box (regenerate wit
 | **schedule**  | `schedule.` | 4     | Reminders and scheduled verb execution                                                         |
 | **session**   | `session.`  | 4     | Session record persistence (store/list/resume/export)                                          |
 | **git**       | `git.`      | 4     | `git.digest` provenance ingestion + `git.commit`/`git.branch`/`git.push` write verbs (ADR-108) |
-| **code**      | _(none)_    | 1     | `code.ingest`: L1 manifest + L1.5 import-scan source ingest (ADR-085 Amendment 2)              |
 | **workspace** | _(none)_    | 0     | Adds the `workspace` entity kind + `contains` endpoint rules to git/gtd/session notes (#873)   |
 | **blob**      | `blob.`     | 3     | Content-addressed object put/get/stat over the `BlobStore` CAS trait (ADR-111)                 |
 
@@ -248,7 +247,7 @@ kkernel --version   # confirms the binary and version you just installed
 ```
 
 All 11 packs load by default, a background daemon auto-spawns to keep the runtime warm, and any
-MCP client discovers the `request` tool with the full 66-verb catalog.
+MCP client discovers the `request` tool with the full 65-verb catalog.
 
 ### Alternative: npm
 
@@ -375,7 +374,7 @@ Docs: [ohdearquant.github.io/khive](https://ohdearquant.github.io/khive/) (agent
 
 ## Status
 
-**v0.5.0.** 66 verbs across 11
+**v0.5.0 (publication pending; crates.io currently serves 0.4.0).** 65 verbs across 10
 packs, 9 entity kinds, 17 edge relations, daemon warm startup (ADR-049), Bayesian brain
 profiles, threaded messaging, scheduled verb execution.
 Ready for use with Claude Code and any MCP-compatible agent.

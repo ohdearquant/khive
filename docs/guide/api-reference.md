@@ -1,13 +1,13 @@
 # API Reference
 
-khive exposes exactly one MCP tool, `request`. Everything else, 66 verbs across 11
+khive exposes exactly one MCP tool, `request`. Everything else, 65 verbs across 10
 production packs, is dispatched through that single tool via a small request DSL.
 This page documents the DSL grammar, the response envelope, and every verb's full
 parameter contract, so an agent can call khive correctly without reading Rust source.
 
 This page is verified against the live registry (`request(ops="verbs()")`) and the pack
 source (`crates/khive-pack-*/src/*.rs` `HandlerDef`/`ParamDef` struct literals). Verb
-count: **66**, matching both the live registry `total` field and the sum of the 11 pack
+count: **65**, matching both the live registry `total` field and the sum of the 10 pack
 counts below. If your server reports a different total, your `KHIVE_PACKS` configuration
 loads a different pack set than the default — run `request(ops="verbs()")` against your
 own server to get the authoritative list.
@@ -29,7 +29,6 @@ An always-machine-readable copy of this page is at
 | `schedule`  | 4     | `KHIVE_PACKS=kg,schedule`                  | Yes                 |
 | `session`   | 4     | `KHIVE_PACKS=kg,session`                   | Yes                 |
 | `git`       | 4     | `KHIVE_PACKS=kg,git`                       | Yes                 |
-| `code`      | 1     | `KHIVE_PACKS=kg,code`                      | Yes                 |
 | `workspace` | 0     | `KHIVE_PACKS=kg,git,gtd,session,workspace` | Yes                 |
 | `blob`      | 3     | `KHIVE_PACKS=kg,blob`                      | Yes                 |
 
@@ -45,11 +44,6 @@ with hardened, allowlisted argv construction.
 creation time and persists nothing when that delivery capability is absent; the other
 three schedule verbs remain available without `comm`.
 
-`code` registers the `finding` note kind and edge rules, plus the `code.ingest` verb (L1
-manifest + L1.5 import-scan source ingest, ADR-085 Amendment 2 — see below); its
-`findings.json` batch ingest still runs only through the `kkernel code-ingest` admin CLI
-path, not the MCP verb surface.
-
 `blob` registers no note or entity kinds; its three verbs (`blob.put` / `blob.get` /
 `blob.stat`) dispatch over the `BlobStore` content-addressed storage trait (ADR-111). A
 normal file-backed boot installs a default `FsBlobStore` rooted beside the database file
@@ -58,7 +52,7 @@ unconfigured (erroring until a backend is installed) when the server boots again
 in-memory backend, which has no directory to default a root beside.
 
 The default binary (no `KHIVE_PACKS`/`--pack` override) loads all 11 packs: 18 + 5 + 5 +
-15 + 7 + 4 + 4 + 4 + 1 + 0 + 3 = **66 verbs**.
+15 + 7 + 4 + 4 + 4 + 0 + 3 = **65 verbs**.
 
 Verb names in the `kg` pack are bare (`create`, `search`, `link`, …). Every other pack
 namespaces its verbs with a `pack.` prefix (`gtd.assign`, `memory.recall`,
@@ -1354,37 +1348,6 @@ branches = ["main", "feat/*", "release-*"]
 
 ```
 request(ops="git.commit(repo=\"/abs/path/repo\", message=\"fix: thing\") | git.push(repo=\"/abs/path/repo\", branch=\"main\")")
-```
-
----
-
-## `code` pack — 1 verb
-
-Deterministic source-code map ingest (ADR-085 Amendment 2, PR #1039). Optional; load
-with `KHIVE_PACKS=kg,code`. Also registers the `finding` note kind used by the
-`kkernel code-ingest` admin CLI's `findings.json` batch ingest (not reachable via this
-MCP verb surface).
-
-### `code.ingest` — Commissive
-
-Walk a source folder and ingest L1 manifest-declared dependency edges
-(`Cargo.toml` / `pyproject.toml` / `package.json`) plus L1.5 regex-based import-scan
-module and project edges, into a dedicated map database — never the shared production
-graph. A folder with no governing manifest anywhere above its source files still
-ingests, using the basename of the ingested folder as its `source_project` identity.
-Idempotent: entity and edge ids are `uuid5`-derived from identity, so re-ingesting the
-same path upserts rather than duplicates, and a synchronous re-resolve pass
-materializes edges for any import that only resolves once a later-scanned file's module
-becomes known.
-
-| Param       | Type            | Required | Notes                                                                                                                                                                                                                                        |
-| ----------- | --------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `path`      | string          | yes      | Folder to ingest — a monorepo subtree (a single crate/package) is first-class, not a special case of whole-repo ingest.                                                                                                                      |
-| `db`        | string          | no       | Target map database path. Defaults to `<path>/.khive/code-map.db`. The shared production database — its default `$HOME/.khive/khive.db` location and the calling server's actual configured database — is always rejected, with no override. |
-| `languages` | array\<string\> | no       | Restrict ingest to a subset of `rust` \| `python` \| `typescript`. Defaults to all three (auto-detected from manifests found under `path`).                                                                                                  |
-
-```
-request(ops="code.ingest(path=\"/repo/crates/my-crate\")")
 ```
 
 ---
