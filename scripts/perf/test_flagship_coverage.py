@@ -132,14 +132,14 @@ class ManifestTests(unittest.TestCase):
 
     def test_oq1_admin_surface_scenario_ids_match_manifest(self):
         """khive#946 Amendment 1 §2: exactly two admin-surface exceptions are
-        named and bounded (F6 git-ingest/code-ingest, F10 daemon-control
+        named and bounded (F6 code-ingest, F10 daemon-control
         probe) - every other scenario is real-MCP coverage by default."""
         data, _ = coverage_validator.load_manifest(MANIFEST_PATH)
         rulings = data["oq_rulings"]
         admin_surface_ids = set(rulings["oq1_admin_surface_scenario_ids"])
         self.assertEqual(
             admin_surface_ids,
-            {"f6.git_ingest.cli.production", "f6.code_ingest.cli.production", "f10.daemon.probe_only.floor"},
+            {"f6.code_ingest.cli.production", "f10.daemon.probe_only.floor"},
         )
         by_id = {sc["scenario_id"]: sc for sc in data["scenario"]}
         for scenario_id in admin_surface_ids:
