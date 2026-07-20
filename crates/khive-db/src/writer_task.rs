@@ -327,8 +327,9 @@ impl WriterTaskHandle {
 /// migration-slice scope this commits per `BEGIN IMMEDIATE`.
 pub fn spawn(pool: &ConnectionPool, capacity: usize) -> Result<WriterTaskHandle, SqliteError> {
     let conn = pool.open_standalone_writer()?;
+    let origin = pool.origin();
     let (tx, rx) = mpsc::channel(capacity.max(1));
-    tokio::spawn(run_writer_task(conn, rx));
+    tokio::spawn(run_writer_task(conn, rx, origin));
     Ok(WriterTaskHandle { tx })
 }
 
@@ -344,8 +345,10 @@ pub fn spawn(pool: &ConnectionPool, capacity: usize) -> Result<WriterTaskHandle,
 async fn run_writer_task(
     mut conn: Connection,
     mut rx: mpsc::Receiver<Box<dyn AnyWriteRequest + Send>>,
+    origin: khive_storage::tx_registry::TxOrigin,
 ) {
     while let Some(request) = rx.recv().await {
+        let origin = origin.clone();
         let outcome = tokio::task::spawn_blocking(move || {
             if request.is_top_level() {
                 // ADR-067 Component A:
@@ -358,8 +361,10 @@ async fn run_writer_task(
                 request.execute_and_reply_top_level(&conn);
                 return conn;
             }
-            let _tx_handle =
-                khive_storage::tx_registry::register(Some("writer_task_tx".to_string()));
+            let _tx_handle = khive_storage::tx_registry::register_scoped(
+                Some("writer_task_tx".to_string()),
+                origin,
+            );
             match conn.execute_batch("BEGIN IMMEDIATE") {
                 Ok(()) => request.execute_and_reply(&conn),
                 Err(e) => {

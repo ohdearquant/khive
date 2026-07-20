@@ -779,14 +779,17 @@ impl VectorStore for SqliteVecStore {
         // `conn.unchecked_transaction()`; the DELETE+INSERT body is the same
         // shared helper the WriterTask/batch paths use (#546), so this path
         // now also exercises the post-delete failpoint in tests.
+        let origin = self.pool.origin();
         self.with_writer("vec_insert", move |conn| {
             // ADR-091 Plank 0: register the span before opening the transaction so
             // the handle (declared first) drops AFTER `tx` (declared second) —
             // locals drop in reverse declaration order, so `tx`'s own Drop (which
             // rolls back if uncommitted) runs while the registry entry is still
             // present.
-            let _tx_handle =
-                khive_storage::tx_registry::register(Some("vec_insert_tx".to_string()));
+            let _tx_handle = khive_storage::tx_registry::register_scoped(
+                Some("vec_insert_tx".to_string()),
+                origin,
+            );
             let tx = conn.unchecked_transaction()?;
 
             replace_vector_row_dml(
@@ -850,10 +853,13 @@ impl VectorStore for SqliteVecStore {
 
         // Flag-off (default) path: byte-for-byte unchanged from pre-ADR-067
         // behavior — the closure owns its own BEGIN IMMEDIATE/COMMIT.
+        let origin = self.pool.origin();
         self.with_writer("vec_insert_batch", move |conn| {
             conn.execute_batch("BEGIN IMMEDIATE")?;
-            let _tx_handle =
-                khive_storage::tx_registry::register(Some("vector_insert_batch".to_string()));
+            let _tx_handle = khive_storage::tx_registry::register_scoped(
+                Some("vector_insert_batch".to_string()),
+                origin,
+            );
 
             let summary = batch_insert_vectors_dml(
                 conn,
@@ -942,11 +948,14 @@ impl VectorStore for SqliteVecStore {
         // Flag-off (default) path: the closure owns its own transaction via
         // `conn.unchecked_transaction()`; the DELETE+INSERT body is the same
         // shared helper the WriterTask/batch paths use (#546).
+        let origin = self.pool.origin();
         self.with_writer("vec_update", move |conn| {
             // ADR-091 Plank 0: registered before the transaction is opened — see
             // the matching note in `insert()` above for the drop-order rationale.
-            let _tx_handle =
-                khive_storage::tx_registry::register(Some("vec_update_tx".to_string()));
+            let _tx_handle = khive_storage::tx_registry::register_scoped(
+                Some("vec_update_tx".to_string()),
+                origin,
+            );
             let tx = conn.unchecked_transaction()?;
 
             replace_vector_row_dml(
@@ -1339,6 +1348,7 @@ impl VectorStore for SqliteVecStore {
         // Flag-off (default) path: byte-for-byte unchanged from pre-ADR-067
         // behavior — the closure owns its own transaction via
         // `Transaction::new_unchecked`.
+        let origin = self.pool.origin();
         self.with_writer_unmanaged("orphan_sweep", move |conn| {
             // `Transaction::new_unchecked` issues `BEGIN IMMEDIATE` and RAII-manages
             // rollback via its Drop impl: it checks `conn.is_autocommit()` and issues
@@ -1356,8 +1366,10 @@ impl VectorStore for SqliteVecStore {
             // ADR-091 Plank 0: registered before the transaction is opened — see the
             // matching note in `insert()` for the drop-order rationale (the handle,
             // declared first, drops after `tx`'s own Drop/rollback runs).
-            let _tx_handle =
-                khive_storage::tx_registry::register(Some("vec_orphan_sweep".to_string()));
+            let _tx_handle = khive_storage::tx_registry::register_scoped(
+                Some("vec_orphan_sweep".to_string()),
+                origin,
+            );
             let tx = rusqlite::Transaction::new_unchecked(
                 conn,
                 rusqlite::TransactionBehavior::Immediate,
