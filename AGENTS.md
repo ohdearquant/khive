@@ -15,17 +15,15 @@ khive gives your agent:
 9. **Brain** — Bayesian profile tuning from feedback signals
 10. **Session** — persist and resume agent-session records
 
-All 11 packs load by default. **82 public verbs** across the packs: the `git` pack
-contributes the `git.digest` verb plus the commit/issue/pull_request provenance note kinds
-and a batch ingester, and three write verbs, `git.commit` / `git.branch` / `git.push`
-(ADR-108), that shell to system git with hardened, allowlisted argv construction — no
-tag/merge/checkout/pull/fetch, no force-push under any argument combination; the `code`
-pack contributes one verb, `code.ingest` (L1 manifest + L1.5 import-scan source ingestion
-into a dedicated map database, ADR-085 Amendment 2); its `finding` note kind is still
-written only through the `kkernel code-ingest` admin CLI path (ADR-085 D1, Amendment 3);
-the `workspace` pack contributes zero verbs, adding only the `workspace` entity kind and
-`contains` endpoint rules to git/gtd/session notes (#873). Regenerate via
-`request(ops="verbs()")`
+All packs load by default. Verbs across the packs: the `git` pack contributes the
+`git.digest` verb plus the commit/issue/pull_request provenance note kinds and a batch
+ingester, and three write verbs, `git.commit` / `git.branch` / `git.push` (ADR-108), that
+shell to system git with hardened, allowlisted argv construction — no
+tag/merge/checkout/pull/fetch, no force-push under any argument combination; the
+`workspace` pack contributes zero verbs, adding only the `workspace` entity kind and
+`contains` endpoint rules to git/gtd/session notes (#873). Code-quality and formal-methods
+(Lean) ontology packs are a commercially licensed extension and are not part of the
+open-source distribution. Regenerate via `request(ops="verbs()")`
 before editing this line.
 
 If you're working on khive itself (writing code in this repo), see `CLAUDE.md` instead.

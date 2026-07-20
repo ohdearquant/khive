@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Moved the formal-methods ontology pack (`khive-pack-formal`) and the code-quality
+  ontology pack (`khive-pack-code`), along with the `kkernel code-ingest` admin CLI
+  subcommand, to a commercial extension. The open-source build no longer registers
+  either pack by default.
+
 ## [0.5.0] - 2026-07-13
 
 ### Added

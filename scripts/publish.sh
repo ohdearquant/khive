@@ -68,10 +68,8 @@ CRATES=(
     khive-vcs
     khive-changeset      # needs khive-types (above)
     # khive-merge — excluded from workspace (ADR-043 forward-deployed, ahead of khive-vcs)
-    khive-pack-formal    # needs khive-runtime + khive-types (both above); dev-dep of khive-pack-kg, so publish first
     khive-pack-kg
     khive-pack-git       # needs khive-runtime/storage + khive-pack-kg (all above)
-    khive-pack-code      # needs khive-runtime/storage + khive-pack-kg (all above)
     khive-pack-gtd
     khive-brain-core
     khive-pack-brain

@@ -311,7 +311,6 @@ impl Default for RuntimeConfig {
                     "knowledge",
                     "session",
                     "git",
-                    "code",
                     "workspace",
                     "blob",
                 ]
