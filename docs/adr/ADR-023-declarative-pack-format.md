@@ -587,9 +587,11 @@ refactor that unifies `gtd.assign` onto the shared create-plus-`TaskHook` path.
 Effective with the accompanying crate-extraction changes (which land as
 separate pull requests; this amendment describes the surface they produce
 together), the open-source distribution's default pack set is reduced. The
-brain, knowledge, and code packs move to commercially licensed extensions
-maintained outside this repository; they are not part of the open-source
-distribution. The formal pack, which was never part of the open-source default
+brain, knowledge, code, and git packs move to commercially licensed
+extensions maintained outside this repository; they are not part of the
+open-source distribution. The git pack's departure takes its note kinds
+(`commit`, `issue`, `pull_request`), its ingestion surface, and its verbs
+with it. The formal pack, which was never part of the open-source default
 pack set (see below), moves alongside the code pack as part of the same
 crate departure. A small set of channel-transport crates supporting alternate
 message delivery also move out of this repository; they contribute no MCP
@@ -614,7 +616,7 @@ kg, gtd, memory, brain, comm, schedule, knowledge, session, git, code, workspace
 and is, after this change:
 
 ```
-kg, gtd, memory, comm, schedule, session, git, workspace, blob
+kg, gtd, memory, comm, schedule, session, workspace, blob
 ```
 
 The formal pack was never included in this default set. It was compiled into
@@ -624,17 +626,30 @@ crates ship in this repository, not the default verb surface.
 
 ### Consequence for the agent-facing verb surface
 
-Following this change, the open-source build no longer registers `brain.*` or
-`knowledge.*` verbs, nor the `code.ingest` verb. The kg substrate verbs (§4)
-and the `memory.*` verbs are unaffected and continue to operate as documented.
+Following this change, the open-source build no longer registers `brain.*`,
+`knowledge.*`, or `git.*` verbs, nor the `code.ingest` verb. The kg substrate
+verbs (§4) and the `memory.*` verbs are unaffected and continue to operate as
+documented.
 
 Serving-profile resolution inside `memory.recall` degrades gracefully in the
-absence of a registered brain pack: profile resolution dispatches an internal
-`brain.resolve` call and treats a failed dispatch (no such verb registered)
-the same as a resolvable-but-unmatched profile, returning no serving profile.
-Recall operates on its plain-scoring path; the profile-weighted ranking terms
+absence of a registered brain pack **only when no profile is configured**:
+profile resolution dispatches an internal `brain.resolve` call and treats a
+failed dispatch (no such verb registered) the same as a
+resolvable-but-unmatched profile, returning no serving profile. Recall
+operates on its plain-scoring path; the profile-weighted ranking terms
 described elsewhere in this document simply do not apply when no brain pack
 is loaded.
+
+That graceful path does not extend to configured or requested profiles. A
+memory-pack configuration that names a brain profile bypasses `brain.resolve`
+entirely: the configured profile id survives a failed `brain.profile` state
+read (the handler logs a warning and scores with configured defaults) and is
+still stamped as `served_by_profile_id` on recall results — the stamp then
+reflects static configuration, not live profile state. A per-request
+`profile_id` parameter is stricter still: its `brain.profile` dispatch failure
+is a hard error, so the request fails outright with no brain pack registered.
+Deployments of the open-source build should therefore leave the memory pack's
+brain-profile configuration unset and omit per-request profile ids.
 
 `memory.feedback` is not fully symmetric: when its configuration routes
 feedback through a brain profile, the handler dispatches `brain.feedback`,
