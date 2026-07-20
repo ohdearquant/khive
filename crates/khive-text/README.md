@@ -57,4 +57,4 @@ future retrieval crate that needs a pluggable analyzer independent of
 
 ## License
 
-Apache-2.0.
+BUSL-1.1. See the repository [LICENSE](https://github.com/ohdearquant/khive/blob/main/LICENSE).

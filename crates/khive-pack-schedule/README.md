@@ -86,4 +86,4 @@ built on [ADR-017](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-0
 
 ## License
 
-Apache-2.0.
+BUSL-1.1. See the repository [LICENSE](https://github.com/ohdearquant/khive/blob/main/LICENSE).

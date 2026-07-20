@@ -210,6 +210,12 @@ pub struct KhiveMcpServer {
     /// Pool arc for the WAL checkpoint background task. `None` for in-memory
     /// or registry-only servers that have no persistent database.
     pool: Option<Arc<ConnectionPool>>,
+    /// File-backed backend pools beyond `pool` (ADR-091 Amendment 3
+    /// fan-out): every additional backend a multi-backend boot wired, so the
+    /// session sweep and the daemon's checkpoint ownership can cover them
+    /// too. Always empty for a single-backend server — `pool` alone is that
+    /// server's one backend.
+    secondary_pools: Vec<Arc<ConnectionPool>>,
     /// Server-level default output format (ADR-078). Resolved from TOML →
     /// `KHIVE_OUTPUT_FORMAT` → builtin `json`. Per-request `format` fields
     /// override this at dispatch time.
@@ -380,6 +386,7 @@ impl KhiveMcpServer {
             config_id,
             coordinator: None,
             pool,
+            secondary_pools: Vec::new(),
             default_output_format: OutputFormat::Json,
         })
     }
@@ -400,6 +407,7 @@ impl KhiveMcpServer {
             config_id: "registry-only".to_string(),
             coordinator: None,
             pool: None,
+            secondary_pools: Vec::new(),
             default_output_format: OutputFormat::Json,
         }
     }
@@ -419,6 +427,7 @@ impl KhiveMcpServer {
             config_id: config_id.to_string(),
             coordinator: None,
             pool: None,
+            secondary_pools: Vec::new(),
             default_output_format: OutputFormat::Json,
         }
     }
@@ -450,6 +459,15 @@ impl KhiveMcpServer {
     /// because registry-only construction has no access to the backend layer).
     pub fn with_pool(mut self, pool: Arc<ConnectionPool>) -> Self {
         self.pool = Some(pool);
+        self
+    }
+
+    /// Attach every file-backed backend pool beyond the main one (ADR-091
+    /// Amendment 3 fan-out), so the session sweep and the daemon's
+    /// checkpoint task can cover the full multi-backend deployment instead
+    /// of only `pool`.
+    pub fn with_secondary_pools(mut self, pools: Vec<Arc<ConnectionPool>>) -> Self {
+        self.secondary_pools = pools;
         self
     }
 
@@ -528,6 +546,12 @@ impl KhiveMcpServer {
     /// Returns `None` for in-memory or registry-only servers.
     pub fn pool(&self) -> Option<Arc<ConnectionPool>> {
         self.pool.clone()
+    }
+
+    /// File-backed backend pools beyond [`Self::pool`] (ADR-091 Amendment 3
+    /// fan-out). Empty for a single-backend server.
+    pub fn secondary_pools(&self) -> Vec<Arc<ConnectionPool>> {
+        self.secondary_pools.clone()
     }
 
     /// This server's configured audit `EventStore`, if any (ADR-094).

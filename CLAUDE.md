@@ -4,7 +4,7 @@
 hybrid search, GQL/SPARQL queries — all in a single ~21MB Rust binary over MCP stdio (see #1055;
 measure a fresh `main` build before citing an exact figure — it drifts).
 
-**v0.3.0** — [crates.io](https://crates.io/crates/khive-mcp) | Apache 2.0
+**v0.3.0** — [crates.io](https://crates.io/crates/khive-mcp) | BUSL-1.1
 
 ---
 
@@ -96,7 +96,7 @@ not shipped.
 | `crates/khive-fusion`      | RRF, weighted, union, vector-only, and keyword-only fusion strategies                                                                                                                                                                            |
 | `crates/khive-bm25`        | BM25 keyword index                                                                                                                                                                                                                               |
 | `crates/khive-hnsw`        | HNSW vector index                                                                                                                                                                                                                                |
-| `crates/khive-vamana`      | Vamana ANN index used by semantic recall                                                                                                                                                                                                        |
+| `crates/khive-vamana`      | Vamana ANN index used by semantic recall                                                                                                                                                                                                         |
 | `crates/khive-query`       | GQL + SPARQL parsers, AST validation, SQL compiler                                                                                                                                                                                               |
 | `crates/khive-runtime`     | Service API + VerbRegistry + PackRuntime trait                                                                                                                                                                                                   |
 | `crates/khive-request`     | Request DSL parser (function-call + JSON; pipe/LNDL planned)                                                                                                                                                                                     |

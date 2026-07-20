@@ -643,7 +643,7 @@ struct WalpinSidecarState {
     /// heartbeat so the enumerating daemon judges freshness against the
     /// PRODUCER's interval — a session on an independently slower configured
     /// cadence must not be misread as stale.
-    interval_ms: u64,
+    sweep_interval_ms: u64,
     wrote: bool,
     /// Whether this process's registration beacon is believed present on
     /// disk. Cleared when a failed heartbeat write escalates to beacon
@@ -651,6 +651,46 @@ struct WalpinSidecarState {
     /// next healthy tick then re-registers with a full write instead of a
     /// metadata touch.
     beacon_registered: bool,
+    /// The content actually on disk in the last successful heartbeat body
+    /// write, if any (ADR-091 Amendment 3 Plank F1). `None` whenever the
+    /// next tick must go through a full write — no heartbeat written yet,
+    /// the last write failed, or the threshold cleared. Compared against
+    /// each new observation to decide touch (content unchanged) vs.
+    /// rewrite (content changed).
+    last_heartbeat: Option<LastHeartbeatState>,
+}
+
+/// ADR-091 Amendment 3 Plank F1: the content signature of the heartbeat
+/// body currently on disk, plus the `oldest_tx_started_at` value that body
+/// carries — kept separate from the signature proper because it is derived
+/// (fixed for as long as the same span stays oldest), not an independent
+/// change signal.
+struct LastHeartbeatState {
+    span_id: khive_storage::tx_registry::TxId,
+    label: Option<String>,
+    attribution_basis: &'static str,
+    sweep_interval_ms: u64,
+    oldest_tx_started_at: i64,
+}
+
+impl LastHeartbeatState {
+    /// Whether a fresh observation carries exactly the content already on
+    /// disk — the licensing condition for a metadata-only touch instead of
+    /// a full body rewrite (the first over-threshold observation, a change
+    /// of the oldest span's identity or label, a change of
+    /// `attribution_basis`, or a change of the declared sweep cadence).
+    fn content_matches(
+        &self,
+        span_id: khive_storage::tx_registry::TxId,
+        label: &Option<String>,
+        attribution_basis: &str,
+        sweep_interval_ms: u64,
+    ) -> bool {
+        self.span_id == span_id
+            && self.label == *label
+            && self.attribution_basis == attribution_basis
+            && self.sweep_interval_ms == sweep_interval_ms
+    }
 }
 
 impl WalpinSidecarState {
@@ -672,8 +712,9 @@ impl WalpinSidecarState {
             pid,
             role,
             started_at: crate::walpin::process_start_time_secs(pid).unwrap_or(0),
-            interval_ms: interval.as_millis().min(u64::MAX as u128) as u64,
+            sweep_interval_ms: interval.as_millis().min(u64::MAX as u128) as u64,
             wrote: false,
+            last_heartbeat: None,
             beacon_registered: false,
         })
     }
@@ -692,7 +733,7 @@ impl WalpinSidecarState {
             pid: self.pid,
             process_role: self.role.to_string(),
             started_at: self.started_at,
-            interval_ms: self.interval_ms,
+            sweep_interval_ms: self.sweep_interval_ms,
         };
         let result =
             tokio::task::spawn_blocking(move || crate::walpin::write_beacon(&dir, &beacon)).await;
@@ -793,19 +834,94 @@ impl WalpinSidecarState {
     /// executor thread on synchronous filesystem I/O.
     async fn observe(
         &mut self,
-        oldest: Option<(khive_storage::tx_registry::TxId, Duration, Option<String>)>,
+        oldest: Option<khive_storage::tx_registry::OldestSpan>,
         tx_warn_secs: Duration,
     ) {
         match oldest {
-            Some((_, age, label)) if age >= tx_warn_secs => {
+            Some(span) if span.age >= tx_warn_secs => {
+                // ADR-091 Amendment 3 Plank F2: the caller's `TxOriginFilter`
+                // guarantees a `Main` view's winner is either `Database` (this
+                // backend's own identity) or `Unscoped` (the fallback), and a
+                // `Secondary` view's winner is always `Database` — `Memory`
+                // can never win a filtered query, so it degrades to
+                // fallback-confidence rather than a reachability panic.
+                let attribution_basis = match span.origin {
+                    khive_storage::tx_registry::TxOrigin::Database(_) => "origin",
+                    khive_storage::tx_registry::TxOrigin::Unscoped
+                    | khive_storage::tx_registry::TxOrigin::Memory => "fallback",
+                };
+
+                // ADR-091 Amendment 3 Plank F1: a metadata-only mtime touch
+                // advances freshness whenever nothing content-relevant has
+                // changed since the last body write; a full rewrite happens
+                // only on the first over-threshold observation or a genuine
+                // content change.
+                let content_unchanged = self.wrote
+                    && self.last_heartbeat.as_ref().is_some_and(|last| {
+                        last.content_matches(
+                            span.id,
+                            &span.label,
+                            attribution_basis,
+                            self.sweep_interval_ms,
+                        )
+                    });
+
+                if content_unchanged {
+                    let dir = self.dir.clone();
+                    let pid = self.pid;
+                    let touch_result = tokio::task::spawn_blocking(move || {
+                        crate::walpin::touch_heartbeat(&dir, pid)
+                    })
+                    .await;
+                    match touch_result {
+                        Ok(Ok(())) => {
+                            self.refresh_beacon().await;
+                            return;
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!(
+                                error = %e,
+                                "ADR-091 Amendment 3 Plank F1: walpin heartbeat touch failed; \
+                                 recreating with a full body write"
+                            );
+                        }
+                        Err(join_err) => {
+                            tracing::warn!(
+                                error = %join_err,
+                                "ADR-091 Amendment 3 Plank F1: walpin heartbeat touch task \
+                                 panicked; recreating with a full body write"
+                            );
+                        }
+                    }
+                    // Recovery rule: the touch path must never assume the
+                    // target still exists — enumeration can delete a slow
+                    // writer's heartbeat while its span is still live. Fall
+                    // through to the full write below unconditionally.
+                }
+
+                // The oldest span's registration instant is fixed for as
+                // long as it stays the SAME span: reuse the previously
+                // recorded value rather than re-deriving it from `now -
+                // age`, which would drift by measurement noise across ticks
+                // for no reason. A genuinely new oldest span (or the first
+                // observation) derives it fresh.
+                let oldest_tx_started_at = self
+                    .last_heartbeat
+                    .as_ref()
+                    .filter(|last| last.span_id == span.id)
+                    .map(|last| last.oldest_tx_started_at)
+                    .unwrap_or_else(|| now_epoch_secs().saturating_sub(span.age.as_secs() as i64));
+
                 let heartbeat = crate::walpin::WalpinHeartbeat {
                     pid: self.pid,
                     process_role: self.role.to_string(),
                     started_at: self.started_at,
-                    oldest_tx_age_secs: age.as_secs_f64(),
-                    oldest_tx_label: label,
+                    oldest_tx_age_secs: span.age.as_secs_f64(),
+                    oldest_tx_label: span.label.clone(),
+                    oldest_tx_started_at: Some(oldest_tx_started_at),
                     updated_at: now_epoch_secs(),
-                    interval_ms: self.interval_ms,
+                    sweep_interval_ms: self.sweep_interval_ms,
+                    attribution_basis: Some(attribution_basis.to_string()),
                 };
                 let dir = self.dir.clone();
                 let result = tokio::task::spawn_blocking(move || {
@@ -824,6 +940,13 @@ impl WalpinSidecarState {
                 match result {
                     Ok(Ok(())) => {
                         self.wrote = true;
+                        self.last_heartbeat = Some(LastHeartbeatState {
+                            span_id: span.id,
+                            label: span.label,
+                            attribution_basis,
+                            sweep_interval_ms: self.sweep_interval_ms,
+                            oldest_tx_started_at,
+                        });
                         self.refresh_beacon().await;
                     }
                     Ok(Err(e)) => {
@@ -833,6 +956,10 @@ impl WalpinSidecarState {
                              removing beacon so this process cannot read as \
                              registered-silent while over threshold"
                         );
+                        // Unknown what (if anything) is on disk now — the
+                        // next tick must go through a full write, never a
+                        // touch, until a write actually lands.
+                        self.last_heartbeat = None;
                         self.drop_beacon_fail_closed().await;
                     }
                     Err(join_err) => {
@@ -840,6 +967,7 @@ impl WalpinSidecarState {
                             error = %join_err,
                             "ADR-091 Amendment 2 Plank B: walpin heartbeat write task panicked"
                         );
+                        self.last_heartbeat = None;
                         self.drop_beacon_fail_closed().await;
                     }
                 }
@@ -865,6 +993,7 @@ impl WalpinSidecarState {
                         ),
                     }
                     self.wrote = false;
+                    self.last_heartbeat = None;
                 }
             }
         }
@@ -940,26 +1069,82 @@ impl SessionSweepConfig {
     }
 }
 
-/// ADR-091 Amendment 2 Plank A: run the observe-only per-session sweep.
+/// One file-backed backend the session sweep observes (ADR-091 Amendment 3
+/// fan-out). `is_main` selects which [`khive_storage::tx_registry::TxOriginFilter`]
+/// variant scopes this backend's view of the registry: the main backend's
+/// `Main` filter additionally observes `Unscoped` spans (the
+/// never-silently-drop fallback for call sites not yet threaded to an
+/// origin); a secondary backend's `Secondary` filter is scoped to exactly
+/// its own identity. A pool whose origin is `Memory` contributes no entry —
+/// in-memory backends have no sidecar and nothing to attribute
+/// cross-process.
+pub struct SweepBackend {
+    pub pool: Arc<ConnectionPool>,
+    pub is_main: bool,
+}
+
+/// Per-backend state the session sweep carries across ticks: this backend's
+/// registry view, its own edge-triggered age-sweep state machine (so a
+/// sustained stale span on one backend logs independently of the others),
+/// and its own walpin sidecar (`None` if the sidecar is disabled or this
+/// backend's origin is `Memory`).
+struct BackendSweep {
+    filter: khive_storage::tx_registry::TxOriginFilter,
+    tx_age_state: TxAgeSweepState,
+    sidecar: Option<WalpinSidecarState>,
+}
+
+/// ADR-091 Amendment 2 Plank A (Amendment 3: per-backend fan-out): run the
+/// observe-only per-session sweep.
 ///
 /// Every non-daemon `kkernel mcp` process runs this instead of the daemon's
 /// `run_checkpoint_task`: same `tx_registry` age check and Plank B heartbeat
 /// refresh, but no PASSIVE/TRUNCATE checkpointing — checkpointing stays
-/// daemon-owned. Loops until `shutdown_rx` observes a change (or its sender
-/// is dropped), removing this process's walpin heartbeat (if written) on the
-/// way out.
+/// daemon-owned. Stays ONE task for the whole process, but fans out
+/// internally: each file-backed backend in `backends` gets its own
+/// registry view, age-sweep state, and sidecar directory, so a long span on
+/// a secondary backend is attributed (and heartbeats) only in that
+/// backend's own sidecar — never the main backend's. Loops until
+/// `shutdown_rx` observes a change (or its sender is dropped), removing
+/// every written heartbeat on the way out.
 pub async fn run_session_sweep_task(
-    db_path: Option<PathBuf>,
+    backends: Vec<SweepBackend>,
     config: SessionSweepConfig,
     mut shutdown_rx: tokio::sync::watch::Receiver<()>,
 ) {
     let mut interval = tokio::time::interval(config.interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut tx_age_state = TxAgeSweepState::default();
-    let mut sidecar = db_path
-        .and_then(|p| WalpinSidecarState::new(Some(p.as_path()), true, "session", config.interval));
-    if let Some(sidecar) = sidecar.as_mut() {
-        sidecar.register_beacon().await;
+
+    let mut sweeps: Vec<BackendSweep> = Vec::with_capacity(backends.len());
+    for backend in backends {
+        let identity = match backend.pool.origin() {
+            khive_storage::tx_registry::TxOrigin::Database(id) => id,
+            // No on-disk file, so no sidecar and no cross-process
+            // attribution surface — nothing for this sweep to fan out to.
+            khive_storage::tx_registry::TxOrigin::Memory
+            | khive_storage::tx_registry::TxOrigin::Unscoped => continue,
+        };
+        let filter = if backend.is_main {
+            khive_storage::tx_registry::TxOriginFilter::Main(identity)
+        } else {
+            khive_storage::tx_registry::TxOriginFilter::Secondary(identity)
+        };
+        let sidecar = WalpinSidecarState::new(
+            backend.pool.canonical_path(),
+            true,
+            "session",
+            config.interval,
+        );
+        sweeps.push(BackendSweep {
+            filter,
+            tx_age_state: TxAgeSweepState::default(),
+            sidecar,
+        });
+    }
+    for sweep in sweeps.iter_mut() {
+        if let Some(sidecar) = sweep.sidecar.as_mut() {
+            sidecar.register_beacon().await;
+        }
     }
 
     loop {
@@ -968,19 +1153,25 @@ pub async fn run_session_sweep_task(
             _ = shutdown_rx.changed() => break,
         }
 
-        let oldest = khive_storage::tx_registry::oldest();
-        for emission in
-            tx_age_state.observe(oldest.clone(), config.tx_warn_secs, config.tx_max_age_secs)
-        {
-            log_tx_age_emission(&emission);
-        }
-        if let Some(sidecar) = sidecar.as_mut() {
-            sidecar.observe(oldest, config.tx_warn_secs).await;
+        for sweep in sweeps.iter_mut() {
+            let oldest = khive_storage::tx_registry::oldest_for(&sweep.filter);
+            for emission in sweep.tx_age_state.observe(
+                oldest.as_ref().map(|s| (s.id, s.age, s.label.clone())),
+                config.tx_warn_secs,
+                config.tx_max_age_secs,
+            ) {
+                log_tx_age_emission(&emission);
+            }
+            if let Some(sidecar) = sweep.sidecar.as_mut() {
+                sidecar.observe(oldest, config.tx_warn_secs).await;
+            }
         }
     }
 
-    if let Some(sidecar) = sidecar.as_mut() {
-        sidecar.shutdown().await;
+    for sweep in sweeps.iter_mut() {
+        if let Some(sidecar) = sweep.sidecar.as_mut() {
+            sidecar.shutdown().await;
+        }
     }
 }
 
@@ -1003,12 +1194,20 @@ pub async fn run_session_sweep_task(
 /// plus one drain row when pressure falls back below `warn_pages`. `None` is
 /// a no-op. See `crates/khive-db/docs/api/checkpoint.md` for the full
 /// shutdown-mechanism and event-emission design history.
+///
+/// `is_main` (ADR-091 Amendment 3): whether `pool` is the deployment's main
+/// backend. A daemon owning several file-backed backends spawns one task per
+/// backend, each with its own pool and shutdown-channel clone (the sender
+/// broadcasts to every receiver clone alike); exactly one of those calls
+/// passes `true`. See the `tx_filter` construction below for what this
+/// selects.
 pub async fn run_checkpoint_task(
     pool: Arc<ConnectionPool>,
     config: CheckpointConfig,
     event_store: Option<Arc<dyn khive_storage::EventStore>>,
     namespace: String,
     mut shutdown_rx: tokio::sync::watch::Receiver<()>,
+    is_main: bool,
 ) {
     let mut interval = tokio::time::interval(config.interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1021,16 +1220,35 @@ pub async fn run_checkpoint_task(
     // elevated" edge the ADR-094 event emission needs, so the event path
     // never has to reach into the severity state machine's private fields.
     let mut event_was_elevated = false;
+    // ADR-091 Amendment 3: this task's own backend-scoped view of the
+    // registry. `is_main` selects which `TxOriginFilter` variant applies —
+    // the caller passes `true` for exactly the one checkpoint task covering
+    // the deployment's main backend, so only that task also observes legacy
+    // `Unscoped` spans from any call site not yet threaded to an origin, the
+    // designed never-silently-drop fallback. A secondary backend's task
+    // never falls back to `Unscoped`: those spans belong to the main view or
+    // to no view, never to a database they were never registered against.
+    // `None` only when this pool's own origin isn't `Database` (an in-memory
+    // checkpoint pool) — degrades to "no open span observed" for the tick
+    // rather than panicking a long-running daemon loop on an
+    // assumed-impossible state.
+    let tx_filter = match pool.origin() {
+        khive_storage::tx_registry::TxOrigin::Database(id) => Some(if is_main {
+            khive_storage::tx_registry::TxOriginFilter::Main(id)
+        } else {
+            khive_storage::tx_registry::TxOriginFilter::Secondary(id)
+        }),
+        khive_storage::tx_registry::TxOrigin::Memory
+        | khive_storage::tx_registry::TxOrigin::Unscoped => None,
+    };
     // ADR-091 Amendment 2 Plank B: the checkpoint pool is only ever wired for
     // file-backed backends (`checkpoint_pool_for`), so `is_file_backed: true`
-    // is always correct here.
+    // is always correct here. `canonical_path()` (not `pool.config().path`)
+    // so the sidecar directory is keyed off the same minted identity every
+    // alias of this backend's configured path converges to.
     #[cfg(unix)]
-    let mut walpin_state = WalpinSidecarState::new(
-        pool.config().path.as_deref(),
-        true,
-        "daemon",
-        config.interval,
-    );
+    let mut walpin_state =
+        WalpinSidecarState::new(pool.canonical_path(), true, "daemon", config.interval);
     #[cfg(unix)]
     if let Some(sidecar) = walpin_state.as_mut() {
         sidecar.register_beacon().await;
@@ -1063,9 +1281,11 @@ pub async fn run_checkpoint_task(
         // tick. Edge-triggered per rung, same debounce idiom as the severity
         // ladder below, so a sustained stale span logs once per rung rather
         // than once per tick.
-        let oldest_tx = khive_storage::tx_registry::oldest();
+        let oldest_tx = tx_filter
+            .as_ref()
+            .and_then(khive_storage::tx_registry::oldest_for);
         for emission in tx_age_state.observe(
-            oldest_tx.clone(),
+            oldest_tx.as_ref().map(|s| (s.id, s.age, s.label.clone())),
             config.tx_warn_secs,
             config.tx_max_age_secs,
         ) {
@@ -1076,7 +1296,9 @@ pub async fn run_checkpoint_task(
         // pin — if any — is attributable the same way a session's is.
         #[cfg(unix)]
         if let Some(sidecar) = walpin_state.as_mut() {
-            sidecar.observe(oldest_tx, config.tx_warn_secs).await;
+            sidecar
+                .observe(oldest_tx.clone(), config.tx_warn_secs)
+                .await;
         }
 
         // Skipped ticks leave crossing state unchanged — a busy tick must not
@@ -1090,11 +1312,12 @@ pub async fn run_checkpoint_task(
         let above_high_water = wal_pages >= config.high_water_pages;
         let above_truncate_high_water = wal_pages >= config.truncate_high_water_pages;
 
-        // Per-tick debug for the oldest open entry always fires (cheap, single
-        // `oldest()` lookup); the two `warn!`-level registry logs below are
-        // gated on the SAME crossing state as the WAL-threshold WARNs above,
-        // so sustained pressure logs once per crossing, not once per tick.
-        log_tx_registry_oldest_debug(wal_pages);
+        // Per-tick debug for the oldest open entry always fires (cheap —
+        // reuses this tick's already-computed `oldest_tx`); the two
+        // `warn!`-level registry logs below are gated on the SAME crossing
+        // state as the WAL-threshold WARNs above, so sustained pressure
+        // logs once per crossing, not once per tick.
+        log_tx_registry_oldest_debug(wal_pages, oldest_tx.as_ref());
 
         // ADR-091 severity ladder: INFO on the first below→above crossing,
         // WARN once `warn_sustained_cycles` consecutive ticks stay elevated.
@@ -1103,7 +1326,7 @@ pub async fn run_checkpoint_task(
         for emission in severity_state.observe_wal_pages(wal_pages, &config) {
             match emission.rung {
                 CheckpointSeverityRung::Info => {
-                    log_tx_registry_oldest_warn(wal_pages);
+                    log_tx_registry_oldest_warn(wal_pages, oldest_tx.as_ref());
                     tracing::info!(
                         wal_pages = emission.wal_pages,
                         warn_threshold = emission.threshold_pages,
@@ -1217,18 +1440,23 @@ async fn append_checkpoint_lifecycle_event<P: serde::Serialize>(
     }
 }
 
-/// ADR-091 Plank 0: log the oldest open transaction registry entry alongside
-/// the WAL frame count at `debug!`, on EVERY tick regardless of threshold
+/// ADR-091 Plank 0 (Amendment 3: takes the tick's already-computed,
+/// backend-scoped oldest span instead of re-querying the process-wide
+/// aggregate): log the oldest open transaction registry entry alongside the
+/// WAL frame count at `debug!`, on EVERY tick regardless of threshold
 /// state. This is the low-volume per-tick trace; the WARN-level escalations
 /// live in [`log_tx_registry_oldest_warn`] and
 /// debug-level, unconditional per-tick trace. See
 /// crates/khive-db/docs/api/checkpoint.md#private-tx-registry-logging-helpers-plank-0
-fn log_tx_registry_oldest_debug(wal_pages: u64) {
-    if let Some((_id, age, label)) = khive_storage::tx_registry::oldest() {
+fn log_tx_registry_oldest_debug(
+    wal_pages: u64,
+    oldest: Option<&khive_storage::tx_registry::OldestSpan>,
+) {
+    if let Some(span) = oldest {
         tracing::debug!(
             wal_pages,
-            oldest_tx_age_secs = age.as_secs_f64(),
-            oldest_tx_label = label.as_deref().unwrap_or("<unlabeled>"),
+            oldest_tx_age_secs = span.age.as_secs_f64(),
+            oldest_tx_label = span.label.as_deref().unwrap_or("<unlabeled>"),
             "WAL checkpoint tick: oldest open transaction registry entry"
         );
     }
@@ -1237,12 +1465,15 @@ fn log_tx_registry_oldest_debug(wal_pages: u64) {
 /// Escalates the oldest open registry entry to `warn!`. NOT internally
 /// rate-limited — caller MUST gate on a below→above `warn_pages` crossing
 /// (`crossing_warn`) or every tick reproduces the log-spam bug this fixes.
-fn log_tx_registry_oldest_warn(wal_pages: u64) {
-    if let Some((_id, age, label)) = khive_storage::tx_registry::oldest() {
+fn log_tx_registry_oldest_warn(
+    wal_pages: u64,
+    oldest: Option<&khive_storage::tx_registry::OldestSpan>,
+) {
+    if let Some(span) = oldest {
         tracing::warn!(
             wal_pages,
-            oldest_tx_age_secs = age.as_secs_f64(),
-            oldest_tx_label = label.as_deref().unwrap_or("<unlabeled>"),
+            oldest_tx_age_secs = span.age.as_secs_f64(),
+            oldest_tx_label = span.label.as_deref().unwrap_or("<unlabeled>"),
             "WAL checkpoint tick: oldest open transaction registry entry"
         );
     }
@@ -1442,16 +1673,17 @@ fn note_truncate_outcome(
 /// instead of silently exonerating them.
 #[cfg(unix)]
 fn log_walpin_sidecar_report(pool: &ConnectionPool) {
-    let Some(path) = pool.config().path.as_deref() else {
+    let Some(path) = pool.canonical_path() else {
         return;
     };
     if !crate::walpin::sidecar_enabled(true) {
         return;
     }
     let dir = crate::walpin::sidecar_dir_for(path);
-    // Each record carries its producer's own sweep cadence (`interval_ms`),
-    // which is what freshness is judged against; the interval passed here is
-    // only the fallback for records written before that field existed.
+    // Each record carries its producer's own sweep cadence
+    // (`sweep_interval_ms`), which is what freshness is judged against; the
+    // interval passed here is only the fallback for records written before
+    // that field existed.
     let sweep_interval = SessionSweepConfig::from_env().interval;
     let report = match crate::walpin::enumerate_live(&dir, sweep_interval) {
         Ok(report) => report,
@@ -1464,12 +1696,20 @@ fn log_walpin_sidecar_report(pool: &ConnectionPool) {
             return;
         }
     };
+    let now = now_epoch_secs();
     for hb in report.reporting() {
+        // ADR-091 Amendment 3 Plank F2 fail-closed reading rule: the
+        // logger must never let a fallback-confidence entry read as live
+        // cross-process ground truth, so the confidence distinction is
+        // always emitted alongside the raw field — never inferred by the
+        // reader of this log line.
         tracing::warn!(
             walpin_pid = hb.pid,
             walpin_role = %hb.process_role,
-            walpin_oldest_tx_age_secs = hb.oldest_tx_age_secs,
+            walpin_oldest_tx_age_secs = hb.current_oldest_tx_age_secs(now),
             walpin_oldest_tx_label = hb.oldest_tx_label.as_deref().unwrap_or("<unlabeled>"),
+            walpin_attribution_basis = hb.attribution_basis.as_deref().unwrap_or("<unspecified>"),
+            walpin_attribution_evidence_backed = hb.attribution_is_evidence_backed(),
             walpin_health = "reporting",
             "ADR-091 Amendment 2 Plank B: live cross-process WAL-pin attribution report"
         );
@@ -1723,12 +1963,21 @@ mod tests {
         let _handle =
             khive_storage::tx_registry::register(Some("checkpoint_tick_test".to_string()));
 
-        let expected_label = khive_storage::tx_registry::oldest()
-            .and_then(|(_, _, label)| label)
+        let oldest = khive_storage::tx_registry::oldest().map(|(id, age, label)| {
+            khive_storage::tx_registry::OldestSpan {
+                id,
+                age,
+                label,
+                origin: khive_storage::tx_registry::TxOrigin::Unscoped,
+            }
+        });
+        let expected_label = oldest
+            .as_ref()
+            .and_then(|s| s.label.clone())
             .unwrap_or_else(|| "<unlabeled>".to_string());
 
         tracing::subscriber::with_default(subscriber, || {
-            log_tx_registry_oldest_debug(100);
+            log_tx_registry_oldest_debug(100, oldest.as_ref());
         });
 
         let events = buffer.lock().unwrap();
@@ -1757,6 +2006,14 @@ mod tests {
 
         let _handle =
             khive_storage::tx_registry::register(Some("registry_warn_crossing_test".to_string()));
+        let oldest = khive_storage::tx_registry::oldest().map(|(id, age, label)| {
+            khive_storage::tx_registry::OldestSpan {
+                id,
+                age,
+                label,
+                origin: khive_storage::tx_registry::TxOrigin::Unscoped,
+            }
+        });
 
         let mut was_above_warn = false;
         let mut was_above_high_water = false;
@@ -1764,7 +2021,7 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             // Tick 1: below→above crossing for both bands — both WARNs fire.
             if crossing_warn(true, &mut was_above_warn) {
-                log_tx_registry_oldest_warn(6000);
+                log_tx_registry_oldest_warn(6000, oldest.as_ref());
             }
             if crossing_warn(true, &mut was_above_high_water) {
                 log_tx_registry_snapshot_warn(6000);
@@ -1772,7 +2029,7 @@ mod tests {
 
             // Tick 2: still above both thresholds — neither must repeat.
             if crossing_warn(true, &mut was_above_warn) {
-                log_tx_registry_oldest_warn(6000);
+                log_tx_registry_oldest_warn(6000, oldest.as_ref());
             }
             if crossing_warn(true, &mut was_above_high_water) {
                 log_tx_registry_snapshot_warn(6000);
@@ -1936,6 +2193,7 @@ mod tests {
             None,
             "local".to_string(),
             shutdown_rx,
+            true,
         ));
 
         shutdown_tx.send(()).expect("send shutdown signal");
@@ -1980,6 +2238,7 @@ mod tests {
             Some(event_store),
             "local".to_string(),
             shutdown_rx,
+            true,
         ));
 
         // Confirm strong_count is well above 1 — the old check would spin
@@ -3458,6 +3717,7 @@ mod tests {
             Some(store_dyn),
             "local".to_string(),
             shutdown_rx,
+            true,
         ));
 
         tokio::time::sleep(Duration::from_millis(60)).await;
@@ -3508,6 +3768,7 @@ mod tests {
             Some(store_dyn),
             "local".to_string(),
             shutdown_rx,
+            true,
         ));
 
         tokio::time::sleep(Duration::from_millis(60)).await;
@@ -3543,6 +3804,7 @@ mod tests {
             None,
             "local".to_string(),
             shutdown_rx,
+            true,
         ));
 
         tokio::time::sleep(Duration::from_millis(40)).await;
@@ -3603,6 +3865,7 @@ mod tests {
             None,
             "local".to_string(),
             shutdown_rx,
+            true,
         ));
 
         tokio::time::sleep(Duration::from_millis(60)).await;
@@ -3657,6 +3920,7 @@ mod tests {
             None,
             "local".to_string(),
             shutdown_rx,
+            true,
         ));
 
         tokio::time::sleep(Duration::from_millis(40)).await;
@@ -3728,6 +3992,7 @@ mod tests {
             None,
             "local".to_string(),
             shutdown_rx,
+            true,
         ));
 
         // Several 10ms intervals, every one of them writer-busy.
@@ -3771,7 +4036,7 @@ mod tests {
             ..SessionSweepConfig::default()
         };
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
-        let handle = tokio::spawn(run_session_sweep_task(None, cfg, shutdown_rx));
+        let handle = tokio::spawn(run_session_sweep_task(Vec::new(), cfg, shutdown_rx));
 
         shutdown_tx.send(()).expect("send shutdown signal");
 
@@ -3827,11 +4092,12 @@ mod tests {
         std::fs::create_dir(&obstruction).unwrap();
 
         tokio::time::sleep(Duration::from_millis(20)).await;
-        let over_threshold = Some((
-            khive_storage::tx_registry::TxId(1),
-            Duration::from_secs(60),
-            None,
-        ));
+        let over_threshold = Some(khive_storage::tx_registry::OldestSpan {
+            id: khive_storage::tx_registry::TxId(1),
+            age: Duration::from_secs(60),
+            label: None,
+            origin: khive_storage::tx_registry::TxOrigin::Unscoped,
+        });
         state
             .observe(over_threshold.clone(), Duration::from_secs(30))
             .await;
@@ -3864,11 +4130,123 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(khive_walpin_sidecar_env)]
+    async fn walpin_observe_touches_mtime_without_rewriting_body_when_content_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("observe_touch.db");
+        let sidecar_dir = crate::walpin::sidecar_dir_for(&db_path);
+        let _env_guard = crate::walpin::EnvVarGuard::capture("KHIVE_WALPIN_SIDECAR");
+        std::env::set_var("KHIVE_WALPIN_SIDECAR", "1");
+
+        let mut state = WalpinSidecarState::new(
+            Some(db_path.as_path()),
+            true,
+            "session",
+            Duration::from_millis(500),
+        )
+        .expect("sidecar enabled for a file-backed path");
+        let pid = std::process::id();
+        let heartbeat_path = sidecar_dir.join(format!("{pid}.json"));
+        let span = khive_storage::tx_registry::OldestSpan {
+            id: khive_storage::tx_registry::TxId(1),
+            age: Duration::from_secs(60),
+            label: None,
+            origin: khive_storage::tx_registry::TxOrigin::Unscoped,
+        };
+
+        state
+            .observe(Some(span.clone()), Duration::from_secs(30))
+            .await;
+        let body_after_create = std::fs::read(&heartbeat_path).expect("heartbeat written");
+
+        // Backdate the mtime so the touch is unambiguous: if `observe`
+        // rewrote the body instead of touching it, the write would also
+        // reset the mtime, making this assertion pass for the wrong reason —
+        // the body-byte comparison below is what actually distinguishes
+        // touch from rewrite.
+        let backdated = std::time::SystemTime::now() - Duration::from_secs(120);
+        std::fs::File::open(&heartbeat_path)
+            .unwrap()
+            .set_modified(backdated)
+            .unwrap();
+
+        state.observe(Some(span), Duration::from_secs(30)).await;
+
+        let body_after_second_observe =
+            std::fs::read(&heartbeat_path).expect("heartbeat still present");
+        assert_eq!(
+            body_after_create, body_after_second_observe,
+            "unchanged oldest-span identity/label/attribution/cadence must touch mtime, \
+             not rewrite the body"
+        );
+        let mtime_after = std::fs::metadata(&heartbeat_path)
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert!(
+            mtime_after > backdated,
+            "the touch must advance mtime past the backdated value"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(khive_walpin_sidecar_env)]
+    async fn walpin_observe_recreates_heartbeat_after_it_is_deleted_while_span_still_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("observe_recreate.db");
+        let sidecar_dir = crate::walpin::sidecar_dir_for(&db_path);
+        let _env_guard = crate::walpin::EnvVarGuard::capture("KHIVE_WALPIN_SIDECAR");
+        std::env::set_var("KHIVE_WALPIN_SIDECAR", "1");
+
+        let mut state = WalpinSidecarState::new(
+            Some(db_path.as_path()),
+            true,
+            "session",
+            Duration::from_millis(500),
+        )
+        .expect("sidecar enabled for a file-backed path");
+        let pid = std::process::id();
+        let heartbeat_path = sidecar_dir.join(format!("{pid}.json"));
+        let span = khive_storage::tx_registry::OldestSpan {
+            id: khive_storage::tx_registry::TxId(1),
+            age: Duration::from_secs(60),
+            label: None,
+            origin: khive_storage::tx_registry::TxOrigin::Unscoped,
+        };
+
+        state
+            .observe(Some(span.clone()), Duration::from_secs(30))
+            .await;
+        assert!(heartbeat_path.exists(), "heartbeat written on first tick");
+
+        // Simulate enumeration deleting a slow writer's heartbeat while its
+        // span is still live: the next tick still sees unchanged content
+        // (same span, same label, same attribution, same cadence) so it
+        // takes the touch path — which must detect the missing target and
+        // fall through to a full recreate rather than silently no-op.
+        std::fs::remove_file(&heartbeat_path).unwrap();
+        assert!(!heartbeat_path.exists());
+
+        state.observe(Some(span), Duration::from_secs(30)).await;
+
+        assert!(
+            heartbeat_path.exists(),
+            "a touch failure against a deleted heartbeat must recreate it via a full write"
+        );
+        let recreated: crate::walpin::WalpinHeartbeat =
+            serde_json::from_slice(&std::fs::read(&heartbeat_path).unwrap()).unwrap();
+        assert_eq!(recreated.pid, pid);
+        assert_eq!(recreated.oldest_tx_age_secs, 60.0);
+    }
+
+    #[tokio::test]
     #[serial(tx_registry, khive_walpin_sidecar_env)]
     async fn session_sweep_task_writes_and_clears_walpin_heartbeat() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("session_sweep.db");
-        let sidecar_dir = crate::walpin::sidecar_dir_for(&db_path);
+        let pool = file_pool(&db_path);
+        let sidecar_dir =
+            crate::walpin::sidecar_dir_for(pool.canonical_path().expect("file-backed pool"));
         let _env_guard = crate::walpin::EnvVarGuard::capture("KHIVE_WALPIN_SIDECAR");
         std::env::set_var("KHIVE_WALPIN_SIDECAR", "1");
 
@@ -3879,7 +4257,10 @@ mod tests {
         };
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
         let handle = tokio::spawn(run_session_sweep_task(
-            Some(db_path.clone()),
+            vec![SweepBackend {
+                pool: Arc::clone(&pool),
+                is_main: true,
+            }],
             cfg,
             shutdown_rx,
         ));
@@ -3916,6 +4297,12 @@ mod tests {
             hb.oldest_tx_label.as_deref(),
             Some("session_sweep_walpin_test")
         );
+        assert_eq!(
+            hb.attribution_basis.as_deref(),
+            Some("fallback"),
+            "an Unscoped span observed only through the main view's fallback \
+             must carry attribution_basis=\"fallback\", never \"origin\""
+        );
 
         drop(tx_handle);
         assert!(
@@ -3928,6 +4315,261 @@ mod tests {
             .await
             .expect("session sweep task should exit within 1s")
             .expect("session sweep task panicked");
+    }
+
+    /// ADR-091 Amendment 3 fan-out: two file-backed pools in one process,
+    /// each its own `SweepBackend`. A span scoped to the SECONDARY pool's
+    /// own origin must produce a heartbeat only in the secondary's sidecar
+    /// — never the main backend's — and, because a `Secondary` filter never
+    /// falls back to `Unscoped`, its heartbeat carries the evidence-backed
+    /// `attribution_basis="origin"`. Uses the `graph_traverse_read` label
+    /// (`stores/graph.rs`'s `traverse`) — the design note's own example of
+    /// "the most WAL-pin-relevant span in the store" — as the registered
+    /// span's label, so this doubles as coverage that a traversal read span
+    /// surfaces correctly in a secondary backend's filtered view.
+    #[tokio::test]
+    #[serial(tx_registry, khive_walpin_sidecar_env)]
+    async fn session_sweep_fan_out_scopes_secondary_span_to_secondary_sidecar_only() {
+        let main_dir = tempfile::tempdir().unwrap();
+        let secondary_dir = tempfile::tempdir().unwrap();
+        let main_pool = file_pool(&main_dir.path().join("main.db"));
+        let secondary_pool = file_pool(&secondary_dir.path().join("secondary.db"));
+        let main_sidecar =
+            crate::walpin::sidecar_dir_for(main_pool.canonical_path().expect("file-backed"));
+        let secondary_sidecar =
+            crate::walpin::sidecar_dir_for(secondary_pool.canonical_path().expect("file-backed"));
+        let _env_guard = crate::walpin::EnvVarGuard::capture("KHIVE_WALPIN_SIDECAR");
+        std::env::set_var("KHIVE_WALPIN_SIDECAR", "1");
+
+        let cfg = SessionSweepConfig {
+            interval: Duration::from_millis(10),
+            tx_warn_secs: Duration::from_millis(20),
+            tx_max_age_secs: Duration::from_millis(500),
+        };
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+        let handle = tokio::spawn(run_session_sweep_task(
+            vec![
+                SweepBackend {
+                    pool: Arc::clone(&main_pool),
+                    is_main: true,
+                },
+                SweepBackend {
+                    pool: Arc::clone(&secondary_pool),
+                    is_main: false,
+                },
+            ],
+            cfg,
+            shutdown_rx,
+        ));
+
+        let pid = std::process::id();
+        let secondary_heartbeat = secondary_sidecar.join(format!("{pid}.json"));
+        let main_heartbeat = main_sidecar.join(format!("{pid}.json"));
+
+        let tx_handle = khive_storage::tx_registry::register_scoped(
+            Some("graph_traverse_read".to_string()),
+            secondary_pool.origin(),
+        );
+        assert!(
+            wait_for(Duration::from_secs(2), || secondary_heartbeat.exists()).await,
+            "expected a walpin heartbeat in the secondary backend's own sidecar"
+        );
+        assert!(
+            !main_heartbeat.exists(),
+            "a span scoped to the secondary backend's origin must never produce \
+             a heartbeat in the main backend's sidecar"
+        );
+
+        let body = std::fs::read_to_string(&secondary_heartbeat).unwrap();
+        let hb: crate::walpin::WalpinHeartbeat = serde_json::from_str(&body).unwrap();
+        assert_eq!(hb.oldest_tx_label.as_deref(), Some("graph_traverse_read"));
+        assert_eq!(
+            hb.attribution_basis.as_deref(),
+            Some("origin"),
+            "a Secondary-view winner is always Database-origin-backed — never fallback"
+        );
+
+        drop(tx_handle);
+        assert!(
+            wait_for(Duration::from_secs(2), || !secondary_heartbeat.exists()).await,
+            "secondary heartbeat must be removed once its span clears"
+        );
+        assert!(
+            !main_heartbeat.exists(),
+            "the main sidecar must have stayed untouched for the whole tick sequence"
+        );
+
+        shutdown_tx.send(()).expect("send shutdown signal");
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("session sweep task should exit within 1s")
+            .expect("session sweep task panicked");
+    }
+
+    /// ADR-091 Amendment 3: a `run_checkpoint_task` instance for backend A
+    /// (`is_main: false`, a `Secondary` filter scoped to A's own identity)
+    /// must never observe a span registered against a DIFFERENT backend's
+    /// `Database` origin, nor an `Unscoped` span — a `Secondary` filter never
+    /// falls back to `Unscoped` (that fallback is the main view's alone).
+    /// Drives the real task for several ticks and asserts neither the
+    /// captured `tracing` emissions nor backend A's own sidecar ever name
+    /// either span.
+    #[tokio::test]
+    #[serial(tx_registry, checkpoint_skip_metrics, khive_walpin_sidecar_env)]
+    async fn checkpoint_task_ignores_span_registered_against_other_backend_origin_and_unscoped() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let pool_a = file_pool(&dir_a.path().join("backend_a.db"));
+        // Only used to mint a real, distinct `DbIdentity` for backend B — no
+        // checkpoint task is spawned for it.
+        let pool_b = file_pool(&dir_b.path().join("backend_b.db"));
+        let sidecar_a =
+            crate::walpin::sidecar_dir_for(pool_a.canonical_path().expect("file-backed"));
+        let _env_guard = crate::walpin::EnvVarGuard::capture("KHIVE_WALPIN_SIDECAR");
+        std::env::set_var("KHIVE_WALPIN_SIDECAR", "1");
+
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = CaptureSubscriber {
+            events: std::sync::Arc::clone(&buffer),
+        };
+        let _tracing_guard = tracing::subscriber::set_default(subscriber);
+
+        let _b_origin_handle = khive_storage::tx_registry::register_scoped(
+            Some("b_origin_span_ignored_by_a".to_string()),
+            pool_b.origin(),
+        );
+        let _unscoped_handle = khive_storage::tx_registry::register(Some(
+            "unscoped_span_ignored_by_secondary".to_string(),
+        ));
+
+        let cfg = CheckpointConfig {
+            interval: Duration::from_millis(10),
+            tx_warn_secs: Duration::from_millis(1),
+            tx_max_age_secs: Duration::from_millis(1),
+            ..CheckpointConfig::default()
+        };
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+        let handle = tokio::spawn(run_checkpoint_task(
+            pool_a,
+            cfg,
+            None,
+            "local".to_string(),
+            shutdown_rx,
+            false, // is_main: backend A is a secondary backend here
+        ));
+
+        // No positive condition to poll for — this asserts an absence over a
+        // bounded run of several ticks, mirroring
+        // `checkpoint_task_emits_no_age_alert_for_an_empty_registry`'s same
+        // fixed-window shape (there is nothing to wait-until for a negative).
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        shutdown_tx.send(()).expect("send shutdown signal");
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("checkpoint task should exit within 1s")
+            .expect("checkpoint task panicked");
+
+        let events = buffer.lock().unwrap();
+        assert!(
+            events.iter().all(|e| {
+                e.tx_label.as_deref() != Some("b_origin_span_ignored_by_a")
+                    && e.tx_label.as_deref() != Some("unscoped_span_ignored_by_secondary")
+            }),
+            "backend A's Secondary filter must never emit an age alert naming a span \
+             registered against a different backend's origin or an Unscoped span, got: \
+             {events:?}"
+        );
+        assert!(
+            !sidecar_a
+                .join(format!("{}.json", std::process::id()))
+                .exists(),
+            "backend A's own sidecar must never gain a heartbeat from a span it does not own"
+        );
+    }
+
+    /// ADR-091 Amendment 3: a secondary backend's own `run_checkpoint_task`
+    /// must detect a stall on its OWN backend (never main-only ownership) —
+    /// both the Plank 1 age-sweep emission and the sidecar heartbeat, with
+    /// `attribution_basis="origin"` (a `Secondary` filter winner is always
+    /// `Database`-origin-backed, never the `Unscoped` fallback) and a
+    /// nonzero reflected age.
+    #[tokio::test]
+    #[serial(tx_registry, checkpoint_skip_metrics, khive_walpin_sidecar_env)]
+    async fn checkpoint_task_detects_and_enumerates_secondary_backend_stall() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = file_pool(&dir.path().join("secondary_stall.db"));
+        let sidecar_dir =
+            crate::walpin::sidecar_dir_for(pool.canonical_path().expect("file-backed"));
+        let _env_guard = crate::walpin::EnvVarGuard::capture("KHIVE_WALPIN_SIDECAR");
+        std::env::set_var("KHIVE_WALPIN_SIDECAR", "1");
+
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = CaptureSubscriber {
+            events: std::sync::Arc::clone(&buffer),
+        };
+        let _tracing_guard = tracing::subscriber::set_default(subscriber);
+
+        let tx_handle = khive_storage::tx_registry::register_scoped(
+            Some("secondary_stall_test".to_string()),
+            pool.origin(),
+        );
+
+        let cfg = CheckpointConfig {
+            interval: Duration::from_millis(10),
+            tx_warn_secs: Duration::from_millis(5),
+            tx_max_age_secs: Duration::from_millis(500),
+            ..CheckpointConfig::default()
+        };
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+        let pid = std::process::id();
+        let heartbeat_path = sidecar_dir.join(format!("{pid}.json"));
+        let handle = tokio::spawn(run_checkpoint_task(
+            pool,
+            cfg,
+            None,
+            "local".to_string(),
+            shutdown_rx,
+            false, // is_main: this is a secondary backend's own checkpoint task
+        ));
+
+        assert!(
+            wait_for(Duration::from_secs(2), || heartbeat_path.exists()).await,
+            "expected a walpin heartbeat once the secondary backend's own span crossed \
+             tx_warn_secs"
+        );
+        let body = std::fs::read_to_string(&heartbeat_path).unwrap();
+        let hb: crate::walpin::WalpinHeartbeat = serde_json::from_str(&body).unwrap();
+        assert_eq!(hb.oldest_tx_label.as_deref(), Some("secondary_stall_test"));
+        assert_eq!(
+            hb.attribution_basis.as_deref(),
+            Some("origin"),
+            "a Secondary-view winner is always Database-origin-backed — never fallback"
+        );
+        assert!(
+            hb.oldest_tx_age_secs > 0.0,
+            "the heartbeat must reflect a nonzero stale age for the secondary backend's own \
+             span, got {hb:?}"
+        );
+
+        shutdown_tx.send(()).expect("send shutdown signal");
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("checkpoint task should exit within 1s")
+            .expect("checkpoint task panicked");
+
+        drop(tx_handle);
+
+        let events = buffer.lock().unwrap();
+        assert!(
+            events.iter().any(|e| {
+                e.tx_label.as_deref() == Some("secondary_stall_test")
+                    && e.message
+                        .as_deref()
+                        .is_some_and(|m| m.contains("ADR-091 Plank 1"))
+            }),
+            "expected the secondary backend's own checkpoint task to emit a Plank 1 age alert \
+             for its own stalled span, got: {events:?}"
+        );
     }
 
     #[test]

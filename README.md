@@ -5,7 +5,7 @@ taxonomies, and a verb-consolidated MCP surface.
 
 [![CI](https://github.com/ohdearquant/khive/actions/workflows/ci.yml/badge.svg)](https://github.com/ohdearquant/khive/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/khive-mcp.svg)](https://crates.io/crates/khive-mcp)
-[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![License: BUSL-1.1](https://img.shields.io/badge/License-BUSL--1.1-blue.svg)](LICENSE)
 [![Docs](https://img.shields.io/badge/docs-ohdearquant.github.io%2Fkhive-0969da)](https://ohdearquant.github.io/khive/)
 [![Discord](https://img.shields.io/badge/Discord-join%20chat-5865F2?logo=discord&logoColor=white)](https://discord.gg/JDj9ENhUE8)
 
@@ -25,7 +25,7 @@ stdio, and `cargo test` finishes in 4 seconds.
 
 | Capability                  | How                                                                                                                                                      |
 | --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **66 verbs, 11 packs**      | KG, GTD, memory, brain, comm, schedule, session, git, code, workspace, blob: all load by default                                              |
+| **66 verbs, 11 packs**      | KG, GTD, memory, brain, comm, schedule, session, git, code, workspace, blob: all load by default                                                         |
 | **Typed entities**          | 9 closed kinds: concept, document, dataset, project, person, org, artifact, service, resource                                                            |
 | **Typed edges**             | 17 closed relations in 9 categories (structure, derivation, provenance, temporal, dependency, impl, lateral, annotation, epistemic)                      |
 | **Typed notes**             | 5 closed kinds: observation, insight, question, decision, reference                                                                                      |
@@ -66,19 +66,19 @@ request(ops="[{\"tool\":\"v1\",\"args\":{...}}, ...]") # equivalent JSON form
 All 11 packs load by default, giving **66 verbs** out of the box (regenerate with
 `request(ops="verbs()")` before editing this table):
 
-| Pack          | Prefix       | Verbs | What it does                                                                                   |
-| ------------- | ------------ | ----- | ---------------------------------------------------------------------------------------------- |
-| **kg**        | _(bare)_     | 18    | Entities, edges, notes, graph queries, reference resolution                                    |
-| **gtd**       | `gtd.`       | 5     | Task lifecycle (inbox → next → active → done)                                                  |
-| **memory**    | `memory.`    | 5     | Salience-weighted remember / decay-ranked recall                                               |
-| **brain**     | `brain.`     | 15    | Bayesian user profiles + feedback loop                                                         |
-| **comm**      | `comm.`      | 7     | Threaded messaging                                                                             |
-| **schedule**  | `schedule.`  | 4     | Reminders and scheduled verb execution                                                         |
-| **session**   | `session.`   | 4     | Session record persistence (store/list/resume/export)                                          |
-| **git**       | `git.`       | 4     | `git.digest` provenance ingestion + `git.commit`/`git.branch`/`git.push` write verbs (ADR-108) |
-| **code**      | _(none)_     | 1     | `code.ingest`: L1 manifest + L1.5 import-scan source ingest (ADR-085 Amendment 2)              |
-| **workspace** | _(none)_     | 0     | Adds the `workspace` entity kind + `contains` endpoint rules to git/gtd/session notes (#873)   |
-| **blob**      | `blob.`      | 3     | Content-addressed object put/get/stat over the `BlobStore` CAS trait (ADR-111)                 |
+| Pack          | Prefix      | Verbs | What it does                                                                                   |
+| ------------- | ----------- | ----- | ---------------------------------------------------------------------------------------------- |
+| **kg**        | _(bare)_    | 18    | Entities, edges, notes, graph queries, reference resolution                                    |
+| **gtd**       | `gtd.`      | 5     | Task lifecycle (inbox → next → active → done)                                                  |
+| **memory**    | `memory.`   | 5     | Salience-weighted remember / decay-ranked recall                                               |
+| **brain**     | `brain.`    | 15    | Bayesian user profiles + feedback loop                                                         |
+| **comm**      | `comm.`     | 7     | Threaded messaging                                                                             |
+| **schedule**  | `schedule.` | 4     | Reminders and scheduled verb execution                                                         |
+| **session**   | `session.`  | 4     | Session record persistence (store/list/resume/export)                                          |
+| **git**       | `git.`      | 4     | `git.digest` provenance ingestion + `git.commit`/`git.branch`/`git.push` write verbs (ADR-108) |
+| **code**      | _(none)_    | 1     | `code.ingest`: L1 manifest + L1.5 import-scan source ingest (ADR-085 Amendment 2)              |
+| **workspace** | _(none)_    | 0     | Adds the `workspace` entity kind + `contains` endpoint rules to git/gtd/session notes (#873)   |
+| **blob**      | `blob.`     | 3     | Content-addressed object put/get/stat over the `BlobStore` CAS trait (ADR-111)                 |
 
 `create`, `list`, `search` take `kind=entity|note` (or `kind=edge` for `list`).
 `get`, `update`, `delete`, `merge` are UUID-only: they auto-detect the record type.
@@ -192,28 +192,28 @@ as a measured headline figure. The benchmark harness lives in `perf/`; raw data 
 
 ## Crates
 
-| Crate                  | Purpose                                                                                                  |
-| ---------------------- | -------------------------------------------------------------------------------------------------------- |
-| `khive-types`          | Domain types, Pack trait, closed enums                                                                   |
-| `khive-score`          | Deterministic i64 fixed-point scoring                                                                    |
-| `khive-storage`        | Trait-only capability surface (zero implementations)                                                     |
-| `khive-db`             | SQLite backend: entity/note/edge tables, FTS5 TextSearch, current sqlite-vec VectorStore compatibility   |
-| `khive-retrieval`      | Hybrid retrieval primitives                                                                              |
-| `khive-fusion`         | RRF, weighted, union, vector-only, and keyword-only fusion strategies                                    |
-| `khive-bm25`           | BM25 keyword index                                                                                       |
-| `khive-hnsw`           | HNSW vector index                                                                                        |
-| `khive-vamana`         | Vamana ANN index used by semantic recall                                                                |
-| `khive-query`          | SPARQL / GQL → SQL compiler                                                                              |
-| `khive-runtime`        | Service API + VerbRegistry + PackRuntime trait                                                           |
-| `khive-request`        | Request DSL parser (function-call, JSON; pipe / LNDL planned). Transport-agnostic AST.                   |
-| `khive-pack-kg`        | KG pack: vocabulary, verb handlers, kind validation                                                      |
-| `khive-pack-gtd`       | GTD pack: task lifecycle over the notes substrate                                                        |
-| `khive-pack-memory`    | Memory pack: salience-weighted remember/recall with decay                                                |
-| `khive-pack-brain`     | Brain pack: Bayesian user profiles, feedback, resolution                                                 |
-| `khive-pack-comm`      | Comm pack: threaded messaging with inbox                                                                 |
-| `khive-pack-schedule`  | Schedule pack: reminders and scheduled verb execution                                                    |
-| `khive-mcp`            | MCP server library: single `request` tool dispatching through the VerbRegistry (served by `kkernel mcp`) |
-| `kkernel`              | The single shipped binary: `kkernel mcp` serves MCP; admin subcommands (exec, reindex, db, …)            |
+| Crate                 | Purpose                                                                                                  |
+| --------------------- | -------------------------------------------------------------------------------------------------------- |
+| `khive-types`         | Domain types, Pack trait, closed enums                                                                   |
+| `khive-score`         | Deterministic i64 fixed-point scoring                                                                    |
+| `khive-storage`       | Trait-only capability surface (zero implementations)                                                     |
+| `khive-db`            | SQLite backend: entity/note/edge tables, FTS5 TextSearch, current sqlite-vec VectorStore compatibility   |
+| `khive-retrieval`     | Hybrid retrieval primitives                                                                              |
+| `khive-fusion`        | RRF, weighted, union, vector-only, and keyword-only fusion strategies                                    |
+| `khive-bm25`          | BM25 keyword index                                                                                       |
+| `khive-hnsw`          | HNSW vector index                                                                                        |
+| `khive-vamana`        | Vamana ANN index used by semantic recall                                                                 |
+| `khive-query`         | SPARQL / GQL → SQL compiler                                                                              |
+| `khive-runtime`       | Service API + VerbRegistry + PackRuntime trait                                                           |
+| `khive-request`       | Request DSL parser (function-call, JSON; pipe / LNDL planned). Transport-agnostic AST.                   |
+| `khive-pack-kg`       | KG pack: vocabulary, verb handlers, kind validation                                                      |
+| `khive-pack-gtd`      | GTD pack: task lifecycle over the notes substrate                                                        |
+| `khive-pack-memory`   | Memory pack: salience-weighted remember/recall with decay                                                |
+| `khive-pack-brain`    | Brain pack: Bayesian user profiles, feedback, resolution                                                 |
+| `khive-pack-comm`     | Comm pack: threaded messaging with inbox                                                                 |
+| `khive-pack-schedule` | Schedule pack: reminders and scheduled verb execution                                                    |
+| `khive-mcp`           | MCP server library: single `request` tool dispatching through the VerbRegistry (served by `kkernel mcp`) |
+| `kkernel`             | The single shipped binary: `kkernel mcp` serves MCP; admin subcommands (exec, reindex, db, …)            |
 
 Dependency direction (storage stack): `types → score → storage → db → query → runtime → packs → mcp`.
 Side input: `request → mcp` (the DSL parser is consumed only at the MCP dispatch boundary;
@@ -382,4 +382,13 @@ Ready for use with Claude Code and any MCP-compatible agent.
 
 ## License
 
-Apache 2.0. See [LICENSE](LICENSE).
+Business Source License 1.1. See [LICENSE](LICENSE).
+
+You may use, modify, and redistribute khive freely, including in production,
+with one restriction: offering khive itself to third parties as a competing
+hosted or embedded service requires a commercial license. On the Change Date
+(2030-07-20) each released version converts automatically to Apache 2.0.
+
+Versions published to crates.io and npm before 2026-07-20 remain under
+Apache 2.0; every release from this date forward ships under the Business
+Source License 1.1.

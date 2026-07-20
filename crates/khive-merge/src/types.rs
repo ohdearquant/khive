@@ -1,5 +1,3 @@
-// Copyright 2026 Haiyang Li. Licensed under Apache-2.0.
-//
 //! Public strategies, results, conflicts, errors, and engine contract.
 //!
 //! See `crates/khive-merge/docs/api/conflict-and-error-taxonomy.md`.

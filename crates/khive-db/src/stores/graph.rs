@@ -1028,10 +1028,13 @@ impl GraphStore for SqlGraphStore {
         // Flag-off (default) path: byte-for-byte unchanged from pre-ADR-067
         // behavior — the closure owns its own BEGIN IMMEDIATE/COMMIT/ROLLBACK
         // via the pool-mutex/standalone writer.
+        let origin = self.pool.origin();
         self.with_writer("upsert_edges", move |conn| {
             conn.execute_batch("BEGIN IMMEDIATE")?;
-            let _tx_handle =
-                khive_storage::tx_registry::register(Some("graph_upsert_edges".to_string()));
+            let _tx_handle = khive_storage::tx_registry::register_scoped(
+                Some("graph_upsert_edges".to_string()),
+                origin,
+            );
 
             let summary = match batch_upsert_edges(conn, &edges, attempted) {
                 Ok(summary) => summary,
@@ -1087,10 +1090,13 @@ impl GraphStore for SqlGraphStore {
         // between them (this fallback previously
         // ran the two as separate autocommit statements on the standalone
         // writer connection).
+        let origin = self.pool.origin();
         self.with_writer("upsert_edge_guarded", move |conn| {
             conn.execute_batch("BEGIN IMMEDIATE")?;
-            let _tx_handle =
-                khive_storage::tx_registry::register(Some("graph_upsert_edge_guarded".to_string()));
+            let _tx_handle = khive_storage::tx_registry::register_scoped(
+                Some("graph_upsert_edge_guarded".to_string()),
+                origin,
+            );
 
             let outcome = match edge_insert_guarded(conn, &statement, source_id, target_id) {
                 Ok(outcome) => outcome,
@@ -1127,11 +1133,13 @@ impl GraphStore for SqlGraphStore {
                 .await;
         }
 
+        let origin = self.pool.origin();
         self.with_writer("upsert_edges_guarded", move |conn| {
             conn.execute_batch("BEGIN IMMEDIATE")?;
-            let _tx_handle = khive_storage::tx_registry::register(Some(
-                "graph_upsert_edges_guarded".to_string(),
-            ));
+            let _tx_handle = khive_storage::tx_registry::register_scoped(
+                Some("graph_upsert_edges_guarded".to_string()),
+                origin,
+            );
 
             let summary = match batch_upsert_edges_guarded(conn, &edges, attempted) {
                 Ok(summary) => summary,
@@ -1831,6 +1839,7 @@ impl GraphStore for SqlGraphStore {
                 ),
             })?;
 
+        let origin = self.pool.origin();
         self.with_reader("traverse", move |conn| {
             // Two SQLite limits apply to the seed VALUES clause:
             //
@@ -1866,8 +1875,10 @@ impl GraphStore for SqlGraphStore {
             // Registered before the transaction is opened so the handle (declared
             // first) drops after `tx`'s own Drop runs (locals drop in reverse
             // declaration order within the same scope).
-            let _tx_handle =
-                khive_storage::tx_registry::register(Some("graph_traverse_read".to_string()));
+            let _tx_handle = khive_storage::tx_registry::register_scoped(
+                Some("graph_traverse_read".to_string()),
+                origin,
+            );
             let tx = conn.unchecked_transaction()?;
 
             // Accumulate per-root state across all chunks: (nodes_with_path_weight, seen_set).

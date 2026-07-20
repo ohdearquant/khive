@@ -741,10 +741,13 @@ impl TextSearch for Fts5TextSearch {
 
         // Flag-off (default) path: byte-for-byte unchanged from pre-ADR-067
         // behavior — the closure owns its own BEGIN IMMEDIATE/COMMIT/ROLLBACK.
+        let origin = self.pool.origin();
         self.with_writer("fts_upsert", move |conn| {
             conn.execute_batch("BEGIN IMMEDIATE")?;
-            let _tx_handle =
-                khive_storage::tx_registry::register(Some("text_upsert_document".to_string()));
+            let _tx_handle = khive_storage::tx_registry::register_scoped(
+                Some("text_upsert_document".to_string()),
+                origin,
+            );
 
             if let Err(e) = upsert_document_dml(conn, &table, &document) {
                 let _ = conn.execute_batch("ROLLBACK");
@@ -781,10 +784,13 @@ impl TextSearch for Fts5TextSearch {
 
         // Flag-off (default) path: byte-for-byte unchanged from pre-ADR-067
         // behavior — the closure owns its own BEGIN IMMEDIATE/COMMIT.
+        let origin = self.pool.origin();
         self.with_writer("fts_upsert_batch", move |conn| {
             conn.execute_batch("BEGIN IMMEDIATE")?;
-            let _tx_handle =
-                khive_storage::tx_registry::register(Some("text_upsert_batch".to_string()));
+            let _tx_handle = khive_storage::tx_registry::register_scoped(
+                Some("text_upsert_batch".to_string()),
+                origin,
+            );
 
             let summary = batch_upsert_documents_dml(conn, &table, &documents, attempted)?;
 
@@ -1381,6 +1387,7 @@ impl Fts5TextSearch {
         let old_ns = old_namespace.to_string();
         let new_ns = new_namespace.to_string();
 
+        let origin = self.pool.origin();
         self.with_writer_unmanaged("fts_rename_namespace", move |conn| {
             let sel_sql = format!(
                 "SELECT subject_id, kind, title, body, tags, metadata, updated_at \
@@ -1417,8 +1424,10 @@ impl Fts5TextSearch {
             }
 
             conn.execute_batch("BEGIN IMMEDIATE")?;
-            let _tx_handle =
-                khive_storage::tx_registry::register(Some("text_rename_namespace".to_string()));
+            let _tx_handle = khive_storage::tx_registry::register_scoped(
+                Some("text_rename_namespace".to_string()),
+                origin,
+            );
 
             let del_sql = format!("DELETE FROM {} WHERE namespace = ?1", table);
             if let Err(e) = conn.execute(&del_sql, rusqlite::params![&old_ns]) {
