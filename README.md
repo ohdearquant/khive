@@ -375,7 +375,7 @@ Docs: [ohdearquant.github.io/khive](https://ohdearquant.github.io/khive/) (agent
 
 ## Status
 
-**v0.5.0 (publication pending; crates.io currently serves 0.4.0).** 66 verbs across 11
+**v0.5.0.** 66 verbs across 11
 packs, 9 entity kinds, 17 edge relations, daemon warm startup (ADR-049), Bayesian brain
 profiles, threaded messaging, scheduled verb execution.
 Ready for use with Claude Code and any MCP-compatible agent.
