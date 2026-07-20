@@ -837,3 +837,174 @@ implicate or exonerate them without reading native code.
 **Config.** `KHIVE_SESSION_SWEEP_INTERVAL_MS` (default 5000, sessions only);
 `KHIVE_WALPIN_SIDECAR` (default on for file-backed backends, off for in-memory).
 Existing threshold keys are reused unchanged.
+
+### 2026-07-20 amendment (Amendment 3): heartbeat freshness basis and the attribution-basis field
+
+**Motivation.** Two contract refinements to Amendment 2 (#1155 item 1; the
+backend-scoped attribution design in
+`docs/design/walpin-backend-scoped-attribution.md`):
+
+1. While a transaction is over-threshold, the session sweep rewrites and fsyncs
+   the full heartbeat record on every tick (exclusive-create temp file plus
+   atomic rename, per the trust-boundary contract). Freshness only needs a
+   timestamp to advance, and beacons already refresh with a metadata-only
+   mtime touch. The asymmetry is pure write churn: N ticks of one long-running
+   span produce N full record writes whose only material delta is the embedded
+   age.
+2. The backend-scoped attribution design introduces heartbeats written under a
+   fallback attribution (an unscoped-origin span observed by the main
+   backend's view). The record format needs a field that distinguishes
+   evidence-based attribution from fallback so diagnostics never read fallback
+   attribution as ground truth. This amendment is the sole source of truth for
+   that field's format; the design note consumes the definition and does not
+   restate it.
+
+**Plank F1: file mtime is the freshness basis for both record kinds.**
+
+Heartbeat liveness moves to the same basis the beacon refresh rule already
+uses: the record's freshness timestamp is the sidecar file's mtime, evaluated
+against the unchanged roughly-3-sweep-interval window. While the warn
+condition persists, each sweep tick performs a metadata-only mtime touch of
+the existing heartbeat file — the same mechanism and the same
+opened-directory-descriptor discipline as beacon refresh, preserving the
+trust-boundary contract. The full body is rewritten (exclusive-create temp
+file plus atomic rename, unchanged) only when record content changes: the
+first over-threshold observation, a change of the oldest span's identity or
+label, a change of `attribution_basis` (Plank F2), and the removal cases
+Amendment 2 already defines (clean shutdown, first tick after the condition
+clears). The body's `updated_at` field is retained and now means exactly "the
+instant of the last body write"; it no longer participates in liveness
+classification.
+
+_Liveness boundary (determinate form)._ Amendment 2 phrased the freshness
+window as "roughly 3 session sweep intervals"; on the mtime basis this
+amendment replaces that phrasing with an exact, observable contract, because
+the window has a hidden indeterminacy: the sweep interval is per-process
+configuration (`KHIVE_SESSION_SWEEP_INTERVAL_MS`), and the enumerating daemon
+cannot know a remote process's configured value — judging a 60-second-interval
+writer by three times the 5-second default would deterministically
+misclassify it. Records therefore declare their own cadence: heartbeat and
+beacon content each gain a `sweep_interval_ms` field, written at record
+creation (a mid-process configuration change is a content change and forces a
+rewrite). Classification is then exact:
+
+- **live** iff `enumeration_time - mtime <= 3 x max(declared
+  sweep_interval_ms, 1000 ms)` (boundary inclusive);
+- otherwise **stale**, with Amendment 2's consequences unchanged (stale
+  entries are deleted and their PIDs classify `unknown`).
+
+The `max(..., 1000 ms)` clamp is the mtime-resolution floor: filesystem
+mtime granularity is as coarse as one second, so a sub-second declared
+cadence must never narrow the classification window below what the basis
+can resolve — without the floor, a 100 ms cadence would yield a 300 ms
+window and healthy records would classify stale on any coarse filesystem.
+Sub-second cadences remain supported on the write side; the clamp affects
+classification only, flooring the effective window at three seconds.
+
+Records written by pre-amendment binaries carry no declaration; the
+enumerator evaluates them against the default interval (5000 ms), which is
+exactly today's behavior. Both timestamps come from the same host — the
+sidecar is same-machine by construction, since every writer holds the same
+database file — so no cross-host clock skew enters the comparison; filesystem
+mtime granularity (worst case one second on coarse filesystems) is covered
+by the mtime-resolution floor above. The multiplier's operational meaning is the measurable
+spec: a touch is a synchronous same-kernel metadata write, visible to
+enumeration the moment the tick completes, so a healthy process's record
+never exceeds one declared interval of age plus scheduling jitter, and the
+3x window tolerates up to two consecutive missed ticks before classifying
+stale. A process that misses more than two ticks is delayed by more than
+twice its own declared cadence — which is precisely the wedged-sweep
+signature Amendment 2's `unknown` classification exists to surface, so the
+false-stale case and the wanted-detection case coincide at the boundary.
+
+_Age is computed at read time._ A body that is not rewritten cannot carry a
+current age. The heartbeat record gains `oldest_tx_started_at` (epoch
+timestamp of the oldest span's registration instant); enumeration computes
+the current age as now minus `oldest_tx_started_at`. The existing
+`oldest_tx_age_secs` field is retained with its documentation narrowed: the
+age as of the last body write. Readers prefer `oldest_tx_started_at` when
+present; records written by pre-amendment binaries lack it and are read
+exactly as before. The alternative — keeping age current by rewriting the
+body every tick — is the status quo this plank exists to remove.
+
+_Recovery rule._ The touch path must never assume the file still exists:
+enumeration deletes stale entries, and a slow writer's heartbeat can be
+deleted while its span is still live. On every sweep tick where the warn
+condition holds, a missing heartbeat (or a touch failing with not-found) is
+recreated by a full body write through the unchanged create path — so a
+deletion costs at most one tick of attribution gap, never permanent
+invisibility. Beacons recover the same way, fail-closed: a missing beacon is
+rewritten on the next tick, and a beacon that cannot be recreated is a
+sidecar-health failure — the process classifies `unknown`, per Amendment 2's
+rule that a daemon-side or write-side failure must never masquerade as
+affirmative evidence. The full record lifecycle is therefore closed, with
+every transition defined: **create** (first over-threshold observation, full
+body write) → **touch** (each subsequent tick while the condition persists,
+metadata-only) → **rewrite** (content change, full body write) → **stale**
+(mtime falls outside the declared window) → **delete** (by enumeration, or
+by the writer on clean shutdown / first tick after the condition clears) →
+**recreate** (next over-threshold tick, identical to create). No state is
+terminal while the underlying span is live.
+
+_Mixed-version rule._ An enumerator predating this amendment classifies by
+body `updated_at` and would delete a live heartbeat whose new-style writer
+touches only mtime — the old reader actively destroys live records, which is
+the dangerous direction. The normative rule is therefore
+**readers-before-writers**: after a binary upgrade, the enumerating daemon
+process is restarted onto the amended binary before new-style writers
+matter. This is the deployment's natural order — the daemon is restarted at
+reinstall while stdio sessions re-exec afterward — so the ordering is the
+default behavior, not an operational burden; readers upgraded to this
+amendment accept both generations (records carrying the new fields classify
+on mtime; records without them classify on `updated_at` exactly as before),
+so upgraded readers never misjudge old writers. Should the ordering ever be
+violated (an old daemon process still running against new-style writers),
+the contract bounds the damage rather than pretending the window away: the
+window exists only between binary upgrade and daemon restart, an old-reader
+deletion is repaired by the recovery rule on the writer's next tick, and the
+interim classification is `unknown` — inconclusive, never false attribution.
+No flag-day coordination is required.
+
+_Crash conservatism._ An mtime touch is not durability-critical: a touch lost
+to a crash makes the record look stale, and Amendment 2's liveness gate
+already deletes stale entries and classifies their PIDs as `unknown` — the
+failure direction is inconclusive attribution, never false attribution. This
+is the same conservatism the beacon refresh rule accepted.
+
+**Plank F2: the `attribution_basis` field.**
+
+The heartbeat record gains exactly one additive field:
+
+- `attribution_basis`: string with exactly two values.
+  - `"origin"` — the oldest span carried this database's own origin
+    identity.
+  - `"fallback"` — the oldest span was unscoped and is observed by the main
+    backend's view as the designed never-silently-drop fallback.
+- Absence: records written by binaries predating this field carry no
+  `attribution_basis`; readers treat absence as unspecified — neither origin
+  nor fallback may be inferred from a missing field.
+
+_Fail-closed reading rule (binding on every consumer)._ Classification of a
+record's attribution confidence fails closed: a missing `attribution_basis`,
+an unrecognized value, or any parse failure of the field classifies the
+record as unspecified/fallback-confidence — **never** as evidence-backed.
+Only the exact string `"origin"` licenses the evidence-backed reading. This
+rule is versioned with the field itself: mixed-version readers encountering
+records from newer writers with values this amendment does not define must
+degrade to fallback-confidence rather than guess. Without this rule a
+fallback attribution could be read as ground truth — the exact confusion the
+field exists to prevent.
+
+The origin semantics (which spans are scoped to which database, and why
+unscoped spans fall back to the main view) are specified by the
+backend-scoped attribution design note; this amendment owns only the field's
+name, type, values, and the reading rule above. A change of
+`attribution_basis` is a content change and forces a body rewrite under
+Plank F1. Beacons carry no attribution and are unchanged beyond the cadence
+declaration.
+
+**Non-goals.** Thresholds, the enumeration liveness gate structure, census
+rules, the filesystem trust boundary, and the beacon refresh mechanism are
+unchanged; beacon content changes only by gaining the same `sweep_interval_ms`
+declaration heartbeats gain. This amendment adds no fields beyond the three
+named here (`oldest_tx_started_at`, `attribution_basis`, `sweep_interval_ms`).
