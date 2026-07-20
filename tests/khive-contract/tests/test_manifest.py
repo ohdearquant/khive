@@ -7,7 +7,10 @@ These tests are static (no MCP calls). They introspect the test suite files
 to enforce structural conventions:
   - Every test module declares VERBS_UNDER_TEST
   - Every test module's docstring references an ADR and section
-  - The union of all VERBS_UNDER_TEST covers all 18 product verbs
+  - The union of all VERBS_UNDER_TEST covers all 11 product verbs in
+    PRODUCT_VERB_MANIFEST (the core KG substrate CRUD/graph surface — see
+    that constant's docstring in khive_contract/fixtures.py for what it
+    deliberately excludes)
   - No test file hardcodes namespace="local" in verb calls (defeats isolation)
 """
 

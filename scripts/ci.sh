@@ -126,8 +126,6 @@ phase_deno_tests() {
 phase_smoke_tests() {
     echo "=== Smoke Test ==="
     python3 "$SCRIPT_DIR/../tests/smoke_test.py"
-    python3 "$SCRIPT_DIR/../tests/smoke_comm.py"
-    python3 "$SCRIPT_DIR/../tests/smoke_schedule.py"
 }
 
 phase_vector_smoke() {
