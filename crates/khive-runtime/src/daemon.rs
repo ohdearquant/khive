@@ -57,11 +57,14 @@ const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 10;
 /// though most of its callers (socket/pid paths) are unix-only.
 ///
 /// Resolution order: `HOME`, then `USERPROFILE` (the conventional Windows
-/// home variable), then the OS temp directory. The fallback chain never
-/// yields a working-directory-relative path: two processes opening the same
-/// database from different working directories must resolve the same lock
-/// file, so a cwd-relative fallback would silently defeat every advisory
-/// lock anchored here.
+/// home variable), then a platform-specific last resort. On non-unix targets
+/// the last resort is the OS temp directory (per-user on Windows), so the
+/// lock path can never be working-directory-relative there: two processes
+/// opening the same database from different working directories must resolve
+/// the same lock file. On unix the last resort stays the historical `"."` —
+/// a shared world-writable anchor such as `/tmp` would be worse, since a
+/// local attacker could pre-claim the directory and the socket/lock files
+/// under it before the daemon's first run.
 fn khive_dir() -> PathBuf {
     khive_root_from(
         std::env::var("HOME").ok(),
@@ -75,8 +78,19 @@ fn khive_root_from(home: Option<String>, userprofile: Option<String>) -> PathBuf
     home.filter(|v| !v.trim().is_empty())
         .or_else(|| userprofile.filter(|v| !v.trim().is_empty()))
         .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
+        .unwrap_or_else(last_resort_root)
         .join(".khive")
+}
+
+/// See [`khive_dir`] for why the two arms differ.
+#[cfg(unix)]
+fn last_resort_root() -> PathBuf {
+    PathBuf::from(".")
+}
+
+#[cfg(not(unix))]
+fn last_resort_root() -> PathBuf {
+    std::env::temp_dir()
 }
 
 /// Unix socket path the daemon binds and clients connect to.
@@ -1379,12 +1393,22 @@ mod khive_root_tests {
         );
     }
 
+    #[cfg(not(unix))]
     #[test]
     fn fallback_is_never_cwd_relative() {
-        // The lock/socket/pid anchor must not depend on the caller's working
+        // On non-unix the lock anchor must not depend on the caller's working
         // directory even when no home variable is set — a relative path here
         // would give the same database different lock files per cwd.
         assert!(khive_root_from(None, None).is_absolute());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_fallback_stays_historical_not_shared_tmp() {
+        // On unix the no-HOME last resort deliberately stays "./.khive"
+        // rather than a shared world-writable anchor like /tmp, which a
+        // local attacker could pre-claim to intercept the daemon socket.
+        assert_eq!(khive_root_from(None, None), PathBuf::from("./.khive"));
     }
 }
 
