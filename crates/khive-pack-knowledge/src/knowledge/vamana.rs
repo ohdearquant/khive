@@ -417,7 +417,7 @@ impl AnnBridge {
     /// reused slot's new owner can be tombstoned by a replay op for the
     /// old, already-deleted subject (#1150).
     pub(crate) fn reverse_map(&self) -> HashMap<Uuid, u32> {
-        let mut reverse: HashMap<Uuid, u32> = HashMap::with_capacity(self.id_map.len());
+        let mut reverse: HashMap<Uuid, u32> = HashMap::with_capacity(self.index.live_count());
         for (ordinal, uuid) in self.id_map.iter().enumerate() {
             if self.index.is_tombstoned(ordinal as u32) {
                 continue;
@@ -431,8 +431,13 @@ impl AnnBridge {
     /// `Some(embedding)` replays a final upsert (tombstone the mapped old
     /// ordinal, then exactly one insert); `None` replays a final delete
     /// (tombstone if mapped, no-op otherwise). `reverse` is the map from
-    /// [`reverse_map`](Self::reverse_map), kept current across calls. Any
-    /// id-map contradiction returns `Err` — the caller escalates to Cold.
+    /// [`reverse_map`](Self::reverse_map), kept current across calls.
+    ///
+    /// A delete whose mapped ordinal has been reassigned by an earlier
+    /// upsert in this replay is skipped with a warning, not an error: the
+    /// old subject's vector was already tombstoned when the slot was
+    /// reused, so there is nothing left to delete. Any other id-map
+    /// contradiction returns `Err` — the caller escalates to Cold.
     pub(crate) fn apply_final_op(
         &mut self,
         reverse: &mut HashMap<Uuid, u32>,
