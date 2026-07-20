@@ -582,6 +582,70 @@ argument, the rejected alternatives (wire-facing verb retirement, a composed
 field-validation registry analogous to `EDGE_RULES`), and the accompanying internal
 refactor that unifies `gtd.assign` onto the shared create-plus-`TaskHook` path.
 
+## Amendment: reduced open-source pack surface (2026-07-20)
+
+As of 2026-07-20, the open-source distribution's default pack set is reduced. The
+brain, knowledge, and code packs move to commercially licensed extensions
+maintained outside this repository; they are not part of the open-source
+distribution. The formal pack, which was never part of the open-source default
+pack set (see below), moves alongside the code pack as part of the same
+crate departure. A small set of channel-transport crates supporting alternate
+message delivery also move out of this repository; they contribute no MCP
+verbs and are unrelated to the pack-verb surface this ADR governs.
+
+### Default pack set, before and after
+
+The open-source default pack set (`RuntimeConfig::default()`, selectable via
+`KHIVE_PACKS` / `--pack`) was, before this change:
+
+```
+kg, gtd, memory, brain, comm, schedule, knowledge, session, git, code, workspace, blob
+```
+
+and is, after this change:
+
+```
+kg, gtd, memory, comm, schedule, session, git, workspace, blob
+```
+
+The formal pack was never included in this default set. It was compiled into
+the admin (`kkernel`) binary for operator/CLI-only use and never registered as
+part of the agent-facing MCP pack selection; its removal here changes which
+crates ship in this repository, not the default verb surface.
+
+### Consequence for the agent-facing verb surface
+
+Following this change, the open-source build no longer registers `brain.*` or
+`knowledge.*` verbs, nor the `code.ingest` verb. The kg substrate verbs (§4)
+and the `memory.*` verbs are unaffected and continue to operate as documented.
+
+Serving-profile resolution inside `memory.recall` (and `memory.feedback`)
+degrades gracefully in the absence of a registered brain pack: profile
+resolution dispatches an internal `brain.resolve` call and treats a failed
+dispatch (no such verb registered) the same as a resolvable-but-unmatched
+profile, returning no serving profile. Recall and feedback continue to operate
+on their plain-scoring path; the profile-weighted ranking terms described
+elsewhere in this document simply do not apply when no brain pack is loaded.
+
+### Composition after the carve
+
+This amendment does not change how packs compose. Per [ADR-027](ADR-027-dynamic-pack-loading.md),
+each pack registers itself into the shared handler table via `inventory::submit!`
+at link time; there is no plugin-loading step at runtime. A distribution that
+wishes to compose additional packs — including the ones described above — does
+so by adding their crates as build dependencies and force-linking them the same
+way every pack in this repository is force-linked today (§9); the open-source
+repository itself carries no feature flags, optional dependencies, or
+configuration referencing packs it does not ship.
+
+### Scope of this amendment
+
+This amendment records the pack-surface consequence of moving pack crates out
+of this repository. It does not introduce, retire, or rename any verb, and it
+does not change the visibility, naming, or composition rules established
+elsewhere in this ADR. Corresponding extraction changes are expected to land as
+separate pull requests against this repository.
+
 ## References
 
 - [ADR-001](ADR-001-entity-kind-taxonomy.md) — closed `EntityKind` taxonomy that packs
