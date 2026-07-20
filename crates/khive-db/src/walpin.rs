@@ -270,7 +270,7 @@ mod unix_impl {
     use std::io::{self, Read, Write};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime};
 
     /// Hard cap on one sidecar entry's byte size. Real heartbeat/beacon
@@ -278,6 +278,13 @@ mod unix_impl {
     /// this module wrote, and reading it unboundedly would let a same-uid
     /// process balloon checkpoint-time enumeration.
     pub(super) const MAX_SIDECAR_ENTRY_BYTES: u64 = 64 * 1024;
+
+    /// Bound on the number of ancestor symlink hops
+    /// [`SidecarDirHandle::open_dir_component_walk`] will resolve (each
+    /// independently root-owned-checked) before refusing outright — caps a
+    /// pathological or looping symlink chain to bounded work instead of
+    /// unbounded recursion.
+    const MAX_ANCESTOR_SYMLINK_DEPTH: u32 = 8;
 
     /// Every raw directory entry — hidden or not — counts toward a scan
     /// bound of `RAW_SCAN_FACTOR * max` in `list_names`, so a flood of
@@ -405,24 +412,34 @@ mod unix_impl {
         /// `openat` call's "final component" the immediate next segment, so
         /// `O_NOFOLLOW` refuses a symlink at every level, not just the last.
         ///
-        /// The walk runs over `path` resolved through `fs::canonicalize`
-        /// first, not the caller's literal path: legitimate OS-level
-        /// ancestor symlinks (macOS's `/tmp -> private/tmp`, `/var ->
-        /// private/var`) are a normal part of the filesystem layout, not an
-        /// attacker's TOCTOU target, and refusing them outright would
-        /// refuse every sidecar under the platform's own temp/var trees.
-        /// `canonicalize` resolves those once, up front; the descriptor
-        /// walk that follows is what closes the actual race ADR-091 cares
-        /// about — an ancestor swapped for a symlink AFTER `canonicalize`
-        /// returns but before (or during) this walk is refused component by
-        /// component via `O_NOFOLLOW`, rather than silently re-resolved the
-        /// way a second path-based open would.
+        /// The walk runs over `path` LITERALLY — never through a
+        /// `fs::canonicalize` pre-pass. A pre-resolve pass would itself
+        /// follow every ancestor symlink through ordinary kernel path
+        /// resolution before the descriptor walk ever starts, silently
+        /// validating whatever a hostile symlink planted before this call
+        /// pointed at; the walk would then only ever see the
+        /// already-attacker-chosen path. Legitimate OS-level ancestor
+        /// symlinks (macOS's `/tmp -> private/tmp`, `/var -> private/var`)
+        /// still have to work, so a component `openat` refuses with
+        /// `ELOOP`/`ENOTDIR` gets exactly one second look, via
+        /// [`Self::open_component`]: `fstatat` it (without following) to
+        /// confirm it really is a symlink AND is owned by root (uid 0,
+        /// mirroring the trust `open_component` extends to firmlinks the OS
+        /// itself planted in stock platform layout — never an arbitrary
+        /// user), then `readlinkat` + recurse into its target through this
+        /// same component-at-a-time discipline. A non-root-owned symlink
+        /// ancestor is refused outright; total symlink hops across the
+        /// whole walk are capped by `MAX_ANCESTOR_SYMLINK_DEPTH`.
         fn open_dir_component_walk(path: &Path) -> io::Result<fs::File> {
-            use std::path::Component;
+            let start = Self::open_anchor(path.is_absolute())?;
+            let mut budget = MAX_ANCESTOR_SYMLINK_DEPTH;
+            Self::walk_components(start, path, &mut budget)
+        }
 
-            let path = fs::canonicalize(path)?;
-            let path = path.as_path();
-            let anchor = if path.is_absolute() { "/" } else { "." };
+        /// Open `/` (absolute) or `.` (relative) as the starting descriptor
+        /// for a component walk.
+        fn open_anchor(absolute: bool) -> io::Result<fs::File> {
+            let anchor = if absolute { "/" } else { "." };
             let c_anchor = path_cstring(Path::new(anchor))?;
             // SAFETY: `c_anchor` is NUL-terminated for the call; the
             // returned fd is uniquely owned by this call and wrapped
@@ -437,32 +454,130 @@ mod unix_impl {
                 return Err(io::Error::last_os_error());
             }
             // SAFETY: `fd` was just returned by the successful `open` above.
-            let mut current = unsafe { fs::File::from_raw_fd(fd) };
+            Ok(unsafe { fs::File::from_raw_fd(fd) })
+        }
 
+        /// Walk every component of `path` starting from the already-open
+        /// `start` descriptor, one `openat(O_NOFOLLOW)` hop at a time.
+        fn walk_components(start: fs::File, path: &Path, budget: &mut u32) -> io::Result<fs::File> {
+            use std::path::Component;
+
+            let mut current = start;
             for component in path.components() {
                 let name = match component {
                     Component::RootDir | Component::CurDir | Component::Prefix(_) => continue,
                     Component::ParentDir => std::ffi::OsStr::new(".."),
                     Component::Normal(c) => c,
                 };
-                let c_name = name_cstring_os(name)?;
-                // SAFETY: `c_name` is NUL-terminated for the call; `current`
-                // is a live, open directory descriptor for the call's
-                // duration; the returned fd is uniquely owned by this call
-                // and wrapped immediately.
-                let next_fd = unsafe {
-                    libc::openat(
-                        current.as_raw_fd(),
-                        c_name.as_ptr(),
-                        libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                    )
-                };
-                if next_fd < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                current = unsafe { fs::File::from_raw_fd(next_fd) };
+                current = Self::open_component(current, name, budget)?;
             }
             Ok(current)
+        }
+
+        /// Open a single path component relative to `dir` via
+        /// `openat(O_DIRECTORY | O_NOFOLLOW)`. If the component is refused
+        /// because it is a symlink, the refusal is allowed exactly one
+        /// second look: the component must independently `fstatat` as a
+        /// root-owned (uid 0) symlink — the only party that plants firmlinks
+        /// in stock platform layout — before its target is read via
+        /// `readlinkat` and resolved through this same discipline. Anything
+        /// else (a non-root-owned symlink, or an `ELOOP`/`ENOTDIR` that
+        /// `fstatat` shows isn't actually a symlink) fails closed with the
+        /// original `openat` error.
+        fn open_component(
+            dir: fs::File,
+            name: &std::ffi::OsStr,
+            budget: &mut u32,
+        ) -> io::Result<fs::File> {
+            let c_name = name_cstring_os(name)?;
+            // SAFETY: `c_name` is NUL-terminated for the call; `dir` is a
+            // live, open directory descriptor for the call's duration; the
+            // returned fd is uniquely owned by this call and wrapped
+            // immediately.
+            let next_fd = unsafe {
+                libc::openat(
+                    dir.as_raw_fd(),
+                    c_name.as_ptr(),
+                    libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if next_fd >= 0 {
+                // SAFETY: `next_fd` was just returned by the successful
+                // `openat` above.
+                return Ok(unsafe { fs::File::from_raw_fd(next_fd) });
+            }
+            let open_err = io::Error::last_os_error();
+            let raw = open_err.raw_os_error();
+            if raw != Some(libc::ELOOP) && raw != Some(libc::ENOTDIR) {
+                return Err(open_err);
+            }
+
+            // The refusal above already made the security decision for
+            // every case except "this component is a root-owned platform
+            // firmlink" — this `fstatat` is diagnostic classification, not
+            // a second trust decision: it runs against the same live `dir`
+            // descriptor and the same `c_name`, so there is no re-resolution
+            // between the refused `openat` and this call.
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            // SAFETY: `c_name` is NUL-terminated for the call; `dir` is a
+            // live, open directory descriptor for the call's duration; `st`
+            // is a valid, appropriately-sized output buffer.
+            let rc = unsafe {
+                libc::fstatat(
+                    dir.as_raw_fd(),
+                    c_name.as_ptr(),
+                    &mut st,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if rc != 0 || !is_symlink_mode(st.st_mode) {
+                return Err(open_err);
+            }
+            if st.st_uid != 0 {
+                return Err(io_other(format!(
+                    "walpin sidecar ancestor {name:?} is a non-root-owned symlink; refusing"
+                )));
+            }
+            if *budget == 0 {
+                return Err(io_other(format!(
+                    "walpin sidecar ancestor {name:?} exceeded the symlink resolution depth budget"
+                )));
+            }
+            *budget -= 1;
+
+            let target = Self::read_link_component(&dir, &c_name)?;
+            let target_path = PathBuf::from(target);
+            let next_start = if target_path.is_absolute() {
+                Self::open_anchor(true)?
+            } else {
+                dir
+            };
+            Self::walk_components(next_start, &target_path, budget)
+        }
+
+        /// `readlinkat` a single component relative to `dir`, byte-exact
+        /// (never a lossy UTF-8 conversion — same rationale as
+        /// [`name_cstring_os`]).
+        fn read_link_component(dir: &fs::File, c_name: &CString) -> io::Result<std::ffi::OsString> {
+            use std::os::unix::ffi::OsStringExt;
+
+            let mut buf = vec![0u8; libc::PATH_MAX as usize];
+            // SAFETY: `c_name` is NUL-terminated for the call; `dir` is a
+            // live, open directory descriptor for the call's duration;
+            // `buf` is a valid output buffer of its declared capacity.
+            let rc = unsafe {
+                libc::readlinkat(
+                    dir.as_raw_fd(),
+                    c_name.as_ptr(),
+                    buf.as_mut_ptr() as *mut libc::c_char,
+                    buf.len(),
+                )
+            };
+            if rc < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            buf.truncate(rc as usize);
+            Ok(std::ffi::OsString::from_vec(buf))
         }
 
         fn open_validated_at(
@@ -969,11 +1084,53 @@ mod windows_impl {
         Ok(())
     }
 
-    /// Open the sidecar directory as a validated handle: a real directory,
-    /// never a reparse point, checked on the OPENED handle via
-    /// `GetFileInformationByHandle` — never a separate path-based query
-    /// that a later operation could re-resolve against a different object.
+    /// Case-insensitive comparison of two `GetFinalPathNameByHandleW`-
+    /// resolved paths (NTFS default collation). Both sides of every call
+    /// site here are handle-resolved paths from the same API, so a lossy
+    /// `to_string_lossy` is a conservative (fail-closed, never
+    /// fail-open) simplification: at worst a non-ASCII-identical byte
+    /// sequence that is genuinely equal reads as a mismatch and the open
+    /// is refused, never the reverse.
+    fn resolved_paths_match(a: &Path, b: &Path) -> bool {
+        a.as_os_str().to_string_lossy().to_ascii_lowercase()
+            == b.as_os_str().to_string_lossy().to_ascii_lowercase()
+    }
+
+    /// Open the sidecar directory as a validated handle, bound to the
+    /// database directory that is its one legitimate anchor (the threat
+    /// model: the sidecar is always a sibling of the live database file,
+    /// so binding to the parent directory's own resolved identity is the
+    /// strongest anchor available — anything above that the OS itself
+    /// owns is trusted platform layout). `dir`'s parent is opened first
+    /// and its `GetFinalPathNameByHandleW`-resolved path establishes the
+    /// EXPECTED final path (`<parent's resolved path>\<dir's own file
+    /// name>`); `dir` is then opened the same reparse-aware way as
+    /// before — a real directory, never a reparse point, checked on the
+    /// OPENED handle via `GetFileInformationByHandle` — and its OWN
+    /// resolved path must equal that expectation. A pre-existing ancestor
+    /// junction, or a create-then-swap race between the two opens, moves
+    /// `dir`'s resolved path away from `<parent>\<name>` and is refused
+    /// here as a mismatch — the racy window collapses to detect-and-
+    /// refuse (fail closed), which is what the contract asks for; nothing
+    /// upstream of the parent open pins that race away.
     fn open_dir_handle(dir: &Path) -> io::Result<fs::File> {
+        let parent = dir.parent().unwrap_or_else(|| Path::new("."));
+        let name = dir.file_name().ok_or_else(|| {
+            io_other(format!(
+                "walpin sidecar path {dir:?} has no final path component"
+            ))
+        })?;
+
+        let parent_handle =
+            open_reparse_aware(parent, 0, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS)?;
+        let parent_info = file_info(&parent_handle)?;
+        if parent_info.dw_file_attributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+            return Err(io_other(format!(
+                "walpin sidecar parent {parent:?} is not a directory"
+            )));
+        }
+        let expected = resolved_path(&parent_handle)?.join(name);
+
         let file = open_reparse_aware(dir, 0, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS)?;
         let info = file_info(&file)?;
         if info.dw_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
@@ -984,6 +1141,13 @@ mod windows_impl {
         if info.dw_file_attributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
             return Err(io_other(format!(
                 "walpin sidecar path {dir:?} exists and is not a directory"
+            )));
+        }
+        let resolved = resolved_path(&file)?;
+        if !resolved_paths_match(&resolved, &expected) {
+            return Err(io_other(format!(
+                "walpin sidecar path {dir:?} resolved to {resolved:?}, outside its \
+                 validated database-directory anchor {expected:?}; refusing"
             )));
         }
         Ok(file)
@@ -1152,6 +1316,8 @@ mod windows_impl {
     /// as its inherited ACL — a residual, documented gap, not an
     /// oversight.
     pub(super) fn touch_mtime(dir: &Path, name: &str) -> io::Result<()> {
+        let dir_handle = open_dir_handle(dir)?;
+        let dir_resolved = resolved_path(&dir_handle)?;
         let target = dir.join(name);
         let file = open_reparse_aware(&target, GENERIC_WRITE, OPEN_EXISTING, 0).map_err(|_| {
             io_other(format!(
@@ -1164,6 +1330,7 @@ mod windows_impl {
                 "walpin sidecar entry {target:?} is a reparse point; refusing to touch it"
             )));
         }
+        verify_under(&resolved_path(&file)?, &dir_resolved, &target)?;
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map_err(|e| io_other(e.to_string()))?;
@@ -2623,6 +2790,28 @@ mod tests {
         std::os::unix::fs::symlink(&real, &link).unwrap();
         let err = ensure_sidecar_dir(&link).expect_err("symlink must be refused");
         assert!(err.to_string().contains("symlink"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ensure_sidecar_dir_refuses_non_root_owned_ancestor_symlink() {
+        // The sidecar dir's own final component is real; a symlink sits at
+        // an ANCESTOR of it instead. This must be refused just as hard as a
+        // symlinked final component — only a root-owned ancestor symlink
+        // (the OS's own firmlinks, e.g. macOS's /tmp -> private/tmp) gets a
+        // pass, and the test process does not own this symlink as root.
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real_ancestor");
+        fs::create_dir(&real).unwrap();
+        let link = root.path().join("linked_ancestor");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let dir = link.join("khive.db.walpin");
+        let err =
+            ensure_sidecar_dir(&dir).expect_err("non-root-owned ancestor symlink must be refused");
+        assert!(
+            err.to_string().contains("symlink"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
