@@ -179,7 +179,7 @@ request(ops="memory.remember(content=\"SESSION: Completed FlashAttention-3 bench
 When you discover something reusable:
 
 ```
-request(ops="memory.remember(content=\"INSIGHT: knowledge.search with rerank=true gives normalized 0-1 scores vs raw RRF ~0.016. Always use rerank for score comparison.\", salience=0.75, memory_type=\"semantic\")")
+request(ops="memory.remember(content=\"INSIGHT: search returns raw RRF fusion scores (~0.01-0.03); do not compare them across queries as if they were normalized [0,1] scores.\", salience=0.75, memory_type=\"semantic\")")
 ```
 
 ### Session start recall
