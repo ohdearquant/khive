@@ -244,13 +244,15 @@ pub fn remote_url_to_slug(url: &str) -> Option<String> {
         return None;
     };
 
-    let mut segs = path.split('/');
-    let owner = segs.next()?;
-    let repo = segs.next()?;
-    if owner.is_empty() || repo.is_empty() {
+    // ALL path segments are preserved (ADR-088 Amendment 2): a nested-group
+    // remote like host/group/subgroup/repo keeps every segment, so two
+    // repositories under one subgroup never collapse onto one slug. Fewer
+    // than two segments, or any empty segment, does not normalize.
+    let segs: Vec<&str> = path.split('/').collect();
+    if segs.len() < 2 || segs.iter().any(|s| s.is_empty()) {
         return None;
     }
-    Some(format!("{}/{owner}/{repo}", host.to_ascii_lowercase()))
+    Some(format!("{}/{}", host.to_ascii_lowercase(), segs.join("/")))
 }
 
 /// Read the local repo's configured `origin` remote URL via `git -C <path>
@@ -479,6 +481,24 @@ mod tests {
                 "spelling {s:?} should normalize to {expected:?}"
             );
         }
+    }
+
+    #[test]
+    fn remote_url_to_slug_preserves_all_nested_path_segments() {
+        assert_eq!(
+            remote_url_to_slug("https://gitlab.com/group/subgroup/repo.git").as_deref(),
+            Some("gitlab.com/group/subgroup/repo")
+        );
+        assert_eq!(
+            remote_url_to_slug("git@gitlab.com:group/subgroup/repo.git").as_deref(),
+            Some("gitlab.com/group/subgroup/repo"),
+            "scp spelling of a nested-group remote must converge with https"
+        );
+        assert_ne!(
+            remote_url_to_slug("https://gitlab.com/group/subgroup/repo"),
+            remote_url_to_slug("https://gitlab.com/group/subgroup/other"),
+            "two repos under one subgroup must not collapse onto one slug"
+        );
     }
 
     #[test]

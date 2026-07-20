@@ -166,6 +166,7 @@ impl GitPack {
                     id,
                     created: false,
                     orphan: None,
+                    slug_duplicates: Vec::new(),
                 }
             }
             None => resolve_or_create_project(self.runtime(), registry, token, &source).await?,
@@ -202,6 +203,18 @@ impl GitPack {
         .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
 
         report.warnings.extend(warnings);
+        if !resolution.slug_duplicates.is_empty() {
+            report.warnings.push(format!(
+                "multiple live project anchors share repo_slug; selected oldest {}; duplicates: {}",
+                project_id,
+                resolution
+                    .slug_duplicates
+                    .iter()
+                    .map(Uuid::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
         report.project_id = Some(project_id.to_string());
         report.project_created = project_created;
         if let Some(orphan) = resolution.orphan {
@@ -250,6 +263,10 @@ pub(crate) struct ProjectResolution {
     /// repo identity was found with a live corpus still annotating it
     /// (issue #1173) — surfaced via `IngestReport`, never silent.
     pub(crate) orphan: Option<OrphanSignal>,
+    /// Additional live anchors carrying the same `repo_slug` beyond the
+    /// deterministically selected one (ADR-088 Amendment 2 step-1
+    /// multi-match) — surfaced as a report warning, never silent.
+    pub(crate) slug_duplicates: Vec<Uuid>,
 }
 
 pub(crate) struct OrphanSignal {
@@ -281,14 +298,15 @@ async fn resolve_or_create_project(
     let identity = repo_identity(source);
     let name = repo_basename(source);
 
-    if let Some(id) = find_project_by_slug(runtime, token, &identity)
+    let slug_matches = find_projects_by_slug(runtime, token, &identity)
         .await
-        .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?
-    {
+        .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+    if let Some((id, duplicates)) = slug_matches.split_first() {
         return Ok(ProjectResolution {
-            id,
+            id: *id,
             created: false,
             orphan: None,
+            slug_duplicates: duplicates.to_vec(),
         });
     }
 
@@ -309,6 +327,7 @@ async fn resolve_or_create_project(
             id,
             created: false,
             orphan: None,
+            slug_duplicates: Vec::new(),
         });
     }
 
@@ -337,36 +356,45 @@ async fn resolve_or_create_project(
         id,
         created: true,
         orphan,
+        slug_duplicates: Vec::new(),
     })
 }
 
-async fn find_project_by_slug(
+// Multiple live anchors can carry one slug when two legacy anchors holding
+// different URL spellings of the same repository were each exact-matched and
+// backfilled on separate ingests. Selection must be deterministic (oldest
+// `created_at`, id tie-break) and the condition surfaced as a report warning,
+// never an arbitrary or silent pick (ADR-088 Amendment 2).
+async fn find_projects_by_slug(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     identity: &str,
-) -> anyhow::Result<Option<Uuid>> {
+) -> anyhow::Result<Vec<Uuid>> {
     let sql = runtime.sql();
     let mut r = sql.reader().await.map_err(|e| anyhow!("{e}"))?;
-    let row = r
-        .query_row(SqlStatement {
+    let rows = r
+        .query_all(SqlStatement {
             sql: "SELECT id FROM entities WHERE kind='project' AND namespace=?1 \
                   AND deleted_at IS NULL \
                   AND json_extract(properties,'$.repo_slug')=?2 \
-                  LIMIT 1"
+                  ORDER BY created_at ASC, id ASC"
                 .into(),
             params: vec![
                 SqlValue::Text(token.namespace().as_str().to_string()),
                 SqlValue::Text(identity.to_string()),
             ],
-            label: Some("git_digest_find_project_by_slug".into()),
+            label: Some("git_digest_find_projects_by_slug".into()),
         })
         .await
         .map_err(|e| anyhow!("{e}"))?;
-    Ok(row.and_then(|r| match r.get("id") {
-        Some(SqlValue::Uuid(u)) => Some(*u),
-        Some(SqlValue::Text(s)) => Uuid::parse_str(s).ok(),
-        _ => None,
-    }))
+    Ok(rows
+        .iter()
+        .filter_map(|r| match r.get("id") {
+            Some(SqlValue::Uuid(u)) => Some(*u),
+            Some(SqlValue::Text(s)) => Uuid::parse_str(s).ok(),
+            _ => None,
+        })
+        .collect())
 }
 
 async fn find_project_by_legacy_repo_url(
@@ -654,6 +682,64 @@ mod tests {
                 .and_then(Value::as_str),
             Some("github.com/org/legacy-repo"),
             "repo_slug must be backfilled on the legacy anchor"
+        );
+    }
+
+    /// Two live anchors sharing one `repo_slug` (each backfilled from a
+    /// different legacy `repo_url` spelling) must resolve deterministically
+    /// to one of them with the rest surfaced as duplicates, never an
+    /// arbitrary or silent pick (ADR-088 Amendment 2 step-1 multi-match).
+    #[tokio::test]
+    async fn duplicate_slug_anchors_resolve_deterministically_with_signal() {
+        let (rt, token, registry) = fixture().await;
+
+        let slug = "github.com/org/dup-repo";
+        let mut ids = Vec::new();
+        for repo_url in [
+            "https://github.com/org/dup-repo",
+            "git@github.com:org/dup-repo.git",
+        ] {
+            let resp = registry
+                .dispatch(
+                    "create",
+                    json!({
+                        "kind": "project",
+                        "name": "dup-repo",
+                        "properties": { "repo_url": repo_url, "repo_slug": slug },
+                    }),
+                )
+                .await
+                .expect("create anchor");
+            ids.push(Uuid::parse_str(resp["id"].as_str().unwrap()).expect("uuid"));
+        }
+
+        let source = DigestSource::Remote {
+            canonical: "https://github.com/org/dup-repo".to_string(),
+            gh_slug: Some(("org".to_string(), "dup-repo".to_string())),
+        };
+        let first = resolve_or_create_project(&rt, &registry, &token, &source)
+            .await
+            .expect("resolve");
+        assert!(!first.created, "multi-match must not create a third anchor");
+        assert!(
+            ids.contains(&first.id),
+            "selected anchor must be one of the existing pair"
+        );
+        assert_eq!(
+            first.slug_duplicates,
+            ids.iter()
+                .copied()
+                .filter(|id| *id != first.id)
+                .collect::<Vec<_>>(),
+            "the unselected anchor must be surfaced as a duplicate"
+        );
+
+        let second = resolve_or_create_project(&rt, &registry, &token, &source)
+            .await
+            .expect("resolve again");
+        assert_eq!(
+            second.id, first.id,
+            "selection must be deterministic across calls"
         );
     }
 
