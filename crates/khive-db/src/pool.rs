@@ -1184,6 +1184,87 @@ mod tests {
         assert_eq!(via_real, via_bare_name);
     }
 
+    /// ADR-091 backend-scoped attribution: `DbIdentity`/canonical-path
+    /// equality across alias spellings (proven above by
+    /// `mint_db_identity_alias_convergence`) does not by itself prove the
+    /// walpin sidecar re-key — `sidecar_dir_for` is a separate, purely
+    /// lexical derivation (`walpin::sidecar_dir_for`) that must be fed the
+    /// *minted* canonical path, never the raw configured one. This test
+    /// opens a real `ConnectionPool` (not the private `mint_db_identity` free
+    /// function) through each alias spelling and asserts
+    /// `sidecar_dir_for(pool.canonical_path())` converges to one directory —
+    /// exercising the actual `ConnectionPool::new` → `canonical_path()` wiring
+    /// every sidecar consumer (`checkpoint.rs`) reads from.
+    #[test]
+    #[serial(pool_cwd)]
+    fn sidecar_dir_for_alias_convergence() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_dir = dir.path().join("real");
+        fs::create_dir(&real_dir).unwrap();
+        let db_path = real_dir.join("khive.db");
+        fs::write(&db_path, b"").unwrap();
+
+        let dir_symlink = dir.path().join("dir_link");
+        let file_symlink = dir.path().join("file_link.db");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&real_dir, &dir_symlink).unwrap();
+            std::os::unix::fs::symlink(&db_path, &file_symlink).unwrap();
+        }
+
+        let pool_for = |path: &Path| -> Arc<ConnectionPool> {
+            let cfg = PoolConfig {
+                path: Some(path.to_path_buf()),
+                ..PoolConfig::default()
+            };
+            Arc::new(ConnectionPool::new(cfg).expect("file-backed pool should open"))
+        };
+        let sidecar_of = |pool: &ConnectionPool| -> PathBuf {
+            crate::walpin::sidecar_dir_for(pool.canonical_path().expect("file-backed pool"))
+        };
+
+        let via_real = pool_for(&db_path);
+        let sidecar_real = sidecar_of(&via_real);
+
+        let orig_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&real_dir).unwrap();
+        let via_relative = pool_for(Path::new("khive.db"));
+        std::env::set_current_dir(&orig_cwd).unwrap();
+        assert_eq!(
+            sidecar_real,
+            sidecar_of(&via_relative),
+            "a relative spelling of the same database must derive the same sidecar directory"
+        );
+
+        #[cfg(unix)]
+        {
+            let via_dir_symlink = pool_for(&dir_symlink.join("khive.db"));
+            assert_eq!(
+                sidecar_real,
+                sidecar_of(&via_dir_symlink),
+                "opening through a directory symlink must derive the same sidecar directory"
+            );
+
+            let via_file_symlink = pool_for(&file_symlink);
+            assert_eq!(
+                sidecar_real,
+                sidecar_of(&via_file_symlink),
+                "opening through a file-level symlink must derive the same sidecar directory"
+            );
+        }
+
+        let orig_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&real_dir).unwrap();
+        let via_bare_name = pool_for(Path::new("khive.db"));
+        std::env::set_current_dir(orig_cwd).unwrap();
+        assert_eq!(
+            sidecar_real,
+            sidecar_of(&via_bare_name),
+            "a bare file name resolved against the current directory must derive the same \
+             sidecar directory"
+        );
+    }
+
     /// ADR-091 backend-scoped attribution: opening via a file-level symlink
     /// whose target does not exist yet (a valid first-open state), then
     /// after the target is created, opening via the target path directly,

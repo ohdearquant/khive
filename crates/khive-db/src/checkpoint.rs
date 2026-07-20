@@ -4170,6 +4170,172 @@ mod tests {
             .expect("session sweep task panicked");
     }
 
+    /// ADR-091 Amendment 3: a `run_checkpoint_task` instance for backend A
+    /// (`is_main: false`, a `Secondary` filter scoped to A's own identity)
+    /// must never observe a span registered against a DIFFERENT backend's
+    /// `Database` origin, nor an `Unscoped` span — a `Secondary` filter never
+    /// falls back to `Unscoped` (that fallback is the main view's alone).
+    /// Drives the real task for several ticks and asserts neither the
+    /// captured `tracing` emissions nor backend A's own sidecar ever name
+    /// either span.
+    #[tokio::test]
+    #[serial(tx_registry, checkpoint_skip_metrics, khive_walpin_sidecar_env)]
+    async fn checkpoint_task_ignores_span_registered_against_other_backend_origin_and_unscoped() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let pool_a = file_pool(&dir_a.path().join("backend_a.db"));
+        // Only used to mint a real, distinct `DbIdentity` for backend B — no
+        // checkpoint task is spawned for it.
+        let pool_b = file_pool(&dir_b.path().join("backend_b.db"));
+        let sidecar_a =
+            crate::walpin::sidecar_dir_for(pool_a.canonical_path().expect("file-backed"));
+        let _env_guard = crate::walpin::EnvVarGuard::capture("KHIVE_WALPIN_SIDECAR");
+        std::env::set_var("KHIVE_WALPIN_SIDECAR", "1");
+
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = CaptureSubscriber {
+            events: std::sync::Arc::clone(&buffer),
+        };
+        let _tracing_guard = tracing::subscriber::set_default(subscriber);
+
+        let _b_origin_handle = khive_storage::tx_registry::register_scoped(
+            Some("b_origin_span_ignored_by_a".to_string()),
+            pool_b.origin(),
+        );
+        let _unscoped_handle = khive_storage::tx_registry::register(Some(
+            "unscoped_span_ignored_by_secondary".to_string(),
+        ));
+
+        let cfg = CheckpointConfig {
+            interval: Duration::from_millis(10),
+            tx_warn_secs: Duration::from_millis(1),
+            tx_max_age_secs: Duration::from_millis(1),
+            ..CheckpointConfig::default()
+        };
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+        let handle = tokio::spawn(run_checkpoint_task(
+            pool_a,
+            cfg,
+            None,
+            "local".to_string(),
+            shutdown_rx,
+            false, // is_main: backend A is a secondary backend here
+        ));
+
+        // No positive condition to poll for — this asserts an absence over a
+        // bounded run of several ticks, mirroring
+        // `checkpoint_task_emits_no_age_alert_for_an_empty_registry`'s same
+        // fixed-window shape (there is nothing to wait-until for a negative).
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        shutdown_tx.send(()).expect("send shutdown signal");
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("checkpoint task should exit within 1s")
+            .expect("checkpoint task panicked");
+
+        let events = buffer.lock().unwrap();
+        assert!(
+            events.iter().all(|e| {
+                e.tx_label.as_deref() != Some("b_origin_span_ignored_by_a")
+                    && e.tx_label.as_deref() != Some("unscoped_span_ignored_by_secondary")
+            }),
+            "backend A's Secondary filter must never emit an age alert naming a span \
+             registered against a different backend's origin or an Unscoped span, got: \
+             {events:?}"
+        );
+        assert!(
+            !sidecar_a
+                .join(format!("{}.json", std::process::id()))
+                .exists(),
+            "backend A's own sidecar must never gain a heartbeat from a span it does not own"
+        );
+    }
+
+    /// ADR-091 Amendment 3: a secondary backend's own `run_checkpoint_task`
+    /// must detect a stall on its OWN backend (never main-only ownership) —
+    /// both the Plank 1 age-sweep emission and the sidecar heartbeat, with
+    /// `attribution_basis="origin"` (a `Secondary` filter winner is always
+    /// `Database`-origin-backed, never the `Unscoped` fallback) and a
+    /// nonzero reflected age.
+    #[tokio::test]
+    #[serial(tx_registry, checkpoint_skip_metrics, khive_walpin_sidecar_env)]
+    async fn checkpoint_task_detects_and_enumerates_secondary_backend_stall() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = file_pool(&dir.path().join("secondary_stall.db"));
+        let sidecar_dir =
+            crate::walpin::sidecar_dir_for(pool.canonical_path().expect("file-backed"));
+        let _env_guard = crate::walpin::EnvVarGuard::capture("KHIVE_WALPIN_SIDECAR");
+        std::env::set_var("KHIVE_WALPIN_SIDECAR", "1");
+
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = CaptureSubscriber {
+            events: std::sync::Arc::clone(&buffer),
+        };
+        let _tracing_guard = tracing::subscriber::set_default(subscriber);
+
+        let tx_handle = khive_storage::tx_registry::register_scoped(
+            Some("secondary_stall_test".to_string()),
+            pool.origin(),
+        );
+
+        let cfg = CheckpointConfig {
+            interval: Duration::from_millis(10),
+            tx_warn_secs: Duration::from_millis(5),
+            tx_max_age_secs: Duration::from_millis(500),
+            ..CheckpointConfig::default()
+        };
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+        let pid = std::process::id();
+        let heartbeat_path = sidecar_dir.join(format!("{pid}.json"));
+        let handle = tokio::spawn(run_checkpoint_task(
+            pool,
+            cfg,
+            None,
+            "local".to_string(),
+            shutdown_rx,
+            false, // is_main: this is a secondary backend's own checkpoint task
+        ));
+
+        assert!(
+            wait_for(Duration::from_secs(2), || heartbeat_path.exists()).await,
+            "expected a walpin heartbeat once the secondary backend's own span crossed \
+             tx_warn_secs"
+        );
+        let body = std::fs::read_to_string(&heartbeat_path).unwrap();
+        let hb: crate::walpin::WalpinHeartbeat = serde_json::from_str(&body).unwrap();
+        assert_eq!(hb.oldest_tx_label.as_deref(), Some("secondary_stall_test"));
+        assert_eq!(
+            hb.attribution_basis.as_deref(),
+            Some("origin"),
+            "a Secondary-view winner is always Database-origin-backed — never fallback"
+        );
+        assert!(
+            hb.oldest_tx_age_secs > 0.0,
+            "the heartbeat must reflect a nonzero stale age for the secondary backend's own \
+             span, got {hb:?}"
+        );
+
+        shutdown_tx.send(()).expect("send shutdown signal");
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("checkpoint task should exit within 1s")
+            .expect("checkpoint task panicked");
+
+        drop(tx_handle);
+
+        let events = buffer.lock().unwrap();
+        assert!(
+            events.iter().any(|e| {
+                e.tx_label.as_deref() == Some("secondary_stall_test")
+                    && e.message
+                        .as_deref()
+                        .is_some_and(|m| m.contains("ADR-091 Plank 1"))
+            }),
+            "expected the secondary backend's own checkpoint task to emit a Plank 1 age alert \
+             for its own stalled span, got: {events:?}"
+        );
+    }
+
     #[test]
     fn wal_pin_depth_arithmetic_against_real_connection() {
         let dir = tempfile::tempdir().unwrap();
