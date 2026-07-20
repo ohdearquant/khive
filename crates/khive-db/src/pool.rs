@@ -213,6 +213,10 @@ impl<'pool> Drop for ReaderGuard<'pool> {
 /// The Mutex ensures only one writer at a time.
 pub struct WriterGuard<'pool> {
     guard: parking_lot::MutexGuard<'pool, Connection>,
+    /// The origin (ADR-091 backend-scoped attribution) of the pool this
+    /// guard was checked out from, carried so `transaction` can register its
+    /// span with the correct origin without holding a `&ConnectionPool`.
+    origin: TxOrigin,
 }
 
 impl<'pool> WriterGuard<'pool> {
@@ -233,7 +237,10 @@ impl<'pool> WriterGuard<'pool> {
         F: FnOnce(&Connection) -> Result<R, SqliteError>,
     {
         self.guard.execute_batch("BEGIN IMMEDIATE")?;
-        let _tx_handle = khive_storage::tx_registry::register(Some("writer_guard_tx".to_string()));
+        let _tx_handle = khive_storage::tx_registry::register_scoped(
+            Some("writer_guard_tx".to_string()),
+            self.origin.clone(),
+        );
 
         match f(&self.guard) {
             Ok(result) => {
@@ -383,7 +390,10 @@ impl ConnectionPool {
                     self.config.checkout_timeout
                 ))
             })?;
-        Ok(WriterGuard { guard })
+        Ok(WriterGuard {
+            guard,
+            origin: self.origin(),
+        })
     }
 
     /// Non-panicking writer checkout.
@@ -408,7 +418,10 @@ impl ConnectionPool {
                 "writer connection busy (checkpoint skipped this tick)".to_string(),
             )
         })?;
-        Ok(WriterGuard { guard })
+        Ok(WriterGuard {
+            guard,
+            origin: self.origin(),
+        })
     }
 
     /// Get the current number of available reader connections.

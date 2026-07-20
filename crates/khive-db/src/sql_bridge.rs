@@ -236,6 +236,9 @@ struct SqliteWriter {
     /// `conn`. `None` when the flag is off or no writer task is available
     /// (best-effort — degrades to the standalone-connection path below).
     writer_task: Option<crate::writer_task::WriterTaskHandle>,
+    /// The origin (ADR-091 backend-scoped attribution) of the pool this
+    /// standalone connection was opened against.
+    origin: khive_storage::tx_registry::TxOrigin,
 }
 
 #[async_trait]
@@ -380,6 +383,7 @@ impl khive_storage::SqlWriter for SqliteWriter {
             operation: "execute_batch".into(),
             message: "connection already consumed".into(),
         })?;
+        let origin = self.origin.clone();
         let (conn, result) = tokio::task::spawn_blocking(move || {
             if let Err(e) = conn.execute_batch("BEGIN IMMEDIATE") {
                 return (conn, Err(e));
@@ -389,8 +393,10 @@ impl khive_storage::SqlWriter for SqliteWriter {
             // statement-execution closure below AND the ROLLBACK path — so it
             // stays registered until the transaction is actually finished
             // (COMMIT or ROLLBACK), not just until the inner closure returns.
-            let _tx_handle =
-                khive_storage::tx_registry::register(Some("execute_batch".to_string()));
+            let _tx_handle = khive_storage::tx_registry::register_scoped(
+                Some("execute_batch".to_string()),
+                origin,
+            );
             let result = (|| -> Result<u64, rusqlite::Error> {
                 let mut total: u64 = 0;
                 for statement in &statements {
@@ -645,8 +651,10 @@ impl khive_storage::SqlWriter for PoolBackedWriter {
             guard
                 .execute_batch("BEGIN IMMEDIATE")
                 .map_err(|e| map_rusqlite_err(e, "pool_writer.execute_batch"))?;
-            let _tx_handle =
-                khive_storage::tx_registry::register(Some("pool_writer.execute_batch".to_string()));
+            let _tx_handle = khive_storage::tx_registry::register_scoped(
+                Some("pool_writer.execute_batch".to_string()),
+                pool.origin(),
+            );
             let result = (|| -> Result<u64, StorageError> {
                 let mut total = 0u64;
                 for statement in &statements {
@@ -888,6 +896,7 @@ fn block_on_sync<F: std::future::Future>(fut: F) -> Result<F::Output, StorageErr
 async fn run_manual_atomic_unit(
     writer: &mut dyn khive_storage::SqlWriter,
     op: AtomicUnitOp,
+    origin: khive_storage::tx_registry::TxOrigin,
 ) -> khive_storage::types::StorageResult<Box<dyn Any + Send>> {
     fn tx_stmt(sql: &str, label: &str) -> SqlStatement {
         SqlStatement {
@@ -897,7 +906,8 @@ async fn run_manual_atomic_unit(
         }
     }
     khive_storage::SqlWriter::execute(writer, tx_stmt("BEGIN IMMEDIATE", "begin")).await?;
-    let _tx_handle = khive_storage::tx_registry::register(Some("atomic_unit".to_string()));
+    let _tx_handle =
+        khive_storage::tx_registry::register_scoped(Some("atomic_unit".to_string()), origin);
 
     let result = op(writer).await;
 
@@ -980,6 +990,7 @@ impl khive_storage::SqlAccess for SqlBridge {
             Ok(Box::new(SqliteWriter {
                 conn: Some(conn),
                 writer_task,
+                origin: self.pool.origin(),
             }))
         } else {
             Ok(Box::new(PoolBackedWriter {
@@ -1046,8 +1057,9 @@ impl khive_storage::SqlAccess for SqlBridge {
             let mut writer = SqliteWriter {
                 conn: Some(conn),
                 writer_task: None,
+                origin: self.pool.origin(),
             };
-            run_manual_atomic_unit(&mut writer, op).await
+            run_manual_atomic_unit(&mut writer, op, self.pool.origin()).await
         } else {
             // In-memory pools are exempt (not accept-loop reachable, per the
             // rework spec's "Out of scope") — preserve the existing
@@ -1055,7 +1067,7 @@ impl khive_storage::SqlAccess for SqlBridge {
             let mut writer = PoolBackedWriter {
                 pool: Arc::clone(&self.pool),
             };
-            run_manual_atomic_unit(&mut writer, op).await
+            run_manual_atomic_unit(&mut writer, op, self.pool.origin()).await
         }
     }
 }
