@@ -16,7 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pack set is now `["kg"]` (18 verbs). `kkernel exec --ops-file --atomic`
   covers kg verbs only (the gtd adapter left with the pack); `kkernel reindex`
   no longer maintains the memory pack's ANN snapshot/epoch state. The
-  marketplace plugin drops the comm/gtd/memory/schedule pattern skills. This
+  marketplace plugin drops the comm/gtd/memory/schedule pattern skills. The
+  memory/comm-driven perf gates (`bench_pipeline_daemon.py`,
+  `bench_load_harness.py`, the load-harness runbook, and the
+  `bench-pipeline.yml` workflow) move with the packs they exercise;
+  `bench_calibrate.py` keeps its `bench-1m` and `contract` suites. This
   repository's git history retains the extracted crates' past commits under
   their original license terms; the change relocates future development and
   does not alter the status of already-published history.
