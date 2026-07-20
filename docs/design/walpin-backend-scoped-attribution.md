@@ -88,10 +88,19 @@ The main backend's attribution view uses a filter matching
   including a symlink at the database-file level itself (a `link.sqlite`
   pointing at the real file must mint the target's identity, which
   parent-only canonicalization would miss). Third, when the file does **not
-  yet exist** (first open), canonicalize the parent directory and append the
-  file name unchanged — the same pattern `FsBlobStore` uses for its
-  root-keyed write locks, and for the same reason (`Path::canonicalize`
-  requires an existing path). Canonicalization is what collapses aliased
+  yet exist** (first open), resolve any symlink at the final component
+  first: a **dangling** file-level symlink is a valid first-open state —
+  SQLite creates the target through the link on first write — and minting
+  the link's own name would diverge from a later opener using the target
+  path, splitting one database across two sidecars. The link chain is
+  followed to its final non-symlink path (bounded, exactly as the OS's own
+  loop limit bounds the subsequent open), and then that path's parent
+  directory is canonicalized and its file name appended unchanged — the
+  same pattern `FsBlobStore` uses for its root-keyed write locks, and for
+  the same reason (`Path::canonicalize` requires an existing path). A
+  resolved target whose parent directory does not exist fails minting
+  exactly as the subsequent open itself would fail — the identity layer
+  never succeeds where the open cannot. Canonicalization is what collapses aliased
   spellings — symlink vs. target, relative vs. absolute, file-level
   symlinks — into one identity, so a daemon and a session opening the same
   database through different spellings mint the same `DbIdentity`.
@@ -196,6 +205,11 @@ provides the same partitioning with an additive API.
   points at the database file), a relative spelling, and a **bare file name**
   (empty parent, resolved against the current directory) mints identical
   `DbIdentity` values and derives the identical sidecar directory.
+- Dangling-symlink first-open test: opening via a file-level symlink whose
+  target does not yet exist, then (after the target is created through the
+  link) via the target path directly, mints identical `DbIdentity` values —
+  the first-open fallback resolves the final component before
+  canonicalizing the parent.
 - Fallback-marker test: a heartbeat produced from an `Unscoped` oldest span
   carries the fallback-attribution marker; one produced from a
   `Database(main)` span does not.
