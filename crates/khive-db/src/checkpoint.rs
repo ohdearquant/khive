@@ -560,7 +560,8 @@ impl TxAgeSweepState {
     pub fn observe(
         &mut self,
         oldest: Option<(khive_storage::tx_registry::TxId, Duration, Option<String>)>,
-        config: &CheckpointConfig,
+        tx_warn_secs: Duration,
+        tx_max_age_secs: Duration,
     ) -> Vec<TxAgeEmission> {
         let mut emissions = Vec::new();
 
@@ -577,8 +578,8 @@ impl TxAgeSweepState {
         }
         self.tracked_id = Some(id);
 
-        let above_warn = age >= config.tx_warn_secs;
-        let above_max_age = age >= config.tx_max_age_secs;
+        let above_warn = age >= tx_warn_secs;
+        let above_max_age = age >= tx_max_age_secs;
 
         if above_warn && !self.was_above_warn {
             emissions.push(TxAgeEmission {
@@ -884,14 +885,6 @@ pub async fn run_session_sweep_task(
     let mut interval = tokio::time::interval(config.interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut tx_age_state = TxAgeSweepState::default();
-    // `TxAgeSweepState::observe` takes a `&CheckpointConfig` purely to read
-    // its two threshold fields; the WAL/TRUNCATE fields are irrelevant here
-    // and left at their defaults.
-    let sweep_thresholds = CheckpointConfig {
-        tx_warn_secs: config.tx_warn_secs,
-        tx_max_age_secs: config.tx_max_age_secs,
-        ..CheckpointConfig::default()
-    };
     let mut sidecar = db_path
         .and_then(|p| WalpinSidecarState::new(Some(p.as_path()), true, "session", config.interval));
     if let Some(sidecar) = sidecar.as_ref() {
@@ -905,7 +898,9 @@ pub async fn run_session_sweep_task(
         }
 
         let oldest = khive_storage::tx_registry::oldest();
-        for emission in tx_age_state.observe(oldest.clone(), &sweep_thresholds) {
+        for emission in
+            tx_age_state.observe(oldest.clone(), config.tx_warn_secs, config.tx_max_age_secs)
+        {
             log_tx_age_emission(&emission);
         }
         if let Some(sidecar) = sidecar.as_mut() {
@@ -998,7 +993,11 @@ pub async fn run_checkpoint_task(
         // ladder below, so a sustained stale span logs once per rung rather
         // than once per tick.
         let oldest_tx = khive_storage::tx_registry::oldest();
-        for emission in tx_age_state.observe(oldest_tx.clone(), &config) {
+        for emission in tx_age_state.observe(
+            oldest_tx.clone(),
+            config.tx_warn_secs,
+            config.tx_max_age_secs,
+        ) {
             log_tx_age_emission(&emission);
         }
         // ADR-091 Amendment 2 Plank B: refresh (or clear) this daemon
@@ -2818,7 +2817,7 @@ mod tests {
         let config = tx_age_test_config();
         let mut state = TxAgeSweepState::default();
 
-        let emissions = state.observe(None, &config);
+        let emissions = state.observe(None, config.tx_warn_secs, config.tx_max_age_secs);
         assert!(emissions.is_empty(), "no open entry must emit nothing");
     }
 
@@ -2834,7 +2833,8 @@ mod tests {
                 Duration::from_secs(5),
                 Some("fresh_span".to_string()),
             )),
-            &config,
+            config.tx_warn_secs,
+            config.tx_max_age_secs,
         );
         assert!(emissions.is_empty(), "a fresh entry must emit nothing");
     }
@@ -2853,7 +2853,8 @@ mod tests {
                 Duration::from_secs(45),
                 Some("stale_span".to_string()),
             )),
-            &config,
+            config.tx_warn_secs,
+            config.tx_max_age_secs,
         );
         assert_eq!(
             tick1,
@@ -2871,7 +2872,8 @@ mod tests {
                 Duration::from_secs(50),
                 Some("stale_span".to_string()),
             )),
-            &config,
+            config.tx_warn_secs,
+            config.tx_max_age_secs,
         );
         assert!(
             tick2.is_empty(),
@@ -2894,7 +2896,8 @@ mod tests {
                 Duration::from_secs(45),
                 Some("stuck_writer_task_tx".to_string()),
             )),
-            &config,
+            config.tx_warn_secs,
+            config.tx_max_age_secs,
         );
 
         let tick = state.observe(
@@ -2903,7 +2906,8 @@ mod tests {
                 Duration::from_secs(130),
                 Some("stuck_writer_task_tx".to_string()),
             )),
-            &config,
+            config.tx_warn_secs,
+            config.tx_max_age_secs,
         );
         assert_eq!(
             tick,
@@ -2921,7 +2925,8 @@ mod tests {
                 Duration::from_secs(200),
                 Some("stuck_writer_task_tx".to_string()),
             )),
-            &config,
+            config.tx_warn_secs,
+            config.tx_max_age_secs,
         );
         assert!(
             tick_repeat.is_empty(),
@@ -2943,7 +2948,8 @@ mod tests {
                 Duration::from_secs(300),
                 Some("ancient_tx".to_string()),
             )),
-            &config,
+            config.tx_warn_secs,
+            config.tx_max_age_secs,
         );
         assert_eq!(
             tick,
@@ -2976,11 +2982,12 @@ mod tests {
                 Duration::from_secs(150),
                 Some("first_span".to_string()),
             )),
-            &config,
+            config.tx_warn_secs,
+            config.tx_max_age_secs,
         );
 
         // The stale span closed; nothing is open now.
-        let cleared = state.observe(None, &config);
+        let cleared = state.observe(None, config.tx_warn_secs, config.tx_max_age_secs);
         assert!(cleared.is_empty(), "a clearing tick must emit nothing");
 
         // A fresh entry (unrelated span) is now oldest — still below threshold.
@@ -2990,7 +2997,8 @@ mod tests {
                 Duration::from_secs(2),
                 Some("second_span".to_string()),
             )),
-            &config,
+            config.tx_warn_secs,
+            config.tx_max_age_secs,
         );
         assert!(fresh.is_empty(), "a fresh oldest entry must emit nothing");
 
@@ -3001,7 +3009,8 @@ mod tests {
                 Duration::from_secs(35),
                 Some("second_span".to_string()),
             )),
-            &config,
+            config.tx_warn_secs,
+            config.tx_max_age_secs,
         );
         assert_eq!(
             rewarn,
@@ -3028,7 +3037,8 @@ mod tests {
                 Duration::from_secs(300),
                 Some("stale_entry_a".to_string()),
             )),
-            &config,
+            config.tx_warn_secs,
+            config.tx_max_age_secs,
         );
         assert_eq!(
             tick_a.len(),
@@ -3044,7 +3054,8 @@ mod tests {
                 Duration::from_secs(400),
                 Some("stale_entry_b".to_string()),
             )),
-            &config,
+            config.tx_warn_secs,
+            config.tx_max_age_secs,
         );
         assert_eq!(
             tick_b,
@@ -3082,7 +3093,8 @@ mod tests {
                 Duration::from_millis(5),
                 Some("fast_cap_span".to_string()),
             )),
-            &config,
+            config.tx_warn_secs,
+            config.tx_max_age_secs,
         );
         assert_eq!(
             tick.len(),
@@ -3173,7 +3185,11 @@ mod tests {
             .find(|(_, label)| label.as_deref() == Some("tx_age_sweep_reader_pin_test"))
             .expect("this test's own tx_registry entry must still be open");
         let mut tx_age_state = TxAgeSweepState::default();
-        let emissions = tx_age_state.observe(Some((tx_id(1), our_entry.0, our_entry.1)), &config);
+        let emissions = tx_age_state.observe(
+            Some((tx_id(1), our_entry.0, our_entry.1)),
+            config.tx_warn_secs,
+            config.tx_max_age_secs,
+        );
         assert!(
             emissions.iter().any(|e| e.rung == TxAgeRung::Stale
                 && e.label.as_deref() == Some("tx_age_sweep_reader_pin_test")),
@@ -3219,7 +3235,11 @@ mod tests {
             ..CheckpointConfig::default()
         };
         let mut state = TxAgeSweepState::default();
-        let emissions = state.observe(Some((tx_id(2), our_entry.0, our_entry.1)), &config);
+        let emissions = state.observe(
+            Some((tx_id(2), our_entry.0, our_entry.1)),
+            config.tx_warn_secs,
+            config.tx_max_age_secs,
+        );
         assert!(
             emissions
                 .iter()
