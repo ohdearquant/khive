@@ -1023,14 +1023,12 @@ pub async fn run_checkpoint_task(
     let mut event_was_elevated = false;
     // ADR-091 Amendment 2 Plank B: the checkpoint pool is only ever wired for
     // file-backed backends (`checkpoint_pool_for`), so `is_file_backed: true`
-    // is always correct here.
+    // is always correct here. `canonical_path()` (not `pool.config().path`)
+    // so the sidecar directory is keyed off the same minted identity every
+    // alias of this backend's configured path converges to.
     #[cfg(unix)]
-    let mut walpin_state = WalpinSidecarState::new(
-        pool.config().path.as_deref(),
-        true,
-        "daemon",
-        config.interval,
-    );
+    let mut walpin_state =
+        WalpinSidecarState::new(pool.canonical_path(), true, "daemon", config.interval);
     #[cfg(unix)]
     if let Some(sidecar) = walpin_state.as_mut() {
         sidecar.register_beacon().await;
@@ -1442,7 +1440,7 @@ fn note_truncate_outcome(
 /// instead of silently exonerating them.
 #[cfg(unix)]
 fn log_walpin_sidecar_report(pool: &ConnectionPool) {
-    let Some(path) = pool.config().path.as_deref() else {
+    let Some(path) = pool.canonical_path() else {
         return;
     };
     if !crate::walpin::sidecar_enabled(true) {
