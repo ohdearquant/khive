@@ -476,7 +476,7 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
     let mut entities_fts_failed: u64 = 0;
     let mut notes_fts_failed: u64 = 0;
 
-    let mut epoch_bump_failed = false;
+    let epoch_bump_failed;
 
     // ── entities + notes (graph substrate) ────────────────────────────────────
     {
