@@ -263,30 +263,6 @@ def main():
         assert "stats" in kg_verb_names, f"'stats' must appear in kg-filtered verbs: {kg_verb_names}"
         print(f"  [ok] verbs — {verbs_result['total']} total verbs, {kg_verbs['total']} in kg pack")
 
-        # 3b. Zero-verb pack load tripwire (khive#848 F6): `code` contributes
-        # no MCP verbs, so a stale/dropped default-pack entry for it would
-        # not show up in the verbs() total above at all. `finding` is a note
-        # kind declared ONLY by khive-pack-code's NOTE_KIND_SPECS (ADR-085
-        # D4/Amendment 3) — if `code` were missing from the default pack set,
-        # this create would be rejected as an unknown note kind. A
-        # successful create is therefore direct proof the pack is loaded
-        # under default config, independent of the verb count.
-        code_pack_finding = call_verb(proc, "create", {
-            "kind": "note",
-            "note_kind": "finding",
-            "title": "smoke-test tripwire finding",
-            "properties": {"severity": "low", "confidence": "high"},
-        })
-        assert code_pack_finding["kind"] == "finding", (
-            f"expected kind=finding (proves the zero-verb `code` pack is loaded "
-            f"under default config), got: {code_pack_finding}"
-        )
-        assert code_pack_finding["properties"]["kind_status"] == "open", (
-            f"a finding with no producer status must default kind_status to 'open': "
-            f"{code_pack_finding}"
-        )
-        print(f"  [ok] code pack loaded — create(kind=\"finding\") succeeded under default config")
-
         # 4. Get entity via get (auto-detects substrate; flat shape per W2 #454,
         #    granular kind at top level — same shape as create/list)
         fetched = call_verb(proc, "get", {"id": lora_id})
@@ -684,91 +660,6 @@ def memory_smoke():
         print(f"  [memory] memory.vacuum — ok")
 
         print(f"\n  MEMORY PACK SMOKE TESTS PASSED")
-    finally:
-        proc.stdin.close()
-        proc.wait(timeout=5)
-
-
-def formal_smoke():
-    """Smoke test for the formal-pack EntityOfType edge rules (vocab.rs).
-
-    The formal pack (khive-pack-formal) adds 21 additive endpoint rules keyed
-    on entity_type (vocab.rs:27-137). Formal math entities are plain concept
-    entities with entity_type set to the subtype ("theorem", "definition", etc.).
-    The pair exercised here:
-
-        depends_on: theorem -> definition  (vocab.rs:37-42)
-
-    Without the formal pack, concept depends_on concept is rejected by the base
-    contract (operations.rs:298-304: depends_on is p->p, s->{p,s,a,ds}, a->{p,s}).
-    With --pack formal loaded, EndpointKind::EntityOfType matching in
-    operations.rs:231-234 (substrate=="entity" && kind==k && entity_type==Some(t))
-    permits it.
-    """
-    env = {**os.environ, "KHIVE_NO_DAEMON": "1"}
-    proc = subprocess.Popen(
-        [
-            BINARY, "mcp", "--db", ":memory:", "--no-embed", "--log", "error",
-            "--pack", "kg", "--pack", "formal",
-        ],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=env,
-    )
-    try:
-        send(proc, "initialize", {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": {"name": "formal-smoke", "version": "0.1.0"},
-        })
-        recv(proc)
-        notify = {"jsonrpc": "2.0", "method": "notifications/initialized"}
-        proc.stdin.write((json.dumps(notify) + "\n").encode())
-        proc.stdin.flush()
-
-        # Create a concept entity with entity_type="theorem".
-        # entity_type is stored via Entity::with_entity_type (operations.rs:487),
-        # making it available to the EntityOfType endpoint matcher.
-        thm = call_verb(proc, "create", {
-            "kind": "entity",
-            "entity_kind": "concept",
-            "entity_type": "theorem",
-            "name": "FormalSmokeTheorem",
-            "description": "Synthetic theorem for formal-pack smoke coverage",
-        })
-        assert thm["name"] == "FormalSmokeTheorem", f"unexpected create result: {thm}"
-        thm_id = thm["id"]
-        print(f"  [formal] create concept entity_type=theorem — {thm_id[:8]}...")
-
-        # Create a concept entity with entity_type="definition".
-        defn = call_verb(proc, "create", {
-            "kind": "entity",
-            "entity_kind": "concept",
-            "entity_type": "definition",
-            "name": "FormalSmokeDefinition",
-            "description": "Synthetic definition for formal-pack smoke coverage",
-        })
-        defn_id = defn["id"]
-        print(f"  [formal] create concept entity_type=definition — {defn_id[:8]}...")
-
-        # Link theorem -[depends_on]-> definition.
-        # Permitted by FORMAL_EDGE_RULES[1] (vocab.rs:37-42):
-        #   EdgeEndpointRule { relation: DependsOn,
-        #     source: EntityOfType { kind: "concept", entity_type: "theorem" },
-        #     target: EntityOfType { kind: "concept", entity_type: "definition" } }
-        edge = call_verb(proc, "link", {
-            "source_id": thm_id,
-            "target_id": defn_id,
-            "relation": "depends_on",
-            "weight": 1.0,
-        })
-        assert edge["relation"] == "depends_on", (
-            f"formal-pack depends_on edge must succeed: {edge}"
-        )
-        print(f"  [formal] link theorem -[depends_on]-> definition — ok")
-
-        print(f"\n  FORMAL PACK SMOKE TESTS PASSED")
     finally:
         proc.stdin.close()
         proc.wait(timeout=5)
@@ -1340,13 +1231,6 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"  [memory FAIL] {e}")
             failed_sections.append("memory")
-
-    if os.environ.get("KHIVE_SMOKE_FORMAL", "1") != "0":
-        try:
-            formal_smoke()
-        except Exception as e:
-            print(f"  [formal FAIL] {e}")
-            failed_sections.append("formal")
 
     if os.environ.get("KHIVE_SMOKE_EPISTEMIC", "1") != "0":
         try:

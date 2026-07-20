@@ -367,8 +367,8 @@ fn kg_commit_fails_loud_on_malformed_changeset() {
 // ── Projection-fidelity regressions: rules must see the full staged record ─
 
 /// A formal typed endpoint (`concept/theorem -[depends_on]->
-/// concept/definition`) is a pack-allowed pairing
-/// (`khive-pack-formal::vocab::FORMAL_EDGE_RULES`), but only if
+/// concept/definition`) is a pack-allowed pairing under a domain pack's
+/// typed edge rules, but only if
 /// `project_changeset` actually carries `entity_type` into the projected
 /// `entities.ndjson` the `edge-endpoint-types` rule reads. Before this fix
 /// both endpoints projected as plain `concept` with no `entity_type`, so the
