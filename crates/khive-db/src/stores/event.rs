@@ -925,9 +925,13 @@ impl EventStore for SqlEventStore {
 
         // Flag-off (default) path: byte-for-byte unchanged from pre-ADR-067
         // behavior — the closure owns its own BEGIN IMMEDIATE/COMMIT/ROLLBACK.
+        let origin = self.pool.origin();
         self.with_writer("append_event", move |conn| {
             conn.execute_batch("BEGIN IMMEDIATE")?;
-            let _tx_handle = khive_storage::tx_registry::register(Some("event_append".to_string()));
+            let _tx_handle = khive_storage::tx_registry::register_scoped(
+                Some("event_append".to_string()),
+                origin,
+            );
             if let Err(e) = insert_event_with_observations(conn, &event) {
                 let _ = conn.execute_batch("ROLLBACK");
                 return Err(e);
@@ -957,10 +961,13 @@ impl EventStore for SqlEventStore {
 
         // Flag-off (default) path: byte-for-byte unchanged from pre-ADR-067
         // behavior — the closure owns its own BEGIN IMMEDIATE/COMMIT/ROLLBACK.
+        let origin = self.pool.origin();
         self.with_writer("append_events", move |conn| {
             conn.execute_batch("BEGIN IMMEDIATE")?;
-            let _tx_handle =
-                khive_storage::tx_registry::register(Some("event_append_batch".to_string()));
+            let _tx_handle = khive_storage::tx_registry::register_scoped(
+                Some("event_append_batch".to_string()),
+                origin,
+            );
 
             let summary = match batch_append_events_dml(conn, &events, attempted) {
                 Ok(summary) => summary,

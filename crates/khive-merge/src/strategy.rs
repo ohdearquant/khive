@@ -1,5 +1,3 @@
-// Copyright 2026 Haiyang Li. Licensed under Apache-2.0.
-//
 //! Last-write-wins shortcut strategies.
 //!
 //! See `crates/khive-merge/docs/api/three-way-merge.md` for composition rules.

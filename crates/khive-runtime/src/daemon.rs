@@ -16,7 +16,6 @@ use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
-#[cfg(unix)]
 use std::path::PathBuf;
 
 #[cfg(unix)]
@@ -53,10 +52,45 @@ const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 10;
 
 // ── paths ─────────────────────────────────────────────────────────────────────
 
-#[cfg(unix)]
+/// Base `.khive` directory used to anchor every advisory lock/socket/pid
+/// path below. Pure path computation — portable on every target, even
+/// though most of its callers (socket/pid paths) are unix-only.
+///
+/// Resolution order: `HOME`, then `USERPROFILE` (the conventional Windows
+/// home variable), then a platform-specific last resort. On non-unix targets
+/// the last resort is the OS temp directory (per-user on Windows), so the
+/// lock path can never be working-directory-relative there: two processes
+/// opening the same database from different working directories must resolve
+/// the same lock file. On unix the last resort stays the historical `"."` —
+/// a shared world-writable anchor such as `/tmp` would be worse, since a
+/// local attacker could pre-claim the directory and the socket/lock files
+/// under it before the daemon's first run.
 fn khive_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".khive")
+    khive_root_from(
+        std::env::var("HOME").ok(),
+        std::env::var("USERPROFILE").ok(),
+    )
+}
+
+/// Env-free core of [`khive_dir`], split out so the fallback chain is
+/// testable without mutating process-global environment variables.
+fn khive_root_from(home: Option<String>, userprofile: Option<String>) -> PathBuf {
+    home.filter(|v| !v.trim().is_empty())
+        .or_else(|| userprofile.filter(|v| !v.trim().is_empty()))
+        .map(PathBuf::from)
+        .unwrap_or_else(last_resort_root)
+        .join(".khive")
+}
+
+/// See [`khive_dir`] for why the two arms differ.
+#[cfg(unix)]
+fn last_resort_root() -> PathBuf {
+    PathBuf::from(".")
+}
+
+#[cfg(not(unix))]
+fn last_resort_root() -> PathBuf {
+    std::env::temp_dir()
 }
 
 /// Unix socket path the daemon binds and clients connect to.
@@ -86,10 +120,13 @@ pub fn pid_path() -> PathBuf {
 }
 
 /// Advisory lock file used to serialize stale-daemon recovery across concurrent
-/// clients (flock on the file; released when the lock file handle is dropped).
+/// clients (flock/`File::lock` on the file; released when the lock file
+/// handle is dropped). Path computation is portable; `kkernel exec`'s
+/// non-unix local-construction guard (`kkernel::exec::acquire_local_construction_guard`)
+/// shares this exact path with the unix daemon-boot guard so the two stay
+/// mutually exclusive.
 ///
 /// Overridable via the `KHIVE_LOCK` env var (for tests).
-#[cfg(unix)]
 pub fn lock_path() -> PathBuf {
     if let Ok(p) = std::env::var("KHIVE_LOCK") {
         if !p.is_empty() {
@@ -560,6 +597,19 @@ pub trait DaemonDispatch: Clone + Send + Sync + 'static {
         None
     }
 
+    /// File-backed backend pools beyond [`Self::pool_for_checkpoint`]'s pool
+    /// (ADR-091 Amendment 3): one checkpoint task is spawned per entry here,
+    /// in addition to the one spawned for the primary pool, so a
+    /// multi-backend deployment gets PASSIVE/TRUNCATE checkpointing and
+    /// sidecar enumeration on every file-backed backend it wired, not only
+    /// the main one.
+    ///
+    /// The default implementation returns an empty `Vec` — an implementor
+    /// with only one backend (or none) needs no override.
+    fn secondary_pools_for_checkpoint(&self) -> Vec<Arc<ConnectionPool>> {
+        Vec::new()
+    }
+
     /// Return the audit `EventStore` the checkpoint task should append
     /// ADR-094 lifecycle events (`CheckpointOutcomeRecorded`) to, if any.
     ///
@@ -710,6 +760,12 @@ pub fn active_phase_names() -> Vec<String> {
 #[cfg(unix)]
 fn build_metrics_snapshot<D: DaemonDispatch>(dispatcher: &D) -> MetricsSnapshot {
     let open_tx_count = khive_storage::tx_registry::snapshot().len();
+    // ADR-091 Amendment 3: deliberately the process-wide aggregate, not a
+    // backend-attributed view — this gauge reports "oldest pinned tx in this
+    // process" across every wired backend, not an attribution claim about
+    // which database it belongs to. Attribution consumers (the session sweep,
+    // the per-backend checkpoint tasks) use the scoped `oldest_for` views in
+    // khive-db instead.
     let (oldest_pinned_tx_micros, oldest_pinned_tx_label) =
         match khive_storage::tx_registry::oldest() {
             Some((_id, age, label)) => (Some(age.as_micros() as u64), label),
@@ -1051,18 +1107,34 @@ pub async fn run_daemon_with_boot_guard<D: DaemonDispatch>(
     // scope and signalled as the first action once shutdown is observed,
     // below.
     let (checkpoint_shutdown_tx, checkpoint_shutdown_rx) = tokio::sync::watch::channel(());
+    // ADR-091 Amendment 3: one checkpoint task per file-backed backend the
+    // dispatcher wired — the primary pool plus every entry
+    // `secondary_pools_for_checkpoint` returns — sharing this one shutdown
+    // channel (the sender broadcasts to every receiver clone), so the single
+    // send below stops every spawned task before `drain()`.
+    let mut checkpoint_pools: Vec<(Arc<ConnectionPool>, bool)> = Vec::new();
     if let Some(pool) = dispatcher.pool_for_checkpoint() {
+        checkpoint_pools.push((pool, true));
+    }
+    for pool in dispatcher.secondary_pools_for_checkpoint() {
+        checkpoint_pools.push((pool, false));
+    }
+    if !checkpoint_pools.is_empty() {
         let cfg = CheckpointConfig::from_env();
         let event_store = dispatcher.event_store_for_checkpoint();
         let namespace = dispatcher.namespace().to_string();
-        track_background_task(run_checkpoint_task(
-            pool,
-            cfg,
-            event_store,
-            namespace,
-            checkpoint_shutdown_rx,
-        ));
-        tracing::info!("WAL checkpoint task started");
+        let checkpoint_task_count = checkpoint_pools.len();
+        for (pool, is_main) in checkpoint_pools {
+            track_background_task(run_checkpoint_task(
+                pool,
+                cfg.clone(),
+                event_store.clone(),
+                namespace.clone(),
+                checkpoint_shutdown_rx.clone(),
+                is_main,
+            ));
+        }
+        tracing::info!(checkpoint_task_count, "WAL checkpoint task(s) started");
     }
 
     let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1325,6 +1397,54 @@ pub fn env_truthy(key: &str) -> bool {
             !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
         })
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod khive_root_tests {
+    use super::khive_root_from;
+    use std::path::PathBuf;
+
+    #[test]
+    fn home_wins_when_set() {
+        assert_eq!(
+            khive_root_from(Some("/base/home".into()), Some("/other".into())),
+            PathBuf::from("/base/home/.khive")
+        );
+    }
+
+    #[test]
+    fn userprofile_backfills_missing_home() {
+        assert_eq!(
+            khive_root_from(None, Some("/profile/home".into())),
+            PathBuf::from("/profile/home/.khive")
+        );
+    }
+
+    #[test]
+    fn blank_values_are_skipped() {
+        assert_eq!(
+            khive_root_from(Some("  ".into()), Some("/profile/home".into())),
+            PathBuf::from("/profile/home/.khive")
+        );
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn fallback_is_never_cwd_relative() {
+        // On non-unix the lock anchor must not depend on the caller's working
+        // directory even when no home variable is set — a relative path here
+        // would give the same database different lock files per cwd.
+        assert!(khive_root_from(None, None).is_absolute());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_fallback_stays_historical_not_shared_tmp() {
+        // On unix the no-HOME last resort deliberately stays "./.khive"
+        // rather than a shared world-writable anchor like /tmp, which a
+        // local attacker could pre-claim to intercept the daemon socket.
+        assert_eq!(khive_root_from(None, None), PathBuf::from("./.khive"));
+    }
 }
 
 #[cfg(all(test, unix))]

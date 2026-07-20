@@ -2,6 +2,7 @@
 use crossbeam_queue::ArrayQueue;
 use parking_lot::Mutex;
 use rusqlite::{Connection, OpenFlags};
+use std::fs;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -11,6 +12,7 @@ use std::time::{Duration, Instant};
 use crate::error::SqliteError;
 use crate::writer_task::WriterTaskHandle;
 use khive_storage::error::StorageError;
+use khive_storage::tx_registry::{DbIdentity, TxOrigin};
 
 const CACHE_SIZE_KIB: &str = "-65536";
 const MMAP_SIZE_BYTES: &str = "1073741824";
@@ -139,6 +141,18 @@ pub struct ConnectionPool {
     /// see that method's doc comment for why this lives here rather than on
     /// each store.
     writer_task: OnceLock<Option<WriterTaskHandle>>,
+    /// This pool's ADR-091 backend-scoped attribution origin, minted exactly
+    /// once at construction (see [`mint_db_identity`]): `Database(_)` for a
+    /// file-backed pool, `Memory` for an in-memory pool. Every
+    /// `tx_registry::register_scoped` call site in this crate reaches its
+    /// origin through [`Self::origin`] rather than re-deriving it.
+    origin: TxOrigin,
+    /// The canonical path `origin`'s `DbIdentity` was minted from, `None` for
+    /// an in-memory pool. `DbIdentity` is deliberately opaque (no path
+    /// accessor) — filesystem consumers that need the actual path (sidecar
+    /// derivation) use this, the same canonical value the identity was
+    /// minted from, via [`Self::canonical_path`].
+    identity_path: Option<PathBuf>,
     /// Test-only instrumentation: counts how many times the writer-task
     /// init closure actually ran. Must never exceed 1 per pool no matter how
     /// many stores are constructed over it — that is the invariant
@@ -199,6 +213,10 @@ impl<'pool> Drop for ReaderGuard<'pool> {
 /// The Mutex ensures only one writer at a time.
 pub struct WriterGuard<'pool> {
     guard: parking_lot::MutexGuard<'pool, Connection>,
+    /// The origin (ADR-091 backend-scoped attribution) of the pool this
+    /// guard was checked out from, carried so `transaction` can register its
+    /// span with the correct origin without holding a `&ConnectionPool`.
+    origin: TxOrigin,
 }
 
 impl<'pool> WriterGuard<'pool> {
@@ -219,7 +237,10 @@ impl<'pool> WriterGuard<'pool> {
         F: FnOnce(&Connection) -> Result<R, SqliteError>,
     {
         self.guard.execute_batch("BEGIN IMMEDIATE")?;
-        let _tx_handle = khive_storage::tx_registry::register(Some("writer_guard_tx".to_string()));
+        let _tx_handle = khive_storage::tx_registry::register_scoped(
+            Some("writer_guard_tx".to_string()),
+            self.origin.clone(),
+        );
 
         match f(&self.guard) {
             Ok(result) => {
@@ -266,12 +287,22 @@ impl ConnectionPool {
 
         let readers = ArrayQueue::new(max_readers.max(1));
 
+        let (origin, identity_path) = match config.path.as_ref() {
+            Some(path) => {
+                let (identity, canonical) = mint_db_identity(path)?;
+                (TxOrigin::Database(identity), Some(canonical))
+            }
+            None => (TxOrigin::Memory, None),
+        };
+
         let pool = Self {
             writer: Arc::new(Mutex::new(writer)),
             readers,
             max_readers,
             config,
             writer_task: OnceLock::new(),
+            origin,
+            identity_path,
             #[cfg(test)]
             writer_task_spawn_count: std::sync::atomic::AtomicUsize::new(0),
         };
@@ -359,7 +390,10 @@ impl ConnectionPool {
                     self.config.checkout_timeout
                 ))
             })?;
-        Ok(WriterGuard { guard })
+        Ok(WriterGuard {
+            guard,
+            origin: self.origin(),
+        })
     }
 
     /// Non-panicking writer checkout.
@@ -384,7 +418,10 @@ impl ConnectionPool {
                 "writer connection busy (checkpoint skipped this tick)".to_string(),
             )
         })?;
-        Ok(WriterGuard { guard })
+        Ok(WriterGuard {
+            guard,
+            origin: self.origin(),
+        })
     }
 
     /// Get the current number of available reader connections.
@@ -400,6 +437,24 @@ impl ConnectionPool {
     /// Return the pool configuration.
     pub fn config(&self) -> &PoolConfig {
         &self.config
+    }
+
+    /// This pool's ADR-091 backend-scoped attribution origin (ADR-091,
+    /// backend-scoped WAL-pin attribution design note): `Database(_)` for a
+    /// file-backed pool, `Memory` for an in-memory pool. Every
+    /// `tx_registry::register_scoped` call site threaded in this crate
+    /// passes this value as the span's origin.
+    pub fn origin(&self) -> TxOrigin {
+        self.origin.clone()
+    }
+
+    /// The canonical path this pool's `origin()` identity was minted from,
+    /// `None` for an in-memory pool. `DbIdentity` has no path accessor by
+    /// design; sidecar derivation and other filesystem consumers use this —
+    /// the same canonical value the identity was minted from — instead of
+    /// re-deriving a path from the raw configured one.
+    pub fn canonical_path(&self) -> Option<&Path> {
+        self.identity_path.as_deref()
     }
 
     /// Return the pool-wide ADR-067 Component A writer task, spawning it
@@ -569,6 +624,129 @@ impl ConnectionPool {
     }
 }
 
+/// Bound on the final-component symlink chain [`resolve_symlink_chain`]
+/// follows before failing loud, mirroring the OS's own loop limit (e.g.
+/// Linux/macOS `ELOOP`, commonly 40 hops) rather than looping forever on a
+/// cycle.
+const MAX_SYMLINK_DEPTH: u32 = 40;
+
+/// Mint the canonical [`DbIdentity`] for a configured database path.
+///
+/// The sole minting point (ADR-091 backend-scoped attribution design note):
+/// `tx_registry` origin threading and `sidecar_dir_for` re-keying both
+/// consume this function's output rather than re-deriving it. Operationally
+/// three steps:
+///
+/// 1. A relative configured path is resolved against the process's current
+///    directory BEFORE any canonicalization — a bare file name has an empty
+///    parent, and canonicalizing an empty path fails.
+/// 2. If the resolved path exists, canonicalize the full path: this
+///    resolves symlinks at every level, including a symlink at the
+///    database-file level itself (a `link.sqlite` pointing at the real file
+///    mints the target's identity).
+/// 3. If the resolved path does not yet exist (first open), a dangling
+///    file-level symlink is a valid first-open state — SQLite creates the
+///    target through the link on first write, and minting the link's own
+///    name would diverge from a later opener using the target path
+///    directly. The final-component symlink chain is followed to its
+///    ultimate target first (bounded, see [`MAX_SYMLINK_DEPTH`]), then that
+///    target's PARENT directory is canonicalized and the file name is
+///    appended unchanged — the same pattern `FsBlobStore` uses for its
+///    root-keyed write locks (`stores/blob.rs::write_lock_for_root`), and
+///    for the same reason: `Path::canonicalize` requires an existing path.
+///
+/// A resolved target whose parent directory does not exist fails minting
+/// exactly as the subsequent database open itself would fail.
+///
+/// Returns the minted [`DbIdentity`] alongside the canonical [`PathBuf`] it
+/// was built from — `DbIdentity` has no path accessor by design, so callers
+/// that need the filesystem path (sidecar derivation) keep this pairing
+/// rather than re-deriving it from the raw configured path.
+fn mint_db_identity(configured_path: &Path) -> Result<(DbIdentity, PathBuf), SqliteError> {
+    let absolute = if configured_path.is_absolute() {
+        configured_path.to_path_buf()
+    } else {
+        let cwd = std::env::current_dir().map_err(|e| {
+            SqliteError::InvalidData(format!(
+                "cannot mint database identity for {configured_path:?}: failed to resolve the \
+                 process current directory: {e}"
+            ))
+        })?;
+        cwd.join(configured_path)
+    };
+
+    if absolute.exists() {
+        let canonical = absolute.canonicalize().map_err(|e| {
+            SqliteError::InvalidData(format!(
+                "cannot mint database identity: failed to canonicalize existing path \
+                 {absolute:?}: {e}"
+            ))
+        })?;
+        return Ok((
+            DbIdentity::new(canonical.clone().into_os_string()),
+            canonical,
+        ));
+    }
+
+    let resolved_target = resolve_symlink_chain(&absolute)?;
+    let parent = resolved_target.parent().ok_or_else(|| {
+        SqliteError::InvalidData(format!(
+            "cannot mint database identity for {resolved_target:?}: path has no parent \
+             directory"
+        ))
+    })?;
+    let file_name = resolved_target.file_name().ok_or_else(|| {
+        SqliteError::InvalidData(format!(
+            "cannot mint database identity for {resolved_target:?}: path has no file name"
+        ))
+    })?;
+    let canonical_parent = parent.canonicalize().map_err(|e| {
+        SqliteError::InvalidData(format!(
+            "cannot mint database identity: parent directory {parent:?} of first-open path \
+             {resolved_target:?} does not exist or is inaccessible: {e}"
+        ))
+    })?;
+    let mut identity_path = canonical_parent;
+    identity_path.push(file_name);
+    Ok((
+        DbIdentity::new(identity_path.clone().into_os_string()),
+        identity_path,
+    ))
+}
+
+/// Follow a (possibly dangling) final-component symlink chain to its
+/// ultimate target, bounded at [`MAX_SYMLINK_DEPTH`] hops. A path that is
+/// not itself a symlink — including one that does not exist at all —
+/// returns unchanged on the first iteration; this is the common case, a
+/// first-open path with no symlink involved.
+fn resolve_symlink_chain(path: &Path) -> Result<PathBuf, SqliteError> {
+    let mut current = path.to_path_buf();
+    for _ in 0..MAX_SYMLINK_DEPTH {
+        match fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let target = fs::read_link(&current).map_err(|e| {
+                    SqliteError::InvalidData(format!(
+                        "cannot mint database identity: failed to read symlink {current:?}: {e}"
+                    ))
+                })?;
+                current = if target.is_absolute() {
+                    target
+                } else {
+                    match current.parent() {
+                        Some(parent) => parent.join(&target),
+                        None => target,
+                    }
+                };
+            }
+            _ => return Ok(current),
+        }
+    }
+    Err(SqliteError::InvalidData(format!(
+        "cannot mint database identity for {path:?}: symlink chain exceeds \
+         {MAX_SYMLINK_DEPTH} levels"
+    )))
+}
+
 fn effective_reader_count(config: &PoolConfig, wal_enabled: bool) -> usize {
     if config.path.is_some() && config.wal_mode && wal_enabled {
         config.max_readers
@@ -731,6 +909,28 @@ fn pool_exhausted_error(timeout: Duration, max_readers: usize) -> SqliteError {
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    /// Restores the process CWD on drop — including on panic — so a mid-test
+    /// assertion failure (or an unexpected panic from the code under test)
+    /// can never leave the process chdir'd into a `tempfile::tempdir()` that
+    /// unwinds out from under every later test sharing this process.
+    struct CwdGuard {
+        original: PathBuf,
+    }
+
+    impl CwdGuard {
+        fn enter(dir: &Path) -> Self {
+            let original = std::env::current_dir().unwrap();
+            std::env::set_current_dir(dir).unwrap();
+            Self { original }
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.original);
+        }
+    }
 
     #[test]
     #[serial]
@@ -946,5 +1146,212 @@ mod tests {
             0,
             "the guard must reject before ever attempting tokio::spawn"
         );
+    }
+
+    /// ADR-091 backend-scoped attribution: the real path, a directory
+    /// symlink, a file-level symlink, a relative spelling, and a bare file
+    /// name (resolved against the current directory) must all mint an
+    /// identical `DbIdentity` and canonical path for the same database.
+    #[test]
+    #[serial(pool_cwd)]
+    fn mint_db_identity_alias_convergence() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_dir = dir.path().join("real");
+        fs::create_dir(&real_dir).unwrap();
+        let db_path = real_dir.join("khive.db");
+        fs::write(&db_path, b"").unwrap();
+
+        let dir_symlink = dir.path().join("dir_link");
+        let file_symlink = dir.path().join("file_link.db");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&real_dir, &dir_symlink).unwrap();
+            std::os::unix::fs::symlink(&db_path, &file_symlink).unwrap();
+        }
+
+        let (via_real, canonical_real) = mint_db_identity(&db_path).unwrap();
+
+        // Relative spelling: resolved against the process CWD (step 1).
+        let relative_result = {
+            let _cwd = CwdGuard::enter(&real_dir);
+            mint_db_identity(&PathBuf::from("khive.db"))
+        };
+        let (via_relative, canonical_relative) = relative_result.unwrap();
+        assert_eq!(canonical_real, canonical_relative);
+        assert_eq!(via_real, via_relative);
+
+        #[cfg(unix)]
+        {
+            let (via_dir_symlink, canonical_dir_symlink) =
+                mint_db_identity(&dir_symlink.join("khive.db")).unwrap();
+            assert_eq!(canonical_real, canonical_dir_symlink);
+            assert_eq!(via_real, via_dir_symlink);
+
+            let (via_file_symlink, canonical_file_symlink) =
+                mint_db_identity(&file_symlink).unwrap();
+            assert_eq!(canonical_real, canonical_file_symlink);
+            assert_eq!(via_real, via_file_symlink);
+        }
+
+        // Bare file name: resolved against the current directory (step 1).
+        let bare_name_result = {
+            let _cwd = CwdGuard::enter(&real_dir);
+            mint_db_identity(&PathBuf::from("khive.db"))
+        };
+        let (via_bare_name, canonical_bare_name) = bare_name_result.unwrap();
+        assert_eq!(canonical_real, canonical_bare_name);
+        assert_eq!(via_real, via_bare_name);
+    }
+
+    /// ADR-091 backend-scoped attribution: `DbIdentity`/canonical-path
+    /// equality across alias spellings (proven above by
+    /// `mint_db_identity_alias_convergence`) does not by itself prove the
+    /// walpin sidecar re-key — `sidecar_dir_for` is a separate, purely
+    /// lexical derivation (`walpin::sidecar_dir_for`) that must be fed the
+    /// *minted* canonical path, never the raw configured one. This test
+    /// opens a real `ConnectionPool` (not the private `mint_db_identity` free
+    /// function) through each alias spelling and asserts
+    /// `sidecar_dir_for(pool.canonical_path())` converges to one directory —
+    /// exercising the actual `ConnectionPool::new` → `canonical_path()` wiring
+    /// every sidecar consumer (`checkpoint.rs`) reads from.
+    #[test]
+    #[serial(pool_cwd)]
+    fn sidecar_dir_for_alias_convergence() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_dir = dir.path().join("real");
+        fs::create_dir(&real_dir).unwrap();
+        let db_path = real_dir.join("khive.db");
+        fs::write(&db_path, b"").unwrap();
+
+        let dir_symlink = dir.path().join("dir_link");
+        let file_symlink = dir.path().join("file_link.db");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&real_dir, &dir_symlink).unwrap();
+            std::os::unix::fs::symlink(&db_path, &file_symlink).unwrap();
+        }
+
+        let pool_for = |path: &Path| -> Arc<ConnectionPool> {
+            let cfg = PoolConfig {
+                path: Some(path.to_path_buf()),
+                ..PoolConfig::default()
+            };
+            Arc::new(ConnectionPool::new(cfg).expect("file-backed pool should open"))
+        };
+        let sidecar_of = |pool: &ConnectionPool| -> PathBuf {
+            crate::walpin::sidecar_dir_for(pool.canonical_path().expect("file-backed pool"))
+        };
+
+        let via_real = pool_for(&db_path);
+        let sidecar_real = sidecar_of(&via_real);
+
+        let via_relative = {
+            let _cwd = CwdGuard::enter(&real_dir);
+            pool_for(Path::new("khive.db"))
+        };
+        assert_eq!(
+            sidecar_real,
+            sidecar_of(&via_relative),
+            "a relative spelling of the same database must derive the same sidecar directory"
+        );
+
+        #[cfg(unix)]
+        {
+            let via_dir_symlink = pool_for(&dir_symlink.join("khive.db"));
+            assert_eq!(
+                sidecar_real,
+                sidecar_of(&via_dir_symlink),
+                "opening through a directory symlink must derive the same sidecar directory"
+            );
+
+            let via_file_symlink = pool_for(&file_symlink);
+            assert_eq!(
+                sidecar_real,
+                sidecar_of(&via_file_symlink),
+                "opening through a file-level symlink must derive the same sidecar directory"
+            );
+        }
+
+        let via_bare_name = {
+            let _cwd = CwdGuard::enter(&real_dir);
+            pool_for(Path::new("khive.db"))
+        };
+        assert_eq!(
+            sidecar_real,
+            sidecar_of(&via_bare_name),
+            "a bare file name resolved against the current directory must derive the same \
+             sidecar directory"
+        );
+    }
+
+    /// ADR-091 backend-scoped attribution: opening via a file-level symlink
+    /// whose target does not exist yet (a valid first-open state), then
+    /// after the target is created, opening via the target path directly,
+    /// must mint identical `DbIdentity` values — the first-open path
+    /// resolves the final component before canonicalizing the parent.
+    #[cfg(unix)]
+    #[test]
+    fn mint_db_identity_dangling_symlink_first_open_convergence() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.db");
+        let link = dir.path().join("link.db");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(!target.exists(), "target must not exist yet (dangling)");
+
+        let (via_dangling_link, canonical_via_link) = mint_db_identity(&link).unwrap();
+
+        // Now create the target (as SQLite would on first write) and mint
+        // again directly against the target path.
+        fs::write(&target, b"").unwrap();
+        let (via_target, canonical_via_target) = mint_db_identity(&target).unwrap();
+
+        assert_eq!(canonical_via_link, canonical_via_target);
+        assert_eq!(via_dangling_link, via_target);
+    }
+
+    /// A resolved target whose parent directory does not exist must fail
+    /// minting exactly as the subsequent database open itself would fail.
+    #[test]
+    fn mint_db_identity_missing_parent_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nonexistent_subdir").join("khive.db");
+        let result = mint_db_identity(&missing);
+        assert!(
+            result.is_err(),
+            "minting must fail when the parent directory does not exist"
+        );
+    }
+
+    /// Non-UTF-8 database paths (Unix) must round-trip through
+    /// `DbIdentity`/canonicalization without loss.
+    #[cfg(unix)]
+    #[test]
+    fn mint_db_identity_non_utf8_path_round_trips() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        // 0xFF is not valid UTF-8 as a standalone byte.
+        let raw_name = OsStr::from_bytes(b"khive-\xffdb.sqlite");
+        let db_path = dir.path().join(raw_name);
+        // Some Unix filesystems (notably macOS's APFS) reject non-UTF-8
+        // names outright at the syscall level — that is a filesystem
+        // limitation, not a `mint_db_identity` bug, so skip rather than
+        // fail where the underlying `write` itself cannot succeed.
+        if let Err(e) = fs::write(&db_path, b"") {
+            eprintln!(
+                "skipping mint_db_identity_non_utf8_path_round_trips: filesystem rejected a \
+                 non-UTF-8 file name ({e}); this platform's filesystem does not support the \
+                 case under test"
+            );
+            return;
+        }
+
+        let (identity, canonical) = mint_db_identity(&db_path).unwrap();
+        assert_eq!(canonical.file_name().unwrap(), raw_name);
+
+        let (identity_again, canonical_again) = mint_db_identity(&db_path).unwrap();
+        assert_eq!(identity, identity_again);
+        assert_eq!(canonical, canonical_again);
     }
 }

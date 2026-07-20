@@ -73,7 +73,7 @@ jobs:
           nav_sort: case_insensitive
           back_to_top: true
           back_to_top_text: "Back to top"
-          footer_content: "khive is Apache-2.0 licensed. Agents: fetch <a href=\"/khive/llms.txt\">/llms.txt</a> or <a href=\"/khive/llms-full.txt\">/llms-full.txt</a> for a machine-readable index."
+          footer_content: "khive is licensed under the Business Source License 1.1. Agents: fetch <a href=\"/khive/llms.txt\">/llms.txt</a> or <a href=\"/khive/llms-full.txt\">/llms-full.txt</a> for a machine-readable index."
           aux_links:
             "GitHub":
               - "https://github.com/ohdearquant/khive"
@@ -140,7 +140,7 @@ jobs:
 
           [crates.io](https://crates.io/crates/khive-mcp) &middot;
           [GitHub](https://github.com/ohdearquant/khive) &middot;
-          [License: Apache 2.0](https://github.com/ohdearquant/khive/blob/main/LICENSE)
+          [License: BUSL-1.1](https://github.com/ohdearquant/khive/blob/main/LICENSE)
 
           ## For AI agents
 

@@ -78,4 +78,4 @@ types -> score -> storage -> db -> query -> runtime -> pack-* -> mcp
 
 ## License
 
-Apache-2.0.
+BUSL-1.1. See the repository [LICENSE](https://github.com/ohdearquant/khive/blob/main/LICENSE).

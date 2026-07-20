@@ -1,5 +1,3 @@
-// Copyright 2026 Haiyang Li. Licensed under Apache-2.0.
-//
 //! Wire record shapes produced by format adapters for the KG import pipeline.
 
 use serde::{Deserialize, Serialize};
