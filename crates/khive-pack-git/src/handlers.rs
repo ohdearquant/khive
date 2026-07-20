@@ -208,7 +208,7 @@ impl GitPack {
         report.warnings.extend(warnings);
         if !resolution.slug_duplicates.is_empty() {
             report.warnings.push(format!(
-                "multiple live project anchors share repo_slug; selected oldest {}; duplicates: {}",
+                "multiple live project anchors match the same repo identity; selected oldest {}; duplicates: {}",
                 project_id,
                 resolution
                     .slug_duplicates
@@ -313,10 +313,11 @@ async fn resolve_or_create_project(
         });
     }
 
-    if let Some(id) = find_project_by_legacy_repo_url(runtime, token, &repo_url)
+    let exact_matches = find_projects_by_legacy_repo_url(runtime, token, &repo_url)
         .await
-        .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?
-    {
+        .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+    if let Some((id, duplicates)) = exact_matches.split_first() {
+        let id = *id;
         registry
             .dispatch(
                 "update",
@@ -337,7 +338,7 @@ async fn resolve_or_create_project(
             id,
             created: false,
             orphan: None,
-            slug_duplicates: Vec::new(),
+            slug_duplicates: duplicates.to_vec(),
         });
     }
 
@@ -453,33 +454,45 @@ async fn find_projects_by_slug(
         .collect())
 }
 
-async fn find_project_by_legacy_repo_url(
+/// Exact step-2 legacy match (ADR-088 Amendment 2): every live pre-slug
+/// anchor whose stored `repo_url` equals the source spelling verbatim,
+/// ordered `created_at ASC, id ASC` so multi-match cases select the oldest
+/// deterministically and surface the remainder as a report warning -- the
+/// same contract as the step-1 slug lookup and the normalized step-2 route.
+/// Anchors that already carry `repo_slug` are excluded: they are found (if
+/// at all) via `find_projects_by_slug`, and an exact `repo_url` hit must
+/// never overwrite an already-derived identity.
+async fn find_projects_by_legacy_repo_url(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     repo_url: &str,
-) -> anyhow::Result<Option<Uuid>> {
+) -> anyhow::Result<Vec<Uuid>> {
     let sql = runtime.sql();
     let mut r = sql.reader().await.map_err(|e| anyhow!("{e}"))?;
-    let row = r
-        .query_row(SqlStatement {
+    let rows = r
+        .query_all(SqlStatement {
             sql: "SELECT id FROM entities WHERE kind='project' AND namespace=?1 \
                   AND deleted_at IS NULL \
+                  AND json_extract(properties,'$.repo_slug') IS NULL \
                   AND json_extract(properties,'$.repo_url')=?2 \
-                  LIMIT 1"
+                  ORDER BY created_at ASC, id ASC"
                 .into(),
             params: vec![
                 SqlValue::Text(token.namespace().as_str().to_string()),
                 SqlValue::Text(repo_url.to_string()),
             ],
-            label: Some("git_digest_find_project_by_legacy_repo_url".into()),
+            label: Some("git_digest_find_projects_by_legacy_repo_url".into()),
         })
         .await
         .map_err(|e| anyhow!("{e}"))?;
-    Ok(row.and_then(|r| match r.get("id") {
-        Some(SqlValue::Uuid(u)) => Some(*u),
-        Some(SqlValue::Text(s)) => Uuid::parse_str(s).ok(),
-        _ => None,
-    }))
+    Ok(rows
+        .iter()
+        .filter_map(|r| match r.get("id") {
+            Some(SqlValue::Uuid(u)) => Some(*u),
+            Some(SqlValue::Text(s)) => Uuid::parse_str(s).ok(),
+            _ => None,
+        })
+        .collect())
 }
 
 /// Fetch every live `project` anchor in this namespace that has no
@@ -1253,5 +1266,86 @@ mod tests {
             .await
             .expect("find_projects_by_slug");
         assert_eq!(live.len(), 2, "no third anchor should be minted: {live:?}");
+    }
+
+    /// Exact step-2 multi-match (ADR-088 Amendment 2 round-3 finding): two
+    /// live pre-slug anchors sharing the source's exact `repo_url` spelling
+    /// must resolve to the oldest deterministically, surface the remainder
+    /// in the report warning, and mint no third anchor -- observed on the
+    /// public `git.digest` wire shape, not the private helper.
+    #[tokio::test]
+    async fn git_digest_exact_legacy_multi_match_selects_oldest_and_warns() {
+        let (rt, token, registry) = fixture().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_repo_with_origin_and_one_commit(dir.path(), "https://github.com/org/exact-dup-repo");
+        let source_path = dir.path().to_string_lossy().to_string();
+
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let resp = registry
+                .dispatch(
+                    "create",
+                    json!({
+                        "kind": "project",
+                        "name": "exact-dup-repo",
+                        // Pre-slug anchors: repo_url only, exactly the local
+                        // source spelling the handler will match on.
+                        "properties": { "repo_url": source_path.clone() },
+                    }),
+                )
+                .await
+                .expect("create anchor");
+            ids.push(Uuid::parse_str(resp["id"].as_str().unwrap()).expect("uuid"));
+        }
+
+        let resp = registry
+            .dispatch(
+                "git.digest",
+                json!({
+                    "source": source_path,
+                    "include": ["commits"],
+                    "max_items": 1,
+                }),
+            )
+            .await
+            .expect("git.digest dispatch");
+
+        assert_eq!(resp["project_created"], json!(false), "{resp}");
+        let selected_id = resp["project_id"]
+            .as_str()
+            .expect("project_id present")
+            .to_string();
+        assert_eq!(selected_id, ids[0].to_string(), "must select the oldest");
+
+        let warnings = resp["warnings"].as_array().expect("warnings array");
+        assert!(
+            warnings.iter().any(|w| {
+                let w = w.as_str().unwrap_or("");
+                w.contains("duplicate")
+                    && w.contains(&selected_id)
+                    && w.contains(&ids[1].to_string())
+            }),
+            "duplicate warning must name the selected and duplicate ids: {warnings:?}"
+        );
+
+        // The selected anchor was backfilled with the origin-derived slug;
+        // the duplicate remains pre-slug and untouched; no third anchor.
+        let slugged = find_projects_by_slug(&rt, &token, "github.com/org/exact-dup-repo")
+            .await
+            .expect("find_projects_by_slug");
+        assert_eq!(
+            slugged,
+            vec![ids[0]],
+            "only the selected anchor gains the slug"
+        );
+        let still_legacy = find_projects_by_legacy_repo_url(&rt, &token, &source_path)
+            .await
+            .expect("find_projects_by_legacy_repo_url");
+        assert_eq!(
+            still_legacy,
+            vec![ids[1]],
+            "duplicate stays pre-slug; no third anchor minted"
+        );
     }
 }
