@@ -723,6 +723,12 @@ pub fn active_phase_names() -> Vec<String> {
 #[cfg(unix)]
 fn build_metrics_snapshot<D: DaemonDispatch>(dispatcher: &D) -> MetricsSnapshot {
     let open_tx_count = khive_storage::tx_registry::snapshot().len();
+    // ADR-091 Amendment 3: deliberately the process-wide aggregate, not a
+    // backend-attributed view — this gauge reports "oldest pinned tx in this
+    // process" across every wired backend, not an attribution claim about
+    // which database it belongs to. Attribution consumers (the session sweep,
+    // the per-backend checkpoint tasks) use the scoped `oldest_for` views in
+    // khive-db instead.
     let (oldest_pinned_tx_micros, oldest_pinned_tx_label) =
         match khive_storage::tx_registry::oldest() {
             Some((_id, age, label)) => (Some(age.as_micros() as u64), label),
