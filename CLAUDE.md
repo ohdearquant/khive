@@ -86,31 +86,30 @@ not shipped.
 
 ## Directory map
 
-| Path                       | Purpose                                                                                                                                                                                                                                          |
-| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `crates/khive-types`       | Domain types: Entity, Note, Event, EntityKind, EdgeRelation, Pack trait                                                                                                                                                                          |
-| `crates/khive-score`       | Deterministic i64 fixed-point scoring + RRF                                                                                                                                                                                                      |
-| `crates/khive-storage`     | Trait-only: SqlAccess, GraphStore, VectorStore, TextSearch                                                                                                                                                                                       |
-| `crates/khive-db`          | SQLite backend; FTS5 trigram TextSearch; current sqlite-vec VectorStore compatibility                                                                                                                                                            |
-| `crates/khive-retrieval`   | Hybrid retrieval primitives over dense, lexical, graph, and fusion signals                                                                                                                                                                       |
-| `crates/khive-fusion`      | RRF, weighted, union, vector-only, and keyword-only fusion strategies                                                                                                                                                                            |
-| `crates/khive-bm25`        | BM25 keyword index                                                                                                                                                                                                                               |
-| `crates/khive-hnsw`        | HNSW vector index                                                                                                                                                                                                                                |
-| `crates/khive-vamana`      | Vamana ANN index used by knowledge search                                                                                                                                                                                                        |
-| `crates/khive-query`       | GQL + SPARQL parsers, AST validation, SQL compiler                                                                                                                                                                                               |
-| `crates/khive-runtime`     | Service API + VerbRegistry + PackRuntime trait                                                                                                                                                                                                   |
-| `crates/khive-request`     | Request DSL parser (function-call + JSON; pipe/LNDL planned)                                                                                                                                                                                     |
-| `crates/khive-pack-kg`     | KG pack: vocabulary, 18 verb handlers, kind validation                                                                                                                                                                                           |
-| `crates/khive-pack-gtd`    | GTD pack: 5 verbs over notes (assign / next / complete / tasks / transition)                                                                                                                                                                     |
-| `crates/khive-pack-memory` | Memory pack: `remember`/`recall`/`feedback` verbs, decay-weighted recall ([ADR-021](docs/adr/ADR-021-memory-pack.md))                                                                                                                            |
-| `crates/khive-pack-formal` | Formal-methods pack: typed edge endpoint rules for six formal-math concept subtypes (theorem, definition, structure, instance, axiom, goal); pure ontology, no verbs ([ADR-069](docs/adr/ADR-069-subject-model.md)); not in the default pack set |
-| `crates/khive-vcs`         | KG versioning: content-addressed snapshots, branch pointers, push/pull ([ADR-010](docs/adr/ADR-010-kg-versioning.md))                                                                                                                            |
-| `crates/khive-merge`       | KG merge: three-way merge with LCA walk, conflict enum, strategy shortcuts ([ADR-039](docs/adr/ADR-039-note-merge.md))                                                                                                                           |
-| `crates/khive-mcp`         | Stdio MCP binary — single `request` tool over VerbRegistry; auto-spawns daemon                                                                                                                                                                   |
-| `docs/adr/`                | Architecture Decision Records (the design contract)                                                                                                                                                                                              |
-| `marketplace/`             | The `khive` umbrella Claude Code plugin (one skill per pack + kg agents) — install via `/plugin install`                                                                                                                                         |
-| `tests/smoke_test.py`      | End-to-end binary smoke test (drives every verb via the `request` DSL)                                                                                                                                                                           |
-| `scripts/publish.sh`       | Publish all crates to crates.io in dependency order                                                                                                                                                                                              |
+| Path                       | Purpose                                                                                                                |
+| -------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `crates/khive-types`       | Domain types: Entity, Note, Event, EntityKind, EdgeRelation, Pack trait                                                |
+| `crates/khive-score`       | Deterministic i64 fixed-point scoring + RRF                                                                            |
+| `crates/khive-storage`     | Trait-only: SqlAccess, GraphStore, VectorStore, TextSearch                                                             |
+| `crates/khive-db`          | SQLite backend; FTS5 trigram TextSearch; current sqlite-vec VectorStore compatibility                                  |
+| `crates/khive-retrieval`   | Hybrid retrieval primitives over dense, lexical, graph, and fusion signals                                             |
+| `crates/khive-fusion`      | RRF, weighted, union, vector-only, and keyword-only fusion strategies                                                  |
+| `crates/khive-bm25`        | BM25 keyword index                                                                                                     |
+| `crates/khive-hnsw`        | HNSW vector index                                                                                                      |
+| `crates/khive-vamana`      | Vamana ANN index used by semantic recall                                                                               |
+| `crates/khive-query`       | GQL + SPARQL parsers, AST validation, SQL compiler                                                                     |
+| `crates/khive-runtime`     | Service API + VerbRegistry + PackRuntime trait                                                                         |
+| `crates/khive-request`     | Request DSL parser (function-call + JSON; pipe/LNDL planned)                                                           |
+| `crates/khive-pack-kg`     | KG pack: vocabulary, 18 verb handlers, kind validation                                                                 |
+| `crates/khive-pack-gtd`    | GTD pack: 5 verbs over notes (assign / next / complete / tasks / transition)                                           |
+| `crates/khive-pack-memory` | Memory pack: `remember`/`recall`/`feedback` verbs, decay-weighted recall ([ADR-021](docs/adr/ADR-021-memory-pack.md))  |
+| `crates/khive-vcs`         | KG versioning: content-addressed snapshots, branch pointers, push/pull ([ADR-010](docs/adr/ADR-010-kg-versioning.md))  |
+| `crates/khive-merge`       | KG merge: three-way merge with LCA walk, conflict enum, strategy shortcuts ([ADR-039](docs/adr/ADR-039-note-merge.md)) |
+| `crates/khive-mcp`         | Stdio MCP binary — single `request` tool over VerbRegistry; auto-spawns daemon                                         |
+| `docs/adr/`                | Architecture Decision Records (the design contract)                                                                    |
+| `marketplace/`             | The `khive` umbrella Claude Code plugin (one skill per pack + kg agents) — install via `/plugin install`               |
+| `tests/smoke_test.py`      | End-to-end binary smoke test (drives every verb via the `request` DSL)                                                 |
+| `scripts/publish.sh`       | Publish all crates to crates.io in dependency order                                                                    |
 
 ---
 
@@ -168,12 +167,9 @@ request(ops="[{\"tool\":\"v1\",\"args\":{...}}, ...]")
 ```
 
 Verbs come from whichever packs are loaded via `KHIVE_PACKS` (env) or `--pack` (CLI). Default
-loads all 12 production packs: kg, gtd, memory, brain, comm, schedule, knowledge, session, git,
-code, workspace, blob (verbs at 85: the `code` pack contributes one verb, `code.ingest`
-(ADR-085 Amendment 2, PR #1039 — L1 manifest + L1.5 import-scan source ingest into a
-dedicated map database); its `finding` note kind and `findings.json` batch ingest are
-still reached only through the `kkernel code-ingest` admin CLI path (ADR-085 Amendment
-3), never the MCP verb surface; git contributes
+loads all 10 production packs: kg, gtd, memory, brain, comm, schedule, session, git,
+workspace, blob (regenerate the verb count via `request(ops="verbs()")` before citing an exact
+figure — it drifts; git contributes
 commit/issue/pull_request note kinds, a batch ingester, the git.digest verb (ADR-088
 Amendment 1), and three write verbs — git.commit / git.branch / git.push — that shell to
 system git with hardened, allowlisted argv construction and unconditional force-push denial

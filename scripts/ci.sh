@@ -128,7 +128,6 @@ phase_smoke_tests() {
     python3 "$SCRIPT_DIR/../tests/smoke_test.py"
     python3 "$SCRIPT_DIR/../tests/smoke_brain.py"
     python3 "$SCRIPT_DIR/../tests/smoke_comm.py"
-    python3 "$SCRIPT_DIR/../tests/smoke_knowledge.py"
     python3 "$SCRIPT_DIR/../tests/smoke_schedule.py"
 }
 

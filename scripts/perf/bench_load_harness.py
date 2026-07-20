@@ -76,8 +76,8 @@ PROTOCOL_VERSION = mbc.PROTOCOL_VERSION
 # scratch DB that path fails bootstrap recall (`fts_notes` vtable construction), and its background
 # writes would also confound the reduced-scale WAL / write-queue gauges this harness reads. The full
 # acceptance run against a real multi-pack config opts session back in via `--packs` (see below).
-DEFAULT_PACKS = "kg,gtd,memory,brain,comm,schedule,knowledge"
-PRODUCTION_PACKS = "kg,gtd,memory,brain,comm,schedule,knowledge,session,git,code"
+DEFAULT_PACKS = "kg,gtd,memory,brain,comm,schedule"
+PRODUCTION_PACKS = "kg,gtd,memory,brain,comm,schedule,session,git"
 
 # ── Metal GPU serialization (machine-wide convention; real-embedder mode only)
 METAL_GPU_LOCK_PATH = os.environ.get("METAL_GPU_LOCK_PATH", "/tmp/lion-metal-gpu-test.lock")
@@ -195,12 +195,6 @@ _RECALL_PHRASES = [
     "brain slot resolve profile compose knowledge domain",
 ]
 
-_COMPOSE_PHRASES = [
-    # auto-compose requires >= 10 words per query (khive-pack-knowledge validation)
-    "concurrency load harness tenant alternation namespace attribution write backpressure gauge",
-    "warm daemon socket frame protocol version config identity coherence check",
-    "write ahead log checkpoint floor pin threshold oldest transaction age gauge",
-]
 
 
 class OpOutcome:
@@ -226,16 +220,6 @@ def _timed_call(proc, verb, args) -> OpOutcome:
 
 def _op_recall(proc, tenant, i):
     return _timed_call(proc, "memory.recall", {"query": random.choice(_RECALL_PHRASES), "limit": 5})
-
-
-def _op_knowledge_search(proc, tenant, i):
-    return _timed_call(proc, "knowledge.search", {"query": random.choice(_RECALL_PHRASES), "limit": 5})
-
-
-def _op_knowledge_compose(proc, tenant, i):
-    return _timed_call(
-        proc, "knowledge.compose", {"query": random.choice(_COMPOSE_PHRASES), "max_tokens": 1500}
-    )
 
 
 def _op_remember(proc, tenant, i):
@@ -266,11 +250,9 @@ def _op_create_entity(proc, tenant, i):
 
 # weighted read-heavy op menu (recall-dominant), steady write fraction
 _OP_MENU = [
-    (_op_recall, 0.40),
-    (_op_knowledge_search, 0.15),
-    (_op_knowledge_compose, 0.10),
-    (_op_remember, 0.15),
-    (_op_create_entity, 0.10),
+    (_op_recall, 0.55),
+    (_op_remember, 0.25),
+    (_op_create_entity, 0.20),
 ]
 _OP_MENU_WEIGHTS_SUM = sum(w for _, w in _OP_MENU)
 
@@ -642,8 +624,6 @@ def main() -> int:
             }
 
         recall_latencies = latencies_by_op.get("memory.recall", [])
-        compose_latencies = latencies_by_op.get("knowledge.compose", [])
-        knowledge_search_latencies = latencies_by_op.get("knowledge.search", [])
 
         # fallback scrape (dim 1) — across every worker's own front-end stderr
         fallback_lines: list[str] = []
@@ -725,14 +705,6 @@ def main() -> int:
                 "not '<namespace>_actor'). This checks write-then-read consistency and that "
                 "distinct tenants get distinct attributed identities (no cross-tenant collapse).",
                 "detail": attributions,
-            },
-            "9_knowledge_latency": {
-                "channel": "client-measured",
-                "compose": _percentiles(compose_latencies),
-                "search": _percentiles(knowledge_search_latencies),
-                "note": "renamed from 9_brain_slot_throughput, which mislabeled this block: it "
-                "aggregated knowledge.compose and knowledge.search client latencies into one "
-                "percentile set and measured nothing brain-slot-related",
             },
         }
 

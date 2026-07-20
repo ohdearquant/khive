@@ -67,25 +67,25 @@ link(source_id="<from>", target_id="<to>", relation="<relation>", weight=<0.4-1.
 
 **17 relations** (closed — map to these, don't invent):
 
-| Category       | Relation        | Direction              | When                      |
-| -------------- | --------------- | ---------------------- | ------------------------- |
-| Structure      | `contains`      | parent → child         | System has component      |
-| Structure      | `part_of`       | child → parent         | Inverse of contains       |
-| Structure      | `instance_of`   | specific → general     | X is a case of Y          |
-| Derivation     | `extends`       | child → parent         | Builds on, generalizes    |
-| Derivation     | `variant_of`    | variant → original     | Modified version          |
-| Derivation     | `introduced_by` | concept → paper/person/org | First described in    |
-| Derivation     | `supersedes`    | new → old              | Replaces entirely         |
-| Provenance     | `derived_from`  | derived → source       | Data/artifact lineage     |
-| Temporal       | `precedes`      | earlier → later        | Ordering over time        |
-| Dependency     | `depends_on`    | consumer → dep         | Hard requirement          |
-| Dependency     | `enables`       | prerequisite → outcome | Makes possible            |
-| Implementation | `implements`    | code → concept         | Code realizes algorithm   |
-| Lateral        | `competes_with` | A ↔ B                  | Alternative approaches    |
-| Lateral        | `composed_with` | A ↔ B                  | Used together             |
-| Annotation     | `annotates`     | note → any substrate   | Note observes/comments on |
-| Epistemic      | `supports`      | evidence → claim       | Evidence for a claim      |
-| Epistemic      | `refutes`       | evidence → claim       | Evidence against a claim  |
+| Category       | Relation        | Direction                  | When                      |
+| -------------- | --------------- | -------------------------- | ------------------------- |
+| Structure      | `contains`      | parent → child             | System has component      |
+| Structure      | `part_of`       | child → parent             | Inverse of contains       |
+| Structure      | `instance_of`   | specific → general         | X is a case of Y          |
+| Derivation     | `extends`       | child → parent             | Builds on, generalizes    |
+| Derivation     | `variant_of`    | variant → original         | Modified version          |
+| Derivation     | `introduced_by` | concept → paper/person/org | First described in        |
+| Derivation     | `supersedes`    | new → old                  | Replaces entirely         |
+| Provenance     | `derived_from`  | derived → source           | Data/artifact lineage     |
+| Temporal       | `precedes`      | earlier → later            | Ordering over time        |
+| Dependency     | `depends_on`    | consumer → dep             | Hard requirement          |
+| Dependency     | `enables`       | prerequisite → outcome     | Makes possible            |
+| Implementation | `implements`    | code → concept             | Code realizes algorithm   |
+| Lateral        | `competes_with` | A ↔ B                      | Alternative approaches    |
+| Lateral        | `composed_with` | A ↔ B                      | Used together             |
+| Annotation     | `annotates`     | note → any substrate       | Note observes/comments on |
+| Epistemic      | `supports`      | evidence → claim           | Evidence for a claim      |
+| Epistemic      | `refutes`       | evidence → claim           | Evidence against a claim  |
 
 **Direction matters.** `introduced_by` goes FROM the concept TO the paper (the concept was
 introduced by the paper). If you get direction wrong, the traversal breaks.

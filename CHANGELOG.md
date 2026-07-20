@@ -13,6 +13,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `khive-channel-telegram`) and their `channel-email`/`channel-telegram`
   `khive-mcp`/`kkernel` cargo features to a commercial extension; no longer
   part of this repository or the open-source build.
+- Moved `khive-pack-knowledge` (the `knowledge.` verb pack: atom/domain corpus, TF-IDF
+  and embedding-rerank search, composition, section feedback) to a commercial extension.
+  It is no longer part of the open-source distribution or its default pack set. The
+  remaining 11 packs are unaffected; `memory.recall` runs standalone (no dependency on
+  the knowledge corpus).
+- Moved the formal-methods ontology pack (`khive-pack-formal`) and the code-quality
+  ontology pack (`khive-pack-code`), along with the `kkernel code-ingest` admin CLI
+  subcommand, to a commercial extension. The open-source build no longer registers
+  either pack by default.
 
 ## [0.5.0] - 2026-07-13
 

@@ -308,10 +308,8 @@ impl Default for RuntimeConfig {
                     "brain",
                     "comm",
                     "schedule",
-                    "knowledge",
                     "session",
                     "git",
-                    "code",
                     "workspace",
                     "blob",
                 ]

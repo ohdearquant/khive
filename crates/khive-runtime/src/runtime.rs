@@ -1154,19 +1154,17 @@ mod tests {
         assert!(cfg.packs.contains(&"brain".to_string()));
         assert!(cfg.packs.contains(&"comm".to_string()));
         assert!(cfg.packs.contains(&"schedule".to_string()));
-        assert!(cfg.packs.contains(&"knowledge".to_string()));
         // session loads by default so its background mirror warm-hook runs in
         // production; its handlers are all operator-only subhandlers (0 wire verbs).
         assert!(cfg.packs.contains(&"session".to_string()));
         assert!(cfg.packs.contains(&"git".to_string()));
-        assert!(cfg.packs.contains(&"code".to_string()));
         assert!(cfg.packs.contains(&"workspace".to_string()));
         // blob loads by default; a normal file-backed boot installs a
         // default FsBlobStore beside the database file with no config
         // needed, so its verbs are live in default deployments too (only an
         // in-memory backend leaves them unconfigured).
         assert!(cfg.packs.contains(&"blob".to_string()));
-        assert_eq!(cfg.packs.len(), 12);
+        assert_eq!(cfg.packs.len(), 11);
         if let Some(v) = prior {
             // SAFETY: single-threaded test cleanup; restores KHIVE_PACKS to its prior value.
             unsafe {

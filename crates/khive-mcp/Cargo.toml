@@ -23,10 +23,8 @@ khive-pack-memory = { version = "0.6.0", path = "../khive-pack-memory" }
 khive-pack-brain = { version = "0.6.0", path = "../khive-pack-brain" }
 khive-pack-comm = { version = "0.6.0", path = "../khive-pack-comm" }
 khive-pack-schedule = { version = "0.6.0", path = "../khive-pack-schedule" }
-khive-pack-knowledge = { version = "0.6.0", path = "../khive-pack-knowledge" }
 khive-pack-session = { version = "0.6.0", path = "../khive-pack-session" }
 khive-pack-git = { version = "0.6.0", path = "../khive-pack-git" }
-khive-pack-code = { version = "0.6.0", path = "../khive-pack-code" }
 khive-pack-blob = { version = "0.6.0", path = "../khive-pack-blob" }
 khive-pack-workspace = { version = "0.6.0", path = "../khive-pack-workspace" }
 uuid = { workspace = true }
@@ -57,5 +55,5 @@ tokio = { workspace = true, features = ["test-util"] }
 rmcp = { workspace = true, features = ["server", "transport-io", "client"] }
 async-trait = { workspace = true }
 serial_test = { workspace = true }
-khive-pack-knowledge = { version = "0.6.0", path = "../khive-pack-knowledge" }
+
 rusqlite = { workspace = true, features = ["bundled"] }

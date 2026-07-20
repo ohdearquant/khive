@@ -62,7 +62,7 @@ PROTOCOL_VERSION = 3
 # Default production pack set (must match RuntimeConfig::default().packs in
 # crates/khive-runtime/src/config.rs so config_id agrees between front-end
 # and daemon child).
-DEFAULT_PACKS = "kg,gtd,memory,brain,comm,schedule,knowledge,session,git,code,workspace"
+DEFAULT_PACKS = "kg,gtd,memory,brain,comm,schedule,session,git,workspace"
 
 # ── Live-DB safety guard ──────────────────────────────────────────────────────
 

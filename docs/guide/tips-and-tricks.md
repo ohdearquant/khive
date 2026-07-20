@@ -8,7 +8,7 @@ find documented in one place.
 
 ### Long, keyword-rich queries beat short ones
 
-`search` and `knowledge.search` fuse full-text (FTS5 trigram) and vector
+`search` fuses full-text (FTS5 trigram) and vector
 similarity results with RRF. A short query (one or two words) gives both
 signals little to work with: FTS5 trigram matching has few n-grams to match
 against, and the embedding has little context to place in vector space. A
@@ -103,23 +103,16 @@ before the one that consumes it. See the `$prev` scoping note above.
 
 ## Param gotchas
 
-A handful of verbs use a parameter name that is easy to guess wrong, and the
-failure mode differs by pack. The KG pack's `search` and `comm.thread` param
-structs carry `#[serde(deny_unknown_fields)]` (`crates/khive-pack-kg/src/handlers/params.rs`,
+A handful of verbs use a parameter name that is easy to guess wrong. The KG
+pack's `search` and `comm.thread` param structs carry
+`#[serde(deny_unknown_fields)]` (`crates/khive-pack-kg/src/handlers/params.rs`,
 `crates/khive-pack-comm/src/params.rs`), so passing a wrong name fails the
-call outright with an unknown-field error. The knowledge pack's `search`,
-`suggest`, and `delete_atoms` param structs (`crates/khive-pack-knowledge/src/knowledge/schema.rs`)
-deserialize with plain `serde_json::from_value` (no `deny_unknown_fields`),
-so an extra unrecognized field is silently ignored; what actually fails the
-call is the _required_ field (`query`, `ids`) being missing because you sent
-the wrong name for it instead:
+call outright with an unknown-field error:
 
-| Verb                                    | Correct param | Common wrong guess | Failure mode                         |
-| --------------------------------------- | ------------- | ------------------ | ------------------------------------ |
-| `search` (KG)                           | `query`       | `q`                | rejected: unknown field              |
-| `comm.thread`                           | `id`          | `thread_id`        | rejected: unknown field              |
-| `knowledge.search`, `knowledge.suggest` | `query`       | `q`                | rejected: `query` missing (required) |
-| `knowledge.delete_atoms`                | `ids`         | `slugs`            | rejected: `ids` missing (required)   |
+| Verb          | Correct param | Common wrong guess | Failure mode            |
+| ------------- | ------------- | ------------------ | ----------------------- |
+| `search` (KG) | `query`       | `q`                | rejected: unknown field |
+| `comm.thread` | `id`          | `thread_id`        | rejected: unknown field |
 
 String values in the function-call DSL must be double-quoted JSON string
 literals. The parser reads the raw value slice and feeds it to
@@ -133,20 +126,6 @@ request(ops="get(id=abc123)")
 # Right: double-quoted string literal
 request(ops="get(id=\"abc123\")")
 ```
-
-## Indexing latency
-
-Writes to the knowledge corpus (`knowledge.upsert_atoms`) land in SQLite and
-are visible to `knowledge.search`'s FTS leg on the next call. The Vamana ANN
-vector index that provides the semantic leg is different: it is an
-in-memory, per-namespace structure that is loaded once and cached, and is
-only invalidated by an explicit `knowledge.index()` call (or a daemon
-restart), not automatically after every `upsert_atoms`. A newly written atom
-will not surface via the ANN path of `knowledge.search` until a reindex runs.
-Treat writes as helping the _next_ indexing pass, not as immediately
-recallable through the vector leg: batch writes, then call
-`knowledge.index()` (or run `kkernel reindex`) before relying on semantic
-recall over what you just wrote.
 
 ## Troubleshooting
 
