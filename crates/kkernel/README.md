@@ -38,7 +38,7 @@ Point an MCP client at the binary's `mcp` subcommand:
 kkernel mcp                            # stdio, default ~/.khive/khive.db
 kkernel mcp --daemon                   # persistent warm daemon over a Unix socket
 kkernel mcp --db :memory:              # ephemeral in-memory database
-kkernel mcp --pack kg --pack gtd       # explicit pack list (default: full production set)
+kkernel mcp --pack kg                  # explicit pack list (default: kg, the only OSS pack)
 kkernel mcp --actor my-project         # default namespace for unscoped ops
 ```
 
@@ -96,13 +96,14 @@ builds).
 
 ## Where this sits
 
-`kkernel` sits at the top of the storage dependency chain — it depends on every pack crate
-(`khive-pack-kg`, `-gtd`, `-memory`, `-comm`, `-schedule`,
-`-session`, `-git`), `khive-mcp` (the server library it serves), `khive-vcs` / `khive-vcs-adapters`
-(KG versioning and import/export), and the core storage stack (`khive-runtime`,
-`khive-db`, `khive-storage`, `khive-types`, `khive-score`). Its `_pack_links` module force-
-references each pack crate so the linker keeps their `inventory::submit!` verb registrations
-in the final binary — dependency alone is not enough for that to happen.
+`kkernel` sits at the top of the storage dependency chain — it depends on the `khive-pack-kg`
+pack crate (the only pack crate in this distribution; commercially licensed extension packs,
+when installed, add their own), `khive-mcp` (the server library it serves), `khive-vcs` /
+`khive-vcs-adapters` (KG versioning and import/export), and the core storage stack
+(`khive-runtime`, `khive-db`, `khive-storage`, `khive-types`, `khive-score`). Its
+`_pack_links` module force-references each pack crate so the linker keeps their
+`inventory::submit!` verb registrations in the final binary — dependency alone is not enough
+for that to happen.
 
 Governed by [ADR-016](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-016-request-dsl.md)
 (request DSL), [ADR-049](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-049-khived-daemon.md)

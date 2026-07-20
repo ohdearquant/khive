@@ -1,6 +1,6 @@
 # khive
 
-A research knowledge graph runtime — 46 verbs, 8 packs, one MCP tool.
+A research knowledge graph runtime — 18 verbs, 1 pack, one MCP tool.
 
 [![GitHub](https://img.shields.io/github/stars/ohdearquant/khive?style=flat)](https://github.com/ohdearquant/khive)
 [![crates.io](https://img.shields.io/crates/v/khive-mcp.svg)](https://crates.io/crates/khive-mcp)
@@ -19,20 +19,17 @@ Add to `.mcp.json` (project-level or `~/.claude/mcp.json` for global):
 { "mcpServers": { "khive": { "command": "khive", "args": ["mcp"] } } }
 ```
 
-All 11 packs load by default. A background daemon auto-spawns to keep the runtime warm.
+The `kg` pack loads by default. A background daemon auto-spawns to keep the runtime warm.
 
 ## What you get
 
-| Pack          | Verbs | What it does                                                                                 |
-| ------------- | ----- | -------------------------------------------------------------------------------------------- |
-| **kg**        | 18    | Entities, edges, notes, graph queries, proposals                                             |
-| **gtd**       | 5     | Task lifecycle (inbox → next → active → done)                                                |
-| **memory**    | 5     | Salience-weighted remember / decay-ranked recall                                             |
-| **comm**      | 7     | Threaded messaging                                                                           |
-| **schedule**  | 4     | Reminders and scheduled verb execution                                                       |
-| **session**   | 4     | Session record persistence (store/list/resume/export)                                        |
-| **workspace** | 0     | Adds the `workspace` entity kind + `contains` endpoint rules to git/gtd/session notes (#873) |
-| **blob**      | 3     | Content-addressed object put/get/stat over the `BlobStore` CAS trait (ADR-111)               |
+| Pack   | Verbs | What it does                                       |
+| ------ | ----- | --------------------------------------------------- |
+| **kg** | 18    | Entities, edges, notes, graph queries, proposals    |
+
+Task management, memory recall, inter-agent messaging, scheduling, session continuity,
+workspace linking, and blob storage are provided by commercially licensed extensions and
+are not part of the open-source distribution.
 
 ## Usage
 
