@@ -876,6 +876,39 @@ clears). The body's `updated_at` field is retained and now means exactly "the
 instant of the last body write"; it no longer participates in liveness
 classification.
 
+_Liveness boundary (determinate form)._ Amendment 2 phrased the freshness
+window as "roughly 3 session sweep intervals"; on the mtime basis this
+amendment replaces that phrasing with an exact, observable contract, because
+the window has a hidden indeterminacy: the sweep interval is per-process
+configuration (`KHIVE_SESSION_SWEEP_INTERVAL_MS`), and the enumerating daemon
+cannot know a remote process's configured value — judging a 60-second-interval
+writer by three times the 5-second default would deterministically
+misclassify it. Records therefore declare their own cadence: heartbeat and
+beacon content each gain a `sweep_interval_ms` field, written at record
+creation (a mid-process configuration change is a content change and forces a
+rewrite). Classification is then exact:
+
+- **live** iff `enumeration_time - mtime <= 3 x declared sweep_interval_ms`
+  (boundary inclusive);
+- otherwise **stale**, with Amendment 2's consequences unchanged (stale
+  entries are deleted and their PIDs classify `unknown`).
+
+Records written by pre-amendment binaries carry no declaration; the
+enumerator evaluates them against the default interval (5000 ms), which is
+exactly today's behavior. Both timestamps come from the same host — the
+sidecar is same-machine by construction, since every writer holds the same
+database file — so no cross-host clock skew enters the comparison; filesystem
+mtime granularity (worst case one second on coarse filesystems) is absorbed
+by the multiplier. The multiplier's operational meaning is the measurable
+spec: a touch is a synchronous same-kernel metadata write, visible to
+enumeration the moment the tick completes, so a healthy process's record
+never exceeds one declared interval of age plus scheduling jitter, and the
+3x window tolerates up to two consecutive missed ticks before classifying
+stale. A process that misses more than two ticks is delayed by more than
+twice its own declared cadence — which is precisely the wedged-sweep
+signature Amendment 2's `unknown` classification exists to surface, so the
+false-stale case and the wanted-detection case coincide at the boundary.
+
 _Age is computed at read time._ A body that is not rewritten cannot carry a
 current age. The heartbeat record gains `oldest_tx_started_at` (epoch
 timestamp of the oldest span's registration instant); enumeration computes
@@ -913,6 +946,7 @@ and forces a body rewrite under Plank F1. Beacons carry no attribution and
 are unchanged.
 
 **Non-goals.** Thresholds, the enumeration liveness gate structure, census
-rules, the filesystem trust boundary, and the beacon contract are unchanged.
-This amendment adds no fields beyond the two named here
-(`oldest_tx_started_at`, `attribution_basis`).
+rules, the filesystem trust boundary, and the beacon refresh mechanism are
+unchanged; beacon content changes only by gaining the same `sweep_interval_ms`
+declaration heartbeats gain. This amendment adds no fields beyond the three
+named here (`oldest_tx_started_at`, `attribution_basis`, `sweep_interval_ms`).
