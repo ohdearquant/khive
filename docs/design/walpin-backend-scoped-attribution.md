@@ -155,8 +155,10 @@ provides the same partitioning with an additive API.
   written with an explicit fallback-attribution marker, so diagnostics can
   distinguish "attributed to main by evidence" from "attributed to main as the
   fallback for unknown origin" and never read fallback attribution as ground
-  truth. The marker is one additive heartbeat-record field; the corresponding
-  record-contract text in ADR-091 Amendment 2 is amended alongside. All in-tree
+  truth. The marker is one additive heartbeat-record field whose name, type,
+  and values are defined solely by ADR-091 Amendment 2's record contract —
+  this note consumes that definition and deliberately does not restate it,
+  so the format has exactly one source of truth. All in-tree
   registration sites are threaded in the same change, so `Unscoped` should not
   occur from khive's own write paths; the grep gate makes any later regression a
   review defect rather than a silent hole.
@@ -198,8 +200,9 @@ routing `sidecar_dir_for` consumers through the minted `DbIdentity`,
 session-sweep fan-out, per-file-backed-backend daemon checkpoint/enumeration
 ownership, and the tests above — producers and consumers of secondary sidecars
 land in the same PR. No schema or wire change. The sidecar format gains exactly
-one additive heartbeat-record field (the fallback-attribution marker), with the
-matching record-contract text amended in ADR-091 Amendment 2 alongside;
-everything else in the sidecar contract is unchanged — this note closes the
-producer-side scoping gap and the main-only consumer-ownership gap against the
-contract's existing per-database key.
+one additive heartbeat-record field (the fallback-attribution marker), defined
+in ADR-091 Amendment 2's record contract — that amendment is the sole source of
+truth for the field's format and must be accepted before or together with the
+implementation; everything else in the sidecar contract is unchanged — this
+note closes the producer-side scoping gap and the main-only consumer-ownership
+gap against the contract's existing per-database key.
