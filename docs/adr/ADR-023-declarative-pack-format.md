@@ -584,7 +584,9 @@ refactor that unifies `gtd.assign` onto the shared create-plus-`TaskHook` path.
 
 ## Amendment: reduced open-source pack surface (2026-07-20)
 
-As of 2026-07-20, the open-source distribution's default pack set is reduced. The
+Effective with the accompanying crate-extraction changes (which land as
+separate pull requests; this amendment describes the surface they produce
+together), the open-source distribution's default pack set is reduced. The
 brain, knowledge, and code packs move to commercially licensed extensions
 maintained outside this repository; they are not part of the open-source
 distribution. The formal pack, which was never part of the open-source default
@@ -592,6 +594,13 @@ pack set (see below), moves alongside the code pack as part of the same
 crate departure. A small set of channel-transport crates supporting alternate
 message delivery also move out of this repository; they contribute no MCP
 verbs and are unrelated to the pack-verb surface this ADR governs.
+
+Interface crates remain. `khive-brain-core` — and, in general, any interface
+crate that a shipped pack depends on — stays in this repository:
+`khive-pack-memory` has a hard dependency on `khive-brain-core` for the
+ranking types and the degradation behavior described below. Removing a pack
+crate never removes the interface crates the remaining open-source packs
+consume.
 
 ### Default pack set, before and after
 
@@ -619,13 +628,20 @@ Following this change, the open-source build no longer registers `brain.*` or
 `knowledge.*` verbs, nor the `code.ingest` verb. The kg substrate verbs (§4)
 and the `memory.*` verbs are unaffected and continue to operate as documented.
 
-Serving-profile resolution inside `memory.recall` (and `memory.feedback`)
-degrades gracefully in the absence of a registered brain pack: profile
-resolution dispatches an internal `brain.resolve` call and treats a failed
-dispatch (no such verb registered) the same as a resolvable-but-unmatched
-profile, returning no serving profile. Recall and feedback continue to operate
-on their plain-scoring path; the profile-weighted ranking terms described
-elsewhere in this document simply do not apply when no brain pack is loaded.
+Serving-profile resolution inside `memory.recall` degrades gracefully in the
+absence of a registered brain pack: profile resolution dispatches an internal
+`brain.resolve` call and treats a failed dispatch (no such verb registered)
+the same as a resolvable-but-unmatched profile, returning no serving profile.
+Recall operates on its plain-scoring path; the profile-weighted ranking terms
+described elsewhere in this document simply do not apply when no brain pack
+is loaded.
+
+`memory.feedback` is not fully symmetric: when its configuration routes
+feedback through a brain profile, the handler dispatches `brain.feedback`,
+and with no brain pack registered that dispatch fails and the error
+propagates to the caller. Deployments of the open-source build should not
+configure brain-profile feedback routing; the plain feedback path operates
+unchanged.
 
 ### Composition after the carve
 
