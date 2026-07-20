@@ -465,7 +465,7 @@ would execute as a side effect of an otherwise-successful, policy-permitted writ
 
 ## Amendment 2 (2026-07-20) — Distribution boundary: commercially licensed extension
 
-Effective with the crate-extraction change recorded in ADR-088 Amendment 2 (which
+Effective with the crate-extraction change recorded in ADR-088 Amendment 3 (which
 lands as a separate pull request; this amendment records the boundary that change
 produces), the pack this ADR's write surface lives in (`khive-pack-git`) ceases to be
 part of the open-source distribution; it ships as a commercially licensed extension,

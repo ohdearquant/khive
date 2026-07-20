@@ -263,7 +263,7 @@ Decision text.
    before submitting commit-message and issue/PR-body content, so ingested provenance text
    is redacted rather than rejected outright.
 
-## Amendment 2 (2026-07-20) — Distribution boundary: commercially licensed extension
+## Amendment 3 (2026-07-20) — Distribution boundary: commercially licensed extension
 
 Effective with the accompanying crate-extraction change (which lands as a separate
 pull request; this amendment records the boundary that change produces),
@@ -275,7 +275,7 @@ same date for the resulting default set). Until that extraction change lands, th
 in-tree crate remains present, force-linked, and part of the default pack set, and
 this ADR's pre-amendment text describes it as-is.
 
-Nothing in this ADR's Decision, Rationale, or Amendment 1 is superseded: the contracts
+Nothing in this ADR's Decision, Rationale, or prior amendments is superseded: the contracts
 here remain normative for the pack wherever it is deployed. What changes is ownership
 and distribution only. Once the extraction change lands:
 
@@ -286,4 +286,4 @@ and distribution only. Once the extraction change lands:
   when the git pack is not loaded — rule installation does not require the named kinds
   to exist (ADR-017; ADR-023 amendment).
 - A deployment that loads the extension observes exactly the surface this ADR and its
-  Amendment 1 specify.
+  prior amendments specify.
