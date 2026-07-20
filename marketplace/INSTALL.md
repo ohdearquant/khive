@@ -9,8 +9,8 @@ correctly to a running `kkernel mcp` server.
 | ------ | ------- | ------- |
 | khive  | 0.5.0   | ≥ 0.2.4 |
 
-`khive` is a single umbrella plugin — one pattern skill per pack plus the kg stewardship agents,
-all over the one `kkernel mcp` server.
+`khive` is a single umbrella plugin — one pattern skill for the `kg` pack plus the kg
+stewardship agents, all over the one `kkernel mcp` server.
 
 ## Step 1 — Install kkernel
 
@@ -54,15 +54,7 @@ Create or update `.mcp.json` in your project root:
       "args": [
         "mcp",
         "--pack",
-        "kg",
-        "--pack",
-        "gtd",
-        "--pack",
-        "memory",
-        "--pack",
-        "comm",
-        "--pack",
-        "schedule"
+        "kg"
       ],
       "env": {
         "KHIVE_ACTOR": "lambda:your-id"
@@ -75,26 +67,8 @@ Create or update `.mcp.json` in your project root:
 ### Option B: per-session CLI registration
 
 ```bash
-# KG only
+# KG only (the open-source distribution ships kg; this is the default pack)
 claude mcp add --transport stdio khive -- kkernel mcp --pack kg
-
-# GTD only
-claude mcp add --transport stdio khive -- kkernel mcp --pack gtd
-
-# Memory only
-claude mcp add --transport stdio khive -- kkernel mcp --pack memory
-
-# Comm only
-claude mcp add --transport stdio khive -- kkernel mcp --pack comm
-
-# Schedule only
-claude mcp add --transport stdio khive -- kkernel mcp --pack schedule
-
-# All packs (recommended)
-claude mcp add --transport stdio khive -- kkernel mcp \
-  --pack kg --pack gtd --pack memory \
-  --pack comm --pack schedule --pack session --pack git \
-  --pack workspace --pack blob
 ```
 
 ### Set your actor identity (attribution)
@@ -108,7 +82,7 @@ The `env` block in Option A is the simplest place — set `KHIVE_ACTOR` to this 
 `lambda:khive`, `lambda:lattice`). For per-session CLI registration, pass the flag instead:
 
 ```bash
-claude mcp add --transport stdio khive -- kkernel mcp --actor lambda:your-id --pack kg --pack gtd
+claude mcp add --transport stdio khive -- kkernel mcp --actor lambda:your-id --pack kg
 ```
 
 Resolution order (highest to lowest):
@@ -126,7 +100,8 @@ The config-file form (searched in order `./khive.toml`, `./.khive/config.toml`,
 id = "lambda:your-id"
 ```
 
-When the `comm` pack is loaded and the actor is still `"local"`, the server logs a startup
+When a messaging extension pack (e.g. `comm`, a commercially licensed extension not part of
+this distribution) is loaded and the actor is still `"local"`, the server logs a startup
 warning — that warning means your mail will be unattributed until you set an id.
 
 ## Step 3 — Install the plugin
@@ -154,34 +129,8 @@ request(ops="search(kind=\"entity\", query=\"test-install\")")
 request(ops="delete(kind=\"entity\", id=\"<id-from-create>\")")
 ```
 
-### GTD pack smoke tests
-
-```text
-request(ops="gtd.assign(title=\"install-test task\", priority=\"p3\", status=\"next\")")
-request(ops="gtd.next(limit=3)")
-request(ops="gtd.transition(id=\"<id-from-assign>\", status=\"active\")")
-request(ops="gtd.complete(id=\"<id-from-assign>\")")
-```
-
-### Memory pack smoke tests
-
-```text
-request(ops="memory.remember(content=\"install verification note\", memory_type=\"episodic\", salience=0.1)")
-request(ops="memory.recall(query=\"install verification\", limit=1)")
-```
-
-### Comm pack smoke tests
-
-```text
-request(ops="comm.send(to=\"local\", content=\"install verification\")")
-request(ops="comm.inbox(limit=1)")
-```
-
-### Schedule pack smoke tests
-
-```text
-request(ops="schedule.agenda()")
-```
+If you have installed a commercially licensed extension pack, run its own smoke tests per
+that extension's documentation.
 
 ## Step 5 — Run the example validator
 

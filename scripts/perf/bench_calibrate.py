@@ -9,26 +9,11 @@ _tolerance_factor_k). This harness never sets a gate threshold itself — it
 measures run-to-run noise at a fixed SHA so a human can place a blocking
 floor with a known noise budget behind it.
 
-Motivation: bench-1m.yml (recall@10 >= 0.90) and bench-pipeline (P@K >=
-0.70), plus the nine load-harness gate dimensions in bench_load_harness.py,
-all carry thresholds that were never calibrated against same-commit noise.
+Motivation: bench-1m.yml (recall@10 >= 0.90) carries thresholds that were
+never calibrated against same-commit noise.
 Rule: no blocking threshold without a measured null distribution.
 
 Suites (pluggable via SUITES registry):
-  pipeline  drives scripts/perf/bench_pipeline_daemon.py (kkernel-bench,
-            bench-embedder feature). Extracts the mean fused/vector/keyword
-            P@K, p50/p95 latency, and per-query P@K/vec/kw/p50 breakdown
-            from its stdout (it does not print JSON; it does append a row
-            to the gitignored perf/pipeline-ledger.csv, which is left
-            untouched by this harness).
-  load      drives scripts/perf/bench_load_harness.py with cheap
-            --mode bench defaults (small worker/tenant counts, no GPU
-            lock). Extracts every numeric leaf under its --report JSON
-            "dimensions" tree (the nine reported gate dimensions) plus
-            op_counts / op_error_counts. Non-numeric leaves (status
-            strings, per-tenant attribution detail) are not statted; they
-            are still visible in the per-run stdout/report.json artifacts
-            kept under --out/runs/.
   bench-1m  drives `bash scripts/bench_1m.sh --ci-synthetic` - the exact
             command run by the blocking ann-ci-gate job in
             .github/workflows/bench-1m.yml. Hermetic: generates synthetic
@@ -82,8 +67,6 @@ REPO_ROOT = pathlib.Path(__file__).parent.parent.parent
 PERF_SCRIPTS_DIR = pathlib.Path(__file__).parent
 _BENCH1M_FIXTURE_PATH = PERF_SCRIPTS_DIR / "testdata" / "bench1m_result_fixture.json"
 _CONTRACT_FIXTURE_PATH = PERF_SCRIPTS_DIR / "testdata" / "contract_result_fixture.json"
-PIPELINE_SCRIPT = PERF_SCRIPTS_DIR / "bench_pipeline_daemon.py"
-LOAD_SCRIPT = PERF_SCRIPTS_DIR / "bench_load_harness.py"
 CONTRACT_SCRIPT = PERF_SCRIPTS_DIR / "contract_suite.py"
 
 DEFAULT_OUT_DIR = PERF_SCRIPTS_DIR / "calibration"
@@ -161,154 +144,6 @@ def _kill_process_tree(pgid: int, proc: subprocess.Popen) -> None:
         os.killpg(pgid, signal.SIGKILL)
     except ProcessLookupError:
         pass
-
-
-# ── suite: pipeline ───────────────────────────────────────────────────────────
-
-_PIPELINE_MEAN_PAK_RE = re.compile(r"Mean Precision@K=([\d.]+)\s+floor=[\d.]+")
-_PIPELINE_MEAN_VEC_RE = re.compile(r"Mean VectorOnly P@K=([\d.]+)\s+floor=[\d.]+")
-_PIPELINE_MEAN_KW_RE = re.compile(r"Mean KeywordOnly P@K=([\d.]+)\s+floor=[\d.]+")
-_PIPELINE_LATENCY_RE = re.compile(r"p50=(\d+)µs\s+p95=(\d+)µs\s+n_latencies=(\d+)")
-_PIPELINE_QUERY_RE = re.compile(
-    r"^\s{2}(.+?)\s{2,}P@K=([\d.]+)\s+vec=([\d.]+)\((?:PASS|FAIL)\)\s+"
-    r"kw=([\d.]+)\((?:PASS|FAIL)\)\s+\((\d+) hits\)\s+p50=(\d+)µs\s+(?:PASS|FAIL)",
-    re.MULTILINE,
-)
-_PIPELINE_GATE_RE = re.compile(r"^Gate: (PASS|FAIL)$", re.MULTILINE)
-
-# QUERIES in bench_pipeline_daemon.py is a fixed 15-row list; each row yields 5
-# per-query metrics (p_at_k, vec_p_at_k, kw_p_at_k, top_k_hits, p50_us) plus 7
-# summary/gate metrics (mean p@k x3, p50/p95/n_latencies, gate_pass) = 82 total.
-_PIPELINE_EXPECTED_QUERY_ROWS = 15
-_PIPELINE_METRICS_PER_QUERY = 5
-_PIPELINE_SUMMARY_METRIC_COUNT = 7
-_PIPELINE_EXPECTED_METRIC_COUNT = (
-    _PIPELINE_EXPECTED_QUERY_ROWS * _PIPELINE_METRICS_PER_QUERY + _PIPELINE_SUMMARY_METRIC_COUNT
-)
-
-
-def _pipeline_build_cmd(run_dir: pathlib.Path, extra_args: list[str]) -> list[str]:
-    return [sys.executable, str(PIPELINE_SCRIPT), *extra_args]
-
-
-def _pipeline_extract(run_dir: pathlib.Path, proc: subprocess.CompletedProcess) -> dict[str, float]:
-    stdout = proc.stdout
-    metrics: dict[str, float] = {}
-
-    def _require(m: re.Match | None, desc: str) -> re.Match:
-        if m is None:
-            raise SchemaError(
-                f"pipeline stdout missing expected {desc}; see {run_dir}/stdout.log"
-            )
-        return m
-
-    m = _require(_PIPELINE_MEAN_PAK_RE.search(stdout), "mean Precision@K summary line")
-    metrics["mean_precision_at_k"] = float(m.group(1))
-    m = _require(_PIPELINE_MEAN_VEC_RE.search(stdout), "mean VectorOnly P@K summary line")
-    metrics["mean_precision_vector_only"] = float(m.group(1))
-    m = _require(_PIPELINE_MEAN_KW_RE.search(stdout), "mean KeywordOnly P@K summary line")
-    metrics["mean_precision_keyword_only"] = float(m.group(1))
-    m = _require(_PIPELINE_LATENCY_RE.search(stdout), "p50/p95/n_latencies summary line")
-    metrics["p50_us"] = float(m.group(1))
-    metrics["p95_us"] = float(m.group(2))
-    metrics["n_latencies"] = float(m.group(3))
-    m = _require(_PIPELINE_GATE_RE.search(stdout), "'Gate: PASS/FAIL' line")
-    metrics["gate_pass"] = 1.0 if m.group(1) == "PASS" else 0.0
-
-    query_rows = list(_PIPELINE_QUERY_RE.finditer(stdout))
-    if len(query_rows) != _PIPELINE_EXPECTED_QUERY_ROWS:
-        raise SchemaError(
-            f"expected {_PIPELINE_EXPECTED_QUERY_ROWS} per-query rows in pipeline stdout, "
-            f"found {len(query_rows)}; see {run_dir}/stdout.log"
-        )
-
-    seen_topics: set[str] = set()
-    for qm in query_rows:
-        topic = qm.group(1).strip().replace(" ", "_")
-        if topic in seen_topics:
-            raise SchemaError(
-                f"duplicate per-query row for topic {topic!r} in pipeline stdout; "
-                f"see {run_dir}/stdout.log"
-            )
-        seen_topics.add(topic)
-        metrics[f"query.{topic}.p_at_k"] = float(qm.group(2))
-        metrics[f"query.{topic}.vec_p_at_k"] = float(qm.group(3))
-        metrics[f"query.{topic}.kw_p_at_k"] = float(qm.group(4))
-        metrics[f"query.{topic}.top_k_hits"] = float(qm.group(5))
-        metrics[f"query.{topic}.p50_us"] = float(qm.group(6))
-
-    if len(metrics) != _PIPELINE_EXPECTED_METRIC_COUNT:
-        raise SchemaError(
-            f"expected exactly {_PIPELINE_EXPECTED_METRIC_COUNT} pipeline metrics "
-            f"({_PIPELINE_EXPECTED_QUERY_ROWS} query rows x {_PIPELINE_METRICS_PER_QUERY} + "
-            f"{_PIPELINE_SUMMARY_METRIC_COUNT} summary), got {len(metrics)}; "
-            f"see {run_dir}/stdout.log"
-        )
-
-    return metrics
-
-
-# ── suite: load ────────────────────────────────────────────────────────────
-
-_LOAD_REPORT_FILENAME = "load_report.json"
-
-
-def _load_build_cmd(run_dir: pathlib.Path, extra_args: list[str]) -> list[str]:
-    report_path = run_dir / _LOAD_REPORT_FILENAME
-    return [sys.executable, str(LOAD_SCRIPT), *extra_args, "--report", str(report_path)]
-
-
-def _flatten_numeric(prefix: str, obj, out: dict[str, float]) -> None:
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            _flatten_numeric(f"{prefix}.{k}" if prefix else str(k), v, out)
-    elif isinstance(obj, bool):
-        return
-    elif isinstance(obj, (int, float)):
-        out[prefix] = float(obj)
-    # lists/strings (status enums, attribution detail, error text) are not
-    # numeric samples; they remain visible in the per-run report.json instead.
-
-
-def _load_extract(run_dir: pathlib.Path, proc: subprocess.CompletedProcess) -> dict[str, float]:
-    report_path = run_dir / _LOAD_REPORT_FILENAME
-    if report_path.exists():
-        report = json.loads(report_path.read_text())
-    else:
-        # Fallback: the script also prints the same JSON report as its last
-        # stdout write when --report could not be written for some reason.
-        try:
-            report = json.loads(proc.stdout.strip().splitlines()[-1])
-        except (IndexError, json.JSONDecodeError) as exc:
-            raise SchemaError(
-                f"no {_LOAD_REPORT_FILENAME} written and stdout does not end in a JSON "
-                f"report; see {run_dir}/stdout.log"
-            ) from exc
-
-    if "dimensions" not in report:
-        raise SchemaError(
-            f"load report missing required 'dimensions' key; see {report_path}"
-        )
-
-    metrics: dict[str, float] = {}
-    _flatten_numeric("", report.get("dimensions", {}), metrics)
-    for k, v in report.get("op_counts", {}).items():
-        metrics[f"op_counts.{k}"] = float(v)
-    for k, v in report.get("op_error_counts", {}).items():
-        metrics[f"op_error_counts.{k}"] = float(v)
-
-    # Validate the extractor actually pulled real suite metrics BEFORE
-    # merging in bookkeeping keys (smoke_pass) - otherwise an empty
-    # dimensions/op_counts/op_error_counts tree still yields a non-empty
-    # dict and the no-metrics guard downstream never fires.
-    if not metrics:
-        raise SchemaError(
-            f"no numeric metrics extracted from load report dimensions/op_counts/"
-            f"op_error_counts; see {report_path}"
-        )
-
-    metrics["smoke_pass"] = 1.0 if report.get("smoke_result") == "PASS" else 0.0
-    return metrics
 
 
 # ── suite: bench-1m ───────────────────────────────────────────────────────────
@@ -545,9 +380,8 @@ def _bench1m_extract(run_dir: pathlib.Path, proc: subprocess.CompletedProcess) -
 # contract-result-v1 document (contract-result.json) per invocation. The
 # document's `dimensions` tree nests ann_query/recall_at_k metrics inside
 # arrays keyed by a discriminant (`workers`, `k`) rather than plain nested
-# dicts, so - unlike the `load` suite's generic _flatten_numeric walk - each
-# dimension is extracted explicitly here (same shape as _bench1m_extract's
-# n-keyed rows).
+# dicts, so each dimension is extracted explicitly here (same shape as
+# _bench1m_extract's n-keyed rows).
 
 _CONTRACT_RESULT_FILENAME = "contract-result.json"
 # Root discriminators pinned by scripts/perf/schemas/contract-result-v1.json
@@ -789,32 +623,6 @@ class ContractExtractSelfCheck(unittest.TestCase):
 # file needs to change.
 
 SUITES = {
-    "pipeline": {
-        "build_cmd": _pipeline_build_cmd,
-        "extract": _pipeline_extract,
-        "default_args": [],
-        "timeout_s": 600,
-    },
-    "load": {
-        "build_cmd": _load_build_cmd,
-        "extract": _load_extract,
-        # Cheap local defaults: bench-embedder (no GPU lock), small
-        # worker/tenant fan-out. Override entirely via --suite-arg (each
-        # --suite-arg token is appended after these, so pass the full
-        # desired flag set, e.g. --suite-arg=--workers --suite-arg=40, to
-        # widen the run). Use the `=` form for dash-prefixed values -
-        # argparse's append action cannot tell a space-separated
-        # `--suite-arg --workers` from a new top-level flag.
-        "default_args": [
-            "--mode", "bench",
-            "--workers", "8",
-            "--tenants", "4",
-            "--ops-per-worker", "3",
-            "--worker-timeout", "30",
-            "--log-level", "warn",
-        ],
-        "timeout_s": 600,
-    },
     "bench-1m": {
         "build_cmd": _bench1m_build_cmd,
         "build_env": _bench1m_build_env,

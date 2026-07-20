@@ -1,24 +1,26 @@
 #!/usr/bin/env python3
-"""Product gate: vector round-trip + recall@1 for the memory pack.
+"""Product gate: vector round-trip + recall@1 for the kg pack.
 
-Spawns kkernel mcp with an in-memory DB and embedding enabled, stores 3
-semantically well-separated items, then asserts that each paraphrase query
-returns the correct item at rank-1.
+Spawns kkernel mcp (--pack kg only) with an in-memory DB and embedding
+enabled, stores 3 semantically well-separated items as notes, then asserts
+that each paraphrase query returns the correct item at rank-1.
 
-This gate must pass before any embed-path changes land (#10 multi-engine
-fan-out, #11 knowledge.edit re-embed).
+This gate must pass before any embed-path changes land.
 
 The gate is cache-gated: it checks for a locally cached embedder model before
 spawning kkernel. If the model weights are not on disk the gate prints SKIP and
 exits 0 without touching the network. This keeps `make ci` clean on fresh
 machines and CI runners without model weights.
 
-The gate validates the default primary embedder (all-minilm-l6-v2) only.
-Both memory.remember and memory.recall are pinned to that model via the
-embedding_model arg, so kkernel's multi-model fan-out (it also registers
-paraphrase-multilingual-minilm-l12-v2 by default) never targets an uncached
-secondary model. Embedders are lazy-loaded via OnceCell, so an untargeted
-model is never built and never downloaded.
+The gate validates the default primary embedder (all-minilm-l6-v2) only. The
+kg pack's `create`/`search` verbs have no per-call embedding_model override
+(unlike the extracted memory pack), so pinning happens at the config layer
+instead: RuntimeConfig::default() ships a single registered engine
+(all-minilm-l6-v2) unless KHIVE_ADDITIONAL_EMBEDDING_MODELS or a config file
+adds more, so the note-create/search embed path only ever targets this model
+in the environment this gate spawns (no khive.toml / .khive/config.toml,
+no KHIVE_ADDITIONAL_EMBEDDING_MODELS). Embedders are lazy-loaded via
+OnceCell, so an untargeted model is never built and never downloaded.
 
 Set KHIVE_NO_EMBED=1 to bypass the gate unconditionally.
 Set LATTICE_MODEL_CACHE to override the default model cache directory.
@@ -32,11 +34,9 @@ import os
 import subprocess
 import sys
 
-# Primary embedder validated by this gate. Pinning both memory.remember and
-# memory.recall to this model prevents kkernel's multi-model fan-out
-# (operations.rs:2055) from targeting the secondary default model
-# (paraphrase-multilingual-minilm-l12-v2), which may not be cached. Embedders
-# are OnceCell lazy-loaded (embedder_registry.rs:52,55,156), so an untargeted
+# Primary embedder validated by this gate — the sole engine RuntimeConfig
+# registers by default (config.rs `RuntimeConfig::default`). Embedders are
+# OnceCell lazy-loaded (embedder_registry.rs:52,55,156), so an untargeted
 # model is never built and never downloads from HuggingFace.
 EMBED_MODEL = "all-minilm-l6-v2"
 
@@ -119,7 +119,6 @@ def spawn():
         "--db", ":memory:",
         "--log", "error",
         "--pack", "kg",
-        "--pack", "memory",
     ]
     return subprocess.Popen(
         cmd,
@@ -183,14 +182,16 @@ def test_vector_round_trip_and_recall_at_1():
 
     Vector-presence is proven by construction before this function is called:
     the cache pre-check in main() confirmed the model weights are on disk, and
-    memory.remember hard-fails on embedding error rather than storing a
-    vectorless record.  The score floor below is therefore a ranking-quality
-    gate for an exact-match top hit, not a vector-presence detector.
+    kg's `create(kind="observation", ...)` hard-fails on embedding error
+    rather than storing a vectorless note. The score floor below is therefore
+    a ranking-quality gate for an exact-match top hit, not a vector-presence
+    detector.
 
     Also asserts:
-    - recall returns a list with at least one hit (vectors were written)
-    - the top hit carries a plausible score (>= 0.5), confirming semantic
-      ranking rather than random or FTS-only ordering
+    - search returns a list with at least one hit (vectors were written)
+    - the top hit carries a non-trivial fused score (kg's `search` scores are
+      RRF-fused ranks, not a raw cosine similarity — see the score-floor
+      assertion below for the scale)
     - a second query for a different topic returns a DIFFERENT rank-1 item,
       confirming the index is not degenerate (always returning the same row)
     """
@@ -198,18 +199,18 @@ def test_vector_round_trip_and_recall_at_1():
     try:
         init_proc(proc)
 
-        # Store all items and record the returned ids.
+        # Store all items as kg notes and record the returned ids.
         stored_ids = {}
         for key, content in ITEMS:
-            result = call_verb(proc, "memory.remember", {
+            result = call_verb(proc, "create", {
+                "kind": "observation",
+                "name": key,
                 "content": content,
                 "salience": 0.9,
-                "memory_type": "semantic",
-                "embedding_model": EMBED_MODEL,
             })
-            assert result is not None, f"memory.remember must return a result for {key!r}"
+            assert result is not None, f"create must return a result for {key!r}"
             item_id = result.get("id")
-            assert item_id, f"memory.remember must return an id for {key!r}: {result}"
+            assert item_id, f"create must return an id for {key!r}: {result}"
             stored_ids[key] = item_id
             print(f"  [store] {key}: id={item_id}")
 
@@ -220,15 +221,15 @@ def test_vector_round_trip_and_recall_at_1():
         # For each query, assert rank-1 is the matching item.
         rank_1_ids = []
         for target_key, query in QUERIES:
-            hits = call_verb(proc, "memory.recall", {
+            hits = call_verb(proc, "search", {
+                "kind": "note",
                 "query": query,
                 "limit": len(ITEMS),
-                "embedding_model": EMBED_MODEL,
             })
 
-            # Vectors actually written: recall must return at least one hit.
+            # Vectors actually written: search must return at least one hit.
             assert isinstance(hits, list) and len(hits) >= 1, (
-                f"memory.recall for {target_key!r} must return >= 1 hit; "
+                f"search for {target_key!r} must return >= 1 hit; "
                 f"got {hits!r}. Vectors may not have been written."
             )
 
@@ -248,9 +249,16 @@ def test_vector_round_trip_and_recall_at_1():
             # Ranking-quality floor: an exact-match top hit in an active vector
             # index must score meaningfully above zero.  This is NOT a
             # vector-presence detector; vector-presence is established by the
-            # cache pre-check + successful memory.remember calls above.
-            assert rank_1_score >= 0.5, (
-                f"rank-1 score {rank_1_score:.3f} < 0.5 for query={query!r}; "
+            # cache pre-check + successful create calls above.
+            #
+            # kg's `search` verb scores are RRF-fused ranks (search.rs ->
+            # search_notes, RRF_K=60), not a raw cosine similarity: a rank-1
+            # hit fused from both the text and vector legs scores around
+            # 2/(RRF_K+1) ~= 0.033, so the floor here is scaled to that regime
+            # rather than the memory pack's old 0-1 cosine-similarity floor.
+            SCORE_FLOOR = 0.01
+            assert rank_1_score >= SCORE_FLOOR, (
+                f"rank-1 score {rank_1_score:.4f} < {SCORE_FLOOR} for query={query!r}; "
                 f"suggests random ordering, not semantic ranking."
             )
 

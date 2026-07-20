@@ -1,16 +1,16 @@
 # API Reference
 
-khive exposes exactly one MCP tool, `request`. Everything else, 46 verbs across 8
-production packs, is dispatched through that single tool via a small request DSL.
-This page documents the DSL grammar, the response envelope, and every verb's full
-parameter contract, so an agent can call khive correctly without reading Rust source.
+khive exposes exactly one MCP tool, `request`. Everything else, 18 verbs in the `kg`
+pack, is dispatched through that single tool via a small request DSL. This page
+documents the DSL grammar, the response envelope, and every verb's full parameter
+contract, so an agent can call khive correctly without reading Rust source.
 
 This page is verified against the live registry (`request(ops="verbs()")`) and the pack
-source (`crates/khive-pack-*/src/*.rs` `HandlerDef`/`ParamDef` struct literals). Verb
-count: **46**, matching both the live registry `total` field and the sum of the 8 pack
-counts below. If your server reports a different total, your `KHIVE_PACKS` configuration
-loads a different pack set than the default — run `request(ops="verbs()")` against your
-own server to get the authoritative list.
+source (`crates/khive-pack-kg/src/*.rs` `HandlerDef`/`ParamDef` struct literals). Verb
+count: **18**, matching the live registry `total` field for the default `kg`-only pack
+set. If your server reports a different total, your `KHIVE_PACKS` configuration loads
+additional (commercially licensed) packs beyond the open-source default — run
+`request(ops="verbs()")` against your own server to get the authoritative list.
 
 An always-machine-readable copy of this page is at
 [`/md/api-reference.md`](md/api-reference.md). The site also publishes
@@ -19,42 +19,23 @@ An always-machine-readable copy of this page is at
 
 ## Packs at a glance
 
-| Pack        | Verbs | Load with                              | Optional?           |
-| ----------- | ----- | -------------------------------------- | ------------------- |
-| `kg`        | 18    | `KHIVE_PACKS=kg` (default)             | No — base substrate |
-| `gtd`       | 5     | `KHIVE_PACKS=kg,gtd`                   | Yes                 |
-| `memory`    | 5     | `KHIVE_PACKS=kg,memory`                | Yes                 |
-| `comm`      | 7     | `KHIVE_PACKS=kg,comm`                  | Yes                 |
-| `schedule`  | 4     | `KHIVE_PACKS=kg,schedule`              | Yes                 |
-| `session`   | 4     | `KHIVE_PACKS=kg,session`               | Yes                 |
-| `workspace` | 0     | `KHIVE_PACKS=kg,gtd,session,workspace` | Yes                 |
-| `blob`      | 3     | `KHIVE_PACKS=kg,blob`                  | Yes                 |
+| Pack | Verbs | Load with                  | Optional?           |
+| ---- | ----- | -------------------------- | ------------------- |
+| `kg` | 18    | `KHIVE_PACKS=kg` (default) | No — base substrate |
 
-Git provenance ingestion (`git.digest`, the `commit`/`issue`/`pull_request` note kinds) and
-the `git.commit` / `git.branch` / `git.push` write verbs (ADR-108) are provided by a
-commercially licensed extension and are not part of this distribution.
+This distribution ships one production pack, `kg`, loaded by default. Task management,
+memory, inter-agent communication, scheduling, session continuity, workspace linking,
+blob storage, and the profile-oriented feedback/learning-loop pack (`brain.*`) are
+provided by commercially licensed extensions and are not part of this distribution; when
+installed, they load the same way, via `KHIVE_PACKS`/`--pack`. Git provenance ingestion
+(`git.digest`, the `commit`/`issue`/`pull_request` note kinds) and the `git.commit` /
+`git.branch` / `git.push` write verbs (ADR-108) are likewise a commercially licensed
+extension.
 
-`workspace` requires `kg`, `gtd`, and `session` to be loaded alongside it (the runtime
-rejects a pack set that omits a declared dependency), so its minimal example lists all
-three. Its `contains` endpoint rules naming `commit`/`issue`/`pull_request` note kinds stay
-declared but inert unless a pack registering those note kinds is loaded.
+The default binary (no `KHIVE_PACKS`/`--pack` override) loads the `kg` pack: **18 verbs**.
 
-`schedule` requires `kg`. `schedule.remind` additionally requires `comm.send` at
-creation time and persists nothing when that delivery capability is absent; the other
-three schedule verbs remain available without `comm`.
-
-`blob` registers no note or entity kinds; its three verbs (`blob.put` / `blob.get` /
-`blob.stat`) dispatch over the `BlobStore` content-addressed storage trait (ADR-111). A
-normal file-backed boot installs a default `FsBlobStore` rooted beside the database file
-even with no `[storage.blob]` section and no `KHIVE_BLOB_ROOT` set; the verbs only stay
-unconfigured (erroring until a backend is installed) when the server boots against an
-in-memory backend, which has no directory to default a root beside.
-
-The default binary (no `KHIVE_PACKS`/`--pack` override) loads all 8 packs: 18 + 5 + 5 +
-7 + 4 + 4 + 0 + 3 = **46 verbs**.
-
-Verb names in the `kg` pack are bare (`create`, `search`, `link`, …). Every other pack
-namespaces its verbs with a `pack.` prefix (`gtd.assign`, `memory.recall`,
+Verb names in the `kg` pack are bare (`create`, `search`, `link`, …). Extension packs
+namespace their verbs with a `pack.` prefix (`gtd.assign`, `memory.recall`,
 `comm.send`, `schedule.remind`, `session.store`).
 
 ---
@@ -74,7 +55,7 @@ request(ops="search(kind=\"entity\", query=\"LoRA\")")
 Up to 100 ops, run with no ordering guarantee between them:
 
 ```
-request(ops="[memory.recall(query=\"x\"), memory.remember(content=\"y\")]")
+request(ops="[search(kind=\"entity\", query=\"x\"), stats()]")
 ```
 
 ### Chain
@@ -256,12 +237,13 @@ compacted to a relative or minute-truncated form; and `salience`/`decay_factor` 
 - **`kind="note"`**: `{id, namespace, kind, status, name, content, salience, decay_factor,
   expires_at, properties, created_at, updated_at, deleted_at}`. Notes have **no top-level
   `tags` field**: unlike entities, tags live inside `properties.tags`. If the note's
-  `properties.status` is set (e.g. a `gtd` task's lifecycle status, or a `comm` message's
-  delivery state), the row's substrate-level `status` (normally `"active"`) is renamed to
-  `lifecycle`, and the top-level `status` is replaced with the `properties.status` value,
-  so a `gtd`/`comm` consumer reads the pack-level status directly off the row instead of
-  digging into `properties`. When no `properties.status` is set, `status` stays the raw
-  substrate value and there is no `lifecycle` key.
+  `properties.status` is set (e.g. a task's lifecycle status, or a message's delivery
+  state — fields set by note kinds that extension packs register), the row's
+  substrate-level `status` (normally `"active"`) is renamed to `lifecycle`, and the
+  top-level `status` is replaced with the `properties.status` value, so a consumer reads
+  the pack-level status directly off the row instead of digging into `properties`. When no
+  `properties.status` is set, `status` stays the raw substrate value and there is no
+  `lifecycle` key.
 - **`kind="edge"`**: `{id, namespace, source_id, target_id, relation, weight, created_at,
   updated_at, deleted_at, metadata, target_backend}`.
 - **`kind="event"`**: `{id, namespace, verb, substrate, actor, kind, outcome, payload,
@@ -630,10 +612,10 @@ request(ops="resolve(refs=[\"the old record\", \"<uuid>\"])")
 List all MCP-callable verbs registered on this server. Internal subhandlers are
 excluded.
 
-| Param      | Type   | Required | Notes                                                                              |
-| ---------- | ------ | -------- | ---------------------------------------------------------------------------------- |
-| `category` | string | no       | Filter: `Assertive`\|`Commissive`\|`Declaration`\|`Directive`.                     |
-| `pack`     | string | no       | Filter by pack name (`kg`, `gtd`, `memory`, `comm`, `schedule`, `session`, `git`). |
+| Param      | Type   | Required | Notes                                                                      |
+| ---------- | ------ | -------- | -------------------------------------------------------------------------- |
+| `category` | string | no       | Filter: `Assertive`\|`Commissive`\|`Declaration`\|`Directive`.             |
+| `pack`     | string | no       | Filter by pack name (`kg` in this distribution; extension packs add more). |
 
 ```
 request(ops="verbs()")
@@ -641,416 +623,13 @@ request(ops="verbs()")
 
 ---
 
-## `gtd` pack — 5 verbs
-
-GTD task lifecycle over notes (`kind="task"`). Optional; load with
-`KHIVE_PACKS=kg,gtd`.
-
-### `gtd.assign` — Directive
-
-Create a GTD task (note with `kind=task`).
-
-| Param               | Type            | Required | Notes                                                                                                                                                                |
-| ------------------- | --------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `title`             | string          | yes      | Task title.                                                                                                                                                          |
-| `status`            | string          | no       | `inbox`\|`next`\|`waiting`\|`someday`\|`active` (default `inbox`). Aliases: `todo`=inbox, `in_progress`=active, `blocked`=waiting, `later`=someday, `finished`=done. |
-| `priority`          | string          | no       | `p0`\|`p1`\|`p2`\|`p3` (default `p2`).                                                                                                                               |
-| `assignee`          | string          | no       | Assignee identifier.                                                                                                                                                 |
-| `due`               | string          | no       | ISO-8601 due date.                                                                                                                                                   |
-| `depends_on`        | array\<uuid\>   | no       | Blocking task UUIDs.                                                                                                                                                 |
-| `context_entity_id` | uuid            | no       | Full UUID of a related KG entity.                                                                                                                                    |
-| `tags`              | array\<string\> | no       | Tag list.                                                                                                                                                            |
-
-```
-request(ops="gtd.assign(title=\"Ship API reference\", priority=\"p1\", assignee=\"agent:docs\")")
-```
-
-### `gtd.next` — Assertive
-
-List actionable tasks (status `next` or `active`) by priority.
-
-| Param      | Type    | Required | Notes                    |
-| ---------- | ------- | -------- | ------------------------ |
-| `limit`    | integer | no       | Default 10.              |
-| `assignee` | string  | no       | Filter to this assignee. |
-
-```
-request(ops="gtd.next(assignee=\"agent:docs\", limit=10)")
-```
-
-### `gtd.complete` — Declaration
-
-Mark a task done (or cancelled) with an optional result note.
-
-| Param    | Type   | Required | Notes                                             |
-| -------- | ------ | -------- | ------------------------------------------------- |
-| `id`     | uuid   | yes      | Task to complete.                                 |
-| `result` | string | no       | Completion note.                                  |
-| `status` | string | no       | Terminal status: `done` (default) or `cancelled`. |
-
-```
-request(ops="gtd.complete(id=\"<task-id>\", result=\"shipped in PR #600\")")
-```
-
-### `gtd.tasks` — Assertive
-
-List tasks filtered by status, assignee, priority.
-
-| Param      | Type    | Required | Notes                                                                                              |
-| ---------- | ------- | -------- | -------------------------------------------------------------------------------------------------- |
-| `status`   | string  | no       | `inbox`\|`next`\|`waiting`\|`someday`\|`active`\|`done`\|`cancelled` (aliases as in `gtd.assign`). |
-| `assignee` | string  | no       | Filter by assignee.                                                                                |
-| `priority` | string  | no       | `p0`\|`p1`\|`p2`\|`p3`.                                                                            |
-| `limit`    | integer | no       | Default 20.                                                                                        |
-| `offset`   | integer | no       | Default 0.                                                                                         |
-
-```
-request(ops="gtd.tasks(status=\"active\", assignee=\"agent:docs\")")
-```
-
-### `gtd.transition` — Declaration
-
-Explicit GTD status transition with lifecycle validation.
-
-| Param    | Type   | Required | Notes                                      |
-| -------- | ------ | -------- | ------------------------------------------ |
-| `id`     | uuid   | yes      | Task to transition.                        |
-| `status` | string | yes      | Target status (same set/aliases as above). |
-| `note`   | string | no       | Note attached to the transition.           |
-
-```
-request(ops="gtd.transition(id=\"<task-id>\", status=\"active\")")
-```
-
----
-
-## `memory` pack — 5 verbs
-
-Salience- and decay-weighted memory notes. Optional; load with
-`KHIVE_PACKS=kg,memory`.
-
-### `memory.remember` — Commissive
-
-Create a memory note with salience and decay.
-
-| Param             | Type   | Required | Notes                                                                                                                       |
-| ----------------- | ------ | -------- | --------------------------------------------------------------------------------------------------------------------------- |
-| `content`         | string | yes      | Memory content.                                                                                                             |
-| `salience`        | number | no       | 0.0–1.0. Type-differentiated default: episodic=0.3, semantic=0.5.                                                           |
-| `decay_factor`    | number | no       | >= 0. Type-differentiated default: episodic=0.02 (~35d half-life), semantic=0.005 (~139d half-life). Higher = faster decay. |
-| `memory_type`     | string | no       | `episodic`\|`semantic` (default `episodic`); no other values accepted.                                                      |
-| `source_id`       | string | no       | UUID or 8-char short ID of the entity/note this memory annotates.                                                           |
-| `embedding_model` | string | no       | Registered model name; defaults to pack config.                                                                             |
-| `tags`            | array  | no       | Stored in `properties.tags`.                                                                                                |
-| `namespace`       | string | no       | Write namespace override. Default: episodic → caller's namespace, semantic → `local`.                                       |
-
-```
-request(ops="memory.remember(content=\"ADR-016 fixes the DSL grammar\", salience=0.7, memory_type=\"semantic\")")
-```
-
-### `memory.recall` — Assertive
-
-Recall memory notes with decay-aware hybrid ranking. Each hit carries resolved
-(read-model) values — `memory_type` defaults to `episodic` when unset; `salience` and
-`decay_factor` reflect the effective defaults used for ranking.
-
-| Param               | Type    | Required | Notes                                                                     |
-| ------------------- | ------- | -------- | ------------------------------------------------------------------------- |
-| `query`             | string  | yes      | Semantic recall query.                                                    |
-| `limit`             | integer | no       | Default 10.                                                               |
-| `top_k`             | integer | no       | Overrides `limit` (max 100).                                              |
-| `min_score`         | number  | no       | Composite score floor, always in [0,1]. Typical production floor 0.3–0.7. |
-| `score_floor`       | number  | no       | Alias for `min_score`.                                                    |
-| `min_salience`      | number  | no       | Salience floor.                                                           |
-| `memory_type`       | string  | no       | Filter to this type.                                                      |
-| `fusion_strategy`   | string  | no       | `rrf`\|`weighted`\|`union`\|`vector_only`\|`keyword_only`.                |
-| `embedding_model`   | string  | no       | Registered model name; defaults to pack config.                           |
-| `include_breakdown` | bool    | no       | Include per-component score breakdown.                                    |
-| `entity_names`      | array   | no       | Names to boost; matches get a 1.3x multiplier.                            |
-| `full_content`      | bool    | no       | Default true; false truncates content to 200 chars.                       |
-| `tags`              | array   | no       | Filter by `properties.tags`.                                              |
-| `tag_mode`          | string  | no       | `any` (default, OR) or `all` (AND).                                       |
-
-```
-request(ops="memory.recall(query=\"ADR-016 DSL grammar\", limit=5, min_score=0.3)")
-```
-
-### `memory.feedback` — Commissive
-
-Emit explicit feedback on a recalled entity; updates recall-domain posteriors.
-
-| Param       | Type   | Required | Notes                                                                                                                              |
-| ----------- | ------ | -------- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| `target_id` | string | yes      | UUID of the recalled entity or memory.                                                                                             |
-| `signal`    | string | yes      | `useful`\|`not_useful`\|`wrong`\|`explicit_positive`\|`explicit_negative`\|`implicit_positive`\|`implicit_negative`\|`correction`. |
-
-```
-request(ops="memory.feedback(target_id=\"<uuid>\", signal=\"useful\")")
-```
-
-### `memory.prune` — Commissive
-
-Soft-delete memories below a salience threshold and/or past `expires_at`
-(curation-layer, ADR-014).
-
-| Param          | Type    | Required | Notes                                                                                                               |
-| -------------- | ------- | -------- | ------------------------------------------------------------------------------------------------------------------- |
-| `min_salience` | number  | no       | Soft-delete memories strictly below this value.                                                                     |
-| `before`       | integer | no       | Soft-delete memories expired at/before this Unix microsecond timestamp; defaults to now; 0 skips the expiry filter. |
-| `namespace`    | string  | no       | Defaults to `local`.                                                                                                |
-| `dry_run`      | bool    | no       | Default false; when true, counts candidates without deleting.                                                       |
-
-```
-request(ops="memory.prune(min_salience=0.2, dry_run=true)")
-```
-
-### `memory.vacuum` — Commissive
-
-Run SQLite `VACUUM` to reclaim space freed by soft-deleted rows. No params.
-
-```
-request(ops="memory.vacuum()")
-```
-
----
-
-The `brain` pack (`brain.*` verbs — recall-tuning profiles, Beta-posterior scoring,
-feedback-driven ranking) is a commercially licensed extension distributed separately;
-it is not part of this distribution.
-
-## `comm` pack — 7 verbs
-
-Actor-to-actor messaging with threading. Optional; load with `KHIVE_PACKS=kg,comm`.
-
-### `comm.send` — Commissive
-
-Send a message, optionally threaded.
-
-| Param       | Type   | Required | Notes                                                                                                                                                                                           |
-| ----------- | ------ | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `to`        | string | yes      | Actor label, e.g. `"lambda:leo"`. Both copies land in the caller's namespace; no cross-namespace write occurs.                                                                                  |
-| `content`   | string | yes      | Non-empty message body.                                                                                                                                                                         |
-| `subject`   | string | no       | Optional subject line.                                                                                                                                                                          |
-| `thread_id` | uuid   | no       | Groups the message into an existing thread.                                                                                                                                                     |
-| `self_send` | bool   | no       | Default false. Required when `to` matches the configured sender actor; otherwise the send is rejected. The anonymous `local` fallback is exempt. Use true only for an intentional note to self. |
-
-```
-request(ops="comm.send(to=\"lambda:leo\", subject=\"PR ready\", content=\"#600 is open for review\")")
-```
-
-### `comm.inbox` — Assertive
-
-List inbound messages for the caller.
-
-| Param    | Type    | Required | Notes                              |
-| -------- | ------- | -------- | ---------------------------------- |
-| `limit`  | integer | no       | Default 20, max 200.               |
-| `status` | string  | no       | `unread` (default)\|`read`\|`all`. |
-
-```
-request(ops="comm.inbox(limit=10)")
-```
-
-### `comm.read` — Declaration
-
-Mark an inbound message as read. Outbound messages cannot be marked read.
-
-| Param | Type   | Required | Notes                                              |
-| ----- | ------ | -------- | -------------------------------------------------- |
-| `id`  | string | yes      | 8-char prefix or full UUID of the inbound message. |
-
-```
-request(ops="comm.read(id=\"<message-id>\")")
-```
-
-### `comm.reply` — Commissive
-
-Reply to a message, threading linkage.
-
-| Param     | Type   | Required | Notes                                                       |
-| --------- | ------ | -------- | ----------------------------------------------------------- |
-| `id`      | string | yes      | 8-char prefix or full UUID of the message being replied to. |
-| `content` | string | yes      | Non-empty reply body.                                       |
-
-```
-request(ops="comm.reply(id=\"<message-id>\", content=\"On it.\")")
-```
-
-### `comm.thread` — Assertive
-
-Retrieve all messages in a conversation thread, ordered chronologically.
-
-| Param   | Type    | Required | Notes                                                               |
-| ------- | ------- | -------- | ------------------------------------------------------------------- |
-| `id`    | string  | yes      | Thread root: 8-char prefix or full UUID of the originating message. |
-| `limit` | integer | no       | Default 100, max 500.                                               |
-
-```
-request(ops="comm.thread(id=\"<thread-root-id>\")")
-```
-
-### `comm.probe` — Assertive
-
-Strictly read-only poll for new inbound message metadata and a stale-unread count. No
-read-flag mutation, no writes: designed for monitors polling every ~30 seconds, served by
-a single cheap indexed query. Returns a `cursor_us` high-water mark, a `stale_unread_count`
-of inbound messages unread past the staleness window, and a `new_messages` array of up to
-100 inbound rows `{id, created_at_us, from_actor, subject?}` newer than `since_us`.
-
-`cursor_us`/`since_us` is an opaque, monotonically increasing token, not a Unix microsecond
-timestamp: round-trip whatever the previous `comm.probe` response returned as the next
-call's `since_us`, and omit it for a baseline-first probe.
-
-| Param           | Type    | Required | Notes                                               |
-| --------------- | ------- | -------- | --------------------------------------------------- |
-| `actor`         | string  | yes      | Actor label whose inbound mail is probed.           |
-| `since_us`      | integer | no       | Opaque cursor from a prior response's `cursor_us`.  |
-| `stale_minutes` | integer | no       | Staleness window for the unread count (default 20). |
-
-```
-request(ops="comm.probe(actor=\"lambda:leo\")")
-request(ops="comm.probe(actor=\"lambda:leo\", since_us=42)")
-```
-
-### `comm.health` — Assertive
-
-Read-only per-channel health snapshot. Returns the daemon-persisted heartbeat row for
-every known channel: timestamps and consecutive-failure counts only, never a computed
-healthy bool. Health judgment belongs to the caller. Rows are read from the caller's
-injected namespace (`namespace=`, defaulting to `local` like every other comm verb) —
-`comm.heartbeat` is the only handler pinned to the fixed `local` operational namespace.
-The response echoes the namespace actually read in a `namespace` field, so an empty
-`channels` array is unambiguous even under a scoped read. See the
-[communication guide](communication.md) for the full response contract.
-
-No parameters.
-
-```
-request(ops="comm.health()")
-```
-
----
-
-## `schedule` pack — 4 verbs
-
-Time-triggered reminders and deferred verb dispatch. Optional; load with
-`KHIVE_PACKS=kg,schedule`. Add `comm` to create reminders.
-
-### `schedule.remind` — Commissive
-
-Create a time-triggered reminder.
-
-| Param     | Type   | Required | Notes                                                                                                                                            |
-| --------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `content` | string | yes      | Non-empty reminder message.                                                                                                                      |
-| `at`      | string | yes      | RFC 3339 trigger time, e.g. `"2026-06-01T09:00:00Z"`.                                                                                            |
-| `repeat`  | string | no       | `daily`\|`weekly`\|`monthly`, or a limited 5-field cron form using only `*` or one in-range integer per field (steps/ranges/lists not accepted). |
-
-```
-request(ops="schedule.remind(content=\"check PR #600 CI\", at=\"2026-07-05T09:00:00Z\")")
-```
-
-### `schedule.schedule` — Commissive
-
-Schedule a future verb dispatch.
-
-| Param    | Type   | Required | Notes                                                               |
-| -------- | ------ | -------- | ------------------------------------------------------------------- |
-| `action` | string | yes      | Verb dispatch payload, e.g. `"schedule.remind(content=\"hello\")"`. |
-| `at`     | string | yes      | RFC 3339 trigger time.                                              |
-| `repeat` | string | no       | Same recurrence grammar as `schedule.remind`.                       |
-
-```
-request(ops="schedule.schedule(action=\"gtd.next(assignee=\\\"agent:docs\\\")\", at=\"2026-07-05T09:00:00Z\")")
-```
-
-### `schedule.agenda` — Assertive
-
-List upcoming scheduled events.
-
-| Param   | Type    | Required | Notes                                                                 |
-| ------- | ------- | -------- | --------------------------------------------------------------------- |
-| `from`  | string  | no       | RFC 3339 window start; omit to start from the earliest pending event. |
-| `to`    | string  | no       | RFC 3339 window end; omit for all future events.                      |
-| `limit` | integer | no       | Default 20, max 200.                                                  |
-
-```
-request(ops="schedule.agenda(limit=10)")
-```
-
-### `schedule.cancel` — Declaration
-
-Cancel a scheduled event.
-
-| Param | Type   | Required | Notes                             |
-| ----- | ------ | -------- | --------------------------------- |
-| `id`  | string | yes      | Full UUID of the scheduled event. |
-
-```
-request(ops="schedule.cancel(id=\"<event-id>\")")
-```
-
----
-
-## `session` pack — 4 verbs
-
-Cross-provider agent-session continuity records. Optional; load with
-`KHIVE_PACKS=kg,session`.
-
-### `session.store` — Directive
-
-Persist an agent-session record as a session note.
-
-| Param                 | Type            | Required | Notes                                                  |
-| --------------------- | --------------- | -------- | ------------------------------------------------------ |
-| `content`             | string          | yes      | Verbatim transcript or summary content.                |
-| `title`               | string          | no       | Stored as `note.name`.                                 |
-| `provider`            | string          | no       | Provider label, e.g. `codex`, `claude_code`, `openai`. |
-| `provider_session_id` | string          | no       | Provider-native continuity anchor.                     |
-| `tags`                | array\<string\> | no       | Stored in `properties.tags`.                           |
-
-```
-request(ops="session.store(content=\"...\", provider=\"claude_code\", title=\"pages revamp session\")")
-```
-
-### `session.list` — Assertive
-
-List stored sessions newest first.
-
-| Param      | Type    | Required | Notes                                  |
-| ---------- | ------- | -------- | -------------------------------------- |
-| `limit`    | integer | no       | 1–200, default 20.                     |
-| `offset`   | integer | no       | Default 0.                             |
-| `provider` | string  | no       | Exact filter on `properties.provider`. |
-
-```
-request(ops="session.list(provider=\"claude_code\", limit=10)")
-```
-
-### `session.resume` — Assertive
-
-Fetch one session's full content by UUID or 8+ hex prefix.
-
-| Param | Type   | Required | Notes                             |
-| ----- | ------ | -------- | --------------------------------- |
-| `id`  | string | yes      | Full UUID or 8+ hex short prefix. |
-
-```
-request(ops="session.resume(id=\"<session-id>\")")
-```
-
-### `session.export` — Assertive
-
-Serialize one stored session as json or markdown.
-
-| Param    | Type   | Required | Notes                               |
-| -------- | ------ | -------- | ----------------------------------- |
-| `id`     | string | yes      | Full UUID or 8+ hex short prefix.   |
-| `format` | string | no       | `json`\|`markdown`, default `json`. |
-
-```
-request(ops="session.export(id=\"<session-id>\", format=\"markdown\")")
-```
+## Other packs
+
+Task management (`gtd.*`), memory (`memory.*`), inter-agent communication (`comm.*`),
+scheduling (`schedule.*`), session continuity (`session.*`), and content-addressed blob
+storage (`blob.*`, ADR-111) are provided by commercially licensed extensions and are not
+part of this distribution; when installed, they load the same way, via
+`KHIVE_PACKS`/`--pack`.
 
 ---
 
@@ -1060,53 +639,6 @@ Git-history ingestion (`git.digest`) and the hardened write surface (`git.commit
 `git.branch` / `git.push`, ADR-108), along with the `commit`/`issue`/`pull_request`
 note kinds they register, are provided by a commercially licensed extension and are
 not part of this distribution.
-
----
-
-## `blob` pack — 3 verbs
-
-Content-addressed binary object storage (ADR-111). Optional; load with
-`KHIVE_PACKS=kg,blob`. Registers no note or entity kinds. A normal file-backed boot
-installs a default `FsBlobStore` rooted beside the database file even with no
-`[storage.blob]` section in `khive.toml` and no `KHIVE_BLOB_ROOT` set; the verbs stay
-unconfigured (erroring until a backend is installed) only when the server boots against
-an in-memory backend, which has no directory to default a root beside.
-
-### `blob.put` — Commissive
-
-Store bytes (base64) in the content-addressed blob store; returns the BLAKE3
-`ContentRef`. Idempotent: identical content returns the same ref without a re-write.
-
-| Param   | Type   | Required | Notes                                                                                                   |
-| ------- | ------ | -------- | ------------------------------------------------------------------------------------------------------- |
-| `bytes` | string | yes      | Base64-encoded object content. Decoded size is capped at 64 MiB per call (ADR-111's v1 object ceiling). |
-
-### `blob.get` — Assertive
-
-Read an object back by `content_ref`, base64-encoded in the response, with an optional
-byte range. The object is rejected before any bytes are hydrated if it exceeds the
-64 MiB ceiling this verb will fetch, or if the requested slice would base64-encode to a
-response exceeding the daemon's IPC frame cap. Concurrent `blob.get` hydration is bounded
-by a small pack-level semaphore.
-
-| Param         | Type   | Required | Notes                                                                                                                             |
-| ------------- | ------ | -------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| `content_ref` | string | yes      | 64-char lowercase-hex BLAKE3 content reference returned by `blob.put`.                                                            |
-| `range`       | object | no       | `{offset, length}`, both non-negative integers when present. Applied to the fetched object as a slice, not a streamed range read. |
-
-### `blob.stat` — Assertive
-
-Report whether an object exists and its size, answered by a single metadata read with
-no bytes hydrated.
-
-| Param         | Type   | Required | Notes                                                                  |
-| ------------- | ------ | -------- | ---------------------------------------------------------------------- |
-| `content_ref` | string | yes      | 64-char lowercase-hex BLAKE3 content reference returned by `blob.put`. |
-
-```
-request(ops="blob.put(bytes=\"aGVsbG8=\")")
-request(ops="blob.stat(content_ref=\"<64-char-hex>\")")
-```
 
 ---
 

@@ -1363,7 +1363,7 @@ default = true
             packs: {
                 let mut m = std::collections::HashMap::new();
                 m.insert(
-                    "comm".to_string(),
+                    "kg".to_string(),
                     PackConfig {
                         backend: "secondary".to_string(),
                     },
@@ -1386,7 +1386,7 @@ default = true
             db_path: khive_runtime::resolve_db_anchor(None),
             embedding_model: None,
             additional_embedding_models: vec![],
-            packs: vec!["kg".to_string(), "comm".to_string()],
+            packs: vec!["kg".to_string()],
             actor_id: Some("actor-routing-test".to_string()),
             ..RuntimeConfig::default()
         };
@@ -1399,9 +1399,9 @@ default = true
         let server = build_local_fallback_server(cfg, &khive_cfg, None, db_anchor.as_deref())
             .expect("multi-backend local fallback must build");
 
-        let send = server
+        let create = server
             .dispatch_request_local(RequestParams {
-                ops: r#"comm.send(to="actor-routing-test", content="routed-via-secondary", self_send=true)"#
+                ops: r#"create(kind="entity", entity_kind="concept", name="routed-via-secondary")"#
                     .to_string(),
                 presentation: None,
                 presentation_per_op: None,
@@ -1411,29 +1411,29 @@ default = true
                 request_id: None,
             })
             .await
-            .expect("comm.send must dispatch");
-        let send_resp: serde_json::Value = serde_json::from_str(&send).expect("valid JSON");
+            .expect("create must dispatch");
+        let create_resp: serde_json::Value = serde_json::from_str(&create).expect("valid JSON");
         assert_eq!(
-            send_resp["results"][0]["ok"].as_bool(),
+            create_resp["results"][0]["ok"].as_bool(),
             Some(true),
-            "comm.send must succeed through the multi-backend fallback server: {send_resp}"
+            "create must succeed through the multi-backend fallback server: {create_resp}"
         );
 
         // Re-open EACH backend file independently (fresh KhiveMcpServer, no
-        // shared state) and list `message` notes directly against it.
-        async fn count_messages(db_path: &std::path::Path) -> usize {
+        // shared state) and list `concept` entities directly against it.
+        async fn count_concepts(db_path: &std::path::Path) -> usize {
             let cfg = RuntimeConfig {
                 db_path: Some(db_path.to_path_buf()),
                 embedding_model: None,
                 additional_embedding_models: vec![],
-                packs: vec!["kg".to_string(), "comm".to_string()],
+                packs: vec!["kg".to_string()],
                 ..RuntimeConfig::default()
             };
             let rt = KhiveRuntime::new(cfg).expect("runtime on backend file");
             let probe = KhiveMcpServer::new(rt).expect("server on backend file");
             let raw = probe
                 .dispatch_request_local(RequestParams {
-                    ops: r#"list(kind="message")"#.to_string(),
+                    ops: r#"list(kind="concept")"#.to_string(),
                     presentation: None,
                     presentation_per_op: None,
                     save_to: None,
@@ -1450,22 +1450,18 @@ default = true
                 .unwrap_or(0)
         }
 
-        let main_count = count_messages(&main_path).await;
-        let secondary_count = count_messages(&secondary_path).await;
+        let main_count = count_concepts(&main_path).await;
+        let secondary_count = count_concepts(&secondary_path).await;
 
         assert_eq!(
             main_count, 0,
-            "comm pack must NOT write into the `main` backend file when pinned to \
+            "kg pack must NOT write into the `main` backend file when pinned to \
              `secondary` (D1-R2: a silent single-backend fallback would have written \
              it here instead)"
         );
         assert_eq!(
-            secondary_count, 2,
-            "comm pack write must land in its declared `secondary` backend file — \
-             `comm.send` dual-writes an outbound + inbound note copy per message \
-             (khive-pack-comm's message.rs), both via the SAME pack runtime, so a \
-             single self-send yields 2 `message` notes in whichever backend `comm` \
-             is pinned to"
+            secondary_count, 1,
+            "kg pack write must land in its declared `secondary` backend file"
         );
     }
 
@@ -2023,67 +2019,11 @@ default = true
 
     // ── strict-actor mode: daemon bypass regression ───────────────────────────
 
-    /// Security regression: strict-actor gate must fire before daemon forward.
-    /// See `crates/kkernel/docs/design.md#execrs-regression-test-notes`.
-    #[tokio::test]
-    #[serial]
-    async fn strict_mode_rejects_before_daemon_forward_when_comm_and_no_actor() {
-        let prev_strict = std::env::var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR").ok();
-        let prev_no_daemon = std::env::var("KHIVE_NO_DAEMON").ok();
-
-        std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", "1");
-        // Belt-and-suspenders: ensure no daemon is contacted even if one happens
-        // to be running.  The error should fire before forwarding, but we make the
-        // test deterministic by also suppressing the daemon path.
-        std::env::set_var("KHIVE_NO_DAEMON", "1");
-
-        let cfg = RuntimeConfig {
-            db_path: None, // in-memory
-            packs: vec!["kg".to_string(), "comm".to_string()],
-            actor_id: None, // no actor — triggers the strict-mode gate
-            ..RuntimeConfig::default()
-        };
-
-        let result = run_exec_inline(
-            "stats()".to_string(),
-            cfg,
-            None,
-            None,
-            None,
-            ExecDbContext::default(),
-        )
-        .await;
-
-        // Restore env.
-        match prev_strict {
-            Some(v) => std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", v),
-            None => std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR"),
-        }
-        match prev_no_daemon {
-            Some(v) => std::env::set_var("KHIVE_NO_DAEMON", v),
-            None => std::env::remove_var("KHIVE_NO_DAEMON"),
-        }
-
-        assert!(
-            result.is_err(),
-            "run_exec_inline must return Err under strict mode + comm + no actor; got Ok"
-        );
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("KHIVE_REQUIRE_ATTRIBUTED_ACTOR"),
-            "error must name the strict-mode env var; got: {msg}"
-        );
-        assert!(
-            msg.contains("KHIVE_ACTOR"),
-            "error must name the remedy (KHIVE_ACTOR); got: {msg}"
-        );
-    }
-
-    /// Complement: strict mode must NOT reject when comm is loaded and an actor
+    /// Complement: strict mode must NOT reject when a pack is loaded and an actor
     /// IS configured — the daemon fast-path must remain available in that case.
     #[tokio::test]
     #[serial]
-    async fn strict_mode_allows_exec_when_comm_and_actor_configured() {
+    async fn strict_mode_allows_exec_when_actor_configured() {
         let prev_strict = std::env::var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR").ok();
         let prev_no_daemon = std::env::var("KHIVE_NO_DAEMON").ok();
         let (prev_home, _home_dir) = isolate_home_for_test();
@@ -2093,7 +2033,7 @@ default = true
 
         let cfg = RuntimeConfig {
             db_path: None,
-            packs: vec!["kg".to_string(), "comm".to_string()],
+            packs: vec!["kg".to_string()],
             actor_id: Some("lambda:tenant-x".to_string()), // actor configured → no gate
             ..RuntimeConfig::default()
         };
@@ -2126,10 +2066,10 @@ default = true
     }
 
     /// Default-off regression: when KHIVE_REQUIRE_ATTRIBUTED_ACTOR is unset,
-    /// run_exec_inline must NOT reject even with comm + no actor (OSS default path).
+    /// run_exec_inline must NOT reject even with no actor (OSS default path).
     #[tokio::test]
     #[serial]
-    async fn strict_mode_off_exec_inline_passes_with_comm_no_actor() {
+    async fn strict_mode_off_exec_inline_passes_with_no_actor() {
         let prev_strict = std::env::var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR").ok();
         let prev_no_daemon = std::env::var("KHIVE_NO_DAEMON").ok();
         let (prev_home, _home_dir) = isolate_home_for_test();
@@ -2139,7 +2079,7 @@ default = true
 
         let cfg = RuntimeConfig {
             db_path: None,
-            packs: vec!["kg".to_string(), "comm".to_string()],
+            packs: vec!["kg".to_string()],
             actor_id: None,
             ..RuntimeConfig::default()
         };
@@ -2167,150 +2107,6 @@ default = true
         assert!(
             result.is_ok(),
             "run_exec_inline must NOT reject when strict mode is OFF (OSS default); got: {result:?}"
-        );
-    }
-
-    // ── spy-based isomorphism guard (Unix only) ───────────────────────────────
-    //
-    // The three tests above use KHIVE_NO_DAEMON=1, which disables the daemon
-    // fast-path at the `forward_or_spawn` level.  That makes them correct checks
-    // of the strict gate in isolation, but tautological w.r.t. the daemon-bypass
-    // bug: moving `enforce_strict_actor_mode` back to BELOW the daemon block would
-    // NOT cause those tests to fail because the daemon path is suppressed.
-    //
-    // These tests use `run_exec_inline_with_forward` directly, passing a spy
-    // function pointer.  KHIVE_NO_DAEMON is NOT set in the rejection test.
-    // The spy can therefore be reached if — and only if — `enforce_strict_actor_mode`
-    // is called AFTER the forwarding attempt.  Under the correct implementation
-    // (enforce first) the gate rejects before the spy is invoked, so the spy
-    // thread-local remains false.
-    //
-    // ISOMORPHISM PROOF:
-    //   Temporarily moved `enforce_strict_actor_mode` to below the daemon block in
-    //   `run_exec_inline_with_forward`.  `strict_mode_spy_confirms_enforce_fires_before_forward`
-    //   failed with: "spy forward_fn was called — enforce fired after forwarding"
-    //   Restoring the early check made the test pass again.
-    //   This confirms the test is NOT tautological w.r.t. the bug it guards.
-
-    // Thread-local spy flag shared between the outer test body and the spy fn pointer.
-    // Using a module-level thread_local! avoids the "two separate statics" trap that
-    // arises when thread_local! is declared inside a function body.
-    #[cfg(unix)]
-    std::thread_local! {
-        static SPY_WAS_CALLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-
-    #[cfg(unix)]
-    fn spy_forward_records_call(_frame: &DaemonRequestFrame) -> super::ForwardFuture<'_> {
-        SPY_WAS_CALLED.with(|c| c.set(true));
-        Box::pin(async { None })
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    #[serial]
-    async fn strict_mode_spy_confirms_enforce_fires_before_forward() {
-        let prev_strict = std::env::var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR").ok();
-        // Deliberately do NOT set KHIVE_NO_DAEMON — the spy must be reachable
-        // if the enforce call is in the wrong place.
-        std::env::remove_var("KHIVE_NO_DAEMON");
-        std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", "1");
-        SPY_WAS_CALLED.with(|c| c.set(false));
-
-        let cfg = RuntimeConfig {
-            db_path: None,
-            packs: vec!["kg".to_string(), "comm".to_string()],
-            actor_id: None, // no actor — should trigger the strict gate
-            ..RuntimeConfig::default()
-        };
-
-        let result = run_exec_inline_with_forward(
-            "stats()".to_string(),
-            cfg,
-            None,
-            None, // output_format
-            None,
-            ExecDbContext::default(),
-            spy_forward_records_call,
-        )
-        .await;
-
-        let spy_was_called = SPY_WAS_CALLED.with(|c| c.get());
-        SPY_WAS_CALLED.with(|c| c.set(false)); // clean up
-
-        match prev_strict {
-            Some(v) => std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", v),
-            None => std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR"),
-        }
-
-        assert!(
-            result.is_err(),
-            "strict mode + comm + no actor must return Err; got Ok"
-        );
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("KHIVE_REQUIRE_ATTRIBUTED_ACTOR"),
-            "error must name the strict-mode env var; got: {msg}"
-        );
-        assert!(
-            !spy_was_called,
-            "spy forward_fn was called — enforce_strict_actor_mode fired AFTER forwarding, not before"
-        );
-    }
-
-    /// Complement: when an actor IS configured, the spy fn is reached because
-    /// the gate passes and forwarding is attempted.  We use KHIVE_NO_DAEMON=1 so
-    /// the spy returns None and in-process dispatch handles the request normally.
-    #[cfg(unix)]
-    #[tokio::test]
-    #[serial]
-    async fn strict_mode_spy_forward_reached_when_actor_configured() {
-        let prev_strict = std::env::var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR").ok();
-        let prev_no_daemon = std::env::var("KHIVE_NO_DAEMON").ok();
-        let (prev_home, _home_dir) = isolate_home_for_test();
-        std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", "1");
-        // Suppress real daemon; spy still records the call before returning None.
-        std::env::set_var("KHIVE_NO_DAEMON", "1");
-        SPY_WAS_CALLED.with(|c| c.set(false));
-
-        let cfg = RuntimeConfig {
-            db_path: None,
-            packs: vec!["kg".to_string(), "comm".to_string()],
-            actor_id: Some("lambda:tenant-x".to_string()), // gate should pass
-            ..RuntimeConfig::default()
-        };
-
-        let result = run_exec_inline_with_forward(
-            "stats()".to_string(),
-            cfg,
-            None,
-            None, // output_format
-            None,
-            ExecDbContext::default(),
-            spy_forward_records_call,
-        )
-        .await;
-
-        let spy_was_called = SPY_WAS_CALLED.with(|c| c.get());
-        SPY_WAS_CALLED.with(|c| c.set(false));
-
-        match prev_strict {
-            Some(v) => std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", v),
-            None => std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR"),
-        }
-        match prev_no_daemon {
-            Some(v) => std::env::set_var("KHIVE_NO_DAEMON", v),
-            None => std::env::remove_var("KHIVE_NO_DAEMON"),
-        }
-        restore_home(prev_home);
-
-        assert!(
-            result.is_ok(),
-            "gate must pass when actor is configured; got: {result:?}"
-        );
-        assert!(
-            spy_was_called,
-            "spy forward_fn must be called when gate passes (KHIVE_NO_DAEMON=1 causes in-process fallback)"
         );
     }
 
@@ -3204,129 +3000,6 @@ backend = "sessions"
         );
     }
 
-    /// `gtd.transition`: a typo'd key (`notee` for `note`) must be rejected
-    /// before any write (task status unchanged); a well-formed transition
-    /// still succeeds.
-    #[tokio::test]
-    async fn atomic_gtd_transition_unknown_field_rejected_well_formed_succeeds() {
-        let db_file = NamedTempFile::new().expect("temp db");
-        let db_path = db_file.path().to_str().expect("utf8").to_string();
-
-        let task_id = {
-            let server = isolated_server(&db_path);
-            let resp = dispatch_json(
-                &server,
-                r#"gtd.assign(title="TransitionTypoGuard", status="inbox")"#,
-            )
-            .await;
-            // gtd.assign's `id` field is always the short hex form
-            // (handlers.rs:372) regardless of presentation mode — use
-            // `full_id`, the real UUID, so it round-trips through the
-            // atomic prepare path's UUID parse.
-            resp["results"][0]["result"]["full_id"]
-                .as_str()
-                .expect("full_id")
-                .to_string()
-        };
-
-        // (a) unknown field rejected — status must stay "inbox".
-        let khive_cfg = KhiveConfig::default();
-        let ops = vec![atomic_op(
-            "gtd.transition",
-            serde_json::json!({"id": task_id, "status": "next", "notee": "typo"}),
-        )];
-        let err = crate::atomic_apply::execute_atomic_ops_file(
-            ops,
-            atomic_cfg(&db_path),
-            &khive_cfg,
-            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
-        )
-        .await
-        .expect_err("typo'd `notee` must be rejected");
-        assert!(
-            format!("{err:#}").contains("unknown field"),
-            "error: {err:#}"
-        );
-
-        // (b) well-formed transition still succeeds.
-        let ops = vec![atomic_op(
-            "gtd.transition",
-            serde_json::json!({"id": task_id, "status": "next"}),
-        )];
-        let envelope = crate::atomic_apply::execute_atomic_ops_file(
-            ops,
-            atomic_cfg(&db_path),
-            &khive_cfg,
-            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
-        )
-        .await
-        .expect("a well-formed gtd.transition must succeed");
-        assert_eq!(
-            envelope["atomic"]["committed"], true,
-            "envelope: {envelope}"
-        );
-    }
-
-    /// `gtd.complete`: a typo'd key (`resutl` for `result`) must be
-    /// rejected before any write (task status unchanged); a well-formed
-    /// complete still succeeds.
-    #[tokio::test]
-    async fn atomic_gtd_complete_unknown_field_rejected_well_formed_succeeds() {
-        let db_file = NamedTempFile::new().expect("temp db");
-        let db_path = db_file.path().to_str().expect("utf8").to_string();
-
-        let task_id = {
-            let server = isolated_server(&db_path);
-            let resp = dispatch_json(
-                &server,
-                r#"gtd.assign(title="CompleteTypoGuard", status="next")"#,
-            )
-            .await;
-            // Same `full_id` note as the transition test above.
-            resp["results"][0]["result"]["full_id"]
-                .as_str()
-                .expect("full_id")
-                .to_string()
-        };
-
-        // (a) unknown field rejected.
-        let khive_cfg = KhiveConfig::default();
-        let ops = vec![atomic_op(
-            "gtd.complete",
-            serde_json::json!({"id": task_id, "resutl": "typo"}),
-        )];
-        let err = crate::atomic_apply::execute_atomic_ops_file(
-            ops,
-            atomic_cfg(&db_path),
-            &khive_cfg,
-            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
-        )
-        .await
-        .expect_err("typo'd `resutl` must be rejected");
-        assert!(
-            format!("{err:#}").contains("unknown field"),
-            "error: {err:#}"
-        );
-
-        // (b) well-formed complete still succeeds.
-        let ops = vec![atomic_op(
-            "gtd.complete",
-            serde_json::json!({"id": task_id, "result": "shipped"}),
-        )];
-        let envelope = crate::atomic_apply::execute_atomic_ops_file(
-            ops,
-            atomic_cfg(&db_path),
-            &khive_cfg,
-            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
-        )
-        .await
-        .expect("a well-formed gtd.complete must succeed");
-        assert_eq!(
-            envelope["atomic"]["committed"], true,
-            "envelope: {envelope}"
-        );
-    }
-
     // ── ADR-099 B3: delete kind parity, update
     // null/type validation, canonical id resolution, per-op result payloads ──
 
@@ -3506,49 +3179,47 @@ backend = "sessions"
     }
 
     /// An atomic ops-file using an 8-hex-prefix id for
-    /// `update` AND `gtd.transition` must succeed identically to canonical
+    /// `update` AND `delete` must succeed identically to canonical
     /// (which accepts full UUID or an 8+ hex prefix); a non-existent prefix
     /// must error with canonical's error shape ("no record matches
     /// prefix"). Pre-fix, atomic did a bare `Uuid::parse_str` and rejected
     /// any short id outright — the same ops-file that succeeds non-atomically
-    /// (e.g. against `gtd.assign`'s own short `id` output) would fail before
+    /// (e.g. against `create`'s own short `id` output) would fail before
     /// prepare under `--atomic`.
     #[tokio::test]
-    async fn atomic_update_and_gtd_transition_accept_8_hex_prefix_ids() {
+    async fn atomic_update_and_delete_accept_8_hex_prefix_ids() {
         let db_file = NamedTempFile::new().expect("temp db");
         let db_path = db_file.path().to_str().expect("utf8").to_string();
         let khive_cfg = KhiveConfig::default();
 
-        let (entity_full_id, task_full_id) = {
+        let (entity_full_id, doomed_full_id) = {
             let server = isolated_server(&db_path);
-            let resp =
-                dispatch_json(&server, r#"create(kind="concept", name="PrefixEntity")"#).await;
+            let resp = dispatch_json(
+                &server,
+                r#"[create(kind="concept", name="PrefixEntity"), create(kind="concept", name="PrefixDoomed")]"#,
+            )
+            .await;
             let entity_id = resp["results"][0]["result"]["id"]
                 .as_str()
                 .expect("entity id")
                 .to_string();
-            let resp =
-                dispatch_json(&server, r#"gtd.assign(title="PrefixTask", status="next")"#).await;
-            let task_id = resp["results"][0]["result"]["full_id"]
+            let doomed_id = resp["results"][1]["result"]["id"]
                 .as_str()
-                .expect("task full_id")
+                .expect("doomed id")
                 .to_string();
-            (entity_id, task_id)
+            (entity_id, doomed_id)
         };
         let entity_prefix = &entity_full_id[..8];
-        let task_prefix = &task_full_id[..8];
+        let doomed_prefix = &doomed_full_id[..8];
 
-        // (a) 8-hex-prefix update and gtd.transition in the SAME atomic unit
+        // (a) 8-hex-prefix update and delete in the SAME atomic unit
         // both succeed.
         let ops = vec![
             atomic_op(
                 "update",
                 serde_json::json!({"id": entity_prefix, "name": "PrefixEntity-renamed"}),
             ),
-            atomic_op(
-                "gtd.transition",
-                serde_json::json!({"id": task_prefix, "status": "active"}),
-            ),
+            atomic_op("delete", serde_json::json!({"id": doomed_prefix})),
         ];
         let envelope = crate::atomic_apply::execute_atomic_ops_file(
             ops,
@@ -3592,25 +3263,17 @@ backend = "sessions"
 
     /// A committed atomic unit's success output must
     /// carry a canonical-shaped `result` per op (ADR-099 D4), not just
-    /// `{ok, tool, op_index}`. Exercises all five v1-admissible verbs in one
+    /// `{ok, tool, op_index}`. Exercises three v1-admissible verbs in one
     /// unit and asserts the relevant field for each:
-    /// updated name for `update`, the deleted marker for `delete`, edge
-    /// fields for `link`, and the transition/completion shape for the two
-    /// gtd verbs.
+    /// updated name for `update`, the deleted marker for `delete`, and edge
+    /// fields for `link`.
     #[tokio::test]
     async fn atomic_success_results_carry_canonical_shaped_result_per_op() {
         let db_file = NamedTempFile::new().expect("temp db");
         let db_path = db_file.path().to_str().expect("utf8").to_string();
         let khive_cfg = KhiveConfig::default();
 
-        // `transition_task_id` and `complete_task_id` are DELIBERATELY two
-        // separate tasks, not one task chained through both verbs: every
-        // op's prepare pass reads state BEFORE the atomic unit applies any
-        // statement (ADR-099 D1 — prepare is async/read-only, commit is the
-        // one synchronous pass), so a `gtd.transition` and a `gtd.complete`
-        // on the SAME task in the SAME unit would race against each other's
-        // as-yet-uncommitted write, not compose sequentially.
-        let (entity_id, doomed_id, source_id, target_id, transition_task_id, complete_task_id) = {
+        let (entity_id, doomed_id, source_id, target_id) = {
             let server = isolated_server(&db_path);
             let resp = dispatch_json(
                 &server,
@@ -3623,32 +3286,7 @@ backend = "sessions"
                     .expect("id")
                     .to_string()
             };
-            let resp = dispatch_json(
-                &server,
-                r#"gtd.assign(title="ResultTransitionTask", status="next")"#,
-            )
-            .await;
-            let transition_task_id = resp["results"][0]["result"]["full_id"]
-                .as_str()
-                .expect("task full_id")
-                .to_string();
-            let resp = dispatch_json(
-                &server,
-                r#"gtd.assign(title="ResultCompleteTask", status="active")"#,
-            )
-            .await;
-            let complete_task_id = resp["results"][0]["result"]["full_id"]
-                .as_str()
-                .expect("task full_id")
-                .to_string();
-            (
-                id(0),
-                id(1),
-                id(2),
-                id(3),
-                transition_task_id,
-                complete_task_id,
-            )
+            (id(0), id(1), id(2), id(3))
         };
 
         let ops = vec![
@@ -3665,14 +3303,6 @@ backend = "sessions"
                     "relation": "extends",
                 }),
             ),
-            atomic_op(
-                "gtd.transition",
-                serde_json::json!({"id": transition_task_id, "status": "active"}),
-            ),
-            atomic_op(
-                "gtd.complete",
-                serde_json::json!({"id": complete_task_id, "result": "shipped"}),
-            ),
         ];
         let envelope = crate::atomic_apply::execute_atomic_ops_file(
             ops,
@@ -3681,14 +3311,14 @@ backend = "sessions"
             khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
         )
         .await
-        .expect("all five v1-admissible verbs must commit as one unit");
+        .expect("three v1-admissible verbs must commit as one unit");
         assert_eq!(
             envelope["atomic"]["committed"], true,
             "envelope: {envelope}"
         );
 
         let results = envelope["results"].as_array().expect("results array");
-        assert_eq!(results.len(), 5, "envelope: {envelope}");
+        assert_eq!(results.len(), 3, "envelope: {envelope}");
 
         assert_eq!(
             results[0]["result"]["name"], "ResultUpdate-renamed",
@@ -3715,24 +3345,6 @@ backend = "sessions"
         assert_eq!(
             results[2]["result"]["target_id"], target_id,
             "link result must carry target_id: {envelope}"
-        );
-
-        assert_eq!(
-            results[3]["result"]["transitioned"], true,
-            "gtd.transition result: {envelope}"
-        );
-        assert_eq!(
-            results[3]["result"]["to"], "active",
-            "gtd.transition result must carry the new status: {envelope}"
-        );
-
-        assert_eq!(
-            results[4]["result"]["completed"], true,
-            "gtd.complete result: {envelope}"
-        );
-        assert_eq!(
-            results[4]["result"]["to"], "done",
-            "gtd.complete result must carry the terminal status: {envelope}"
         );
     }
 }

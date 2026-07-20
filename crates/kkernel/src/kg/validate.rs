@@ -2586,39 +2586,22 @@ message = "bad"
     }
 
     #[test]
-    fn note_kind_task_is_accepted_as_pack_registered() {
-        // `task` is registered by the GTD pack — must be accepted by the registry check.
+    fn note_kind_template_note_is_accepted_as_pack_registered() {
+        // `template_note` is registered by khive-pack-template (a dev-only
+        // pack here, used to prove taxonomy building isn't hardcoded to the
+        // kg pack's own note kinds) — must be accepted by the registry check.
         let tmp = TempDir::new().unwrap();
         let kg_dir = make_kg_dir(&tmp);
-        write_notes(&kg_dir, &[("note-0001", "task")]);
+        write_notes(&kg_dir, &[("note-0001", "template_note")]);
         let taxonomy = real_taxonomy();
         assert!(
-            taxonomy.note_kinds.contains("task"),
-            "VerbRegistry must include 'task' from GTD pack"
+            taxonomy.note_kinds.contains("template_note"),
+            "VerbRegistry must include 'template_note' from khive-pack-template"
         );
         let result = check_valid_note_kinds(&kg_dir.join("notes.ndjson"), &taxonomy.note_kinds);
         assert!(
             result.passed,
-            "pack-registered note kind 'task' must pass; violations: {:?}",
-            result.violations
-        );
-    }
-
-    #[test]
-    fn note_kind_memory_is_accepted_as_pack_registered() {
-        // `memory` is registered by the memory pack — must be accepted by the registry check.
-        let tmp = TempDir::new().unwrap();
-        let kg_dir = make_kg_dir(&tmp);
-        write_notes(&kg_dir, &[("note-0001", "memory")]);
-        let taxonomy = real_taxonomy();
-        assert!(
-            taxonomy.note_kinds.contains("memory"),
-            "VerbRegistry must include 'memory' from memory pack"
-        );
-        let result = check_valid_note_kinds(&kg_dir.join("notes.ndjson"), &taxonomy.note_kinds);
-        assert!(
-            result.passed,
-            "pack-registered note kind 'memory' must pass; violations: {:?}",
+            "pack-registered note kind 'template_note' must pass; violations: {:?}",
             result.violations
         );
     }

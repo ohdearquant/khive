@@ -57,8 +57,6 @@ behavior isn't written there, it is an unspecified design decision → escalate,
                             ↕ VerbRegistry dispatch
 ┌──────────────────────────────────────────────────────────────┐
 │  khive-pack-kg     — KG vocabulary + 18 verb handlers (ADR-017)     │
-│  khive-pack-gtd    — GTD lifecycle, 5 verbs (ADR-019, optional)     │
-│  khive-pack-memory — memory/recall verbs + feedback + decay (ADR-021, optional)│
 │  khive-vcs         — KG versioning: snapshots/branches (ADR-010)    │
 │  khive-merge       — KG merge algorithm (ADR-039)                   │
 └──────────────────────────────────────────────────────────────┘
@@ -75,7 +73,7 @@ behavior isn't written there, it is an unspecified design decision → escalate,
 └──────────────────────────────────────────────────────────────┘
 ```
 
-Dependency chain (storage stack): `types → score → storage → db → query → runtime → pack-kg / pack-gtd → mcp`.
+Dependency chain (storage stack): `types → score → storage → db → query → runtime → pack-kg → mcp`.
 Side input: `request → mcp` (the DSL parser is consumed only at the MCP dispatch boundary;
 packs do not depend on it).
 
@@ -86,30 +84,28 @@ not shipped.
 
 ## Directory map
 
-| Path                       | Purpose                                                                                                                |
-| -------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
-| `crates/khive-types`       | Domain types: Entity, Note, Event, EntityKind, EdgeRelation, Pack trait                                                |
-| `crates/khive-score`       | Deterministic i64 fixed-point scoring + RRF                                                                            |
-| `crates/khive-storage`     | Trait-only: SqlAccess, GraphStore, VectorStore, TextSearch                                                             |
-| `crates/khive-db`          | SQLite backend; FTS5 trigram TextSearch; current sqlite-vec VectorStore compatibility                                  |
-| `crates/khive-retrieval`   | Hybrid retrieval primitives over dense, lexical, graph, and fusion signals                                             |
-| `crates/khive-fusion`      | RRF, weighted, union, vector-only, and keyword-only fusion strategies                                                  |
-| `crates/khive-bm25`        | BM25 keyword index                                                                                                     |
-| `crates/khive-hnsw`        | HNSW vector index                                                                                                      |
-| `crates/khive-vamana`      | Vamana ANN index used by semantic recall                                                                               |
-| `crates/khive-query`       | GQL + SPARQL parsers, AST validation, SQL compiler                                                                     |
-| `crates/khive-runtime`     | Service API + VerbRegistry + PackRuntime trait                                                                         |
-| `crates/khive-request`     | Request DSL parser (function-call + JSON; pipe/LNDL planned)                                                           |
-| `crates/khive-pack-kg`     | KG pack: vocabulary, 18 verb handlers, kind validation                                                                 |
-| `crates/khive-pack-gtd`    | GTD pack: 5 verbs over notes (assign / next / complete / tasks / transition)                                           |
-| `crates/khive-pack-memory` | Memory pack: `remember`/`recall`/`feedback` verbs, decay-weighted recall ([ADR-021](docs/adr/ADR-021-memory-pack.md))  |
-| `crates/khive-vcs`         | KG versioning: content-addressed snapshots, branch pointers, push/pull ([ADR-010](docs/adr/ADR-010-kg-versioning.md))  |
-| `crates/khive-merge`       | KG merge: three-way merge with LCA walk, conflict enum, strategy shortcuts ([ADR-039](docs/adr/ADR-039-note-merge.md)) |
-| `crates/khive-mcp`         | Stdio MCP binary — single `request` tool over VerbRegistry; auto-spawns daemon                                         |
-| `docs/adr/`                | Architecture Decision Records (the design contract)                                                                    |
-| `marketplace/`             | The `khive` umbrella Claude Code plugin (one skill per pack + kg agents) — install via `/plugin install`               |
-| `tests/smoke_test.py`      | End-to-end binary smoke test (drives every verb via the `request` DSL)                                                 |
-| `scripts/publish.sh`       | Publish all crates to crates.io in dependency order                                                                    |
+| Path                     | Purpose                                                                                                                |
+| ------------------------ | ---------------------------------------------------------------------------------------------------------------------- |
+| `crates/khive-types`     | Domain types: Entity, Note, Event, EntityKind, EdgeRelation, Pack trait                                                |
+| `crates/khive-score`     | Deterministic i64 fixed-point scoring + RRF                                                                            |
+| `crates/khive-storage`   | Trait-only: SqlAccess, GraphStore, VectorStore, TextSearch                                                             |
+| `crates/khive-db`        | SQLite backend; FTS5 trigram TextSearch; current sqlite-vec VectorStore compatibility                                  |
+| `crates/khive-retrieval` | Hybrid retrieval primitives over dense, lexical, graph, and fusion signals                                             |
+| `crates/khive-fusion`    | RRF, weighted, union, vector-only, and keyword-only fusion strategies                                                  |
+| `crates/khive-bm25`      | BM25 keyword index                                                                                                     |
+| `crates/khive-hnsw`      | HNSW vector index                                                                                                      |
+| `crates/khive-vamana`    | Vamana ANN index used by semantic recall                                                                               |
+| `crates/khive-query`     | GQL + SPARQL parsers, AST validation, SQL compiler                                                                     |
+| `crates/khive-runtime`   | Service API + VerbRegistry + PackRuntime trait                                                                         |
+| `crates/khive-request`   | Request DSL parser (function-call + JSON; pipe/LNDL planned)                                                           |
+| `crates/khive-pack-kg`   | KG pack: vocabulary, 18 verb handlers, kind validation                                                                 |
+| `crates/khive-vcs`       | KG versioning: content-addressed snapshots, branch pointers, push/pull ([ADR-010](docs/adr/ADR-010-kg-versioning.md))  |
+| `crates/khive-merge`     | KG merge: three-way merge with LCA walk, conflict enum, strategy shortcuts ([ADR-039](docs/adr/ADR-039-note-merge.md)) |
+| `crates/khive-mcp`       | Stdio MCP binary — single `request` tool over VerbRegistry; auto-spawns daemon                                         |
+| `docs/adr/`              | Architecture Decision Records (the design contract)                                                                    |
+| `marketplace/`           | The `khive` umbrella Claude Code plugin (one skill per pack + kg agents) — install via `/plugin install`               |
+| `tests/smoke_test.py`    | End-to-end binary smoke test (drives every verb via the `request` DSL)                                                 |
+| `scripts/publish.sh`     | Publish all crates to crates.io in dependency order                                                                    |
 
 ---
 
@@ -142,10 +138,10 @@ not silently accepted.
 
 The per-relation **endpoint contract** (which `(source, relation, target)` triples are legal)
 is the ADR-002 base contract _plus_ any pack-declared additions
-([ADR-017](docs/adr/ADR-017-pack-standard.md) §"Pack-extensible edge endpoints"). The GTD pack
-uses this to allow `depends_on` between two `task` notes — base contract alone would reject a
-note source for non-`annotates` relations. Rules are additive only; packs cannot tighten the
-base contract.
+([ADR-017](docs/adr/ADR-017-pack-standard.md) §"Pack-extensible edge endpoints"). A pack that
+registers its own note kind can use this to allow `depends_on` between two notes of that kind —
+base contract alone would reject a note source for non-`annotates` relations. Rules are
+additive only; packs cannot tighten the base contract.
 
 ---
 
@@ -166,19 +162,13 @@ request(ops="[v1(...), v2(...), v3(...)]")
 request(ops="[{\"tool\":\"v1\",\"args\":{...}}, ...]")
 ```
 
-Verbs come from whichever packs are loaded via `KHIVE_PACKS` (env) or `--pack` (CLI). Default
-loads all 8 production packs: kg, gtd, memory, comm, schedule, session,
-workspace, blob (regenerate the verb count via `request(ops="verbs()")` before citing an exact
-figure — it drifts; comm.probe (#644) added 2026-07-07; kg.resolve added 2026-07-09; workspace (#873)
-contributes zero verbs, adding only the `workspace` entity kind and `contains` endpoint rules
-to git/gtd/session notes — the commit/issue/pull_request note kinds those rules name are
-registered by a git-lifecycle pack that is a commercial extension, not part of this
-distribution; blob contributes three verbs, blob.put/blob.get/blob.stat (ADR-111),
-over the `BlobStore` content-addressed storage trait; a normal file-backed boot installs a
-default `FsBlobStore` beside the database file with no config needed, and the verbs stay
-unconfigured only against an in-memory backend; the profile-oriented feedback/learning-loop
-pack (`brain.*`) is a commercial extension distributed separately, not part of this
-distribution — regenerate via `request(ops="verbs()")` before editing this line).
+Verbs come from whichever packs are loaded via `KHIVE_PACKS` (env) or `--pack` (CLI). The
+open-source distribution ships one production pack, `kg`, loaded by default (regenerate the
+verb count via `request(ops="verbs()")` before citing an exact figure — it drifts). Task
+management, memory recall, inter-agent messaging, scheduling, session continuity, workspace
+linking, blob storage, and the profile-oriented feedback/learning-loop pack (`brain.*`) are
+provided by commercially licensed extensions and are not part of this distribution; when
+installed, they load the same way, via `KHIVE_PACKS`/`--pack`.
 
 ### KG pack verbs (18 — ADR-017, ADR-046, ADR-089)
 
@@ -208,29 +198,8 @@ Mixing a granular `kind` with a contradicting `entity_kind`/`note_kind` sub-filt
 | `verbs`     | `category?`, `pack?`                                                                         | List all MCP-callable verbs registered on this server                                            |
 | `context`   | `query?`, `entity_ids?`, `hops?`, `budget?`, `relations?`, `direction?`, `limit?`, `fanout?` | Entity-anchored graph context in one call (ADR-089)                                              |
 
-### GTD pack verbs (5 — ADR-019, optional)
-
-Load with `KHIVE_PACKS=kg,gtd` or `--pack gtd`. Adds the `task` note kind.
-
-| Verb             | Args                                                                         | What it does                                                |
-| ---------------- | ---------------------------------------------------------------------------- | ----------------------------------------------------------- |
-| `gtd.assign`     | `title`, `priority?`, `status?`, `assignee?`, `due?`, `depends_on?`, `tags?` | Create a task (defaults: status=inbox, priority=p2)         |
-| `gtd.next`       | `limit?`, `assignee?`                                                        | List actionable tasks (status ∈ next/active), priority-sort |
-| `gtd.complete`   | `id`, `result?`                                                              | Validate transition → done, record `completed_at`           |
-| `gtd.tasks`      | `status?`, `assignee?`, `priority?`, `limit?`, `offset?`                     | Filtered task listing                                       |
-| `gtd.transition` | `id`, `status`, `note?`                                                      | Explicit lifecycle change with `can_transition` validation  |
-
-### Memory pack verbs (5 — ADR-021, optional)
-
-Load with `KHIVE_PACKS=kg,memory` or `--pack memory`. Adds the `memory` note kind.
-
-| Verb              | Args                                                                                   | What it does                                                                                   |
-| ----------------- | -------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| `memory.remember` | `content`, `salience?`, `decay_factor?`, `memory_type?`, `source_id?`                  | Create a memory note with salience + decay; optionally annotates a source                      |
-| `memory.recall`   | `query`, `limit?`, `min_score?`, `min_salience?`, `memory_type?`, `tags?`, `tag_mode?` | Hybrid FTS + vector recall with RRF fusion, decay-weighted ranking                             |
-| `memory.feedback` | `target_id`, `signal`                                                                  | Emit explicit feedback on a recalled entity; updates recall posteriors                         |
-| `memory.prune`    | `min_salience?`, `before?`, `namespace?`, `dry_run?`                                   | Soft-delete memories below a salience floor and/or past `expires_at` (curation-layer, ADR-014) |
-| `memory.vacuum`   | —                                                                                      | Run SQLite `VACUUM` to reclaim space freed by soft-deleted rows                                |
+Task-management (`gtd.*`) and memory-recall (`memory.*`) verbs are provided by commercially
+licensed extensions and are not part of the open-source distribution.
 
 `get`/`update`/`delete`/`merge` are UUID-only — no `kind` needed, the handler resolves
 the substrate from the UUID. `create`/`list`/`search` require `kind`.
@@ -343,10 +312,9 @@ Conventional commits with crate scope: `feat(query): add SPARQL property filter`
 - **Verify before claiming complete.** Run the test, check the output.
 - **Report outcomes faithfully.** If tests fail, say so.
 - **Integration > unit** for the MCP surface — the value is in the composition.
-- **Smoke test**: `python3 tests/smoke_test.py` drives every verb through the `request` tool
-  end-to-end (KG verbs in the default run; GTD verbs in the post-pass when both packs are
-  loaded). Asserts `tools/list` returns only `request` and that its description carries the
-  full verb catalog.
+- **Smoke test**: `python3 tests/smoke_test.py` drives every `kg` verb through the `request`
+  tool end-to-end. Asserts `tools/list` returns only `request` and that its description
+  carries the full verb catalog.
 
 ---
 

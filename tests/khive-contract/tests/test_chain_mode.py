@@ -19,7 +19,7 @@ import pytest
 from khive_contract.client import KhiveMcpSession, KhiveRpcError
 from khive_contract.schema import assert_envelope
 
-VERBS_UNDER_TEST = {"create", "get", "link", "update", "gtd.assign", "gtd.complete"}
+VERBS_UNDER_TEST = {"create", "get", "link", "update"}
 
 # ---------------------------------------------------------------------------
 # Skip entire module when the MCP binary is not present.
@@ -40,61 +40,6 @@ pytestmark = [
     pytest.mark.adr_016,
     pytest.mark.slow,
 ]
-
-
-# ---------------------------------------------------------------------------
-# Case 1: GTD chain — assign then complete via $prev.id
-#
-# `gtd.assign(title='x') | gtd.complete(id=$prev.id)`
-# Both ops must succeed; completed task must have status "done".
-# ---------------------------------------------------------------------------
-
-
-def test_chain_assign_then_complete(
-    khive_gtd_session: KhiveMcpSession,
-    temp_namespace: str,
-) -> None:
-    """Chain: assign a task then complete it using $prev.id.
-
-    ADR: ADR-016
-    section: Chain semantics; $prev substitution
-
-    Asserts:
-    - Both ops ok=True.
-    - Summary: total=2, succeeded=2, failed=0, aborted=0.
-    - Completed task status is "done".
-    """
-    ns = temp_namespace
-    title = f"ChainAssignComplete_{uuid.uuid4().hex[:6]}"
-
-    # gtd.assign defaults to inbox; complete rejects inbox→done directly (ADR-462).
-    # Assign with status="next" so gtd.complete can run immediately via $prev.id.
-    ops = (
-        f'gtd.assign(title="{title}", status="next", namespace="{ns}")'
-        f' | gtd.complete(id=$prev.id, namespace="{ns}")'
-    )
-    envelope = khive_gtd_session.request(ops)
-
-    assert_envelope(envelope)
-    results = envelope["results"]
-    summary = envelope.get("summary", {})
-
-    assert len(results) == 2, f"Expected 2 results, got {len(results)}: {results}"
-    assert results[0].get("ok") is True, f"assign failed: {results[0]}"
-    assert results[1].get("ok") is True, f"complete failed: {results[1]}"
-
-    assert summary.get("total") == 2, f"summary.total != 2: {summary}"
-    assert summary.get("succeeded") == 2, f"summary.succeeded != 2: {summary}"
-    assert summary.get("failed") == 0, f"summary.failed != 0: {summary}"
-    assert summary.get("aborted") == 0, f"summary.aborted != 0: {summary}"
-
-    # Per P-H2 (ADR-045): get returns flat object — no {data: ...} wrapper.
-    # Verify the completed task has status "done"
-    task_id = results[1]["result"]["id"]
-    fetched = khive_gtd_session.verb("get", {"id": task_id, "namespace": ns})
-    assert fetched.get("status") == "done", (
-        f"Completed task status must be 'done', got: {fetched.get('status')}"
-    )
 
 
 # ---------------------------------------------------------------------------

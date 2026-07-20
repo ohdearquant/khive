@@ -31,10 +31,17 @@ pub mod vector;
 #[doc(hidden)]
 #[allow(unused_imports)]
 mod _pack_links {
-    use khive_pack_comm::CommPack as _;
-    use khive_pack_gtd::GtdPack as _;
     use khive_pack_kg::KgPack as _;
-    use khive_pack_memory::MemoryPack as _;
-    use khive_pack_schedule::SchedulePack as _;
-    use khive_pack_session::SessionPack as _;
+}
+
+// Test-only: force-link `khive-pack-template` (a dev-dependency) so its
+// `inventory::submit!` registration is visible to this crate's test binary —
+// tests that need a second, non-`kg` pack (for registry/taxonomy variety,
+// multi-backend routing, etc.) dispatch through `template.my_verb` / the
+// `template_note` note kind instead of a removed pack.
+#[cfg(test)]
+#[doc(hidden)]
+#[allow(unused_imports)]
+mod _test_pack_links {
+    use khive_pack_template::TemplatePack as _;
 }

@@ -7,8 +7,7 @@ MCP server exposes a single tool, `request` (ADR-016 + ADR-027), that accepts
 a function-call DSL or JSON-form batch; every verb is reached through it.
 
 Verb semantics (unchanged from v0.1): create, get, list, update, delete, merge,
-search, link, neighbors, traverse, query — plus the gtd pack's assign, next,
-complete, tasks, transition when KHIVE_PACKS=...,gtd.
+search, link, neighbors, traverse, query — the full kg-pack verb surface.
 get/update/delete/merge auto-detect record kind from UUID — no kind= needed.
 get returns {"kind": "entity"|"note"|"edge", "data": {...}}.
 
@@ -196,31 +195,17 @@ def main():
         assert "total" in verbs_result, f"verbs must return 'total' key: {verbs_result}"
         assert isinstance(verbs_result["verbs"], list), f"verbs must be a list: {verbs_result}"
         # Surface-contract tripwire: the default config (no --pack, KHIVE_PACKS
-        # unset) loads 8 production packs (kg, gtd, memory, comm, schedule,
-        # session, workspace, blob), so verbs() returns exactly
-        # 46 user-facing MCP-callable verbs (count what verbs() returns, not internal
-        # dispatch arms). The session pack contributes 4 agent-facing T1 verbs
-        # (store/list/resume/export), promoted from internal subhandlers to
-        # Visibility::Verb per ADR-083; context
-        # (ADR-089, the 17th kg-substrate bare verb), resolve (unified-verb
-        # draft ADR Slice 1, the 18th kg-substrate bare verb), comm.health
-        # (#606, verified live 2026-07-04), and comm.probe (#644 read-only
-        # inbound poll) are included in the count;
-        # workspace (#873) contributes zero verbs, adding only the
-        # `workspace` entity kind and `contains` endpoint rules; blob
-        # contributes three verbs (blob.put / blob.get / blob.stat, ADR-111)
-        # over the `BlobStore` CAS trait, unconfigured (erroring at dispatch)
-        # until a backend is installed via [storage.blob] or KHIVE_BLOB_ROOT.
+        # unset) loads the single production pack (kg), so verbs() returns
+        # exactly 18 user-facing MCP-callable verbs (count what verbs()
+        # returns, not internal dispatch arms). context (ADR-089, the 17th
+        # kg-substrate bare verb) and resolve (unified-verb draft ADR Slice 1,
+        # the 18th) are included in the count.
         # Update this number when the pack set or verb surface changes; a
         # silent drift here is the bug this assertion exists to catch.
-        assert verbs_result["total"] == 46, (
-            f"expected 46 user-facing verbs from the 8 default packs "
-            f"(session contributes 4 T1 verbs promoted to Visibility::Verb per "
-            f"ADR-083; context is the 17th kg-substrate bare verb per ADR-089; "
-            f"resolve is the 18th kg-substrate bare verb per the unified-verb "
-            f"draft ADR Slice 1; comm.health is #606; comm.probe is #644; "
-            f"workspace (#873) contributes zero verbs; "
-            f"blob contributes blob.put/blob.get/blob.stat per ADR-111), "
+        assert verbs_result["total"] == 18, (
+            f"expected 18 user-facing verbs from the default kg pack "
+            f"(context is the 17th kg-substrate bare verb per ADR-089; "
+            f"resolve is the 18th per the unified-verb draft ADR Slice 1), "
             f"got {verbs_result['total']}: {verbs_result}"
         )
         verb_names = [v["verb"] for v in verbs_result["verbs"]]
@@ -459,198 +444,6 @@ def main():
     return 0
 
 
-def gtd_smoke():
-    """Optional smoke test for the gtd pack — only runs if KHIVE_PACKS=...,gtd."""
-    env = {**os.environ, "KHIVE_NO_DAEMON": "1"}
-    proc = subprocess.Popen(
-        [
-            BINARY, "mcp", "--db", ":memory:", "--no-embed", "--log", "error",
-            "--pack", "kg", "--pack", "gtd",
-        ],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=env,
-    )
-    try:
-        send(proc, "initialize", {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": {"name": "gtd-smoke", "version": "0.1.0"},
-        })
-        recv(proc)
-        notify = {"jsonrpc": "2.0", "method": "notifications/initialized"}
-        proc.stdin.write((json.dumps(notify) + "\n").encode())
-        proc.stdin.flush()
-
-        # gtd.assign → gtd.next → gtd.complete round-trip
-        assigned = call_verb(proc, "gtd.assign", {
-            "title": "ship pack-gtd",
-            "status": "next",
-            "priority": "p0",
-        })
-        assert assigned["kind"] == "task"
-        assert assigned["status"] == "next"
-        print(f"  [gtd] gtd.assign — {assigned['title']!r} ({assigned['id']})")
-
-        ready = call_verb(proc, "gtd.next", {})
-        assert any(t["full_id"] == assigned["full_id"] for t in ready), (
-            f"assigned task not in gtd.next(): {ready}"
-        )
-        print(f"  [gtd] gtd.next — {len(ready)} actionable")
-
-        done = call_verb(proc, "gtd.complete", {
-            "id": assigned["full_id"],
-            "result": "smoke-test pass",
-        })
-        assert done["to"] == "done"
-        print(f"  [gtd] gtd.complete — transitioned to done")
-
-        # gtd.tasks: list tasks filtered by status
-        t1 = call_verb(proc, "gtd.assign", {
-            "title": "waiting task",
-            "status": "waiting",
-            "priority": "p1",
-        })
-        t2 = call_verb(proc, "gtd.assign", {
-            "title": "inbox task",
-            "status": "inbox",
-            "priority": "p2",
-        })
-        waiting_tasks = call_verb(proc, "gtd.tasks", {"status": "waiting"})
-        assert isinstance(waiting_tasks, list), f"gtd.tasks must return a list, got: {waiting_tasks}"
-        waiting_ids = [t["full_id"] for t in waiting_tasks]
-        assert t1["full_id"] in waiting_ids, (
-            f"'waiting task' must appear in gtd.tasks(status=waiting): {waiting_ids}"
-        )
-        assert t2["full_id"] not in waiting_ids, (
-            f"'inbox task' must NOT appear in gtd.tasks(status=waiting): {waiting_ids}"
-        )
-        print(f"  [gtd] gtd.tasks(status=waiting) — {len(waiting_tasks)} task(s)")
-
-        # gtd.transition: explicit lifecycle change with validation
-        trans = call_verb(proc, "gtd.transition", {
-            "id": t2["full_id"],
-            "status": "next",
-            "note": "promoted from inbox",
-        })
-        assert trans["transitioned"] is True, f"gtd.transition must set transitioned=true: {trans}"
-        assert trans["to"] == "next", f"gtd.transition must report to=next: {trans}"
-        print(f"  [gtd] gtd.transition inbox→next — ok")
-
-        # gtd.transition: idempotent (same status) must not error
-        trans_idem = call_verb(proc, "gtd.transition", {
-            "id": t2["full_id"],
-            "status": "next",
-        })
-        assert trans_idem["transitioned"] is False, (
-            f"idempotent gtd.transition must set transitioned=false: {trans_idem}"
-        )
-        print(f"  [gtd] gtd.transition idempotent — ok")
-
-        print(f"\n  GTD PACK SMOKE TESTS PASSED")
-    finally:
-        proc.stdin.close()
-        proc.wait(timeout=5)
-
-
-def memory_smoke():
-    """Optional smoke test for the memory pack — exercises remember and recall."""
-    env = {**os.environ, "KHIVE_NO_DAEMON": "1"}
-    proc = subprocess.Popen(
-        [
-            BINARY, "mcp", "--db", ":memory:", "--no-embed", "--log", "error",
-            "--pack", "kg", "--pack", "memory",
-        ],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=env,
-    )
-    try:
-        send(proc, "initialize", {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": {"name": "memory-smoke", "version": "0.1.0"},
-        })
-        recv(proc)
-        notify = {"jsonrpc": "2.0", "method": "notifications/initialized"}
-        proc.stdin.write((json.dumps(notify) + "\n").encode())
-        proc.stdin.flush()
-
-        # memory.remember: store a memory note
-        mem = call_verb(proc, "memory.remember", {
-            "content": "khive uses SQLite with FTS5 and sqlite-vec for hybrid search",
-            "salience": 0.9,
-            "memory_type": "semantic",
-        })
-        assert mem is not None, "memory.remember must return a result"
-        mem_id = mem["id"]
-        assert mem_id, f"memory.remember must return an id: {mem}"
-        print(f"  [memory] memory.remember — id {str(mem_id)[:8]}...")
-
-        # memory.remember: second memory with different content
-        mem2 = call_verb(proc, "memory.remember", {
-            "content": "The runtime enforces namespace isolation for every ID-based operation",
-            "salience": 0.7,
-            "memory_type": "semantic",
-        })
-        assert mem2 is not None, "second memory.remember must return a result"
-        print(f"  [memory] memory.remember (second) — ok")
-
-        # memory.recall: returns a list (possibly empty with --no-embed, FTS still works)
-        hits = call_verb(proc, "memory.recall", {
-            "query": "SQLite hybrid search",
-            "limit": 5,
-        })
-        assert isinstance(hits, list), f"memory.recall must return a list, got: {hits}"
-        print(f"  [memory] memory.recall — {len(hits)} hit(s)")
-
-        # memory.prune dry-run: count candidates without deleting.
-        # Result shape from prune.rs:121-127: {"pruned": 0, "dry_run": true, "would_prune": int, "namespace": str}.
-        prune_dry = call_verb(proc, "memory.prune", {
-            "min_salience": 0.5,
-            "before": 0,  # 0 = skip expiry filter (prune.rs:101-102: Some(0) => None)
-            "dry_run": True,
-        })
-        assert prune_dry.get("dry_run") is True, f"dry_run response must set dry_run=true: {prune_dry}"
-        assert "would_prune" in prune_dry, f"dry_run response must include would_prune key: {prune_dry}"
-        print(f"  [memory] memory.prune(dry_run=True) — would_prune={prune_dry['would_prune']}")
-
-        # Store a low-salience memory so the real prune has something to delete.
-        mem_low = call_verb(proc, "memory.remember", {
-            "content": "ephemeral low-salience note for prune coverage test",
-            "salience": 0.1,
-            "memory_type": "episodic",
-        })
-        assert mem_low is not None, "low-salience memory.remember must return a result"
-
-        # memory.prune real run: salience < 0.2 filter removes the 0.1-salience memory.
-        # before=0 skips expiry filter (NULL expires_at rows are safe regardless).
-        # Result shape from prune.rs:138-142: {"pruned": int, "dry_run": false, "namespace": str}.
-        prune_result = call_verb(proc, "memory.prune", {
-            "min_salience": 0.2,
-            "before": 0,
-        })
-        assert prune_result.get("dry_run") is False, f"real prune must set dry_run=false: {prune_result}"
-        assert "pruned" in prune_result, f"prune response must include pruned count: {prune_result}"
-        assert prune_result["pruned"] >= 1, (
-            f"at least the 0.1-salience memory must be pruned: {prune_result}"
-        )
-        print(f"  [memory] memory.prune — pruned={prune_result['pruned']}")
-
-        # memory.vacuum: reclaim space freed by soft-deleted rows.
-        # Result shape from prune.rs:156-158: {"ok": true}.
-        vacuum_result = call_verb(proc, "memory.vacuum", {})
-        assert vacuum_result.get("ok") is True, f"memory.vacuum must return ok=true: {vacuum_result}"
-        print(f"  [memory] memory.vacuum — ok")
-
-        print(f"\n  MEMORY PACK SMOKE TESTS PASSED")
-    finally:
-        proc.stdin.close()
-        proc.wait(timeout=5)
-
-
 def epistemic_smoke():
     """E2E smoke test for supports/refutes epistemic edge relations (ADR-055).
 
@@ -837,226 +630,6 @@ def epistemic_smoke():
         proc.wait(timeout=5)
 
 
-def comm_smoke():
-    """Optional smoke test for the comm pack -- send, inbox, read, reply, and thread."""
-    env = {**os.environ, "KHIVE_NO_DAEMON": "1"}
-    proc = subprocess.Popen(
-        [
-            BINARY, "mcp", "--db", ":memory:", "--no-embed", "--log", "error",
-            "--pack", "kg", "--pack", "comm",
-        ],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=env,
-    )
-    try:
-        send(proc, "initialize", {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": {"name": "comm-smoke", "version": "0.1.0"},
-        })
-        recv(proc)
-        notify = {"jsonrpc": "2.0", "method": "notifications/initialized"}
-        proc.stdin.write((json.dumps(notify) + "\n").encode())
-        proc.stdin.flush()
-
-        # comm.send: send a message to the local actor so it appears in the inbox.
-        # comm.inbox filters by to_actor matching the caller's actor id ("local" in
-        # the test environment), so the recipient must be "local" for inbox visibility.
-        sent = call_verb(proc, "comm.send", {
-            "to": "local",
-            "subject": "smoke-subject",
-            "content": "smoke comm message",
-        })
-        assert sent.get("full_id"), f"comm.send must return a full_id: {sent}"
-        print(f"  [comm] comm.send -- {sent['full_id'][:8]}...")
-
-        # comm.inbox: the inbound copy of the sent message must be visible
-        inbox_result = call_verb(proc, "comm.inbox", {})
-        messages = inbox_result.get("messages", [])
-        assert len(messages) >= 1, (
-            f"comm.inbox must return at least one message after send: {inbox_result}"
-        )
-        assert any("smoke comm message" in str(m) for m in messages), (
-            f"sent message content must appear in comm.inbox: {messages}"
-        )
-        # Grab the first inbound message's full_id for subsequent operations
-        inbound_full_id = messages[0].get("full_id") or messages[0].get("id")
-        assert inbound_full_id, f"inbox message must have a full_id or id: {messages[0]}"
-        print(f"  [comm] comm.inbox -- {len(messages)} message(s)")
-
-        # comm.read: mark the inbound message as read
-        read_result = call_verb(proc, "comm.read", {"id": inbound_full_id})
-        assert read_result.get("read") is True, (
-            f"comm.read must return read=true: {read_result}"
-        )
-        print(f"  [comm] comm.read -- ok")
-
-        # comm.reply: send a reply threaded on the original inbound message
-        reply = call_verb(proc, "comm.reply", {
-            "id": inbound_full_id,
-            "content": "smoke reply",
-        })
-        assert reply.get("full_id"), f"comm.reply must return a full_id: {reply}"
-        print(f"  [comm] comm.reply -- {reply['full_id'][:8]}...")
-
-        # comm.thread: retrieve the full thread; must contain both messages in order
-        thread = call_verb(proc, "comm.thread", {"id": inbound_full_id})
-        thread_messages = thread.get("messages", [])
-        assert thread.get("count", 0) >= 2, (
-            f"thread must contain at least 2 messages; got count={thread.get('count')}: {thread}"
-        )
-        thread_text = str(thread_messages)
-        assert "smoke comm message" in thread_text, (
-            f"original content must appear in thread: {thread_messages}"
-        )
-        assert "smoke reply" in thread_text, (
-            f"reply content must appear in thread: {thread_messages}"
-        )
-        print(f"  [comm] comm.thread -- {thread['count']} message(s) in thread")
-
-        print(f"\n  COMM PACK SMOKE TESTS PASSED")
-    finally:
-        proc.stdin.close()
-        proc.wait(timeout=5)
-
-
-def schedule_smoke():
-    """Optional smoke test for the schedule pack -- remind, agenda, cancel, and schedule.
-
-    schedule.remind requires the registered comm.send delivery capability at
-    creation time (khive-pack-schedule/README.md "Usage"; khive-pack-comm/README.md
-    "Where this sits"): the schedule pack itself only requires kg, but remind
-    specifically fails fast without comm loaded. Verify both sides of that
-    contract -- the loud rejection with kg+schedule only, and the happy path
-    with kg+comm+schedule.
-    """
-    future_at = (
-        datetime.now(timezone.utc) + timedelta(days=30)
-    ).strftime("%Y-%m-%dT%H:%M:%S") + "Z"
-
-    env = {**os.environ, "KHIVE_NO_DAEMON": "1"}
-
-    # Without comm loaded, schedule.remind must be rejected before any
-    # scheduled_event note is persisted -- fail fast, not silently degrade.
-    no_comm_proc = subprocess.Popen(
-        [
-            BINARY, "mcp", "--db", ":memory:", "--no-embed", "--log", "error",
-            "--pack", "kg", "--pack", "schedule",
-        ],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=env,
-    )
-    try:
-        send(no_comm_proc, "initialize", {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": {"name": "schedule-smoke-no-comm", "version": "0.1.0"},
-        })
-        recv(no_comm_proc)
-        notify = {"jsonrpc": "2.0", "method": "notifications/initialized"}
-        no_comm_proc.stdin.write((json.dumps(notify) + "\n").encode())
-        no_comm_proc.stdin.flush()
-
-        try:
-            call_verb(no_comm_proc, "schedule.remind", {
-                "content": "should be rejected without comm",
-                "at": future_at,
-            })
-            raise AssertionError(
-                "schedule.remind must fail without the comm pack loaded"
-            )
-        except RuntimeError as e:
-            assert "comm" in str(e).lower(), (
-                f"expected 'comm' delivery-capability hint in rejection; got: {e}"
-            )
-        print("  [schedule] schedule.remind without comm pack -- rejected as expected")
-    finally:
-        no_comm_proc.stdin.close()
-        no_comm_proc.wait(timeout=5)
-
-    proc = subprocess.Popen(
-        [
-            BINARY, "mcp", "--db", ":memory:", "--no-embed", "--log", "error",
-            "--pack", "kg", "--pack", "comm", "--pack", "schedule",
-        ],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=env,
-    )
-    try:
-        send(proc, "initialize", {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": {"name": "schedule-smoke", "version": "0.1.0"},
-        })
-        recv(proc)
-        notify = {"jsonrpc": "2.0", "method": "notifications/initialized"}
-        proc.stdin.write((json.dumps(notify) + "\n").encode())
-        proc.stdin.flush()
-
-        # schedule.remind: create a time-triggered reminder 30 days in the future
-        remind = call_verb(proc, "schedule.remind", {
-            "content": "smoke reminder",
-            "at": future_at,
-        })
-        assert remind.get("status") == "pending", (
-            f"schedule.remind must return status=pending: {remind}"
-        )
-        remind_full_id = remind["full_id"]
-        print(f"  [schedule] schedule.remind -- {remind_full_id[:8]}... at {future_at[:10]}")
-
-        # schedule.agenda: the reminder must appear in the pending agenda
-        agenda1 = call_verb(proc, "schedule.agenda", {})
-        agenda_ids = [e.get("full_id") for e in agenda1.get("events", [])]
-        assert remind_full_id in agenda_ids, (
-            f"reminder must appear in schedule.agenda after creation: {agenda_ids}"
-        )
-        print(f"  [schedule] schedule.agenda -- {agenda1['count']} pending event(s)")
-
-        # schedule.cancel: cancel the reminder; it must disappear from the pending agenda
-        cancelled = call_verb(proc, "schedule.cancel", {"id": remind_full_id})
-        assert cancelled.get("status") == "cancelled", (
-            f"schedule.cancel must return status=cancelled: {cancelled}"
-        )
-        print(f"  [schedule] schedule.cancel -- ok")
-
-        agenda2 = call_verb(proc, "schedule.agenda", {})
-        agenda_ids2 = [e.get("full_id") for e in agenda2.get("events", [])]
-        assert remind_full_id not in agenda_ids2, (
-            f"cancelled event must not appear in schedule.agenda: {agenda_ids2}"
-        )
-        print(f"  [schedule] schedule.agenda post-cancel -- {agenda2['count']} pending event(s)")
-
-        # schedule.schedule: schedule a future verb dispatch and verify it appears in agenda
-        action = f'schedule.remind(content="scheduled action", at="{future_at}")'
-        scheduled = call_verb(proc, "schedule.schedule", {
-            "action": action,
-            "at": future_at,
-        })
-        assert scheduled.get("status") == "pending", (
-            f"schedule.schedule must return status=pending: {scheduled}"
-        )
-        scheduled_full_id = scheduled["full_id"]
-        print(f"  [schedule] schedule.schedule -- {scheduled_full_id[:8]}...")
-
-        agenda3 = call_verb(proc, "schedule.agenda", {})
-        agenda_ids3 = [e.get("full_id") for e in agenda3.get("events", [])]
-        assert scheduled_full_id in agenda_ids3, (
-            f"scheduled action must appear in schedule.agenda: {agenda_ids3}"
-        )
-        print(f"  [schedule] schedule.agenda post-schedule -- {agenda3['count']} pending event(s)")
-
-        print(f"\n  SCHEDULE PACK SMOKE TESTS PASSED")
-    finally:
-        proc.stdin.close()
-        proc.wait(timeout=5)
-
-
 if __name__ == "__main__":
     failed_sections: list[str] = []
 
@@ -1064,40 +637,12 @@ if __name__ == "__main__":
     if code != 0:
         failed_sections.append("kg")
 
-    if os.environ.get("KHIVE_SMOKE_GTD", "1") != "0":
-        try:
-            gtd_smoke()
-        except Exception as e:
-            print(f"  [gtd FAIL] {e}")
-            failed_sections.append("gtd")
-
-    if os.environ.get("KHIVE_SMOKE_MEMORY", "1") != "0":
-        try:
-            memory_smoke()
-        except Exception as e:
-            print(f"  [memory FAIL] {e}")
-            failed_sections.append("memory")
-
     if os.environ.get("KHIVE_SMOKE_EPISTEMIC", "1") != "0":
         try:
             epistemic_smoke()
         except Exception as e:
             print(f"  [epistemic FAIL] {e}")
             failed_sections.append("epistemic")
-
-    if os.environ.get("KHIVE_SMOKE_COMM", "1") != "0":
-        try:
-            comm_smoke()
-        except Exception as e:
-            print(f"  [comm FAIL] {e}")
-            failed_sections.append("comm")
-
-    if os.environ.get("KHIVE_SMOKE_SCHEDULE", "1") != "0":
-        try:
-            schedule_smoke()
-        except Exception as e:
-            print(f"  [schedule FAIL] {e}")
-            failed_sections.append("schedule")
 
     if failed_sections:
         print(f"\nFAILED sections: {', '.join(failed_sections)}", file=sys.stderr)

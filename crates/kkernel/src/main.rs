@@ -746,6 +746,14 @@ mod tests {
     use serial_test::serial;
     use tempfile::TempDir;
 
+    // Force-link `khive-pack-template` (a dev-dependency only) so its
+    // `inventory::submit!` registration is visible to this bin target's own
+    // test binary — mirrors the same force-link in `kkernel::lib`'s
+    // `_test_pack_links` (this bin target compiles independently of the lib
+    // crate's `#[cfg(test)]` items).
+    #[allow(unused_imports)]
+    use khive_pack_template::TemplatePack as _TemplatePack;
+
     // A schema check must be read-only: it must not create a missing database,
     // and it must not migrate (mutate) an existing one. Regression for the
     // finding that `db check` ran migrations via the read-only runtime path.
@@ -1218,7 +1226,7 @@ mod tests {
                     read_only: false,
                 },
                 khive_runtime::BackendConfig {
-                    name: "sessions".to_string(),
+                    name: "secondary".to_string(),
                     kind: khive_runtime::BackendKind::Memory,
                     path: None,
                     cache_mb: None,
@@ -1229,9 +1237,9 @@ mod tests {
             packs: {
                 let mut m = std::collections::HashMap::new();
                 m.insert(
-                    "session".to_string(),
+                    "template".to_string(),
                     PackConfig {
-                        backend: "sessions".to_string(),
+                        backend: "secondary".to_string(),
                     },
                 );
                 m
@@ -1240,7 +1248,7 @@ mod tests {
         };
 
         let base_cfg = RuntimeConfig {
-            packs: vec!["kg".to_string(), "session".to_string()],
+            packs: vec!["kg".to_string(), "template".to_string()],
             ..base_multi_backend_runtime_config()
         };
 

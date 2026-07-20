@@ -1,33 +1,29 @@
 # khive — Claude Code plugin
 
-One plugin for the whole khive surface: a knowledge graph, GTD, memory, inter-agent comm,
-and scheduling, all served by a single MCP server (`kkernel mcp`)
-exposing one tool — `request` — that dispatches 46 verbs across 8 packs.
+One plugin for the khive knowledge graph surface, served by a single MCP server
+(`kkernel mcp`) exposing one tool — `request` — that dispatches the 18 verbs of the
+`kg` pack.
 
-This plugin is **guidance, not a second runtime**. It ships the pattern skills that teach an
-agent how to use each pack well, plus the kg stewardship agents. The data and verbs live in the
-MCP server; install and configure that per [INSTALL.md](../INSTALL.md).
+This plugin is **guidance, not a second runtime**. It ships the pattern skill that teaches an
+agent how to use the `kg` pack well, plus the kg stewardship agents. The data and verbs live in
+the MCP server; install and configure that per [INSTALL.md](../INSTALL.md).
 
 ## Configure your actor first
 
 Every record you write is stamped with **who you are** (`from_actor`), resolved from the MCP
-server's actor config. If it is unset it silently defaults to `"local"`, which leaves your
-messages unattributed and your `comm.inbox` unscoped. Set `KHIVE_ACTOR=lambda:<your-id>` in the
-server env (or pass `--actor`) before you start. See
+server's actor config. If it is unset it silently defaults to `"local"`. Set
+`KHIVE_ACTOR=lambda:<your-id>` in the server env (or pass `--actor`) before you start. See
 [INSTALL.md → Set your actor identity](../INSTALL.md#set-your-actor-identity-attribution).
 
-## Pattern skills (one per pack)
+## Pattern skill
 
-Each skill teaches the _reusable pattern_ for its pack, not a how-to for every verb. Per-verb
-parameter detail is always one call away at runtime: `request(ops="<verb>(help=true)")`.
+The skill teaches the _reusable pattern_ for the `kg` pack, not a how-to for every verb.
+Per-verb parameter detail is always one call away at runtime:
+`request(ops="<verb>(help=true)")`.
 
-| Skill      | Pack     | The pattern it teaches                                                                     |
-| ---------- | -------- | ------------------------------------------------------------------------------------------ |
-| `kg`       | kg       | Search before you create; model as typed entities + edges; explore; propose                |
-| `gtd`      | gtd      | Capture with an assignee, process the inbox, advance the lifecycle, complete with evidence |
-| `memory`   | memory   | Store-before-recall with honest salience; recall before acting                             |
-| `comm`     | comm     | Be attributable, address by actor with a subject, triage, reply to thread                  |
-| `schedule` | schedule | `remind` for prompts vs `schedule` for deferred verb dispatch; agenda; cancel              |
+| Skill | Pack | The pattern it teaches                                                       |
+| ----- | ---- | ------------------------------------------------------------------------------ |
+| `kg`  | kg   | Search before you create; model as typed entities + edges; explore; propose  |
 
 ## kg stewardship agents
 
@@ -47,19 +43,14 @@ Once installed, invoke them as `khive:digester`, `khive:polisher`, and so on.
 
 ## Requirements
 
-The `kg` pack is the base (entities, edges, notes); every other pack builds on it. The default
-server config loads all eight (`kg`, `gtd`, `memory`, `comm`, `schedule`,
-`session`, `workspace`, `blob` — `workspace` contributes entity/endpoint vocabulary,
-no verbs; `blob` contributes `blob.put`/`blob.get`/`blob.stat` over a
-content-addressed storage trait, ADR-111) —
-this plugin currently ships pattern skills for the first five; `session`, `workspace`,
-and `blob` have no skill yet (see the Pattern skills table above).
-The `brain` pack (`brain.*` verbs — Bayesian recall-tuning profiles) is a commercially
-licensed extension distributed separately; it is not part of this distribution.
-Git provenance ingestion and write verbs (`git.digest`, `git.commit`, `git.branch`,
-`git.push`) are provided by a commercially licensed extension and are not part of
-this distribution.
-See [INSTALL.md](../INSTALL.md) for setup, the actor config, and per-pack smoke tests.
+The `kg` pack is the base (entities, edges, notes) and the default server config loads it
+alone. Task management, memory, inter-agent communication, scheduling, session continuity,
+workspace linking, blob storage, and brain profiles (`brain.*` verbs — Bayesian
+recall-tuning) are provided by commercially licensed extensions and are not part of this
+distribution; this plugin ships a pattern skill only for `kg`. Git provenance ingestion and
+write verbs (`git.digest`, `git.commit`, `git.branch`, `git.push`) are likewise a
+commercially licensed extension.
+See [INSTALL.md](../INSTALL.md) for setup, the actor config, and the smoke test.
 
 ## Links
 

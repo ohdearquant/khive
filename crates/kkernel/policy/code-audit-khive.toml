@@ -11,7 +11,7 @@
 #
 # Ranks below are the longest-path depth of each crate's PRODUCTION
 # `[dependencies]` graph (dev-dependencies excluded — several packs carry
-# deliberate cyclic dev-only test deps, e.g. khive-pack-kg/khive-pack-gtd;
+# deliberate cyclic dev-only test deps;
 # production dependencies among them do
 # not cycle). Every ingested `project` in the code map must appear here — the
 # Rust crates under `crates/` and every other manifest `code.ingest` resolves
@@ -50,18 +50,10 @@ khive-db = 3
 khive-hnsw = 3
 khive-retrieval = 4
 khive-runtime = 4
-khive-brain-core = 5
 khive-merge = 5
-khive-pack-blob = 5
-khive-pack-comm = 5
-khive-pack-gtd = 5
 khive-pack-kg = 5
-khive-pack-schedule = 5
-khive-pack-session = 5
 khive-pack-template = 5
-khive-pack-workspace = 5
 khive-vcs = 5
-khive-pack-memory = 6
 khive-mcp = 7
 kkernel = 8
 

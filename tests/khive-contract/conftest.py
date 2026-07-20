@@ -29,34 +29,12 @@ def khive_session() -> Iterator[KhiveMcpSession]:
 
     ADR: ADR-027 (single-tool MCP surface)
     Spawn config: packs=("kg",), db=":memory:", no_embed=True, log="error".
+
+    kg is the sole pack in this OSS distribution — gtd/memory/comm/schedule/
+    session/blob are commercially licensed extensions loaded the same way
+    (KHIVE_PACKS / --pack) but not present in this binary.
     """
     with KhiveMcpSession(packs=("kg",), db=":memory:", no_embed=True, log="error") as session:
-        yield session
-
-
-@pytest.fixture(scope="session")
-def khive_gtd_session() -> Iterator[KhiveMcpSession]:
-    """KG + GTD MCP session.
-
-    ADR: ADR-019 (GTD pack)
-    Spawn config: packs=("kg", "gtd"), db=":memory:", no_embed=True, log="error".
-    """
-    with KhiveMcpSession(
-        packs=("kg", "gtd"), db=":memory:", no_embed=True, log="error"
-    ) as session:
-        yield session
-
-
-@pytest.fixture(scope="session")
-def khive_memory_session() -> Iterator[KhiveMcpSession]:
-    """KG + memory MCP session.
-
-    ADR: ADR-021 (memory pack)
-    Spawn config: packs=("kg", "memory"), db=":memory:", no_embed=True, log="error".
-    """
-    with KhiveMcpSession(
-        packs=("kg", "memory"), db=":memory:", no_embed=True, log="error"
-    ) as session:
         yield session
 
 

@@ -1,19 +1,17 @@
 # Specialized Packs
 
-khive's default install loads eleven production packs
-(`kg, gtd, memory, comm, schedule, session, workspace, blob`, per
-`RuntimeConfig::default()` in `crates/khive-runtime/src/config.rs`). `workspace`
-registers the `workspace` entity kind and five `contains` endpoint rules only,
-with no verbs; `blob` contributes content-addressed `blob.put`/`blob.get`/`blob.stat`
-verbs over the `BlobStore` trait ([ADR-111](../adr/ADR-111-blob-store.md)).
+This open-source distribution ships one production pack, `kg`, loaded by default
+(per `RuntimeConfig::default()` in `crates/khive-runtime/src/config.rs`). It is the
+base substrate: entities, edges, notes, graph queries, and reference resolution.
 
-Beyond the default set, khive supports niche packs that extend the graph for
-a specific domain — including packs that declare zero verbs and contribute
-purely to the edge ontology. Domain-specific packs of that shape (for
-example, a pure-ontology extension targeting formal mathematics or source
-code) are commercially licensed extensions, not part of this OSS
-distribution. This guide covers how pack loading and composition work in
-general, so you can write your own.
+Task management, memory recall, inter-agent communication, scheduling, session
+continuity, workspace linking, and content-addressed blob storage are provided by
+commercially licensed extensions and are not part of this distribution. Domain-specific
+ontology packs (for example, a pure-ontology extension targeting formal mathematics or
+source code, which can declare zero verbs and contribute purely to the edge ontology)
+are likewise commercially licensed extensions. This guide covers how pack loading and
+composition work in general, so you can write your own — the `KHIVE_PACKS` mechanism
+described below applies equally to the `kg` pack and to any extension pack you add.
 
 ## Pack composition model
 
@@ -33,9 +31,9 @@ Packs are selected via the `--pack` CLI flag (repeatable) or the
 `KHIVE_PACKS` environment variable (comma- or whitespace-separated):
 
 ```bash
-kkernel mcp --pack kg --pack gtd
+kkernel mcp --pack kg --pack <extension-name>
 # or
-KHIVE_PACKS="kg,gtd" kkernel mcp
+KHIVE_PACKS="kg,<extension-name>" kkernel mcp
 ```
 
 A pack that declares `REQUIRES = &["kg"]` needs `kg` in the same load set.
@@ -52,6 +50,5 @@ verb/note/entity/edge-rule format.
 
 - [Knowledge Graph Modeling](knowledge-graph.md): the base entity kind and
   edge relation taxonomy that specialized packs extend.
-- [Agent Sessions and Data Ingest](sessions-and-ingest.md): another optional
-  pack (`session`), included in the default set but with its own opt-in
-  background service.
+- [Agent Sessions and Data Ingest](sessions-and-ingest.md): the `session` pack, a
+  commercially licensed extension with its own opt-in background service.
