@@ -68,8 +68,14 @@ entity properties.
    whose stored `repo_url` normalizes to the same slug also matches (this
    reconciles an anchor created from one spelling with a later ingest under
    another, e.g. a local-path anchor with a subsequent remote-URL digest).
-   On either hit, backfill `properties.repo_slug` onto the matched entity.
-   Existing anchors therefore need no migration.
+   Step-2 matches, exact or normalized, resolve multi-candidate cases by
+   the same rule as step 1: oldest `created_at` (id tie-break) selected
+   deterministically, with the remainder surfaced in the same report
+   warning — never an arbitrary or silent pick. On a hit, backfill
+   `properties.repo_slug` onto the matched entity, and redact its stored
+   `properties.repo_url` (userinfo, query, fragment) in the same patch —
+   the lazy-upgrade path also closes out any credential-bearing legacy URL
+   it touches. Existing anchors therefore need no migration.
 3. Otherwise create the anchor with both `repo_slug` and `repo_url` set.
 
 Anchor creation carries no uniqueness constraint, so two concurrent digests
