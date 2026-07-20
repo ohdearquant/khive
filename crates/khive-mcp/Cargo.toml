@@ -46,5 +46,6 @@ tokio = { workspace = true, features = ["test-util"] }
 rmcp = { workspace = true, features = ["server", "transport-io", "client"] }
 async-trait = { workspace = true }
 serial_test = { workspace = true }
+khive-pack-template = { version = "0.6.0", path = "../khive-pack-template" }
 
 rusqlite = { workspace = true, features = ["bundled"] }

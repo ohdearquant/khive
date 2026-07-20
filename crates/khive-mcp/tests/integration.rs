@@ -11,7 +11,11 @@
 // propagate to all coverage areas simultaneously.
 
 use async_trait::async_trait;
+// Force-link khive-pack-template so its `inventory::submit!` registration is
+// visible to this test binary's `PackRegistry` (it is a dev-dependency only).
 use khive_mcp::server::KhiveMcpServer;
+#[allow(unused_imports)]
+use khive_pack_template::TemplatePack as _TemplatePack;
 use khive_runtime::{
     runtime_config_from_khive_config, GitWriteEntryConfig, GitWriteSectionConfig, KhiveConfig,
     KhiveRuntime, Namespace, NamespaceToken, PackRuntime, RuntimeConfig, RuntimeError,
@@ -39,11 +43,11 @@ fn make_server() -> KhiveMcpServer {
         default_namespace: Namespace::parse("test").unwrap(),
         embedding_model: None,
         additional_embedding_models: vec![],
-        packs: vec!["kg".to_string(), "gtd".to_string()],
+        packs: vec!["kg".to_string()],
         ..RuntimeConfig::default()
     };
     let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
-    KhiveMcpServer::new(runtime).expect("server builds with kg+gtd")
+    KhiveMcpServer::new(runtime).expect("server builds with kg")
 }
 
 #[derive(Clone, Default)]
@@ -123,8 +127,8 @@ async fn server_info_advertises_request_tool_only() {
         "instructions should explain the request-only surface"
     );
     // Pack verbs must appear in the catalog so agents can discover what's loaded.
-    assert!(instructions.contains("assign"), "gtd verb should appear");
     assert!(instructions.contains("create"), "kg verb should appear");
+    assert!(instructions.contains("link"), "kg verb should appear");
 }
 
 #[tokio::test]
@@ -363,80 +367,6 @@ async fn malformed_dsl_returns_invalid_params() -> anyhow::Result<()> {
     Ok(())
 }
 
-// ── GTD verbs round-tripped through the DSL ─────────────────────────────────
-
-#[tokio::test]
-async fn assign_then_next_then_complete() -> anyhow::Result<()> {
-    let client = connect().await?;
-
-    let assigned = ok_one(
-        &client,
-        r#"gtd.assign(title="ship release", status="next", priority="p0")"#,
-    )
-    .await?;
-    let id = assigned["full_id"].as_str().unwrap().to_string();
-    assert_eq!(assigned["kind"], "task");
-    assert_eq!(assigned["status"], "next");
-
-    let next_list = ok_one(&client, "gtd.next()").await?;
-    let arr = next_list.as_array().unwrap();
-    assert!(arr.iter().any(|t| t["full_id"] == id));
-
-    let completed = ok_one(
-        &client,
-        &format!(r#"gtd.complete(id="{id}", result="shipped via request")"#),
-    )
-    .await?;
-    assert_eq!(completed["to"], "done");
-    Ok(())
-}
-
-#[tokio::test]
-async fn transition_lifecycle_rejection_is_per_op_not_protocol_error() -> anyhow::Result<()> {
-    let client = connect().await?;
-    let assigned = ok_one(&client, r#"gtd.assign(title="lifecycle")"#).await?;
-    let id = assigned["full_id"].as_str().unwrap().to_string();
-
-    // inbox → done is allowed; done → inbox is NOT.
-    ok_one(
-        &client,
-        &format!(r#"gtd.transition(id="{id}", status="done")"#),
-    )
-    .await?;
-
-    let result = call(
-        &client,
-        "request",
-        json!({"ops": format!(r#"gtd.transition(id="{id}", status="inbox")"#)}),
-    )
-    .await?;
-    let body: Value = serde_json::from_str(&first_text(&result))?;
-    let first = &body["results"][0];
-    assert_eq!(first["ok"], false);
-    // Per P15 (PR #418), terminal states (done/cancelled) reject ALL outgoing
-    // transitions with "task X is in terminal state Y; no further transitions allowed".
-    assert!(
-        first["error"].as_str().unwrap().contains("terminal state"),
-        "expected terminal-state rejection, got: {}",
-        first["error"]
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn parallel_assign_batch_creates_n_tasks() -> anyhow::Result<()> {
-    let client = connect().await?;
-    let ops = r#"[
-        gtd.assign(title="t1", priority="p0"),
-        gtd.assign(title="t2", priority="p1"),
-        gtd.assign(title="t3", priority="p2")
-    ]"#;
-    let result = call(&client, "request", json!({"ops": ops})).await?;
-    let body: Value = serde_json::from_str(&first_text(&result))?;
-    assert_eq!(body["summary"]["succeeded"], 3);
-    Ok(())
-}
-
 #[tokio::test]
 async fn unknown_verb_returns_per_op_failure_not_invalid_params() -> anyhow::Result<()> {
     let client = connect().await?;
@@ -495,81 +425,24 @@ async fn pack_gtd_without_kg_fails_at_boot() {
 }
 
 #[tokio::test]
-async fn pack_schedule_without_comm_rejects_only_remind_before_persisting() -> anyhow::Result<()> {
-    disable_daemon();
+async fn pack_template_with_kg_explicit_works() {
+    // When both kg and template are listed, template's requires=["kg"] is satisfied.
     let config = RuntimeConfig {
         db_path: None,
         default_namespace: Namespace::parse("test").unwrap(),
         embedding_model: None,
         additional_embedding_models: vec![],
-        packs: vec!["kg".to_string(), "schedule".to_string()],
-        ..RuntimeConfig::default()
-    };
-    let runtime = KhiveRuntime::new(config).expect("kg+schedule runtime");
-    let server = KhiveMcpServer::new(runtime).expect("kg+schedule server builds without comm");
-    let (server_transport, client_transport) = tokio::io::duplex(65536);
-    tokio::spawn(async move {
-        if let Ok(svc) = server.serve(server_transport).await {
-            let _ = svc.waiting().await;
-        }
-    });
-    let client = DummyClient.serve(client_transport).await?;
-
-    let result = call(
-        &client,
-        "request",
-        json!({
-            "ops": r#"schedule.remind(content="must not persist", at="2099-01-01T00:00:00Z")"#,
-            "presentation": "verbose"
-        }),
-    )
-    .await?;
-    let body: Value = serde_json::from_str(&first_text(&result))?;
-    let failed = &body["results"][0];
-    assert_eq!(failed["ok"], json!(false), "remind must fail: {failed}");
-    let error = failed["error"].as_str().unwrap_or_default();
-    assert!(
-        error.contains("comm.send") && error.contains("delivery"),
-        "error must name the missing comm delivery capability: {error}"
-    );
-
-    let notes = ok_one(&client, r#"list(kind="note")"#).await?;
-    assert_eq!(notes, json!([]), "failed remind must persist no note");
-    let empty_agenda = ok_one(&client, "schedule.agenda()").await?;
-    assert_eq!(empty_agenda["count"], json!(0));
-
-    let scheduled = ok_one(
-        &client,
-        r#"schedule.schedule(action="schedule.agenda()", at="2099-01-02T00:00:00Z")"#,
-    )
-    .await?;
-    let full_id = scheduled["full_id"]
-        .as_str()
-        .expect("schedule.schedule returns full_id");
-    let agenda = ok_one(&client, "schedule.agenda()").await?;
-    assert_eq!(agenda["count"], json!(1));
-    let cancelled = ok_one(&client, &format!(r#"schedule.cancel(id="{full_id}")"#)).await?;
-    assert_eq!(cancelled["status"], json!("cancelled"));
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn pack_gtd_with_kg_explicit_works() {
-    // When both kg and gtd are listed, gtd's requires=["kg"] is satisfied.
-    let config = RuntimeConfig {
-        db_path: None,
-        default_namespace: Namespace::parse("test").unwrap(),
-        embedding_model: None,
-        additional_embedding_models: vec![],
-        packs: vec!["kg".to_string(), "gtd".to_string()],
+        packs: vec!["kg".to_string(), "template".to_string()],
         ..RuntimeConfig::default()
     };
     let runtime = KhiveRuntime::new(config).unwrap();
-    let server = KhiveMcpServer::new(runtime).expect("kg+gtd builds");
+    let server = KhiveMcpServer::new(runtime).expect("kg+template builds");
     let info = server.get_info();
     let instructions = info.instructions.unwrap_or_default();
-    assert!(instructions.contains("assign"), "gtd verb must be present");
+    assert!(
+        instructions.contains("my_verb"),
+        "template verb must be present"
+    );
     assert!(instructions.contains("create"), "kg verb must be present");
 }
 
@@ -579,12 +452,12 @@ async fn json_form_request_works_identically() -> anyhow::Result<()> {
     let result = call(
         &client,
         "request",
-        json!({"ops": r#"[{"tool":"gtd.assign","args":{"title":"json form","priority":"p1"}}]"#}),
+        json!({"ops": r#"[{"tool":"create","args":{"kind":"entity","entity_kind":"concept","name":"json form"}}]"#}),
     )
     .await?;
     let body: Value = serde_json::from_str(&first_text(&result))?;
     assert_eq!(body["summary"]["succeeded"], 1);
-    assert_eq!(body["results"][0]["result"]["title"], "json form");
+    assert_eq!(body["results"][0]["result"]["name"], "json form");
     Ok(())
 }
 
@@ -645,154 +518,32 @@ async fn json_form_namespace_non_string_returns_invalid_input() -> anyhow::Resul
     Ok(())
 }
 
-// ── Kind hooks (ADR-030) — shared CRUD reaches gtd-owned `task` via TaskHook ──
-
-#[tokio::test]
-async fn kg_create_with_note_kind_task_invokes_gtd_hook_defaults() -> anyhow::Result<()> {
-    let client = connect().await?;
-    // Drive the kg `create` verb with note_kind="task" — the kg handler
-    // consults the registry, finds gtd's TaskHook, and the hook fills GTD
-    // defaults (status=inbox) before the storage write.
-    let created = ok_one(
-        &client,
-        r#"create(kind="note", note_kind="task", title="ship release", priority="p0")"#,
-    )
-    .await?;
-
-    // Response is the kg note envelope, NOT the gtd task envelope.
-    assert_eq!(created["kind"], "task", "note stored with kind=task");
-    assert_eq!(created["name"], "ship release", "title folded into name");
-    assert_eq!(
-        created["properties"]["status"], "inbox",
-        "TaskHook applies default status"
-    );
-    assert_eq!(
-        created["properties"]["priority"], "p0",
-        "user-supplied priority preserved in properties"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn kg_create_note_kind_task_resolves_depends_on_against_task_target() -> anyhow::Result<()> {
-    let client = connect().await?;
-
-    // Stand up a task that the new task will depend on. The GTD ADR-031 edge
-    // rule allows depends_on between two task notes, so this is the only
-    // shape the kg-create-with-task-kind path will accept.
-    let blocker = ok_one(&client, r#"gtd.assign(title="write spec")"#).await?;
-    let blocker_full = blocker["full_id"].as_str().unwrap().to_string();
-
-    let task = ok_one(
-        &client,
-        &format!(
-            r#"create(kind="note", note_kind="task", title="depends on something", depends_on=["{}"])"#,
-            blocker_full
-        ),
-    )
-    .await?;
-
-    // Hook resolved the short/full id into a canonical UUID string and
-    // placed it in `properties.depends_on` — same shape gtd's `assign`
-    // produces.
-    let deps = task["properties"]["depends_on"].as_array().unwrap();
-    assert_eq!(deps.len(), 1, "exactly one resolved dependency");
-    let resolved = deps[0].as_str().unwrap();
-    assert!(
-        resolved.contains('-'),
-        "depends_on stored as full UUID string, got: {resolved}"
-    );
-    assert_eq!(resolved, &blocker_full, "depends_on resolves to blocker");
-    Ok(())
-}
-
-#[tokio::test]
-async fn kg_create_note_kind_task_rejects_non_task_depends_on_before_write() -> anyhow::Result<()> {
-    let client = connect().await?;
-
-    // Stand up an entity target. The GTD ADR-031 edge rule is task→task only,
-    // so the kg-create path must reject this BEFORE the task is persisted —
-    // otherwise we'd leave a task with `properties.depends_on` pointing at a
-    // non-task (ADR-030 forbids reporting failure after a successful write).
-    let entity = ok_one(
-        &client,
-        r#"create(kind="entity", entity_kind="concept", name="DependencyTarget")"#,
-    )
-    .await?;
-    // Entity create returns the storage-layer struct keyed on `id` (full UUID),
-    // not the GTD task envelope shape.
-    let entity_full = entity["id"].as_str().unwrap().to_string();
-
-    let result = call(
-        &client,
-        "request",
-        json!({"ops": format!(
-            r#"create(kind="note", note_kind="task", title="depends on entity", depends_on=["{}"])"#,
-            entity_full
-        )}),
-    )
-    .await?;
-    let body: Value = serde_json::from_str(&first_text(&result))?;
-    let first = &body["results"][0];
-    assert_eq!(first["ok"], false, "expected rejection: {first}");
-    let err = first["error"].as_str().unwrap();
-    assert!(
-        err.contains("must be a task note"),
-        "error must point to the GTD edge rule: {err}"
-    );
-
-    // And there should be no task with the supplied title — write was prevented.
-    let listed = ok_one(&client, r#"list(kind="note", note_kind="task")"#).await?;
-    let notes = listed.as_array().expect("note list");
-    let titles: Vec<&str> = notes.iter().filter_map(|n| n["name"].as_str()).collect();
-    assert!(
-        !titles.contains(&"depends on entity"),
-        "task must not be persisted when depends_on validation fails: {titles:?}"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn gtd_assign_creates_depends_on_edge_between_two_tasks() -> anyhow::Result<()> {
-    let client = connect().await?;
-
-    let blocker = ok_one(&client, r#"gtd.assign(title="write spec")"#).await?;
-    let blocker_full = blocker["full_id"].as_str().unwrap().to_string();
-    let dependent = ok_one(
-        &client,
-        &format!(
-            r#"gtd.assign(title="implement feature", depends_on=["{}"])"#,
-            blocker_full
-        ),
-    )
-    .await?;
-    let dep_full = dependent["full_id"].as_str().unwrap().to_string();
-
-    // ADR-031: the GTD pack's EDGE_RULES adds task→task `depends_on`.
-    // `neighbors(node_id=dependent, direction="out", relations=["depends_on"])`
-    // should surface the blocker — proving the edge landed.
-    let neighbors = ok_one(
-        &client,
-        &format!(
-            r#"neighbors(node_id="{}", direction="out", relations=["depends_on"])"#,
-            dep_full
-        ),
-    )
-    .await?;
-
-    let hits = neighbors.as_array().expect("neighbors returns array");
-    // #148: response uses canonical `id` (legacy `node_id` accepted as alias on input only).
-    let targets: Vec<&str> = hits.iter().filter_map(|h| h["id"].as_str()).collect();
-    assert!(
-        targets.iter().any(|t| *t == blocker_full),
-        "task→task depends_on edge missing — got targets {targets:?}"
-    );
-    Ok(())
+async fn connect_kg_template(
+) -> anyhow::Result<impl std::ops::Deref<Target = rmcp::service::Peer<rmcp::RoleClient>>> {
+    disable_daemon();
+    let config = RuntimeConfig {
+        db_path: None,
+        default_namespace: Namespace::parse("test").unwrap(),
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        packs: vec!["kg".to_string(), "template".to_string()],
+        ..RuntimeConfig::default()
+    };
+    let runtime = KhiveRuntime::new(config).expect("kg+template runtime");
+    let server = KhiveMcpServer::new(runtime).expect("kg+template server builds");
+    let (server_transport, client_transport) = tokio::io::duplex(65536);
+    tokio::spawn(async move {
+        if let Ok(svc) = server.serve(server_transport).await {
+            let _ = svc.waiting().await;
+        }
+    });
+    let client = DummyClient.serve(client_transport).await?;
+    Ok(client)
 }
 
 #[tokio::test]
 async fn kg_create_unknown_note_kind_lists_merged_pack_vocabulary() -> anyhow::Result<()> {
-    let client = connect().await?;
+    let client = connect_kg_template().await?;
     let result = call(
         &client,
         "request",
@@ -804,10 +555,11 @@ async fn kg_create_unknown_note_kind_lists_merged_pack_vocabulary() -> anyhow::R
     assert_eq!(first["ok"], false);
     let err = first["error"].as_str().unwrap();
     assert!(err.contains("bogus"), "error names the bad kind: {err}");
-    // The merged vocabulary list must include "task" (gtd) alongside kg kinds.
+    // The merged vocabulary list must include the template pack's note kind
+    // alongside kg's own kinds.
     assert!(
-        err.contains("task"),
-        "error must list gtd-registered 'task' kind: {err}"
+        err.contains("template_note"),
+        "error must list template-registered 'template_note' kind: {err}"
     );
     assert!(
         err.contains("observation"),
@@ -887,25 +639,29 @@ async fn list_with_granular_entity_kind_filters_results() -> anyhow::Result<()> 
 }
 
 #[tokio::test]
-async fn list_with_granular_task_kind_lists_only_tasks() -> anyhow::Result<()> {
+async fn list_with_granular_note_kind_lists_only_that_kind() -> anyhow::Result<()> {
     let client = connect().await?;
-    ok_one(&client, r#"gtd.assign(title="GranularTaskA")"#).await?;
     ok_one(
         &client,
-        r#"create(kind="observation", content="not a task")"#,
+        r#"create(kind="insight", content="GranularInsightA")"#,
+    )
+    .await?;
+    ok_one(
+        &client,
+        r#"create(kind="observation", content="not an insight")"#,
     )
     .await?;
 
-    let listed = ok_one(&client, r#"list(kind="task")"#).await?;
+    let listed = ok_one(&client, r#"list(kind="insight")"#).await?;
     let arr = listed.as_array().expect("array");
-    let titles: Vec<&str> = arr.iter().filter_map(|n| n["name"].as_str()).collect();
+    let contents: Vec<&str> = arr.iter().filter_map(|n| n["content"].as_str()).collect();
     assert!(
-        titles.contains(&"GranularTaskA"),
-        "task missing: {titles:?}"
+        contents.contains(&"GranularInsightA"),
+        "insight missing: {contents:?}"
     );
     assert!(
-        !titles.iter().any(|t| t.contains("not a task")),
-        "observation leaked into task list: {titles:?}"
+        !contents.iter().any(|t| t.contains("not an insight")),
+        "observation leaked into insight list: {contents:?}"
     );
     Ok(())
 }
@@ -944,9 +700,13 @@ async fn search_with_granular_entity_kind() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn search_with_granular_task_kind() -> anyhow::Result<()> {
+async fn search_with_granular_note_kind() -> anyhow::Result<()> {
     let client = connect().await?;
-    ok_one(&client, r#"gtd.assign(title="urgent search needle one")"#).await?;
+    ok_one(
+        &client,
+        r#"create(kind="insight", content="urgent search needle one")"#,
+    )
+    .await?;
     ok_one(
         &client,
         r#"create(kind="observation", content="urgent search needle two")"#,
@@ -955,17 +715,17 @@ async fn search_with_granular_task_kind() -> anyhow::Result<()> {
 
     let hits = ok_one(
         &client,
-        r#"search(kind="task", query="urgent search needle", limit=10)"#,
+        r#"search(kind="insight", query="urgent search needle", limit=10)"#,
     )
     .await?;
     let arr = hits.as_array().expect("array");
-    assert!(!arr.is_empty(), "expected task hits");
+    assert!(!arr.is_empty(), "expected insight hits");
     for hit in arr {
         let id = hit["id"].as_str().unwrap().to_string();
         let got = ok_one(&client, &format!(r#"get(id="{}")"#, id)).await?;
         assert_eq!(
-            got["kind"], "task",
-            "search(kind=\"task\") returned non-task: {got}"
+            got["kind"], "insight",
+            "search(kind=\"insight\") returned non-insight: {got}"
         );
     }
     Ok(())
@@ -976,7 +736,7 @@ async fn search_substrate_wide_note_kind_still_works() -> anyhow::Result<()> {
     let client = connect().await?;
     ok_one(
         &client,
-        r#"gtd.assign(title="quasiparticle task entry", description="quasiparticle decoherence backlog")"#,
+        r#"create(kind="insight", content="quasiparticle decoherence backlog")"#,
     )
     .await?;
     ok_one(
@@ -994,7 +754,7 @@ async fn search_substrate_wide_note_kind_still_works() -> anyhow::Result<()> {
     let arr = hits.as_array().expect("array");
     assert!(
         arr.len() >= 2,
-        "kind=note should range over task AND observation; got {arr:?}"
+        "kind=note should range over insight AND observation; got {arr:?}"
     );
     Ok(())
 }
@@ -1014,7 +774,7 @@ async fn search_unknown_kind_lists_all_valid_options() -> anyhow::Result<()> {
     let err = first["error"].as_str().unwrap();
     assert!(err.contains("bogus"), "error names the bad kind: {err}");
     // The merged list must include substrate-level + pack-registered kinds.
-    for expected in ["entity", "note", "edge", "concept", "task"] {
+    for expected in ["entity", "note", "edge", "concept", "insight"] {
         assert!(
             err.contains(expected),
             "error must list {expected:?}: {err}"
@@ -1066,7 +826,7 @@ async fn search_substrate_kind_note_with_legacy_note_kind_sub_filter() -> anyhow
     let client = connect().await?;
     ok_one(
         &client,
-        r#"gtd.assign(title="ghyll task entry", description="ghyll mistral foxtrot marker")"#,
+        r#"create(kind="insight", content="ghyll mistral foxtrot marker insight")"#,
     )
     .await?;
     ok_one(
@@ -1077,17 +837,17 @@ async fn search_substrate_kind_note_with_legacy_note_kind_sub_filter() -> anyhow
 
     let hits = ok_one(
         &client,
-        r#"search(kind="note", note_kind="task", query="ghyll mistral foxtrot", limit=10)"#,
+        r#"search(kind="note", note_kind="insight", query="ghyll mistral foxtrot", limit=10)"#,
     )
     .await?;
     let arr = hits.as_array().expect("array");
-    assert!(!arr.is_empty(), "expected task hits, got: {arr:?}");
+    assert!(!arr.is_empty(), "expected insight hits, got: {arr:?}");
     for hit in arr {
         let id = hit["id"].as_str().unwrap().to_string();
         let got = ok_one(&client, &format!(r#"get(id="{}")"#, id)).await?;
         assert_eq!(
-            got["kind"], "task",
-            "search(kind=\"note\", note_kind=\"task\") returned non-task: {got}"
+            got["kind"], "insight",
+            "search(kind=\"note\", note_kind=\"insight\") returned non-insight: {got}"
         );
     }
     Ok(())
@@ -1401,10 +1161,10 @@ model = "bge-small-en-v1.5"
 // resolved against the prior op's canonical result BEFORE dispatch — not passed
 // through as literal strings.  The four cases mirror the UE4 DSL critical finding.
 
-/// Chain: assign a task then complete it using $prev.id.
+/// Chain: create an entity then update it using $prev.id.
 ///
-/// The canonical result of `assign` contains an `id` field (short UUID).
-/// `$prev.id` must resolve to that value so `complete` receives a valid ID.
+/// The canonical result of `create` contains an `id` field (short UUID).
+/// `$prev.id` must resolve to that value so `update` receives a valid ID.
 #[tokio::test]
 async fn test_prev_dot_id_resolves() -> anyhow::Result<()> {
     let client = connect().await?;
@@ -1413,7 +1173,7 @@ async fn test_prev_dot_id_resolves() -> anyhow::Result<()> {
         &client,
         "request",
         json!({
-            "ops": r#"gtd.assign(title="chain-prev-id-test", status="next") | gtd.complete(id=$prev.id)"#,
+            "ops": r#"create(kind="entity", entity_kind="concept", name="chain-prev-id-test") | update(id=$prev.id, description="chained update")"#,
             "presentation": "verbose"
         }),
     )
@@ -1425,25 +1185,25 @@ async fn test_prev_dot_id_resolves() -> anyhow::Result<()> {
     assert_eq!(
         results[0]["ok"],
         json!(true),
-        "gtd.assign (op 0) must succeed: {}",
+        "create (op 0) must succeed: {}",
         results[0]
     );
     assert_eq!(
         results[1]["ok"],
         json!(true),
-        "gtd.complete (op 1) must succeed — $prev.id was not resolved: {}",
+        "update (op 1) must succeed — $prev.id was not resolved: {}",
         results[1]
     );
     assert_eq!(body["summary"]["succeeded"], json!(2));
     assert_eq!(body["summary"]["failed"], json!(0));
     assert_eq!(body["summary"]["aborted"], json!(0));
 
-    // The completed task must have status "done".
-    let complete_result = &results[1]["result"];
+    // The updated entity must carry the new description.
+    let update_result = &results[1]["result"];
     assert_eq!(
-        complete_result["to"].as_str().unwrap_or(""),
-        "done",
-        "completed task must have to=done: {complete_result}"
+        update_result["description"].as_str().unwrap_or(""),
+        "chained update",
+        "updated entity must reflect the patch: {update_result}"
     );
     Ok(())
 }
@@ -1608,7 +1368,7 @@ async fn test_ue4_h1_bare_prev_map_produces_clear_substitution_error() -> anyhow
         &client,
         "request",
         json!({
-            "ops": r#"gtd.assign(title="bare-prev-test") | gtd.complete(id=$prev.id, result=$prev)"#,
+            "ops": r#"create(kind="entity", entity_kind="concept", name="bare-prev-test") | update(id=$prev.id, description=$prev)"#,
             "presentation": "verbose"
         }),
     )
@@ -1620,11 +1380,11 @@ async fn test_ue4_h1_bare_prev_map_produces_clear_substitution_error() -> anyhow
     assert_eq!(
         results[0]["ok"],
         json!(true),
-        "assign must succeed: {}",
+        "create must succeed: {}",
         results[0]
     );
 
-    // Op 1: result=$prev resolves to the whole assign result map.
+    // Op 1: description=$prev resolves to the whole create result map.
     // UE4-H1: the dispatcher must detect this and return a substitution_error
     // rather than passing the map through to the handler.
     assert_eq!(
@@ -1642,15 +1402,13 @@ async fn test_ue4_h1_bare_prev_map_produces_clear_substitution_error() -> anyhow
         "UE4-H1: error must mention dotted path or $prev; got: {err_msg}"
     );
     assert!(
-        err_msg.contains("result") || error["kind"].as_str() == Some("substitution_error"),
+        err_msg.contains("description") || error["kind"].as_str() == Some("substitution_error"),
         "UE4-H1: error must reference the offending arg or be a substitution_error; got: {error}"
     );
     // The error must list at least one available field from the prior result.
-    // assign result includes fields like id/full_id/title/kind.
-    let mentions_field = err_msg.contains("id")
-        || err_msg.contains("title")
-        || err_msg.contains("kind")
-        || err_msg.contains("full_id");
+    // create result includes fields like id/name/kind.
+    let mentions_field =
+        err_msg.contains("id") || err_msg.contains("name") || err_msg.contains("kind");
     assert!(
         mentions_field,
         "UE4-H1: error must list available top-level fields from prior result; got: {err_msg}"
@@ -1721,33 +1479,6 @@ async fn test_h3_prev_nonexistent_field_error_lists_available_fields() -> anyhow
 // non-empty params slices with specific known parameters — verifying that
 // the HandlerDef.params slices are populated (not left as &[]).
 
-fn make_full_server() -> KhiveMcpServer {
-    disable_daemon();
-    let config = RuntimeConfig {
-        db_path: None,
-        default_namespace: Namespace::parse("test").unwrap(),
-        embedding_model: None,
-        additional_embedding_models: vec![],
-        packs: vec!["kg".to_string(), "gtd".to_string(), "memory".to_string()],
-        ..RuntimeConfig::default()
-    };
-    let runtime = KhiveRuntime::new(config).expect("in-memory runtime with all packs");
-    KhiveMcpServer::new(runtime).expect("server builds with kg+gtd+memory")
-}
-
-async fn connect_full(
-) -> anyhow::Result<impl std::ops::Deref<Target = rmcp::service::Peer<rmcp::RoleClient>>> {
-    let (server_transport, client_transport) = tokio::io::duplex(65536);
-    let server = make_full_server();
-    tokio::spawn(async move {
-        if let Ok(server_service) = server.serve(server_transport).await {
-            let _ = server_service.waiting().await;
-        }
-    });
-    let client = DummyClient.serve(client_transport).await?;
-    Ok(client)
-}
-
 /// Helper: call `verb(help=true)` through the MCP surface and return the
 /// parsed result. Asserts the op succeeded and returns the schema envelope.
 async fn help_schema(
@@ -1767,51 +1498,8 @@ async fn help_schema(
 }
 
 #[tokio::test]
-async fn help_recall_params_non_empty_with_query_param() -> anyhow::Result<()> {
-    let client = connect_full().await?;
-    let schema = help_schema(&client, "memory.recall").await?;
-    let params = schema["params"]
-        .as_array()
-        .expect("params must be an array");
-    assert!(
-        !params.is_empty(),
-        "recall help=true must return non-empty params; got empty slice"
-    );
-    let has_query = params.iter().any(|p| p["name"] == json!("query"));
-    assert!(
-        has_query,
-        "recall params must include 'query'; got: {params:?}"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn help_memory_feedback_params_non_empty_with_target_and_signal() -> anyhow::Result<()> {
-    let client = connect_full().await?;
-    let schema = help_schema(&client, "memory.feedback").await?;
-    let params = schema["params"]
-        .as_array()
-        .expect("params must be an array");
-    assert!(
-        !params.is_empty(),
-        "memory.feedback help=true must return non-empty params"
-    );
-    let has_target_id = params.iter().any(|p| p["name"] == json!("target_id"));
-    assert!(
-        has_target_id,
-        "memory.feedback params must include 'target_id'; got: {params:?}"
-    );
-    let has_signal = params.iter().any(|p| p["name"] == json!("signal"));
-    assert!(
-        has_signal,
-        "memory.feedback params must include 'signal'; got: {params:?}"
-    );
-    Ok(())
-}
-
-#[tokio::test]
 async fn help_propose_params_non_empty_with_title_description_changeset() -> anyhow::Result<()> {
-    let client = connect_full().await?;
+    let client = connect().await?;
     let schema = help_schema(&client, "propose").await?;
     let params = schema["params"]
         .as_array()
@@ -1835,160 +1523,6 @@ async fn help_propose_params_non_empty_with_title_description_changeset() -> any
         has_changeset,
         "propose params must include 'changeset'; got: {params:?}"
     );
-    Ok(())
-}
-
-// ── help=true schema envelopes for comm + schedule verbs (issue #287) ─────────
-
-fn make_comm_schedule_server() -> KhiveMcpServer {
-    disable_daemon();
-    let config = RuntimeConfig {
-        db_path: None,
-        default_namespace: Namespace::parse("test").unwrap(),
-        embedding_model: None,
-        additional_embedding_models: vec![],
-        packs: vec!["kg".to_string(), "comm".to_string(), "schedule".to_string()],
-        ..RuntimeConfig::default()
-    };
-    let runtime = KhiveRuntime::new(config).expect("in-memory runtime with comm+schedule");
-    KhiveMcpServer::new(runtime).expect("server builds with kg+comm+schedule")
-}
-
-async fn connect_comm_schedule(
-) -> anyhow::Result<impl std::ops::Deref<Target = rmcp::service::Peer<rmcp::RoleClient>>> {
-    let (server_transport, client_transport) = tokio::io::duplex(65536);
-    let server = make_comm_schedule_server();
-    tokio::spawn(async move {
-        if let Ok(svc) = server.serve(server_transport).await {
-            let _ = svc.waiting().await;
-        }
-    });
-    let client = DummyClient.serve(client_transport).await?;
-    Ok(client)
-}
-
-/// `comm.send(help=true)` must return a non-empty params array with required `to` and `content`.
-#[tokio::test]
-async fn send_help_returns_required_to_and_content() -> anyhow::Result<()> {
-    let client = connect_comm_schedule().await?;
-    let result = ok_one(&client, "comm.send(help=true)").await?;
-
-    assert_eq!(result["verb"], "comm.send");
-    assert_eq!(result["pack"], "comm");
-
-    let params = result["params"]
-        .as_array()
-        .expect("params must be an array");
-    assert!(!params.is_empty(), "send help must have non-empty params");
-
-    let to = params
-        .iter()
-        .find(|p| p["name"] == "to")
-        .expect("send help must include 'to'");
-    assert_eq!(to["required"], serde_json::json!(true));
-
-    let content = params
-        .iter()
-        .find(|p| p["name"] == "content")
-        .expect("send help must include 'content'");
-    assert_eq!(content["required"], serde_json::json!(true));
-
-    Ok(())
-}
-
-/// `comm.inbox(help=true)` must return optional `limit` and `status`.
-#[tokio::test]
-async fn inbox_help_returns_optional_limit_and_status() -> anyhow::Result<()> {
-    let client = connect_comm_schedule().await?;
-    let result = ok_one(&client, "comm.inbox(help=true)").await?;
-
-    assert_eq!(result["verb"], "comm.inbox");
-    assert_eq!(result["pack"], "comm");
-
-    let params = result["params"]
-        .as_array()
-        .expect("params must be an array");
-    assert!(!params.is_empty(), "inbox help must have non-empty params");
-
-    let limit = params
-        .iter()
-        .find(|p| p["name"] == "limit")
-        .expect("inbox help must include 'limit'");
-    assert_eq!(limit["required"], serde_json::json!(false));
-
-    let status = params
-        .iter()
-        .find(|p| p["name"] == "status")
-        .expect("inbox help must include 'status'");
-    assert_eq!(status["required"], serde_json::json!(false));
-
-    Ok(())
-}
-
-/// `schedule.schedule(help=true)` must return required `action` and `at`.
-#[tokio::test]
-async fn schedule_help_returns_required_action_and_at() -> anyhow::Result<()> {
-    let client = connect_comm_schedule().await?;
-    let result = ok_one(&client, "schedule.schedule(help=true)").await?;
-
-    assert_eq!(result["verb"], "schedule.schedule");
-    assert_eq!(result["pack"], "schedule");
-
-    let params = result["params"]
-        .as_array()
-        .expect("params must be an array");
-    assert!(
-        !params.is_empty(),
-        "schedule help must have non-empty params"
-    );
-
-    let action = params
-        .iter()
-        .find(|p| p["name"] == "action")
-        .expect("schedule help must include 'action'");
-    assert_eq!(action["required"], serde_json::json!(true));
-
-    let at = params
-        .iter()
-        .find(|p| p["name"] == "at")
-        .expect("schedule help must include 'at'");
-    assert_eq!(at["required"], serde_json::json!(true));
-
-    Ok(())
-}
-
-/// `schedule.remind(help=true)` must return required `content` and `at`, optional `repeat`.
-#[tokio::test]
-async fn remind_help_returns_required_content_and_at() -> anyhow::Result<()> {
-    let client = connect_comm_schedule().await?;
-    let result = ok_one(&client, "schedule.remind(help=true)").await?;
-
-    assert_eq!(result["verb"], "schedule.remind");
-    assert_eq!(result["pack"], "schedule");
-
-    let params = result["params"]
-        .as_array()
-        .expect("params must be an array");
-    assert!(!params.is_empty(), "remind help must have non-empty params");
-
-    let content = params
-        .iter()
-        .find(|p| p["name"] == "content")
-        .expect("remind help must include 'content'");
-    assert_eq!(content["required"], serde_json::json!(true));
-
-    let at = params
-        .iter()
-        .find(|p| p["name"] == "at")
-        .expect("remind help must include 'at'");
-    assert_eq!(at["required"], serde_json::json!(true));
-
-    let repeat = params
-        .iter()
-        .find(|p| p["name"] == "repeat")
-        .expect("remind help must include 'repeat'");
-    assert_eq!(repeat["required"], serde_json::json!(false));
-
     Ok(())
 }
 
@@ -2067,128 +1601,6 @@ async fn startup_migrations_applied_to_fresh_file_backed_db() -> anyhow::Result<
     assert_eq!(
         first["ok"], true,
         "propose must succeed on a freshly-migrated DB; got: {first}"
-    );
-    Ok(())
-}
-
-// ── Fix 2: Visibility::Subhandler gate ──────────────────────────────────────
-
-/// `memory.recall_candidates`, `memory.recall_fuse`, `memory.recall_rerank`,
-/// and `memory.recall_score` are tagged `Visibility::Subhandler` in the
-/// memory pack.  The MCP request surface must reject them with a per-op
-/// `{ok: false}` rather than routing to the handler.  `help=true`
-/// introspection must still work (short-circuit before the gate).
-fn make_subhandler_server() -> KhiveMcpServer {
-    disable_daemon();
-    let config = RuntimeConfig {
-        db_path: None,
-        default_namespace: Namespace::parse("subhtest").unwrap(),
-        embedding_model: None,
-        additional_embedding_models: vec![],
-        packs: vec!["kg".to_string(), "memory".to_string()],
-        ..RuntimeConfig::default()
-    };
-    let runtime = KhiveRuntime::new(config).expect("kg+memory runtime");
-    KhiveMcpServer::new(runtime).expect("server builds with kg+memory")
-}
-
-#[tokio::test]
-async fn subhandler_verbs_are_blocked_at_mcp_boundary() -> anyhow::Result<()> {
-    let (server_transport, client_transport) = tokio::io::duplex(65536);
-    let server = make_subhandler_server();
-    tokio::spawn(async move {
-        if let Ok(svc) = server.serve(server_transport).await {
-            let _ = svc.waiting().await;
-        }
-    });
-    let client = DummyClient.serve(client_transport).await?;
-
-    // All four Subhandler verbs must be rejected.
-    for verb in &[
-        "memory.recall_candidates",
-        "memory.recall_fuse",
-        "memory.recall_rerank",
-        "memory.recall_score",
-    ] {
-        let result = call(&client, "request", json!({"ops": format!("{verb}()")})).await?;
-        let body: Value = serde_json::from_str(&first_text(&result))?;
-        let first = &body["results"][0];
-        assert_eq!(
-            first["ok"], false,
-            "Subhandler verb {verb:?} must be blocked: got {first}"
-        );
-        let err = first["error"].as_str().unwrap_or("");
-        assert!(
-            err.contains("permission denied") || err.contains("subhandler"),
-            "error for {verb:?} must mention permission/subhandler: {err}"
-        );
-    }
-    Ok(())
-}
-
-/// The operator path (`dispatch_request_local`, the path `kkernel exec` uses)
-/// must NOT gate subhandler verbs. The visibility gate is wire-only
-/// (`from_wire`): agents cannot reach subhandlers via the MCP `request` tool,
-/// but operators invoke them directly. This is the invariant that regressed
-/// when the gate lived in the shared dispatch — every handler had to be
-/// promoted to `Verb` to stay reachable, which is exactly what we are undoing.
-#[tokio::test]
-async fn subhandler_verbs_are_allowed_on_operator_path() -> anyhow::Result<()> {
-    use khive_mcp::tools::request::RequestParams;
-
-    let server = make_subhandler_server();
-
-    for verb in &[
-        "memory.recall_candidates",
-        "memory.recall_fuse",
-        "memory.recall_rerank",
-    ] {
-        let raw = server
-            .dispatch_request_local(RequestParams {
-                ops: format!("{verb}()"),
-                presentation: None,
-                presentation_per_op: None,
-                save_to: None,
-                format: None,
-                format_per_op: None,
-                request_id: None,
-            })
-            .await
-            .expect("operator dispatch must not RPC-fail");
-        let body: Value = serde_json::from_str(&raw)?;
-        let first = &body["results"][0];
-        let err = first["error"].as_str().unwrap_or("");
-        // The gate must NOT have fired: its signature message must be absent.
-        // The handler may still succeed (ok=true) or fail for its own reasons,
-        // but it must have been *reached*, not blocked at the visibility gate.
-        assert!(
-            !err.contains("internal subhandler") && !err.contains("permission denied"),
-            "operator path must NOT gate subhandler {verb:?}: {first}"
-        );
-    }
-    Ok(())
-}
-
-#[tokio::test]
-async fn subhandler_verb_help_introspection_still_works() -> anyhow::Result<()> {
-    let (server_transport, client_transport) = tokio::io::duplex(65536);
-    let server = make_subhandler_server();
-    tokio::spawn(async move {
-        if let Ok(svc) = server.serve(server_transport).await {
-            let _ = svc.waiting().await;
-        }
-    });
-    let client = DummyClient.serve(client_transport).await?;
-
-    // `help=true` is short-circuited before the visibility gate — must succeed.
-    let result = ok_one(&client, r#"memory.recall_candidates(help=true)"#).await?;
-    // Help response includes the verb name or param list.
-    let text = serde_json::to_string(&result).unwrap_or_default();
-    assert!(
-        text.contains("memory.recall_candidates")
-            || text.contains("params")
-            || text.contains("help"),
-        "help response for Subhandler verb must return introspection data: {text}"
     );
     Ok(())
 }
@@ -3156,54 +2568,6 @@ async fn update_rejects_unknown_kwarg() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `remember(content="x", garbage_arg="y")` must return `ok: false` (ue-errors C1).
-#[tokio::test]
-async fn remember_rejects_unknown_kwarg() -> anyhow::Result<()> {
-    let client = connect_full().await?;
-
-    let result = call(
-        &client,
-        "request",
-        json!({ "ops": r#"memory.remember(content="test memory", garbage_arg="xyz")"# }),
-    )
-    .await?;
-    let body: Value = serde_json::from_str(&first_text(&result))?;
-    let first = &body["results"][0];
-    assert_eq!(
-        first["ok"],
-        json!(false),
-        "remember with unknown kwarg must fail; got: {first}"
-    );
-    let err = first["error"].as_str().unwrap_or("");
-    assert!(
-        err.contains("garbage_arg") || err.contains("unknown field"),
-        "error must mention the unknown field; got: {err}"
-    );
-    Ok(())
-}
-
-/// Known `remember` aliases (`salience`, `decay`, `source`) must still work
-/// after deny_unknown_fields is applied (ue-errors C1 regression guard).
-#[tokio::test]
-async fn remember_aliases_still_accepted() -> anyhow::Result<()> {
-    let client = connect_full().await?;
-
-    let result = call(
-        &client,
-        "request",
-        json!({ "ops": r#"memory.remember(content="alias test", salience=0.8, decay=0.005)"# }),
-    )
-    .await?;
-    let body: Value = serde_json::from_str(&first_text(&result))?;
-    let first = &body["results"][0];
-    assert_eq!(
-        first["ok"],
-        json!(true),
-        "remember with aliases salience/decay must succeed; got: {first}"
-    );
-    Ok(())
-}
-
 // ── ADR-045 §5 handler invariant: ISO-8601 timestamps at MCP boundary ────────
 
 /// Entity `create` must return ISO-8601 timestamps (not raw microsecond i64s).
@@ -3353,32 +2717,6 @@ async fn entity_update_returns_iso8601_timestamps() -> anyhow::Result<()> {
 
 // ── ue-errors C1 extension: unknown-kwarg rejection on additional verbs ───────
 
-/// `recall(query="x", typo_kwarg="y")` must return `ok: false` (ue-errors C1).
-#[tokio::test]
-async fn recall_rejects_unknown_kwarg() -> anyhow::Result<()> {
-    let client = connect_full().await?;
-
-    let result = call(
-        &client,
-        "request",
-        json!({ "ops": r#"memory.recall(query="test", typo_kwarg="oops")"# }),
-    )
-    .await?;
-    let body: Value = serde_json::from_str(&first_text(&result))?;
-    let first = &body["results"][0];
-    assert_eq!(
-        first["ok"],
-        json!(false),
-        "recall with unknown kwarg must fail; got: {first}"
-    );
-    let err = first["error"].as_str().unwrap_or("");
-    assert!(
-        err.contains("typo_kwarg") || err.contains("unknown field"),
-        "error must mention the unknown field; got: {err}"
-    );
-    Ok(())
-}
-
 /// `list(kind="entity", typo_kwarg="y")` must return `ok: false` (ue-errors C1).
 #[tokio::test]
 async fn list_rejects_unknown_kwarg() -> anyhow::Result<()> {
@@ -3401,176 +2739,6 @@ async fn list_rejects_unknown_kwarg() -> anyhow::Result<()> {
     assert!(
         err.contains("typo_kwarg") || err.contains("unknown field"),
         "error must mention the unknown field; got: {err}"
-    );
-    Ok(())
-}
-
-// ── MCP-wide ISO-8601 timestamps ──────────────────────────────────────────
-
-/// `remember` must return ISO-8601 `created_at` (not a raw microsecond i64).
-#[tokio::test]
-async fn remember_returns_iso8601_timestamp() -> anyhow::Result<()> {
-    let client = connect_full().await?;
-
-    let result = ok_one(
-        &client,
-        r#"memory.remember(content="r3 timestamp test", salience=0.7)"#,
-    )
-    .await?;
-
-    let created_at = result["created_at"].as_str().unwrap_or("");
-    assert!(
-        created_at.starts_with("20"),
-        "remember created_at must be ISO-8601 string, got: {:?}",
-        result["created_at"]
-    );
-    Ok(())
-}
-
-/// `recall` must return ISO-8601 `created_at` on each hit (not raw i64).
-#[tokio::test]
-async fn recall_returns_iso8601_timestamps() -> anyhow::Result<()> {
-    let client = connect_full().await?;
-
-    // Seed a memory first.
-    ok_one(
-        &client,
-        r#"memory.remember(content="r3 recall timestamp seed")"#,
-    )
-    .await?;
-
-    let result = ok_one(
-        &client,
-        r#"memory.recall(query="r3 recall timestamp seed", limit=1)"#,
-    )
-    .await?;
-
-    let hits = result.as_array().expect("recall returns array");
-    assert!(!hits.is_empty(), "recall must return at least one hit");
-    let created_at = hits[0]["created_at"].as_str().unwrap_or("");
-    assert!(
-        created_at.starts_with("20"),
-        "recall hit created_at must be ISO-8601 string, got: {:?}",
-        hits[0]["created_at"]
-    );
-    Ok(())
-}
-
-fn make_comm_server_only() -> KhiveMcpServer {
-    disable_daemon();
-    let config = RuntimeConfig {
-        db_path: None,
-        default_namespace: Namespace::parse("commtest").unwrap(),
-        embedding_model: None,
-        additional_embedding_models: vec![],
-        packs: vec!["kg".to_string(), "comm".to_string()],
-        ..RuntimeConfig::default()
-    };
-    let runtime = KhiveRuntime::new(config).expect("kg+comm runtime");
-    KhiveMcpServer::new(runtime).expect("server builds with kg+comm")
-}
-
-async fn connect_comm_only(
-) -> anyhow::Result<impl std::ops::Deref<Target = rmcp::service::Peer<rmcp::RoleClient>>> {
-    let (server_transport, client_transport) = tokio::io::duplex(65536);
-    let server = make_comm_server_only();
-    tokio::spawn(async move {
-        if let Ok(svc) = server.serve(server_transport).await {
-            let _ = svc.waiting().await;
-        }
-    });
-    let client = DummyClient.serve(client_transport).await?;
-    Ok(client)
-}
-
-/// `inbox` returns message notes; `created_at` and `updated_at` must be ISO-8601
-/// strings (not raw microsecond i64s) — validates note_to_message_json fix.
-#[tokio::test]
-async fn send_returns_iso8601_timestamps() -> anyhow::Result<()> {
-    let client = connect_comm_only().await?;
-
-    // Self-send produces one outbound note visible to inbox.
-    ok_one(
-        &client,
-        r#"comm.send(to="commtest", content="r3 timestamp test message")"#,
-    )
-    .await?;
-
-    // inbox lists inbound; self-send is the same note — use the listing path
-    // that calls note_to_message_json which we fixed.
-    let result = call(
-        &client,
-        "request",
-        json!({"ops": r#"list(kind="note", limit=1)"#, "presentation": "verbose"}),
-    )
-    .await?;
-    let body: Value = serde_json::from_str(&first_text(&result))?;
-    let first = &body["results"][0];
-    assert_eq!(
-        first["ok"],
-        json!(true),
-        "list(kind=note) must succeed: {first}"
-    );
-    let items = first["result"].as_array().expect("list returns array");
-    assert!(!items.is_empty(), "must have at least one message note");
-    let created_at = items[0]["created_at"].as_str().unwrap_or("");
-    assert!(
-        created_at.starts_with("20"),
-        "message note created_at must be ISO-8601 string, got: {:?}",
-        items[0]["created_at"]
-    );
-    Ok(())
-}
-
-fn make_schedule_server() -> KhiveMcpServer {
-    disable_daemon();
-    let config = RuntimeConfig {
-        db_path: None,
-        default_namespace: Namespace::parse("schedtest").unwrap(),
-        embedding_model: None,
-        additional_embedding_models: vec![],
-        packs: vec!["kg".to_string(), "comm".to_string(), "schedule".to_string()],
-        ..RuntimeConfig::default()
-    };
-    let runtime = KhiveRuntime::new(config).expect("kg+comm+schedule runtime");
-    KhiveMcpServer::new(runtime).expect("server builds with kg+comm+schedule")
-}
-
-async fn connect_schedule(
-) -> anyhow::Result<impl std::ops::Deref<Target = rmcp::service::Peer<rmcp::RoleClient>>> {
-    let (server_transport, client_transport) = tokio::io::duplex(65536);
-    let server = make_schedule_server();
-    tokio::spawn(async move {
-        if let Ok(svc) = server.serve(server_transport).await {
-            let _ = svc.waiting().await;
-        }
-    });
-    let client = DummyClient.serve(client_transport).await?;
-    Ok(client)
-}
-
-/// `remind` creates a scheduled_event note; `agenda` returns ISO-8601 timestamps.
-#[tokio::test]
-async fn agenda_returns_iso8601_timestamps() -> anyhow::Result<()> {
-    let client = connect_schedule().await?;
-
-    ok_one(
-        &client,
-        r#"schedule.remind(content="r3 agenda ts test", at="2099-01-01T00:00:00Z")"#,
-    )
-    .await?;
-
-    let result = ok_one(&client, r#"schedule.agenda()"#).await?;
-    // agenda returns { events: [...], count: N }
-    let items = result["events"]
-        .as_array()
-        .expect("agenda returns events array");
-    assert!(!items.is_empty(), "agenda must return at least one event");
-    let created_at = items[0]["created_at"].as_str().unwrap_or("");
-    assert!(
-        created_at.starts_with("20"),
-        "agenda event created_at must be ISO-8601 string, got: {:?}",
-        items[0]["created_at"]
     );
     Ok(())
 }
@@ -3619,84 +2787,6 @@ async fn create_rejects_unknown_kwarg() -> anyhow::Result<()> {
         first["ok"],
         json!(false),
         "create with unknown kwarg must fail; got: {first}"
-    );
-    let err = first["error"].as_str().unwrap_or("");
-    assert!(
-        err.contains("unknownkw") || err.contains("unknown field"),
-        "error must mention the unknown field; got: {err}"
-    );
-    Ok(())
-}
-
-/// `assign(title="T", unknownkw="x")` (GTD) must return `ok: false`.
-#[tokio::test]
-async fn assign_rejects_unknown_kwarg() -> anyhow::Result<()> {
-    let client = connect_full().await?;
-
-    let result = call(
-        &client,
-        "request",
-        json!({ "ops": r#"gtd.assign(title="GTD unknown kwarg test", unknownkw="oops")"# }),
-    )
-    .await?;
-    let body: Value = serde_json::from_str(&first_text(&result))?;
-    let first = &body["results"][0];
-    assert_eq!(
-        first["ok"],
-        json!(false),
-        "assign with unknown kwarg must fail; got: {first}"
-    );
-    let err = first["error"].as_str().unwrap_or("");
-    assert!(
-        err.contains("unknownkw") || err.contains("unknown field"),
-        "error must mention the unknown field; got: {err}"
-    );
-    Ok(())
-}
-
-/// `send(to="x", content="y", unknownkw="z")` (comm) must return `ok: false`.
-#[tokio::test]
-async fn send_rejects_unknown_kwarg() -> anyhow::Result<()> {
-    let client = connect_comm_only().await?;
-
-    let result = call(
-        &client,
-        "request",
-        json!({ "ops": r#"comm.send(to="alice", content="test", unknownkw="oops")"# }),
-    )
-    .await?;
-    let body: Value = serde_json::from_str(&first_text(&result))?;
-    let first = &body["results"][0];
-    assert_eq!(
-        first["ok"],
-        json!(false),
-        "send with unknown kwarg must fail; got: {first}"
-    );
-    let err = first["error"].as_str().unwrap_or("");
-    assert!(
-        err.contains("unknownkw") || err.contains("unknown field"),
-        "error must mention the unknown field; got: {err}"
-    );
-    Ok(())
-}
-
-/// `agenda(unknownkw="x")` (schedule) must return `ok: false`.
-#[tokio::test]
-async fn agenda_rejects_unknown_kwarg() -> anyhow::Result<()> {
-    let client = connect_schedule().await?;
-
-    let result = call(
-        &client,
-        "request",
-        json!({ "ops": r#"schedule.agenda(unknownkw="oops")"# }),
-    )
-    .await?;
-    let body: Value = serde_json::from_str(&first_text(&result))?;
-    let first = &body["results"][0];
-    assert_eq!(
-        first["ok"],
-        json!(false),
-        "agenda with unknown kwarg must fail; got: {first}"
     );
     let err = first["error"].as_str().unwrap_or("");
     assert!(
@@ -3830,120 +2920,6 @@ async fn exec_output_valid_json_with_backslash_escape_content() -> anyhow::Resul
         json!(true),
         "update must succeed: {update_first}"
     );
-
-    Ok(())
-}
-
-// ── #546: schedule.agenda Agent response preserves properties.trigger_at ──────
-
-/// Schedule agenda in default Agent mode must not compact `trigger_at` inside
-/// `properties` — the full ISO-8601 string must round-trip verbatim (#546).
-#[tokio::test]
-async fn schedule_agenda_agent_preserves_properties_trigger_at_verbatim() -> anyhow::Result<()> {
-    let client = connect_schedule().await?;
-    let trigger_at = "2099-01-01T00:00:00Z";
-
-    ok_one(
-        &client,
-        &format!(r#"schedule.remind(content="agent trigger_at fidelity", at="{trigger_at}")"#),
-    )
-    .await?;
-
-    // Default Agent mode (no `presentation` key).
-    let result = call(&client, "request", json!({"ops": "schedule.agenda()"})).await?;
-    let body: Value = serde_json::from_str(&first_text(&result))?;
-    let first = &body["results"][0];
-    assert_eq!(
-        first["ok"],
-        json!(true),
-        "schedule.agenda must succeed: {first}"
-    );
-
-    let events = first["result"]["events"].as_array().expect("events array");
-    assert!(!events.is_empty(), "agenda must have at least one event");
-    let actual = events[0]["properties"]["trigger_at"].as_str().unwrap_or("");
-    assert_eq!(
-        actual, trigger_at,
-        "trigger_at inside properties must be preserved verbatim in Agent mode"
-    );
-    assert_ne!(
-        actual, "2099-01-01T00:00",
-        "trigger_at must not be truncated to minute granularity"
-    );
-    Ok(())
-}
-
-// ── #871: schedule.remind create-response preserves top-level trigger_at ─────
-//
-// These two tests deliberately cover `schedule.remind` only; `schedule` (the
-// verb-dispatch scheduling sibling) shares the same create-response shape and
-// the same presentation-layer fix, but an equivalent end-to-end case for it
-// is out of scope here to keep this regression narrow (#871).
-
-/// `schedule.remind`'s create response returns `trigger_at` as a top-level
-/// convenience field (sibling to `id`/`full_id`), not nested under
-/// `"properties"`. In default Agent mode this must round-trip verbatim,
-/// offset intact — the humanize layer previously discarded the offset (and
-/// seconds) by minute-truncating or relativizing this top-level field, even
-/// though the underlying offset-to-UTC conversion used for the relative-time
-/// comparison itself was already correct (#871).
-#[tokio::test]
-async fn schedule_remind_agent_preserves_top_level_trigger_at_with_offset() -> anyhow::Result<()> {
-    let client = connect_schedule().await?;
-    // Far enough in the future (relative to "now") to land outside the 24h
-    // relative-render window, so pre-fix this would have been silently
-    // minute-truncated (dropping the seconds and the "-04:00" offset)
-    // instead of round-tripping the exact ISO string.
-    let trigger_at = "2099-06-15T19:00:00-04:00";
-
-    let result = call(
-        &client,
-        "request",
-        json!({"ops": format!(
-            r#"schedule.remind(content="agent create-response trigger_at fidelity", at="{trigger_at}")"#
-        )}),
-    )
-    .await?;
-    let body: Value = serde_json::from_str(&first_text(&result))?;
-    let first = &body["results"][0];
-    assert_eq!(
-        first["ok"],
-        json!(true),
-        "schedule.remind must succeed: {first}"
-    );
-
-    let actual = first["result"]["trigger_at"].as_str().unwrap_or("");
-    assert_eq!(
-        actual, trigger_at,
-        "top-level trigger_at in the create response must be preserved verbatim, offset intact, in Agent mode"
-    );
-    Ok(())
-}
-
-/// A `Z`-suffixed UTC `at` input must likewise round-trip unchanged through
-/// the create-response humanize layer (#871 regression coverage). Bare
-/// offset-less input (no `Z`/`±HH:MM` suffix) is not a case here: it is
-/// rejected upstream as non-RFC-3339 by `schedule.remind`'s own validation
-/// (`crates/khive-pack-schedule/src/handlers.rs` `validate_at`), so it never
-/// reaches this presentation-layer fix.
-#[tokio::test]
-async fn schedule_remind_agent_preserves_top_level_trigger_at_utc() -> anyhow::Result<()> {
-    let client = connect_schedule().await?;
-
-    let utc = "2099-06-15T23:00:00Z";
-    let result = call(
-        &client,
-        "request",
-        json!({"ops": format!(
-            r#"schedule.remind(content="agent create-response trigger_at utc", at="{utc}")"#
-        )}),
-    )
-    .await?;
-    let body: Value = serde_json::from_str(&first_text(&result))?;
-    let actual = body["results"][0]["result"]["trigger_at"]
-        .as_str()
-        .unwrap_or("");
-    assert_eq!(actual, utc, "UTC trigger_at must round-trip unchanged");
 
     Ok(())
 }
@@ -4479,7 +3455,7 @@ fn make_format_server() -> KhiveMcpServer {
         default_namespace: khive_runtime::Namespace::parse("test").unwrap(),
         embedding_model: None,
         additional_embedding_models: vec![],
-        packs: vec!["kg".to_string(), "gtd".to_string()],
+        packs: vec!["kg".to_string()],
         ..khive_runtime::RuntimeConfig::default()
     };
     let rt = khive_runtime::KhiveRuntime::new(config).expect("in-memory runtime");
@@ -4625,10 +3601,11 @@ async fn presentation_per_op_verbose_preserves_full_id_namespace_and_props() {
 
     let server = make_format_server();
 
-    // Create a GTD task so we have a record with duplicated properties
-    // (assignee/priority/status echoed in both top-level and `properties`).
+    // Create a kg entity with `properties` that deliberately duplicate the
+    // top-level `name`/`description` fields — the same shape the redundancy-
+    // drop pre-pass targets (ADR-078 §7.2).
     let create_params = RequestParams {
-        ops: r#"gtd.assign(title="verbose-pin-task", priority="p1", assignee="lambda:test")"#
+        ops: r#"create(kind="entity", entity_kind="concept", name="verbose-pin-entity", description="verbose-pin-description", properties={"name":"verbose-pin-entity","description":"verbose-pin-description","team":"lambda:test"})"#
             .to_string(),
         presentation: Some("verbose".to_string()),
         presentation_per_op: None,
@@ -4640,19 +3617,19 @@ async fn presentation_per_op_verbose_preserves_full_id_namespace_and_props() {
     let create_raw = server
         .dispatch_request_local(create_params)
         .await
-        .expect("task creation must succeed");
+        .expect("entity creation must succeed");
     let create_body: serde_json::Value = serde_json::from_str(&create_raw).unwrap();
-    let task_id = create_body["results"][0]["result"]["id"]
+    let entity_id = create_body["results"][0]["result"]["id"]
         .as_str()
-        .expect("task id must be present");
+        .expect("entity id must be present");
 
     // Now fetch as a 2-op batch: op0 = agent (will be redundancy-dropped),
     // op1 = verbose (must survive the redundancy-drop pre-pass).
     //
-    // We use gtd.tasks (which returns records with assignee/priority/status in both
-    // top-level AND properties), then get the specific task in verbose mode.
+    // op1 gets the same entity in verbose mode; its `properties` duplicate
+    // top-level `name`/`description`.
     let batch_params = RequestParams {
-        ops: format!(r#"[gtd.tasks(limit=10), get(id="{task_id}")]"#),
+        ops: format!(r#"[list(kind="concept", limit=10), get(id="{entity_id}")]"#),
         // Batch default: agent (will apply redundancy drop).
         presentation: Some("agent".to_string()),
         // Op1 overrides to verbose — must skip redundancy drop for that op.
@@ -4680,7 +3657,7 @@ async fn presentation_per_op_verbose_preserves_full_id_namespace_and_props() {
     assert_eq!(
         results[0]["ok"],
         serde_json::json!(true),
-        "op0 (gtd.tasks) must succeed: {}",
+        "op0 (list) must succeed: {}",
         results[0]
     );
 
@@ -4688,7 +3665,7 @@ async fn presentation_per_op_verbose_preserves_full_id_namespace_and_props() {
     assert_eq!(
         results[1]["ok"],
         serde_json::json!(true),
-        "op1 (get task) must succeed: {}",
+        "op1 (get entity) must succeed: {}",
         results[1]
     );
 
@@ -4703,8 +3680,10 @@ async fn presentation_per_op_verbose_preserves_full_id_namespace_and_props() {
     //
     // What we can assert positively:
     //   - `namespace` appears (in agent+auto it is elided when "local" per §7.3).
-    //   - `properties` keys that duplicate top-level fields (assignee, priority,
-    //     status) survive (in agent+auto they are deduped away per §7.2).
+    //   - `properties` keys that duplicate top-level fields (name, description)
+    //     survive (in agent+auto they are deduped away per §7.2) — the
+    //     "verbose-pin-description" marker appears twice: once as the top-level
+    //     `description`, once inside `properties.description`.
     let op1_rendered = results[1]["result"]
         .as_str()
         .expect("op1 result must be a rendered string");
@@ -4715,15 +3694,19 @@ async fn presentation_per_op_verbose_preserves_full_id_namespace_and_props() {
         "verbose op: namespace must survive the redundancy-drop pre-pass; rendered: {op1_rendered}"
     );
 
-    // properties: duplicate keys (assignee, priority, status) must survive in
-    // verbose mode (§7.2 dedup is skipped).  In agent+auto these are removed.
+    // properties: a non-duplicate marker key always survives (sanity check
+    // that `properties` itself is present)...
     assert!(
-        op1_rendered.contains("assignee"),
-        "verbose op: properties.assignee must survive the redundancy-drop pre-pass; rendered: {op1_rendered}"
+        op1_rendered.contains("team"),
+        "verbose op: properties.team must survive the redundancy-drop pre-pass; rendered: {op1_rendered}"
     );
+    // ...and the duplicate `description` value must appear twice: once at
+    // top-level, once inside `properties` (dedup is skipped in verbose mode).
+    let description_occurrences = op1_rendered.matches("verbose-pin-description").count();
     assert!(
-        op1_rendered.contains("priority"),
-        "verbose op: properties.priority must survive the redundancy-drop pre-pass; rendered: {op1_rendered}"
+        description_occurrences >= 2,
+        "verbose op: duplicate properties.description must survive the redundancy-drop \
+         pre-pass (expected >=2 occurrences, got {description_occurrences}); rendered: {op1_rendered}"
     );
 }
 
@@ -4744,10 +3727,10 @@ async fn format_auto_always_verbose_verb_skips_redundancy_drop_without_override(
 
     let server = make_format_server();
 
-    // Create a GTD task: assignee/priority/status are echoed in both top-level
-    // and `properties`, and the record carries namespace="local".
+    // Create a kg entity whose `properties` deliberately duplicate the
+    // top-level `name`/`description` fields, and which carries namespace="local".
     let create_params = RequestParams {
-        ops: r#"gtd.assign(title="always-verbose-pin", priority="p1", assignee="lambda:test")"#
+        ops: r#"create(kind="entity", entity_kind="concept", name="always-verbose-pin", description="always-verbose-pin-description", properties={"name":"always-verbose-pin","description":"always-verbose-pin-description","team":"lambda:test"})"#
             .to_string(),
         presentation: Some("verbose".to_string()),
         presentation_per_op: None,
@@ -4759,18 +3742,18 @@ async fn format_auto_always_verbose_verb_skips_redundancy_drop_without_override(
     let create_raw = server
         .dispatch_request_local(create_params)
         .await
-        .expect("task creation must succeed");
+        .expect("entity creation must succeed");
     let create_body: serde_json::Value = serde_json::from_str(&create_raw).unwrap();
-    let task_id = create_body["results"][0]["result"]["id"]
+    let entity_id = create_body["results"][0]["result"]["id"]
         .as_str()
-        .expect("task id must be present");
+        .expect("entity id must be present");
 
     // get() is AlwaysVerbose (ADR-045 §6). Dispatch it under format=auto with the
     // DEFAULT Agent presentation and NO presentation_per_op override. The
     // AlwaysVerbose policy must force Verbose at the format seam, so the
     // redundancy-drop pre-pass is skipped and namespace/properties survive.
     let get_params = RequestParams {
-        ops: format!(r#"get(id="{task_id}")"#),
+        ops: format!(r#"get(id="{entity_id}")"#),
         presentation: None,        // → default Agent
         presentation_per_op: None, // → no per-op override
         save_to: None,
@@ -4804,14 +3787,18 @@ async fn format_auto_always_verbose_verb_skips_redundancy_drop_without_override(
         "AlwaysVerbose get: namespace must survive redundancy-drop under format=auto + \
          default agent (no override); rendered: {rendered}"
     );
-    // Duplicate properties keys (assignee/priority) are deduped under agent+auto
-    // but MUST survive for an AlwaysVerbose verb.
+    // A non-duplicate marker key always survives (sanity check that
+    // `properties` itself is present)...
     assert!(
-        rendered.contains("assignee"),
-        "AlwaysVerbose get: properties.assignee must survive redundancy-drop; rendered: {rendered}"
+        rendered.contains("team"),
+        "AlwaysVerbose get: properties.team must survive redundancy-drop; rendered: {rendered}"
     );
+    // ...and the duplicate `description` value must appear twice: once at
+    // top-level, once inside `properties` (dedup is skipped for AlwaysVerbose).
+    let description_occurrences = rendered.matches("always-verbose-pin-description").count();
     assert!(
-        rendered.contains("priority"),
-        "AlwaysVerbose get: properties.priority must survive redundancy-drop; rendered: {rendered}"
+        description_occurrences >= 2,
+        "AlwaysVerbose get: duplicate properties.description must survive redundancy-drop \
+         (expected >=2 occurrences, got {description_occurrences}); rendered: {rendered}"
     );
 }

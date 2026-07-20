@@ -186,13 +186,13 @@ mod tests {
             result.err()
         );
 
-        // Confirm the registry is functional: comm pack must appear in the surface
+        // Confirm the registry is functional: kg pack must appear in the surface
         // even under strict mode.
         let (registry, _runtime) = result.unwrap();
         let pack_names: Vec<&str> = registry.pack_names().into_iter().collect();
         assert!(
-            pack_names.contains(&"comm"),
-            "comm pack must be present in introspection registry under strict mode; \
+            pack_names.contains(&"kg"),
+            "kg pack must be present in introspection registry under strict mode; \
              got: {pack_names:?}"
         );
     }
@@ -238,35 +238,6 @@ mod tests {
         assert!(
             !create.category.is_empty(),
             "kg create must have a non-empty category"
-        );
-    }
-
-    #[test]
-    fn memory_pack_subhandlers_carry_subhandler_visibility() {
-        let info = pack_handler("memory")
-            .expect("pack_handler succeeds")
-            .expect("memory pack must exist");
-        // recall.embed, recall.candidates, recall.fuse, recall.score are Subhandler.
-        let subhandlers: Vec<&VerbInfo> = info
-            .verbs
-            .iter()
-            .filter(|v| v.visibility == VerbVisibility::Subhandler)
-            .collect();
-        assert!(
-            !subhandlers.is_empty(),
-            "memory pack must have subhandler entries; got none in {:?}",
-            info.verbs.iter().map(|v| &v.name).collect::<Vec<_>>()
-        );
-        // memory.recall_embed must be a subhandler.
-        let embed = info
-            .verbs
-            .iter()
-            .find(|v| v.name == "memory.recall_embed")
-            .expect("memory.recall_embed must be in the handler list");
-        assert_eq!(
-            embed.visibility,
-            VerbVisibility::Subhandler,
-            "memory.recall_embed must have Subhandler visibility (F119)"
         );
     }
 

@@ -1404,6 +1404,12 @@ mod tests {
     use serial_test::serial;
     use std::io::Write;
 
+    // Force-link khive-pack-template (a dev-dependency only) so its
+    // `inventory::submit!` registration is visible to this test binary's
+    // `PackRegistry` — mirrors the same force-link in tests/integration.rs.
+    #[allow(unused_imports)]
+    use khive_pack_template::TemplatePack as _TemplatePack;
+
     // #689: `config_discovery_db_anchor` is a pure function (no env/cwd
     // dependency), so its explicit-vs-unset contract is covered here without
     // the env-mutation isolation the cwd/HOME-dependent tests below require.
@@ -2346,7 +2352,7 @@ id = "lambda:project-actor"
     // --- multi-backend boot path (ADR-028) ---
 
     /// Build a `RuntimeConfig` suitable for multi-backend tests: in-memory db,
-    /// AllowAllGate, "local" namespace, no embedder, both kg and comm packs.
+    /// AllowAllGate, "local" namespace, no embedder, both kg and template packs.
     ///
     /// `db_path` mirrors what `resolve_runtime_config` sets for a `--db`-unset
     /// invocation (every call site below passes `cli_db_override: None` to
@@ -2361,14 +2367,14 @@ id = "lambda:project-actor"
             default_namespace: Namespace::parse("local").expect("ns"),
             embedding_model: None,
             additional_embedding_models: vec![],
-            packs: vec!["kg".to_string(), "comm".to_string()],
+            packs: vec!["kg".to_string(), "template".to_string()],
             backend_id: BackendId::main(),
             ..RuntimeConfig::default()
         }
     }
 
     /// Two in-memory backends — `main` plus a second named `secondary`.
-    /// The `comm` pack is pinned to `secondary`; `kg` defaults to `main`.
+    /// The `template` pack is pinned to `secondary`; `kg` defaults to `main`.
     /// Positive test: `build_server_multi_backend` must return `Ok` and both
     /// packs must be functional.
     #[tokio::test]
@@ -2399,7 +2405,7 @@ id = "lambda:project-actor"
             packs: {
                 let mut m = std::collections::HashMap::new();
                 m.insert(
-                    "comm".to_string(),
+                    "template".to_string(),
                     PackConfig {
                         backend: "secondary".to_string(),
                     },
@@ -2438,10 +2444,11 @@ id = "lambda:project-actor"
             "kg create must succeed; response: {kg_resp}"
         );
 
-        // comm round-trip: send a message on the secondary backend.
-        let comm_resp = server
+        // template round-trip: dispatch template's stateless verb on the
+        // secondary backend.
+        let template_resp = server
             .dispatch_request_local(RequestParams {
-                ops: r#"comm.send(to="local", content="multi-backend-test")"#.to_string(),
+                ops: r#"template.my_verb(name="multi-backend-test")"#.to_string(),
                 presentation: None,
                 presentation_per_op: None,
                 save_to: None,
@@ -2450,15 +2457,15 @@ id = "lambda:project-actor"
                 request_id: None,
             })
             .await
-            .expect("comm dispatch must not error");
+            .expect("template dispatch must not error");
 
-        let comm_json: serde_json::Value =
-            serde_json::from_str(&comm_resp).expect("comm response is valid JSON");
-        let first_comm_ok = comm_json["results"][0]["ok"].as_bool();
+        let template_json: serde_json::Value =
+            serde_json::from_str(&template_resp).expect("template response is valid JSON");
+        let first_template_ok = template_json["results"][0]["ok"].as_bool();
         assert_eq!(
-            first_comm_ok,
+            first_template_ok,
             Some(true),
-            "comm.send must succeed; response: {comm_resp}"
+            "template.my_verb must succeed; response: {template_resp}"
         );
     }
 
@@ -2709,47 +2716,6 @@ region = "us-east-1"
         }
     }
 
-    /// RAII guard: clears the `KHIVE_*` variables that would otherwise
-    /// override the temp `khive.toml` the boot tests write, restoring each
-    /// prior value (or absence) on drop, even on panic/unwind. `#[serial]`
-    /// serializes access but does not restore process-global state; this
-    /// guard does.
-    struct ClearedKhiveEnvGuard {
-        prev: Vec<(&'static str, Option<std::ffi::OsString>)>,
-    }
-
-    impl ClearedKhiveEnvGuard {
-        const VARS: [&'static str; 4] = [
-            "KHIVE_DB",
-            "KHIVE_ACTOR",
-            "KHIVE_PACKS",
-            "KHIVE_REQUIRE_ATTRIBUTED_ACTOR",
-        ];
-
-        fn clear() -> Self {
-            let prev = Self::VARS
-                .iter()
-                .map(|name| {
-                    let value = std::env::var_os(name);
-                    std::env::remove_var(name);
-                    (*name, value)
-                })
-                .collect();
-            Self { prev }
-        }
-    }
-
-    impl Drop for ClearedKhiveEnvGuard {
-        fn drop(&mut self) {
-            for (name, value) in self.prev.drain(..) {
-                match value {
-                    Some(v) => std::env::set_var(name, v),
-                    None => std::env::remove_var(name),
-                }
-            }
-        }
-    }
-
     fn s3_blob_config() -> BlobConfig {
         BlobConfig::S3 {
             bucket: "khive-blobs".to_string(),
@@ -2758,63 +2724,6 @@ region = "us-east-1"
             prefix: None,
             allow_http: None,
         }
-    }
-
-    /// Positive counterpart to `single_backend_boot_wires_configured_s3_blob_store`:
-    /// with valid (dummy) AWS credentials present, the single-backend startup
-    /// path's `install_resolved_blob_store` call (`:1826`) must actually
-    /// install an `S3BlobStore`, not merely fail closed when credentials are
-    /// absent. Round-4 remediation: drives the real `build_server` boot entry
-    /// (not `KhiveRuntime::new` + a direct `install_resolved_blob_store` call)
-    /// via a temporary `khive.toml` + parsed `Args`, selecting the `schedule`
-    /// pack so its already-installed runtime (`:1847`) is returned for
-    /// inspection.
-    #[test]
-    #[serial]
-    fn single_backend_boot_installs_s3_blob_store_on_successful_selection() {
-        let _env = ClearedKhiveEnvGuard::clear();
-        let _creds = DummyAwsCredsGuard::set();
-
-        let dir = tempfile::tempdir().expect("temp dir");
-        let config_path = write_config(
-            dir.path(),
-            r#"
-[storage.blob]
-backend = "s3"
-bucket = "khive-blobs"
-region = "us-east-1"
-"#,
-        );
-
-        use clap::Parser;
-        let args = Args::parse_from([
-            "mcp",
-            "--db",
-            ":memory:",
-            "--pack",
-            "kg",
-            "--pack",
-            "schedule",
-            "--config",
-            config_path.to_str().expect("utf8 path"),
-        ]);
-
-        let (_server, schedule_rt) = build_server(&args).expect(
-            "valid dummy AWS credentials must resolve and install an S3BlobStore through the \
-             real single-backend boot path",
-        );
-        let runtime = schedule_rt
-            .expect("the schedule pack was selected so its installed runtime must be returned");
-
-        let installed = runtime.blob_store().expect(
-            "install_resolved_blob_store must call KhiveRuntime::install_blob_store at the \
-             real :1826 call site",
-        );
-        let debug = format!("{installed:?}");
-        assert!(
-            debug.contains("S3BlobStore"),
-            "expected the installed store to be an S3BlobStore, got: {debug}"
-        );
     }
 
     /// Positive counterpart to `multi_backend_boot_wires_configured_s3_blob_store`:
@@ -2861,76 +2770,6 @@ region = "us-east-1"
         }
     }
 
-    /// Guards the ADR-111 Amendment 2 fs-default promise (`docs/adr/ADR-111-blob-store.md:538-541`):
-    /// with no `[storage.blob]` section at all, the single-backend startup
-    /// path must still install a usable `FsBlobStore` rooted beside the
-    /// database file, and that store must actually round-trip a blob --
-    /// not merely construct without error. Round-4 remediation: drives the
-    /// real `build_server` boot entry via a temporary (sectionless)
-    /// `khive.toml` + parsed `Args`, selecting the `schedule` pack so its
-    /// already-installed runtime (`:1847`) is returned for inspection.
-    #[tokio::test]
-    #[serial]
-    async fn single_backend_boot_default_fs_blob_store_is_usable_without_storage_section() {
-        let _env = ClearedKhiveEnvGuard::clear();
-
-        let dir = tempfile::tempdir().expect("temp dir");
-        let db_path = dir.path().join("main.db");
-        let config_path = write_config(dir.path(), "");
-
-        use clap::Parser;
-        let args = Args::parse_from([
-            "mcp",
-            "--db",
-            db_path.to_str().expect("utf8 path"),
-            "--pack",
-            "kg",
-            "--pack",
-            "schedule",
-            "--config",
-            config_path.to_str().expect("utf8 path"),
-        ]);
-
-        let (_server, schedule_rt) = build_server(&args)
-            .expect("absent [storage.blob] must resolve the fs default through the real single-backend boot path");
-        let runtime = schedule_rt
-            .expect("the schedule pack was selected so its installed runtime must be returned");
-
-        let installed = runtime.blob_store().expect(
-            "install_resolved_blob_store must call KhiveRuntime::install_blob_store at the \
-             real :1826 call site for a file-backed backend",
-        );
-        let debug = format!("{installed:?}");
-        assert!(
-            debug.contains("FsBlobStore"),
-            "expected the default store to be an FsBlobStore, got: {debug}"
-        );
-
-        // The absent-section default keeps FsBlobStore's 100 GB free-space
-        // floor — that default is exactly what this test locks in, and a CI
-        // runner legitimately may not clear it. A CapacityFloor rejection can
-        // only come from inside FsBlobStore::put, so it is equally valid
-        // proof that the boot path wired a live fs-default store; round-trip
-        // only when the volume has room.
-        match installed
-            .put(b"adr-111 fs-default regression".to_vec())
-            .await
-        {
-            Ok(content_ref) => {
-                let round_tripped = installed
-                    .get(&content_ref)
-                    .await
-                    .expect("fs-default store must serve back what it just accepted");
-                assert_eq!(
-                    round_tripped, b"adr-111 fs-default regression",
-                    "fs-default store must round-trip the exact bytes written"
-                );
-            }
-            Err(khive_storage::StorageError::CapacityFloor { .. }) => {}
-            Err(other) => panic!("fs-default store must accept a write: {other:?}"),
-        }
-    }
-
     /// Regression for ADR-073: a pack assigned to a secondary backend must
     /// have `core_backend` wired at boot so that `rt.core().backend_id()` returns "main".
     ///
@@ -2966,7 +2805,7 @@ region = "us-east-1"
             packs: {
                 let mut m = std::collections::HashMap::new();
                 m.insert(
-                    "comm".to_string(),
+                    "template".to_string(),
                     PackConfig {
                         backend: "secondary".to_string(),
                     },
@@ -2981,27 +2820,27 @@ region = "us-east-1"
         let result = build_registry_for_multi_backend(base_cfg, &khive_cfg, None)
             .expect("multi-backend registry must boot");
 
-        let comm_rt = result
+        let template_rt = result
             .per_pack_runtimes
-            .get("comm")
-            .expect("comm pack runtime must be present in per_pack_runtimes");
+            .get("template")
+            .expect("template pack runtime must be present in per_pack_runtimes");
 
         // Own backend_id is "secondary" — not main.
         assert_eq!(
-            comm_rt.backend_id().as_str(),
+            template_rt.backend_id().as_str(),
             "secondary",
-            "comm pack runtime's own backend_id must be \"secondary\""
+            "template pack runtime's own backend_id must be \"secondary\""
         );
 
         // ADR-073 contract: core() on a secondary-backend pack must return a
         // main-bound handle, not a clone of self. Failure here means the
         // build_pack_runtime wiring was not applied.
         assert_eq!(
-            comm_rt.core().backend_id().as_str(),
+            template_rt.core().backend_id().as_str(),
             BackendId::MAIN,
             "secondary-backend pack must have core_backend wired to main (ADR-073); \
              core().backend_id() returned {:?} — build_pack_runtime wiring missing",
-            comm_rt.core().backend_id().as_str()
+            template_rt.core().backend_id().as_str()
         );
     }
 
@@ -3243,109 +3082,6 @@ region = "us-east-1"
         }
     }
 
-    /// Regression: the multi-backend boot path
-    /// MUST thread the configured actor identity (issue #75) into the registry,
-    /// exactly as the single-backend path does. If `with_actor_id` is dropped,
-    /// dispatch mints `ActorRef::anonymous()` and `comm.inbox` reverts to
-    /// party-line — silently re-opening the cross-actor leak #75 fixed. With a
-    /// configured actor `"actor-b"`, a message addressed to `"actor-a"` must NOT
-    /// appear in `actor-b`'s inbox, while one addressed to `"actor-b"` must.
-    #[tokio::test]
-    #[serial]
-    async fn multi_backend_preserves_actor_filtering() {
-        use crate::tools::request::RequestParams;
-        use khive_runtime::PackConfig;
-
-        let khive_cfg = KhiveConfig {
-            backends: vec![
-                BackendConfig {
-                    name: "main".to_string(),
-                    kind: BackendKind::Memory,
-                    path: None,
-                    cache_mb: None,
-                    journal_mode: None,
-                    read_only: false,
-                },
-                BackendConfig {
-                    name: "secondary".to_string(),
-                    kind: BackendKind::Memory,
-                    path: None,
-                    cache_mb: None,
-                    journal_mode: None,
-                    read_only: false,
-                },
-            ],
-            packs: {
-                let mut m = std::collections::HashMap::new();
-                m.insert(
-                    "comm".to_string(),
-                    PackConfig {
-                        backend: "secondary".to_string(),
-                    },
-                );
-                m
-            },
-            ..KhiveConfig::default()
-        };
-
-        // Configured actor — the value #75 threads end-to-end.
-        let base_cfg = RuntimeConfig {
-            actor_id: Some("actor-b".to_string()),
-            ..base_runtime_config_for_multi_backend()
-        };
-
-        let server = build_server_multi_backend(base_cfg, &khive_cfg, None)
-            .expect("multi-backend boot must succeed");
-
-        let dispatch = |ops: String| {
-            let server = &server;
-            async move {
-                let resp = server
-                    .dispatch_request_local(RequestParams {
-                        ops,
-                        presentation: None,
-                        presentation_per_op: None,
-                        save_to: None,
-                        format: None,
-                        format_per_op: None,
-                        request_id: None,
-                    })
-                    .await
-                    .expect("dispatch must not error");
-                serde_json::from_str::<serde_json::Value>(&resp).expect("valid JSON")
-            }
-        };
-
-        // One message to a different actor, one explicit message to ourselves.
-        let to_a = dispatch(r#"comm.send(to="actor-a", content="for-a")"#.to_string()).await;
-        assert_eq!(to_a["results"][0]["ok"].as_bool(), Some(true), "{to_a}");
-        let to_b =
-            dispatch(r#"comm.send(to="actor-b", content="for-b", self_send=true)"#.to_string())
-                .await;
-        assert_eq!(to_b["results"][0]["ok"].as_bool(), Some(true), "{to_b}");
-
-        // Inbox for the configured actor (actor-b) must be filtered by to_actor.
-        let inbox = dispatch(r#"comm.inbox()"#.to_string()).await;
-        let result = &inbox["results"][0]["result"];
-        let messages = result["messages"]
-            .as_array()
-            .expect("inbox returns a messages array");
-
-        let contents: Vec<&str> = messages
-            .iter()
-            .filter_map(|m| m["content"].as_str())
-            .collect();
-        assert!(
-            contents.contains(&"for-b"),
-            "actor-b must see the message addressed to it; got {contents:?}"
-        );
-        assert!(
-            !contents.contains(&"for-a"),
-            "actor-b must NOT see the message addressed to actor-a (leak #75); \
-             got {contents:?} — actor identity was not threaded into the multi-backend registry"
-        );
-    }
-
     /// Negative test: `[[backends]]` is declared but there is no entry named
     /// `"main"`. `build_server_multi_backend` must return an error whose
     /// message mentions `"main"` so operators know what to fix.
@@ -3404,7 +3140,7 @@ region = "us-east-1"
             packs: {
                 let mut m = std::collections::HashMap::new();
                 m.insert(
-                    "comm".to_string(),
+                    "template".to_string(),
                     PackConfig {
                         backend: "archive".to_string(),
                     },
@@ -3428,7 +3164,7 @@ region = "us-east-1"
         if let Err(err) = result {
             let msg = err.to_string();
             assert!(
-                msg.contains("packs.comm"),
+                msg.contains("packs.template"),
                 "error must name the pack; got: {msg}"
             );
             assert!(
@@ -3462,7 +3198,7 @@ region = "us-east-1"
             packs: {
                 let mut m = std::collections::HashMap::new();
                 m.insert(
-                    "comm".to_string(),
+                    "template".to_string(),
                     PackConfig {
                         backend: "archive".to_string(),
                     },
@@ -3483,7 +3219,7 @@ region = "us-east-1"
         if let Err(err) = result {
             let msg = err.to_string();
             assert!(
-                msg.contains("packs.comm"),
+                msg.contains("packs.template"),
                 "error must name the pack; got: {msg}"
             );
             assert!(
@@ -3953,173 +3689,6 @@ region = "us-east-1"
         );
     }
 
-    /// Physical isolation guard: a record written through a pack pinned to backend B's
-    /// SQLite file MUST NOT appear in backend A's file, and vice versa.
-    ///
-    /// This is the "billing data must not mix with agent memory" guarantee.
-    /// The test opens each file independently with rusqlite after the server is
-    /// dropped to confirm cross-file absence in both directions.
-    ///
-    /// Schema facts discovered from crates/khive-db/sql/:
-    ///   entities table — column `name` holds the entity name (entities-ddl.sql)
-    ///   notes table    — column `content` holds the message body; `kind` = "message"
-    ///                    for comm.send output (notes-ddl.sql + comm handlers.rs)
-    ///
-    /// Relies on `base_runtime_config_for_multi_backend` leaving `embedding_model`
-    /// unset: no embedder means no `vec0` virtual table is created, so the plain
-    /// `rusqlite::Connection::open` below (which does not load the vec0 extension)
-    /// can read both files. If an embedder is ever added to that helper, this test
-    /// must load the extension or query through a runtime instead.
-    #[tokio::test]
-    #[serial]
-    async fn multi_backend_isolates_pack_data_to_separate_files() {
-        use crate::tools::request::RequestParams;
-        use khive_runtime::PackConfig;
-        use rusqlite::Connection;
-
-        let dir = tempfile::tempdir().expect("temp dir");
-        let main_path = dir.path().join("main.db");
-        let second_path = dir.path().join("second.db");
-
-        let khive_cfg = KhiveConfig {
-            backends: vec![
-                BackendConfig {
-                    name: "main".to_string(),
-                    kind: BackendKind::Sqlite,
-                    path: Some(main_path.clone()),
-                    cache_mb: None,
-                    journal_mode: None,
-                    read_only: false,
-                },
-                BackendConfig {
-                    name: "second".to_string(),
-                    kind: BackendKind::Sqlite,
-                    path: Some(second_path.clone()),
-                    cache_mb: None,
-                    journal_mode: None,
-                    read_only: false,
-                },
-            ],
-            packs: {
-                let mut m = std::collections::HashMap::new();
-                m.insert(
-                    "comm".to_string(),
-                    PackConfig {
-                        backend: "second".to_string(),
-                    },
-                );
-                m
-            },
-            ..KhiveConfig::default()
-        };
-
-        let base_cfg = base_runtime_config_for_multi_backend();
-
-        let server = build_server_multi_backend(base_cfg, &khive_cfg, None)
-            .expect("multi-backend boot must succeed");
-
-        let dispatch = |ops: String| {
-            let server = &server;
-            async move {
-                server
-                    .dispatch_request_local(RequestParams {
-                        ops,
-                        presentation: None,
-                        presentation_per_op: None,
-                        save_to: None,
-                        format: None,
-                        format_per_op: None,
-                        request_id: None,
-                    })
-                    .await
-                    .expect("dispatch must not error")
-            }
-        };
-
-        // kg → main.db: create an entity
-        let kg_resp =
-            dispatch(r#"create(kind="concept", name="MainOnlyEntity")"#.to_string()).await;
-        let kg_json: serde_json::Value =
-            serde_json::from_str(&kg_resp).expect("kg response is valid JSON");
-        assert_eq!(
-            kg_json["results"][0]["ok"].as_bool(),
-            Some(true),
-            "kg create must succeed; response: {kg_resp}"
-        );
-
-        // comm → second.db: send a message
-        let comm_resp =
-            dispatch(r#"comm.send(to="local", content="SecondOnlyMsg")"#.to_string()).await;
-        let comm_json: serde_json::Value =
-            serde_json::from_str(&comm_resp).expect("comm response is valid JSON");
-        assert_eq!(
-            comm_json["results"][0]["ok"].as_bool(),
-            Some(true),
-            "comm.send must succeed; response: {comm_resp}"
-        );
-
-        // Drop the server so WAL is checkpointed and files are fully flushed
-        // before we open them with rusqlite.
-        drop(server);
-
-        // --- Verify main.db ---
-        let main_conn = Connection::open(&main_path).expect("open main.db");
-
-        let main_entity_count: i64 = main_conn
-            .query_row(
-                "SELECT COUNT(*) FROM entities WHERE name = 'MainOnlyEntity' AND deleted_at IS NULL",
-                [],
-                |row| row.get(0),
-            )
-            .expect("query entities in main.db");
-        assert_eq!(
-            main_entity_count, 1,
-            "main.db MUST contain MainOnlyEntity (written via kg pack); got count={main_entity_count}"
-        );
-
-        let main_msg_count: i64 = main_conn
-            .query_row(
-                "SELECT COUNT(*) FROM notes WHERE kind = 'message'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("query notes in main.db");
-        assert_eq!(
-            main_msg_count, 0,
-            "main.db MUST NOT contain any message notes (comm is pinned to second.db); \
-             got count={main_msg_count}"
-        );
-
-        // --- Verify second.db ---
-        let second_conn = Connection::open(&second_path).expect("open second.db");
-
-        let second_msg_count: i64 = second_conn
-            .query_row(
-                "SELECT COUNT(*) FROM notes WHERE kind = 'message' AND content = 'SecondOnlyMsg'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("query notes in second.db");
-        assert_eq!(
-            second_msg_count, 2,
-            "second.db MUST contain SecondOnlyMsg (dual-write: 1 outbound + 1 inbound copy); \
-             got count={second_msg_count}"
-        );
-
-        let second_entity_count: i64 = second_conn
-            .query_row(
-                "SELECT COUNT(*) FROM entities WHERE name = 'MainOnlyEntity'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("query entities in second.db");
-        assert_eq!(
-            second_entity_count, 0,
-            "second.db MUST NOT contain MainOnlyEntity (kg is pinned to main.db); \
-             got count={second_entity_count}"
-        );
-    }
-
     // --- should_warn_unattributed predicate ---
 
     fn packs(names: &[&str]) -> Vec<String> {
@@ -4310,63 +3879,6 @@ region = "us-east-1"
 
     #[test]
     #[serial]
-    fn build_server_schedule_tick_uses_the_configured_backend_not_the_home_default() {
-        let seat_dir = tempfile::tempdir().expect("seat tempdir");
-        let _seat_env = SeatEnv::enter(seat_dir.path());
-        std::env::remove_var("KHIVE_DB");
-        std::env::remove_var("KHIVE_ACTOR");
-        std::env::remove_var("KHIVE_PACKS");
-        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
-
-        let configured_db = seat_dir.path().join("configured-schedule-backend.db");
-
-        use clap::Parser;
-        let args = Args::parse_from(["mcp", "--db", configured_db.to_str().expect("utf8 path")]);
-
-        let (_server, schedule_rt) = build_server(&args).expect("build_server must succeed");
-        let rt = schedule_rt
-            .expect("the default pack set includes \"schedule\" — a runtime must be returned");
-
-        assert_eq!(
-            rt.config().db_path.as_deref(),
-            Some(configured_db.as_path()),
-            "the tick's runtime must target the exact --db this daemon was configured with, \
-             not RuntimeConfig::default()'s $HOME/.khive/khive.db fallback"
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn build_server_schedule_tick_uses_the_configured_actor_identity() {
-        let seat_dir = tempfile::tempdir().expect("seat tempdir");
-        let _seat_env = SeatEnv::enter(seat_dir.path());
-        std::env::remove_var("KHIVE_DB");
-        std::env::remove_var("KHIVE_ACTOR");
-        std::env::remove_var("KHIVE_PACKS");
-        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
-
-        use clap::Parser;
-        let args = Args::parse_from([
-            "mcp",
-            "--db",
-            ":memory:",
-            "--actor",
-            "lambda:adr106-tick-actor",
-        ]);
-
-        let (_server, schedule_rt) = build_server(&args).expect("build_server must succeed");
-        let rt = schedule_rt.expect("schedule pack is loaded by default");
-
-        assert_eq!(
-            rt.config().actor_id.as_deref(),
-            Some("lambda:adr106-tick-actor"),
-            "the tick's runtime must carry the daemon's own resolved --actor identity, \
-             not RuntimeConfig::default()'s unattributed actor_id=None"
-        );
-    }
-
-    #[test]
-    #[serial]
     fn build_server_schedule_tick_is_none_when_schedule_pack_is_not_in_the_restricted_pack_set() {
         let seat_dir = tempfile::tempdir().expect("seat tempdir");
         let _seat_env = SeatEnv::enter(seat_dir.path());
@@ -4385,325 +3897,6 @@ region = "us-east-1"
             "when the operator restricts --pack to exclude \"schedule\", the tick must have \
              nothing to drain against — never silently falling back to a runtime that can \
              dispatch through a pack the daemon was not configured to load"
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn build_server_schedule_tick_runtime_satisfies_strict_actor_mode_like_the_live_server() {
-        // Regression for the exact "strict actor mode can make every tick
-        // fail" scenario this fix addressed: before this fix, the
-        // tick's separately-reconstructed `RuntimeConfig::default()` carried
-        // NO actor regardless of what `--actor` the daemon itself was given,
-        // so a strict-mode daemon's tick would trip `enforce_strict_actor_mode`
-        // on every single pass even though the live server's own actor was
-        // configured correctly. `build_server` must both (a) succeed under
-        // strict mode when an actor IS configured, and (b) hand back a
-        // schedule-tick runtime carrying that SAME actor — proving the tick
-        // no longer performs its own, separately-failing resolution.
-        let seat_dir = tempfile::tempdir().expect("seat tempdir");
-        let _seat_env = SeatEnv::enter(seat_dir.path());
-        std::env::remove_var("KHIVE_DB");
-        std::env::remove_var("KHIVE_ACTOR");
-        std::env::remove_var("KHIVE_PACKS");
-        let prev_strict = std::env::var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR").ok();
-        std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", "1");
-
-        use clap::Parser;
-        let args = Args::parse_from([
-            "mcp",
-            "--db",
-            ":memory:",
-            "--actor",
-            "lambda:strict-mode-tenant",
-            "--pack",
-            "kg",
-            "--pack",
-            "comm",
-            "--pack",
-            "schedule",
-        ]);
-
-        let result = build_server(&args);
-
-        match prev_strict {
-            Some(v) => std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", v),
-            None => std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR"),
-        }
-
-        let (_server, schedule_rt) = result.expect(
-            "build_server must succeed under strict mode when --actor is properly configured",
-        );
-        let rt = schedule_rt.expect("\"schedule\" pack was explicitly requested");
-        assert_eq!(
-            rt.config().actor_id.as_deref(),
-            Some("lambda:strict-mode-tenant"),
-            "the tick's runtime must carry the same actor identity that satisfied strict \
-             mode at daemon boot, not a separately-resolved, unattributed default"
-        );
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn build_server_schedule_tick_uses_the_declared_multi_backend_not_main() {
-        // Multi-backend (ADR-028 [[backends]]) config-backed targeting: the
-        // "schedule" pack is explicitly routed to its OWN backend, distinct
-        // from "main". `build_server`'s returned schedule-tick runtime must
-        // WRITE INTO that declared backend's file, not main's — proving the
-        // correct per-pack runtime is threaded through for
-        // multi-backend boots too, not only the single-backend common case.
-        // (`RuntimeConfig.db_path` is not itself a reliable signal here —
-        // per-pack multi-backend runtimes only override `backend_id`, not
-        // `db_path` — so this test verifies the actual bound storage file by
-        // writing a marker row and re-opening both declared backend files
-        // independently.)
-        let seat_dir = tempfile::tempdir().expect("seat tempdir");
-        let _seat_env = SeatEnv::enter(seat_dir.path());
-        std::env::remove_var("KHIVE_DB");
-        std::env::remove_var("KHIVE_ACTOR");
-        std::env::remove_var("KHIVE_PACKS");
-        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
-
-        let main_db = seat_dir.path().join("main.db");
-        let schedule_db = seat_dir.path().join("schedule-backend.db");
-        let config_path = write_config(
-            seat_dir.path(),
-            &format!(
-                r#"
-[[backends]]
-name = "main"
-kind = "sqlite"
-path = "{main}"
-
-[[backends]]
-name = "schedule-backend"
-kind = "sqlite"
-path = "{schedule}"
-
-[packs.schedule]
-backend = "schedule-backend"
-"#,
-                main = main_db.display(),
-                schedule = schedule_db.display(),
-            ),
-        );
-
-        use clap::Parser;
-        let args = Args::parse_from(["mcp", "--config", config_path.to_str().expect("utf8 path")]);
-
-        let (_server, schedule_rt) = build_server(&args).expect("build_server must succeed");
-        let rt = schedule_rt.expect("schedule pack is loaded by default and declared here");
-
-        let marker_content = "adr106-multi-backend-schedule-marker";
-        let ns = Namespace::parse("local").expect("ns");
-        let token = rt.authorize(ns).expect("authorize schedule runtime");
-        let store = rt.notes(&token).expect("notes store");
-        store
-            .upsert_note(khive_storage::note::Note::new(
-                "local",
-                "observation",
-                marker_content,
-            ))
-            .await
-            .expect("write marker note through the tick's runtime");
-
-        // Re-open each declared backend file independently (the original
-        // `_server`/`rt` are dropped-in-scope-still-alive but this is a
-        // sequential, not concurrent, re-open) and confirm the marker landed
-        // in "schedule-backend.db" only.
-        let count_marker_notes = |path: std::path::PathBuf| async move {
-            let cfg = RuntimeConfig {
-                db_path: Some(path),
-                default_namespace: Namespace::parse("local").unwrap(),
-                embedding_model: None,
-                additional_embedding_models: vec![],
-                ..RuntimeConfig::default()
-            };
-            let probe_rt = KhiveRuntime::new(cfg).expect("reopen backend file");
-            let ns = Namespace::parse("local").unwrap();
-            let token = probe_rt.authorize(ns).expect("authorize probe");
-            let store = probe_rt.notes(&token).expect("notes store");
-            let page = store
-                .query_notes(
-                    "local",
-                    Some("observation"),
-                    khive_storage::types::PageRequest {
-                        limit: 10,
-                        offset: 0,
-                    },
-                )
-                .await
-                .expect("query observation notes");
-            page.items
-                .into_iter()
-                .filter(|n| n.content == marker_content)
-                .count()
-        };
-
-        assert_eq!(
-            count_marker_notes(schedule_db.clone()).await,
-            1,
-            "the marker written through the tick's runtime must be present in the declared \
-             \"schedule-backend\" backend file"
-        );
-        assert_eq!(
-            count_marker_notes(main_db.clone()).await,
-            0,
-            "the marker must be ABSENT from \"main\" — the tick's runtime must not have \
-             silently written into the main backend instead of the declared schedule backend"
-        );
-    }
-
-    /// Multi-backend ACTION-DISPATCH routing (PR #782):
-    /// `schedule` defaults to "main" (no `[packs.schedule]`
-    /// entry declared), while `kg` — the pack whose `create` verb the stored
-    /// action below replays — is routed to a SEPARATE declared backend. A due
-    /// scheduled event whose action writes through `kg` must land its side
-    /// effect in `kg`'s OWN declared backend, never "main".
-    ///
-    /// This is the regression the prior fix was missing: it
-    /// fixed SCANNING (`scheduled_event` rows now correctly read from
-    /// `schedule`'s own backend, proven by
-    /// `build_server_schedule_tick_uses_the_declared_multi_backend_not_main`
-    /// above) but not DISPATCH — the drain replayed every stored action
-    /// through a throwaway `KhiveMcpServer::new(schedule_rt.clone())`, which
-    /// registers EVERY pack against the schedule backend alone. This test
-    /// drives the drain through `run_pending_events_on(&rt, &server, ..)`
-    /// with the daemon's REAL, fully-wired `server` (as
-    /// `spawn_schedule_tick_loop_if_daemon` now passes it) and asserts the
-    /// replayed action's own write shows up only in `kg`'s declared backend.
-    #[tokio::test]
-    #[serial]
-    async fn build_server_schedule_tick_dispatches_actions_through_the_declared_multi_backend_not_schedule(
-    ) {
-        let seat_dir = tempfile::tempdir().expect("seat tempdir");
-        let _seat_env = SeatEnv::enter(seat_dir.path());
-        std::env::remove_var("KHIVE_DB");
-        std::env::remove_var("KHIVE_ACTOR");
-        std::env::remove_var("KHIVE_PACKS");
-        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
-
-        let main_db = seat_dir.path().join("main.db");
-        let kg_db = seat_dir.path().join("kg-backend.db");
-        let config_path = write_config(
-            seat_dir.path(),
-            &format!(
-                r#"
-[[backends]]
-name = "main"
-kind = "sqlite"
-path = "{main}"
-
-[[backends]]
-name = "kg-backend"
-kind = "sqlite"
-path = "{kg}"
-
-[packs.kg]
-backend = "kg-backend"
-"#,
-                main = main_db.display(),
-                kg = kg_db.display(),
-            ),
-        );
-
-        use clap::Parser;
-        let args = Args::parse_from([
-            "mcp",
-            "--config",
-            config_path.to_str().expect("utf8 path"),
-            "--no-embed",
-        ]);
-
-        let (server, schedule_rt) = build_server(&args).expect("build_server must succeed");
-        // No `[packs.schedule]` entry above, so it defaults to "main".
-        let rt = schedule_rt.expect("schedule pack is loaded by default");
-        assert!(
-            rt.config().embedding_model.is_none()
-                && rt.config().additional_embedding_models.is_empty(),
-            "the backend-routing fixture must remain independent of external embedding models"
-        );
-
-        let marker = "adr106-multi-backend-dispatch-marker";
-        let action_dsl = format!("create(kind=\"observation\", content=\"{marker}\")");
-        let past = (chrono::Utc::now() - chrono::Duration::seconds(5)).to_rfc3339();
-        let repeat: Option<&str> = None;
-        let fired_at: Option<&str> = None;
-        let cancelled_at: Option<&str> = None;
-        let props = serde_json::json!({
-            "trigger_at": past,
-            "repeat": repeat,
-            "status": "pending",
-            "event_type": "schedule",
-            "payload": action_dsl,
-            "fired_at": fired_at,
-            "cancelled_at": cancelled_at,
-        });
-        let ns = Namespace::parse("local").expect("ns");
-        let token = rt.authorize(ns).expect("authorize schedule runtime");
-        rt.create_note(
-            &token,
-            "scheduled_event",
-            None,
-            &action_dsl,
-            None,
-            Some(props),
-            vec![],
-        )
-        .await
-        .expect("create scheduled_event through the schedule runtime");
-
-        let summary = crate::pending_events::run_pending_events_on(&rt, &server, false)
-            .await
-            .expect("drain");
-        assert_eq!(
-            summary.fired + summary.advanced,
-            1,
-            "the due event must be dispatched, got summary={summary:?}"
-        );
-        assert_eq!(summary.failed, 0, "dispatch must not fail: {summary:?}");
-
-        let count_marker_notes = |path: std::path::PathBuf| async move {
-            let cfg = RuntimeConfig {
-                db_path: Some(path),
-                default_namespace: Namespace::parse("local").unwrap(),
-                embedding_model: None,
-                additional_embedding_models: vec![],
-                ..RuntimeConfig::default()
-            };
-            let probe_rt = KhiveRuntime::new(cfg).expect("reopen backend file");
-            let ns = Namespace::parse("local").unwrap();
-            let token = probe_rt.authorize(ns).expect("authorize probe");
-            let store = probe_rt.notes(&token).expect("notes store");
-            let page = store
-                .query_notes(
-                    "local",
-                    Some("observation"),
-                    khive_storage::types::PageRequest {
-                        limit: 10,
-                        offset: 0,
-                    },
-                )
-                .await
-                .expect("query observation notes");
-            page.items
-                .into_iter()
-                .filter(|n| n.content == marker)
-                .count()
-        };
-
-        assert_eq!(
-            count_marker_notes(kg_db.clone()).await,
-            1,
-            "the replayed create(kind=\"observation\") action must land in the kg pack's OWN \
-             declared backend (\"kg-backend\"), not the schedule backend"
-        );
-        assert_eq!(
-            count_marker_notes(main_db.clone()).await,
-            0,
-            "the marker must be ABSENT from \"main\" (the schedule backend) — dispatching \
-             through a throwaway single-runtime server built from the schedule runtime alone \
-             would have written it here instead"
         );
     }
 

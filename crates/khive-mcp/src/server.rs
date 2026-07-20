@@ -2621,11 +2621,11 @@ mod tests {
             default_namespace: Namespace::parse("test").unwrap(),
             embedding_model: None,
             additional_embedding_models: vec![],
-            packs: vec!["kg".to_string(), "comm".to_string()],
+            packs: vec!["kg".to_string()],
             ..RuntimeConfig::default()
         };
         let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
-        let server = KhiveMcpServer::new(runtime).expect("server builds with kg + comm");
+        let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
 
         // Fake "crashed daemon": accept exactly one connection, read the
         // request frame (the real write #644 cares about), then drop the
@@ -2653,7 +2653,7 @@ mod tests {
 
         let resp = server
             .request(Parameters(RequestParams {
-                ops: "comm.send(to=\"bob\", content=\"double-forward-probe\")".to_string(),
+                ops: "create(kind=\"entity\", entity_kind=\"concept\", name=\"double-forward-probe\")".to_string(),
                 presentation: None,
                 presentation_per_op: None,
                 save_to: None,
@@ -2736,11 +2736,11 @@ mod tests {
             default_namespace: Namespace::parse("test").unwrap(),
             embedding_model: None,
             additional_embedding_models: vec![],
-            packs: vec!["kg".to_string(), "comm".to_string()],
+            packs: vec!["kg".to_string()],
             ..RuntimeConfig::default()
         };
         let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
-        let server = KhiveMcpServer::new(runtime).expect("server builds with kg + comm");
+        let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
 
         let baseline = server
             .dispatch_request_local(RequestParams {
@@ -2776,7 +2776,9 @@ mod tests {
         // ── single op ──────────────────────────────────────────────────────
         let single_resp = server
             .request(Parameters(RequestParams {
-                ops: "comm.send(to=\"bob\", content=\"strict-single-probe\")".to_string(),
+                ops:
+                    "create(kind=\"entity\", entity_kind=\"concept\", name=\"strict-single-probe\")"
+                        .to_string(),
                 presentation: None,
                 presentation_per_op: None,
                 save_to: None,
@@ -2792,7 +2794,7 @@ mod tests {
             single["results"].as_array().expect("results array").len(),
             1
         );
-        assert_fallback_error(&single["results"][0], "comm.send");
+        assert_fallback_error(&single["results"][0], "create");
         assert_eq!(
             single["summary"],
             json!({ "total": 1, "succeeded": 0, "failed": 1, "aborted": 0 })
@@ -2801,8 +2803,8 @@ mod tests {
         // ── parallel batch ─────────────────────────────────────────────────
         let batch_resp = server
             .request(Parameters(RequestParams {
-                ops: "[comm.send(to=\"bob\", content=\"strict-batch-1\"), \
-                       comm.send(to=\"bob\", content=\"strict-batch-2\")]"
+                ops: "[create(kind=\"entity\", entity_kind=\"concept\", name=\"strict-batch-1\"), \
+                       create(kind=\"entity\", entity_kind=\"concept\", name=\"strict-batch-2\")]"
                     .to_string(),
                 presentation: None,
                 presentation_per_op: None,
@@ -2818,7 +2820,7 @@ mod tests {
         let batch_results = batch["results"].as_array().expect("results array");
         assert_eq!(batch_results.len(), 2);
         for entry in batch_results {
-            assert_fallback_error(entry, "comm.send");
+            assert_fallback_error(entry, "create");
         }
         assert_eq!(
             batch["summary"],
@@ -2828,8 +2830,8 @@ mod tests {
         // ── chain (must abort remaining ops per the wire contract) ─────────
         let chain_resp = server
             .request(Parameters(RequestParams {
-                ops: "comm.send(to=\"bob\", content=\"strict-chain-1\") | \
-                      comm.send(to=\"bob\", content=\"strict-chain-2\")"
+                ops: "create(kind=\"entity\", entity_kind=\"concept\", name=\"strict-chain-1\") | \
+                      create(kind=\"entity\", entity_kind=\"concept\", name=\"strict-chain-2\")"
                     .to_string(),
                 presentation: None,
                 presentation_per_op: None,
@@ -2844,10 +2846,10 @@ mod tests {
             serde_json::from_str(&chain_resp).expect("response must be the request envelope");
         let chain_results = chain["results"].as_array().expect("results array");
         assert_eq!(chain_results.len(), 2);
-        assert_fallback_error(&chain_results[0], "comm.send");
+        assert_fallback_error(&chain_results[0], "create");
         assert_eq!(
             chain_results[1],
-            json!({ "ok": false, "tool": "comm.send", "aborted": true })
+            json!({ "ok": false, "tool": "create", "aborted": true })
         );
         assert_eq!(
             chain["summary"],
@@ -2869,7 +2871,7 @@ mod tests {
             .expect("post-request stats() must succeed");
         assert_eq!(
             after, baseline,
-            "no comm.send op must ever have run locally under strict-mode fallback \
+            "no create op must ever have run locally under strict-mode fallback \
              rejection — a local dispatch would mutate local state here"
         );
 

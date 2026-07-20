@@ -44,6 +44,7 @@ tokio = { workspace = true, features = ["test-util"] }
 serial_test = { workspace = true }
 lattice-embed = { workspace = true }
 rmcp = { workspace = true, features = ["client", "transport-child-process"] }
+khive-pack-template = { version = "0.6.0", path = "../khive-pack-template" }
 
 [features]
 # Pass-through: enables the deterministic hash embedder in the serve path (bench use only).
