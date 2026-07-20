@@ -322,7 +322,14 @@ async fn resolve_or_create_project(
                 "update",
                 json!({
                     "id": id.to_string(),
-                    "properties": { REPO_SLUG_PROPERTY: identity },
+                    // Backfill hits also redact the stored repo_url in the
+                    // same patch (ADR-088 Amendment 2 step 2) -- the
+                    // lazy-upgrade path closes out any credential-bearing
+                    // legacy URL it touches.
+                    "properties": {
+                        REPO_SLUG_PROPERTY: identity,
+                        "repo_url": redact_repo_url(&repo_url),
+                    },
                 }),
             )
             .await?;
@@ -343,24 +350,29 @@ async fn resolve_or_create_project(
     let legacy_candidates = find_legacy_projects_without_slug(runtime, token)
         .await
         .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
-    let mut normalized_matches: Vec<Uuid> = Vec::new();
+    let mut normalized_matches: Vec<(Uuid, String)> = Vec::new();
     for (id, candidate_repo_url) in legacy_candidates {
         if normalize_legacy_repo_url(&candidate_repo_url)
             .await
             .as_deref()
             == Some(identity.as_str())
         {
-            normalized_matches.push(id);
+            normalized_matches.push((id, candidate_repo_url));
         }
     }
-    if let Some((selected, duplicates)) = normalized_matches.split_first() {
+    if let Some(((selected, selected_repo_url), duplicates)) = normalized_matches.split_first() {
         let selected = *selected;
         registry
             .dispatch(
                 "update",
                 json!({
                     "id": selected.to_string(),
-                    "properties": { REPO_SLUG_PROPERTY: identity },
+                    // Same-patch redaction of the matched anchor's own stored
+                    // repo_url (ADR-088 Amendment 2 step 2).
+                    "properties": {
+                        REPO_SLUG_PROPERTY: identity,
+                        "repo_url": redact_repo_url(selected_repo_url),
+                    },
                 }),
             )
             .await?;
@@ -368,7 +380,7 @@ async fn resolve_or_create_project(
             id: selected,
             created: false,
             orphan: None,
-            slug_duplicates: duplicates.to_vec(),
+            slug_duplicates: duplicates.iter().map(|(id, _)| *id).collect(),
         });
     }
 
