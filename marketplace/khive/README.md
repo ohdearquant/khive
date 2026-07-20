@@ -65,4 +65,4 @@ See [INSTALL.md](../INSTALL.md) for setup, the actor config, and per-pack smoke 
 
 - Repository: <https://github.com/ohdearquant/khive>
 - Install guide: [INSTALL.md](../INSTALL.md)
-- License: Apache-2.0
+- License: BUSL-1.1

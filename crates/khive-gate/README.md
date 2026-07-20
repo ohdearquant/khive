@@ -56,8 +56,8 @@ are both non-zero.
 field consulted before every verb dispatch and defaults it to `AllowAllGate`. It has no
 dependency on any other khive crate beyond `khive-types`.
 
-- **`khive-gate` (Apache-2.0)** — this crate; the trait, wire types, and permissive default.
-- [`khive-gate-rego`](https://crates.io/crates/khive-gate-rego) (Apache-2.0) — the OSS
+- **`khive-gate` (BUSL-1.1)** — this crate; the trait, wire types, and permissive default.
+- [`khive-gate-rego`](https://crates.io/crates/khive-gate-rego) (BUSL-1.1) — the OSS
   reference [Rego](https://www.openpolicyagent.org/) backend (`RegoGate`), installed in
   place of `AllowAllGate` when a deployment needs real policy enforcement.
 
@@ -65,4 +65,4 @@ Governed by [ADR-018](https://github.com/ohdearquant/khive/blob/main/docs/adr/AD
 
 ## License
 
-Apache-2.0.
+BUSL-1.1. See the repository [LICENSE](https://github.com/ohdearquant/khive/blob/main/LICENSE).

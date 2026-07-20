@@ -1,5 +1,3 @@
-// Copyright 2026 Haiyang Li. Licensed under Apache-2.0.
-//
 //! Integration tests for [`JsonFormatAdapter`].
 //!
 //! These tests drive the public API — no access to private fields.

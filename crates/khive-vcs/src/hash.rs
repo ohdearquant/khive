@@ -1,5 +1,3 @@
-// Copyright 2026 Haiyang Li. Licensed under Apache-2.0.
-//
 //! Canonical JSON serialization and SHA-256 snapshot hashing.
 //!
 //! Algorithm:

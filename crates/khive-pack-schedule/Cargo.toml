@@ -15,10 +15,10 @@ description = "Schedule pack — time-triggered intent storage (remind, schedule
 bench = false
 
 [dependencies]
-khive-types = { version = "0.5.0", path = "../khive-types", features = ["serde"] }
-khive-runtime = { version = "0.5.0", path = "../khive-runtime" }
-khive-storage = { version = "0.5.0", path = "../khive-storage" }
-khive-request = { version = "0.5.0", path = "../khive-request" }
+khive-types = { version = "0.6.0", path = "../khive-types", features = ["serde"] }
+khive-runtime = { version = "0.6.0", path = "../khive-runtime" }
+khive-storage = { version = "0.6.0", path = "../khive-storage" }
+khive-request = { version = "0.6.0", path = "../khive-request" }
 inventory = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
@@ -29,9 +29,9 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
-khive-pack-kg = { version = "0.5.0", path = "../khive-pack-kg" }
-khive-pack-comm = { version = "0.5.0", path = "../khive-pack-comm" }
-khive-pack-brain = { version = "0.5.0", path = "../khive-pack-brain" }
+khive-pack-kg = { version = "0.6.0", path = "../khive-pack-kg" }
+khive-pack-comm = { version = "0.6.0", path = "../khive-pack-comm" }
+khive-pack-brain = { version = "0.6.0", path = "../khive-pack-brain" }
 criterion = { workspace = true }
 
 [[bench]]

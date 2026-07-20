@@ -12,26 +12,26 @@ categories.workspace = true
 description = "khive kernel — stdio MCP server binary and admin CLI (sync, pack introspection, db ops)"
 
 [dependencies]
-khive-runtime = { version = "0.5.0", path = "../khive-runtime" }
-khive-mcp = { version = "0.5.0", path = "../khive-mcp" }
-khive-score = { version = "0.5.0", path = "../khive-score" }
-khive-db = { version = "0.5.0", path = "../khive-db" }
-khive-storage = { version = "0.5.0", path = "../khive-storage" }
-khive-types = { version = "0.5.0", path = "../khive-types" }
-khive-vcs = { version = "0.5.0", path = "../khive-vcs" }
-khive-vcs-adapters = { version = "0.5.0", path = "../khive-vcs-adapters" }
-khive-pack-kg = { version = "0.5.0", path = "../khive-pack-kg" }
-khive-pack-gtd = { version = "0.5.0", path = "../khive-pack-gtd" }
-khive-pack-memory = { version = "0.5.0", path = "../khive-pack-memory" }
-khive-pack-brain = { version = "0.5.0", path = "../khive-pack-brain" }
-khive-pack-comm = { version = "0.5.0", path = "../khive-pack-comm" }
-khive-pack-schedule = { version = "0.5.0", path = "../khive-pack-schedule" }
-khive-pack-formal = { version = "0.5.0", path = "../khive-pack-formal" }
-khive-pack-code = { version = "0.5.0", path = "../khive-pack-code" }
-khive-pack-knowledge = { version = "0.5.0", path = "../khive-pack-knowledge" }
-khive-pack-session = { version = "0.5.0", path = "../khive-pack-session" }
-khive-request = { version = "0.5.0", path = "../khive-request" }
-khive-changeset = { version = "0.5.0", path = "../khive-changeset" }
+khive-runtime = { version = "0.6.0", path = "../khive-runtime" }
+khive-mcp = { version = "0.6.0", path = "../khive-mcp" }
+khive-score = { version = "0.6.0", path = "../khive-score" }
+khive-db = { version = "0.6.0", path = "../khive-db" }
+khive-storage = { version = "0.6.0", path = "../khive-storage" }
+khive-types = { version = "0.6.0", path = "../khive-types" }
+khive-vcs = { version = "0.6.0", path = "../khive-vcs" }
+khive-vcs-adapters = { version = "0.6.0", path = "../khive-vcs-adapters" }
+khive-pack-kg = { version = "0.6.0", path = "../khive-pack-kg" }
+khive-pack-gtd = { version = "0.6.0", path = "../khive-pack-gtd" }
+khive-pack-memory = { version = "0.6.0", path = "../khive-pack-memory" }
+khive-pack-brain = { version = "0.6.0", path = "../khive-pack-brain" }
+khive-pack-comm = { version = "0.6.0", path = "../khive-pack-comm" }
+khive-pack-schedule = { version = "0.6.0", path = "../khive-pack-schedule" }
+khive-pack-formal = { version = "0.6.0", path = "../khive-pack-formal" }
+khive-pack-code = { version = "0.6.0", path = "../khive-pack-code" }
+khive-pack-knowledge = { version = "0.6.0", path = "../khive-pack-knowledge" }
+khive-pack-session = { version = "0.6.0", path = "../khive-pack-session" }
+khive-request = { version = "0.6.0", path = "../khive-request" }
+khive-changeset = { version = "0.6.0", path = "../khive-changeset" }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }

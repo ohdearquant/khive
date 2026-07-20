@@ -2720,6 +2720,20 @@ properties and is corrected here.
 - The address form (`imessage:<slug>`, normative) and the poll-interval and sender-validation
   rules are settled by this amendment text; no open items remain for design sign-off.
 
+## Amendment 2026-07-20 -- Distribution boundary: commercially licensed extensions
+
+Effective with the accompanying crate-extraction change (which lands as a separate
+pull request; this amendment records the boundary that change produces), the
+channel-transport crates -- `khive-channel`, `khive-channel-email`, and
+`khive-channel-telegram` -- cease to be part of the open-source distribution and ship
+as commercially licensed extensions. They contribute no MCP verbs, so the comm pack's
+verb surface (ADR-063) is unaffected; the optional cargo features that wired these
+crates into the server binary leave with them. Until the extraction change lands, the
+in-tree crates and this ADR's pre-amendment text describe the tree as-is. This ADR
+remains the normative contract for the `Channel` trait and the adapters wherever the
+extensions are deployed; dependent designs (for example ADR-105's node channel) build
+against the extension's trait crate.
+
 ## Context
 
 The autonomous build loop blocks regularly on the maintainer. Merge approvals and ADR
