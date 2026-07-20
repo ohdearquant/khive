@@ -463,3 +463,236 @@ async fn find_orphaned_anchor(
         annotated_note_count,
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use khive_runtime::{Namespace, VerbRegistryBuilder};
+
+    use super::*;
+
+    async fn fixture() -> (KhiveRuntime, NamespaceToken, VerbRegistry) {
+        let rt = KhiveRuntime::memory().expect("memory runtime");
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(khive_pack_kg::KgPack::new(rt.clone()));
+        builder.register(GitPack::new(rt.clone()));
+        let registry = builder.build().expect("registry builds");
+        rt.install_edge_rules(registry.all_edge_rules());
+        registry.apply_schema_plans(rt.backend());
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+        (rt, token, registry)
+    }
+
+    async fn create_note_annotating(
+        registry: &VerbRegistry,
+        kind: &str,
+        name: &str,
+        project_id: Uuid,
+    ) -> Uuid {
+        let properties = match kind {
+            "commit" => json!({ "sha": "deadbeef".repeat(5) }),
+            "issue" | "pull_request" => {
+                json!({ "number": 1, "project_id": project_id.to_string() })
+            }
+            other => panic!("unsupported note kind in test helper: {other}"),
+        };
+        let resp = registry
+            .dispatch(
+                "create",
+                json!({
+                    "kind": kind,
+                    "name": name,
+                    "content": format!("{name} body"),
+                    "properties": properties,
+                    "annotates": [project_id.to_string()],
+                }),
+            )
+            .await
+            .expect("create note ok");
+        Uuid::parse_str(resp["id"].as_str().expect("id present")).expect("id is uuid")
+    }
+
+    /// Regression for the 505-dup incident shape (issue #1173): a repo
+    /// digested once via a local clone path and once via its remote https
+    /// URL must converge on ONE anchor, not mint a second one that then
+    /// re-ingests the whole corpus from an empty start.
+    #[tokio::test]
+    async fn same_repo_via_local_and_remote_spelling_resolves_to_one_anchor() {
+        let (rt, token, registry) = fixture().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(["init", "-q"])
+            .status()
+            .expect("git init");
+        assert!(status.success());
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/org/dupe-repo",
+            ])
+            .status()
+            .expect("git remote add");
+        assert!(status.success());
+
+        let local_source = DigestSource::Local(dir.path().to_path_buf());
+        let remote_source = DigestSource::Remote {
+            canonical: "https://github.com/org/dupe-repo".to_string(),
+            gh_slug: Some(("org".to_string(), "dupe-repo".to_string())),
+        };
+
+        let first = resolve_or_create_project(&rt, &registry, &token, &local_source)
+            .await
+            .expect("first resolve");
+        assert!(first.created);
+
+        let second = resolve_or_create_project(&rt, &registry, &token, &remote_source)
+            .await
+            .expect("second resolve");
+        assert!(!second.created, "second spelling must match, not re-create");
+        assert_eq!(first.id, second.id);
+    }
+
+    /// An unrelated `project` entity that happens to share the repo's
+    /// basename must NOT capture the ingest (issue #1173 item 1 -- the
+    /// basename fallback is dropped entirely).
+    #[tokio::test]
+    async fn basename_collision_with_unrelated_project_is_not_captured() {
+        let (rt, token, registry) = fixture().await;
+
+        let unrelated_id = registry
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "project",
+                    "name": "collide-repo",
+                    "properties": { "repo_url": "https://example.com/totally/unrelated" },
+                }),
+            )
+            .await
+            .expect("create unrelated project");
+        let unrelated_id = Uuid::parse_str(unrelated_id["id"].as_str().unwrap()).expect("uuid");
+
+        let source = DigestSource::Remote {
+            canonical: "https://github.com/org/collide-repo".to_string(),
+            gh_slug: Some(("org".to_string(), "collide-repo".to_string())),
+        };
+        let resolution = resolve_or_create_project(&rt, &registry, &token, &source)
+            .await
+            .expect("resolve");
+        assert!(
+            resolution.created,
+            "basename collision must not capture an unrelated anchor"
+        );
+        assert_ne!(resolution.id, unrelated_id);
+    }
+
+    /// A pre-existing anchor created before this fix (only `properties.repo_url`,
+    /// no `repo_slug`) is matched by legacy `repo_url` lookup and backfilled
+    /// with `repo_slug`, so subsequent calls converge on the slug match
+    /// without a migration (issue #1173 item 1).
+    #[tokio::test]
+    async fn legacy_anchor_without_slug_is_matched_and_backfilled() {
+        let (rt, token, registry) = fixture().await;
+
+        let source = DigestSource::Remote {
+            canonical: "https://github.com/org/legacy-repo".to_string(),
+            gh_slug: Some(("org".to_string(), "legacy-repo".to_string())),
+        };
+        let repo_url = "https://github.com/org/legacy-repo";
+
+        let legacy_id = registry
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "project",
+                    "name": "legacy-repo",
+                    "properties": { "repo_url": repo_url },
+                }),
+            )
+            .await
+            .expect("create legacy project");
+        let legacy_id = Uuid::parse_str(legacy_id["id"].as_str().unwrap()).expect("uuid");
+
+        let resolution = resolve_or_create_project(&rt, &registry, &token, &source)
+            .await
+            .expect("resolve");
+        assert!(
+            !resolution.created,
+            "legacy repo_url match must not re-create"
+        );
+        assert_eq!(resolution.id, legacy_id);
+
+        let entity = rt
+            .get_entity(&token, legacy_id)
+            .await
+            .expect("fetch legacy entity");
+        assert_eq!(
+            entity
+                .properties
+                .as_ref()
+                .and_then(|p| p.get("repo_slug"))
+                .and_then(Value::as_str),
+            Some("github.com/org/legacy-repo"),
+            "repo_slug must be backfilled on the legacy anchor"
+        );
+    }
+
+    /// A hard-deleted-vs-soft-deleted anchor whose corpus is still
+    /// `annotates`-linked surfaces a distinct, non-silent signal instead of
+    /// quietly minting a fresh anchor over an orphaned corpus (issue #1173
+    /// items 2/3).
+    #[tokio::test]
+    async fn orphaned_anchor_is_flagged_not_silently_reminted() {
+        let (rt, token, registry) = fixture().await;
+
+        let source = DigestSource::Remote {
+            canonical: "https://github.com/org/orphan-repo".to_string(),
+            gh_slug: Some(("org".to_string(), "orphan-repo".to_string())),
+        };
+
+        let dead = registry
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "project",
+                    "name": "orphan-repo",
+                    "properties": {
+                        "repo_url": "https://github.com/org/orphan-repo",
+                        "repo_slug": "github.com/org/orphan-repo",
+                    },
+                }),
+            )
+            .await
+            .expect("create dead anchor");
+        let dead_id = Uuid::parse_str(dead["id"].as_str().unwrap()).expect("uuid");
+
+        create_note_annotating(&registry, "commit", "c1", dead_id).await;
+        create_note_annotating(&registry, "issue", "#1 bug", dead_id).await;
+
+        let deleted = rt
+            .delete_entity(&token, dead_id, false)
+            .await
+            .expect("soft delete");
+        assert!(deleted);
+
+        let resolution = resolve_or_create_project(&rt, &registry, &token, &source)
+            .await
+            .expect("resolve");
+        assert!(
+            resolution.created,
+            "no live anchor for this slug -- a fresh one is minted"
+        );
+        assert_ne!(resolution.id, dead_id);
+        let orphan = resolution
+            .orphan
+            .expect("orphaned corpus must be flagged, not silent");
+        assert_eq!(orphan.dead_project_id, dead_id);
+        assert_eq!(orphan.annotated_note_count, 2);
+    }
+}

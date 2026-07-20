@@ -390,4 +390,101 @@ mod tests {
         assert_eq!(a.len(), 16);
         assert!(a.chars().all(|ch| ch.is_ascii_hexdigit()));
     }
+
+    // -- repo identity slug (issue #1173) --------------------------------
+
+    #[test]
+    fn remote_url_to_slug_normalization_table() {
+        let expected = "github.com/org/repo";
+        let spellings = [
+            "https://github.com/org/repo",
+            "https://github.com/org/repo.git",
+            "https://github.com/org/repo/",
+            "https://github.com/org/repo.git/",
+            "http://github.com/org/repo",
+            "https://token@github.com/org/repo.git",
+            "https://user:token@github.com/org/repo.git",
+            "ssh://git@github.com/org/repo.git",
+            "git@github.com:org/repo.git",
+            "git@github.com:org/repo",
+            "git://github.com/org/repo.git",
+            // Host case is folded; owner/repo case is preserved separately below.
+            "https://GitHub.com/org/repo",
+        ];
+        for s in spellings {
+            assert_eq!(
+                remote_url_to_slug(s).as_deref(),
+                Some(expected),
+                "spelling {s:?} should normalize to {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_url_to_slug_preserves_owner_repo_case() {
+        assert_eq!(
+            remote_url_to_slug("https://github.com/Org/Repo").as_deref(),
+            Some("github.com/Org/Repo")
+        );
+    }
+
+    #[test]
+    fn remote_url_to_slug_rejects_unparseable_input() {
+        assert_eq!(remote_url_to_slug(""), None);
+        assert_eq!(remote_url_to_slug("not-a-url"), None);
+        assert_eq!(remote_url_to_slug("https://github.com/onlyowner"), None);
+    }
+
+    fn init_repo_with_origin(dir: &Path, origin: &str) {
+        for args in [vec!["init", "-q"], vec!["remote", "add", "origin", origin]] {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(&args)
+                .status()
+                .expect("spawn git");
+            assert!(status.success(), "git {args:?} failed");
+        }
+    }
+
+    #[test]
+    fn repo_identity_https_and_ssh_spellings_of_same_remote_converge() {
+        let https = DigestSource::Remote {
+            canonical: "https://github.com/org/repo".to_string(),
+            gh_slug: Some(("org".to_string(), "repo".to_string())),
+        };
+        assert_eq!(repo_identity(&https), "github.com/org/repo");
+    }
+
+    #[test]
+    fn repo_identity_local_path_with_origin_matches_remote_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_repo_with_origin(dir.path(), "git@github.com:org/repo.git");
+
+        let local = DigestSource::Local(dir.path().to_path_buf());
+        let remote = DigestSource::Remote {
+            canonical: "https://github.com/org/repo".to_string(),
+            gh_slug: Some(("org".to_string(), "repo".to_string())),
+        };
+        assert_eq!(repo_identity(&local), repo_identity(&remote));
+        assert_eq!(repo_identity(&local), "github.com/org/repo");
+    }
+
+    #[test]
+    fn repo_identity_local_path_without_remote_falls_back_to_path_form() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(["init", "-q"])
+            .status()
+            .expect("spawn git init");
+        assert!(status.success());
+
+        let local = DigestSource::Local(dir.path().to_path_buf());
+        let identity = repo_identity(&local);
+        assert!(identity.starts_with("local:"), "{identity}");
+        let canon = std::fs::canonicalize(dir.path()).unwrap();
+        assert_eq!(identity, format!("local:{}", canon.to_string_lossy()));
+    }
 }
