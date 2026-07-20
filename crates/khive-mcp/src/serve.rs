@@ -185,6 +185,21 @@ async fn serve_with_session_sweep(
     registry: &TransportRegistry,
 ) -> anyhow::Result<()> {
     let session_sweep = spawn_session_walpin_sweep(&server);
+    serve_holding_sweep(session_sweep, server, args, registry).await
+}
+
+/// Inner half of [`serve_with_session_sweep`], split so tests can inject an
+/// observable [`SessionSweepHandle`] and prove the shutdown is awaited on
+/// every return path — the completion signal fires happens-before this
+/// function returns, which the spawn-composed wrapper cannot demonstrate
+/// deterministically (a dropped sender also wakes the task, just not before
+/// the caller resumes).
+async fn serve_holding_sweep(
+    session_sweep: Option<SessionSweepHandle>,
+    server: KhiveMcpServer,
+    args: &Args,
+    registry: &TransportRegistry,
+) -> anyhow::Result<()> {
     let result = async {
         let transport_name = args.transport.as_deref().unwrap_or("stdio");
         let transport = registry.get(transport_name).ok_or_else(|| {
@@ -7855,6 +7870,64 @@ backend = "kg-backend"
         assert!(
             !heartbeat.exists(),
             "sweep heartbeat must not survive the serve guard"
+        );
+    }
+
+    /// Discriminating regression for the sweep-lifecycle guard: the old
+    /// code's early `?` return on transport resolution dropped the handle
+    /// without awaiting shutdown, so the task's exit raced the caller's
+    /// resume. The guard must await `SessionSweepHandle::shutdown` on the
+    /// error path — observed here via an injected task whose completion
+    /// flag flips only after it receives the shutdown signal, checked
+    /// synchronously the moment the guard returns.
+    #[tokio::test]
+    #[serial]
+    async fn serve_guard_awaits_sweep_shutdown_before_returning() {
+        use clap::Parser;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("khive.db");
+        let config_path = write_config(dir.path(), "");
+        let args = Args::parse_from([
+            "kkernel",
+            "--db",
+            db_path.to_str().expect("utf8 path"),
+            "--config",
+            config_path.to_str().expect("utf8 path"),
+            "--transport",
+            "no-such-transport",
+            "--no-embed",
+            "--pack",
+            "kg",
+        ]);
+        let (server, _schedule_rt) = build_server(&args).expect("build server");
+
+        let completed = Arc::new(AtomicBool::new(false));
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(());
+        let join = tokio::spawn({
+            let completed = Arc::clone(&completed);
+            async move {
+                let _ = shutdown_rx.changed().await;
+                completed.store(true, Ordering::SeqCst);
+            }
+        });
+        let handle = SessionSweepHandle { shutdown_tx, join };
+
+        let registry = TransportRegistry::default();
+        let err = serve_holding_sweep(Some(handle), server, &args, &registry)
+            .await
+            .expect_err("unknown transport must fail resolution");
+        assert!(
+            err.to_string().contains("unknown transport"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            completed.load(Ordering::SeqCst),
+            "the guard must await sweep shutdown before returning on the \
+             transport-resolution error path — an unawaited (dropped) handle \
+             leaves this flag unset at the moment the guard returns"
         );
     }
 }
