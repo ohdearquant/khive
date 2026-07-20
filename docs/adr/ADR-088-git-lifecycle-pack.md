@@ -265,15 +265,19 @@ Decision text.
 
 ## Amendment 2 (2026-07-20) — Distribution boundary: commercially licensed extension
 
+Effective with the accompanying crate-extraction change (which lands as a separate
+pull request; this amendment records the boundary that change produces),
 `khive-pack-git` — the `commit` / `issue` / `pull_request` note kinds, the batch
-ingester, `git.digest` (Amendment 1), and the ADR-108 write verbs — is no longer part
+ingester, `git.digest` (Amendment 1), and the ADR-108 write verbs — ceases to be part
 of the open-source distribution. The crate ships as a commercially licensed extension,
 and the default pack set no longer includes `git` (see the ADR-023 amendment of the
-same date for the resulting default set).
+same date for the resulting default set). Until that extraction change lands, the
+in-tree crate remains present, force-linked, and part of the default pack set, and
+this ADR's pre-amendment text describes it as-is.
 
 Nothing in this ADR's Decision, Rationale, or Amendment 1 is superseded: the contracts
 here remain normative for the pack wherever it is deployed. What changes is ownership
-and distribution only:
+and distribution only. Once the extraction change lands:
 
 - The open-source tree no longer contains `crates/khive-pack-git`; references to that
   path in this ADR describe the extension's crate, not an in-tree one.

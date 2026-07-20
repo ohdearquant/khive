@@ -465,15 +465,21 @@ would execute as a side effect of an otherwise-successful, policy-permitted writ
 
 ## Amendment 2 (2026-07-20) — Distribution boundary: commercially licensed extension
 
-The pack this ADR's write surface lives in (`khive-pack-git`, per ADR-088 Amendment 2)
-is no longer part of the open-source distribution; it ships as a commercially licensed
-extension, and the default pack set no longer registers `git.commit` / `git.branch` /
-`git.push` (see the ADR-023 amendment of the same date).
+Effective with the crate-extraction change recorded in ADR-088 Amendment 2 (which
+lands as a separate pull request; this amendment records the boundary that change
+produces), the pack this ADR's write surface lives in (`khive-pack-git`) ceases to be
+part of the open-source distribution; it ships as a commercially licensed extension,
+and the default pack set no longer registers `git.commit` / `git.branch` / `git.push`
+(see the ADR-023 amendment of the same date). Until that extraction change lands, the
+in-tree pack — including its `[git_write]`-gated write verbs — remains present in the
+default pack set and operational under this ADR's pre-amendment contract; an
+allowlisted `[git_write]` configuration continues to expose the write verbs exactly
+as Amendment 1 specifies.
 
 This ADR's normative content — the hardened argv construction, unconditional
 force-push denial, the Amendment 1 fail-closed `[git_write]` allowlist, and the
 hooks-disabled execution contract — is unchanged and continues to govern the verbs
-wherever the extension is deployed. The runtime keeps the `[git_write]` configuration
-plumbing so a deployment that loads the extension gets Amendment 1's fail-closed
-behavior without further changes; with no git pack loaded, that configuration is
-inert.
+wherever the extension is deployed. After the extraction, the runtime keeps the
+`[git_write]` configuration plumbing so a deployment that loads the extension gets
+Amendment 1's fail-closed behavior without further changes; in a build with no git
+pack loaded, that configuration is inert.
