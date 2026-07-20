@@ -929,22 +929,33 @@ invisibility. Beacons recover the same way, fail-closed: a missing beacon is
 rewritten on the next tick, and a beacon that cannot be recreated is a
 sidecar-health failure — the process classifies `unknown`, per Amendment 2's
 rule that a daemon-side or write-side failure must never masquerade as
-affirmative evidence.
+affirmative evidence. The full record lifecycle is therefore closed, with
+every transition defined: **create** (first over-threshold observation, full
+body write) → **touch** (each subsequent tick while the condition persists,
+metadata-only) → **rewrite** (content change, full body write) → **stale**
+(mtime falls outside the declared window) → **delete** (by enumeration, or
+by the writer on clean shutdown / first tick after the condition clears) →
+**recreate** (next over-threshold tick, identical to create). No state is
+terminal while the underlying span is live.
 
 _Mixed-version rule._ An enumerator predating this amendment classifies by
 body `updated_at` and would delete a live heartbeat whose new-style writer
-touches only mtime. The contract does not pretend this window away; it bounds
-it and fixes the failure direction. Deployment on a host is effectively
-single-binary (every khive process runs the installed `kkernel`; the daemon
-restarts on reinstall and sessions re-exec), so a mixed window exists only
-between binary upgrade and process restart. Inside that window, an old-reader
-deletion of a new-writer record is repaired by the recovery rule on the
-writer's next tick, and the interim classification is `unknown` —
-inconclusive, never false attribution. Readers upgraded to this amendment
-accept both generations: records carrying the new fields classify on mtime;
-records without them classify on `updated_at` exactly as before. The window
-closes when the enumerating daemon process is running the amended binary; no
-flag-day coordination is required.
+touches only mtime — the old reader actively destroys live records, which is
+the dangerous direction. The normative rule is therefore
+**readers-before-writers**: after a binary upgrade, the enumerating daemon
+process is restarted onto the amended binary before new-style writers
+matter. This is the deployment's natural order — the daemon is restarted at
+reinstall while stdio sessions re-exec afterward — so the ordering is the
+default behavior, not an operational burden; readers upgraded to this
+amendment accept both generations (records carrying the new fields classify
+on mtime; records without them classify on `updated_at` exactly as before),
+so upgraded readers never misjudge old writers. Should the ordering ever be
+violated (an old daemon process still running against new-style writers),
+the contract bounds the damage rather than pretending the window away: the
+window exists only between binary upgrade and daemon restart, an old-reader
+deletion is repaired by the recovery rule on the writer's next tick, and the
+interim classification is `unknown` — inconclusive, never false attribution.
+No flag-day coordination is required.
 
 _Crash conservatism._ An mtime touch is not durability-critical: a touch lost
 to a crash makes the record look stale, and Amendment 2's liveness gate
