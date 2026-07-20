@@ -208,6 +208,12 @@ mod unix_impl {
     /// process balloon checkpoint-time enumeration.
     pub(super) const MAX_SIDECAR_ENTRY_BYTES: u64 = 64 * 1024;
 
+    /// Every raw directory entry — hidden or not — counts toward a scan
+    /// bound of `RAW_SCAN_FACTOR * max` in `list_names`, so a flood of
+    /// dot-files cannot extend the `readdir` loop unboundedly even though
+    /// hidden names never consume the retained-name budget itself.
+    const RAW_SCAN_FACTOR: usize = 8;
+
     pub(super) fn current_uid() -> u32 {
         // SAFETY: `geteuid()` takes no arguments and cannot fail.
         unsafe { libc::geteuid() }
@@ -576,9 +582,12 @@ mod unix_impl {
         /// directory content cannot inflate either the allocation or the
         /// iteration work done by an enumeration pass — a truncated listing
         /// is reported to the caller, never silently clipped. Dot-names
-        /// (`.`, `..`, in-flight `.<pid>.*.tmp` temp files) are skipped
-        /// before counting so junk temp entries cannot consume the budget
-        /// ahead of real records.
+        /// (`.`, `..`, in-flight `.<pid>.*.tmp` temp files) are skipped —
+        /// by inspecting the first raw byte, before any allocation — so
+        /// junk temp entries cannot consume the retained-name budget ahead
+        /// of real records; they still count toward the raw scan bound
+        /// (`RAW_SCAN_FACTOR * max`), and exhausting either bound reports
+        /// truncation.
         pub(super) fn list_names(&self, max: usize) -> io::Result<(Vec<String>, bool)> {
             // SAFETY: duplicates a live, open fd; the duplicate is uniquely
             // owned by this call and handed to `fdopendir` below.
@@ -595,6 +604,8 @@ mod unix_impl {
                 unsafe { libc::close(dup_fd) };
                 return Err(err);
             }
+            let raw_scan_limit = max.saturating_mul(RAW_SCAN_FACTOR).max(max);
+            let mut raw_scanned: usize = 0;
             let mut names = Vec::new();
             let mut truncated = false;
             loop {
@@ -603,18 +614,27 @@ mod unix_impl {
                 if entry.is_null() {
                     break;
                 }
-                // SAFETY: `entry` is valid until the next `readdir`/
-                // `closedir` call; the name is copied out before either.
-                let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }
-                    .to_string_lossy()
-                    .into_owned();
-                if name.starts_with('.') {
+                if raw_scanned == raw_scan_limit {
+                    truncated = true;
+                    break;
+                }
+                raw_scanned += 1;
+                // SAFETY: `d_name` is NUL-terminated, so its first byte is
+                // always in bounds; hidden names are rejected on this raw
+                // byte before any allocation happens for them.
+                let first = unsafe { *(*entry).d_name.as_ptr() };
+                if first == b'.' as libc::c_char {
                     continue;
                 }
                 if names.len() == max {
                     truncated = true;
                     break;
                 }
+                // SAFETY: `entry` is valid until the next `readdir`/
+                // `closedir` call; the name is copied out before either.
+                let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }
+                    .to_string_lossy()
+                    .into_owned();
                 names.push(name);
             }
             // SAFETY: `dirp` was successfully opened above and not yet closed.
@@ -2192,6 +2212,42 @@ mod tests {
         // Report memory is bounded by the cap: at most one processed entry
         // plus the sentinel, regardless of directory content.
         assert!(report.entries.len() <= 2, "got {:?}", report.entries);
+    }
+
+    #[test]
+    fn enumerate_live_bounded_caps_hidden_entry_scan_with_sentinel_marker() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("khive.db.walpin");
+        let live = heartbeat(std::process::id());
+        write_heartbeat(&dir, &live).unwrap();
+        // Far more hidden entries than the raw scan bound (cap 4 → 32 raw
+        // entries): hidden names never consume the retained-name budget,
+        // but they must still exhaust the raw scan bound and report
+        // truncation instead of extending the readdir loop unboundedly.
+        for i in 0..64 {
+            std::fs::write(dir.join(format!(".junk{i}")), b"x").unwrap();
+        }
+
+        let report = enumerate_live_bounded(&dir, Duration::from_secs(5), 4).unwrap();
+        let markers = report
+            .entries
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    WalpinPidHealth::Unknown { pid: 0, reason }
+                        if reason.contains("enumeration cap")
+                )
+            })
+            .count();
+        assert_eq!(
+            markers, 1,
+            "a hidden-entry flood must surface exactly one sentinel Unknown marker"
+        );
+        assert!(
+            !report.fully_attributed(),
+            "an enumeration cut short by hidden entries can never claim full attribution"
+        );
     }
 
     #[test]
