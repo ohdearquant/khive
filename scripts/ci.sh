@@ -172,7 +172,7 @@ phase_macos_pr_tests() {
     echo "=== macOS PR Platform Tests ==="
     # These crates own the SQLite/filesystem, daemon/process, and native CLI
     # boundaries where macOS behavior has historically differed from Linux.
-    cargo test -p khive-db -p khive-runtime -p khive-mcp -p khive-pack-git -p kkernel --features khive-mcp/channel-email
+    cargo test -p khive-db -p khive-runtime -p khive-mcp -p kkernel --features khive-mcp/channel-email
 }
 
 run_phase() {

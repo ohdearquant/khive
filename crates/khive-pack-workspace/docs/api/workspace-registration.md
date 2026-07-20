@@ -6,8 +6,10 @@ rules with the shared runtime. It contributes no verbs or private schema.
 ## `WorkspacePack::new`
 
 The constructor binds a `KhiveRuntime` handle used by the pack runtime and returns a pack ready for
-inventory-created or explicit installation. The pack depends on `kg`, `git`, `gtd`, and `session`
-because its endpoint rules refer to their note kinds.
+inventory-created or explicit installation. The pack depends on `kg`, `gtd`, and `session` because
+its endpoint rules refer to their note kinds. The `issue`/`pull_request`/`commit` note kinds are
+registered by a git-lifecycle pack that is not part of this distribution; the endpoint rules
+naming them stay declared but inert until such a pack is loaded.
 
 ## Creation hook
 

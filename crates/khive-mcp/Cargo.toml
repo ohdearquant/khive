@@ -25,7 +25,6 @@ khive-pack-comm = { version = "0.5.0", path = "../khive-pack-comm" }
 khive-pack-schedule = { version = "0.5.0", path = "../khive-pack-schedule" }
 khive-pack-knowledge = { version = "0.5.0", path = "../khive-pack-knowledge" }
 khive-pack-session = { version = "0.5.0", path = "../khive-pack-session" }
-khive-pack-git = { version = "0.5.0", path = "../khive-pack-git" }
 khive-pack-code = { version = "0.5.0", path = "../khive-pack-code" }
 khive-pack-blob = { version = "0.5.0", path = "../khive-pack-blob" }
 khive-pack-workspace = { version = "0.5.0", path = "../khive-pack-workspace" }

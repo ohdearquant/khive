@@ -70,7 +70,6 @@ CRATES=(
     # khive-merge — excluded from workspace (ADR-043 forward-deployed, ahead of khive-vcs)
     khive-pack-formal    # needs khive-runtime + khive-types (both above); dev-dep of khive-pack-kg, so publish first
     khive-pack-kg
-    khive-pack-git       # needs khive-runtime/storage + khive-pack-kg (all above)
     khive-pack-code      # needs khive-runtime/storage + khive-pack-kg (all above)
     khive-pack-gtd
     khive-brain-core
@@ -118,8 +117,8 @@ echo "    CRATES ladder OK (${#CRATES[@]} publishable workspace members all pres
 # excluded until their first publish. As of the 0.5.0 cycle those are
 # khive-channel-telegram (added since 0.4.0 via #1048) and khive-pack-blob
 # (the new blob-verb pack, not yet released). The four crates first
-# published in 0.4.0 — khive-changeset, khive-pack-code, khive-pack-git,
-# khive-pack-workspace — now have a 0.4.0 baseline and are checked again. Every
+# published in 0.4.0 — khive-changeset, khive-pack-code, khive-pack-workspace —
+# now have a 0.4.0 baseline and are checked again. Every
 # other workspace crate has a published baseline and MUST be checked. Drop an
 # exclusion once that crate has one published version.
 echo ""

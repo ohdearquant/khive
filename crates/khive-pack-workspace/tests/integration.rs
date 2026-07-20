@@ -2,7 +2,6 @@
 //! registration, `REQUIRES`, the five `contains` endpoint rules (positive +
 //! negative), and `name`/`schema_version` validation on create.
 
-use khive_pack_git::GitPack;
 use khive_pack_gtd::GtdPack;
 use khive_pack_kg::KgPack;
 use khive_pack_session::SessionPack;
@@ -20,7 +19,6 @@ fn build_registry(rt: KhiveRuntime) -> VerbRegistry {
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
     builder.register(GtdPack::new(rt.clone()));
-    builder.register(GitPack::new(rt.clone()));
     builder.register(SessionPack::new(rt.clone()));
     builder.register(WorkspacePack::new(rt.clone()));
     let registry = builder.build().expect("registry builds");
@@ -46,11 +44,11 @@ async fn workspace_entity_kind_registers() {
 }
 
 #[test]
-fn workspace_pack_requires_four_packs() {
+fn workspace_pack_requires_three_packs() {
     assert_eq!(
         WorkspacePack::REQUIRES,
-        &["kg", "git", "gtd", "session"],
-        "REQUIRES must list all four hard v0 dependencies per the SPEC-gate ruling"
+        &["kg", "gtd", "session"],
+        "REQUIRES must list all three hard v0 dependencies bundled in this distribution"
     );
 }
 
@@ -116,81 +114,6 @@ async fn create_workspace_accepts_optional_filesystem_path() {
         resp["properties"]["filesystem_path"],
         ".khive/workspaces/2026-07-11/pack-workspace"
     );
-}
-
-#[tokio::test]
-async fn workspace_contains_issue_is_allowed() {
-    let registry = build_registry(rt());
-    let ws = create_workspace(&registry, "ws-issue").await;
-    let issue = registry
-        .dispatch(
-            "create",
-            json!({
-                "kind": "note", "note_kind": "issue", "content": "issue body",
-                "properties": {"number": 1, "project_id": Uuid::new_v4().to_string()},
-            }),
-        )
-        .await
-        .expect("issue create ok");
-    let issue_id = issue["id"].as_str().unwrap();
-
-    registry
-        .dispatch(
-            "link",
-            json!({"source_id": ws, "target_id": issue_id, "relation": "contains"}),
-        )
-        .await
-        .expect("workspace contains issue must be allowed");
-}
-
-#[tokio::test]
-async fn workspace_contains_pull_request_is_allowed() {
-    let registry = build_registry(rt());
-    let ws = create_workspace(&registry, "ws-pr").await;
-    let pr = registry
-        .dispatch(
-            "create",
-            json!({
-                "kind": "note", "note_kind": "pull_request", "content": "pr body",
-                "properties": {"number": 7, "project_id": Uuid::new_v4().to_string()},
-            }),
-        )
-        .await
-        .expect("pull_request create ok");
-    let pr_id = pr["id"].as_str().unwrap();
-
-    registry
-        .dispatch(
-            "link",
-            json!({"source_id": ws, "target_id": pr_id, "relation": "contains"}),
-        )
-        .await
-        .expect("workspace contains pull_request must be allowed");
-}
-
-#[tokio::test]
-async fn workspace_contains_commit_is_allowed() {
-    let registry = build_registry(rt());
-    let ws = create_workspace(&registry, "ws-commit").await;
-    let commit = registry
-        .dispatch(
-            "create",
-            json!({
-                "kind": "note", "note_kind": "commit", "content": "commit body",
-                "properties": {"sha": "a".repeat(40)},
-            }),
-        )
-        .await
-        .expect("commit create ok");
-    let commit_id = commit["id"].as_str().unwrap();
-
-    registry
-        .dispatch(
-            "link",
-            json!({"source_id": ws, "target_id": commit_id, "relation": "contains"}),
-        )
-        .await
-        .expect("workspace contains commit must be allowed");
 }
 
 #[tokio::test]
@@ -264,30 +187,27 @@ async fn workspace_contains_unrelated_entity_kind_is_rejected() {
 }
 
 #[tokio::test]
-async fn workspace_depends_on_issue_is_rejected() {
+async fn workspace_depends_on_task_is_rejected() {
     let registry = build_registry(rt());
     let ws = create_workspace(&registry, "ws-negative-relation").await;
-    let issue = registry
+    let task = registry
         .dispatch(
             "create",
-            json!({
-                "kind": "note", "note_kind": "issue", "content": "issue body",
-                "properties": {"number": 2, "project_id": Uuid::new_v4().to_string()},
-            }),
+            json!({"kind": "note", "note_kind": "task", "title": "unrelated relation probe"}),
         )
         .await
-        .expect("issue create ok");
-    let issue_id = issue["id"].as_str().unwrap();
+        .expect("task create ok");
+    let task_id = task["id"].as_str().unwrap();
 
     let err = registry
         .dispatch(
             "link",
-            json!({"source_id": ws, "target_id": issue_id, "relation": "depends_on"}),
+            json!({"source_id": ws, "target_id": task_id, "relation": "depends_on"}),
         )
         .await
         .unwrap_err();
     assert!(
         !err.to_string().is_empty(),
-        "workspace -[depends_on]-> issue must be rejected (only contains is extended)"
+        "workspace -[depends_on]-> task must be rejected (only contains is extended)"
     );
 }

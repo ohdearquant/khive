@@ -18,8 +18,6 @@ pub use khive_pack_code::CodePack as _CodePack;
 #[doc(hidden)]
 pub use khive_pack_comm::CommPack as _CommPack;
 #[doc(hidden)]
-pub use khive_pack_git::GitPack as _GitPack;
-#[doc(hidden)]
 pub use khive_pack_gtd::GtdPack as _GtdPack;
 #[doc(hidden)]
 pub use khive_pack_kg::KgPack as _KgPack;

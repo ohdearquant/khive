@@ -1,14 +1,14 @@
 # API Reference
 
-khive exposes exactly one MCP tool, `request`. Everything else, 85 verbs across 12
+khive exposes exactly one MCP tool, `request`. Everything else, 81 verbs across 11
 production packs, is dispatched through that single tool via a small request DSL.
 This page documents the DSL grammar, the response envelope, and every verb's full
 parameter contract, so an agent can call khive correctly without reading Rust source.
 
 This page is verified against the live registry (`request(ops="verbs()")`, run
 2026-07-17) and the pack source (`crates/khive-pack-*/src/*.rs` `HandlerDef`/`ParamDef`
-struct literals). Verb count: **85**, matching both the live registry `total` field and
-the sum of the 12 pack counts below. If your server reports a different total, your
+struct literals). Verb count: **81**, matching both the live registry `total` field and
+the sum of the 11 pack counts below. If your server reports a different total, your
 `KHIVE_PACKS` configuration loads a different pack set than the default — run
 `request(ops="verbs()")` against your own server to get the authoritative list.
 
@@ -29,18 +29,18 @@ An always-machine-readable copy of this page is at
 | `schedule`  | 4     | `KHIVE_PACKS=kg,schedule`                  | Yes                 |
 | `knowledge` | 19    | `KHIVE_PACKS=kg,knowledge`                 | Yes                 |
 | `session`   | 4     | `KHIVE_PACKS=kg,session`                   | Yes                 |
-| `git`       | 4     | `KHIVE_PACKS=kg,git`                       | Yes                 |
 | `code`      | 1     | `KHIVE_PACKS=kg,code`                      | Yes                 |
-| `workspace` | 0     | `KHIVE_PACKS=kg,git,gtd,session,workspace` | Yes                 |
+| `workspace` | 0     | `KHIVE_PACKS=kg,gtd,session,workspace`     | Yes                 |
 | `blob`      | 3     | `KHIVE_PACKS=kg,blob`                      | Yes                 |
 
-`git` also registers the `commit` / `issue` / `pull_request` note kinds and the shared
-`run_ingest` core (`crates/khive-pack-git/src/ingest.rs`) that both `git.digest` and the
-`kkernel git-ingest` CLI drive. Its four verbs are `git.digest` (read/ingest) plus three
-write verbs, `git.commit` / `git.branch` / `git.push` (ADR-108), that shell to system git
-with hardened, allowlisted argv construction.
+Git provenance ingestion (`git.digest`, the `commit`/`issue`/`pull_request` note kinds) and
+the `git.commit` / `git.branch` / `git.push` write verbs (ADR-108) are provided by a
+commercial extension and are not part of this distribution.
 
-`workspace` requires `kg`, `git`, `gtd`, and `session` to be loaded alongside it (the runtime rejects a pack set that omits a declared dependency), so its minimal example lists all four.
+`workspace` requires `kg`, `gtd`, and `session` to be loaded alongside it (the runtime
+rejects a pack set that omits a declared dependency), so its minimal example lists all
+three. Its `contains` endpoint rules naming `commit`/`issue`/`pull_request` note kinds stay
+declared but inert unless a pack registering those note kinds is loaded.
 
 `schedule` requires `kg`. `schedule.remind` additionally requires `comm.send` at
 creation time and persists nothing when that delivery capability is absent; the other
@@ -1569,73 +1569,13 @@ request(ops="session.export(id=\"<session-id>\", format=\"markdown\")")
 
 ---
 
-## `git` pack — 4 verbs
+## `git` pack
 
-Git-history ingester plus a hardened write surface (ADR-088, ADR-088 Amendment 1,
-ADR-108). Optional; load with `KHIVE_PACKS=kg,git`. Also registers the `commit` /
-`issue` / `pull_request` note kinds, used by `git.digest` below and by the `kkernel
-git-ingest` CLI (both drive the same underlying ingest core, so ingest enrichment —
-readable `name`s, `Closes #N` reference edges, parent→child commit `precedes` edges —
-applies identically either way).
+Git-history ingestion (`git.digest`) and the hardened write surface (`git.commit` /
+`git.branch` / `git.push`, ADR-108), along with the `commit`/`issue`/`pull_request`
+note kinds they register, are provided by a commercial extension and are not part
+of this distribution.
 
-### `git.digest` — Commissive
-
-Walk a local repository path or clone/fetch a remote `https://` URL, then ingest commits
-and (when the source is a github.com repo and the `gh` CLI is available) issues and pull
-requests as provenance notes, resolving or auto-creating the repo-anchor `project` entity.
-Bounded and cursor-resumable: call again with the same `source`/`project` while the
-response's `done` field is `false`.
-
-| Param       | Type            | Required | Notes                                                                                                                                                                                                                                     |
-| ----------- | --------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `source`    | string          | yes      | A local filesystem path (must contain `.git`) or an `https://` URL. Any `https` host is accepted; non-github.com hosts degrade to commits-only. `ssh://`, `git://`, `http://`, and scp-shorthand (`user@host:path`) sources are rejected. |
-| `project`   | string          | no       | UUID or 8+ hex prefix of the repo-anchor `project` entity. When absent, resolved by matching `properties.repo_url` or `name`, or created if none is found (see the response's `project_id` and `project_created`).                        |
-| `max_items` | integer         | no       | Bounded work for this call, counted across commits + issues + PRs (default 500, clamped to 1..=2000). Cursor-resumable: call again while the response's `done` field is `false`.                                                          |
-| `include`   | array\<string\> | no       | Which record kinds to ingest this call: any of `commits` \| `issues` \| `pull_requests` (default: all three).                                                                                                                             |
-
-```
-request(ops="git.digest(source=\"https://github.com/org/repo\", max_items=500)")
-```
-
-### `git.commit` / `git.branch` / `git.push` — Commissive (ADR-108)
-
-Thin write verbs that shell to system git (`std::process::Command::args`, no shell
-interpolation). Branch/ref names, remotes, messages, and authors are validated before they
-enter fixed argv shapes. Commit paths are bounded, repository-relative, traversal-free,
-and internally converted to Git literal pathspecs, so characters such as `*`, `?`, brackets,
-Unicode, and caller text such as `:(top)` remain literal filename text. `force` on
-`git.push` is always rejected when `true` — no policy or argument combination authorizes a
-force-push through this surface.
-
-The handler-level `[git_write]` allowlist is mandatory and independent of Gate policy
-(ADR-018). With no `[[git_write.allowed]]` entries, all three write verbs deny every request,
-including under `AllowAllGate`. Repository paths are compared after canonicalization, so an
-entry names exactly one real repository; branch patterns are exact names or a glob containing
-at most one `*` wildcard.
-
-```toml
-[[git_write.allowed]]
-repo = "/abs/path/repo"
-branches = ["main", "feat/*", "release-*"]
-```
-
-| Verb         | Param     | Type            | Required | Notes                                                                                                                                                                          |
-| ------------ | --------- | --------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `git.commit` | `repo`    | string          | yes      | Absolute local path to a git repository (must contain a `.git` entry).                                                                                                         |
-|              | `message` | string          | yes      | Commit message, passed as a single `-m` argument value.                                                                                                                        |
-|              | `paths`   | array\<string\> | no       | Relative paths to stage and scope the commit to. Absent commits everything currently staged/modified in tracked files (`git commit -a`) — never auto-adds new untracked files. |
-|              | `author`  | string          | no       | Override the commit author, e.g. `"Name <email>"`.                                                                                                                             |
-| `git.branch` | `repo`    | string          | yes      | Same as above.                                                                                                                                                                 |
-|              | `name`    | string          | yes      | New branch name.                                                                                                                                                               |
-|              | `from`    | string          | no       | Ref or SHA to branch from. Absent uses the repo's current HEAD.                                                                                                                |
-| `git.push`   | `repo`    | string          | yes      | Same as above.                                                                                                                                                                 |
-|              | `branch`  | string          | yes      | Branch to push.                                                                                                                                                                |
-|              | `remote`  | string          | no       | Remote to push to (default `origin`).                                                                                                                                          |
-|              | `force`   | bool            | no       | Always rejected when `true` (ADR-108 hard rule 1) — present only so an explicit `force=true` request fails loudly instead of being silently ignored.                           |
-
-```
-request(ops="git.commit(repo=\"/abs/path/repo\", message=\"fix: thing\") | git.push(repo=\"/abs/path/repo\", branch=\"main\")")
-```
 
 ---
 

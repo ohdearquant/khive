@@ -15,16 +15,14 @@ khive gives your agent:
 9. **Brain** — Bayesian profile tuning from feedback signals
 10. **Session** — persist and resume agent-session records
 
-All 11 packs load by default. **82 public verbs** across the packs: the `git` pack
-contributes the `git.digest` verb plus the commit/issue/pull_request provenance note kinds
-and a batch ingester, and three write verbs, `git.commit` / `git.branch` / `git.push`
-(ADR-108), that shell to system git with hardened, allowlisted argv construction — no
-tag/merge/checkout/pull/fetch, no force-push under any argument combination; the `code`
+All 10 packs load by default. **78 public verbs** across the packs: the `code`
 pack contributes one verb, `code.ingest` (L1 manifest + L1.5 import-scan source ingestion
 into a dedicated map database, ADR-085 Amendment 2); its `finding` note kind is still
 written only through the `kkernel code-ingest` admin CLI path (ADR-085 D1, Amendment 3);
 the `workspace` pack contributes zero verbs, adding only the `workspace` entity kind and
-`contains` endpoint rules to git/gtd/session notes (#873). Regenerate via
+`contains` endpoint rules to git/gtd/session notes (#873). Git provenance ingestion and
+write verbs (`git.digest`, `git.commit`, `git.branch`, `git.push`) are provided by a
+commercial extension and are not part of the open-source distribution. Regenerate via
 `request(ops="verbs()")`
 before editing this line.
 

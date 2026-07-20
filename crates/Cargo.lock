@@ -2044,7 +2044,6 @@ dependencies = [
  "khive-pack-brain",
  "khive-pack-code",
  "khive-pack-comm",
- "khive-pack-git",
  "khive-pack-gtd",
  "khive-pack-kg",
  "khive-pack-knowledge",
@@ -2173,29 +2172,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "khive-pack-git"
-version = "0.5.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "blake3",
- "chrono",
- "clap",
- "inventory",
- "khive-pack-kg",
- "khive-runtime",
- "khive-storage",
- "khive-types",
- "lattice-embed",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "khive-pack-gtd"
 version = "0.5.0"
 dependencies = [
@@ -2305,7 +2281,6 @@ dependencies = [
  "inventory",
  "khive-pack-brain",
  "khive-pack-comm",
- "khive-pack-git",
  "khive-pack-kg",
  "khive-request",
  "khive-runtime",
@@ -2357,7 +2332,6 @@ version = "0.5.0"
 dependencies = [
  "async-trait",
  "inventory",
- "khive-pack-git",
  "khive-pack-gtd",
  "khive-pack-kg",
  "khive-pack-session",
@@ -2571,7 +2545,6 @@ dependencies = [
  "khive-pack-code",
  "khive-pack-comm",
  "khive-pack-formal",
- "khive-pack-git",
  "khive-pack-gtd",
  "khive-pack-kg",
  "khive-pack-knowledge",

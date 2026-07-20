@@ -13,7 +13,7 @@ use khive_runtime::{BackendId, KhiveConfig, KhiveRuntime, RuntimeConfig};
 use kkernel::{
     code_audit, code_ingest,
     coordinator::{BackendRegistry, SubstrateCoordinator, SubstrateCoordinatorService},
-    engine, exec, git_ingest, kg, pack_introspect, reindex, sync, vector,
+    engine, exec, kg, pack_introspect, reindex, sync, vector,
 };
 
 #[derive(Parser, Debug)]
@@ -83,10 +83,6 @@ enum Command {
     /// Inspect registered backends.
     #[command(subcommand)]
     Backend(BackendCommand),
-
-    /// One-shot batch ingest of commit/issue/pull_request provenance notes
-    /// from a local git repository (ADR-088).
-    GitIngest(git_ingest::GitIngestArgs),
 
     /// Validate and ingest a `findings.json` audit sweep into the graph as
     /// `finding` notes (ADR-085 Amendment 3).
@@ -338,7 +334,6 @@ async fn main() -> Result<()> {
             }
         }
         Command::Backend(b) => cmd_backend(b),
-        Command::GitIngest(a) => git_ingest::run_git_ingest(a).await,
         Command::CodeIngest(a) => code_ingest::run_code_ingest(a).await,
         Command::CodeAudit(a) => code_audit::run_code_audit(a).await,
     }

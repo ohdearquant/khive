@@ -6819,7 +6819,7 @@ mod tests {
     /// The `resolve_prefix*` boundary rejects
     /// non-hex/non-hyphen input (e.g. LIKE wildcards `%`/`_`) instead of
     /// letting it reach the bound `LIKE` pattern unfiltered — covers callers
-    /// (like khive-pack-git/src/ingest.rs) that resolve raw input without
+    /// (like a git-integration pack's ingest path) that resolve raw input without
     /// their own all-hex gate.
     #[tokio::test]
     async fn resolve_prefix_rejects_like_wildcard_input() {
