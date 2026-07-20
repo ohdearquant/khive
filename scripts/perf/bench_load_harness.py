@@ -76,8 +76,8 @@ PROTOCOL_VERSION = mbc.PROTOCOL_VERSION
 # scratch DB that path fails bootstrap recall (`fts_notes` vtable construction), and its background
 # writes would also confound the reduced-scale WAL / write-queue gauges this harness reads. The full
 # acceptance run against a real multi-pack config opts session back in via `--packs` (see below).
-DEFAULT_PACKS = "kg,gtd,memory,brain,comm,schedule"
-PRODUCTION_PACKS = "kg,gtd,memory,brain,comm,schedule,session,git"
+DEFAULT_PACKS = "kg,gtd,memory,comm,schedule"
+PRODUCTION_PACKS = "kg,gtd,memory,comm,schedule,session,git"
 
 # ── Metal GPU serialization (machine-wide convention; real-embedder mode only)
 METAL_GPU_LOCK_PATH = os.environ.get("METAL_GPU_LOCK_PATH", "/tmp/lion-metal-gpu-test.lock")

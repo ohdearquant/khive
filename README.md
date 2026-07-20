@@ -25,7 +25,7 @@ stdio, and `cargo test` finishes in 4 seconds.
 
 | Capability                  | How                                                                                                                                                      |
 | --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **65 verbs, 10 packs**      | KG, GTD, memory, brain, comm, schedule, session, git, workspace, blob: all load by default                                                               |
+| **50 verbs, 9 packs**       | KG, GTD, memory, comm, schedule, session, git, workspace, blob: all load by default                                                                      |
 | **Typed entities**          | 9 closed kinds: concept, document, dataset, project, person, org, artifact, service, resource                                                            |
 | **Typed edges**             | 17 closed relations in 9 categories (structure, derivation, provenance, temporal, dependency, impl, lateral, annotation, epistemic)                      |
 | **Typed notes**             | 5 closed kinds: observation, insight, question, decision, reference                                                                                      |
@@ -63,7 +63,7 @@ request(ops="[v1(...), v2(...), v3(...)]")             # parallel batch (max 100
 request(ops="[{\"tool\":\"v1\",\"args\":{...}}, ...]") # equivalent JSON form
 ```
 
-All 10 packs load by default, giving **65 verbs** out of the box (regenerate with
+All 9 packs load by default, giving **50 verbs** out of the box (regenerate with
 `request(ops="verbs()")` before editing this table):
 
 | Pack          | Prefix      | Verbs | What it does                                                                                   |
@@ -71,7 +71,6 @@ All 10 packs load by default, giving **65 verbs** out of the box (regenerate wit
 | **kg**        | _(bare)_    | 18    | Entities, edges, notes, graph queries, reference resolution                                    |
 | **gtd**       | `gtd.`      | 5     | Task lifecycle (inbox → next → active → done)                                                  |
 | **memory**    | `memory.`   | 5     | Salience-weighted remember / decay-ranked recall                                               |
-| **brain**     | `brain.`    | 15    | Bayesian user profiles + feedback loop                                                         |
 | **comm**      | `comm.`     | 7     | Threaded messaging                                                                             |
 | **schedule**  | `schedule.` | 4     | Reminders and scheduled verb execution                                                         |
 | **session**   | `session.`  | 4     | Session record persistence (store/list/resume/export)                                          |
@@ -137,7 +136,6 @@ records what's connected, in which direction, and why.
 │  khive-pack-kg:        KG vocabulary + 18 verb handlers       │
 │  khive-pack-gtd:       task lifecycle (5 verbs)               │
 │  khive-pack-memory:    salience + decay recall (5 verbs)      │
-│  khive-pack-brain:     Bayesian profiles (15 verbs)           │
 │  khive-pack-comm:      threaded messaging (7 verbs)           │
 │  khive-pack-schedule:  reminders + scheduled ops (4 verbs)    │
 │  khive-pack-session:   session record persistence (4 verbs)   │
@@ -208,7 +206,6 @@ as a measured headline figure. The benchmark harness lives in `perf/`; raw data 
 | `khive-pack-kg`       | KG pack: vocabulary, verb handlers, kind validation                                                      |
 | `khive-pack-gtd`      | GTD pack: task lifecycle over the notes substrate                                                        |
 | `khive-pack-memory`   | Memory pack: salience-weighted remember/recall with decay                                                |
-| `khive-pack-brain`    | Brain pack: Bayesian user profiles, feedback, resolution                                                 |
 | `khive-pack-comm`     | Comm pack: threaded messaging with inbox                                                                 |
 | `khive-pack-schedule` | Schedule pack: reminders and scheduled verb execution                                                    |
 | `khive-mcp`           | MCP server library: single `request` tool dispatching through the VerbRegistry (served by `kkernel mcp`) |
@@ -247,7 +244,7 @@ kkernel --version   # confirms the binary and version you just installed
 ```
 
 All 11 packs load by default, a background daemon auto-spawns to keep the runtime warm, and any
-MCP client discovers the `request` tool with the full 65-verb catalog.
+MCP client discovers the `request` tool with the full 50-verb catalog.
 
 ### Alternative: npm
 
@@ -374,9 +371,9 @@ Docs: [ohdearquant.github.io/khive](https://ohdearquant.github.io/khive/) (agent
 
 ## Status
 
-**v0.5.0 (publication pending; crates.io currently serves 0.4.0).** 65 verbs across 10
-packs, 9 entity kinds, 17 edge relations, daemon warm startup (ADR-049), Bayesian brain
-profiles, threaded messaging, scheduled verb execution.
+**v0.5.0 (publication pending; crates.io currently serves 0.4.0).** 50 verbs across 9
+packs, 9 entity kinds, 17 edge relations, daemon warm startup (ADR-049), threaded
+messaging, scheduled verb execution.
 Ready for use with Claude Code and any MCP-compatible agent.
 
 ## License

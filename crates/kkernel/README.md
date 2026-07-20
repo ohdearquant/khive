@@ -97,7 +97,7 @@ builds).
 ## Where this sits
 
 `kkernel` sits at the top of the storage dependency chain — it depends on every pack crate
-(`khive-pack-kg`, `-gtd`, `-memory`, `-brain`, `-comm`, `-schedule`, `-knowledge`,
+(`khive-pack-kg`, `-gtd`, `-memory`, `-comm`, `-schedule`,
 `-session`, `-git`), `khive-mcp` (the server library it serves), `khive-vcs` / `khive-vcs-adapters`
 (KG versioning and import/export), and the core storage stack (`khive-runtime`,
 `khive-db`, `khive-storage`, `khive-types`, `khive-score`). Its `_pack_links` module force-

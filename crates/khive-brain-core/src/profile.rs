@@ -135,6 +135,12 @@ pub async fn resolve_consumer_profile(
     namespace: &str,
     consumer_kind: ConsumerKind,
 ) -> Option<String> {
+    // Without the brain pack loaded there is no binding table to consult;
+    // skip the dispatch entirely rather than paying a guaranteed-failed
+    // call (and its audit write) on every consumer invocation.
+    if !registry.has_verb("brain.resolve") {
+        return None;
+    }
     let resolve_params = serde_json::json!({
         "actor": actor,
         "namespace": namespace,

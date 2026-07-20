@@ -124,7 +124,7 @@ jobs:
                 crates/khive-hnsw/*|crates/khive-vamana/*|crates/khive-quant/*|crates/khive-query/*|crates/khive-request/*)
                   ann_query=true
                   ;;
-                crates/khive-db/*|crates/khive-fold/*|crates/khive-brain-core/*|crates/khive-pack-brain/*|crates/khive-pack-comm/*)
+                crates/khive-db/*|crates/khive-fold/*|crates/khive-brain-core/*|crates/khive-pack-comm/*)
                   storage_brain=true
                   ;;
                 crates/khive-pack-gtd/*|crates/khive-pack-kg/*|crates/khive-pack-memory/*|crates/khive-pack-schedule/*)
@@ -191,7 +191,7 @@ jobs:
     uses: ./.github/workflows/bench-component.yml
     with:
       component: storage-brain
-      crates: khive-db khive-fold khive-brain-core khive-pack-brain khive-pack-comm
+      crates: khive-db khive-fold khive-brain-core khive-pack-comm
 
   component-packs:
     name: Component benches / packs

@@ -1,13 +1,13 @@
 # API Reference
 
-khive exposes exactly one MCP tool, `request`. Everything else, 65 verbs across 10
+khive exposes exactly one MCP tool, `request`. Everything else, 50 verbs across 9
 production packs, is dispatched through that single tool via a small request DSL.
 This page documents the DSL grammar, the response envelope, and every verb's full
 parameter contract, so an agent can call khive correctly without reading Rust source.
 
 This page is verified against the live registry (`request(ops="verbs()")`) and the pack
 source (`crates/khive-pack-*/src/*.rs` `HandlerDef`/`ParamDef` struct literals). Verb
-count: **65**, matching both the live registry `total` field and the sum of the 10 pack
+count: **50**, matching both the live registry `total` field and the sum of the 9 pack
 counts below. If your server reports a different total, your `KHIVE_PACKS` configuration
 loads a different pack set than the default — run `request(ops="verbs()")` against your
 own server to get the authoritative list.
@@ -24,7 +24,6 @@ An always-machine-readable copy of this page is at
 | `kg`        | 18    | `KHIVE_PACKS=kg` (default)                 | No — base substrate |
 | `gtd`       | 5     | `KHIVE_PACKS=kg,gtd`                       | Yes                 |
 | `memory`    | 5     | `KHIVE_PACKS=kg,memory`                    | Yes                 |
-| `brain`     | 15    | `KHIVE_PACKS=kg,brain`                     | Yes                 |
 | `comm`      | 7     | `KHIVE_PACKS=kg,comm`                      | Yes                 |
 | `schedule`  | 4     | `KHIVE_PACKS=kg,schedule`                  | Yes                 |
 | `session`   | 4     | `KHIVE_PACKS=kg,session`                   | Yes                 |
@@ -51,12 +50,12 @@ even with no `[storage.blob]` section and no `KHIVE_BLOB_ROOT` set; the verbs on
 unconfigured (erroring until a backend is installed) when the server boots against an
 in-memory backend, which has no directory to default a root beside.
 
-The default binary (no `KHIVE_PACKS`/`--pack` override) loads all 11 packs: 18 + 5 + 5 +
-15 + 7 + 4 + 4 + 4 + 0 + 3 = **65 verbs**.
+The default binary (no `KHIVE_PACKS`/`--pack` override) loads all 9 packs: 18 + 5 + 5 +
+7 + 4 + 4 + 4 + 0 + 3 = **50 verbs**.
 
 Verb names in the `kg` pack are bare (`create`, `search`, `link`, …). Every other pack
 namespaces its verbs with a `pack.` prefix (`gtd.assign`, `memory.recall`,
-`brain.feedback`, `comm.send`, `schedule.remind`, `session.store`).
+`comm.send`, `schedule.remind`, `session.store`).
 
 ---
 
@@ -631,10 +630,10 @@ request(ops="resolve(refs=[\"the old record\", \"<uuid>\"])")
 List all MCP-callable verbs registered on this server. Internal subhandlers are
 excluded.
 
-| Param      | Type   | Required | Notes                                                                                       |
-| ---------- | ------ | -------- | ------------------------------------------------------------------------------------------- |
-| `category` | string | no       | Filter: `Assertive`\|`Commissive`\|`Declaration`\|`Directive`.                              |
-| `pack`     | string | no       | Filter by pack name (`kg`, `gtd`, `memory`, `brain`, `comm`, `schedule`, `session`, `git`). |
+| Param      | Type   | Required | Notes                                                                              |
+| ---------- | ------ | -------- | ---------------------------------------------------------------------------------- |
+| `category` | string | no       | Filter: `Assertive`\|`Commissive`\|`Declaration`\|`Directive`.                     |
+| `pack`     | string | no       | Filter by pack name (`kg`, `gtd`, `memory`, `comm`, `schedule`, `session`, `git`). |
 
 ```
 request(ops="verbs()")
@@ -815,236 +814,9 @@ request(ops="memory.vacuum()")
 
 ---
 
-## `brain` pack — 15 verbs
-
-Recall-tuning profiles: Beta-posterior scoring, profile lifecycle, and the actor/
-namespace/consumer-kind resolution table that picks which profile serves a given
-caller. Optional; load with `KHIVE_PACKS=kg,brain`.
-
-### `brain.event_counts` — Assertive
-
-Windowed event counts grouped by kind, actor, and verb over the event plane (ADR-103
-Stage 1, #724 Ask A). `feedback_explicit` events are additionally split by
-`served_by_profile_id`. Events carrying a `work_class` (today:
-`phase_started`/`phase_completed`/`phase_cancelled` payloads, or `payload.resource.work_class`
-on a dispatch audit row) split by `counts_by_work_class`. Events carrying
-`payload.resource.cost_unit` (ADR-103 Amendment 1, stamped on every successful verb dispatch
-since PR #927) sum into `total_cost_unit` and `cost_unit_by_verb`; both are omitted, not
-zero-filled, when no event in the window carries `cost_unit`. Events without a `cost_unit`
-(pre-Amendment-1 events, or errored/denied dispatches) simply do not contribute. When
-`truncated` is `true`, these sums are computed over the fetched page only, same as the other
-`counts_by_*` fields.
-
-| Param   | Type   | Required | Notes                                                                                                                                                       |
-| ------- | ------ | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `since` | string | yes      | Window start, ISO-8601/RFC-3339 datetime. Inclusive.                                                                                                        |
-| `until` | string | no       | Window end, ISO-8601/RFC-3339 datetime. Exclusive. Defaults to now.                                                                                         |
-| `actor` | string | no       | Filter to a single actor. Stored actor strings are prefixed (`actor:lambda:khive`); bare (`lambda:khive`) or prefixed form both match. Omit for all actors. |
-| `kind`  | string | no       | Filter to a single EventKind (e.g. `"recall_executed"`). Omit for all.                                                                                      |
-
-```
-request(ops="brain.event_counts(since=\"2026-07-01T00:00:00Z\")")
-```
-
-### `brain.profiles` — Assertive
-
-List profiles, optionally filtered by lifecycle.
-
-| Param       | Type   | Required | Notes                                           |
-| ----------- | ------ | -------- | ----------------------------------------------- |
-| `lifecycle` | string | no       | `active`\|`inactive`\|`archived`; omit for all. |
-
-```
-request(ops="brain.profiles(lifecycle=\"active\")")
-```
-
-### `brain.profile` — Assertive
-
-Profile metadata, latest snapshot, current state summary.
-
-| Param        | Type   | Required | Notes                                                         |
-| ------------ | ------ | -------- | ------------------------------------------------------------- |
-| `profile_id` | string | yes      | Profile ID string (e.g. `"balanced-recall-v1"`) — not a UUID. |
-
-```
-request(ops="brain.profile(profile_id=\"implementer-recall-v1\")")
-```
-
-### `brain.resolve` — Assertive
-
-Show which profile would serve a caller context.
-
-| Param           | Type   | Required | Notes                                                        |
-| --------------- | ------ | -------- | ------------------------------------------------------------ |
-| `consumer_kind` | string | yes      | Verb/operation type about to be performed (e.g. `"recall"`). |
-| `actor`         | string | no       | Default `*` (wildcard match).                                |
-| `namespace`     | string | no       | Default `*` (wildcard match).                                |
-
-```
-request(ops="brain.resolve(consumer_kind=\"recall\", actor=\"agent:docs\")")
-```
-
-### `brain.activate` — Commissive
-
-Move a profile to Active (starts the live update loop).
-
-| Param        | Type   | Required | Notes                |
-| ------------ | ------ | -------- | -------------------- |
-| `profile_id` | string | yes      | Profile to activate. |
-
-```
-request(ops="brain.activate(profile_id=\"implementer-recall-v1\")")
-```
-
-### `brain.deactivate` — Commissive
-
-Move a profile to Inactive (stop live updates, retain state).
-
-| Param        | Type   | Required | Notes                  |
-| ------------ | ------ | -------- | ---------------------- |
-| `profile_id` | string | yes      | Profile to deactivate. |
-
-```
-request(ops="brain.deactivate(profile_id=\"implementer-recall-v1\")")
-```
-
-### `brain.archive` — Declaration
-
-Move a profile to Archived (read-only, audit-retained).
-
-| Param        | Type   | Required | Notes               |
-| ------------ | ------ | -------- | ------------------- |
-| `profile_id` | string | yes      | Profile to archive. |
-
-```
-request(ops="brain.archive(profile_id=\"deprecated-recall-v0\")")
-```
-
-### `brain.reset` — Declaration
-
-Reset posteriors to priors (preserves event history).
-
-| Param        | Type   | Required | Notes                                                         |
-| ------------ | ------ | -------- | ------------------------------------------------------------- |
-| `profile_id` | string | no       | Must exist and be active. Defaults to `"balanced-recall-v1"`. |
-
-```
-request(ops="brain.reset(profile_id=\"implementer-recall-v1\")")
-```
-
-### `brain.feedback` — Commissive
-
-Emit a `FeedbackExplicit` event into the shared log.
-
-| Param                  | Type   | Required | Notes                                                                                                      |
-| ---------------------- | ------ | -------- | ---------------------------------------------------------------------------------------------------------- |
-| `target_id`            | uuid   | yes      | Memory note or entity the feedback applies to.                                                             |
-| `signal`               | string | yes      | Same signal set as `memory.feedback`.                                                                      |
-| `served_by_profile_id` | string | no       | Profile that served the rated result.                                                                      |
-| `section_signals`      | object | no       | Per-section signals for `knowledge_compose` profiles: `{"section_name": "useful"\|"not_useful"\|"wrong"}`. |
-| `scorer_run_id`        | string | no       | ADR-081 scorer-pass id; must pair with `serve_ledger_id`.                                                  |
-| `serve_ledger_id`      | string | no       | ADR-081 `brain_serve_ledger` row id; must pair with `scorer_run_id`.                                       |
-
-```
-request(ops="brain.feedback(target_id=\"<uuid>\", signal=\"useful\")")
-```
-
-### `brain.auto_feedback` — Commissive
-
-Emit implicit feedback for recall results supplied by an agent — the convenience verb
-to call right after `memory.recall` instead of hand-building `brain.feedback`.
-
-| Param                  | Type   | Required | Notes                                                                 |
-| ---------------------- | ------ | -------- | --------------------------------------------------------------------- |
-| `query`                | string | yes      | The recall query that produced the results.                           |
-| `results`              | array  | yes      | Recall result objects; the first object's `id` is credited.           |
-| `signal`               | string | no       | Defaults to `implicit_positive`.                                      |
-| `served_by_profile_id` | string | no       | Profile that served the recall.                                       |
-| `scorer_run_id`        | string | no       | Forwarded verbatim to `brain.feedback`; pairs with `serve_ledger_id`. |
-| `serve_ledger_id`      | string | no       | Forwarded verbatim to `brain.feedback`; pairs with `scorer_run_id`.   |
-
-```
-request(ops="memory.recall(query=\"x\", limit=5) | brain.auto_feedback(query=\"x\", results=[{\"id\": \"$prev.items[0].id\"}])")
-```
-
-### `brain.bind` — Declaration
-
-Write a row in the profile resolution table.
-
-| Param           | Type    | Required | Notes                                        |
-| --------------- | ------- | -------- | -------------------------------------------- |
-| `profile_id`    | string  | yes      | Must exist.                                  |
-| `actor`         | string  | no       | Default `*` (all actors).                    |
-| `namespace`     | string  | no       | Default `*` (all namespaces).                |
-| `consumer_kind` | string  | no       | Default `*` (all kinds).                     |
-| `priority`      | integer | no       | Higher wins on multiple matches (default 0). |
-
-```
-request(ops="brain.bind(profile_id=\"implementer-recall-v1\", actor=\"role:implementer\")")
-```
-
-### `brain.unbind` — Declaration
-
-Remove rows from the profile resolution table. At least one filter is required.
-
-| Param           | Type   | Required | Notes                            |
-| --------------- | ------ | -------- | -------------------------------- |
-| `profile_id`    | string | no       | AND-combined with other filters. |
-| `actor`         | string | no       |                                  |
-| `namespace`     | string | no       |                                  |
-| `consumer_kind` | string | no       |                                  |
-
-```
-request(ops="brain.unbind(actor=\"role:implementer\")")
-```
-
-### `brain.bindings` — Assertive
-
-List rows in the profile resolution table, optionally filtered.
-
-| Param           | Type   | Required | Notes |
-| --------------- | ------ | -------- | ----- |
-| `profile_id`    | string | no       |       |
-| `actor`         | string | no       |       |
-| `namespace`     | string | no       |       |
-| `consumer_kind` | string | no       |       |
-
-```
-request(ops="brain.bindings(consumer_kind=\"recall\")")
-```
-
-### `brain.create_profile` — Declaration
-
-Create a new brain profile with a given name and optional seed priors.
-
-| Param           | Type   | Required | Notes                                                                                                                                                               |
-| --------------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `name`          | string | yes      | Profile ID (alphanumeric + hyphens), must be unique.                                                                                                                |
-| `description`   | string | no       | Human-readable description.                                                                                                                                         |
-| `consumer_kind` | string | no       | Default `"recall"`.                                                                                                                                                 |
-| `seed_priors`   | object | no       | For `knowledge_compose`: `{"section_posteriors": {"overview": {"alpha": 2.0, "beta": 2.0}, ...}}`; for `recall`: `{"relevance": {"alpha": 7.0, "beta": 3.0}, ...}`. |
-
-```
-request(ops="brain.create_profile(name=\"implementer-recall-v2\", consumer_kind=\"recall\")")
-```
-
-### `brain.register_adapter` — Declaration
-
-Register an adapter integrity record so the router only composes adapters matching the
-active base model revision.
-
-| Param                 | Type   | Required | Notes                                                       |
-| --------------------- | ------ | -------- | ----------------------------------------------------------- |
-| `adapter_id`          | string | yes      | Stable adapter identifier (used as the entity name).        |
-| `content_hash`        | string | yes      | Content hash of the adapter weights.                        |
-| `base_model_revision` | string | yes      | Must match the active revision or registration is rejected. |
-| `metadata`            | object | no       | Merged into entity properties.                              |
-
-```
-request(ops="brain.register_adapter(adapter_id=\"lora-v3\", content_hash=\"<sha256>\", base_model_revision=\"2026-07-01\")")
-```
-
----
+The `brain` pack (`brain.*` verbs — recall-tuning profiles, Beta-posterior scoring,
+feedback-driven ranking) is a commercially licensed extension distributed separately;
+it is not part of this distribution.
 
 ## `comm` pack — 7 verbs
 

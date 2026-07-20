@@ -11,8 +11,7 @@ khive gives your agent:
 5. **Memory** — salience- and decay-weighted recall across sessions
 6. **Communication** — namespaced message passing between agents
 7. **Scheduling** — time-triggered reminders and future verb dispatch
-8. **Brain** — Bayesian profile tuning from feedback signals
-9. **Session** — persist and resume agent-session records
+8. **Session** — persist and resume agent-session records
 
 All packs load by default. Verbs across the packs: the `git` pack contributes the
 `git.digest` verb plus the commit/issue/pull_request provenance note kinds and a batch
@@ -132,25 +131,8 @@ false, id, full_id, from, to, note: "already in target status"}` — the task fi
 `memory.recall` supports `tags` and `tag_mode` ("any"|"all") for tag-based post-filtering.
 Composite scores are always in [0,1]. Typical production floor: 0.3-0.7.
 
-### Brain pack — 15 verbs (`brain.` prefix)
-
-| Verb                     | What it does                                                                             | When to use                                                     |
-| ------------------------ | ---------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
-| `brain.event_counts`     | Windowed event counts by kind/actor/verb (+ feedback by_profile split, cost_unit totals) | Flywheel metrics, feedback-coverage reporting, cost attribution |
-| `brain.profiles`         | List profiles (optionally filtered by lifecycle)                                         | See what profiles exist                                         |
-| `brain.profile`          | Full detail: metadata, snapshot, state summary                                           | Inspect a specific profile                                      |
-| `brain.create_profile`   | Create a new profile with optional seed priors                                           | Custom tuning for a new consumer                                |
-| `brain.resolve`          | Which profile serves a given consumer context?                                           | Before recall — check active tuning                             |
-| `brain.activate`         | Start live update loop for a profile                                                     | Enable feedback-driven tuning                                   |
-| `brain.deactivate`       | Stop live updates, retain state                                                          | Pause tuning without losing progress                            |
-| `brain.archive`          | Read-only, audit-retained                                                                | Retire a profile permanently                                    |
-| `brain.reset`            | Reset posteriors to priors (preserves event history)                                     | Start tuning fresh                                              |
-| `brain.feedback`         | Emit explicit feedback event                                                             | Rate a recall result as useful/not_useful/wrong                 |
-| `brain.auto_feedback`    | Emit implicit feedback for recall results                                                | Convenience: agents call after memory.recall                    |
-| `brain.bind`             | Bind a profile to an actor + consumer                                                    | Route a specific caller to a specific profile                   |
-| `brain.unbind`           | Remove a binding                                                                         | Stop routing                                                    |
-| `brain.bindings`         | List binding rows                                                                        | Audit profile routing                                           |
-| `brain.register_adapter` | Register an adapter integrity record                                                     | Gate adapter composition to the active base-model revision      |
+Brain verbs (profile-oriented feedback and learning-loop orchestration, `brain.` prefix) are
+provided by a commercial extension and are not part of the open-source distribution.
 
 ### Comm pack — 7 verbs (`comm.` prefix)
 
@@ -307,7 +289,7 @@ _view_ for agents reading rather than parsing — they truncate long cells and a
 In a compounded request (batch/chain) the format applies **per-op** to each op's `result`; the
 `results`/`summary` envelope stays compact JSON, and error entries are never reformatted. The
 per-op override is `format_per_op` (mirrors `presentation_per_op`). Verbs whose policy is
-AlwaysVerbose (`get`, `link`, `query`, `traverse`, `neighbors`, `brain.feedback`) are exempt from
+AlwaysVerbose (`get`, `link`, `query`, `traverse`, `neighbors`) are exempt from
 the redundancy-drop even under `auto`/`table`, so agents still get their full output.
 
 **Precedence** (ADR-078 §2, highest to lowest):

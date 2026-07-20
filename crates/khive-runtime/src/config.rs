@@ -305,7 +305,6 @@ impl Default for RuntimeConfig {
                     "kg",
                     "gtd",
                     "memory",
-                    "brain",
                     "comm",
                     "schedule",
                     "session",

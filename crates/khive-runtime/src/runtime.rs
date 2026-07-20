@@ -1151,7 +1151,6 @@ mod tests {
         assert!(cfg.packs.contains(&"kg".to_string()));
         assert!(cfg.packs.contains(&"gtd".to_string()));
         assert!(cfg.packs.contains(&"memory".to_string()));
-        assert!(cfg.packs.contains(&"brain".to_string()));
         assert!(cfg.packs.contains(&"comm".to_string()));
         assert!(cfg.packs.contains(&"schedule".to_string()));
         // session loads by default so its background mirror warm-hook runs in

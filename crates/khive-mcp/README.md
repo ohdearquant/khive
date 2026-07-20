@@ -44,7 +44,7 @@ mcp` both call.
 ## Where this sits
 
 `khive-mcp` depends on `khive-db`, `khive-runtime`, `khive-storage`, `khive-request`, and
-every first-party pack crate (`khive-pack-kg`, `-gtd`, `-memory`, `-brain`, `-comm`,
+every first-party pack crate (`khive-pack-kg`, `-gtd`, `-memory`, `-comm`,
 `-schedule`, `-session`) so their `inventory::submit!` verb registrations link
 into any binary that depends on this crate. `kkernel` is that binary: its `mcp` subcommand
 parses `khive_mcp::args::Args`, builds the runtime and pack registry, and calls into
