@@ -1696,12 +1696,20 @@ fn log_walpin_sidecar_report(pool: &ConnectionPool) {
             return;
         }
     };
+    let now = now_epoch_secs();
     for hb in report.reporting() {
+        // ADR-091 Amendment 3 Plank F2 fail-closed reading rule: the
+        // logger must never let a fallback-confidence entry read as live
+        // cross-process ground truth, so the confidence distinction is
+        // always emitted alongside the raw field — never inferred by the
+        // reader of this log line.
         tracing::warn!(
             walpin_pid = hb.pid,
             walpin_role = %hb.process_role,
-            walpin_oldest_tx_age_secs = hb.oldest_tx_age_secs,
+            walpin_oldest_tx_age_secs = hb.current_oldest_tx_age_secs(now),
             walpin_oldest_tx_label = hb.oldest_tx_label.as_deref().unwrap_or("<unlabeled>"),
+            walpin_attribution_basis = hb.attribution_basis.as_deref().unwrap_or("<unspecified>"),
+            walpin_attribution_evidence_backed = hb.attribution_is_evidence_backed(),
             walpin_health = "reporting",
             "ADR-091 Amendment 2 Plank B: live cross-process WAL-pin attribution report"
         );

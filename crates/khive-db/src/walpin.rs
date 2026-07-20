@@ -61,6 +61,11 @@ pub struct WalpinHeartbeat {
     /// check at enumeration time — a reused PID is rejected deterministically
     /// rather than probabilistically.
     pub started_at: i64,
+    /// Age of the oldest span as of the last body write. Not current once a
+    /// tick advances freshness via a metadata-only mtime touch (ADR-091
+    /// Amendment 3 Plank F1) — readers that want the current age prefer
+    /// [`WalpinHeartbeat::current_oldest_tx_age_secs`], which uses
+    /// `oldest_tx_started_at` when present.
     pub oldest_tx_age_secs: f64,
     pub oldest_tx_label: Option<String>,
     /// Epoch timestamp of the oldest span's registration instant, fixed for
@@ -87,12 +92,36 @@ pub struct WalpinHeartbeat {
     /// carried this backend's own origin identity, `"fallback"` when it was
     /// an `Unscoped` span observed only through the main view's
     /// never-silently-drop fallback. `None` for records written before this
-    /// field existed. Exactly these two values when present — a consumer
-    /// MUST fail closed (treat as fallback-confidence) on any other value,
-    /// per the amendment's reading rule; this crate does not yet have a
-    /// reader that classifies on it.
+    /// field existed. Exactly these two values when present — every
+    /// consumer MUST fail closed (treat as fallback-confidence) on any
+    /// other value, per the amendment's reading rule; see
+    /// [`WalpinHeartbeat::attribution_is_evidence_backed`].
     #[serde(default)]
     pub attribution_basis: Option<String>,
+}
+
+impl WalpinHeartbeat {
+    /// ADR-091 Amendment 3 Plank F2 fail-closed reading rule, binding on
+    /// every consumer: only the exact string `"origin"` licenses an
+    /// evidence-backed reading. A missing field, or any value this
+    /// amendment does not define, classifies as fallback-confidence —
+    /// never evidence-backed.
+    pub fn attribution_is_evidence_backed(&self) -> bool {
+        self.attribution_basis.as_deref() == Some("origin")
+    }
+
+    /// ADR-091 Amendment 3 Plank F1: age computed at read time. Prefers
+    /// `oldest_tx_started_at` — fixed for as long as the span stays the
+    /// oldest one, so it stays correct across metadata-only touches — over
+    /// the possibly-stale `oldest_tx_age_secs` body field. Records written
+    /// before this amendment lack the field and fall back to the body
+    /// value exactly as before.
+    pub fn current_oldest_tx_age_secs(&self, now_epoch_secs: i64) -> f64 {
+        match self.oldest_tx_started_at {
+            Some(started_at) => (now_epoch_secs - started_at).max(0) as f64,
+            None => self.oldest_tx_age_secs,
+        }
+    }
 }
 
 /// A heartbeat that survived the three-test liveness gate at enumeration time.
@@ -2795,6 +2824,34 @@ mod tests {
             1,
             "a 100ms declared cadence must floor its window at 3s, not 1s: 2s old must \
              still classify live: {report:?}"
+        );
+    }
+
+    /// ADR-091 Amendment 3 Plank F2 fail-closed reading rule, exercised at
+    /// the canonical consumer-facing accessor: only the exact string
+    /// `"origin"` licenses an evidence-backed reading. A missing field or
+    /// any unrecognized value — including a value a future amendment might
+    /// define — must classify as fallback-confidence, never evidence-backed.
+    #[test]
+    fn attribution_is_evidence_backed_fails_closed_on_missing_or_unrecognized_value() {
+        let mut hb = heartbeat(std::process::id());
+
+        hb.attribution_basis = Some("origin".to_string());
+        assert!(hb.attribution_is_evidence_backed());
+
+        hb.attribution_basis = Some("fallback".to_string());
+        assert!(!hb.attribution_is_evidence_backed());
+
+        hb.attribution_basis = None;
+        assert!(
+            !hb.attribution_is_evidence_backed(),
+            "a missing attribution_basis must never be read as evidence-backed"
+        );
+
+        hb.attribution_basis = Some("some-future-value".to_string());
+        assert!(
+            !hb.attribution_is_evidence_backed(),
+            "an unrecognized value must degrade to fallback-confidence, never guess origin"
         );
     }
 
