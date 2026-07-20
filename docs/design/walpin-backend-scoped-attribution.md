@@ -59,7 +59,17 @@ pub enum TxOrigin {
     Unscoped,
 }
 pub fn register_scoped(label: Option<String>, origin: TxOrigin) -> TxHandle;
-pub fn oldest_for(filter: &TxOriginFilter) -> Option<(TxId, Duration, Option<String>)>;
+pub struct OldestSpan {
+    pub id: TxId,
+    pub age: Duration,
+    pub label: Option<String>,
+    /// The winning span's origin, so the consumer can distinguish an
+    /// evidence-backed Database(_) winner from an Unscoped fallback winner
+    /// when writing the attribution-basis field. Without this the marker
+    /// could not be set at all.
+    pub origin: TxOrigin,
+}
+pub fn oldest_for(filter: &TxOriginFilter) -> Option<OldestSpan>;
 // oldest() retained unchanged: the process-wide aggregate view.
 ```
 
@@ -69,16 +79,22 @@ The main backend's attribution view uses a filter matching
 
 - **Database identity** (`DbIdentity`) is a shared key produced at exactly
   one minting point — the pool — and reused everywhere origin is compared.
-  Minting is defined operationally: filesystem-canonicalize the database
-  file's **parent directory** (resolving symlinks and dot segments through
-  the part of the path that exists), then append the file name unchanged.
-  The database file itself may not exist yet at open time, so only the
-  parent is canonicalized — the same pattern `FsBlobStore` uses for its
+  Minting is defined operationally, in three steps. First, a relative
+  configured path is resolved against the process current directory before
+  any canonicalization — a bare file name like `khive.db` has an empty
+  parent, and canonicalizing an empty path fails, so resolution must precede
+  the filesystem steps. Second, when the database file **exists**,
+  canonicalize the full path: this resolves symlinks at every level,
+  including a symlink at the database-file level itself (a `link.sqlite`
+  pointing at the real file must mint the target's identity, which
+  parent-only canonicalization would miss). Third, when the file does **not
+  yet exist** (first open), canonicalize the parent directory and append the
+  file name unchanged — the same pattern `FsBlobStore` uses for its
   root-keyed write locks, and for the same reason (`Path::canonicalize`
   requires an existing path). Canonicalization is what collapses aliased
-  spellings — symlink vs. target, relative vs. absolute — into one
-  identity, so a daemon and a session opening the same database through
-  different spellings mint the same `DbIdentity`.
+  spellings — symlink vs. target, relative vs. absolute, file-level
+  symlinks — into one identity, so a daemon and a session opening the same
+  database through different spellings mint the same `DbIdentity`.
 - **Canonical and lossless are reconciled explicitly**, because they pull in
   opposite directions: _canonical_ collapses aliases; _lossless_ governs the
   representation of the canonical path once minted (`OsString`-based, never
@@ -155,10 +171,13 @@ provides the same partitioning with an additive API.
   written with an explicit fallback-attribution marker, so diagnostics can
   distinguish "attributed to main by evidence" from "attributed to main as the
   fallback for unknown origin" and never read fallback attribution as ground
-  truth. The marker is one additive heartbeat-record field whose name, type,
-  and values are defined solely by ADR-091 Amendment 2's record contract —
-  this note consumes that definition and deliberately does not restate it,
-  so the format has exactly one source of truth. All in-tree
+  truth. The marker is the `attribution_basis` heartbeat field whose name,
+  type, values, and fail-closed reading rule are defined solely by ADR-091
+  Amendment 3 (which also defines the freshness-contract fields the sweep
+  writes) — this note consumes that definition and deliberately does not
+  restate it, so the record format has exactly one source of truth. The
+  sweep sets it from the winning span's origin, which `oldest_for` returns
+  for exactly this purpose. All in-tree
   registration sites are threaded in the same change, so `Unscoped` should not
   occur from khive's own write paths; the grep gate makes any later regression a
   review defect rather than a silent hole.
@@ -173,8 +192,10 @@ provides the same partitioning with an additive API.
   appear in no attribution view but still in `oldest()`; `Database` entries never
   leak into a different backend's view.
 - Alias-convergence test: the same database opened via its real path, a
-  symlink, and a relative spelling mints identical `DbIdentity` values and
-  derives the identical sidecar directory.
+  directory symlink, a **file-level symlink** (a link whose final component
+  points at the database file), a relative spelling, and a **bare file name**
+  (empty parent, resolved against the current directory) mints identical
+  `DbIdentity` values and derives the identical sidecar directory.
 - Fallback-marker test: a heartbeat produced from an `Unscoped` oldest span
   carries the fallback-attribution marker; one produced from a
   `Database(main)` span does not.
@@ -199,10 +220,10 @@ at every registry call site (the grep-gated inventory above, including
 routing `sidecar_dir_for` consumers through the minted `DbIdentity`,
 session-sweep fan-out, per-file-backed-backend daemon checkpoint/enumeration
 ownership, and the tests above — producers and consumers of secondary sidecars
-land in the same PR. No schema or wire change. The sidecar format gains exactly
-one additive heartbeat-record field (the fallback-attribution marker), defined
-in ADR-091 Amendment 2's record contract — that amendment is the sole source of
-truth for the field's format and must be accepted before or together with the
-implementation; everything else in the sidecar contract is unchanged — this
+land in the same PR. No schema or wire change. Every sidecar record-format
+delta — the `attribution_basis` marker this note motivates and the
+freshness-contract fields — is defined in ADR-091 Amendment 3, the sole source
+of truth for the record format, which must be accepted before or together with
+the implementation; everything else in the sidecar contract is unchanged — this
 note closes the producer-side scoping gap and the main-only consumer-ownership
 gap against the contract's existing per-database key.
