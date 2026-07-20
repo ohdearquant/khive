@@ -1,5 +1,3 @@
-// Copyright 2026 Haiyang Li. Licensed under Apache-2.0.
-//
 //! Cycle-safe lowest-common-ancestor discovery for snapshot histories.
 //!
 //! See `crates/khive-merge/docs/api/lowest-common-ancestor.md`.

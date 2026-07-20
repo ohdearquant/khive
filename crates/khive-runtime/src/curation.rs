@@ -1,5 +1,3 @@
-// Licensed under the Apache License, Version 2.0.
-
 // FILE SIZE JUSTIFICATION: curation.rs holds entity/note/edge patch types alongside
 // their update and merge implementations. The implementations share private helpers
 // (merge_properties, namespace checks, dedup policy) that need pub(crate) access to

@@ -52,4 +52,5 @@
 
 ## License
 
-Apache-2.0.
+Business Source License 1.1. See the repository
+[LICENSE](https://github.com/ohdearquant/khive/blob/main/LICENSE).

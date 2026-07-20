@@ -42,6 +42,10 @@ ignore = [
 [licenses]
 confidence-threshold = 0.93
 allow = [
+    # BUSL-1.1 — the workspace's own license (source-available; converts to
+    # Apache-2.0 on the Change Date). Listed so cargo-deny accepts the
+    # workspace crates themselves; no third-party dependency carries it.
+    "BUSL-1.1",
     # Standard permissive — OSI approved
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",

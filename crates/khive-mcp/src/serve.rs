@@ -3,7 +3,7 @@
 //! This is the bootstrap that the `kkernel mcp` subcommand drives. Logging is
 //! initialized by the binary, not here.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -133,9 +133,11 @@ impl SessionSweepHandle {
     }
 }
 
-/// Spawn the ADR-091 Amendment 2 Plank A observe-only session sweep task for
-/// this process's checkpoint pool, if it has one (a checkpoint pool is only
-/// wired for file-backed backends — see `checkpoint_pool_for`). Returns a
+/// Spawn the ADR-091 Amendment 2 Plank A observe-only session sweep task,
+/// fanned out over every file-backed backend this server carries: `pool` as
+/// the main backend, plus one entry per pool in `secondary_pools` (ADR-091
+/// Amendment 3). Returns `None` only when the server has no file-backed
+/// backend at all (a purely in-memory or registry-only server). Returns a
 /// [`SessionSweepHandle`] the caller MUST hold for the session's run scope
 /// and shut down explicitly (see [`SessionSweepHandle::shutdown`]) — mirrors
 /// `run_checkpoint_task`'s shutdown-channel contract on the daemon side.
@@ -155,12 +157,26 @@ impl SessionSweepHandle {
 /// classifies as `reporting`/`registered-silent` (not a permanent `unknown`)
 /// whenever a Unix daemon does enumerate the shared sidecar directory.
 fn spawn_session_walpin_sweep(server: &KhiveMcpServer) -> Option<SessionSweepHandle> {
-    let pool = server.pool()?;
-    let db_path = pool.config().path.clone();
+    let mut backends = Vec::new();
+    if let Some(pool) = server.pool() {
+        backends.push(khive_db::SweepBackend {
+            pool,
+            is_main: true,
+        });
+    }
+    for pool in server.secondary_pools() {
+        backends.push(khive_db::SweepBackend {
+            pool,
+            is_main: false,
+        });
+    }
+    if backends.is_empty() {
+        return None;
+    }
     let config = khive_db::SessionSweepConfig::from_env();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
     let join = tokio::spawn(khive_db::run_session_sweep_task(
-        db_path,
+        backends,
         config,
         shutdown_rx,
     ));
@@ -2078,6 +2094,11 @@ pub fn build_server_from_multi_backend_registry(
     // only present for file-backed databases; in-memory backends return None here
     // so that checkpoint_once never runs on a non-WAL connection.
     let pool = checkpoint_pool_for(multi.main_backend.as_ref());
+    // ADR-091 Amendment 3: every OTHER file-backed backend this registry
+    // wired, so the session sweep (`spawn_session_walpin_sweep`) and the
+    // daemon's checkpoint task can attribute and checkpoint them instead of
+    // leaving them permanently invisible to cross-process WAL-pin attribution.
+    let secondary_pools = secondary_file_backed_pools(&multi);
     let fmt = apply_env_output_format(khive_cfg.runtime.default_output_format);
 
     let server = KhiveMcpServer::from_registry_with_meta(
@@ -2085,7 +2106,8 @@ pub fn build_server_from_multi_backend_registry(
         &multi.default_namespace,
         &multi.config_id,
     )
-    .with_default_output_format(fmt);
+    .with_default_output_format(fmt)
+    .with_secondary_pools(secondary_pools);
 
     let server = match coordinator {
         Some(c) => server.with_coordinator(c),
@@ -2096,6 +2118,46 @@ pub fn build_server_from_multi_backend_registry(
         Some(p) => server.with_pool(p),
         None => server,
     }
+}
+
+/// Distinct file-backed backend pools among `multi`'s per-pack runtimes,
+/// excluding the main backend's own pool (wired separately via
+/// [`checkpoint_pool_for`]) — ADR-091 Amendment 3 fan-out needs exactly one
+/// entry per additional file-backed backend the registry wired, not one per
+/// pack, since several packs can share a backend.
+///
+/// Dedup is by canonical database identity (each pool's [`TxOrigin::Database`]
+/// origin, minted from its canonical path — see `ConnectionPool::origin`),
+/// never by pool pointer: two backends configured with alias spellings of
+/// the SAME file (a direct path and a symlinked path, say) mint two distinct
+/// `Arc<ConnectionPool>` but converge on one canonical sidecar, and admitting
+/// both would race two `SweepBackend`s on the same heartbeat file.
+fn secondary_file_backed_pools(multi: &MultiBackendRegistry) -> Vec<Arc<ConnectionPool>> {
+    use khive_storage::tx_registry::TxOrigin;
+
+    let mut seen: HashSet<khive_storage::tx_registry::DbIdentity> = HashSet::new();
+    if let TxOrigin::Database(id) = multi.main_backend.pool_arc().origin() {
+        seen.insert(id);
+    }
+    let mut pools = Vec::new();
+    for rt in multi.per_pack_runtimes.values() {
+        let backend = rt.backend();
+        if !backend.is_file_backed() {
+            continue;
+        }
+        let pool = backend.pool_arc();
+        let TxOrigin::Database(id) = pool.origin() else {
+            // A file-backed backend always mints a `Database` origin
+            // (`ConnectionPool::origin`'s own contract); anything else here
+            // has no canonical identity to dedup on, so it cannot be
+            // admitted as a secondary fan-out target.
+            continue;
+        };
+        if seen.insert(id) {
+            pools.push(pool);
+        }
+    }
+    pools
 }
 
 /// Construction-time facts that every multi-backend boot path must agree on
@@ -4174,6 +4236,106 @@ region = "us-east-1"
             "secondary-backend pack must have core_backend wired to main (ADR-073); \
              core().backend_id() returned {:?} — build_pack_runtime wiring missing",
             comm_rt.core().backend_id().as_str()
+        );
+    }
+
+    /// ADR-091 Amendment 3 fan-out regression: two backends declared at
+    /// alias spellings of the SAME database file (a direct path and a
+    /// symlinked path) must mint the same canonical `DbIdentity` and
+    /// therefore dedup to exactly one secondary pool. The pointer-identity
+    /// dedup this replaced would have kept both `Arc<ConnectionPool>`
+    /// instances distinct, letting two `SweepBackend`s race on one
+    /// heartbeat file.
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn secondary_pools_dedup_by_canonical_identity_across_alias_spellings() {
+        use khive_runtime::PackConfig;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_path = dir.path().join("khive.db");
+        std::fs::write(&real_path, b"").unwrap();
+        let alias_path = dir.path().join("khive_alias.db");
+        std::os::unix::fs::symlink(&real_path, &alias_path).unwrap();
+
+        let khive_cfg = KhiveConfig {
+            backends: vec![
+                BackendConfig {
+                    name: "main".to_string(),
+                    kind: BackendKind::Memory,
+                    path: None,
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: false,
+                },
+                BackendConfig {
+                    name: "direct".to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(real_path.clone()),
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: false,
+                },
+                BackendConfig {
+                    name: "alias".to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(alias_path.clone()),
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: false,
+                },
+            ],
+            packs: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(
+                    "kg".to_string(),
+                    PackConfig {
+                        backend: "direct".to_string(),
+                    },
+                );
+                m.insert(
+                    "comm".to_string(),
+                    PackConfig {
+                        backend: "alias".to_string(),
+                    },
+                );
+                m
+            },
+            ..KhiveConfig::default()
+        };
+
+        let base_cfg = base_runtime_config_for_multi_backend();
+        let multi = build_registry_for_multi_backend(base_cfg, &khive_cfg, None)
+            .expect("multi-backend registry with alias-spelled backends must boot");
+
+        let secondary = secondary_file_backed_pools(&multi);
+        assert_eq!(
+            secondary.len(),
+            1,
+            "two backends aliasing the same database file must dedup to exactly one \
+             secondary pool by canonical identity, got {} pools",
+            secondary.len()
+        );
+
+        let server = build_server_from_multi_backend_registry(multi, &khive_cfg, None);
+        let mut backends = Vec::new();
+        if let Some(pool) = server.pool() {
+            backends.push(khive_db::SweepBackend {
+                pool,
+                is_main: true,
+            });
+        }
+        for pool in server.secondary_pools() {
+            backends.push(khive_db::SweepBackend {
+                pool,
+                is_main: false,
+            });
+        }
+        assert_eq!(
+            backends.len(),
+            1,
+            "exactly one SweepBackend must survive dedup for the alias pair — the \
+             in-memory main backend contributes no pool of its own"
         );
     }
 

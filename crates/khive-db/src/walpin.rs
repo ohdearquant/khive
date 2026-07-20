@@ -26,17 +26,32 @@
 //! anchors to) is Unix-only: its sole caller is the daemon's checkpoint task,
 //! and daemon mode itself requires Unix (`khive-mcp/src/serve.rs` refuses
 //! `--daemon` on non-Unix). The Unix write path is additionally
-//! **handle-bound**: the sidecar directory is opened once with
-//! `O_DIRECTORY | O_NOFOLLOW`, validated on that file descriptor, and every
-//! create/rename/unlink/enumeration read is performed `*at()`-relative to it
-//! — the path is never re-resolved per operation, closing the window where a
-//! path component swapped between a path-based validation and the subsequent
-//! operation could redirect a rename or deletion outside the sidecar. Windows
-//! has no equivalent of `openat`/`fstat`-bound ownership validation in `std`;
-//! it uses plain `std::fs` path-based primitives with symlink refusal via
-//! `symlink_metadata` and no uid/mode check (documented residual gap: a
-//! Windows sidecar directory is only as protected as its inherited ACL, not
-//! actively narrowed by this code).
+//! **handle-bound at every path component**: reaching the sidecar directory
+//! walks each component of its parent path with
+//! `openat(.., O_DIRECTORY | O_NOFOLLOW)` relative to the previous
+//! descriptor (never a single `open()` on the parent's full path, which
+//! only refuses a symlink at the parent's own final component and silently
+//! follows every component before it), the directory itself is then
+//! validated on the resulting file descriptor, and every
+//! create/rename/unlink/enumeration read is performed `*at()`-relative to
+//! it — no path is ever re-resolved per operation. The final path
+//! component (the sidecar directory's own name, derived from the database
+//! file name) is converted to its `openat` argument byte-exact, never via a
+//! lossy UTF-8 conversion, since this project supports non-UTF-8 database
+//! paths and a lossy conversion could collide two distinct database names
+//! onto one sidecar directory. Windows has no `openat`/`fstat`-bound
+//! ownership-validation equivalent in `std`, so this module talks to the
+//! Win32 API directly: every write/rename/delete opens its target with
+//! `FILE_FLAG_OPEN_REPARSE_POINT` (never following a symlink/junction at
+//! the target), validates on the resulting handle via
+//! `GetFileInformationByHandle`, confirms the handle's OS-resolved path
+//! (`GetFinalPathNameByHandle`) sits inside the validated directory
+//! handle's own resolved path, and performs the rename/delete itself
+//! through `SetFileInformationByHandle` on that same handle — never a
+//! re-resolved path in between. There is no uid/mode-equivalent narrowing
+//! on Windows (documented residual gap: a Windows sidecar directory is
+//! only as protected as its inherited ACL, not actively narrowed by this
+//! code — ADR-091 specifies handle-bound validation, not ACL hardening).
 
 use std::fs;
 use std::io;
@@ -61,17 +76,70 @@ pub struct WalpinHeartbeat {
     /// check at enumeration time — a reused PID is rejected deterministically
     /// rather than probabilistically.
     pub started_at: i64,
+    /// Age of the oldest span as of the last body write. Not current once a
+    /// tick advances freshness via a metadata-only mtime touch (ADR-091
+    /// Amendment 3 Plank F1) — readers that want the current age prefer
+    /// [`WalpinHeartbeat::current_oldest_tx_age_secs`], which uses
+    /// `oldest_tx_started_at` when present.
     pub oldest_tx_age_secs: f64,
     pub oldest_tx_label: Option<String>,
+    /// Epoch timestamp of the oldest span's registration instant, fixed for
+    /// as long as that span stays the oldest one (ADR-091 Amendment 3 Plank
+    /// F1). `None` for records written before this field existed. Present
+    /// specifically to let readers compute a current age from a body that a
+    /// touch-only tick left otherwise unchanged.
+    #[serde(default)]
+    pub oldest_tx_started_at: Option<i64>,
+    /// The instant of the last body write. No longer part of liveness
+    /// classification for a record carrying `oldest_tx_started_at` (Plank
+    /// F1 moves that basis to the entry's mtime); records without it are
+    /// still classified on this field exactly as before Amendment 3.
     pub updated_at: i64,
     /// The producer's own sweep cadence in milliseconds. Freshness at
     /// enumeration is judged against THIS cadence, not the enumerating
     /// daemon's — two processes with independently configured sweep
     /// intervals must not misread each other as stale. `0` (absent in a
     /// record written before this field existed) falls back to the
-    /// enumerator's own interval.
+    /// enumerator's own interval. `interval_ms` is accepted as an alias for
+    /// records written before the ADR-091 Amendment 2 review-follow-up
+    /// rename — a live writer still on the old field name must not have its
+    /// real cadence silently dropped to the enumerator's fallback.
+    #[serde(default, alias = "interval_ms")]
+    pub sweep_interval_ms: u64,
+    /// ADR-091 Amendment 3 Plank F2: `"origin"` when the oldest span above
+    /// carried this backend's own origin identity, `"fallback"` when it was
+    /// an `Unscoped` span observed only through the main view's
+    /// never-silently-drop fallback. `None` for records written before this
+    /// field existed. Exactly these two values when present — every
+    /// consumer MUST fail closed (treat as fallback-confidence) on any
+    /// other value, per the amendment's reading rule; see
+    /// [`WalpinHeartbeat::attribution_is_evidence_backed`].
     #[serde(default)]
-    pub interval_ms: u64,
+    pub attribution_basis: Option<String>,
+}
+
+impl WalpinHeartbeat {
+    /// ADR-091 Amendment 3 Plank F2 fail-closed reading rule, binding on
+    /// every consumer: only the exact string `"origin"` licenses an
+    /// evidence-backed reading. A missing field, or any value this
+    /// amendment does not define, classifies as fallback-confidence —
+    /// never evidence-backed.
+    pub fn attribution_is_evidence_backed(&self) -> bool {
+        self.attribution_basis.as_deref() == Some("origin")
+    }
+
+    /// ADR-091 Amendment 3 Plank F1: age computed at read time. Prefers
+    /// `oldest_tx_started_at` — fixed for as long as the span stays the
+    /// oldest one, so it stays correct across metadata-only touches — over
+    /// the possibly-stale `oldest_tx_age_secs` body field. Records written
+    /// before this amendment lack the field and fall back to the body
+    /// value exactly as before.
+    pub fn current_oldest_tx_age_secs(&self, now_epoch_secs: i64) -> f64 {
+        match self.oldest_tx_started_at {
+            Some(started_at) => (now_epoch_secs - started_at).max(0) as f64,
+            None => self.oldest_tx_age_secs,
+        }
+    }
 }
 
 /// A heartbeat that survived the three-test liveness gate at enumeration time.
@@ -95,8 +163,11 @@ pub struct WalpinBeacon {
     /// The producer's own sweep cadence in milliseconds — the beacon's
     /// refresh mtime is judged against this cadence at enumeration, not the
     /// enumerating daemon's. `0` falls back to the enumerator's interval.
-    #[serde(default)]
-    pub interval_ms: u64,
+    /// `interval_ms` is accepted as an alias — see
+    /// [`WalpinHeartbeat::sweep_interval_ms`] for why the old field name
+    /// must still deserialize correctly.
+    #[serde(default, alias = "interval_ms")]
+    pub sweep_interval_ms: u64,
 }
 
 /// Three-state sidecar-health classification for one PID observed in the
@@ -199,7 +270,7 @@ mod unix_impl {
     use std::io::{self, Read, Write};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime};
 
     /// Hard cap on one sidecar entry's byte size. Real heartbeat/beacon
@@ -207,6 +278,13 @@ mod unix_impl {
     /// this module wrote, and reading it unboundedly would let a same-uid
     /// process balloon checkpoint-time enumeration.
     pub(super) const MAX_SIDECAR_ENTRY_BYTES: u64 = 64 * 1024;
+
+    /// Bound on the number of ancestor symlink hops
+    /// [`SidecarDirHandle::open_dir_component_walk`] will resolve (each
+    /// independently root-owned-checked) before refusing outright — caps a
+    /// pathological or looping symlink chain to bounded work instead of
+    /// unbounded recursion.
+    const MAX_ANCESTOR_SYMLINK_DEPTH: u32 = 8;
 
     /// Every raw directory entry — hidden or not — counts toward a scan
     /// bound of `RAW_SCAN_FACTOR * max` in `list_names`, so a flood of
@@ -229,6 +307,20 @@ mod unix_impl {
             .map_err(|_| io_other(format!("sidecar entry name {name:?} contains a NUL byte")))
     }
 
+    /// Byte-exact `CString` construction for a path component that may come
+    /// from an arbitrary database file name (never lossy `to_string_lossy`
+    /// conversion): the sidecar directory's own final component is derived
+    /// from the caller's database path (see `sidecar_dir_for`), and this
+    /// project explicitly supports non-UTF-8 database paths (`pool.rs`'s
+    /// `mint_db_identity_non_utf8_path_round_trips`). A lossy conversion
+    /// here would map distinct non-UTF-8 names to the same replacement-
+    /// character byte sequence, colliding two different databases onto one
+    /// sidecar directory.
+    fn name_cstring_os(name: &std::ffi::OsStr) -> io::Result<CString> {
+        CString::new(name.as_bytes())
+            .map_err(|_| io_other(format!("sidecar entry name {name:?} contains a NUL byte")))
+    }
+
     fn is_symlink_mode(mode: libc::mode_t) -> bool {
         (mode & libc::S_IFMT) == libc::S_IFLNK
     }
@@ -245,19 +337,22 @@ mod unix_impl {
         /// the OPENED descriptor, never trusted from the `mkdir` call alone
         /// — a concurrent process could have raced the creation.
         pub(super) fn open_or_create(dir: &Path) -> io::Result<Self> {
-            match Self::open_validated(dir) {
+            let (parent_fd, c_name) = Self::open_parent_and_name(dir)?;
+            match Self::open_validated_at(&parent_fd, &c_name, dir) {
                 Ok(handle) => Ok(handle),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    let c_path = path_cstring(dir)?;
-                    // SAFETY: `c_path` is NUL-terminated for the call.
-                    let rc = unsafe { libc::mkdir(c_path.as_ptr(), 0o700) };
+                    // SAFETY: `c_name` is NUL-terminated for the call;
+                    // `parent_fd` is a live, open directory descriptor for
+                    // the call's duration.
+                    let rc =
+                        unsafe { libc::mkdirat(parent_fd.as_raw_fd(), c_name.as_ptr(), 0o700) };
                     if rc != 0 {
                         let err = io::Error::last_os_error();
                         if err.kind() != io::ErrorKind::AlreadyExists {
                             return Err(err);
                         }
                     }
-                    Self::open_validated(dir)
+                    Self::open_validated_at(&parent_fd, &c_name, dir)
                 }
                 Err(e) => Err(e),
             }
@@ -268,26 +363,242 @@ mod unix_impl {
         /// not an error, and must not have the side effect of creating one
         /// — e.g. a stray `remove_heartbeat`/`touch_beacon` call).
         pub(super) fn open_if_exists(dir: &Path) -> io::Result<Option<Self>> {
-            match Self::open_validated(dir) {
+            let (parent_fd, c_name) = Self::open_parent_and_name(dir)?;
+            match Self::open_validated_at(&parent_fd, &c_name, dir) {
                 Ok(handle) => Ok(Some(handle)),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
                 Err(e) => Err(e),
             }
         }
 
-        fn open_validated(dir: &Path) -> io::Result<Self> {
-            let c_path = path_cstring(dir)?;
-            // SAFETY: `c_path` is NUL-terminated for the call; the returned
-            // fd is uniquely owned by this call and wrapped immediately.
+        /// Open `dir`'s parent directory and return it alongside `dir`'s
+        /// final path component (as an exact, non-lossy `CString` — see
+        /// [`name_cstring_os`]), so the caller can `openat()` `dir` itself
+        /// relative to an already-live descriptor instead of re-resolving
+        /// `dir`'s full path. The parent is reached via
+        /// [`open_dir_component_walk`], which refuses a symlink at EVERY
+        /// path component, not just `dir`'s own final one — a bare
+        /// `open(parent, O_NOFOLLOW)` only refuses a symlink at `parent`'s
+        /// own final component; every component before that is followed by
+        /// ordinary kernel path resolution, so an attacker who can replace
+        /// any ancestor of `dir` between path construction and this open
+        /// would still redirect the lookup. Anchoring on a descriptor at
+        /// every level closes that gap for `dir` the same way
+        /// `SidecarDirHandle` already closes it for every entry `dir`
+        /// contains.
+        fn open_parent_and_name(dir: &Path) -> io::Result<(fs::File, CString)> {
+            let parent = match dir.parent() {
+                Some(p) if !p.as_os_str().is_empty() => p,
+                _ => Path::new("."),
+            };
+            let name = dir.file_name().ok_or_else(|| {
+                io_other(format!(
+                    "walpin sidecar path {dir:?} has no final path component"
+                ))
+            })?;
+            let parent_file = Self::open_dir_component_walk(parent)?;
+            let c_name = name_cstring_os(name)?;
+            Ok((parent_file, c_name))
+        }
+
+        /// Open `path` (a directory) as an owned descriptor by walking
+        /// every path component with `openat(.., O_DIRECTORY | O_NOFOLLOW)`
+        /// relative to the previous descriptor — anchored at `/` for an
+        /// absolute path, or the current directory for a relative one. A
+        /// single `open(path, O_NOFOLLOW)` only refuses a symlink at
+        /// `path`'s own, final component; every intermediate component is
+        /// followed by ordinary kernel path resolution regardless of that
+        /// flag. Walking component-by-component makes each individual
+        /// `openat` call's "final component" the immediate next segment, so
+        /// `O_NOFOLLOW` refuses a symlink at every level, not just the last.
+        ///
+        /// The walk runs over `path` LITERALLY — never through a
+        /// `fs::canonicalize` pre-pass. A pre-resolve pass would itself
+        /// follow every ancestor symlink through ordinary kernel path
+        /// resolution before the descriptor walk ever starts, silently
+        /// validating whatever a hostile symlink planted before this call
+        /// pointed at; the walk would then only ever see the
+        /// already-attacker-chosen path. Legitimate OS-level ancestor
+        /// symlinks (macOS's `/tmp -> private/tmp`, `/var -> private/var`)
+        /// still have to work, so a component `openat` refuses with
+        /// `ELOOP`/`ENOTDIR` gets exactly one second look, via
+        /// [`Self::open_component`]: `fstatat` it (without following) to
+        /// confirm it really is a symlink AND is owned by root (uid 0,
+        /// mirroring the trust `open_component` extends to firmlinks the OS
+        /// itself planted in stock platform layout — never an arbitrary
+        /// user), then `readlinkat` + recurse into its target through this
+        /// same component-at-a-time discipline. A non-root-owned symlink
+        /// ancestor is refused outright; total symlink hops across the
+        /// whole walk are capped by `MAX_ANCESTOR_SYMLINK_DEPTH`.
+        fn open_dir_component_walk(path: &Path) -> io::Result<fs::File> {
+            let start = Self::open_anchor(path.is_absolute())?;
+            let mut budget = MAX_ANCESTOR_SYMLINK_DEPTH;
+            Self::walk_components(start, path, &mut budget)
+        }
+
+        /// Open `/` (absolute) or `.` (relative) as the starting descriptor
+        /// for a component walk.
+        fn open_anchor(absolute: bool) -> io::Result<fs::File> {
+            let anchor = if absolute { "/" } else { "." };
+            let c_anchor = path_cstring(Path::new(anchor))?;
+            // SAFETY: `c_anchor` is NUL-terminated for the call; the
+            // returned fd is uniquely owned by this call and wrapped
+            // immediately.
             let fd = unsafe {
                 libc::open(
-                    c_path.as_ptr(),
+                    c_anchor.as_ptr(),
+                    libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: `fd` was just returned by the successful `open` above.
+            Ok(unsafe { fs::File::from_raw_fd(fd) })
+        }
+
+        /// Walk every component of `path` starting from the already-open
+        /// `start` descriptor, one `openat(O_NOFOLLOW)` hop at a time.
+        fn walk_components(start: fs::File, path: &Path, budget: &mut u32) -> io::Result<fs::File> {
+            use std::path::Component;
+
+            let mut current = start;
+            for component in path.components() {
+                let name = match component {
+                    Component::RootDir | Component::CurDir | Component::Prefix(_) => continue,
+                    Component::ParentDir => std::ffi::OsStr::new(".."),
+                    Component::Normal(c) => c,
+                };
+                current = Self::open_component(current, name, budget)?;
+            }
+            Ok(current)
+        }
+
+        /// Open a single path component relative to `dir` via
+        /// `openat(O_DIRECTORY | O_NOFOLLOW)`. If the component is refused
+        /// because it is a symlink, the refusal is allowed exactly one
+        /// second look: the component must independently `fstatat` as a
+        /// root-owned (uid 0) symlink — the only party that plants firmlinks
+        /// in stock platform layout — before its target is read via
+        /// `readlinkat` and resolved through this same discipline. Anything
+        /// else (a non-root-owned symlink, or an `ELOOP`/`ENOTDIR` that
+        /// `fstatat` shows isn't actually a symlink) fails closed with the
+        /// original `openat` error.
+        fn open_component(
+            dir: fs::File,
+            name: &std::ffi::OsStr,
+            budget: &mut u32,
+        ) -> io::Result<fs::File> {
+            let c_name = name_cstring_os(name)?;
+            // SAFETY: `c_name` is NUL-terminated for the call; `dir` is a
+            // live, open directory descriptor for the call's duration; the
+            // returned fd is uniquely owned by this call and wrapped
+            // immediately.
+            let next_fd = unsafe {
+                libc::openat(
+                    dir.as_raw_fd(),
+                    c_name.as_ptr(),
+                    libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if next_fd >= 0 {
+                // SAFETY: `next_fd` was just returned by the successful
+                // `openat` above.
+                return Ok(unsafe { fs::File::from_raw_fd(next_fd) });
+            }
+            let open_err = io::Error::last_os_error();
+            let raw = open_err.raw_os_error();
+            if raw != Some(libc::ELOOP) && raw != Some(libc::ENOTDIR) {
+                return Err(open_err);
+            }
+
+            // The refusal above already made the security decision for
+            // every case except "this component is a root-owned platform
+            // firmlink" — this `fstatat` is diagnostic classification, not
+            // a second trust decision: it runs against the same live `dir`
+            // descriptor and the same `c_name`, so there is no re-resolution
+            // between the refused `openat` and this call.
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            // SAFETY: `c_name` is NUL-terminated for the call; `dir` is a
+            // live, open directory descriptor for the call's duration; `st`
+            // is a valid, appropriately-sized output buffer.
+            let rc = unsafe {
+                libc::fstatat(
+                    dir.as_raw_fd(),
+                    c_name.as_ptr(),
+                    &mut st,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if rc != 0 || !is_symlink_mode(st.st_mode) {
+                return Err(open_err);
+            }
+            if st.st_uid != 0 {
+                return Err(io_other(format!(
+                    "walpin sidecar ancestor {name:?} is a non-root-owned symlink; refusing"
+                )));
+            }
+            if *budget == 0 {
+                return Err(io_other(format!(
+                    "walpin sidecar ancestor {name:?} exceeded the symlink resolution depth budget"
+                )));
+            }
+            *budget -= 1;
+
+            let target = Self::read_link_component(&dir, &c_name)?;
+            let target_path = PathBuf::from(target);
+            let next_start = if target_path.is_absolute() {
+                Self::open_anchor(true)?
+            } else {
+                dir
+            };
+            Self::walk_components(next_start, &target_path, budget)
+        }
+
+        /// `readlinkat` a single component relative to `dir`, byte-exact
+        /// (never a lossy UTF-8 conversion — same rationale as
+        /// [`name_cstring_os`]).
+        fn read_link_component(dir: &fs::File, c_name: &CString) -> io::Result<std::ffi::OsString> {
+            use std::os::unix::ffi::OsStringExt;
+
+            let mut buf = vec![0u8; libc::PATH_MAX as usize];
+            // SAFETY: `c_name` is NUL-terminated for the call; `dir` is a
+            // live, open directory descriptor for the call's duration;
+            // `buf` is a valid output buffer of its declared capacity.
+            let rc = unsafe {
+                libc::readlinkat(
+                    dir.as_raw_fd(),
+                    c_name.as_ptr(),
+                    buf.as_mut_ptr() as *mut libc::c_char,
+                    buf.len(),
+                )
+            };
+            if rc < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            buf.truncate(rc as usize);
+            Ok(std::ffi::OsString::from_vec(buf))
+        }
+
+        fn open_validated_at(
+            parent_fd: &fs::File,
+            c_name: &CString,
+            dir: &Path,
+        ) -> io::Result<Self> {
+            // SAFETY: `c_name` is NUL-terminated for the call; `parent_fd`
+            // is a live, open directory descriptor for the call's duration;
+            // the returned fd is uniquely owned by this call and wrapped
+            // immediately.
+            let fd = unsafe {
+                libc::openat(
+                    parent_fd.as_raw_fd(),
+                    c_name.as_ptr(),
                     libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                 )
             };
             if fd < 0 {
                 let err = io::Error::last_os_error();
-                // The `O_NOFOLLOW` open above already made the refusal
+                // The `O_NOFOLLOW` openat above already made the refusal
                 // decision (a symlink at `dir` cannot have produced a live
                 // fd) — this is diagnostic-only, not a second
                 // security check, so it carries no TOCTOU risk. It exists
@@ -305,7 +616,7 @@ mod unix_impl {
                 }
                 return Err(err);
             }
-            // SAFETY: `fd` was just returned by the successful `open` above.
+            // SAFETY: `fd` was just returned by the successful `openat` above.
             let handle = Self(unsafe { fs::File::from_raw_fd(fd) });
             handle.validate(dir)?;
             Ok(handle)
@@ -671,36 +982,256 @@ mod unix_impl {
 #[cfg(windows)]
 mod windows_impl {
     use super::io_other;
+    use std::ffi::OsStr;
     use std::fs;
     use std::io::{self, Write};
     use std::os::raw::c_void;
-    use std::path::Path;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
+    use std::path::{Path, PathBuf};
     use std::time::SystemTime;
 
+    fn to_wide_nul(path: &Path) -> Vec<u16> {
+        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        wide.push(0);
+        wide
+    }
+
+    /// Open `path` with `FILE_FLAG_OPEN_REPARSE_POINT`, so a symlink or
+    /// junction planted at `path`'s own final component is opened AS that
+    /// reparse-point object itself, never followed. The returned `File`
+    /// owns the handle and closes it exactly once, on drop.
+    fn open_reparse_aware(
+        path: &Path,
+        access: u32,
+        disposition: u32,
+        extra_flags: u32,
+    ) -> io::Result<fs::File> {
+        let wide = to_wide_nul(path);
+        // SAFETY: `wide` is a valid, NUL-terminated UTF-16 string for the
+        // call's duration; the returned handle, on success, is uniquely
+        // owned by this call and wrapped immediately below.
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                access,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null_mut(),
+                disposition,
+                FILE_FLAG_OPEN_REPARSE_POINT | extra_flags,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == invalid_handle_value() {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `handle` was just returned by the successful `CreateFileW`
+        // above; wrapping it in `File` binds its lifetime to this value so
+        // it is closed exactly once, on drop.
+        Ok(unsafe { fs::File::from_raw_handle(handle as RawHandle) })
+    }
+
+    fn file_info(file: &fs::File) -> io::Result<ByHandleFileInformation> {
+        let mut info: ByHandleFileInformation = unsafe { std::mem::zeroed() };
+        // SAFETY: `file`'s handle is live; `info` is a valid,
+        // appropriately-sized output buffer for the call.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle() as Handle, &mut info) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(info)
+    }
+
+    /// The handle's own OS-resolved canonical path, queried from the live
+    /// object rather than re-derived from a path string — the binding half
+    /// of the handle-bound contract: a path can be swapped by a concurrent
+    /// rename/symlink between a path-based validation and a path-based
+    /// use, but a resolved handle always names the exact object it was
+    /// opened against.
+    fn resolved_path(file: &fs::File) -> io::Result<PathBuf> {
+        let mut buf: Vec<u16> = vec![0u16; 260];
+        loop {
+            // SAFETY: `file`'s handle is live; `buf` is a valid output
+            // buffer of its declared capacity.
+            let len = unsafe {
+                GetFinalPathNameByHandleW(
+                    file.as_raw_handle() as Handle,
+                    buf.as_mut_ptr(),
+                    buf.len() as u32,
+                    0,
+                )
+            };
+            if len == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if (len as usize) < buf.len() {
+                buf.truncate(len as usize);
+                return Ok(PathBuf::from(std::ffi::OsString::from_wide(&buf)));
+            }
+            buf.resize(len as usize + 1, 0);
+        }
+    }
+
+    /// `resolved` must sit directly inside `dir_resolved` — the binding
+    /// check that catches `dir` (or an ancestor of it) having been swapped
+    /// for a symlink between the directory handle's own validation and
+    /// this entry's open.
+    fn verify_under(resolved: &Path, dir_resolved: &Path, target: &Path) -> io::Result<()> {
+        if resolved.parent() != Some(dir_resolved) {
+            return Err(io_other(format!(
+                "walpin sidecar path {target:?} resolved outside its validated directory"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Case-insensitive comparison of two `GetFinalPathNameByHandleW`-
+    /// resolved paths (NTFS default collation). Both sides of every call
+    /// site here are handle-resolved paths from the same API, so a lossy
+    /// `to_string_lossy` is a conservative (fail-closed, never
+    /// fail-open) simplification: at worst a non-ASCII-identical byte
+    /// sequence that is genuinely equal reads as a mismatch and the open
+    /// is refused, never the reverse.
+    fn resolved_paths_match(a: &Path, b: &Path) -> bool {
+        a.as_os_str().to_string_lossy().to_ascii_lowercase()
+            == b.as_os_str().to_string_lossy().to_ascii_lowercase()
+    }
+
+    /// Open the sidecar directory as a validated handle, bound to the
+    /// database directory that is its one legitimate anchor (the threat
+    /// model: the sidecar is always a sibling of the live database file,
+    /// so binding to the parent directory's own resolved identity is the
+    /// strongest anchor available — anything above that the OS itself
+    /// owns is trusted platform layout). `dir`'s parent is opened first
+    /// and its `GetFinalPathNameByHandleW`-resolved path establishes the
+    /// EXPECTED final path (`<parent's resolved path>\<dir's own file
+    /// name>`); `dir` is then opened the same reparse-aware way as
+    /// before — a real directory, never a reparse point, checked on the
+    /// OPENED handle via `GetFileInformationByHandle` — and its OWN
+    /// resolved path must equal that expectation. A pre-existing ancestor
+    /// junction, or a create-then-swap race between the two opens, moves
+    /// `dir`'s resolved path away from `<parent>\<name>` and is refused
+    /// here as a mismatch — the racy window collapses to detect-and-
+    /// refuse (fail closed), which is what the contract asks for; nothing
+    /// upstream of the parent open pins that race away.
+    fn open_dir_handle(dir: &Path) -> io::Result<fs::File> {
+        let parent = dir.parent().unwrap_or_else(|| Path::new("."));
+        let name = dir.file_name().ok_or_else(|| {
+            io_other(format!(
+                "walpin sidecar path {dir:?} has no final path component"
+            ))
+        })?;
+
+        let parent_handle =
+            open_reparse_aware(parent, 0, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS)?;
+        let parent_info = file_info(&parent_handle)?;
+        if parent_info.dw_file_attributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+            return Err(io_other(format!(
+                "walpin sidecar parent {parent:?} is not a directory"
+            )));
+        }
+        let expected = resolved_path(&parent_handle)?.join(name);
+
+        let file = open_reparse_aware(dir, 0, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS)?;
+        let info = file_info(&file)?;
+        if info.dw_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io_other(format!(
+                "walpin sidecar path {dir:?} is a symlink; refusing"
+            )));
+        }
+        if info.dw_file_attributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+            return Err(io_other(format!(
+                "walpin sidecar path {dir:?} exists and is not a directory"
+            )));
+        }
+        let resolved = resolved_path(&file)?;
+        if !resolved_paths_match(&resolved, &expected) {
+            return Err(io_other(format!(
+                "walpin sidecar path {dir:?} resolved to {resolved:?}, outside its \
+                 validated database-directory anchor {expected:?}; refusing"
+            )));
+        }
+        Ok(file)
+    }
+
     pub(super) fn ensure_sidecar_dir(dir: &Path) -> io::Result<()> {
-        match fs::symlink_metadata(dir) {
-            Ok(meta) => validate(dir, &meta),
+        match open_dir_handle(dir) {
+            Ok(_) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 fs::create_dir(dir)?;
                 // Re-validate post-creation the same way the Unix path
                 // does: a concurrent process could have raced this create.
-                let meta = fs::symlink_metadata(dir)?;
-                validate(dir, &meta)
+                open_dir_handle(dir).map(|_| ())
             }
             Err(e) => Err(e),
         }
     }
 
-    fn validate(dir: &Path, meta: &fs::Metadata) -> io::Result<()> {
-        if meta.file_type().is_symlink() {
-            return Err(io_other(format!(
-                "walpin sidecar path {dir:?} is a symlink; refusing"
-            )));
+    fn delete_via_handle(file: &fs::File) -> io::Result<()> {
+        let info = FileDispositionInfo { delete_pending: 1 };
+        // SAFETY: `file`'s handle is live and was opened with `DELETE`
+        // access; `info` is a valid, correctly sized input buffer for the
+        // `FileDispositionInfo` class.
+        let ok = unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle() as Handle,
+                FILE_DISPOSITION_INFO_CLASS,
+                &info as *const FileDispositionInfo as *mut c_void,
+                std::mem::size_of::<FileDispositionInfo>() as u32,
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
         }
-        if !meta.is_dir() {
-            return Err(io_other(format!(
-                "walpin sidecar path {dir:?} exists and is not a directory"
-            )));
+        Ok(())
+    }
+
+    /// Handle-bound rename: `RootDirectory` is the validated directory's
+    /// own handle, so the new name resolves relative to the directory the
+    /// caller already proved is real and non-reparse — the closest Win32
+    /// equivalent to Unix `renameat`, since `CreateFileW` itself has no
+    /// directory-relative open primitive.
+    fn rename_via_handle(
+        file: &fs::File,
+        dir_handle: &fs::File,
+        target_name: &str,
+    ) -> io::Result<()> {
+        let wide: Vec<u16> = OsStr::new(target_name).encode_wide().collect();
+        let name_bytes = wide.len() * 2;
+        // `size_of::<FileRenameInfo>() - 2` over-counts the true header
+        // offset by however much trailing struct padding rounds the whole
+        // type up to its 8-byte alignment — always >= the real `file_name`
+        // field offset, so the buffer this sizes is never too small, only
+        // (harmlessly) a few bytes larger than strictly required.
+        let header_size = std::mem::size_of::<FileRenameInfo>() - 2;
+        let total_size = header_size + name_bytes;
+        let words = total_size.div_ceil(8).max(1);
+        let mut buf: Vec<u64> = vec![0u64; words];
+        // SAFETY: `buf` is 8-byte aligned (backed by `Vec<u64>`) and sized
+        // to hold at least the header plus `name_bytes` of `file_name`; the
+        // pointer arithmetic below stays within that allocation.
+        unsafe {
+            let header = buf.as_mut_ptr() as *mut FileRenameInfo;
+            (*header).replace_if_exists = 1;
+            (*header).root_directory = dir_handle.as_raw_handle() as Handle;
+            (*header).file_name_length = name_bytes as u32;
+            let name_ptr = (*header).file_name.as_mut_ptr();
+            std::ptr::copy_nonoverlapping(wide.as_ptr(), name_ptr, wide.len());
+        }
+        let byte_ptr = buf.as_mut_ptr() as *mut c_void;
+        // SAFETY: `file`'s handle is live and was opened with `DELETE`
+        // access (required by the `FileRenameInfo` class); `byte_ptr`
+        // addresses the well-formed buffer built above, sized exactly
+        // `total_size`.
+        let ok = unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle() as Handle,
+                FILE_RENAME_INFO_CLASS,
+                byte_ptr,
+                total_size as u32,
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
         }
         Ok(())
     }
@@ -711,50 +1242,121 @@ mod windows_impl {
         tmp_name: &str,
         body: &[u8],
     ) -> io::Result<()> {
+        let dir_handle = open_dir_handle(dir)?;
+        let dir_resolved = resolved_path(&dir_handle)?;
+
+        // Refuse a pre-existing symlink at the target — checked on an
+        // opened handle (never followed, via `FILE_FLAG_OPEN_REPARSE_POINT`)
+        // rather than a path query a later step could re-resolve
+        // differently.
         let target = dir.join(target_name);
-        if let Ok(meta) = fs::symlink_metadata(&target) {
-            if meta.file_type().is_symlink() {
-                return Err(io_other(format!(
-                    "walpin sidecar path {target:?} is a symlink; refusing to write through it"
-                )));
+        match open_reparse_aware(&target, 0, OPEN_EXISTING, 0) {
+            Ok(existing) => {
+                let info = file_info(&existing)?;
+                if info.dw_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                    return Err(io_other(format!(
+                        "walpin sidecar path {target:?} is a symlink; refusing to write through it"
+                    )));
+                }
             }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
         }
+
+        // Best-effort stale-tmp cleanup: delete-on-close via a
+        // reparse-aware handle removes whatever object sits at `tmp_name`
+        // (including a symlink itself, never its target) without a
+        // separate path-based `remove_file` re-resolving it.
         let tmp = dir.join(tmp_name);
-        let _ = fs::remove_file(&tmp);
-        {
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp)?;
-            file.write_all(body)?;
-            file.sync_all()?;
+        if let Ok(stale) = open_reparse_aware(&tmp, DELETE, OPEN_EXISTING, 0) {
+            let _ = delete_via_handle(&stale);
         }
-        fs::rename(&tmp, &target)
+
+        let mut tmp_file = open_reparse_aware(&tmp, GENERIC_WRITE | DELETE, CREATE_NEW, 0)?;
+        verify_under(&resolved_path(&tmp_file)?, &dir_resolved, &tmp)?;
+        tmp_file.write_all(body)?;
+        tmp_file.sync_all()?;
+        rename_via_handle(&tmp_file, &dir_handle, target_name)
     }
 
     pub(super) fn remove_checked(dir: &Path, name: &str) -> io::Result<()> {
+        let dir_handle = open_dir_handle(dir)?;
+        let dir_resolved = resolved_path(&dir_handle)?;
         let target = dir.join(name);
-        match fs::symlink_metadata(&target) {
-            Ok(meta) if meta.file_type().is_symlink() => Err(io_other(format!(
-                "refusing to remove symlinked walpin sidecar entry {target:?}"
-            ))),
-            Ok(_) => fs::remove_file(&target),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e),
-        }
-    }
-
-    pub(super) fn touch_mtime(dir: &Path, name: &str) -> io::Result<()> {
-        let target = dir.join(name);
-        let meta = fs::symlink_metadata(&target)
-            .map_err(|_| io_other(format!("walpin sidecar entry {target:?} does not exist")))?;
-        if meta.file_type().is_symlink() {
+        let file = match open_reparse_aware(&target, DELETE, OPEN_EXISTING, 0) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let info = file_info(&file)?;
+        if info.dw_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             return Err(io_other(format!(
-                "walpin sidecar entry {target:?} is a symlink; refusing to touch it"
+                "refusing to remove symlinked walpin sidecar entry {target:?}"
             )));
         }
-        let file = fs::OpenOptions::new().write(true).open(&target)?;
-        file.set_modified(SystemTime::now())
+        verify_under(&resolved_path(&file)?, &dir_resolved, &target)?;
+        delete_via_handle(&file)
+    }
+
+    /// Validation-then-operation on a plain path (the historical
+    /// `write_atomic`/`remove_checked` pattern) is a TOCTOU race: nothing
+    /// pins the object between a path-based validation and a follow-up
+    /// path-based open. Every write/rename/delete path above, and the
+    /// touch path below, are hardened against it the same way:
+    /// `CreateFileW` with `FILE_FLAG_OPEN_REPARSE_POINT` opens the target
+    /// AS a reparse point rather than following it, the reparse-point
+    /// check runs against the SAME opened handle via
+    /// `GetFileInformationByHandle`, the created/opened object's identity
+    /// is confirmed via `GetFinalPathNameByHandle` against the validated
+    /// directory handle's own resolved path, and the rename/delete
+    /// themselves run through `SetFileInformationByHandle` on that same
+    /// handle — never a re-resolved path. ACL hardening is explicitly NOT
+    /// part of this: ADR-091 specifies handle-bound validation, not ACL
+    /// narrowing, so a Windows sidecar directory remains only as protected
+    /// as its inherited ACL — a residual, documented gap, not an
+    /// oversight.
+    pub(super) fn touch_mtime(dir: &Path, name: &str) -> io::Result<()> {
+        let dir_handle = open_dir_handle(dir)?;
+        let dir_resolved = resolved_path(&dir_handle)?;
+        let target = dir.join(name);
+        let file = open_reparse_aware(&target, GENERIC_WRITE, OPEN_EXISTING, 0).map_err(|_| {
+            io_other(format!(
+                "walpin sidecar entry {target:?} does not exist or could not be opened"
+            ))
+        })?;
+        let info = file_info(&file)?;
+        if info.dw_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io_other(format!(
+                "walpin sidecar entry {target:?} is a reparse point; refusing to touch it"
+            )));
+        }
+        verify_under(&resolved_path(&file)?, &dir_resolved, &target)?;
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_err(|e| io_other(e.to_string()))?;
+        const EPOCH_DIFF_100NS: u64 = 116_444_736_000_000_000;
+        let ticks =
+            now.as_secs() * 10_000_000 + u64::from(now.subsec_nanos()) / 100 + EPOCH_DIFF_100NS;
+        let last_write = FileTime {
+            dw_low_date_time: (ticks & 0xFFFF_FFFF) as u32,
+            dw_high_date_time: (ticks >> 32) as u32,
+        };
+        // SAFETY: `file`'s handle is live; null creation/access-time
+        // pointers leave those fields untouched (metadata-only mtime
+        // refresh, mirroring the Unix `UTIME_OMIT` behavior); `last_write`
+        // is a valid `FILETIME`-shaped value for the call's duration.
+        if unsafe {
+            SetFileTime(
+                file.as_raw_handle() as Handle,
+                std::ptr::null(),
+                std::ptr::null(),
+                &last_write,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
 
     type Handle = *mut c_void;
@@ -765,8 +1367,64 @@ mod windows_impl {
         dw_high_date_time: u32,
     }
 
+    /// Mirrors Win32's `BY_HANDLE_FILE_INFORMATION` layout exactly — every
+    /// field must stay present and in order even though callers here only
+    /// read `dw_file_attributes`, since `GetFileInformationByHandle` writes
+    /// the full struct.
+    #[repr(C)]
+    struct ByHandleFileInformation {
+        dw_file_attributes: u32,
+        ft_creation_time: FileTime,
+        ft_last_access_time: FileTime,
+        ft_last_write_time: FileTime,
+        dw_volume_serial_number: u32,
+        n_file_size_high: u32,
+        n_file_size_low: u32,
+        n_number_of_links: u32,
+        n_file_index_high: u32,
+        n_file_index_low: u32,
+    }
+
+    /// Mirrors Win32's `FILE_RENAME_INFO` (the pre-Windows-10-1607 layout,
+    /// the one `SetFileInformationByHandle`'s `FileRenameInfo` class
+    /// expects): a `BOOLEAN`, then a `HANDLE` (natural alignment inserts
+    /// padding between them, matched here by `repr(C)`), a `DWORD` length,
+    /// and a flexible `WCHAR` array sized by `file_name_length` bytes — the
+    /// trailing `[u16; 1]` is a placeholder; real instances are built in a
+    /// manually sized buffer in [`rename_via_handle`].
+    #[repr(C)]
+    struct FileRenameInfo {
+        replace_if_exists: u8,
+        root_directory: Handle,
+        file_name_length: u32,
+        file_name: [u16; 1],
+    }
+
+    /// Mirrors Win32's `FILE_DISPOSITION_INFO`: a single `BOOLEAN` marking
+    /// the handle's object for delete-on-close.
+    #[repr(C)]
+    struct FileDispositionInfo {
+        delete_pending: u8,
+    }
+
     const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
     const STILL_ACTIVE: u32 = 259;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const DELETE: u32 = 0x0001_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const OPEN_EXISTING: u32 = 3;
+    const CREATE_NEW: u32 = 1;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
+    const FILE_RENAME_INFO_CLASS: i32 = 3;
+    const FILE_DISPOSITION_INFO_CLASS: i32 = 4;
+
+    fn invalid_handle_value() -> Handle {
+        usize::MAX as Handle
+    }
 
     // `kernel32` is implicitly linked on every Windows target (same as
     // `std` itself relies on); no explicit `#[link(...)]` is needed, mirroring
@@ -782,6 +1440,37 @@ mod windows_impl {
             lp_exit_time: *mut FileTime,
             lp_kernel_time: *mut FileTime,
             lp_user_time: *mut FileTime,
+        ) -> i32;
+        fn CreateFileW(
+            lp_file_name: *const u16,
+            dw_desired_access: u32,
+            dw_share_mode: u32,
+            lp_security_attributes: *mut c_void,
+            dw_creation_disposition: u32,
+            dw_flags_and_attributes: u32,
+            h_template_file: Handle,
+        ) -> Handle;
+        fn GetFileInformationByHandle(
+            h_file: Handle,
+            lp_file_information: *mut ByHandleFileInformation,
+        ) -> i32;
+        fn SetFileTime(
+            h_file: Handle,
+            lp_creation_time: *const FileTime,
+            lp_last_access_time: *const FileTime,
+            lp_last_write_time: *const FileTime,
+        ) -> i32;
+        fn GetFinalPathNameByHandleW(
+            h_file: Handle,
+            lp_sz_file_path: *mut u16,
+            cch_file_path: u32,
+            dw_flags: u32,
+        ) -> u32;
+        fn SetFileInformationByHandle(
+            h_file: Handle,
+            file_information_class: i32,
+            lp_file_information: *mut c_void,
+            dw_buffer_size: u32,
         ) -> i32;
     }
 
@@ -1454,6 +2143,28 @@ pub fn write_heartbeat(dir: &Path, heartbeat: &WalpinHeartbeat) -> io::Result<()
     }
 }
 
+/// ADR-091 Amendment 3 Plank F1: a metadata-only mtime touch of this
+/// process's already-written heartbeat — no data write, mirroring
+/// [`touch_beacon`]'s mechanism and opened-directory-descriptor discipline
+/// exactly. Must run on every sweep tick where the warn condition persists
+/// and the heartbeat's content has not changed; a content change still
+/// goes through [`write_heartbeat`]. Callers must not assume the target
+/// exists — enumeration can delete a slow writer's heartbeat while its
+/// span is still live — and must recreate via [`write_heartbeat`] on any
+/// touch failure, never treat the record as gone for good.
+pub fn touch_heartbeat(dir: &Path, pid: u32) -> io::Result<()> {
+    let name = format!("{pid}.json");
+    #[cfg(unix)]
+    {
+        let handle = unix_impl::SidecarDirHandle::open_or_create(dir)?;
+        handle.touch_mtime(&name)
+    }
+    #[cfg(windows)]
+    {
+        windows_impl::touch_mtime(dir, &name)
+    }
+}
+
 /// Remove this process's registration beacon, if present (fail-closed
 /// escalation for a failing heartbeat write path — see the sidecar
 /// `observe` logic in `khive-db`'s checkpoint module). Never follows a
@@ -1674,20 +2385,27 @@ fn now_epoch_secs() -> i64 {
 }
 
 /// Staleness window for a producer sweeping at `interval`: three missed
-/// ticks, floored at one second — subsecond intervals must not collapse the
-/// window to zero, which would make any timestamp other than the current
-/// wall-clock second appear stale.
+/// ticks of a cadence floored at one second (ADR-091 Amendment 3 Plank F1's
+/// `3 x max(interval, 1000ms)`) — a sub-second interval must not collapse
+/// the window below what mtime resolution can distinguish, which would make
+/// any timestamp other than the current wall-clock second appear stale.
 #[cfg(unix)]
 fn stale_window_from(interval: Duration) -> i64 {
+    // ADR-091 Amendment 3 Plank F1's determinate form is `3 x
+    // max(declared cadence, 1000ms)` — clamp the interval to the
+    // mtime-resolution floor FIRST, then multiply by three, so a
+    // sub-second cadence floors the effective window at three seconds
+    // rather than merely at one. `max(3*interval, 1s)` (multiplying
+    // first) would under-floor any cadence below ~333ms.
     interval
-        .saturating_mul(3)
         .max(Duration::from_secs(1))
+        .saturating_mul(3)
         .as_secs() as i64
 }
 
 /// Per-record staleness window: the producer's own recorded cadence wins;
-/// `0` (a record written before `interval_ms` existed) falls back to the
-/// enumerator's window.
+/// `0` (a record written before `sweep_interval_ms` existed) falls back to
+/// the enumerator's window.
 #[cfg(unix)]
 fn stale_window_secs(producer_interval_ms: u64, fallback_secs: i64) -> i64 {
     if producer_interval_ms == 0 {
@@ -1783,11 +2501,11 @@ fn enumerate_live_bounded(
     };
 
     let now = now_epoch_secs();
-    // Fallback window for records that predate the `interval_ms` field —
-    // records carrying their producer's own cadence are judged against it
-    // instead (see `stale_window_secs`), so a session sweeping on an
-    // independently slower configured interval is not misread as stale by
-    // a faster-ticking daemon.
+    // Fallback window for records that predate the `sweep_interval_ms`
+    // field — records carrying their producer's own cadence are judged
+    // against it instead (see `stale_window_secs`), so a session sweeping
+    // on an independently slower configured interval is not misread as
+    // stale by a faster-ticking daemon.
     let fallback_window_secs = stale_window_from(sweep_interval);
 
     let mut heartbeats: std::collections::HashMap<u32, WalpinHeartbeat> = Default::default();
@@ -1872,13 +2590,22 @@ fn enumerate_live_bounded(
                 let _ = handle.unlink_tolerant(&name);
                 continue;
             }
-            // `updated_at` is the heartbeat's own field (refreshed every
-            // tick the warn condition persists); the entry's mtime tracks
-            // it closely, but the JSON field is the authoritative source
-            // the ADR specifies for heartbeat freshness. The window is the
-            // PRODUCER's recorded cadence, not the enumerator's.
-            let window = stale_window_secs(heartbeat.interval_ms, fallback_window_secs);
-            let hb_fresh = epoch_abs_diff(now, heartbeat.updated_at) <= window as u64;
+            // ADR-091 Amendment 3 Plank F1: a record carrying
+            // `oldest_tx_started_at` is new-style — its body is only
+            // rewritten on content change, so freshness is judged against
+            // the entry's mtime (advanced by a metadata-only touch every
+            // tick), never the possibly-stale `updated_at` body field. A
+            // record without it predates this amendment and is read
+            // exactly as before: `updated_at` is its own freshness field.
+            // Either way the window is the PRODUCER's recorded cadence,
+            // not the enumerator's — the mixed-version rule (readers accept
+            // both generations; see the amendment) depends on this branch.
+            let window = stale_window_secs(heartbeat.sweep_interval_ms, fallback_window_secs);
+            let hb_fresh = if heartbeat.oldest_tx_started_at.is_some() {
+                epoch_abs_diff(now, mtime_secs) <= window as u64
+            } else {
+                epoch_abs_diff(now, heartbeat.updated_at) <= window as u64
+            };
             if !hb_fresh {
                 let _ = handle.unlink_tolerant(&name);
                 wedged.insert(pid);
@@ -1912,7 +2639,7 @@ fn enumerate_live_bounded(
             // metadata-only touch), not any JSON field — the beacon's body
             // is written once and never refreshed. The window is the
             // producer's recorded cadence, not the enumerator's.
-            let window = stale_window_secs(beacon.interval_ms, fallback_window_secs);
+            let window = stale_window_secs(beacon.sweep_interval_ms, fallback_window_secs);
             let fresh = epoch_abs_diff(now, mtime_secs) <= window as u64;
             if !fresh {
                 let _ = handle.unlink_tolerant(&name);
@@ -1984,14 +2711,17 @@ mod tests {
     }
 
     fn heartbeat(pid: u32) -> WalpinHeartbeat {
+        let now = now_epoch_secs();
         WalpinHeartbeat {
             pid,
             process_role: "session".to_string(),
             started_at: process_start_time_secs(std::process::id()).unwrap_or(0),
             oldest_tx_age_secs: 45.0,
             oldest_tx_label: Some("test_span".to_string()),
-            updated_at: now_epoch_secs(),
-            interval_ms: 5_000,
+            oldest_tx_started_at: Some(now - 45),
+            updated_at: now,
+            sweep_interval_ms: 5_000,
+            attribution_basis: Some("origin".to_string()),
         }
     }
 
@@ -2063,6 +2793,28 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn ensure_sidecar_dir_refuses_non_root_owned_ancestor_symlink() {
+        // The sidecar dir's own final component is real; a symlink sits at
+        // an ANCESTOR of it instead. This must be refused just as hard as a
+        // symlinked final component — only a root-owned ancestor symlink
+        // (the OS's own firmlinks, e.g. macOS's /tmp -> private/tmp) gets a
+        // pass, and the test process does not own this symlink as root.
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real_ancestor");
+        fs::create_dir(&real).unwrap();
+        let link = root.path().join("linked_ancestor");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let dir = link.join("khive.db.walpin");
+        let err =
+            ensure_sidecar_dir(&dir).expect_err("non-root-owned ancestor symlink must be refused");
+        assert!(
+            err.to_string().contains("symlink"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn write_then_read_heartbeat_roundtrips() {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("khive.db.walpin");
@@ -2071,6 +2823,38 @@ mod tests {
         let content = fs::read_to_string(dir.join(format!("{}.json", hb.pid))).unwrap();
         let read_back: WalpinHeartbeat = serde_json::from_str(&content).unwrap();
         assert_eq!(read_back, hb);
+    }
+
+    #[test]
+    fn heartbeat_deserializes_pre_rename_interval_ms_field() {
+        // Old-format sidecar body from a writer that predates the
+        // `interval_ms` -> `sweep_interval_ms` rename. A live writer still
+        // on the old field name must keep its real cadence, not silently
+        // fall back to the enumerator's default (which can misjudge a slow
+        // writer's heartbeat as stale mid-upgrade).
+        let json = r#"{
+            "pid": 4242,
+            "process_role": "session",
+            "started_at": 1000,
+            "oldest_tx_age_secs": 45.0,
+            "oldest_tx_label": "test_span",
+            "updated_at": 1045,
+            "interval_ms": 60000
+        }"#;
+        let hb: WalpinHeartbeat = serde_json::from_str(json).unwrap();
+        assert_eq!(hb.sweep_interval_ms, 60_000);
+    }
+
+    #[test]
+    fn beacon_deserializes_pre_rename_interval_ms_field() {
+        let json = r#"{
+            "pid": 4242,
+            "process_role": "session",
+            "started_at": 1000,
+            "interval_ms": 60000
+        }"#;
+        let b: WalpinBeacon = serde_json::from_str(json).unwrap();
+        assert_eq!(b.sweep_interval_ms, 60_000);
     }
 
     #[test]
@@ -2087,6 +2871,61 @@ mod tests {
         assert!(err.to_string().contains("symlink"));
         // The real file behind the symlink must be untouched.
         assert_eq!(fs::read_to_string(&real).unwrap(), "nope");
+    }
+
+    /// Regression for the review-round-2 finding: the resolver used to
+    /// convert the sidecar directory's final `OsStr` component via
+    /// `to_string_lossy()` before `openat`, so two distinct non-UTF-8
+    /// database names (which differ only in their invalid byte) both
+    /// lossy-collapsed to the same `U+FFFD`-bearing name and cross-
+    /// contaminated attribution onto one physical sidecar directory. This
+    /// project explicitly supports non-UTF-8 database paths (see
+    /// `pool.rs`'s `mint_db_identity_non_utf8_path_round_trips`), so the
+    /// sidecar resolver must preserve that same byte-exact distinctness.
+    #[cfg(unix)]
+    #[test]
+    fn sidecar_dir_distinguishes_non_utf8_db_names_on_disk() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = tempfile::tempdir().unwrap();
+        // 0xFF and 0xFE are each invalid standalone UTF-8 bytes; both
+        // lossy-convert to the same U+FFFD replacement character.
+        let name_a = std::ffi::OsStr::from_bytes(b"khive-\xffdb.sqlite");
+        let name_b = std::ffi::OsStr::from_bytes(b"khive-\xfedb.sqlite");
+        let dir_a = sidecar_dir_for(&root.path().join(name_a));
+        let dir_b = sidecar_dir_for(&root.path().join(name_b));
+        assert_ne!(
+            dir_a, dir_b,
+            "distinct db names must produce distinct sidecar paths"
+        );
+
+        let hb = heartbeat(std::process::id());
+        // Some Unix filesystems (notably macOS's APFS) reject non-UTF-8
+        // names outright at the syscall level — a filesystem limitation,
+        // not a bug under test here, so skip rather than fail in that case
+        // (mirrors pool.rs's non-UTF-8 round-trip test).
+        if let Err(e) = write_heartbeat(&dir_a, &hb) {
+            eprintln!(
+                "skipping sidecar_dir_distinguishes_non_utf8_db_names_on_disk: filesystem \
+                 rejected a non-UTF-8 sidecar directory name ({e}); this platform's filesystem \
+                 does not support the case under test"
+            );
+            return;
+        }
+        write_heartbeat(&dir_b, &hb).expect("write to second non-UTF-8 sidecar");
+
+        let mut entries: Vec<_> = fs::read_dir(root.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .collect();
+        entries.sort();
+        assert_eq!(
+            entries.len(),
+            2,
+            "distinct non-UTF-8 database names must produce two distinct sidecar directories \
+             on disk, not collide onto one: got {entries:?}"
+        );
     }
 
     #[test]
@@ -2123,7 +2962,7 @@ mod tests {
             pid,
             process_role: "session".to_string(),
             started_at: process_start_time_secs(std::process::id()).unwrap_or(0),
-            interval_ms: 5_000,
+            sweep_interval_ms: 5_000,
         }
     }
 
@@ -2160,6 +2999,9 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("khive.db.walpin");
         let mut hb = heartbeat(std::process::id());
+        // Pre-amendment (`updated_at`-basis) record: this test exercises
+        // `epoch_abs_diff`'s overflow protection on that field specifically.
+        hb.oldest_tx_started_at = None;
         hb.updated_at = i64::MIN;
         write_heartbeat(&dir, &hb).unwrap();
 
@@ -2305,6 +3147,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("khive.db.walpin");
         let mut hb = heartbeat(std::process::id());
+        // Pre-amendment record: freshness classifies on `updated_at` alone.
+        hb.oldest_tx_started_at = None;
         hb.updated_at = now_epoch_secs() - 3600; // far outside 3 sweep intervals
         write_heartbeat(&dir, &hb).unwrap();
 
@@ -2507,6 +3351,8 @@ mod tests {
         let pid = std::process::id();
         write_beacon(&dir, &beacon(pid)).unwrap();
         let mut hb = heartbeat(pid);
+        // Pre-amendment record: freshness classifies on `updated_at` alone.
+        hb.oldest_tx_started_at = None;
         hb.updated_at = now_epoch_secs() - 3600;
         write_heartbeat(&dir, &hb).unwrap();
 
@@ -2549,7 +3395,12 @@ mod tests {
     /// Producer-cadence regression: freshness is judged against the cadence
     /// RECORDED in the entry, not the enumerating daemon's interval — a
     /// session sweeping on an independently slower configured interval must
-    /// not be misread as stale by a faster-ticking daemon.
+    /// not be misread as stale by a faster-ticking daemon. Pre-amendment
+    /// records (`oldest_tx_started_at: None`) still classify on `updated_at`
+    /// (ADR-091 Amendment 3 Plank F1 mixed-version rule) — a new-style
+    /// record's `updated_at` would go stale under a touch-only tick even
+    /// while its mtime stays fresh, so this test pins the basis this
+    /// exercises to the old-style body field deliberately.
     #[test]
     #[cfg(unix)]
     fn heartbeat_freshness_uses_producer_cadence_not_enumerator_interval() {
@@ -2558,7 +3409,8 @@ mod tests {
         let pid = std::process::id();
 
         let mut slow = heartbeat(pid);
-        slow.interval_ms = 60_000;
+        slow.oldest_tx_started_at = None;
+        slow.sweep_interval_ms = 60_000;
         slow.updated_at = now_epoch_secs() - 30;
         write_heartbeat(&dir, &slow).unwrap();
 
@@ -2575,12 +3427,180 @@ mod tests {
         // Control: the same 30s-old timestamp under a recorded 1s cadence
         // IS stale — the recorded cadence cuts both ways.
         let mut fast = heartbeat(pid);
-        fast.interval_ms = 1_000;
+        fast.oldest_tx_started_at = None;
+        fast.sweep_interval_ms = 1_000;
         fast.updated_at = now_epoch_secs() - 30;
         write_heartbeat(&dir, &fast).unwrap();
         let report = enumerate_live(&dir, Duration::from_secs(60)).unwrap();
         assert_eq!(report.reporting().count(), 0);
         assert_eq!(report.unknown_pids().collect::<Vec<_>>(), vec![pid]);
+    }
+
+    /// ADR-091 Amendment 3 Plank F1 mixed-version rule: a record carrying
+    /// `oldest_tx_started_at` is new-style and classifies on the entry's
+    /// mtime, never the body's `updated_at` field — a stale `updated_at`
+    /// (as a touch-only tick would leave it) must not make a genuinely
+    /// fresh entry classify stale.
+    #[test]
+    #[cfg(unix)]
+    fn enumerate_live_new_style_heartbeat_uses_mtime_not_stale_updated_at() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("khive.db.walpin");
+        let mut hb = heartbeat(std::process::id());
+        hb.updated_at = now_epoch_secs() - 3600;
+        write_heartbeat(&dir, &hb).unwrap(); // mtime is fresh (just written)
+
+        let report = enumerate_live(&dir, Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            report.reporting().count(),
+            1,
+            "a new-style record with a fresh mtime must classify live regardless \
+             of a stale `updated_at` body field: {report:?}"
+        );
+    }
+
+    /// Complement of the above: a new-style record whose mtime has fallen
+    /// outside the declared window classifies stale even though its body's
+    /// `updated_at` field looks fresh — proving the classification basis is
+    /// genuinely the mtime, not merely "whichever of the two is fresher."
+    #[test]
+    #[cfg(unix)]
+    fn enumerate_live_new_style_heartbeat_stale_via_mtime_despite_fresh_updated_at() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("khive.db.walpin");
+        let pid = std::process::id();
+        let hb = heartbeat(pid); // updated_at freshly set by the helper
+        write_heartbeat(&dir, &hb).unwrap();
+
+        let heartbeat_path = dir.join(format!("{pid}.json"));
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(&heartbeat_path)
+            .unwrap();
+        file.set_modified(SystemTime::now() - Duration::from_secs(3600))
+            .unwrap();
+
+        let report = enumerate_live(&dir, Duration::from_secs(5)).unwrap();
+        assert_eq!(report.reporting().count(), 0);
+        assert_eq!(report.unknown_pids().collect::<Vec<_>>(), vec![pid]);
+        assert!(
+            !heartbeat_path.exists(),
+            "a new-style entry stale by mtime must be deleted, not merely unreported"
+        );
+    }
+
+    /// ADR-091 Amendment 3 Plank F1: `3 x max(interval, 1000ms)` is exact
+    /// and inclusive — not "roughly 3 intervals" — and a sub-second
+    /// declared cadence floors the effective window at three seconds
+    /// (flooring the interval at 1s BEFORE multiplying by 3), never at one.
+    #[test]
+    #[cfg(unix)]
+    fn stale_window_from_boundary_inclusive_and_floors_subsecond_cadence_at_three_seconds() {
+        assert_eq!(stale_window_from(Duration::from_secs(2)), 6);
+        assert_eq!(stale_window_from(Duration::from_millis(100)), 3);
+        assert_eq!(stale_window_from(Duration::from_millis(999)), 3);
+        assert_eq!(stale_window_from(Duration::from_secs(1)), 3);
+    }
+
+    /// Boundary inclusivity exercised end-to-end through `enumerate_live`:
+    /// an entry exactly `3 x max(interval, 1000ms)` old is still live
+    /// (`<=`, not `<`); one second older is stale.
+    #[test]
+    #[cfg(unix)]
+    fn enumerate_live_new_style_heartbeat_boundary_is_inclusive() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("khive.db.walpin");
+        let pid = std::process::id();
+        let mut hb = heartbeat(pid);
+        hb.sweep_interval_ms = 2_000; // window = 3 * 2s = 6s
+
+        write_heartbeat(&dir, &hb).unwrap();
+        let heartbeat_path = dir.join(format!("{pid}.json"));
+        let touch = |age_secs: u64| {
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .open(&heartbeat_path)
+                .unwrap();
+            file.set_modified(SystemTime::now() - Duration::from_secs(age_secs))
+                .unwrap();
+        };
+
+        touch(6);
+        let report = enumerate_live(&dir, Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            report.reporting().count(),
+            1,
+            "exactly 3x the declared interval old must still classify live: {report:?}"
+        );
+
+        // Re-write (enumeration deletes stale/live entries it processes,
+        // but a live entry is retained — reuse the same file) and push one
+        // second past the boundary.
+        touch(7);
+        let report = enumerate_live(&dir, Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            report.reporting().count(),
+            0,
+            "one second past 3x the declared interval must classify stale: {report:?}"
+        );
+    }
+
+    /// Sub-second declared cadence floors the effective window at three
+    /// seconds (not one) — exercised end-to-end, not just at the pure
+    /// `stale_window_from` function.
+    #[test]
+    #[cfg(unix)]
+    fn enumerate_live_new_style_heartbeat_subsecond_cadence_floors_at_three_seconds() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("khive.db.walpin");
+        let pid = std::process::id();
+        let mut hb = heartbeat(pid);
+        hb.sweep_interval_ms = 100; // floors to a 3s window, not 300ms/1s
+
+        write_heartbeat(&dir, &hb).unwrap();
+        let heartbeat_path = dir.join(format!("{pid}.json"));
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(&heartbeat_path)
+            .unwrap();
+        file.set_modified(SystemTime::now() - Duration::from_secs(2))
+            .unwrap();
+
+        let report = enumerate_live(&dir, Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            report.reporting().count(),
+            1,
+            "a 100ms declared cadence must floor its window at 3s, not 1s: 2s old must \
+             still classify live: {report:?}"
+        );
+    }
+
+    /// ADR-091 Amendment 3 Plank F2 fail-closed reading rule, exercised at
+    /// the canonical consumer-facing accessor: only the exact string
+    /// `"origin"` licenses an evidence-backed reading. A missing field or
+    /// any unrecognized value — including a value a future amendment might
+    /// define — must classify as fallback-confidence, never evidence-backed.
+    #[test]
+    fn attribution_is_evidence_backed_fails_closed_on_missing_or_unrecognized_value() {
+        let mut hb = heartbeat(std::process::id());
+
+        hb.attribution_basis = Some("origin".to_string());
+        assert!(hb.attribution_is_evidence_backed());
+
+        hb.attribution_basis = Some("fallback".to_string());
+        assert!(!hb.attribution_is_evidence_backed());
+
+        hb.attribution_basis = None;
+        assert!(
+            !hb.attribution_is_evidence_backed(),
+            "a missing attribution_basis must never be read as evidence-backed"
+        );
+
+        hb.attribution_basis = Some("some-future-value".to_string());
+        assert!(
+            !hb.attribution_is_evidence_backed(),
+            "an unrecognized value must degrade to fallback-confidence, never guess origin"
+        );
     }
 
     /// A FIFO planted at a sidecar entry name must be refused as `Unknown`

@@ -588,10 +588,13 @@ impl EntityStore for SqlEntityStore {
         // Flag-off (default) path: byte-for-byte unchanged from pre-ADR-067
         // behavior — the closure owns its own BEGIN IMMEDIATE/COMMIT/ROLLBACK
         // via the pool-mutex writer.
+        let origin = self.pool.origin();
         self.with_writer("upsert_entities", move |conn| {
             conn.execute_batch("BEGIN IMMEDIATE")?;
-            let _tx_handle =
-                khive_storage::tx_registry::register(Some("entity_upsert_batch".to_string()));
+            let _tx_handle = khive_storage::tx_registry::register_scoped(
+                Some("entity_upsert_batch".to_string()),
+                origin,
+            );
 
             let summary = batch_upsert_entities(conn, &entities, attempted)?;
 

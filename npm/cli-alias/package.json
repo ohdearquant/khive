@@ -2,7 +2,7 @@
   "name": "@khive-ai/cli",
   "version": "0.2.8",
   "description": "Alias for the khive package — research knowledge graph runtime",
-  "license": "Apache-2.0",
+  "license": "BUSL-1.1",
   "repository": {
     "type": "git",
     "url": "https://github.com/ohdearquant/khive"

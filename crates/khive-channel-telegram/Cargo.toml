@@ -12,7 +12,7 @@ categories.workspace = true
 description = "Telegram Bot API channel adapter for khive (ADR-056)"
 
 [dependencies]
-khive-channel = { version = "0.5.0", path = "../khive-channel" }
+khive-channel = { version = "0.6.0", path = "../khive-channel" }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
