@@ -55,9 +55,28 @@ const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 10;
 /// Base `.khive` directory used to anchor every advisory lock/socket/pid
 /// path below. Pure path computation — portable on every target, even
 /// though most of its callers (socket/pid paths) are unix-only.
+///
+/// Resolution order: `HOME`, then `USERPROFILE` (the conventional Windows
+/// home variable), then the OS temp directory. The fallback chain never
+/// yields a working-directory-relative path: two processes opening the same
+/// database from different working directories must resolve the same lock
+/// file, so a cwd-relative fallback would silently defeat every advisory
+/// lock anchored here.
 fn khive_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".khive")
+    khive_root_from(
+        std::env::var("HOME").ok(),
+        std::env::var("USERPROFILE").ok(),
+    )
+}
+
+/// Env-free core of [`khive_dir`], split out so the fallback chain is
+/// testable without mutating process-global environment variables.
+fn khive_root_from(home: Option<String>, userprofile: Option<String>) -> PathBuf {
+    home.filter(|v| !v.trim().is_empty())
+        .or_else(|| userprofile.filter(|v| !v.trim().is_empty()))
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join(".khive")
 }
 
 /// Unix socket path the daemon binds and clients connect to.
@@ -1329,6 +1348,44 @@ pub fn env_truthy(key: &str) -> bool {
             !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
         })
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod khive_root_tests {
+    use super::khive_root_from;
+    use std::path::PathBuf;
+
+    #[test]
+    fn home_wins_when_set() {
+        assert_eq!(
+            khive_root_from(Some("/base/home".into()), Some("/other".into())),
+            PathBuf::from("/base/home/.khive")
+        );
+    }
+
+    #[test]
+    fn userprofile_backfills_missing_home() {
+        assert_eq!(
+            khive_root_from(None, Some("/profile/home".into())),
+            PathBuf::from("/profile/home/.khive")
+        );
+    }
+
+    #[test]
+    fn blank_values_are_skipped() {
+        assert_eq!(
+            khive_root_from(Some("  ".into()), Some("/profile/home".into())),
+            PathBuf::from("/profile/home/.khive")
+        );
+    }
+
+    #[test]
+    fn fallback_is_never_cwd_relative() {
+        // The lock/socket/pid anchor must not depend on the caller's working
+        // directory even when no home variable is set — a relative path here
+        // would give the same database different lock files per cwd.
+        assert!(khive_root_from(None, None).is_absolute());
+    }
 }
 
 #[cfg(all(test, unix))]
