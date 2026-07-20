@@ -2124,13 +2124,21 @@ pub fn build_server_from_multi_backend_registry(
 /// excluding the main backend's own pool (wired separately via
 /// [`checkpoint_pool_for`]) — ADR-091 Amendment 3 fan-out needs exactly one
 /// entry per additional file-backed backend the registry wired, not one per
-/// pack, since several packs can share a backend. Dedup is pool-identity
-/// (`Arc::as_ptr`), the same pointer-identity discipline
-/// `apply_schema_plans_with_map` (khive-runtime) already uses to tell
-/// backends apart.
+/// pack, since several packs can share a backend.
+///
+/// Dedup is by canonical database identity (each pool's [`TxOrigin::Database`]
+/// origin, minted from its canonical path — see `ConnectionPool::origin`),
+/// never by pool pointer: two backends configured with alias spellings of
+/// the SAME file (a direct path and a symlinked path, say) mint two distinct
+/// `Arc<ConnectionPool>` but converge on one canonical sidecar, and admitting
+/// both would race two `SweepBackend`s on the same heartbeat file.
 fn secondary_file_backed_pools(multi: &MultiBackendRegistry) -> Vec<Arc<ConnectionPool>> {
-    let main_ptr = Arc::as_ptr(&multi.main_backend.pool_arc());
-    let mut seen: HashSet<*const ConnectionPool> = HashSet::from([main_ptr]);
+    use khive_storage::tx_registry::TxOrigin;
+
+    let mut seen: HashSet<khive_storage::tx_registry::DbIdentity> = HashSet::new();
+    if let TxOrigin::Database(id) = multi.main_backend.pool_arc().origin() {
+        seen.insert(id);
+    }
     let mut pools = Vec::new();
     for rt in multi.per_pack_runtimes.values() {
         let backend = rt.backend();
@@ -2138,7 +2146,14 @@ fn secondary_file_backed_pools(multi: &MultiBackendRegistry) -> Vec<Arc<Connecti
             continue;
         }
         let pool = backend.pool_arc();
-        if seen.insert(Arc::as_ptr(&pool)) {
+        let TxOrigin::Database(id) = pool.origin() else {
+            // A file-backed backend always mints a `Database` origin
+            // (`ConnectionPool::origin`'s own contract); anything else here
+            // has no canonical identity to dedup on, so it cannot be
+            // admitted as a secondary fan-out target.
+            continue;
+        };
+        if seen.insert(id) {
             pools.push(pool);
         }
     }
@@ -4275,6 +4290,106 @@ region = "us-east-1"
             "secondary-backend pack must have core_backend wired to main (ADR-073); \
              core().backend_id() returned {:?} — build_pack_runtime wiring missing",
             comm_rt.core().backend_id().as_str()
+        );
+    }
+
+    /// ADR-091 Amendment 3 fan-out regression: two backends declared at
+    /// alias spellings of the SAME database file (a direct path and a
+    /// symlinked path) must mint the same canonical `DbIdentity` and
+    /// therefore dedup to exactly one secondary pool. The pointer-identity
+    /// dedup this replaced would have kept both `Arc<ConnectionPool>`
+    /// instances distinct, letting two `SweepBackend`s race on one
+    /// heartbeat file.
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn secondary_pools_dedup_by_canonical_identity_across_alias_spellings() {
+        use khive_runtime::PackConfig;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_path = dir.path().join("khive.db");
+        std::fs::write(&real_path, b"").unwrap();
+        let alias_path = dir.path().join("khive_alias.db");
+        std::os::unix::fs::symlink(&real_path, &alias_path).unwrap();
+
+        let khive_cfg = KhiveConfig {
+            backends: vec![
+                BackendConfig {
+                    name: "main".to_string(),
+                    kind: BackendKind::Memory,
+                    path: None,
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: false,
+                },
+                BackendConfig {
+                    name: "direct".to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(real_path.clone()),
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: false,
+                },
+                BackendConfig {
+                    name: "alias".to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(alias_path.clone()),
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: false,
+                },
+            ],
+            packs: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(
+                    "kg".to_string(),
+                    PackConfig {
+                        backend: "direct".to_string(),
+                    },
+                );
+                m.insert(
+                    "comm".to_string(),
+                    PackConfig {
+                        backend: "alias".to_string(),
+                    },
+                );
+                m
+            },
+            ..KhiveConfig::default()
+        };
+
+        let base_cfg = base_runtime_config_for_multi_backend();
+        let multi = build_registry_for_multi_backend(base_cfg, &khive_cfg, None)
+            .expect("multi-backend registry with alias-spelled backends must boot");
+
+        let secondary = secondary_file_backed_pools(&multi);
+        assert_eq!(
+            secondary.len(),
+            1,
+            "two backends aliasing the same database file must dedup to exactly one \
+             secondary pool by canonical identity, got {} pools",
+            secondary.len()
+        );
+
+        let server = build_server_from_multi_backend_registry(multi, &khive_cfg, None);
+        let mut backends = Vec::new();
+        if let Some(pool) = server.pool() {
+            backends.push(khive_db::SweepBackend {
+                pool,
+                is_main: true,
+            });
+        }
+        for pool in server.secondary_pools() {
+            backends.push(khive_db::SweepBackend {
+                pool,
+                is_main: false,
+            });
+        }
+        assert_eq!(
+            backends.len(),
+            1,
+            "exactly one SweepBackend must survive dedup for the alias pair — the \
+             in-memory main backend contributes no pool of its own"
         );
     }
 
