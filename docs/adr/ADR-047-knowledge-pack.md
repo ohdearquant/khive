@@ -1,8 +1,25 @@
 # ADR-047: Knowledge Pack
 
-**Status**: accepted (amended 2026-06-07, 2026-06-10, 2026-06-10b)
+**Status**: accepted (amended 2026-06-07, 2026-06-10, 2026-06-10b, 2026-07-20)
 **Date**: 2026-05-25
 **Authors**: khive maintainers
+
+## Amendment (2026-07-20): distribution boundary — commercially licensed extension
+
+Effective with the accompanying crate-extraction change (which lands as a separate
+pull request; this amendment records the boundary that change produces),
+`khive-pack-knowledge` ceases to be part of the open-source distribution. The crate
+ships as a commercially licensed extension; the default pack set no longer includes
+`knowledge`, and the open-source build registers no `knowledge.*` verbs (see the
+ADR-023 amendment of the same date). Until that extraction change lands, the in-tree
+crate remains present, force-linked, and part of the default pack set, and this ADR's
+pre-amendment text describes it as-is.
+
+Nothing normative here is superseded: this ADR and its amendments continue to govern
+the pack wherever the extension is deployed. The atom/section stores, the Vamana ANN
+index over the knowledge corpus, and the warm-path behavior described in ADR-049
+travel with the pack; `khive-vamana` and the other retrieval crates remain in the
+open-source tree, consumed by the memory pack's recall path.
 
 ## Amendment (2026-06-10b): exclude_status precedence fix; auto-compose member filter; atom status taxonomy clarification
 

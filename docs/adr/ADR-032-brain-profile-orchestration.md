@@ -1323,3 +1323,18 @@ As of #1016, newly emitted `FeedbackExplicit` events always persist the effectiv
 - Rao, R. & Ballard, D., "Predictive coding in the visual cortex" (1999)
 - Anderson, J.R., "How Can the Human Mind Occur in the Physical Universe?" (2007) — ACT-R
   base-level activation as a structural analogue to Beta-posterior accumulation
+
+## Amendment (2026-07-20): distribution boundary — commercially licensed extension
+
+Effective with the accompanying crate-extraction change (which lands as a separate
+pull request; this amendment records the boundary that change produces),
+`khive-pack-brain` ceases to be part of the open-source distribution. The crate ships
+as a commercially licensed extension; the default pack set no longer includes
+`brain`, and the open-source build registers no `brain.*` verbs (see the ADR-023
+amendment of the same date, which also specifies `memory.recall`'s degradation
+behavior when no brain pack is registered). `khive-brain-core` — the interface crate
+`khive-pack-memory` consumes for ranking types — remains in the open-source tree.
+Until the extraction change lands, the in-tree crate remains present, force-linked,
+and part of the default pack set, and this ADR's pre-amendment text describes it
+as-is. Nothing normative here is superseded: this ADR continues to govern the pack
+wherever the extension is deployed.
