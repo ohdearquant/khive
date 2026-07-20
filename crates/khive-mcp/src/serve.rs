@@ -3,7 +3,7 @@
 //! This is the bootstrap that the `kkernel mcp` subcommand drives. Logging is
 //! initialized by the binary, not here.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -133,9 +133,11 @@ impl SessionSweepHandle {
     }
 }
 
-/// Spawn the ADR-091 Amendment 2 Plank A observe-only session sweep task for
-/// this process's checkpoint pool, if it has one (a checkpoint pool is only
-/// wired for file-backed backends — see `checkpoint_pool_for`). Returns a
+/// Spawn the ADR-091 Amendment 2 Plank A observe-only session sweep task,
+/// fanned out over every file-backed backend this server carries: `pool` as
+/// the main backend, plus one entry per pool in `secondary_pools` (ADR-091
+/// Amendment 3). Returns `None` only when the server has no file-backed
+/// backend at all (a purely in-memory or registry-only server). Returns a
 /// [`SessionSweepHandle`] the caller MUST hold for the session's run scope
 /// and shut down explicitly (see [`SessionSweepHandle::shutdown`]) — mirrors
 /// `run_checkpoint_task`'s shutdown-channel contract on the daemon side.
@@ -155,20 +157,26 @@ impl SessionSweepHandle {
 /// classifies as `reporting`/`registered-silent` (not a permanent `unknown`)
 /// whenever a Unix daemon does enumerate the shared sidecar directory.
 fn spawn_session_walpin_sweep(server: &KhiveMcpServer) -> Option<SessionSweepHandle> {
-    let pool = server.pool()?;
-    // ADR-091 Amendment 3: this server exposes exactly one backend pool
-    // today, so it is always the sweep's main backend — the sidecar
-    // directory and registry view are keyed off the pool's own minted
-    // identity internally, not a raw configured path passed in here.
-    // Multi-backend discovery (a secondary pool per additional wired
-    // backend) is a separate wiring concern from this single-pool server.
+    let mut backends = Vec::new();
+    if let Some(pool) = server.pool() {
+        backends.push(khive_db::SweepBackend {
+            pool,
+            is_main: true,
+        });
+    }
+    for pool in server.secondary_pools() {
+        backends.push(khive_db::SweepBackend {
+            pool,
+            is_main: false,
+        });
+    }
+    if backends.is_empty() {
+        return None;
+    }
     let config = khive_db::SessionSweepConfig::from_env();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
     let join = tokio::spawn(khive_db::run_session_sweep_task(
-        vec![khive_db::SweepBackend {
-            pool,
-            is_main: true,
-        }],
+        backends,
         config,
         shutdown_rx,
     ));
@@ -2086,6 +2094,11 @@ pub fn build_server_from_multi_backend_registry(
     // only present for file-backed databases; in-memory backends return None here
     // so that checkpoint_once never runs on a non-WAL connection.
     let pool = checkpoint_pool_for(multi.main_backend.as_ref());
+    // ADR-091 Amendment 3: every OTHER file-backed backend this registry
+    // wired, so the session sweep (`spawn_session_walpin_sweep`) and the
+    // daemon's checkpoint task can attribute and checkpoint them instead of
+    // leaving them permanently invisible to cross-process WAL-pin attribution.
+    let secondary_pools = secondary_file_backed_pools(&multi);
     let fmt = apply_env_output_format(khive_cfg.runtime.default_output_format);
 
     let server = KhiveMcpServer::from_registry_with_meta(
@@ -2093,7 +2106,8 @@ pub fn build_server_from_multi_backend_registry(
         &multi.default_namespace,
         &multi.config_id,
     )
-    .with_default_output_format(fmt);
+    .with_default_output_format(fmt)
+    .with_secondary_pools(secondary_pools);
 
     let server = match coordinator {
         Some(c) => server.with_coordinator(c),
@@ -2104,6 +2118,31 @@ pub fn build_server_from_multi_backend_registry(
         Some(p) => server.with_pool(p),
         None => server,
     }
+}
+
+/// Distinct file-backed backend pools among `multi`'s per-pack runtimes,
+/// excluding the main backend's own pool (wired separately via
+/// [`checkpoint_pool_for`]) — ADR-091 Amendment 3 fan-out needs exactly one
+/// entry per additional file-backed backend the registry wired, not one per
+/// pack, since several packs can share a backend. Dedup is pool-identity
+/// (`Arc::as_ptr`), the same pointer-identity discipline
+/// `apply_schema_plans_with_map` (khive-runtime) already uses to tell
+/// backends apart.
+fn secondary_file_backed_pools(multi: &MultiBackendRegistry) -> Vec<Arc<ConnectionPool>> {
+    let main_ptr = Arc::as_ptr(&multi.main_backend.pool_arc());
+    let mut seen: HashSet<*const ConnectionPool> = HashSet::from([main_ptr]);
+    let mut pools = Vec::new();
+    for rt in multi.per_pack_runtimes.values() {
+        let backend = rt.backend();
+        if !backend.is_file_backed() {
+            continue;
+        }
+        let pool = backend.pool_arc();
+        if seen.insert(Arc::as_ptr(&pool)) {
+            pools.push(pool);
+        }
+    }
+    pools
 }
 
 /// Construction-time facts that every multi-backend boot path must agree on
