@@ -672,8 +672,14 @@ at link time; there is no plugin-loading step at runtime. A distribution that
 wishes to compose additional packs — including the ones described above — does
 so by adding their crates as build dependencies and force-linking them the same
 way every pack in this repository is force-linked today (§9); the open-source
-repository itself carries no feature flags, optional dependencies, or
-configuration referencing packs it does not ship.
+repository itself carries no feature flags or optional dependencies referencing
+packs it does not ship. Runtime configuration sections that an extension pack
+consumes are the one deliberate exception: the `[git_write]` allowlist plumbing
+is retained (ADR-108 amendment of the same date) so a deployment that loads the
+extension gets the documented fail-closed behavior without further changes, and
+the section is inert — parsed but consumed by nothing — in a build where the
+pack is not loaded. Retained inert configuration of this shape is permitted;
+feature flags and optional crate dependencies on unshipped packs are not.
 
 ### Scope of this amendment
 
