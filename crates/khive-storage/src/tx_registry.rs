@@ -8,6 +8,7 @@
 //! holding a WAL snapshot open.
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -22,10 +23,76 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TxId(pub u64);
 
+/// Opaque identity for a file-backed database, keyed on its already-minted
+/// canonical path. Minting (resolving aliases to one canonical path) happens
+/// at exactly one point — the pool in `khive-db` — every other layer treats
+/// this constructor as accepting that output only.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct DbIdentity(OsString);
+
+impl DbIdentity {
+    pub fn new(canonical_path: impl Into<OsString>) -> Self {
+        Self(canonical_path.into())
+    }
+}
+
+/// Which database, if any, a registered span runs against. Three states,
+/// never an option: "no database file" ([`TxOrigin::Memory`]) and "not yet
+/// threaded to an origin" ([`TxOrigin::Unscoped`]) are different facts and
+/// must never share a representation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TxOrigin {
+    /// A file-backed database, identified by its minted [`DbIdentity`].
+    Database(DbIdentity),
+    /// An in-memory backend: no database file, no WAL, no sidecar —
+    /// excluded from WAL-pin attribution entirely.
+    Memory,
+    /// A registration site not yet threaded to an origin. Observed by the
+    /// main backend's attribution view, exactly as every entry was before
+    /// origins existed, so scoping can never silently drop a span.
+    Unscoped,
+}
+
+/// An attribution view over the registry: which origins it observes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TxOriginFilter {
+    /// The main backend's view: spans scoped to `main`, plus every
+    /// [`TxOrigin::Unscoped`] span (the never-silently-drop fallback).
+    Main(DbIdentity),
+    /// A secondary backend's view: spans scoped to exactly this database.
+    /// Never falls back to unscoped spans — only the main view does.
+    Secondary(DbIdentity),
+}
+
+impl TxOriginFilter {
+    fn matches(&self, origin: &TxOrigin) -> bool {
+        match (self, origin) {
+            (TxOriginFilter::Main(id), TxOrigin::Database(origin_id)) => origin_id == id,
+            (TxOriginFilter::Main(_), TxOrigin::Unscoped) => true,
+            (TxOriginFilter::Main(_), TxOrigin::Memory) => false,
+            (TxOriginFilter::Secondary(id), TxOrigin::Database(origin_id)) => origin_id == id,
+            (TxOriginFilter::Secondary(_), TxOrigin::Unscoped | TxOrigin::Memory) => false,
+        }
+    }
+}
+
+/// Identity, age, label, and origin of the oldest span an attribution view
+/// observes. Origin lets the consumer distinguish an evidence-backed
+/// `Database(_)` winner from an `Unscoped` fallback winner when writing the
+/// attribution-basis field.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OldestSpan {
+    pub id: TxId,
+    pub age: Duration,
+    pub label: Option<String>,
+    pub origin: TxOrigin,
+}
+
 #[derive(Clone, Debug)]
 struct TxMeta {
     opened_at: Instant,
     label: Option<String>,
+    origin: TxOrigin,
 }
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -48,16 +115,16 @@ impl Drop for TxHandle {
     }
 }
 
-/// Register a new open transaction span with an optional diagnostic label.
-///
-/// Recovers a poisoned lock via `into_inner()` rather than dropping the
-/// write — a poisoned registry must keep tracking spans, not go silently
-/// blind. See `crates/khive-storage/docs/api/tx-registry.md`.
-pub fn register(label: Option<String>) -> TxHandle {
+/// Register a new open transaction span with an optional diagnostic label
+/// and an explicit origin. Recovers a poisoned lock via `into_inner()`
+/// rather than dropping the write — a poisoned registry must keep tracking
+/// spans, not go silently blind. See `crates/khive-storage/docs/api/tx-registry.md`.
+pub fn register_scoped(label: Option<String>, origin: TxOrigin) -> TxHandle {
     let id = TxId(NEXT_ID.fetch_add(1, Ordering::Relaxed));
     let meta = TxMeta {
         opened_at: Instant::now(),
         label,
+        origin,
     };
     let mut registry = REGISTRY
         .lock()
@@ -65,6 +132,12 @@ pub fn register(label: Option<String>) -> TxHandle {
     registry.insert(id, meta);
     drop(registry);
     TxHandle { id }
+}
+
+/// Register a new open transaction span with an optional diagnostic label.
+/// Delegates to [`register_scoped`] with [`TxOrigin::Unscoped`].
+pub fn register(label: Option<String>) -> TxHandle {
+    register_scoped(label, TxOrigin::Unscoped)
 }
 
 /// Identity, age, and label of the oldest currently-open registry entry, if
@@ -81,6 +154,26 @@ pub fn oldest() -> Option<(TxId, Duration, Option<String>)> {
         .iter()
         .min_by_key(|(_, meta)| meta.opened_at)
         .map(|(id, meta)| (*id, meta.opened_at.elapsed(), meta.label.clone()))
+}
+
+/// Identity, age, label, and origin of the oldest entry an attribution view
+/// observes, if any. See [`TxOriginFilter`] for the main/secondary view
+/// semantics and [`oldest`] for the process-wide aggregate this narrows.
+/// Recovers a poisoned lock via `into_inner()` (see [`register_scoped`]).
+pub fn oldest_for(filter: &TxOriginFilter) -> Option<OldestSpan> {
+    let registry = REGISTRY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    registry
+        .iter()
+        .filter(|(_, meta)| filter.matches(&meta.origin))
+        .min_by_key(|(_, meta)| meta.opened_at)
+        .map(|(id, meta)| OldestSpan {
+            id: *id,
+            age: meta.opened_at.elapsed(),
+            label: meta.label.clone(),
+            origin: meta.origin.clone(),
+        })
 }
 
 /// Age and label of every currently-open registry entry. Recovers a poisoned
@@ -159,6 +252,103 @@ mod tests {
         assert!(labels.contains(&Some("snap_b".to_string())));
         drop(a);
         drop(b);
+    }
+
+    #[test]
+    fn oldest_for_partitions_by_origin() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let main_id = DbIdentity::new("main.db");
+        let secondary_id = DbIdentity::new("secondary.db");
+        let main_view = TxOriginFilter::Main(main_id.clone());
+        let secondary_view = TxOriginFilter::Secondary(secondary_id.clone());
+
+        let main_handle = register_scoped(
+            Some("main_span".to_string()),
+            TxOrigin::Database(main_id.clone()),
+        );
+        let secondary_handle = register_scoped(
+            Some("secondary_span".to_string()),
+            TxOrigin::Database(secondary_id.clone()),
+        );
+
+        let main_oldest = oldest_for(&main_view).expect("main span visible in main view");
+        assert_eq!(main_oldest.label.as_deref(), Some("main_span"));
+        assert_eq!(main_oldest.origin, TxOrigin::Database(main_id));
+
+        let secondary_oldest =
+            oldest_for(&secondary_view).expect("secondary span visible in secondary view");
+        assert_eq!(secondary_oldest.label.as_deref(), Some("secondary_span"));
+
+        drop(main_handle);
+        drop(secondary_handle);
+    }
+
+    #[test]
+    fn register_delegates_to_unscoped_origin() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let main_id = DbIdentity::new("main.db");
+        let main_view = TxOriginFilter::Main(main_id);
+        let handle = register(Some("legacy_span".to_string()));
+
+        let oldest = oldest_for(&main_view).expect("register() delegates to Unscoped");
+        assert_eq!(oldest.origin, TxOrigin::Unscoped);
+
+        drop(handle);
+    }
+
+    #[test]
+    fn unscoped_visible_in_main_view_and_oldest() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let main_id = DbIdentity::new("main.db");
+        let main_view = TxOriginFilter::Main(main_id);
+        let handle = register_scoped(Some("unscoped_span".to_string()), TxOrigin::Unscoped);
+
+        let via_filter = oldest_for(&main_view).expect("unscoped span falls back to main view");
+        assert_eq!(via_filter.label.as_deref(), Some("unscoped_span"));
+        assert_eq!(via_filter.origin, TxOrigin::Unscoped);
+
+        let via_aggregate = oldest().expect("unscoped span visible in aggregate oldest()");
+        assert_eq!(via_aggregate.2.as_deref(), Some("unscoped_span"));
+
+        drop(handle);
+    }
+
+    #[test]
+    fn memory_absent_from_attribution_views_but_present_in_oldest() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let main_id = DbIdentity::new("main.db");
+        let secondary_id = DbIdentity::new("secondary.db");
+        let main_view = TxOriginFilter::Main(main_id);
+        let secondary_view = TxOriginFilter::Secondary(secondary_id);
+        let handle = register_scoped(Some("memory_span".to_string()), TxOrigin::Memory);
+
+        assert!(oldest_for(&main_view).is_none());
+        assert!(oldest_for(&secondary_view).is_none());
+
+        let via_aggregate = oldest().expect("memory span visible in aggregate oldest()");
+        assert_eq!(via_aggregate.2.as_deref(), Some("memory_span"));
+
+        drop(handle);
+    }
+
+    #[test]
+    fn database_entries_never_leak_across_views() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let main_id = DbIdentity::new("main.db");
+        let secondary_id = DbIdentity::new("secondary.db");
+        let main_view = TxOriginFilter::Main(main_id);
+        let secondary_view = TxOriginFilter::Secondary(secondary_id.clone());
+        let handle = register_scoped(
+            Some("secondary_span".to_string()),
+            TxOrigin::Database(secondary_id),
+        );
+
+        assert!(oldest_for(&main_view).is_none());
+        let via_secondary =
+            oldest_for(&secondary_view).expect("secondary span visible in its own view");
+        assert_eq!(via_secondary.label.as_deref(), Some("secondary_span"));
+
+        drop(handle);
     }
 
     #[test]
