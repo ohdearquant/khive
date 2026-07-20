@@ -471,15 +471,6 @@ impl KhiveMcpServer {
         self
     }
 
-    /// Clone the verb registry for use by background tasks (e.g. channel polling loops).
-    ///
-    /// `VerbRegistry` is internally `Arc`-wrapped so this clone is cheap. The returned
-    /// registry shares the same packs and dispatch state as the server.
-    #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
-    pub(crate) fn verb_registry_clone(&self) -> VerbRegistry {
-        self.registry.clone()
-    }
-
     /// Route a `link` or `search` verb through the coordinator when in multi-backend mode.
     ///
     /// Returns `Some(result)` when the coordinator handled the op (caller should skip
@@ -556,10 +547,10 @@ impl KhiveMcpServer {
 
     /// This server's configured audit `EventStore`, if any (ADR-094).
     ///
-    /// Exposed so the `DaemonDispatch::event_store_for_checkpoint` impl and
-    /// the email channel poll loop can append best-effort lifecycle events
-    /// to the same sink gate-check audit rows already use, without a second
-    /// constructor argument threaded everywhere a registry is built.
+    /// Exposed so the `DaemonDispatch::event_store_for_checkpoint` impl can
+    /// append best-effort lifecycle events to the same sink gate-check audit
+    /// rows already use, without a second constructor argument threaded
+    /// everywhere a registry is built.
     pub fn event_store(&self) -> Option<Arc<dyn khive_storage::EventStore>> {
         self.registry.event_store()
     }

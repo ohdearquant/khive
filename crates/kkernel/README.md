@@ -90,9 +90,9 @@ take precedence).
 | `KHIVE_LOG`                       | Log level for stderr (JSON results on stdout are unaffected)  |
 | `KHIVE_BRAIN_PROFILE`             | Brain profile for feedback routing and recall boosting        |
 
-Two feature flags gate optional functionality, both pass-through to `khive-mcp`:
+One feature flag gates optional functionality, a pass-through to `khive-mcp`:
 `bench-embedder` (deterministic hash embedder for benchmarking, never enabled in release
-builds) and `channel-email` (SMTP/IMAP polling loop, inert without `KHIVE_EMAIL_*` env vars).
+builds).
 
 ## Where this sits
 
