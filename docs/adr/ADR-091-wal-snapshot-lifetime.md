@@ -810,6 +810,13 @@ question (Inventory item 4) remains unverified precisely there.
   `renameat` / `unlinkat` semantics) — the path is never re-resolved per
   operation, and parent components must resolve without traversing a symlink
   at open time.
+
+  _Amendment (clarification of existing intent, 2026-07-20)._ Ancestor path
+  components above the database file's containing directory are trusted
+  platform layout: an adversary able to substitute or redirect that ancestry
+  already controls the database path itself, so sidecar hardening binds
+  identity from the database's containing directory downward and makes no
+  guarantee against hostile mutation of higher components.
 - **Plank C: pin-depth probe via `PRAGMA wal_checkpoint(PASSIVE)` return
   columns.** On a TRUNCATE no-progress event, additionally run
   `PRAGMA wal_checkpoint(PASSIVE)` and report pin depth as `log` minus
