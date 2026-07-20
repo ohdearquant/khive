@@ -371,8 +371,13 @@ impl AnnBridge {
     /// bridge: `Some(embedding)` replays a final upsert (tombstone the mapped
     /// old ordinal, then exactly one insert); `None` replays a final delete
     /// (tombstone if mapped, no-op otherwise). `new_s` is the highest tail
-    /// seq, stamped as the new applied watermark. Any id-map contradiction
-    /// returns `Err` — the caller escalates to Cold.
+    /// seq, stamped as the new applied watermark.
+    ///
+    /// A delete whose mapped ordinal has been reassigned by an earlier
+    /// upsert in the same batch is skipped with a warning, not an error:
+    /// the old subject's vector was already tombstoned when the slot was
+    /// reused, so there is nothing left to delete. Any other id-map
+    /// contradiction returns `Err` — the caller escalates to Cold.
     pub(crate) fn apply_final_ops(
         &mut self,
         ops: Vec<(Uuid, Option<Vec<f32>>)>,
@@ -383,7 +388,7 @@ impl AnnBridge {
         // are stale (tombstoning never clears them) and must be excluded
         // here, or a reused slot's new owner can be tombstoned by a replay
         // op for the old, already-deleted subject (#1150).
-        let mut reverse: HashMap<Uuid, u32> = HashMap::with_capacity(self.id_map.len());
+        let mut reverse: HashMap<Uuid, u32> = HashMap::with_capacity(self.index.live_count());
         for (ordinal, uuid) in self.id_map.iter().enumerate() {
             if self.index.is_tombstoned(ordinal as u32) {
                 continue;
