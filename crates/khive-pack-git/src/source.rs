@@ -87,27 +87,53 @@ pub fn parse_source(raw: &str) -> Result<DigestSource, String> {
     Ok(DigestSource::Local(path))
 }
 
-/// `true` for scp-like SSH shorthand (`user@host:path`, e.g.
-/// `git@github.com:org/repo.git`) — recognized by an `@` before the first
-/// `:` and no leading `/`.
+/// `true` for scp-like SSH shorthand (`[user@]host:path`, e.g.
+/// `git@github.com:org/repo.git` or the bare `github.com:org/repo.git` —
+/// the SCP user is optional in git's own remote grammar).
 fn is_scp_shorthand(s: &str) -> bool {
+    scp_parts(s).is_some()
+}
+
+/// Split `[user@]host:path` shorthand into `(host, path)`, or `None` when
+/// `s` doesn't have that shape. The host segment (whatever precedes the
+/// first `:`, minus any `user@` prefix) must contain no `/` -- this is what
+/// keeps a local path with an embedded colon, e.g. `local/path:with-colon`,
+/// from being misparsed as SCP shorthand: `local/path` fails the host check
+/// because of the `/`, so `scp_parts` returns `None` and the caller falls
+/// through to local-path handling.
+fn scp_parts(s: &str) -> Option<(&str, &str)> {
     if s.starts_with('/') {
-        return false;
+        return None;
     }
-    let Some(at) = s.find('@') else {
-        return false;
+    let colon = s.find(':')?;
+    let before_colon = &s[..colon];
+    let host = match before_colon.rfind('@') {
+        Some(at) => {
+            let user = &before_colon[..at];
+            if user.is_empty()
+                || !user
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+            {
+                return None;
+            }
+            &before_colon[at + 1..]
+        }
+        None => before_colon,
     };
-    let Some(colon) = s.find(':') else {
-        return false;
-    };
-    if colon <= at {
-        return false;
-    }
-    let user = &s[..at];
-    !user.is_empty()
-        && user
+    if host.is_empty()
+        || host.contains('/')
+        || !host
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+    {
+        return None;
+    }
+    let path = &s[colon + 1..];
+    if path.is_empty() {
+        return None;
+    }
+    Some((host, path))
 }
 
 fn canonicalize_https_url(url: &str) -> String {
@@ -145,7 +171,10 @@ pub const REPO_SLUG_PROPERTY: &str = "repo_slug";
 /// `github.com/owner/repo` from `https://github.com/owner/repo`, or
 /// `github.com/owner/repo` from the `host/owner/repo` remainder of an
 /// `ssh://user@host/owner/repo` URL. `rfind('@')` (not the first `@`) drops
-/// userinfo because a password component can itself contain `@`.
+/// userinfo because a password component can itself contain `@`. Any port
+/// on the authority is stripped via `strip_port` -- the slug identity is
+/// host+path only, so `github.com:2222/org/repo` and `github.com/org/repo`
+/// must converge.
 fn split_host_path(rest: &str) -> Option<(String, String)> {
     let after_userinfo = match rest.rfind('@') {
         Some(pos) => &rest[pos + 1..],
@@ -155,7 +184,29 @@ fn split_host_path(rest: &str) -> Option<(String, String)> {
     if host.is_empty() || path.is_empty() {
         return None;
     }
-    Some((host.to_string(), path.to_string()))
+    let host = strip_port(host);
+    if host.is_empty() {
+        return None;
+    }
+    Some((host, path.to_string()))
+}
+
+/// Strip a trailing `:port` from a URL authority's host segment. Handles a
+/// bracketed IPv6 host (`[::1]:2222` -> `[::1]`, brackets kept -- brackets
+/// are what make an IPv6 literal unambiguous in a slug, since the address
+/// itself contains colons) as well as a plain hostname (`github.com:2222`
+/// -> `github.com`). A host with no port passes through unchanged.
+fn strip_port(host: &str) -> String {
+    if let Some(rest) = host.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            return format!("[{}]", &rest[..end]);
+        }
+        return host.to_string();
+    }
+    match host.split_once(':') {
+        Some((h, _port)) => h.to_string(),
+        None => host.to_string(),
+    }
 }
 
 /// Normalize ANY git remote URL spelling -- `https://`, `ssh://`, the
@@ -187,20 +238,18 @@ pub fn remote_url_to_slug(url: &str) -> Option<String> {
         split_host_path(rest)?
     } else if let Some(rest) = trimmed.strip_prefix("ssh://") {
         split_host_path(rest)?
-    } else if is_scp_shorthand(trimmed) {
-        let at = trimmed.find('@')?;
-        let (host, path) = trimmed[at + 1..].split_once(':')?;
-        if host.is_empty() || path.is_empty() {
-            return None;
-        }
+    } else if let Some((host, path)) = scp_parts(trimmed) {
         (host.to_string(), path.to_string())
     } else {
         return None;
     };
 
-    let mut segs = path.split('/').filter(|s| !s.is_empty());
+    let mut segs = path.split('/');
     let owner = segs.next()?;
     let repo = segs.next()?;
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
     Some(format!("{}/{owner}/{repo}", host.to_ascii_lowercase()))
 }
 
@@ -333,6 +382,12 @@ mod tests {
     }
 
     #[test]
+    fn bare_scp_shorthand_without_userinfo_rejected() {
+        let err = parse_source("github.com:org/repo.git").unwrap_err();
+        assert!(err.contains("SSH"), "{err}");
+    }
+
+    #[test]
     fn git_protocol_rejected() {
         let err = parse_source("git://github.com/org/repo.git").unwrap_err();
         assert!(err.contains("git://"), "{err}");
@@ -408,6 +463,12 @@ mod tests {
             "git@github.com:org/repo.git",
             "git@github.com:org/repo",
             "git://github.com/org/repo.git",
+            // Bare SCP shorthand -- the SCP user is optional.
+            "github.com:org/repo.git",
+            "github.com:org/repo",
+            // ssh:// with a port -- the port is not part of the identity.
+            "ssh://git@github.com:2222/org/repo.git",
+            "ssh://github.com:2222/org/repo",
             // Host case is folded; owner/repo case is preserved separately below.
             "https://GitHub.com/org/repo",
         ];
@@ -426,6 +487,35 @@ mod tests {
             remote_url_to_slug("https://github.com/Org/Repo").as_deref(),
             Some("github.com/Org/Repo")
         );
+    }
+
+    #[test]
+    fn remote_url_to_slug_bracketed_ipv6_host_with_port() {
+        assert_eq!(
+            remote_url_to_slug("ssh://git@[::1]:2222/org/repo").as_deref(),
+            Some("[::1]/org/repo")
+        );
+    }
+
+    #[test]
+    fn remote_url_to_slug_bracketed_ipv6_host_without_port() {
+        assert_eq!(
+            remote_url_to_slug("ssh://git@[::1]/org/repo").as_deref(),
+            Some("[::1]/org/repo")
+        );
+    }
+
+    #[test]
+    fn remote_url_to_slug_rejects_empty_owner_or_repo_segment() {
+        assert_eq!(remote_url_to_slug("https://github.com/org//repo"), None);
+        assert_eq!(remote_url_to_slug("https://github.com//repo"), None);
+        assert_eq!(remote_url_to_slug("git@github.com:/repo"), None);
+        assert_eq!(remote_url_to_slug("git@github.com:org/"), None);
+    }
+
+    #[test]
+    fn remote_url_to_slug_does_not_misparse_local_path_with_colon() {
+        assert_eq!(remote_url_to_slug("local/path:with-colon"), None);
     }
 
     #[test]

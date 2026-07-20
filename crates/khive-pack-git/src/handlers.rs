@@ -404,6 +404,17 @@ async fn find_project_by_legacy_repo_url(
 /// #1173 items 2/3). A hard-deleted anchor cannot be detected this way — its
 /// row, including `properties.repo_slug`, is gone — this covers the soft
 /// delete (the default; see ADR-014) case, where the identity survives.
+///
+/// Multiple soft-deleted tombstones can share the same identity (repeated
+/// delete/re-ingest cycles). The most-recently-deleted one is not
+/// necessarily the one still holding the live corpus — e.g. a later
+/// tombstone created by an empty re-ingest-then-delete has zero annotating
+/// notes while an older one still has the original corpus. Every matching
+/// tombstone (newest first) is checked in turn; the signal fires only for
+/// the first one found with at least one live annotating note. A tombstone
+/// with zero live notes is not an orphan — it is a routine delete of an
+/// already-empty anchor — so `None` is returned instead of `Some` with a
+/// zero count.
 async fn find_orphaned_anchor(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -412,13 +423,13 @@ async fn find_orphaned_anchor(
 ) -> anyhow::Result<Option<OrphanSignal>> {
     let sql = runtime.sql();
     let mut r = sql.reader().await.map_err(|e| anyhow!("{e}"))?;
-    let row = r
-        .query_row(SqlStatement {
+    let rows = r
+        .query_all(SqlStatement {
             sql: "SELECT id FROM entities WHERE kind='project' AND namespace=?1 \
                   AND deleted_at IS NOT NULL \
                   AND (json_extract(properties,'$.repo_slug')=?2 \
                        OR json_extract(properties,'$.repo_url')=?3) \
-                  ORDER BY deleted_at DESC LIMIT 1"
+                  ORDER BY deleted_at DESC"
                 .into(),
             params: vec![
                 SqlValue::Text(token.namespace().as_str().to_string()),
@@ -429,39 +440,42 @@ async fn find_orphaned_anchor(
         })
         .await
         .map_err(|e| anyhow!("{e}"))?;
-    let Some(dead_project_id) = row.and_then(|r| match r.get("id") {
+    let dead_project_ids = rows.into_iter().filter_map(|r| match r.get("id") {
         Some(SqlValue::Uuid(u)) => Some(*u),
         Some(SqlValue::Text(s)) => Uuid::parse_str(s).ok(),
         _ => None,
-    }) else {
-        return Ok(None);
-    };
+    });
 
-    let count = r
-        .query_scalar(SqlStatement {
-            sql: "SELECT COUNT(*) FROM notes n \
-                  JOIN graph_edges e ON e.source_id = n.id AND e.namespace = n.namespace \
-                  WHERE n.namespace = ?1 AND n.deleted_at IS NULL \
-                  AND n.kind IN ('commit', 'issue', 'pull_request') \
-                  AND e.relation = 'annotates' AND e.target_id = ?2 AND e.deleted_at IS NULL"
-                .into(),
-            params: vec![
-                SqlValue::Text(token.namespace().as_str().to_string()),
-                SqlValue::Text(dead_project_id.to_string()),
-            ],
-            label: Some("git_digest_count_orphaned_notes".into()),
-        })
-        .await
-        .map_err(|e| anyhow!("{e}"))?;
-    let annotated_note_count = match count {
-        Some(SqlValue::Integer(n)) => n as u64,
-        _ => 0,
-    };
+    for dead_project_id in dead_project_ids {
+        let count = r
+            .query_scalar(SqlStatement {
+                sql: "SELECT COUNT(*) FROM notes n \
+                      JOIN graph_edges e ON e.source_id = n.id AND e.namespace = n.namespace \
+                      WHERE n.namespace = ?1 AND n.deleted_at IS NULL \
+                      AND n.kind IN ('commit', 'issue', 'pull_request') \
+                      AND e.relation = 'annotates' AND e.target_id = ?2 AND e.deleted_at IS NULL"
+                    .into(),
+                params: vec![
+                    SqlValue::Text(token.namespace().as_str().to_string()),
+                    SqlValue::Text(dead_project_id.to_string()),
+                ],
+                label: Some("git_digest_count_orphaned_notes".into()),
+            })
+            .await
+            .map_err(|e| anyhow!("{e}"))?;
+        let annotated_note_count = match count {
+            Some(SqlValue::Integer(n)) => n as u64,
+            _ => 0,
+        };
+        if annotated_note_count > 0 {
+            return Ok(Some(OrphanSignal {
+                dead_project_id,
+                annotated_note_count,
+            }));
+        }
+    }
 
-    Ok(Some(OrphanSignal {
-        dead_project_id,
-        annotated_note_count,
-    }))
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -694,5 +708,119 @@ mod tests {
             .expect("orphaned corpus must be flagged, not silent");
         assert_eq!(orphan.dead_project_id, dead_id);
         assert_eq!(orphan.annotated_note_count, 2);
+    }
+
+    /// A soft-deleted anchor with zero live annotating notes is a routine
+    /// delete of an already-empty anchor, not an orphaned corpus -- it must
+    /// not raise the signal (issue #1185 finding 3).
+    #[tokio::test]
+    async fn tombstone_with_zero_live_notes_is_not_flagged_as_orphan() {
+        let (rt, token, registry) = fixture().await;
+
+        let source = DigestSource::Remote {
+            canonical: "https://github.com/org/empty-tombstone-repo".to_string(),
+            gh_slug: Some(("org".to_string(), "empty-tombstone-repo".to_string())),
+        };
+
+        let dead = registry
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "project",
+                    "name": "empty-tombstone-repo",
+                    "properties": {
+                        "repo_url": "https://github.com/org/empty-tombstone-repo",
+                        "repo_slug": "github.com/org/empty-tombstone-repo",
+                    },
+                }),
+            )
+            .await
+            .expect("create dead anchor");
+        let dead_id = Uuid::parse_str(dead["id"].as_str().unwrap()).expect("uuid");
+
+        // No annotating notes created -- this tombstone never had a corpus.
+        let deleted = rt
+            .delete_entity(&token, dead_id, false)
+            .await
+            .expect("soft delete");
+        assert!(deleted);
+
+        let resolution = resolve_or_create_project(&rt, &registry, &token, &source)
+            .await
+            .expect("resolve");
+        assert!(resolution.created);
+        assert!(
+            resolution.orphan.is_none(),
+            "zero live notes must not raise the orphan signal"
+        );
+    }
+
+    /// When several soft-deleted tombstones share the same repo identity,
+    /// the signal must select the one that actually still has a live
+    /// annotating corpus -- not merely the most-recently-deleted one (issue
+    /// #1185 finding 3).
+    #[tokio::test]
+    async fn orphan_signal_selects_tombstone_with_live_corpus_among_several() {
+        let (rt, token, registry) = fixture().await;
+
+        let source = DigestSource::Remote {
+            canonical: "https://github.com/org/multi-tombstone-repo".to_string(),
+            gh_slug: Some(("org".to_string(), "multi-tombstone-repo".to_string())),
+        };
+        let properties = json!({
+            "repo_url": "https://github.com/org/multi-tombstone-repo",
+            "repo_slug": "github.com/org/multi-tombstone-repo",
+        });
+
+        // Older tombstone: still has a live annotating corpus.
+        let old_dead = registry
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "project",
+                    "name": "multi-tombstone-repo",
+                    "properties": properties.clone(),
+                }),
+            )
+            .await
+            .expect("create old dead anchor");
+        let old_dead_id = Uuid::parse_str(old_dead["id"].as_str().unwrap()).expect("uuid");
+        create_note_annotating(&registry, "commit", "c-old", old_dead_id).await;
+        rt.delete_entity(&token, old_dead_id, false)
+            .await
+            .expect("soft delete old");
+
+        // deleted_at ordering must be distinct for the two tombstones.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        // Newer tombstone: an empty re-ingest-then-delete cycle, zero live notes.
+        let new_dead = registry
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "project",
+                    "name": "multi-tombstone-repo",
+                    "properties": properties,
+                }),
+            )
+            .await
+            .expect("create new dead anchor");
+        let new_dead_id = Uuid::parse_str(new_dead["id"].as_str().unwrap()).expect("uuid");
+        rt.delete_entity(&token, new_dead_id, false)
+            .await
+            .expect("soft delete new");
+
+        let resolution = resolve_or_create_project(&rt, &registry, &token, &source)
+            .await
+            .expect("resolve");
+        assert!(resolution.created);
+        let orphan = resolution
+            .orphan
+            .expect("orphaned corpus must be flagged, not silent");
+        assert_eq!(
+            orphan.dead_project_id, old_dead_id,
+            "signal must point at the tombstone with the live corpus, not merely the most recent one"
+        );
+        assert_eq!(orphan.annotated_note_count, 1);
     }
 }
