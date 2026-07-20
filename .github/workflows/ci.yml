@@ -181,9 +181,6 @@ jobs:
       - name: Workspace tests
         if: env.CI_SUITE == 'full'
         run: ../scripts/ci.sh tests
-      - name: Channel-email feature tests
-        if: env.CI_SUITE == 'full'
-        run: ../scripts/ci.sh channel-email
       - name: No-default-features check
         if: env.CI_SUITE == 'full'
         run: ../scripts/ci.sh no-default-features

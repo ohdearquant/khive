@@ -10,10 +10,6 @@
 // section exercises the same server construction path and that helper changes
 // propagate to all coverage areas simultaneously.
 
-// Force the knowledge pack to be linked (inventory::submit! requires the crate
-// to be linked into the test binary for its PackRegistration to self-register).
-use khive_pack_knowledge as _;
-
 use async_trait::async_trait;
 use khive_mcp::server::KhiveMcpServer;
 use khive_runtime::{
@@ -3701,59 +3697,6 @@ async fn agenda_rejects_unknown_kwarg() -> anyhow::Result<()> {
         first["ok"],
         json!(false),
         "agenda with unknown kwarg must fail; got: {first}"
-    );
-    let err = first["error"].as_str().unwrap_or("");
-    assert!(
-        err.contains("unknownkw") || err.contains("unknown field"),
-        "error must mention the unknown field; got: {err}"
-    );
-    Ok(())
-}
-
-fn make_knowledge_server() -> KhiveMcpServer {
-    disable_daemon();
-    let config = RuntimeConfig {
-        db_path: None,
-        default_namespace: Namespace::parse("knowtest").unwrap(),
-        embedding_model: None,
-        additional_embedding_models: vec![],
-        packs: vec!["kg".to_string(), "knowledge".to_string()],
-        ..RuntimeConfig::default()
-    };
-    let runtime = KhiveRuntime::new(config).expect("kg+knowledge runtime");
-    KhiveMcpServer::new(runtime).expect("server builds with kg+knowledge")
-}
-
-async fn connect_knowledge(
-) -> anyhow::Result<impl std::ops::Deref<Target = rmcp::service::Peer<rmcp::RoleClient>>> {
-    let (server_transport, client_transport) = tokio::io::duplex(65536);
-    let server = make_knowledge_server();
-    tokio::spawn(async move {
-        if let Ok(svc) = server.serve(server_transport).await {
-            let _ = svc.waiting().await;
-        }
-    });
-    let client = DummyClient.serve(client_transport).await?;
-    Ok(client)
-}
-
-/// `topic(unknownkw="x")` (knowledge) must return `ok: false`.
-#[tokio::test]
-async fn topic_rejects_unknown_kwarg() -> anyhow::Result<()> {
-    let client = connect_knowledge().await?;
-
-    let result = call(
-        &client,
-        "request",
-        json!({ "ops": r#"knowledge.topic(unknownkw="oops")"# }),
-    )
-    .await?;
-    let body: Value = serde_json::from_str(&first_text(&result))?;
-    let first = &body["results"][0];
-    assert_eq!(
-        first["ok"],
-        json!(false),
-        "topic with unknown kwarg must fail; got: {first}"
     );
     let err = first["error"].as_str().unwrap_or("");
     assert!(

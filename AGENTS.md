@@ -11,21 +11,17 @@ khive gives your agent:
 5. **Memory** — salience- and decay-weighted recall across sessions
 6. **Communication** — namespaced message passing between agents
 7. **Scheduling** — time-triggered reminders and future verb dispatch
-8. **Knowledge corpus** — atom/domain CRUD, FTS + embedding search, compose briefings
-9. **Blob storage** — content-addressed storage for binary artifacts
-10. **Session** — persist and resume agent-session records
+8. **Session** — persist and resume agent-session records
 
-All 11 packs load by default. **70 public verbs** across the packs: the `git` pack
-contributes the `git.digest` verb plus the commit/issue/pull_request provenance note kinds
-and a batch ingester, and three write verbs, `git.commit` / `git.branch` / `git.push`
-(ADR-108), that shell to system git with hardened, allowlisted argv construction — no
-tag/merge/checkout/pull/fetch, no force-push under any argument combination; the `code`
-pack contributes one verb, `code.ingest` (L1 manifest + L1.5 import-scan source ingestion
-into a dedicated map database, ADR-085 Amendment 2); its `finding` note kind is still
-written only through the `kkernel code-ingest` admin CLI path (ADR-085 D1, Amendment 3);
-the `workspace` pack contributes zero verbs, adding only the `workspace` entity kind and
-`contains` endpoint rules to git/gtd/session notes (#873). Regenerate via
-`request(ops="verbs()")`
+All packs load by default. Verbs across the packs: the `git` pack contributes the
+`git.digest` verb plus the commit/issue/pull_request provenance note kinds and a batch
+ingester, and three write verbs, `git.commit` / `git.branch` / `git.push` (ADR-108), that
+shell to system git with hardened, allowlisted argv construction — no
+tag/merge/checkout/pull/fetch, no force-push under any argument combination; the
+`workspace` pack contributes zero verbs, adding only the `workspace` entity kind and
+`contains` endpoint rules to git/gtd/session notes (#873). Code-quality and formal-methods
+(Lean) ontology packs are a commercially licensed extension and are not part of the
+open-source distribution. Regenerate via `request(ops="verbs()")`
 before editing this line.
 
 If you're working on khive itself (writing code in this repo), see `CLAUDE.md` instead.
@@ -171,40 +167,9 @@ or `comm.thread`.
 | `schedule.agenda`   | List upcoming scheduled events                | "What's on the calendar?"                                     |
 | `schedule.cancel`   | Cancel a scheduled event                      | Remove a pending reminder/action                              |
 
-### Knowledge pack — 19 verbs (`knowledge.` prefix)
-
-| Verb                       | What it does                                            | When to use                                  |
-| -------------------------- | ------------------------------------------------------- | -------------------------------------------- |
-| `knowledge.upsert_atoms`   | Bulk insert/update atoms by slug                        | Ingesting knowledge corpus                   |
-| `knowledge.upsert_domains` | Bulk insert/update domain groupings                     | Organizing atoms into domains                |
-| `knowledge.get`            | Fetch atom/domain by UUID or slug                       | Read a specific knowledge entry              |
-| `knowledge.list`           | Paginated listing of atoms or domains                   | Browse the corpus                            |
-| `knowledge.search`         | TF-IDF search with embedding rerank (default on)        | Finding relevant knowledge                   |
-| `knowledge.suggest`        | Orient query against domains for composition            | "Which domains cover topic X?"               |
-| `knowledge.compose`        | Compose a markdown briefing from selected atoms/domains | Build a context briefing for an agent        |
-| `knowledge.edit`           | Upsert sections for an atom                             | Update part of an atom without wiping others |
-| `knowledge.import`         | Ingest markdown files as atoms                          | Batch import from filesystem                 |
-| `knowledge.delete_atoms`   | Soft-delete atoms by slug or ID                         | Retire stale knowledge                       |
-| `knowledge.stats`          | Corpus statistics: atom/domain/coverage counts          | Health check                                 |
-| `knowledge.index`          | Backfill embeddings + FTS                               | After bulk import or reindex                 |
-| `knowledge.fold`           | Budget-constrained knapsack selection                   | Token-aware subset picking                   |
-| `knowledge.challenge`      | Mark a section as disputed                              | Flag incorrect content                       |
-| `knowledge.adjudicate`     | Resolve a disputed section                              | Accept or reject a challenge                 |
-| `knowledge.learn`          | Register a concept entity with domain/tags              | Quick concept creation                       |
-| `knowledge.cite`           | Link concept → paper/person/org (introduced_by edge)    | Attribution                                  |
-| `knowledge.topic`          | List concepts by domain or free-text                    | Explore the concept graph                    |
-| `knowledge.feedback`       | Apply per-section feedback signals to posterior weights | Signal useful/not_useful on compose results  |
-
-`knowledge.search` supports `decompose=true` for multi-concept query splitting (avoids FTS edge
-cases). Scores are normalized to [0,1] when `rerank` is active (default).
-Pass `kind=` (`"atom"` or `"domain"`) to filter by result type; `type=` is accepted as a legacy
-alias. `knowledge.list` accepts the same `kind=`/`type=` discriminant.
-
-`knowledge.edit` takes `sections=[{section_type, content, heading?, sort_order?}]`. `section_type`
-is a **closed enum** — valid values: `overview` | `core_model` | `boundary_conditions` |
-`formalism` | `operational_guidance` | `examples` | `failure_modes` | `expert_lens` |
-`references` | `other`. Content must be **at least 80 characters**. Shorter content or an
-unrecognized `section_type` returns a validation error listing the valid values.
+`knowledge.` verbs (atom/domain corpus, TF-IDF + embedding-rerank search, composition,
+section feedback) are provided by a commercial extension and are not part of the
+open-source distribution.
 
 ### Session pack — 4 verbs (`session.` prefix)
 
@@ -655,7 +620,7 @@ If you are adding a new pack or a new verb to an existing pack:
 ## Daemon and warm startup
 
 The `kkernel` binary auto-spawns a background daemon (`kkernel mcp --daemon`) on the first request. The daemon
-keeps the ANN index and embedding model warm so `knowledge.search` and `memory.recall` are fast on
+keeps the ANN index and embedding model warm so `memory.recall` is fast on
 subsequent calls. Users do not need to configure or manage the daemon — it starts automatically and
 cleans up on exit.
 

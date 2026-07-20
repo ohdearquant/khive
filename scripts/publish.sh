@@ -68,23 +68,17 @@ CRATES=(
     khive-vcs
     khive-changeset      # needs khive-types (above)
     # khive-merge — excluded from workspace (ADR-043 forward-deployed, ahead of khive-vcs)
-    khive-pack-formal    # needs khive-runtime + khive-types (both above); dev-dep of khive-pack-kg, so publish first
     khive-pack-kg
     khive-pack-git       # needs khive-runtime/storage + khive-pack-kg (all above)
-    khive-pack-code      # needs khive-runtime/storage + khive-pack-kg (all above)
     khive-pack-gtd
     khive-brain-core
     khive-pack-memory
     khive-pack-comm
     khive-pack-schedule
-    khive-pack-knowledge
     khive-pack-session   # needs khive-pack-kg + khive-runtime/storage/types (all above)
     khive-pack-workspace # needs khive-pack-kg/gtd/git/session (all above)
     khive-pack-template
     khive-pack-blob        # needs khive-runtime/storage/types (all above); dep of khive-mcp
-    khive-channel          # no khive-* deps; transport abstraction
-    khive-channel-email    # needs khive-channel (above); optional dep of khive-mcp
-    khive-channel-telegram # needs khive-channel (above); optional dep of khive-mcp
     khive-mcp
     kkernel
 )
@@ -114,10 +108,9 @@ echo "    CRATES ladder OK (${#CRATES[@]} publishable workspace members all pres
 # (which is why it is NOT a per-PR CI gate). Runs in preflight and live alike so
 # `make publish-dry` validates SemVer before any real publish. Crates with no
 # crates.io baseline yet (never published) have nothing to diff against and are
-# excluded until their first publish. As of the 0.5.0 cycle those are
-# khive-channel-telegram (added since 0.4.0 via #1048) and khive-pack-blob
-# (the new blob-verb pack, not yet released). The four crates first
-# published in 0.4.0 — khive-changeset, khive-pack-code, khive-pack-git,
+# excluded until their first publish. As of the 0.5.0 cycle that is
+# khive-pack-blob (the new blob-verb pack, not yet released). The four crates
+# first published in 0.4.0 — khive-changeset, khive-pack-code, khive-pack-git,
 # khive-pack-workspace — now have a 0.4.0 baseline and are checked again. Every
 # other workspace crate has a published baseline and MUST be checked. Drop an
 # exclusion once that crate has one published version.
@@ -129,7 +122,6 @@ if ! command -v cargo-semver-checks >/dev/null 2>&1; then
     exit 1
 fi
 cargo semver-checks check-release --workspace \
-    --exclude khive-channel-telegram \
     --exclude khive-pack-blob
 echo "    SemVer gate OK"
 

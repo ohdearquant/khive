@@ -30,7 +30,6 @@ The `search(tags=[...])` filter checks the correct field for each substrate.
 
 Out of scope for this file (covered elsewhere in the suite):
   - create_many bulk verb (#232) — see tests/test_create_many.py
-  - khive-pack-formal / EntityOfType (#231) — see tests/test_formal_pack.py
   - True N-physical-backend fan-out routing (storage-pluggability unmerged)
 """
 

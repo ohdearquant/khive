@@ -127,7 +127,7 @@ jobs:
                 crates/khive-db/*|crates/khive-fold/*|crates/khive-brain-core/*|crates/khive-pack-comm/*)
                   storage_brain=true
                   ;;
-                crates/khive-pack-gtd/*|crates/khive-pack-kg/*|crates/khive-pack-knowledge/*|crates/khive-pack-memory/*|crates/khive-pack-schedule/*)
+                crates/khive-pack-gtd/*|crates/khive-pack-kg/*|crates/khive-pack-memory/*|crates/khive-pack-schedule/*)
                   packs=true
                   ;;
                 crates/Cargo.toml|crates/Cargo.lock|scripts/perf/bench_track.py|scripts/perf/bench_calibrate.py|scripts/perf/publish_ledger.sh|scripts/bench_1m.sh|.github/workflows/bench-track.yml|.github/workflows/bench-component.yml)
@@ -205,7 +205,7 @@ jobs:
     uses: ./.github/workflows/bench-component.yml
     with:
       component: packs
-      crates: khive-pack-gtd khive-pack-kg khive-pack-knowledge khive-pack-memory khive-pack-schedule
+      crates: khive-pack-gtd khive-pack-kg khive-pack-memory khive-pack-schedule
       # The packs bench-target compile alone runs ~16m (issue #940); the
       # default 20m budget killed the Criterion step mid-run on every main
       # push and the ledger steps skipped, leaving the trend data packs-blind.

@@ -62,9 +62,7 @@ Create or update `.mcp.json` in your project root:
         "--pack",
         "comm",
         "--pack",
-        "schedule",
-        "--pack",
-        "knowledge"
+        "schedule"
       ],
       "env": {
         "KHIVE_ACTOR": "lambda:your-id"
@@ -92,13 +90,11 @@ claude mcp add --transport stdio khive -- kkernel mcp --pack comm
 # Schedule only
 claude mcp add --transport stdio khive -- kkernel mcp --pack schedule
 
-# Knowledge only
-claude mcp add --transport stdio khive -- kkernel mcp --pack knowledge
-
 # All packs (recommended)
 claude mcp add --transport stdio khive -- kkernel mcp \
   --pack kg --pack gtd --pack memory \
-  --pack comm --pack schedule --pack knowledge
+  --pack comm --pack schedule --pack session --pack git \
+  --pack workspace --pack blob
 ```
 
 ### Set your actor identity (attribution)
@@ -185,13 +181,6 @@ request(ops="comm.inbox(limit=1)")
 
 ```text
 request(ops="schedule.agenda()")
-```
-
-### Knowledge pack smoke tests
-
-```text
-request(ops="knowledge.stats()")
-request(ops="knowledge.search(query=\"test\", limit=1)")
 ```
 
 ## Step 5 — Run the example validator

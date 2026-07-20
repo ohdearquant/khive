@@ -307,10 +307,8 @@ impl Default for RuntimeConfig {
                     "memory",
                     "comm",
                     "schedule",
-                    "knowledge",
                     "session",
                     "git",
-                    "code",
                     "workspace",
                     "blob",
                 ]
