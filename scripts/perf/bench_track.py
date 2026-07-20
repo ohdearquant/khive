@@ -10,10 +10,10 @@ That is `bench_calibrate.py`'s job for calibration and, eventually, a real
 CI gate's job for enforcement.
 
 Three metric sources, one record shape:
-  calibrate   reuse scripts/perf/bench_calibrate.py's SUITES registry
-              (pipeline, load) - runs the suite's build_cmd once via
-              bench_calibrate._run_once and reuses its extractor. Does not
-              duplicate the pipeline/load stdout-parsing regexes.
+  calibrate   reuse scripts/perf/bench_calibrate.py's SUITES registry -
+              runs the suite's build_cmd once via bench_calibrate._run_once
+              and reuses its extractor. Does not duplicate any suite's
+              stdout-parsing logic.
   json        flatten every numeric leaf out of an arbitrary bench JSON file
               (e.g. the BENCH_JSON scripts/bench_1m.sh --ci-synthetic writes).
   criterion   walk a `cargo bench` --quick output tree
@@ -142,8 +142,8 @@ def collect_calibrate_metrics(
     bench-program spec's promotion ladder), so a suite whose own internal
     recall/precision gate returns FAIL is exactly the interesting data point
     to record, not a reason to record nothing. `_run_once_no_gate` below
-    reuses the suite's own `build_cmd`/`extract` pair (the pipeline/load
-    stdout and JSON parsing logic is not duplicated here) but always
+    reuses the suite's own `build_cmd`/`extract` pair (no suite's stdout or
+    JSON parsing logic is duplicated here) but always
     attempts extraction regardless of the child's exit code.
     """
     if suite_name not in calibrate.SUITES:
@@ -217,8 +217,8 @@ def _run_once_no_gate(
 
     cp = subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
     # Extraction runs regardless of proc.returncode - a nonzero exit caused
-    # by the suite's own internal threshold (e.g. bench_pipeline_daemon.py's
-    # "Gate: FAIL" -> exit 1) still has fully-formed stdout to extract from.
+    # by the suite's own internal threshold ("Gate: FAIL" -> exit 1) still
+    # has fully-formed stdout to extract from.
     # A genuinely broken run (crash before any output) still surfaces loudly
     # here via SchemaError from the extractor finding no expected output.
     metrics = suite["extract"](run_dir, cp)
@@ -588,7 +588,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     rec = sub.add_parser("record", help="run one suite once and append a trend-ledger record")
-    rec.add_argument("--suite", required=True, help="ledger name, e.g. pipeline, load, bench-1m, components")
+    rec.add_argument("--suite", required=True, help="ledger name, e.g. bench-1m, components")
     rec.add_argument("--source", required=True, choices=["calibrate", "json", "criterion"])
     rec.add_argument("--json-file", help="(--source json) path to a bench JSON file to flatten")
     rec.add_argument("--json-prefix", default="", help="(--source json) key prefix for flattened metrics")
