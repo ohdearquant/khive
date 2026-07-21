@@ -1612,6 +1612,51 @@ async fn get_dispatch_after_merge_discloses_kept_id() {
         "expected a merged_into disclosure naming {}, got {msg:?}",
         into.id
     );
+
+    // The documented short-prefix form must reach the same disclosure:
+    // absorbed entities are soft-deleted, so this exercises the
+    // including-deleted prefix-resolution fallback in handle_get.
+    let short = from.id.to_string().replace('-', "")[..8].to_string();
+    let err = registry
+        .dispatch("get", json!({ "id": short }))
+        .await
+        .expect_err("get on an absorbed short id must still miss");
+    let RuntimeError::NotFound(msg) = err else {
+        panic!("expected NotFound, got {err:?}");
+    };
+    assert!(
+        msg.contains("was merged into") && msg.contains(&into.id.to_string()),
+        "expected a merged_into disclosure for the short-prefix form naming {}, got {msg:?}",
+        into.id
+    );
+}
+
+#[tokio::test]
+async fn get_dispatch_short_prefix_with_include_deleted_returns_deleted_entity() {
+    let (rt, token, _pack) = configured_kg_pack().await;
+    let mut builder = khive_runtime::VerbRegistryBuilder::new();
+    builder.register(crate::KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry build");
+
+    let entity = rt
+        .create_entity(&token, "concept", None, "SoftDeleted", None, None, vec![])
+        .await
+        .expect("create entity");
+    assert!(rt.delete_entity(&token, entity.id, false).await.unwrap());
+
+    let short = entity.id.to_string().replace('-', "")[..8].to_string();
+    let got = registry
+        .dispatch("get", json!({ "id": short, "include_deleted": true }))
+        .await
+        .expect("short prefix + include_deleted must return the soft-deleted entity");
+    assert_eq!(
+        got.get("id").and_then(|v| v.as_str()),
+        Some(entity.id.to_string().as_str())
+    );
+    assert!(
+        got.get("deleted_at").and_then(|v| v.as_str()).is_some(),
+        "deleted_at must be populated on the returned soft-deleted entity, got {got:?}"
+    );
 }
 
 #[tokio::test]
