@@ -147,7 +147,7 @@ available to operator-only introspection.
 ### 4. Verb naming — kg bare, all others pack-prefixed
 
 The native kg pack (`khive-pack-kg`) owns the **substrate verbs** and exposes them as
-bare verb names (17 verbs total):
+bare verb names (18 verbs total):
 
 | Verb        | Speech act  | Description                                                                                                                                                                                                                                                                                                                                                                                     |
 | ----------- | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -168,6 +168,7 @@ bare verb names (17 verbs total):
 | `stats`     | assertive   | Aggregate counts and health metrics for the namespace graph.                                                                                                                                                                                                                                                                                                                                    |
 | `verbs`     | assertive   | Enumerate all MCP-callable verbs; supports `category` and `pack` filters.                                                                                                                                                                                                                                                                                                                       |
 | `context`   | assertive   | Entity-anchored graph context in one call: resolves anchors (by ID or hybrid search), expands 1-2 hops with per-node fanout caps, and packs the result within a char budget (ADR-089).                                                                                                                                                                                                          |
+| `resolve`   | assertive   | Resolve natural-language references to record ids: id-string passthrough, recently-referenced ring, exact-name match, then hybrid-search fallback; returns Resolved/Ambiguous/NotFound per ref, never a silent pick.                                                                                                                                                                            |
 
 `verbs` was added in Wave 4 (ue-help-introspection H5) to provide a machine-readable discovery
 endpoint. It is a pure read operation with no side effects. It excludes internal subhandlers
@@ -202,7 +203,7 @@ The single rule: **first dot is always the pack name. There is no second dot.**
 `crates/kkernel/tests/verb_namespace_contract.rs`. The test loads every
 `inventory`-registered pack, walks all `HandlerDef` names, and asserts:
 
-- A bare name (no dot) must be in the 17-entry kg-substrate allowlist.
+- A bare name (no dot) must be in the 18-entry kg-substrate allowlist.
 - A dotted name must carry exactly one dot whose prefix matches `Pack::NAME`.
 - Two or more dots are always a violation.
 
@@ -741,9 +742,13 @@ downstream.
 ### Data in place
 
 No schema or data migration accompanies this change. A database written by a
-fuller pack set opens under the reduced default; records belonging to
-unloaded packs remain stored and queryable through the substrate-level kg
-verbs, while the unloaded packs' own verbs are simply not registered.
+fuller pack set opens under the reduced default, and no stored data is
+altered or removed. Substrate records that extension packs store as entities
+and notes remain reachable through the substrate-level kg verbs to the
+extent those verbs' own resolution rules cover them; pack-private auxiliary
+state (for example profile tables) and content-addressed blob objects are
+retained on disk but are not accessible until the owning pack — and with it
+the pack's registered resolvers and verbs — is loaded again.
 
 ## References
 

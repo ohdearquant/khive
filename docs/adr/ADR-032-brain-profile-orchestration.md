@@ -1338,3 +1338,11 @@ Until the extraction change lands, the in-tree crate remains present, force-link
 and part of the default pack set, and this ADR's pre-amendment text describes it
 as-is. Nothing normative here is superseded: this ADR continues to govern the pack
 wherever the extension is deployed.
+
+**Follow-up (same date):** a second extraction, recorded in the ADR-023 amendment
+"single-pack open-source surface," moved `khive-pack-memory` — the sole in-tree
+consumer of `khive-brain-core` — out of this repository, and `khive-brain-core`
+departed with it. The preceding paragraph's "remains in the open-source tree"
+statement was grounded in that consumer dependency and no longer holds; the
+interface crate now ships alongside the commercially licensed extensions. This
+ADR's governance of the brain pack's behavior is unchanged.
