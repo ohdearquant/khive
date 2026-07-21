@@ -679,11 +679,17 @@ fn concurrent_boots_converge() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("concurrent-boot.db");
 
+    // Both threads open their connection first, then release through a barrier
+    // so the two run_migrations calls genuinely race for the write lock
+    // instead of serializing on thread spawn latency.
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
     let handles: Vec<_> = (0..2)
         .map(|_| {
             let path = path.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
             std::thread::spawn(move || {
                 let mut conn = Connection::open(&path).expect("open");
+                barrier.wait();
                 run_migrations(&mut conn)
             })
         })

@@ -249,13 +249,18 @@ pub fn inspect_schema_version(path: &std::path::Path) -> Result<u32, SqliteError
 
 pub fn run_migrations(conn: &mut Connection) -> Result<u32, SqliteError> {
     // Concurrent boots (multiple processes migrating the same file) contend on
-    // the write lock below; the pool default busy_timeout is tuned for hot-path
-    // queries and is too short to wait out a sibling's migration. Raise it for
-    // the migration run and restore the caller's value after.
+    // the write lock below; a short hot-path busy_timeout cannot wait out a
+    // sibling's migration. Raise-only to a 5s floor — never reduce a caller
+    // whose configured timeout is already longer — and restore after.
     let prior_busy_ms: i64 = conn.query_row("PRAGMA busy_timeout", [], |row| row.get(0))?;
-    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    let raised = prior_busy_ms < 5_000;
+    if raised {
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    }
     let result = run_migrations_locked(conn);
-    let _ = conn.busy_timeout(std::time::Duration::from_millis(prior_busy_ms.max(0) as u64));
+    if raised {
+        let _ = conn.busy_timeout(std::time::Duration::from_millis(prior_busy_ms.max(0) as u64));
+    }
     result
 }
 
@@ -280,9 +285,14 @@ fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
     }
 
     let mut applied_version = current_version;
+    // Floor advanced when a sibling's work is observed under the write lock,
+    // so a losing process skips the remaining already-applied migrations
+    // without opening a transaction for each.
+    let mut skip_through = current_version;
 
     for migration in MIGRATIONS {
-        if migration.version <= current_version {
+        if migration.version <= skip_through {
+            applied_version = applied_version.max(migration.version);
             continue;
         }
 
@@ -297,19 +307,21 @@ fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
             })?;
 
         // Re-check under the write lock: a sibling process may have applied
-        // this migration while we waited. Running its DDL again would fail.
-        let already_applied: bool = tx
+        // this migration (and possibly later ones) while we waited. Running
+        // its DDL again would fail; fast-forward past everything it applied.
+        let sibling_version: u32 = tx
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM _schema_migrations WHERE version = ?1)",
-                rusqlite::params![migration.version],
+                "SELECT COALESCE(MAX(version), 0) FROM _schema_migrations",
+                [],
                 |row| row.get(0),
             )
             .map_err(|e| SqliteError::Migration {
                 version: migration.version,
                 error: e.to_string(),
             })?;
-        if already_applied {
-            applied_version = migration.version;
+        if sibling_version >= migration.version {
+            skip_through = sibling_version.min(latest_version);
+            applied_version = applied_version.max(migration.version);
             continue;
         }
 
