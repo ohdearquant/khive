@@ -671,13 +671,27 @@ fn read_schema_version_missing_ledger_is_zero() {
     );
 }
 
+/// Clears the shared `test_sync` barrier on drop so a panicking test cannot
+/// strand it and hang every later test that opts into the contention hook.
+struct BarrierGuard;
+
+impl Drop for BarrierGuard {
+    fn drop(&mut self) {
+        *test_sync::STALE_READ_BARRIER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+}
+
 // khive#1212: two processes booting the same database file must both complete
 // migrations — the IMMEDIATE transaction serializes them and the under-lock
 // re-check makes the loser converge instead of failing on already-applied DDL.
 #[test]
+#[serial_test::serial(migration_contention)]
 fn concurrent_boots_converge() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("concurrent-boot.db");
+    let _guard = BarrierGuard;
 
     // Deterministic interleaving via the in-crate stale-read barrier: both
     // threads must observe the empty ledger (version 0, no lock held) before
@@ -746,5 +760,75 @@ fn concurrent_boots_converge() {
         rows as usize,
         MIGRATIONS.len(),
         "exactly one ledger row per migration"
+    );
+}
+
+// khive#1217 review blocking finding: the pre-lock ahead-of-latest guard runs
+// on a stale read. If a NEWER build commits a schema version above this
+// binary's latest while this process waits for the migration write lock, the
+// under-lock re-read must reject that version — not clamp it into a false Ok.
+#[test]
+#[serial_test::serial(migration_contention)]
+fn mixed_version_boot_rejects_newer_schema_under_lock() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("mixed-version-boot.db");
+    let _guard = BarrierGuard;
+
+    // The "newer build": create the ledger, then hold an uncommitted
+    // IMMEDIATE transaction carrying a version above latest. Uncommitted, it
+    // is invisible to the booting thread's stale read regardless of thread
+    // scheduling; committed only after the barrier, it is ordered before the
+    // booting thread's under-lock re-read by the write lock itself. That
+    // makes the under-lock guard — not the pre-lock guard — the one that
+    // must fire.
+    let newer = Connection::open(&path).expect("open newer-build connection");
+    newer
+        .execute_batch(MIGRATION_TRACKING_TABLE)
+        .expect("create ledger");
+    let latest = MIGRATIONS.last().expect("at least one migration").version;
+    newer
+        .execute_batch(&format!(
+            "BEGIN IMMEDIATE; INSERT INTO _schema_migrations (version, name, applied_at) \
+             VALUES ({}, 'future-build', 0);",
+            latest + 1
+        ))
+        .expect("stage future version uncommitted");
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    *test_sync::STALE_READ_BARRIER.lock().unwrap() = Some(barrier.clone());
+    test_sync::BUSY_OBSERVED.store(false, std::sync::atomic::Ordering::SeqCst);
+    test_sync::WINNER_COMMITTED.store(false, std::sync::atomic::Ordering::SeqCst);
+    test_sync::LOSER_SAW_WINNER_COMMIT.store(false, std::sync::atomic::Ordering::SeqCst);
+
+    let boot = {
+        let path = path.clone();
+        std::thread::spawn(move || {
+            test_sync::PARTICIPATE.with(|p| p.set(true));
+            let mut conn = Connection::open(&path).expect("open booting connection");
+            run_migrations(&mut conn)
+        })
+    };
+
+    // Rendezvous: the booting thread has read the (stale, version-0) ledger
+    // and is released toward its BEGIN IMMEDIATE, which blocks on the lock
+    // still held here. Committing now publishes the future version strictly
+    // before the boot's under-lock re-read.
+    barrier.wait();
+    newer
+        .execute_batch("COMMIT")
+        .expect("commit future version");
+
+    let err = boot
+        .join()
+        .expect("thread join")
+        .expect_err("a schema version above latest must be rejected, not clamped");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("ahead of the latest known migration"),
+        "unexpected error: {msg}"
+    );
+    assert!(
+        msg.contains("migration write lock"),
+        "the under-lock guard, not the pre-lock guard, must fire: {msg}"
     );
 }

@@ -410,6 +410,19 @@ fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
             }
         }
 
+        // The ahead-of-latest guard above ran on a pre-lock read; a newer
+        // build may have committed a version past ours while we waited for
+        // the write lock. Accepting it (clamped) would return Ok on a schema
+        // this binary does not understand — reject it the same way.
+        if sibling_version > latest_version {
+            return Err(SqliteError::InvalidData(format!(
+                "database schema version {sibling_version} is ahead of the latest known \
+                 migration {latest_version} (committed by a concurrent process while this \
+                 one waited for the migration write lock). This build cannot run against \
+                 the newer schema; upgrade the binary or recreate the database."
+            )));
+        }
+
         if sibling_version >= migration.version {
             #[cfg(test)]
             test_sync::LOCKED_FAST_FORWARDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
