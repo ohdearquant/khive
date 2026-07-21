@@ -164,10 +164,10 @@ request(ops="create(kind=\"concept\", name=\"RoPE\", description=\"Rotary positi
 
 Fetch any record by UUID (auto-detects entity/note/edge/event/proposal).
 
-| Param             | Type | Required | Notes                                                                  |
-| ----------------- | ---- | -------- | ---------------------------------------------------------------------- |
-| `id`              | uuid | yes      | Full UUID or short hex prefix (min 8 chars).                           |
-| `include_deleted` | bool | no       | Return soft-deleted records too (default false); requires a full UUID. |
+| Param             | Type | Required | Notes                                                                 |
+| ----------------- | ---- | -------- | --------------------------------------------------------------------- |
+| `id`              | uuid | yes      | Full UUID or short hex prefix (min 8 chars).                          |
+| `include_deleted` | bool | no       | Return soft-deleted records too (default false); full UUID or prefix. |
 
 ```
 request(ops="get(id=\"3f2a9c1e\")")
