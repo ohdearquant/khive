@@ -1562,3 +1562,140 @@ async fn merge_note_reason_forwarded_through_registry_dispatch() {
         events.items[0].payload
     );
 }
+
+// ── interim merged_into miss-hint (data-integrity, precedes the full
+// ADR-113 transitive redirect chase) ───────────────────────────────────────
+//
+// `get(absorbed_id)` after a merge names the kept id in its NotFound error
+// instead of a bare "not found" — single-level pointer disclosure, message
+// only, never a transparent redirect to the kept entity's data.
+
+#[tokio::test]
+async fn get_dispatch_after_merge_discloses_kept_id() {
+    use khive_runtime::RuntimeError;
+
+    let (rt, token, _pack) = configured_kg_pack().await;
+    let mut builder = khive_runtime::VerbRegistryBuilder::new();
+    builder.register(crate::KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry build");
+
+    let into = rt
+        .create_entity(&token, "concept", None, "Kept", None, None, vec![])
+        .await
+        .expect("create into entity");
+    let from = rt
+        .create_entity(&token, "concept", None, "Absorbed", None, None, vec![])
+        .await
+        .expect("create from entity");
+
+    registry
+        .dispatch(
+            "merge",
+            json!({
+                "kind": "entity",
+                "into_id": into.id.to_string(),
+                "from_id": from.id.to_string(),
+            }),
+        )
+        .await
+        .expect("merge dispatch must succeed");
+
+    let err = registry
+        .dispatch("get", json!({ "id": from.id.to_string() }))
+        .await
+        .expect_err("get on an absorbed id must still miss");
+    let RuntimeError::NotFound(msg) = err else {
+        panic!("expected NotFound, got {err:?}");
+    };
+    assert!(
+        msg.contains("was merged into") && msg.contains(&into.id.to_string()),
+        "expected a merged_into disclosure naming {}, got {msg:?}",
+        into.id
+    );
+}
+
+#[tokio::test]
+async fn get_dispatch_on_plain_deleted_and_absent_ids_unchanged() {
+    use khive_runtime::RuntimeError;
+
+    let (rt, token, _pack) = configured_kg_pack().await;
+    let mut builder = khive_runtime::VerbRegistryBuilder::new();
+    builder.register(crate::KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry build");
+
+    let entity = rt
+        .create_entity(&token, "concept", None, "Deleted", None, None, vec![])
+        .await
+        .expect("create entity");
+    assert!(rt.delete_entity(&token, entity.id, false).await.unwrap());
+
+    let deleted_err = registry
+        .dispatch("get", json!({ "id": entity.id.to_string() }))
+        .await
+        .expect_err("get on a plain soft-deleted id must still miss");
+    let RuntimeError::NotFound(msg) = deleted_err else {
+        panic!("expected NotFound, got {deleted_err:?}");
+    };
+    assert!(
+        !msg.contains("merged into"),
+        "plain soft-delete must not gain a merge hint, got {msg:?}"
+    );
+
+    let absent = uuid::Uuid::new_v4();
+    let absent_err = registry
+        .dispatch("get", json!({ "id": absent.to_string() }))
+        .await
+        .expect_err("get on a never-existed id must miss");
+    let RuntimeError::NotFound(msg) = absent_err else {
+        panic!("expected NotFound, got {absent_err:?}");
+    };
+    assert!(
+        !msg.contains("merged into"),
+        "a never-existed id must not gain a merge hint, got {msg:?}"
+    );
+}
+
+// `resolve`'s `NotFound` outcome (`ReferenceResolution::NotFound`) is a unit
+// variant with no message slot to carry a hint in — scope is `get` only for
+// this interim change (see PR description). This test pins that boundary:
+// resolving an absorbed uuid still reports a bare `not_found` status.
+#[tokio::test]
+async fn resolve_dispatch_on_merged_uuid_stays_bare_not_found() {
+    let (rt, token, _pack) = configured_kg_pack().await;
+    let mut builder = khive_runtime::VerbRegistryBuilder::new();
+    builder.register(crate::KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry build");
+    let _ = token;
+
+    let into = rt
+        .create_entity(&token, "concept", None, "Kept", None, None, vec![])
+        .await
+        .expect("create into entity");
+    let from = rt
+        .create_entity(&token, "concept", None, "Absorbed", None, None, vec![])
+        .await
+        .expect("create from entity");
+
+    registry
+        .dispatch(
+            "merge",
+            json!({
+                "kind": "entity",
+                "into_id": into.id.to_string(),
+                "from_id": from.id.to_string(),
+            }),
+        )
+        .await
+        .expect("merge dispatch must succeed");
+
+    let result = registry
+        .dispatch("resolve", json!({ "refs": [from.id.to_string()] }))
+        .await
+        .expect("resolve dispatch must succeed (NotFound is a status, not an error)");
+
+    let status = result["results"][0]["status"].as_str().unwrap();
+    assert_eq!(
+        status, "not_found",
+        "resolve has no message slot for a merge hint in this interim change; got {result:?}"
+    );
+}
