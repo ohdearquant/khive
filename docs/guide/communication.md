@@ -283,7 +283,7 @@ boundary (ADR-063). Any process
 with access to the underlying SQLite store can read every message row
 regardless of `to_actor`, and there is no per-principal storage partition on
 the local backend. Where authorization is enforced, it lives at a single
-seam, the Gate (ADR-018), not at the
+seam, the Gate, not at the
 comm pack's inbox filter.
 
 ## See also

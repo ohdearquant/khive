@@ -226,9 +226,9 @@ pub struct RuntimeConfig {
     /// Single-backend deployments use the default `BackendId::MAIN`.
     pub backend_id: BackendId,
     /// Brain profile to use for `memory.feedback` / `knowledge.feedback` and
-    /// recall-time score boosting (ADR-035 §Brain profile configuration).
+    /// recall-time score boosting (brain profile configuration).
     ///
-    /// Resolution order (highest to lowest, ADR-035): CLI flag, then
+    /// Resolution order (highest to lowest): CLI flag, then
     /// `runtime.brain_profile` in project/global `khive.toml`, then the
     /// `KHIVE_BRAIN_PROFILE` env var as fallback default. Callers must keep
     /// env OUT of the base config they pass in (see `khive-mcp` serve.rs).

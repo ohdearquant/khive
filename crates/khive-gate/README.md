@@ -43,7 +43,7 @@ are both non-zero.
 - `AuditEvent::from_check` builds the structured audit record (`actor`, `namespace`,
   `verb`, `decision`, `obligations`, `gate_impl`, `session_id`) emitted once per gate
   consultation. Its JSON projection is a stable public contract — field names don't
-  change without a new ADR.
+  change without a design-record amendment.
 - All wire types (`ActorRef`, `GateRequest`, `GateDecision`, `Obligation`) validate
   their invariants both at construction (`try_new` / `try_*` constructors) and at
   deserialization (custom `Deserialize` via a private `TryFrom<Raw*>` shape), so a
@@ -60,8 +60,6 @@ dependency on any other khive crate beyond `khive-types`.
 - [`khive-gate-rego`](https://crates.io/crates/khive-gate-rego) (BUSL-1.1) — the OSS
   reference [Rego](https://www.openpolicyagent.org/) backend (`RegoGate`), installed in
   place of `AllowAllGate` when a deployment needs real policy enforcement.
-
-Governed by ADR-018.
 
 ## License
 

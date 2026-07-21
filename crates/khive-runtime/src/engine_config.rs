@@ -409,7 +409,7 @@ pub struct KhiveConfig {
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct RuntimeSectionConfig {
     /// Brain profile ID to use for `memory.feedback` / `knowledge.feedback`
-    /// and recall-time score boosting (ADR-035 §Brain profile configuration).
+    /// and recall-time score boosting (brain profile configuration).
     ///
     /// Mirrors `--brain-profile` / `KHIVE_BRAIN_PROFILE`. When absent, the
     /// namespace-bound profile (via `brain.resolve`) is tried, then the

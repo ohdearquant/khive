@@ -46,8 +46,7 @@
 
        types -> score -> storage -> db -> query -> runtime -> pack-* -> mcp
 
-     Name the crates it builds on and the ones that consume it, and link the
-     governing ADR(s) by full GitHub URL. -->
+     Name the crates it builds on and the ones that consume it. -->
 
 ## License
 

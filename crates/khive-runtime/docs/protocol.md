@@ -63,7 +63,7 @@ For subhandlers, the envelope additionally carries `"visibility": "internal"` an
 ## Invariants
 
 - One pack per verb at boot: duplicate verb names across packs produce `RuntimeError::VerbCollision`.
-- Gate is consulted before every dispatch. Gate infrastructure errors are fail-open (ADR-018).
+- Gate is consulted before every dispatch. Gate infrastructure errors are fail-open by design.
 - Namespace is attribution and gate-policy input (ADR-007 Rev 6, ADR-050): it is minted into
   the dispatch `NamespaceToken`'s read/write scope, not re-checked per record. By-ID
   operations (get, delete, update) resolve globally unique UUIDs without a namespace
@@ -71,16 +71,16 @@ For subhandlers, the envelope additionally carries `"visibility": "internal"` an
   namespace match.
 - A present but non-string `namespace` request param (`null`, number, boolean, array,
   object) is rejected with `RuntimeError::InvalidInput` before the gate is consulted —
-  it is never coerced to the default namespace (RUNTIME-AUD-002 / #433, ADR-018 fail-closed).
+  it is never coerced to the default namespace (RUNTIME-AUD-002 / #433 fail-closed contract).
 
 ## Failure Modes
 
-| Condition                        | Error                                              |
-| --------------------------------- | --------------------------------------------------- |
-| Unknown verb                      | `RuntimeError::InvalidInput("unknown verb ...")`   |
-| Gate deny                         | `RuntimeError::PermissionDenied { verb, reason }`  |
-| Pack not loaded                   | `RuntimeError::InvalidInput` (unknown verb path)   |
-| Malformed explicit namespace      | `RuntimeError::InvalidInput` (non-string `namespace`, rejected before gate) |
+| Condition                    | Error                                                                       |
+| ---------------------------- | --------------------------------------------------------------------------- |
+| Unknown verb                 | `RuntimeError::InvalidInput("unknown verb ...")`                            |
+| Gate deny                    | `RuntimeError::PermissionDenied { verb, reason }`                           |
+| Pack not loaded              | `RuntimeError::InvalidInput` (unknown verb path)                            |
+| Malformed explicit namespace | `RuntimeError::InvalidInput` (non-string `namespace`, rejected before gate) |
 
 `RuntimeError::NamespaceMismatch` is a historical/rejected variant from a pre-Rev-6
 design where by-ID lookups compared `record.namespace == caller_namespace`; it is not

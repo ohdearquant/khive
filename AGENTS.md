@@ -553,8 +553,8 @@ default. It is attribution, not isolation: queryable and filterable as a data co
 storage boundary.
 
 By-ID operations (`get`, `update`, `delete`, `merge`) are namespace-agnostic. They resolve the
-globally-unique UUID with no namespace check at any layer. Authorization is enforced at the Gate
-(ADR-018), not in storage or by-ID post-fetch checks.
+globally-unique UUID with no namespace check at any layer. Authorization is enforced at the Gate,
+not in storage or by-ID post-fetch checks.
 
 Multi-record operations (`list`, `search`, `recall`, `neighbors`, `traverse`, `query`) default to
 `WHERE namespace='local'`. The only way to target a different namespace is an explicit `namespace=`
