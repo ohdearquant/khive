@@ -1021,6 +1021,152 @@ async fn query_static_possible_pattern_entity_of_type_pack_rule_no_false_warning
 }
 
 #[tokio::test]
+async fn query_static_possible_pattern_untyped_endpoints_with_entity_of_type_rule_no_false_warning()
+{
+    let rt = rt();
+    let tok = rt.authorize(Namespace::local()).unwrap();
+
+    // Same EntityOfType rule as the typed-pattern test above, but the pattern
+    // here names no `entity_type` on either endpoint — just the base kind.
+    // An untyped pattern endpoint has not ruled out any subtype, so the
+    // installed theorem->definition rule still makes concept->concept
+    // depends_on possible and this must not warn.
+    rt.install_edge_rules(vec![khive_types::EdgeEndpointRule {
+        relation: EdgeRelation::DependsOn,
+        source: khive_types::EndpointKind::EntityOfType {
+            kind: "concept",
+            entity_type: "theorem",
+        },
+        target: khive_types::EndpointKind::EntityOfType {
+            kind: "concept",
+            entity_type: "definition",
+        },
+    }]);
+
+    let thm = rt
+        .create_entity(&tok, "concept", Some("theorem"), "T1", None, None, vec![])
+        .await
+        .unwrap();
+    let def = rt
+        .create_entity(
+            &tok,
+            "concept",
+            Some("definition"),
+            "D1",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+    rt.link(&tok, thm.id, def.id, EdgeRelation::DependsOn, 1.0, None)
+        .await
+        .unwrap();
+
+    let result = rt
+        .query_with_metadata(
+            &tok,
+            "MATCH (a:concept)-[:depends_on]->(b:concept) RETURN a, b LIMIT 10",
+            khive_query::CompileOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "the stored theorem->definition edge must be returned: {:?}",
+        result.rows
+    );
+    assert!(
+        result.warnings.is_empty(),
+        "an untyped pattern endpoint has not ruled out any entity_type, so it must not \
+         be falsely flagged as impossible just because it names no entity_type filter: {:?}",
+        result.warnings
+    );
+}
+
+#[tokio::test]
+async fn query_static_impossible_pattern_mismatching_entity_type_still_warns() {
+    let rt = rt();
+    let tok = rt.authorize(Namespace::local()).unwrap();
+
+    // Same EntityOfType rule, but the pattern names an entity_type that does
+    // NOT match the rule's source subtype ("lemma" vs the rule's "theorem")
+    // — exact-match semantics must still apply and this must warn.
+    rt.install_edge_rules(vec![khive_types::EdgeEndpointRule {
+        relation: EdgeRelation::DependsOn,
+        source: khive_types::EndpointKind::EntityOfType {
+            kind: "concept",
+            entity_type: "theorem",
+        },
+        target: khive_types::EndpointKind::EntityOfType {
+            kind: "concept",
+            entity_type: "definition",
+        },
+    }]);
+
+    let result = rt
+        .query_with_metadata(
+            &tok,
+            "MATCH (a:concept {entity_type: 'lemma'})-[:depends_on]->\
+             (b:concept {entity_type: 'definition'}) RETURN a, b LIMIT 10",
+            khive_query::CompileOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        result.warnings.len(),
+        1,
+        "a pattern entity_type that mismatches the installed rule's subtype must still \
+         be flagged as impossible: {:?}",
+        result.warnings
+    );
+}
+
+#[tokio::test]
+async fn query_static_impossible_warning_accepted_pairs_include_entity_of_type_only_relation() {
+    let rt = rt();
+    let tok = rt.authorize(Namespace::local()).unwrap();
+
+    // depends_on has no base-contract person->person row (the base allowlist
+    // only grants project/service/artifact/document pairs); the only way
+    // concept->concept becomes accepted is the installed EntityOfType rule.
+    // person->person stays impossible and must still warn, and the
+    // accepted-pairs list in the warning text must surface the
+    // EntityOfType-derived concept->concept pair rather than omitting it.
+    rt.install_edge_rules(vec![khive_types::EdgeEndpointRule {
+        relation: EdgeRelation::DependsOn,
+        source: khive_types::EndpointKind::EntityOfType {
+            kind: "concept",
+            entity_type: "theorem",
+        },
+        target: khive_types::EndpointKind::EntityOfType {
+            kind: "concept",
+            entity_type: "definition",
+        },
+    }]);
+
+    let result = rt
+        .query_with_metadata(
+            &tok,
+            "MATCH (a:person)-[:depends_on]->(b:person) RETURN a, b LIMIT 10",
+            khive_query::CompileOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.warnings.len(), 1, "warnings: {:?}", result.warnings);
+    assert!(
+        result.warnings[0].contains("concept->concept"),
+        "the accepted-pairs list must include the EntityOfType-derived concept->concept \
+         pair for depends_on, not just base-allowlist pairs: {}",
+        result.warnings[0]
+    );
+}
+
+#[tokio::test]
 async fn query_static_impossible_chained_pattern_warns_once_per_edge() {
     let rt = rt();
     let tok = rt.authorize(Namespace::local()).unwrap();
