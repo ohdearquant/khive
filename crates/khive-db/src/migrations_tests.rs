@@ -679,17 +679,21 @@ fn concurrent_boots_converge() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("concurrent-boot.db");
 
-    // Both threads open their connection first, then release through a barrier
-    // so the two run_migrations calls genuinely race for the write lock
-    // instead of serializing on thread spawn latency.
+    // Deterministic interleaving via the in-crate stale-read barrier: both
+    // threads must observe the empty ledger (version 0, no lock held) before
+    // either is released to compete for the IMMEDIATE write lock. The loser
+    // is thereby guaranteed to reach the under-lock re-check with a stale
+    // view, which the fast-forward counter asserts below.
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    *test_sync::STALE_READ_BARRIER.lock().unwrap() = Some(barrier);
+    test_sync::LOCKED_FAST_FORWARDS.store(0, std::sync::atomic::Ordering::Relaxed);
+
     let handles: Vec<_> = (0..2)
         .map(|_| {
             let path = path.clone();
-            let barrier = std::sync::Arc::clone(&barrier);
             std::thread::spawn(move || {
+                test_sync::PARTICIPATE.with(|p| p.set(true));
                 let mut conn = Connection::open(&path).expect("open");
-                barrier.wait();
                 run_migrations(&mut conn)
             })
         })
@@ -703,6 +707,16 @@ fn concurrent_boots_converge() {
             .expect("both concurrent boots must succeed");
         assert_eq!(version, latest);
     }
+    *test_sync::STALE_READ_BARRIER.lock().unwrap() = None;
+
+    // Both threads observed version 0 before either took the write lock, so
+    // the loser necessarily re-checked under the lock and fast-forwarded past
+    // the winner's applied migrations. This fails if either the IMMEDIATE
+    // behavior or the under-lock MAX(version) re-check regresses.
+    assert!(
+        test_sync::LOCKED_FAST_FORWARDS.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+        "loser thread must observe the sibling's ledger under the write lock"
+    );
 
     let conn = Connection::open(&path).expect("reopen");
     let rows: u32 = conn

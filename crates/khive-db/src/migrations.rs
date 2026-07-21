@@ -247,6 +247,26 @@ pub fn inspect_schema_version(path: &std::path::Path) -> Result<u32, SqliteError
     read_schema_version(&conn)
 }
 
+#[cfg(test)]
+pub(crate) mod test_sync {
+    use std::sync::atomic::AtomicU32;
+    use std::sync::{Arc, Barrier, Mutex};
+
+    /// When set, `run_migrations_locked` parks after its initial (stale)
+    /// ledger read until every racing thread has arrived — forcing the
+    /// contended interleaving the concurrent-boot test asserts on.
+    pub(crate) static STALE_READ_BARRIER: Mutex<Option<Arc<Barrier>>> = Mutex::new(None);
+    /// Counts entries into the under-lock sibling fast-forward branch.
+    pub(crate) static LOCKED_FAST_FORWARDS: AtomicU32 = AtomicU32::new(0);
+
+    std::thread_local! {
+        /// Opt-in flag: only threads that set this participate in the barrier,
+        /// so unrelated tests migrating in parallel are never parked.
+        pub(crate) static PARTICIPATE: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+}
+
 pub fn run_migrations(conn: &mut Connection) -> Result<u32, SqliteError> {
     // Concurrent boots (multiple processes migrating the same file) contend on
     // the write lock below; a short hot-path busy_timeout cannot wait out a
@@ -268,6 +288,17 @@ fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
     conn.execute_batch(MIGRATION_TRACKING_TABLE)?;
 
     let current_version: u32 = read_schema_version(conn)?;
+
+    // Deterministic-contention hook: parks every caller after the stale ledger
+    // read (no lock held) until all racing test threads have observed it, so
+    // they are then released to compete for the IMMEDIATE write lock below.
+    #[cfg(test)]
+    if test_sync::PARTICIPATE.with(|p| p.get()) {
+        let barrier = test_sync::STALE_READ_BARRIER.lock().unwrap().clone();
+        if let Some(barrier) = barrier {
+            barrier.wait();
+        }
+    }
 
     // A database whose recorded version is ahead of the latest known migration
     // predates the consolidated V1 baseline (ADR-015) — e.g. it still carries the
@@ -320,6 +351,8 @@ fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
                 error: e.to_string(),
             })?;
         if sibling_version >= migration.version {
+            #[cfg(test)]
+            test_sync::LOCKED_FAST_FORWARDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             skip_through = sibling_version.min(latest_version);
             applied_version = applied_version.max(migration.version);
             continue;
