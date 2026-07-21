@@ -258,11 +258,27 @@ pub(crate) mod test_sync {
     pub(crate) static STALE_READ_BARRIER: Mutex<Option<Arc<Barrier>>> = Mutex::new(None);
     /// Counts entries into the under-lock sibling fast-forward branch.
     pub(crate) static LOCKED_FAST_FORWARDS: AtomicU32 = AtomicU32::new(0);
+    /// Number of participating threads that have registered their first
+    /// `BEGIN IMMEDIATE` attempt.
+    pub(crate) static BEGIN_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
+    /// Set by the winner immediately before committing its first migration
+    /// transaction — i.e. before the write lock is first released.
+    pub(crate) static WINNER_COMMITTED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    /// Recorded by the loser when its first `BEGIN IMMEDIATE` returns: whether
+    /// the winner had already committed at that moment. `true` is direct
+    /// evidence the loser's lock acquisition blocked across the winner's held
+    /// write lock rather than the two calls serializing by scheduler accident.
+    pub(crate) static LOSER_SAW_WINNER_COMMIT: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
 
     std::thread_local! {
         /// Opt-in flag: only threads that set this participate in the barrier,
         /// so unrelated tests migrating in parallel are never parked.
         pub(crate) static PARTICIPATE: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+        /// Whether this thread has already instrumented its first BEGIN.
+        pub(crate) static FIRST_BEGIN_DONE: std::cell::Cell<bool> =
             const { std::cell::Cell::new(false) };
     }
 }
@@ -330,6 +346,14 @@ fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
         // IMMEDIATE: take the write lock up front so concurrent boots serialize
         // here instead of failing mid-migration when a DEFERRED transaction
         // upgrades to a write.
+        #[cfg(test)]
+        let instrumented_first_begin = test_sync::PARTICIPATE.with(|p| p.get())
+            && !test_sync::FIRST_BEGIN_DONE.with(|f| f.get());
+        #[cfg(test)]
+        if instrumented_first_begin {
+            test_sync::FIRST_BEGIN_DONE.with(|f| f.set(true));
+            test_sync::BEGIN_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| SqliteError::Migration {
@@ -350,6 +374,31 @@ fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
                 version: migration.version,
                 error: e.to_string(),
             })?;
+        #[cfg(test)]
+        if instrumented_first_begin {
+            use std::sync::atomic::Ordering::SeqCst;
+            if sibling_version == 0 {
+                // Winner: hold the write lock until every participating thread
+                // has registered its first BEGIN attempt (bounded), plus a
+                // grace interval for the last registrant to reach the blocking
+                // call — guaranteeing the loser's acquisition overlaps this
+                // held lock instead of serializing by scheduler accident.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while test_sync::BEGIN_ATTEMPTS.load(SeqCst) < 2
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::yield_now();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            } else {
+                // Loser: our first BEGIN just returned. Record whether the
+                // winner had already committed — true means we blocked across
+                // its held lock.
+                test_sync::LOSER_SAW_WINNER_COMMIT
+                    .store(test_sync::WINNER_COMMITTED.load(SeqCst), SeqCst);
+            }
+        }
+
         if sibling_version >= migration.version {
             #[cfg(test)]
             test_sync::LOCKED_FAST_FORWARDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -374,6 +423,11 @@ fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
             version: migration.version,
             error: e.to_string(),
         })?;
+
+        #[cfg(test)]
+        if instrumented_first_begin {
+            test_sync::WINNER_COMMITTED.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
 
         tx.commit().map_err(|e| SqliteError::Migration {
             version: migration.version,
