@@ -85,8 +85,5 @@ pub async fn emit_phase_event<P: serde::Serialize>(
             label,
             "ADR-103 phase-span event append failed"
         );
-    } else {
-        // Amendment 2: `event_rows` counts successfully appended rows only.
-        crate::usage::count(crate::usage::UsageUnit::EventRows, 1);
     }
 }

@@ -376,6 +376,29 @@ async fn traverse_usage_counts_graph_work_per_op() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn propose_usage_counts_request_owned_event_rows() -> anyhow::Result<()> {
+    let client = connect().await?;
+    let response = call(
+        &client,
+        "request",
+        json!({
+            "ops": r#"propose(title="usage event-rows probe", description="request-owned event append must count", changeset={"kind": "add_entity", "entity": {"kind": "concept", "name": "UsageEventRowsEntity"}})"#,
+            "presentation": "verbose"
+        }),
+    )
+    .await?;
+    let body: Value = serde_json::from_str(&first_text(&response))?;
+    let entry = &body["results"][0];
+    assert_eq!(entry["ok"], json!(true), "propose failed: {entry}");
+    let usage = entry["usage"].as_object().expect("usage object");
+    assert!(
+        usage.get("event_rows").and_then(Value::as_u64).unwrap_or(0) >= 1,
+        "propose appends a request-owned lifecycle event row that must count: {usage:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn chain_entries_each_carry_their_own_usage() -> anyhow::Result<()> {
     let client = connect().await?;
     let target = ok_one(
