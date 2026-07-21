@@ -167,7 +167,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 19] = [
     },
     HandlerDef {
         name: "knowledge.search",
-        description: "TF-IDF ranked search over the knowledge corpus with embedding rerank (default when embedder is configured). Draft and deprecated atoms are excluded by default; pass include_drafts=true to include drafts (deprecated remain excluded). Score bands: score>=0.46 reliably on-target, 0.42<=score<0.46 mixed quality, score<0.42 mostly off-target.",
+        description: "TF-IDF ranked search over the atom teaching corpus ONLY — knowledge graph entities and notes are a disjoint corpus and are never returned here; use the kg pack's `search` verb for those. Embedding rerank applies by default when an embedder is configured. Draft and deprecated atoms are excluded by default; pass include_drafts=true to include drafts (deprecated remain excluded). Score bands: score>=0.46 reliably on-target, 0.42<=score<0.46 mixed quality, score<0.42 mostly off-target.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
