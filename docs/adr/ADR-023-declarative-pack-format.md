@@ -147,7 +147,7 @@ available to operator-only introspection.
 ### 4. Verb naming — kg bare, all others pack-prefixed
 
 The native kg pack (`khive-pack-kg`) owns the **substrate verbs** and exposes them as
-bare verb names (17 verbs total):
+bare verb names (18 verbs total):
 
 | Verb        | Speech act  | Description                                                                                                                                                                                                                                                                                                                                                                                     |
 | ----------- | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -168,6 +168,7 @@ bare verb names (17 verbs total):
 | `stats`     | assertive   | Aggregate counts and health metrics for the namespace graph.                                                                                                                                                                                                                                                                                                                                    |
 | `verbs`     | assertive   | Enumerate all MCP-callable verbs; supports `category` and `pack` filters.                                                                                                                                                                                                                                                                                                                       |
 | `context`   | assertive   | Entity-anchored graph context in one call: resolves anchors (by ID or hybrid search), expands 1-2 hops with per-node fanout caps, and packs the result within a char budget (ADR-089).                                                                                                                                                                                                          |
+| `resolve`   | assertive   | Resolve natural-language references to record ids: id-string passthrough, recently-referenced ring, exact-name match, then hybrid-search fallback; returns Resolved/Ambiguous/NotFound per ref, never a silent pick.                                                                                                                                                                            |
 
 `verbs` was added in Wave 4 (ue-help-introspection H5) to provide a machine-readable discovery
 endpoint. It is a pure read operation with no side effects. It excludes internal subhandlers
@@ -202,7 +203,7 @@ The single rule: **first dot is always the pack name. There is no second dot.**
 `crates/kkernel/tests/verb_namespace_contract.rs`. The test loads every
 `inventory`-registered pack, walks all `HandlerDef` names, and asserts:
 
-- A bare name (no dot) must be in the 17-entry kg-substrate allowlist.
+- A bare name (no dot) must be in the 18-entry kg-substrate allowlist.
 - A dotted name must carry exactly one dot whose prefix matches `Pack::NAME`.
 - Two or more dots are always a violation.
 
@@ -688,6 +689,66 @@ of this repository. It does not introduce, retire, or rename any verb, and it
 does not change the visibility, naming, or composition rules established
 elsewhere in this ADR. Corresponding extraction changes are expected to land as
 separate pull requests against this repository.
+
+## Amendment: single-pack open-source surface (2026-07-20)
+
+A second extraction, landing later the same day as the preceding amendment,
+completes the reduction: the open-source distribution ships exactly one
+production pack, `kg`, plus the `khive-pack-template` example pack. The
+`gtd`, `memory`, `comm`, `schedule`, `session`, `workspace`, and `blob`
+packs move to commercially licensed extensions maintained outside this
+repository, joining the packs extracted by the preceding amendment.
+
+The `khive-brain-core` interface crate moves out as well. This supersedes
+the preceding amendment's "interface crates remain" rule in its specific
+application: that rule was grounded in `khive-pack-memory`'s hard dependency
+on `khive-brain-core`, and with the memory pack itself extracted, no pack in
+this repository consumes the crate. The general principle stands — an
+interface crate stays for as long as a shipped open-source pack depends on
+it — and now selects the empty set.
+
+### Default pack set, before and after
+
+The open-source default pack set (`RuntimeConfig::default()`, selectable via
+`KHIVE_PACKS` / `--pack`) was, after the preceding amendment:
+
+```
+kg, gtd, memory, comm, schedule, session, workspace, blob
+```
+
+and is, after this change:
+
+```
+kg
+```
+
+### Consequence for the agent-facing verb surface
+
+The open-source build registers the kg substrate verbs (§4) and nothing
+else. Regenerate the authoritative count via `request(ops="verbs()")`; at
+the time of this amendment it is 18 verbs. Extension packs, when installed,
+load through the same `KHIVE_PACKS` / `--pack` selection this ADR already
+specifies — the reduction changes which crates ship in this repository, not
+the selection mechanism.
+
+To support distributions that link extension packs, the admin binary's CLI
+entry point is exposed as a library function (`kkernel::cli::cli_main`): a
+downstream distribution crate depends on this repository's crates, adds its
+pack crates as dependencies with one force-link `use` per pack (the ADR-027
+inventory registration requires the crate to be linked), and provides a
+one-line `main`. No dispatch, registry, or configuration code is duplicated
+downstream.
+
+### Data in place
+
+No schema or data migration accompanies this change. A database written by a
+fuller pack set opens under the reduced default, and no stored data is
+altered or removed. Substrate records that extension packs store as entities
+and notes remain reachable through the substrate-level kg verbs to the
+extent those verbs' own resolution rules cover them; pack-private auxiliary
+state (for example profile tables) and content-addressed blob objects are
+retained on disk but are not accessible until the owning pack — and with it
+the pack's registered resolvers and verbs — is loaded again.
 
 ## References
 
