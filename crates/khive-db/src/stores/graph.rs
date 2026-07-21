@@ -1418,6 +1418,11 @@ impl GraphStore for SqlGraphStore {
                     Ok(pairs)
                 })
                 .await?;
+            khive_storage::usage::count(khive_storage::usage::UsageUnit::DbRoundTrips, 1);
+            khive_storage::usage::count(
+                khive_storage::usage::UsageUnit::GraphHops,
+                pairs.len() as u64,
+            );
             result.extend(pairs);
         }
 
@@ -1719,6 +1724,13 @@ impl GraphStore for SqlGraphStore {
             Ok(hits)
         })
         .await
+        .inspect(|hits| {
+            khive_storage::usage::count(khive_storage::usage::UsageUnit::DbRoundTrips, 1);
+            khive_storage::usage::count(
+                khive_storage::usage::UsageUnit::GraphHops,
+                hits.len() as u64,
+            );
+        })
     }
 
     /// Single-query both-direction neighbor fetch (ADR-089 context-verb
@@ -1814,6 +1826,13 @@ impl GraphStore for SqlGraphStore {
             Ok(hits)
         })
         .await
+        .inspect(|hits| {
+            khive_storage::usage::count(khive_storage::usage::UsageUnit::DbRoundTrips, 1);
+            khive_storage::usage::count(
+                khive_storage::usage::UsageUnit::GraphHops,
+                hits.len() as u64,
+            );
+        })
     }
 
     async fn traverse(&self, request: TraversalRequest) -> Result<Vec<GraphPath>, StorageError> {
@@ -1887,6 +1906,9 @@ impl GraphStore for SqlGraphStore {
             // over the kept nodes.
             let mut root_data: HashMap<Uuid, (Vec<(PathNode, f64)>, HashSet<Uuid>)> =
                 HashMap::with_capacity(roots.len());
+            // Amendment 2 `graph_hops`: adjacency rows returned by the CTE,
+            // counted before first-visit de-duplication.
+            let mut raw_rows: u64 = 0;
 
             // Pre-seed with root nodes when include_roots is set (done once for all roots).
             for root_id in &roots {
@@ -2011,6 +2033,7 @@ impl GraphStore for SqlGraphStore {
                 // keep (BFS first-visit semantics, matching #285).
                 for row in rows_iter {
                     let (root_str, node_str, edge_str, depth, total_weight) = row?;
+                    raw_rows += 1;
                     let root_id = parse_uuid(&root_str)?;
                     let node_id = parse_uuid(&node_str)?;
                     let (nodes, seen) = root_data.entry(root_id).or_default();
@@ -2064,9 +2087,14 @@ impl GraphStore for SqlGraphStore {
                 }
             }
 
-            Ok(all_paths)
+            Ok((all_paths, raw_rows))
         })
         .await
+        .inspect(|(_, raw_rows)| {
+            khive_storage::usage::count(khive_storage::usage::UsageUnit::DbRoundTrips, 1);
+            khive_storage::usage::count(khive_storage::usage::UsageUnit::GraphHops, *raw_rows);
+        })
+        .map(|(all_paths, _)| all_paths)
     }
 
     async fn purge_incident_edges(&self, node_id: Uuid) -> Result<u64, StorageError> {

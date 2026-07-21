@@ -878,6 +878,11 @@ impl KhiveMcpServer {
                     let op_identity = identity_owned.clone();
                     let op_mode = mode_for_op(i);
                     async move {
+                        // ADR-103 Amendment 2: one dispatch-accounting context
+                        // per op; the entry is stamped with the frozen usage
+                        // snapshot after dispatch resolves.
+                        let usage_ctx = khive_runtime::usage::UsageContext::new();
+                        let mut entry = khive_runtime::usage::scope(usage_ctx.clone(), async {
                         let tool = op.tool.clone();
                         // Conflicting ops get a per-op error; skip dispatch.
                         if let Some(msg) = conflict_with {
@@ -985,6 +990,10 @@ impl KhiveMcpServer {
                             }
                             Err(e) => json!({ "ok": false, "tool": tool, "error": e.to_string() }),
                         }
+                        })
+                        .await;
+                        stamp_usage(&mut entry, &usage_ctx);
+                        entry
                     }
                 });
                 let results: Vec<Value> = futures::future::join_all(futures).await;
@@ -1024,11 +1033,15 @@ impl KhiveMcpServer {
                     } else {
                         op_mode
                     };
-                    match self
-                        .dispatch_op(op, prev_result.as_ref(), from_wire, identity)
-                        .await
+                    let usage_ctx = khive_runtime::usage::UsageContext::new();
+                    match khive_runtime::usage::scope(
+                        usage_ctx.clone(),
+                        self.dispatch_op(op, prev_result.as_ref(), from_wire, identity),
+                    )
+                    .await
                     {
-                        Ok(result_obj) => {
+                        Ok(mut result_obj) => {
+                            stamp_usage(&mut result_obj, &usage_ctx);
                             // Guard against a pathologically deep handler result
                             // (e.g. `traverse`/`context`) before it is ever cloned
                             // into `$prev` context or handed to presentation/
@@ -1058,8 +1071,10 @@ impl KhiveMcpServer {
                             }
                         }
                         Err((tool, error_payload)) => {
-                            results
-                                .push(json!({ "ok": false, "tool": tool, "error": error_payload }));
+                            let mut entry =
+                                json!({ "ok": false, "tool": tool, "error": error_payload });
+                            stamp_usage(&mut entry, &usage_ctx);
+                            results.push(entry);
                             aborted_from = Some(i + 1);
                         }
                     }
@@ -1368,6 +1383,16 @@ fn drop_value_iteratively(value: Value) {
 /// wrapped in the response envelope. On violation returns a `result_too_deep`
 /// error that does not embed the oversized value, and discards the rejected
 /// value iteratively so its own drop can't overflow the stack either.
+/// ADR-103 Amendment 2: stamp the per-op envelope entry with the dispatch's
+/// frozen usage snapshot. All-or-nothing: an empty snapshot (nothing measured
+/// counted, but the context WAS armed) still stamps `{}`; the key is absent
+/// only when no context existed. Best-effort — never alters ok/error status.
+fn stamp_usage(entry: &mut Value, ctx: &khive_runtime::usage::UsageContext) {
+    if let Value::Object(map) = entry {
+        map.insert("usage".to_string(), ctx.frozen_or_snapshot());
+    }
+}
+
 fn chain_ok_envelope_or_depth_error(tool: String, result: Value) -> Result<Value, (String, Value)> {
     if !result_within_depth_limit(&result) {
         drop_value_iteratively(result);
