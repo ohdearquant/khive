@@ -963,11 +963,28 @@ impl KhiveRuntime {
     /// Retrieve an entity by ID.
     ///
     /// UUID v4 is globally unique: no namespace filter on by-ID ops.
+    ///
+    /// Interim identifier-continuity disclosure (precedes the full transitive
+    /// redirect chase): a miss is probed once against the tombstone row. If
+    /// the id was consumed by `merge(into_id, from_id)` — `merged_into` set —
+    /// the `NotFound` message names the kept id so the caller can requery it
+    /// directly. Single-level only: it does not chase a chain of merges and
+    /// does not return the kept entity in place of the miss. The probe only
+    /// runs after the live-row lookup misses, so the happy path pays no
+    /// extra query.
     pub async fn get_entity(&self, token: &NamespaceToken, id: Uuid) -> RuntimeResult<Entity> {
-        self.entities(token)?
-            .get_entity(id)
-            .await?
-            .ok_or_else(|| RuntimeError::NotFound(format!("entity {id}")))
+        let store = self.entities(token)?;
+        if let Some(entity) = store.get_entity(id).await? {
+            return Ok(entity);
+        }
+        if let Some(tombstone) = store.get_entity_including_deleted(id).await? {
+            if let Some(kept_id) = tombstone.merged_into {
+                return Err(RuntimeError::NotFound(format!(
+                    "{id} was merged into {kept_id}; query the kept id"
+                )));
+            }
+        }
+        Err(RuntimeError::NotFound(format!("entity {id}")))
     }
 
     /// Retrieve an entity by ID including soft-deleted rows.
