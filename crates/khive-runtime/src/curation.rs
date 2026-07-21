@@ -1222,7 +1222,7 @@ fn merge_entity_sql(
         // Preserve the original edge ID where possible so callers can still get()
         // it by the ID returned from link(): update in-place when there's no
         // conflict; when into_id already owns this (source,target,relation), drop
-        // the from-edge instead and refresh the existing into-edge.
+        // the from-edge and leave the existing into-edge untouched (ADR-039).
         // Check for a conflict: does into_id already have this natural key?
         let conflict_id: Option<String> = {
             let conflict_src = new_src.to_string();
@@ -1613,8 +1613,10 @@ fn merge_note_sql(
         .as_ref()
         .map(|v| serde_json::to_string(v).unwrap_or_default());
 
+    // The loop always runs so a dry-run reports a predictive `edges_rewired`
+    // count instead of zero (mirrors the entity merge path).
     let mut edges_rewired = 0usize;
-    if !dry_run {
+    {
         for edge in all_edges {
             let raw_src = if edge.source_id == from_id {
                 into_id
@@ -1632,10 +1634,17 @@ fn merge_note_sql(
                 Err(_) => (raw_src, raw_tgt),
             };
             if new_src == new_tgt {
-                conn.execute(
-                    "DELETE FROM graph_edges WHERE namespace = ?1 AND id = ?2",
-                    rusqlite::params![&namespace, edge.id.to_string()],
-                )?;
+                if !dry_run {
+                    conn.execute(
+                        "DELETE FROM graph_edges WHERE namespace = ?1 AND id = ?2",
+                        rusqlite::params![&namespace, edge.id.to_string()],
+                    )?;
+                }
+                continue;
+            }
+            if dry_run {
+                // Predictive count only — no write in a dry-run.
+                edges_rewired += 1;
                 continue;
             }
             let now_ts = chrono::Utc::now().timestamp_micros();
@@ -1683,7 +1692,9 @@ fn merge_note_sql(
                 edges_rewired += 1;
             }
         }
+    }
 
+    if !dry_run {
         conn.prepare_cached(khive_db::stores::note::NOTE_UPSERT_SQL)?
             .execute(rusqlite::params![
                 &into_str,
@@ -2340,6 +2351,46 @@ mod tests {
             got.entity_type.as_deref(),
             Some("skill"),
             "merge must not null the survivor's entity_type"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_entity_preserves_survivor_content_ref() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let into = rt
+            .create_entity(&tok, "document", None, "Into", None, None, vec![])
+            .await
+            .unwrap();
+        let from = rt
+            .create_entity(&tok, "document", None, "From", None, None, vec![])
+            .await
+            .unwrap();
+
+        let content_ref = "blake3:0000000000000000000000000000000000000000000000000000000000000000";
+        let store = rt.entities(&tok).unwrap();
+        let stored = store.get_entity(into.id).await.unwrap().unwrap();
+        store
+            .upsert_entity(stored.with_content_ref(content_ref))
+            .await
+            .unwrap();
+
+        rt.merge_entity(
+            &tok,
+            into.id,
+            from.id,
+            EntityDedupMergePolicy::PreferInto,
+            ContentMergeStrategy::Append,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let got = store.get_entity(into.id).await.unwrap().unwrap();
+        assert_eq!(
+            got.content_ref.as_deref(),
+            Some(content_ref),
+            "merge must not null the survivor's content_ref"
         );
     }
 
@@ -3493,6 +3544,64 @@ mod tests {
             1,
             "exactly one live into→shared annotates edge must exist after merge; got: {into_edges:?}"
         );
+    }
+
+    // A note dry-run must predict edges_rewired like the entity path does,
+    // and must not touch topology.
+    #[tokio::test]
+    async fn merge_note_dry_run_predicts_edges_rewired() {
+        use khive_storage::EdgeRelation;
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let into = rt
+            .create_note(&tok, "observation", None, "Into", None, None, vec![])
+            .await
+            .unwrap();
+        let from = rt
+            .create_note(&tok, "observation", None, "From", None, None, vec![])
+            .await
+            .unwrap();
+        let shared = rt
+            .create_entity(&tok, "concept", None, "Shared", None, None, vec![])
+            .await
+            .unwrap();
+        rt.link(&tok, from.id, shared.id, EdgeRelation::Annotates, 1.0, None)
+            .await
+            .unwrap();
+
+        let summary = rt
+            .merge_note_with_reason(
+                &tok,
+                into.id,
+                from.id,
+                EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
+                true,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(summary.dry_run);
+        assert_eq!(
+            summary.edges_rewired, 1,
+            "note dry-run must predict the rewire count"
+        );
+
+        let from_edges = rt
+            .list_edges(
+                &tok,
+                crate::EdgeListFilter {
+                    source_id: Some(from.id),
+                    target_id: Some(shared.id),
+                    relations: vec![EdgeRelation::Annotates],
+                    ..Default::default()
+                },
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(from_edges.len(), 1, "dry-run must leave topology untouched");
     }
 
     #[tokio::test]
