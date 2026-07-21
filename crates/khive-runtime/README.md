@@ -16,7 +16,7 @@ verb-dispatch machinery that lets packs (`kg`, `gtd`, `memory`, …) extend the 
   an optional auxiliary `SchemaPlan`
 - **Curation** (`EntityPatch`, `NotePatch`, `EdgePatch`, `MergeSummary`,
   `EntityDedupMergePolicy`) — update/merge semantics per
-  [ADR-014](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-014-curation-operations.md)
+  ADR-014
 - **Retrieval objectives** (`RrfFusionObjective`, `VectorSimilarityObjective`,
   `TextRelevanceObjective`, `TemporalRecencyObjective`, `DecayAwareSalienceObjective`, …)
   composed into a `MemoryRecallPipeline`
@@ -103,15 +103,14 @@ It re-exports the `khive-db` and `khive-gate` types packs need
 (`StorageBackend`, `ConnectionPool`, `Gate`, `GateDecision`, `ActorRef`, …) so most
 pack crates depend on `khive-runtime` alone rather than reaching past it. Governing
 ADRs: pack contract and object-safe dispatch
-([ADR-017](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-017-pack-standard.md)),
+(ADR-017),
 verb surface, visibility and composition
-([ADR-023](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-023-declarative-pack-format.md)),
+(ADR-023),
 dynamic pack loading via self-registration
-([ADR-027](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-027-dynamic-pack-loading.md)),
+(ADR-027),
 pack-scoped backends and per-pack schema
-([ADR-028](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-028-pack-scoped-backends.md)),
-and the authorization gate
-([ADR-018](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-018-authorization-gate.md)).
+(ADR-028),
+and the authorization gate.
 
 ## License
 

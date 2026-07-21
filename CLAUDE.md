@@ -30,7 +30,7 @@ to delete, mutate, copy, or transfer data to "fix" what a query returns.** That'
 rule.
 
 (Distinct from correctness. If a stored record is actually _wrong_, use the curation verbs —
-`update` / `delete` / `merge` per [ADR-014](docs/adr/ADR-014-curation-operations.md). Curation
+`update` / `delete` / `merge` per ADR-014. Curation
 modifies data deliberately; the view-layer rule doesn't apply to deliberate correction.)
 
 `supersedes` means _precisely_: keep the old record, mark it superseded; what a query returns is
@@ -84,38 +84,37 @@ not shipped.
 
 ## Directory map
 
-| Path                     | Purpose                                                                                                                |
-| ------------------------ | ---------------------------------------------------------------------------------------------------------------------- |
-| `crates/khive-types`     | Domain types: Entity, Note, Event, EntityKind, EdgeRelation, Pack trait                                                |
-| `crates/khive-score`     | Deterministic i64 fixed-point scoring + RRF                                                                            |
-| `crates/khive-storage`   | Trait-only: SqlAccess, GraphStore, VectorStore, TextSearch                                                             |
-| `crates/khive-db`        | SQLite backend; FTS5 trigram TextSearch; current sqlite-vec VectorStore compatibility                                  |
-| `crates/khive-retrieval` | Hybrid retrieval primitives over dense, lexical, graph, and fusion signals                                             |
-| `crates/khive-fusion`    | RRF, weighted, union, vector-only, and keyword-only fusion strategies                                                  |
-| `crates/khive-bm25`      | BM25 keyword index                                                                                                     |
-| `crates/khive-hnsw`      | HNSW vector index                                                                                                      |
-| `crates/khive-vamana`    | Vamana ANN index used by semantic recall                                                                               |
-| `crates/khive-query`     | GQL + SPARQL parsers, AST validation, SQL compiler                                                                     |
-| `crates/khive-runtime`   | Service API + VerbRegistry + PackRuntime trait                                                                         |
-| `crates/khive-request`   | Request DSL parser (function-call + JSON; pipe/LNDL planned)                                                           |
-| `crates/khive-pack-kg`   | KG pack: vocabulary, 18 verb handlers, kind validation                                                                 |
-| `crates/khive-vcs`       | KG versioning: content-addressed snapshots, branch pointers, push/pull ([ADR-010](docs/adr/ADR-010-kg-versioning.md))  |
-| `crates/khive-merge`     | KG merge: three-way merge with LCA walk, conflict enum, strategy shortcuts ([ADR-039](docs/adr/ADR-039-note-merge.md)) |
-| `crates/khive-mcp`       | Stdio MCP binary — single `request` tool over VerbRegistry; auto-spawns daemon                                         |
-| `docs/adr/`              | Architecture Decision Records (the design contract)                                                                    |
-| `marketplace/`           | The `khive` umbrella Claude Code plugin (one skill per pack + kg agents) — install via `/plugin install`               |
-| `tests/smoke_test.py`    | End-to-end binary smoke test (drives every verb via the `request` DSL)                                                 |
-| `scripts/publish.sh`     | Publish all crates to crates.io in dependency order                                                                    |
+| Path                     | Purpose                                                                                                  |
+| ------------------------ | -------------------------------------------------------------------------------------------------------- |
+| `crates/khive-types`     | Domain types: Entity, Note, Event, EntityKind, EdgeRelation, Pack trait                                  |
+| `crates/khive-score`     | Deterministic i64 fixed-point scoring + RRF                                                              |
+| `crates/khive-storage`   | Trait-only: SqlAccess, GraphStore, VectorStore, TextSearch                                               |
+| `crates/khive-db`        | SQLite backend; FTS5 trigram TextSearch; current sqlite-vec VectorStore compatibility                    |
+| `crates/khive-retrieval` | Hybrid retrieval primitives over dense, lexical, graph, and fusion signals                               |
+| `crates/khive-fusion`    | RRF, weighted, union, vector-only, and keyword-only fusion strategies                                    |
+| `crates/khive-bm25`      | BM25 keyword index                                                                                       |
+| `crates/khive-hnsw`      | HNSW vector index                                                                                        |
+| `crates/khive-vamana`    | Vamana ANN index used by semantic recall                                                                 |
+| `crates/khive-query`     | GQL + SPARQL parsers, AST validation, SQL compiler                                                       |
+| `crates/khive-runtime`   | Service API + VerbRegistry + PackRuntime trait                                                           |
+| `crates/khive-request`   | Request DSL parser (function-call + JSON; pipe/LNDL planned)                                             |
+| `crates/khive-pack-kg`   | KG pack: vocabulary, 18 verb handlers, kind validation                                                   |
+| `crates/khive-vcs`       | KG versioning: content-addressed snapshots, branch pointers, push/pull (ADR-010)                         |
+| `crates/khive-merge`     | KG merge: three-way merge with LCA walk, conflict enum, strategy shortcuts (ADR-039)                     |
+| `crates/khive-mcp`       | Stdio MCP binary — single `request` tool over VerbRegistry; auto-spawns daemon                           |
+| `marketplace/`           | The `khive` umbrella Claude Code plugin (one skill per pack + kg agents) — install via `/plugin install` |
+| `tests/smoke_test.py`    | End-to-end binary smoke test (drives every verb via the `request` DSL)                                   |
+| `scripts/publish.sh`     | Publish all crates to crates.io in dependency order                                                      |
 
 ---
 
 ## Closed taxonomies (DO NOT extend without an ADR)
 
-### 9 entity kinds ([ADR-001](docs/adr/ADR-001-entity-kind-taxonomy.md), [ADR-048](docs/adr/ADR-048-knowledge-section-profiles.md))
+### 9 entity kinds (ADR-001, ADR-048)
 
 `concept` | `document` | `dataset` | `project` | `person` | `org` | `artifact` | `service` | `resource`
 
-### 17 edge relations ([ADR-002](docs/adr/ADR-002-edge-ontology.md) base 15; [ADR-055](docs/adr/ADR-055-epistemic-edge-relations.md) +2 epistemic)
+### 17 edge relations (ADR-002 base 15; ADR-055 +2 epistemic)
 
 Structure: `contains` | `part_of` | `instance_of`
 Derivation: `extends` | `variant_of` | `introduced_by` | `supersedes`
@@ -127,18 +126,18 @@ Lateral: `competes_with` | `composed_with`
 Annotation: `annotates`
 Epistemic: `supports` | `refutes`
 
-### 5 note kinds ([ADR-013](docs/adr/ADR-013-note-kind-taxonomy.md))
+### 5 note kinds (ADR-013)
 
 `observation` | `insight` | `question` | `decision` | `reference`
 
-Entity and note kinds are **pack-owned** ([ADR-017](docs/adr/ADR-017-pack-standard.md)) — the
+Entity and note kinds are **pack-owned** (ADR-017) — the
 `kg` pack declares them as static vocabulary; the runtime validates against all loaded packs.
 Edge relations remain a **closed enum** (compile-time). Ad-hoc kinds/relations are rejected,
 not silently accepted.
 
 The per-relation **endpoint contract** (which `(source, relation, target)` triples are legal)
 is the ADR-002 base contract _plus_ any pack-declared additions
-([ADR-017](docs/adr/ADR-017-pack-standard.md) §"Pack-extensible edge endpoints"). A pack that
+(ADR-017 §"Pack-extensible edge endpoints"). A pack that
 registers its own note kind can use this to allow `depends_on` between two notes of that kind —
 base contract alone would reject a note source for non-`annotates` relations. Rules are
 additive only; packs cannot tighten the base contract.
@@ -232,7 +231,7 @@ NOT abort the batch — each entry has its own ok/error. The aggregate response 
 - **Migrations only.** Schema changes go through `crates/khive-db/src/migrations.rs`.
   Add a new `VersionedMigration` (`version = <last + 1>`) pointing at a new
   `sql/NNN-<name>.sql` file. Never edit V1. (V1 is the consolidated fresh-start
-  baseline — see [ADR-015](docs/adr/ADR-015-schema-migrations.md).)
+  baseline — see ADR-015.)
 - **Lint SQL.** `scripts/lint-sql.sh` loads every `crates/**/*.sql` into an
   in-memory SQLite db and checks hygiene; it runs in `make ci` and pre-commit. A
   malformed `.sql` fails before it ships.
@@ -264,7 +263,7 @@ NOT abort the batch — each entry has its own ok/error. The aggregate response 
   caller_namespace` check exists at the store, runtime, or handler layer. This was the
   prior v1 behavior; it was removed by PR-A1 (commit 2607e263) and is no longer correct.
   Do not add such checks.
-- **Authorization lives at one seam: the Gate** (ADR-018). Storage stores are ID-only. The
+- **Authorization lives at one seam: the Gate.** Storage stores are ID-only. The
   Gate is the trust boundary.
 - **Multi-record ops default to `WHERE namespace='local'`**; the only escape is an explicit
   `namespace=` parameter from the caller.
@@ -318,28 +317,13 @@ Conventional commits with crate scope: `feat(query): add SPARQL property filter`
 
 ---
 
-## ADR-driven development
+## Design-record-driven development
 
-Architecture Decision Records (`docs/adr/`) are the normative contract. Code implements what
-ADRs specify. Changing the schema or interface requires an ADR **before** code lands.
-
-Key ADRs for contributors:
-
-| ADR                                                  | What it governs                                                     |
-| ---------------------------------------------------- | ------------------------------------------------------------------- |
-| [001](docs/adr/ADR-001-entity-kind-taxonomy.md)      | 9 entity kinds (8 base + resource ADR-048) — don't add without this |
-| [002](docs/adr/ADR-002-edge-ontology.md)             | 15 base edge relations; +2 epistemic via ADR-055 = 17 total         |
-| [005](docs/adr/ADR-005-storage-capability-traits.md) | Storage traits — the abstraction boundary                           |
-| [008](docs/adr/ADR-008-query-layer-separation.md)    | Query crate — parser/validator/compiler separation                  |
-| [013](docs/adr/ADR-013-note-kind-taxonomy.md)        | 5 base note kinds                                                   |
-| [015](docs/adr/ADR-015-schema-migrations.md)         | Migration system — how to change the DB schema                      |
-| [016](docs/adr/ADR-016-request-dsl.md)               | Request DSL — verb-dispatch syntax for `request`                    |
-| [017](docs/adr/ADR-017-pack-standard.md)             | Pack trait, `EDGE_RULES`, pack-extensible endpoints                 |
-| [023](docs/adr/ADR-023-declarative-pack-format.md)   | Pack verb surface, visibility, and composition                      |
-| [027](docs/adr/ADR-027-dynamic-pack-loading.md)      | Dynamic pack loading via self-registration                          |
-| [028](docs/adr/ADR-028-pack-scoped-backends.md)      | Pack-scoped backends and per-pack schema declaration                |
-
-Full index: [docs/adr/README.md](docs/adr/README.md).
+Design decisions (schemas, taxonomies, interfaces, pack contracts) are recorded in design
+records maintained by the project maintainers outside this repository. ADR numbers cited in
+code and docs refer to those records. Changing the schema or a public interface requires a
+maintainer-approved design record **before** code lands — propose the change in an issue and
+a maintainer will drive the design review.
 
 ---
 
@@ -353,10 +337,10 @@ Full index: [docs/adr/README.md](docs/adr/README.md).
 | Add a runtime operation                                     | `crates/khive-runtime/src/operations.rs`                                                                                            |
 | Change DB schema                                            | New `crates/khive-db/sql/NNN-<name>.sql` file + register it as a new `VersionedMigration` in `crates/khive-db/src/migrations.rs`    |
 | Add a new entity kind                                       | `crates/khive-pack-kg/src/vocab.rs` + ADR-001 amendment                                                                             |
-| Add a new edge relation                                     | **STOP** — ADR change ([ADR-002](docs/adr/ADR-002-edge-ontology.md))                                                                |
-| Allow a new edge endpoint pair (e.g. note-kind→entity-kind) | Pack's `EDGE_RULES` const ([ADR-017](docs/adr/ADR-017-pack-standard.md) §"Pack-extensible edge endpoints"); additive only           |
+| Add a new edge relation                                     | **STOP** — ADR change (ADR-002)                                                                                                     |
+| Allow a new edge endpoint pair (e.g. note-kind→entity-kind) | Pack's `EDGE_RULES` const (ADR-017 §"Pack-extensible edge endpoints"); additive only                                                |
 | Add a new note kind                                         | `crates/khive-pack-kg/src/vocab.rs` + ADR-013 amendment                                                                             |
-| Add a new pack                                              | New crate implementing `Pack` + `PackRuntime` ([ADR-017](docs/adr/ADR-017-pack-standard.md))                                        |
+| Add a new pack                                              | New crate implementing `Pack` + `PackRuntime` (ADR-017)                                                                             |
 | Fix a query parser bug                                      | `crates/khive-query/src/parsers/` + add regression test                                                                             |
 | Fix a storage bug                                           | `crates/khive-db/src/stores/` + test                                                                                                |
 

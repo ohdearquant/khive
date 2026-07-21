@@ -1,8 +1,8 @@
 # `kkernel kg commit` — tier-2 change-set commit
 
-**ADRs**: [ADR-020](../../../docs/adr/ADR-020-git-native-kg-implementation.md) §5,
-[ADR-101](../../../docs/adr/ADR-101-kg-changeset-model.md) (change-set model),
-[ADR-102](../../../docs/adr/ADR-102-tiered-validate-and-merge.md) (Amendment to ADR-020)
+**ADRs**: ADR-020 §5,
+ADR-101 (change-set model),
+ADR-102 (Amendment to ADR-020)
 
 `kg commit` restores the `kg commit` verb ADR-020 §5 specified but never shipped, scoped
 per ADR-102's amendment: this is the commit step for an already-staged ADR-101 change-set,

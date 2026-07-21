@@ -13,17 +13,17 @@ It is the first-party pack shipped with the khive binary.
 
 | ADR                                                                | What it governs                                   | Status      |
 | ------------------------------------------------------------------ | ------------------------------------------------- | ----------- |
-| [ADR-001](../../../docs/adr/ADR-001-entity-kind-taxonomy.md)       | 9 entity kinds (8 base + resource per ADR-048)    | Implemented |
-| [ADR-002](../../../docs/adr/ADR-002-edge-ontology.md)              | 17 edge relations, closed set (15 base + 2 epistemic via ADR-055) | Implemented |
-| [ADR-007](../../../docs/adr/ADR-007-namespace.md)                  | KG uses shared `local` namespace                  | Implemented |
-| [ADR-013](../../../docs/adr/ADR-013-note-kind-taxonomy.md)         | 5 base note kinds                                 | Implemented |
-| [ADR-014](../../../docs/adr/ADR-014-curation-operations.md)        | UUID-only get/update/delete                       | Implemented |
-| [ADR-017](../../../docs/adr/ADR-017-pack-standard.md)              | Pack trait, vocabulary, edge rules                | Implemented |
-| [ADR-001](../../../docs/adr/ADR-001-entity-kind-taxonomy.md)       | Alias normalization (paper→document, write-time)  | Implemented |
-| [ADR-045](../../../docs/adr/ADR-045-verb-response-presentation.md) | ISO-8601 timestamps at handler boundary           | Implemented |
-| [ADR-046](../../../docs/adr/ADR-046-event-sourced-proposals.md)    | Event-sourced proposals (propose/review/withdraw) | Implemented |
-| [ADR-048](../../../docs/adr/ADR-048-knowledge-section-profiles.md) | `resource` entity kind (9th kind)                 | Implemented |
-| [ADR-089](../../../docs/adr/ADR-089-context-verb.md)               | `context` verb — entity-anchored graph context    | Implemented |
+| ADR-001       | 9 entity kinds (8 base + resource per ADR-048)    | Implemented |
+| ADR-002              | 17 edge relations, closed set (15 base + 2 epistemic via ADR-055) | Implemented |
+| ADR-007                  | KG uses shared `local` namespace                  | Implemented |
+| ADR-013         | 5 base note kinds                                 | Implemented |
+| ADR-014        | UUID-only get/update/delete                       | Implemented |
+| ADR-017              | Pack trait, vocabulary, edge rules                | Implemented |
+| ADR-001       | Alias normalization (paper→document, write-time)  | Implemented |
+| ADR-045 | ISO-8601 timestamps at handler boundary           | Implemented |
+| ADR-046    | Event-sourced proposals (propose/review/withdraw) | Implemented |
+| ADR-048 | `resource` entity kind (9th kind)                 | Implemented |
+| ADR-089               | `context` verb — entity-anchored graph context    | Implemented |
 
 ## Primary Modules
 

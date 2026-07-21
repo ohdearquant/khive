@@ -2,14 +2,14 @@
 
 ## ADR Compliance
 
-### ADR-018: Authorization Gate
+### Authorization gate
 
-This crate is the reference Rego backend for the khive authorization gate defined in ADR-018.
+This crate is the reference Rego backend for the khive authorization gate design record.
 
 Key design decisions and constraints:
 
 - **Fail-open on dispatch errors.** When `Gate::check` returns `Err(GateError)`, the runtime
-  treats it as an infrastructure failure, logs a warning, and proceeds. This is the ADR-018
+  treats it as an infrastructure failure, logs a warning, and proceeds. This is the gate contract's
   "fail-open on gate Err" behavior. To prevent unintended access, always declare a
   `default decision := {"decision": "deny", ...}` so unmatched requests deny explicitly
   rather than relying on the fail-open path.
@@ -32,9 +32,6 @@ Key design decisions and constraints:
 
 ## Consistency Notes
 
-- The `README.md` and `docs/api/policy-contract.md` retain ADR-018 cross-references for external readers
-  navigating from documentation to the authoritative design record. Only the `.rs` source files
-  have had ADR citations removed.
 - The fail-open behavior described here matches the production runtime behavior in
   `khive-runtime`. Any change to the gate error handling policy must be coordinated with
   the runtime gate dispatch path.

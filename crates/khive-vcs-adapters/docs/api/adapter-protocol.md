@@ -2,8 +2,8 @@
 
 Format adapters are pure transforms from external data into the intermediate entity and edge
 records consumed by khive's two-stage KG import pipeline. The protocol follows
-[ADR-020](../../../../docs/adr/ADR-020-git-native-kg-implementation.md) and
-[ADR-036](../../../../docs/adr/ADR-036-kg-import-export-adapters.md).
+ADR-020 and
+ADR-036.
 
 ## Pipeline
 

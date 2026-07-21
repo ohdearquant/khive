@@ -57,8 +57,8 @@ must not rely on those behaviors.
 
 `khive.Retrieval.Distance.distanceToSimilarity` and `khive.Retrieval.Distance.similarity_nonneg`
 in `proofs/Retrieval/Distance.lean` cover the ADR-030 phase-2 formalization. The API also implements
-[ADR-006 deterministic scoring](../../../../docs/adr/ADR-006-deterministic-scoring.md) and
-[ADR-012 retrieval composition](../../../../docs/adr/ADR-012-retrieval-composition.md).
+ADR-006 deterministic scoring and
+ADR-012 retrieval composition.
 
 ## Verification and benchmarks
 

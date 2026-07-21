@@ -348,10 +348,11 @@ Docs: [ohdearquant.github.io/khive](https://ohdearquant.github.io/khive/) (agent
 
 ## Contributing
 
-- Feature branches + PRs. Never push directly to main.
-- `make ci` must pass (fmt, clippy, test, no-default-features check, release build).
-- Conventional commits: `feat(types): add NoteKind taxonomy`.
-- Schema/interface changes need a design doc. Propose it in the PR or as an issue.
+khive is developed internally and **does not accept external contributions** —
+external pull requests and issues are not monitored and may be closed without
+review (see [CONTRIBUTING.md](CONTRIBUTING.md)). The source is published for
+transparency and for building on top of khive under its license terms.
+
 - See [CLAUDE.md](CLAUDE.md) for the developer guide, [AGENTS.md](AGENTS.md) for agent usage.
 
 ---

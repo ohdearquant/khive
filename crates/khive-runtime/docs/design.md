@@ -77,7 +77,7 @@
 - Boot-time collision: two packs declaring the same public verb name produce `RuntimeError::VerbCollision`
 - Pack-auxiliary schema plans are collected from all registered packs and applied at startup
 
-### ADR-018: Authorization Gate
+### Authorization gate
 
 - Gate is consulted before every verb dispatch; gate infrastructure failures are fail-open
 - `GateDecision::Deny` is hard enforcement: the pack is never invoked on denial

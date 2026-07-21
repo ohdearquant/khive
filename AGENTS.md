@@ -25,9 +25,9 @@ If you're working on khive itself (writing code in this repo), see `CLAUDE.md` i
 ## Core verbs
 
 All verbs are dispatched through a single MCP tool, `request`, which accepts a function-call DSL
-or JSON form ([ADR-016](docs/adr/ADR-016-request-dsl.md),
-[ADR-027](docs/adr/ADR-027-dynamic-pack-loading.md)). Verb semantics and namespace contract are
-defined in [ADR-023](docs/adr/ADR-023-declarative-pack-format.md).
+or JSON form (ADR-016,
+ADR-027). Verb semantics and namespace contract are
+defined in ADR-023.
 
 ### KG pack — 18 verbs (bare names, no prefix)
 
@@ -59,7 +59,7 @@ prefix lookup, but in practice only the exact 8-char compact ID returned by writ
 because stored UUIDs carry a dash at position 9, so a 9+ pure-hex string never matches; (3) anything
 else falls through to an exact, case-insensitive entity-name lookup. `create`, `list`, `search`
 take a `kind` discriminant, but accepted values differ per verb: `list` accepts substrate names
-(`entity`, `note`, `edge`, `event` per [ADR-022](docs/adr/ADR-022-events-query-surface.md),
+(`entity`, `note`, `edge`, `event` per ADR-022,
 `proposal`) plus any pack-registered granular kind (`concept`, `document`, `task`, `observation`,
 …); `create` and `search` accept `entity`/`note` and the granular kinds but reject `edge`, `event`,
 and `proposal` (proposals are created via `propose` and browsed via `list`, not `create`/`search`).
@@ -181,7 +181,7 @@ form. Use the function-call form shown above for chaining.
 ### Output format
 
 The `request` envelope accepts a `format` parameter that controls how the response is serialized
-([ADR-078](docs/adr/ADR-078-output-format-shape-aware-rendering.md)):
+(ADR-078):
 
 | Value   | Description                                                                                                                                                                                      | Default for                                                        |
 | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------ |
@@ -232,7 +232,7 @@ Use `create(kind="note", note_kind="observation", ...)` for notes.
 
 ---
 
-## The 9 entity kinds (closed set — [ADR-001](docs/adr/ADR-001-entity-kind-taxonomy.md), [ADR-048](docs/adr/ADR-048-knowledge-section-profiles.md))
+## The 9 entity kinds (closed set — ADR-001, ADR-048)
 
 | Kind       | What it represents                                                         |
 | ---------- | -------------------------------------------------------------------------- |
@@ -251,7 +251,7 @@ Use `create(kind="note", note_kind="observation", ...)` for notes.
 
 ---
 
-## The 5 note kinds (closed set — [ADR-013](docs/adr/ADR-013-note-kind-taxonomy.md))
+## The 5 note kinds (closed set — ADR-013)
 
 | Kind          | What it records                               |
 | ------------- | --------------------------------------------- |
@@ -266,7 +266,7 @@ annotates=[entity_id], ...)`.
 
 ---
 
-## The 17-relation ontology (closed set — [ADR-002](docs/adr/ADR-002-edge-ontology.md) base 15; [ADR-055](docs/adr/ADR-055-epistemic-edge-relations.md) +2 epistemic)
+## The 17-relation ontology (closed set — ADR-002 base 15; ADR-055 +2 epistemic)
 
 When you `link` nodes, use ONLY these relations:
 
@@ -516,7 +516,7 @@ If you are an AI agent authoring PRs, issues, or comments via someone's CLI:
 
 ---
 
-## Pack authoring pattern (governance — [ADR-023](docs/adr/ADR-023-declarative-pack-format.md), [ADR-095](docs/adr/ADR-095-verb-surface-consolidation.md))
+## Pack authoring pattern (governance — ADR-023, ADR-095)
 
 If you are adding a new pack or a new verb to an existing pack:
 
@@ -529,7 +529,7 @@ If you are adding a new pack or a new verb to an existing pack:
    that dispatch-by-kind cannot express.
 2. **Put per-kind create-time field validation in `KindHook::prepare_create`.** Enum checks,
    format checks, and cross-field guards for a kind belong in that kind's `KindHook`
-   implementation ([ADR-017](docs/adr/ADR-017-pack-standard.md)), not in a parallel handler
+   implementation (ADR-017), not in a parallel handler
    that duplicates the same checks outside the hook seam.
 
 ---
@@ -553,8 +553,8 @@ default. It is attribution, not isolation: queryable and filterable as a data co
 storage boundary.
 
 By-ID operations (`get`, `update`, `delete`, `merge`) are namespace-agnostic. They resolve the
-globally-unique UUID with no namespace check at any layer. Authorization is enforced at the Gate
-(ADR-018), not in storage or by-ID post-fetch checks.
+globally-unique UUID with no namespace check at any layer. Authorization is enforced at the Gate,
+not in storage or by-ID post-fetch checks.
 
 Multi-record operations (`list`, `search`, `recall`, `neighbors`, `traverse`, `query`) default to
 `WHERE namespace='local'`. The only way to target a different namespace is an explicit `namespace=`
@@ -573,5 +573,4 @@ agent-facing operations go through the `request` tool.
 ## See also
 
 - `CLAUDE.md` — for working on khive itself
-- `docs/adr/` — Architecture Decision Records (the design contract)
-- `docs/adr/README.md` — full ADR index
+- Design records are maintained by the project maintainers outside this repository.

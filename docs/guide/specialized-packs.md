@@ -20,7 +20,7 @@ additively, what it contributes: note kinds, entity kinds, verb handlers,
 and edge endpoint rules. A pack can declare zero verbs and still be useful,
 contributing purely to the edge ontology. Packs declare a `REQUIRES` list of
 other packs that must already be loaded; the runtime resolves this at
-startup. See [ADR-017](../adr/ADR-017-pack-standard.md) for the full
+startup. See ADR-017 for the full
 standard, including how pack-declared edge endpoint rules combine with the
 base ADR-002 contract: rules are additive only, never tightening what the
 base contract already allows.
@@ -42,8 +42,8 @@ A pack that declares `REQUIRES = &["kg"]` needs `kg` in the same load set.
 
 A reference scaffold lives at `crates/khive-pack-template/` in the workspace
 — start there when building a new pack. See
-[ADR-017](../adr/ADR-017-pack-standard.md) for the `Pack` trait contract and
-[ADR-023](../adr/ADR-023-declarative-pack-format.md) for the declarative
+ADR-017 for the `Pack` trait contract and
+ADR-023 for the declarative
 verb/note/entity/edge-rule format.
 
 ## See also

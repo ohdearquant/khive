@@ -73,9 +73,9 @@ production pack currently calls into it — the v1 path (`khive-vcs`, git line-m
 NDJSON) governs KG merges today. See `crates/khive-merge/docs/semantic-merge-architecture.md` for the full
 promotion plan.
 
-Relates to [ADR-010](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-010-kg-versioning.md)
+Relates to ADR-010
 (KG versioning strategy — the v1/v2 merge distinction) and
-[ADR-020](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-020-git-native-kg-implementation.md)
+ADR-020
 (git-native KG implementation).
 
 ## License

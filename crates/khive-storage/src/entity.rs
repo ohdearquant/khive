@@ -31,7 +31,7 @@ pub struct Entity {
     /// the raw hex digest string. `None` when this entity has no attached
     /// binary payload. Storage does not validate that the referenced blob
     /// actually exists — callers publish the blob before setting this field
-    /// (see `docs/adr` BlobStore ADR "publish-then-reference" ordering).
+    /// (see the BlobStore design record: "publish-then-reference" ordering).
     pub content_ref: Option<String>,
 }
 

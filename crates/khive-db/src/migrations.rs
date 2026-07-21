@@ -216,14 +216,23 @@ const MIGRATION_TRACKING_TABLE: &str = include_str!("../sql/schema-migrations-ta
 /// Errors on non-contiguous version array or failed migration.
 /// Read the applied schema version from an open connection **without** running
 /// migrations. Returns 0 when the `_schema_migrations` ledger is absent (an
-/// un-migrated or empty database). Never writes.
-pub fn read_schema_version(conn: &Connection) -> u32 {
-    conn.query_row(
+/// un-migrated or empty database); any other failure (BUSY, IO) propagates —
+/// collapsing it to 0 would misreport a live database as un-migrated. Never
+/// writes.
+pub fn read_schema_version(conn: &Connection) -> Result<u32, SqliteError> {
+    match conn.query_row(
         "SELECT COALESCE(MAX(version), 0) FROM _schema_migrations",
         [],
         |row| row.get(0),
-    )
-    .unwrap_or(0)
+    ) {
+        Ok(version) => Ok(version),
+        Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
+            if msg.contains("no such table: _schema_migrations") =>
+        {
+            Ok(0)
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Open `path` read-only and report its applied schema version without creating
@@ -235,19 +244,91 @@ pub fn inspect_schema_version(path: &std::path::Path) -> Result<u32, SqliteError
         path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
-    Ok(read_schema_version(&conn))
+    read_schema_version(&conn)
+}
+
+#[cfg(test)]
+pub(crate) mod test_sync {
+    use std::sync::atomic::AtomicU32;
+    use std::sync::{Arc, Barrier, Mutex};
+
+    /// When set, `run_migrations_locked` parks after its initial (stale)
+    /// ledger read until every racing thread has arrived — forcing the
+    /// contended interleaving the concurrent-boot test asserts on.
+    pub(crate) static STALE_READ_BARRIER: Mutex<Option<Arc<Barrier>>> = Mutex::new(None);
+    /// Counts entries into the under-lock sibling fast-forward branch.
+    pub(crate) static LOCKED_FAST_FORWARDS: AtomicU32 = AtomicU32::new(0);
+    /// Set by the SQLite busy handler installed on participating connections:
+    /// `true` means SQLite itself reported a blocked lock acquisition to the
+    /// loser — actual contention, not merely an intended attempt.
+    pub(crate) static BUSY_OBSERVED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// Busy handler for participating test connections: records that SQLite
+    /// observed a busy acquisition, then keeps retrying.
+    pub(crate) fn record_busy(_count: i32) -> bool {
+        BUSY_OBSERVED.store(true, std::sync::atomic::Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        true
+    }
+
+    /// Set by the winner immediately before committing its first migration
+    /// transaction — i.e. before the write lock is first released.
+    pub(crate) static WINNER_COMMITTED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    /// Recorded by the loser when its first `BEGIN IMMEDIATE` returns: whether
+    /// the winner had already committed at that moment. `true` is direct
+    /// evidence the loser's lock acquisition blocked across the winner's held
+    /// write lock rather than the two calls serializing by scheduler accident.
+    pub(crate) static LOSER_SAW_WINNER_COMMIT: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    std::thread_local! {
+        /// Opt-in flag: only threads that set this participate in the barrier,
+        /// so unrelated tests migrating in parallel are never parked.
+        pub(crate) static PARTICIPATE: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+        /// Whether this thread has already instrumented its first BEGIN.
+        pub(crate) static FIRST_BEGIN_DONE: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
 }
 
 pub fn run_migrations(conn: &mut Connection) -> Result<u32, SqliteError> {
+    // Concurrent boots (multiple processes migrating the same file) contend on
+    // the write lock below; a short hot-path busy_timeout cannot wait out a
+    // sibling's migration. Raise-only to a 5s floor — never reduce a caller
+    // whose configured timeout is already longer — and restore after.
+    let prior_busy_ms: i64 = conn.query_row("PRAGMA busy_timeout", [], |row| row.get(0))?;
+    let raised = prior_busy_ms < 5_000;
+    if raised {
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    }
+    let result = run_migrations_locked(conn);
+    if raised {
+        let _ = conn.busy_timeout(std::time::Duration::from_millis(prior_busy_ms.max(0) as u64));
+    }
+    result
+}
+
+fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
     conn.execute_batch(MIGRATION_TRACKING_TABLE)?;
 
-    let current_version: u32 = conn
-        .query_row(
-            "SELECT COALESCE(MAX(version), 0) FROM _schema_migrations",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
+    let current_version: u32 = read_schema_version(conn)?;
+
+    // Deterministic-contention hook: parks every caller after the stale ledger
+    // read (no lock held) until all racing test threads have observed it, so
+    // they are then released to compete for the IMMEDIATE write lock below.
+    #[cfg(test)]
+    if test_sync::PARTICIPATE.with(|p| p.get()) {
+        // Replaces the busy_timeout raised by `run_migrations` on this test
+        // connection: records SQLite-observed contention, then keeps retrying.
+        conn.busy_handler(Some(test_sync::record_busy))?;
+        let barrier = test_sync::STALE_READ_BARRIER.lock().unwrap().clone();
+        if let Some(barrier) = barrier {
+            barrier.wait();
+        }
+    }
 
     // A database whose recorded version is ahead of the latest known migration
     // predates the consolidated V1 baseline (ADR-015) — e.g. it still carries the
@@ -265,16 +346,90 @@ pub fn run_migrations(conn: &mut Connection) -> Result<u32, SqliteError> {
     }
 
     let mut applied_version = current_version;
+    // Floor advanced when a sibling's work is observed under the write lock,
+    // so a losing process skips the remaining already-applied migrations
+    // without opening a transaction for each.
+    let mut skip_through = current_version;
 
     for migration in MIGRATIONS {
-        if migration.version <= current_version {
+        if migration.version <= skip_through {
+            applied_version = applied_version.max(migration.version);
             continue;
         }
 
-        let tx = conn.transaction().map_err(|e| SqliteError::Migration {
-            version: migration.version,
-            error: e.to_string(),
-        })?;
+        // IMMEDIATE: take the write lock up front so concurrent boots serialize
+        // here instead of failing mid-migration when a DEFERRED transaction
+        // upgrades to a write.
+        #[cfg(test)]
+        let instrumented_first_begin = test_sync::PARTICIPATE.with(|p| p.get())
+            && !test_sync::FIRST_BEGIN_DONE.with(|f| f.get());
+        #[cfg(test)]
+        if instrumented_first_begin {
+            test_sync::FIRST_BEGIN_DONE.with(|f| f.set(true));
+        }
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| SqliteError::Migration {
+                version: migration.version,
+                error: e.to_string(),
+            })?;
+
+        // Re-check under the write lock: a sibling process may have applied
+        // this migration (and possibly later ones) while we waited. Running
+        // its DDL again would fail; fast-forward past everything it applied.
+        let sibling_version: u32 = tx
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM _schema_migrations",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| SqliteError::Migration {
+                version: migration.version,
+                error: e.to_string(),
+            })?;
+        #[cfg(test)]
+        if instrumented_first_begin {
+            use std::sync::atomic::Ordering::SeqCst;
+            if sibling_version == 0 {
+                // Winner: hold the write lock until SQLite has reported a
+                // busy acquisition to the loser (its busy handler fired) —
+                // proof the loser's BEGIN is actually blocked on this held
+                // lock, not merely intended. Bounded so a regression fails
+                // the assertion instead of hanging the test.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !test_sync::BUSY_OBSERVED.load(SeqCst) && std::time::Instant::now() < deadline
+                {
+                    std::thread::yield_now();
+                }
+            } else {
+                // Loser: our first BEGIN just returned. Record whether the
+                // winner had already committed — true means we blocked across
+                // its held lock.
+                test_sync::LOSER_SAW_WINNER_COMMIT
+                    .store(test_sync::WINNER_COMMITTED.load(SeqCst), SeqCst);
+            }
+        }
+
+        // The ahead-of-latest guard above ran on a pre-lock read; a newer
+        // build may have committed a version past ours while we waited for
+        // the write lock. Accepting it (clamped) would return Ok on a schema
+        // this binary does not understand — reject it the same way.
+        if sibling_version > latest_version {
+            return Err(SqliteError::InvalidData(format!(
+                "database schema version {sibling_version} is ahead of the latest known \
+                 migration {latest_version} (committed by a concurrent process while this \
+                 one waited for the migration write lock). This build cannot run against \
+                 the newer schema; upgrade the binary or recreate the database."
+            )));
+        }
+
+        if sibling_version >= migration.version {
+            #[cfg(test)]
+            test_sync::LOCKED_FAST_FORWARDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            skip_through = sibling_version.min(latest_version);
+            applied_version = applied_version.max(migration.version);
+            continue;
+        }
 
         tx.execute_batch(migration.up)
             .map_err(|e| SqliteError::Migration {
@@ -284,13 +439,19 @@ pub fn run_migrations(conn: &mut Connection) -> Result<u32, SqliteError> {
 
         let now = chrono::Utc::now().timestamp_micros();
         tx.execute(
-            "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (?1, ?2, ?3)",
+            "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(version) DO NOTHING",
             rusqlite::params![migration.version, migration.name, now],
         )
         .map_err(|e| SqliteError::Migration {
             version: migration.version,
             error: e.to_string(),
         })?;
+
+        #[cfg(test)]
+        if instrumented_first_begin {
+            test_sync::WINNER_COMMITTED.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
 
         tx.commit().map_err(|e| SqliteError::Migration {
             version: migration.version,

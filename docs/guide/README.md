@@ -45,4 +45,4 @@ requesting schema changes.
 
 - [AGENTS.md](../../AGENTS.md) — agent usage reference (verb tables, property conventions, edge density rules)
 - [CLAUDE.md](../../CLAUDE.md) — developer guide for working on khive itself
-- [ADR index](../adr/README.md) — architecture decision records (the design contract)
+- ADR index — architecture decision records (the design contract)

@@ -7,7 +7,7 @@ document keeps them separate, because only one of them runs today.
 
 ## ADR Links
 
-- [ADR-034](../../../../docs/adr/ADR-034-kg-validation-pipelines.md) — KG validation pipelines specification
+- ADR-034 — KG validation pipelines specification
 
 ## 1. Shipped: the data-driven TOML RulePass
 

@@ -12,8 +12,8 @@ labels: enhancement
 ## Proposal
 
 <!-- The smallest change that addresses the problem.
-     For schema or interface changes, draft an ADR inline or link to a
-     docs/adr/ADR-NNN draft. See docs/adr/README.md for the full ADR index. -->
+     For schema or interface changes, sketch the design inline — a maintainer
+     will drive the design review. -->
 
 ## Alternatives considered
 

@@ -80,9 +80,9 @@ parallelism and persistence — no dependency on `khive-hnsw`, `khive-fusion`, o
 `khive-score`.
 
 Governing ADRs:
-[ADR-054](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-054-ann-build-strategy-scaling-limits.md)
+ADR-054
 (scaling contract for batch build and query latency) and
-[ADR-052](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-052-ann-production-lifecycle.md)
+ADR-052
 (SQ8 quantization, tombstone delete, consolidation, crash-safe persistence).
 
 ## License

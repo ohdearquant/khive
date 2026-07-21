@@ -49,8 +49,8 @@ into any binary that depends on this crate. `kkernel` is that binary: its `mcp` 
 parses `khive_mcp::args::Args`, builds the runtime and pack registry, and calls into
 `khive_mcp::serve::run`.
 
-Governed by [ADR-016](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-016-request-dsl.md)
-(the `request` tool contract) and [ADR-049](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-049-khived-daemon.md)
+Governed by ADR-016
+(the `request` tool contract) and ADR-049
 (the warm daemon protocol this crate's client/daemon config-fingerprint matching supports).
 
 ## License

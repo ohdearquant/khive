@@ -57,7 +57,7 @@ squaring, or the equivalent portable fallback.
 Built on `rayon` only — no khive-* dependencies. Consumed today by
 [khive-vamana](https://crates.io/crates/khive-vamana) for its SQ8-quantized
 acquisition path. Governed by
-[ADR-052](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-052-ann-production-lifecycle.md),
+ADR-052,
 which documents why the predecessor per-dimension L2 codec (with an
 anisotropy gate calibrated on a synthetic corpus) silently fell back to a full
 residual pass on real transformer embeddings, and why the global-scale design

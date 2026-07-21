@@ -1,7 +1,7 @@
 # Query: Question Classes and Idiom Cookbook
 
 The `query` verb compiles GQL (Graph Query Language) and SPARQL strings to SQL
-`SELECT` statements over the knowledge graph ([ADR-008](../adr/ADR-008-query-layer-separation.md)).
+`SELECT` statements over the knowledge graph (ADR-008).
 It is a structural pattern matcher, not a full-text or semantic search engine,
 and it is read-only: mutations always go through `create`, `update`, `link`,
 `merge`, and `delete`.
@@ -35,7 +35,7 @@ can name the relation(s) and shape of the pattern you're matching.
 ## Question-class catalogue
 
 Verdicts derived from the shipped parsers, AST validation, SQL compiler, the
-KG verb handlers, [ADR-008](../adr/ADR-008-query-layer-separation.md), and
+KG verb handlers, ADR-008, and
 live read-only checks against a production knowledge graph.
 
 | Question class            | Example question                                                    | Verdict                      | Idiom or boundary                                                                                                                                                |
@@ -158,7 +158,7 @@ returns rows on the live MCP tool.
 
 ## See also
 
-- [ADR-008: Query Layer Separation](../adr/ADR-008-query-layer-separation.md) — why GQL and SPARQL share one SQL compilation target and no mutation path.
+- ADR-008: Query Layer Separation — why GQL and SPARQL share one SQL compilation target and no mutation path.
 - [Search and Retrieval](search.md) — fuzzy, full-text, and hybrid retrieval when `query` isn't the right tool.
 - [Prompt Cookbook](prompt-cookbook.md) — verb patterns beyond `query`.
 - [AGENTS.md](../../AGENTS.md) — additional GQL and SPARQL examples for agents.

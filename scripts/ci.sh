@@ -30,12 +30,6 @@ phase_lint() {
 
     echo "=== SQL Lint ==="
     sh "$SCRIPT_DIR/lint-sql.sh"
-
-    echo "=== ADR Reference Lint ==="
-    sh "$SCRIPT_DIR/lint-adr-refs.sh"
-
-    echo "=== ADR Reference Lint Self-Test ==="
-    sh "$SCRIPT_DIR/lint-adr-refs.sh" --self-test
 }
 
 phase_no_stubs_scan() {
