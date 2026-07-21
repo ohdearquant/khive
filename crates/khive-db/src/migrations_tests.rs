@@ -661,3 +661,52 @@ fn v10_content_ref_defaults_null_and_accepts_a_value() {
         .expect("read content_ref");
     assert_eq!(stored_ref, Some(digest));
 }
+
+#[test]
+fn read_schema_version_missing_ledger_is_zero() {
+    let conn = open_memory();
+    assert_eq!(
+        read_schema_version(&conn).expect("absent ledger is not an error"),
+        0
+    );
+}
+
+// khive#1212: two processes booting the same database file must both complete
+// migrations — the IMMEDIATE transaction serializes them and the under-lock
+// re-check makes the loser converge instead of failing on already-applied DDL.
+#[test]
+fn concurrent_boots_converge() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("concurrent-boot.db");
+
+    let handles: Vec<_> = (0..2)
+        .map(|_| {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let mut conn = Connection::open(&path).expect("open");
+                run_migrations(&mut conn)
+            })
+        })
+        .collect();
+
+    let latest = MIGRATIONS.last().expect("at least one migration").version;
+    for handle in handles {
+        let version = handle
+            .join()
+            .expect("thread join")
+            .expect("both concurrent boots must succeed");
+        assert_eq!(version, latest);
+    }
+
+    let conn = Connection::open(&path).expect("reopen");
+    let rows: u32 = conn
+        .query_row("SELECT COUNT(*) FROM _schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .expect("count ledger rows");
+    assert_eq!(
+        rows as usize,
+        MIGRATIONS.len(),
+        "exactly one ledger row per migration"
+    );
+}

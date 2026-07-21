@@ -216,14 +216,23 @@ const MIGRATION_TRACKING_TABLE: &str = include_str!("../sql/schema-migrations-ta
 /// Errors on non-contiguous version array or failed migration.
 /// Read the applied schema version from an open connection **without** running
 /// migrations. Returns 0 when the `_schema_migrations` ledger is absent (an
-/// un-migrated or empty database). Never writes.
-pub fn read_schema_version(conn: &Connection) -> u32 {
-    conn.query_row(
+/// un-migrated or empty database); any other failure (BUSY, IO) propagates —
+/// collapsing it to 0 would misreport a live database as un-migrated. Never
+/// writes.
+pub fn read_schema_version(conn: &Connection) -> Result<u32, SqliteError> {
+    match conn.query_row(
         "SELECT COALESCE(MAX(version), 0) FROM _schema_migrations",
         [],
         |row| row.get(0),
-    )
-    .unwrap_or(0)
+    ) {
+        Ok(version) => Ok(version),
+        Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
+            if msg.contains("no such table: _schema_migrations") =>
+        {
+            Ok(0)
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Open `path` read-only and report its applied schema version without creating
@@ -235,19 +244,25 @@ pub fn inspect_schema_version(path: &std::path::Path) -> Result<u32, SqliteError
         path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
-    Ok(read_schema_version(&conn))
+    read_schema_version(&conn)
 }
 
 pub fn run_migrations(conn: &mut Connection) -> Result<u32, SqliteError> {
+    // Concurrent boots (multiple processes migrating the same file) contend on
+    // the write lock below; the pool default busy_timeout is tuned for hot-path
+    // queries and is too short to wait out a sibling's migration. Raise it for
+    // the migration run and restore the caller's value after.
+    let prior_busy_ms: i64 = conn.query_row("PRAGMA busy_timeout", [], |row| row.get(0))?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    let result = run_migrations_locked(conn);
+    let _ = conn.busy_timeout(std::time::Duration::from_millis(prior_busy_ms.max(0) as u64));
+    result
+}
+
+fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
     conn.execute_batch(MIGRATION_TRACKING_TABLE)?;
 
-    let current_version: u32 = conn
-        .query_row(
-            "SELECT COALESCE(MAX(version), 0) FROM _schema_migrations",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
+    let current_version: u32 = read_schema_version(conn)?;
 
     // A database whose recorded version is ahead of the latest known migration
     // predates the consolidated V1 baseline (ADR-015) — e.g. it still carries the
@@ -271,10 +286,32 @@ pub fn run_migrations(conn: &mut Connection) -> Result<u32, SqliteError> {
             continue;
         }
 
-        let tx = conn.transaction().map_err(|e| SqliteError::Migration {
-            version: migration.version,
-            error: e.to_string(),
-        })?;
+        // IMMEDIATE: take the write lock up front so concurrent boots serialize
+        // here instead of failing mid-migration when a DEFERRED transaction
+        // upgrades to a write.
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| SqliteError::Migration {
+                version: migration.version,
+                error: e.to_string(),
+            })?;
+
+        // Re-check under the write lock: a sibling process may have applied
+        // this migration while we waited. Running its DDL again would fail.
+        let already_applied: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM _schema_migrations WHERE version = ?1)",
+                rusqlite::params![migration.version],
+                |row| row.get(0),
+            )
+            .map_err(|e| SqliteError::Migration {
+                version: migration.version,
+                error: e.to_string(),
+            })?;
+        if already_applied {
+            applied_version = migration.version;
+            continue;
+        }
 
         tx.execute_batch(migration.up)
             .map_err(|e| SqliteError::Migration {
@@ -284,7 +321,8 @@ pub fn run_migrations(conn: &mut Connection) -> Result<u32, SqliteError> {
 
         let now = chrono::Utc::now().timestamp_micros();
         tx.execute(
-            "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (?1, ?2, ?3)",
+            "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(version) DO NOTHING",
             rusqlite::params![migration.version, migration.name, now],
         )
         .map_err(|e| SqliteError::Migration {
