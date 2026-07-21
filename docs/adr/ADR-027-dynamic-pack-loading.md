@@ -461,6 +461,11 @@ and plays no role in selection.
 --pack (CLI) > KHIVE_PACKS (env) > runtime.packs (config) > built-in default
 ```
 
+Layers override, never merge: the first present layer supplies the entire resolved
+set, and lower layers are ignored. An empty value at any layer (`--pack` with no
+names, an empty `KHIVE_PACKS`, `runtime.packs = []`) is treated as absent and falls
+through to the next layer — matching the existing environment-variable behavior.
+
 For this option the environment outranks discovered configuration, deviating from the
 general ADR-035 rule (config over env). Pack selection is deployment topology: a
 single host legitimately runs processes with different surfaces, and a per-process
@@ -478,7 +483,10 @@ names an externally-issued, verifiable artifact carrying the set of packs the
 deployment is entitled to load. When present, the _resolved_ requested set — from
 whichever precedence layer supplied it — must be a subset of the manifest's allow
 list. Because the manifest bounds the result rather than participating in precedence,
-no higher-precedence layer can escape it.
+no higher-precedence layer can escape it. `pack_manifest` is deliberately
+configuration-only — there is no CLI flag or environment variable for it; licensed
+deployments have configuration files, and a constraint that could be repointed
+per-process would not be one.
 
 **4. Fail-closed, loudly.** Each of the following is a hard boot error, never a
 silent narrowing of the loaded set:
