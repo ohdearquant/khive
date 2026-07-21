@@ -1612,6 +1612,23 @@ async fn get_dispatch_after_merge_discloses_kept_id() {
         "expected a merged_into disclosure naming {}, got {msg:?}",
         into.id
     );
+
+    // The documented short-prefix form must reach the same disclosure:
+    // absorbed entities are soft-deleted, so this exercises the
+    // including-deleted prefix-resolution fallback in handle_get.
+    let short = from.id.to_string().replace('-', "")[..8].to_string();
+    let err = registry
+        .dispatch("get", json!({ "id": short }))
+        .await
+        .expect_err("get on an absorbed short id must still miss");
+    let RuntimeError::NotFound(msg) = err else {
+        panic!("expected NotFound, got {err:?}");
+    };
+    assert!(
+        msg.contains("was merged into") && msg.contains(&into.id.to_string()),
+        "expected a merged_into disclosure for the short-prefix form naming {}, got {msg:?}",
+        into.id
+    );
 }
 
 #[tokio::test]

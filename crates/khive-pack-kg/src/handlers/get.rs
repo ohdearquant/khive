@@ -17,7 +17,7 @@ use khive_types::EventKind;
 use super::common::{
     deser, flatten_get_result, normalize_entity_timestamps, normalize_event_timestamps,
     parse_event_kind, parse_event_outcome, parse_event_substrate, remap_note_status,
-    resolve_uuid_unfiltered, to_json, GetParams,
+    resolve_uuid_unfiltered, resolve_uuid_unfiltered_including_deleted, to_json, GetParams,
 };
 use crate::KgPack;
 
@@ -33,9 +33,18 @@ impl KgPack {
 
         // By-ID resolution (including the hex-prefix form) is namespace-agnostic
         // (ADR-007 Rev 6 / #391 §3) — the Gate is the authz seam, not this lookup.
+        // Live rows resolve first so ambiguity semantics are unchanged; the
+        // including-deleted fallback lets a short prefix reach soft-deleted
+        // rows — required both for `include_deleted=true` and for the
+        // merged_into disclosure below (absorbed entities are soft-deleted, so
+        // a live-only prefix scan would miss them before the hint could fire).
         let id = if let Ok(id) = resolve_uuid_unfiltered(&p.id, &self.runtime, graph_token).await {
             id
         } else if let Ok(id) = resolve_uuid_unfiltered(&p.id, &self.runtime, token).await {
+            id
+        } else if let Ok(id) =
+            resolve_uuid_unfiltered_including_deleted(&p.id, &self.runtime, graph_token).await
+        {
             id
         } else {
             if let Some(payload_val) = self.try_get_proposal_payload(token, &p.id).await? {
