@@ -834,11 +834,22 @@ impl KhiveRuntime {
                     }
                 }));
             }
-            let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(embed_model_names.len());
+            // Await every handle before inspecting any result. Each handle holds a
+            // clone of the dispatch's UsageContext (ADR-103 Amendment 2); returning
+            // early on the first error would leave later handles un-awaited, so
+            // their embed tasks keep running (and incrementing embed_calls) after
+            // this function has already returned — the usage snapshot must never
+            // observe a task the dispatch didn't wait for.
+            let mut join_results = Vec::with_capacity(handles.len());
             for handle in handles {
-                let join_result = handle
-                    .await
-                    .map_err(|e| RuntimeError::Internal(format!("embed task panicked: {e}")));
+                join_results.push(
+                    handle
+                        .await
+                        .map_err(|e| RuntimeError::Internal(format!("embed task panicked: {e}"))),
+                );
+            }
+            let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(embed_model_names.len());
+            for join_result in join_results {
                 match join_result {
                     Err(e) => {
                         if let Ok(store) = self.entities(token) {
@@ -2807,11 +2818,22 @@ impl KhiveRuntime {
                     }
                 }));
             }
-            let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(embed_model_names.len());
+            // Await every handle before inspecting any result. Each handle holds a
+            // clone of the dispatch's UsageContext (ADR-103 Amendment 2); returning
+            // early on the first error would leave later handles un-awaited, so
+            // their embed tasks keep running (and incrementing embed_calls) after
+            // this function has already returned — the usage snapshot must never
+            // observe a task the dispatch didn't wait for.
+            let mut join_results = Vec::with_capacity(handles.len());
             for handle in handles {
-                let join_result = handle
-                    .await
-                    .map_err(|e| RuntimeError::Internal(format!("embed task panicked: {e}")));
+                join_results.push(
+                    handle
+                        .await
+                        .map_err(|e| RuntimeError::Internal(format!("embed task panicked: {e}"))),
+                );
+            }
+            let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(embed_model_names.len());
+            for join_result in join_results {
                 match join_result {
                     Err(e) => {
                         // Compensate note row + FTS (no vectors inserted yet).
@@ -5119,6 +5141,95 @@ mod tests {
         async fn build(&self) -> crate::error::RuntimeResult<Arc<dyn EmbeddingService>> {
             self.build_count.fetch_add(1, Ordering::SeqCst);
             Ok(Arc::new(ConstVecService { dims: self.dims }))
+        }
+    }
+
+    /// Embedding service that sleeps briefly before returning, so its spawned
+    /// embed task is still in flight when a sibling model's task resolves
+    /// first — used to exercise the drain-before-return invariant on the
+    /// multi-model embed fan-out.
+    struct SlowVecService {
+        dims: usize,
+    }
+
+    #[async_trait]
+    impl EmbeddingService for SlowVecService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            Ok(texts.iter().map(|_| vec![1.0_f32; self.dims]).collect())
+        }
+
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "slow-vec"
+        }
+    }
+
+    struct SlowVecProvider {
+        provider_name: String,
+        dims: usize,
+    }
+
+    impl SlowVecProvider {
+        fn new(name: &str, dims: usize) -> Self {
+            Self {
+                provider_name: name.to_owned(),
+                dims,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl EmbedderProvider for SlowVecProvider {
+        fn name(&self) -> &str {
+            &self.provider_name
+        }
+
+        fn dimensions(&self) -> usize {
+            self.dims
+        }
+
+        async fn build(&self) -> crate::error::RuntimeResult<Arc<dyn EmbeddingService>> {
+            Ok(Arc::new(SlowVecService { dims: self.dims }))
+        }
+    }
+
+    /// Embedder provider whose `build()` always fails immediately — models
+    /// this provider's embed task resolving (with an error) well before a
+    /// slower sibling model's task completes.
+    struct FailFastProvider {
+        provider_name: String,
+    }
+
+    impl FailFastProvider {
+        fn new(name: &str) -> Self {
+            Self {
+                provider_name: name.to_owned(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl EmbedderProvider for FailFastProvider {
+        fn name(&self) -> &str {
+            &self.provider_name
+        }
+
+        fn dimensions(&self) -> usize {
+            4
+        }
+
+        async fn build(&self) -> crate::error::RuntimeResult<Arc<dyn EmbeddingService>> {
+            Err(RuntimeError::Internal(
+                "injected embed build failure".to_string(),
+            ))
         }
     }
 
@@ -11269,6 +11380,102 @@ mod tests {
         assert_eq!(
             snap["embed_calls"], 2,
             "both configured models' executed embeds must be counted; got {snap:?}"
+        );
+    }
+
+    // ADR-103 Amendment 2 regression: when one of several spawned embed tasks
+    // errors, create_entity must drain (await) every remaining handle before
+    // returning — each handle holds a clone of the dispatch's UsageContext, so
+    // an un-awaited handle keeps running and can increment embed_calls after
+    // the response has already gone out, making the counter nondeterministic.
+    // The fail-fast model resolves (with an error) first; the slow model's
+    // task is still in flight at that point — the drain must wait for it too.
+    #[tokio::test]
+    async fn create_entity_multi_model_error_drains_all_spawned_embeds_before_returning() {
+        const DIMS: usize = 4;
+
+        let rt = KhiveRuntime::memory().unwrap();
+        rt.register_embedder(FailFastProvider::new("usage-entity-fail-fast"));
+        rt.register_embedder(SlowVecProvider::new("usage-entity-slow", DIMS));
+
+        let ns = Namespace::parse("usage-entity-error-drain").unwrap();
+        let tok = NamespaceToken::for_namespace(ns.clone());
+
+        let ctx = crate::usage::UsageContext::new();
+        let result = crate::usage::scope(ctx.clone(), async {
+            rt.create_entity(
+                &tok,
+                "concept",
+                None,
+                "usage-drain entity",
+                Some("description so embed body is non-empty"),
+                None,
+                vec![],
+            )
+            .await
+        })
+        .await;
+
+        assert!(
+            result.is_err(),
+            "one model failing must fail the whole create_entity call"
+        );
+
+        let snap_immediately_after = ctx.snapshot();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let snap_after_delay = ctx.snapshot();
+
+        assert_eq!(
+            snap_immediately_after, snap_after_delay,
+            "no spawned embed task may still be running after create_entity returns \
+             its error — a late increment means a context-holding handle was left \
+             un-awaited; got immediately_after={snap_immediately_after:?} \
+             after_delay={snap_after_delay:?}"
+        );
+    }
+
+    // Same regression for the note create path's multi-model embed fan-out.
+    #[tokio::test]
+    async fn create_note_multi_model_error_drains_all_spawned_embeds_before_returning() {
+        const DIMS: usize = 4;
+
+        let rt = KhiveRuntime::memory().unwrap();
+        rt.register_embedder(FailFastProvider::new("usage-note-fail-fast"));
+        rt.register_embedder(SlowVecProvider::new("usage-note-slow", DIMS));
+
+        let ns = Namespace::parse("usage-note-error-drain").unwrap();
+        let tok = NamespaceToken::for_namespace(ns.clone());
+
+        let ctx = crate::usage::UsageContext::new();
+        let result = crate::usage::scope(ctx.clone(), async {
+            rt.create_note(
+                &tok,
+                "observation",
+                None,
+                "usage-drain note body",
+                None,
+                None,
+                vec![],
+            )
+            .await
+        })
+        .await;
+
+        assert!(
+            result.is_err(),
+            "one model failing must fail the whole create_note call"
+        );
+
+        let snap_immediately_after = ctx.snapshot();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let snap_after_delay = ctx.snapshot();
+
+        assert_eq!(
+            snap_immediately_after, snap_after_delay,
+            "no spawned embed task may still be running after create_note returns \
+             its error — a late increment means a context-holding handle was left \
+             un-awaited; got immediately_after={snap_immediately_after:?} \
+             after_delay={snap_after_delay:?}"
         );
     }
 

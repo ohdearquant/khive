@@ -2652,6 +2652,65 @@ async fn traverse_chunks_root_binds_over_host_param_limit() {
     }
 }
 
+/// ADR-103 Amendment 2 regression: `DbRoundTrips` must count one increment
+/// per executed chunk query, not one flat increment per `traverse` call.
+/// Pre-fix, the single `.inspect` after the `with_reader` closure counted a
+/// flat `1` regardless of how many `CHUNK_ROOTS`-sized (400) SQL executions
+/// actually ran — a 1 000-root call executes 3 chunk queries (400 + 400 +
+/// 200) but reported only 1 round trip.
+#[tokio::test]
+async fn traverse_over_chunk_limit_counts_one_db_round_trip_per_chunk() {
+    let store = setup_memory_store();
+
+    const N: usize = 1_000;
+    const CHUNK_ROOTS: usize = 400;
+    let expected_chunks = N.div_ceil(CHUNK_ROOTS) as u64;
+
+    let mut roots: Vec<Uuid> = Vec::with_capacity(N);
+    for _ in 0..N {
+        let root = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        store
+            .upsert_edge(make_edge(root, child, EdgeRelation::Extends, 1.0))
+            .await
+            .unwrap();
+        roots.push(root);
+    }
+
+    let ctx = khive_storage::usage::UsageContext::new();
+    let paths = khive_storage::usage::scope(ctx.clone(), async {
+        store
+            .traverse(TraversalRequest {
+                roots: roots.clone(),
+                options: TraversalOptions {
+                    max_depth: 1,
+                    direction: Direction::Out,
+                    relations: None,
+                    min_weight: None,
+                    limit: None,
+                },
+                include_roots: false,
+                include_properties: false,
+            })
+            .await
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        paths.len(),
+        N,
+        "traverse over {N} roots must return one GraphPath per root"
+    );
+
+    let snap = ctx.snapshot();
+    assert_eq!(
+        snap["db_round_trips"], expected_chunks,
+        "a {N}-root traverse split into {expected_chunks} chunk queries must count \
+         {expected_chunks} db_round_trips, not a flat 1; got {snap:?}"
+    );
+}
+
 /// STORAGE-AUD-003 / #485: PageRequest.offset > i64::MAX must return
 /// InvalidInput instead of silently narrowing to a negative i64 offset.
 #[tokio::test]

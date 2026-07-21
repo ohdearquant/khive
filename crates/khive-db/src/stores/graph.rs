@@ -1909,6 +1909,10 @@ impl GraphStore for SqlGraphStore {
             // Amendment 2 `graph_hops`: adjacency rows returned by the CTE,
             // counted before first-visit de-duplication.
             let mut raw_rows: u64 = 0;
+            // Amendment 2 `db_round_trips`: one per executed chunk query — a
+            // root set over CHUNK_ROOTS (400) splits into multiple SQL
+            // executions, each of which must count as its own round trip.
+            let mut chunks_executed: u64 = 0;
 
             // Pre-seed with root nodes when include_roots is set (done once for all roots).
             for root_id in &roots {
@@ -1930,6 +1934,7 @@ impl GraphStore for SqlGraphStore {
             }
 
             for chunk in roots.chunks(CHUNK_ROOTS) {
+                chunks_executed += 1;
                 let n_chunk = chunk.len();
 
                 // Param layout (per-chunk, not total):
@@ -2087,14 +2092,17 @@ impl GraphStore for SqlGraphStore {
                 }
             }
 
-            Ok((all_paths, raw_rows))
+            Ok((all_paths, raw_rows, chunks_executed))
         })
         .await
-        .inspect(|(_, raw_rows)| {
-            khive_storage::usage::count(khive_storage::usage::UsageUnit::DbRoundTrips, 1);
+        .inspect(|(_, raw_rows, chunks_executed)| {
+            khive_storage::usage::count(
+                khive_storage::usage::UsageUnit::DbRoundTrips,
+                *chunks_executed,
+            );
             khive_storage::usage::count(khive_storage::usage::UsageUnit::GraphHops, *raw_rows);
         })
-        .map(|(all_paths, _)| all_paths)
+        .map(|(all_paths, _, _)| all_paths)
     }
 
     async fn purge_incident_edges(&self, node_id: Uuid) -> Result<u64, StorageError> {
