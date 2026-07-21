@@ -995,6 +995,87 @@ fn batch_upsert_edges_guarded(
     })
 }
 
+/// Builds the recursive-member SQL for one chunk of `GraphStore::traverse`'s
+/// recursive CTE. `ns_param`/`depth_param` are the 1-based positional bind
+/// indices for this chunk's `?N` placeholders; `relation_cond`/`weight_cond`
+/// are the (already-indexed) optional filter fragments built by the caller.
+///
+/// `Out`/`In` each emit a single indexed-seek arm. `Both` emits two arms —
+/// one keyed on `e.source_id = t.node_id` (seekable via
+/// `idx_graph_edges_ns_src_rel`), one on `e.target_id = t.node_id` (seekable
+/// via `idx_graph_edges_ns_tgt_rel`) — UNION ALL'd inside the recursive
+/// member, mirroring the pattern already proven correct and fast for
+/// `batch_neighbors` (`build_inner_sql` above). A single
+/// `e.source_id = t.node_id OR e.target_id = t.node_id` predicate cannot be
+/// satisfied by one index seek: SQLite falls back to a full namespace scan
+/// per frontier row, degrading `Direction::Both` traversal from
+/// `O(frontier × avg_degree)` to `O(frontier × total_edges)` (#1229).
+fn traverse_recursive_member_sql(
+    direction: Direction,
+    ns_param: usize,
+    depth_param: usize,
+    relation_cond: &str,
+    weight_cond: &str,
+) -> String {
+    match direction {
+        Direction::Out => format!(
+            "SELECT t.root_id, e.target_id, e.id, t.depth + 1, \
+                 t.path || ',' || e.target_id, t.total_weight + e.weight \
+             FROM traversal t CROSS JOIN graph_edges e \
+                 ON e.source_id = t.node_id \
+             WHERE e.namespace = ?{ns} \
+               AND e.deleted_at IS NULL \
+               AND t.depth < ?{depth} \
+               AND (',' || t.path || ',') NOT LIKE '%,' || e.target_id || ',%'\
+               {rel_cond}{wt_cond}",
+            ns = ns_param,
+            depth = depth_param,
+            rel_cond = relation_cond,
+            wt_cond = weight_cond,
+        ),
+        Direction::In => format!(
+            "SELECT t.root_id, e.source_id, e.id, t.depth + 1, \
+                 t.path || ',' || e.source_id, t.total_weight + e.weight \
+             FROM traversal t CROSS JOIN graph_edges e \
+                 ON e.target_id = t.node_id \
+             WHERE e.namespace = ?{ns} \
+               AND e.deleted_at IS NULL \
+               AND t.depth < ?{depth} \
+               AND (',' || t.path || ',') NOT LIKE '%,' || e.source_id || ',%'\
+               {rel_cond}{wt_cond}",
+            ns = ns_param,
+            depth = depth_param,
+            rel_cond = relation_cond,
+            wt_cond = weight_cond,
+        ),
+        Direction::Both => format!(
+            "SELECT t.root_id, e.target_id, e.id, t.depth + 1, \
+                 t.path || ',' || e.target_id, t.total_weight + e.weight \
+             FROM traversal t CROSS JOIN graph_edges e \
+                 ON e.source_id = t.node_id \
+             WHERE e.namespace = ?{ns} \
+               AND e.deleted_at IS NULL \
+               AND t.depth < ?{depth} \
+               AND (',' || t.path || ',') NOT LIKE '%,' || e.target_id || ',%'\
+               {rel_cond}{wt_cond} \
+             UNION ALL \
+             SELECT t.root_id, e.source_id, e.id, t.depth + 1, \
+                 t.path || ',' || e.source_id, t.total_weight + e.weight \
+             FROM traversal t CROSS JOIN graph_edges e \
+                 ON e.target_id = t.node_id \
+             WHERE e.namespace = ?{ns} \
+               AND e.deleted_at IS NULL \
+               AND t.depth < ?{depth} \
+               AND (',' || t.path || ',') NOT LIKE '%,' || e.source_id || ',%'\
+               {rel_cond}{wt_cond}",
+            ns = ns_param,
+            depth = depth_param,
+            rel_cond = relation_cond,
+            wt_cond = weight_cond,
+        ),
+    }
+}
+
 #[async_trait]
 impl GraphStore for SqlGraphStore {
     async fn upsert_edge(&self, edge: Edge) -> Result<(), StorageError> {
@@ -1819,8 +1900,6 @@ impl GraphStore for SqlGraphStore {
     async fn traverse(&self, request: TraversalRequest) -> Result<Vec<GraphPath>, StorageError> {
         use std::collections::{HashMap, HashSet};
 
-        use khive_storage::types::Direction;
-
         if request.roots.is_empty() {
             return Ok(Vec::new());
         }
@@ -1854,16 +1933,6 @@ impl GraphStore for SqlGraphStore {
             // 400 rows stays safely below both: 400 < 500 (compound) and
             // 400 + fixed << 999 (variables).
             const CHUNK_ROOTS: usize = 400;
-
-            // Determine join direction (invariant across chunks).
-            let (join_condition, next_node) = match opts.direction {
-                Direction::Out => ("e.source_id = t.node_id", "e.target_id"),
-                Direction::In => ("e.target_id = t.node_id", "e.source_id"),
-                Direction::Both => (
-                    "(e.source_id = t.node_id OR e.target_id = t.node_id)",
-                    "CASE WHEN e.source_id = t.node_id THEN e.target_id ELSE e.source_id END",
-                ),
-            };
 
             // Open a deferred read transaction so ALL chunk queries observe the same
             // graph snapshot.  Without this, a writer committing between chunks could
@@ -1951,36 +2020,33 @@ impl GraphStore for SqlGraphStore {
                     .collect();
                 let seeds = seed_rows.join(", ");
 
-                // CTE covering the chunk's roots.  CROSS JOIN forces SQLite to put
-                // the frontier (t) as the outer loop and seek graph_edges by index,
-                // avoiding the O(edges × frontier) plan (#250, #251).
+                // Recursive-member SQL for this chunk.  CROSS JOIN forces SQLite to
+                // put the frontier (t) as the outer loop and seek graph_edges by
+                // index, avoiding the O(edges × frontier) plan (#250, #251).
+                // See `traverse_recursive_member_sql` for why `Both` is split
+                // into two UNION ALL'd arms instead of one OR-predicate arm
+                // (#1229).
+                let recursive_member = traverse_recursive_member_sql(
+                    opts.direction.clone(),
+                    ns_param,
+                    depth_param,
+                    &relation_cond,
+                    &weight_cond,
+                );
+
                 let cte_sql = format!(
                     "WITH RECURSIVE traversal(\
                          root_id, node_id, edge_id, depth, path, total_weight\
                      ) AS (\
                          VALUES {seeds} \
                          UNION ALL \
-                         SELECT t.root_id, {next_node}, e.id, t.depth + 1, \
-                                t.path || ',' || {next_node}, \
-                                t.total_weight + e.weight \
-                         FROM traversal t CROSS JOIN graph_edges e \
-                             ON {join_condition} \
-                         WHERE e.namespace = ?{ns} \
-                           AND e.deleted_at IS NULL \
-                           AND t.depth < ?{depth} \
-                           AND (',' || t.path || ',') NOT LIKE '%,' || {next_node} || ',%'\
-                           {rel_cond}{wt_cond} \
+                         {recursive_member} \
                      ) \
                      SELECT root_id, node_id, edge_id, depth, total_weight \
                      FROM traversal WHERE depth > 0 \
                      ORDER BY root_id, depth",
                     seeds = seeds,
-                    next_node = next_node,
-                    join_condition = join_condition,
-                    ns = ns_param,
-                    depth = depth_param,
-                    rel_cond = relation_cond,
-                    wt_cond = weight_cond,
+                    recursive_member = recursive_member,
                 );
 
                 let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
