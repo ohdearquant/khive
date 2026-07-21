@@ -391,6 +391,13 @@ pub fn accepted_pack_relations_for_entities(
 /// (the exact functions the live validator consults) over the closed kind set,
 /// rather than re-deriving a parallel table — issue #543 precedent, applied to
 /// GQL query-pattern hint derivation (issue #593).
+///
+/// Pack rules are skipped for `crate::pack::SPECIAL_RELATIONS` (supersedes /
+/// supports / refutes): the live validator's special-relation branch
+/// (`validate_edge_relation_endpoints`, this file) resolves those relations
+/// before `pack_rule_allows` is ever reached, so a pack `EDGE_RULES` entry for
+/// one of them is never actually enforced (see `pack.rs`'s
+/// `edge_endpoint_table` doc comment for the authoritative statement of this).
 fn accepted_entity_kind_pairs_for_relation(
     pack_rules: &[EdgeEndpointRule],
     relation: EdgeRelation,
@@ -399,14 +406,15 @@ fn accepted_entity_kind_pairs_for_relation(
     for src in khive_types::EntityKind::ALL {
         for tgt in khive_types::EntityKind::ALL {
             let allowed = base_entity_rule_allows(src.name(), relation, tgt.name())
-                || accepted_pack_relations_for_entities(
-                    pack_rules,
-                    src.name(),
-                    None,
-                    tgt.name(),
-                    None,
-                )
-                .contains(&relation);
+                || (!crate::pack::SPECIAL_RELATIONS.contains(&relation)
+                    && accepted_pack_relations_for_entities(
+                        pack_rules,
+                        src.name(),
+                        None,
+                        tgt.name(),
+                        None,
+                    )
+                    .contains(&relation));
             if allowed {
                 pairs.push((src.name(), tgt.name()));
             }
@@ -425,6 +433,10 @@ fn accepted_entity_kind_pairs_for_relation(
 /// undirected edges, variable-length hops, and note-kind endpoints are left
 /// unchecked, since none of those name a single static triple to test against
 /// the validator (issue #593).
+///
+/// Mirrors the validator's special-relation precedence for `supersedes` /
+/// `supports` / `refutes` (see [`accepted_entity_kind_pairs_for_relation`]):
+/// pack rules never make those triples possible, only the base allowlist does.
 fn static_impossible_edge_pattern_warnings(
     pattern: &khive_query::ast::MatchPattern,
     pack_rules: &[EdgeEndpointRule],
@@ -465,14 +477,15 @@ fn static_impossible_edge_pattern_warnings(
         };
 
         let possible = base_entity_rule_allows(src_kind.name(), relation, tgt_kind.name())
-            || accepted_pack_relations_for_entities(
-                pack_rules,
-                src_kind.name(),
-                src_node.entity_type.as_deref(),
-                tgt_kind.name(),
-                tgt_node.entity_type.as_deref(),
-            )
-            .contains(&relation);
+            || (!crate::pack::SPECIAL_RELATIONS.contains(&relation)
+                && accepted_pack_relations_for_entities(
+                    pack_rules,
+                    src_kind.name(),
+                    src_node.entity_type.as_deref(),
+                    tgt_kind.name(),
+                    tgt_node.entity_type.as_deref(),
+                )
+                .contains(&relation));
         if possible {
             continue;
         }
