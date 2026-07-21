@@ -920,7 +920,7 @@ fn endpoint_kind_label(kind: &EndpointKind) -> String {
 /// any `note -> note` pair unconditionally, regardless of note kind
 /// (ADR-002 §"Versioning" and §"Epistemic"), and never consults pack
 /// `EDGE_RULES` at all, on either substrate.
-const SPECIAL_RELATIONS: &[khive_types::EdgeRelation] = &[
+pub(crate) const SPECIAL_RELATIONS: &[khive_types::EdgeRelation] = &[
     khive_types::EdgeRelation::Supersedes,
     khive_types::EdgeRelation::Supports,
     khive_types::EdgeRelation::Refutes,
