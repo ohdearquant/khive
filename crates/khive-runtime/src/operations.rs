@@ -819,13 +819,19 @@ impl KhiveRuntime {
             // with inserted_models tracking for rollback on partial failure.
             let rt_clone = self.clone();
             let body_owned = embed_body.clone();
+            let usage_ctx = crate::usage::current();
             let mut handles = Vec::with_capacity(embed_model_names.len());
             for model_name in &embed_model_names {
                 let rt = rt_clone.clone();
                 let text = body_owned.clone();
                 let name = model_name.clone();
+                let ctx = usage_ctx.clone();
                 handles.push(tokio::spawn(async move {
-                    rt.embed_document_with_model(&name, &text).await
+                    let fut = rt.embed_document_with_model(&name, &text);
+                    match ctx {
+                        Some(ctx) => crate::usage::scope(ctx, fut).await,
+                        None => fut.await,
+                    }
                 }));
             }
             let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(embed_model_names.len());
@@ -2786,13 +2792,19 @@ impl KhiveRuntime {
             // then insert one VectorRecord per model.
             let rt_clone = self.clone();
             let content_owned = embed_text.to_string();
+            let usage_ctx = crate::usage::current();
             let mut handles = Vec::with_capacity(embed_model_names.len());
             for model_name in &embed_model_names {
                 let rt = rt_clone.clone();
                 let text = content_owned.clone();
                 let name = model_name.clone();
+                let ctx = usage_ctx.clone();
                 handles.push(tokio::spawn(async move {
-                    rt.embed_document_with_model(&name, &text).await
+                    let fut = rt.embed_document_with_model(&name, &text);
+                    match ctx {
+                        Some(ctx) => crate::usage::scope(ctx, fut).await,
+                        None => fut.await,
+                    }
                 }));
             }
             let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(embed_model_names.len());
@@ -3107,6 +3119,7 @@ impl KhiveRuntime {
             "search_notes",
             query_text,
         )?;
+        crate::usage::count(crate::usage::UsageUnit::FtsPasses, 1);
 
         // Vector search filtered to notes.
         let vector_hits = if query_vector.is_some() || self.config().embedding_model.is_some() {
@@ -11179,6 +11192,119 @@ mod tests {
         assert!(
             hits_b.is_empty(),
             "model-b vector store must be empty after rollback; got {hits_b:?}"
+        );
+    }
+
+    // ADR-103 Amendment 2 regression: multi-model create_entity spawns one
+    // embed task per configured model via tokio::spawn. Task-locals do not
+    // cross a spawn boundary, so each spawned task must re-enter the
+    // dispatch's usage scope explicitly for its embed to be counted.
+    #[tokio::test]
+    async fn create_entity_multi_model_counts_all_executed_embeds() {
+        const DIMS: usize = 4;
+
+        let rt = KhiveRuntime::memory().unwrap();
+        let (provider_a, _ca) = ConstVecProvider::new("usage-entity-model-a", DIMS);
+        let (provider_b, _cb) = ConstVecProvider::new("usage-entity-model-b", DIMS);
+        rt.register_embedder(provider_a);
+        rt.register_embedder(provider_b);
+
+        let ns = Namespace::parse("usage-entity-multi").unwrap();
+        let tok = NamespaceToken::for_namespace(ns.clone());
+
+        let ctx = crate::usage::UsageContext::new();
+        crate::usage::scope(ctx.clone(), async {
+            rt.create_entity(
+                &tok,
+                "concept",
+                None,
+                "usage-counted entity",
+                Some("description so embed body is non-empty"),
+                None,
+                vec![],
+            )
+            .await
+        })
+        .await
+        .expect("create_entity must succeed");
+
+        let snap = ctx.snapshot();
+        assert_eq!(
+            snap["embed_calls"], 2,
+            "both configured models' executed embeds must be counted; got {snap:?}"
+        );
+    }
+
+    // Same regression for the note create path's multi-model embed fan-out.
+    #[tokio::test]
+    async fn create_note_multi_model_counts_all_executed_embeds() {
+        const DIMS: usize = 4;
+
+        let rt = KhiveRuntime::memory().unwrap();
+        let (provider_a, _ca) = ConstVecProvider::new("usage-note-model-a", DIMS);
+        let (provider_b, _cb) = ConstVecProvider::new("usage-note-model-b", DIMS);
+        rt.register_embedder(provider_a);
+        rt.register_embedder(provider_b);
+
+        let ns = Namespace::parse("usage-note-multi").unwrap();
+        let tok = NamespaceToken::for_namespace(ns.clone());
+
+        let ctx = crate::usage::UsageContext::new();
+        crate::usage::scope(ctx.clone(), async {
+            rt.create_note(
+                &tok,
+                "observation",
+                None,
+                "usage-counted note body",
+                None,
+                None,
+                vec![],
+            )
+            .await
+        })
+        .await
+        .expect("create_note must succeed");
+
+        let snap = ctx.snapshot();
+        assert_eq!(
+            snap["embed_calls"], 2,
+            "both configured models' executed embeds must be counted; got {snap:?}"
+        );
+    }
+
+    // Note search must count its FTS5 execution the same way entity
+    // hybrid_search does (retrieval.rs:435) — the search_notes FTS leg was
+    // silently uncounted.
+    #[tokio::test]
+    async fn search_notes_counts_one_fts_pass() {
+        let rt = KhiveRuntime::memory().unwrap();
+        let ns = Namespace::parse("usage-note-search").unwrap();
+        let tok = NamespaceToken::for_namespace(ns.clone());
+
+        rt.create_note(
+            &tok,
+            "observation",
+            None,
+            "usage counted note search body",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create_note must succeed");
+
+        let ctx = crate::usage::UsageContext::new();
+        crate::usage::scope(ctx.clone(), async {
+            rt.search_notes(&tok, "usage counted", None, 10, None, false, &[], None)
+                .await
+        })
+        .await
+        .expect("search_notes must succeed");
+
+        let snap = ctx.snapshot();
+        assert!(
+            snap["fts_passes"].as_u64().unwrap_or(0) >= 1,
+            "note search FTS execution must count fts_passes; got {snap:?}"
         );
     }
 
