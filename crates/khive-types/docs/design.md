@@ -13,18 +13,18 @@ types for proposals, events, and namespace isolation.
 
 ## Relevant ADRs
 
-- [ADR-001: Entity Kind Taxonomy](../../../docs/adr/ADR-001-entity-kind-taxonomy.md)
-- [ADR-002: Closed Edge Ontology](../../../docs/adr/ADR-002-edge-ontology.md)
-- [ADR-004: Substrate Observables](../../../docs/adr/ADR-004-substrate-observables.md)
-- [ADR-013: Note Kind Taxonomy](../../../docs/adr/ADR-013-note-kind-taxonomy.md)
-- [ADR-017: Pack Standard](../../../docs/adr/ADR-017-pack-standard.md)
-- [ADR-019: GTD Pack](../../../docs/adr/ADR-019-gtd-pack.md)
-- [ADR-021: Memory Pack](../../../docs/adr/ADR-021-memory-pack.md)
-- [ADR-023: Pack Verb Surface, Visibility, and Composition](../../../docs/adr/ADR-023-declarative-pack-format.md)
-- [ADR-025: Verb Surface as Speech-Act Taxonomy](../../../docs/adr/ADR-025-verb-speech-acts.md)
-- [ADR-034: KG Validation Pipelines](../../../docs/adr/ADR-034-kg-validation-pipelines.md)
-- [ADR-045: Verb Response Presentation Modes](../../../docs/adr/ADR-045-verb-response-presentation.md)
-- [ADR-046: Event-Sourced Agent KG Proposals](../../../docs/adr/ADR-046-event-sourced-proposals.md)
+- ADR-001: Entity Kind Taxonomy
+- ADR-002: Closed Edge Ontology
+- ADR-004: Substrate Observables
+- ADR-013: Note Kind Taxonomy
+- ADR-017: Pack Standard
+- ADR-019: GTD Pack
+- ADR-021: Memory Pack
+- ADR-023: Pack Verb Surface, Visibility, and Composition
+- ADR-025: Verb Surface as Speech-Act Taxonomy
+- ADR-034: KG Validation Pipelines
+- ADR-045: Verb Response Presentation Modes
+- ADR-046: Event-Sourced Agent KG Proposals
 
 ## Primary Modules
 

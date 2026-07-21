@@ -1,3 +1,6 @@
+<!-- khive does not accept external contributions; external pull requests may be
+     closed without review. Maintainer use only. -->
+
 ## Summary
 
 <!-- 1-3 bullets: what changed and why. Match the actual diff. -->
@@ -11,10 +14,10 @@
 - [ ] `cargo fmt --all -- --check`
 - [ ] `deno fmt --check docs/` (if docs changed)
 
-## ADR
+## Design record
 
-<!-- If this PR introduces a significant design change, link to the ADR
-     (docs/adr/ADR-NNN-*.md). For small fixes, write "n/a". -->
+<!-- If this PR introduces a significant design change, reference the issue
+     where the design was agreed with a maintainer. For small fixes, write "n/a". -->
 
 ## AI-assisted contribution checklist
 

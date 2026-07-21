@@ -279,11 +279,11 @@ the intended behavior, not a silent failure.
 
 Actor addressing (`to_actor` filtering on `comm.send`/`comm.inbox`) is a
 view-layer convention for cooperating, co-located actors, not a security
-boundary ([ADR-063](../adr/ADR-063-comm-principal-model.md)). Any process
+boundary (ADR-063). Any process
 with access to the underlying SQLite store can read every message row
 regardless of `to_actor`, and there is no per-principal storage partition on
 the local backend. Where authorization is enforced, it lives at a single
-seam, the Gate ([ADR-018](../adr/ADR-018-authorization-gate.md)), not at the
+seam, the Gate (ADR-018), not at the
 comm pack's inbox filter.
 
 ## See also

@@ -1,6 +1,16 @@
 # Contributing to khive
 
-## Getting Started
+khive is developed internally by its maintainers and **does not accept external
+contributions**. External pull requests, issues, and review comments are not
+monitored and may be closed without review; repository interactions are limited
+to collaborators.
+
+The source is published for transparency and for building on top of khive under
+its license terms — use it, fork it, embed it. If you believe you have found a
+security issue, contact the maintainers privately rather than opening a public
+issue.
+
+## Building from source
 
 ### Prerequisites
 
@@ -48,21 +58,14 @@ make ci
 
 Individual targets: `make check`, `make clippy`, `make test`, `make fmt`.
 
-## Pull Request Workflow
+## For maintainers
 
-1. Fork the repository and create a feature branch from `main`.
-2. Make your changes. All new public APIs require tests.
-3. Ensure `cargo test --workspace` and `cargo clippy --workspace -- -D warnings` pass.
-4. Open a pull request against `main`. Describe what changed and why.
+Design decisions are recorded as design records maintained outside this
+repository. Non-trivial changes to crate boundaries, public APIs, or the pack
+system need an approved design record before code lands. Feature branches and
+pull requests only; never push directly to `main`.
 
-## Architecture
-
-Design decisions are recorded as Architecture Decision Records (ADRs) in
-[`docs/adr/`](docs/adr/). Read `docs/adr/README.md` for an index and the
-ADR format. Non-trivial changes to crate boundaries, public APIs, or the
-pack system should be accompanied by a new or updated ADR.
-
-## Code Style
+### Code style
 
 - Follow standard Rust idioms. Clippy with `-D warnings` is enforced in CI.
 - Keep public API surface minimal and well-documented.

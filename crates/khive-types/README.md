@@ -69,11 +69,11 @@ default across the runtime.
 `khive-types` is the base of khive's dependency chain — every other crate
 (`khive-score`, `khive-storage`, `khive-db`, every pack) depends on it, directly
 or transitively. It owns the entity kind taxonomy
-([ADR-001](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-001-entity-kind-taxonomy.md)),
+(ADR-001),
 the edge ontology
-([ADR-002](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-002-edge-ontology.md)),
+(ADR-002),
 and the note kind taxonomy
-([ADR-013](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-013-note-kind-taxonomy.md)).
+(ADR-013).
 
 ## License
 

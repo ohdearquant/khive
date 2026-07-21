@@ -61,7 +61,7 @@ dependency on any other khive crate beyond `khive-types`.
   reference [Rego](https://www.openpolicyagent.org/) backend (`RegoGate`), installed in
   place of `AllowAllGate` when a deployment needs real policy enforcement.
 
-Governed by [ADR-018](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-018-authorization-gate.md).
+Governed by ADR-018.
 
 ## License
 

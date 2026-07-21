@@ -5,7 +5,7 @@ Agent) backend for [`khive-gate`](https://crates.io/crates/khive-gate)'s `Gate` 
 powered by [`regorus`](https://crates.io/crates/regorus).
 
 This is the **reference policy backend** for khive's authorization gate
-([ADR-018](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-018-authorization-gate.md)).
+(ADR-018).
 It is opt-in: a deployment that wants Rego-based authorization adds this crate as a
 dependency and installs a `RegoGate` as the runtime gate. Consumers that do not need
 Rego (e.g. the personal-local OSS binary, which runs the permissive `AllowAllGate`
@@ -94,7 +94,7 @@ Load every `*.rego` file under a directory (non-recursive, deterministic order) 
 
 ## Semantics
 
-Per [ADR-018](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-018-authorization-gate.md):
+Per ADR-018:
 
 - **`Deny` is authoritative.** A `Deny` decision aborts dispatch with
   `RuntimeError::PermissionDenied`.

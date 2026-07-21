@@ -152,6 +152,4 @@ All examples should report `invalid=0`.
 ## Links
 
 - Repository: <https://github.com/ohdearquant/khive>
-- ADR-016 (request DSL):
-  <https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-016-request-dsl.md>
 - Releases: <https://github.com/ohdearquant/khive/releases>

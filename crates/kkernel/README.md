@@ -105,9 +105,9 @@ when installed, add their own), `khive-mcp` (the server library it serves), `khi
 `inventory::submit!` verb registrations in the final binary — dependency alone is not enough
 for that to happen.
 
-Governed by [ADR-016](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-016-request-dsl.md)
-(request DSL), [ADR-049](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-049-khived-daemon.md)
-(the `--daemon` warm runtime), and [ADR-027](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-027-dynamic-pack-loading.md)
+Governed by ADR-016
+(request DSL), ADR-049
+(the `--daemon` warm runtime), and ADR-027
 (pack self-registration via `inventory`).
 
 ## License

@@ -75,7 +75,7 @@ vector data is a cache, so callers re-embed after recreating the table.
 ## Where this sits
 
 `khive-db` implements the `khive-storage` capability traits
-([ADR-005](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-005-storage-capability-traits.md))
+(ADR-005)
 against SQLite, sitting directly above `khive-storage`/`khive-score`/`khive-types` and
 below `khive-query` and `khive-runtime` in the storage dependency chain:
 
@@ -85,7 +85,7 @@ types -> score -> storage -> db -> query -> runtime -> pack-* -> mcp
 
 `khive-runtime`'s `KhiveRuntime` wraps `StorageBackend` and layers namespace
 authorization and pack dispatch on top. Schema evolution follows
-[ADR-015](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-015-schema-migrations.md).
+ADR-015.
 
 ## License
 

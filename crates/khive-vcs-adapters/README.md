@@ -63,7 +63,7 @@ it has no dependency on `khive-storage` or `khive-runtime`. Its output feeds the
 standard `khive kg import` pipeline, which is what performs validation and loading
 into `working.db`; the adapter itself never touches a database.
 
-Governed by [ADR-036](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-036-kg-import-export-adapters.md).
+Governed by ADR-036.
 
 ## License
 

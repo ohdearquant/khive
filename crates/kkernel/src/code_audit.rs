@@ -1,5 +1,5 @@
 //! `kkernel code-audit`: a read-only derived-report pipeline over a
-//! dedicated code-map database (docs/adr/ADR-114-code-audit-derived-report.md).
+//! dedicated code-map database (ADR-114-code-audit-derived-report).
 //!
 //! Phase 1 scope: structural signals computed with deterministic SQL over the
 //! `code.ingest` L1/L1.5 facts already present in the map (no file/history

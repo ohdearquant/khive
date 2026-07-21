@@ -8,10 +8,10 @@ has no dependency on storage, DB, or runtime crates.
 
 ## ADR Links
 
-- [ADR-001: Entity Kind Taxonomy](../../../docs/adr/ADR-001-entity-kind-taxonomy.md)
-- [ADR-002: Closed Edge Ontology](../../../docs/adr/ADR-002-edge-ontology.md)
-- [ADR-008: Query Layer Separation](../../../docs/adr/ADR-008-query-layer-separation.md)
-- [ADR-041: Event Provenance Projection — Hybrid Log + Graph Edges](../../../docs/adr/ADR-041-event-provenance-projection.md)
+- ADR-001: Entity Kind Taxonomy
+- ADR-002: Closed Edge Ontology
+- ADR-008: Query Layer Separation
+- ADR-041: Event Provenance Projection — Hybrid Log + Graph Edges
 
 ## Modules
 

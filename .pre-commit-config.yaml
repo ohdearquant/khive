@@ -54,12 +54,6 @@ repos:
         language: system
         files: ^crates/.*\.sql$
         pass_filenames: false
-      - id: lint-adr-refs
-        name: lint ADR references
-        entry: sh scripts/lint-adr-refs.sh
-        language: system
-        files: ^(docs/.*\.md|crates/(.*/docs/.*\.md|.*/design[^/]*\.md))$
-        pass_filenames: false
 
   # TypeScript / Next.js: eslint + prettier (run via pnpm)
   - repo: local
