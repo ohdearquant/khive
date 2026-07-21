@@ -3340,6 +3340,75 @@ mod tests {
         .unwrap();
     }
 
+    // ---- interim merged_into miss-hint (data-integrity, precedes ADR-113 chase) ----
+
+    #[tokio::test]
+    async fn get_entity_after_merge_discloses_kept_id() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let into = rt
+            .create_entity(&tok, "concept", None, "Kept", None, None, vec![])
+            .await
+            .unwrap();
+        let from = rt
+            .create_entity(&tok, "concept", None, "Absorbed", None, None, vec![])
+            .await
+            .unwrap();
+
+        rt.merge_entity(
+            &tok,
+            into.id,
+            from.id,
+            EntityDedupMergePolicy::PreferInto,
+            ContentMergeStrategy::Append,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let err = rt.get_entity(&tok, from.id).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("was merged into") && msg.contains(&into.id.to_string()),
+            "expected a merged_into disclosure naming {}, got {msg:?}",
+            into.id
+        );
+    }
+
+    #[tokio::test]
+    async fn get_entity_on_plain_soft_delete_stays_bare_not_found() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let entity = rt
+            .create_entity(&tok, "concept", None, "Deleted", None, None, vec![])
+            .await
+            .unwrap();
+        assert!(rt.delete_entity(&tok, entity.id, false).await.unwrap());
+
+        let err = rt.get_entity(&tok, entity.id).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("merged into"),
+            "plain soft-delete must not gain a merge hint, got {msg:?}"
+        );
+        assert_eq!(msg, format!("not found: entity {}", entity.id));
+    }
+
+    #[tokio::test]
+    async fn get_entity_on_absent_id_stays_bare_not_found() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let absent = Uuid::new_v4();
+
+        let err = rt.get_entity(&tok, absent).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("merged into"),
+            "a never-existed id must not gain a merge hint, got {msg:?}"
+        );
+        assert_eq!(msg, format!("not found: entity {absent}"));
+    }
+
     // ---- merge helper unit tests ----
 
     #[test]

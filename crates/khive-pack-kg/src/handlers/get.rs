@@ -46,6 +46,14 @@ impl KgPack {
 
         let include_deleted = p.include_deleted.unwrap_or(false);
 
+        // Interim merged_into disclosure (data-integrity, precedes the full
+        // ADR-113 redirect chase): `get_entity` names the kept id in its
+        // NotFound message when `id` was consumed by `merge`. Captured here
+        // so it can stand in for the generic not-found built below once
+        // every other substrate (note/edge/event/pack-resolver) also misses
+        // — the marker string is one we control on the write side above.
+        let mut merge_redirect_hint: Option<String> = None;
+
         match self.runtime.get_entity(graph_token, id).await {
             Ok(entity) => {
                 return flatten_get_result(
@@ -53,7 +61,24 @@ impl KgPack {
                     normalize_entity_timestamps(to_json(&entity)?),
                 );
             }
-            Err(RuntimeError::NotFound(_) | RuntimeError::NamespaceMismatch { .. }) => {
+            Err(RuntimeError::NotFound(msg)) => {
+                if msg.contains("was merged into") {
+                    merge_redirect_hint = Some(msg);
+                }
+                if include_deleted {
+                    if let Some(deleted) = self
+                        .runtime
+                        .get_entity_including_deleted(graph_token, id)
+                        .await?
+                    {
+                        return flatten_get_result(
+                            "entity",
+                            normalize_entity_timestamps(to_json(&deleted)?),
+                        );
+                    }
+                }
+            }
+            Err(RuntimeError::NamespaceMismatch { .. }) => {
                 if include_deleted {
                     if let Some(deleted) = self
                         .runtime
@@ -110,6 +135,10 @@ impl KgPack {
 
         if let Some(payload_val) = self.try_get_proposal_payload(token, &p.id).await? {
             return Ok(payload_val);
+        }
+
+        if let Some(hint) = merge_redirect_hint {
+            return Err(RuntimeError::NotFound(hint));
         }
 
         Err(RuntimeError::NotFound(format!("not found: {}", p.id)))
