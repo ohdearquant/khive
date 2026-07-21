@@ -55,7 +55,7 @@ Both walk the graph, but they answer different question shapes:
 
 `context` composes the same runtime ops as `search` and `neighbors` (it adds
 no new storage or index); see
-[ADR-089](../adr/ADR-089-context-verb.md) for the full parameter and
+ADR-089 for the full parameter and
 ordering contract. `context`'s `direction` also defaults to `both`, matching
 `neighbors`' current default (see the direction note above).
 
@@ -145,5 +145,5 @@ request(ops="get(id=\"abc123\")")
 - [Search and Retrieval](search.md): scoring, reranking, and decompose
 - [Configuration](../configuration.md): config resolution and connect-failure
   troubleshooting
-- [ADR-089](../adr/ADR-089-context-verb.md): `context` verb design
+- ADR-089: `context` verb design
 - [Proof-Graph Case Study](proof-graph-case-study.md): khive at scale

@@ -4,7 +4,7 @@
 
 ### ADR-018: Authorization Gate
 
-Full spec: `docs/adr/ADR-018-authorization-gate.md` (repo root).
+Full spec: `ADR-018-authorization-gate` (repo root).
 
 This crate implements the public types and default gate defined by ADR-018:
 

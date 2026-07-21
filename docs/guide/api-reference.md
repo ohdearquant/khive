@@ -473,7 +473,7 @@ request(ops="traverse(roots=[\"<uuid>\"], max_depth=2)")
 
 ### `context` — Assertive
 
-Entity-anchored graph context in one call ([ADR-089](../adr/ADR-089-context-verb.md)).
+Entity-anchored graph context in one call (ADR-089).
 Resolves anchors from `query` and/or `entity_ids`, expands 1-2 hops via the same
 runtime op behind `neighbors`, and assembles a budgeted, deterministically-ordered
 response — replacing a caller-side `search | neighbors` chain with a single
@@ -650,5 +650,5 @@ not part of this distribution.
 - [Search and Retrieval](search.html): FTS, vector, hybrid fusion, reranking.
 - [GTD Task Management](tasks.html): task lifecycle in depth.
 - [Prompt Cookbook](prompt-cookbook.html): ready-to-use verb patterns.
-- [ADR-016: request DSL](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-016-request-dsl.md)
-- [ADR-002: Closed Edge Ontology](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-002-edge-ontology.md)
+- ADR-016: request DSL
+- ADR-002: Closed Edge Ontology

@@ -1,6 +1,6 @@
 # khive-gate
 
-**ADR:** [ADR-018 Authorization Gate](../../docs/adr/ADR-018-authorization-gate.md)
+**ADR:** ADR-018 Authorization Gate
 
 Pluggable authorization gate for verb dispatch in the khive runtime.
 

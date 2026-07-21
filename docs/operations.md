@@ -311,9 +311,9 @@ kkernel kg commit <changeset.ndjson> --rules <rules.toml> --repo <path> -m "<mes
 ```
 
 Restores the `kg commit` verb ADR-020 §5 specified (`export + validate + git add + git commit`)
-but never shipped, scoped per [ADR-102](adr/ADR-102-tiered-validate-and-merge.md)'s "Amendment to
+but never shipped, scoped per ADR-102's "Amendment to
 ADR-020" to the tier-2 flow that ADR defines: landing an already-staged, already-reviewed
-[ADR-101](adr/ADR-101-kg-changeset-model.md) NDJSON-delta change-set into ADR-102's own
+ADR-101 NDJSON-delta change-set into ADR-102's own
 **local-only** staged-change-set/snapshot repository (D6) — this is a _different_ repository from
 the project-repository-embedded `.khive/kg/` layout every other `kg` verb above operates on.
 `--repo` here is that separate repository's root, not a project checkout.

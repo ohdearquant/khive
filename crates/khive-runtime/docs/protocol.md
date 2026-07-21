@@ -9,12 +9,12 @@ input, not a storage access boundary).
 
 ## ADR Links
 
-- [ADR-017](../../../docs/adr/ADR-017-pack-standard.md) — Pack trait, verb surface, and boot-time collision checks
-- [ADR-023](../../../docs/adr/ADR-023-declarative-pack-format.md) — Declarative pack format and verb visibility
-- [ADR-027](../../../docs/adr/ADR-027-dynamic-pack-loading.md) — Dynamic pack loading via self-registration
-- [ADR-028](../../../docs/adr/ADR-028-pack-scoped-backends.md) — Pack-scoped backends and schema declaration
-- [ADR-007](../../../docs/adr/ADR-007-namespace.md) — Namespace attribution and read visibility
-- [ADR-050](../../../docs/adr/ADR-050-kg-token-namespace-contract.md) — NamespaceToken authority contract
+- ADR-017 — Pack trait, verb surface, and boot-time collision checks
+- ADR-023 — Declarative pack format and verb visibility
+- ADR-027 — Dynamic pack loading via self-registration
+- ADR-028 — Pack-scoped backends and schema declaration
+- ADR-007 — Namespace attribution and read visibility
+- ADR-050 — NamespaceToken authority contract
 
 ## Dispatch Flow
 

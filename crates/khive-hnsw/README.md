@@ -72,10 +72,10 @@ kernels); the optional `checkpoint` feature adds a `khive-fold` dependency for
 persisted snapshots.
 
 Governing ADRs:
-[ADR-052](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-052-ann-production-lifecycle.md)
+ADR-052
 (SQ8 quantization, tombstone delete, consolidation, crash-safe persistence across
 both ANN engines) and
-[ADR-079](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-079-ann-persistence-warm-path-integration.md)
+ADR-079
 (wiring persisted snapshots into the daemon warm path).
 
 ## License

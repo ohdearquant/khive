@@ -14,8 +14,7 @@
       core type rather than invent a code block — README snippets are NOT compiled.
     - Length is proportional to the crate: a thin trait/type crate is ~30-50
       lines; an engine or server crate is ~80-130.
-    - Link sibling crates to their crates.io page and ADRs via full GitHub URLs:
-      https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-NNN-<slug>.md
+    - Link sibling crates to their crates.io page via full GitHub URLs.
   Delete these comments in the filled README.
 -->
 

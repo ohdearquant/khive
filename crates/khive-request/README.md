@@ -77,7 +77,7 @@ types -> score -> storage -> db -> query -> runtime -> pack-* -> mcp
 `khive-mcp`'s `request` tool calls `parse_request`, then routes each `ParsedOp`
 through the runtime's `VerbRegistry::dispatch`. The DSL shape and grammar are
 specified in
-[ADR-016](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-016-request-dsl.md).
+ADR-016.
 
 ## License
 

@@ -6,13 +6,13 @@ graph-based retrieval engine (ADR-048).
 
 **ADR refs:**
 
-- [ADR-048: Knowledge Section Profiles](../../../docs/adr/ADR-048-knowledge-section-profiles.md)
+- ADR-048: Knowledge Section Profiles
   -- recall/latency targets, snapshot validation, production defaults
-- [ADR-009: Backend Architecture](../../../docs/adr/ADR-009-backend-architecture.md)
+- ADR-009: Backend Architecture
   -- in-process retrieval engine boundary
-- [ADR-012: Retrieval Composition (High-Level Composition Layer)](../../../docs/adr/ADR-012-retrieval-composition.md)
+- ADR-012: Retrieval Composition (High-Level Composition Layer)
   -- hybrid retrieval stack integration
-- [ADR-030: Retrieval Stack Port — khive-retrieval](../../../docs/adr/ADR-030-retrieval-stack-port.md)
+- ADR-030: Retrieval Stack Port — khive-retrieval
   -- Rust retrieval layer
 
 **Primary modules:**

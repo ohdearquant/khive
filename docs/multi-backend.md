@@ -6,8 +6,8 @@ case is isolating audit or operational records from agent memory: a deployment
 can store operator-specific data in its own file without that data mixing into
 the shared agent-memory database.
 
-References: [ADR-028](adr/ADR-028-pack-scoped-backends.md) (per-pack backend
-config), [ADR-029](adr/ADR-029-substrate-coordinator.md) (SubstrateCoordinator
+References: ADR-028 (per-pack backend
+config), ADR-029 (SubstrateCoordinator
 and cross-backend operations).
 
 See also [docs/configuration.md](configuration.md) for the `--db` / `[[backends]]`
@@ -203,7 +203,7 @@ And Rule 1:
 > "Stores are unscoped database connections... No inline namespace == checks in
 > handlers or stores are permitted. No per-namespace storage partitioning."
 
-(Source: `docs/adr/ADR-007-namespace.md`, Rules 0 and 1.)
+(Source: `ADR-007-namespace`, Rules 0 and 1.)
 
 Physical backend separation is the only mechanism that guarantees records owned
 by one pack cannot appear in another pack's query, regardless of namespace
