@@ -706,6 +706,200 @@ async fn explicit_limit_over_cap_with_few_real_matches_emits_no_warning() {
 }
 
 // =============================================================================
+// GQL static edge-pattern schema-mismatch hint (issue #593)
+//
+// A MATCH pattern that names an explicit relation and explicit entity kinds
+// on both endpoints can be *statically* impossible under the composed edge
+// endpoint contract (base allowlist + pack EDGE_RULES) — e.g. `precedes`
+// never accepts concept->concept endpoints. Executed unchanged, this always
+// returns zero rows, indistinguishable from "no data yet". These tests cover
+// the warning that distinguishes the two cases, scoped to the exact cases
+// where the emptiness is statically knowable.
+// =============================================================================
+
+#[tokio::test]
+async fn query_static_impossible_pattern_precedes_concept_concept_warns_and_returns_empty() {
+    let rt = rt();
+    let tok = rt.authorize(Namespace::local()).unwrap();
+
+    // Real `precedes` edges exist — just never between two concepts (issue
+    // #593's repro: 3445 `precedes` edges in the wild, all document/project/etc).
+    let d1 = rt
+        .create_entity(&tok, "document", None, "Doc1", None, None, vec![])
+        .await
+        .unwrap();
+    let d2 = rt
+        .create_entity(&tok, "document", None, "Doc2", None, None, vec![])
+        .await
+        .unwrap();
+    rt.link(&tok, d1.id, d2.id, EdgeRelation::Precedes, 1.0, None)
+        .await
+        .unwrap();
+
+    let result = rt
+        .query_with_metadata(
+            &tok,
+            "MATCH (n:concept)-[:precedes]->(m:concept) RETURN n.name, m.name LIMIT 10",
+            khive_query::CompileOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        result.rows.is_empty(),
+        "no concept->concept precedes edges exist: {:?}",
+        result.rows
+    );
+    assert_eq!(result.warnings.len(), 1, "warnings: {:?}", result.warnings);
+    let w = &result.warnings[0];
+    assert!(w.contains("precedes"), "{w}");
+    assert!(w.contains("concept"), "{w}");
+    assert!(
+        w.contains("document->document"),
+        "must name an accepted pair for the relation: {w}"
+    );
+}
+
+#[tokio::test]
+async fn query_static_possible_pattern_extends_concept_concept_no_warning() {
+    let rt = rt();
+    let tok = rt.authorize(Namespace::local()).unwrap();
+
+    let a = rt
+        .create_entity(&tok, "concept", None, "LoRA2", None, None, vec![])
+        .await
+        .unwrap();
+    let b = rt
+        .create_entity(&tok, "concept", None, "QLoRA2", None, None, vec![])
+        .await
+        .unwrap();
+    rt.link(&tok, b.id, a.id, EdgeRelation::Extends, 1.0, None)
+        .await
+        .unwrap();
+
+    let result = rt
+        .query_with_metadata(
+            &tok,
+            "MATCH (n:concept)-[:extends]->(m:concept) RETURN n, m LIMIT 10",
+            khive_query::CompileOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "concept->concept is a valid base-contract pair for extends"
+    );
+    assert!(
+        result.warnings.is_empty(),
+        "a statically-valid pattern must not warn: {:?}",
+        result.warnings
+    );
+}
+
+#[tokio::test]
+async fn query_static_impossible_check_skips_unlabeled_source_node() {
+    let rt = rt();
+    let tok = rt.authorize(Namespace::local()).unwrap();
+
+    // The source node is unlabeled — no static (kind, relation, kind) triple
+    // is named, so this must never warn regardless of what `precedes` accepts.
+    let result = rt
+        .query_with_metadata(
+            &tok,
+            "MATCH (n)-[:precedes]->(m:document) RETURN n, m LIMIT 10",
+            khive_query::CompileOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        result.warnings.is_empty(),
+        "an unlabeled endpoint names no static triple to test: {:?}",
+        result.warnings
+    );
+}
+
+#[tokio::test]
+async fn query_static_impossible_check_honors_pack_extended_endpoint_rules() {
+    let rt = rt();
+    let tok = rt.authorize(Namespace::local()).unwrap();
+
+    // Mirrors khive-pack-kg's KG_EDGE_RULES: `person part_of org` is valid
+    // only via a pack-declared rule, never the base allowlist alone. The hint
+    // must consult the exact same composed rule set the link validator does.
+    rt.install_edge_rules(vec![khive_types::EdgeEndpointRule {
+        relation: EdgeRelation::PartOf,
+        source: khive_types::EndpointKind::EntityOfKind("person"),
+        target: khive_types::EndpointKind::EntityOfKind("org"),
+    }]);
+
+    let p = rt
+        .create_entity(&tok, "person", None, "Ada", None, None, vec![])
+        .await
+        .unwrap();
+    let o = rt
+        .create_entity(&tok, "org", None, "Acme", None, None, vec![])
+        .await
+        .unwrap();
+    rt.link(&tok, p.id, o.id, EdgeRelation::PartOf, 1.0, None)
+        .await
+        .unwrap();
+
+    let result = rt
+        .query_with_metadata(
+            &tok,
+            "MATCH (n:person)-[:part_of]->(m:org) RETURN n, m LIMIT 10",
+            khive_query::CompileOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.rows.len(), 1);
+    assert!(
+        result.warnings.is_empty(),
+        "a pack-declared endpoint rule must not be falsely flagged as impossible: {:?}",
+        result.warnings
+    );
+}
+
+#[tokio::test]
+async fn query_static_impossible_check_skips_sparql() {
+    let rt = rt();
+    let tok = rt.authorize(Namespace::local()).unwrap();
+
+    let d1 = rt
+        .create_entity(&tok, "document", None, "Doc1", None, None, vec![])
+        .await
+        .unwrap();
+    let d2 = rt
+        .create_entity(&tok, "document", None, "Doc2", None, None, vec![])
+        .await
+        .unwrap();
+    rt.link(&tok, d1.id, d2.id, EdgeRelation::Precedes, 1.0, None)
+        .await
+        .unwrap();
+
+    // Same statically-impossible shape as the GQL case above (precedes
+    // concept->concept), expressed in SPARQL — must never receive the hint.
+    let result = rt
+        .query_with_metadata(
+            &tok,
+            "SELECT ?a ?b WHERE { ?a :precedes ?b . ?a a :concept . ?b a :concept . }",
+            khive_query::CompileOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        result.warnings.is_empty(),
+        "SPARQL must never receive the static GQL-pattern hint: {:?}",
+        result.warnings
+    );
+}
+
+// =============================================================================
 // Namespace isolation
 // =============================================================================
 
