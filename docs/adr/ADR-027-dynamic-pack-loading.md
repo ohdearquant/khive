@@ -466,13 +466,18 @@ set, and lower layers are ignored. An empty value at any layer (`--pack` with no
 names, an empty `KHIVE_PACKS`, `runtime.packs = []`) is treated as absent and falls
 through to the next layer — matching the existing environment-variable behavior.
 
+The built-in default is `["kg"]`, matching the single-pack open-source surface
+(ADR-023 amendment) and the runtime's default configuration. Amendment 2's
+eleven-pack default described the pre-split distribution and is superseded on this
+point by the ADR-023 amendment and this amendment.
+
 For this option the environment outranks discovered configuration, deviating from the
 general ADR-035 rule (config over env). Pack selection is deployment topology: a
 single host legitimately runs processes with different surfaces, and a per-process
 override must not require editing a shared file. ADR-035's option table is updated by
 this amendment to reflect the deviation.
 
-**3. The manifest is a constraint, not a precedence layer.** An optional key:
+**3. The manifest is a constraint, not a precedence layer.** A configuration key:
 
 ```toml
 [runtime]
@@ -488,22 +493,61 @@ configuration-only — there is no CLI flag or environment variable for it; lice
 deployments have configuration files, and a constraint that could be repointed
 per-process would not be one.
 
-**4. Fail-closed, loudly.** Each of the following is a hard boot error, never a
-silent narrowing of the loaded set:
+The manifest is not optional for the deployments it exists to bound. Pack metadata
+(the `Pack` trait's static declaration, ADR-017) carries a licensing classification:
+`open` or `licensed`. Every pack in the open-source distribution is `open`;
+commercially licensed extensions declare `licensed`. Whenever the resolved requested
+set contains a `licensed` pack, a verified manifest covering it is required — a
+missing `pack_manifest` key in that case is itself a hard boot error, identical in
+consequence to a manifest that fails verification. Deployments whose resolved set is
+entirely `open` packs load without any manifest processing.
+
+**4. The verification contract.** The open-source runtime defines an opaque verifier
+interface and consumes only its result; it embeds no entitlement logic, key
+material, or signature scheme. The contract:
+
+- **Input**: the manifest bytes read from the configured `pack_manifest` path.
+- **Output**: either a normalized allow list — a set of canonical pack names plus an
+  expiry instant — or a typed verification error.
+- **Expiry**: boot compares the returned expiry instant against the system UTC clock
+  once, at boot; an expired manifest is a verification failure. In-flight behavior
+  after boot is out of scope for this ADR.
+- **Registration**: verifier implementations are supplied by the commercially
+  licensed distribution and register through the same self-registration mechanism as
+  packs (Amendment 1). If a `licensed` pack is requested and no verifier is
+  registered, boot fails — an unverifiable manifest and an absent verifier are the
+  same condition.
+
+Manifest issuance, the signature scheme, trust-root and key lifecycle, renewal, and
+entitlement semantics are the licensing system's contract: the commercially licensed
+distribution's documentation is the authoritative source for them, and its verifier
+implementation is the trust-root handoff. This ADR fixes only the interface above
+and the subset rule.
+
+**5. Fail-closed, loudly.** Each of the following is a hard boot error, never a
+silent narrowing of the loaded set. The error names the failing condition (which
+pack, which rule) without reproducing manifest contents:
 
 - a requested pack the binary does not carry (existing behavior, unchanged);
 - a requested pack outside the manifest's allow list;
-- a manifest that is named but missing, unreadable, expired, or fails verification.
+- a `licensed` pack requested with no `pack_manifest` configured;
+- a manifest that is named but missing, unreadable, expired, or fails verification;
+- a `licensed` pack requested with no verifier registered.
 
-**5. Introspection names the source.** `kkernel pack list --loaded` and the `verbs()`
+**6. Introspection names the source.** `kkernel pack list --loaded` and the `verbs()`
 verb report which layer supplied the resolved set (CLI, environment, configuration,
 or default) alongside the set itself, so a mis-threaded deployment is diagnosable
 from the surface it exposes.
 
-Manifest issuance, signature scheme, renewal, and entitlement semantics are the
-licensing system's contract and live with the commercial distribution's
-documentation, not in this ADR; the open-source runtime defines only the
-verification hook and the subset rule.
+**Scope of the manifest constraint.** The manifest bounds deployments where the
+operator runs their own binary: desktop application installs and self-hosted or
+single-tenant deployments. A shared hosted multi-tenant service is not a manifest
+consumer — it loads its full pack surface at boot and enforces per-caller
+entitlement at its own request-authorization gate, which checks each dispatched
+verb's owning pack against the caller's entitlements and rejects unauthorized calls
+with an error. Boot-time selection and request-time authorization are complementary
+enforcement points, not alternatives: each applies to the deployment shape where the
+trust boundary actually sits.
 
 ### Alternatives considered
 
@@ -522,7 +566,8 @@ verification hook and the subset rule.
   environment variable becomes an override, not a load-bearing requirement.
 - The commercial licensing boundary gains a runtime enforcement point with
   fail-closed semantics, without the open-source runtime embedding any entitlement
-  logic.
+  logic. Pack metadata gains a licensing classification (`open`/`licensed`), an
+  ADR-017 surface addition.
 - One more selection layer to document and test; the resolution order is centralized
   in the runtime configuration loader and reported by introspection.
 
