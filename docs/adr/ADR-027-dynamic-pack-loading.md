@@ -494,13 +494,27 @@ deployments have configuration files, and a constraint that could be repointed
 per-process would not be one.
 
 The manifest is not optional for the deployments it exists to bound. Pack metadata
-(the `Pack` trait's static declaration, ADR-017) carries a licensing classification:
-`open` or `licensed`. Every pack in the open-source distribution is `open`;
-commercially licensed extensions declare `licensed`. Whenever the resolved requested
-set contains a `licensed` pack, a verified manifest covering it is required — a
-missing `pack_manifest` key in that case is itself a hard boot error, identical in
-consequence to a manifest that fails verification. Deployments whose resolved set is
-entirely `open` packs load without any manifest processing.
+carries a licensing classification, `open` or `licensed`, declared in the pack's
+static registration record (the same self-registration inventory entry that carries
+the pack's name, Amendment 1) — it is therefore readable before any pack is
+constructed, and the boot sequence evaluates the manifest rules against the resolved
+requested set strictly before pack construction begins. Every pack in the
+open-source distribution is `open`; commercially licensed extensions declare
+`licensed`. Whenever the resolved requested set contains a `licensed` pack, a
+verified manifest covering it is required — a missing `pack_manifest` key in that
+case is itself a hard boot error, identical in consequence to a manifest that fails
+verification.
+
+The rules compose as follows, in order:
+
+1. If `pack_manifest` is configured, the named manifest is always read and verified
+   — regardless of the resolved set's composition. A named manifest that is missing,
+   unreadable, expired, or fails verification is a hard boot error even when every
+   requested pack is `open`.
+2. If `pack_manifest` is not configured and the resolved set contains a `licensed`
+   pack, boot fails.
+3. If `pack_manifest` is not configured and the resolved set is entirely `open`
+   packs, no manifest processing occurs.
 
 **4. The verification contract.** The open-source runtime defines an opaque verifier
 interface and consumes only its result; it embeds no entitlement logic, key
@@ -514,9 +528,12 @@ material, or signature scheme. The contract:
   after boot is out of scope for this ADR.
 - **Registration**: verifier implementations are supplied by the commercially
   licensed distribution and register through the same self-registration mechanism as
-  packs (Amendment 1). If a `licensed` pack is requested and no verifier is
-  registered, boot fails — an unverifiable manifest and an absent verifier are the
-  same condition.
+  packs (Amendment 1). Exactly one verifier may be registered: zero registered
+  verifiers with a `licensed` pack requested is a hard boot error (an unverifiable
+  manifest and an absent verifier are the same condition), and more than one
+  registered verifier is likewise a hard boot error — verification must not depend
+  on registration order or an ambiguous selection among verifiers. Introspection
+  reports the registered verifier's identity alongside the loaded-pack source.
 
 Manifest issuance, the signature scheme, trust-root and key lifecycle, renewal, and
 entitlement semantics are the licensing system's contract: the commercially licensed
@@ -545,7 +562,9 @@ single-tenant deployments. A shared hosted multi-tenant service is not a manifes
 consumer — it loads its full pack surface at boot and enforces per-caller
 entitlement at its own request-authorization gate, which checks each dispatched
 verb's owning pack against the caller's entitlements and rejects unauthorized calls
-with an error. Boot-time selection and request-time authorization are complementary
+with an error. Such a gate must itself be fail-closed for entitlement decisions: a
+verb whose owning pack cannot be determined, or an entitlement lookup that fails for
+infrastructure reasons, is a denial, never a pass-through. Boot-time selection and request-time authorization are complementary
 enforcement points, not alternatives: each applies to the deployment shape where the
 trust boundary actually sits.
 
