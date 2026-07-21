@@ -110,8 +110,7 @@ dynamic pack loading via self-registration
 (ADR-027),
 pack-scoped backends and per-pack schema
 (ADR-028),
-and the authorization gate
-(ADR-018).
+and the authorization gate.
 
 ## License
 

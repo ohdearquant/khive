@@ -51,7 +51,7 @@ decisions and rationale.
 - `call_register_embedders` is invoked after registry construction, before any
   verb dispatch, to wire custom embedding providers from each pack.
 
-### Authorization Gate and Audit Persistence (ADR-018)
+### Authorization Gate and Audit Persistence
 
 - The authorization gate from `runtime.config().gate` is threaded into the
   registry. Gate decisions are hard-enforcing — a `Deny` result blocks pack

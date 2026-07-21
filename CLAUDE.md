@@ -263,7 +263,7 @@ NOT abort the batch — each entry has its own ok/error. The aggregate response 
   caller_namespace` check exists at the store, runtime, or handler layer. This was the
   prior v1 behavior; it was removed by PR-A1 (commit 2607e263) and is no longer correct.
   Do not add such checks.
-- **Authorization lives at one seam: the Gate** (ADR-018). Storage stores are ID-only. The
+- **Authorization lives at one seam: the Gate.** Storage stores are ID-only. The
   Gate is the trust boundary.
 - **Multi-record ops default to `WHERE namespace='local'`**; the only escape is an explicit
   `namespace=` parameter from the caller.
