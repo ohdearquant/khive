@@ -366,10 +366,14 @@ fn collect_op_failures(
         .enumerate()
         .filter(|(_, entry)| entry["ok"].as_bool() == Some(false))
         .map(|(i, entry)| {
+            let error = match &entry["error"] {
+                serde_json::Value::Null => serde_json::Value::from("unknown error"),
+                other => other.clone(),
+            };
             serde_json::json!({
                 "op_index": applied_before + i,
                 "tool": entry["tool"].as_str().unwrap_or("?"),
-                "error": entry["error"].as_str().unwrap_or("unknown error"),
+                "error": error,
             })
         })
         .collect()
@@ -427,11 +431,14 @@ async fn apply_ops_file(
         total_failed += chunk_failed;
 
         for failure in collect_op_failures(&parsed, applied_before) {
+            let reason = match &failure["error"] {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
             eprintln!(
-                "op {} ({}) failed: {}",
+                "op {} ({}) failed: {reason}",
                 failure["op_index"],
                 failure["tool"].as_str().unwrap_or("?"),
-                failure["error"].as_str().unwrap_or("unknown error")
             );
             failures.push(failure);
         }
@@ -873,7 +880,24 @@ mod tests {
         assert_eq!(failures[1]["op_index"], 502);
         assert_eq!(
             failures[1]["error"], "unknown error",
-            "a failed entry with no error string still surfaces a placeholder"
+            "a failed entry with no error value still surfaces a placeholder"
+        );
+    }
+
+    #[test]
+    fn collect_op_failures_preserves_structured_error_payloads() {
+        let parsed = serde_json::json!({
+            "results": [
+                {"ok": false, "tool": "create",
+                 "error": {"kind": "invalid_input", "message": "content rejected"}},
+            ],
+            "summary": {"total": 1, "succeeded": 0, "failed": 1}
+        });
+        let failures = collect_op_failures(&parsed, 0);
+        assert_eq!(
+            failures[0]["error"],
+            serde_json::json!({"kind": "invalid_input", "message": "content rejected"}),
+            "structured KhiveError payloads pass through as JSON, not a placeholder"
         );
     }
 
