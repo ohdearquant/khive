@@ -687,7 +687,7 @@ fn concurrent_boots_converge() {
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
     *test_sync::STALE_READ_BARRIER.lock().unwrap() = Some(barrier);
     test_sync::LOCKED_FAST_FORWARDS.store(0, std::sync::atomic::Ordering::Relaxed);
-    test_sync::BEGIN_ATTEMPTS.store(0, std::sync::atomic::Ordering::SeqCst);
+    test_sync::BUSY_OBSERVED.store(false, std::sync::atomic::Ordering::SeqCst);
     test_sync::WINNER_COMMITTED.store(false, std::sync::atomic::Ordering::SeqCst);
     test_sync::LOSER_SAW_WINNER_COMMIT.store(false, std::sync::atomic::Ordering::SeqCst);
 
@@ -721,16 +721,19 @@ fn concurrent_boots_converge() {
         "loser thread must observe the sibling's ledger under the write lock"
     );
 
-    // The loser's first BEGIN IMMEDIATE returned only after the winner had
-    // committed: the winner held the write lock (parked inside its first
-    // transaction until both threads registered a BEGIN attempt) while the
-    // loser's acquisition was pending, so the loser demonstrably blocked on
-    // the lock. If IMMEDIATE regressed to deferred behavior, the loser's
-    // BEGIN would return before any commit and this flag would stay false
-    // (that interleaving also fails outright on duplicate DDL).
+    // SQLite itself reported a busy acquisition to the loser while the winner
+    // held the write lock: the winner does not commit until the loser's busy
+    // handler has fired, so this is observed contention, not an intended
+    // attempt. If IMMEDIATE regressed to deferred behavior, no busy signal
+    // occurs on BEGIN and this fails (that interleaving also fails outright
+    // on duplicate DDL).
+    assert!(
+        test_sync::BUSY_OBSERVED.load(std::sync::atomic::Ordering::SeqCst),
+        "SQLite must observe the loser's blocked BEGIN IMMEDIATE while the winner holds the lock"
+    );
     assert!(
         test_sync::LOSER_SAW_WINNER_COMMIT.load(std::sync::atomic::Ordering::SeqCst),
-        "loser's BEGIN IMMEDIATE must block across the winner's held write lock"
+        "loser's BEGIN IMMEDIATE must return only after the winner committed"
     );
 
     let conn = Connection::open(&path).expect("reopen");

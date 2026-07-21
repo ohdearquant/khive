@@ -258,9 +258,20 @@ pub(crate) mod test_sync {
     pub(crate) static STALE_READ_BARRIER: Mutex<Option<Arc<Barrier>>> = Mutex::new(None);
     /// Counts entries into the under-lock sibling fast-forward branch.
     pub(crate) static LOCKED_FAST_FORWARDS: AtomicU32 = AtomicU32::new(0);
-    /// Number of participating threads that have registered their first
-    /// `BEGIN IMMEDIATE` attempt.
-    pub(crate) static BEGIN_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
+    /// Set by the SQLite busy handler installed on participating connections:
+    /// `true` means SQLite itself reported a blocked lock acquisition to the
+    /// loser — actual contention, not merely an intended attempt.
+    pub(crate) static BUSY_OBSERVED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// Busy handler for participating test connections: records that SQLite
+    /// observed a busy acquisition, then keeps retrying.
+    pub(crate) fn record_busy(_count: i32) -> bool {
+        BUSY_OBSERVED.store(true, std::sync::atomic::Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        true
+    }
+
     /// Set by the winner immediately before committing its first migration
     /// transaction — i.e. before the write lock is first released.
     pub(crate) static WINNER_COMMITTED: std::sync::atomic::AtomicBool =
@@ -310,6 +321,9 @@ fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
     // they are then released to compete for the IMMEDIATE write lock below.
     #[cfg(test)]
     if test_sync::PARTICIPATE.with(|p| p.get()) {
+        // Replaces the busy_timeout raised by `run_migrations` on this test
+        // connection: records SQLite-observed contention, then keeps retrying.
+        conn.busy_handler(Some(test_sync::record_busy))?;
         let barrier = test_sync::STALE_READ_BARRIER.lock().unwrap().clone();
         if let Some(barrier) = barrier {
             barrier.wait();
@@ -352,7 +366,6 @@ fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
         #[cfg(test)]
         if instrumented_first_begin {
             test_sync::FIRST_BEGIN_DONE.with(|f| f.set(true));
-            test_sync::BEGIN_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -378,18 +391,16 @@ fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
         if instrumented_first_begin {
             use std::sync::atomic::Ordering::SeqCst;
             if sibling_version == 0 {
-                // Winner: hold the write lock until every participating thread
-                // has registered its first BEGIN attempt (bounded), plus a
-                // grace interval for the last registrant to reach the blocking
-                // call — guaranteeing the loser's acquisition overlaps this
-                // held lock instead of serializing by scheduler accident.
+                // Winner: hold the write lock until SQLite has reported a
+                // busy acquisition to the loser (its busy handler fired) —
+                // proof the loser's BEGIN is actually blocked on this held
+                // lock, not merely intended. Bounded so a regression fails
+                // the assertion instead of hanging the test.
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-                while test_sync::BEGIN_ATTEMPTS.load(SeqCst) < 2
-                    && std::time::Instant::now() < deadline
+                while !test_sync::BUSY_OBSERVED.load(SeqCst) && std::time::Instant::now() < deadline
                 {
                     std::thread::yield_now();
                 }
-                std::thread::sleep(std::time::Duration::from_millis(100));
             } else {
                 // Loser: our first BEGIN just returned. Record whether the
                 // winner had already committed — true means we blocked across
