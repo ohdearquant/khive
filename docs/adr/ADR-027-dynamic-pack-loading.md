@@ -415,6 +415,109 @@ only the pack count moves from ten to eleven. Every surface that enumerates the 
 list. The force-link discipline of Amendment 1 applies: `workspace` carries a `Cargo.toml`
 dependency and an anchor line in `crates/khive-mcp/src/pack.rs`.
 
+## Amendment 3 (2026-07-21): configuration-file pack selection and the licensed-pack manifest constraint
+
+**Status**: proposed
+
+### Context
+
+Pack selection is specified by this ADR as `--pack` CLI > `KHIVE_PACKS` env > built-in
+default. [ADR-035](ADR-035-cli-config-and-auto-embed.md) additionally lists a
+`runtime.packs` configuration key in its option table, but that key was never
+implemented: the configuration loader parses only `[packs.<name>]` backend assignments
+(ADR-028), and the runtime resolves the loaded set from the environment alone.
+
+Environment-only selection makes the loaded pack set a property of each spawning
+process's environment. Every spawn path — interactive shells, service managers,
+supervisor-launched helpers, a daemon auto-spawned by its first client — must
+independently carry the same variable, and a path that misses it silently boots a
+different surface. Operating the current distribution surfaced this as a recurring
+failure class: service managers do not read shell profiles, and long-lived processes
+re-spawned after a host restart inherit whatever environment their launcher happened
+to have. A declaration in discovered configuration removes the per-spawn-path
+threading entirely.
+
+Separately, commercially licensed pack extensions (see the ADR-023 amendment on the
+single-pack open-source surface) need a way for a deployment to be bounded to the
+packs it is licensed to load, issued and verified outside the binary's own
+configuration.
+
+### Decision
+
+**1. `runtime.packs` in discovered configuration.** The discovered `khive.toml` gains
+the selection key ADR-035 already lists:
+
+```toml
+[runtime]
+packs = ["kg", "gtd", "memory"]
+```
+
+This is distinct from `[packs.<name>]`, which remains backend assignment (ADR-028)
+and plays no role in selection.
+
+**2. Precedence of the requested set.**
+
+```text
+--pack (CLI) > KHIVE_PACKS (env) > runtime.packs (config) > built-in default
+```
+
+For this option the environment outranks discovered configuration, deviating from the
+general ADR-035 rule (config over env). Pack selection is deployment topology: a
+single host legitimately runs processes with different surfaces, and a per-process
+override must not require editing a shared file. ADR-035's option table is updated by
+this amendment to reflect the deviation.
+
+**3. The manifest is a constraint, not a precedence layer.** An optional key:
+
+```toml
+[runtime]
+pack_manifest = "/path/to/manifest"
+```
+
+names an externally-issued, verifiable artifact carrying the set of packs the
+deployment is entitled to load. When present, the _resolved_ requested set — from
+whichever precedence layer supplied it — must be a subset of the manifest's allow
+list. Because the manifest bounds the result rather than participating in precedence,
+no higher-precedence layer can escape it.
+
+**4. Fail-closed, loudly.** Each of the following is a hard boot error, never a
+silent narrowing of the loaded set:
+
+- a requested pack the binary does not carry (existing behavior, unchanged);
+- a requested pack outside the manifest's allow list;
+- a manifest that is named but missing, unreadable, expired, or fails verification.
+
+**5. Introspection names the source.** `kkernel pack list --loaded` and the `verbs()`
+verb report which layer supplied the resolved set (CLI, environment, configuration,
+or default) alongside the set itself, so a mis-threaded deployment is diagnosable
+from the surface it exposes.
+
+Manifest issuance, signature scheme, renewal, and entitlement semantics are the
+licensing system's contract and live with the commercial distribution's
+documentation, not in this ADR; the open-source runtime defines only the
+verification hook and the subset rule.
+
+### Alternatives considered
+
+- **Keep environment-only selection.** Rejected: the per-spawn-path threading failure
+  class is structural, not a matter of operator discipline.
+- **Configuration over environment (strict ADR-035 ordering).** Rejected: breaks
+  per-process override on multi-surface hosts, and the manifest constraint already
+  removes any security rationale for ordering — no layer ordering can widen the
+  loaded set past the manifest.
+- **Per-deployment binaries with only licensed packs compiled in.** Rejected: a
+  build-matrix explosion, and contradicts this ADR's single-binary, linked-set model.
+
+### Consequences
+
+- Fleet and service-manager deployments declare packs once in configuration; the
+  environment variable becomes an override, not a load-bearing requirement.
+- The commercial licensing boundary gains a runtime enforcement point with
+  fail-closed semantics, without the open-source runtime embedding any entitlement
+  logic.
+- One more selection layer to document and test; the resolution order is centralized
+  in the runtime configuration loader and reported by introspection.
+
 ## References
 
 - [ADR-003](ADR-003-system-architecture.md) — `kkernel` binary; `pack list` introspection

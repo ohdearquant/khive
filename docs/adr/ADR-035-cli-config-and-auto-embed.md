@@ -146,6 +146,11 @@ A `KHIVE_*` env var is only a fallback default — when a TOML key resolves at e
 wins over the env var. This matches the runtime config loader (`engine_config.rs`) and the
 config docs (`docs/khive-config-example.toml`).
 
+Exception: **Loaded packs** resolves as `--pack` > `KHIVE_PACKS` > `runtime.packs` >
+default — the environment outranks configuration for this option. Rationale and the
+licensed-pack manifest constraint that bounds the resolved set:
+[ADR-027 Amendment 3](ADR-027-dynamic-pack-loading.md).
+
 | Option             | CLI flag          | Env var                  | Config key                | Default           |
 | ------------------ | ----------------- | ------------------------ | ------------------------- | ----------------- |
 | Namespace          | `--namespace`     | `KHIVE_NAMESPACE`        | `runtime.namespace`       | `default`         |
