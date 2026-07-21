@@ -350,6 +350,34 @@ pub fn endpoint_matches(
     }
 }
 
+/// `true` if `spec` matches the given substrate + kind + entity_type triple,
+/// treating an *absent* `entity_type` on the query side as unconstrained
+/// rather than an exact match against "no subtype".
+///
+/// Used only by the static GQL impossibility hint (`static_impossible_edge_pattern_warnings`,
+/// `accepted_entity_kind_pairs_for_relation`), which reasons over a *pattern*
+/// endpoint, not a resolved entity. A pattern endpoint that names a kind but
+/// no `entity_type` (`(a:concept)-[:depends_on]->(b:concept)`) has not ruled
+/// out any subtype, so an `EntityOfType` rule for that kind still makes the
+/// triple possible — unlike `endpoint_matches`, which the live link
+/// validator applies to *resolved* entities, where a `None` `entity_type`
+/// means the entity genuinely has no subtype and must be an exact miss
+/// against a typed rule. Do not use this for validation.
+fn pattern_endpoint_matches(
+    spec: &EndpointKind,
+    substrate: &str,
+    kind: &str,
+    entity_type: Option<&str>,
+) -> bool {
+    match spec {
+        EndpointKind::EntityOfType {
+            kind: k,
+            entity_type: t,
+        } => substrate == "entity" && *k == kind && entity_type.is_none_or(|et| et == *t),
+        _ => endpoint_matches(spec, substrate, kind, entity_type),
+    }
+}
+
 /// Relations that a composed pack `EDGE_RULES` set accepts for a given
 /// `(entity_kind, entity_type)` endpoint pair, using the EXACT SAME
 /// `endpoint_matches` semantics `pack_rule_allows` applies internally
@@ -383,14 +411,40 @@ pub fn accepted_pack_relations_for_entities(
     relations
 }
 
+/// Hint-only counterpart to [`accepted_pack_relations_for_entities`] that
+/// matches via [`pattern_endpoint_matches`] instead of [`endpoint_matches`],
+/// so an absent `entity_type` is treated as unconstrained rather than an
+/// exact-match miss against `EntityOfType` rules. Used exclusively by the
+/// static GQL impossibility hint — never by validation.
+fn accepted_pack_relations_for_pattern_entities(
+    rules: &[EdgeEndpointRule],
+    src_kind: &str,
+    src_entity_type: Option<&str>,
+    tgt_kind: &str,
+    tgt_entity_type: Option<&str>,
+) -> Vec<EdgeRelation> {
+    let mut relations: Vec<EdgeRelation> = rules
+        .iter()
+        .filter(|r| {
+            pattern_endpoint_matches(&r.source, "entity", src_kind, src_entity_type)
+                && pattern_endpoint_matches(&r.target, "entity", tgt_kind, tgt_entity_type)
+        })
+        .map(|r| r.relation)
+        .collect();
+    relations.sort_by_key(|r| r.as_str());
+    relations.dedup();
+    relations
+}
+
 /// All `(source_kind, target_kind)` entity-kind pairs — restricted to the closed
 /// 8-kind base [`khive_types::EntityKind`] taxonomy — that accept `relation`
 /// under the composed base allowlist plus pack `EDGE_RULES`.
 ///
-/// Reuses [`base_entity_rule_allows`] and [`accepted_pack_relations_for_entities`]
-/// (the exact functions the live validator consults) over the closed kind set,
-/// rather than re-deriving a parallel table — issue #543 precedent, applied to
-/// GQL query-pattern hint derivation (issue #593).
+/// Reuses [`base_entity_rule_allows`] and [`accepted_pack_relations_for_pattern_entities`]
+/// (the pattern-side, unconstrained-`None` counterpart of the functions the live
+/// validator consults) over the closed kind set, rather than re-deriving a
+/// parallel table — issue #543 precedent, applied to GQL query-pattern hint
+/// derivation (issue #593).
 ///
 /// Pack rules are skipped for `crate::pack::SPECIAL_RELATIONS` (supersedes /
 /// supports / refutes): the live validator's special-relation branch
@@ -407,7 +461,7 @@ fn accepted_entity_kind_pairs_for_relation(
         for tgt in khive_types::EntityKind::ALL {
             let allowed = base_entity_rule_allows(src.name(), relation, tgt.name())
                 || (!crate::pack::SPECIAL_RELATIONS.contains(&relation)
-                    && accepted_pack_relations_for_entities(
+                    && accepted_pack_relations_for_pattern_entities(
                         pack_rules,
                         src.name(),
                         None,
@@ -478,7 +532,7 @@ fn static_impossible_edge_pattern_warnings(
 
         let possible = base_entity_rule_allows(src_kind.name(), relation, tgt_kind.name())
             || (!crate::pack::SPECIAL_RELATIONS.contains(&relation)
-                && accepted_pack_relations_for_entities(
+                && accepted_pack_relations_for_pattern_entities(
                     pack_rules,
                     src_kind.name(),
                     src_node.entity_type.as_deref(),
