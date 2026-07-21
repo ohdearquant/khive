@@ -25,8 +25,14 @@ Operations add, subtract, or multiply. `ScoreAdjustment::apply` leaves the score
 Default adjustments are:
 
 - a `+0.05` bonus for episodic memories no older than seven days;
-- a `-0.05` penalty for semantic memories at least 30 days old with salience at least `0.85`;
 - a `1.3` multiplier when a query entity appears in content.
+
+A third default — a `-0.05` penalty for semantic memories at least 30 days old with
+salience at least `0.85` — was removed after a 2026-07-21 single-delta ablation on the
+live corpus: dropping only that penalty improved golden-suite hit@5 from `0.4706` to
+`0.5882` with a byte-identical holdout suite. Old high-salience semantic memories are
+durable reference material that recall must keep surfacing. The penalty remains
+expressible per call via `ScoringConfig.adjustments`.
 
 Entity matching lowercases both sides and requires character boundaries, preventing `beta` from matching `alphabet` and `car` from matching `scarcity`. Multi-word names work because only the outer boundaries matter. All-CJK strings use substring matching because CJK text does not supply equivalent alphanumeric word separators.
 

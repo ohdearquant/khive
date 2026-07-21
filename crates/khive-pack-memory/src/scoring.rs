@@ -171,7 +171,17 @@ impl ScoreAdjustment {
     }
 }
 
-/// Default score adjustments: episodic recency bonus, semantic age penalty, entity boost.
+/// Default score adjustments: episodic recency bonus, entity boost.
+///
+/// A third default — a semantic age penalty (semantic, >= 30 days old,
+/// salience >= 0.85, subtract 0.05) — was removed after a 2026-07-21
+/// single-delta ablation on the live corpus: removing only that penalty
+/// improved golden-suite hit@5 from 0.4706 to 0.5882 (MRR 0.2766 -> 0.3105)
+/// while a 24-query holdout suite was byte-identical. Old high-salience
+/// semantic memories are typically durable reference material (directives,
+/// corrections) that recall must keep surfacing; penalizing them by age
+/// suppressed exactly that class. The penalty remains expressible per-call
+/// via `ScoringConfig.adjustments`.
 pub fn default_adjustments() -> Vec<ScoreAdjustment> {
     vec![
         // Episodic recency bonus: recent episodic memories get an additive boost.
@@ -188,26 +198,6 @@ pub fn default_adjustments() -> Vec<ScoreAdjustment> {
                 ],
             },
             operation: AdjustmentOp::Add { value: 0.05 },
-        },
-        // Semantic age penalty: old high-salience semantic memories get penalized
-        // to prevent reference docs from crowding out episodic content.
-        ScoreAdjustment {
-            condition: AdjustmentCondition::All {
-                conditions: vec![
-                    AdjustmentCondition::MemoryType {
-                        kind: "semantic".into(),
-                    },
-                    AdjustmentCondition::AgeRange {
-                        min_days: Some(30.0),
-                        max_days: None,
-                    },
-                    AdjustmentCondition::SalienceRange {
-                        min: Some(0.85),
-                        max: None,
-                    },
-                ],
-            },
-            operation: AdjustmentOp::Subtract { value: 0.05 },
         },
         // Entity match boost: memories mentioning queried entities get boosted.
         ScoreAdjustment {
@@ -522,7 +512,7 @@ pub struct ScoringConfig {
 
     // ── Conditional adjustments ────────────────────────────────────────────
     /// Score adjustments applied after the base formula. Default: episodic bonus,
-    /// semantic age penalty, entity boost.
+    /// entity boost (semantic age penalty removed 2026-07-21, see `default_adjustments`).
     pub adjustments: Vec<ScoreAdjustment>,
 }
 
