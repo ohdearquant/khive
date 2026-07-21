@@ -307,6 +307,12 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 19] = [
                 required: true,
                 description: "Query used to rerank selected atom bodies",
             },
+            ParamDef {
+                name: "blend_kg",
+                param_type: "boolean",
+                required: false,
+                description: "Blend relevant KG concept/document entities into the briefing as a supplementary \"Knowledge graph\" section (default true). Has no effect on atom_ids-only calls, which never blend.",
+            },
         ],
     },
     // ── section tier ─────────────────────────────────────────────────────────

@@ -10,7 +10,8 @@ use uuid::Uuid;
 
 use khive_runtime::{hex_prefix_to_uuid_pattern, KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_score::DeterministicScore;
-use khive_storage::types::{SqlStatement, SqlValue};
+use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
+use khive_storage::EntityFilter;
 
 use super::matching;
 use super::schema::{Atom, ComposeParams, Domain, SearchParams, SuggestParams};
@@ -831,6 +832,170 @@ async fn rerank_text_items(
     Ok(())
 }
 
+// ─── KG entity blending (ADR-051 Amendment 1) ─────────────────────────────────
+
+/// The KG entity kinds `knowledge.compose` blends into a briefing. Concepts
+/// and documents are the kinds that carry the measured, expert-curated
+/// content (algorithms, papers, ADRs) that outranks generic lore atoms on
+/// sharply technical queries — see ADR-051 Amendment 1.
+const KG_BLEND_ENTITY_KINDS: [&str; 2] = ["concept", "document"];
+
+/// Cap on blended KG entities per briefing, so entities stay a supplementary
+/// "Knowledge graph" section and atoms remain the body of the briefing.
+const KG_BLEND_CAP: usize = 5;
+
+/// A `concept`/`document` KG entity blended into a compose briefing.
+struct KgEntityHit {
+    id: String,
+    kind: String,
+    name: String,
+    description: String,
+    score: f32,
+}
+
+/// Finds `concept`/`document` KG entities relevant to `query`, reranked with
+/// the same embedding-cosine signal `rerank_text_items` uses for atom bodies
+/// (embed `name + description`, cosine against the query embedding). Because
+/// both pools are scored with the identical metric against the identical
+/// query embedding, the resulting scores land on the same 0..1 scale as
+/// atom/section scores — direct comparison, not a separate rank-fusion step,
+/// is what makes them a valid blended candidate pool.
+///
+/// Candidate discovery itself reuses `KhiveRuntime::hybrid_search` — the same
+/// FTS+ANN RRF-fused retrieval path `kg.search(kind="entity")` dispatches to
+/// (`khive-pack-kg`'s `handle_search` calls the identical method) — so this
+/// does not stand up a parallel retrieval stack; only the final relevance
+/// score is recomputed, to land on the atom-comparable scale.
+///
+/// `min_score` is the self-calibrating inclusion floor (ADR-051 Amendment
+/// 1): only hits scoring at or above it survive, applied after rerank and
+/// before the `cap` truncation. Callers derive it from the minimum rerank
+/// score among the atoms that made the final compose body.
+async fn search_kg_entities(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    ns: &str,
+    query: &str,
+    cap: usize,
+    min_score: f32,
+) -> Result<Vec<KgEntityHit>, RuntimeError> {
+    let candidate_k = ((cap * 4) as u32).max(20);
+    let mut candidate_ids: Vec<Uuid> = Vec::new();
+    let mut seen: HashSet<Uuid> = HashSet::new();
+    for kind in KG_BLEND_ENTITY_KINDS {
+        let hits = runtime
+            .hybrid_search(token, query, None, candidate_k, Some(kind), None, &[], None)
+            .await?;
+        for hit in hits {
+            if seen.insert(hit.entity_id) {
+                candidate_ids.push(hit.entity_id);
+            }
+        }
+    }
+    if candidate_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let visible_ns: Vec<String> = token
+        .visible_namespace_strs()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let entities_page = runtime
+        .entities(token)?
+        .query_entities(
+            ns,
+            EntityFilter {
+                ids: candidate_ids.clone(),
+                kinds: KG_BLEND_ENTITY_KINDS
+                    .iter()
+                    .map(|k| k.to_string())
+                    .collect(),
+                namespaces: visible_ns,
+                ..EntityFilter::default()
+            },
+            PageRequest {
+                offset: 0,
+                limit: candidate_ids.len() as u32,
+            },
+        )
+        .await?;
+
+    if entities_page.items.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let texts: Vec<String> = entities_page
+        .items
+        .iter()
+        .map(|e| format!("{} {}", e.name, e.description.as_deref().unwrap_or("")))
+        .collect();
+    let cosines = match embed_cosine_scores(runtime, query, &texts).await {
+        Some(c) => c,
+        None => return Ok(Vec::new()),
+    };
+
+    let mut hits: Vec<KgEntityHit> = entities_page
+        .items
+        .iter()
+        .zip(cosines.iter())
+        .map(|(e, &score)| KgEntityHit {
+            id: e.id.to_string(),
+            kind: e.kind.clone(),
+            name: e.name.clone(),
+            description: e.description.clone().unwrap_or_default(),
+            score: score.max(0.0),
+        })
+        .collect();
+
+    hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    // Self-calibrating inclusion floor (ADR-051 Amendment 1): an entity only
+    // blends in if it outranks the weakest atom that made the final body —
+    // no fixed score constant. Applied after rerank, before the cap, so a
+    // query with many strong entities doesn't starve out a marginal one that
+    // still clears the floor.
+    hits.retain(|h| h.score >= min_score);
+    hits.truncate(cap);
+    Ok(hits)
+}
+
+/// Trims already-sorted, best-first `hits` to fit `remaining_budget`
+/// characters, using the same per-item cost accounting the atom/section trim
+/// loops use (`name + description` length plus a fixed per-entry overhead).
+/// Entities are trimmed against whatever budget the atom/section trim left
+/// over, so a tight `max_tokens` never evicts an atom to make room for a
+/// blended entity.
+fn trim_kg_entities_to_budget(hits: Vec<KgEntityHit>, remaining_budget: usize) -> Vec<KgEntityHit> {
+    let mut used = 0usize;
+    hits.into_iter()
+        .take_while(|h| {
+            let cost = h.name.len() + h.description.len() + 40;
+            if used + cost > remaining_budget {
+                return false;
+            }
+            used += cost;
+            true
+        })
+        .collect()
+}
+
+fn format_kg_entities_markdown(entities: &[KgEntityHit]) -> String {
+    let mut out = String::from("\n---\n\n## Knowledge graph\n\n");
+    for e in entities {
+        out.push_str(&format!("- **{}** ({})", e.name, e.kind));
+        if !e.description.is_empty() {
+            out.push_str(&format!(" — {}", e.description));
+        }
+        out.push('\n');
+    }
+    out
+}
+
 fn format_section_compose_markdown(
     query: &str,
     domains: &[Domain],
@@ -1271,6 +1436,11 @@ impl KnowledgeHandlers {
             .collect();
 
         let is_auto = domain_ids.is_empty() && atom_ids.is_empty();
+        // `atom_ids`-only calls (caller pinned exact atoms, no domain_ids) never
+        // blend KG entities — the caller opted into exactly those atoms. Auto and
+        // explicit-domain_ids calls both blend (ADR-051 Amendment 1).
+        let atom_ids_only = domain_ids.is_empty() && !atom_ids.is_empty();
+        let blend_kg = p.blend_kg.unwrap_or(true) && !atom_ids_only;
         let mut suggest_ann_unavailable = false;
         if is_auto {
             let word_count = raw_query.split_whitespace().count();
@@ -1493,19 +1663,25 @@ impl KnowledgeHandlers {
         const CHARS_PER_TOKEN: usize = 4;
         let char_budget = max_tokens * CHARS_PER_TOKEN;
 
+        // Tracks characters consumed by the atom/section body so blended KG
+        // entities (below) trim against whatever budget is left over, never
+        // evicting an atom or section to make room for an entity.
+        let mut body_used = 0usize;
+
         if !section_results.is_empty() {
-            let mut used = 0usize;
             section_results.retain(|s| {
                 let cost = s.heading.len() + s.content.len() + 40;
-                if used + cost > char_budget {
+                if body_used + cost > char_budget {
                     return false;
                 }
-                used += cost;
+                body_used += cost;
                 true
             });
         }
 
-        let (markdown, section_json) = if !section_results.is_empty() {
+        let (markdown, section_json, included_atom_ids) = if !section_results.is_empty() {
+            let included_atom_ids: HashSet<String> =
+                section_results.iter().map(|s| s.atom_id.clone()).collect();
             let md = format_section_compose_markdown(
                 &raw_query,
                 &resolved_domains,
@@ -1536,9 +1712,8 @@ impl KnowledgeHandlers {
             } else {
                 Vec::new()
             };
-            (md, sj)
+            (md, sj, included_atom_ids)
         } else {
-            let mut used = 0usize;
             let sorted_atoms: Vec<(&Atom, f32)> = items
                 .iter()
                 .filter_map(|item| {
@@ -1549,18 +1724,74 @@ impl KnowledgeHandlers {
                 })
                 .take_while(|(a, _)| {
                     let cost = a.name.len() + a.content.len() + 40;
-                    if used + cost > char_budget {
+                    if body_used + cost > char_budget {
                         return false;
                     }
-                    used += cost;
+                    body_used += cost;
                     true
                 })
                 .collect();
+            let included_atom_ids: HashSet<String> =
+                sorted_atoms.iter().map(|(a, _)| a.id.to_string()).collect();
             (
                 format_compose_markdown(&raw_query, &resolved_domains, &sorted_atoms, explain),
                 Vec::new(),
+                included_atom_ids,
             )
         };
+
+        // KG entity blend (ADR-051 Amendment 1): additive "Knowledge graph"
+        // section, trimmed against whatever budget the atom/section body left
+        // over. Runs after the body is finalized so entities never displace an
+        // atom or section — see `trim_kg_entities_to_budget`.
+        //
+        // Self-calibrating inclusion floor: an entity only blends in if its
+        // rerank score clears the minimum rerank score among the atoms that
+        // actually made the final body. A compose whose final body has zero
+        // atoms (everything trimmed by `max_tokens`) has no floor to
+        // calibrate against, so it blends no entities at all (ADR-051
+        // Amendment 1, zero-atom edge case).
+        let entity_score_floor: Option<f32> = included_atom_ids
+            .iter()
+            .filter_map(|id| atom_cosine_scores.get(id).copied())
+            .fold(None, |acc, s| Some(acc.map_or(s, |a: f32| a.min(s))));
+        let mut markdown = markdown;
+        let mut kg_entities_json: Vec<Value> = Vec::new();
+        if blend_kg {
+            if let Some(floor) = entity_score_floor {
+                // Discovery/hydration failures degrade to an atom-only
+                // response instead of aborting the whole compose — the
+                // finalized atom/section body above is still a valid,
+                // useful briefing even without the supplementary KG section.
+                match search_kg_entities(runtime, token, &ns, &raw_query, KG_BLEND_CAP, floor).await
+                {
+                    Ok(kg_hits) => {
+                        let remaining_budget = char_budget.saturating_sub(body_used);
+                        let kg_hits = trim_kg_entities_to_budget(kg_hits, remaining_budget);
+                        if !kg_hits.is_empty() {
+                            markdown.push_str(&format_kg_entities_markdown(&kg_hits));
+                            kg_entities_json = kg_hits
+                                .iter()
+                                .map(|e| {
+                                    json!({
+                                        "id": e.id,
+                                        "kind": e.kind,
+                                        "name": e.name,
+                                        "score": (e.score * 10000.0).round() / 10000.0,
+                                    })
+                                })
+                                .collect();
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "knowledge.compose: KG entity blend failed, continuing with atom-only response"
+                        );
+                    }
+                }
+            }
+        }
 
         let atom_json: Vec<Value> = items
             .iter()
@@ -1591,6 +1822,9 @@ impl KnowledgeHandlers {
         if explain && !section_json.is_empty() {
             data["sections"] = json!(section_json);
             data["section_count"] = json!(section_json.len());
+        }
+        if !kg_entities_json.is_empty() {
+            data["entities"] = json!(kg_entities_json);
         }
         if suggest_ann_unavailable {
             data["ann_unavailable"] = json!(true);

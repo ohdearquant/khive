@@ -285,6 +285,12 @@ pub(crate) struct ComposeParams {
     pub max_tokens: Option<usize>,
     #[serde(default)]
     pub explain: Option<bool>,
+    /// Blend knowledge-graph `concept`/`document` entities into the candidate
+    /// pool (ADR-051 Amendment 1). Defaults to `true`. Has no effect on
+    /// `atom_ids`-only calls, which never blend (the caller pinned exact
+    /// atoms and gets exactly those back).
+    #[serde(default)]
+    pub blend_kg: Option<bool>,
 }
 
 // ── edit ─────────────────────────────────────────────────────────────────────

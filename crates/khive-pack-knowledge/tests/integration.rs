@@ -2997,3 +2997,635 @@ async fn resolver_generic_hard_delete_domain_with_mirror_sections() {
         "expected NotFound for domain after hard delete, got: {domain_not_found:?}"
     );
 }
+
+// ── ADR-051 Amendment 1: KG entity blending in knowledge.compose ─────────────
+//
+// A fake `EmbedderProvider` whose vector is a function of a marker substring
+// ("zzzquantumfoo") rather than real semantics: texts containing the marker
+// embed to [1.0, 0.0], everything else to [0.0, 1.0]. This makes the
+// KG-concept-outranks-lore-atom scenario (the ADR-051 Amendment 1 dogfood
+// motivation) deterministic without a real embedding model — the query and
+// the seeded concept share the marker, atoms/domains never do.
+mod kg_blend {
+    use super::*;
+    use async_trait::async_trait;
+    use khive_runtime::{AllowAllGate, BackendId, EmbedderProvider, RuntimeConfig};
+    use khive_types::Namespace;
+    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    const MARKER: &str = "zzzquantumfoo";
+    const MODEL_KEY: &str = "all-minilm-l6-v2";
+    const DIM: usize = 384;
+
+    struct MarkerEmbedService;
+
+    #[async_trait]
+    impl EmbeddingService for MarkerEmbedService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+            Ok(texts
+                .iter()
+                .map(|t| {
+                    let mut v = vec![0.0f32; DIM];
+                    if t.contains(MARKER) {
+                        v[0] = 1.0;
+                    } else {
+                        v[1] = 1.0;
+                    }
+                    v
+                })
+                .collect())
+        }
+
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "marker-embed-service"
+        }
+    }
+
+    struct MarkerEmbedProvider;
+
+    #[async_trait]
+    impl EmbedderProvider for MarkerEmbedProvider {
+        fn name(&self) -> &str {
+            MODEL_KEY
+        }
+
+        fn dimensions(&self) -> usize {
+            DIM
+        }
+
+        async fn build(
+            &self,
+        ) -> std::result::Result<Arc<dyn EmbeddingService>, khive_runtime::RuntimeError> {
+            Ok(Arc::new(MarkerEmbedService))
+        }
+    }
+
+    fn rt_with_marker_embedder() -> KhiveRuntime {
+        let rt = KhiveRuntime::new(RuntimeConfig {
+            git_write: Default::default(),
+            db_path: None,
+            default_namespace: Namespace::local(),
+            embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
+            additional_embedding_models: vec![],
+            gate: Arc::new(AllowAllGate),
+            packs: vec!["kg".to_string(), "knowledge".to_string()],
+            backend_id: BackendId::main(),
+            brain_profile: None,
+            visible_namespaces: vec![],
+            allowed_outbound_namespaces: vec![],
+            actor_id: None,
+        })
+        .expect("runtime");
+        rt.register_embedder(MarkerEmbedProvider);
+        rt
+    }
+
+    const QUERY: &str = "zzzquantumfoo kv cache paging decode attention retrieval \
+        augmented generation dense sparse benchmark corpus";
+
+    const OVERLAP_CONTENT: &str = "kv cache paging decode attention retrieval augmented \
+        generation dense sparse benchmark corpus latency gradient descent transformer vector \
+        index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity";
+
+    async fn seed_domain_and_atom(f: &Fixture) -> String {
+        f.dispatch(
+            "knowledge.upsert_atoms",
+            json!({
+                "atoms": [
+                    { "slug": "kg-blend-atom", "name": "KG Blend Atom", "content": OVERLAP_CONTENT, "finalized": true }
+                ]
+            }),
+        )
+        .await
+        .expect("upsert atom");
+
+        f.dispatch(
+            "knowledge.upsert_domains",
+            json!({
+                "domains": [
+                    {
+                        "slug": "kg-blend-domain",
+                        "name": "KG Blend Domain",
+                        "description": OVERLAP_CONTENT,
+                        "members": ["kg-blend-atom"]
+                    }
+                ]
+            }),
+        )
+        .await
+        .expect("upsert domain");
+
+        let domain_resp = f
+            .dispatch("knowledge.get", json!({ "id": "kg-blend-domain" }))
+            .await
+            .expect("get domain");
+        domain_resp["id"].as_str().expect("domain id").to_string()
+    }
+
+    async fn seed_kg_concept(f: &Fixture) -> String {
+        let resp = f
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "concept",
+                    "name": "ZipCache",
+                    "description": format!(
+                        "{MARKER} paged KV cache quantization technique for decode-time attention"
+                    ),
+                }),
+            )
+            .await
+            .expect("create kg concept");
+        resp["id"].as_str().expect("entity id").to_string()
+    }
+
+    /// Test 1: AUTO compose with a query whose top KG concept is seeded blends
+    /// the entity into `data.entities` and the "Knowledge graph" markdown
+    /// section, while atoms remain present.
+    #[tokio::test]
+    async fn auto_compose_blends_seeded_kg_concept() {
+        let f = pack(rt_with_marker_embedder());
+        seed_domain_and_atom(&f).await;
+        let concept_id = seed_kg_concept(&f).await;
+
+        let resp = f
+            .dispatch("knowledge.compose", json!({ "query": QUERY }))
+            .await
+            .expect("auto compose ok");
+
+        let data = &resp["data"];
+        let atoms = data["atoms"].as_array().expect("atoms array");
+        assert!(!atoms.is_empty(), "atoms must still be present");
+
+        let entities = data["entities"]
+            .as_array()
+            .expect("entities array must be present when a KG concept blends");
+        assert!(
+            entities.iter().any(|e| e["id"] == concept_id),
+            "expected seeded concept {concept_id} in entities, got: {entities:?}"
+        );
+
+        let md = data["markdown"].as_str().expect("markdown");
+        assert!(
+            md.contains("Knowledge graph"),
+            "markdown must contain the Knowledge graph section, got: {md}"
+        );
+        assert!(
+            md.contains("ZipCache"),
+            "markdown must render the blended concept's name, got: {md}"
+        );
+    }
+
+    /// Test 2: `blend_kg=false` behaves exactly as compose did before this
+    /// feature — no `entities` field, no "Knowledge graph" markdown section —
+    /// even when a matching KG concept exists.
+    #[tokio::test]
+    async fn blend_kg_false_omits_entities() {
+        let f = pack(rt_with_marker_embedder());
+        seed_domain_and_atom(&f).await;
+        seed_kg_concept(&f).await;
+
+        let resp = f
+            .dispatch(
+                "knowledge.compose",
+                json!({ "query": QUERY, "blend_kg": false }),
+            )
+            .await
+            .expect("compose with blend_kg=false ok");
+
+        let data = &resp["data"];
+        assert!(
+            data.get("entities").is_none(),
+            "entities must be absent when blend_kg=false, got: {data}"
+        );
+        let md = data["markdown"].as_str().expect("markdown");
+        assert!(
+            !md.contains("Knowledge graph"),
+            "markdown must not contain a Knowledge graph section when blend_kg=false, got: {md}"
+        );
+        let atoms = data["atoms"].as_array().expect("atoms array");
+        assert!(!atoms.is_empty(), "atoms must still be present");
+    }
+
+    /// Test 3: `atom_ids`-only calls never blend, regardless of `blend_kg`
+    /// (which defaults to true) — the caller pinned exact atoms.
+    #[tokio::test]
+    async fn atom_ids_only_never_blends() {
+        let f = pack(rt_with_marker_embedder());
+        f.dispatch(
+            "knowledge.upsert_atoms",
+            json!({
+                "atoms": [
+                    { "slug": "kg-blend-atom", "name": "KG Blend Atom", "content": OVERLAP_CONTENT }
+                ]
+            }),
+        )
+        .await
+        .expect("upsert atom");
+        seed_kg_concept(&f).await;
+
+        let resp = f
+            .dispatch(
+                "knowledge.compose",
+                json!({ "atom_ids": ["kg-blend-atom"], "query": QUERY }),
+            )
+            .await
+            .expect("atom_ids-only compose ok");
+
+        let data = &resp["data"];
+        assert!(
+            data.get("entities").is_none(),
+            "atom_ids-only compose must never blend KG entities, got: {data}"
+        );
+        let md = data["markdown"].as_str().expect("markdown");
+        assert!(
+            !md.contains("Knowledge graph"),
+            "atom_ids-only markdown must not contain a Knowledge graph section, got: {md}"
+        );
+    }
+
+    /// Test 4: blended entities respect `max_tokens` trimming — a budget too
+    /// tight to fit any entity after the atom/section body omits the
+    /// "Knowledge graph" section entirely, while the atom body itself
+    /// survives untouched.
+    #[tokio::test]
+    async fn blended_entities_respect_max_tokens_budget() {
+        let f = pack(rt_with_marker_embedder());
+
+        // A padded atom whose cost alone consumes nearly all of the
+        // minimum-clamped max_tokens=500 budget (2000 chars), leaving too
+        // little remaining for the entity section but not exceeding the
+        // budget itself — the atom must survive either way.
+        let filler = "x".repeat(1677);
+        let big_content = format!("{OVERLAP_CONTENT} {filler}");
+        f.dispatch(
+            "knowledge.upsert_atoms",
+            json!({
+                "atoms": [
+                    { "slug": "kg-blend-atom", "name": "KG Blend Atom", "content": big_content, "finalized": true }
+                ]
+            }),
+        )
+        .await
+        .expect("upsert atom");
+        f.dispatch(
+            "knowledge.upsert_domains",
+            json!({
+                "domains": [
+                    {
+                        "slug": "kg-blend-domain",
+                        "name": "KG Blend Domain",
+                        "description": OVERLAP_CONTENT,
+                        "members": ["kg-blend-atom"]
+                    }
+                ]
+            }),
+        )
+        .await
+        .expect("upsert domain");
+        seed_kg_concept(&f).await;
+
+        // Generous budget: entity fits.
+        let generous = f
+            .dispatch(
+                "knowledge.compose",
+                json!({ "query": QUERY, "max_tokens": 8000 }),
+            )
+            .await
+            .expect("generous-budget compose ok");
+        let generous_atoms = generous["data"]["atoms"].as_array().expect("atoms array");
+        assert!(!generous_atoms.is_empty(), "atoms must be present");
+        assert!(
+            generous["data"].get("entities").is_some(),
+            "entity must fit under a generous budget, got: {}",
+            generous["data"]
+        );
+
+        // Minimum-clamp budget: the atom body alone consumes it, leaving no
+        // room for the entity section — atoms must still survive.
+        let tight = f
+            .dispatch(
+                "knowledge.compose",
+                json!({ "query": QUERY, "max_tokens": 500 }),
+            )
+            .await
+            .expect("tight-budget compose ok");
+        let tight_atoms = tight["data"]["atoms"].as_array().expect("atoms array");
+        assert!(!tight_atoms.is_empty(), "atoms must survive a tight budget");
+        assert!(
+            tight["data"].get("entities").is_none(),
+            "entity must be trimmed out under a tight budget, got: {}",
+            tight["data"]
+        );
+    }
+
+    async fn seed_kg_document(f: &Fixture) -> String {
+        let resp = f
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "document",
+                    "name": "ADR-051",
+                    "description": format!(
+                        "{MARKER} section-embeddings hybrid compose architecture decision record"
+                    ),
+                }),
+            )
+            .await
+            .expect("create kg document");
+        resp["id"].as_str().expect("entity id").to_string()
+    }
+
+    /// Test 5: explicit `domain_ids` (non-AUTO) calls blend exactly like AUTO
+    /// calls do — the Amendment 1 decision covers both, not just AUTO.
+    #[tokio::test]
+    async fn explicit_domain_ids_compose_blends_seeded_kg_concept() {
+        let f = pack(rt_with_marker_embedder());
+        let domain_id = seed_domain_and_atom(&f).await;
+        let concept_id = seed_kg_concept(&f).await;
+
+        let resp = f
+            .dispatch(
+                "knowledge.compose",
+                json!({ "domain_ids": [domain_id], "query": QUERY }),
+            )
+            .await
+            .expect("explicit domain_ids compose ok");
+
+        let data = &resp["data"];
+        let atoms = data["atoms"].as_array().expect("atoms array");
+        assert!(!atoms.is_empty(), "atoms must still be present");
+        let entities = data["entities"]
+            .as_array()
+            .expect("entities array must be present for explicit domain_ids blend");
+        assert!(
+            entities.iter().any(|e| e["id"] == concept_id),
+            "expected seeded concept {concept_id} in entities, got: {entities:?}"
+        );
+    }
+
+    /// Test 6: a `document`-kind KG entity (not just `concept`) blends.
+    #[tokio::test]
+    async fn auto_compose_blends_seeded_kg_document() {
+        let f = pack(rt_with_marker_embedder());
+        seed_domain_and_atom(&f).await;
+        let document_id = seed_kg_document(&f).await;
+
+        let resp = f
+            .dispatch("knowledge.compose", json!({ "query": QUERY }))
+            .await
+            .expect("auto compose ok");
+
+        let data = &resp["data"];
+        let entities = data["entities"]
+            .as_array()
+            .expect("entities array must be present when a KG document blends");
+        assert!(
+            entities
+                .iter()
+                .any(|e| e["id"] == document_id && e["kind"] == "document"),
+            "expected seeded document {document_id} in entities, got: {entities:?}"
+        );
+    }
+
+    /// Test 7: the blended candidate pool is capped at `KG_BLEND_CAP` (5) and
+    /// deduplicated — seeding more matching concept/document entities than
+    /// the cap never yields duplicate or over-cap results.
+    #[tokio::test]
+    async fn blend_candidates_are_capped_and_deduped_across_kinds() {
+        let f = pack(rt_with_marker_embedder());
+        seed_domain_and_atom(&f).await;
+
+        for i in 0..4 {
+            f.dispatch(
+                "create",
+                json!({
+                    "kind": "concept",
+                    "name": format!("Concept{i}"),
+                    "description": format!("{MARKER} paged KV cache technique variant {i}"),
+                }),
+            )
+            .await
+            .expect("create kg concept");
+        }
+        for i in 0..4 {
+            f.dispatch(
+                "create",
+                json!({
+                    "kind": "document",
+                    "name": format!("Document{i}"),
+                    "description": format!("{MARKER} decode-time attention paper variant {i}"),
+                }),
+            )
+            .await
+            .expect("create kg document");
+        }
+
+        let resp = f
+            .dispatch("knowledge.compose", json!({ "query": QUERY }))
+            .await
+            .expect("auto compose ok");
+
+        let entities = resp["data"]["entities"]
+            .as_array()
+            .expect("entities array must be present — 8 matching entities were seeded");
+        assert!(
+            entities.len() <= 5,
+            "blended entities must be capped at KG_BLEND_CAP=5, got {}: {entities:?}",
+            entities.len()
+        );
+        let ids: HashSet<&str> = entities.iter().filter_map(|e| e["id"].as_str()).collect();
+        assert_eq!(
+            ids.len(),
+            entities.len(),
+            "blended entities must be deduplicated by id, got: {entities:?}"
+        );
+    }
+
+    /// Test 8: zero-atom edge case (ADR-051 Amendment 1 Decision) — when the
+    /// final compose body ends up with zero atoms (everything trimmed by
+    /// `max_tokens`), the entity inclusion floor is undefined, so no
+    /// entities blend even though the leftover budget would easily fit one.
+    #[tokio::test]
+    async fn zero_atoms_in_final_body_blends_no_entities_even_with_budget_room() {
+        let f = pack(rt_with_marker_embedder());
+
+        // Oversized atom: alone it exceeds the max_tokens=500 (2000-char)
+        // budget, so it is excluded from the body entirely — body_used stays
+        // 0, leaving the *entire* budget as "remaining" for the entity trim.
+        let filler = "x".repeat(2500);
+        let big_content = format!("{OVERLAP_CONTENT} {filler}");
+        f.dispatch(
+            "knowledge.upsert_atoms",
+            json!({
+                "atoms": [
+                    { "slug": "kg-blend-atom", "name": "KG Blend Atom", "content": big_content, "finalized": true }
+                ]
+            }),
+        )
+        .await
+        .expect("upsert atom");
+        f.dispatch(
+            "knowledge.upsert_domains",
+            json!({
+                "domains": [
+                    {
+                        "slug": "kg-blend-domain",
+                        "name": "KG Blend Domain",
+                        "description": OVERLAP_CONTENT,
+                        "members": ["kg-blend-atom"]
+                    }
+                ]
+            }),
+        )
+        .await
+        .expect("upsert domain");
+        seed_kg_concept(&f).await;
+
+        let resp = f
+            .dispatch(
+                "knowledge.compose",
+                json!({ "query": QUERY, "max_tokens": 500 }),
+            )
+            .await
+            .expect("compose ok");
+
+        let data = &resp["data"];
+        assert!(
+            data.get("entities").is_none(),
+            "zero-atom final body must blend no entities even with room in the budget, got: {data}"
+        );
+    }
+
+    // ── degrade-not-abort ───────────────────────────────────────────────────
+
+    /// Embedder that fails exactly the single-text `embed_query` calls the KG
+    /// blend path's `hybrid_search` → `vector_search` makes for the literal
+    /// compose query text, while behaving like `MarkerEmbedService` for every
+    /// other call (batched atom rerank, entity setup during seeding). This
+    /// isolates the failure to the blend boundary without breaking fixture
+    /// setup or the atom-scoring path, which only ever calls `embed` with
+    /// batches of 2+ texts (query + candidates).
+    struct FailingBlendEmbedService;
+
+    #[async_trait]
+    impl EmbeddingService for FailingBlendEmbedService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+            if texts.len() == 1 && texts[0] == QUERY {
+                return Err(EmbedError::Internal(
+                    "simulated KG blend-path embed failure".into(),
+                ));
+            }
+            Ok(texts
+                .iter()
+                .map(|t| {
+                    let mut v = vec![0.0f32; DIM];
+                    if t.contains(MARKER) {
+                        v[0] = 1.0;
+                    } else {
+                        v[1] = 1.0;
+                    }
+                    v
+                })
+                .collect())
+        }
+
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "failing-blend-embed-service"
+        }
+    }
+
+    struct FailingBlendEmbedProvider;
+
+    #[async_trait]
+    impl EmbedderProvider for FailingBlendEmbedProvider {
+        fn name(&self) -> &str {
+            MODEL_KEY
+        }
+
+        fn dimensions(&self) -> usize {
+            DIM
+        }
+
+        async fn build(
+            &self,
+        ) -> std::result::Result<Arc<dyn EmbeddingService>, khive_runtime::RuntimeError> {
+            Ok(Arc::new(FailingBlendEmbedService))
+        }
+    }
+
+    fn rt_with_failing_blend_embedder() -> KhiveRuntime {
+        let rt = KhiveRuntime::new(RuntimeConfig {
+            git_write: Default::default(),
+            db_path: None,
+            default_namespace: Namespace::local(),
+            embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
+            additional_embedding_models: vec![],
+            gate: Arc::new(AllowAllGate),
+            packs: vec!["kg".to_string(), "knowledge".to_string()],
+            backend_id: BackendId::main(),
+            brain_profile: None,
+            visible_namespaces: vec![],
+            allowed_outbound_namespaces: vec![],
+            actor_id: None,
+        })
+        .expect("runtime");
+        rt.register_embedder(FailingBlendEmbedProvider);
+        rt
+    }
+
+    /// Test 9 (High finding regression): a KG-blend-path embed failure
+    /// (`hybrid_search` → `vector_search` → `embed_query` erroring) must not
+    /// abort `knowledge.compose` — it must degrade to the already-finalized
+    /// atom-only response. Uses explicit `domain_ids` (not AUTO) so the
+    /// `knowledge.suggest` phase never calls `embed_query` on `QUERY` itself,
+    /// keeping the induced failure isolated to the KG blend call.
+    #[tokio::test]
+    async fn kg_blend_failure_degrades_to_atom_only_response() {
+        let f = pack(rt_with_failing_blend_embedder());
+        let domain_id = seed_domain_and_atom(&f).await;
+        seed_kg_concept(&f).await;
+
+        let resp = f
+            .dispatch(
+                "knowledge.compose",
+                json!({ "domain_ids": [domain_id], "query": QUERY }),
+            )
+            .await
+            .expect("compose must succeed atom-only despite KG blend failure");
+
+        let data = &resp["data"];
+        let atoms = data["atoms"].as_array().expect("atoms array");
+        assert!(
+            !atoms.is_empty(),
+            "atom-only body must survive a KG blend failure, got: {data}"
+        );
+        assert!(
+            data.get("entities").is_none(),
+            "entities must be absent when the KG blend fails, got: {data}"
+        );
+        let md = data["markdown"].as_str().expect("markdown");
+        assert!(
+            !md.contains("Knowledge graph"),
+            "markdown must not contain a Knowledge graph section when the blend fails, got: {md}"
+        );
+    }
+}
