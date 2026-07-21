@@ -1554,7 +1554,7 @@ brain_profile = "unrelated"
     /// Regression for PR #52: project-toml brain_profile
     /// MUST win over KHIVE_BRAIN_PROFILE env var.
     ///
-    /// Merged ADR-035 §Precedence: CLI > project toml > global toml > env > default.
+    /// Merged config precedence: CLI > project toml > global toml > env > default.
     /// Before the fix, the env var was bound into the clap `brain_profile` arg and
     /// placed at tier-1 via RuntimeConfig::default() in the base_config spread,
     /// causing env to override TOML.
