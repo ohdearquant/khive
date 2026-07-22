@@ -529,7 +529,7 @@ async fn prepare_repair_models(
             .unwrap_or_else(|_| model_name.clone());
 
         identities_by_table
-            .entry(vector_table.clone())
+            .entry(vector_table.to_ascii_lowercase())
             .or_default()
             .insert(embedding_model.clone());
         targets.push(RepairModelTarget {
@@ -1743,6 +1743,66 @@ mod tests {
             vectors.count().await.expect("count after refusal"),
             0,
             "collision refusal must happen before vector writes"
+        );
+    }
+
+    #[tokio::test]
+    async fn embeds_only_repair_refuses_case_distinct_models_before_vector_writes() {
+        use khive_runtime::RuntimeConfig;
+
+        const MODEL_A: &str = "collision";
+        const MODEL_B: &str = "Collision";
+        const TABLE: &str = "vec_collision";
+
+        let rt = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            ..RuntimeConfig::default()
+        })
+        .expect("runtime");
+        rt.register_embedder(RepairEmbedderProvider {
+            model_name: MODEL_A,
+        });
+        rt.register_embedder(RepairEmbedderProvider {
+            model_name: MODEL_B,
+        });
+        let token = rt
+            .authorize(Namespace::parse("local").expect("namespace"))
+            .expect("authorize");
+        let note = Note::new("local", "observation", "do not repair case-distinct models");
+        rt.notes(&token)
+            .expect("notes")
+            .upsert_note(note)
+            .await
+            .expect("seed note");
+        let vectors = rt.vectors_for_model(&token, MODEL_A).expect("vectors");
+        assert_eq!(vectors.count().await.expect("count before repair"), 0);
+
+        let error = repair_missing_embeddings(
+            &rt,
+            &token,
+            &[MODEL_A.to_string(), MODEL_B.to_string()],
+            "local",
+            100,
+        )
+        .await
+        .expect_err("case-distinct repair models must be refused");
+
+        let message = error.to_string();
+        assert!(message.contains(MODEL_A), "missing first model: {message}");
+        assert!(message.contains(MODEL_B), "missing second model: {message}");
+        assert!(message.contains(TABLE), "missing shared table: {message}");
+        assert!(
+            message.contains(
+                "colliding registered model names cannot be repaired or served from one table"
+            ),
+            "missing refusal rationale: {message}"
+        );
+        assert_eq!(
+            vectors.count().await.expect("count after refusal"),
+            0,
+            "case-distinct collision refusal must happen before vector writes"
         );
     }
 
