@@ -13,6 +13,7 @@ use khive_storage::types::{
     TextGatherMode, TextIndexStats, TextQueryMode, TextSearchHit, TextSearchOptions,
     TextSearchRequest, TextTermStats, TextTermStatsRequest,
 };
+use khive_storage::usage::{UsageContext, UsageUnit};
 use khive_storage::StorageCapability;
 use khive_storage::TextSearch;
 use khive_types::SubstrateKind;
@@ -100,6 +101,12 @@ fn map_err(e: rusqlite::Error, op: &'static str) -> StorageError {
 
 fn map_sqlite_err(e: SqliteError, op: &'static str) -> StorageError {
     StorageError::driver(StorageCapability::Text, op, e)
+}
+
+fn count_fts_pass(context: Option<&UsageContext>) {
+    if let Some(context) = context {
+        context.add(UsageUnit::FtsPasses, 1);
+    }
 }
 
 /// A TextSearch backed by SQLite FTS5 virtual tables.
@@ -879,20 +886,7 @@ impl TextSearch for Fts5TextSearch {
 
     async fn search(&self, request: TextSearchRequest) -> Result<Vec<TextSearchHit>, StorageError> {
         let table = self.table_name.clone();
-
-        // `fts_passes` is an *issued* counter (khive_storage::usage docs): it
-        // must count one FTS5 statement actually prepared and run, not every
-        // call to this method. An empty/fully-sanitized `request.query`
-        // short-circuits below (`build_match_expr` -> `None`) before any
-        // statement exists, so that path must not count. `with_reader` runs
-        // this closure on a blocking-pool thread via `spawn_blocking`, where
-        // the dispatch's usage task-local is not visible, so the closure
-        // signals success through a plain `Arc<AtomicBool>` and the actual
-        // `khive_storage::usage::count` call happens after the `.await`
-        // below, back on the caller's task (mirrors graph.rs's traversal
-        // round-trip/hop accounting).
-        let issued = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let issued_flag = Arc::clone(&issued);
+        let usage = khive_storage::usage::current();
 
         let result = self
             .with_reader("fts_search", move |conn| {
@@ -927,9 +921,7 @@ impl TextSearch for Fts5TextSearch {
                 );
 
                 let mut stmt = conn.prepare(&sql)?;
-                // The statement exists — this call is issuing a real FTS5
-                // query from here on, regardless of how the rest resolves.
-                issued_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                count_fts_pass(usage.as_ref());
                 stmt.raw_bind_parameter(1, &match_expr)?;
                 stmt.raw_bind_parameter(2, request.top_k as i64)?;
 
@@ -990,10 +982,6 @@ impl TextSearch for Fts5TextSearch {
                 Ok(results)
             })
             .await;
-
-        if issued.load(std::sync::atomic::Ordering::Relaxed) {
-            khive_storage::usage::count(khive_storage::usage::UsageUnit::FtsPasses, 1);
-        }
 
         result
     }
@@ -1201,6 +1189,7 @@ impl Fts5TextSearch {
         request: TextSearchRequest,
     ) -> Result<Vec<TextSearchHit>, StorageError> {
         let table = self.table_name.clone();
+        let usage = khive_storage::usage::current();
 
         self.with_reader("fts_search_unranked", move |conn| {
             let match_expr = match build_match_expr(&request.query, request.mode) {
@@ -1222,6 +1211,7 @@ impl Fts5TextSearch {
             );
 
             let mut stmt = conn.prepare(&sql)?;
+            count_fts_pass(usage.as_ref());
             stmt.raw_bind_parameter(1, &match_expr)?;
             stmt.raw_bind_parameter(2, request.top_k as i64)?;
 
@@ -1270,6 +1260,7 @@ impl Fts5TextSearch {
         gather_limit: u32,
     ) -> Result<Vec<TextSearchHit>, StorageError> {
         let table = self.table_name.clone();
+        let usage = khive_storage::usage::current();
 
         self.with_reader("fts_search_rank_within_cap", move |conn| {
             let match_expr = match build_match_expr(&request.query, request.mode) {
@@ -1289,6 +1280,7 @@ impl Fts5TextSearch {
             );
 
             let mut stmt = conn.prepare(&gather_sql)?;
+            count_fts_pass(usage.as_ref());
             stmt.raw_bind_parameter(1, &match_expr)?;
             stmt.raw_bind_parameter(2, gather_limit as i64)?;
             for (i, param) in filter_params.iter().enumerate() {
@@ -1331,6 +1323,7 @@ impl Fts5TextSearch {
             );
 
             let mut stmt2 = conn.prepare(&rank_sql)?;
+            count_fts_pass(usage.as_ref());
             stmt2.raw_bind_parameter(1, &match_expr)?;
             stmt2.raw_bind_parameter(2, request.top_k as i64)?;
             for (i, id_str) in gathered_ids.iter().enumerate() {

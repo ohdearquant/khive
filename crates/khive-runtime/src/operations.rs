@@ -5395,7 +5395,7 @@ pub struct EntityCreateSpec {
 mod tests {
     use super::*;
     use crate::curation::EdgeListFilter;
-    use crate::embedder_registry::EmbedderProvider;
+    use crate::embedder_registry::{BlockingEmbeddingService, EmbedderProvider};
     use crate::error::RuntimeError;
     use crate::runtime::{KhiveRuntime, NamespaceToken};
     use crate::{ActorRef, Namespace};
@@ -5608,33 +5608,25 @@ mod tests {
         dims: usize,
         release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
         entered: Arc<AtomicBool>,
-        exited: Arc<tokio::sync::Notify>,
     }
 
     struct BlockingVecControls {
         release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
         entered: Arc<AtomicBool>,
-        exited: Arc<tokio::sync::Notify>,
     }
 
     impl BlockingVecProvider {
         fn new(name: &str, dims: usize) -> (Self, BlockingVecControls) {
             let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
             let entered = Arc::new(AtomicBool::new(false));
-            let exited = Arc::new(tokio::sync::Notify::new());
             (
                 Self {
                     provider_name: name.to_owned(),
                     dims,
                     release: Arc::clone(&release),
                     entered: Arc::clone(&entered),
-                    exited: Arc::clone(&exited),
                 },
-                BlockingVecControls {
-                    release,
-                    entered,
-                    exited,
-                },
+                BlockingVecControls { release, entered },
             )
         }
     }
@@ -5650,12 +5642,12 @@ mod tests {
         }
 
         async fn build(&self) -> crate::error::RuntimeResult<Arc<dyn EmbeddingService>> {
-            Ok(Arc::new(BlockingVecService {
+            let service = Arc::new(BlockingVecService {
                 dims: self.dims,
                 release: Arc::clone(&self.release),
                 entered: Arc::clone(&self.entered),
-                exited: Arc::clone(&self.exited),
-            }))
+            });
+            Ok(Arc::new(BlockingEmbeddingService::new(service)))
         }
     }
 
@@ -5663,7 +5655,6 @@ mod tests {
         dims: usize,
         release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
         entered: Arc<AtomicBool>,
-        exited: Arc<tokio::sync::Notify>,
     }
 
     #[async_trait]
@@ -5679,7 +5670,6 @@ mod tests {
             let _guard = wake
                 .wait_while(guard, |released| !*released)
                 .expect("release lock must not be poisoned");
-            self.exited.notify_one();
             Ok(texts.iter().map(|_| vec![1.0_f32; self.dims]).collect())
         }
 
@@ -12237,20 +12227,27 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn create_entity_embed_failure_returns_while_sibling_encode_is_blocked() {
-        let rt = KhiveRuntime::memory().unwrap();
+    #[test]
+    fn create_entity_embed_failure_returns_under_single_worker_saturation() {
         let (blocking, controls) = BlockingVecProvider::new("latency-blocking", 4);
-        rt.register_embedder(blocking);
-        rt.register_embedder(FailFastProvider::after_signal(
+        let fail_after_entry = FailFastProvider::after_signal(
             "latency-fail-after-entry",
             Arc::clone(&controls.entered),
-        ));
+        );
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
 
-        let tok = NamespaceToken::for_namespace(Namespace::parse("embed-failure-latency").unwrap());
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            rt.create_entity(
+        let runtime_thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .expect("single-worker runtime must build");
+            let rt = KhiveRuntime::memory().unwrap();
+            rt.register_embedder(blocking);
+            rt.register_embedder(fail_after_entry);
+            let tok =
+                NamespaceToken::for_namespace(Namespace::parse("embed-failure-latency").unwrap());
+            let result = runtime.block_on(rt.create_entity(
                 &tok,
                 "concept",
                 None,
@@ -12258,24 +12255,25 @@ mod tests {
                 None,
                 None,
                 vec![],
-            ),
-        )
-        .await;
+            ));
+            result_tx
+                .send(result.map_err(|error| error.to_string()))
+                .expect("test receiver must remain connected");
+        });
+
+        let result = result_rx.recv_timeout(std::time::Duration::from_secs(3));
 
         let (released, wake) = &*controls.release;
         *released.lock().expect("release lock must not be poisoned") = true;
         wake.notify_all();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            controls.exited.notified(),
-        )
-        .await
-        .expect("blocked sibling must exit after release");
+        runtime_thread
+            .join()
+            .expect("single-worker runtime thread must join after release");
 
         let error = result
-            .expect("embed failure must return without waiting for synchronous inference")
+            .expect("embed failure must return while synchronous inference remains blocked")
             .expect_err("one failed model must fail entity creation");
-        assert!(error.to_string().contains("injected embed failure"));
+        assert!(error.contains("injected embed failure"));
     }
 
     // Issued-at-dispatch accounting: an embed call that was handed to the

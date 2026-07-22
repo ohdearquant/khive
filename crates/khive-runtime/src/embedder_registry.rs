@@ -15,6 +15,86 @@ use tokio::sync::OnceCell;
 
 use crate::error::{RuntimeError, RuntimeResult};
 
+#[derive(Clone, Copy)]
+enum EmbeddingCall {
+    Generic,
+    Query,
+    Passage,
+}
+
+pub(crate) struct BlockingEmbeddingService<S> {
+    inner: Arc<S>,
+}
+
+impl<S> BlockingEmbeddingService<S> {
+    pub(crate) fn new(inner: Arc<S>) -> Self {
+        Self { inner }
+    }
+}
+
+impl<S: EmbeddingService + 'static> BlockingEmbeddingService<S> {
+    async fn run(
+        &self,
+        texts: &[String],
+        model: EmbeddingModel,
+        call: EmbeddingCall,
+    ) -> lattice_embed::Result<Vec<Vec<f32>>> {
+        let inner = Arc::clone(&self.inner);
+        let texts = texts.to_vec();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            runtime.block_on(async move {
+                match call {
+                    EmbeddingCall::Generic => inner.embed(&texts, model).await,
+                    EmbeddingCall::Query => inner.embed_query(&texts, model).await,
+                    EmbeddingCall::Passage => inner.embed_passage(&texts, model).await,
+                }
+            })
+        })
+        .await
+        .map_err(|error| lattice_embed::EmbedError::Internal(error.to_string()))?
+    }
+}
+
+#[async_trait]
+impl<S: EmbeddingService + 'static> EmbeddingService for BlockingEmbeddingService<S> {
+    async fn embed(
+        &self,
+        texts: &[String],
+        model: EmbeddingModel,
+    ) -> lattice_embed::Result<Vec<Vec<f32>>> {
+        self.run(texts, model, EmbeddingCall::Generic).await
+    }
+
+    async fn embed_query(
+        &self,
+        texts: &[String],
+        model: EmbeddingModel,
+    ) -> lattice_embed::Result<Vec<Vec<f32>>> {
+        self.run(texts, model, EmbeddingCall::Query).await
+    }
+
+    async fn embed_passage(
+        &self,
+        texts: &[String],
+        model: EmbeddingModel,
+    ) -> lattice_embed::Result<Vec<Vec<f32>>> {
+        self.run(texts, model, EmbeddingCall::Passage).await
+    }
+
+    fn model_config(&self, model: EmbeddingModel) -> lattice_embed::ModelConfig {
+        self.inner.model_config(model)
+    }
+
+    fn supports_model(&self, model: EmbeddingModel) -> bool {
+        self.inner.supports_model(model)
+    }
+
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+}
+
 /// A source that can produce an [`EmbeddingService`] by name.
 ///
 /// Packs implement this trait to register custom embedding backends.
@@ -205,8 +285,8 @@ impl EmbedderProvider for LatticeEmbedderProvider {
 
     async fn build(&self) -> RuntimeResult<Arc<dyn EmbeddingService>> {
         let native = Arc::new(NativeEmbeddingService::with_model(self.model));
-        let cached = CachedEmbeddingService::with_default_cache(native);
-        Ok(Arc::new(cached) as Arc<dyn EmbeddingService>)
+        let cached = Arc::new(CachedEmbeddingService::with_default_cache(native));
+        Ok(Arc::new(BlockingEmbeddingService::new(cached)) as Arc<dyn EmbeddingService>)
     }
 }
 

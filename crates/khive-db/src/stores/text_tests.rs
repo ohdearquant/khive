@@ -2403,3 +2403,119 @@ async fn test_search_normal_query_counts_exactly_one_fts_pass() {
         "a query that reaches conn.prepare must count exactly one fts_pass; got {snap:?}"
     );
 }
+
+#[tokio::test]
+async fn test_cancelled_search_continuation_counts_issued_fts_pass() {
+    let store = setup_memory_store("cancelled_search_counts");
+    store
+        .upsert_document(make_document(
+            Uuid::new_v4(),
+            "counted",
+            "cancelled continuation accounting",
+        ))
+        .await
+        .unwrap();
+
+    let pool = Arc::clone(&store.pool);
+    let reader_blocker = pool.writer().unwrap();
+    let ctx = khive_storage::usage::UsageContext::new();
+    let task = tokio::spawn(khive_storage::usage::scope(ctx.clone(), async move {
+        store
+            .search(TextSearchRequest {
+                query: "continuation".to_string(),
+                mode: TextQueryMode::Plain,
+                filter: Some(ns_filter("test_ns")),
+                top_k: 10,
+                snippet_chars: 0,
+            })
+            .await
+    }));
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    task.abort();
+    let joined = task.await;
+    assert!(joined.unwrap_err().is_cancelled());
+    drop(reader_blocker);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while ctx.snapshot().get("fts_passes").is_none() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        ctx.snapshot()["fts_passes"],
+        1,
+        "the blocking query continues after caller cancellation and must count when issued"
+    );
+}
+
+#[tokio::test]
+async fn test_search_unranked_counts_exactly_one_fts_pass() {
+    let store = setup_memory_store("unranked_counts_once");
+    store
+        .upsert_document(make_document(
+            Uuid::new_v4(),
+            "counted",
+            "unranked pass accounting",
+        ))
+        .await
+        .unwrap();
+
+    let ctx = khive_storage::usage::UsageContext::new();
+    khive_storage::usage::scope(ctx.clone(), async {
+        store
+            .search_with_options(
+                TextSearchRequest {
+                    query: "unranked".to_string(),
+                    mode: TextQueryMode::Plain,
+                    filter: Some(ns_filter("test_ns")),
+                    top_k: 10,
+                    snippet_chars: 0,
+                },
+                TextSearchOptions {
+                    gather_mode: TextGatherMode::Unranked,
+                    gather_limit: None,
+                },
+            )
+            .await
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(ctx.snapshot()["fts_passes"], 1);
+}
+
+#[tokio::test]
+async fn test_search_rank_within_cap_counts_two_fts_passes() {
+    let store = setup_memory_store("rank_within_cap_counts_twice");
+    store
+        .upsert_document(make_document(
+            Uuid::new_v4(),
+            "counted",
+            "rank within cap accounting",
+        ))
+        .await
+        .unwrap();
+
+    let ctx = khive_storage::usage::UsageContext::new();
+    khive_storage::usage::scope(ctx.clone(), async {
+        store
+            .search_with_options(
+                TextSearchRequest {
+                    query: "accounting".to_string(),
+                    mode: TextQueryMode::Plain,
+                    filter: Some(ns_filter("test_ns")),
+                    top_k: 10,
+                    snippet_chars: 0,
+                },
+                TextSearchOptions {
+                    gather_mode: TextGatherMode::RankWithinCap,
+                    gather_limit: Some(20),
+                },
+            )
+            .await
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(ctx.snapshot()["fts_passes"], 2);
+}
