@@ -126,7 +126,7 @@ impl<'a> Parser<'a> {
             let name = self.parse_identifier()?;
             self.expect_char('=')?;
             self.skip_ws();
-            let arg_val = self.parse_arg_value()?;
+            let arg_val = self.parse_arg_value_with_hint(Some(&name))?;
             if args.contains_key(&name) {
                 return Err(DslError::DuplicateArg { name });
             }
@@ -154,6 +154,14 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_arg_value(&mut self) -> Result<ArgValue, DslError> {
+        self.parse_arg_value_with_hint(None)
+    }
+
+    /// Same as [`Self::parse_arg_value`], but `hint` names the argument or
+    /// object key this value is being assigned to (when known), so a
+    /// bareword-value failure can show the exact corrected call instead of
+    /// just the corrected literal.
+    fn parse_arg_value_with_hint(&mut self, hint: Option<&str>) -> Result<ArgValue, DslError> {
         self.skip_ws();
         if self.peek() == Some('$') {
             return self.parse_prev_ref();
@@ -164,7 +172,7 @@ impl<'a> Parser<'a> {
         if self.peek() == Some('{') {
             return self.parse_object_arg();
         }
-        let v = self.parse_value()?;
+        let v = self.parse_value(hint)?;
         if let Value::String(s) = &v {
             if let Some(prev_ref) = Self::string_as_prev_ref(s) {
                 return Ok(prev_ref);
@@ -268,7 +276,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect_char(':')?;
             self.skip_ws();
-            let val = self.parse_arg_value()?;
+            let val = self.parse_arg_value_with_hint(Some(&key))?;
             pairs.push((key, val));
             self.skip_ws();
             match self.peek() {
@@ -376,7 +384,10 @@ impl<'a> Parser<'a> {
         Ok(ArgValue::PrevRef { path })
     }
 
-    fn parse_value(&mut self) -> Result<Value, DslError> {
+    /// `hint` names the argument or object key this value is assigned to
+    /// (when the caller knows it), used only to show a fully corrected call
+    /// when the failure is a bareword value (see [`bareword_hint_message`]).
+    fn parse_value(&mut self, hint: Option<&str>) -> Result<Value, DslError> {
         self.skip_ws();
         let start = self.pos;
         let end = self.scan_value_end()?;
@@ -392,9 +403,21 @@ impl<'a> Parser<'a> {
         let value = if trimmed.starts_with('"') {
             Value::String(decode_quoted_json_string(trimmed, start)?)
         } else {
-            serde_json::from_str(trimmed).map_err(|e| DslError::InvalidValue {
-                pos: start,
-                error: e.to_string(),
+            serde_json::from_str(trimmed).map_err(|e| {
+                let error = if is_bareword_identifier(trimmed) {
+                    bareword_hint_message(trimmed, hint)
+                } else {
+                    // `e.to_string()` carries its own "at line L column C",
+                    // always relative to `trimmed` (this one value's own
+                    // slice, always line 1) rather than the DSL input as a
+                    // whole — pairing it verbatim with the `at position
+                    // {start}` this crate reports for the same failure would
+                    // state two different, disagreeing locations for one
+                    // problem. Keep the descriptive prefix, drop the
+                    // contradicting position clause.
+                    strip_serde_position(&e.to_string())
+                };
+                DslError::InvalidValue { pos: start, error }
             })?
         };
         self.pos = end;
@@ -558,7 +581,7 @@ fn describe_quoted_string_parse_error(
     e: &serde_json::Error,
     normalized: &NormalizedQuotedString<'_>,
 ) -> String {
-    let base = e.to_string();
+    let base = strip_serde_position(&e.to_string());
     let Some(offset) = serde_error_byte_offset(e, normalized.text.as_ref()) else {
         return base;
     };
@@ -611,8 +634,52 @@ fn decode_quoted_json_string(raw: &str, pos: usize) -> Result<String, DslError> 
 fn decode_quoted_json_key(raw: &str, pos: usize) -> Result<String, DslError> {
     serde_json::from_str(raw).map_err(|e| DslError::InvalidValue {
         pos,
-        error: e.to_string(),
+        error: strip_serde_position(&e.to_string()),
     })
+}
+
+/// Returns whether `s` is a bare identifier (`[A-Za-z_][A-Za-z0-9_]*`) —
+/// the shape of the most common invalid-value mistake: a string value typed
+/// without its surrounding `"..."`. Only called after `serde_json` has
+/// already rejected `s` as a value, so this never misclassifies a valid
+/// JSON literal (`true`, `false`, `null`, a number) as a bareword.
+fn is_bareword_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Builds the message for a bareword-shaped invalid value. `hint`, when the
+/// caller knows the argument name or object key this value belongs to,
+/// lets the message show the exact corrected call rather than just the
+/// corrected literal — a caller who wrote `id=abc` sees `id="abc"` and can
+/// copy it directly.
+fn bareword_hint_message(bareword: &str, hint: Option<&str>) -> String {
+    match hint {
+        Some(name) => format!(
+            "{bareword:?} is a bareword, not a valid value; string values must be \
+             double-quoted — did you mean {name}={bareword:?}?"
+        ),
+        None => format!(
+            "{bareword:?} is a bareword, not a valid value; string values must be \
+             double-quoted — did you mean {bareword:?}?"
+        ),
+    }
+}
+
+/// Strips a `serde_json` `Display` message's trailing `at line L column C`
+/// clause. That clause is always relative to the isolated substring
+/// `serde_json` parsed (one value's slice, or a quoted string's decoded
+/// body) rather than the overall DSL input, so it disagrees with the
+/// `at position {pos}` this crate reports for the same failure whenever the
+/// value does not start at byte 0. The descriptive prefix (`expected
+/// value`, `trailing characters`, `control character ... found while
+/// parsing a string`, ...) stays meaningful on its own and is kept.
+fn strip_serde_position(msg: &str) -> String {
+    msg.split(" at line ").next().unwrap_or(msg).to_owned()
 }
 
 /// Validates quoted-reference brackets before promoting a string to `PrevRef`.
