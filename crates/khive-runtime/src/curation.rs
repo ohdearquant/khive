@@ -241,10 +241,13 @@ fn resolve_merge_edge_endpoint(
 /// reused here rather than re-derived, per the #543/#621 lesson that a parallel
 /// matcher drifts out of sync with the validator.
 ///
-/// `annotates` is exempt: within a merge, the entity/note being rewired can only
-/// ever be `annotates`'s unfiltered *target* (its source must be a note, enforced
-/// at edge creation and unaffected by which id the target column holds), so
-/// rewiring the target id never changes that verdict.
+/// `annotates` is exempt: its source-must-be-a-note constraint is enforced at
+/// edge creation and unchanged by rewiring (an entity merge only ever rewires
+/// its unfiltered target; a note merge rewiring the source substitutes another
+/// note), and its target may be any substrate. Callers short-circuit `annotates`
+/// before endpoint resolution — an annotates target may be an event or an edge,
+/// which `resolve_merge_edge_endpoint` cannot resolve; the exemption here is
+/// kept as defense in depth.
 // REASON: the two endpoints each need substrate/kind/entity_type independently —
 // collapsing them into a tuple/struct would obscure which side is which at call
 // sites that already pass them as separate locals.
@@ -260,6 +263,17 @@ fn merge_rewire_endpoint_contract_allows(
     tgt_type: Option<&str>,
 ) -> bool {
     if relation == EdgeRelation::Annotates {
+        return true;
+    }
+    // Same-substrate relations permit any note→note pair unconditionally,
+    // matching `validate_edge_relation_endpoints`'s `(Note, Note) => {}` arm.
+    if src_sub == "note"
+        && tgt_sub == "note"
+        && matches!(
+            relation,
+            EdgeRelation::Supersedes | EdgeRelation::Supports | EdgeRelation::Refutes
+        )
+    {
         return true;
     }
     if src_sub == "entity"
@@ -1335,6 +1349,11 @@ fn merge_entity_sql(
         // counted, mirroring the existing dangling-endpoint skip behavior rather
         // than silently writing a contract-violating edge or aborting the merge.
         let contract_ok = match relation_typed {
+            // `annotates` targets may be events or edges, which
+            // `resolve_merge_edge_endpoint` cannot resolve — evaluate its
+            // (unconditional) exemption before endpoint resolution so valid
+            // annotates edges are not dropped as unresolvable.
+            Some(EdgeRelation::Annotates) => true,
             Some(rel) => {
                 let src_info = if new_src == into_id {
                     Some((
@@ -1839,6 +1858,10 @@ fn merge_note_sql(
             // rewiring endpoint is a note (`into_id`'s kind, substrate "note"),
             // not an entity.
             let contract_ok = match relation_typed {
+                // Same rationale as the entity-merge path: annotates targets may
+                // be events or edges, unresolvable by substrate lookup — the
+                // exemption must precede endpoint resolution.
+                Some(EdgeRelation::Annotates) => true,
                 Some(rel) => {
                     let src_info = if new_src == into_id {
                         Some(("note", into_note.kind.clone(), None))
@@ -4129,6 +4152,242 @@ mod tests {
             1,
             "exactly one live into→shared annotates edge must exist after merge; got: {into_edges:?}"
         );
+    }
+
+    // The rewire contract check must preserve note→note supersedes, supports,
+    // and refutes — `validate_edge_relation_endpoints` permits any note→note
+    // pair for these relations, so the merge matcher must too, or a note merge
+    // deletes valid epistemic/supersession edges.
+    #[tokio::test]
+    async fn merge_note_preserves_note_to_note_epistemic_and_supersession_edges() {
+        use khive_storage::EdgeRelation;
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        let into = rt
+            .create_note(&tok, "observation", None, "Into", None, None, vec![])
+            .await
+            .unwrap();
+        let from = rt
+            .create_note(&tok, "observation", None, "From", None, None, vec![])
+            .await
+            .unwrap();
+        let superseded = rt
+            .create_note(&tok, "observation", None, "Old", None, None, vec![])
+            .await
+            .unwrap();
+        let claim = rt
+            .create_note(&tok, "insight", None, "Claim", None, None, vec![])
+            .await
+            .unwrap();
+        let counter = rt
+            .create_note(&tok, "observation", None, "Counter", None, None, vec![])
+            .await
+            .unwrap();
+
+        // Outgoing from `from` (source rewires) and incoming onto `from`
+        // (target rewires) — both directions must survive.
+        rt.link(
+            &tok,
+            from.id,
+            superseded.id,
+            EdgeRelation::Supersedes,
+            1.0,
+            None,
+        )
+        .await
+        .unwrap();
+        rt.link(&tok, from.id, claim.id, EdgeRelation::Supports, 1.0, None)
+            .await
+            .unwrap();
+        rt.link(&tok, counter.id, from.id, EdgeRelation::Refutes, 1.0, None)
+            .await
+            .unwrap();
+
+        let summary = rt
+            .merge_note_with_reason(
+                &tok,
+                into.id,
+                from.id,
+                EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            summary.edges_rewired, 3,
+            "all three note→note edges must be rewired, not contract-dropped"
+        );
+        assert_eq!(
+            summary.edges_contract_skipped, 0,
+            "no valid note→note supersedes/supports/refutes edge may be dropped"
+        );
+
+        for (src, tgt, rel) in [
+            (into.id, superseded.id, EdgeRelation::Supersedes),
+            (into.id, claim.id, EdgeRelation::Supports),
+            (counter.id, into.id, EdgeRelation::Refutes),
+        ] {
+            let edges = rt
+                .list_edges(
+                    &tok,
+                    crate::EdgeListFilter {
+                        source_id: Some(src),
+                        target_id: Some(tgt),
+                        relations: vec![rel],
+                        ..Default::default()
+                    },
+                    10,
+                    0,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                edges.len(),
+                1,
+                "rewired {rel:?} edge {src}→{tgt} must survive the merge; got {edges:?}"
+            );
+        }
+    }
+
+    // Annotates targets may be edges or events — substrates
+    // `resolve_merge_edge_endpoint` cannot resolve. The contract check must
+    // exempt annotates BEFORE endpoint resolution, or a note merge deletes
+    // valid annotates edges pointing at them.
+    #[tokio::test]
+    async fn merge_note_preserves_annotates_edges_targeting_edges_and_events() {
+        use khive_storage::EdgeRelation;
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        // An edge to annotate.
+        let a = rt
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(&tok, "concept", None, "B", None, None, vec![])
+            .await
+            .unwrap();
+        let annotated_edge = rt
+            .link(&tok, a.id, b.id, EdgeRelation::Extends, 1.0, None)
+            .await
+            .unwrap();
+
+        // An event to annotate: a throwaway note merge emits a NoteMerged
+        // event (creation ops don't emit in this harness).
+        let scrap_into = rt
+            .create_note(&tok, "observation", None, "ScrapInto", None, None, vec![])
+            .await
+            .unwrap();
+        let scrap_from = rt
+            .create_note(&tok, "observation", None, "ScrapFrom", None, None, vec![])
+            .await
+            .unwrap();
+        rt.merge_note_with_reason(
+            &tok,
+            scrap_into.id,
+            scrap_from.id,
+            EntityDedupMergePolicy::PreferInto,
+            ContentMergeStrategy::Append,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        let events = rt
+            .events(&tok)
+            .unwrap()
+            .query_events(
+                khive_storage::EventFilter {
+                    kinds: vec![EventKind::NoteMerged],
+                    ..Default::default()
+                },
+                khive_storage::types::PageRequest {
+                    offset: 0,
+                    limit: 1,
+                },
+            )
+            .await
+            .unwrap();
+        let annotated_event_id = events.items[0].id;
+
+        let into = rt
+            .create_note(&tok, "observation", None, "Into", None, None, vec![])
+            .await
+            .unwrap();
+        let from = rt
+            .create_note(&tok, "observation", None, "From", None, None, vec![])
+            .await
+            .unwrap();
+
+        rt.link(
+            &tok,
+            from.id,
+            annotated_edge.id.0,
+            EdgeRelation::Annotates,
+            1.0,
+            None,
+        )
+        .await
+        .unwrap();
+        rt.link(
+            &tok,
+            from.id,
+            annotated_event_id,
+            EdgeRelation::Annotates,
+            1.0,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let summary = rt
+            .merge_note_with_reason(
+                &tok,
+                into.id,
+                from.id,
+                EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            summary.edges_rewired, 2,
+            "annotates edges targeting an edge and an event must be rewired"
+        );
+        assert_eq!(
+            summary.edges_contract_skipped, 0,
+            "no valid annotates edge may be dropped as contract-violating"
+        );
+
+        for tgt in [annotated_edge.id.0, annotated_event_id] {
+            let edges = rt
+                .list_edges(
+                    &tok,
+                    crate::EdgeListFilter {
+                        source_id: Some(into.id),
+                        target_id: Some(tgt),
+                        relations: vec![EdgeRelation::Annotates],
+                        ..Default::default()
+                    },
+                    10,
+                    0,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                edges.len(),
+                1,
+                "rewired annotates edge onto target {tgt} must survive the merge; got {edges:?}"
+            );
+        }
     }
 
     // A note dry-run must predict edges_rewired like the entity path does,
