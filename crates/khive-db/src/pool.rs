@@ -22,6 +22,9 @@ const DEFAULT_WAL_AUTOCHECKPOINT_PAGES: u32 = 4000;
 const DEFAULT_JOURNAL_SIZE_LIMIT_BYTES: i64 = 67_108_864; // 64 MiB
 const DEFAULT_WRITE_QUEUE_CAPACITY: usize = 256;
 
+#[cfg(any(test, debug_assertions))]
+const TEST_HARNESS_ENV: &str = "KHIVE_TEST_HARNESS";
+
 /// Configuration for the connection pool.
 #[derive(Clone, Debug)]
 pub struct PoolConfig {
@@ -119,6 +122,26 @@ impl Default for PoolConfig {
                 .unwrap_or(DEFAULT_WRITE_QUEUE_CAPACITY),
         }
     }
+}
+
+#[cfg(any(test, debug_assertions))]
+fn refuse_home_data_store_in_tests(config: &PoolConfig) -> Result<(), SqliteError> {
+    let under_test = cfg!(test) || std::env::var(TEST_HARNESS_ENV).is_ok_and(|value| value == "1");
+    if !under_test {
+        return Ok(());
+    }
+
+    let (Some(path), Some(home)) = (config.path.as_deref(), std::env::var_os("HOME")) else {
+        return Ok(());
+    };
+    let home_data_dir = PathBuf::from(home).join(".khive");
+    if path.starts_with(&home_data_dir) {
+        return Err(SqliteError::InvalidData(format!(
+            "test harness refused to open SQLite database under the HOME data directory: {}",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 /// A read-write connection pool for SQLite.
@@ -281,6 +304,9 @@ impl ConnectionPool {
     /// WAL is disabled or unavailable, the pool falls back to single-connection
     /// mode.
     pub fn new(config: PoolConfig) -> Result<Self, SqliteError> {
+        #[cfg(any(test, debug_assertions))]
+        refuse_home_data_store_in_tests(&config)?;
+
         let writer = open_writer_connection(&config)?;
         let wal_enabled = configure_writer_connection(&writer, &config)?;
         let max_readers = effective_reader_count(&config, wal_enabled);

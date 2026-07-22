@@ -1,0 +1,4 @@
+[env]
+# Cargo propagates this marker to unit tests, integration tests, and test-spawned
+# binaries. The store-open guard compiles it out of release builds.
+KHIVE_TEST_HARNESS = { value = "1", force = true }

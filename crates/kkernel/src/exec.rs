@@ -2499,8 +2499,12 @@ default = true
         // is not a legitimate way to reach this scenario — default discovery is.
         let khive_dir = home_dir.path().join(".khive");
         std::fs::create_dir_all(&khive_dir).expect("mkdir .khive");
-        let main_backend_path = khive_dir.join("main-backend.db");
-        let sessions_backend_path = khive_dir.join("sessions-backend.db");
+        // Keep the configuration home-shaped while placing the stores in a
+        // separate tempdir. Test-harness builds reject every store under
+        // `$HOME/.khive`, including isolated fixtures, at the open boundary.
+        let backend_dir = tempfile::tempdir().expect("backend tempdir");
+        let main_backend_path = backend_dir.path().join("main-backend.db");
+        let sessions_backend_path = backend_dir.path().join("sessions-backend.db");
         std::fs::write(
             khive_dir.join("config.toml"),
             format!(
