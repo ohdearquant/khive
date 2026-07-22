@@ -1170,6 +1170,22 @@ async fn update_entity_with_note_field_salience_returns_error() {
 
 // ── #764: create's embedding_content wiring ─────────────────────────────────
 
+#[test]
+fn create_embedding_truncation_advisory_matches_warnings_shape() {
+    let mut truncated = json!({"id": "created"});
+    super::create::add_embedding_truncation_warning(&mut truncated, true);
+    let warnings = truncated["warnings"].as_array().expect("warnings array");
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].as_str().unwrap().contains("truncated"));
+
+    let mut normal = json!({"id": "created"});
+    super::create::add_embedding_truncation_warning(&mut normal, false);
+    assert!(
+        normal.get("warnings").is_none(),
+        "normal input must not emit an advisory"
+    );
+}
+
 /// A note create with a proper-prefix `embedding_content` must succeed and
 /// store the full `content`; the override is a runtime-layer concern
 /// (covered by `khive-runtime`'s own unit tests) — this proves the handler

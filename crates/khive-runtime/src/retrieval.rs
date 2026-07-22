@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use lattice_embed::EmbeddingModel;
+use lattice_embed::{EmbeddingModel, MAX_TEXT_CHARS};
 use uuid::Uuid;
 
 use crate::config::{parse_embedding_model_alias, sanitize_key};
@@ -84,6 +84,32 @@ const RRF_K: usize = 10;
 /// Candidates pulled per path before fusion. Higher = better recall, more work.
 const CANDIDATE_MULTIPLIER: u32 = 4;
 
+/// Advisory emitted by write verbs when only the embedding input was bounded.
+pub const EMBEDDING_INPUT_TRUNCATED_WARNING: &str =
+    "embedding input was truncated to the embedder maximum; full content was stored unchanged";
+
+fn document_embedding_budget(model_name: &str) -> usize {
+    parse_embedding_model_alias(model_name)
+        .and_then(|model| model.document_instruction())
+        .map_or(MAX_TEXT_CHARS, |prefix| {
+            MAX_TEXT_CHARS.saturating_sub(prefix.len())
+        })
+}
+
+fn bounded_embedding_input(text: &str, max_bytes: usize) -> (&str, bool) {
+    if text.len() <= max_bytes {
+        return (text, false);
+    }
+
+    let end = text
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= max_bytes)
+        .last()
+        .unwrap_or(0);
+    (&text[..end], true)
+}
+
 impl KhiveRuntime {
     /// Generate an embedding vector for `text` using the configured default model.
     ///
@@ -147,6 +173,7 @@ impl KhiveRuntime {
         let model = parse_embedding_model_alias(model_name);
         let service = self.embedder(model_name).await?;
         let emb_model = model.unwrap_or_default();
+        let (text, _) = bounded_embedding_input(text, document_embedding_budget(model_name));
         let embeddings = service.embed_passage(&[text.to_string()], emb_model).await;
         crate::usage::count(crate::usage::UsageUnit::EmbedCalls, 1);
         let out = embeddings?
@@ -276,9 +303,26 @@ impl KhiveRuntime {
         let model = parse_embedding_model_alias(model_name);
         let service = self.embedder(model_name).await?;
         let emb_model = model.unwrap_or_default();
-        let out = service.embed_passage(texts, emb_model).await;
+        let budget = document_embedding_budget(model_name);
+        let bounded = texts.iter().any(|text| text.len() > budget).then(|| {
+            texts
+                .iter()
+                .map(|text| bounded_embedding_input(text, budget).0.to_string())
+                .collect::<Vec<_>>()
+        });
+        let embed_texts = bounded.as_deref().unwrap_or(texts);
+        let out = service.embed_passage(embed_texts, emb_model).await;
         crate::usage::count(crate::usage::UsageUnit::EmbedCalls, texts.len() as u64);
         Ok(out?)
+    }
+
+    /// Whether any registered write embedder would receive a bounded form of `text`.
+    pub fn document_embedding_input_will_be_truncated(&self, text: &str) -> bool {
+        self.registered_embedding_model_names()
+            .iter()
+            .any(|model_name| {
+                bounded_embedding_input(text, document_embedding_budget(model_name)).1
+            })
     }
 
     /// Embed a batch of documents for indexing using the configured default model.
@@ -1093,6 +1137,30 @@ mod tests {
     use khive_storage::types::{TextSearchHit, VectorSearchHit};
     use khive_types::namespace::Namespace;
     use lattice_embed::EmbeddingModel;
+
+    #[test]
+    fn bounded_embedding_input_reserves_prefix_and_preserves_utf8() {
+        assert_eq!(
+            document_embedding_budget("multilingual-e5-base"),
+            MAX_TEXT_CHARS - "passage: ".len()
+        );
+
+        let input = format!("{}\u{1f980}tail", "a".repeat(MAX_TEXT_CHARS - 1));
+        let (bounded, truncated) = bounded_embedding_input(&input, MAX_TEXT_CHARS);
+        assert!(truncated);
+        assert_eq!(bounded.len(), MAX_TEXT_CHARS - 1);
+        assert!(bounded.is_char_boundary(bounded.len()));
+        assert!(!bounded.contains('\u{1f980}'));
+    }
+
+    #[test]
+    fn bounded_embedding_input_leaves_normal_text_unchanged() {
+        let input = "normal byte-identical embedding input";
+        let (bounded, truncated) = bounded_embedding_input(input, MAX_TEXT_CHARS);
+        assert!(!truncated);
+        assert_eq!(bounded, input);
+        assert_eq!(bounded.as_ptr(), input.as_ptr());
+    }
 
     fn text_hit(id: Uuid, rank: u32, title: &str) -> TextSearchHit {
         TextSearchHit {
