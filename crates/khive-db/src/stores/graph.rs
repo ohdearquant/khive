@@ -1656,81 +1656,87 @@ impl GraphStore for SqlGraphStore {
         let namespace = self.namespace.clone();
         let node_str = node_id.to_string();
 
-        self.with_reader("neighbors", move |conn| {
-            let base_out = "SELECT target_id AS node_id, id AS edge_id, relation, weight \
+        let result = self
+            .with_reader("neighbors", move |conn| {
+                let base_out = "SELECT target_id AS node_id, id AS edge_id, relation, weight \
                             FROM graph_edges \
                             WHERE namespace = ?1 AND source_id = ?2 AND deleted_at IS NULL";
-            let base_in = "SELECT source_id AS node_id, id AS edge_id, relation, weight \
+                let base_in = "SELECT source_id AS node_id, id AS edge_id, relation, weight \
                            FROM graph_edges \
                            WHERE namespace = ?1 AND target_id = ?2 AND deleted_at IS NULL";
 
-            let sql = match query.direction {
-                Direction::Out => base_out.to_string(),
-                Direction::In => base_in.to_string(),
-                Direction::Both => format!("{} UNION ALL {}", base_out, base_in),
-            };
+                let sql = match query.direction {
+                    Direction::Out => base_out.to_string(),
+                    Direction::In => base_in.to_string(),
+                    Direction::Both => format!("{} UNION ALL {}", base_out, base_in),
+                };
 
-            let (where_extra, limit_clause, extra_params) = neighbor_extra_clause(&query, 3);
+                let (where_extra, limit_clause, extra_params) = neighbor_extra_clause(&query, 3);
 
-            // Deterministic weight-descending order, tie-broken by node_id ascending,
-            // applied BEFORE `LIMIT` — otherwise a `limit`/`fanout` cap can silently
-            // drop high-weight neighbors in favor of arbitrary SQLite row order
-            // (ADR-089 context-verb review).
-            let full_sql = format!(
-                "SELECT node_id, edge_id, relation, weight FROM ({}){} \
+                // Deterministic weight-descending order, tie-broken by node_id ascending,
+                // applied BEFORE `LIMIT` — otherwise a `limit`/`fanout` cap can silently
+                // drop high-weight neighbors in favor of arbitrary SQLite row order
+                // (ADR-089 context-verb review).
+                let full_sql = format!(
+                    "SELECT node_id, edge_id, relation, weight FROM ({}){} \
                  ORDER BY weight DESC, node_id ASC{}",
-                sql, where_extra, limit_clause
-            );
+                    sql, where_extra, limit_clause
+                );
 
-            let mut stmt = conn.prepare(&full_sql)?;
+                let mut stmt = conn.prepare(&full_sql)?;
 
-            let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-            all_params.push(Box::new(namespace.clone()));
-            all_params.push(Box::new(node_str.clone()));
-            all_params.extend(extra_params);
+                let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+                all_params.push(Box::new(namespace.clone()));
+                all_params.push(Box::new(node_str.clone()));
+                all_params.extend(extra_params);
 
-            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                all_params.iter().map(|p| p.as_ref()).collect();
+                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    all_params.iter().map(|p| p.as_ref()).collect();
 
-            let rows = stmt.query_map(param_refs.as_slice(), |row| {
-                let nid_str: String = row.get(0)?;
-                let eid_str: String = row.get(1)?;
-                let relation_str: String = row.get(2)?;
-                let weight: f64 = row.get(3)?;
-                Ok((nid_str, eid_str, relation_str, weight))
-            })?;
-
-            let mut hits = Vec::new();
-            for row in rows {
-                let (nid_str, eid_str, relation_str, weight) = row?;
-                let relation = relation_str.parse::<EdgeRelation>().map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        2,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
+                let rows = stmt.query_map(param_refs.as_slice(), |row| {
+                    let nid_str: String = row.get(0)?;
+                    let eid_str: String = row.get(1)?;
+                    let relation_str: String = row.get(2)?;
+                    let weight: f64 = row.get(3)?;
+                    Ok((nid_str, eid_str, relation_str, weight))
                 })?;
-                hits.push(NeighborHit {
-                    node_id: parse_uuid(&nid_str)?,
-                    edge_id: parse_uuid(&eid_str)?,
-                    relation,
-                    weight,
-                    name: None,
-                    kind: None,
-                    entity_type: None,
-                });
-            }
 
-            Ok(hits)
-        })
-        .await
-        .inspect(|hits| {
-            khive_storage::usage::count(khive_storage::usage::UsageUnit::DbRoundTrips, 1);
+                let mut hits = Vec::new();
+                for row in rows {
+                    let (nid_str, eid_str, relation_str, weight) = row?;
+                    let relation = relation_str.parse::<EdgeRelation>().map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?;
+                    hits.push(NeighborHit {
+                        node_id: parse_uuid(&nid_str)?,
+                        edge_id: parse_uuid(&eid_str)?,
+                        relation,
+                        weight,
+                        name: None,
+                        kind: None,
+                        entity_type: None,
+                    });
+                }
+
+                Ok(hits)
+            })
+            .await;
+
+        // The round trip was ISSUED whether or not it resolved, so it counts
+        // on both outcomes; `graph_hops` counts rows storage actually
+        // returned, so it counts only what came back.
+        khive_storage::usage::count(khive_storage::usage::UsageUnit::DbRoundTrips, 1);
+        if let Ok(hits) = &result {
             khive_storage::usage::count(
                 khive_storage::usage::UsageUnit::GraphHops,
                 hits.len() as u64,
             );
-        })
+        }
+        result
     }
 
     /// Single-query both-direction neighbor fetch (ADR-089 context-verb
@@ -1747,92 +1753,98 @@ impl GraphStore for SqlGraphStore {
         let namespace = self.namespace.clone();
         let node_str = node_id.to_string();
 
-        self.with_reader("neighbors_both_directions", move |conn| {
-            let base_out = "SELECT target_id AS node_id, id AS edge_id, relation, weight, \
+        let result = self
+            .with_reader("neighbors_both_directions", move |conn| {
+                let base_out = "SELECT target_id AS node_id, id AS edge_id, relation, weight, \
                             'out' AS dir \
                             FROM graph_edges \
                             WHERE namespace = ?1 AND source_id = ?2 AND deleted_at IS NULL";
-            let base_in = "SELECT source_id AS node_id, id AS edge_id, relation, weight, \
+                let base_in = "SELECT source_id AS node_id, id AS edge_id, relation, weight, \
                            'in' AS dir \
                            FROM graph_edges \
                            WHERE namespace = ?1 AND target_id = ?2 AND deleted_at IS NULL";
-            let sql = format!("{} UNION ALL {}", base_out, base_in);
+                let sql = format!("{} UNION ALL {}", base_out, base_in);
 
-            let (where_extra, limit_clause, extra_params) = neighbor_extra_clause(&query, 3);
+                let (where_extra, limit_clause, extra_params) = neighbor_extra_clause(&query, 3);
 
-            // Same global weight-descending/node_id-ascending order as `neighbors`
-            // (ADR-089 context-verb review),
-            // applied across BOTH directions before `LIMIT` truncates. A
-            // reciprocal pair (an Out edge and an In edge to/from the same
-            // neighbor at the same weight) ties on `(weight, node_id)`, so the
-            // order is extended with a direction rank (`out` before `in`) and
-            // finally `edge_id` to make the pre-`LIMIT` order fully
-            // deterministic).
-            let full_sql = format!(
-                "SELECT node_id, edge_id, relation, weight, dir FROM ({}){} \
+                // Same global weight-descending/node_id-ascending order as `neighbors`
+                // (ADR-089 context-verb review),
+                // applied across BOTH directions before `LIMIT` truncates. A
+                // reciprocal pair (an Out edge and an In edge to/from the same
+                // neighbor at the same weight) ties on `(weight, node_id)`, so the
+                // order is extended with a direction rank (`out` before `in`) and
+                // finally `edge_id` to make the pre-`LIMIT` order fully
+                // deterministic).
+                let full_sql = format!(
+                    "SELECT node_id, edge_id, relation, weight, dir FROM ({}){} \
                  ORDER BY weight DESC, node_id ASC, \
                  CASE dir WHEN 'out' THEN 0 ELSE 1 END ASC, edge_id ASC{}",
-                sql, where_extra, limit_clause
-            );
+                    sql, where_extra, limit_clause
+                );
 
-            let mut stmt = conn.prepare(&full_sql)?;
+                let mut stmt = conn.prepare(&full_sql)?;
 
-            let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-            all_params.push(Box::new(namespace.clone()));
-            all_params.push(Box::new(node_str.clone()));
-            all_params.extend(extra_params);
+                let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+                all_params.push(Box::new(namespace.clone()));
+                all_params.push(Box::new(node_str.clone()));
+                all_params.extend(extra_params);
 
-            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                all_params.iter().map(|p| p.as_ref()).collect();
+                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    all_params.iter().map(|p| p.as_ref()).collect();
 
-            let rows = stmt.query_map(param_refs.as_slice(), |row| {
-                let nid_str: String = row.get(0)?;
-                let eid_str: String = row.get(1)?;
-                let relation_str: String = row.get(2)?;
-                let weight: f64 = row.get(3)?;
-                let dir_str: String = row.get(4)?;
-                Ok((nid_str, eid_str, relation_str, weight, dir_str))
-            })?;
-
-            let mut hits = Vec::new();
-            for row in rows {
-                let (nid_str, eid_str, relation_str, weight, dir_str) = row?;
-                let relation = relation_str.parse::<EdgeRelation>().map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        2,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
+                let rows = stmt.query_map(param_refs.as_slice(), |row| {
+                    let nid_str: String = row.get(0)?;
+                    let eid_str: String = row.get(1)?;
+                    let relation_str: String = row.get(2)?;
+                    let weight: f64 = row.get(3)?;
+                    let dir_str: String = row.get(4)?;
+                    Ok((nid_str, eid_str, relation_str, weight, dir_str))
                 })?;
-                let direction = if dir_str == "out" {
-                    Direction::Out
-                } else {
-                    Direction::In
-                };
-                hits.push(DirectedNeighborHit {
-                    hit: NeighborHit {
-                        node_id: parse_uuid(&nid_str)?,
-                        edge_id: parse_uuid(&eid_str)?,
-                        relation,
-                        weight,
-                        name: None,
-                        kind: None,
-                        entity_type: None,
-                    },
-                    direction,
-                });
-            }
 
-            Ok(hits)
-        })
-        .await
-        .inspect(|hits| {
-            khive_storage::usage::count(khive_storage::usage::UsageUnit::DbRoundTrips, 1);
+                let mut hits = Vec::new();
+                for row in rows {
+                    let (nid_str, eid_str, relation_str, weight, dir_str) = row?;
+                    let relation = relation_str.parse::<EdgeRelation>().map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?;
+                    let direction = if dir_str == "out" {
+                        Direction::Out
+                    } else {
+                        Direction::In
+                    };
+                    hits.push(DirectedNeighborHit {
+                        hit: NeighborHit {
+                            node_id: parse_uuid(&nid_str)?,
+                            edge_id: parse_uuid(&eid_str)?,
+                            relation,
+                            weight,
+                            name: None,
+                            kind: None,
+                            entity_type: None,
+                        },
+                        direction,
+                    });
+                }
+
+                Ok(hits)
+            })
+            .await;
+
+        // The round trip was ISSUED whether or not it resolved, so it counts
+        // on both outcomes; `graph_hops` counts rows storage actually
+        // returned, so it counts only what came back.
+        khive_storage::usage::count(khive_storage::usage::UsageUnit::DbRoundTrips, 1);
+        if let Ok(hits) = &result {
             khive_storage::usage::count(
                 khive_storage::usage::UsageUnit::GraphHops,
                 hits.len() as u64,
             );
-        })
+        }
+        result
     }
 
     async fn traverse(&self, request: TraversalRequest) -> Result<Vec<GraphPath>, StorageError> {
@@ -1859,130 +1871,141 @@ impl GraphStore for SqlGraphStore {
             })?;
 
         let origin = self.pool.origin();
-        self.with_reader("traverse", move |conn| {
-            // Two SQLite limits apply to the seed VALUES clause:
-            //
-            //   1. SQLITE_LIMIT_COMPOUND_SELECT (default 500): SQLite counts each row in a
-            //      VALUES list as one term in a compound SELECT.  Exceeding it gives
-            //      "too many terms in compound SELECT".
-            //
-            //   2. SQLITE_LIMIT_VARIABLE_NUMBER (default 999): each root binds one parameter
-            //      (referenced 3× in its seed row but counted once).  Fixed overhead —
-            //      namespace, depth, optional relation/weight params — adds ~20 at most.
-            //
-            // 400 rows stays safely below both: 400 < 500 (compound) and
-            // 400 + fixed << 999 (variables).
-            const CHUNK_ROOTS: usize = 400;
+        // Shared with the blocking closure so the counts survive an error.
+        // `with_reader` runs the closure on a blocking thread where the
+        // task-local usage context is invisible, so it cannot call
+        // `usage::count` itself; returning the totals in the Ok value would
+        // lose every round trip already issued when a later chunk fails.
+        let counted_rows = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counted_chunks = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let closure_rows = Arc::clone(&counted_rows);
+        let closure_chunks = Arc::clone(&counted_chunks);
+        let result = self
+            .with_reader("traverse", move |conn| {
+                // Two SQLite limits apply to the seed VALUES clause:
+                //
+                //   1. SQLITE_LIMIT_COMPOUND_SELECT (default 500): SQLite counts each row in a
+                //      VALUES list as one term in a compound SELECT.  Exceeding it gives
+                //      "too many terms in compound SELECT".
+                //
+                //   2. SQLITE_LIMIT_VARIABLE_NUMBER (default 999): each root binds one parameter
+                //      (referenced 3× in its seed row but counted once).  Fixed overhead —
+                //      namespace, depth, optional relation/weight params — adds ~20 at most.
+                //
+                // 400 rows stays safely below both: 400 < 500 (compound) and
+                // 400 + fixed << 999 (variables).
+                const CHUNK_ROOTS: usize = 400;
 
-            // Determine join direction (invariant across chunks).
-            let (join_condition, next_node) = match opts.direction {
-                Direction::Out => ("e.source_id = t.node_id", "e.target_id"),
-                Direction::In => ("e.target_id = t.node_id", "e.source_id"),
-                Direction::Both => (
-                    "(e.source_id = t.node_id OR e.target_id = t.node_id)",
-                    "CASE WHEN e.source_id = t.node_id THEN e.target_id ELSE e.source_id END",
-                ),
-            };
+                // Determine join direction (invariant across chunks).
+                let (join_condition, next_node) = match opts.direction {
+                    Direction::Out => ("e.source_id = t.node_id", "e.target_id"),
+                    Direction::In => ("e.target_id = t.node_id", "e.source_id"),
+                    Direction::Both => (
+                        "(e.source_id = t.node_id OR e.target_id = t.node_id)",
+                        "CASE WHEN e.source_id = t.node_id THEN e.target_id ELSE e.source_id END",
+                    ),
+                };
 
-            // Open a deferred read transaction so ALL chunk queries observe the same
-            // graph snapshot.  Without this, a writer committing between chunks could
-            // let roots 1..400 see the pre-commit graph and 401..800 see the post-commit
-            // graph.  One pool checkout, one snapshot for the full traverse.
-            //
-            // ADR-091 Plank 0: this is the most WAL-pin-relevant span in the store —
-            // it intentionally holds a read snapshot across chunked traversal work.
-            // Registered before the transaction is opened so the handle (declared
-            // first) drops after `tx`'s own Drop runs (locals drop in reverse
-            // declaration order within the same scope).
-            let _tx_handle = khive_storage::tx_registry::register_scoped(
-                Some("graph_traverse_read".to_string()),
-                origin,
-            );
-            let tx = conn.unchecked_transaction()?;
+                // Open a deferred read transaction so ALL chunk queries observe the same
+                // graph snapshot.  Without this, a writer committing between chunks could
+                // let roots 1..400 see the pre-commit graph and 401..800 see the post-commit
+                // graph.  One pool checkout, one snapshot for the full traverse.
+                //
+                // ADR-091 Plank 0: this is the most WAL-pin-relevant span in the store —
+                // it intentionally holds a read snapshot across chunked traversal work.
+                // Registered before the transaction is opened so the handle (declared
+                // first) drops after `tx`'s own Drop runs (locals drop in reverse
+                // declaration order within the same scope).
+                let _tx_handle = khive_storage::tx_registry::register_scoped(
+                    Some("graph_traverse_read".to_string()),
+                    origin,
+                );
+                let tx = conn.unchecked_transaction()?;
 
-            // Accumulate per-root state across all chunks: (nodes_with_path_weight, seen_set).
-            // Each entry carries the PathNode and its cumulative path weight from the SQL row,
-            // so the Rust-level per-root limit truncation can compute an accurate max_weight
-            // over the kept nodes.
-            let mut root_data: HashMap<Uuid, (Vec<(PathNode, f64)>, HashSet<Uuid>)> =
-                HashMap::with_capacity(roots.len());
-            // Amendment 2 `graph_hops`: adjacency rows returned by the CTE,
-            // counted before first-visit de-duplication.
-            let mut raw_rows: u64 = 0;
-            // Amendment 2 `db_round_trips`: one per executed chunk query — a
-            // root set over CHUNK_ROOTS (400) splits into multiple SQL
-            // executions, each of which must count as its own round trip.
-            let mut chunks_executed: u64 = 0;
+                // Accumulate per-root state across all chunks: (nodes_with_path_weight, seen_set).
+                // Each entry carries the PathNode and its cumulative path weight from the SQL row,
+                // so the Rust-level per-root limit truncation can compute an accurate max_weight
+                // over the kept nodes.
+                let mut root_data: HashMap<Uuid, (Vec<(PathNode, f64)>, HashSet<Uuid>)> =
+                    HashMap::with_capacity(roots.len());
+                // Amendment 2 `graph_hops`: adjacency rows returned by the CTE,
+                // counted before first-visit de-duplication.
+                let raw_rows = &closure_rows;
+                // Amendment 2 `db_round_trips`: one per executed chunk query — a
+                // root set over CHUNK_ROOTS (400) splits into multiple SQL
+                // executions, each of which must count as its own round trip.
+                let chunks_executed = &closure_chunks;
 
-            // Pre-seed with root nodes when include_roots is set (done once for all roots).
-            for root_id in &roots {
-                let (nodes, seen) = root_data.entry(*root_id).or_default();
-                if include_roots {
-                    seen.insert(*root_id);
-                    nodes.push((
-                        PathNode {
-                            node_id: *root_id,
-                            via_edge: None,
-                            depth: 0,
-                            name: None,
-                            kind: None,
-                            properties: None,
-                        },
-                        0.0,
-                    ));
-                }
-            }
-
-            for chunk in roots.chunks(CHUNK_ROOTS) {
-                chunks_executed += 1;
-                let n_chunk = chunk.len();
-
-                // Param layout (per-chunk, not total):
-                //   ?1 .. ?{n_chunk}     — root UUID strings (each used 3× in seed row)
-                //   ?{n_chunk + 1}       — namespace
-                //   ?{n_chunk + 2}       — max_depth
-                //   ?{n_chunk + 3} ..    — optional relation / weight params
-                let ns_param = n_chunk + 1;
-                let depth_param = n_chunk + 2;
-                let mut extra_param_idx = n_chunk + 3;
-
-                let mut relation_cond = String::new();
-                let mut extra_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-
-                if let Some(ref rels) = opts.relations {
-                    if !rels.is_empty() {
-                        let placeholders: Vec<String> = rels
-                            .iter()
-                            .map(|r| {
-                                extra_params.push(Box::new(r.to_string()));
-                                let p = format!("?{extra_param_idx}");
-                                extra_param_idx += 1;
-                                p
-                            })
-                            .collect();
-                        relation_cond = format!(" AND e.relation IN ({})", placeholders.join(","));
+                // Pre-seed with root nodes when include_roots is set (done once for all roots).
+                for root_id in &roots {
+                    let (nodes, seen) = root_data.entry(*root_id).or_default();
+                    if include_roots {
+                        seen.insert(*root_id);
+                        nodes.push((
+                            PathNode {
+                                node_id: *root_id,
+                                via_edge: None,
+                                depth: 0,
+                                name: None,
+                                kind: None,
+                                properties: None,
+                            },
+                            0.0,
+                        ));
                     }
                 }
 
-                let mut weight_cond = String::new();
-                if let Some(min_w) = opts.min_weight {
-                    extra_params.push(Box::new(min_w));
-                    weight_cond = format!(" AND e.weight >= ?{extra_param_idx}");
-                    // limit is applied in Rust (see below), so no SQL param needed.
-                }
+                for chunk in roots.chunks(CHUNK_ROOTS) {
+                    chunks_executed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let n_chunk = chunk.len();
 
-                // Seed rows: one per root in this chunk, each referencing its own
-                // param 3× (root_id, node_id, and the initial path string).
-                let seed_rows: Vec<String> = (1..=n_chunk)
-                    .map(|i| format!("(?{i}, ?{i}, NULL, 0, ?{i}, 0.0)"))
-                    .collect();
-                let seeds = seed_rows.join(", ");
+                    // Param layout (per-chunk, not total):
+                    //   ?1 .. ?{n_chunk}     — root UUID strings (each used 3× in seed row)
+                    //   ?{n_chunk + 1}       — namespace
+                    //   ?{n_chunk + 2}       — max_depth
+                    //   ?{n_chunk + 3} ..    — optional relation / weight params
+                    let ns_param = n_chunk + 1;
+                    let depth_param = n_chunk + 2;
+                    let mut extra_param_idx = n_chunk + 3;
 
-                // CTE covering the chunk's roots.  CROSS JOIN forces SQLite to put
-                // the frontier (t) as the outer loop and seek graph_edges by index,
-                // avoiding the O(edges × frontier) plan (#250, #251).
-                let cte_sql = format!(
-                    "WITH RECURSIVE traversal(\
+                    let mut relation_cond = String::new();
+                    let mut extra_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+                    if let Some(ref rels) = opts.relations {
+                        if !rels.is_empty() {
+                            let placeholders: Vec<String> = rels
+                                .iter()
+                                .map(|r| {
+                                    extra_params.push(Box::new(r.to_string()));
+                                    let p = format!("?{extra_param_idx}");
+                                    extra_param_idx += 1;
+                                    p
+                                })
+                                .collect();
+                            relation_cond =
+                                format!(" AND e.relation IN ({})", placeholders.join(","));
+                        }
+                    }
+
+                    let mut weight_cond = String::new();
+                    if let Some(min_w) = opts.min_weight {
+                        extra_params.push(Box::new(min_w));
+                        weight_cond = format!(" AND e.weight >= ?{extra_param_idx}");
+                        // limit is applied in Rust (see below), so no SQL param needed.
+                    }
+
+                    // Seed rows: one per root in this chunk, each referencing its own
+                    // param 3× (root_id, node_id, and the initial path string).
+                    let seed_rows: Vec<String> = (1..=n_chunk)
+                        .map(|i| format!("(?{i}, ?{i}, NULL, 0, ?{i}, 0.0)"))
+                        .collect();
+                    let seeds = seed_rows.join(", ");
+
+                    // CTE covering the chunk's roots.  CROSS JOIN forces SQLite to put
+                    // the frontier (t) as the outer loop and seek graph_edges by index,
+                    // avoiding the O(edges × frontier) plan (#250, #251).
+                    let cte_sql = format!(
+                        "WITH RECURSIVE traversal(\
                          root_id, node_id, edge_id, depth, path, total_weight\
                      ) AS (\
                          VALUES {seeds} \
@@ -2001,108 +2024,119 @@ impl GraphStore for SqlGraphStore {
                      SELECT root_id, node_id, edge_id, depth, total_weight \
                      FROM traversal WHERE depth > 0 \
                      ORDER BY root_id, depth",
-                    seeds = seeds,
-                    next_node = next_node,
-                    join_condition = join_condition,
-                    ns = ns_param,
-                    depth = depth_param,
-                    rel_cond = relation_cond,
-                    wt_cond = weight_cond,
-                );
+                        seeds = seeds,
+                        next_node = next_node,
+                        join_condition = join_condition,
+                        ns = ns_param,
+                        depth = depth_param,
+                        rel_cond = relation_cond,
+                        wt_cond = weight_cond,
+                    );
 
-                let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-                for root_id in chunk {
-                    all_params.push(Box::new(root_id.to_string()));
+                    let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+                    for root_id in chunk {
+                        all_params.push(Box::new(root_id.to_string()));
+                    }
+                    all_params.push(Box::new(namespace.clone()));
+                    all_params.push(Box::new(max_depth_i64));
+                    all_params.extend(extra_params);
+
+                    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                        all_params.iter().map(|p| p.as_ref()).collect();
+
+                    // Queries run on `conn`; reads are connection-level and participate
+                    // in the open `tx` deferred snapshot.
+                    let mut stmt = conn.prepare(&cte_sql)?;
+                    let rows_iter = stmt.query_map(param_refs.as_slice(), |row| {
+                        let root_str: String = row.get(0)?;
+                        let node_str: String = row.get(1)?;
+                        let edge_str: Option<String> = row.get(2)?;
+                        let depth: i64 = row.get(3)?;
+                        let total_weight: f64 = row.get(4)?;
+                        Ok((root_str, node_str, edge_str, depth, total_weight))
+                    })?;
+
+                    // The CTE is ordered by (root_id, depth), so the first occurrence of
+                    // each (root_id, node_id) pair is the shallowest — that is the one we
+                    // keep (BFS first-visit semantics, matching #285).
+                    for row in rows_iter {
+                        let (root_str, node_str, edge_str, depth, total_weight) = row?;
+                        raw_rows.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let root_id = parse_uuid(&root_str)?;
+                        let node_id = parse_uuid(&node_str)?;
+                        let (nodes, seen) = root_data.entry(root_id).or_default();
+                        if !seen.insert(node_id) {
+                            continue;
+                        }
+                        let via_edge = edge_str.map(|s| parse_uuid(&s)).transpose()?;
+                        nodes.push((
+                            PathNode {
+                                node_id,
+                                via_edge,
+                                depth: depth as usize,
+                                name: None,
+                                kind: None,
+                                properties: None,
+                            },
+                            total_weight,
+                        ));
+                    }
                 }
-                all_params.push(Box::new(namespace.clone()));
-                all_params.push(Box::new(max_depth_i64));
-                all_params.extend(extra_params);
 
-                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                    all_params.iter().map(|p| p.as_ref()).collect();
+                tx.commit()?;
 
-                // Queries run on `conn`; reads are connection-level and participate
-                // in the open `tx` deferred snapshot.
-                let mut stmt = conn.prepare(&cte_sql)?;
-                let rows_iter = stmt.query_map(param_refs.as_slice(), |row| {
-                    let root_str: String = row.get(0)?;
-                    let node_str: String = row.get(1)?;
-                    let edge_str: Option<String> = row.get(2)?;
-                    let depth: i64 = row.get(3)?;
-                    let total_weight: f64 = row.get(4)?;
-                    Ok((root_str, node_str, edge_str, depth, total_weight))
-                })?;
-
-                // The CTE is ordered by (root_id, depth), so the first occurrence of
-                // each (root_id, node_id) pair is the shallowest — that is the one we
-                // keep (BFS first-visit semantics, matching #285).
-                for row in rows_iter {
-                    let (root_str, node_str, edge_str, depth, total_weight) = row?;
-                    raw_rows += 1;
-                    let root_id = parse_uuid(&root_str)?;
-                    let node_id = parse_uuid(&node_str)?;
-                    let (nodes, seen) = root_data.entry(root_id).or_default();
-                    if !seen.insert(node_id) {
-                        continue;
+                // Reconstruct Vec<GraphPath> in original root order.
+                // Per-root limit: counts only non-root nodes against the cap, matching
+                // the original per-root-CTE semantics where the SQL LIMIT applied only
+                // to depth > 0 rows.  Truncation is on the post-dedup list (BFS order),
+                // so the shallowest `limit` reachable nodes are kept per root.
+                let mut all_paths: Vec<GraphPath> = Vec::with_capacity(roots.len());
+                for root_id in &roots {
+                    if let Some((mut nw, _)) = root_data.remove(root_id) {
+                        if nw.is_empty() {
+                            continue;
+                        }
+                        if let Some(lim) = opts.limit {
+                            let root_count = usize::from(include_roots);
+                            nw.truncate(root_count + lim as usize);
+                        }
+                        // Post-truncation guard: a limit=0 + include_roots=false call
+                        // truncates to zero nodes; there is nothing to emit.
+                        if nw.is_empty() {
+                            continue;
+                        }
+                        let max_weight = nw.iter().map(|(_, w)| *w).fold(0.0_f64, f64::max);
+                        let nodes: Vec<PathNode> = nw.into_iter().map(|(n, _)| n).collect();
+                        all_paths.push(GraphPath {
+                            root_id: *root_id,
+                            nodes,
+                            total_weight: max_weight,
+                        });
                     }
-                    let via_edge = edge_str.map(|s| parse_uuid(&s)).transpose()?;
-                    nodes.push((
-                        PathNode {
-                            node_id,
-                            via_edge,
-                            depth: depth as usize,
-                            name: None,
-                            kind: None,
-                            properties: None,
-                        },
-                        total_weight,
-                    ));
                 }
-            }
 
-            tx.commit()?;
+                Ok(all_paths)
+            })
+            .await;
 
-            // Reconstruct Vec<GraphPath> in original root order.
-            // Per-root limit: counts only non-root nodes against the cap, matching
-            // the original per-root-CTE semantics where the SQL LIMIT applied only
-            // to depth > 0 rows.  Truncation is on the post-dedup list (BFS order),
-            // so the shallowest `limit` reachable nodes are kept per root.
-            let mut all_paths: Vec<GraphPath> = Vec::with_capacity(roots.len());
-            for root_id in &roots {
-                if let Some((mut nw, _)) = root_data.remove(root_id) {
-                    if nw.is_empty() {
-                        continue;
-                    }
-                    if let Some(lim) = opts.limit {
-                        let root_count = usize::from(include_roots);
-                        nw.truncate(root_count + lim as usize);
-                    }
-                    // Post-truncation guard: a limit=0 + include_roots=false call
-                    // truncates to zero nodes; there is nothing to emit.
-                    if nw.is_empty() {
-                        continue;
-                    }
-                    let max_weight = nw.iter().map(|(_, w)| *w).fold(0.0_f64, f64::max);
-                    let nodes: Vec<PathNode> = nw.into_iter().map(|(n, _)| n).collect();
-                    all_paths.push(GraphPath {
-                        root_id: *root_id,
-                        nodes,
-                        total_weight: max_weight,
-                    });
-                }
-            }
+        // Accounted on BOTH outcomes. `db_round_trips` counts round trips
+        // *issued* and `graph_hops` counts adjacency rows storage *returned*,
+        // so work already done before a later chunk errors is real work and
+        // must appear. Reading the shared counters here rather than off the
+        // Ok value is what makes that possible: the closure runs on a blocking
+        // thread where the task-local usage context is not visible, so it
+        // cannot count for itself, and a value returned only on success
+        // reports nothing at all when the traversal fails partway.
+        khive_storage::usage::count(
+            khive_storage::usage::UsageUnit::DbRoundTrips,
+            counted_chunks.load(std::sync::atomic::Ordering::Relaxed),
+        );
+        khive_storage::usage::count(
+            khive_storage::usage::UsageUnit::GraphHops,
+            counted_rows.load(std::sync::atomic::Ordering::Relaxed),
+        );
 
-            Ok((all_paths, raw_rows, chunks_executed))
-        })
-        .await
-        .inspect(|(_, raw_rows, chunks_executed)| {
-            khive_storage::usage::count(
-                khive_storage::usage::UsageUnit::DbRoundTrips,
-                *chunks_executed,
-            );
-            khive_storage::usage::count(khive_storage::usage::UsageUnit::GraphHops, *raw_rows);
-        })
-        .map(|(all_paths, _, _)| all_paths)
+        result
     }
 
     async fn purge_incident_edges(&self, node_id: Uuid) -> Result<u64, StorageError> {

@@ -3287,3 +3287,97 @@ async fn upsert_edge_guarded_probe_is_atomic_with_insert_on_file_backed_singleto
         "no dangling edge may be persisted"
     );
 }
+
+/// A store whose schema was never created, so every statement fails at
+/// execution — after the round trip has been issued. That is the only shape
+/// that separates "issued" from "succeeded" deterministically, with no
+/// fault-injection hook and no timing dependence.
+fn setup_memory_store_without_schema() -> SqlGraphStore {
+    let config = PoolConfig {
+        path: None,
+        ..PoolConfig::default()
+    };
+    let pool = Arc::new(ConnectionPool::new(config).unwrap());
+    SqlGraphStore::new_scoped(pool, false, "default")
+}
+
+/// `db_round_trips` counts round trips ISSUED, not round trips that resolved
+/// `Ok`. Accounting that commits only on success under-reports exactly when a
+/// caller most wants the number: a request that did real database work and
+/// then failed reports as if it had done none.
+///
+/// `graph_hops` is the opposite case by its own definition — adjacency rows
+/// storage *returned* — so a failed query legitimately contributes none.
+#[tokio::test]
+async fn neighbors_counts_the_issued_round_trip_when_the_query_fails() {
+    let store = setup_memory_store_without_schema();
+    let ctx = khive_storage::usage::UsageContext::new();
+
+    let result = khive_storage::usage::scope(ctx.clone(), async {
+        store
+            .neighbors(
+                Uuid::new_v4(),
+                NeighborQuery {
+                    direction: Direction::Out,
+                    relations: None,
+                    limit: None,
+                    min_weight: None,
+                },
+            )
+            .await
+    })
+    .await;
+
+    assert!(
+        result.is_err(),
+        "a store with no schema must fail the query, or this test proves nothing"
+    );
+
+    let usage = ctx.snapshot();
+    assert_eq!(
+        usage
+            .get("db_round_trips")
+            .and_then(serde_json::Value::as_u64),
+        Some(1),
+        "the round trip was issued and must be counted despite the error; got {usage}"
+    );
+    assert!(
+        usage.get("graph_hops").is_none(),
+        "no adjacency rows were returned, so graph_hops must be absent; got {usage}"
+    );
+}
+
+/// Same rule on the traversal path, where the stakes are higher: a traversal
+/// chunks its root set, so a failure in a later chunk discards the round trips
+/// every earlier chunk already made unless the counters survive the error.
+#[tokio::test]
+async fn traverse_counts_the_issued_chunk_when_the_query_fails() {
+    let store = setup_memory_store_without_schema();
+    let ctx = khive_storage::usage::UsageContext::new();
+
+    let result = khive_storage::usage::scope(ctx.clone(), async {
+        store
+            .traverse(TraversalRequest {
+                roots: vec![Uuid::new_v4()],
+                options: TraversalOptions::new(2).with_direction(Direction::Out),
+                include_roots: false,
+                include_properties: false,
+            })
+            .await
+    })
+    .await;
+
+    assert!(
+        result.is_err(),
+        "a store with no schema must fail the traversal, or this test proves nothing"
+    );
+
+    let usage = ctx.snapshot();
+    assert_eq!(
+        usage
+            .get("db_round_trips")
+            .and_then(serde_json::Value::as_u64),
+        Some(1),
+        "the chunk query was issued and must be counted despite the error; got {usage}"
+    );
+}
