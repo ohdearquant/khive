@@ -1,4 +1,4 @@
-//! Static `KG_HANDLERS` table (18 `HandlerDef` entries) and the `verbs` introspection handler.
+//! Static `KG_HANDLERS` table (19 `HandlerDef` entries) and the `verbs` introspection handler.
 
 // Illocutionary classification (Searle 1976):
 //   Assertive  -- retrieves/presents state of affairs

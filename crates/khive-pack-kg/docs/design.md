@@ -4,26 +4,27 @@
 
 ## Scope
 
-The KG pack provides 18 verb handlers for the knowledge graph substrate: entity
+The KG pack provides 19 verb handlers for the knowledge graph substrate: entity
 CRUD, note CRUD, edge creation/traversal, hybrid search, graph queries (GQL),
-entity-anchored graph context (ADR-089), and event-sourced proposals (ADR-046).
+entity-anchored graph context (ADR-089), event-sourced proposals (ADR-046), and
+caller identity introspection (`whoami`).
 It is the first-party pack shipped with the khive binary.
 
 ## ADR Compliance
 
-| ADR                                                                | What it governs                                   | Status      |
-| ------------------------------------------------------------------ | ------------------------------------------------- | ----------- |
-| ADR-001       | 9 entity kinds (8 base + resource per ADR-048)    | Implemented |
-| ADR-002              | 17 edge relations, closed set (15 base + 2 epistemic via ADR-055) | Implemented |
-| ADR-007                  | KG uses shared `local` namespace                  | Implemented |
-| ADR-013         | 5 base note kinds                                 | Implemented |
-| ADR-014        | UUID-only get/update/delete                       | Implemented |
-| ADR-017              | Pack trait, vocabulary, edge rules                | Implemented |
-| ADR-001       | Alias normalization (paper→document, write-time)  | Implemented |
-| ADR-045 | ISO-8601 timestamps at handler boundary           | Implemented |
-| ADR-046    | Event-sourced proposals (propose/review/withdraw) | Implemented |
-| ADR-048 | `resource` entity kind (9th kind)                 | Implemented |
-| ADR-089               | `context` verb — entity-anchored graph context    | Implemented |
+| ADR     | What it governs                                                   | Status      |
+| ------- | ----------------------------------------------------------------- | ----------- |
+| ADR-001 | 9 entity kinds (8 base + resource per ADR-048)                    | Implemented |
+| ADR-002 | 17 edge relations, closed set (15 base + 2 epistemic via ADR-055) | Implemented |
+| ADR-007 | KG uses shared `local` namespace                                  | Implemented |
+| ADR-013 | 5 base note kinds                                                 | Implemented |
+| ADR-014 | UUID-only get/update/delete                                       | Implemented |
+| ADR-017 | Pack trait, vocabulary, edge rules                                | Implemented |
+| ADR-001 | Alias normalization (paper→document, write-time)                  | Implemented |
+| ADR-045 | ISO-8601 timestamps at handler boundary                           | Implemented |
+| ADR-046 | Event-sourced proposals (propose/review/withdraw)                 | Implemented |
+| ADR-048 | `resource` entity kind (9th kind)                                 | Implemented |
+| ADR-089 | `context` verb — entity-anchored graph context                    | Implemented |
 
 ## Primary Modules
 
@@ -32,8 +33,8 @@ It is the first-party pack shipped with the khive binary.
 | [`src/lib.rs`](../src/lib.rs)                                     | Pack re-exports and crate documentation                  |
 | [`src/pack.rs`](../src/pack.rs)                                   | KgPack struct, Pack trait impl, edge endpoint rules      |
 | [`src/dispatch.rs`](../src/dispatch.rs)                           | PackRuntime impl, inventory self-registration            |
-| [`src/handler_defs.rs`](../src/handler_defs.rs)                   | KG_HANDLERS static table (18 HandlerDef entries)         |
-| [`src/handlers/mod.rs`](../src/handlers/mod.rs)                   | 18 verb handler implementations                          |
+| [`src/handler_defs.rs`](../src/handler_defs.rs)                   | KG_HANDLERS static table (19 HandlerDef entries)         |
+| [`src/handlers/mod.rs`](../src/handlers/mod.rs)                   | 19 verb handler implementations                          |
 | [`src/vocab.rs`](../src/vocab.rs)                                 | EntityKind (9) and NoteKind (5) enums with alias parsing |
 | [`src/entity_type_registry.rs`](../src/entity_type_registry.rs)   | Validates entity_type against per-kind subtypes          |
 | [`src/apply_worker/mod.rs`](../src/apply_worker/mod.rs)           | Applies approved proposal changesets to KG               |

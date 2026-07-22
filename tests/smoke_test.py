@@ -196,16 +196,18 @@ def main():
         assert isinstance(verbs_result["verbs"], list), f"verbs must be a list: {verbs_result}"
         # Surface-contract tripwire: the default config (no --pack, KHIVE_PACKS
         # unset) loads the single production pack (kg), so verbs() returns
-        # exactly 18 user-facing MCP-callable verbs (count what verbs()
+        # exactly 19 user-facing MCP-callable verbs (count what verbs()
         # returns, not internal dispatch arms). context (ADR-089, the 17th
-        # kg-substrate bare verb) and resolve (unified-verb draft ADR Slice 1,
-        # the 18th) are included in the count.
+        # kg-substrate bare verb), resolve (unified-verb draft ADR Slice 1,
+        # the 18th), and whoami (caller identity introspection, the 19th) are
+        # included in the count.
         # Update this number when the pack set or verb surface changes; a
         # silent drift here is the bug this assertion exists to catch.
-        assert verbs_result["total"] == 18, (
-            f"expected 18 user-facing verbs from the default kg pack "
+        assert verbs_result["total"] == 19, (
+            f"expected 19 user-facing verbs from the default kg pack "
             f"(context is the 17th kg-substrate bare verb per ADR-089; "
-            f"resolve is the 18th per the unified-verb draft ADR Slice 1), "
+            f"resolve is the 18th per the unified-verb draft ADR Slice 1; "
+            f"whoami is the 19th), "
             f"got {verbs_result['total']}: {verbs_result}"
         )
         verb_names = [v["verb"] for v in verbs_result["verbs"]]

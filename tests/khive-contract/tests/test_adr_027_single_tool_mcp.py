@@ -13,7 +13,7 @@ from khive_contract.fixtures import KG_VERBS as _KG_VERBS
 
 VERBS_UNDER_TEST = {"create"}
 
-# KG verbs imported from fixtures.py — single source of truth (18 verbs).
+# KG verbs imported from fixtures.py — single source of truth (19 verbs).
 KG_VERBS = tuple(sorted(_KG_VERBS))
 # gtd/memory are commercially licensed extensions, not part of this OSS
 # distribution — their absence from the kg-only surface is asserted below.

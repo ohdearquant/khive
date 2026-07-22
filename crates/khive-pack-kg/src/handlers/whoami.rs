@@ -2,7 +2,7 @@
 
 use serde_json::{json, Value};
 
-use khive_runtime::{NamespaceToken, RuntimeError};
+use khive_runtime::{actor_is_unattributed, NamespaceToken, RuntimeError};
 
 use super::common::{deser, WhoamiParams};
 use crate::KgPack;
@@ -12,6 +12,12 @@ impl KgPack {
     /// caller's actor reference, write namespace, and read-visible namespace
     /// set. A projection of existing `NamespaceToken` state, not new state —
     /// every field here is already computed before dispatch reaches a handler.
+    ///
+    /// `unattributed` uses the same id-based fallback predicate as gate
+    /// checks, token minting, and comm attribution (`actor_is_unattributed`),
+    /// not `ActorRef::is_anonymous()` — a configured actor whose id happens
+    /// to be `"local"` is still treated as the unattributed fallback
+    /// elsewhere in the runtime, and this verb must agree with that.
     pub(crate) async fn handle_whoami(
         &self,
         token: &NamespaceToken,
@@ -22,7 +28,7 @@ impl KgPack {
         Ok(json!({
             "actor_id": actor.id,
             "actor_kind": actor.kind,
-            "unattributed": actor.is_anonymous(),
+            "unattributed": actor_is_unattributed(actor),
             "namespace": token.namespace().as_str(),
             "visible_namespaces": token.visible_namespace_strs(),
         }))

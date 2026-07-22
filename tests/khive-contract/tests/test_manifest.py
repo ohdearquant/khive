@@ -143,7 +143,7 @@ def test_all_test_modules_have_adr_docstring() -> None:
 
 
 def test_combined_verb_coverage_is_complete() -> None:
-    """The union of all VERBS_UNDER_TEST across modules covers all 18 product verbs.
+    """The union of all VERBS_UNDER_TEST across modules covers all product verbs in PRODUCT_VERB_MANIFEST.
 
     ADR: ADR-023
     section: Coverage gates; Verb naming
@@ -193,7 +193,7 @@ def test_no_hardcoded_local_namespace() -> None:
 
 
 def test_verb_coverage_count_reported() -> None:
-    """Report the actual covered verb count vs 18-verb baseline (informational).
+    """Report the actual covered verb count vs the PRODUCT_VERB_MANIFEST baseline (informational).
 
     ADR: ADR-023
     section: Coverage gates
