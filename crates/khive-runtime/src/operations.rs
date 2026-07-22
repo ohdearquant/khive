@@ -86,17 +86,31 @@ pub fn arm_vector_fail_after(n: usize) {
 #[cfg(any(test, feature = "fault-injection"))]
 static FTS_FAIL_NS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+// Namespace-keyed one-shot set, same shape as `FTS_FAIL_NS` above and for the
+// same reason (#1263): a single `Option<String>` slot lets a concurrently
+// running test's `arm_vector_fail(other_ns)` overwrite this test's armed
+// namespace before its own `create_note`/`create_entity` call consumed it,
+// so the intended injection silently never fired. Keying by namespace fixes
+// that at the root — arming `ns_B` inserts `ns_B` without evicting `ns_A`.
+// Process-wide (not thread-local) for the same cross-OS-thread reason
+// documented on `arm_fts_fail` below.
 #[cfg(any(test, feature = "fault-injection"))]
-static VECTOR_FAIL_NS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static VECTOR_FAIL_NS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 /// FTS failure injection for `create_many` — separate from `FTS_FAIL_NS` so that
-/// create_note_inner and create_many tests cannot disarm each other.
+/// create_note_inner and create_many tests cannot disarm each other. Namespace-keyed
+/// set (not a single `Option<String>` slot) for the same reason as `VECTOR_FAIL_NS` (#1263).
 #[cfg(any(test, feature = "fault-injection"))]
-static FTS_FAIL_MANY_NS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static FTS_FAIL_MANY_NS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 /// FTS partial-failure injection for `create_many` — returns `Ok(BatchWriteSummary)`
 /// with `failed > 0` so that the `summary.failed > 0` rollback branch is exercised.
-/// Distinct from `FTS_FAIL_MANY_NS` which injects a hard `Err`.
+/// Distinct from `FTS_FAIL_MANY_NS` which injects a hard `Err`. Namespace-keyed set
+/// for the same reason as `VECTOR_FAIL_NS` (#1263).
 #[cfg(any(test, feature = "fault-injection"))]
-static FTS_FAIL_MANY_PARTIAL_NS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static FTS_FAIL_MANY_PARTIAL_NS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 /// Non-parser FTS *search*-leg failure injection for `search_notes`: distinct
 /// from `FTS_FAIL_NS` (which injects at the FTS *upsert*/write step of
 /// `create_note_inner`). Injects a `StorageError::Timeout` at the `search()`
@@ -129,7 +143,7 @@ pub fn arm_fts_fail(ns: &str) {
 /// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
 #[cfg(any(test, feature = "fault-injection"))]
 pub fn arm_fts_fail_many(ns: &str) {
-    *FTS_FAIL_MANY_NS.lock().unwrap() = Some(ns.to_string());
+    FTS_FAIL_MANY_NS.lock().unwrap().insert(ns.to_string());
 }
 
 /// Arm the FTS *partial*-failure injection for `create_many` targeting namespace `ns`.
@@ -141,7 +155,10 @@ pub fn arm_fts_fail_many(ns: &str) {
 /// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
 #[cfg(any(test, feature = "fault-injection"))]
 pub fn arm_fts_fail_many_partial(ns: &str) {
-    *FTS_FAIL_MANY_PARTIAL_NS.lock().unwrap() = Some(ns.to_string());
+    FTS_FAIL_MANY_PARTIAL_NS
+        .lock()
+        .unwrap()
+        .insert(ns.to_string());
 }
 
 /// Arm a non-parser FTS *search*-leg failure injection for `search_notes` targeting
@@ -166,7 +183,7 @@ pub fn arm_fts_search_fail(ns: &str) {
 /// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
 #[cfg(any(test, feature = "fault-injection"))]
 pub fn arm_vector_fail(ns: &str) {
-    *VECTOR_FAIL_NS.lock().unwrap() = Some(ns.to_string());
+    VECTOR_FAIL_NS.lock().unwrap().insert(ns.to_string());
 }
 
 /// Failure injection for `delete_note_row_first_for_compensation`'s post-row-removal
@@ -1033,15 +1050,7 @@ impl KhiveRuntime {
                 .await;
 
             #[cfg(any(test, feature = "fault-injection"))]
-            let vec_inject = {
-                let mut g = VECTOR_FAIL_NS.lock().unwrap();
-                if g.as_deref() == Some(ns) {
-                    *g = None;
-                    true
-                } else {
-                    false
-                }
-            };
+            let vec_inject = VECTOR_FAIL_NS.lock().unwrap().remove(ns);
             #[cfg(not(any(test, feature = "fault-injection")))]
             let vec_inject = false;
             let vec_result: RuntimeResult<Vec<f32>> = if vec_inject {
@@ -3029,15 +3038,7 @@ impl KhiveRuntime {
             // the cfg(not) branch is a const false eliminating the if-branch.
             #[cfg(any(test, feature = "fault-injection"))]
             let vec_inject = {
-                let ns_inject = {
-                    let mut g = VECTOR_FAIL_NS.lock().unwrap();
-                    if g.as_deref() == Some(ns) {
-                        *g = None;
-                        true
-                    } else {
-                        false
-                    }
-                };
+                let ns_inject = VECTOR_FAIL_NS.lock().unwrap().remove(ns);
                 let count_inject = VECTOR_FAIL_AFTER.with(|cell| match cell.get() {
                     Some(0) => {
                         cell.set(None);
@@ -5230,30 +5231,14 @@ impl KhiveRuntime {
         let docs: Vec<_> = entities.iter().map(entity_fts_document).collect();
 
         #[cfg(any(test, feature = "fault-injection"))]
-        let fts_many_inject = {
-            let mut g = FTS_FAIL_MANY_NS.lock().unwrap();
-            if g.as_deref() == Some(ns) {
-                *g = None;
-                true
-            } else {
-                false
-            }
-        };
+        let fts_many_inject = FTS_FAIL_MANY_NS.lock().unwrap().remove(ns);
         #[cfg(not(any(test, feature = "fault-injection")))]
         let fts_many_inject = false;
 
         // Partial-failure seam: returns Ok(summary) with failed > 0 so the
         // `summary.failed > 0` rollback branch is exercised in tests.
         #[cfg(any(test, feature = "fault-injection"))]
-        let fts_many_inject_partial = {
-            let mut g = FTS_FAIL_MANY_PARTIAL_NS.lock().unwrap();
-            if g.as_deref() == Some(ns) {
-                *g = None;
-                true
-            } else {
-                false
-            }
-        };
+        let fts_many_inject_partial = FTS_FAIL_MANY_PARTIAL_NS.lock().unwrap().remove(ns);
         #[cfg(not(any(test, feature = "fault-injection")))]
         let fts_many_inject_partial = false;
 
