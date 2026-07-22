@@ -105,13 +105,18 @@ phase_tests() {
     # in khive.db-wal/-shm and may leave the main file's mtime untouched
     # until a checkpoint, so watching khive.db alone misses live
     # contamination. Size is fingerprinted alongside mtime to catch writes
-    # inside the filesystem's mtime granularity.
+    # inside the filesystem's mtime granularity, and a content hash catches
+    # the residual gap: a same-size write landing within the same timestamp
+    # second (WAL frame reuse can preserve both mtime and size after a
+    # committed write) changes none of the stat fields but cannot preserve
+    # the digest.
     sentinel_fingerprint() {
         for f in "$HOME/.khive/khive.db" "$HOME/.khive/khive.db-wal" "$HOME/.khive/khive.db-shm"; do
             if [ -f "$f" ]; then
                 m=$(stat -f%m "$f" 2>/dev/null || stat -c%Y "$f")
                 s=$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f")
-                printf '%s mtime=%s size=%s\n' "$f" "$m" "$s"
+                h=$({ shasum -a 256 "$f" 2>/dev/null || sha256sum "$f"; } | awk '{print $1}')
+                printf '%s mtime=%s size=%s sha256=%s\n' "$f" "$m" "$s" "$h"
             else
                 printf '%s absent\n' "$f"
             fi
