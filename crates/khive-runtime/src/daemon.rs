@@ -721,6 +721,7 @@ pub trait DaemonDispatch: Clone + Send + Sync + 'static {
     }
 }
 
+#[cfg(unix)]
 struct CheckpointTaskSpec {
     pool: Arc<ConnectionPool>,
     lifecycle_owner: Option<CheckpointLifecycleOwner>,
@@ -733,6 +734,7 @@ struct CheckpointTaskSpec {
 /// main backend is in-memory and therefore has no checkpoint task, the first
 /// file-backed secondary owns emission instead. All remaining tasks are
 /// explicit non-owners.
+#[cfg(unix)]
 fn checkpoint_task_specs(
     main_pool: Option<Arc<ConnectionPool>>,
     secondary_pools: Vec<Arc<ConnectionPool>>,
