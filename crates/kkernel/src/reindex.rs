@@ -158,6 +158,11 @@ pub struct ReindexArgs {
     #[arg(long)]
     pub keep_existing: bool,
 
+    /// Repair only missing embeddings. Skips FTS backfill and reads only base
+    /// rows without a vector for each target model.
+    #[arg(long)]
+    pub embeds_only: bool,
+
     /// Namespace to operate on. When omitted, the config file `[actor] id` (if
     /// any) is honored — matching the same precedence as `kkernel mcp`. An
     /// explicit `--namespace` / `KHIVE_NAMESPACE` overrides the config tier.
@@ -406,6 +411,149 @@ async fn filter_unembedded(
     }
 }
 
+fn vector_table_name(model_key: &str) -> Result<String> {
+    if model_key.is_empty()
+        || !model_key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        anyhow::bail!("invalid vector model key {model_key:?}");
+    }
+    Ok(format!("vec_{model_key}"))
+}
+
+async fn missing_embedding_batch(
+    rt: &KhiveRuntime,
+    namespace: &str,
+    vector_table: &str,
+    kind: SubstrateKind,
+    after: &str,
+    limit: u32,
+) -> Result<Vec<(Uuid, String)>> {
+    use khive_storage::types::{SqlStatement, SqlValue};
+
+    let (select, table, text_predicate) = match kind {
+        SubstrateKind::Entity => (
+            "base.id, base.name, base.description",
+            "entities",
+            "TRIM(base.name) <> ''",
+        ),
+        SubstrateKind::Note => ("base.id, base.content", "notes", "TRIM(base.content) <> ''"),
+        _ => anyhow::bail!("embeds-only reindex does not support {kind}"),
+    };
+    let sql = format!(
+        "SELECT {select} FROM {table} AS base \
+         WHERE base.namespace = ?1 AND base.deleted_at IS NULL AND base.id > ?2 \
+         AND {text_predicate} \
+         AND NOT EXISTS (SELECT 1 FROM {vector_table} AS vectors \
+             WHERE vectors.subject_id = base.id AND vectors.namespace = ?1) \
+         ORDER BY base.id LIMIT ?3"
+    );
+    let rows = {
+        let mut reader = rt
+            .sql()
+            .reader()
+            .await
+            .context("open SQL reader for embeds-only reindex")?;
+        reader
+            .query_all(SqlStatement {
+                sql,
+                params: vec![
+                    SqlValue::Text(namespace.to_string()),
+                    SqlValue::Text(after.to_string()),
+                    SqlValue::Integer(i64::from(limit)),
+                ],
+                label: Some("reindex_missing_embeddings".into()),
+            })
+            .await
+            .context("select rows missing embeddings")?
+    };
+
+    rows.into_iter()
+        .map(|row| {
+            let text = |name: &str| match row.get(name) {
+                Some(SqlValue::Text(value)) => Ok(value.clone()),
+                Some(SqlValue::Null) => Ok(String::new()),
+                _ => anyhow::bail!("missing or invalid {name} in embeds-only row"),
+            };
+            let id = text("id")?
+                .parse::<Uuid>()
+                .context("invalid subject id in embeds-only row")?;
+            let content = match kind {
+                SubstrateKind::Entity => {
+                    let name = text("name")?;
+                    let description = text("description")?;
+                    if description.is_empty() {
+                        name
+                    } else {
+                        format!("{name} {description}")
+                    }
+                }
+                SubstrateKind::Note => text("content")?,
+                _ => unreachable!("kind checked above"),
+            };
+            Ok((id, content))
+        })
+        .collect()
+}
+
+async fn repair_missing_embeddings(
+    rt: &KhiveRuntime,
+    token: &khive_runtime::NamespaceToken,
+    model_names: &[String],
+    namespace: &str,
+    batch_size: u32,
+) -> Result<(u64, u64, u64)> {
+    let mut entities_processed = 0u64;
+    let mut notes_processed = 0u64;
+    let mut errors = 0u64;
+
+    for model_name in model_names {
+        let vectors = rt
+            .vectors_for_model(token, model_name)
+            .with_context(|| format!("resolve vector store for model {model_name}"))?;
+        let info = vectors
+            .info()
+            .await
+            .with_context(|| format!("inspect vector store for model {model_name}"))?;
+        let vector_table = vector_table_name(&info.model_name)?;
+
+        for (kind, field) in [
+            (SubstrateKind::Entity, "entity.body"),
+            (SubstrateKind::Note, "note.content"),
+        ] {
+            let mut after = String::new();
+            loop {
+                let batch =
+                    missing_embedding_batch(rt, namespace, &vector_table, kind, &after, batch_size)
+                        .await?;
+                let Some((last_id, _)) = batch.last() else {
+                    break;
+                };
+                after = last_id.to_string();
+                errors += embed_and_store_batch(
+                    rt,
+                    token,
+                    std::slice::from_ref(model_name),
+                    namespace,
+                    &batch,
+                    kind,
+                    field,
+                    false,
+                )
+                .await;
+                match kind {
+                    SubstrateKind::Entity => entities_processed += batch.len() as u64,
+                    SubstrateKind::Note => notes_processed += batch.len() as u64,
+                    _ => unreachable!("repair kinds are fixed above"),
+                }
+            }
+        }
+    }
+
+    Ok((entities_processed, notes_processed, errors))
+}
+
 /// Re-embed entities and notes, fanning out across every configured embedding
 /// engine. Engines, db path, and config are resolved with the same precedence
 /// as `kkernel mcp` so reindex writes the SAME vectors the MCP server serves
@@ -451,12 +599,16 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
         Some(name) => vec![name.to_string()],
         None => {
             let names = rt.registered_embedding_model_names();
-            if names.is_empty() {
+            if names.is_empty() && !args.embeds_only {
                 eprintln!("warning: no embedding model configured — skipping vector embedding; FTS backfill will still run");
             }
             names
         }
     };
+
+    if args.embeds_only && model_names.is_empty() {
+        anyhow::bail!("--embeds-only requires at least one configured embedding model");
+    }
 
     let batch_size = args.batch_size.clamp(1, 500);
     let drop_existing = !args.keep_existing;
@@ -468,6 +620,27 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
     let mut errors_skipped: u64 = 0;
     let mut entities_fts_failed: u64 = 0;
     let mut notes_fts_failed: u64 = 0;
+
+    if args.embeds_only {
+        (entities_processed, notes_processed, errors_skipped) =
+            repair_missing_embeddings(&rt, &token, &model_names, &ns_str, batch_size).await?;
+        if entities_processed + notes_processed > 0 {
+            if let Err(e) = invalidate_vamana_snapshots(&rt, &ns_str).await {
+                tracing::warn!(error = %e, "failed to invalidate Vamana snapshots after reindex");
+            }
+        }
+        let report = ReindexReport {
+            entities_processed,
+            notes_processed,
+            models_used: model_names,
+            elapsed_ms: start.elapsed().as_millis() as u64,
+            errors_skipped,
+            entities_fts_failed,
+            notes_fts_failed,
+        };
+        print_report(&report, args.human);
+        return finish(&report, args.best_effort);
+    }
 
     // ── entities + notes (graph substrate) ────────────────────────────────────
     {
@@ -1214,6 +1387,67 @@ mod tests {
         assert!(decide_result(false, true).is_ok());
     }
 
+    #[test]
+    fn embeds_only_arg_is_opt_in() {
+        let default_args = ReindexArgs::parse_from(["reindex"]);
+        assert!(!default_args.embeds_only);
+
+        let repair_args = ReindexArgs::parse_from(["reindex", "--embeds-only"]);
+        assert!(repair_args.embeds_only);
+    }
+
+    #[tokio::test]
+    async fn embeds_only_selection_returns_only_notes_missing_target_model() {
+        use khive_runtime::RuntimeConfig;
+        use khive_storage::types::VectorRecord;
+        use lattice_embed::EmbeddingModel;
+
+        const MODEL: &str = "paraphrase-multilingual-minilm-l12-v2";
+        const TABLE: &str = "vec_paraphrase_multilingual_minilm_l12_v2";
+
+        let rt = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            embedding_model: None,
+            additional_embedding_models: vec![EmbeddingModel::ParaphraseMultilingualMiniLmL12V2],
+            ..RuntimeConfig::default()
+        })
+        .expect("runtime");
+        let token = rt
+            .authorize(Namespace::parse("local").expect("namespace"))
+            .expect("authorize");
+        let notes = rt.notes(&token).expect("notes");
+        let existing = Note::new("local", "observation", "already embedded");
+        let missing = Note::new("local", "observation", "needs repair");
+        notes
+            .upsert_note(existing.clone())
+            .await
+            .expect("seed existing note");
+        notes
+            .upsert_note(missing.clone())
+            .await
+            .expect("seed missing note");
+
+        rt.vectors_for_model(&token, MODEL)
+            .expect("vectors")
+            .insert_batch(vec![VectorRecord {
+                subject_id: existing.id,
+                kind: SubstrateKind::Note,
+                namespace: "local".to_string(),
+                field: "note.content".to_string(),
+                embedding_model: Some(MODEL.to_string()),
+                vectors: vec![vec![0.1; 384]],
+                updated_at: chrono::Utc::now(),
+            }])
+            .await
+            .expect("seed vector");
+
+        let selected = missing_embedding_batch(&rt, "local", TABLE, SubstrateKind::Note, "", 100)
+            .await
+            .expect("select missing notes");
+
+        assert_eq!(selected, vec![(missing.id, missing.content)]);
+    }
+
     // DB resolution parity with `kkernel exec` / `kkernel mcp`. The shared
     // helper is unit-tested in `dbpath`; here we assert reindex consumes it
     // through clap (`--db` / `KHIVE_DB` / `:memory:`) the same way.
@@ -1757,6 +1991,7 @@ mod tests {
             model: None,
             batch_size: 100,
             keep_existing: false,
+            embeds_only: false,
             namespace: Some("local".to_string()),
             best_effort: true,
             human: false,
@@ -2023,6 +2258,7 @@ mod tests {
             model: None,
             batch_size: 100,
             keep_existing: false,
+            embeds_only: false,
             namespace: Some("local".to_string()),
             best_effort: true,
             human: false,

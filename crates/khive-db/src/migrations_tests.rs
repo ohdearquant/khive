@@ -57,24 +57,32 @@ fn v4_creates_consolidated_fts_tables() {
 }
 
 #[test]
-fn rejects_pre_consolidation_ledger() {
+fn newer_store_reports_binary_upgrade_action() {
     let mut conn = open_memory();
-    // Simulate a database carrying the old, pre-consolidation V1..V22 ledger.
+    let latest = MIGRATIONS.last().expect("at least one migration").version;
+    let store_version = latest + 1;
     conn.execute_batch(MIGRATION_TRACKING_TABLE).unwrap();
     conn.execute(
-        "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (22, 'legacy', 0)",
-        [],
+        "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (?1, 'future', 0)",
+        [store_version],
     )
     .unwrap();
 
     let err = run_migrations(&mut conn).expect_err("must reject a version ahead of latest");
-    match err {
-        SqliteError::InvalidData(msg) => assert!(
-            msg.contains("ahead of the latest known migration"),
-            "unexpected message: {msg}"
-        ),
-        other => panic!("expected InvalidData, got {other:?}"),
-    }
+    assert!(matches!(
+        &err,
+        SqliteError::SchemaTooNew {
+            store_version: found,
+            max_known_migration,
+        } if *found == store_version && *max_known_migration == latest
+    ));
+    let message = err.to_string();
+    assert!(
+        message.contains("the binary is older than the store"),
+        "{message}"
+    );
+    assert!(message.contains("upgrade the binary"), "{message}");
+    assert!(!message.contains("recreate"), "{message}");
 }
 
 #[test]
@@ -822,13 +830,11 @@ fn mixed_version_boot_rejects_newer_schema_under_lock() {
         .join()
         .expect("thread join")
         .expect_err("a schema version above latest must be rejected, not clamped");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("ahead of the latest known migration"),
-        "unexpected error: {msg}"
-    );
-    assert!(
-        msg.contains("migration write lock"),
-        "the under-lock guard, not the pre-lock guard, must fire: {msg}"
-    );
+    assert!(matches!(
+        err,
+        SqliteError::SchemaTooNew {
+            store_version,
+            max_known_migration,
+        } if store_version == latest + 1 && max_known_migration == latest
+    ));
 }

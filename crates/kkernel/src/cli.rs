@@ -553,14 +553,13 @@ async fn cmd_db_check(args: DbCheckArgs) -> Result<()> {
     };
 
     let is_current = current_version == latest;
-    // A version beyond the latest known migration is a stale ledger: the database
-    // predates the consolidated V1 baseline (ADR-015) or was written by a newer
-    // build. Report it rather than treating it as current.
+    // A version beyond the latest known migration was written by a newer build.
+    // Report it rather than treating it as current.
     let ahead = current_version > latest;
 
     if args.human {
         let state = if ahead {
-            "ahead — predates the consolidated baseline (ADR-015) or written by a newer build; recreate it"
+            "ahead — the binary is older than the store; upgrade the binary"
         } else if is_current {
             "current"
         } else {
@@ -581,9 +580,9 @@ async fn cmd_db_check(args: DbCheckArgs) -> Result<()> {
     if args.strict && !is_current {
         if ahead {
             anyhow::bail!(
-                "schema version {current_version} is ahead of the latest known migration {latest} — \
-                 this database predates the consolidated baseline (ADR-015) or was written by a newer \
-                 build; recreate it from the current schema"
+                "this binary knows migrations up to {latest} but the store is at version \
+                 {current_version} — the binary is older than the store; upgrade the binary \
+                 (in-place downgrade is not supported)"
             );
         }
         anyhow::bail!(

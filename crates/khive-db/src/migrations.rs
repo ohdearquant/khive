@@ -331,18 +331,14 @@ fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
     }
 
     // A database whose recorded version is ahead of the latest known migration
-    // predates the consolidated V1 baseline (ADR-015) — e.g. it still carries the
-    // pre-consolidation V2..V22 ledger — or was written by a newer build. Either
-    // way the baseline schema would be silently skipped, leaving the process on a
-    // stale schema. Fail loudly instead of corrupting silently.
+    // was written by a newer build. Running this binary would silently skip
+    // unknown schema changes, so fail with the upgrade action instead.
     let latest_version = MIGRATIONS.last().map(|m| m.version).unwrap_or(0);
     if current_version > latest_version {
-        return Err(SqliteError::InvalidData(format!(
-            "database schema version {current_version} is ahead of the latest known migration \
-             {latest_version}. This database predates the consolidated baseline (ADR-015) or was \
-             written by a newer build. Recreate it from the current schema; in-place downgrade is \
-             not supported."
-        )));
+        return Err(SqliteError::SchemaTooNew {
+            max_known_migration: latest_version,
+            store_version: current_version,
+        });
     }
 
     let mut applied_version = current_version;
@@ -415,12 +411,10 @@ fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
         // the write lock. Accepting it (clamped) would return Ok on a schema
         // this binary does not understand — reject it the same way.
         if sibling_version > latest_version {
-            return Err(SqliteError::InvalidData(format!(
-                "database schema version {sibling_version} is ahead of the latest known \
-                 migration {latest_version} (committed by a concurrent process while this \
-                 one waited for the migration write lock). This build cannot run against \
-                 the newer schema; upgrade the binary or recreate the database."
-            )));
+            return Err(SqliteError::SchemaTooNew {
+                max_known_migration: latest_version,
+                store_version: sibling_version,
+            });
         }
 
         if sibling_version >= migration.version {
