@@ -7089,6 +7089,36 @@ mod event_counts_tests {
             "until must be documented as optional"
         );
     }
+
+    /// Issue #14: the untruncated case is unaffected -- `total`/
+    /// `total_cost_unit` keep their existing bare names. This is the shape
+    /// every other test in this module already exercises via the real
+    /// handler (window sizes here never approach `MAX_WINDOW_EVENTS`).
+    #[test]
+    fn truncatable_total_key_is_unchanged_when_not_truncated() {
+        assert_eq!(BrainPack::truncatable_total_key("total", false), "total");
+        assert_eq!(
+            BrainPack::truncatable_total_key("total_cost_unit", false),
+            "total_cost_unit"
+        );
+    }
+
+    /// Issue #14: when the window was truncated, the misleading bare key
+    /// must never be emitted -- it is renamed to an explicitly
+    /// page-scoped/incomplete key instead, so a caller reading `total`
+    /// directly gets nothing rather than a number that may be off by an
+    /// order of magnitude.
+    #[test]
+    fn truncatable_total_key_is_renamed_when_truncated() {
+        assert_eq!(
+            BrainPack::truncatable_total_key("total", true),
+            "total_page_scoped"
+        );
+        assert_eq!(
+            BrainPack::truncatable_total_key("total_cost_unit", true),
+            "total_cost_unit_page_scoped"
+        );
+    }
 }
 
 /// #808: `brain.feedback`'s `FeedbackExplicit` event must carry the resolved

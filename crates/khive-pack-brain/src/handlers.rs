@@ -78,9 +78,13 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
             payload.resource.cost_unit (ADR-103 Amendment 1; stamped on every successful verb \
             dispatch since PR #927) sum into total_cost_unit and cost_unit_by_verb; events with \
             no resource.cost_unit (pre-Amendment-1 events, or errored/denied dispatches) simply \
-            do not contribute. Both fields are omitted, not zero-filled, when no event in the \
-            window carries cost_unit. When truncated=true, both sums are over the fetched page \
-            only, same as the other counts_by_* fields.",
+            do not contribute. total_cost_unit is omitted, not zero-filled, when no event in the \
+            window carries cost_unit. When truncated=true, every scalar total (total, \
+            total_cost_unit) is over the fetched page only, same as the other counts_by_* \
+            fields — and, to keep a page-scoped number from being read as the real window total, \
+            each is renamed to an explicitly incomplete key (total_page_scoped, \
+            total_cost_unit_page_scoped) instead of being returned under its normal name \
+            (issue #14). window_event_total always carries the true count regardless.",
         visibility: khive_types::Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[
@@ -716,6 +720,26 @@ impl BrainPack {
     /// rather than contorting `EventStore` for a case that is not yet load-bearing.
     const MAX_WINDOW_EVENTS: u32 = 50_000;
 
+    /// Issue #14: when the window's aggregation ran over a bounded page
+    /// rather than the full window (`truncated`), a bare scalar total next
+    /// to complete-looking `counts_by_*` maps reads as authoritative even
+    /// though it is only a page-scoped estimate. The interim fix (the
+    /// primary fix -- a SQL-side grouped-count primitive on `EventStore` --
+    /// requires widening a trait owned by the upstream OSS `khive-storage`
+    /// crate, out of scope here): when truncated, the misleading key is
+    /// never emitted; the same page-scoped value is returned under an
+    /// explicitly incomplete name instead. A missing `total` gets noticed;
+    /// a `total` that is wrong by an order of magnitude does not.
+    /// `window_event_total` (the true count) and `truncated` (the marker)
+    /// are unaffected -- this only renames the page-scoped scalar's own key.
+    pub(crate) fn truncatable_total_key(base_key: &str, truncated: bool) -> String {
+        if truncated {
+            format!("{base_key}_page_scoped")
+        } else {
+            base_key.to_string()
+        }
+    }
+
     pub(crate) async fn handle_event_counts(
         &self,
         token: &NamespaceToken,
@@ -840,13 +864,13 @@ impl BrainPack {
             "until": micros_to_iso(until_us),
             "actor": p.actor,
             "kind": p.kind,
-            "total": page.items.len() as u64,
             "counts_by_kind": counts_by_kind,
             "counts_by_actor": counts_by_actor,
             "counts_by_verb": counts_by_verb,
             "truncated": truncated,
             "window_event_total": window_event_total,
         });
+        result[Self::truncatable_total_key("total", truncated)] = json!(page.items.len() as u64);
         if !by_profile.is_empty() {
             result["by_profile"] = json!(by_profile);
         }
@@ -854,7 +878,8 @@ impl BrainPack {
             result["counts_by_work_class"] = json!(counts_by_work_class);
         }
         if !cost_unit_by_verb.is_empty() {
-            result["total_cost_unit"] = json!(total_cost_unit);
+            result[Self::truncatable_total_key("total_cost_unit", truncated)] =
+                json!(total_cost_unit);
             result["cost_unit_by_verb"] = json!(cost_unit_by_verb);
         }
         Ok(result)
