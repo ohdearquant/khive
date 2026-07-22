@@ -34,6 +34,22 @@ use khive_storage::EdgeRelation;
 use crate::coordinator::CoordinatorService;
 use crate::tools::request::RequestParams;
 
+struct OpSuccess {
+    result: Value,
+    partial: bool,
+    missing_backends: Vec<String>,
+}
+
+impl OpSuccess {
+    fn complete(result: Value) -> Self {
+        Self {
+            result,
+            partial: false,
+            missing_backends: Vec::new(),
+        }
+    }
+}
+
 /// Fingerprint the engine-coherence parts of a resolved [`RuntimeConfig`].
 ///
 /// Two servers produce the same id iff they can safely share one warm engine:
@@ -481,7 +497,7 @@ impl KhiveMcpServer {
     /// - args cannot be extracted for coordinator dispatch (e.g. non-UUID source/target)
     ///
     /// Result semantics mirror the per-op envelope from the registry:
-    /// `Ok(Value)` → success payload (caller wraps in `{ok:true, tool, result}`).
+    /// `Ok(OpSuccess)` → success payload and any coordinator advisory fields.
     /// `Err((tool, error_value))` → error payload (caller wraps in `{ok:false, tool, error}`).
     ///
     /// `identity` mirrors the override [`Self::dispatch_op`] applies to the
@@ -494,7 +510,7 @@ impl KhiveMcpServer {
         tool: &str,
         args_value: &Value,
         identity: Option<&khive_runtime::RequestIdentity>,
-    ) -> Option<Result<Value, (String, Value)>> {
+    ) -> Option<Result<OpSuccess, (String, Value)>> {
         let coord = self.coordinator.as_ref()?;
         if coord.is_single_backend() {
             return None;
@@ -771,7 +787,7 @@ impl KhiveMcpServer {
             .dispatch_with_identity(&tool, args_value, identity.cloned())
             .await
         {
-            Ok(result) => chain_ok_envelope_or_depth_error(tool, result),
+            Ok(result) => chain_ok_envelope_or_depth_error(tool, OpSuccess::complete(result)),
             Err(RuntimeError::Khive(k)) => {
                 let error_payload = serde_json::to_value(&k)
                     .unwrap_or_else(|_| json!({ "kind": "internal", "message": k.to_string() }));
@@ -808,7 +824,10 @@ impl KhiveMcpServer {
     /// already carry this information, but a caller that checks only for the
     /// absence of a top-level RPC error has nothing to branch on. `"partial"`
     /// means at least one op in this response failed or was aborted;
-    /// `"success"` means every op in `results` reports `ok: true`.
+    /// `"success"` means every op in `results` reports `ok: true`. A successful
+    /// but incomplete backend fan-out instead carries `partial: true` and
+    /// `missing_backends` on that operation's entry without changing its
+    /// canonical `result` shape.
     async fn run_parsed(
         &self,
         ops: Vec<ParsedOp>,
@@ -986,7 +1005,7 @@ impl KhiveMcpServer {
                         {
                             Ok(result) => present_ok_envelope_or_depth_error(
                                 tool,
-                                result,
+                                OpSuccess::complete(result),
                                 effective_mode,
                                 now_unix,
                             ),
@@ -1110,7 +1129,7 @@ impl KhiveMcpServer {
 
 /// Route a `link` or `search` verb through `coord` when in multi-backend mode.
 /// Shared logic behind both dispatch sites (`dispatch_op` chain mode and the
-/// parallel/single closure in `run_parsed`). Returns `Some(Ok(Value))` when
+/// parallel/single closure in `run_parsed`). Returns `Some(Ok(OpSuccess))` when
 /// the coordinator handled the op, `Some(Err((tool, error_value)))` on a
 /// coordinator error (including fail-closed namespace rejection), `None` to
 /// fall through to the registry. Must apply the exact same fail-closed
@@ -1121,7 +1140,7 @@ async fn dispatch_via_coordinator_inner(
     tool: &str,
     args_value: &Value,
     default_namespace_str: &str,
-) -> Option<Result<Value, (String, Value)>> {
+) -> Option<Result<OpSuccess, (String, Value)>> {
     // Only link/search are ever intercepted here — resolve/validate the
     // namespace only for those verbs so unrelated verbs (which always
     // fall through to `None` below) don't pay for a parse they don't need.
@@ -1187,7 +1206,7 @@ async fn dispatch_via_coordinator_inner(
                             obj.insert("target_id".to_string(), json!(target_id.to_string()));
                         }
                     }
-                    Ok(raw)
+                    Ok(OpSuccess::complete(raw))
                 }
                 Err(e) => {
                     let re: RuntimeError = e.into();
@@ -1282,6 +1301,15 @@ async fn dispatch_via_coordinator_inner(
                     &tags_owned,
                 )
                 .await;
+            let mut missing_backends: Vec<String> = coord_result
+                .per_backend
+                .iter()
+                .filter(|backend| backend.error.is_some())
+                .map(|backend| backend.backend_id.as_str().to_string())
+                .collect();
+            missing_backends.sort();
+            missing_backends.dedup();
+            let partial = coord_result.partial || !missing_backends.is_empty();
 
             // Shape result to match the kg search handler's output fields exactly.
             // Entity hits: [{id, entity_kind, score, title, snippet}]
@@ -1331,7 +1359,11 @@ async fn dispatch_via_coordinator_inner(
                 serde_json::to_value(items).unwrap_or_else(|_| json!([]))
             };
 
-            Some(Ok(result_val))
+            Some(Ok(OpSuccess {
+                result: result_val,
+                partial,
+                missing_backends,
+            }))
         }
         _ => None,
     }
@@ -1363,11 +1395,24 @@ fn depth_error_payload(context: &str) -> Value {
 /// without re-serializing an already-owned `Value` through `json!` (which
 /// would call `serde_json::to_value` and recurse over the whole tree
 /// again). The depth check must already have passed before this is called.
-fn ok_envelope(tool: String, result: Value) -> Value {
-    let mut map = serde_json::Map::with_capacity(3);
+fn ok_envelope(tool: String, success: OpSuccess) -> Value {
+    let mut map = serde_json::Map::with_capacity(if success.partial { 5 } else { 3 });
     map.insert("ok".to_string(), Value::Bool(true));
     map.insert("tool".to_string(), Value::String(tool));
-    map.insert("result".to_string(), result);
+    map.insert("result".to_string(), success.result);
+    if success.partial {
+        map.insert("partial".to_string(), Value::Bool(true));
+        map.insert(
+            "missing_backends".to_string(),
+            Value::Array(
+                success
+                    .missing_backends
+                    .into_iter()
+                    .map(Value::String)
+                    .collect(),
+            ),
+        );
+    }
     Value::Object(map)
 }
 
@@ -1405,15 +1450,18 @@ fn stamp_usage(entry: &mut Value, ctx: &khive_runtime::usage::UsageContext) {
 /// wrapped in the response envelope. On violation returns a `result_too_deep`
 /// error that does not embed the oversized value, and discards the rejected
 /// value iteratively so its own drop can't overflow the stack either.
-fn chain_ok_envelope_or_depth_error(tool: String, result: Value) -> Result<Value, (String, Value)> {
-    if !result_within_depth_limit(&result) {
-        drop_value_iteratively(result);
+fn chain_ok_envelope_or_depth_error(
+    tool: String,
+    success: OpSuccess,
+) -> Result<Value, (String, Value)> {
+    if !result_within_depth_limit(&success.result) {
+        drop_value_iteratively(success.result);
         return Err((
             tool,
             depth_error_payload("; cannot be used as $prev chain context"),
         ));
     }
-    Ok(ok_envelope(tool, result))
+    Ok(ok_envelope(tool, success))
 }
 
 /// Parallel/single-mode success path: check the raw handler `result` against
@@ -1424,16 +1472,16 @@ fn chain_ok_envelope_or_depth_error(tool: String, result: Value) -> Result<Value
 /// (see [`drop_value_iteratively`]).
 fn present_ok_envelope_or_depth_error(
     tool: String,
-    result: Value,
+    mut success: OpSuccess,
     mode: PresentationMode,
     now_unix: i64,
 ) -> Value {
-    if !result_within_depth_limit(&result) {
-        drop_value_iteratively(result);
+    if !result_within_depth_limit(&success.result) {
+        drop_value_iteratively(success.result);
         return json!({ "ok": false, "tool": tool, "error": depth_error_payload("") });
     }
-    let presented = present(result, mode, now_unix);
-    ok_envelope(tool, presented)
+    success.result = present(success.result, mode, now_unix);
+    ok_envelope(tool, success)
 }
 
 /// Returns `true` if a dispatched op's canonical `result` field nests
@@ -1540,6 +1588,8 @@ Parallel: a failed op does NOT abort siblings. Chain: failure aborts remaining
 ops (reported as {"ok": false, "aborted": true}). Committed ops are not rolled back.
 `status` is "partial" whenever summary.failed or summary.aborted is non-zero — check
 it (or summary) rather than relying on the absence of a top-level error.
+Successful backend fan-out degradation is reported separately on the affected op as
+`"partial": true, "missing_backends": [...]`; its `result` keeps the verb's normal shape.
 
 Verb discovery: install the `kg` / `gtd` plugins for usage skills. The verbs
 currently registered on this server (pack-derived) are listed below. Argument
@@ -2245,8 +2295,11 @@ mod tests {
         // this value would be a real stack risk; the guard must reject it
         // via the iterative checker without ever attempting that recursion.
         let pathological = nest_object(khive_request::NESTING_DEPTH_LIMIT + 50_000, json!(true));
-        let err = chain_ok_envelope_or_depth_error("traverse".to_string(), pathological)
-            .expect_err("over-limit result must be rejected, not enveloped");
+        let err = chain_ok_envelope_or_depth_error(
+            "traverse".to_string(),
+            OpSuccess::complete(pathological),
+        )
+        .expect_err("over-limit result must be rejected, not enveloped");
         assert_eq!(err.0, "traverse");
         assert_eq!(err.1["kind"], json!("result_too_deep"));
         // The error payload must never embed the oversized value itself.
@@ -2257,8 +2310,11 @@ mod tests {
     #[test]
     fn chain_seam_accepts_at_limit_result_and_moves_value_without_reserializing() {
         let at_limit = nest_object(khive_request::NESTING_DEPTH_LIMIT, json!("leaf"));
-        let envelope = chain_ok_envelope_or_depth_error("get".to_string(), at_limit.clone())
-            .expect("result at exactly the limit must be accepted");
+        let envelope = chain_ok_envelope_or_depth_error(
+            "get".to_string(),
+            OpSuccess::complete(at_limit.clone()),
+        )
+        .expect("result at exactly the limit must be accepted");
         assert_eq!(envelope["ok"], json!(true));
         assert_eq!(envelope["tool"], json!("get"));
         assert_eq!(envelope["result"], at_limit);
@@ -2269,7 +2325,7 @@ mod tests {
         let pathological = nest_object(khive_request::NESTING_DEPTH_LIMIT + 50_000, json!(true));
         let envelope = present_ok_envelope_or_depth_error(
             "context".to_string(),
-            pathological,
+            OpSuccess::complete(pathological),
             PresentationMode::Agent,
             0,
         );
@@ -2284,7 +2340,7 @@ mod tests {
         let shallow = json!({"id": "11111111-1111-1111-1111-111111111111"});
         let envelope = present_ok_envelope_or_depth_error(
             "get".to_string(),
-            shallow,
+            OpSuccess::complete(shallow),
             PresentationMode::Verbose,
             0,
         );
