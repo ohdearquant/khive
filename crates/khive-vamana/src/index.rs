@@ -24,7 +24,7 @@ use crate::{
     error::{Result, VamanaError},
     graph::{
         greedy_search_inner, greedy_search_inner_sq8, is_tombstoned_bit, robust_prune_inner,
-        sort_dedup_u32, VamanaGraph, VisitedSet,
+        sort_dedup_u32, CodesView, VamanaGraph, VisitedSet,
     },
 };
 
@@ -316,6 +316,145 @@ impl VectorStorage {
     }
 }
 
+#[cfg(feature = "mmap")]
+const CODES_MAGIC: &[u8; 8] = b"KHVCODE1";
+#[cfg(feature = "mmap")]
+const CODES_HEADER_LEN: usize = 8 + 8 + 8 + 4 + 4;
+
+/// Storage for the per-node SQ8 code table: owned per-vector allocations
+/// (build and mutation paths) or the flat, memory-mapped `codes.bin` segment
+/// (v2 load path). Mirrors `VectorStorage`'s Owned/Mmap split.
+enum CodeStore {
+    Owned(Vec<GsEncodedVector>),
+    #[cfg(feature = "mmap")]
+    Mmap {
+        mmap: memmap2::Mmap,
+        dims: usize,
+        len: usize,
+    },
+}
+
+impl std::fmt::Debug for CodeStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Owned(v) => write!(f, "Owned(len={})", v.len()),
+            #[cfg(feature = "mmap")]
+            Self::Mmap { len, .. } => write!(f, "Mmap(len={len})"),
+        }
+    }
+}
+
+impl CodeStore {
+    fn view(&self) -> CodesView<'_> {
+        match self {
+            Self::Owned(v) => CodesView::Owned(v),
+            #[cfg(feature = "mmap")]
+            Self::Mmap { mmap, dims, len } => CodesView::Flat {
+                bytes: &mmap.as_ref()[CODES_HEADER_LEN + dims * 4..][..len * dims],
+                dims: *dims,
+            },
+        }
+    }
+
+    fn owned_mut(&mut self) -> Result<&mut Vec<GsEncodedVector>> {
+        match self {
+            Self::Owned(v) => Ok(v),
+            #[cfg(feature = "mmap")]
+            Self::Mmap { .. } => Err(VamanaError::invalid_format(
+                "codes: unexpected Mmap after ensure_owned".into(),
+            )),
+        }
+    }
+
+    fn ensure_owned(&mut self) {
+        #[cfg(feature = "mmap")]
+        if let Self::Mmap { len, .. } = self {
+            let len = *len;
+            let view = self.view();
+            let owned: Vec<GsEncodedVector> = (0..len)
+                .map(|i| GsEncodedVector {
+                    codes: view.code(i).to_vec(),
+                })
+                .collect();
+            *self = Self::Owned(owned);
+        }
+    }
+}
+
+/// Serialize the SQ8 codec parameters and per-node codes into the `codes.bin`
+/// segment layout: magic, dims, count, gs, anisotropy_ratio, per-dimension
+/// minima, then `count * dims` code bytes in ordinal order.
+#[cfg(feature = "mmap")]
+fn encode_codes_bin(codec: &GsSq8Codec, codes: CodesView<'_>) -> Vec<u8> {
+    let dims = codec.dims();
+    let count = codes.len();
+    let mut buf = Vec::with_capacity(CODES_HEADER_LEN + dims * 4 + count * dims);
+    buf.extend_from_slice(CODES_MAGIC);
+    buf.extend_from_slice(&(dims as u64).to_le_bytes());
+    buf.extend_from_slice(&(count as u64).to_le_bytes());
+    buf.extend_from_slice(&codec.gs.to_le_bytes());
+    buf.extend_from_slice(&codec.anisotropy_ratio.to_le_bytes());
+    for m in &codec.min {
+        buf.extend_from_slice(&m.to_le_bytes());
+    }
+    for i in 0..count {
+        buf.extend_from_slice(codes.code(i));
+    }
+    buf
+}
+
+/// Parse and validate a `codes.bin` header, returning the reconstructed codec.
+/// The code bytes themselves stay in the caller's buffer/mapping at offset
+/// `CODES_HEADER_LEN + dims * 4`.
+#[cfg(feature = "mmap")]
+fn parse_codes_bin(data: &[u8], expected_dims: usize, expected_count: usize) -> Result<GsSq8Codec> {
+    if data.len() < CODES_HEADER_LEN || &data[..8] != CODES_MAGIC {
+        return Err(VamanaError::invalid_format(
+            "codes.bin missing or bad magic".into(),
+        ));
+    }
+    let dims = usize::try_from(u64::from_le_bytes(data[8..16].try_into().unwrap()))
+        .map_err(|_| VamanaError::invalid_format("codes.bin dims overflow".into()))?;
+    let count = usize::try_from(u64::from_le_bytes(data[16..24].try_into().unwrap()))
+        .map_err(|_| VamanaError::invalid_format("codes.bin count overflow".into()))?;
+    let gs = f32::from_le_bytes(data[24..28].try_into().unwrap());
+    let anisotropy_ratio = f32::from_le_bytes(data[28..32].try_into().unwrap());
+    if dims != expected_dims || count != expected_count {
+        return Err(VamanaError::invalid_format(format!(
+            "codes.bin shape {count}x{dims} != expected {expected_count}x{expected_dims}"
+        )));
+    }
+    let expected_len = CODES_HEADER_LEN + dims * 4 + count * dims;
+    if data.len() != expected_len {
+        return Err(VamanaError::invalid_format(format!(
+            "codes.bin length {} != expected {expected_len}",
+            data.len()
+        )));
+    }
+    if !gs.is_finite() || gs <= 0.0 {
+        return Err(VamanaError::invalid_format(
+            "codes.bin non-positive gs".into(),
+        ));
+    }
+    let mut min = Vec::with_capacity(dims);
+    for d in 0..dims {
+        let off = CODES_HEADER_LEN + d * 4;
+        let v = f32::from_le_bytes(data[off..off + 4].try_into().unwrap());
+        if !v.is_finite() {
+            return Err(VamanaError::invalid_format(
+                "codes.bin non-finite min".into(),
+            ));
+        }
+        min.push(v);
+    }
+    Ok(GsSq8Codec {
+        min,
+        gs,
+        gs_sq: gs * gs,
+        anisotropy_ratio,
+    })
+}
+
 /// An in-memory Vamana ANN index over pre-normalized vectors.
 #[derive(Debug)]
 pub struct VamanaIndex {
@@ -338,8 +477,13 @@ pub struct VamanaIndex {
     // ---- SQ8 acquisition tier (ADR-052 §1, Step 2) ----
     /// Global-scale SQ8 codec trained over the build corpus; used for acquisition-tier distances.
     gs_codec: GsSq8Codec,
-    /// Pre-encoded corpus vectors (one `GsEncodedVector` per node, ordinal-stable).
-    gs_codes: Vec<GsEncodedVector>,
+    /// Pre-encoded corpus vectors, ordinal-stable (owned or mmap `codes.bin`).
+    gs_codes: CodeStore,
+    /// External write-log watermark carried in the v2 commit record. `None` on
+    /// indexes built or loaded from segments that predate the field; the
+    /// storage layer that owns the log sets it before `save_atomic` and reads
+    /// it back after load to classify restart state.
+    last_applied_seq: Option<u64>,
 }
 
 struct IndexMetadata {
@@ -391,7 +535,8 @@ impl VamanaIndex {
 
         let (gs_codec, gs_codes) = train_codec_and_encode(vectors, config.dimensions);
 
-        let graph = VamanaGraph::build_sq8(vectors, &gs_codes, &gs_codec, &config)?;
+        let graph =
+            VamanaGraph::build_sq8(vectors, CodesView::Owned(&gs_codes), &gs_codec, &config)?;
         let dimensions = config.dimensions;
 
         Ok(Self {
@@ -406,7 +551,8 @@ impl VamanaIndex {
             free_slots: Vec::new(),
             consolidation_tau: DEFAULT_CONSOLIDATION_TAU,
             gs_codec,
-            gs_codes,
+            gs_codes: CodeStore::Owned(gs_codes),
+            last_applied_seq: None,
         })
     }
 
@@ -442,11 +588,11 @@ impl VamanaIndex {
             greedy_search_inner_sq8(
                 self.vectors()?,
                 self.dimensions,
-                &self.gs_codes,
+                self.gs_codes.view(),
                 &self.gs_codec,
                 self.graph.adjacency(),
                 query,
-                &query_enc,
+                &query_enc.codes,
                 self.graph.medoid(),
                 k,
                 self.config.search_list_size,
@@ -503,6 +649,8 @@ impl VamanaIndex {
             self.config.max_degree,
             self.config.search_list_size,
             self.config.alpha,
+            self.last_applied_seq,
+            None,
         );
 
         let mut segments = vec![
@@ -626,7 +774,8 @@ impl VamanaIndex {
             free_slots: parsed.free_slots,
             consolidation_tau: DEFAULT_CONSOLIDATION_TAU,
             gs_codec,
-            gs_codes,
+            gs_codes: CodeStore::Owned(gs_codes),
+            last_applied_seq: commit.last_applied_seq,
         })
     }
 
@@ -703,7 +852,8 @@ impl VamanaIndex {
             free_slots: Vec::new(),
             consolidation_tau: DEFAULT_CONSOLIDATION_TAU,
             gs_codec,
-            gs_codes,
+            gs_codes: CodeStore::Owned(gs_codes),
+            last_applied_seq: None,
         })
     }
 
@@ -722,9 +872,11 @@ impl VamanaIndex {
         let vectors_new = path.join("vectors.bin.v2new");
         let graph_new = path.join("graph.bin.v2new");
         let lifecycle_new = path.join("lifecycle.bin.v2new");
+        let codes_new = path.join("codes.bin.v2new");
         let vectors_path = path.join("vectors.bin");
         let graph_path = path.join("graph.bin");
         let lifecycle_path = path.join("lifecycle.bin");
+        let codes_path = path.join("codes.bin");
         let metadata_path = path.join("metadata.bin");
         let metadata_tmp = path.join("metadata.bin.tmp");
 
@@ -749,14 +901,27 @@ impl VamanaIndex {
             self.ops_since_consolidation,
         )?;
 
-        // 5. Compute blake3 checksums of the three staged segments.
+        // 4b. Write codes.bin.v2new (SQ8 codec + per-node codes, ADR-052
+        // acquisition tier) so the load path never retrains over the corpus.
+        {
+            let buf = encode_codes_bin(&self.gs_codec, self.gs_codes.view());
+            let file = File::create(&codes_new)?;
+            let mut w = std::io::BufWriter::new(file);
+            w.write_all(&buf)?;
+            let file = w.into_inner().map_err(|e| e.into_error())?;
+            file.sync_all()?;
+        }
+
+        // 5. Compute blake3 checksums of the four staged segments.
         let vectors_data = fs::read(&vectors_new)?;
         let graph_data = fs::read(&graph_new)?;
         let lifecycle_data = fs::read(&lifecycle_new)?;
+        let codes_data = fs::read(&codes_new)?;
 
         let vectors_hash = blake3::hash(&vectors_data);
         let graph_hash = blake3::hash(&graph_data);
         let lifecycle_hash = blake3::hash(&lifecycle_data);
+        let codes_hash = blake3::hash(&codes_data);
 
         // 6. Build the corpus fingerprint (content_hash = blake3 over raw vector bytes).
         let content_hash = *vectors_hash.as_bytes();
@@ -778,6 +943,8 @@ impl VamanaIndex {
             self.config.max_degree,
             self.config.search_list_size,
             self.config.alpha,
+            self.last_applied_seq,
+            Some(codes_hash.as_bytes()),
         )?;
         fs::rename(&metadata_tmp, &metadata_path)?;
 
@@ -795,6 +962,7 @@ impl VamanaIndex {
         fs::rename(&vectors_new, &vectors_path)?;
         fs::rename(&graph_new, &graph_path)?;
         fs::rename(&lifecycle_new, &lifecycle_path)?;
+        fs::rename(&codes_new, &codes_path)?;
 
         // 9. Sync the directory entry so all renames are durable.
         let dir_file = File::open(path)?;
@@ -917,6 +1085,26 @@ impl VamanaIndex {
                 return Ok(index);
             }
 
+            // codes.bin is checksum-gated exactly like the other segments whenever the
+            // commit record carries a codes_hash: a missing or altered codes segment
+            // must never reach load_v2_fast's mmap parse, which trusts its header.
+            if let Some(expected) = commit.codes_hash {
+                let codes_ok = fs::read(path.join("codes.bin"))
+                    .map(|d| *blake3::hash(&d).as_bytes() == expected)
+                    .unwrap_or(false);
+                if !codes_ok {
+                    let config = VamanaConfig {
+                        dimensions: commit.index_meta.dimensions,
+                        max_degree: commit.index_meta.max_degree,
+                        search_list_size: commit.index_meta.search_list_size,
+                        alpha: commit.index_meta.alpha,
+                    };
+                    let index = Self::rebuild_from_corpus(corpus_vectors, config)?;
+                    index.save_atomic(path)?;
+                    return Ok(index);
+                }
+            }
+
             // Verify corpus fingerprint: dimensions, count, and content hash.
             let dim = commit.index_meta.dimensions;
             if dim == 0 || !corpus_vectors.len().is_multiple_of(dim) {
@@ -1019,6 +1207,14 @@ impl VamanaIndex {
                 "v2 segment checksum mismatch".into(),
             ));
         }
+        if let Some(expected) = commit.codes_hash {
+            let codes_data = fs::read(path.join("codes.bin"))?;
+            if *blake3::hash(&codes_data).as_bytes() != expected {
+                return Err(VamanaError::invalid_format(
+                    "v2 codes segment checksum mismatch".into(),
+                ));
+            }
+        }
 
         Self::load_v2_fast(path, &lifecycle_data)
     }
@@ -1105,7 +1301,37 @@ impl VamanaIndex {
             )));
         }
 
-        let (gs_codec, gs_codes) = train_codec_and_encode(storage.as_slice()?, dimensions);
+        // Codes segment: mmap `codes.bin` when the commit record carries its
+        // checksum (extended format); otherwise retrain from the corpus — the
+        // compatibility path for segments written before the codes segment
+        // existed. Retraining touches every vector page; the extended format
+        // exists precisely to avoid that on the steady-state load.
+        let (gs_codec, gs_codes) = match commit.codes_hash {
+            Some(_) => {
+                let codes_path = path.join("codes.bin");
+                let file = File::open(&codes_path)?;
+                let byte_len = usize::try_from(file.metadata()?.len()).map_err(|_| {
+                    VamanaError::invalid_format("codes.bin file size exceeds usize".into())
+                })?;
+                // SAFETY: read-only mapping; callers must not mutate or
+                // truncate codes.bin while this index is alive (same contract
+                // as the vectors.bin mapping).
+                let mmap = unsafe { MmapOptions::new().len(byte_len).map(&file)? };
+                let codec = parse_codes_bin(mmap.as_ref(), dimensions, num_vectors)?;
+                (
+                    codec,
+                    CodeStore::Mmap {
+                        mmap,
+                        dims: dimensions,
+                        len: num_vectors,
+                    },
+                )
+            }
+            None => {
+                let (codec, codes) = train_codec_and_encode(storage.as_slice()?, dimensions);
+                (codec, CodeStore::Owned(codes))
+            }
+        };
 
         Ok(Self {
             vectors: storage,
@@ -1120,6 +1346,7 @@ impl VamanaIndex {
             consolidation_tau: DEFAULT_CONSOLIDATION_TAU,
             gs_codec,
             gs_codes,
+            last_applied_seq: commit.last_applied_seq,
         })
     }
 
@@ -1344,7 +1571,8 @@ impl VamanaIndex {
             free_slots: Vec::new(),
             consolidation_tau: DEFAULT_CONSOLIDATION_TAU,
             gs_codec,
-            gs_codes,
+            gs_codes: CodeStore::Owned(gs_codes),
+            last_applied_seq: None,
         })
     }
 
@@ -1371,6 +1599,19 @@ impl VamanaIndex {
     /// Return the flat row-major vector data as a slice.
     pub fn vectors(&self) -> Result<&[f32]> {
         self.vectors.as_slice()
+    }
+
+    /// Write-log watermark carried by the v2 commit record. `None` on indexes
+    /// built in-memory or loaded from segments predating the field.
+    pub fn last_applied_seq(&self) -> Option<u64> {
+        self.last_applied_seq
+    }
+
+    /// Set the write-log watermark to persist with the next [`Self::save_atomic`].
+    /// The caller owns the log and must pass the highest sequence whose write is
+    /// reflected in this index's current state.
+    pub fn set_last_applied_seq(&mut self, seq: Option<u64>) {
+        self.last_applied_seq = seq;
     }
 
     // ---- PR2: lifecycle API (ADR-052 §2) ----
@@ -1410,6 +1651,7 @@ impl VamanaIndex {
             let owned: Vec<f32> = self.vectors.as_slice()?.to_vec();
             self.vectors = VectorStorage::Owned(owned);
         }
+        self.gs_codes.ensure_owned();
         Ok(())
     }
 
@@ -1478,7 +1720,8 @@ impl VamanaIndex {
                 }
             }
             // Update SQ8 code for the recycled slot.
-            self.gs_codes[ordinal as usize] = self.gs_codec.encode(vector);
+            let code = self.gs_codec.encode(vector);
+            self.gs_codes.owned_mut()?[ordinal as usize] = code;
         } else {
             // Append path: assign next ordinal and extend storage.
             ordinal = self.num_vectors as u32;
@@ -1504,7 +1747,8 @@ impl VamanaIndex {
                 }
             }
             // Append SQ8 code for the new slot.
-            self.gs_codes.push(self.gs_codec.encode(vector));
+            let code = self.gs_codec.encode(vector);
+            self.gs_codes.owned_mut()?.push(code);
         }
 
         // Graph wiring.
@@ -1721,9 +1965,12 @@ impl VamanaIndex {
         new_graph.rebuild_reverse_adj_from_adjacency();
 
         // Compact the SQ8 code table to match the new ordinal space.
+        let codes_view = self.gs_codes.view();
         let new_gs_codes: Vec<GsEncodedVector> = new_to_old
             .iter()
-            .map(|&old| self.gs_codes[old as usize].clone())
+            .map(|&old| GsEncodedVector {
+                codes: codes_view.code(old as usize).to_vec(),
+            })
             .collect();
 
         self.graph = new_graph;
@@ -1733,7 +1980,7 @@ impl VamanaIndex {
         self.tombstone_count = 0;
         self.free_slots.clear();
         self.ops_since_consolidation = 0;
-        self.gs_codes = new_gs_codes;
+        self.gs_codes = CodeStore::Owned(new_gs_codes);
 
         Ok(new_to_old)
     }
@@ -2483,6 +2730,16 @@ struct V2Commit {
     lifecycle_hash: [u8; 32],
     fingerprint: V2CorpusFingerprint,
     index_meta: IndexMetadata,
+    /// Write-log watermark trailer. `None` when the record predates the field
+    /// (short layout) — the record length, not a sentinel value, discriminates,
+    /// so a legitimate watermark of 0 (empty log at save time) round-trips.
+    last_applied_seq: Option<u64>,
+    /// blake3 checksum of the `codes.bin` segment; `None` on pre-trailer
+    /// records and on containers that omit the codes segment. Read only by
+    /// the mmap load path; parsed unconditionally so record validation stays
+    /// identical across feature sets.
+    #[cfg_attr(not(feature = "mmap"), allow(dead_code))]
+    codes_hash: Option<[u8; 32]>,
 }
 
 /// Parsed lifecycle.bin content.
@@ -2507,6 +2764,8 @@ fn write_v2_commit_full(
     max_degree: usize,
     search_list_size: usize,
     alpha: f64,
+    last_applied_seq: Option<u64>,
+    codes_hash: Option<&[u8; 32]>,
 ) -> Result<()> {
     let buf = encode_v2_commit_full(
         vectors_hash,
@@ -2518,6 +2777,8 @@ fn write_v2_commit_full(
         max_degree,
         search_list_size,
         alpha,
+        last_applied_seq,
+        codes_hash,
     );
     let file = File::create(path)?;
     let mut w = std::io::BufWriter::new(file);
@@ -2538,8 +2799,10 @@ fn encode_v2_commit_full(
     max_degree: usize,
     search_list_size: usize,
     alpha: f64,
+    last_applied_seq: Option<u64>,
+    codes_hash: Option<&[u8; 32]>,
 ) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(200);
+    let mut buf = Vec::with_capacity(220);
     buf.extend_from_slice(V2_COMMIT_MAGIC);
     buf.extend_from_slice(vectors_hash);
     buf.extend_from_slice(graph_hash);
@@ -2552,6 +2815,20 @@ fn encode_v2_commit_full(
     buf.extend_from_slice(&(max_degree as u64).to_le_bytes());
     buf.extend_from_slice(&(search_list_size as u64).to_le_bytes());
     buf.extend_from_slice(&alpha.to_le_bytes());
+    // Fixed-size trailer: flags byte (bit0 = watermark present, bit1 =
+    // codes hash present) + watermark + codes hash. Written unconditionally so
+    // all new records share one length; the short pre-trailer layout parses as
+    // a pre-amendment record.
+    let mut flags = 0u8;
+    if last_applied_seq.is_some() {
+        flags |= 1;
+    }
+    if codes_hash.is_some() {
+        flags |= 2;
+    }
+    buf.push(flags);
+    buf.extend_from_slice(&last_applied_seq.unwrap_or(0).to_le_bytes());
+    buf.extend_from_slice(codes_hash.unwrap_or(&[0u8; 32]));
     buf
 }
 
@@ -2559,10 +2836,12 @@ fn encode_v2_commit_full(
 fn parse_v2_commit(data: &[u8]) -> Result<V2Commit> {
     // magic(8) + 3 hashes(96) + fp.vector_count(8) + fp.dimensions(8) + fp.content_hash(32)
     // + num_vectors(8) + dimensions(8) + max_degree(8) + search_list_size(8) + alpha(8)
-    let expected_len = 8 + 32 + 32 + 32 + 8 + 8 + 32 + 8 + 8 + 8 + 8 + 8;
-    if data.len() != expected_len {
+    // + optional trailer: flags(1) + last_applied_seq(8) + codes_hash(32)
+    let base_len = 8 + 32 + 32 + 32 + 8 + 8 + 32 + 8 + 8 + 8 + 8 + 8;
+    let trailer_len = base_len + 41;
+    if data.len() != base_len && data.len() != trailer_len {
         return Err(VamanaError::invalid_format(format!(
-            "v2 commit record length {} != {expected_len}",
+            "v2 commit record length {} != {base_len} or {trailer_len}",
             data.len()
         )));
     }
@@ -2616,6 +2895,22 @@ fn parse_v2_commit(data: &[u8]) -> Result<V2Commit> {
     .map_err(|_| VamanaError::invalid_format("v2 commit search_list_size overflow".into()))?;
     offset += 8;
     let alpha = f64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+    offset += 8;
+
+    let (last_applied_seq, codes_hash) = if data.len() == trailer_len {
+        let flags = data[offset];
+        offset += 1;
+        let seq = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+        offset += 8;
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&data[offset..offset + 32]);
+        (
+            (flags & 1 != 0).then_some(seq),
+            (flags & 2 != 0).then_some(hash),
+        )
+    } else {
+        (None, None)
+    };
 
     if num_vectors == 0 {
         return Err(VamanaError::invalid_format(
@@ -2658,6 +2953,8 @@ fn parse_v2_commit(data: &[u8]) -> Result<V2Commit> {
             search_list_size,
             alpha,
         },
+        last_applied_seq,
+        codes_hash,
     })
 }
 
@@ -3183,6 +3480,43 @@ fn mmap_vectors(path: &Path, expected_len_f32: usize) -> Result<VectorStorage> {
         mmap,
         len_f32: expected_len_f32,
     })
+}
+
+/// Extended commit metadata: the corpus fingerprint plus the write-log
+/// watermark trailer. `last_applied_seq` is `None` for pre-amendment (short
+/// layout) records — the ADR-079 Amendment 1 classifier treats that as Cold.
+#[cfg(feature = "mmap")]
+pub struct PersistedCommitInfo {
+    pub vector_count: u64,
+    pub dimensions: u64,
+    pub content_hash: [u8; 32],
+    pub last_applied_seq: Option<u64>,
+}
+
+/// Read the full v2 commit record from `path/metadata.bin`.
+///
+/// Same absence/corruption semantics as [`read_commit_fingerprint`]:
+/// `Ok(None)` for a missing file, v1 magic, or an unparseable record.
+#[cfg(feature = "mmap")]
+pub fn read_commit_info(path: &Path) -> Result<Option<PersistedCommitInfo>> {
+    let metadata_path = path.join("metadata.bin");
+    let bytes = match fs::read(&metadata_path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    if bytes.len() < 8 || &bytes[..8] != V2_COMMIT_MAGIC {
+        return Ok(None);
+    }
+    match parse_v2_commit(&bytes) {
+        Ok(commit) => Ok(Some(PersistedCommitInfo {
+            vector_count: commit.fingerprint.vector_count,
+            dimensions: commit.fingerprint.dimensions,
+            content_hash: commit.fingerprint.content_hash,
+            last_applied_seq: commit.last_applied_seq,
+        })),
+        Err(_) => Ok(None),
+    }
 }
 
 /// Read the v2 commit fingerprint from a persisted segment directory without
@@ -4430,11 +4764,11 @@ mod tests {
         let sq8_only = greedy_search_inner_sq8(
             vecs,
             DIM,
-            &index.gs_codes,
+            index.gs_codes.view(),
             &index.gs_codec,
             index.graph.adjacency(),
             &query,
-            &query_enc,
+            &query_enc.codes,
             index.graph.medoid(),
             1,
             index.config.search_list_size,
@@ -4519,11 +4853,11 @@ mod tests {
         let sq8_result = greedy_search_inner_sq8(
             &vectors,
             DIM,
-            &encoded,
+            CodesView::Owned(&encoded),
             &codec,
             &adjacency,
             &query,
-            &query_enc,
+            &query_enc.codes,
             0, // start at node 0
             2,
             4,
@@ -4559,7 +4893,7 @@ mod tests {
         let sq8_prune = robust_prune_inner_sq8(
             &vectors,
             DIM,
-            &encoded,
+            CodesView::Owned(&encoded),
             &codec,
             2, // node
             vec![0, 1],
@@ -4628,8 +4962,16 @@ mod tests {
         let f32_result = robust_prune_inner(&vectors, DIM, 0, vec![1, 2], 1.2, 4);
 
         // SQ8 RobustPrune — after the predicate fix, must match f32.
-        let sq8_result =
-            robust_prune_inner_sq8(&vectors, DIM, &encoded, &codec, 0, vec![1, 2], 1.2, 4);
+        let sq8_result = robust_prune_inner_sq8(
+            &vectors,
+            DIM,
+            CodesView::Owned(&encoded),
+            &codec,
+            0,
+            vec![1, 2],
+            1.2,
+            4,
+        );
 
         println!(
             "sq8_prune_predicate | f32={f32_result:?}  sq8={sq8_result:?}  \

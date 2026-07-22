@@ -193,7 +193,7 @@ fn raw_newline_immediately_after_escaped_quote_boundary() {
 fn raw_control_char_in_bareword_position_rejected() {
     // The literal-control-char exception only applies inside a
     // double-quoted string value (`parse_value` only calls
-    // `escape_literal_control_chars` when the trimmed slice starts with
+    // `normalize_quoted_string` when the trimmed slice starts with
     // `"`). A raw NUL embedded in an unquoted (bareword) numeric value must
     // still fail to parse as JSON, exactly as before this PR.
     let src = format!("gtd.assign(weight=1{}0)", '\u{0}');
@@ -221,12 +221,353 @@ fn other_raw_control_chars_in_quoted_string_still_rejected() {
 }
 
 #[test]
+fn control_char_error_teaches_escape_syntax_and_mcp_double_escape() {
+    // #491: the bare serde message ("control character ... found while
+    // parsing a string") teaches nothing. The wrapped error must name the
+    // JSON escape grammar and the MCP-transport double-escape gotcha, so a
+    // caller can actually fix the `ops` string instead of landing on the
+    // wrong "switch to JSON op form" workaround.
+    let src = format!("gtd.assign(title=\"a{}b\")", '\u{c}');
+    let err = parse_request(&src).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        matches!(err, DslError::InvalidValue { .. }),
+        "expected InvalidValue, got {err:?}"
+    );
+    assert!(
+        msg.contains(r#"\n"#) && msg.contains(r#"\t"#) && msg.contains(r#"\""#),
+        "error should name the JSON escape grammar, got: {msg}"
+    );
+    assert!(
+        msg.to_lowercase().contains("double"),
+        "error should call out the MCP double-escape requirement, got: {msg}"
+    );
+}
+
+#[test]
+fn control_char_error_reports_value_relative_byte_index() {
+    // #491: the diagnostic byte index is relative to the value, not the raw
+    // quoted span; it must not count the opening quote. A control byte that is
+    // the first byte of the value is reported as "byte 0 of the value", not
+    // "byte 1".
+    let src = format!("gtd.assign(title=\"{}b\")", '\u{c}');
+    let err = parse_request(&src).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("byte 0 of the value"),
+        "byte index must be value-relative (exclude the opening quote), got: {msg}"
+    );
+}
+
+#[test]
+fn control_char_in_object_key_rejected_with_plain_serde_message() {
+    // #491: quoted object KEYS decode through a separate, strict path from
+    // quoted values (`parse_object_arg_body` vs `parse_value`) — the
+    // value-path escape-grammar teaching diagnostic is scoped to values only
+    // (ADR-016, PR #957). A raw control byte in a key still fails to parse,
+    // but with the plain serde message rather than the value-path
+    // enrichment.
+    let src = format!("gtd.assign(properties={{\"a{}b\":\"x\"}})", '\u{c}');
+    let err = parse_request(&src).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        matches!(err, DslError::InvalidValue { .. }),
+        "expected InvalidValue, got {err:?}"
+    );
+    assert!(
+        !msg.to_lowercase().contains("double"),
+        "key-path error should not carry the value-path MCP double-escape teaching, got: {msg}"
+    );
+}
+
+#[test]
+fn raw_control_byte_in_object_key_rejected() {
+    // #491: the literal-newline/CR/tab carve-out (ADR-016, PR #957) is scoped
+    // to quoted argument VALUES only. A quoted object KEY containing one of
+    // these bytes raw must still be rejected — only the escaped form (`\n`,
+    // `\r`, `\t`) is legal inside a key.
+    for raw in ['\n', '\r', '\t'] {
+        let src = format!("gtd.assign(properties={{\"a{raw}b\":\"x\"}})");
+        let err = parse_request(&src).unwrap_err();
+        assert!(
+            matches!(err, DslError::InvalidValue { .. }),
+            "expected InvalidValue for raw control byte {:#04x} in an object key, got {err:?}",
+            raw as u32
+        );
+    }
+}
+
+#[test]
+fn bareword_value_names_the_quoting_fix() {
+    // `id=abc` is the most common invalid-value mistake: a string typed
+    // without its surrounding quotes. The message must say it is a
+    // bareword, that string values need double quotes, and — since the
+    // argument name is known here — show the exact corrected call.
+    let err = parse_request("get(id=abc)").unwrap_err();
+    assert!(matches!(err, DslError::InvalidValue { .. }));
+    let msg = err.to_string();
+    assert!(
+        msg.contains("bareword") && msg.contains("double-quoted"),
+        "must name the bareword and the quoting fix, got: {msg}"
+    );
+    assert!(
+        msg.contains(r#"id="abc""#),
+        "must show the corrected call, got: {msg}"
+    );
+}
+
+#[test]
+fn bareword_value_in_object_literal_uses_the_key_as_hint() {
+    // Same mistake, inside a JSON-object-shaped argument value: the key is
+    // known there too, so the reconstructed call still names it.
+    let err = parse_request(r#"update(patch={"name": abc})"#).unwrap_err();
+    assert!(matches!(err, DslError::InvalidValue { .. }));
+    let msg = err.to_string();
+    assert!(
+        msg.contains(r#"name="abc""#),
+        "must show the corrected key:value, got: {msg}"
+    );
+}
+
+#[test]
+fn bareword_value_in_array_element_has_no_reconstruction_to_guess() {
+    // Same mistake, as a bare array element: there is no argument name to
+    // anchor a reconstruction to, so the message must describe the fix
+    // without inventing a call it cannot verify.
+    let err = parse_request("get(id=[abc])").unwrap_err();
+    assert!(matches!(err, DslError::InvalidValue { .. }));
+    let msg = err.to_string();
+    assert!(
+        msg.contains("bareword") && msg.contains("double-quoted"),
+        "must still name the bareword mistake, got: {msg}"
+    );
+}
+
+#[test]
+fn invalid_value_position_and_message_no_longer_disagree() {
+    // Before this fix, a non-bareword invalid value (e.g. `1.2.3`) leaked
+    // serde_json's own "at line 1 column N" — always relative to that
+    // single value's isolated slice, so it disagreed with the DSL-absolute
+    // "at position N" this crate reports for the same failure. The
+    // descriptive part of the message stays; the contradicting position
+    // clause must be gone.
+    let err = parse_request("get(id=1.2.3)").unwrap_err();
+    assert!(matches!(err, DslError::InvalidValue { .. }));
+    let msg = err.to_string();
+    assert!(
+        msg.starts_with("at position 7:"),
+        "expected the DSL-absolute position, got: {msg}"
+    );
+    assert!(
+        !msg.contains("line 1 column"),
+        "must not leak serde's own, disagreeing position, got: {msg}"
+    );
+    assert!(
+        msg.contains("trailing characters"),
+        "must keep serde's descriptive text, got: {msg}"
+    );
+}
+
+#[test]
+fn json_request_form_keeps_its_own_serde_position() {
+    // The JSON request form (an object/array of objects sent as `ops`) is
+    // genuinely JSON end to end — its serde `line`/`column` IS the real
+    // location of the problem, so it must NOT be stripped the way the
+    // function-call form's per-value serde fragment is.
+    let err = parse_request(r#"{"tool": "get", "args": {"id": }}"#).unwrap_err();
+    assert!(matches!(err, DslError::InvalidJson { .. }));
+    let msg = err.to_string();
+    assert!(
+        msg.contains("line 1 column"),
+        "JSON form's own serde position is meaningful and must be kept, got: {msg}"
+    );
+}
+
+#[test]
 fn invalid_backslash_escape_in_quoted_string_rejected() {
     // A negative invalid-escape case: `\q` is not a JSON escape sequence.
     // This must fail regardless of the literal-newline carve-out.
     let src = r#"gtd.assign(title="bad \q escape")"#;
     let err = parse_request(src).unwrap_err();
     assert!(matches!(err, DslError::InvalidValue { .. }));
+}
+
+#[test]
+fn invalid_escape_with_unrelated_control_byte_not_misattributed() {
+    // #491 round-2 blocking fix 1(a): a `\q` invalid escape occurs before an
+    // unrelated form-feed later in the same span. The failure is the `\q`,
+    // not the control byte, so the control-char teaching diagnostic must NOT
+    // fire — misattributing the error to the wrong byte would send a caller
+    // chasing the wrong fix.
+    let src = format!("gtd.assign(title=\"bad \\q escape{}tail\")", '\u{c}');
+    let err = parse_request(&src).unwrap_err();
+    let msg = err.to_string();
+    assert!(matches!(err, DslError::InvalidValue { .. }));
+    assert!(
+        !msg.to_lowercase().contains("double"),
+        "an invalid \\q escape must not be enriched with the control-char diagnostic, got: {msg}"
+    );
+}
+
+#[test]
+fn malformed_unicode_escape_adjacent_to_control_byte_not_misattributed() {
+    // A malformed `\u` escape (only 3 hex digits) followed immediately by a
+    // raw control byte fails with serde's `InvalidEscape`, not a
+    // control-character error — but the failure's byte offset can coincide
+    // with the recorded control-byte hit (the 4th hex-digit slot serde reads
+    // is the control byte itself). Offset alone is not enough to gate the
+    // enrichment; the error's kind must also be checked, or this lands the
+    // control-char/double-escape guidance on an invalid-escape failure.
+    let src = format!("gtd.assign(title=\"bad \\u123{}tail\")", '\u{c}');
+    let err = parse_request(&src).unwrap_err();
+    let msg = err.to_string();
+    assert!(matches!(err, DslError::InvalidValue { .. }));
+    assert!(
+        msg.contains("invalid escape"),
+        "expected the plain serde invalid-escape message, got: {msg}"
+    );
+    assert!(
+        !msg.to_lowercase().contains("double"),
+        "a malformed \\u escape must not be enriched with the control-char diagnostic, got: {msg}"
+    );
+}
+
+#[test]
+fn short_unicode_escape_backslash_adjacent_control_byte_not_misattributed() {
+    // A `\u` escape short by exactly 2 hex digits has its 3rd slot land on a
+    // raw backslash and its 4th slot land on a raw control byte — so the
+    // control byte IS physically adjacent to a backslash, unlike the
+    // 3-hex-digit case above. That adjacency is spurious: both bytes are
+    // consumed as `\u`'s own hex-digit slots, never reinterpreted as a fresh
+    // `\<ctrl>` escape pair. The failure must stay the plain malformed
+    // unicode-escape message with no double-escape guidance.
+    let src = format!("gtd.assign(title=\"bad \\u12\\{}tail\")", '\u{c}');
+    let err = parse_request(&src).unwrap_err();
+    let msg = err.to_string();
+    assert!(matches!(err, DslError::InvalidValue { .. }));
+    assert!(
+        msg.contains("invalid escape"),
+        "expected the plain serde invalid-escape message, got: {msg}"
+    );
+    assert!(
+        !msg.to_lowercase().contains("double"),
+        "a short \\u escape landing on a backslash+control-byte pair must not be \
+         enriched with the control-char diagnostic, got: {msg}"
+    );
+
+    // A genuine broken `\<ctrl>` pair with no preceding `\u` run still gets
+    // the teaching diagnostic — the fix must not blind the guard to the
+    // legitimate case.
+    let genuine_src = format!("gtd.assign(title=\"before\\{}after\")", '\u{c}');
+    let genuine_err = parse_request(&genuine_src).unwrap_err();
+    let genuine_msg = genuine_err.to_string();
+    assert!(matches!(genuine_err, DslError::InvalidValue { .. }));
+    assert!(
+        genuine_msg.to_lowercase().contains("double"),
+        "a genuine broken \\<ctrl> pair must still get the double-escape guidance, got: {genuine_msg}"
+    );
+}
+
+#[test]
+fn leading_surrogate_escape_followed_by_control_byte_not_misattributed() {
+    // #491 round-5: a well-formed high-surrogate `\u` escape (U+D800-U+DBFF)
+    // must be followed by a `\u` low-surrogate escape. When the byte after the
+    // continuation backslash is a raw control byte instead, `serde_json` fails
+    // on the malformed surrogate continuation, not on a broken `\<ctrl>`
+    // escape. Scan's general backslash-pair walk resets after the high
+    // surrogate's 4 hex slots, so without the surrogate-continuation guard it
+    // would record that `\<ctrl>` as a genuine broken pair
+    // (`preceded_by_backslash: true`) and land the double-escape teaching on a
+    // failure it does not explain. The continuation control byte must not be
+    // recorded, so the error stays serde's own surrogate message.
+    let src = format!("gtd.assign(title=\"bad \\uD800\\{}tail\")", '\u{c}');
+    let err = parse_request(&src).unwrap_err();
+    let msg = err.to_string();
+    assert!(matches!(err, DslError::InvalidValue { .. }));
+    assert!(
+        !msg.to_lowercase().contains("double"),
+        "a control byte on a surrogate-continuation path must not be enriched \
+         with the control-char double-escape diagnostic, got: {msg}"
+    );
+
+    // A broken `\<ctrl>` pair AFTER a complete surrogate pair (high + low) is a
+    // real broken escape and still gets the teaching; the suppression is scoped
+    // to the immediate continuation, not to everything after any `\u`.
+    let after_pair = format!("gtd.assign(title=\"ok \\uD800\\uDC00\\{}tail\")", '\u{c}');
+    let after_pair_err = parse_request(&after_pair).unwrap_err();
+    let after_pair_msg = after_pair_err.to_string();
+    assert!(matches!(after_pair_err, DslError::InvalidValue { .. }));
+    assert!(
+        after_pair_msg.to_lowercase().contains("double"),
+        "a broken \\<ctrl> pair after a complete surrogate pair must still get \
+         the double-escape guidance, got: {after_pair_msg}"
+    );
+}
+
+#[test]
+fn raw_newline_immediately_after_backslash_caught_as_control_char_cause() {
+    // #491 round-2 blocking fix 1(b): a raw LF directly following a
+    // backslash is not a valid two-byte JSON escape (valid escapes are
+    // backslash + an ASCII letter, never backslash + a literal control
+    // byte). This must be caught as a control-char cause and receive the
+    // teaching diagnostic, not silently fall through to the bare serde
+    // message.
+    let src = "gtd.assign(title=\"before\\\nafter\")";
+    let err = parse_request(src).unwrap_err();
+    let msg = err.to_string();
+    assert!(matches!(err, DslError::InvalidValue { .. }));
+    assert!(
+        msg.contains(r#"\n"#) && msg.contains(r#"\t"#) && msg.contains(r#"\""#),
+        "error should name the JSON escape grammar, got: {msg}"
+    );
+    assert!(
+        msg.to_lowercase().contains("double"),
+        "error should call out the MCP double-escape requirement, got: {msg}"
+    );
+}
+
+#[test]
+fn raw_carriage_return_and_tab_after_backslash_also_caught() {
+    // Same defect as the LF case above, for CR and TAB.
+    for raw in ['\r', '\t'] {
+        let src = format!("gtd.assign(title=\"before\\{raw}after\")");
+        let err = parse_request(&src).unwrap_err();
+        assert!(
+            matches!(err, DslError::InvalidValue { .. }),
+            "expected InvalidValue for backslash + raw {:#04x}, got {err:?}",
+            raw as u32
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.to_lowercase().contains("double"),
+            "error should call out the MCP double-escape requirement for {:#04x}, got: {msg}",
+            raw as u32
+        );
+    }
+}
+
+#[test]
+fn backslash_followed_by_other_raw_control_bytes_also_caught() {
+    // #491 round-2 blocking fix 2: the post-backslash branch previously
+    // recorded a hit only for `\n`/`\r`/`\t`. A backslash followed by any
+    // OTHER raw U+0000-U+001F byte — NUL, form feed, and ESC here — is
+    // equally not a valid JSON escape and must reach the same teaching
+    // diagnostic instead of the bare serde message.
+    for raw in ['\u{0}', '\u{c}', '\u{1b}'] {
+        let src = format!("gtd.assign(title=\"before\\{raw}after\")");
+        let err = parse_request(&src).unwrap_err();
+        assert!(
+            matches!(err, DslError::InvalidValue { .. }),
+            "expected InvalidValue for backslash + raw {:#04x}, got {err:?}",
+            raw as u32
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.to_lowercase().contains("double"),
+            "error should call out the MCP double-escape requirement for {:#04x}, got: {msg}",
+            raw as u32
+        );
+    }
 }
 
 #[test]
@@ -814,6 +1155,41 @@ fn comma_only_parallel_accepted() {
     let r = parse_request("[a(), b(), c()]").unwrap();
     assert_eq!(r.mode, ExecutionMode::Parallel);
     assert_eq!(r.ops.len(), 3);
+}
+
+#[test]
+fn mixed_separator_before_any_chain_pipe_reaches_the_same_message() {
+    // `a(), b() | c()` hits the mixed-separator mistake on the very first
+    // op, before a chain `|` has ever been seen — a third code path from
+    // the other two `MixedSeparators` tests above (`[a() | b(), c()]` and
+    // `a() | b(), c()`). All three must reach the same actionable message,
+    // not fall through to a generic "expected '|' or end of input" report.
+    let err = parse_request("a(), b() | c()").unwrap_err();
+    assert!(
+        matches!(err, DslError::MixedSeparators),
+        "expected MixedSeparators, got {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("cannot mix ',' (parallel) and '|' (chain) separators"),
+        "message must name the mix mistake, got: {msg}"
+    );
+}
+
+#[test]
+fn trailing_comma_before_batch_close_bracket_named() {
+    // `[gtd.next(),]` used to fail with a confusing "invalid identifier"
+    // report pointing at the `]` — the real mistake is the trailing `,`.
+    let err = parse_request("[gtd.next(),]").unwrap_err();
+    assert!(
+        matches!(err, DslError::TrailingComma { .. }),
+        "expected TrailingComma, got {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("trailing comma"),
+        "message must name the trailing comma, got: {msg}"
+    );
 }
 
 #[test]

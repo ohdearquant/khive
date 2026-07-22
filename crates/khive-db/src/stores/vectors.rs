@@ -376,6 +376,39 @@ fn replace_vector_row_dml(
         ],
     )?;
 
+    // Delta record for the ANN restart classifier; rides the caller's
+    // savepoint/transaction so a rolled-back upsert leaves no log row.
+    conn.execute(
+        "INSERT INTO ann_write_log (namespace, embedding_model, kind, field, subject_id, op) \
+         VALUES (?1, ?2, ?3, ?4, ?5, 'upsert')",
+        rusqlite::params![
+            row.namespace,
+            row.embedding_model,
+            row.kind,
+            row.field,
+            row.subject_id.to_string()
+        ],
+    )?;
+
+    Ok(())
+}
+
+/// Log `'delete'` rows into `ann_write_log` for every vector row in `table`
+/// matching `where_clause` (a predicate over the vec0 table's own columns).
+/// Must run in the same transaction as — and before — the corresponding
+/// `DELETE`, so the logged set is exactly the deleted set.
+fn log_vector_deletes(
+    conn: &rusqlite::Connection,
+    table: &str,
+    where_clause: &str,
+    params: &[&dyn rusqlite::ToSql],
+) -> Result<(), rusqlite::Error> {
+    let sql = format!(
+        "INSERT INTO ann_write_log (namespace, embedding_model, kind, field, subject_id, op) \
+         SELECT namespace, embedding_model, kind, field, subject_id, 'delete' \
+         FROM {table} WHERE {where_clause}"
+    );
+    conn.execute(&sql, params)?;
     Ok(())
 }
 
@@ -393,6 +426,12 @@ pub fn delete_subject_from_vector_tables(
     namespace: &str,
 ) -> Result<(), rusqlite::Error> {
     for table in tables {
+        log_vector_deletes(
+            conn,
+            table,
+            "subject_id = ?1 AND namespace = ?2",
+            &[&subject_id.to_string(), &namespace],
+        )?;
         let sql = format!("DELETE FROM {table} WHERE subject_id = ?1 AND namespace = ?2");
         conn.execute(&sql, rusqlite::params![subject_id.to_string(), namespace])?;
     }
@@ -619,20 +658,44 @@ fn orphan_sweep_dml(
     // delete subject_ids returned by a capped SELECT subquery.  SQLite
     // materialises the inner SELECT before running the outer DELETE, so there
     // is no self-referential conflict.
+    // Materialize the capped victim set first: the same `LIMIT` subquery
+    // evaluated twice (once to log deletes, once to delete) has no ordering
+    // guarantee, so logging and deleting must share one explicit id list.
     let deleted: i64 = if dry_run {
         0
     } else {
-        let del_sql = format!(
-            "DELETE FROM {t} WHERE subject_id IN (\
-             SELECT subject_id FROM {t} WHERE {p} LIMIT ?4\
-             )",
+        let select_sql = format!(
+            "SELECT subject_id FROM {t} WHERE {p} LIMIT ?4",
             t = table,
             p = orphan_pred,
         );
-        conn.execute(
-            &del_sql,
-            rusqlite::params![ns_json, kind_json, allow_json, max_delete],
-        )? as i64
+        let mut stmt = conn.prepare(&select_sql)?;
+        let victim_ids: Vec<String> = stmt
+            .query_map(
+                rusqlite::params![ns_json, kind_json, allow_json, max_delete],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<Result<_, _>>()?;
+        drop(stmt);
+
+        let mut total: i64 = 0;
+        for chunk in victim_ids.chunks(400) {
+            let placeholders: String = (1..=chunk.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let in_clause = format!("subject_id IN ({placeholders})");
+            let params: Vec<&dyn rusqlite::ToSql> =
+                chunk.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+            log_vector_deletes(conn, table, &in_clause, &params)?;
+            let del_sql = format!("DELETE FROM {t} WHERE {in_clause}", t = table);
+            let mut del_stmt = conn.prepare(&del_sql)?;
+            for (i, id_str) in chunk.iter().enumerate() {
+                del_stmt.raw_bind_parameter(i + 1, id_str.as_str())?;
+            }
+            total += del_stmt.raw_execute()? as i64;
+        }
+        total
     };
 
     Ok(OrphanSweepResult {
@@ -716,14 +779,17 @@ impl VectorStore for SqliteVecStore {
         // `conn.unchecked_transaction()`; the DELETE+INSERT body is the same
         // shared helper the WriterTask/batch paths use (#546), so this path
         // now also exercises the post-delete failpoint in tests.
+        let origin = self.pool.origin();
         self.with_writer("vec_insert", move |conn| {
             // ADR-091 Plank 0: register the span before opening the transaction so
             // the handle (declared first) drops AFTER `tx` (declared second) —
             // locals drop in reverse declaration order, so `tx`'s own Drop (which
             // rolls back if uncommitted) runs while the registry entry is still
             // present.
-            let _tx_handle =
-                khive_storage::tx_registry::register(Some("vec_insert_tx".to_string()));
+            let _tx_handle = khive_storage::tx_registry::register_scoped(
+                Some("vec_insert_tx".to_string()),
+                origin,
+            );
             let tx = conn.unchecked_transaction()?;
 
             replace_vector_row_dml(
@@ -787,10 +853,13 @@ impl VectorStore for SqliteVecStore {
 
         // Flag-off (default) path: byte-for-byte unchanged from pre-ADR-067
         // behavior — the closure owns its own BEGIN IMMEDIATE/COMMIT.
+        let origin = self.pool.origin();
         self.with_writer("vec_insert_batch", move |conn| {
             conn.execute_batch("BEGIN IMMEDIATE")?;
-            let _tx_handle =
-                khive_storage::tx_registry::register(Some("vector_insert_batch".to_string()));
+            let _tx_handle = khive_storage::tx_registry::register_scoped(
+                Some("vector_insert_batch".to_string()),
+                origin,
+            );
 
             let summary = batch_insert_vectors_dml(
                 conn,
@@ -879,11 +948,14 @@ impl VectorStore for SqliteVecStore {
         // Flag-off (default) path: the closure owns its own transaction via
         // `conn.unchecked_transaction()`; the DELETE+INSERT body is the same
         // shared helper the WriterTask/batch paths use (#546).
+        let origin = self.pool.origin();
         self.with_writer("vec_update", move |conn| {
             // ADR-091 Plank 0: registered before the transaction is opened — see
             // the matching note in `insert()` above for the drop-order rationale.
-            let _tx_handle =
-                khive_storage::tx_registry::register(Some("vec_update_tx".to_string()));
+            let _tx_handle = khive_storage::tx_registry::register_scoped(
+                Some("vec_update_tx".to_string()),
+                origin,
+            );
             let tx = conn.unchecked_transaction()?;
 
             replace_vector_row_dml(
@@ -908,11 +980,33 @@ impl VectorStore for SqliteVecStore {
 
     async fn delete(&self, subject_id: Uuid) -> Result<bool, StorageError> {
         let statement = delete_vector_statement(&self.table_name, subject_id, &self.namespace);
+        let table = self.table_name.clone();
+        let namespace = self.namespace.clone();
 
         self.with_writer("vec_delete", move |conn| {
-            let mut stmt = conn.prepare(&statement.sql)?;
-            bind_params(&mut stmt, &statement.params)?;
-            Ok(stmt.raw_execute()? > 0)
+            conn.execute_batch("SAVEPOINT vec_delete_log")?;
+            let result = (|| {
+                log_vector_deletes(
+                    conn,
+                    &table,
+                    "subject_id = ?1 AND namespace = ?2",
+                    &[&subject_id.to_string(), &namespace],
+                )?;
+                let mut stmt = conn.prepare(&statement.sql)?;
+                bind_params(&mut stmt, &statement.params)?;
+                Ok(stmt.raw_execute()? > 0)
+            })();
+            match result {
+                Ok(v) => {
+                    conn.execute_batch("RELEASE SAVEPOINT vec_delete_log")?;
+                    Ok(v)
+                }
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK TO SAVEPOINT vec_delete_log");
+                    let _ = conn.execute_batch("RELEASE SAVEPOINT vec_delete_log");
+                    Err(e)
+                }
+            }
         })
         .await
     }
@@ -1097,15 +1191,37 @@ impl VectorStore for SqliteVecStore {
                 .collect::<Vec<_>>()
                 .join(", ");
             let sql = format!("DELETE FROM {table} WHERE subject_id IN ({placeholders})");
+            let in_clause = format!("subject_id IN ({placeholders})");
             let chunk_owned = chunk.to_vec();
             let table_cl = table.clone();
+            let table_sp = table.clone();
             let deleted = self
                 .with_writer("vec_delete_subjects", move |conn| {
-                    let mut stmt = conn.prepare(&sql)?;
-                    for (i, id_str) in chunk_owned.iter().enumerate() {
-                        stmt.raw_bind_parameter(i + 1, id_str.as_str())?;
+                    conn.execute_batch("SAVEPOINT vec_delete_subjects_log")?;
+                    let result = (|| {
+                        let params: Vec<&dyn rusqlite::ToSql> = chunk_owned
+                            .iter()
+                            .map(|s| s as &dyn rusqlite::ToSql)
+                            .collect();
+                        log_vector_deletes(conn, &table_sp, &in_clause, &params)?;
+                        let mut stmt = conn.prepare(&sql)?;
+                        for (i, id_str) in chunk_owned.iter().enumerate() {
+                            stmt.raw_bind_parameter(i + 1, id_str.as_str())?;
+                        }
+                        stmt.raw_execute().map(|n| n as u64)
+                    })();
+                    match result {
+                        Ok(n) => {
+                            conn.execute_batch("RELEASE SAVEPOINT vec_delete_subjects_log")?;
+                            Ok(n)
+                        }
+                        Err(e) => {
+                            let _ =
+                                conn.execute_batch("ROLLBACK TO SAVEPOINT vec_delete_subjects_log");
+                            let _ = conn.execute_batch("RELEASE SAVEPOINT vec_delete_subjects_log");
+                            Err(e)
+                        }
                     }
-                    stmt.raw_execute().map(|n| n as u64)
                 })
                 .await
                 .map_err(|e| {
@@ -1232,6 +1348,7 @@ impl VectorStore for SqliteVecStore {
         // Flag-off (default) path: byte-for-byte unchanged from pre-ADR-067
         // behavior — the closure owns its own transaction via
         // `Transaction::new_unchecked`.
+        let origin = self.pool.origin();
         self.with_writer_unmanaged("orphan_sweep", move |conn| {
             // `Transaction::new_unchecked` issues `BEGIN IMMEDIATE` and RAII-manages
             // rollback via its Drop impl: it checks `conn.is_autocommit()` and issues
@@ -1249,8 +1366,10 @@ impl VectorStore for SqliteVecStore {
             // ADR-091 Plank 0: registered before the transaction is opened — see the
             // matching note in `insert()` for the drop-order rationale (the handle,
             // declared first, drops after `tx`'s own Drop/rollback runs).
-            let _tx_handle =
-                khive_storage::tx_registry::register(Some("vec_orphan_sweep".to_string()));
+            let _tx_handle = khive_storage::tx_registry::register_scoped(
+                Some("vec_orphan_sweep".to_string()),
+                origin,
+            );
             let tx = rusqlite::Transaction::new_unchecked(
                 conn,
                 rusqlite::TransactionBehavior::Immediate,
@@ -1432,6 +1551,10 @@ mod batch_exists_tests {
             model_key, dims
         );
         writer.conn().execute_batch(&ddl).expect("create vec table");
+        writer
+            .conn()
+            .execute_batch(crate::migrations::ANN_WRITE_LOG_DDL)
+            .expect("create ann_write_log");
     }
 
     /// Valid (underscored) model key: batch_exists returns the exact set of IDs
@@ -1848,6 +1971,10 @@ mod atomic_replace_tests {
             model_key, dims
         );
         writer.conn().execute_batch(&ddl).expect("create vec table");
+        writer
+            .conn()
+            .execute_batch(crate::migrations::ANN_WRITE_LOG_DDL)
+            .expect("create ann_write_log");
     }
 
     /// insert_batch: a record with wrong dimensions fails its INSERT but must not
@@ -2629,11 +2756,12 @@ mod orphan_sweep_tests {
              embedding float[{}] distance_metric=cosine)",
             model_key, dims
         );
-        pool.try_writer()
-            .expect("writer")
+        let writer = pool.try_writer().expect("writer");
+        writer.conn().execute_batch(&ddl).expect("create vec table");
+        writer
             .conn()
-            .execute_batch(&ddl)
-            .expect("create vec table");
+            .execute_batch(crate::migrations::ANN_WRITE_LOG_DDL)
+            .expect("create ann_write_log");
     }
 
     fn make_store(
@@ -3234,11 +3362,12 @@ mod write_queue_tests {
              embedding float[{}] distance_metric=cosine)",
             model_key, dims
         );
-        pool.writer()
-            .expect("writer")
+        let writer = pool.writer().expect("writer");
+        writer.conn().execute_batch(&ddl).expect("create vec table");
+        writer
             .conn()
-            .execute_batch(&ddl)
-            .expect("create vec table");
+            .execute_batch(crate::migrations::ANN_WRITE_LOG_DDL)
+            .expect("create ann_write_log");
     }
 
     /// Constructed via a `PoolConfig` literal (`write_queue_enabled: true`),

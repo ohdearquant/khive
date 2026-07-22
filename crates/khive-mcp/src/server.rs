@@ -210,6 +210,12 @@ pub struct KhiveMcpServer {
     /// Pool arc for the WAL checkpoint background task. `None` for in-memory
     /// or registry-only servers that have no persistent database.
     pool: Option<Arc<ConnectionPool>>,
+    /// File-backed backend pools beyond `pool` (ADR-091 Amendment 3
+    /// fan-out): every additional backend a multi-backend boot wired, so the
+    /// session sweep and the daemon's checkpoint ownership can cover them
+    /// too. Always empty for a single-backend server — `pool` alone is that
+    /// server's one backend.
+    secondary_pools: Vec<Arc<ConnectionPool>>,
     /// Server-level default output format (ADR-078). Resolved from TOML →
     /// `KHIVE_OUTPUT_FORMAT` → builtin `json`. Per-request `format` fields
     /// override this at dispatch time.
@@ -380,6 +386,7 @@ impl KhiveMcpServer {
             config_id,
             coordinator: None,
             pool,
+            secondary_pools: Vec::new(),
             default_output_format: OutputFormat::Json,
         })
     }
@@ -400,6 +407,7 @@ impl KhiveMcpServer {
             config_id: "registry-only".to_string(),
             coordinator: None,
             pool: None,
+            secondary_pools: Vec::new(),
             default_output_format: OutputFormat::Json,
         }
     }
@@ -419,6 +427,7 @@ impl KhiveMcpServer {
             config_id: config_id.to_string(),
             coordinator: None,
             pool: None,
+            secondary_pools: Vec::new(),
             default_output_format: OutputFormat::Json,
         }
     }
@@ -453,13 +462,13 @@ impl KhiveMcpServer {
         self
     }
 
-    /// Clone the verb registry for use by background tasks (e.g. channel polling loops).
-    ///
-    /// `VerbRegistry` is internally `Arc`-wrapped so this clone is cheap. The returned
-    /// registry shares the same packs and dispatch state as the server.
-    #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
-    pub(crate) fn verb_registry_clone(&self) -> VerbRegistry {
-        self.registry.clone()
+    /// Attach every file-backed backend pool beyond the main one (ADR-091
+    /// Amendment 3 fan-out), so the session sweep and the daemon's
+    /// checkpoint task can cover the full multi-backend deployment instead
+    /// of only `pool`.
+    pub fn with_secondary_pools(mut self, pools: Vec<Arc<ConnectionPool>>) -> Self {
+        self.secondary_pools = pools;
+        self
     }
 
     /// Route a `link` or `search` verb through the coordinator when in multi-backend mode.
@@ -530,12 +539,18 @@ impl KhiveMcpServer {
         self.pool.clone()
     }
 
+    /// File-backed backend pools beyond [`Self::pool`] (ADR-091 Amendment 3
+    /// fan-out). Empty for a single-backend server.
+    pub fn secondary_pools(&self) -> Vec<Arc<ConnectionPool>> {
+        self.secondary_pools.clone()
+    }
+
     /// This server's configured audit `EventStore`, if any (ADR-094).
     ///
-    /// Exposed so the `DaemonDispatch::event_store_for_checkpoint` impl and
-    /// the email channel poll loop can append best-effort lifecycle events
-    /// to the same sink gate-check audit rows already use, without a second
-    /// constructor argument threaded everywhere a registry is built.
+    /// Exposed so the `DaemonDispatch::event_store_for_checkpoint` impl can
+    /// append best-effort lifecycle events to the same sink gate-check audit
+    /// rows already use, without a second constructor argument threaded
+    /// everywhere a registry is built.
     pub fn event_store(&self) -> Option<Arc<dyn khive_storage::EventStore>> {
         self.registry.event_store()
     }
@@ -783,9 +798,17 @@ impl KhiveMcpServer {
     /// ```json
     /// {
     ///   "results": [...],
-    ///   "summary": { "total": N, "succeeded": K, "failed": M, "aborted": A }
+    ///   "summary": { "total": N, "succeeded": K, "failed": M, "aborted": A },
+    ///   "status": "success" | "partial"
     /// }
     /// ```
+    ///
+    /// `status` is a structural signal for a partially-failed batch (#1220):
+    /// per-op `results` entries and `summary.failed`/`summary.aborted` counts
+    /// already carry this information, but a caller that checks only for the
+    /// absence of a top-level RPC error has nothing to branch on. `"partial"`
+    /// means at least one op in this response failed or was aborted;
+    /// `"success"` means every op in `results` reports `ok: true`.
     async fn run_parsed(
         &self,
         ops: Vec<ParsedOp>,
@@ -863,6 +886,11 @@ impl KhiveMcpServer {
                     let op_identity = identity_owned.clone();
                     let op_mode = mode_for_op(i);
                     async move {
+                        // ADR-103 Amendment 2: one dispatch-accounting context
+                        // per op; the entry is stamped with the frozen usage
+                        // snapshot after dispatch resolves.
+                        let usage_ctx = khive_runtime::usage::UsageContext::new();
+                        let mut entry = khive_runtime::usage::scope(usage_ctx.clone(), async {
                         let tool = op.tool.clone();
                         // Conflicting ops get a per-op error; skip dispatch.
                         if let Some(msg) = conflict_with {
@@ -970,6 +998,10 @@ impl KhiveMcpServer {
                             }
                             Err(e) => json!({ "ok": false, "tool": tool, "error": e.to_string() }),
                         }
+                        })
+                        .await;
+                        stamp_usage(&mut entry, &usage_ctx);
+                        entry
                     }
                 });
                 let results: Vec<Value> = futures::future::join_all(futures).await;
@@ -982,6 +1014,7 @@ impl KhiveMcpServer {
                 json!({
                     "results": results,
                     "summary": { "total": total, "succeeded": succeeded, "failed": failed, "aborted": 0 },
+                    "status": batch_status(failed, 0),
                 })
             }
             ExecutionMode::Chain => {
@@ -1009,11 +1042,15 @@ impl KhiveMcpServer {
                     } else {
                         op_mode
                     };
-                    match self
-                        .dispatch_op(op, prev_result.as_ref(), from_wire, identity)
-                        .await
+                    let usage_ctx = khive_runtime::usage::UsageContext::new();
+                    match khive_runtime::usage::scope(
+                        usage_ctx.clone(),
+                        self.dispatch_op(op, prev_result.as_ref(), from_wire, identity),
+                    )
+                    .await
                     {
-                        Ok(result_obj) => {
+                        Ok(mut result_obj) => {
+                            stamp_usage(&mut result_obj, &usage_ctx);
                             // Guard against a pathologically deep handler result
                             // (e.g. `traverse`/`context`) before it is ever cloned
                             // into `$prev` context or handed to presentation/
@@ -1043,8 +1080,10 @@ impl KhiveMcpServer {
                             }
                         }
                         Err((tool, error_payload)) => {
-                            results
-                                .push(json!({ "ok": false, "tool": tool, "error": error_payload }));
+                            let mut entry =
+                                json!({ "ok": false, "tool": tool, "error": error_payload });
+                            stamp_usage(&mut entry, &usage_ctx);
+                            results.push(entry);
                             aborted_from = Some(i + 1);
                         }
                     }
@@ -1062,6 +1101,7 @@ impl KhiveMcpServer {
                 json!({
                     "results": results,
                     "summary": { "total": total, "succeeded": succeeded, "failed": failed, "aborted": aborted },
+                    "status": batch_status(failed, aborted),
                 })
             }
         }
@@ -1263,6 +1303,7 @@ async fn dispatch_via_coordinator_inner(
                             "id": h.note_id.to_string(),
                             "note_kind": note_kind,
                             "score": h.score.to_f64(),
+                            "source": h.source.as_str(),
                             "title": h.title,
                             "snippet": h.snippet,
                         })
@@ -1281,6 +1322,7 @@ async fn dispatch_via_coordinator_inner(
                             "id": h.entity_id.to_string(),
                             "entity_kind": entity_kind,
                             "score": h.score.to_f64(),
+                            "source": h.source.as_str(),
                             "title": h.title,
                             "snippet": h.snippet,
                         })
@@ -1345,6 +1387,16 @@ fn drop_value_iteratively(value: Value) {
             Value::Object(map) => stack.extend(map.into_values()),
             _ => {}
         }
+    }
+}
+
+/// ADR-103 Amendment 2: stamp the per-op envelope entry with the dispatch's
+/// frozen usage snapshot. All-or-nothing: an empty snapshot (nothing measured
+/// counted, but the context WAS armed) still stamps `{}`; the key is absent
+/// only when no context existed. Best-effort — never alters ok/error status.
+fn stamp_usage(entry: &mut Value, ctx: &khive_runtime::usage::UsageContext) {
+    if let Value::Object(map) = entry {
+        map.insert("usage".to_string(), ctx.frozen_or_snapshot());
     }
 }
 
@@ -1480,11 +1532,14 @@ Response shape:
 
   {
     "results": [ {"ok": true, "tool": "verb", "result": {...}}, ... ],
-    "summary": { "total": N, "succeeded": N, "failed": N, "aborted": N }
+    "summary": { "total": N, "succeeded": N, "failed": N, "aborted": N },
+    "status": "success" | "partial"
   }
 
 Parallel: a failed op does NOT abort siblings. Chain: failure aborts remaining
 ops (reported as {"ok": false, "aborted": true}). Committed ops are not rolled back.
+`status` is "partial" whenever summary.failed or summary.aborted is non-zero — check
+it (or summary) rather than relying on the absence of a top-level error.
 
 Verb discovery: install the `kg` / `gtd` plugins for usage skills. The verbs
 currently registered on this server (pack-derived) are listed below. Argument
@@ -1529,6 +1584,19 @@ result (e.g. create then link with the new entity's id)."#)]
             }
         }
         self.dispatch_request_wire(p).await
+    }
+}
+
+/// Response-envelope `status` for a batch of `failed`/`aborted` counts
+/// (#1220): `"partial"` when either is non-zero, `"success"` otherwise. A
+/// caller that only checks for the absence of a top-level RPC error has
+/// nothing else to branch on for a batch where some ops failed or were
+/// skipped after a chain abort.
+fn batch_status(failed: usize, aborted: usize) -> &'static str {
+    if failed == 0 && aborted == 0 {
+        "success"
+    } else {
+        "partial"
     }
 }
 
@@ -1598,6 +1666,7 @@ fn strict_fallback_envelope_response(
     Ok(serde_json::to_string(&json!({
         "results": results,
         "summary": { "total": total, "succeeded": 0, "failed": failed, "aborted": aborted },
+        "status": batch_status(failed, aborted),
     }))
     .expect("envelope of string/bool JSON values always serializes"))
 }
@@ -1831,7 +1900,7 @@ fn parse_output_format(s: Option<&str>) -> Result<Option<OutputFormat>, String> 
 ///   verb's AlwaysVerbose policy forces Verbose), apply `render_format` to the
 ///   `result` payload with the effective presentation so that both
 ///   `presentation_per_op=["verbose"]` and AlwaysVerbose verbs (get/link/query/
-///   traverse/neighbors/brain.feedback) correctly skip the redundancy-drop
+///   traverse/neighbors) correctly skip the redundancy-drop
 ///   pre-pass (ADR-078 §7 + §8.4; mirrors `run_parsed`).
 ///
 /// The outer envelope (`{results:[...], summary:{...}}`) is always compact JSON (§8.4).
@@ -1864,8 +1933,8 @@ fn render_result(
                 // Resolve per-op presentation: per-op entry overrides batch default,
                 // then the AlwaysVerbose verb policy forces Verbose — mirroring the
                 // resolution `run_parsed` applies before presentation. Without this,
-                // a policy-verbose verb (get/link/query/traverse/neighbors/
-                // brain.feedback) dispatched under format=auto/table with the default
+                // a policy-verbose verb (get/link/query/traverse/neighbors)
+                // dispatched under format=auto/table with the default
                 // Agent presentation would be redundancy-dropped at the format seam,
                 // stripping the namespace/properties it is declared AlwaysVerbose
                 // precisely to preserve.
@@ -2055,63 +2124,6 @@ mod tests {
             .map(|l| l.trim_start().split(' ').next().unwrap())
             .collect();
         assert_eq!(names, vec!["assign", "list", "search"]);
-    }
-
-    // ── #658 regression: brain dispatch hook wired into production builder ──
-
-    /// The hook (registered via `PackInstall::dispatch_hook`) and the pack
-    /// runtime the registry dispatches `brain.*` verbs to must be the same
-    /// `BrainPack` instance — otherwise the hook's posterior updates would be
-    /// invisible to `brain.state` reads. `brain.state` loads the default
-    /// namespace into the shared active slot as a side effect, so a
-    /// subsequent non-brain dispatch in the same namespace lands on
-    /// `ApplyTarget::ActiveSlot` and is immediately observable.
-    ///
-    /// Uses the `local` namespace (rather than an arbitrary one) because
-    /// ADR-007 Rule 3b always pins the implicit write token to `local`
-    /// regardless of the registry's configured default namespace; using
-    /// `local` for both keeps the dispatched event's namespace and the
-    /// token's namespace identical, so the signal lands on the active slot
-    /// instead of the cold-namespace queue.
-    #[tokio::test]
-    async fn brain_dispatch_hook_updates_state_visible_through_same_instance() {
-        let config = RuntimeConfig {
-            db_path: None,
-            default_namespace: Namespace::local(),
-            embedding_model: None,
-            additional_embedding_models: vec![],
-            packs: vec!["kg".to_string(), "brain".to_string()],
-            ..RuntimeConfig::default()
-        };
-        let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
-        let server = KhiveMcpServer::with_packs(runtime, &["kg".to_string(), "brain".to_string()])
-            .expect("server builds with kg + brain");
-
-        server
-            .registry
-            .dispatch("brain.state", serde_json::Value::Null)
-            .await
-            .expect("brain.state loads the default namespace into the active slot");
-
-        server
-            .registry
-            .dispatch("stats", serde_json::json!({}))
-            .await
-            .expect("kg.stats dispatch succeeds");
-
-        let state = server
-            .registry
-            .dispatch("brain.state", serde_json::Value::Null)
-            .await
-            .expect("brain.state dispatch");
-        let total_events = state["balanced_recall"]["total_events"]
-            .as_u64()
-            .unwrap_or(0);
-        assert!(
-            total_events > 0,
-            "dispatch hook must update the same BrainPack instance the registry \
-             dispatches brain.* verbs to; got snapshot {state:?}"
-        );
     }
 
     // ── #823: runtime `$prev` result depth guard ────────────────────────────
@@ -2363,7 +2375,7 @@ mod tests {
         // `ops` argument as a JSON string using the standard JSON `\n`
         // escape. Deserializing `RequestParams` decodes that escape into an
         // actual raw LF byte inside the DSL source — the exact shape
-        // `escape_literal_control_chars` (crates/khive-request/src/parser/scan.rs)
+        // `normalize_quoted_string` (crates/khive-request/src/parser/scan.rs)
         // exists to accept. This confirms the decoded raw newline survives
         // parsing and dispatch all the way to the pack handler's result.
         let wire = "{\"ops\":\"create(kind=\\\"entity\\\", entity_kind=\\\"concept\\\", name=\\\"line1\\nline2\\\")\"}";
@@ -2663,11 +2675,11 @@ mod tests {
             default_namespace: Namespace::parse("test").unwrap(),
             embedding_model: None,
             additional_embedding_models: vec![],
-            packs: vec!["kg".to_string(), "comm".to_string()],
+            packs: vec!["kg".to_string()],
             ..RuntimeConfig::default()
         };
         let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
-        let server = KhiveMcpServer::new(runtime).expect("server builds with kg + comm");
+        let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
 
         // Fake "crashed daemon": accept exactly one connection, read the
         // request frame (the real write #644 cares about), then drop the
@@ -2695,7 +2707,7 @@ mod tests {
 
         let resp = server
             .request(Parameters(RequestParams {
-                ops: "comm.send(to=\"bob\", content=\"double-forward-probe\")".to_string(),
+                ops: "create(kind=\"entity\", entity_kind=\"concept\", name=\"double-forward-probe\")".to_string(),
                 presentation: None,
                 presentation_per_op: None,
                 save_to: None,
@@ -2778,11 +2790,11 @@ mod tests {
             default_namespace: Namespace::parse("test").unwrap(),
             embedding_model: None,
             additional_embedding_models: vec![],
-            packs: vec!["kg".to_string(), "comm".to_string()],
+            packs: vec!["kg".to_string()],
             ..RuntimeConfig::default()
         };
         let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
-        let server = KhiveMcpServer::new(runtime).expect("server builds with kg + comm");
+        let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
 
         let baseline = server
             .dispatch_request_local(RequestParams {
@@ -2818,7 +2830,9 @@ mod tests {
         // ── single op ──────────────────────────────────────────────────────
         let single_resp = server
             .request(Parameters(RequestParams {
-                ops: "comm.send(to=\"bob\", content=\"strict-single-probe\")".to_string(),
+                ops:
+                    "create(kind=\"entity\", entity_kind=\"concept\", name=\"strict-single-probe\")"
+                        .to_string(),
                 presentation: None,
                 presentation_per_op: None,
                 save_to: None,
@@ -2834,7 +2848,7 @@ mod tests {
             single["results"].as_array().expect("results array").len(),
             1
         );
-        assert_fallback_error(&single["results"][0], "comm.send");
+        assert_fallback_error(&single["results"][0], "create");
         assert_eq!(
             single["summary"],
             json!({ "total": 1, "succeeded": 0, "failed": 1, "aborted": 0 })
@@ -2843,8 +2857,8 @@ mod tests {
         // ── parallel batch ─────────────────────────────────────────────────
         let batch_resp = server
             .request(Parameters(RequestParams {
-                ops: "[comm.send(to=\"bob\", content=\"strict-batch-1\"), \
-                       comm.send(to=\"bob\", content=\"strict-batch-2\")]"
+                ops: "[create(kind=\"entity\", entity_kind=\"concept\", name=\"strict-batch-1\"), \
+                       create(kind=\"entity\", entity_kind=\"concept\", name=\"strict-batch-2\")]"
                     .to_string(),
                 presentation: None,
                 presentation_per_op: None,
@@ -2860,7 +2874,7 @@ mod tests {
         let batch_results = batch["results"].as_array().expect("results array");
         assert_eq!(batch_results.len(), 2);
         for entry in batch_results {
-            assert_fallback_error(entry, "comm.send");
+            assert_fallback_error(entry, "create");
         }
         assert_eq!(
             batch["summary"],
@@ -2870,8 +2884,8 @@ mod tests {
         // ── chain (must abort remaining ops per the wire contract) ─────────
         let chain_resp = server
             .request(Parameters(RequestParams {
-                ops: "comm.send(to=\"bob\", content=\"strict-chain-1\") | \
-                      comm.send(to=\"bob\", content=\"strict-chain-2\")"
+                ops: "create(kind=\"entity\", entity_kind=\"concept\", name=\"strict-chain-1\") | \
+                      create(kind=\"entity\", entity_kind=\"concept\", name=\"strict-chain-2\")"
                     .to_string(),
                 presentation: None,
                 presentation_per_op: None,
@@ -2886,10 +2900,10 @@ mod tests {
             serde_json::from_str(&chain_resp).expect("response must be the request envelope");
         let chain_results = chain["results"].as_array().expect("results array");
         assert_eq!(chain_results.len(), 2);
-        assert_fallback_error(&chain_results[0], "comm.send");
+        assert_fallback_error(&chain_results[0], "create");
         assert_eq!(
             chain_results[1],
-            json!({ "ok": false, "tool": "comm.send", "aborted": true })
+            json!({ "ok": false, "tool": "create", "aborted": true })
         );
         assert_eq!(
             chain["summary"],
@@ -2911,11 +2925,109 @@ mod tests {
             .expect("post-request stats() must succeed");
         assert_eq!(
             after, baseline,
-            "no comm.send op must ever have run locally under strict-mode fallback \
+            "no create op must ever have run locally under strict-mode fallback \
              rejection — a local dispatch would mutate local state here"
         );
 
         crate::daemon::reset_fallback_counters();
         clear_daemon_env();
+    }
+
+    // ── #1220: top-level `status` distinguishes a partially-failed batch ──────
+
+    fn in_memory_kg_server() -> KhiveMcpServer {
+        let config = RuntimeConfig {
+            db_path: None,
+            default_namespace: Namespace::local(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        };
+        let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
+        KhiveMcpServer::new(runtime).expect("server builds with kg")
+    }
+
+    #[tokio::test]
+    async fn request_status_is_success_when_every_op_in_batch_succeeds() {
+        let server = in_memory_kg_server();
+        let resp = server
+            .dispatch_request_local(RequestParams {
+                ops: "[create(kind=\"entity\", entity_kind=\"concept\", name=\"status-ok-1\"), \
+                       create(kind=\"entity\", entity_kind=\"concept\", name=\"status-ok-2\")]"
+                    .to_string(),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .expect("batch dispatch must succeed");
+        let parsed: Value = serde_json::from_str(&resp).expect("envelope must be JSON");
+        assert_eq!(parsed["summary"]["failed"], 0);
+        assert_eq!(
+            parsed["status"], "success",
+            "an all-succeeding batch must report status=success; got {parsed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_status_is_partial_when_a_batch_op_fails() {
+        let server = in_memory_kg_server();
+        // The second op targets an unknown kind and fails; the first succeeds.
+        let resp = server
+            .dispatch_request_local(RequestParams {
+                ops:
+                    "[create(kind=\"entity\", entity_kind=\"concept\", name=\"status-partial-1\"), \
+                       search(kind=\"not_a_real_kind\", query=\"x\")]"
+                        .to_string(),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .expect("batch dispatch must succeed at the RPC level even with a failed op");
+        let parsed: Value = serde_json::from_str(&resp).expect("envelope must be JSON");
+        assert!(
+            parsed["summary"]["failed"].as_u64().unwrap_or(0) > 0,
+            "expected at least one failed op; got {parsed}"
+        );
+        assert_eq!(
+            parsed["status"], "partial",
+            "a batch with a failed op must report status=partial; got {parsed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_status_is_partial_when_a_chain_op_is_aborted() {
+        let server = in_memory_kg_server();
+        let resp = server
+            .dispatch_request_local(RequestParams {
+                ops: "search(kind=\"not_a_real_kind\", query=\"x\") | \
+                      create(kind=\"entity\", entity_kind=\"concept\", name=\"status-chain-aborted\")"
+                    .to_string(),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .expect("chain dispatch must succeed at the RPC level even with an aborted op");
+        let parsed: Value = serde_json::from_str(&resp).expect("envelope must be JSON");
+        assert!(
+            parsed["summary"]["aborted"].as_u64().unwrap_or(0) > 0,
+            "expected the second chain op to be aborted; got {parsed}"
+        );
+        assert_eq!(
+            parsed["status"], "partial",
+            "a chain with an aborted op must report status=partial; got {parsed}"
+        );
     }
 }

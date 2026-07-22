@@ -465,8 +465,8 @@ class CalibrateNoGateTests(unittest.TestCase):
     """collect_calibrate_metrics must record metrics from a run whose
     internal threshold FAILED (nonzero child exit) - it is a tracker, not a
     gate. Registers a synthetic bench_calibrate suite whose child process
-    always exits 1 (simulating a suite's own "Gate: FAIL" -> exit 1, e.g.
-    bench_pipeline_daemon.py) and asserts the metric still gets extracted
+    always exits 1 (simulating a suite's own "Gate: FAIL" -> exit 1) and
+    asserts the metric still gets extracted
     instead of an exception propagating.
     """
 

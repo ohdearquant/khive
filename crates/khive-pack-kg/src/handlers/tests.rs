@@ -173,16 +173,16 @@ fn propose_params_no_actor_field() {
     assert_eq!(p.title, "Fix RoPE");
 }
 
-// KG pack must expose exactly 18 handlers including propose/review/withdraw/verbs/stats/context/resolve
+// KG pack must expose exactly 19 handlers including propose/review/withdraw/verbs/stats/context/resolve/whoami
 #[test]
-fn kg_pack_exposes_18_handlers() {
+fn kg_pack_exposes_19_handlers() {
     use crate::KgPack;
     use khive_types::Pack;
     let handlers = KgPack::HANDLERS;
     assert_eq!(
         handlers.len(),
-        18,
-        "kg pack must expose 18 handlers (was 17, +1 for resolve — unified-verb draft ADR Slice 1)"
+        19,
+        "kg pack must expose 19 handlers (was 18, +1 for whoami)"
     );
     let names: Vec<&str> = handlers.iter().map(|h| h.name).collect();
     assert!(names.contains(&"propose"), "propose must be in KG_HANDLERS");
@@ -615,209 +615,6 @@ async fn valid_relations_hint_matches_real_validator_acceptance_across_all_entit
             );
         }
     }
-}
-
-// #621: `valid_relations_for_entity_pair` only
-// matched `EndpointKind::EntityOfKind` pack rules, silently omitting
-// `EndpointKind::EntityOfType` rules such as khive-pack-formal's typed
-// `concept/theorem -> concept/definition` `depends_on` rule
-// (`crates/khive-pack-formal/src/vocab.rs:29-38`) — exactly the #543
-// divergence class this PR fixes. This test proves the fix: with `kg,formal`
-// installed, the hint for the typed pair includes `depends_on`, and a
-// generative cross-check against the real validator confirms the hint set is
-// exactly the validator's acceptance set for that typed pair.
-#[tokio::test]
-async fn valid_relations_hint_covers_formal_pack_entity_of_type_rules() {
-    use crate::KgPack;
-    use khive_pack_formal::FormalPack;
-    use khive_runtime::{KhiveRuntime, Namespace, VerbRegistryBuilder};
-    use khive_storage::EdgeRelation;
-
-    let rt = KhiveRuntime::memory().expect("in-memory runtime");
-    let mut builder = VerbRegistryBuilder::new();
-    builder.register(KgPack::new(rt.clone()));
-    builder.register(FormalPack::new(rt.clone()));
-    let registry = builder.build().expect("kg+formal registry builds");
-    rt.install_edge_rules(registry.all_edge_rules());
-
-    let hinted = super::valid_relations_for_entity_pair(
-        &rt,
-        "concept",
-        Some("theorem"),
-        "concept",
-        Some("definition"),
-    );
-    assert!(
-        hinted.contains(&"depends_on"),
-        "#621: hint for concept/theorem->concept/definition must \
-         include depends_on from khive-pack-formal's EntityOfType rule; \
-         got: {hinted:?}"
-    );
-
-    // Generative cross-check on the same typed pair: create real typed
-    // entities, call the real validator across all relations, and assert the
-    // hint equals the actual acceptance set — not just a presence check.
-    let token = rt.authorize(Namespace::local()).unwrap();
-    let mut expected = Vec::new();
-    for relation in EdgeRelation::ALL {
-        if relation == EdgeRelation::Annotates {
-            continue;
-        }
-        let src = rt
-            .create_entity(
-                &token,
-                "concept",
-                Some("theorem"),
-                "src",
-                None,
-                None,
-                vec![],
-            )
-            .await
-            .expect("create typed source entity");
-        let tgt = rt
-            .create_entity(
-                &token,
-                "concept",
-                Some("definition"),
-                "tgt",
-                None,
-                None,
-                vec![],
-            )
-            .await
-            .expect("create typed target entity");
-        if rt
-            .link(&token, src.id, tgt.id, relation, 1.0, None)
-            .await
-            .is_ok()
-        {
-            expected.push(relation.as_str());
-        }
-    }
-    expected.sort_unstable();
-    expected.dedup();
-
-    assert_eq!(
-        hinted, expected,
-        "#621: hint set for typed concept/theorem->concept/definition \
-         must equal the real validator's acceptance set; hinted={hinted:?} \
-         expected={expected:?}"
-    );
-}
-
-// GTD's task->task depends_on rule is NoteOfKind-scoped, not an entity-pair
-// rule, so it structurally cannot appear in (and is correctly absent from)
-// this entity-pair hint path — a task/task mismatch produces a different
-// validation error ("must be an entity for relation ...") that never reaches
-// `enrich_allowlist_error` in the first place. This pure-function check
-// complements `gtd_task_mismatch_bypasses_enriched_hint_on_real_link_path`
-// below, which proves the same boundary on the real `handle_link` path.
-#[tokio::test]
-async fn valid_relations_hint_does_not_cover_gtd_note_scoped_rules() {
-    use crate::KgPack;
-    use khive_pack_gtd::GtdPack;
-    use khive_runtime::{KhiveRuntime, VerbRegistryBuilder};
-
-    let rt = KhiveRuntime::memory().expect("in-memory runtime");
-    let mut builder = VerbRegistryBuilder::new();
-    builder.register(KgPack::new(rt.clone()));
-    builder.register(GtdPack::new(rt.clone()));
-    let registry = builder.build().expect("kg+gtd registry builds");
-    rt.install_edge_rules(registry.all_edge_rules());
-
-    // No entity kind is named "task" (it's a note kind) so no (src_kind,
-    // tgt_kind) entity pair can ever surface GTD's depends_on rule here.
-    let hinted = super::valid_relations_for_entity_pair(&rt, "project", None, "project", None);
-    assert!(
-        !hinted.is_empty(),
-        "sanity: project->project must still have base-rule hints"
-    );
-    // The composed pack_edge_rules() DOES include GTD's rule at runtime, but
-    // it is NoteOfKind("task") on both ends, so it can never satisfy the
-    // entity-substrate match this hint function requires — confirmed by
-    // checking no entity-kind pair yields "depends_on" from a NoteOfKind
-    // source.
-    assert!(
-        rt.pack_edge_rules().iter().any(|r| matches!(
-            (r.relation, r.source, r.target),
-            (
-                khive_storage::EdgeRelation::DependsOn,
-                khive_types::EndpointKind::NoteOfKind("task"),
-                khive_types::EndpointKind::NoteOfKind("task"),
-            )
-        )),
-        "GTD's task->task depends_on rule must be present in the composed \
-         runtime rule set (proves it's reachable, not just absent by omission)"
-    );
-}
-
-// #621: proves the GTD boundary on the REAL
-// `KgPack::handle_link` path with real task notes, not just rule presence in
-// `pack_edge_rules()`. A task->task relation outside GTD's declared
-// `depends_on` must fail with the substrate-mismatch error ("must be an
-// entity for relation ...") and must NOT carry the enriched
-// "Valid relations:" hint -- proving `enrich_allowlist_error` is never
-// reached for a note/note mismatch. The GTD-declared relation
-// (`depends_on`) between the same two notes must still succeed.
-#[tokio::test]
-async fn gtd_task_mismatch_bypasses_enriched_hint_on_real_link_path() {
-    use crate::KgPack;
-    use khive_pack_gtd::GtdPack;
-    use khive_runtime::{KhiveRuntime, Namespace, VerbRegistryBuilder};
-
-    let rt = KhiveRuntime::memory().expect("in-memory runtime");
-    let mut builder = VerbRegistryBuilder::new();
-    builder.register(KgPack::new(rt.clone()));
-    builder.register(GtdPack::new(rt.clone()));
-    let registry = builder.build().expect("kg+gtd registry builds");
-    rt.install_edge_rules(registry.all_edge_rules());
-
-    let token = rt.authorize(Namespace::local()).unwrap();
-    let src = rt
-        .create_note(&token, "task", None, "task A", None, None, vec![])
-        .await
-        .expect("create task note A");
-    let tgt = rt
-        .create_note(&token, "task", None, "task B", None, None, vec![])
-        .await
-        .expect("create task note B");
-
-    let pack = KgPack::new(rt.clone());
-
-    // "extends" is a valid relation string but not GTD's task->task rule
-    // (only depends_on is declared NoteOfKind for task->task).
-    let params = serde_json::json!({
-        "source_id": src.id.to_string(),
-        "target_id": tgt.id.to_string(),
-        "relation": "extends",
-    });
-    let result = pack.handle_link(&token, params).await;
-    assert!(result.is_err(), "task->task extends must be rejected");
-    let err_msg = format!("{}", result.unwrap_err());
-    assert!(
-        err_msg.contains("must be an entity"),
-        "expected the substrate-mismatch error (only annotates crosses \
-         substrates), got: {err_msg}"
-    );
-    assert!(
-        !err_msg.contains("Valid relations:"),
-        "a note/note mismatch must NOT be enriched with the entity-pair hint \
-         -- enrich_allowlist_error is only reachable for entity/entity \
-         mismatches; got: {err_msg}"
-    );
-
-    // Sanity: the actual GTD-declared relation succeeds on the same two notes
-    // via the real link path.
-    let params_ok = serde_json::json!({
-        "source_id": src.id.to_string(),
-        "target_id": tgt.id.to_string(),
-        "relation": "depends_on",
-    });
-    assert!(
-        pack.handle_link(&token, params_ok).await.is_ok(),
-        "task->task depends_on must be accepted by the real link path"
-    );
 }
 
 // Integration test: link with invalid relation returns error containing valid relations.
@@ -1763,5 +1560,187 @@ async fn merge_note_reason_forwarded_through_registry_dispatch() {
         Some("duplicate via dispatch"),
         "reason supplied through the registry dispatch route must land in the NoteMerged payload; got: {:?}",
         events.items[0].payload
+    );
+}
+
+// ── interim merged_into miss-hint (data-integrity, precedes the full
+// ADR-113 transitive redirect chase) ───────────────────────────────────────
+//
+// `get(absorbed_id)` after a merge names the kept id in its NotFound error
+// instead of a bare "not found" — single-level pointer disclosure, message
+// only, never a transparent redirect to the kept entity's data.
+
+#[tokio::test]
+async fn get_dispatch_after_merge_discloses_kept_id() {
+    use khive_runtime::RuntimeError;
+
+    let (rt, token, _pack) = configured_kg_pack().await;
+    let mut builder = khive_runtime::VerbRegistryBuilder::new();
+    builder.register(crate::KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry build");
+
+    let into = rt
+        .create_entity(&token, "concept", None, "Kept", None, None, vec![])
+        .await
+        .expect("create into entity");
+    let from = rt
+        .create_entity(&token, "concept", None, "Absorbed", None, None, vec![])
+        .await
+        .expect("create from entity");
+
+    registry
+        .dispatch(
+            "merge",
+            json!({
+                "kind": "entity",
+                "into_id": into.id.to_string(),
+                "from_id": from.id.to_string(),
+            }),
+        )
+        .await
+        .expect("merge dispatch must succeed");
+
+    let err = registry
+        .dispatch("get", json!({ "id": from.id.to_string() }))
+        .await
+        .expect_err("get on an absorbed id must still miss");
+    let RuntimeError::NotFound(msg) = err else {
+        panic!("expected NotFound, got {err:?}");
+    };
+    assert!(
+        msg.contains("was merged into") && msg.contains(&into.id.to_string()),
+        "expected a merged_into disclosure naming {}, got {msg:?}",
+        into.id
+    );
+
+    // The documented short-prefix form must reach the same disclosure:
+    // absorbed entities are soft-deleted, so this exercises the
+    // including-deleted prefix-resolution fallback in handle_get.
+    let short = from.id.to_string().replace('-', "")[..8].to_string();
+    let err = registry
+        .dispatch("get", json!({ "id": short }))
+        .await
+        .expect_err("get on an absorbed short id must still miss");
+    let RuntimeError::NotFound(msg) = err else {
+        panic!("expected NotFound, got {err:?}");
+    };
+    assert!(
+        msg.contains("was merged into") && msg.contains(&into.id.to_string()),
+        "expected a merged_into disclosure for the short-prefix form naming {}, got {msg:?}",
+        into.id
+    );
+}
+
+#[tokio::test]
+async fn get_dispatch_short_prefix_with_include_deleted_returns_deleted_entity() {
+    let (rt, token, _pack) = configured_kg_pack().await;
+    let mut builder = khive_runtime::VerbRegistryBuilder::new();
+    builder.register(crate::KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry build");
+
+    let entity = rt
+        .create_entity(&token, "concept", None, "SoftDeleted", None, None, vec![])
+        .await
+        .expect("create entity");
+    assert!(rt.delete_entity(&token, entity.id, false).await.unwrap());
+
+    let short = entity.id.to_string().replace('-', "")[..8].to_string();
+    let got = registry
+        .dispatch("get", json!({ "id": short, "include_deleted": true }))
+        .await
+        .expect("short prefix + include_deleted must return the soft-deleted entity");
+    assert_eq!(
+        got.get("id").and_then(|v| v.as_str()),
+        Some(entity.id.to_string().as_str())
+    );
+    assert!(
+        got.get("deleted_at").and_then(|v| v.as_str()).is_some(),
+        "deleted_at must be populated on the returned soft-deleted entity, got {got:?}"
+    );
+}
+
+#[tokio::test]
+async fn get_dispatch_on_plain_deleted_and_absent_ids_unchanged() {
+    use khive_runtime::RuntimeError;
+
+    let (rt, token, _pack) = configured_kg_pack().await;
+    let mut builder = khive_runtime::VerbRegistryBuilder::new();
+    builder.register(crate::KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry build");
+
+    let entity = rt
+        .create_entity(&token, "concept", None, "Deleted", None, None, vec![])
+        .await
+        .expect("create entity");
+    assert!(rt.delete_entity(&token, entity.id, false).await.unwrap());
+
+    let deleted_err = registry
+        .dispatch("get", json!({ "id": entity.id.to_string() }))
+        .await
+        .expect_err("get on a plain soft-deleted id must still miss");
+    let RuntimeError::NotFound(msg) = deleted_err else {
+        panic!("expected NotFound, got {deleted_err:?}");
+    };
+    assert!(
+        !msg.contains("merged into"),
+        "plain soft-delete must not gain a merge hint, got {msg:?}"
+    );
+
+    let absent = uuid::Uuid::new_v4();
+    let absent_err = registry
+        .dispatch("get", json!({ "id": absent.to_string() }))
+        .await
+        .expect_err("get on a never-existed id must miss");
+    let RuntimeError::NotFound(msg) = absent_err else {
+        panic!("expected NotFound, got {absent_err:?}");
+    };
+    assert!(
+        !msg.contains("merged into"),
+        "a never-existed id must not gain a merge hint, got {msg:?}"
+    );
+}
+
+// `resolve`'s `NotFound` outcome (`ReferenceResolution::NotFound`) is a unit
+// variant with no message slot to carry a hint in — scope is `get` only for
+// this interim change (see PR description). This test pins that boundary:
+// resolving an absorbed uuid still reports a bare `not_found` status.
+#[tokio::test]
+async fn resolve_dispatch_on_merged_uuid_stays_bare_not_found() {
+    let (rt, token, _pack) = configured_kg_pack().await;
+    let mut builder = khive_runtime::VerbRegistryBuilder::new();
+    builder.register(crate::KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry build");
+    let _ = token;
+
+    let into = rt
+        .create_entity(&token, "concept", None, "Kept", None, None, vec![])
+        .await
+        .expect("create into entity");
+    let from = rt
+        .create_entity(&token, "concept", None, "Absorbed", None, None, vec![])
+        .await
+        .expect("create from entity");
+
+    registry
+        .dispatch(
+            "merge",
+            json!({
+                "kind": "entity",
+                "into_id": into.id.to_string(),
+                "from_id": from.id.to_string(),
+            }),
+        )
+        .await
+        .expect("merge dispatch must succeed");
+
+    let result = registry
+        .dispatch("resolve", json!({ "refs": [from.id.to_string()] }))
+        .await
+        .expect("resolve dispatch must succeed (NotFound is a status, not an error)");
+
+    let status = result["results"][0]["status"].as_str().unwrap();
+    assert_eq!(
+        status, "not_found",
+        "resolve has no message slot for a merge hint in this interim change; got {result:?}"
     );
 }

@@ -56,8 +56,7 @@ request(ops="search(kind=\"entity\", query=\"attention\", entity_kind=\"concept\
 ### Score interpretation
 
 Scores from `search` are RRF fusion scores. Raw RRF values are typically small
-(0.01-0.03). When `rerank` is active (via `knowledge.search`), scores are
-normalized to [0,1].
+(0.01-0.03).
 
 A practical floor: results below 0.3 are usually noise. Results above 0.7 are
 strong matches.
@@ -126,32 +125,6 @@ request(ops="query(query=\"SELECT ?a WHERE { ?a :extends+ ?b . ?b :name 'LoRA' .
 
 Both syntaxes compile to the same SQL backend. Use whichever feels natural.
 
-## Knowledge search: rerank and decompose
-
-The `knowledge.search` verb adds two capabilities on top of base search:
-
-### Reranking
-
-```
-request(ops="knowledge.search(query=\"memory efficient attention mechanisms\", rerank=true)")
-```
-
-Reranking uses a cross-encoder model to re-score results after the initial
-retrieval pass. This produces clean [0,1] scores instead of raw RRF values.
-Reranking is on by default for `knowledge.search`.
-
-### Query decomposition
-
-```
-request(ops="knowledge.search(query=\"compare LoRA and QLoRA fine-tuning approaches\", decompose=true)")
-```
-
-Decomposition splits multi-concept queries into sub-queries, runs them
-independently, and merges the results. This avoids FTS edge cases where
-compound queries miss relevant documents.
-
-Use `decompose=true` when your query mentions multiple distinct concepts.
-
 ## Memory recall
 
 `memory.recall` is a specialized search over memory notes with decay-weighted
@@ -166,16 +139,15 @@ patterns.
 
 ## Choosing the right retrieval
 
-| You want to...                    | Use                                          |
-| --------------------------------- | -------------------------------------------- |
-| Find entities about a topic       | `search(kind="entity", query="...")`         |
-| Find notes about a topic          | `search(kind="note", query="...")`           |
-| Browse all entities of a kind     | `list(kind="entity", entity_kind="concept")` |
-| See what connects to a node       | `neighbors(node_id="...", direction="both")` |
-| Explore multi-hop paths           | `traverse(roots=["..."], max_depth=3)`       |
-| Structural pattern matching       | `query(query="MATCH ...")`                   |
-| Find knowledge atoms with scoring | `knowledge.search(query="...", rerank=true)` |
-| Recall agent memories             | `memory.recall(query="...")`                 |
+| You want to...                | Use                                          |
+| ----------------------------- | -------------------------------------------- |
+| Find entities about a topic   | `search(kind="entity", query="...")`         |
+| Find notes about a topic      | `search(kind="note", query="...")`           |
+| Browse all entities of a kind | `list(kind="entity", entity_kind="concept")` |
+| See what connects to a node   | `neighbors(node_id="...", direction="both")` |
+| Explore multi-hop paths       | `traverse(roots=["..."], max_depth=3)`       |
+| Structural pattern matching   | `query(query="MATCH ...")`                   |
+| Recall agent memories         | `memory.recall(query="...")`                 |
 
 ## Performance notes
 

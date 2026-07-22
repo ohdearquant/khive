@@ -920,11 +920,15 @@ fn endpoint_kind_label(kind: &EndpointKind) -> String {
 /// any `note -> note` pair unconditionally, regardless of note kind
 /// (ADR-002 §"Versioning" and §"Epistemic"), and never consults pack
 /// `EDGE_RULES` at all, on either substrate.
-const SPECIAL_RELATIONS: &[khive_types::EdgeRelation] = &[
+pub(crate) const SPECIAL_RELATIONS: &[khive_types::EdgeRelation] = &[
     khive_types::EdgeRelation::Supersedes,
     khive_types::EdgeRelation::Supports,
     khive_types::EdgeRelation::Refutes,
 ];
+
+pub(crate) fn is_special_relation(relation: khive_types::EdgeRelation) -> bool {
+    SPECIAL_RELATIONS.contains(&relation)
+}
 
 /// Compose the full per-relation endpoint allowlist surfaced by
 /// `link(help=true)` (issue #964).
@@ -965,7 +969,7 @@ fn edge_endpoint_table(packs: &[Box<dyn PackRuntime>]) -> Vec<Value> {
 
     for pack in packs.iter() {
         for rule in pack.edge_rules().iter() {
-            if SPECIAL_RELATIONS.contains(&rule.relation) {
+            if is_special_relation(rule.relation) {
                 continue;
             }
             rows.push(serde_json::json!({
@@ -1019,6 +1023,19 @@ impl VerbRegistry {
     /// audit-persistence default.
     pub fn event_store(&self) -> Option<Arc<dyn EventStore>> {
         self.event_store.clone()
+    }
+
+    /// Whether any loaded pack registers `verb`, at any visibility.
+    ///
+    /// Internal callers use this to skip optional cross-pack dispatches
+    /// (e.g. serving-profile resolution) when the providing pack is not in
+    /// the loaded set, instead of paying a failed dispatch plus its audit
+    /// write on every call.
+    pub fn has_verb(&self, verb: &str) -> bool {
+        self.packs
+            .iter()
+            .flat_map(|p| p.handlers().iter())
+            .any(|h| h.name == verb)
     }
 
     /// Return the help schema envelope for a verb.
@@ -2017,9 +2034,8 @@ impl VerbRegistry {
 
 /// Output of [`PackFactory::create_install`] — bundles the pack runtime with
 /// its optional by-ID resolver and dispatch hook so a factory can hand back
-/// all three built from one shared instance (see `BrainPackFactory` for why
-/// this matters: the dispatch hook must observe the same state the runtime
-/// mutates, not a second unrelated instance).
+/// all three built from one shared instance (a dispatch hook must observe
+/// the same state the runtime mutates, not a second unrelated instance).
 pub struct PackInstall {
     /// The pack runtime, registered into the builder's pack list.
     pub runtime: Box<dyn PackRuntime>,
@@ -6458,7 +6474,7 @@ mod help_tests {
     ///   (`HELP_EDGE_RULES[1]`) — because the validator's special-relation
     ///   branch returns before `pack_rule_allows` is consulted, that pack
     ///   rule is never actually enforced, so advertising it would be a false
-    ///   promise (the exact codex HIGH this test guards against, issue #991).
+    ///   promise (the exact defect this test guards against, issue #991).
     #[tokio::test]
     async fn test_link_help_true_matches_special_relation_validator_set() {
         let invocations = Arc::new(AtomicUsize::new(0));
@@ -6510,6 +6526,22 @@ mod help_tests {
                     && r["target"] == "entity:concept"),
                 "endpoint_rules must include the base entity:{kind}->entity:concept row \
                  for '{relation}'; got {rules:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn special_relation_predicate_matches_the_dedicated_validator_set() {
+        for relation in khive_types::EdgeRelation::ALL {
+            assert_eq!(
+                is_special_relation(relation),
+                matches!(
+                    relation,
+                    khive_types::EdgeRelation::Supersedes
+                        | khive_types::EdgeRelation::Supports
+                        | khive_types::EdgeRelation::Refutes
+                ),
+                "unexpected special-relation classification for {relation}"
             );
         }
     }

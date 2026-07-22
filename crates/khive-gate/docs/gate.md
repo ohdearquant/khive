@@ -1,7 +1,5 @@
 # khive-gate
 
-**ADR:** [ADR-018 Authorization Gate](../../docs/adr/ADR-018-authorization-gate.md)
-
 Pluggable authorization gate for verb dispatch in the khive runtime.
 
 ## Purpose
@@ -30,11 +28,11 @@ Tagged by `"decision"` field: `"allow"` or `"deny"`.
 - `Allow` carries an optional `obligations` array.
 - `Deny` carries a `reason` string.
 
-### `AuditEvent` (ADR-018 audit record)
+### `AuditEvent` (audit record)
 
 Emitted once per gate consultation. Fields include `actor`, `namespace`, `verb`,
 `decision`, `deny_reason`, `obligations`, `gate_impl`, `session_id`, and `timestamp`.
-Field names are a **stable public contract** — renaming requires a new ADR.
+Field names are a **stable public contract** — renaming requires a design-record amendment.
 
 ## Quick start
 
@@ -87,10 +85,10 @@ An `Allow` decision may carry obligations the dispatch layer should honour:
 
 ## Known gate implementations
 
-| Crate             | License    | Description                               |
-| ----------------- | ---------- | ----------------------------------------- |
-| `khive-gate`      | Apache-2.0 | `AllowAllGate` — permissive local default |
-| `khive-gate-rego` | Apache-2.0 | Rego-backed via `regorus` (ADR-018)       |
+| Crate             | License  | Description                               |
+| ----------------- | -------- | ----------------------------------------- |
+| `khive-gate`      | BUSL-1.1 | `AllowAllGate` — permissive local default |
+| `khive-gate-rego` | BUSL-1.1 | Rego-backed via `regorus`                 |
 
 Deployments with multi-actor isolation requirements may supply a custom `Gate` implementation
 behind the `Gate` trait without modifying this crate.

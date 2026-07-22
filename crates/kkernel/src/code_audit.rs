@@ -1,6 +1,5 @@
 //! `kkernel code-audit`: a read-only derived-report pipeline over a
-//! dedicated code-map database (docs/adr/ADR-114-code-audit-derived-report.md,
-//! ADR-Q1/Q2 in `.khive/workspaces/20260716/code-quality-graph/DESIGN.md`).
+//! dedicated code-map database (ADR-114-code-audit-derived-report).
 //!
 //! Phase 1 scope: structural signals computed with deterministic SQL over the
 //! `code.ingest` L1/L1.5 facts already present in the map (no file/history
@@ -84,8 +83,8 @@ struct AuditRequest {
 }
 
 /// The only `policy_version` this build understands. A policy file carrying
-/// any other version (or none at all) is rejected outright — see M1 in
-/// `.khive/codex_reviews/codex_review_pr1052.md`.
+/// any other version (or none at all) is rejected outright rather than
+/// silently interpreted under an assumed schema.
 const SUPPORTED_POLICY_VERSION: u32 = 1;
 
 #[derive(Debug, Deserialize)]
@@ -100,7 +99,7 @@ struct Policy {
     /// must meet before absence-based candidate signals (today:
     /// `zero_in_edge_module`)
     /// are reported for its modules. Below the floor, the candidate degrades to
-    /// `unavailable` rather than being silently emitted or dropped (M1).
+    /// `unavailable` rather than being silently emitted or dropped.
     #[serde(default)]
     coverage_floor: f64,
 }
@@ -430,10 +429,9 @@ async fn generate_report(request: &AuditRequest) -> Result<AuditReport> {
     // Base edge signals (`module_fan_in`, `zero_in_edge_module`) only read
     // `source_id`/`target_id`/`relation`/`deleted_at` — never `id` or
     // `metadata` — so they must stay available on a map missing only the
-    // metadata column (codex round-2 Medium,
-    // `.khive/codex_reviews/codex_review_pr1052_round2.md`) or only the `id`
-    // column (codex round-3 Medium,
-    // `.khive/codex_reviews/codex_review_pr1052_round3.md`).
+    // metadata column, or only the `id` column: both are real degraded-schema
+    // scenarios seen in practice, and neither field is needed by these two
+    // signals.
     if caps.entities_ok && caps.edges_base_ok {
         fan_in_signals(reader.as_mut(), &mut signals).await?;
         zero_in_edge_signals(
@@ -516,13 +514,11 @@ fn map_storage_busy(e: khive_storage::StorageError) -> anyhow::Error {
 /// What the open map database can support. Built once per report via
 /// `PRAGMA table_info` so every derivation can be gated on real column
 /// presence rather than aborting the whole report the first time an older
-/// or partial map is missing a table or column (H1,
-/// `.khive/codex_reviews/codex_review_pr1052.md`).
+/// or partial map is missing a table or column.
 ///
 /// `edges_ok` was originally a single table-wide boolean, but that over-
 /// suppressed signals whose SQL never reads `graph_edges.metadata` on a map
-/// missing only that column (round-2 Medium,
-/// `.khive/codex_reviews/codex_review_pr1052_round2.md`). Edge capability is
+/// missing only that column. Edge capability is
 /// therefore split per the columns each signal group actually reads:
 /// `edges_base_ok` covers exactly `source_id`/`target_id`/`relation`/
 /// `deleted_at` — the columns `SQL_FAN_IN` and `SQL_ZERO_IN_EDGE` read, and
@@ -531,8 +527,7 @@ fn map_storage_busy(e: khive_storage::StorageError) -> anyhow::Error {
 /// layering, manifest/import mismatch, and the project-level dependency-
 /// cycle graphs; `id` moved out of the base tier here because neither
 /// `SQL_FAN_IN` nor `SQL_ZERO_IN_EDGE` reads `graph_edges.id`, so a map
-/// missing only that column must not suppress them (round-3 Medium,
-/// `.khive/codex_reviews/codex_review_pr1052_round3.md`).
+/// missing only that column must not suppress them.
 struct SchemaCaps {
     entities_ok: bool,
     edges_base_ok: bool,
@@ -706,7 +701,7 @@ async fn ingest_coverage_signals(
         // entity, not the project (source_ingest.rs:776-784) — the project's
         // own `unresolved_specifiers` (manifest-level, if any) is only part
         // of the picture. Aggregate both so a project with unresolved module
-        // imports is never reported as a false zero (H2).
+        // imports is never reported as a false zero.
         let mut own_unresolved = unresolved_count(&properties);
         let mut unresolved_evidence: BTreeSet<String> = BTreeSet::new();
 
@@ -842,7 +837,7 @@ async fn layering_signals(
     // not just the crates that happen to appear in a selected edge — a
     // project with no evaluated edge at all (e.g. no edges, or only a
     // dev-only edge with dev evaluation disabled) is still unmapped and must
-    // still degrade rather than silently vanish (H4).
+    // still degrade rather than silently vanish.
     let unmapped: BTreeSet<String> = all_projects
         .iter()
         .filter(|name| policy.rank(name).is_none())
@@ -867,7 +862,7 @@ async fn layering_signals(
             && !kinds.contains("dependencies")
             && !kinds.contains("build-dependencies");
         // include_dev_dependencies gates VIOLATION EVALUATION only; policy
-        // completeness (above) is independent of it (H4).
+        // completeness (above) is independent of it.
         if is_dev_only && !include_dev {
             continue;
         }
@@ -954,7 +949,7 @@ async fn manifest_import_mismatch_signals(
 /// Node identity is the map's `source_id`/`target_id` (entity UUIDs) rather
 /// than display names — module names are not unique across languages
 /// (ADR-085 §"module identity"), so keying the graph by name can silently
-/// merge two distinct module graphs into one false SCC (H3). Field order
+/// merge two distinct module graphs into one false SCC. Field order
 /// matches the required tie-break sort `(source_id, target_id, edge_id)`.
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
 struct DepEdge {
@@ -1224,7 +1219,7 @@ async fn zero_in_edge_signals(
         };
 
         // Module identity, not display name, is the subject: two modules in
-        // different languages can share a display name (H3).
+        // different languages can share a display name.
         signals.push(Signal {
             id: "zero_in_edge_module",
             subject_id: module_id.clone(),
@@ -1667,7 +1662,7 @@ crate-b = 1
 
         // crate-z is only reachable via a dev-only edge and crate-orphan has
         // NO edge at all — both are unmapped in the policy, so BOTH must
-        // degrade to unavailable regardless of include_dev_dependencies (H4):
+        // degrade to unavailable regardless of include_dev_dependencies:
         // POLICY_INCOMPLETE is derived from the full project set, not from
         // which edges happened to be selected.
         for unmapped in ["crate-z", "crate-orphan"] {
@@ -1785,7 +1780,7 @@ crate-b = 1
         // crate-a itself carries no `unresolved_specifiers` property; the
         // one unresolved import lives on its `crate_a::orphan` MODULE
         // (source_ingest.rs:776-784). The pre-fix code read only the
-        // project's own property and reported 0 (H2).
+        // project's own property and reported 0.
         let coverage = report
             .signals
             .iter()
@@ -2007,7 +2002,7 @@ crate-b = 1
         }
         let policy = test_policy(tmp.path());
 
-        // Round-2 Medium: `module_fan_in` and `zero_in_edge_module` never
+        // `module_fan_in` and `zero_in_edge_module` never
         // read `graph_edges.metadata`, so a map missing ONLY that column
         // must not suppress them — only the dependency-kind-classification
         // signals (layering, manifest/import mismatch, dependency cycles)
@@ -2087,7 +2082,7 @@ crate-b = 1
         }
         let policy = test_policy(tmp.path());
 
-        // Round-3 Medium: `module_fan_in` and `zero_in_edge_module` never
+        // `module_fan_in` and `zero_in_edge_module` never
         // read `graph_edges.id` (`SQL_FAN_IN`/`SQL_ZERO_IN_EDGE` select only
         // `source_id`/`target_id`/`relation`/`deleted_at`), so a map missing
         // ONLY that column must not suppress them — only the signals that

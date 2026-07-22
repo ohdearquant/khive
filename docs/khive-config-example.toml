@@ -162,7 +162,7 @@ fusion_weight = 0.5
 #
 # Route an individual pack to a declared backend. Packs not listed here fall back to
 # `main`. The referenced backend must appear in [[backends]] above. Loadable packs:
-# kg, gtd, memory, brain, comm, schedule, knowledge, session, git, code.
+# kg, gtd, memory, brain, comm, schedule, knowledge, session, code.
 
 # [packs.knowledge]
 # backend = "knowledge"
@@ -185,7 +185,7 @@ fusion_weight = 0.5
 #   KHIVE_NAMESPACE=local        Legacy alias for KHIVE_ACTOR; loses to it when both are set.
 #   KHIVE_NO_EMBED=false         Disable the local embedding model (skips vector indexing).
 #                                STRICT bool: only "true"/"false" — "1" is a startup error.
-#   KHIVE_PACKS=kg,gtd,memory,brain,comm,schedule,knowledge,session,git,code,workspace
+#   KHIVE_PACKS=kg,gtd,memory,brain,comm,schedule,knowledge,session,code,workspace
 #                                Packs to load when --pack is absent. Comma / space separated.
 #   KHIVE_CONFIG=./khive.toml    Path to THIS config file. Also --config. Overrides the search order.
 #   KHIVE_LOG=warn               Stderr log level (JSON results on stdout are unaffected).
@@ -215,27 +215,6 @@ fusion_weight = 0.5
 #   KHIVE_MIRROR_POLL_SECS=2     Seconds between mirror poll ticks.
 #   KHIVE_MIRROR_BACKFILL=true   true → mirror existing files from offset 0; false → only new bytes
 #                                from EOF. Set false via 0/false/no.
-#
-# ── Email channel (build with feature `channel-email`; inert without these) ──────
-#   Never commit KHIVE_EMAIL_PASSWORD or KHIVE_EMAIL_OAUTH_CLIENT_SECRET.
-#   KHIVE_EMAIL_SMTP_HOST=smtp.example.com    Required. Outbound relay host.
-#   KHIVE_EMAIL_SMTP_PORT=587                 Optional. Default 587 (STARTTLS).
-#   KHIVE_EMAIL_IMAP_HOST=imap.example.com    Required. Inbound polling host.
-#   KHIVE_EMAIL_IMAP_PORT=993                 Optional. Default 993 (TLS).
-#   KHIVE_EMAIL_USERNAME=bot@example.com      Required. SMTP / IMAP login; default mailbox.
-#   KHIVE_EMAIL_PASSWORD=                     Required in Basic-auth mode (no OAuth vars set). Secret.
-#   KHIVE_EMAIL_MAILBOX=bot@example.com       Optional. Sender / XOAUTH2 user. Default: USERNAME.
-#   KHIVE_EMAIL_MAINTAINER_ADDRESS=you@example.com
-#                                Required. Comma-separated allowlist of senders whose inbound mail
-#                                is accepted; the first entry is primary.
-#   KHIVE_EMAIL_DEFAULT_ACTOR=lambda:leo      Actor for new inbound mail with no thread match.
-#   KHIVE_EMAIL_INGEST_NAMESPACE=local        Namespace stamped on channel messages.
-#   KHIVE_EMAIL_SEND_ALLOWED_RECIPIENTS=you@example.com
-#                                Comma-separated outbound allowlist. Default: the maintainer address.
-#   OAuth (Exchange Online app-only) — all three together select OAuth mode; a partial set errors:
-#   KHIVE_EMAIL_OAUTH_TENANT_ID=              Azure AD tenant GUID.
-#   KHIVE_EMAIL_OAUTH_CLIENT_ID=              Azure AD application (client) GUID. Presence selects OAuth.
-#   KHIVE_EMAIL_OAUTH_CLIENT_SECRET=          Client secret. Secret.
 #
 # ── Daemon / IPC (ADR-049; advanced) ─────────────────────────────────────────────
 #   KHIVE_NO_DAEMON=1            Disable daemon auto-spawn; dispatch every request in-process.

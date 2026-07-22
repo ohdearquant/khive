@@ -58,10 +58,10 @@ ranked `(Id, DeterministicScore)` lists from `khive-hnsw` (vector) and
 composition and by the runtime's ADR-012 retrieval composition path.
 
 Governing ADR:
-[ADR-006](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-006-deterministic-scoring.md)
+ADR-006
 (deterministic scoring — the `DeterministicScore` contract every strategy here
 scores against).
 
 ## License
 
-Apache-2.0.
+BUSL-1.1. See the repository [LICENSE](https://github.com/ohdearquant/khive/blob/main/LICENSE).

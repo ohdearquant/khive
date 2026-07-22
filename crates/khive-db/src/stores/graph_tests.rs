@@ -1047,6 +1047,89 @@ async fn test_traverse_binary_tree_result_count() {
     }
 }
 
+/// ADR-091 Amendment 3 / design-note test plan "Traversal coverage test":
+/// the `graph_traverse_read` registration inside `traverse` (the long-lived
+/// deferred-read snapshot the whole design exists for) must carry the
+/// store's own pool origin, so it is visible through a `Secondary` filter
+/// scoped to THIS backend's identity and invisible through a `Main` filter
+/// scoped to a DIFFERENT backend's identity. Exercises the real
+/// `SqlGraphStore::traverse` call site rather than a hand-registered span —
+/// a wide root set (with real matching edges) forces the chunked traversal
+/// past `CHUNK_ROOTS` (400) more than once inside the single registered
+/// closure, giving the polling loop below a real window in which the span
+/// is observably open (registered before, dropped after, the whole chunked
+/// loop — see `traverse`'s doc comment).
+#[tokio::test]
+#[serial(tx_registry)]
+async fn graph_traverse_read_span_scoped_to_secondary_backend_visible_only_in_its_own_view() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("traverse_secondary_origin.db");
+    let pool_cfg = PoolConfig {
+        path: Some(path.clone()),
+        ..PoolConfig::default()
+    };
+    let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
+    {
+        let writer = pool.writer().unwrap();
+        writer.conn().execute_batch(GRAPH_DDL).unwrap();
+    }
+    let secondary_identity = match pool.origin() {
+        khive_storage::tx_registry::TxOrigin::Database(id) => id,
+        other => panic!("expected a file-backed pool to mint a Database origin, got {other:?}"),
+    };
+    let other_identity = khive_storage::tx_registry::DbIdentity::new(
+        pool.canonical_path()
+            .unwrap()
+            .with_file_name("unrelated-backend.db"),
+    );
+
+    let store = SqlGraphStore::new_scoped(Arc::clone(&pool), false, "default");
+    let roots: Vec<Uuid> = (0..900).map(|_| Uuid::new_v4()).collect();
+    let edges: Vec<Edge> = roots
+        .iter()
+        .map(|&root| make_edge(root, Uuid::new_v4(), EdgeRelation::Extends, 1.0))
+        .collect();
+    store.upsert_edges(edges).await.unwrap();
+
+    let request = TraversalRequest {
+        roots,
+        options: TraversalOptions::new(10).with_direction(Direction::Out),
+        include_roots: false,
+        include_properties: false,
+    };
+
+    let traverse_handle = tokio::spawn(async move { store.traverse(request).await });
+
+    let secondary_view =
+        khive_storage::tx_registry::TxOriginFilter::Secondary(secondary_identity.clone());
+    let main_view = khive_storage::tx_registry::TxOriginFilter::Main(other_identity);
+
+    let mut seen_via_secondary = false;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while std::time::Instant::now() < deadline && !traverse_handle.is_finished() {
+        if let Some(span) = khive_storage::tx_registry::oldest_for(&secondary_view) {
+            if span.label.as_deref() == Some("graph_traverse_read") {
+                seen_via_secondary = true;
+                assert!(
+                    khive_storage::tx_registry::oldest_for(&main_view).is_none(),
+                    "a secondary-origin graph_traverse_read span must never be visible \
+                     through a different backend's Main view"
+                );
+                break;
+            }
+        }
+        tokio::task::yield_now().await;
+    }
+
+    let result = traverse_handle.await.unwrap();
+    assert!(result.is_ok(), "traverse should succeed: {result:?}");
+    assert!(
+        seen_via_secondary,
+        "expected to observe a graph_traverse_read span through the secondary backend's own \
+         filtered view while the traversal's read transaction was open"
+    );
+}
+
 #[tokio::test]
 async fn test_metadata_roundtrip() {
     let store = setup_memory_store();
@@ -2569,6 +2652,65 @@ async fn traverse_chunks_root_binds_over_host_param_limit() {
     }
 }
 
+/// ADR-103 Amendment 2 regression: `DbRoundTrips` must count one increment
+/// per executed chunk query, not one flat increment per `traverse` call.
+/// Pre-fix, the single `.inspect` after the `with_reader` closure counted a
+/// flat `1` regardless of how many `CHUNK_ROOTS`-sized (400) SQL executions
+/// actually ran — a 1 000-root call executes 3 chunk queries (400 + 400 +
+/// 200) but reported only 1 round trip.
+#[tokio::test]
+async fn traverse_over_chunk_limit_counts_one_db_round_trip_per_chunk() {
+    let store = setup_memory_store();
+
+    const N: usize = 1_000;
+    const CHUNK_ROOTS: usize = 400;
+    let expected_chunks = N.div_ceil(CHUNK_ROOTS) as u64;
+
+    let mut roots: Vec<Uuid> = Vec::with_capacity(N);
+    for _ in 0..N {
+        let root = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        store
+            .upsert_edge(make_edge(root, child, EdgeRelation::Extends, 1.0))
+            .await
+            .unwrap();
+        roots.push(root);
+    }
+
+    let ctx = khive_storage::usage::UsageContext::new();
+    let paths = khive_storage::usage::scope(ctx.clone(), async {
+        store
+            .traverse(TraversalRequest {
+                roots: roots.clone(),
+                options: TraversalOptions {
+                    max_depth: 1,
+                    direction: Direction::Out,
+                    relations: None,
+                    min_weight: None,
+                    limit: None,
+                },
+                include_roots: false,
+                include_properties: false,
+            })
+            .await
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        paths.len(),
+        N,
+        "traverse over {N} roots must return one GraphPath per root"
+    );
+
+    let snap = ctx.snapshot();
+    assert_eq!(
+        snap["db_round_trips"], expected_chunks,
+        "a {N}-root traverse split into {expected_chunks} chunk queries must count \
+         {expected_chunks} db_round_trips, not a flat 1; got {snap:?}"
+    );
+}
+
 /// STORAGE-AUD-003 / #485: PageRequest.offset > i64::MAX must return
 /// InvalidInput instead of silently narrowing to a negative i64 offset.
 #[tokio::test]
@@ -3143,5 +3285,363 @@ async fn upsert_edge_guarded_probe_is_atomic_with_insert_on_file_backed_singleto
     assert!(
         store.get_edge(edge_id).await.unwrap().is_none(),
         "no dangling edge may be persisted"
+    );
+}
+
+/// A store whose schema was never created, so statement preparation fails
+/// before any query reaches the database. Used to pin the negative case: a
+/// read that never got as far as executing must count no round trip.
+fn setup_memory_store_without_schema() -> SqlGraphStore {
+    let config = PoolConfig {
+        path: None,
+        ..PoolConfig::default()
+    };
+    let pool = Arc::new(ConnectionPool::new(config).unwrap());
+    SqlGraphStore::new_scoped(pool, false, "default")
+}
+
+/// A store holding `good` valid edges out of `node`, plus one row whose
+/// `relation` column is not a member of the closed relation enum.
+///
+/// Written through raw SQL because the typed write path cannot express it —
+/// which is the point: the row models a database that has drifted from the
+/// binary reading it, the one shape where a query prepares, executes, and
+/// returns rows, and then fails partway through converting them. Weights
+/// order the valid rows ahead of the corrupt one, so the number of entries
+/// storage returns before the failure is fixed rather than incidental.
+fn setup_store_with_a_corrupt_relation_row(node: Uuid, good: usize) -> SqlGraphStore {
+    let config = PoolConfig {
+        path: None,
+        ..PoolConfig::default()
+    };
+    let pool = Arc::new(ConnectionPool::new(config).unwrap());
+    {
+        let writer = pool.writer().unwrap();
+        writer.conn().execute_batch(GRAPH_DDL).unwrap();
+        let now = Utc::now().timestamp_micros();
+        for i in 0..good {
+            writer
+                .conn()
+                .execute(
+                    "INSERT INTO graph_edges \
+                     (namespace, id, source_id, target_id, relation, weight, created_at, updated_at) \
+                     VALUES ('default', ?1, ?2, ?3, 'extends', ?4, ?5, ?5)",
+                    rusqlite::params![
+                        Uuid::new_v4().to_string(),
+                        node.to_string(),
+                        Uuid::new_v4().to_string(),
+                        1.0 - (i as f64) * 0.01,
+                        now,
+                    ],
+                )
+                .unwrap();
+        }
+        writer
+            .conn()
+            .execute(
+                "INSERT INTO graph_edges \
+                 (namespace, id, source_id, target_id, relation, weight, created_at, updated_at) \
+                 VALUES ('default', ?1, ?2, ?3, 'not_a_relation', 0.1, ?4, ?4)",
+                rusqlite::params![
+                    Uuid::new_v4().to_string(),
+                    node.to_string(),
+                    Uuid::new_v4().to_string(),
+                    now,
+                ],
+            )
+            .unwrap();
+    }
+    SqlGraphStore::new_scoped(pool, false, "default")
+}
+
+fn neighbor_query(limit: u32) -> NeighborQuery {
+    NeighborQuery {
+        direction: Direction::Out,
+        relations: None,
+        limit: Some(limit),
+        min_weight: None,
+    }
+}
+
+/// `db_round_trips` counts round trips ISSUED. A read that executed and then
+/// failed did real database work, and reporting zero for it is the failure
+/// mode a consumer of these numbers cannot afford.
+///
+/// `graph_hops` counts adjacency entries storage RETURNED, which is a
+/// statement about the database rather than about our types: all three rows
+/// here came back off the cursor, and the third then failed to convert into
+/// an `EdgeRelation`. So the expected count is `good + 1`, matching where the
+/// traversal path increments — immediately after the row is read, before any
+/// parsing. Counting after conversion would attribute our own decoding failure
+/// to storage having done less work than it did.
+#[tokio::test]
+async fn neighbors_counts_the_query_and_the_rows_returned_before_the_failure() {
+    let node = Uuid::new_v4();
+    let store = setup_store_with_a_corrupt_relation_row(node, 2);
+    let ctx = khive_storage::usage::UsageContext::new();
+
+    let result = khive_storage::usage::scope(ctx.clone(), async {
+        store.neighbors(node, neighbor_query(10)).await
+    })
+    .await;
+
+    assert!(
+        result.is_err(),
+        "the corrupt relation row must fail conversion, or this test proves nothing"
+    );
+
+    let usage = ctx.snapshot();
+    assert_eq!(
+        usage
+            .get("db_round_trips")
+            .and_then(serde_json::Value::as_u64),
+        Some(1),
+        "the query executed and must be counted despite the error; got {usage}"
+    );
+    assert_eq!(
+        usage.get("graph_hops").and_then(serde_json::Value::as_u64),
+        Some(3),
+        "all three rows came back off the cursor before the conversion failed; got {usage}"
+    );
+}
+
+/// The other direction, and the one an unconditional post-await increment gets
+/// wrong: a read whose statement never prepared issued nothing, so it must
+/// count nothing. Counting it would inflate the number with work that did not
+/// happen, which is the same class of error as dropping work that did.
+#[tokio::test]
+async fn neighbors_counts_nothing_when_the_statement_never_prepared() {
+    let store = setup_memory_store_without_schema();
+    let ctx = khive_storage::usage::UsageContext::new();
+
+    let result = khive_storage::usage::scope(ctx.clone(), async {
+        store.neighbors(Uuid::new_v4(), neighbor_query(10)).await
+    })
+    .await;
+
+    assert!(
+        result.is_err(),
+        "a store with no schema must fail to prepare, or this test proves nothing"
+    );
+
+    let usage = ctx.snapshot();
+    assert!(
+        usage.get("db_round_trips").is_none(),
+        "no statement executed, so no round trip may be counted; got {usage}"
+    );
+    assert!(
+        usage.get("graph_hops").is_none(),
+        "no rows were returned; got {usage}"
+    );
+}
+
+/// Both directions again on the batched path, where a chunked read makes the
+/// stakes higher: the counters live across the whole chunk loop, so a failure
+/// in a later chunk must not erase what earlier chunks already did.
+#[tokio::test]
+async fn batch_neighbors_counts_the_query_and_the_rows_returned_before_the_failure() {
+    let node = Uuid::new_v4();
+    let store = setup_store_with_a_corrupt_relation_row(node, 2);
+    let ctx = khive_storage::usage::UsageContext::new();
+
+    let sources = vec![node];
+    let result = khive_storage::usage::scope(ctx.clone(), async {
+        store.batch_neighbors(&sources, neighbor_query(10)).await
+    })
+    .await;
+
+    assert!(
+        result.is_err(),
+        "the corrupt relation row must fail conversion, or this test proves nothing"
+    );
+
+    let usage = ctx.snapshot();
+    assert_eq!(
+        usage
+            .get("db_round_trips")
+            .and_then(serde_json::Value::as_u64),
+        Some(1),
+        "the batched query executed and must be counted despite the error; got {usage}"
+    );
+    assert_eq!(
+        usage.get("graph_hops").and_then(serde_json::Value::as_u64),
+        Some(3),
+        "all three rows came back off the cursor before the conversion failed; got {usage}"
+    );
+}
+
+/// Same rule as the `neighbors` twin, on the traversal path: a chunk whose
+/// statement never prepared issued nothing to the store, so it must count
+/// nothing — the increment sits after `prepare` succeeds, exactly where the
+/// neighbors and batch paths put theirs.
+#[tokio::test]
+async fn traverse_counts_nothing_when_the_statement_never_prepared() {
+    let store = setup_memory_store_without_schema();
+    let ctx = khive_storage::usage::UsageContext::new();
+
+    let result = khive_storage::usage::scope(ctx.clone(), async {
+        store
+            .traverse(TraversalRequest {
+                roots: vec![Uuid::new_v4()],
+                options: TraversalOptions::new(2).with_direction(Direction::Out),
+                include_roots: false,
+                include_properties: false,
+            })
+            .await
+    })
+    .await;
+
+    assert!(
+        result.is_err(),
+        "a store with no schema must fail the traversal, or this test proves nothing"
+    );
+
+    let usage = ctx.snapshot();
+    assert!(
+        usage.get("db_round_trips").is_none(),
+        "the chunk statement never prepared, so no round trip may be counted; got {usage}"
+    );
+}
+
+/// khive#1229: `Direction::Both`'s recursive-CTE join predicate used to be a
+/// single `(e.source_id = t.node_id OR e.target_id = t.node_id)` arm, which
+/// SQLite cannot satisfy with one index seek — it falls back to a full
+/// namespace scan of `graph_edges` per frontier row. This asserts the fixed
+/// `traverse_recursive_member_sql` shape plans as two separately-indexed
+/// `SEARCH` operations (one on `idx_graph_edges_ns_src_rel` binding
+/// `source_id=?`, one on `idx_graph_edges_ns_tgt_rel` binding `target_id=?`),
+/// not a scan qualified by `namespace=?` alone.
+#[tokio::test]
+async fn traverse_both_direction_recursive_member_seeks_by_source_and_target_id() {
+    let store = setup_memory_store();
+    // Same schema `traverse()` runs against; EXPLAIN QUERY PLAN doesn't
+    // execute the statement, so no rows need to exist.
+    let seeds = "(?1, ?1, NULL, 0, ?1, 0.0)";
+    let recursive_member = traverse_recursive_member_sql(Direction::Both, 2, 3, "", "");
+    let cte_sql = format!(
+        "WITH RECURSIVE traversal(\
+             root_id, node_id, edge_id, depth, path, total_weight\
+         ) AS (\
+             VALUES {seeds} \
+             UNION ALL \
+             {recursive_member} \
+         ) \
+         SELECT root_id, node_id, edge_id, depth, total_weight \
+         FROM traversal WHERE depth > 0 \
+         ORDER BY root_id, depth",
+        seeds = seeds,
+        recursive_member = recursive_member,
+    );
+
+    let reader = store.pool.reader().unwrap();
+    let plan_sql = format!("EXPLAIN QUERY PLAN {cte_sql}");
+    let mut stmt = reader.conn().prepare(&plan_sql).unwrap();
+    let params: [&str; 3] = ["root", "default", "2"];
+    let details: Vec<String> = stmt
+        .query_map(rusqlite::params_from_iter(params.iter()), |row| row.get(3))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+
+    assert!(
+        details
+            .iter()
+            .any(|d| d.contains("idx_graph_edges_ns_src_rel") && d.contains("source_id=?")),
+        "expected an out-arm SEARCH binding source_id=? via idx_graph_edges_ns_src_rel, got: {details:?}"
+    );
+    assert!(
+        details
+            .iter()
+            .any(|d| d.contains("idx_graph_edges_ns_tgt_rel") && d.contains("target_id=?")),
+        "expected an in-arm SEARCH binding target_id=? via idx_graph_edges_ns_tgt_rel, got: {details:?}"
+    );
+    assert!(
+        !details.iter().any(|d| d.contains("SCAN e")),
+        "no arm may fall back to a full graph_edges scan, got: {details:?}"
+    );
+}
+
+/// khive#1229 correctness: a hub node with mixed out- and in-edges to its
+/// spokes, each spoke extending one hop further to its own tail node.
+/// `Direction::Both` at `max_depth=2` from the hub must return every spoke
+/// (reached via whichever direction connects it to the hub) AND every tail
+/// (reached via the spoke's outgoing edge), regardless of which arm of the
+/// recursive member found the spoke. This is the exact shape the OR-predicate
+/// bug silently returned correct results for at small scale but 380x slower
+/// at hub scale — this test locks the result set the perf fix must preserve.
+#[tokio::test]
+async fn traverse_both_direction_hub_depth_two_returns_full_node_set() {
+    let store = setup_memory_store();
+
+    let hub = Uuid::new_v4();
+    let mut expected_depth1 = HashSet::new();
+    let mut expected_depth2 = HashSet::new();
+
+    const SPOKES: usize = 40;
+    for i in 0..SPOKES {
+        let spoke = Uuid::new_v4();
+        let tail = Uuid::new_v4();
+        expected_depth1.insert(spoke);
+        expected_depth2.insert(tail);
+
+        if i % 2 == 0 {
+            // hub --out--> spoke
+            store
+                .upsert_edge(make_edge(hub, spoke, EdgeRelation::Extends, 1.0))
+                .await
+                .unwrap();
+        } else {
+            // spoke --out--> hub (hub reaches it via the in-arm)
+            store
+                .upsert_edge(make_edge(spoke, hub, EdgeRelation::Extends, 1.0))
+                .await
+                .unwrap();
+        }
+        // spoke --out--> tail, reachable regardless of which arm found spoke
+        store
+            .upsert_edge(make_edge(spoke, tail, EdgeRelation::VariantOf, 1.0))
+            .await
+            .unwrap();
+    }
+
+    let paths = store
+        .traverse(TraversalRequest {
+            roots: vec![hub],
+            options: TraversalOptions::new(2).with_direction(Direction::Both),
+            include_roots: false,
+            include_properties: false,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(paths.len(), 1);
+    let path = &paths[0];
+    assert_eq!(path.root_id, hub);
+
+    let got_depth1: HashSet<Uuid> = path
+        .nodes
+        .iter()
+        .filter(|n| n.depth == 1)
+        .map(|n| n.node_id)
+        .collect();
+    let got_depth2: HashSet<Uuid> = path
+        .nodes
+        .iter()
+        .filter(|n| n.depth == 2)
+        .map(|n| n.node_id)
+        .collect();
+
+    assert_eq!(
+        got_depth1, expected_depth1,
+        "every spoke must be reached at depth 1 regardless of edge direction"
+    );
+    assert_eq!(
+        got_depth2, expected_depth2,
+        "every tail must be reached at depth 2 through its spoke's out-edge"
+    );
+    assert_eq!(
+        path.nodes.len(),
+        expected_depth1.len() + expected_depth2.len(),
+        "no duplicate or spurious nodes"
     );
 }

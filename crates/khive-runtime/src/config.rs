@@ -226,9 +226,9 @@ pub struct RuntimeConfig {
     /// Single-backend deployments use the default `BackendId::MAIN`.
     pub backend_id: BackendId,
     /// Brain profile to use for `memory.feedback` / `knowledge.feedback` and
-    /// recall-time score boosting (ADR-035 §Brain profile configuration).
+    /// recall-time score boosting (brain profile configuration).
     ///
-    /// Resolution order (highest to lowest, ADR-035): CLI flag, then
+    /// Resolution order (highest to lowest): CLI flag, then
     /// `runtime.brain_profile` in project/global `khive.toml`, then the
     /// `KHIVE_BRAIN_PROFILE` env var as fallback default. Callers must keep
     /// env OUT of the base config they pass in (see `khive-mcp` serve.rs).
@@ -263,7 +263,7 @@ pub struct RuntimeConfig {
     /// Resolved `[git_write]` policy allowlist (ADR-108 Amendment), populated
     /// from `khive.toml`'s `[[git_write.allowed]]` entries by
     /// [`runtime_config_from_khive_config`]. Threaded through so
-    /// `khive-pack-git`'s write-verb handlers read an already-resolved policy
+    /// a git-integration pack's write-verb handlers read an already-resolved policy
     /// instead of re-running config discovery (which would ignore an
     /// explicit `--config` path not also exported as `KHIVE_CONFIG`).
     pub git_write: crate::engine_config::GitWriteSectionConfig,
@@ -289,32 +289,18 @@ impl Default for RuntimeConfig {
             .ok()
             .and_then(|s| s.parse().ok())
             .or(Some(EmbeddingModel::AllMiniLmL6V2));
+        // Ships single-engine. A second engine is embedded on every write and
+        // searched on every read, which is cost a deployment should opt into
+        // rather than inherit: set KHIVE_ADDITIONAL_EMBEDDING_MODELS to add one.
         let additional_embedding_models = std::env::var("KHIVE_ADDITIONAL_EMBEDDING_MODELS")
             .ok()
             .map(|s| parse_embedding_model_list(&s))
-            .unwrap_or_else(|| vec![EmbeddingModel::ParaphraseMultilingualMiniLmL12V2]);
+            .unwrap_or_default();
         let packs = std::env::var("KHIVE_PACKS")
             .ok()
             .map(|s| parse_pack_list(&s))
             .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| {
-                vec![
-                    "kg",
-                    "gtd",
-                    "memory",
-                    "brain",
-                    "comm",
-                    "schedule",
-                    "knowledge",
-                    "session",
-                    "git",
-                    "code",
-                    "workspace",
-                ]
-                .into_iter()
-                .map(String::from)
-                .collect()
-            });
+            .unwrap_or_else(|| vec!["kg"].into_iter().map(String::from).collect());
         let brain_profile = std::env::var("KHIVE_BRAIN_PROFILE")
             .ok()
             .filter(|s| !s.trim().is_empty());
@@ -496,13 +482,15 @@ pub(crate) fn build_embedder_registry(
 }
 
 fn configured_embedding_models(config: &RuntimeConfig) -> Vec<EmbeddingModel> {
-    let mut models = Vec::new();
+    let mut models: Vec<EmbeddingModel> = Vec::new();
     if let Some(model) = config.embedding_model {
         models.push(model);
     }
-    models.extend(config.additional_embedding_models.iter().copied());
-    models.sort_by_key(|model| model.to_string());
-    models.dedup();
+    for model in config.additional_embedding_models.iter().copied() {
+        if !models.contains(&model) {
+            models.push(model);
+        }
+    }
     models
 }
 
@@ -881,12 +869,21 @@ mod no_embeddings_tests {
 
     #[test]
     #[serial]
-    fn default_still_seeds_additional_models_when_env_unset() {
+    fn default_computes_additional_models_independently_of_no_embeddings() {
         // `Default` must keep computing `embedding_model` and
         // `additional_embedding_models` independently; `no_embeddings()` is a
         // separate opt-out constructor, not a change to `Default`'s seeding.
-        std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
+        // The env var is SET here rather than cleared: since Default now ships
+        // no secondary engine, an unset env would make Default and
+        // no_embeddings() indistinguishable and the test would stop
+        // discriminating the thing it exists to discriminate.
+        std::env::set_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS", "paraphrase");
         let config = RuntimeConfig::default();
+        let buggy_form = RuntimeConfig {
+            embedding_model: None,
+            ..RuntimeConfig::default()
+        };
+        std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
 
         assert_eq!(
             config.additional_embedding_models,
@@ -895,14 +892,81 @@ mod no_embeddings_tests {
 
         // Overriding only `embedding_model` via struct-update syntax does not
         // clear `additional_embedding_models`.
-        let buggy_form = RuntimeConfig {
-            embedding_model: None,
-            ..RuntimeConfig::default()
-        };
         assert!(
             !buggy_form.additional_embedding_models.is_empty(),
             "Default's independent-field seeding must remain unchanged; \
              no_embeddings() is the fix, not a change to Default"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn default_ships_a_single_engine_when_env_unset() {
+        // A secondary engine is embedded on every write and searched on every
+        // read. That cost is opted into, not inherited.
+        std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
+        let config = RuntimeConfig::default();
+
+        assert!(
+            config.additional_embedding_models.is_empty(),
+            "shipped default must register one engine; a second is opt-in via \
+             KHIVE_ADDITIONAL_EMBEDDING_MODELS"
+        );
+        assert_eq!(
+            configured_embedding_models(&config),
+            vec![EmbeddingModel::AllMiniLmL6V2]
+        );
+    }
+}
+
+#[cfg(test)]
+mod configured_embedding_models_order_tests {
+    use super::*;
+
+    /// Issue #1115: the configured engine list must preserve declaration
+    /// order (primary first, then `additional_embedding_models` in order)
+    /// instead of alphabetizing — any consumer that treats the list as
+    /// ordered (e.g. recall fan-out) otherwise gets the wrong primary.
+    #[test]
+    fn preserves_primary_first_then_additional_in_declared_order() {
+        let config = RuntimeConfig {
+            embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
+            additional_embedding_models: vec![
+                EmbeddingModel::Qwen3Embedding4B,
+                EmbeddingModel::BgeSmallEnV15,
+            ],
+            ..RuntimeConfig::default()
+        };
+
+        assert_eq!(
+            configured_embedding_models(&config),
+            vec![
+                EmbeddingModel::AllMiniLmL6V2,
+                EmbeddingModel::Qwen3Embedding4B,
+                EmbeddingModel::BgeSmallEnV15,
+            ],
+            "order must be primary-first, then additional models as declared, \
+             not alphabetized"
+        );
+    }
+
+    /// A model repeated in both `embedding_model` and `additional_embedding_models`
+    /// must be deduped to a single entry, keeping its first (primary) position.
+    #[test]
+    fn dedupes_model_shared_between_primary_and_additional() {
+        let config = RuntimeConfig {
+            embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
+            additional_embedding_models: vec![
+                EmbeddingModel::AllMiniLmL6V2,
+                EmbeddingModel::BgeSmallEnV15,
+            ],
+            ..RuntimeConfig::default()
+        };
+
+        assert_eq!(
+            configured_embedding_models(&config),
+            vec![EmbeddingModel::AllMiniLmL6V2, EmbeddingModel::BgeSmallEnV15],
+            "the shared model must appear once, in its primary position"
         );
     }
 }

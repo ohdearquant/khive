@@ -164,6 +164,6 @@ fn fixed_seed_build_has_feature_independent_graph_and_search_digest() {
     }
     assert_eq!(
         blake3::hash(&bytes).to_hex().as_str(),
-        "19d4c2097fbd58d54920724d5a2749370166e345406e06b80fc71e745b52feee"
+        "86afcf6147c2de6da5f7d03e1df9f171e400c1ea4e73134debbc09d42129e91d"
     );
 }

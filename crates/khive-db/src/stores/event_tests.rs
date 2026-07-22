@@ -509,10 +509,10 @@ async fn rerank_executed_reranked_malformed_sub_scores_rejected() {
 
 #[tokio::test]
 async fn feedback_explicit_projects_signal_observation_from_target_id() {
-    // Regression test for #811: the emitter (khive-pack-brain's `brain.feedback`
-    // handler) sets `event.target_id` via `Event::with_target`, never a payload
-    // `about_id` field. The decoder must read the field the emitter actually
-    // writes so the round trip survives.
+    // Regression test for #811: the emitter (a feedback handler) sets
+    // `event.target_id` via `Event::with_target`, never a payload `about_id`
+    // field. The decoder must read the field the emitter actually writes so
+    // the round trip survives.
     let store = setup_memory_store();
     let target = Uuid::new_v4();
     let event = Event::new(
@@ -869,8 +869,8 @@ async fn read_event_rejects_negative_payload_schema_version() {
 }
 
 /// KDB-006 regression: u32::MAX + 1 must be rejected by the position conversion helper.
-/// The `as u32` truncation bug was the blocker finding — this test verifies the exact
-/// boundary that would have silently wrapped before the fix.
+/// This test verifies the exact boundary that would have silently wrapped via an
+/// `as u32` truncation before the fix.
 #[test]
 fn observation_position_u32_max_plus_one_is_rejected() {
     // usize value one past u32::MAX — this is the exact overflow boundary.

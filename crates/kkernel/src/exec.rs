@@ -35,7 +35,7 @@ use clap::Parser;
 use khive_mcp::serve::resolve_runtime_config;
 use khive_mcp::serve::{
     apply_env_output_format, build_server_multi_backend_with_db_anchor, config_discovery_db_anchor,
-    enforce_strict_actor_mode, RuntimeConfigInputs,
+    enforce_strict_actor_mode, install_resolved_blob_store, RuntimeConfigInputs,
 };
 #[cfg(unix)]
 use khive_mcp::server::compute_config_id;
@@ -90,7 +90,7 @@ use khive_mcp::pending_events;
 #[cfg(unix)]
 type LocalConstructionGuard = Option<khive_runtime::daemon::DaemonBootGuard>;
 #[cfg(not(unix))]
-type LocalConstructionGuard = ();
+type LocalConstructionGuard = Option<std::fs::File>;
 
 /// Acquire the daemon boot/recovery guard for a local (non-daemon)
 /// `kkernel exec` construction path, fatally — an unavailable lock is a hard
@@ -98,8 +98,8 @@ type LocalConstructionGuard = ();
 /// FTS race this guard exists to close (#667).
 ///
 /// In-memory databases (`cfg.db_path.is_none()`) need no guard: there is no
-/// shared file another process could be racing to initialize. Non-Unix
-/// targets have no advisory boot lock to hold in the first place.
+/// shared file another process could be racing to initialize. See the
+/// `#[cfg(not(unix))]` arm below for the non-unix equivalent.
 #[cfg(unix)]
 pub(crate) fn acquire_local_construction_guard(
     cfg: &RuntimeConfig,
@@ -115,11 +115,45 @@ pub(crate) fn acquire_local_construction_guard(
     ))
 }
 
+/// Non-unix mirror of the `#[cfg(unix)]` arm above: no daemon ever boots on
+/// this target (`khive_runtime::daemon::run_daemon` is unix-only), so this
+/// guard exists purely to serialize *concurrent local-construction* callers
+/// against each other (e.g. two overlapping `kkernel exec` invocations, or
+/// `--ops-file`/`KHIVE_NO_DAEMON=1` racing a fallback dispatch) — the same
+/// cold-boot FTS race #667 closes on unix, just without a daemon on the
+/// other end of it.
+///
+/// Uses `std::fs::File::lock()` (stabilized 1.89, workspace MSRV 1.93) on the
+/// SAME lock file path the unix guard uses
+/// ([`khive_runtime::daemon::lock_path`]) — a blocking exclusive advisory
+/// lock, released when the returned `File` is dropped. On unix this API is
+/// documented to correspond exactly to `flock(..., LOCK_EX)`, i.e. the same
+/// primitive the unix arm uses directly; here it is the platform-appropriate
+/// equivalent (`LockFileEx` w/ `LOCKFILE_EXCLUSIVE_LOCK` on Windows).
 #[cfg(not(unix))]
 pub(crate) fn acquire_local_construction_guard(
-    _cfg: &RuntimeConfig,
+    cfg: &RuntimeConfig,
 ) -> Result<LocalConstructionGuard> {
-    Ok(())
+    if cfg.db_path.is_none() {
+        return Ok(None);
+    }
+    let path = khive_runtime::daemon::lock_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!("create parent directory for construction guard lock file {path:?}")
+        })?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("open construction guard lock file {path:?}"))?;
+    file.lock().context(
+        "acquire local construction guard lock for kkernel exec construction \
+         (another process may be cold-booting the same database)",
+    )?;
+    Ok(Some(file))
 }
 
 // `khive-request` is not a direct kkernel dependency.  We use serde_json to
@@ -244,6 +278,16 @@ pub struct ExecArgs {
     /// meaningful with `--atomic`.
     #[arg(long, requires = "atomic")]
     pub atomic_max_ops: Option<usize>,
+
+    /// Exit non-zero when any op in the batch fails (or, for `--ops-file`,
+    /// when any applied op fails). Without this flag the process exits 0
+    /// whenever the request itself was dispatched, even if every op inside
+    /// it failed — the per-op `results` entries and the `summary`/`status`
+    /// fields in the printed output are the only signal (#1220). Not
+    /// meaningful with `--atomic`, which already fails the whole file on
+    /// any rejected op.
+    #[arg(long)]
+    pub strict: bool,
 }
 
 /// A single parsed op entry from an ops-file line.
@@ -315,16 +359,48 @@ pub(crate) fn parse_ops_file(path: &PathBuf) -> Result<Vec<OpsFileEntry>> {
     Ok(ops)
 }
 
+/// Extract the failed entries of one dispatched chunk as `{op_index, tool,
+/// error}` objects, with `op_index` global across chunks. A failure summary
+/// without the per-op reason strings is unactionable: a gate rejection, a
+/// schema error, and a transient failure all look identical, and pipelines
+/// that trust the counts alone lose records silently.
+fn collect_op_failures(
+    parsed: &serde_json::Value,
+    applied_before: usize,
+) -> Vec<serde_json::Value> {
+    let Some(results) = parsed["results"].as_array() else {
+        return Vec::new();
+    };
+    results
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry["ok"].as_bool() == Some(false))
+        .map(|(i, entry)| {
+            let error = match &entry["error"] {
+                serde_json::Value::Null => serde_json::Value::from("unknown error"),
+                other => other.clone(),
+            };
+            serde_json::json!({
+                "op_index": applied_before + i,
+                "tool": entry["tool"].as_str().unwrap_or("?"),
+                "error": error,
+            })
+        })
+        .collect()
+}
+
 /// Apply a parsed ops-file against the given server, printing progress to
 /// stderr and the final summary to stdout.
 async fn apply_ops_file(
     server: &KhiveMcpServer,
     ops: Vec<OpsFileEntry>,
     presentation: Option<String>,
+    strict: bool,
 ) -> Result<()> {
     let total = ops.len();
     let mut total_succeeded: usize = 0;
     let mut total_failed: usize = 0;
+    let mut failures: Vec<serde_json::Value> = Vec::new();
 
     for (chunk_idx, chunk) in ops.chunks(OPS_FILE_CHUNK_SIZE).enumerate() {
         let applied_before = (chunk_idx * OPS_FILE_CHUNK_SIZE).min(total);
@@ -365,19 +441,40 @@ async fn apply_ops_file(
         total_succeeded += chunk_succeeded;
         total_failed += chunk_failed;
 
+        for failure in collect_op_failures(&parsed, applied_before) {
+            let reason = match &failure["error"] {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            eprintln!(
+                "op {} ({}) failed: {reason}",
+                failure["op_index"],
+                failure["tool"].as_str().unwrap_or("?"),
+            );
+            failures.push(failure);
+        }
+
         let applied_now = applied_before + chunk.len();
         eprintln!("applied {applied_now}/{total} (ok={total_succeeded}, failed={total_failed})");
     }
 
-    let summary = serde_json::json!({
+    let mut summary = serde_json::json!({
         "total": total,
         "succeeded": total_succeeded,
         "failed": total_failed,
     });
+    if !failures.is_empty() {
+        summary["failures"] = serde_json::Value::Array(failures);
+    }
     println!(
         "{}",
         serde_json::to_string_pretty(&summary).expect("serialize summary")
     );
+    if strict && total_failed > 0 {
+        anyhow::bail!(
+            "--strict: {total_failed} op(s) failed out of {total} (see printed summary above)"
+        );
+    }
     Ok(())
 }
 
@@ -485,6 +582,7 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
                 args.output_format,
                 args.save_file,
                 db_context,
+                args.strict,
             )
             .await
         }
@@ -497,10 +595,35 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
                 db_context,
                 args.atomic,
                 args.atomic_max_ops,
+                args.strict,
             )
             .await
         }
     }
+}
+
+/// Returns `Err` describing the failed/aborted op counts when `strict` is set
+/// and the parsed response envelope's `summary` reports either as non-zero
+/// (#1220). `raw` must be the exact envelope string already printed to
+/// stdout — the caller prints first, unconditionally, then this decides the
+/// exit code; a caller piping the output still sees the full result either way.
+fn enforce_strict_batch_result(raw: &str, strict: bool) -> Result<()> {
+    if !strict {
+        return Ok(());
+    }
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw) else {
+        // Non-JSON output (e.g. --output-format table/auto): nothing to
+        // inspect here. `--strict` only applies to the default JSON shape.
+        return Ok(());
+    };
+    let failed = parsed["summary"]["failed"].as_u64().unwrap_or(0);
+    let aborted = parsed["summary"]["aborted"].as_u64().unwrap_or(0);
+    if failed > 0 || aborted > 0 {
+        anyhow::bail!(
+            "--strict: {failed} op(s) failed, {aborted} op(s) aborted (see printed output above)"
+        );
+    }
+    Ok(())
 }
 
 enum ExecMode {
@@ -521,6 +644,7 @@ async fn run_exec_inline(
     output_format: Option<String>,
     save_file: Option<String>,
     db_context: ExecDbContext,
+    strict: bool,
 ) -> Result<()> {
     #[cfg(unix)]
     return run_exec_inline_with_forward(
@@ -530,6 +654,7 @@ async fn run_exec_inline(
         output_format,
         save_file,
         db_context,
+        strict,
         forward_or_spawn_boxed,
     )
     .await;
@@ -541,6 +666,7 @@ async fn run_exec_inline(
         output_format,
         save_file,
         db_context,
+        strict,
     )
     .await;
 }
@@ -558,6 +684,7 @@ async fn run_exec_inline(
 /// enables the latter: tests pass a spy `forward_fn` and assert it is never
 /// called when the gate should have rejected.
 #[cfg_attr(not(unix), allow(unused_variables))]
+#[allow(clippy::too_many_arguments)]
 async fn run_exec_inline_with_forward(
     ops: String,
     cfg: RuntimeConfig,
@@ -565,6 +692,7 @@ async fn run_exec_inline_with_forward(
     output_format: Option<String>,
     save_file: Option<String>,
     db_context: ExecDbContext,
+    strict: bool,
     #[cfg(unix)] forward_fn: ForwardFnPtr,
 ) -> Result<()> {
     // ── strict-actor gate (before any forwarding) ─────────────────────────────
@@ -602,6 +730,18 @@ async fn run_exec_inline_with_forward(
         .map_err(|e| anyhow::anyhow!("config error: {e}"))?
         .unwrap_or_default();
 
+    // #1226: apply the same --db/[[backends]] conflict guard the in-process
+    // fallback below applies, BEFORE the daemon fast-path — otherwise a warm
+    // daemon answers this request without the override ever being checked at
+    // all, while the identical override on `--ops-file` (always in-process)
+    // correctly rejects it. See `validate_db_override_against_backends`.
+    if !khive_cfg.backends.is_empty() {
+        khive_mcp::serve::validate_db_override_against_backends(
+            db_context.raw.as_deref(),
+            khive_cfg.backends.len(),
+        )?;
+    }
+
     // ── daemon fast-path (Unix only) ─────────────────────────────────────────
     // The daemon path does not support --save-file (the daemon returns a string;
     // we would need to parse it back to apply the sink).  Skip daemon forwarding
@@ -638,6 +778,7 @@ async fn run_exec_inline_with_forward(
         if let Some(res) = forward_fn(&frame).await {
             let output = res.map_err(|e| anyhow::anyhow!("{}", e.message))?;
             println!("{output}");
+            enforce_strict_batch_result(&output, strict)?;
             return Ok(());
         }
     }
@@ -673,6 +814,7 @@ async fn run_exec_inline_with_forward(
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     println!("{output}");
+    enforce_strict_batch_result(&output, strict)?;
     Ok(())
 }
 
@@ -693,6 +835,12 @@ fn build_local_fallback_server(
     let _boot_guard = acquire_local_construction_guard(&cfg)?;
     if khive_cfg.backends.is_empty() {
         let rt = KhiveRuntime::new(cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
+        // Mirror the `serve` boot path's single-backend branch (ADR-111
+        // Amendment 2): without this, `exec`'s in-process fallback server
+        // never installs a `BlobStore`, so `blob.put`/`blob.get`/`blob.stat`
+        // fail as "unconfigured" here even when `serve` resolves one from
+        // the same config and backend (khive#1209).
+        install_resolved_blob_store(&rt, khive_cfg, rt.backend())?;
         let env_fmt = apply_env_output_format(khive_cfg.runtime.default_output_format);
         Ok(KhiveMcpServer::new(rt)
             .map_err(|e| anyhow::anyhow!("{e}"))?
@@ -702,6 +850,7 @@ fn build_local_fallback_server(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_exec_ops_file(
     path: PathBuf,
     cfg: RuntimeConfig,
@@ -710,6 +859,7 @@ async fn run_exec_ops_file(
     db_context: ExecDbContext,
     atomic: bool,
     atomic_max_ops: Option<usize>,
+    strict: bool,
 ) -> Result<()> {
     // Parse the whole file first — fail before any writes if any line is bad.
     let ops = parse_ops_file(&path)?;
@@ -766,7 +916,7 @@ async fn run_exec_ops_file(
         db_context.anchor.as_deref(),
     )?;
 
-    apply_ops_file(&server, ops, presentation).await
+    apply_ops_file(&server, ops, presentation, strict).await
 }
 
 #[cfg(test)]
@@ -775,6 +925,60 @@ mod tests {
     use clap::Parser;
     use serial_test::serial;
     use tempfile::NamedTempFile;
+
+    // ── collect_op_failures: per-op error surfacing (#1228) ───────────────────
+
+    #[test]
+    fn collect_op_failures_extracts_reason_with_global_index() {
+        let parsed = serde_json::json!({
+            "results": [
+                {"ok": true, "tool": "create", "result": {}},
+                {"ok": false, "tool": "create", "error": "content rejected: suspected credential material"},
+                {"ok": false, "tool": "link"},
+            ],
+            "summary": {"total": 3, "succeeded": 1, "failed": 2}
+        });
+        let failures = collect_op_failures(&parsed, 500);
+        assert_eq!(failures.len(), 2);
+        assert_eq!(failures[0]["op_index"], 501);
+        assert_eq!(failures[0]["tool"], "create");
+        assert_eq!(
+            failures[0]["error"],
+            "content rejected: suspected credential material"
+        );
+        assert_eq!(failures[1]["op_index"], 502);
+        assert_eq!(
+            failures[1]["error"], "unknown error",
+            "a failed entry with no error value still surfaces a placeholder"
+        );
+    }
+
+    #[test]
+    fn collect_op_failures_preserves_structured_error_payloads() {
+        let parsed = serde_json::json!({
+            "results": [
+                {"ok": false, "tool": "create",
+                 "error": {"kind": "invalid_input", "message": "content rejected"}},
+            ],
+            "summary": {"total": 1, "succeeded": 0, "failed": 1}
+        });
+        let failures = collect_op_failures(&parsed, 0);
+        assert_eq!(
+            failures[0]["error"],
+            serde_json::json!({"kind": "invalid_input", "message": "content rejected"}),
+            "structured KhiveError payloads pass through as JSON, not a placeholder"
+        );
+    }
+
+    #[test]
+    fn collect_op_failures_empty_on_all_ok_or_missing_results() {
+        let all_ok = serde_json::json!({
+            "results": [{"ok": true, "tool": "stats", "result": {}}],
+            "summary": {"total": 1, "succeeded": 1, "failed": 0}
+        });
+        assert!(collect_op_failures(&all_ok, 0).is_empty());
+        assert!(collect_op_failures(&serde_json::json!({}), 0).is_empty());
+    }
 
     // ── HOME isolation for local-fallback tests ───────────────────────────────
     //
@@ -802,6 +1006,96 @@ mod tests {
             Some(v) => std::env::set_var("HOME", v),
             None => std::env::remove_var("HOME"),
         }
+    }
+
+    // ── acquire_local_construction_guard: in-memory dbs skip the guard ────────
+
+    #[test]
+    #[serial(local_exec_boot_guard)]
+    fn acquire_local_construction_guard_is_noop_for_in_memory_db() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("KHIVE_LOCK", dir.path().join("khived.recovery.lock"));
+
+        let cfg = RuntimeConfig {
+            db_path: None,
+            ..RuntimeConfig::default()
+        };
+        let guard = acquire_local_construction_guard(&cfg).expect("in-memory db needs no guard");
+        assert!(
+            guard.is_none(),
+            "an in-memory database has no shared file to serialize construction against"
+        );
+
+        std::env::remove_var("KHIVE_LOCK");
+    }
+
+    // ── acquire_local_construction_guard: file-backed dbs serialize ──────────
+    //
+    // Two threads race to acquire the guard for the same file-backed db.
+    // Both must succeed (the guard is a blocking exclusive lock, not a
+    // try-and-fail check), but their guarded critical sections must never
+    // overlap — proven the same way
+    // `khive_runtime::daemon::tests::recovery_lock_serializes_two_concurrent_boot_sequences`
+    // proves it for the raw primitive: two threads increment/decrement a
+    // shared "inside the critical section" counter around a sleep, and a
+    // third-thread-visible max-observed-concurrency of 1 is the guarantee.
+
+    #[cfg(unix)]
+    #[test]
+    #[serial(local_exec_boot_guard)]
+    fn acquire_local_construction_guard_serializes_concurrent_file_backed_callers() {
+        acquire_local_construction_guard_serializes_concurrent_file_backed_callers_impl();
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    #[serial(local_exec_boot_guard)]
+    fn acquire_local_construction_guard_serializes_concurrent_file_backed_callers_nonunix() {
+        acquire_local_construction_guard_serializes_concurrent_file_backed_callers_impl();
+    }
+
+    fn acquire_local_construction_guard_serializes_concurrent_file_backed_callers_impl() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("KHIVE_LOCK", dir.path().join("khived.recovery.lock"));
+        let db_path = dir.path().join("cold.db3");
+
+        let concurrent = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_observed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let spawn_one = |label: &'static str| {
+            let db_path = db_path.clone();
+            let concurrent = concurrent.clone();
+            let max_observed = max_observed.clone();
+            std::thread::spawn(move || {
+                let cfg = RuntimeConfig {
+                    db_path: Some(db_path),
+                    ..RuntimeConfig::default()
+                };
+                let guard = acquire_local_construction_guard(&cfg)
+                    .unwrap_or_else(|e| panic!("{label} must acquire the guard: {e}"));
+
+                let now = concurrent.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                max_observed.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                concurrent.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+
+                drop(guard);
+            })
+        };
+
+        let t_a = spawn_one("writer-a");
+        let t_b = spawn_one("writer-b");
+        t_a.join().expect("writer-a thread must not panic");
+        t_b.join().expect("writer-b thread must not panic");
+
+        assert_eq!(
+            max_observed.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the two guarded critical sections must never overlap — the guard \
+             failed to serialize concurrent local-construction callers"
+        );
+
+        std::env::remove_var("KHIVE_LOCK");
     }
 
     // ── clap / env-binding tests ───────────────────────────────────────────────
@@ -903,10 +1197,42 @@ mod tests {
             db_path: Some(PathBuf::from(db_path)),
             embedding_model: None,
             additional_embedding_models: vec![],
+            // Pin the pack list explicitly rather than inheriting `KHIVE_PACKS`
+            // from the ambient environment (#1276) — every caller of this
+            // helper only dispatches `kg` verbs, so the behavior under test
+            // shouldn't depend on a wider pack set a developer's shell exports.
+            packs: vec!["kg".to_string()],
             ..Default::default()
         };
         let rt = KhiveRuntime::new(cfg).expect("runtime on temp db");
         KhiveMcpServer::new(rt).expect("server on temp db")
+    }
+
+    // ── isolated_server ignores ambient KHIVE_PACKS (#1276) ───────────────────
+    //
+    // `cargo test -p kkernel` failed ~20 exec tests whenever a developer's
+    // shell exported `KHIVE_PACKS` naming a pack not compiled into this
+    // workspace (e.g. `kg,gtd`): every `RuntimeConfig` built by this test
+    // module's shared helpers fell through to `RuntimeConfig::default()`'s
+    // `packs` field, which reads that env var, so construction panicked with
+    // `PackRegError { unknown: "gtd", .. }`. A unit test's outcome must not
+    // depend on ambient shell configuration.
+    #[test]
+    #[serial(khive_packs_env)]
+    fn isolated_server_ignores_ambient_khive_packs_naming_unavailable_pack() {
+        let prev = std::env::var("KHIVE_PACKS").ok();
+        std::env::set_var("KHIVE_PACKS", "kg,gtd");
+
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        // Before the fix, this panicked inside `KhiveMcpServer::new` — the
+        // helper inherited the ambient list above instead of pinning its own.
+        let _server = isolated_server(&db_path);
+
+        match prev {
+            Some(v) => std::env::set_var("KHIVE_PACKS", v),
+            None => std::env::remove_var("KHIVE_PACKS"),
+        }
     }
 
     // ── exec-path / serve-path config_id parity (#581) ────────────────────────
@@ -1239,7 +1565,7 @@ default = true
             packs: {
                 let mut m = std::collections::HashMap::new();
                 m.insert(
-                    "comm".to_string(),
+                    "kg".to_string(),
                     PackConfig {
                         backend: "secondary".to_string(),
                     },
@@ -1262,7 +1588,7 @@ default = true
             db_path: khive_runtime::resolve_db_anchor(None),
             embedding_model: None,
             additional_embedding_models: vec![],
-            packs: vec!["kg".to_string(), "comm".to_string()],
+            packs: vec!["kg".to_string()],
             actor_id: Some("actor-routing-test".to_string()),
             ..RuntimeConfig::default()
         };
@@ -1275,9 +1601,9 @@ default = true
         let server = build_local_fallback_server(cfg, &khive_cfg, None, db_anchor.as_deref())
             .expect("multi-backend local fallback must build");
 
-        let send = server
+        let create = server
             .dispatch_request_local(RequestParams {
-                ops: r#"comm.send(to="actor-routing-test", content="routed-via-secondary", self_send=true)"#
+                ops: r#"create(kind="entity", entity_kind="concept", name="routed-via-secondary")"#
                     .to_string(),
                 presentation: None,
                 presentation_per_op: None,
@@ -1287,29 +1613,29 @@ default = true
                 request_id: None,
             })
             .await
-            .expect("comm.send must dispatch");
-        let send_resp: serde_json::Value = serde_json::from_str(&send).expect("valid JSON");
+            .expect("create must dispatch");
+        let create_resp: serde_json::Value = serde_json::from_str(&create).expect("valid JSON");
         assert_eq!(
-            send_resp["results"][0]["ok"].as_bool(),
+            create_resp["results"][0]["ok"].as_bool(),
             Some(true),
-            "comm.send must succeed through the multi-backend fallback server: {send_resp}"
+            "create must succeed through the multi-backend fallback server: {create_resp}"
         );
 
         // Re-open EACH backend file independently (fresh KhiveMcpServer, no
-        // shared state) and list `message` notes directly against it.
-        async fn count_messages(db_path: &std::path::Path) -> usize {
+        // shared state) and list `concept` entities directly against it.
+        async fn count_concepts(db_path: &std::path::Path) -> usize {
             let cfg = RuntimeConfig {
                 db_path: Some(db_path.to_path_buf()),
                 embedding_model: None,
                 additional_embedding_models: vec![],
-                packs: vec!["kg".to_string(), "comm".to_string()],
+                packs: vec!["kg".to_string()],
                 ..RuntimeConfig::default()
             };
             let rt = KhiveRuntime::new(cfg).expect("runtime on backend file");
             let probe = KhiveMcpServer::new(rt).expect("server on backend file");
             let raw = probe
                 .dispatch_request_local(RequestParams {
-                    ops: r#"list(kind="message")"#.to_string(),
+                    ops: r#"list(kind="concept")"#.to_string(),
                     presentation: None,
                     presentation_per_op: None,
                     save_to: None,
@@ -1326,22 +1652,18 @@ default = true
                 .unwrap_or(0)
         }
 
-        let main_count = count_messages(&main_path).await;
-        let secondary_count = count_messages(&secondary_path).await;
+        let main_count = count_concepts(&main_path).await;
+        let secondary_count = count_concepts(&secondary_path).await;
 
         assert_eq!(
             main_count, 0,
-            "comm pack must NOT write into the `main` backend file when pinned to \
+            "kg pack must NOT write into the `main` backend file when pinned to \
              `secondary` (D1-R2: a silent single-backend fallback would have written \
              it here instead)"
         );
         assert_eq!(
-            secondary_count, 2,
-            "comm pack write must land in its declared `secondary` backend file — \
-             `comm.send` dual-writes an outbound + inbound note copy per message \
-             (khive-pack-comm's message.rs), both via the SAME pack runtime, so a \
-             single self-send yields 2 `message` notes in whichever backend `comm` \
-             is pinned to"
+            secondary_count, 1,
+            "kg pack write must land in its declared `secondary` backend file"
         );
     }
 
@@ -1378,6 +1700,42 @@ default = true
             result.is_ok(),
             "exec fallback must use the anchor captured with RuntimeConfig after HOME changes: {}",
             result.err().unwrap()
+        );
+    }
+
+    // ── single-backend fallback installs a BlobStore (khive#1209) ────────────
+    //
+    // Before this fix, `build_local_fallback_server`'s single-backend branch
+    // constructed `KhiveRuntime`/`KhiveMcpServer` without ever calling
+    // `install_resolved_blob_store`, so `blob.*` verbs dispatched through
+    // `kkernel exec`'s in-process fallback always saw an unconfigured
+    // `BlobStore` even when the same config/backend combination resolves one
+    // for the `serve` daemon boot path. `KhiveMcpServer` does not expose its
+    // wrapped runtime, so this asserts the same *observable* side effect the
+    // `serve` path's own tests rely on: `FsBlobStore::new` (khive-db
+    // `stores/blob.rs`) creates its root directory eagerly. With no
+    // `[storage.blob]` config and no `KHIVE_BLOB_ROOT`, resolution falls
+    // back to `<db_dir>/blobs` — that directory existing after construction
+    // is proof the install call ran.
+    #[test]
+    fn build_local_fallback_server_installs_blob_store_single_backend() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("exec_blob.db");
+        let cfg = RuntimeConfig {
+            db_path: Some(db_path),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            ..RuntimeConfig::default()
+        };
+        let khive_cfg = KhiveConfig::default();
+
+        let _server = build_local_fallback_server(cfg, &khive_cfg, None, None)
+            .expect("single-backend local-exec construction must succeed");
+
+        assert!(
+            dir.path().join("blobs").is_dir(),
+            "default <db_dir>/blobs root must exist after construction, proving \
+             install_resolved_blob_store ran for the single-backend fallback path"
         );
     }
 
@@ -1449,6 +1807,10 @@ default = true
                 db_path: Some(db_path),
                 embedding_model: None,
                 additional_embedding_models: vec![],
+                // Pin the pack list explicitly rather than inheriting
+                // `KHIVE_PACKS` from the ambient environment (#1276) — this
+                // race only exercises `kg` writes.
+                packs: vec!["kg".to_string()],
                 ..RuntimeConfig::default()
             };
             let khive_cfg = KhiveConfig::default();
@@ -1527,6 +1889,9 @@ default = true
                 db_path: Some(db_path),
                 embedding_model: None,
                 additional_embedding_models: vec![],
+                // Pin the pack list explicitly rather than inheriting
+                // `KHIVE_PACKS` from the ambient environment (#1276).
+                packs: vec!["kg".to_string()],
                 ..RuntimeConfig::default()
             };
             let khive_cfg = KhiveConfig::default();
@@ -1696,7 +2061,7 @@ default = true
 
         let ops = parse_ops_file(&f.path().to_path_buf()).unwrap();
         assert_eq!(ops.len(), 3);
-        apply_ops_file(&server, ops, None).await.unwrap();
+        apply_ops_file(&server, ops, None, false).await.unwrap();
 
         // Verify all 3 entities are present.
         let params = RequestParams {
@@ -1720,6 +2085,94 @@ default = true
             count, 3,
             "all 3 entities should be present after apply\nraw: {resp}"
         );
+    }
+
+    // ── #1220: --strict exit-code signal for partially-failed batches ─────────
+
+    #[test]
+    fn enforce_strict_batch_result_ok_when_strict_off_regardless_of_failures() {
+        let raw = serde_json::json!({
+            "results": [],
+            "summary": {"total": 1, "succeeded": 0, "failed": 1, "aborted": 0},
+        })
+        .to_string();
+        assert!(enforce_strict_batch_result(&raw, false).is_ok());
+    }
+
+    #[test]
+    fn enforce_strict_batch_result_ok_when_strict_on_and_nothing_failed() {
+        let raw = serde_json::json!({
+            "results": [],
+            "summary": {"total": 2, "succeeded": 2, "failed": 0, "aborted": 0},
+        })
+        .to_string();
+        assert!(enforce_strict_batch_result(&raw, true).is_ok());
+    }
+
+    #[test]
+    fn enforce_strict_batch_result_errs_when_strict_on_and_a_failure_present() {
+        let raw = serde_json::json!({
+            "results": [],
+            "summary": {"total": 2, "succeeded": 1, "failed": 1, "aborted": 0},
+        })
+        .to_string();
+        let err = enforce_strict_batch_result(&raw, true).unwrap_err();
+        assert!(format!("{err}").contains("1 op(s) failed"));
+    }
+
+    #[test]
+    fn enforce_strict_batch_result_errs_when_strict_on_and_chain_aborted() {
+        let raw = serde_json::json!({
+            "results": [],
+            "summary": {"total": 2, "succeeded": 0, "failed": 1, "aborted": 1},
+        })
+        .to_string();
+        assert!(enforce_strict_batch_result(&raw, true).is_err());
+    }
+
+    #[test]
+    fn enforce_strict_batch_result_errs_on_save_manifest_with_failures() {
+        // The save-file path prints a manifest, not the raw envelope; the
+        // manifest carries the envelope's summary through (khive-mcp
+        // save_sink) precisely so --strict works on this path too.
+        let raw = r#"{"path":"/tmp/out.jsonl","rows":2,"checksum":"ab","summary":{"total":2,"succeeded":1,"failed":1,"aborted":0}}"#;
+        assert!(enforce_strict_batch_result(raw, true).is_err());
+        let clean = r#"{"path":"/tmp/out.jsonl","rows":2,"checksum":"ab","summary":{"total":2,"succeeded":2,"failed":0,"aborted":0}}"#;
+        assert!(enforce_strict_batch_result(clean, true).is_ok());
+    }
+
+    #[test]
+    fn enforce_strict_batch_result_ok_on_non_json_output() {
+        // --output-format table/auto renders a non-JSON string; --strict has
+        // nothing to inspect and must not itself error out on that shape.
+        assert!(enforce_strict_batch_result("| a | b |\n", true).is_ok());
+    }
+
+    #[tokio::test]
+    async fn apply_ops_file_strict_errs_when_an_op_fails() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        let server = isolated_server(&db_path);
+
+        // First op succeeds; second targets an unknown kind and fails.
+        let mut f = NamedTempFile::new().unwrap();
+        use std::io::Write as _;
+        f.write_all(
+            b"{\"tool\":\"create\",\"args\":{\"kind\":\"concept\",\"name\":\"StrictOne\"}}\n",
+        )
+        .unwrap();
+        f.write_all(
+            b"{\"tool\":\"search\",\"args\":{\"kind\":\"not_a_real_kind\",\"query\":\"x\"}}\n",
+        )
+        .unwrap();
+
+        let ops = parse_ops_file(&f.path().to_path_buf()).unwrap();
+        assert_eq!(ops.len(), 2);
+
+        let err = apply_ops_file(&server, ops, None, true)
+            .await
+            .expect_err("strict mode must surface the per-op failure as a process error");
+        assert!(format!("{err}").contains("1 op(s) failed"));
     }
 
     // ── ADR-099 B1 inertness (golden shape) ────────────────────────────────────
@@ -1817,8 +2270,8 @@ default = true
             .collect();
         assert_eq!(
             top_level_keys,
-            std::collections::BTreeSet::from(["results", "summary"]),
-            "non-atomic envelope must carry exactly results+summary, no `atomic` block: {resp}"
+            std::collections::BTreeSet::from(["results", "summary", "status"]),
+            "non-atomic envelope must carry exactly results+summary+status, no `atomic` block (#1220 added `status`): {resp}"
         );
 
         let summary_keys: std::collections::BTreeSet<&str> = resp["summary"]
@@ -1873,6 +2326,7 @@ default = true
             ExecDbContext::default(),
             false,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -1899,67 +2353,11 @@ default = true
 
     // ── strict-actor mode: daemon bypass regression ───────────────────────────
 
-    /// Security regression: strict-actor gate must fire before daemon forward.
-    /// See `crates/kkernel/docs/design.md#execrs-regression-test-notes`.
-    #[tokio::test]
-    #[serial]
-    async fn strict_mode_rejects_before_daemon_forward_when_comm_and_no_actor() {
-        let prev_strict = std::env::var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR").ok();
-        let prev_no_daemon = std::env::var("KHIVE_NO_DAEMON").ok();
-
-        std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", "1");
-        // Belt-and-suspenders: ensure no daemon is contacted even if one happens
-        // to be running.  The error should fire before forwarding, but we make the
-        // test deterministic by also suppressing the daemon path.
-        std::env::set_var("KHIVE_NO_DAEMON", "1");
-
-        let cfg = RuntimeConfig {
-            db_path: None, // in-memory
-            packs: vec!["kg".to_string(), "comm".to_string()],
-            actor_id: None, // no actor — triggers the strict-mode gate
-            ..RuntimeConfig::default()
-        };
-
-        let result = run_exec_inline(
-            "stats()".to_string(),
-            cfg,
-            None,
-            None,
-            None,
-            ExecDbContext::default(),
-        )
-        .await;
-
-        // Restore env.
-        match prev_strict {
-            Some(v) => std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", v),
-            None => std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR"),
-        }
-        match prev_no_daemon {
-            Some(v) => std::env::set_var("KHIVE_NO_DAEMON", v),
-            None => std::env::remove_var("KHIVE_NO_DAEMON"),
-        }
-
-        assert!(
-            result.is_err(),
-            "run_exec_inline must return Err under strict mode + comm + no actor; got Ok"
-        );
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("KHIVE_REQUIRE_ATTRIBUTED_ACTOR"),
-            "error must name the strict-mode env var; got: {msg}"
-        );
-        assert!(
-            msg.contains("KHIVE_ACTOR"),
-            "error must name the remedy (KHIVE_ACTOR); got: {msg}"
-        );
-    }
-
-    /// Complement: strict mode must NOT reject when comm is loaded and an actor
+    /// Complement: strict mode must NOT reject when a pack is loaded and an actor
     /// IS configured — the daemon fast-path must remain available in that case.
     #[tokio::test]
     #[serial]
-    async fn strict_mode_allows_exec_when_comm_and_actor_configured() {
+    async fn strict_mode_allows_exec_when_actor_configured() {
         let prev_strict = std::env::var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR").ok();
         let prev_no_daemon = std::env::var("KHIVE_NO_DAEMON").ok();
         let (prev_home, _home_dir) = isolate_home_for_test();
@@ -1969,7 +2367,7 @@ default = true
 
         let cfg = RuntimeConfig {
             db_path: None,
-            packs: vec!["kg".to_string(), "comm".to_string()],
+            packs: vec!["kg".to_string()],
             actor_id: Some("lambda:tenant-x".to_string()), // actor configured → no gate
             ..RuntimeConfig::default()
         };
@@ -1982,6 +2380,7 @@ default = true
             None,
             None,
             ExecDbContext::default(),
+            false,
         )
         .await;
 
@@ -2002,10 +2401,10 @@ default = true
     }
 
     /// Default-off regression: when KHIVE_REQUIRE_ATTRIBUTED_ACTOR is unset,
-    /// run_exec_inline must NOT reject even with comm + no actor (OSS default path).
+    /// run_exec_inline must NOT reject even with no actor (OSS default path).
     #[tokio::test]
     #[serial]
-    async fn strict_mode_off_exec_inline_passes_with_comm_no_actor() {
+    async fn strict_mode_off_exec_inline_passes_with_no_actor() {
         let prev_strict = std::env::var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR").ok();
         let prev_no_daemon = std::env::var("KHIVE_NO_DAEMON").ok();
         let (prev_home, _home_dir) = isolate_home_for_test();
@@ -2015,7 +2414,7 @@ default = true
 
         let cfg = RuntimeConfig {
             db_path: None,
-            packs: vec!["kg".to_string(), "comm".to_string()],
+            packs: vec!["kg".to_string()],
             actor_id: None,
             ..RuntimeConfig::default()
         };
@@ -2027,6 +2426,7 @@ default = true
             None,
             None,
             ExecDbContext::default(),
+            false,
         )
         .await;
 
@@ -2043,150 +2443,6 @@ default = true
         assert!(
             result.is_ok(),
             "run_exec_inline must NOT reject when strict mode is OFF (OSS default); got: {result:?}"
-        );
-    }
-
-    // ── spy-based isomorphism guard (Unix only) ───────────────────────────────
-    //
-    // The three tests above use KHIVE_NO_DAEMON=1, which disables the daemon
-    // fast-path at the `forward_or_spawn` level.  That makes them correct checks
-    // of the strict gate in isolation, but tautological w.r.t. the daemon-bypass
-    // bug: moving `enforce_strict_actor_mode` back to BELOW the daemon block would
-    // NOT cause those tests to fail because the daemon path is suppressed.
-    //
-    // These tests use `run_exec_inline_with_forward` directly, passing a spy
-    // function pointer.  KHIVE_NO_DAEMON is NOT set in the rejection test.
-    // The spy can therefore be reached if — and only if — `enforce_strict_actor_mode`
-    // is called AFTER the forwarding attempt.  Under the correct implementation
-    // (enforce first) the gate rejects before the spy is invoked, so the spy
-    // thread-local remains false.
-    //
-    // ISOMORPHISM PROOF:
-    //   Temporarily moved `enforce_strict_actor_mode` to below the daemon block in
-    //   `run_exec_inline_with_forward`.  `strict_mode_spy_confirms_enforce_fires_before_forward`
-    //   failed with: "spy forward_fn was called — enforce fired after forwarding"
-    //   Restoring the early check made the test pass again.
-    //   This confirms the test is NOT tautological w.r.t. the bug it guards.
-
-    // Thread-local spy flag shared between the outer test body and the spy fn pointer.
-    // Using a module-level thread_local! avoids the "two separate statics" trap that
-    // arises when thread_local! is declared inside a function body.
-    #[cfg(unix)]
-    std::thread_local! {
-        static SPY_WAS_CALLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-
-    #[cfg(unix)]
-    fn spy_forward_records_call(_frame: &DaemonRequestFrame) -> super::ForwardFuture<'_> {
-        SPY_WAS_CALLED.with(|c| c.set(true));
-        Box::pin(async { None })
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    #[serial]
-    async fn strict_mode_spy_confirms_enforce_fires_before_forward() {
-        let prev_strict = std::env::var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR").ok();
-        // Deliberately do NOT set KHIVE_NO_DAEMON — the spy must be reachable
-        // if the enforce call is in the wrong place.
-        std::env::remove_var("KHIVE_NO_DAEMON");
-        std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", "1");
-        SPY_WAS_CALLED.with(|c| c.set(false));
-
-        let cfg = RuntimeConfig {
-            db_path: None,
-            packs: vec!["kg".to_string(), "comm".to_string()],
-            actor_id: None, // no actor — should trigger the strict gate
-            ..RuntimeConfig::default()
-        };
-
-        let result = run_exec_inline_with_forward(
-            "stats()".to_string(),
-            cfg,
-            None,
-            None, // output_format
-            None,
-            ExecDbContext::default(),
-            spy_forward_records_call,
-        )
-        .await;
-
-        let spy_was_called = SPY_WAS_CALLED.with(|c| c.get());
-        SPY_WAS_CALLED.with(|c| c.set(false)); // clean up
-
-        match prev_strict {
-            Some(v) => std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", v),
-            None => std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR"),
-        }
-
-        assert!(
-            result.is_err(),
-            "strict mode + comm + no actor must return Err; got Ok"
-        );
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("KHIVE_REQUIRE_ATTRIBUTED_ACTOR"),
-            "error must name the strict-mode env var; got: {msg}"
-        );
-        assert!(
-            !spy_was_called,
-            "spy forward_fn was called — enforce_strict_actor_mode fired AFTER forwarding, not before"
-        );
-    }
-
-    /// Complement: when an actor IS configured, the spy fn is reached because
-    /// the gate passes and forwarding is attempted.  We use KHIVE_NO_DAEMON=1 so
-    /// the spy returns None and in-process dispatch handles the request normally.
-    #[cfg(unix)]
-    #[tokio::test]
-    #[serial]
-    async fn strict_mode_spy_forward_reached_when_actor_configured() {
-        let prev_strict = std::env::var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR").ok();
-        let prev_no_daemon = std::env::var("KHIVE_NO_DAEMON").ok();
-        let (prev_home, _home_dir) = isolate_home_for_test();
-        std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", "1");
-        // Suppress real daemon; spy still records the call before returning None.
-        std::env::set_var("KHIVE_NO_DAEMON", "1");
-        SPY_WAS_CALLED.with(|c| c.set(false));
-
-        let cfg = RuntimeConfig {
-            db_path: None,
-            packs: vec!["kg".to_string(), "comm".to_string()],
-            actor_id: Some("lambda:tenant-x".to_string()), // gate should pass
-            ..RuntimeConfig::default()
-        };
-
-        let result = run_exec_inline_with_forward(
-            "stats()".to_string(),
-            cfg,
-            None,
-            None, // output_format
-            None,
-            ExecDbContext::default(),
-            spy_forward_records_call,
-        )
-        .await;
-
-        let spy_was_called = SPY_WAS_CALLED.with(|c| c.get());
-        SPY_WAS_CALLED.with(|c| c.set(false));
-
-        match prev_strict {
-            Some(v) => std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", v),
-            None => std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR"),
-        }
-        match prev_no_daemon {
-            Some(v) => std::env::set_var("KHIVE_NO_DAEMON", v),
-            None => std::env::remove_var("KHIVE_NO_DAEMON"),
-        }
-        restore_home(prev_home);
-
-        assert!(
-            result.is_ok(),
-            "gate must pass when actor is configured; got: {result:?}"
-        );
-        assert!(
-            spy_was_called,
-            "spy forward_fn must be called when gate passes (KHIVE_NO_DAEMON=1 causes in-process fallback)"
         );
     }
 
@@ -2269,7 +2525,10 @@ backend = "sessions"
             namespace_explicit: true,
             actor_explicit: false,
             no_embed: true,
-            packs: None,
+            // Pin the pack list explicitly rather than inheriting `KHIVE_PACKS`
+            // from the ambient environment (#1276) — this test's assertion is
+            // about config_id parity, not about pack resolution.
+            packs: Some(vec!["kg".to_string()]),
             brain_profile: None,
         })
         .expect("resolve exec-shaped config");
@@ -2281,6 +2540,7 @@ backend = "sessions"
             None,
             None,
             ExecDbContext::default(),
+            false,
             spy_capture_config_id,
         )
         .await;
@@ -2303,7 +2563,10 @@ backend = "sessions"
             namespace_explicit: false,
             actor_explicit: false,
             no_embed: true,
-            packs: None,
+            // Same pin as `cfg` above (#1276) — both sides of the parity
+            // comparison must resolve identically regardless of ambient
+            // `KHIVE_PACKS`.
+            packs: Some(vec!["kg".to_string()]),
             brain_profile: None,
         })
         .expect("resolve serve-shaped config");
@@ -2324,6 +2587,87 @@ backend = "sessions"
              daemon must be byte-identical to what the daemon computes for the same \
              multi-backend config.toml (D1 acceptance gate, exercised end-to-end through \
              the real call site rather than a standalone compute_config_id comparison)"
+        );
+    }
+
+    // ── #1226: inline --db/[[backends]] guard must fire before daemon-forward ──
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn inline_db_override_conflicting_with_backends_is_rejected_before_daemon_forward() {
+        std::env::remove_var("KHIVE_EMBEDDING_MODEL");
+        std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
+        std::env::remove_var("KHIVE_ACTOR");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+        let (prev_home, home_dir) = isolate_home_for_test();
+        SPY_CAPTURED_CONFIG_ID.with(|c| *c.borrow_mut() = None);
+
+        let khive_dir = home_dir.path().join(".khive");
+        std::fs::create_dir_all(&khive_dir).expect("mkdir .khive");
+        let main_backend_path = khive_dir.join("main-backend.db");
+        let sessions_backend_path = khive_dir.join("sessions-backend.db");
+        std::fs::write(
+            khive_dir.join("config.toml"),
+            format!(
+                r#"
+[[backends]]
+name = "main"
+kind = "sqlite"
+path = "{}"
+
+[[backends]]
+name = "sessions"
+kind = "sqlite"
+path = "{}"
+
+[packs.session]
+backend = "sessions"
+"#,
+                main_backend_path.display(),
+                sessions_backend_path.display(),
+            ),
+        )
+        .expect("write multi-backend config.toml");
+
+        let cfg = resolve_runtime_config(RuntimeConfigInputs {
+            db: None,
+            config: None,
+            namespace: Namespace::parse("local").expect("ns"),
+            namespace_explicit: true,
+            actor_explicit: false,
+            no_embed: true,
+            packs: None,
+            brain_profile: None,
+        })
+        .expect("resolve exec-shaped config");
+
+        let conflicting_override = khive_dir.join("override.db");
+        let result = run_exec_inline_with_forward(
+            "stats()".to_string(),
+            cfg,
+            None,
+            None,
+            None,
+            ExecDbContext {
+                raw: Some(conflicting_override.display().to_string()),
+                anchor: None,
+            },
+            false,
+            spy_capture_config_id,
+        )
+        .await;
+        restore_home(prev_home);
+
+        assert!(
+            result.is_err(),
+            "a --db/KHIVE_DB override that conflicts with a declared [[backends]] topology \
+             must be rejected on the inline path too, not only on --ops-file; got: {result:?}"
+        );
+        assert!(
+            SPY_CAPTURED_CONFIG_ID.with(|c| c.borrow().is_none()),
+            "the conflict must be caught BEFORE any daemon-forward attempt — the spy must \
+             never have been called"
         );
     }
 
@@ -2408,6 +2752,10 @@ backend = "sessions"
             db_path: Some(PathBuf::from(db_path)),
             embedding_model: None,
             additional_embedding_models: vec![],
+            // Pin the pack list explicitly rather than inheriting `KHIVE_PACKS`
+            // from the ambient environment (#1276) — every atomic-apply test
+            // using this helper only dispatches `kg` verbs.
+            packs: vec!["kg".to_string()],
             ..Default::default()
         }
     }
@@ -3080,129 +3428,6 @@ backend = "sessions"
         );
     }
 
-    /// `gtd.transition`: a typo'd key (`notee` for `note`) must be rejected
-    /// before any write (task status unchanged); a well-formed transition
-    /// still succeeds.
-    #[tokio::test]
-    async fn atomic_gtd_transition_unknown_field_rejected_well_formed_succeeds() {
-        let db_file = NamedTempFile::new().expect("temp db");
-        let db_path = db_file.path().to_str().expect("utf8").to_string();
-
-        let task_id = {
-            let server = isolated_server(&db_path);
-            let resp = dispatch_json(
-                &server,
-                r#"gtd.assign(title="TransitionTypoGuard", status="inbox")"#,
-            )
-            .await;
-            // gtd.assign's `id` field is always the short hex form
-            // (handlers.rs:372) regardless of presentation mode — use
-            // `full_id`, the real UUID, so it round-trips through the
-            // atomic prepare path's UUID parse.
-            resp["results"][0]["result"]["full_id"]
-                .as_str()
-                .expect("full_id")
-                .to_string()
-        };
-
-        // (a) unknown field rejected — status must stay "inbox".
-        let khive_cfg = KhiveConfig::default();
-        let ops = vec![atomic_op(
-            "gtd.transition",
-            serde_json::json!({"id": task_id, "status": "next", "notee": "typo"}),
-        )];
-        let err = crate::atomic_apply::execute_atomic_ops_file(
-            ops,
-            atomic_cfg(&db_path),
-            &khive_cfg,
-            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
-        )
-        .await
-        .expect_err("typo'd `notee` must be rejected");
-        assert!(
-            format!("{err:#}").contains("unknown field"),
-            "error: {err:#}"
-        );
-
-        // (b) well-formed transition still succeeds.
-        let ops = vec![atomic_op(
-            "gtd.transition",
-            serde_json::json!({"id": task_id, "status": "next"}),
-        )];
-        let envelope = crate::atomic_apply::execute_atomic_ops_file(
-            ops,
-            atomic_cfg(&db_path),
-            &khive_cfg,
-            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
-        )
-        .await
-        .expect("a well-formed gtd.transition must succeed");
-        assert_eq!(
-            envelope["atomic"]["committed"], true,
-            "envelope: {envelope}"
-        );
-    }
-
-    /// `gtd.complete`: a typo'd key (`resutl` for `result`) must be
-    /// rejected before any write (task status unchanged); a well-formed
-    /// complete still succeeds.
-    #[tokio::test]
-    async fn atomic_gtd_complete_unknown_field_rejected_well_formed_succeeds() {
-        let db_file = NamedTempFile::new().expect("temp db");
-        let db_path = db_file.path().to_str().expect("utf8").to_string();
-
-        let task_id = {
-            let server = isolated_server(&db_path);
-            let resp = dispatch_json(
-                &server,
-                r#"gtd.assign(title="CompleteTypoGuard", status="next")"#,
-            )
-            .await;
-            // Same `full_id` note as the transition test above.
-            resp["results"][0]["result"]["full_id"]
-                .as_str()
-                .expect("full_id")
-                .to_string()
-        };
-
-        // (a) unknown field rejected.
-        let khive_cfg = KhiveConfig::default();
-        let ops = vec![atomic_op(
-            "gtd.complete",
-            serde_json::json!({"id": task_id, "resutl": "typo"}),
-        )];
-        let err = crate::atomic_apply::execute_atomic_ops_file(
-            ops,
-            atomic_cfg(&db_path),
-            &khive_cfg,
-            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
-        )
-        .await
-        .expect_err("typo'd `resutl` must be rejected");
-        assert!(
-            format!("{err:#}").contains("unknown field"),
-            "error: {err:#}"
-        );
-
-        // (b) well-formed complete still succeeds.
-        let ops = vec![atomic_op(
-            "gtd.complete",
-            serde_json::json!({"id": task_id, "result": "shipped"}),
-        )];
-        let envelope = crate::atomic_apply::execute_atomic_ops_file(
-            ops,
-            atomic_cfg(&db_path),
-            &khive_cfg,
-            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
-        )
-        .await
-        .expect("a well-formed gtd.complete must succeed");
-        assert_eq!(
-            envelope["atomic"]["committed"], true,
-            "envelope: {envelope}"
-        );
-    }
-
     // ── ADR-099 B3: delete kind parity, update
     // null/type validation, canonical id resolution, per-op result payloads ──
 
@@ -3382,49 +3607,47 @@ backend = "sessions"
     }
 
     /// An atomic ops-file using an 8-hex-prefix id for
-    /// `update` AND `gtd.transition` must succeed identically to canonical
+    /// `update` AND `delete` must succeed identically to canonical
     /// (which accepts full UUID or an 8+ hex prefix); a non-existent prefix
     /// must error with canonical's error shape ("no record matches
     /// prefix"). Pre-fix, atomic did a bare `Uuid::parse_str` and rejected
     /// any short id outright — the same ops-file that succeeds non-atomically
-    /// (e.g. against `gtd.assign`'s own short `id` output) would fail before
+    /// (e.g. against `create`'s own short `id` output) would fail before
     /// prepare under `--atomic`.
     #[tokio::test]
-    async fn atomic_update_and_gtd_transition_accept_8_hex_prefix_ids() {
+    async fn atomic_update_and_delete_accept_8_hex_prefix_ids() {
         let db_file = NamedTempFile::new().expect("temp db");
         let db_path = db_file.path().to_str().expect("utf8").to_string();
         let khive_cfg = KhiveConfig::default();
 
-        let (entity_full_id, task_full_id) = {
+        let (entity_full_id, doomed_full_id) = {
             let server = isolated_server(&db_path);
-            let resp =
-                dispatch_json(&server, r#"create(kind="concept", name="PrefixEntity")"#).await;
+            let resp = dispatch_json(
+                &server,
+                r#"[create(kind="concept", name="PrefixEntity"), create(kind="concept", name="PrefixDoomed")]"#,
+            )
+            .await;
             let entity_id = resp["results"][0]["result"]["id"]
                 .as_str()
                 .expect("entity id")
                 .to_string();
-            let resp =
-                dispatch_json(&server, r#"gtd.assign(title="PrefixTask", status="next")"#).await;
-            let task_id = resp["results"][0]["result"]["full_id"]
+            let doomed_id = resp["results"][1]["result"]["id"]
                 .as_str()
-                .expect("task full_id")
+                .expect("doomed id")
                 .to_string();
-            (entity_id, task_id)
+            (entity_id, doomed_id)
         };
         let entity_prefix = &entity_full_id[..8];
-        let task_prefix = &task_full_id[..8];
+        let doomed_prefix = &doomed_full_id[..8];
 
-        // (a) 8-hex-prefix update and gtd.transition in the SAME atomic unit
+        // (a) 8-hex-prefix update and delete in the SAME atomic unit
         // both succeed.
         let ops = vec![
             atomic_op(
                 "update",
                 serde_json::json!({"id": entity_prefix, "name": "PrefixEntity-renamed"}),
             ),
-            atomic_op(
-                "gtd.transition",
-                serde_json::json!({"id": task_prefix, "status": "active"}),
-            ),
+            atomic_op("delete", serde_json::json!({"id": doomed_prefix})),
         ];
         let envelope = crate::atomic_apply::execute_atomic_ops_file(
             ops,
@@ -3468,25 +3691,17 @@ backend = "sessions"
 
     /// A committed atomic unit's success output must
     /// carry a canonical-shaped `result` per op (ADR-099 D4), not just
-    /// `{ok, tool, op_index}`. Exercises all five v1-admissible verbs in one
+    /// `{ok, tool, op_index}`. Exercises three v1-admissible verbs in one
     /// unit and asserts the relevant field for each:
-    /// updated name for `update`, the deleted marker for `delete`, edge
-    /// fields for `link`, and the transition/completion shape for the two
-    /// gtd verbs.
+    /// updated name for `update`, the deleted marker for `delete`, and edge
+    /// fields for `link`.
     #[tokio::test]
     async fn atomic_success_results_carry_canonical_shaped_result_per_op() {
         let db_file = NamedTempFile::new().expect("temp db");
         let db_path = db_file.path().to_str().expect("utf8").to_string();
         let khive_cfg = KhiveConfig::default();
 
-        // `transition_task_id` and `complete_task_id` are DELIBERATELY two
-        // separate tasks, not one task chained through both verbs: every
-        // op's prepare pass reads state BEFORE the atomic unit applies any
-        // statement (ADR-099 D1 — prepare is async/read-only, commit is the
-        // one synchronous pass), so a `gtd.transition` and a `gtd.complete`
-        // on the SAME task in the SAME unit would race against each other's
-        // as-yet-uncommitted write, not compose sequentially.
-        let (entity_id, doomed_id, source_id, target_id, transition_task_id, complete_task_id) = {
+        let (entity_id, doomed_id, source_id, target_id) = {
             let server = isolated_server(&db_path);
             let resp = dispatch_json(
                 &server,
@@ -3499,32 +3714,7 @@ backend = "sessions"
                     .expect("id")
                     .to_string()
             };
-            let resp = dispatch_json(
-                &server,
-                r#"gtd.assign(title="ResultTransitionTask", status="next")"#,
-            )
-            .await;
-            let transition_task_id = resp["results"][0]["result"]["full_id"]
-                .as_str()
-                .expect("task full_id")
-                .to_string();
-            let resp = dispatch_json(
-                &server,
-                r#"gtd.assign(title="ResultCompleteTask", status="active")"#,
-            )
-            .await;
-            let complete_task_id = resp["results"][0]["result"]["full_id"]
-                .as_str()
-                .expect("task full_id")
-                .to_string();
-            (
-                id(0),
-                id(1),
-                id(2),
-                id(3),
-                transition_task_id,
-                complete_task_id,
-            )
+            (id(0), id(1), id(2), id(3))
         };
 
         let ops = vec![
@@ -3541,14 +3731,6 @@ backend = "sessions"
                     "relation": "extends",
                 }),
             ),
-            atomic_op(
-                "gtd.transition",
-                serde_json::json!({"id": transition_task_id, "status": "active"}),
-            ),
-            atomic_op(
-                "gtd.complete",
-                serde_json::json!({"id": complete_task_id, "result": "shipped"}),
-            ),
         ];
         let envelope = crate::atomic_apply::execute_atomic_ops_file(
             ops,
@@ -3557,14 +3739,14 @@ backend = "sessions"
             khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
         )
         .await
-        .expect("all five v1-admissible verbs must commit as one unit");
+        .expect("three v1-admissible verbs must commit as one unit");
         assert_eq!(
             envelope["atomic"]["committed"], true,
             "envelope: {envelope}"
         );
 
         let results = envelope["results"].as_array().expect("results array");
-        assert_eq!(results.len(), 5, "envelope: {envelope}");
+        assert_eq!(results.len(), 3, "envelope: {envelope}");
 
         assert_eq!(
             results[0]["result"]["name"], "ResultUpdate-renamed",
@@ -3591,24 +3773,6 @@ backend = "sessions"
         assert_eq!(
             results[2]["result"]["target_id"], target_id,
             "link result must carry target_id: {envelope}"
-        );
-
-        assert_eq!(
-            results[3]["result"]["transitioned"], true,
-            "gtd.transition result: {envelope}"
-        );
-        assert_eq!(
-            results[3]["result"]["to"], "active",
-            "gtd.transition result must carry the new status: {envelope}"
-        );
-
-        assert_eq!(
-            results[4]["result"]["completed"], true,
-            "gtd.complete result: {envelope}"
-        );
-        assert_eq!(
-            results[4]["result"]["to"], "done",
-            "gtd.complete result must carry the terminal status: {envelope}"
         );
     }
 }

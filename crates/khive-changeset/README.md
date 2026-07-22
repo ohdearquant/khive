@@ -78,11 +78,11 @@ relations, and the closed edge-endpoint contract are never redefined here) plus 
 `serde_json`, and `thiserror`. It knows nothing about any producer, any ingester, the rule
 evaluator, diff computation, or the CLI — those are separate crates and separate lanes.
 
-Governed by [ADR-101](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-101-kg-changeset-model.md)
+Governed by ADR-101
 (change-set model — D1, D2, D5 crate #1) and consumed by
-[ADR-102](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-102-tiered-validate-and-merge.md)
+ADR-102
 (tiered validate-and-merge, not implemented by this crate).
 
 ## License
 
-Apache-2.0.
+BUSL-1.1. See the repository [LICENSE](https://github.com/ohdearquant/khive/blob/main/LICENSE).

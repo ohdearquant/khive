@@ -6,4 +6,4 @@
 # --exclude` list — consumed by both scripts/publish.sh (publish-boundary
 # preflight/live gate) and .github/workflows/release.yml (release SemVer gate).
 # One blank-/comment-filtered crate name per line.
-khive-channel-telegram
+# No crates in the current workspace require exclusion.

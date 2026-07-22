@@ -46,7 +46,7 @@ See `crates/khive-db/src/stores/text.rs` — private fn `sanitize_fts5_query`.
    Chars replaced with space: `(`, `)`, `,`, `:`, `-`, `.`, `/`
    (`/` added: FTS5's MATCH-expression parser rejects a bareword containing
    `/` as a syntax error, e.g. the throughput query `GB/s`)
-2. **Remove** remaining FTS5 operator characters (H1: `~`, `!` added; issue
+2. **Remove** remaining FTS5 operator characters (`~`, `!` added; issue
    #388: `$` added — FTS5's MATCH-expression parser treats a bareword
    starting with, containing, or consisting solely of `$` as a syntax error
    regardless of tokenizer, e.g. the DSL-doc query `$prev.id`):

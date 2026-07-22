@@ -24,7 +24,8 @@ that excludes `i`. Self-loops and duplicates are impossible by construction.
 
 ### Phase 2 — Two-pass refinement
 
-The two passes use `alpha = 1.0` then `alpha = config.alpha`:
+The two passes use `alpha = 1.0` then `alpha = config.alpha`, unconditionally
+— including when `config.alpha == 1.0`, so both passes run at the same alpha:
 
 ```
 for pass_alpha in [1.0, config.alpha]:
@@ -44,6 +45,20 @@ for pass_alpha in [1.0, config.alpha]:
 
 Each pass applies forward edges (greedy-search proposals) and back-edges
 (connectivity from all nodes that just pointed to a target).
+
+The second pass at `alpha = config.alpha == 1.0` is **not** a redundant rerun
+of the first pass, even though `pass_alpha` is identical across both. Each
+pass's `greedy_search` runs over the adjacency the *previous* pass left
+behind, so the second pass explores a more-connected graph and its
+`robust_prune` calls see a different (typically richer) candidate set than
+the first pass did — the two passes are not idempotent. Differential testing
+at production scale (n>=250, 384-dim normalized vectors) shows the two-pass
+adjacency diverging from a single alpha=1.0 pass, for both `build` and
+`build_sq8`
+(`build_alpha_one_two_passes_are_not_idempotent_at_scale` and
+`build_sq8_alpha_one_two_passes_are_not_idempotent_at_scale` in `graph.rs`);
+an earlier revision skipped the second pass on the assumption that it was a
+no-op at `config.alpha == 1.0` and was reverted once this was disproven.
 
 ---
 

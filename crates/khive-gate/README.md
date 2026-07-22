@@ -43,7 +43,7 @@ are both non-zero.
 - `AuditEvent::from_check` builds the structured audit record (`actor`, `namespace`,
   `verb`, `decision`, `obligations`, `gate_impl`, `session_id`) emitted once per gate
   consultation. Its JSON projection is a stable public contract — field names don't
-  change without a new ADR.
+  change without a design-record amendment.
 - All wire types (`ActorRef`, `GateRequest`, `GateDecision`, `Obligation`) validate
   their invariants both at construction (`try_new` / `try_*` constructors) and at
   deserialization (custom `Deserialize` via a private `TryFrom<Raw*>` shape), so a
@@ -56,13 +56,11 @@ are both non-zero.
 field consulted before every verb dispatch and defaults it to `AllowAllGate`. It has no
 dependency on any other khive crate beyond `khive-types`.
 
-- **`khive-gate` (Apache-2.0)** — this crate; the trait, wire types, and permissive default.
-- [`khive-gate-rego`](https://crates.io/crates/khive-gate-rego) (Apache-2.0) — the OSS
+- **`khive-gate` (BUSL-1.1)** — this crate; the trait, wire types, and permissive default.
+- [`khive-gate-rego`](https://crates.io/crates/khive-gate-rego) (BUSL-1.1) — the OSS
   reference [Rego](https://www.openpolicyagent.org/) backend (`RegoGate`), installed in
   place of `AllowAllGate` when a deployment needs real policy enforcement.
 
-Governed by [ADR-018](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-018-authorization-gate.md).
-
 ## License
 
-Apache-2.0.
+BUSL-1.1. See the repository [LICENSE](https://github.com/ohdearquant/khive/blob/main/LICENSE).

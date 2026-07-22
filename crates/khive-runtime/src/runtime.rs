@@ -317,6 +317,14 @@ impl KhiveRuntime {
         self.backend.data_dir()
     }
 
+    /// Root directory for this database's ANN segment tree (`<db-file>.ann/`
+    /// beside the file), or `None` for an in-memory backend. Scoped to the
+    /// database file itself so two databases sharing a parent directory can
+    /// never adopt each other's segments.
+    pub fn backend_ann_root(&self) -> Option<std::path::PathBuf> {
+        self.backend.ann_root()
+    }
+
     // ---- Store accessors (token-scoped) ----
 
     /// Get an EntityStore scoped to the token's namespace.
@@ -404,6 +412,31 @@ impl KhiveRuntime {
             dims,
             token.namespace().as_str(),
         )?)
+    }
+
+    /// Output dimensions for a named embedding model, resolved from the
+    /// embedder registry alone — no storage access. Mirrors
+    /// [`vectors_for_model`](Self::vectors_for_model)'s resolution order:
+    /// lattice aliases route through the enum when registered, otherwise the
+    /// custom provider's declared `dimensions()`. `None` when no such model
+    /// is registered.
+    pub fn embedder_dimensions(&self, model_name: &str) -> Option<usize> {
+        if let Some(model) = parse_embedding_model_alias(model_name) {
+            let key = model.to_string();
+            let in_registry = self
+                .embedder_registry
+                .read()
+                .map(|reg| reg.contains(&key))
+                .unwrap_or(false);
+            if in_registry {
+                return Some(model.dimensions());
+            }
+        }
+        self.embedder_registry
+            .read()
+            .ok()?
+            .get_provider(model_name)
+            .map(|p| p.dimensions())
     }
 
     fn vectors_for_embedding_model(
@@ -714,6 +747,14 @@ impl KhiveRuntime {
             .read()
             .map(|g| g.clone())
             .unwrap_or_default()
+    }
+
+    /// Borrow the installed pack edge rules for a synchronous calculation.
+    pub(crate) fn with_pack_edge_rules<T>(&self, f: impl FnOnce(&[EdgeEndpointRule]) -> T) -> T {
+        match self.edge_rules.read() {
+            Ok(rules) => f(&rules),
+            Err(_) => f(&[]),
+        }
     }
 
     /// Return the name of the default embedding model (empty string if none configured).
@@ -1108,27 +1149,17 @@ mod tests {
     }
 
     #[test]
-    fn default_config_packs_loads_all_production_packs() {
+    fn default_config_packs_loads_kg_only() {
         let prior = std::env::var("KHIVE_PACKS").ok();
         // SAFETY: test function runs single-threaded; no other threads read or write KHIVE_PACKS.
         unsafe {
             std::env::remove_var("KHIVE_PACKS");
         }
+        // The open-source distribution ships a single production pack: kg.
+        // Extension packs are commercially licensed, distributed separately,
+        // and opt in via KHIVE_PACKS / --pack against a binary that links them.
         let cfg = RuntimeConfig::default();
-        assert!(cfg.packs.contains(&"kg".to_string()));
-        assert!(cfg.packs.contains(&"gtd".to_string()));
-        assert!(cfg.packs.contains(&"memory".to_string()));
-        assert!(cfg.packs.contains(&"brain".to_string()));
-        assert!(cfg.packs.contains(&"comm".to_string()));
-        assert!(cfg.packs.contains(&"schedule".to_string()));
-        assert!(cfg.packs.contains(&"knowledge".to_string()));
-        // session loads by default so its background mirror warm-hook runs in
-        // production; its handlers are all operator-only subhandlers (0 wire verbs).
-        assert!(cfg.packs.contains(&"session".to_string()));
-        assert!(cfg.packs.contains(&"git".to_string()));
-        assert!(cfg.packs.contains(&"code".to_string()));
-        assert!(cfg.packs.contains(&"workspace".to_string()));
-        assert_eq!(cfg.packs.len(), 11);
+        assert_eq!(cfg.packs, vec!["kg".to_string()]);
         if let Some(v) = prior {
             // SAFETY: single-threaded test cleanup; restores KHIVE_PACKS to its prior value.
             unsafe {

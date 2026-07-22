@@ -169,7 +169,7 @@ jobs:
         # and the publish-boundary gate there cannot drift out of sync.
         id: semver-excludes
         run: |
-          list=$(grep -v '^[[:space:]]*#' scripts/lib/semver_excludes.txt | grep -v '^[[:space:]]*$' | paste -sd, -)
+          list=$(awk 'BEGIN { sep = "" } !/^[[:space:]]*(#|$)/ { printf "%s%s", sep, $0; sep = "," } END { print "" }' scripts/lib/semver_excludes.txt)
           echo "list=$list" >> "$GITHUB_OUTPUT"
       - name: Check semver vs crates.io baseline
         # Pinned to a commit SHA, not the mutable @v2 tag (same drift rationale

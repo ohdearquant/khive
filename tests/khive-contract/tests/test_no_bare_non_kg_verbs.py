@@ -1,7 +1,7 @@
 """Verb namespace contract: no bare non-KG verbs in the product surface.
 
 ADR: ADR-023
-section: Verb naming; Pack product verbs; Verb namespace enforcement
+section: Verb naming; Verb namespace enforcement
 
 Static contract test — no MCP calls. Asserts that every verb declared in
 ALL_PRODUCT_VERBS (the manifest's canonical list) is either:
@@ -9,7 +9,11 @@ ALL_PRODUCT_VERBS (the manifest's canonical list) is either:
   - A dotted pack.verb verb (exactly one dot, non-empty prefix and suffix).
 
 This mirrors the Rust `verb_namespace_contract.rs` test in kkernel and prevents
-future Python tests from silently re-introducing bare pack verbs.
+future Python tests from silently re-introducing bare pack verbs. kg is the
+sole pack shipped in this OSS distribution, so today ALL_PRODUCT_VERBS is
+entirely bare KG substrate verbs; the dotted pack.verb branch below is
+retained as the general contract shape (commercially licensed extensions
+that load additional packs still get pack.verb dispatch).
 """
 
 from __future__ import annotations
@@ -27,8 +31,6 @@ from tests.test_manifest import ALL_PRODUCT_VERBS
 VERBS_UNDER_TEST = {
     "create", "get", "list", "update", "delete", "merge",
     "search", "link", "neighbors", "traverse", "query",
-    "gtd.assign", "gtd.next", "gtd.complete", "gtd.tasks", "gtd.transition",
-    "memory.remember", "memory.recall",
 }
 
 # KG substrate verbs that are allowed as bare names (no pack prefix).

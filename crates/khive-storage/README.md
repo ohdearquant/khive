@@ -3,7 +3,7 @@
 Storage capability traits for khive's substrate: `SqlAccess`, `VectorStore`,
 `TextSearch`, `GraphStore`, `NoteStore`, `EntityStore`, `EventStore`,
 `SparseStore`. Zero implementations — only contracts
-([ADR-005](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-005-storage-capability-traits.md)).
+(ADR-005).
 A concrete backend (`khive-db`'s SQLite implementation, for example) implements
 these traits; the runtime and every pack depend only on this crate, never on a
 specific backend.
@@ -68,4 +68,4 @@ here, never on `khive-db` directly.
 
 ## License
 
-Apache-2.0.
+BUSL-1.1. See the repository [LICENSE](https://github.com/ohdearquant/khive/blob/main/LICENSE).

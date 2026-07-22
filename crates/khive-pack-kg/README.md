@@ -7,7 +7,7 @@ workspace declares it as a dependency.
 
 ## Verbs
 
-17 handlers, registered under [ADR-017](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-017-pack-standard.md):
+19 handlers, registered under ADR-017:
 
 | Verb        | What it does                                                                    |
 | ----------- | ------------------------------------------------------------------------------- |
@@ -28,9 +28,11 @@ workspace declares it as a dependency.
 | `verbs`     | List all MCP-callable verbs registered on the server                            |
 | `stats`     | Aggregate KG substrate counts (entities, edges, notes)                          |
 | `context`   | Entity-anchored graph context in one call (ADR-089)                             |
+| `resolve`   | Resolve natural-language references to record ids                               |
+| `whoami`    | Report the caller identity this request resolved to                             |
 
 `propose`/`review`/`withdraw` implement the event-sourced proposal lifecycle from
-[ADR-046](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-046-event-sourced-proposals.md).
+ADR-046.
 
 ## Vocabulary
 
@@ -39,7 +41,7 @@ The pack declares 9 entity kinds (`concept`, `document`, `dataset`, `project`,
 (`observation`, `insight`, `question`, `decision`, `reference`) — see
 `KgPack::NOTE_KINDS` / `KgPack::ENTITY_KINDS` in `src/pack.rs`.
 
-It also extends the base edge endpoint contract ([ADR-002](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-002-edge-ontology.md))
+It also extends the base edge endpoint contract (ADR-002)
 with `person`/`org`-specific pairs — e.g. `part_of` and `instance_of` from a
 `person` entity to an `org` entity, plus several `org`→`org` pairs
 (`depends_on`, `enables`, `contains`, `part_of`, `precedes`). This is
@@ -48,7 +50,7 @@ pack-extensible per ADR-017; the edge relation enum itself stays closed.
 ## Usage
 
 Packs are consumed through the MCP `request` tool
-([ADR-016](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-016-request-dsl.md)),
+(ADR-016),
 not called as a Rust library. A deployment wires `KgPack` onto a
 `VerbRegistry` and dispatches verbs by name:
 
@@ -77,8 +79,8 @@ Over MCP, the same call is issued as a DSL string:
 request(ops="create(kind=\"entity\", entity_kind=\"concept\", name=\"RoPE\")")
 ```
 
-`khive-mcp` loads a default set of eleven packs: `kg`, `gtd`, `memory`, `brain`,
-`comm`, `schedule`, `knowledge`, `session`, `git`, `code`, `workspace`, with `kg`
+`khive-mcp` loads a default set of eleven packs: `kg`, `gtd`, `memory`, `comm`,
+`schedule`, `knowledge`, `session`, `git`, `code`, `workspace`, `blob`, with `kg`
 always present; `KHIVE_PACKS` / `--pack` select a subset.
 
 ## Where this sits
@@ -89,14 +91,14 @@ always present; `KHIVE_PACKS` / `--pack` select a subset.
 `schedule.remind` verb additionally requires the registered `comm.send` delivery
 capability at creation time, while the rest of the schedule pack works without `comm`.
 Governing ADRs:
-[ADR-001](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-001-entity-kind-taxonomy.md) (entity kinds),
-[ADR-002](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-002-edge-ontology.md) (edge relations),
-[ADR-013](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-013-note-kind-taxonomy.md) (note kinds),
-[ADR-016](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-016-request-dsl.md) (request DSL),
-[ADR-017](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-017-pack-standard.md) (pack standard),
-[ADR-023](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-023-declarative-pack-format.md) (verb surface/visibility),
-[ADR-046](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-046-event-sourced-proposals.md) (proposals).
+ADR-001 (entity kinds),
+ADR-002 (edge relations),
+ADR-013 (note kinds),
+ADR-016 (request DSL),
+ADR-017 (pack standard),
+ADR-023 (verb surface/visibility),
+ADR-046 (proposals).
 
 ## License
 
-Apache-2.0.
+BUSL-1.1. See the repository [LICENSE](https://github.com/ohdearquant/khive/blob/main/LICENSE).

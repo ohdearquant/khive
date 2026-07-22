@@ -12,12 +12,12 @@ categories.workspace = true
 description = "Reference template for new khive packs (ADR-023 §8). Copy this crate to get a working pack scaffold."
 
 [dependencies]
-khive-types = { version = "0.5.0", path = "../khive-types", features = ["serde"] }
-khive-runtime = { version = "0.5.0", path = "../khive-runtime" }
+khive-types = { version = "0.6.0", path = "../khive-types", features = ["serde"] }
+khive-runtime = { version = "0.6.0", path = "../khive-runtime" }
 inventory = { workspace = true }
 async-trait = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
-khive-pack-kg = { version = "0.5.0", path = "../khive-pack-kg" }
+khive-pack-kg = { version = "0.6.0", path = "../khive-pack-kg" }

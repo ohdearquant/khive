@@ -25,6 +25,10 @@ async fn assert_conforms(store: Arc<dyn BlobStore>) {
     assert_eq!(ref_a, ref_b);
 
     assert!(store.exists(&ref_a).await.expect("exists"));
+    assert_eq!(
+        store.size(&ref_a).await.expect("size"),
+        Some(bytes.len() as u64)
+    );
 
     let round_tripped = store.get(&ref_a).await.expect("get");
     assert_eq!(round_tripped, bytes);
@@ -94,7 +98,7 @@ async fn s3_blob_store_conforms_against_a_live_endpoint() {
     assert_conforms(store).await;
 }
 
-/// ADR-111 Amendment 2 (H3 fix round 2): `orphan_sweep`'s `ListObjectsV2`
+/// ADR-111 Amendment 2: `orphan_sweep`'s `ListObjectsV2`
 /// pagination is untested unless a real sweep crosses the 1,000-key page
 /// boundary. This populates `PAGE_CROSSING_OBJECT_COUNT` (> 1,000) tiny,
 /// distinct-content objects under a scratch prefix and confirms the sweep

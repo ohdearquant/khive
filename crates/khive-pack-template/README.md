@@ -58,10 +58,10 @@ valid input, invalid input, and dispatch of an unknown verb.
 `KhiveRuntime`), `REQUIRES` [`khive-pack-kg`](https://crates.io/crates/khive-pack-kg)
 like every other pack, and is never force-linked into a shipping binary — it
 exists purely as the copy-me reference for
-[ADR-023 (Pack Verb Surface, Visibility, and Composition)](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-023-declarative-pack-format.md)
+ADR-023 (Pack Verb Surface, Visibility, and Composition)
 §8 and
-[ADR-027 (Dynamic Pack Loading via Self-Registration)](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-027-dynamic-pack-loading.md).
+ADR-027 (Dynamic Pack Loading via Self-Registration).
 
 ## License
 
-Apache-2.0.
+BUSL-1.1. See the repository [LICENSE](https://github.com/ohdearquant/khive/blob/main/LICENSE).

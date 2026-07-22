@@ -19,27 +19,12 @@ members = [
     "khive-runtime",
     "khive-request",
     "khive-pack-kg",
-    "khive-pack-gtd",
-    "khive-pack-memory",
-    "khive-brain-core",
-    "khive-pack-brain",
-    "khive-pack-comm",
-    "khive-pack-schedule",
-    "khive-pack-formal",
-    "khive-pack-code",
     "khive-pack-template",
-    "khive-pack-knowledge",
-    "khive-pack-session",
-    "khive-pack-git",
-    "khive-pack-workspace",
     "khive-mcp",
     "khive-vcs",
     "khive-vcs-adapters",
     "kkernel",
     "khive-retrieval",
-    "khive-channel",
-    "khive-channel-email",
-    "khive-channel-telegram",
 ]
 exclude = ["khive-merge"]
 # khive-merge is forward-deployed v2 infrastructure (ADR-039), not removed or
@@ -50,13 +35,13 @@ exclude = ["khive-merge"]
 # keep this exclusion from members.
 
 [workspace.package]
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
-# lattice-embed and lattice-fann 0.6 require Rust 1.93, setting the workspace MSRV.
+# lattice-embed 0.6 requires Rust 1.93, setting the workspace MSRV.
 # The previous 1.91 floor came from floor_char_boundary use (issue #398).
 rust-version = "1.93.0"
-authors = ["Ocean <ocean@lionagi.ai>"]
-license = "Apache-2.0"
+authors = ["Haiyang Li <quantocean.li@gmail.com>"]
+license = "BUSL-1.1"
 repository = "https://github.com/ohdearquant/khive"
 homepage = "https://github.com/ohdearquant/khive"
 keywords = ["knowledge-graph", "semantic-search", "mcp", "ai-tools", "graph-database"]
@@ -68,10 +53,6 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.40", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt", "compat"] }
-lettre = { version = "0.11", default-features = false, features = ["tokio1-rustls-tls", "smtp-transport", "builder"] }
-async-imap = "0.9"
-async-native-tls = "0.5"
-mail-parser = "0.9"
 rusqlite = { version = "0.33" }
 anyhow = "1.0.103"
 thiserror = "2.0"
@@ -83,10 +64,8 @@ async-trait = "0.1"
 clap = { version = "4.5", features = ["derive", "env"] }
 dotenvy = "0.15"
 lattice-embed = "0.6.0"
-lattice-fann = "0.6.0"
 parking_lot = "0.12"
 rand = "0.8"
-rand_distr = "0.4"
 toml = "0.8"
 regex = "1.10"
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }

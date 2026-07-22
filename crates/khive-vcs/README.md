@@ -73,10 +73,10 @@ it directly for the `sync`, `kg status`, and `kg fetch` subcommands.
 merge layer that will consume `khive-vcs`'s snapshot ancestry once ADR-039's LCA-walk
 integration lands; today's merge path is git's own line-merge over sorted NDJSON.
 
-Governed by [ADR-010](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-010-kg-versioning.md)
-(versioning strategy) and [ADR-020](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-020-git-native-kg-implementation.md)
+Governed by ADR-010
+(versioning strategy) and ADR-020
 (git-native implementation).
 
 ## License
 
-Apache-2.0.
+BUSL-1.1. See the repository [LICENSE](https://github.com/ohdearquant/khive/blob/main/LICENSE).

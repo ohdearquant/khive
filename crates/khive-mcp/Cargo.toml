@@ -12,22 +12,12 @@ categories.workspace = true
 description = "khive MCP server library — served via the kkernel binary"
 
 [dependencies]
-khive-db = { version = "0.5.0", path = "../khive-db" }
-khive-runtime = { version = "0.5.0", path = "../khive-runtime" }
-khive-storage = { version = "0.5.0", path = "../khive-storage" }
-khive-types = { version = "0.5.0", path = "../khive-types", features = ["serde"] }
-khive-request = { version = "0.5.0", path = "../khive-request" }
-khive-pack-kg = { version = "0.5.0", path = "../khive-pack-kg" }
-khive-pack-gtd = { version = "0.5.0", path = "../khive-pack-gtd" }
-khive-pack-memory = { version = "0.5.0", path = "../khive-pack-memory" }
-khive-pack-brain = { version = "0.5.0", path = "../khive-pack-brain" }
-khive-pack-comm = { version = "0.5.0", path = "../khive-pack-comm" }
-khive-pack-schedule = { version = "0.5.0", path = "../khive-pack-schedule" }
-khive-pack-knowledge = { version = "0.5.0", path = "../khive-pack-knowledge" }
-khive-pack-session = { version = "0.5.0", path = "../khive-pack-session" }
-khive-pack-git = { version = "0.5.0", path = "../khive-pack-git" }
-khive-pack-code = { version = "0.5.0", path = "../khive-pack-code" }
-khive-pack-workspace = { version = "0.5.0", path = "../khive-pack-workspace" }
+khive-db = { version = "0.6.0", path = "../khive-db" }
+khive-runtime = { version = "0.6.0", path = "../khive-runtime" }
+khive-storage = { version = "0.6.0", path = "../khive-storage" }
+khive-types = { version = "0.6.0", path = "../khive-types", features = ["serde"] }
+khive-request = { version = "0.6.0", path = "../khive-request" }
+khive-pack-kg = { version = "0.6.0", path = "../khive-pack-kg" }
 uuid = { workspace = true }
 inventory = { workspace = true }
 rmcp = { workspace = true, features = ["server", "transport-io"] }
@@ -45,26 +35,17 @@ sha2 = { workspace = true }
 chrono = { workspace = true }
 tempfile = { workspace = true }
 lattice-embed = { workspace = true, optional = true }
-khive-channel = { version = "0.5.0", path = "../khive-channel", optional = true }
-khive-channel-email = { version = "0.5.0", path = "../khive-channel-email", optional = true }
-khive-channel-telegram = { version = "0.5.0", path = "../khive-channel-telegram", optional = true }
 
 [features]
 # bench-embedder: inject deterministic FNV-1a hash embedder into the serve path.
 # Bench-only — never enabled in release/publish builds.
 bench-embedder = ["lattice-embed"]
-# channel-email: enable the SMTP/IMAP email polling loop.
-# Requires KHIVE_EMAIL_* environment variables at runtime; does nothing when unset.
-channel-email = ["khive-channel", "khive-channel-email"]
-# channel-telegram: enable the Telegram Bot API polling + outbox loop.
-# Requires KHIVE_TELEGRAM_* environment variables at runtime; does nothing when unset.
-# Coexists with channel-email (ChannelRegistry keys by (kind, slug), #606).
-channel-telegram = ["khive-channel", "khive-channel-telegram"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 rmcp = { workspace = true, features = ["server", "transport-io", "client"] }
 async-trait = { workspace = true }
 serial_test = { workspace = true }
-khive-pack-knowledge = { version = "0.5.0", path = "../khive-pack-knowledge" }
+khive-pack-template = { version = "0.6.0", path = "../khive-pack-template" }
+
 rusqlite = { workspace = true, features = ["bundled"] }

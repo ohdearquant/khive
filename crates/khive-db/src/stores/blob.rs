@@ -344,6 +344,17 @@ impl BlobStore for FsBlobStore {
             .map_err(|e| StorageError::driver(StorageCapability::Blob, "exists", e))?
     }
 
+    async fn size(&self, content_ref: &ContentRef) -> StorageResult<Option<u64>> {
+        let path = shard_path(&self.root, content_ref);
+        tokio::task::spawn_blocking(move || match fs::metadata(&path) {
+            Ok(meta) => Ok(Some(meta.len())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(map_io_err(e, "size")),
+        })
+        .await
+        .map_err(|e| StorageError::driver(StorageCapability::Blob, "size", e))?
+    }
+
     async fn delete(&self, content_ref: &ContentRef) -> StorageResult<bool> {
         let path = shard_path(&self.root, content_ref);
         tokio::task::spawn_blocking(move || match fs::remove_file(&path) {
@@ -530,6 +541,24 @@ mod tests {
         let (_dir, store) = store(0);
         let missing = ContentRef::from_hex("f".repeat(64)).unwrap();
         assert!(!store.delete(&missing).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn size_reports_byte_length_for_a_present_object() {
+        let (_dir, store) = store(0);
+        let bytes = b"size check".to_vec();
+        let content_ref = store.put(bytes.clone()).await.unwrap();
+        assert_eq!(
+            store.size(&content_ref).await.unwrap(),
+            Some(bytes.len() as u64)
+        );
+    }
+
+    #[tokio::test]
+    async fn size_returns_none_for_an_absent_object() {
+        let (_dir, store) = store(0);
+        let missing = ContentRef::from_hex("9".repeat(64)).unwrap();
+        assert_eq!(store.size(&missing).await.unwrap(), None);
     }
 
     #[tokio::test]

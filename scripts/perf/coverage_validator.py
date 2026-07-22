@@ -186,8 +186,10 @@ def load_manifest(path: pathlib.Path) -> tuple[dict, list[str]]:
                 f"{label}: scenario_id does not match f<N>.<verb>.<arm>.<embedder> convention: {sc['scenario_id']!r}"
             )
 
-        if sc["feature"] not in flagship_schema.FEATURES:
-            errors.append(f"{label}: invalid feature {sc['feature']!r} (expected one of {flagship_schema.FEATURES})")
+        if sc["feature"] not in flagship_schema.MANIFEST_FEATURES:
+            errors.append(
+                f"{label}: invalid feature {sc['feature']!r} (expected one of {flagship_schema.MANIFEST_FEATURES})"
+            )
 
         if sc["surface"] not in flagship_schema.SURFACES:
             errors.append(f"{label}: invalid surface {sc['surface']!r} (expected one of {flagship_schema.SURFACES})")
@@ -226,7 +228,7 @@ def load_manifest(path: pathlib.Path) -> tuple[dict, list[str]]:
 
 
 def _required_scenario_ids_by_feature(scenarios: list[dict]) -> dict[str, list[str]]:
-    by_feature: dict[str, list[str]] = {feature: [] for feature in flagship_schema.FEATURES}
+    by_feature: dict[str, list[str]] = {feature: [] for feature in flagship_schema.MANIFEST_FEATURES}
     for sc in scenarios:
         by_feature.setdefault(sc.get("feature", "?"), []).append(sc.get("scenario_id", "?"))
     return by_feature
@@ -516,7 +518,7 @@ def compute_coverage(
     by_feature = _required_scenario_ids_by_feature(scenarios)
     features_with_zero_measured = sorted(
         feature
-        for feature in flagship_schema.FEATURES
+        for feature in flagship_schema.MANIFEST_FEATURES
         if by_feature.get(feature)
         and not any(s["feature"] == feature and s["status"] == "measured" for s in per_scenario)
     )

@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `whoami` verb (kg pack, bare name): reports the caller's actor reference,
+  write namespace, and read-visible namespace set already resolved by the
+  runtime for the current request. The default pack set now exposes 19 verbs.
+
+### Changed
+
+- Reduced the open-source distribution to a single production pack: `kg`. The
+  `gtd`, `memory`, `comm`, `schedule`, `session`, `workspace`, and `blob` packs
+  and the `khive-brain-core` crate moved to commercially licensed extensions
+  distributed separately, joining the previously extracted packs. The default
+  pack set is now `["kg"]` (18 verbs). `kkernel exec --ops-file --atomic`
+  covers kg verbs only (the gtd adapter left with the pack); `kkernel reindex`
+  no longer maintains the memory pack's ANN snapshot/epoch state. The
+  marketplace plugin drops the comm/gtd/memory/schedule pattern skills. The
+  memory/comm-driven perf gates (`bench_pipeline_daemon.py`,
+  `bench_load_harness.py`, the load-harness runbook, and the
+  `bench-pipeline.yml` workflow) move with the packs they exercise;
+  `bench_calibrate.py` keeps its `bench-1m` and `contract` suites. This
+  repository's git history retains the extracted crates' past commits under
+  their original license terms; the change relocates future development and
+  does not alter the status of already-published history.
+
+- Moved the git-lifecycle pack (`khive-pack-git`: `git.digest` provenance ingestion,
+  `git.commit` / `git.branch` / `git.push` write verbs, and the `commit`/`issue`/
+  `pull_request` note kinds) to a commercial extension, no longer part of this
+  distribution. The default pack set drops from 12 to 11 packs (85 to 81 verbs). The
+  `workspace` pack's `contains` endpoint rules naming those note kinds remain declared
+  but are inert without the pack that registers them. This repository's git history
+  retains the extracted crate's past commits under their original license terms; the
+  change relocates future development and does not alter the status of already-published
+  history.
+- The brain pack (`khive-pack-brain`, `brain.*` verbs — profile lifecycle,
+  feedback ingestion, resolution/binding) moved to a commercial extension
+  distributed separately and is no longer part of this distribution's
+  default 11-pack, 70-verb surface. `khive-brain-core` (posterior math types)
+  stays public: it remains a runtime dependency of `memory.recall`'s ranking
+  hooks, which run plain when no brain-providing pack is registered. This
+  repository's git history retains the extracted crate's past commits under
+  their original license terms; this change relocates future development and
+  does not alter the status of already-published history.
+- Moved the transport channel crates (`khive-channel`, `khive-channel-email`,
+  `khive-channel-telegram`) and their `channel-email`/`channel-telegram`
+  `khive-mcp`/`kkernel` cargo features to a commercial extension; no longer
+  part of this repository or the open-source build.
+- Moved `khive-pack-knowledge` (the `knowledge.` verb pack: atom/domain corpus, TF-IDF
+  and embedding-rerank search, composition, section feedback) to a commercial extension.
+  It is no longer part of the open-source distribution or its default pack set. The
+  remaining 11 packs are unaffected; `memory.recall` runs standalone (no dependency on
+  the knowledge corpus).
+- Moved the formal-methods ontology pack (`khive-pack-formal`) and the code-quality
+  ontology pack (`khive-pack-code`), along with the `kkernel code-ingest` admin CLI
+  subcommand, to a commercial extension. The open-source build no longer registers
+  either pack by default.
+
 ## [0.5.0] - 2026-07-13
 
 ### Added

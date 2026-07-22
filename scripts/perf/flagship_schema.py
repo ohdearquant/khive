@@ -43,7 +43,14 @@ import re
 SCHEMA_VERSION = 3
 SUITE_NAME = "flagship-e2e"
 
+# Schema-valid feature labels (records and historical data may carry any of
+# these). F1/F7/F8/F9 covered packs now distributed as commercially licensed
+# extensions; their scenarios are gone from this workspace's manifest but the
+# labels stay schema-valid so historical perf records still parse.
 FEATURES = ("F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10")
+# Feature classes the in-repo manifest must cover (the kg-pack surface plus
+# the daemon-control probe).
+MANIFEST_FEATURES = ("F2", "F3", "F4", "F5", "F6", "F10")
 SURFACES = ("mcp_daemon", "admin_cli", "raw_daemon_control")
 EMBEDDERS = ("none", "bench_hash", "production")
 STATES = ("cold", "settling", "warm")

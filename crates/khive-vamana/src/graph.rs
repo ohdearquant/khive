@@ -4,6 +4,49 @@ use std::collections::{BTreeMap, HashSet};
 
 use khive_quant::{GsEncodedVector, GsSq8Codec};
 use rand::prelude::*;
+
+/// Read-only view over per-node SQ8 codes, decoupling graph algorithms from
+/// how the codes are stored: per-vector heap allocations (build/mutation
+/// paths) or one flat, possibly memory-mapped buffer (segment load paths).
+#[derive(Clone, Copy)]
+pub enum CodesView<'a> {
+    /// One `GsEncodedVector` per node.
+    Owned(&'a [GsEncodedVector]),
+    /// Flat row-major code bytes, `dims` bytes per node.
+    Flat { bytes: &'a [u8], dims: usize },
+}
+
+impl<'a> CodesView<'a> {
+    /// Code bytes for node `i`.
+    #[inline]
+    pub fn code(&self, i: usize) -> &'a [u8] {
+        match self {
+            CodesView::Owned(v) => &v[i].codes,
+            CodesView::Flat { bytes, dims } => &bytes[i * dims..(i + 1) * dims],
+        }
+    }
+
+    /// Number of encoded nodes.
+    #[inline]
+    pub fn len(&self) -> usize {
+        match self {
+            CodesView::Owned(v) => v.len(),
+            CodesView::Flat { bytes, dims } => {
+                if *dims == 0 {
+                    0
+                } else {
+                    bytes.len() / dims
+                }
+            }
+        }
+    }
+
+    /// True when no nodes are encoded.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
@@ -16,6 +59,40 @@ use crate::{
 const BUILD_BATCH_SIZE: usize = 1024;
 const MEDOID_SAMPLE_K: usize = 1000;
 const BUILD_SEED: u64 = 0x5641_4d41_4e41;
+
+// Test-only override to cap how many of the [1.0, config.alpha] refinement
+// passes `build`/`build_sq8` run, so a test can build a single-pass graph to
+// compare against the normal two-pass build (see
+// build_alpha_one_two_passes_are_not_idempotent_at_scale).
+#[cfg(test)]
+thread_local! {
+    static MAX_PASSES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn set_max_passes(v: Option<usize>) {
+    MAX_PASSES.with(|c| c.set(v));
+}
+
+/// Two refinement passes always run, even at alpha == 1.0: the second pass
+/// reruns greedy search and robust_prune over the graph the first pass just
+/// produced, and a more-connected graph changes which candidates survive
+/// pruning. This is not idempotent — differential testing at production scale
+/// (n>=250, 384-dim normalized vectors) shows the two-pass and skip-second-pass
+/// adjacency diverge, so a run with only the first pass is a materially
+/// different (and less-refined) graph, not a redundant rerun.
+fn refinement_alpha_schedule(config_alpha: f64) -> Vec<f64> {
+    let all_alphas = [1.0f64, config_alpha];
+    #[cfg(test)]
+    {
+        let cap = MAX_PASSES.with(|c| c.get()).unwrap_or(all_alphas.len());
+        all_alphas[..cap.min(all_alphas.len())].to_vec()
+    }
+    #[cfg(not(test))]
+    {
+        all_alphas.to_vec()
+    }
+}
 
 /// Output of a single greedy-search traversal over the Vamana graph.
 #[derive(Debug, Clone, PartialEq)]
@@ -163,7 +240,8 @@ impl VamanaGraph {
         let mut order: Vec<u32> = (0..num_vectors as u32).collect();
         order.shuffle(&mut rng);
 
-        for &pass_alpha in &[1.0f64, config.alpha] {
+        let alphas = refinement_alpha_schedule(config.alpha);
+        for &pass_alpha in &alphas {
             for batch in order.chunks(batch_size) {
                 // L1: capture only the current neighbors of the batch nodes (O(batch*R))
                 // instead of cloning the full adjacency (O(N)). The greedy search reads
@@ -276,7 +354,7 @@ impl VamanaGraph {
     /// `vectors` into `encoded` first (see crates/khive-vamana/docs/api/algorithm.md#sq8-acquisition-tier).
     pub fn build_sq8(
         vectors: &[f32],
-        encoded: &[GsEncodedVector],
+        encoded: CodesView<'_>,
         codec: &GsSq8Codec,
         config: &VamanaConfig,
     ) -> Result<Self> {
@@ -306,7 +384,8 @@ impl VamanaGraph {
         let mut order: Vec<u32> = (0..num_vectors as u32).collect();
         order.shuffle(&mut rng);
 
-        for &pass_alpha in &[1.0f64, config.alpha] {
+        let alphas = refinement_alpha_schedule(config.alpha);
+        for &pass_alpha in &alphas {
             for batch in order.chunks(batch_size) {
                 let batch_prior: Vec<Vec<u32>> = batch
                     .iter()
@@ -316,7 +395,7 @@ impl VamanaGraph {
                 let propose = |(&node, prior_neighbors): (&u32, &Vec<u32>)| {
                     let mut visited = VisitedSet::new(num_vectors);
                     let query = row(vectors, config.dimensions, node);
-                    let query_enc = &encoded[node as usize];
+                    let query_enc = encoded.code(node as usize);
                     let search = greedy_search_inner_sq8(
                         vectors,
                         config.dimensions,
@@ -801,11 +880,11 @@ pub(crate) fn robust_prune_inner(
 pub(crate) fn greedy_search_inner_sq8(
     vectors: &[f32],
     dimensions: usize,
-    encoded: &[GsEncodedVector],
+    encoded: CodesView<'_>,
     codec: &GsSq8Codec,
     adjacency: &[Vec<u32>],
     query: &[f32],
-    query_enc: &GsEncodedVector,
+    query_enc: &[u8],
     start: u32,
     k: usize,
     search_list_size: usize,
@@ -824,7 +903,7 @@ pub(crate) fn greedy_search_inner_sq8(
         }
     }
 
-    let start_dist = codec.l2_sq(query_enc, &encoded[start as usize]);
+    let start_dist = codec.l2_sq_codes(query_enc, encoded.code(start as usize));
     visited.mark_if_new(start as usize);
 
     let mut frontier = vec![Candidate {
@@ -862,7 +941,7 @@ pub(crate) fn greedy_search_inner_sq8(
             if !visited.mark_if_new(neighbor as usize) {
                 continue;
             }
-            let d = codec.l2_sq(query_enc, &encoded[neighbor as usize]);
+            let d = codec.l2_sq_codes(query_enc, encoded.code(neighbor as usize));
             frontier.push(Candidate {
                 id: neighbor,
                 distance: d,
@@ -922,14 +1001,14 @@ pub(crate) fn greedy_search_inner_sq8(
 pub(crate) fn robust_prune_inner_sq8(
     vectors: &[f32],
     dimensions: usize,
-    encoded: &[GsEncodedVector],
+    encoded: CodesView<'_>,
     codec: &GsSq8Codec,
     node: u32,
     candidates: Vec<u32>,
     alpha: f64,
     max_degree: usize,
 ) -> Vec<u32> {
-    let node_enc = &encoded[node as usize];
+    let node_enc = encoded.code(node as usize);
     let mut seen = HashSet::new();
     let mut pool: Vec<(u32, f32)> = Vec::new();
 
@@ -940,7 +1019,7 @@ pub(crate) fn robust_prune_inner_sq8(
         if !seen.insert(candidate) {
             continue;
         }
-        let d2 = codec.l2_sq(node_enc, &encoded[candidate as usize]);
+        let d2 = codec.l2_sq_codes(node_enc, encoded.code(candidate as usize));
         pool.push((candidate, d2));
     }
 
@@ -1365,6 +1444,77 @@ mod tests {
         assert_eq!(g1, g2);
     }
 
+    #[test]
+    fn build_alpha_one_two_passes_are_not_idempotent_at_scale() {
+        // Regression guard for #559: an earlier revision skipped the second
+        // refinement pass when config.alpha == 1.0, reasoning that a second pass
+        // at an identical alpha reruns pruning over an already-converged graph and
+        // reproduces the same adjacency. That reasoning does not hold once the
+        // graph is large enough for the first pass to leave real refinement on
+        // the table: the second pass runs greedy search over the *now more
+        // connected* graph the first pass produced and finds different pruning
+        // candidates. This test pins that divergence down directly so the skip
+        // is not silently reintroduced.
+        // n=250 is the smallest size (of 150/200/250/300/384 probed at this dim,
+        // max_degree, and search_list_size) at which the two builds diverge;
+        // below it the first pass already converges to a fixed point.
+        let dim = 384usize;
+        let n = 250usize;
+        let mut rng = StdRng::seed_from_u64(1000);
+        let mut raw: Vec<f32> = (0..n * dim).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+        normalize_rows(&mut raw, dim);
+
+        let cfg = VamanaConfig::with_dimensions(dim)
+            .with_max_degree(32)
+            .with_search_list_size(64)
+            .with_alpha(1.0);
+
+        set_max_passes(Some(1));
+        let one_pass = VamanaGraph::build(&raw, &cfg).unwrap();
+        set_max_passes(None);
+        let two_pass = VamanaGraph::build(&raw, &cfg).unwrap();
+
+        assert_ne!(
+            one_pass, two_pass,
+            "second alpha==1.0 pass changed adjacency vs a single pass; it is not \
+             a redundant no-op at this scale and must not be skipped"
+        );
+    }
+
+    #[test]
+    fn build_sq8_alpha_one_two_passes_are_not_idempotent_at_scale() {
+        // SQ8 counterpart of build_alpha_one_two_passes_are_not_idempotent_at_scale:
+        // build_sq8 runs the same two-pass alpha schedule as build, so it needs the
+        // same regression guard against a reintroduced alpha==1.0 skip. Same n=250
+        // divergence point established there.
+        let dim = 384usize;
+        let n = 250usize;
+        let mut rng = StdRng::seed_from_u64(1000);
+        let mut raw: Vec<f32> = (0..n * dim).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+        normalize_rows(&mut raw, dim);
+
+        let codec = GsSq8Codec::train_flat(&raw, dim);
+        let encoded = codec.encode_flat_par(&raw, dim);
+
+        let cfg = VamanaConfig::with_dimensions(dim)
+            .with_max_degree(32)
+            .with_search_list_size(64)
+            .with_alpha(1.0);
+
+        set_max_passes(Some(1));
+        let one_pass =
+            VamanaGraph::build_sq8(&raw, CodesView::Owned(&encoded), &codec, &cfg).unwrap();
+        set_max_passes(None);
+        let two_pass =
+            VamanaGraph::build_sq8(&raw, CodesView::Owned(&encoded), &codec, &cfg).unwrap();
+
+        assert_ne!(
+            one_pass, two_pass,
+            "second alpha==1.0 pass changed adjacency vs a single pass for build_sq8; \
+             it is not a redundant no-op at this scale and must not be skipped"
+        );
+    }
+
     fn normalize_rows(v: &mut [f32], dim: usize) {
         for row in v.chunks_mut(dim) {
             let norm: f32 = row.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -1686,8 +1836,9 @@ mod tests {
         let mut encoded = codec.encode_flat_par(&vectors, dim);
         encoded.truncate(0); // malformed: expected 2 encoded rows, actual 0
 
-        let result =
-            std::panic::catch_unwind(|| VamanaGraph::build_sq8(&vectors, &encoded, &codec, &cfg));
+        let result = std::panic::catch_unwind(|| {
+            VamanaGraph::build_sq8(&vectors, CodesView::Owned(&encoded), &codec, &cfg)
+        });
         assert!(matches!(
             result,
             Ok(Err(VamanaError::DimensionMismatch {

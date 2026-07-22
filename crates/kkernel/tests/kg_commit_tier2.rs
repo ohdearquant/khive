@@ -98,25 +98,6 @@ fn invalid_note_kind_op(id: &str) -> String {
     .to_string()
 }
 
-/// A `create` op for a `concept` entity carrying `entity_type` (the field
-/// H1's fix now projects into `entities.ndjson`).
-fn typed_concept_create_op(id: &str, name: &str, entity_type: &str) -> String {
-    serde_json::json!({
-        "op": "create",
-        "id": id,
-        "namespace": "local",
-        "target": {
-            "kind": "entity",
-            "entity_kind": "concept",
-            "entity_type": entity_type,
-            "name": name,
-            "properties": {},
-            "tags": [],
-        },
-    })
-    .to_string()
-}
-
 /// A `create` op for a `concept` entity carrying `description` (the other
 /// field H1's fix now projects into `entities.ndjson`).
 fn described_concept_create_op(id: &str, name: &str, description: &str) -> String {
@@ -132,20 +113,6 @@ fn described_concept_create_op(id: &str, name: &str, description: &str) -> Strin
             "properties": {},
             "tags": [],
         },
-    })
-    .to_string()
-}
-
-fn link_op(id: &str, source: &str, target: &str, relation: &str) -> String {
-    serde_json::json!({
-        "op": "link",
-        "id": id,
-        "namespace": "local",
-        "source": source,
-        "target": target,
-        "relation": relation,
-        "weight": 1.0,
-        "properties": {},
     })
     .to_string()
 }
@@ -366,70 +333,8 @@ fn kg_commit_fails_loud_on_malformed_changeset() {
 
 // ── Projection-fidelity regressions: rules must see the full staged record ─
 
-/// H1(a): a formal typed endpoint (`concept/theorem -[depends_on]->
-/// concept/definition`) is a pack-allowed pairing
-/// (`khive-pack-formal::vocab::FORMAL_EDGE_RULES`), but only if
-/// `project_changeset` actually carries `entity_type` into the projected
-/// `entities.ndjson` the `edge-endpoint-types` rule reads. Before the H1 fix
-/// both endpoints projected as plain `concept` with no `entity_type`, so the
-/// pack rule never matched and this change-set was wrongly rejected.
-#[test]
-fn kg_commit_lands_formal_typed_endpoint_with_edge_endpoint_types_enabled() {
-    let repo = TempDir::new().expect("repo tmp");
-    init_repo(repo.path());
-    let stage = TempDir::new().expect("stage tmp");
-
-    let theorem_id = "dddddddd-dddd-dddd-dddd-dddddddddddd";
-    let definition_id = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
-    let changeset = write_changeset(
-        stage.path(),
-        "batch.ndjson",
-        &[
-            typed_concept_create_op(theorem_id, "Pythagorean theorem", "theorem"),
-            typed_concept_create_op(definition_id, "Right triangle", "definition"),
-            link_op(
-                "ffffffff-ffff-ffff-ffff-ffffffffffff",
-                theorem_id,
-                definition_id,
-                "depends_on",
-            ),
-        ],
-    );
-    let rules = stage.path().join("rules.toml");
-    std::fs::write(
-        &rules,
-        "[edge_endpoint_types]\nenabled = true\nseverity = \"error\"\n",
-    )
-    .expect("write rules.toml");
-
-    let output = Command::new(kkernel_bin())
-        .args([
-            "kg",
-            "commit",
-            changeset.to_str().unwrap(),
-            "--rules",
-            rules.to_str().unwrap(),
-            "--repo",
-            repo.path().to_str().unwrap(),
-            "--format",
-            "json",
-            "-m",
-            "formal typed endpoint",
-        ])
-        .output()
-        .expect("run kkernel kg commit");
-
-    assert!(
-        output.status.success(),
-        "theorem -[depends_on]-> definition is a pack-allowed endpoint pairing \
-         and must commit; stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-/// H1(b): a generic `[[rules]] require_field = "description"` rule must see
-/// the `description` a create op actually carries. Before the H1 fix
+/// A generic `[[rules]] require_field = "description"` rule must see
+/// the `description` a create op actually carries. Before this fix
 /// `project_changeset` dropped `description` entirely, so this rule always
 /// reported it missing.
 #[test]
@@ -482,10 +387,10 @@ fn kg_commit_lands_changeset_with_description_satisfying_require_field_rule() {
 
 // ── Rule-result suppression regressions: only the built-in partial-view ────
 
-/// H2(a): a malformed `[dangling_refs] severity = "catastrophic"` must still
+/// A malformed `[dangling_refs] severity = "catastrophic"` must still
 /// produce an error-severity config-validation finding and refuse the
 /// commit, even though the built-in dangling-ref evaluator itself is never
-/// invoked at commit time. Before the H2 fix, `commit.rs` filtered every
+/// invoked at commit time. Before this fix, `commit.rs` filtered every
 /// result with `id == "dangling-refs"` out of the pass/fail decision — which
 /// also silently dropped this config-error result — and the commit landed.
 #[test]
@@ -547,9 +452,9 @@ fn kg_commit_refuses_malformed_dangling_refs_severity() {
     );
 }
 
-/// H2(b): a generic `[[rules]]` entry that happens to be named
-/// `id = "dangling-refs"` must still be evaluated and enforced. Before the
-/// H2 fix, `commit.rs`'s post-hoc `id == "dangling-refs"` filter dropped
+/// A generic `[[rules]]` entry that happens to be named
+/// `id = "dangling-refs"` must still be evaluated and enforced. Before this
+/// fix, `commit.rs`'s post-hoc `id == "dangling-refs"` filter dropped
 /// this result regardless of where it came from, letting an error-severity
 /// `require_field` violation through.
 #[test]

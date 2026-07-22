@@ -346,6 +346,84 @@ fn v2_crash_corrupted_metadata_falls_back_to_rebuild() {
     assert!(!rebuilt.search(&query, 3).unwrap().is_empty());
 }
 
+/// A checksum-invalid codes.bin with a still-valid header must never reach the
+/// fast mmap parse: load_or_build rebuilds and rewrites the segment.
+#[cfg(feature = "mmap")]
+#[test]
+fn v2_corrupt_codes_segment_triggers_rebuild_in_load_or_build() {
+    let dim = 4usize;
+    let vectors = rand_unit_vectors(20, dim, 0xC0_DE);
+    let cfg = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(4)
+        .with_search_list_size(8);
+    let idx = VamanaIndex::build(&vectors, cfg).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    idx.save_atomic(dir.path()).unwrap();
+
+    // Flip the last byte (a quantized code, well past the header) so the header
+    // still parses but the blake3 gate must reject the segment.
+    let codes_path = dir.path().join("codes.bin");
+    let mut codes = fs::read(&codes_path).unwrap();
+    let last = codes.len() - 1;
+    codes[last] ^= 0xff;
+    fs::write(&codes_path, &codes).unwrap();
+    let corrupted = codes;
+
+    let fallback = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(4)
+        .with_search_list_size(8);
+    let loaded = VamanaIndex::load_or_build(dir.path(), &vectors, fallback).unwrap();
+    assert_eq!(loaded.num_vectors(), idx.num_vectors());
+
+    // The rebuild path re-runs save_atomic, replacing the corrupted bytes. A
+    // fast-path load would have left the corrupt file in place untouched.
+    let after = fs::read(&codes_path).unwrap();
+    assert_ne!(
+        after, corrupted,
+        "load_or_build accepted a checksum-invalid codes.bin via the fast path"
+    );
+    let query = rand_unit_vectors(1, dim, 0xdef);
+    assert!(!loaded.search(&query, 3).unwrap().is_empty());
+}
+
+/// A partially truncated extended trailer (base + 40 bytes) is an invalid
+/// commit-record length — rule 1 (corrupt) rather than rule 2 (pre-amendment).
+#[cfg(feature = "mmap")]
+#[test]
+fn v2_truncated_extended_trailer_is_invalid() {
+    let dim = 4usize;
+    let vectors = rand_unit_vectors(12, dim, 0x7A_11);
+    let cfg = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(4)
+        .with_search_list_size(8);
+    let idx = VamanaIndex::build(&vectors, cfg).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    idx.save_atomic(dir.path()).unwrap();
+
+    let meta_path = dir.path().join("metadata.bin");
+    let meta = fs::read(&meta_path).unwrap();
+    fs::write(&meta_path, &meta[..meta.len() - 1]).unwrap();
+
+    // The commit-record reader must reject the malformed length: it reports
+    // an unparseable record as None (torn write), never as a valid base or
+    // extended record.
+    assert!(
+        khive_vamana::read_commit_info(dir.path())
+            .expect("reading a present but malformed record is not an IO error")
+            .is_none(),
+        "a base+40-byte record must not parse as either base or extended"
+    );
+
+    // load_or_build recovers by rebuilding, mirroring the corrupt-metadata case.
+    let fallback = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(4)
+        .with_search_list_size(8);
+    let rebuilt = VamanaIndex::load_or_build(dir.path(), &vectors, fallback).unwrap();
+    assert_eq!(rebuilt.num_vectors(), idx.num_vectors());
+}
+
 /// Fingerprint mismatch: modify corpus → load_or_build triggers rebuild.
 #[cfg(feature = "mmap")]
 #[test]

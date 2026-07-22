@@ -126,10 +126,9 @@ impl ProgressBar {
     }
 }
 
-/// Arguments for `kkernel reindex` — rebuilds embedding vectors for entities,
-/// notes, and the knowledge corpus, fanning out across every configured
-/// embedding engine (resolved with the same config-file/env precedence as
-/// `kkernel mcp`).
+/// Arguments for `kkernel reindex` — rebuilds embedding vectors for entities
+/// and notes, fanning out across every configured embedding engine (resolved
+/// with the same config-file/env precedence as `kkernel mcp`).
 #[derive(Parser, Debug)]
 pub struct ReindexArgs {
     /// Database path (defaults to `~/.khive/khive.db`). `:memory:` selects an
@@ -146,7 +145,7 @@ pub struct ReindexArgs {
     pub config: Option<PathBuf>,
 
     /// Embedding model for entities/notes. When omitted, fans out to ALL
-    /// registered models. (Knowledge always uses the default embedder.)
+    /// registered models.
     #[arg(long)]
     pub model: Option<String>,
 
@@ -165,28 +164,12 @@ pub struct ReindexArgs {
     #[arg(long, env = "KHIVE_NAMESPACE")]
     pub namespace: Option<String>,
 
-    /// Only reindex the knowledge corpus (skip entities and notes).
-    #[arg(long, conflicts_with = "no_knowledge")]
-    pub knowledge_only: bool,
-
-    /// Skip the knowledge corpus (reindex only entities and notes).
-    #[arg(long)]
-    pub no_knowledge: bool,
-
-    /// Downgrade partial failures (failed model, failed vector insert, failed
-    /// knowledge pass) to a warning and still exit 0. Without this flag,
-    /// reindex FAILS CLOSED: any failure returns a non-zero exit so automation
-    /// does not treat a partial rebuild as a clean one.
+    /// Downgrade partial failures (failed model, failed vector insert) to a
+    /// warning and still exit 0. Without this flag, reindex FAILS CLOSED: any
+    /// failure returns a non-zero exit so automation does not treat a partial
+    /// rebuild as a clean one.
     #[arg(long)]
     pub best_effort: bool,
-
-    /// Skip knowledge section embeddings (embed atoms but not sections).
-    #[arg(long, conflicts_with = "sections_only")]
-    pub no_sections: bool,
-
-    /// Only embed knowledge sections (skip entities, notes, and atoms).
-    #[arg(long, conflicts_with = "no_knowledge")]
-    pub sections_only: bool,
 
     /// Print human-readable output instead of JSON.
     #[arg(long)]
@@ -197,22 +180,6 @@ pub struct ReindexArgs {
 struct ReindexReport {
     entities_processed: u64,
     notes_processed: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    knowledge_atoms_indexed: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    knowledge_sections_indexed: Option<u64>,
-    /// Atoms whose vector write failed during the knowledge pass.
-    knowledge_atoms_failed: u64,
-    /// True when the knowledge pass itself errored (could not run to completion).
-    knowledge_pass_errored: bool,
-    /// True when the Vamana ANN build or snapshot persist failed during the
-    /// knowledge pass. Distinct from atom-level failures: atom vectors DID
-    /// persist; the ANN snapshot is the failure dimension.
-    knowledge_ann_failed: bool,
-    /// Section-level embed or SQL-write failures during the knowledge pass.
-    /// Distinct from atom-level failures; sections still index atoms even if
-    /// section embedding fails.
-    knowledge_sections_failed: u64,
     models_used: Vec<String>,
     elapsed_ms: u64,
     /// Entity/note vector inserts that failed across all engines.
@@ -221,27 +188,12 @@ struct ReindexReport {
     entities_fts_failed: u64,
     /// Note FTS upserts that failed during the backfill pass.
     notes_fts_failed: u64,
-    /// True when the completion ("settled") durable memory-ANN epoch bump
-    /// failed after entity/note mutations were already committed (#812). The
-    /// start-of-pass bump
-    /// (`begin_reindex_epoch`) aborts the whole run before any mutation on
-    /// failure, so there is nothing left to "abort" here — but a swallowed
-    /// failure at this point is exactly the bug this fix closes, so it now
-    /// surfaces as a fail-closed exit instead of a silent warning.
-    epoch_bump_failed: bool,
 }
 
 impl ReindexReport {
     /// Did any part of the run fail? Drives the fail-closed exit decision.
     fn has_failures(&self) -> bool {
-        self.errors_skipped > 0
-            || self.entities_fts_failed > 0
-            || self.notes_fts_failed > 0
-            || self.knowledge_atoms_failed > 0
-            || self.knowledge_pass_errored
-            || self.knowledge_ann_failed
-            || self.knowledge_sections_failed > 0
-            || self.epoch_bump_failed
+        self.errors_skipped > 0 || self.entities_fts_failed > 0 || self.notes_fts_failed > 0
     }
 }
 
@@ -349,7 +301,11 @@ async fn embed_and_store_batch(
             continue;
         }
 
-        let texts: Vec<String> = subset.iter().map(|(_, t)| truncate_text(t)).collect();
+        let budget = embed_budget(model_name);
+        let texts: Vec<String> = subset
+            .iter()
+            .map(|(_, t)| truncate_text(t, budget))
+            .collect();
         match rt.embed_document_batch_with_model(model_name, &texts).await {
             Ok(embeddings) if embeddings.len() == subset.len() => {
                 // No pre-delete: SqliteVecStore::insert wraps DELETE+INSERT in
@@ -450,11 +406,11 @@ async fn filter_unembedded(
     }
 }
 
-/// Re-embed entities, notes, and the knowledge corpus, fanning out across every
-/// configured embedding engine. Engines, db path, and config are resolved with
-/// the same precedence as `kkernel mcp` so reindex writes the SAME vectors the
-/// MCP server serves recall from. Fails closed on any partial failure unless
-/// `--best-effort` is set.
+/// Re-embed entities and notes, fanning out across every configured embedding
+/// engine. Engines, db path, and config are resolved with the same precedence
+/// as `kkernel mcp` so reindex writes the SAME vectors the MCP server serves
+/// recall from. Fails closed on any partial failure unless `--best-effort` is
+/// set.
 pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
     // Namespace precedence mirrors `kkernel mcp`:
     //   1. --namespace / KHIVE_NAMESPACE (explicit CLI/env) — skips config tier
@@ -484,32 +440,21 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("{e}"))
         .context("failed to authorize namespace")?;
 
-    // `--sections-only` is the narrowest scope: knowledge sections alone.
-    let do_graph = !args.knowledge_only && !args.sections_only; // entities + notes
-    let do_knowledge = !args.no_knowledge; // knowledge corpus
-    let do_atoms = do_knowledge && !args.sections_only;
-    let do_sections = do_knowledge && !args.no_sections;
-
     // Explicit --model targets a single engine; otherwise fan out to ALL
     // registered engines, matching the runtime's multi-model write path so a
     // reindex reproduces exactly what create/update would have embedded.
-    // Only needed for the entity/note pass (knowledge uses the default embedder).
     //
     // When no embedding model is configured, model_names is empty: the embedding
     // loop is a no-op but the note loop still runs for FTS backfill, which needs
     // no embedder and must never be skipped due to a missing embedding config.
-    let model_names: Vec<String> = if !do_graph {
-        vec![]
-    } else {
-        match args.model.as_deref().filter(|s| !s.is_empty()) {
-            Some(name) => vec![name.to_string()],
-            None => {
-                let names = rt.registered_embedding_model_names();
-                if names.is_empty() {
-                    eprintln!("warning: no embedding model configured — skipping vector embedding; FTS backfill will still run");
-                }
-                names
+    let model_names: Vec<String> = match args.model.as_deref().filter(|s| !s.is_empty()) {
+        Some(name) => vec![name.to_string()],
+        None => {
+            let names = rt.registered_embedding_model_names();
+            if names.is_empty() {
+                eprintln!("warning: no embedding model configured — skipping vector embedding; FTS backfill will still run");
             }
+            names
         }
     };
 
@@ -524,14 +469,8 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
     let mut entities_fts_failed: u64 = 0;
     let mut notes_fts_failed: u64 = 0;
 
-    let mut epoch_bump_failed = false;
-
     // ── entities + notes (graph substrate) ────────────────────────────────────
-    if do_graph {
-        begin_reindex_epoch(&rt)
-            .await
-            .context("aborting reindex before any vector mutation")?;
-
+    {
         let entity_total = rt.count_entities(&token, None).await.unwrap_or(0);
         let entity_bar = ProgressBar::new("entities");
         entity_bar.update(0, entity_total);
@@ -646,25 +585,6 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
             tracing::warn!(error = %e, "failed to invalidate Vamana snapshots after reindex");
         }
 
-        // Purge stale per-namespace memory Vamana snapshot rows (legacy key format
-        // `{ns}::memory_vamana::*`). After FTS+ANN consolidation the unified key is
-        // `global::memory_vamana::*`; old per-ns rows are orphaned and waste space.
-        purge_stale_memory_vamana_snapshots(&rt).await;
-
-        // Invalidate the ACTIVE global memory Vamana snapshot too (#812).
-        // Its key (`global::memory_vamana::*`)
-        // never matched `invalidate_vamana_snapshots`'s `{namespace}::vamana::%`
-        // pattern above, so the note re-embed this pass just did left that
-        // snapshot installed and untouched — the content-hash restart check in
-        // `khive-pack-memory::ann` is the primary defense against a daemon
-        // trusting it afterward, but deleting it here forces a rebuild on the
-        // very next warm regardless, without depending on that check alone.
-        //
-        // This also performs the completion ("settled") durable epoch bump
-        // (#812); see its own doc comment for
-        // why a failure here is reported rather than warned-and-ignored.
-        epoch_bump_failed = !invalidate_active_memory_vamana_snapshot(&rt).await;
-
         // Drop per-namespace FTS partition tables that survived the V4 migration
         // (tables created by the runtime before the migration ran, or on databases
         // that were migrated but not swept). The sweep is guarded: it only runs
@@ -674,92 +594,18 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
         // written to the new unified table). On a single-namespace (post-relabel)
         // db the guard always passes and the sweep runs normally.
         sweep_stale_fts_partitions(&rt, &ns_str).await;
-    } // end if do_graph
-
-    // ── knowledge corpus ───────────────────────────────────────────────────────
-    // Reindex through the knowledge library directly (the `knowledge.index`
-    // handler over the full corpus), not the verb-DSL shell.
-    let mut knowledge_atoms_indexed: Option<u64> = None;
-    let mut knowledge_sections_indexed: Option<u64> = None;
-    let mut knowledge_atoms_failed: u64 = 0;
-    let mut knowledge_pass_errored = false;
-    let mut knowledge_ann_failed = false;
-    let mut knowledge_sections_failed: u64 = 0;
-    if do_atoms || do_sections {
-        let atom_bar = ProgressBar::new("atoms");
-        let section_bar = ProgressBar::new("sections");
-        let on_atom = |c: u64, t: u64| atom_bar.update(c, t);
-        let on_section = |c: u64, t: u64| section_bar.update(c, t);
-
-        let opts = khive_pack_knowledge::KnowledgeReindexOptions {
-            atoms: do_atoms,
-            sections: do_sections,
-            drop_existing,
-            rebuild_ann: true,
-            batch_size: Some(batch_size),
-        };
-        match khive_pack_knowledge::reindex_knowledge(
-            &rt,
-            &token,
-            opts,
-            if do_atoms { Some(&on_atom) } else { None },
-            if do_sections { Some(&on_section) } else { None },
-        )
-        .await
-        {
-            Ok(v) => {
-                if do_atoms {
-                    knowledge_atoms_indexed =
-                        Some(v.get("atoms_indexed").and_then(|n| n.as_u64()).unwrap_or(0));
-                    knowledge_atoms_failed = v.get("failed").and_then(|n| n.as_u64()).unwrap_or(0);
-                    knowledge_ann_failed = v
-                        .get("ann_failed")
-                        .and_then(|b| b.as_bool())
-                        .unwrap_or(false);
-                }
-                if do_sections {
-                    knowledge_sections_indexed = Some(
-                        v.get("sections_indexed")
-                            .and_then(|n| n.as_u64())
-                            .unwrap_or(0),
-                    );
-                    knowledge_sections_failed = v
-                        .get("sections_failed")
-                        .and_then(|n| n.as_u64())
-                        .unwrap_or(0);
-                }
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "knowledge reindex failed");
-                eprintln!("\nerror: knowledge reindex failed: {e}");
-                knowledge_pass_errored = true;
-            }
-        }
-        if do_atoms {
-            atom_bar.finish();
-        }
-        if do_sections {
-            section_bar.finish();
-        }
-    }
+    } // entities + notes
 
     let elapsed_ms = start.elapsed().as_millis() as u64;
 
     let report = ReindexReport {
         entities_processed,
         notes_processed,
-        knowledge_atoms_indexed,
-        knowledge_sections_indexed,
-        knowledge_atoms_failed,
-        knowledge_pass_errored,
-        knowledge_ann_failed,
-        knowledge_sections_failed,
         models_used: model_names,
         elapsed_ms,
         errors_skipped,
         entities_fts_failed,
         notes_fts_failed,
-        epoch_bump_failed,
     };
 
     print_report(&report, args.human);
@@ -839,139 +685,6 @@ async fn invalidate_vamana_snapshots(rt: &KhiveRuntime, namespace: &str) -> anyh
             }
         }
     }
-}
-
-/// Remove per-namespace memory Vamana snapshot rows (legacy `{ns}::memory_vamana::*` format).
-/// After FTS+ANN consolidation the active, retained key is `global::memory_vamana::{model}`
-/// (ADR-062, corrected by ADR-116 (PR #1080)); old per-ns rows are orphaned. Best-effort —
-/// missing table or SQL failure is logged and ignored.
-async fn purge_stale_memory_vamana_snapshots(rt: &KhiveRuntime) {
-    use khive_storage::types::SqlStatement;
-    let sql = rt.sql();
-    let Ok(mut writer) = sql.writer().await else {
-        return;
-    };
-    match writer
-        .execute(SqlStatement {
-            // `retrieval_snapshots.namespace` holds the FULL composite key produced by
-            // `ann::snapshot_key` (`"global::memory_vamana::{model}"`), not a bare
-            // namespace — `namespace != 'global'` never matches that literal string and
-            // so purged every memory_vamana row unconditionally, including current,
-            // still-valid `global::memory_vamana::*` snapshots (ADR-116 (PR #1080)
-            // condition 4). Match the retained key's prefix instead, mirroring
-            // `invalidate_active_memory_vamana_snapshot`'s LIKE pattern below — but with
-            // GLOB, not LIKE: SQLite's LIKE is ASCII case-insensitive, so a legacy
-            // `GLOBAL::memory_vamana::*` row (a valid namespace per namespace validation)
-            // would otherwise be treated as the retained lowercase key and never purged.
-            // GLOB is case-sensitive (uses `*`/`?` globbing, not `%`/`_`).
-            sql: "DELETE FROM retrieval_snapshots \
-                  WHERE index_type = 'memory_vamana' \
-                    AND namespace NOT GLOB 'global::memory_vamana::*'"
-                .into(),
-            params: vec![],
-            label: Some("purge_stale_memory_vamana_snapshots".into()),
-        })
-        .await
-    {
-        Ok(deleted) => {
-            if deleted > 0 {
-                tracing::info!(deleted, "purged stale per-ns memory Vamana snapshot rows");
-            }
-        }
-        Err(e) => {
-            let msg = e.to_string();
-            if !msg.contains("no such table") {
-                tracing::warn!(error = %e, "failed to purge stale memory Vamana snapshots");
-            }
-        }
-    }
-}
-
-/// Durably marks the reindex-in-progress epoch, BEFORE any vector mutation in
-/// this pass (#812, ADR-107 §4). Fail-closed: an error here (schema creation OR
-/// the epoch write) aborts the whole reindex before any mutation runs — never
-/// warn-and-continue. See
-/// `crates/kkernel/docs/design.md#reindex-memory-vamana-epoch-protocol-812-adr-107-4`
-/// for the in-progress/completed epoch protocol this is half of.
-async fn begin_reindex_epoch(rt: &KhiveRuntime) -> Result<()> {
-    khive_pack_memory::ensure_ann_epoch_schema(rt)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))
-        .context("failed to ensure memory_ann_epoch schema before reindex")?;
-    khive_pack_memory::bump_memory_ann_epoch(rt)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))
-        .context("failed to durably mark reindex-in-progress epoch")?;
-    Ok(())
-}
-
-/// Delete the ACTIVE global memory Vamana snapshot row (`global::memory_vamana::*`),
-/// distinct from `purge_stale_memory_vamana_snapshots`'s legacy-row cleanup above
-/// (#812). Reindex rewrites note
-/// embeddings directly, bypassing `memory.remember`, so it never bumps the memory
-/// pack's in-memory write-generation counter — that daemon-side signal simply
-/// cannot see this change. The DELETE itself stays best-effort (a missing table
-/// or SQL failure is logged and ignored, matching this file's other
-/// snapshot-maintenance helpers) — it is a defense-in-depth optimization, not
-/// the correctness mechanism.
-///
-/// Returns `false` when the completion ("settled") durable epoch bump below
-/// fails — see `begin_reindex_epoch`'s doc comment for the two-phase
-/// protocol this half completes. Unlike `begin_reindex_epoch`, mutations have
-/// already committed by this point, so there is nothing left to abort; the
-/// caller instead folds this into `ReindexReport::epoch_bump_failed`, which
-/// drives a fail-closed non-zero exit instead of the old warn-and-continue.
-async fn invalidate_active_memory_vamana_snapshot(rt: &KhiveRuntime) -> bool {
-    use khive_storage::types::{SqlStatement, SqlValue};
-    let sql = rt.sql();
-    if let Ok(mut writer) = sql.writer().await {
-        // `retrieval_snapshots.namespace` holds the FULL composite key produced
-        // by `ann::snapshot_key` (`"global::memory_vamana::{model}"`), not a
-        // bare namespace — matching on `namespace = 'global'` would never
-        // match any row.
-        match writer
-            .execute(SqlStatement {
-                sql: "DELETE FROM retrieval_snapshots \
-                      WHERE index_type = 'memory_vamana' AND namespace LIKE ?1"
-                    .into(),
-                params: vec![SqlValue::Text("global::memory_vamana::%".into())],
-                label: Some("invalidate_active_memory_vamana_snapshot".into()),
-            })
-            .await
-        {
-            Ok(deleted) => {
-                if deleted > 0 {
-                    tracing::info!(
-                        deleted,
-                        "invalidated active global memory Vamana snapshot after reindex"
-                    );
-                }
-            }
-            Err(e) => {
-                let msg = e.to_string();
-                if !msg.contains("no such table") {
-                    tracing::warn!(error = %e, "failed to invalidate active memory Vamana snapshot");
-                }
-            }
-        }
-    }
-
-    // #812: the completion half of the
-    // in-progress/completed epoch protocol described on `begin_reindex_epoch`.
-    // A khive daemon that warmed its in-memory ANN index before this reindex
-    // ran shares no process, and therefore no in-memory write-generation
-    // state, with this `kkernel reindex` invocation — its `common.rs` recall
-    // path would keep trusting that cached index forever with no way to
-    // observe this mutation at all. Bumping the durable epoch here gives that
-    // daemon's amortized freshness check
-    // (`khive_pack_memory::ann::maybe_check_durable_epoch`, sampled from the
-    // recall path) a signal written to the shared database file instead of
-    // one confined to this process.
-    if let Err(e) = khive_pack_memory::bump_memory_ann_epoch(rt).await {
-        tracing::warn!(error = %e, "failed to bump durable memory ANN epoch after reindex");
-        return false;
-    }
-    true
 }
 
 /// Return the set of distinct namespaces present in base `entities` and `notes`
@@ -1153,11 +866,25 @@ async fn count_notes(rt: &KhiveRuntime, ns: &str) -> u64 {
     }
 }
 
-fn truncate_text(t: &str) -> String {
-    if t.len() <= MAX_EMBED_BYTES {
+// The embed service prepends the model's document instruction (e.g. "passage: "
+// for multilingual-e5) AFTER this truncation, and its input guard rejects the
+// combined length. Reserve the prefix bytes here or a text truncated exactly to
+// the cap fails the whole batch post-prefix.
+fn embed_budget(model_name: &str) -> usize {
+    let normalized = model_name.trim().to_ascii_lowercase().replace('_', "-");
+    let prefix_len = normalized
+        .parse::<lattice_embed::EmbeddingModel>()
+        .ok()
+        .and_then(|m| m.document_instruction())
+        .map_or(0, str::len);
+    MAX_EMBED_BYTES - prefix_len
+}
+
+fn truncate_text(t: &str, max_bytes: usize) -> String {
+    if t.len() <= max_bytes {
         t.to_string()
     } else {
-        let mut end = MAX_EMBED_BYTES;
+        let mut end = max_bytes;
         while !t.is_char_boundary(end) {
             end -= 1;
         }
@@ -1167,14 +894,6 @@ fn truncate_text(t: &str) -> String {
 
 fn print_report(report: &ReindexReport, human: bool) {
     if human {
-        let atoms = report
-            .knowledge_atoms_indexed
-            .map(|n| format!(", {n} knowledge atoms"))
-            .unwrap_or_default();
-        let sections = report
-            .knowledge_sections_indexed
-            .map(|n| format!(", {n} sections"))
-            .unwrap_or_default();
         let status = if report.has_failures() {
             "Reindex completed WITH FAILURES"
         } else {
@@ -1182,11 +901,9 @@ fn print_report(report: &ReindexReport, human: bool) {
         };
         let fts_errors = report.entities_fts_failed + report.notes_fts_failed;
         println!(
-            "{status}: {} entities, {} notes{}{} ({} vector errors, {} FTS errors) in {}ms",
+            "{status}: {} entities, {} notes ({} vector errors, {} FTS errors) in {}ms",
             report.entities_processed,
             report.notes_processed,
-            atoms,
-            sections,
             report.errors_skipped,
             fts_errors,
             report.elapsed_ms
@@ -1203,23 +920,6 @@ fn print_report(report: &ReindexReport, human: bool) {
                 report.notes_fts_failed
             );
         }
-        if report.knowledge_pass_errored {
-            println!("Knowledge pass: FAILED (did not run to completion)");
-        } else if report.knowledge_atoms_failed > 0 {
-            println!(
-                "Knowledge pass: {} atom vector inserts FAILED",
-                report.knowledge_atoms_failed
-            );
-        }
-        if report.knowledge_sections_failed > 0 {
-            println!(
-                "Knowledge sections: {} section embed/write failures",
-                report.knowledge_sections_failed
-            );
-        }
-        if report.knowledge_ann_failed {
-            println!("Knowledge ANN: FAILED (snapshot not rebuilt/persisted)");
-        }
         if !report.models_used.is_empty() {
             println!("Models: {}", report.models_used.join(", "));
         }
@@ -1232,6 +932,29 @@ fn print_report(report: &ReindexReport, human: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn embed_budget_reserves_document_prefix_bytes() {
+        // multilingual-e5 prepends "passage: " (9 bytes) after truncation; the
+        // budget must reserve it or exactly-at-cap texts fail the whole batch.
+        assert_eq!(embed_budget("multilingual-e5-base"), MAX_EMBED_BYTES - 9);
+        assert_eq!(embed_budget("multilingual_e5_small"), MAX_EMBED_BYTES - 9);
+        assert_eq!(embed_budget("all-minilm-l6-v2"), MAX_EMBED_BYTES);
+        assert_eq!(embed_budget("unknown-model"), MAX_EMBED_BYTES);
+    }
+
+    #[test]
+    fn truncate_text_respects_budget_and_char_boundaries() {
+        let long = "a".repeat(MAX_EMBED_BYTES + 100);
+        assert_eq!(
+            truncate_text(&long, MAX_EMBED_BYTES - 9).len(),
+            MAX_EMBED_BYTES - 9
+        );
+        let cjk = "\u{4e2d}".repeat(20_000); // 3 bytes each
+        let out = truncate_text(&cjk, 32_759);
+        assert!(out.len() <= 32_759);
+        assert!(out.chars().all(|c| c == '\u{4e2d}'));
+    }
+
     use crate::dbpath::resolve_db_override;
     use clap::Parser;
     use khive_storage::types::{SqlStatement, SqlValue};
@@ -1391,244 +1114,6 @@ mod tests {
         );
     }
 
-    /// Regression test (#812): the active global memory Vamana snapshot row
-    /// must
-    /// be deleted by `invalidate_active_memory_vamana_snapshot`, since
-    /// `invalidate_vamana_snapshots`'s `{namespace}::vamana::%` pattern never
-    /// matches the memory pack's distinct `global::memory_vamana::*` key.
-    #[tokio::test]
-    async fn test_reindex_invalidates_active_memory_vamana_snapshot() {
-        let rt = KhiveRuntime::memory().expect("in-memory runtime");
-        let sql = rt.sql();
-
-        let mut w = sql.writer().await.expect("writer");
-        w.execute_script(
-            "CREATE TABLE IF NOT EXISTS retrieval_snapshots (\
-             namespace TEXT NOT NULL, \
-             index_type TEXT NOT NULL, \
-             snapshot BLOB NOT NULL, \
-             created_at INTEGER NOT NULL, \
-             PRIMARY KEY (namespace, index_type));"
-                .into(),
-        )
-        .await
-        .expect("create table");
-
-        for (ns, idx_type) in &[
-            ("global::memory_vamana::model-a", "memory_vamana"),
-            ("local::vamana::model-a", "vamana"),
-            ("local::memory_vamana::model-a", "memory_vamana"),
-        ] {
-            w.execute(SqlStatement {
-                sql: "INSERT INTO retrieval_snapshots \
-                      (namespace, index_type, snapshot, created_at) \
-                      VALUES (?1, ?2, ?3, 0)"
-                    .into(),
-                params: vec![
-                    SqlValue::Text(ns.to_string()),
-                    SqlValue::Text(idx_type.to_string()),
-                    SqlValue::Blob(b"{}".to_vec()),
-                ],
-                label: None,
-            })
-            .await
-            .expect("insert row");
-        }
-        drop(w);
-
-        invalidate_active_memory_vamana_snapshot(&rt).await;
-
-        let mut r = sql.reader().await.expect("reader");
-        let rows = r
-            .query_all(SqlStatement {
-                sql: "SELECT namespace FROM retrieval_snapshots ORDER BY namespace".into(),
-                params: vec![],
-                label: None,
-            })
-            .await
-            .expect("query");
-
-        let remaining: Vec<String> = rows
-            .iter()
-            .filter_map(|row| match row.get("namespace") {
-                Some(SqlValue::Text(s)) => Some(s.clone()),
-                _ => None,
-            })
-            .collect();
-
-        assert!(
-            !remaining.contains(&"global::memory_vamana::model-a".to_string()),
-            "the active global memory Vamana snapshot must be deleted: {remaining:?}"
-        );
-        assert!(
-            remaining.contains(&"local::vamana::model-a".to_string()),
-            "unrelated knowledge Vamana rows must survive: {remaining:?}"
-        );
-        assert!(
-            remaining.contains(&"local::memory_vamana::model-a".to_string()),
-            "legacy per-namespace memory Vamana rows are purge_stale_memory_vamana_snapshots's \
-             job, not this function's: {remaining:?}"
-        );
-    }
-
-    /// Regression test (ADR-116 (PR #1080) condition 4): `purge_stale_memory_vamana_snapshots` must
-    /// keep the current, retained `global::memory_vamana::{model}` key (ADR-062) and purge
-    /// only legacy per-namespace `{ns}::memory_vamana::*` rows. The prior predicate
-    /// (`namespace != 'global'`) matched every row unconditionally, since the namespace
-    /// column stores the full composite key and is never the bare string `'global'`.
-    #[tokio::test]
-    async fn test_purge_stale_memory_vamana_snapshots_keeps_current_key() {
-        let rt = KhiveRuntime::memory().expect("in-memory runtime");
-        let sql = rt.sql();
-
-        let mut w = sql.writer().await.expect("writer");
-        w.execute_script(
-            "CREATE TABLE IF NOT EXISTS retrieval_snapshots (\
-             namespace TEXT NOT NULL, \
-             index_type TEXT NOT NULL, \
-             snapshot BLOB NOT NULL, \
-             created_at INTEGER NOT NULL, \
-             PRIMARY KEY (namespace, index_type));"
-                .into(),
-        )
-        .await
-        .expect("create table");
-
-        for (ns, idx_type) in &[
-            ("global::memory_vamana::model-a", "memory_vamana"),
-            ("local::memory_vamana::model-a", "memory_vamana"),
-            ("tenant-a::memory_vamana::model-b", "memory_vamana"),
-            ("local::vamana::model-a", "vamana"),
-        ] {
-            w.execute(SqlStatement {
-                sql: "INSERT INTO retrieval_snapshots \
-                      (namespace, index_type, snapshot, created_at) \
-                      VALUES (?1, ?2, ?3, 0)"
-                    .into(),
-                params: vec![
-                    SqlValue::Text(ns.to_string()),
-                    SqlValue::Text(idx_type.to_string()),
-                    SqlValue::Blob(b"{}".to_vec()),
-                ],
-                label: None,
-            })
-            .await
-            .expect("insert row");
-        }
-        drop(w);
-
-        purge_stale_memory_vamana_snapshots(&rt).await;
-
-        let mut r = sql.reader().await.expect("reader");
-        let rows = r
-            .query_all(SqlStatement {
-                sql: "SELECT namespace FROM retrieval_snapshots ORDER BY namespace".into(),
-                params: vec![],
-                label: None,
-            })
-            .await
-            .expect("query");
-
-        let remaining: Vec<String> = rows
-            .iter()
-            .filter_map(|row| match row.get("namespace") {
-                Some(SqlValue::Text(s)) => Some(s.clone()),
-                _ => None,
-            })
-            .collect();
-
-        assert!(
-            remaining.contains(&"global::memory_vamana::model-a".to_string()),
-            "current-key global memory Vamana snapshot must be retained: {remaining:?}"
-        );
-        assert!(
-            !remaining.contains(&"local::memory_vamana::model-a".to_string()),
-            "legacy per-namespace memory Vamana snapshot must be purged: {remaining:?}"
-        );
-        assert!(
-            !remaining.contains(&"tenant-a::memory_vamana::model-b".to_string()),
-            "legacy per-namespace memory Vamana snapshot must be purged: {remaining:?}"
-        );
-        assert!(
-            remaining.contains(&"local::vamana::model-a".to_string()),
-            "unrelated knowledge Vamana rows must survive: {remaining:?}"
-        );
-    }
-
-    /// Regression test (PR #1081 review): SQLite `LIKE` is ASCII case-insensitive, so
-    /// `NOT LIKE 'global::memory_vamana::%'` treated a legacy `GLOBAL::memory_vamana::*`
-    /// row (a valid namespace per namespace validation) as the retained lowercase key and
-    /// never purged it. `GLOB` is case-sensitive and must tell the two apart.
-    #[tokio::test]
-    async fn test_purge_stale_memory_vamana_snapshots_is_case_sensitive() {
-        let rt = KhiveRuntime::memory().expect("in-memory runtime");
-        let sql = rt.sql();
-
-        let mut w = sql.writer().await.expect("writer");
-        w.execute_script(
-            "CREATE TABLE IF NOT EXISTS retrieval_snapshots (\
-             namespace TEXT NOT NULL, \
-             index_type TEXT NOT NULL, \
-             snapshot BLOB NOT NULL, \
-             created_at INTEGER NOT NULL, \
-             PRIMARY KEY (namespace, index_type));"
-                .into(),
-        )
-        .await
-        .expect("create table");
-
-        for (ns, idx_type) in &[
-            ("global::memory_vamana::model-a", "memory_vamana"),
-            ("GLOBAL::memory_vamana::model-a", "memory_vamana"),
-        ] {
-            w.execute(SqlStatement {
-                sql: "INSERT INTO retrieval_snapshots \
-                      (namespace, index_type, snapshot, created_at) \
-                      VALUES (?1, ?2, ?3, 0)"
-                    .into(),
-                params: vec![
-                    SqlValue::Text(ns.to_string()),
-                    SqlValue::Text(idx_type.to_string()),
-                    SqlValue::Blob(b"{}".to_vec()),
-                ],
-                label: None,
-            })
-            .await
-            .expect("insert row");
-        }
-        drop(w);
-
-        purge_stale_memory_vamana_snapshots(&rt).await;
-
-        let mut r = sql.reader().await.expect("reader");
-        let rows = r
-            .query_all(SqlStatement {
-                sql: "SELECT namespace FROM retrieval_snapshots ORDER BY namespace".into(),
-                params: vec![],
-                label: None,
-            })
-            .await
-            .expect("query");
-
-        let remaining: Vec<String> = rows
-            .iter()
-            .filter_map(|row| match row.get("namespace") {
-                Some(SqlValue::Text(s)) => Some(s.clone()),
-                _ => None,
-            })
-            .collect();
-
-        assert!(
-            remaining.contains(&"global::memory_vamana::model-a".to_string()),
-            "current-key lowercase global memory Vamana snapshot must be retained: {remaining:?}"
-        );
-        assert!(
-            !remaining.contains(&"GLOBAL::memory_vamana::model-a".to_string()),
-            "legacy uppercase GLOBAL::memory_vamana snapshot must be purged, not mistaken for \
-             the retained lowercase key: {remaining:?}"
-        );
-    }
-
     #[tokio::test]
     async fn stale_fts_sweep_quotes_malicious_table_name_and_preserves_entities() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
@@ -1693,104 +1178,22 @@ mod tests {
         );
     }
 
-    fn report_with(errors: u64, k_failed: u64, k_errored: bool) -> ReindexReport {
+    fn report_with(errors: u64) -> ReindexReport {
         ReindexReport {
             entities_processed: 0,
             notes_processed: 0,
-            knowledge_atoms_indexed: Some(0),
-            knowledge_sections_indexed: None,
-            knowledge_atoms_failed: k_failed,
-            knowledge_pass_errored: k_errored,
-            knowledge_ann_failed: false,
-            knowledge_sections_failed: 0,
             models_used: vec![],
             elapsed_ms: 0,
             errors_skipped: errors,
             entities_fts_failed: 0,
             notes_fts_failed: 0,
-            epoch_bump_failed: false,
         }
     }
 
     #[test]
     fn has_failures_flags_each_failure_source() {
-        assert!(!report_with(0, 0, false).has_failures());
-        assert!(
-            report_with(1, 0, false).has_failures(),
-            "entity/note errors"
-        );
-        assert!(
-            report_with(0, 1, false).has_failures(),
-            "knowledge atom fails"
-        );
-        assert!(
-            report_with(0, 0, true).has_failures(),
-            "knowledge pass error"
-        );
-    }
-
-    #[test]
-    fn has_failures_flags_knowledge_ann_failed() {
-        let report = ReindexReport {
-            entities_processed: 0,
-            notes_processed: 0,
-            knowledge_atoms_indexed: Some(10),
-            knowledge_sections_indexed: None,
-            knowledge_atoms_failed: 0,
-            knowledge_pass_errored: false,
-            knowledge_ann_failed: true,
-            knowledge_sections_failed: 0,
-            models_used: vec![],
-            elapsed_ms: 0,
-            errors_skipped: 0,
-            entities_fts_failed: 0,
-            notes_fts_failed: 0,
-            epoch_bump_failed: false,
-        };
-        assert!(
-            report.has_failures(),
-            "knowledge_ann_failed alone must drive has_failures() = true"
-        );
-        assert!(
-            decide_result(report.has_failures(), false).is_err(),
-            "knowledge_ann_failed must fail closed (non-zero exit)"
-        );
-        assert!(
-            decide_result(report.has_failures(), true).is_ok(),
-            "best-effort downgrades knowledge_ann_failed to exit 0"
-        );
-    }
-
-    #[test]
-    fn has_failures_flags_knowledge_sections_failed() {
-        let report = ReindexReport {
-            entities_processed: 0,
-            notes_processed: 0,
-            knowledge_atoms_indexed: None,
-            knowledge_sections_indexed: Some(0),
-            knowledge_atoms_failed: 0,
-            knowledge_pass_errored: false,
-            knowledge_ann_failed: false,
-            knowledge_sections_failed: 3,
-            models_used: vec![],
-            elapsed_ms: 0,
-            errors_skipped: 0,
-            entities_fts_failed: 0,
-            notes_fts_failed: 0,
-            epoch_bump_failed: false,
-        };
-        assert!(
-            report.has_failures(),
-            "knowledge_sections_failed > 0 alone must drive has_failures() = true"
-        );
-        assert!(
-            decide_result(report.has_failures(), false).is_err(),
-            "knowledge_sections_failed must fail closed (non-zero exit)"
-        );
-        assert!(
-            decide_result(report.has_failures(), true).is_ok(),
-            "best-effort downgrades knowledge_sections_failed to exit 0"
-        );
+        assert!(!report_with(0).has_failures());
+        assert!(report_with(1).has_failures(), "entity/note errors");
     }
 
     #[test]
@@ -2137,18 +1540,11 @@ mod tests {
         let report = ReindexReport {
             entities_processed: 0,
             notes_processed: 0,
-            knowledge_atoms_indexed: None,
-            knowledge_sections_indexed: None,
-            knowledge_atoms_failed: 0,
-            knowledge_pass_errored: false,
-            knowledge_ann_failed: false,
-            knowledge_sections_failed: 0,
             models_used: vec![],
             elapsed_ms: 0,
             errors_skipped: 0,
             entities_fts_failed: 0,
             notes_fts_failed: 1,
-            epoch_bump_failed: false,
         };
         assert!(
             report.has_failures(),
@@ -2354,7 +1750,7 @@ mod tests {
             }
         }
 
-        // run_reindex with no embedding model and --no-knowledge.
+        // run_reindex with no embedding model.
         let args = ReindexArgs {
             db: Some(db_path.clone()),
             config: None,
@@ -2362,11 +1758,7 @@ mod tests {
             batch_size: 100,
             keep_existing: false,
             namespace: Some("local".to_string()),
-            knowledge_only: false,
-            no_knowledge: true,
             best_effort: true,
-            no_sections: false,
-            sections_only: false,
             human: false,
         };
         run_reindex(args).await.expect("run_reindex must succeed");
@@ -2632,11 +2024,7 @@ mod tests {
             batch_size: 100,
             keep_existing: false,
             namespace: Some("local".to_string()),
-            knowledge_only: false,
-            no_knowledge: true,
             best_effort: true,
-            no_sections: false,
-            sections_only: false,
             human: false,
         };
         run_reindex(args).await.expect("run_reindex must succeed");
@@ -2720,18 +2108,11 @@ mod tests {
         let report = ReindexReport {
             entities_processed: 0,
             notes_processed: 0,
-            knowledge_atoms_indexed: None,
-            knowledge_sections_indexed: None,
-            knowledge_atoms_failed: 0,
-            knowledge_pass_errored: false,
-            knowledge_ann_failed: false,
-            knowledge_sections_failed: 0,
             models_used: vec![],
             elapsed_ms: 0,
             errors_skipped: 0,
             entities_fts_failed: 1,
             notes_fts_failed: 0,
-            epoch_bump_failed: false,
         };
         assert!(
             report.has_failures(),

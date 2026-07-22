@@ -74,7 +74,7 @@ assert!(gate.check(&req).unwrap().is_allow());
 
 ## Evaluation failures and fail-closed behavior
 
-Per ADR-018, a `GateError` returned from `Gate::check` is treated as a fail-open infrastructure
+By the authorization-gate contract, a `GateError` returned from `Gate::check` is treated as a fail-open infrastructure
 failure by the dispatcher. `RegoGate` therefore converts policy evaluation uncertainty into an
 explicit `Ok(GateDecision::Deny)`:
 

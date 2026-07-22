@@ -57,8 +57,8 @@ needs cross-platform-identical ranking:
 [khive-runtime](https://crates.io/crates/khive-runtime).
 Deterministic scoring is required so that two nodes evaluating the same query
 produce the same ranked order — see
-[ADR-006](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-006-deterministic-scoring.md).
+ADR-006.
 
 ## License
 
-Apache-2.0.
+BUSL-1.1. See the repository [LICENSE](https://github.com/ohdearquant/khive/blob/main/LICENSE).

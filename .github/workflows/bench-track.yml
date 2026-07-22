@@ -1,7 +1,7 @@
 name: Bench Trend Tracking
 
 # Informational trend tracking for BOTH component (Criterion) and e2e
-# (pipeline / bench-1m synthetic) benchmarks. Per the bench-program spec
+# (bench-1m synthetic) benchmarks. Per the bench-program spec
 # (.khive/workspaces/20260710/bench-program/SPEC-draft.md, "Blocking-promotion
 # ladder"): every metric here is Advisory - measured, appended to
 # bench-data/<suite>.jsonl on the `perf-data` branch, and rendered as a trend
@@ -124,10 +124,10 @@ jobs:
                 crates/khive-hnsw/*|crates/khive-vamana/*|crates/khive-quant/*|crates/khive-query/*|crates/khive-request/*)
                   ann_query=true
                   ;;
-                crates/khive-db/*|crates/khive-fold/*|crates/khive-brain-core/*|crates/khive-pack-brain/*|crates/khive-pack-comm/*)
+                crates/khive-db/*|crates/khive-fold/*)
                   storage_brain=true
                   ;;
-                crates/khive-pack-gtd/*|crates/khive-pack-kg/*|crates/khive-pack-knowledge/*|crates/khive-pack-memory/*|crates/khive-pack-schedule/*)
+                crates/khive-pack-kg/*)
                   packs=true
                   ;;
                 crates/Cargo.toml|crates/Cargo.lock|scripts/perf/bench_track.py|scripts/perf/bench_calibrate.py|scripts/perf/publish_ledger.sh|scripts/bench_1m.sh|.github/workflows/bench-track.yml|.github/workflows/bench-component.yml)
@@ -191,7 +191,7 @@ jobs:
     uses: ./.github/workflows/bench-component.yml
     with:
       component: storage-brain
-      crates: khive-db khive-fold khive-brain-core khive-pack-brain khive-pack-comm
+      crates: khive-db khive-fold
 
   component-packs:
     name: Component benches / packs
@@ -205,20 +205,18 @@ jobs:
     uses: ./.github/workflows/bench-component.yml
     with:
       component: packs
-      crates: khive-pack-gtd khive-pack-kg khive-pack-knowledge khive-pack-memory khive-pack-schedule
+      crates: khive-pack-kg
       # The packs bench-target compile alone runs ~16m (issue #940); the
       # default 20m budget killed the Criterion step mid-run on every main
       # push and the ledger steps skipped, leaving the trend data packs-blind.
       timeout_minutes: 40
 
   # ─────────────────────────────────────────────────────────────────────────
-  # e2e benches: the pipeline daemon suite (bench_calibrate's `pipeline`
-  # extractor, reused not duplicated) plus the hermetic bench-1m synthetic
-  # gate, run once as an informational data point. Advisory ledgers:
-  # bench-data/pipeline.jsonl, bench-data/bench-1m.jsonl
+  # e2e benches: the hermetic bench-1m synthetic gate, run once as an
+  # informational data point. Advisory ledger: bench-data/bench-1m.jsonl
   # ─────────────────────────────────────────────────────────────────────────
   e2e:
-    name: E2E benches (pipeline + bench-1m synthetic)
+    name: E2E benches (bench-1m synthetic)
     runs-on: ubuntu-latest
     if: vars.BENCH_TRACK_DISABLED != 'true' && github.event_name == 'push'
     timeout-minutes: 20
@@ -242,34 +240,6 @@ jobs:
           cache-on-failure: true
 
       - uses: astral-sh/setup-uv@v5
-
-      - name: Build kkernel (bench-embedder feature)
-        run: |
-          set -euo pipefail
-          cargo build --release -p kkernel --features bench-embedder --manifest-path crates/Cargo.toml
-          cp crates/target/release/kkernel crates/target/release/kkernel-bench
-
-      - name: Record pipeline suite (single informational run)
-        id: record_pipeline
-        env:
-          KKERNEL_BENCH_BINARY: crates/target/release/kkernel-bench
-        # Captures bench_track.py's own exit code instead of failing the
-        # step outright (this step failing before publish ran meant an
-        # already-written error record never reached perf-data). See the
-        # "Fail job" step at the end of this job.
-        run: |
-          set +e
-          python3 scripts/perf/bench_track.py record \
-            --suite pipeline \
-            --source calibrate \
-            --sha "$GITHUB_SHA" \
-            --branch "$GITHUB_REF_NAME" \
-            --run-id "$GITHUB_RUN_ID" \
-            --run-attempt "$GITHUB_RUN_ATTEMPT" \
-            --data-dir bench-data \
-            --summary-out /tmp/pipeline-trend.md
-          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
-          exit 0
 
       - name: Run hermetic bench-1m synthetic gate (informational, --runs 1)
         id: bench_1m
@@ -309,12 +279,11 @@ jobs:
 
       - name: Publish ledgers to perf-data branch
         if: ${{ !cancelled() }}
-        run: bash scripts/perf/publish_ledger.sh bench-data/pipeline.jsonl bench-data/bench-1m.jsonl
+        run: bash scripts/perf/publish_ledger.sh bench-data/bench-1m.jsonl
 
       - name: Write step summary
         if: always()
         run: |
-          cat /tmp/pipeline-trend.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
           cat /tmp/bench-1m-trend.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
 
       - name: Upload raw e2e output
@@ -323,7 +292,6 @@ jobs:
         with:
           name: bench-track-e2e-${{ github.run_id }}
           path: |
-            perf/pipeline-ledger.csv
             target/bench-out/SIFT-CI-synthetic.json
             perf/ci-synthetic-ledger.csv
           retention-days: 90
@@ -331,14 +299,13 @@ jobs:
 
       # Advisory-lane semantics: see the components job note above. Exit 0.
       - name: Warn if trend ledger record errored (advisory, never fails)
-        if: ${{ !cancelled() && (steps.record_pipeline.outputs.exit_code != '0' || steps.record_bench_1m.outputs.exit_code != '0') }}
+        if: ${{ !cancelled() && steps.record_bench_1m.outputs.exit_code != '0' }}
         env:
-          PIPELINE_EXIT_CODE: ${{ steps.record_pipeline.outputs.exit_code }}
           BENCH_1M_RECORD_EXIT_CODE: ${{ steps.record_bench_1m.outputs.exit_code }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set +e
-          MSG="bench_track.py record failed: pipeline exit=${PIPELINE_EXIT_CODE} bench-1m exit=${BENCH_1M_RECORD_EXIT_CODE}; status=error record(s) were still published to perf-data. Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          MSG="bench_track.py record failed: bench-1m exit=${BENCH_1M_RECORD_EXIT_CODE}; status=error record(s) were still published to perf-data. Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           echo "::warning::${MSG}"
           {
             echo "## Trend ledger record errored (advisory)"

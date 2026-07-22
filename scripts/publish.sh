@@ -68,23 +68,8 @@ CRATES=(
     khive-vcs
     khive-changeset      # needs khive-types (above)
     # khive-merge — excluded from workspace (ADR-043 forward-deployed, ahead of khive-vcs)
-    khive-pack-formal    # needs khive-runtime + khive-types (both above); dev-dep of khive-pack-kg, so publish first
     khive-pack-kg
-    khive-pack-git       # needs khive-runtime/storage + khive-pack-kg (all above)
-    khive-pack-code      # needs khive-runtime/storage + khive-pack-kg (all above)
-    khive-pack-gtd
-    khive-brain-core
-    khive-pack-brain
-    khive-pack-memory
-    khive-pack-comm
-    khive-pack-schedule
-    khive-pack-knowledge
-    khive-pack-session   # needs khive-pack-kg + khive-runtime/storage/types (all above)
-    khive-pack-workspace # needs khive-pack-kg/gtd/git/session (all above)
     khive-pack-template
-    khive-channel          # no khive-* deps; transport abstraction
-    khive-channel-email    # needs khive-channel (above); optional dep of khive-mcp
-    khive-channel-telegram # needs khive-channel (above); optional dep of khive-mcp
     khive-mcp
     kkernel
 )
@@ -123,11 +108,11 @@ if ! command -v cargo-semver-checks >/dev/null 2>&1; then
     echo "       Install it:  cargo install cargo-semver-checks --locked" >&2
     exit 1
 fi
-mapfile -t SEMVER_EXCLUDES < <(grep -v '^[[:space:]]*#' "$SCRIPT_DIR/lib/semver_excludes.txt" | grep -v '^[[:space:]]*$')
 SEMVER_EXCLUDE_ARGS=()
-for crate in "${SEMVER_EXCLUDES[@]}"; do
+while IFS= read -r crate; do
+    [[ "$crate" =~ ^[[:space:]]*(#|$) ]] && continue
     SEMVER_EXCLUDE_ARGS+=(--exclude "$crate")
-done
+done <"$SCRIPT_DIR/lib/semver_excludes.txt"
 cargo semver-checks check-release --workspace "${SEMVER_EXCLUDE_ARGS[@]}"
 echo "    SemVer gate OK"
 
