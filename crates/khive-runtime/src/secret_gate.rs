@@ -729,7 +729,9 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
             continue;
         }
 
-        if is_git_revision_reference(text, token_offset, raw_token) {
+        if is_git_revision_reference(text, token_offset, raw_token)
+            && !has_immediate_credential_label(text, token_offset, raw_token)
+        {
             continue;
         }
 
@@ -2555,6 +2557,28 @@ mod tests {
                 "credential assignment must remain blocked: {content:?}"
             );
         }
+    }
+
+    #[test]
+    fn blocks_sha_revision_marker_immediately_labeled_as_api_key() {
+        let revision = "d362950a3c9b1a4cb47d97f1623e38f1a1e6bcdf";
+        let content = format!("api_key sha:{revision}");
+
+        assert!(
+            check(&content).is_err(),
+            "credential-labeled SHA value must remain blocked: {content:?}"
+        );
+    }
+
+    #[test]
+    fn blocks_rev_revision_marker_immediately_labeled_as_token() {
+        let revision = "d362950a3c9b1a4cb47d97f1623e38f1a1e6bcdf";
+        let content = format!("token rev:{revision}");
+
+        assert!(
+            check(&content).is_err(),
+            "credential-labeled revision value must remain blocked: {content:?}"
+        );
     }
 
     #[test]
