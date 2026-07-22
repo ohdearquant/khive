@@ -221,12 +221,11 @@ fn other_raw_control_chars_in_quoted_string_still_rejected() {
 }
 
 #[test]
-fn control_char_error_teaches_escape_syntax_and_mcp_double_escape() {
+fn control_char_error_teaches_escape_syntax_without_transport_guidance() {
     // #491: the bare serde message ("control character ... found while
     // parsing a string") teaches nothing. The wrapped error must name the
-    // JSON escape grammar and the MCP-transport double-escape gotcha, so a
-    // caller can actually fix the `ops` string instead of landing on the
-    // wrong "switch to JSON op form" workaround.
+    // JSON escape grammar while remaining transport-neutral; wire encoding
+    // guidance belongs to the transport boundary, not this parser.
     let src = format!("gtd.assign(title=\"a{}b\")", '\u{c}');
     let err = parse_request(&src).unwrap_err();
     let msg = err.to_string();
@@ -239,8 +238,8 @@ fn control_char_error_teaches_escape_syntax_and_mcp_double_escape() {
         "error should name the JSON escape grammar, got: {msg}"
     );
     assert!(
-        msg.to_lowercase().contains("double"),
-        "error should call out the MCP double-escape requirement, got: {msg}"
+        !msg.contains("MCP") && !msg.to_lowercase().contains("transport"),
+        "generic parser error should stay transport-neutral, got: {msg}"
     );
 }
 
@@ -275,8 +274,8 @@ fn control_char_in_object_key_rejected_with_plain_serde_message() {
         "expected InvalidValue, got {err:?}"
     );
     assert!(
-        !msg.to_lowercase().contains("double"),
-        "key-path error should not carry the value-path MCP double-escape teaching, got: {msg}"
+        !msg.contains("DSL string escapes follow JSON"),
+        "key-path error should not carry the value-path escape teaching, got: {msg}"
     );
 }
 
@@ -404,7 +403,7 @@ fn invalid_escape_with_unrelated_control_byte_not_misattributed() {
     let msg = err.to_string();
     assert!(matches!(err, DslError::InvalidValue { .. }));
     assert!(
-        !msg.to_lowercase().contains("double"),
+        !msg.contains("DSL string escapes follow JSON"),
         "an invalid \\q escape must not be enriched with the control-char diagnostic, got: {msg}"
     );
 }
@@ -417,7 +416,7 @@ fn malformed_unicode_escape_adjacent_to_control_byte_not_misattributed() {
     // with the recorded control-byte hit (the 4th hex-digit slot serde reads
     // is the control byte itself). Offset alone is not enough to gate the
     // enrichment; the error's kind must also be checked, or this lands the
-    // control-char/double-escape guidance on an invalid-escape failure.
+    // control-character escape guidance on an invalid-escape failure.
     let src = format!("gtd.assign(title=\"bad \\u123{}tail\")", '\u{c}');
     let err = parse_request(&src).unwrap_err();
     let msg = err.to_string();
@@ -427,7 +426,7 @@ fn malformed_unicode_escape_adjacent_to_control_byte_not_misattributed() {
         "expected the plain serde invalid-escape message, got: {msg}"
     );
     assert!(
-        !msg.to_lowercase().contains("double"),
+        !msg.contains("DSL string escapes follow JSON"),
         "a malformed \\u escape must not be enriched with the control-char diagnostic, got: {msg}"
     );
 }
@@ -440,7 +439,7 @@ fn short_unicode_escape_backslash_adjacent_control_byte_not_misattributed() {
     // 3-hex-digit case above. That adjacency is spurious: both bytes are
     // consumed as `\u`'s own hex-digit slots, never reinterpreted as a fresh
     // `\<ctrl>` escape pair. The failure must stay the plain malformed
-    // unicode-escape message with no double-escape guidance.
+    // unicode-escape message with no control-character escape guidance.
     let src = format!("gtd.assign(title=\"bad \\u12\\{}tail\")", '\u{c}');
     let err = parse_request(&src).unwrap_err();
     let msg = err.to_string();
@@ -450,7 +449,7 @@ fn short_unicode_escape_backslash_adjacent_control_byte_not_misattributed() {
         "expected the plain serde invalid-escape message, got: {msg}"
     );
     assert!(
-        !msg.to_lowercase().contains("double"),
+        !msg.contains("DSL string escapes follow JSON"),
         "a short \\u escape landing on a backslash+control-byte pair must not be \
          enriched with the control-char diagnostic, got: {msg}"
     );
@@ -463,8 +462,8 @@ fn short_unicode_escape_backslash_adjacent_control_byte_not_misattributed() {
     let genuine_msg = genuine_err.to_string();
     assert!(matches!(genuine_err, DslError::InvalidValue { .. }));
     assert!(
-        genuine_msg.to_lowercase().contains("double"),
-        "a genuine broken \\<ctrl> pair must still get the double-escape guidance, got: {genuine_msg}"
+        genuine_msg.contains("DSL string escapes follow JSON"),
+        "a genuine broken \\<ctrl> pair must still get the escape guidance, got: {genuine_msg}"
     );
 }
 
@@ -477,7 +476,7 @@ fn leading_surrogate_escape_followed_by_control_byte_not_misattributed() {
     // escape. Scan's general backslash-pair walk resets after the high
     // surrogate's 4 hex slots, so without the surrogate-continuation guard it
     // would record that `\<ctrl>` as a genuine broken pair
-    // (`preceded_by_backslash: true`) and land the double-escape teaching on a
+    // (`preceded_by_backslash: true`) and land the escape teaching on a
     // failure it does not explain. The continuation control byte must not be
     // recorded, so the error stays serde's own surrogate message.
     let src = format!("gtd.assign(title=\"bad \\uD800\\{}tail\")", '\u{c}');
@@ -485,9 +484,9 @@ fn leading_surrogate_escape_followed_by_control_byte_not_misattributed() {
     let msg = err.to_string();
     assert!(matches!(err, DslError::InvalidValue { .. }));
     assert!(
-        !msg.to_lowercase().contains("double"),
+        !msg.contains("DSL string escapes follow JSON"),
         "a control byte on a surrogate-continuation path must not be enriched \
-         with the control-char double-escape diagnostic, got: {msg}"
+         with the control-char escape diagnostic, got: {msg}"
     );
 
     // A broken `\<ctrl>` pair AFTER a complete surrogate pair (high + low) is a
@@ -498,9 +497,9 @@ fn leading_surrogate_escape_followed_by_control_byte_not_misattributed() {
     let after_pair_msg = after_pair_err.to_string();
     assert!(matches!(after_pair_err, DslError::InvalidValue { .. }));
     assert!(
-        after_pair_msg.to_lowercase().contains("double"),
+        after_pair_msg.contains("DSL string escapes follow JSON"),
         "a broken \\<ctrl> pair after a complete surrogate pair must still get \
-         the double-escape guidance, got: {after_pair_msg}"
+         the escape guidance, got: {after_pair_msg}"
     );
 }
 
@@ -520,10 +519,7 @@ fn raw_newline_immediately_after_backslash_caught_as_control_char_cause() {
         msg.contains(r#"\n"#) && msg.contains(r#"\t"#) && msg.contains(r#"\""#),
         "error should name the JSON escape grammar, got: {msg}"
     );
-    assert!(
-        msg.to_lowercase().contains("double"),
-        "error should call out the MCP double-escape requirement, got: {msg}"
-    );
+    assert!(msg.contains("DSL string escapes follow JSON"));
 }
 
 #[test]
@@ -539,8 +535,8 @@ fn raw_carriage_return_and_tab_after_backslash_also_caught() {
         );
         let msg = err.to_string();
         assert!(
-            msg.to_lowercase().contains("double"),
-            "error should call out the MCP double-escape requirement for {:#04x}, got: {msg}",
+            msg.contains("DSL string escapes follow JSON"),
+            "error should explain DSL escape syntax for {:#04x}, got: {msg}",
             raw as u32
         );
     }
@@ -563,8 +559,8 @@ fn backslash_followed_by_other_raw_control_bytes_also_caught() {
         );
         let msg = err.to_string();
         assert!(
-            msg.to_lowercase().contains("double"),
-            "error should call out the MCP double-escape requirement for {:#04x}, got: {msg}",
+            msg.contains("DSL string escapes follow JSON"),
+            "error should explain DSL escape syntax for {:#04x}, got: {msg}",
             raw as u32
         );
     }
