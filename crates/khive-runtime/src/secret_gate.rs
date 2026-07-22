@@ -18,8 +18,9 @@
 //!    apikey, api_key, access_key, private_key). The word `token` alone is
 //!    NOT a trigger, to avoid blocking `tokenizer_*`, `token_count`, etc.
 //!
-//! A credential trigger word in the surrounding window always dominates the
-//! allowlist below — no exemption is unconditional near a trigger.
+//! Credential-shaped labels and assignments dominate the allowlist below.
+//! Public VCS revisions and plausible file paths remain exempt in ordinary
+//! technical prose, while path segments are still scanned independently.
 //!
 //! Full exemption rules (hex/UUID/SRI-hash passes, non-ASCII token
 //! delimiting, structured-identifier decomposition, trigger word-boundary
@@ -663,12 +664,9 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
         // `token` is ASCII here (non-ASCII was split out at tokenization), so
         // `shannon_entropy` over its bytes is a true per-character entropy.
 
-        // Compute the trigger window BEFORE any shape-based allowlist decision.
-        // Every allowlist below (UUID, base64 content-hash, pure-hex) is a
-        // prose-context exemption, not an unconditional one: a credential
-        // trigger word dominates shape allowlists, because attacker-suppliable
-        // shapes (a UUID, a sha-prefixed hash) are exactly as ambiguous near a
-        // trigger word as any other high-entropy candidate.
+        // Compute the trigger window before any shape-based allowlist decision.
+        // UUID and base64 content-hash exemptions remain trigger-sensitive.
+        // VCS revisions and file paths use narrower syntactic context below.
         let window_start = floor_char_boundary(text, tok_offset.saturating_sub(TRIGGER_WINDOW));
         let window_end = floor_char_boundary(text, tok_offset + raw_token.len() + TRIGGER_WINDOW);
         let window = &text[window_start..window_end];
@@ -724,9 +722,14 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
             continue;
         }
 
-        // Pure hex tokens (git SHA, checksum digests) are allowlisted only when
-        // they are NOT near a credential trigger.
+        // Pure hex tokens (git SHA, checksum digests) are allowlisted when they
+        // are not near a trigger. Trigger-adjacent Git revisions require an
+        // explicit VCS coordinate marker.
         if !near_trigger && is_pure_hex(token) {
+            continue;
+        }
+
+        if is_git_revision_reference(text, token_offset, raw_token) {
             continue;
         }
 
@@ -735,11 +738,9 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
         // cannot catch them — hex alphabet maxes at log2(16) = 4.0 bits/char,
         // which is always below ENTROPY_THRESHOLD (4.5).  A credential-shaped
         // hex token (32 / 40 / 64 / 128 chars) near a trigger word is always
-        // flagged.  Credential triggers dominate: adding "sha" or "hash" to
-        // the window does not rescue the token — a caller controlling the prose
-        // could trivially bypass the gate with one extra word.  Safe git SHAs
-        // and content-hash digests do not appear near credential trigger words
-        // and are already allowed via the `!near_trigger && is_pure_hex` path.
+        // flagged. Generic "sha" or "hash" prose does not rescue a token;
+        // `is_git_revision_reference` requires a 40-hex value attached to a
+        // VCS coordinate marker.
         if near_trigger && is_pure_hex(token) && HEX_CREDENTIAL_LENGTHS.contains(&token.len()) {
             return Some((token, "hex-credential-token"));
         }
@@ -808,12 +809,13 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
             // glue) is itself transparent to the walk — see
             // [`is_delimiter_only_token`] — so it is absorbed as gap material
             // rather than treated as a chain-terminating non-fragment token.
-            // Every fragment actually merged into the chain — not just the
-            // anchor — must itself be [`is_bridge_fragment_shape`]
-            // (alphanumeric, MIN_BRIDGE_FRAGMENT_LEN+): this is what stops
-            // the walk at a short trigger/glue word (`key`, `api`, `for`,
-            // 3-4 chars) either side of the real fragments, rather than
-            // dragging prose into the reconstruction and corrupting it.
+            // Every token found while extending from the anchor must itself
+            // be [`is_bridge_fragment_shape`] (alphanumeric,
+            // MIN_BRIDGE_FRAGMENT_LEN+): this is what stops the walk at a
+            // short trigger/glue word (`key`, `api`, `for`, 3-4 chars) rather
+            // than dragging prose into the reconstruction. The anchor is
+            // included unconditionally, so shape exemptions that can admit a
+            // long non-fragment anchor must run after this reconstruction.
             //
             // ACTUAL GUARANTEE (not "every three-or-more-way split is
             // reconstructed", which this function does NOT provide):
@@ -875,19 +877,23 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
                     }
                 }
             }
+
+            if is_plausible_file_path(token)
+                && !has_immediate_credential_label(text, token_offset, raw_token)
+            {
+                continue;
+            }
         }
 
-        // Structured identifiers (file paths, branch names, ADR/doc slugs,
-        // snake_case identifiers) are exempted from the entropy check — see
-        // the module doc and `is_structured_identifier`. Must come after the
+        // Other structured identifiers (branch names, doc slugs, snake_case
+        // identifiers) are exempted from the entropy check — see the module
+        // doc and `is_structured_identifier`. Must come after the
         // UUID/content-hash and hex-credential-token checks above (neither of
         // which it weakens) and before the entropy computation, since a
-        // legitimate path can exceed ENTROPY_THRESHOLD on Shannon entropy
-        // alone. The exemption applies ONLY outside trigger context: see the
-        // module doc for why no shape-based signal can be made sound near a
-        // trigger word; in trigger context this falls through to the entropy
-        // heuristic below unconditionally, an accepted false-positive
-        // tradeoff for genuine paths that happen to score high entropy.
+        // identifier can exceed ENTROPY_THRESHOLD on Shannon entropy alone.
+        // This general exemption applies only outside trigger context; the
+        // narrower file-path exemption above also requires the absence of an
+        // immediate credential label.
         if !near_trigger && is_structured_identifier(token) {
             continue;
         }
@@ -913,6 +919,130 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
 /// that still must sum correctly with its neighbors.
 fn is_hex_run(run: &str) -> bool {
     !run.is_empty() && run.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn is_git_revision_reference(text: &str, token_offset: usize, raw_token: &str) -> bool {
+    const MARKERS: &[&str] = &["commit", "revision", "rev", "sha"];
+
+    let token = wrapper_strip_repeated(raw_token);
+    let marker = strip_delimiters(token);
+    if MARKERS
+        .iter()
+        .any(|candidate| marker.eq_ignore_ascii_case(candidate))
+    {
+        let raw_offset = raw_token.as_ptr() as usize - text.as_ptr() as usize;
+        let next = text[raw_offset + raw_token.len()..].trim_start();
+        let next = wrapper_strip_repeated(extract_token(next));
+        if next.len() == 40 && next.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return true;
+        }
+    }
+
+    if token.len() == 40 && token.bytes().all(|b| b.is_ascii_hexdigit()) {
+        let marker = trailing_identifier(&text[..token_offset]);
+        return MARKERS
+            .iter()
+            .any(|candidate| marker.eq_ignore_ascii_case(candidate));
+    }
+
+    let Some((label, value)) = token.rsplit_once(':') else {
+        return false;
+    };
+    let label = wrapper_strip_repeated(label);
+    let value = wrapper_strip_repeated(value);
+    MARKERS
+        .iter()
+        .any(|candidate| label.eq_ignore_ascii_case(candidate))
+        && value.len() == 40
+        && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn trailing_identifier(text: &str) -> &str {
+    let trimmed = text.trim_end_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_');
+    trimmed
+        .rsplit(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .next()
+        .unwrap_or_default()
+}
+
+fn has_immediate_credential_label(text: &str, token_offset: usize, raw_token: &str) -> bool {
+    if has_inline_credential_trigger(raw_token) {
+        return true;
+    }
+
+    let label = trailing_identifier(&text[..token_offset]).to_ascii_lowercase();
+    label == "token"
+        || COMPOUND_TRIGGER_WORDS
+            .iter()
+            .any(|trigger| label.contains(trigger))
+        || TRIGGER_WORDS
+            .iter()
+            .any(|trigger| contains_bounded_word(&label, trigger))
+}
+
+fn is_plausible_file_path(token: &str) -> bool {
+    let token = token.trim_start_matches(|c: char| {
+        matches!(
+            c,
+            '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';'
+        )
+    });
+    let token = token.trim_end_matches(|c: char| {
+        matches!(
+            c,
+            '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | '.'
+        )
+    });
+    let path = if let Some(angle_path) = token.strip_prefix('<') {
+        let Some(close) = angle_path.rfind('>') else {
+            return false;
+        };
+        if !is_line_location_suffix(&angle_path[close + 1..]) {
+            return false;
+        }
+        &angle_path[..close]
+    } else if let Some((path, suffix)) = token.rsplit_once(':') {
+        if is_line_location_suffix(suffix) {
+            path
+        } else {
+            token
+        }
+    } else {
+        token
+    };
+
+    if path.contains("://")
+        || !path.contains('/')
+        || !path
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-' | b'~'))
+    {
+        return false;
+    }
+
+    let segment_count = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .count();
+    segment_count >= 2 || (path.starts_with('/') && segment_count == 1)
+}
+
+fn is_line_location_suffix(suffix: &str) -> bool {
+    if suffix.is_empty() {
+        return true;
+    }
+    let suffix = suffix.strip_prefix(':').unwrap_or(suffix);
+    let suffix = suffix.strip_prefix('~').unwrap_or(suffix);
+    let mut parts = suffix.split('-');
+    let Some(start) = parts.next() else {
+        return false;
+    };
+    !start.is_empty()
+        && start.bytes().all(|b| b.is_ascii_digit())
+        && parts
+            .next()
+            .is_none_or(|end| !end.is_empty() && end.bytes().all(|b| b.is_ascii_digit()))
+        && parts.next().is_none()
 }
 
 /// `true` when concatenating consecutive pure-hex runs in `token` — splitting
@@ -962,13 +1092,12 @@ fn adjacent_gap_is_bridgeable(text: &str, gap_start: usize, gap_end: usize) -> b
 
 /// `true` when `s` is shaped like a plausible FRAGMENT of a separator-split
 /// credential: alphanumeric-only and at least [`MIN_BRIDGE_FRAGMENT_LEN`]
-/// bytes. Shared by the anchor-admission check in [`check_entropy_heuristic`]
-/// and by [`bridge_fragment_chain`]'s walk — applying it to every fragment
-/// merged into a chain (not just the anchor) is what stops the walk at a
-/// short trigger/glue word (`key`, `api`, `for`) sitting immediately beside
-/// the real fragments: such a word is either too short or, if long enough,
-/// still competes on the same reconstructed-entropy/length terms as any
-/// other fragment (#1062).
+/// bytes. Shared by the short-token anchor-admission check in
+/// [`check_entropy_heuristic`] and by [`bridge_fragment_chain`]'s outward
+/// walk. A long anchor can reach reconstruction without satisfying this
+/// shape, but every neighboring fragment merged into its chain must satisfy
+/// it. This stops the walk at a short trigger/glue word (`key`, `api`, `for`)
+/// sitting immediately beside the real fragments (#1062).
 fn is_bridge_fragment_shape(s: &str) -> bool {
     s.len() >= MIN_BRIDGE_FRAGMENT_LEN && s.bytes().all(|b| b.is_ascii_alphanumeric())
 }
@@ -1045,6 +1174,8 @@ fn probe_bridge_fragment(
 /// anchor is the MIDDLE fragment of a three-way split) is fully
 /// reconstructed, not just one side of it. A length-1 result means no
 /// extension was possible — callers should skip further work in that case.
+/// The anchor itself is included without a fragment-shape check; only outward
+/// extensions are admitted through [`probe_bridge_fragment`].
 fn bridge_fragment_chain<'a>(
     tokens: &[(usize, &'a str)],
     text: &str,
@@ -2392,6 +2523,41 @@ mod tests {
     }
 
     #[test]
+    fn allows_git_revision_reference_near_ordinary_key_and_token_prose() {
+        let revision = "d362950a3c9b1a4cb47d97f1623e38f1a1e6bcdf";
+        let contents = [
+            format!("the primary key behavior is pinned to commit {revision}"),
+            format!("revision: {revision} emits one extra token"),
+            format!("primary key behavior at revision:{revision};"),
+            format!("configuration key\n\nrev {revision}."),
+            format!("one extra token was introduced by sha: {revision}"),
+        ];
+        for content in &contents {
+            assert!(
+                check(content).is_ok(),
+                "git revision reference in technical prose must pass: {content:?}, got {:?}",
+                scan(content)
+            );
+        }
+    }
+
+    #[test]
+    fn git_revision_reference_does_not_exempt_credential_assignments() {
+        let revision = "d362950a3c9b1a4cb47d97f1623e38f1a1e6bcdf";
+        for content in [
+            format!("api_key={revision}"),
+            format!("secret key: {revision}"),
+            format!("token={revision}"),
+            format!("api key hash {revision}"),
+        ] {
+            assert!(
+                check(&content).is_err(),
+                "credential assignment must remain blocked: {content:?}"
+            );
+        }
+    }
+
+    #[test]
     fn hex64_near_hash_context_allowed() {
         // A 64-char hex near "sha256" or "hash" — with no credential trigger —
         // must be allowed (content digest in normal prose).
@@ -2818,52 +2984,36 @@ mod tests {
         );
     }
 
-    // ── Structured-identifier exemption: file paths / branch names ──────────
-    //
-    // The entropy heuristic tokenizes on whitespace, so a full file path is
-    // one long token, and mixed-case+digit+punctuation paths can legitimately
-    // exceed the Shannon-entropy threshold. The structured-identifier
-    // exemption does not apply in trigger context (see the module doc): no
-    // sound signal separates a real path from an attacker-chopped/padded
-    // credential once Shannon entropy is the only measure and the attacker
-    // controls run boundaries. The three cases below are accepted false
-    // positives: their own full-token entropy exceeds ENTROPY_THRESHOLD, so
-    // they block near a trigger word.
+    // ── Structured identifiers: file paths / branch names ───────────────────
 
     #[test]
-    fn blocks_high_entropy_file_path_near_secret_word() {
-        // Full-token entropy 4.5994 > ENTROPY_THRESHOLD (4.5).
+    fn allows_high_entropy_file_path_near_secret_word() {
         let content =
             "workspace path fable-ops/ADR-DRAFT-adr079-slices234.md for the secret gate bug";
         assert!(
-            check(content).is_err(),
-            "accepted FP: structured file path near 'secret' is now \
-             blocked; got {:?}",
+            check(content).is_ok(),
+            "structured file path in technical prose must pass; got {:?}",
             scan(content)
         );
     }
 
     #[test]
-    fn blocks_high_entropy_workspace_path_near_key_word() {
-        // Full-token entropy 4.7938 > 4.5.
+    fn allows_high_entropy_workspace_path_near_key_word() {
         let content = "key: see internal/workspaces/20260701/adr079-slices234/PACKET.md";
         assert!(
-            check(content).is_err(),
-            "accepted FP: workspace path near 'key' is now blocked; \
-             got {:?}",
+            check(content).is_ok(),
+            "workspace path in technical prose must pass; got {:?}",
             scan(content)
         );
     }
 
     #[test]
-    fn blocks_high_entropy_short_run_path_near_auth_word() {
-        // Full-token entropy 4.5955 > 4.5.
+    fn allows_high_entropy_short_run_path_near_auth_word() {
         let content =
             "auth work saved at internal/workspaces/20260701/cloud-rebuild/R1-repo-audit.md";
         assert!(
-            check(content).is_err(),
-            "accepted FP: path with a short 'R1' run near 'auth' is \
-             now blocked; got {:?}",
+            check(content).is_ok(),
+            "path with a short run in technical prose must pass; got {:?}",
             scan(content)
         );
     }
@@ -2975,7 +3125,7 @@ mod tests {
         assert!(!is_structured_identifier(&token));
     }
 
-    // ── Structured-identifier exemption drops entirely in trigger context ───
+    // ── Credential-labeled structured identifiers remain blocked ────────────
     //
     // Narrower fixes that keep some exemption alive in trigger context (e.g.
     // requiring a trailing file-extension run, or requiring >= 2 path-shaped
@@ -2991,16 +3141,10 @@ mod tests {
     // length (two different N-character strings can and do score
     // differently; neither is distinguishable from the other by a threshold
     // alone once both sit near that shared ceiling). So no aggregation is
-    // sound. The exemption is therefore dropped unconditionally in trigger
-    // context: a structured-identifier-shaped token near a trigger word is
-    // entropy-checked like any other token, with 3 known false positives
-    // accepted (see `accepted_false_positive_*` below). The 10 `#[test]`
-    // functions immediately below (16 assertions total) are the checked-in,
-    // always-run regression suite for this bypass class; any change loosening
-    // this gate must keep every one of them passing — see
-    // `tests/data/secret_gate_corpus_manifest.md` for the full named list and
-    // the reproducible corpus evidence behind dropping #1040/#1056 from this
-    // batch rather than shipping an unsound loosening.
+    // sound. Plausible file paths are therefore exempt only after their
+    // individual runs have passed the entropy and normalized-hex checks, and
+    // only when the path is not immediately labeled as a credential value.
+    // The tests below guard that credential-label boundary.
 
     #[test]
     fn blocks_separator_secret_access_key_bypass() {
@@ -3176,6 +3320,30 @@ mod tests {
         assert!(
             check(content).is_err(),
             "Unicode-separator split hex credential must be blocked: got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_unicode_split_hex_credential_with_path_shaped_anchor() {
+        let content =
+            "api key handling uses source/x/0123456789abcdef0123\u{200B}456789abcdef01234567";
+        let tokens: Vec<(usize, &str)> = content
+            .split(|c: char| c.is_ascii_whitespace() || !c.is_ascii())
+            .filter(|token| !token.is_empty())
+            .map(|token| (token.as_ptr() as usize - content.as_ptr() as usize, token))
+            .collect();
+        let anchor = tokens
+            .iter()
+            .position(|(_, token)| token.starts_with("source/"))
+            .expect("path anchor must be tokenized");
+        assert!(is_plausible_file_path(tokens[anchor].1));
+        let fragments = bridge_fragment_chain(&tokens, content, anchor);
+        assert_eq!(fragments.len(), 2);
+        assert!(contains_normalized_hex_credential(&fragments.join(" ")));
+        assert!(
+            check(content).is_err(),
+            "path-shaped anchor must not bypass fragment reconstruction: got {:?}",
             scan(content)
         );
     }
@@ -3381,45 +3549,75 @@ mod tests {
     }
 
     #[test]
-    fn accepted_false_positive_adr_draft_path_near_trigger() {
-        // Accepted tradeoff: this path's full-token Shannon entropy (4.5994)
-        // exceeds ENTROPY_THRESHOLD (4.5) on its own. With the
-        // structured-identifier exemption dropped in trigger context, it is
-        // blocked near an explicit credential trigger word: a deliberate,
-        // documented false positive, not a regression to fix, since no sound
-        // signal exists to distinguish this from a chopped/padded credential
-        // of the same shape.
+    fn allows_adr_draft_path_near_trigger() {
         let content = "api_key handling in fable-ops/ADR-DRAFT-adr079-slices234.md";
         assert!(
-            check(content).is_err(),
-            "accepted FP: ADR-DRAFT path near 'api_key' is now blocked; \
-             got {:?}",
+            check(content).is_ok(),
+            "ADR-DRAFT path in technical prose must pass; got {:?}",
             scan(content)
         );
     }
 
     #[test]
-    fn accepted_false_positive_workspace_packet_path_near_trigger() {
-        // Same tradeoff as above: full-token entropy 4.7938 > 4.5.
+    fn allows_workspace_packet_path_near_trigger() {
         let content = "api_key handling in internal/workspaces/20260701/adr079-slices234/PACKET.md";
         assert!(
-            check(content).is_err(),
-            "accepted FP: PACKET.md workspace path near 'api_key' is now blocked \
-             got {:?}",
+            check(content).is_ok(),
+            "workspace path in technical prose must pass; got {:?}",
             scan(content)
         );
     }
 
     #[test]
-    fn blocks_high_entropy_repo_audit_path_near_api_key() {
-        // Same tradeoff as above: full-token entropy 4.5955 > 4.5.
+    fn allows_high_entropy_repo_audit_path_near_api_key() {
         let content =
             "api_key handling in internal/workspaces/20260701/cloud-rebuild/R1-repo-audit.md";
         assert!(
-            check(content).is_err(),
-            "accepted FP: R1-repo-audit path near 'api_key' is now blocked; \
-             got {:?}",
+            check(content).is_ok(),
+            "repository path in technical prose must pass; got {:?}",
             scan(content)
+        );
+    }
+
+    #[test]
+    fn allows_source_paths_near_ordinary_key_and_token_prose() {
+        let contents = [
+            "see <a/path/to/file.py>:~97-103 lists it as a real checkpoint-supplied key",
+            "see <a/path/to/file.py>:~97-103 emits one extra token",
+            "see /workspace/src/checkpoint_loader.rs:97-103\n\nconfiguration key behavior",
+            "the token behavior is implemented in src/runtime/secret_gate.rs:618-914.",
+        ];
+        for content in contents {
+            assert!(
+                check(content).is_ok(),
+                "source path in technical prose must pass: {content:?}, got {:?}",
+                scan(content)
+            );
+        }
+    }
+
+    #[test]
+    fn allows_adr_authorization_path_in_markdown_ingest() {
+        let content =
+            "- Evidence: `docs/adr/C-ADR-007-authorization-server.md:70` defines token handling.";
+        assert!(
+            check(content).is_ok(),
+            "ADR path citation in technical markdown must pass: got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_markdown_ingest_bare_opaque_value_near_token() {
+        let content = concat!(
+            "- Review evidence for token handling: ",
+            "Xk9mZ2vQpLrT8nJwYuAeHfBs",
+            "DcGiONvM1qPrStUvWxYz23456789"
+        );
+        assert_eq!(
+            scan(content).map(|matched| matched.detector),
+            Some("high-entropy-token"),
+            "bare opaque value near token must remain blocked"
         );
     }
 
@@ -3861,48 +4059,33 @@ mod tests {
     }
 
     #[test]
-    fn blocks_workspace_artifact_path_near_standalone_secret() {
-        // A dot-prefixed root + date segment + hyphenated topic dir +
-        // SCREAMING_SNAKE filename, discussed in prose that genuinely (not by
-        // substring collision) mentions "secret". `secret` here is a real
-        // standalone word, not a substring collision, so it still dominates
-        // and the path still falls through to the entropy heuristic like any
-        // other near-trigger token. A documented accepted tradeoff, not a
-        // regression.
+    fn allows_workspace_artifact_path_near_standalone_secret() {
         let content = "writing up the secret gate false positive repro: \
              .workspace/20260101/fix-secret-gate-trigger-false-positive/MEASUREMENT_REPORT.md";
         assert!(
-            check(content).is_err(),
-            "accepted FP: workspace artifact path near a \
-             genuine standalone 'secret' mention is still blocked; got {:?}",
+            check(content).is_ok(),
+            "workspace artifact path in technical prose must pass; got {:?}",
             scan(content)
         );
     }
 
     #[test]
-    fn blocks_archive_doc_path_near_standalone_secret() {
-        // An archive-style doc path discussed near a genuine standalone
-        // "secret" mention.
+    fn allows_archive_doc_path_near_standalone_secret() {
         let content =
             "secret scanner archive notes: docs/_archive/ADR051-TenantEncryption-v2Notes.md";
         assert!(
-            check(content).is_err(),
-            "accepted FP: archive doc path near a genuine \
-             standalone 'secret' mention is still blocked; got {:?}",
+            check(content).is_ok(),
+            "archive document path in technical prose must pass; got {:?}",
             scan(content)
         );
     }
 
     #[test]
-    fn blocks_absolute_path_near_standalone_auth() {
-        // An absolute path written as one unbroken token, with the
-        // surrounding message genuinely (not via substring collision)
-        // discussing "auth".
+    fn allows_absolute_path_near_standalone_auth() {
         let content = "the auth scanner flagged this file: /home/user/projects/workspace/SessionNotes20260107/AuthGateFollowup2.md";
         assert!(
-            check(content).is_err(),
-            "accepted FP: absolute path near a genuine \
-             standalone 'auth' mention is still blocked; got {:?}",
+            check(content).is_ok(),
+            "absolute path in technical prose must pass; got {:?}",
             scan(content)
         );
     }
@@ -3912,10 +4095,8 @@ mod tests {
         // Adversarial negative: a credential-shaped value glued via '='
         // directly to a trigger word must not be exempted just because it is
         // path-shaped (separator-delimited, word-shaped runs) and looks
-        // superficially like the accepted-FP repro paths above. The compound
-        // label `api_key` is assignment-shaped, and the structured-identifier
-        // exemption is unconditionally dropped in trigger context, so this
-        // must block.
+        // superficially like the technical paths above. The compound label
+        // `api_key` makes this a credential value, so it must block.
         let content = "api_key=/home/user/workspaces/2026/topic-name-example/SECRET_VALUE_HERE.md";
         assert!(
             check(content).is_err(),

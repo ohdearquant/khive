@@ -11,6 +11,10 @@ Re-run manually and replace this file whenever the detector set changes
 enough to warrant a fresh snapshot; this is a point-in-time artifact, not a
 CI-enforced check.
 
+This snapshot predates the public Git-revision and technical file-path
+exemptions added for #1219 and #1227. Its counts and hashes are retained as
+historical measurements and do not describe the current detector verdicts.
+
 ## Run
 
 - Date: 2026-07-16 (regenerated after fixing this generator: an earlier version
@@ -143,22 +147,19 @@ does not appear in this replay's `blocked_content_sha256_by_detector` output
 that is *not* blocked. The reproducible evidence for that specific claim is
 the checked-in, always-run adversarial regression-test suite in
 `secret_gate.rs` (see the block below), not this corpus replay. This replay
-instead answers the adjacent, verifiable question the Medium finding also
-raised: is the detector's overall false-positive exposure on real production
-content small enough to support keeping the `near_trigger` gate unconditional
-rather than loosening it? At a ~0.101% block rate across 64405 real strings,
-yes — and every blocked hash above can be looked up locally against the same
-DB to inspect the specific verdict without exposing content in this file.
+instead records the detector's overall false-positive exposure at the time it
+was generated. Every blocked hash above can be looked up locally against the
+same DB to inspect that historical verdict without exposing content in this
+file.
 
-## Adversarial regression tests guarding the dropped `#1040`/`#1056` fix
+## Credential-label regression tests
 
 The PR body's "12 adversarial regression tests" reference could not be
 matched to 12 specific test functions on inspection; the actual named
 regression suite for this exact bypass class ("split/pad/disguise a
 credential into word-shaped runs to defeat the entropy check") in
-`crates/khive-runtime/src/secret_gate.rs` is **10** tests, all under the "──
-Structured-identifier exemption drops entirely in trigger context ──"
-section:
+`crates/khive-runtime/src/secret_gate.rs` is **10** tests, now grouped under
+the credential-labeled structured-identifier section:
 
 1. `blocks_separator_secret_access_key_bypass`
 2. `blocks_adversarial_lowercase_only_separator_token_near_access_key`
@@ -171,9 +172,7 @@ section:
 9. `blocks_low_entropy_padding_run_bypass_attempts` (4 cases)
 10. `blocks_run_splitting_bypass_attempts` (3 cases)
 
-16 total assertions across these 10 `#[test]` functions. Loosening the
-`near_trigger` gate on `is_structured_identifier` (or adding any per-run
-entropy-cap variant) to admit the `#1040`/`#1056` real-path false positives
+16 total assertions across these 10 `#[test]` functions. File-path exemptions
 must keep all of these passing, per the module's own soundness argument
 (every run-length-N string has the SAME maximum Shannon entropy `log2(N)`
 regardless of content — an upper bound, not a claim that entropy is

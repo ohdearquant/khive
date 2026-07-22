@@ -2089,6 +2089,28 @@ async fn note_create_blocks_hex_credential_in_content() {
     );
 }
 
+#[tokio::test]
+async fn note_create_allows_source_path_near_ordinary_key_prose() {
+    let rt = rt();
+    let tok = rt.authorize(Namespace::local()).unwrap();
+    let content = "see <a/path/to/file.py>:~97-103 lists it as a real checkpoint-supplied key";
+
+    rt.create_note(&tok, "question", None, content, None, None, vec![])
+        .await
+        .expect("source path in technical prose must be stored");
+}
+
+#[tokio::test]
+async fn note_create_allows_git_revision_near_ordinary_token_prose() {
+    let rt = rt();
+    let tok = rt.authorize(Namespace::local()).unwrap();
+    let content = "revision d362950a3c9b1a4cb47d97f1623e38f1a1e6bcdf emits one extra token";
+
+    rt.create_note(&tok, "question", None, content, None, None, vec![])
+        .await
+        .expect("git revision in technical prose must be stored");
+}
+
 // =============================================================================
 // EmbedderRegistry integration tests (#397)
 // =============================================================================
