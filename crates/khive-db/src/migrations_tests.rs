@@ -114,6 +114,68 @@ fn pre_consolidation_store_reports_recreation_action() {
 }
 
 #[test]
+fn legacy_v1_only_store_reports_recreation_before_current_v2() {
+    let mut conn = open_memory();
+    conn.execute_batch(
+        "CREATE TABLE events (\
+             id TEXT PRIMARY KEY,\
+             namespace TEXT NOT NULL,\
+             verb TEXT NOT NULL,\
+             substrate TEXT NOT NULL,\
+             actor TEXT NOT NULL,\
+             outcome TEXT NOT NULL,\
+             data TEXT,\
+             duration_us INTEGER NOT NULL DEFAULT 0,\
+             target_id TEXT,\
+             created_at INTEGER NOT NULL\
+         );",
+    )
+    .expect("create legacy V1 schema marker");
+    conn.execute_batch(MIGRATION_TRACKING_TABLE).unwrap();
+    conn.execute(
+        "INSERT INTO _schema_migrations (version, name, applied_at) \
+         VALUES (1, 'initial_schema', 0)",
+        [],
+    )
+    .unwrap();
+
+    let err = run_migrations(&mut conn).expect_err("legacy V1 must require recreation");
+    let SqliteError::InvalidData(message) = err else {
+        panic!("expected legacy-schema InvalidData diagnostic, got {err:?}");
+    };
+    assert!(
+        message.contains("predates the consolidated baseline"),
+        "{message}"
+    );
+    assert!(message.contains("recreate"), "{message}");
+    assert_eq!(
+        read_schema_version(&conn).expect("read unchanged ledger"),
+        1,
+        "the current V2 migration must not run"
+    );
+}
+
+#[test]
+fn consolidated_v1_only_store_migrates_normally() {
+    let mut conn = open_memory();
+    conn.execute_batch(MIGRATION_TRACKING_TABLE).unwrap();
+    conn.execute_batch(MIGRATIONS[0].up)
+        .expect("apply consolidated V1 schema");
+    conn.execute(
+        "INSERT INTO _schema_migrations (version, name, applied_at) \
+         VALUES (1, 'initial_schema', 0)",
+        [],
+    )
+    .unwrap();
+
+    let version = run_migrations(&mut conn).expect("consolidated V1 must migrate");
+    assert_eq!(
+        version,
+        MIGRATIONS.last().expect("latest migration").version
+    );
+}
+
+#[test]
 fn core_tables_exist() {
     let mut conn = open_memory();
     run_migrations(&mut conn).expect("migrations");

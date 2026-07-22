@@ -224,13 +224,33 @@ pub struct SchemaInspection {
 fn is_pre_consolidation_ledger(conn: &Connection) -> Result<bool, SqliteError> {
     // V1 used the same name in both lineages; the historical V2 and V22 names
     // are unambiguous signals that this ledger predates consolidation.
-    conn.query_row(
+    let has_legacy_name: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM _schema_migrations \
          WHERE (version = 2 AND name = ?1) OR (version = 22 AND name = ?2))",
         ["add_name_to_notes", "knowledge_lifecycle_status"],
         |row| row.get(0),
-    )
-    .map_err(Into::into)
+    )?;
+    if has_legacy_name {
+        return Ok(true);
+    }
+
+    let highest_version: u32 = conn.query_row(
+        "SELECT COALESCE(MAX(version), 0) FROM _schema_migrations",
+        [],
+        |row| row.get(0),
+    )?;
+    if highest_version != 1 {
+        return Ok(false);
+    }
+
+    // Consolidated V1 includes the event-kind discriminator; historical V1
+    // did not gain it until a later migration in the retired lineage.
+    let has_consolidated_v1_shape: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('events') WHERE name = 'kind')",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(!has_consolidated_v1_shape)
 }
 
 fn validate_schema_compatibility(

@@ -426,6 +426,7 @@ async fn missing_embedding_batch(
     rt: &KhiveRuntime,
     namespace: &str,
     vector_table: &str,
+    embedding_model: &str,
     kind: SubstrateKind,
     after: &str,
     limit: u32,
@@ -446,8 +447,9 @@ async fn missing_embedding_batch(
          WHERE base.namespace = ?1 AND base.deleted_at IS NULL AND base.id > ?2 \
          AND {text_predicate} \
          AND NOT EXISTS (SELECT 1 FROM {vector_table} AS vectors \
-             WHERE vectors.subject_id = base.id AND vectors.namespace = ?1) \
-         ORDER BY base.id LIMIT ?3"
+             WHERE vectors.subject_id = base.id AND vectors.namespace = ?1 \
+             AND vectors.embedding_model = ?3) \
+         ORDER BY base.id LIMIT ?4"
     );
     let rows = {
         let mut reader = rt
@@ -461,6 +463,7 @@ async fn missing_embedding_batch(
                 params: vec![
                     SqlValue::Text(namespace.to_string()),
                     SqlValue::Text(after.to_string()),
+                    SqlValue::Text(embedding_model.to_string()),
                     SqlValue::Integer(i64::from(limit)),
                 ],
                 label: Some("reindex_missing_embeddings".into()),
@@ -517,6 +520,10 @@ async fn repair_missing_embeddings(
             .await
             .with_context(|| format!("inspect vector store for model {model_name}"))?;
         let vector_table = vector_table_name(&info.model_name)?;
+        let embedding_model = rt
+            .resolve_embedding_model(Some(model_name))
+            .map(|model| model.to_string())
+            .unwrap_or_else(|_| model_name.clone());
 
         for (kind, field) in [
             (SubstrateKind::Entity, "entity.body"),
@@ -524,9 +531,16 @@ async fn repair_missing_embeddings(
         ] {
             let mut after = String::new();
             loop {
-                let batch =
-                    missing_embedding_batch(rt, namespace, &vector_table, kind, &after, batch_size)
-                        .await?;
+                let batch = missing_embedding_batch(
+                    rt,
+                    namespace,
+                    &vector_table,
+                    &embedding_model,
+                    kind,
+                    &after,
+                    batch_size,
+                )
+                .await?;
                 let Some((last_id, _)) = batch.last() else {
                     break;
                 };
@@ -1159,12 +1173,14 @@ mod tests {
         }
     }
 
-    struct RepairEmbedderProvider;
+    struct RepairEmbedderProvider {
+        model_name: &'static str,
+    }
 
     #[async_trait::async_trait]
     impl khive_runtime::EmbedderProvider for RepairEmbedderProvider {
         fn name(&self) -> &str {
-            REPAIR_MODEL
+            self.model_name
         }
 
         fn dimensions(&self) -> usize {
@@ -1487,9 +1503,10 @@ mod tests {
             .await
             .expect("seed vector");
 
-        let selected = missing_embedding_batch(&rt, "local", TABLE, SubstrateKind::Note, "", 100)
-            .await
-            .expect("select missing notes");
+        let selected =
+            missing_embedding_batch(&rt, "local", TABLE, MODEL, SubstrateKind::Note, "", 100)
+                .await
+                .expect("select missing notes");
 
         assert_eq!(selected, vec![(missing.id, missing.content)]);
     }
@@ -1506,7 +1523,9 @@ mod tests {
             ..RuntimeConfig::default()
         })
         .expect("runtime");
-        rt.register_embedder(RepairEmbedderProvider);
+        rt.register_embedder(RepairEmbedderProvider {
+            model_name: REPAIR_MODEL,
+        });
         let token = rt
             .authorize(Namespace::parse("local").expect("namespace"))
             .expect("authorize");
@@ -1552,6 +1571,78 @@ mod tests {
         assert!(
             matches!(rows[0].get("namespace"), Some(SqlValue::Text(value)) if value == "local"),
             "repair must replace the stale row with the base row namespace"
+        );
+    }
+
+    #[tokio::test]
+    async fn embeds_only_repair_does_not_treat_colliding_model_as_target_embedding() {
+        use khive_runtime::RuntimeConfig;
+        use khive_storage::types::VectorRecord;
+
+        const MODEL_A: &str = "collision-model";
+        const MODEL_B: &str = "collision_model";
+        const TABLE: &str = "vec_collision_model";
+
+        let rt = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            ..RuntimeConfig::default()
+        })
+        .expect("runtime");
+        rt.register_embedder(RepairEmbedderProvider {
+            model_name: MODEL_A,
+        });
+        rt.register_embedder(RepairEmbedderProvider {
+            model_name: MODEL_B,
+        });
+        let token = rt
+            .authorize(Namespace::parse("local").expect("namespace"))
+            .expect("authorize");
+        let note = Note::new("local", "observation", "repair colliding model");
+        rt.notes(&token)
+            .expect("notes")
+            .upsert_note(note.clone())
+            .await
+            .expect("seed note");
+
+        rt.vectors_for_model(&token, MODEL_A)
+            .expect("model A vectors")
+            .insert_batch(vec![VectorRecord {
+                subject_id: note.id,
+                kind: SubstrateKind::Note,
+                namespace: "local".to_string(),
+                field: "note.content".to_string(),
+                embedding_model: Some(MODEL_A.to_string()),
+                vectors: vec![vec![0.1; REPAIR_DIMS]],
+                updated_at: chrono::Utc::now(),
+            }])
+            .await
+            .expect("seed model A vector");
+
+        let result = repair_missing_embeddings(&rt, &token, &[MODEL_B.to_string()], "local", 100)
+            .await
+            .expect("repair model B embeddings");
+        assert_eq!(result, (0, 1, 0));
+
+        let mut reader = rt.sql().reader().await.expect("reader");
+        let rows = reader
+            .query_all(SqlStatement {
+                sql: format!(
+                    "SELECT embedding_model FROM {TABLE} WHERE subject_id = ?1 AND namespace = ?2"
+                ),
+                params: vec![
+                    SqlValue::Text(note.id.to_string()),
+                    SqlValue::Text("local".to_string()),
+                ],
+                label: None,
+            })
+            .await
+            .expect("read repaired vector");
+        assert_eq!(rows.len(), 1, "repair must leave one vector row");
+        assert!(
+            matches!(rows[0].get("embedding_model"), Some(SqlValue::Text(value)) if value == MODEL_B),
+            "repair must replace the colliding model A row with model B"
         );
     }
 
