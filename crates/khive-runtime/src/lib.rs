@@ -81,7 +81,7 @@ pub use objectives::{
 #[cfg(any(test, feature = "fault-injection"))]
 pub use operations::{
     arm_fts_fail, arm_fts_fail_many, arm_fts_fail_many_partial, arm_rollback_cleanup_fail,
-    arm_vector_fail, arm_vector_fail_after,
+    arm_vector_fail, arm_vector_fail_after, FaultInjectionArm,
 };
 pub use operations::{
     base_entity_endpoint_rules, base_entity_rule_allows, endpoint_matches,
