@@ -741,19 +741,61 @@ fn pid_is_khive_daemon(pid: u32) -> bool {
     }
 }
 
-/// Kill the daemon named by the PID file and remove its PID + socket files
-/// (caller holds the recovery lock).
-///
-/// #645: the PID observed here (`expected_pid`) is captured once, before
-/// SIGTERM, and re-checked immediately before unlinking in
-/// [`remove_daemon_paths_if_still_stale`]. The recovery lock normally
-/// serializes this whole function against a concurrent daemon boot (which
-/// holds the same lock across its own cleanup → bind → pid-write), but that
-/// guarantee depends on the daemon side successfully acquiring the lock too.
-/// Re-checking ownership right before deleting is the defense that still
-/// holds if a booting daemon ever proceeds without the lock: this call must
-/// not delete a replacement daemon's live socket/PID out from under it.
-fn kill_stale_daemon_inner() {
+const INCUMBENT_EXIT_TIMEOUT_SECS: u64 = 12;
+const INCUMBENT_EXIT_POLL_MS: u64 = 25;
+
+#[derive(Debug)]
+enum RecoveryError {
+    Spawn(std::io::Error),
+    IncumbentStillAlive { pid: u32 },
+}
+
+fn process_is_alive(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: signal 0 is an existence/permission probe with no side effects.
+    let result = unsafe { libc::kill(pid, 0) };
+    let exists = result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+    if !exists {
+        return false;
+    }
+    match std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "stat="])
+        .output()
+    {
+        Ok(output) if output.status.success() => !String::from_utf8_lossy(&output.stdout)
+            .trim_start()
+            .starts_with('Z'),
+        _ => true,
+    }
+}
+
+async fn wait_for_process_exit(pid: u32, timeout: std::time::Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if !process_is_alive(pid) {
+            return true;
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        tokio::time::sleep(
+            std::time::Duration::from_millis(INCUMBENT_EXIT_POLL_MS).min(deadline - now),
+        )
+        .await;
+    }
+}
+
+/// Signal the daemon named by the PID file and remove its rendezvous files
+/// only after its PID is positively confirmed dead (caller holds the recovery
+/// lock). The PID is captured before SIGTERM and ownership is re-checked by
+/// [`remove_daemon_paths_if_still_stale`] immediately before unlinking.
+async fn kill_stale_daemon_inner(exit_timeout: std::time::Duration) -> Result<(), RecoveryError> {
     #[cfg(test)]
     KILL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
@@ -779,9 +821,13 @@ fn kill_stale_daemon_inner() {
                 "PID in daemon file does not belong to a khive daemon — skipping SIGTERM"
             );
         }
+        if !wait_for_process_exit(pid, exit_timeout).await {
+            return Err(RecoveryError::IncumbentStillAlive { pid });
+        }
     }
 
     remove_daemon_paths_if_still_stale(&pid_file, expected_pid);
+    Ok(())
 }
 
 /// Remove `pid_file`/the daemon socket only if ownership has not changed since
@@ -1056,11 +1102,11 @@ async fn confirm_genuinely_dead(config_id: &str, namespace: &str) -> ProbeOutcom
 }
 
 /// Deadline for acquiring the recoverer-only lock before starting the
-/// dead-confirmation → kill → spawn critical section — generous enough to
-/// cover a peer's full worst-case critical section so a healthy peer's turn
-/// is never mistaken for a wedge. See
+/// dead-confirmation → kill → confirmed-exit → spawn critical section.
+/// This exceeds the incumbent-exit deadline so a peer can finish a full
+/// recovery turn before another recoverer treats the lock as wedged. See
 /// `crates/khive-mcp/docs/api/daemon-lifecycle.md`.
-const RECOVERER_LOCK_TIMEOUT_MS: u64 = 8_000;
+const RECOVERER_LOCK_TIMEOUT_MS: u64 = 16_000;
 
 /// Kill the stale daemon and spawn a fresh one, serialized against concurrent
 /// recoverers by a dedicated recoverer-only lock (#838 double-checked
@@ -1068,14 +1114,34 @@ const RECOVERER_LOCK_TIMEOUT_MS: u64 = 8_000;
 /// (NEVER-KILL-SLOW). `LockContended` (confirm rounds inconclusive, or the
 /// recoverer lock itself timed out) → `Uncertain`, no kill — same safe
 /// behavior as `Skipped` but reported distinctly. `Dead` (confirmed,
-/// recoverer lock held) → kill+spawn → `Spawned`. See
+/// recoverer lock held) → signal + bounded exit confirmation + spawn →
+/// `Spawned`; a PID still alive at the deadline returns
+/// [`RecoveryError::IncumbentStillAlive`] without spawning. See
 /// `crates/khive-mcp/docs/api/daemon-lifecycle.md` for why a second lock
 /// file is required and how this avoids deadlocking a booting daemon.
 async fn kill_and_respawn<F>(
     config_id: &str,
     namespace: &str,
     spawn: &F,
-) -> std::io::Result<RecoveryOutcome>
+) -> Result<RecoveryOutcome, RecoveryError>
+where
+    F: Fn() -> std::io::Result<std::process::Child> + Sync,
+{
+    kill_and_respawn_with_exit_timeout(
+        config_id,
+        namespace,
+        spawn,
+        std::time::Duration::from_secs(INCUMBENT_EXIT_TIMEOUT_SECS),
+    )
+    .await
+}
+
+async fn kill_and_respawn_with_exit_timeout<F>(
+    config_id: &str,
+    namespace: &str,
+    spawn: &F,
+    exit_timeout: std::time::Duration,
+) -> Result<RecoveryOutcome, RecoveryError>
 where
     F: Fn() -> std::io::Result<std::process::Child> + Sync,
 {
@@ -1170,8 +1236,10 @@ where
             // is a distinct lock file from `recoverer_guard` above, acquired
             // and dropped entirely within this arm.
             let _boot_lock = acquire_recovery_lock();
-            kill_stale_daemon_inner();
-            spawn().map(RecoveryOutcome::Spawned)
+            kill_stale_daemon_inner(exit_timeout).await?;
+            spawn()
+                .map(RecoveryOutcome::Spawned)
+                .map_err(RecoveryError::Spawn)
         }
     };
     drop(recoverer_guard);
@@ -1265,6 +1333,25 @@ fn respawn_failed_error(failure: RespawnFailure) -> McpError {
     };
     McpError::internal_error(
         "daemon respawn failed (respawn_failed); rebuild with `make local` and retry",
+        Some(data),
+    )
+}
+
+fn incumbent_still_alive_error(pid: u32) -> McpError {
+    tracing::error!(
+        reason = "incumbent_still_alive",
+        pid,
+        "daemon recovery refused because the incumbent did not exit before the deadline"
+    );
+    let mut data = serde_json::json!({
+        "reason": "incumbent_still_alive",
+        "pid": pid,
+    });
+    if is_daemon_strict_mode() {
+        data[STRICT_FALLBACK_MARKER] = serde_json::Value::Bool(true);
+    }
+    McpError::internal_error(
+        format!("daemon recovery refused: incumbent PID {pid} is still alive after the deadline"),
         Some(data),
     )
 }
@@ -1783,13 +1870,16 @@ where
     // connect-retry window or the #667 boot-quiescence wait short.
     let mut spawned_child: Option<std::process::Child> = None;
     match kill_and_respawn(&frame.config_id, &frame.namespace, spawn).await {
-        Err(e) => {
+        Err(RecoveryError::Spawn(e)) => {
             // #898: `Command::spawn` itself failed to start the child at all —
             // an unambiguous, already-fully-diagnosed respawn failure. Loud in
             // both strict and non-strict mode; never a silent local fallback.
             return Some(Err(respawn_failed_error(RespawnFailure::SpawnError {
                 os_error_code: e.raw_os_error(),
             })));
+        }
+        Err(RecoveryError::IncumbentStillAlive { pid }) => {
+            return Some(Err(incumbent_still_alive_error(pid)));
         }
         Ok(RecoveryOutcome::Skipped) => {
             // A concurrent client already has a live matching daemon ready.
@@ -3641,6 +3731,115 @@ mod tests {
         assert!(argv_is_khive_daemon(
             "/Users/x/.cargo/bin/kkernel-bench mcp --daemon"
         ));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn recovery_requires_incumbent_exit_before_spawning() {
+        clear_daemon_env();
+        reset_counters();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("khived.pid");
+        let ready_file = dir.path().join("incumbent.ready");
+
+        std::env::set_var("KHIVE_SOCKET", dir.path().join("khived.sock"));
+        std::env::set_var("KHIVE_PID", &pid_file);
+        std::env::set_var("KHIVE_LOCK", dir.path().join("khived.recovery.lock"));
+        std::env::set_var(
+            "KHIVE_RECOVERER_LOCK",
+            dir.path().join("khived.recoverer.lock"),
+        );
+        std::env::remove_var("KHIVE_NO_DAEMON");
+
+        let mut incumbent = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("trap '' TERM; : > \"$1\"; while :; do sleep 1; done")
+            .arg("stubborn-incumbent")
+            .arg(&ready_file)
+            .spawn()
+            .expect("spawn signal-resistant incumbent");
+        let ready_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !ready_file.exists() {
+            assert!(
+                tokio::time::Instant::now() < ready_deadline,
+                "incumbent did not install its signal handler"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        std::fs::write(&pid_file, incumbent.id().to_string()).expect("write incumbent pid file");
+        let incumbent_pid = incumbent.id();
+        FORCE_PID_IS_DAEMON.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let spawn_calls = std::sync::atomic::AtomicUsize::new(0);
+        let spawn = || {
+            spawn_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::process::Command::new("/bin/sh")
+                .args(["-c", "exit 0"])
+                .spawn()
+        };
+        let outcome = kill_and_respawn_with_exit_timeout(
+            CFG,
+            NS,
+            &spawn,
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+        let refused_pid = match outcome {
+            Err(RecoveryError::IncumbentStillAlive { pid }) => Some(pid),
+            Ok(RecoveryOutcome::Spawned(mut child)) => {
+                let _ = child.wait();
+                None
+            }
+            Ok(RecoveryOutcome::Skipped | RecoveryOutcome::Uncertain)
+            | Err(RecoveryError::Spawn(_)) => None,
+        };
+        let live_pid_file_preserved = pid_file.exists();
+        incumbent.kill().expect("kill incumbent fixture");
+        incumbent.wait().expect("reap incumbent fixture");
+
+        assert_eq!(refused_pid, Some(incumbent_pid));
+        assert_eq!(
+            spawn_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a replacement must not spawn while the signalled incumbent PID is still alive"
+        );
+        assert!(
+            live_pid_file_preserved,
+            "the live incumbent's PID file must remain in place after refusal"
+        );
+        let refusal = incumbent_still_alive_error(incumbent_pid);
+        assert!(refusal.message.contains(&format!("PID {incumbent_pid}")));
+        let data = refusal.data.expect("live-incumbent refusal data");
+        assert_eq!(data["reason"], "incumbent_still_alive");
+        assert_eq!(data["pid"], incumbent_pid);
+
+        let recovered = kill_and_respawn_with_exit_timeout(
+            CFG,
+            NS,
+            &spawn,
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+        let spawned = match recovered {
+            Ok(RecoveryOutcome::Spawned(mut child)) => {
+                let _ = child.wait();
+                true
+            }
+            _ => false,
+        };
+
+        FORCE_PID_IS_DAEMON.store(false, std::sync::atomic::Ordering::SeqCst);
+        clear_daemon_env();
+        assert!(spawned, "a confirmed-dead incumbent must still be replaced");
+        assert_eq!(
+            spawn_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "confirmed-dead recovery must spawn exactly one replacement"
+        );
+        assert!(
+            !pid_file.exists(),
+            "the confirmed-dead incumbent PID file must be removed before spawning"
+        );
     }
 
     // ── concurrent recovery — second client skips kill+spawn when daemon alive ──
