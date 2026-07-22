@@ -1303,6 +1303,7 @@ async fn dispatch_via_coordinator_inner(
                             "id": h.note_id.to_string(),
                             "note_kind": note_kind,
                             "score": h.score.to_f64(),
+                            "source": h.source.as_str(),
                             "title": h.title,
                             "snippet": h.snippet,
                         })
@@ -1321,6 +1322,7 @@ async fn dispatch_via_coordinator_inner(
                             "id": h.entity_id.to_string(),
                             "entity_kind": entity_kind,
                             "score": h.score.to_f64(),
+                            "source": h.source.as_str(),
                             "title": h.title,
                             "snippet": h.snippet,
                         })
