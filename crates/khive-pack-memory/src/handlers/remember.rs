@@ -3,7 +3,7 @@
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use khive_runtime::{micros_to_iso, Namespace, NamespaceToken, RuntimeError};
+use khive_runtime::{micros_to_iso, KhiveRuntime, Namespace, NamespaceToken, RuntimeError};
 use khive_storage::types::{Direction, NeighborQuery};
 use khive_storage::EdgeRelation;
 
@@ -162,6 +162,9 @@ impl MemoryPack {
             None
         };
 
+        emit_memory_remembered_event(&self.runtime, write_token, note.id, memory_type, salience)
+            .await;
+
         let mut response = json!({
             "id": note.id.to_string(),
             "kind": note.kind,
@@ -174,5 +177,131 @@ impl MemoryPack {
             response["edge_id"] = json!(eid);
         }
         to_json(&response)
+    }
+}
+
+/// Best-effort `NoteCreated` telemetry for `memory.remember`.
+///
+/// `EventKind` is a closed enum owned by the OSS `khive-types` crate and has
+/// no dedicated `MemoryRemembered` variant, so — same constraint documented
+/// against `brain.mark_turn`'s `PhaseStarted`/`actor_turn` reuse
+/// — this reuses `NoteCreated`: `memory.remember` always
+/// creates a `memory`-kind `Note`, so a `NoteCreated` event carrying the new
+/// note's id as `target_id` (with `substrate = Note`, matching
+/// `decode_target_observation`'s `ReferentKind` selection) is the concrete
+/// "memory_remembered" signal the issue asks for. Awaited inline rather than
+/// backgrounded like `recall.rs`'s `RecallExecuted` emission: `memory.remember`
+/// is a write path, not a latency-sensitive hot read path, and git pack's
+/// `emit_write_audit` establishes the same inline-await, swallow-on-error
+/// shape for write-time telemetry.
+async fn emit_memory_remembered_event(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    note_id: Uuid,
+    memory_type: &str,
+    salience: f64,
+) {
+    let store = match rt.events(token) {
+        Ok(store) => store,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                namespace = token.namespace().as_str(),
+                event_kind = "note_created",
+                "memory_remembered (note_created) event store acquisition failed; remember result is unaffected"
+            );
+            return;
+        }
+    };
+    let actor = format!("{}:{}", token.actor().kind, token.actor().id);
+    let payload = json!({
+        "actor": actor,
+        "memory_type": memory_type,
+        "salience": salience,
+    });
+    let event = khive_storage::Event::new(
+        token.namespace().as_str(),
+        "memory.remember",
+        khive_types::EventKind::NoteCreated,
+        khive_types::SubstrateKind::Note,
+        actor,
+    )
+    .with_payload(payload)
+    .with_target(note_id);
+    if let Err(err) = store.append_event(event).await {
+        tracing::warn!(
+            error = %err,
+            "memory_remembered (note_created) event append failed; remember result is unaffected"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use khive_pack_kg::KgPack;
+    use khive_runtime::{KhiveRuntime, Namespace, VerbRegistryBuilder};
+
+    use crate::MemoryPack;
+
+    /// `memory.remember` must persist a `NoteCreated` event (the
+    /// "memory_remembered" signal) carrying the calling actor, the new
+    /// note's id as `target_id`, and `substrate = Note` so
+    /// `decode_target_observation` resolves it as a `Note` referent.
+    #[tokio::test]
+    async fn remember_persists_note_created_event_with_target() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns).expect("authorize local");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+
+        let result = registry
+            .dispatch(
+                "memory.remember",
+                serde_json::json!({
+                    "content": "memory_remembered event payload coverage",
+                    "memory_type": "semantic",
+                }),
+            )
+            .await
+            .expect("memory.remember must succeed");
+        let note_id: uuid::Uuid = result["id"]
+            .as_str()
+            .expect("response must carry id")
+            .parse()
+            .expect("id must be a uuid");
+
+        let store = rt.events(&token).expect("event store");
+        let page = store
+            .query_events(
+                khive_storage::event::EventFilter {
+                    kinds: vec![khive_types::EventKind::NoteCreated],
+                    ..Default::default()
+                },
+                khive_storage::types::PageRequest {
+                    offset: 0,
+                    limit: 10,
+                },
+            )
+            .await
+            .expect("query_events");
+
+        assert_eq!(
+            page.items.len(),
+            1,
+            "exactly one NoteCreated event must be persisted: {page:?}"
+        );
+        let event = &page.items[0];
+        assert_eq!(event.verb, "memory.remember");
+        assert_eq!(
+            event.actor,
+            format!("{}:{}", token.actor().kind, token.actor().id)
+        );
+        assert_eq!(event.target_id, Some(note_id));
+        assert_eq!(event.substrate, khive_types::SubstrateKind::Note);
+        assert_eq!(event.payload["memory_type"], serde_json::json!("semantic"));
     }
 }

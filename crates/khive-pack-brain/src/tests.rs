@@ -6411,6 +6411,179 @@ mod event_counts_tests {
         assert!(result["counts_by_kind"].get("search_executed").is_none());
     }
 
+    // ── brain.mark_turn work-start marker ────────────────────
+
+    /// `brain.mark_turn` must persist a `PhaseStarted` event carrying the
+    /// calling actor, the fixed `work_class = "actor_turn"`, and the caller's
+    /// free-form `label` in the `phase` field.
+    #[tokio::test]
+    async fn mark_turn_persists_phase_started_actor_turn_event() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        let result = pack
+            .dispatch(
+                "brain.mark_turn",
+                json!({ "label": "wake" }),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("brain.mark_turn must succeed");
+
+        assert_eq!(result["ok"], json!(true));
+        assert_eq!(result["work_class"], json!("actor_turn"));
+
+        let page = rt
+            .events(&token)
+            .expect("event store")
+            .query_events(
+                EventFilter {
+                    kinds: vec![EventKind::PhaseStarted],
+                    ..EventFilter::default()
+                },
+                PageRequest {
+                    offset: 0,
+                    limit: 10,
+                },
+            )
+            .await
+            .expect("query_events");
+
+        assert_eq!(
+            page.items.len(),
+            1,
+            "exactly one PhaseStarted event must be persisted: {page:?}"
+        );
+        let event = &page.items[0];
+        assert_eq!(event.verb, "brain.mark_turn");
+        assert_eq!(
+            event.actor,
+            format!("{}:{}", token.actor().kind, token.actor().id)
+        );
+        assert_eq!(event.payload["work_class"], json!("actor_turn"));
+        assert_eq!(event.payload["phase"], json!("wake"));
+    }
+
+    /// A rejected credential-shaped label must not reach the event plane.
+    #[tokio::test]
+    async fn mark_turn_blocks_secret_label_without_persisting_event() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let actor = format!("{}:{}", token.actor().kind, token.actor().id);
+        let window_start = chrono::Utc::now().timestamp_micros();
+
+        let err = pack
+            .dispatch(
+                "brain.mark_turn",
+                json!({
+                    "label": "AKIAFAKEKEY000000000", // gitleaks:allow
+                }),
+                &registry,
+                &token,
+            )
+            .await
+            .expect_err("credential-shaped label must be rejected");
+        let window_end = chrono::Utc::now().timestamp_micros();
+
+        assert!(
+            matches!(err, RuntimeError::SecretDetected(_)),
+            "credential-shaped label must return SecretDetected, got {err:?}"
+        );
+
+        let page = rt
+            .events(&token)
+            .expect("event store")
+            .query_events(
+                EventFilter {
+                    kinds: vec![EventKind::PhaseStarted],
+                    verbs: vec!["brain.mark_turn".to_string()],
+                    actors: vec![actor],
+                    after: Some(window_start.saturating_sub(1)),
+                    before: Some(window_end.saturating_add(1)),
+                    ..EventFilter::default()
+                },
+                PageRequest {
+                    offset: 0,
+                    limit: 10,
+                },
+            )
+            .await
+            .expect("query phase_started events");
+
+        assert!(
+            page.items.is_empty(),
+            "rejected mark_turn must not persist phase_started events: {page:?}"
+        );
+    }
+
+    /// `brain.mark_turn` calls without an explicit `label` default the
+    /// `phase` field to `"actor_turn"`.
+    #[tokio::test]
+    async fn mark_turn_without_label_defaults_phase_to_actor_turn() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        pack.dispatch("brain.mark_turn", json!({}), &registry, &token)
+            .await
+            .expect("brain.mark_turn must succeed with no params");
+
+        let page = rt
+            .events(&token)
+            .expect("event store")
+            .query_events(
+                EventFilter {
+                    kinds: vec![EventKind::PhaseStarted],
+                    ..EventFilter::default()
+                },
+                PageRequest {
+                    offset: 0,
+                    limit: 10,
+                },
+            )
+            .await
+            .expect("query_events");
+
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].payload["phase"], json!("actor_turn"));
+    }
+
+    /// The `actor_turn` work-unit marker must be visible in
+    /// `brain.event_counts`'s `counts_by_work_class` (the flywheel-scorecard
+    /// discipline-ratio denominator) and grouped correctly by actor via the
+    /// existing kind-agnostic `counts_by_actor` machinery.
+    #[tokio::test]
+    async fn mark_turn_counted_by_work_class_and_grouped_by_actor_in_event_counts() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        pack.dispatch("brain.mark_turn", json!({}), &registry, &token)
+            .await
+            .expect("brain.mark_turn 1");
+        pack.dispatch("brain.mark_turn", json!({}), &registry, &token)
+            .await
+            .expect("brain.mark_turn 2");
+
+        let result = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({ "since": micros_to_iso(0) }),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("brain.event_counts must succeed");
+
+        assert_eq!(result["counts_by_work_class"]["actor_turn"], json!(2));
+        let actor = format!("{}:{}", token.actor().kind, token.actor().id);
+        assert_eq!(result["counts_by_actor"][actor.as_str()], json!(2));
+        assert_eq!(result["counts_by_kind"]["phase_started"], json!(2));
+    }
+
     #[tokio::test]
     async fn actor_filter_scopes_counts() {
         let (pack, rt) = make_pack();

@@ -85,8 +85,14 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
             total_cost_unit) is over the fetched page only, same as the other counts_by_* \
             fields — and, to keep a page-scoped number from being read as the real window total, \
             each is renamed to an explicitly incomplete key (total_page_scoped, \
-            total_cost_unit_page_scoped) instead of being returned under its normal name \
-            (issue #14). window_event_total always carries the true count regardless. The \
+            total_cost_unit_page_scoped) instead of being returned under its normal name. \
+            window_event_total always carries the true count regardless. \
+            `kind`/`actor` filters are applied in SQL before the internal window cap \
+            — `window_event_total` reflects the exact filtered total even when \
+            truncated=true. For an exact per-actor count of a specific low-frequency kind, pass \
+            `kind=` explicitly rather than reading it out of an unfiltered call's \
+            counts_by_kind/counts_by_actor breakdown, which is capped over the mixed-kind \
+            window and can undercount a low-frequency kind relative to noisier ones. The \
             unfiltered default view (no `kind`) segregates the high-volume `audit` kind from \
             the shared truncation budget so it cannot crowd other kinds out of counts_by_kind. \
             Pass exhaustive=true for an exact, non-sampled full-window aggregate (paginates \
@@ -366,6 +372,27 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 description: "Serve timestamp in epoch microseconds. Defaults to now.",
             },
         ],
+    },
+    HandlerDef {
+        name: "brain.mark_turn",
+        description: "Emit a PhaseStarted event (work_class=\"actor_turn\") carrying the \
+            calling actor and a timestamp. A per-actor per-work-unit marker: \
+            callers invoke this once per bounded unit of work (a wake, a turn) so \
+            brain.event_counts's counts_by_work_class[\"actor_turn\"], grouped by actor, \
+            gives a discipline-ratio denominator (e.g. feedback_explicit / actor_turn) that \
+            is not biased toward whichever actor issues the most raw verb calls. Reuses the \
+            existing ADR-103 Stage 1 PhaseStarted/work_class vocabulary rather than a new \
+            EventKind variant. Best-effort — never fails the caller's turn.",
+        visibility: khive_types::Visibility::Verb,
+        category: khive_types::VerbCategory::Commissive,
+        params: &[khive_types::ParamDef {
+            name: "label",
+            param_type: "string",
+            required: false,
+            description: "Free-form label for this unit of work (e.g. \"wake\", \"turn\"), \
+                recorded in the event payload's `phase` field for debugging. Does not affect \
+                the work_class grouping, which stays fixed at \"actor_turn\".",
+        }],
     },
     // ── Declaration verbs ─────────────────────────────────────────────────
     HandlerDef {
@@ -1952,6 +1979,51 @@ impl BrainPack {
         }))
     }
 
+    // ── brain.mark_turn ───────────────────────────────────────────────────
+
+    /// Best-effort per-actor work-unit marker. Reuses the
+    /// ADR-103 Stage 1 `PhaseStarted`/`work_class` vocabulary (fixed
+    /// `work_class = "actor_turn"`) instead of minting a new `EventKind`
+    /// variant, since `EventKind` is a closed enum owned by the OSS
+    /// `khive-types` crate.
+    pub(crate) async fn handle_mark_turn(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct MarkTurnParams {
+            label: Option<String>,
+        }
+        let p: MarkTurnParams = serde_json::from_value(params)
+            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+        if let Some(label) = p.label.as_deref() {
+            khive_runtime::secret_gate::check(label)?;
+        }
+        let phase = p.label.unwrap_or_else(|| "actor_turn".to_string());
+        let actor = format!("{}:{}", token.actor().kind, token.actor().id);
+
+        khive_runtime::emit_phase_event(
+            &self.runtime,
+            token,
+            "brain.mark_turn",
+            khive_types::EventKind::PhaseStarted,
+            khive_storage::PhaseStartedPayload {
+                work_class: "actor_turn".to_string(),
+                phase,
+                corpus_size: None,
+            },
+        )
+        .await;
+
+        Ok(json!({
+            "ok": true,
+            "work_class": "actor_turn",
+            "actor": actor,
+        }))
+    }
+
     // ── brain.emit (deprecated) ───────────────────────────────────────────
 
     /// Deprecated alias for `brain.feedback`; routes to `handle_feedback`.
@@ -2911,6 +2983,7 @@ impl khive_runtime::pack::PackRuntime for BrainPack {
             "brain.feedback" => self.handle_feedback(token, params).await,
             "brain.auto_feedback" => self.handle_auto_feedback(token, params).await,
             "brain.record_serve" => self.handle_record_serve(token, params).await,
+            "brain.mark_turn" => self.handle_mark_turn(token, params).await,
             // Declaration
             "brain.bind" => self.handle_bind(token, params).await,
             "brain.unbind" => self.handle_unbind(token, params).await,
