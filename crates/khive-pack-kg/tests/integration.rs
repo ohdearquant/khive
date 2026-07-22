@@ -12025,3 +12025,40 @@ async fn whoami_appears_in_verbs_introspection() {
         "whoami must be registered as a public verb; got {names:?}"
     );
 }
+
+/// Regression for #1168/#1247: the `query()` wire response always carries a
+/// structural `truncated` boolean, present whether or not the cap fired, so
+/// a caller can check it directly instead of inferring "not truncated" from
+/// the absence of a `warnings` entry (whose text also used to recommend an
+/// unimplemented OFFSET/SKIP paging path).
+#[tokio::test]
+async fn query_response_always_carries_truncated_field() {
+    let pack = pack();
+    pack.dispatch(
+        "create",
+        json!({"kind": "entity", "name": "QueryTruncFieldProbe", "entity_kind": "concept"}),
+    )
+    .await
+    .expect("create must succeed");
+
+    let result = pack
+        .dispatch("query", json!({"query": "MATCH (a:concept) RETURN a"}))
+        .await
+        .expect("query must succeed");
+
+    assert_eq!(
+        result.get("truncated").and_then(Value::as_bool),
+        Some(false),
+        "#1247: an under-the-cap query result must still carry truncated:false, not omit the \
+         field; got {result}"
+    );
+    if let Some(warnings) = result.get("warnings").and_then(Value::as_array) {
+        for w in warnings {
+            let text = w.as_str().unwrap_or_default();
+            assert!(
+                !text.contains("LIMIT/OFFSET"),
+                "#1168: no warning may recommend the unimplemented OFFSET/SKIP path: {text}"
+            );
+        }
+    }
+}

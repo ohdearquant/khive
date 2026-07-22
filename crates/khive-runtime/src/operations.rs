@@ -4134,6 +4134,11 @@ pub struct QueryResult {
     pub rows: Vec<SqlRow>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    /// `true` when the server-side row cap bound this result — `rows` is a
+    /// prefix of the true match set, not the whole thing (#1168, #1247). A
+    /// structural flag so a caller can detect an incomplete result without
+    /// parsing the human-oriented `warnings` text.
+    pub truncated: bool,
 }
 
 impl KhiveRuntime {
@@ -4216,25 +4221,39 @@ impl KhiveRuntime {
         // result set — not the requested LIMIT — is the truncation signal
         // (a `LIMIT 1000` that only matches 20 rows must not warn, and a
         // query with no `LIMIT` that matches 501+ rows must).
+        let mut truncated = false;
         if let Some(check) = truncation_check {
             if rows.len() > check.max_limit {
                 rows.truncate(check.max_limit);
+                truncated = true;
+                // GQL has no SKIP/OFFSET/ORDER BY today (#1168) — the prior
+                // wording here recommended a paging path that does not exist.
+                // `truncated` is the structural signal (#1247); this message
+                // stays prose-only context for a human reader.
                 warnings.push(match check.requested_limit {
                     Some(requested) => format!(
                         "result set capped at {} rows; requested limit {requested} exceeds the \
-                         cap — use LIMIT/OFFSET to page through the remaining results",
+                         cap. This query language does not support SKIP/OFFSET paging yet — \
+                         check the `truncated` field, not this message, to detect an incomplete \
+                         result programmatically.",
                         check.max_limit
                     ),
                     None => format!(
                         "result set capped at {} rows; more than {} rows matched with no LIMIT \
-                         clause — use LIMIT/OFFSET to page through the remaining results",
+                         clause. This query language does not support SKIP/OFFSET paging yet — \
+                         check the `truncated` field, not this message, to detect an incomplete \
+                         result programmatically.",
                         check.max_limit, check.max_limit
                     ),
                 });
             }
         }
 
-        Ok(QueryResult { rows, warnings })
+        Ok(QueryResult {
+            rows,
+            warnings,
+            truncated,
+        })
     }
 
     /// Soft-delete or hard-delete an entity by ID (soft delete by default).
