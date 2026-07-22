@@ -3288,10 +3288,9 @@ async fn upsert_edge_guarded_probe_is_atomic_with_insert_on_file_backed_singleto
     );
 }
 
-/// A store whose schema was never created, so every statement fails at
-/// execution — after the round trip has been issued. That is the only shape
-/// that separates "issued" from "succeeded" deterministically, with no
-/// fault-injection hook and no timing dependence.
+/// A store whose schema was never created, so statement preparation fails
+/// before any query reaches the database. Used to pin the negative case: a
+/// read that never got as far as executing must count no round trip.
 fn setup_memory_store_without_schema() -> SqlGraphStore {
     let config = PoolConfig {
         path: None,
@@ -3301,36 +3300,94 @@ fn setup_memory_store_without_schema() -> SqlGraphStore {
     SqlGraphStore::new_scoped(pool, false, "default")
 }
 
-/// `db_round_trips` counts round trips ISSUED, not round trips that resolved
-/// `Ok`. Accounting that commits only on success under-reports exactly when a
-/// caller most wants the number: a request that did real database work and
-/// then failed reports as if it had done none.
+/// A store holding `good` valid edges out of `node`, plus one row whose
+/// `relation` column is not a member of the closed relation enum.
 ///
-/// `graph_hops` is the opposite case by its own definition — adjacency rows
-/// storage *returned* — so a failed query legitimately contributes none.
+/// Written through raw SQL because the typed write path cannot express it —
+/// which is the point: the row models a database that has drifted from the
+/// binary reading it, the one shape where a query prepares, executes, and
+/// returns rows, and then fails partway through converting them. Weights
+/// order the valid rows ahead of the corrupt one, so the number of entries
+/// storage returns before the failure is fixed rather than incidental.
+fn setup_store_with_a_corrupt_relation_row(node: Uuid, good: usize) -> SqlGraphStore {
+    let config = PoolConfig {
+        path: None,
+        ..PoolConfig::default()
+    };
+    let pool = Arc::new(ConnectionPool::new(config).unwrap());
+    {
+        let writer = pool.writer().unwrap();
+        writer.conn().execute_batch(GRAPH_DDL).unwrap();
+        let now = Utc::now().timestamp_micros();
+        for i in 0..good {
+            writer
+                .conn()
+                .execute(
+                    "INSERT INTO graph_edges \
+                     (namespace, id, source_id, target_id, relation, weight, created_at, updated_at) \
+                     VALUES ('default', ?1, ?2, ?3, 'extends', ?4, ?5, ?5)",
+                    rusqlite::params![
+                        Uuid::new_v4().to_string(),
+                        node.to_string(),
+                        Uuid::new_v4().to_string(),
+                        1.0 - (i as f64) * 0.01,
+                        now,
+                    ],
+                )
+                .unwrap();
+        }
+        writer
+            .conn()
+            .execute(
+                "INSERT INTO graph_edges \
+                 (namespace, id, source_id, target_id, relation, weight, created_at, updated_at) \
+                 VALUES ('default', ?1, ?2, ?3, 'not_a_relation', 0.1, ?4, ?4)",
+                rusqlite::params![
+                    Uuid::new_v4().to_string(),
+                    node.to_string(),
+                    Uuid::new_v4().to_string(),
+                    now,
+                ],
+            )
+            .unwrap();
+    }
+    SqlGraphStore::new_scoped(pool, false, "default")
+}
+
+fn neighbor_query(limit: u32) -> NeighborQuery {
+    NeighborQuery {
+        direction: Direction::Out,
+        relations: None,
+        limit: Some(limit),
+        min_weight: None,
+    }
+}
+
+/// `db_round_trips` counts round trips ISSUED. A read that executed and then
+/// failed did real database work, and reporting zero for it is the failure
+/// mode a consumer of these numbers cannot afford.
+///
+/// `graph_hops` counts adjacency entries storage RETURNED, which is a
+/// statement about the database rather than about our types: all three rows
+/// here came back off the cursor, and the third then failed to convert into
+/// an `EdgeRelation`. So the expected count is `good + 1`, matching where the
+/// traversal path increments — immediately after the row is read, before any
+/// parsing. Counting after conversion would attribute our own decoding failure
+/// to storage having done less work than it did.
 #[tokio::test]
-async fn neighbors_counts_the_issued_round_trip_when_the_query_fails() {
-    let store = setup_memory_store_without_schema();
+async fn neighbors_counts_the_query_and_the_rows_returned_before_the_failure() {
+    let node = Uuid::new_v4();
+    let store = setup_store_with_a_corrupt_relation_row(node, 2);
     let ctx = khive_storage::usage::UsageContext::new();
 
     let result = khive_storage::usage::scope(ctx.clone(), async {
-        store
-            .neighbors(
-                Uuid::new_v4(),
-                NeighborQuery {
-                    direction: Direction::Out,
-                    relations: None,
-                    limit: None,
-                    min_weight: None,
-                },
-            )
-            .await
+        store.neighbors(node, neighbor_query(10)).await
     })
     .await;
 
     assert!(
         result.is_err(),
-        "a store with no schema must fail the query, or this test proves nothing"
+        "the corrupt relation row must fail conversion, or this test proves nothing"
     );
 
     let usage = ctx.snapshot();
@@ -3339,11 +3396,77 @@ async fn neighbors_counts_the_issued_round_trip_when_the_query_fails() {
             .get("db_round_trips")
             .and_then(serde_json::Value::as_u64),
         Some(1),
-        "the round trip was issued and must be counted despite the error; got {usage}"
+        "the query executed and must be counted despite the error; got {usage}"
+    );
+    assert_eq!(
+        usage.get("graph_hops").and_then(serde_json::Value::as_u64),
+        Some(3),
+        "all three rows came back off the cursor before the conversion failed; got {usage}"
+    );
+}
+
+/// The other direction, and the one an unconditional post-await increment gets
+/// wrong: a read whose statement never prepared issued nothing, so it must
+/// count nothing. Counting it would inflate the number with work that did not
+/// happen, which is the same class of error as dropping work that did.
+#[tokio::test]
+async fn neighbors_counts_nothing_when_the_statement_never_prepared() {
+    let store = setup_memory_store_without_schema();
+    let ctx = khive_storage::usage::UsageContext::new();
+
+    let result = khive_storage::usage::scope(ctx.clone(), async {
+        store.neighbors(Uuid::new_v4(), neighbor_query(10)).await
+    })
+    .await;
+
+    assert!(
+        result.is_err(),
+        "a store with no schema must fail to prepare, or this test proves nothing"
+    );
+
+    let usage = ctx.snapshot();
+    assert!(
+        usage.get("db_round_trips").is_none(),
+        "no statement executed, so no round trip may be counted; got {usage}"
     );
     assert!(
         usage.get("graph_hops").is_none(),
-        "no adjacency rows were returned, so graph_hops must be absent; got {usage}"
+        "no rows were returned; got {usage}"
+    );
+}
+
+/// Both directions again on the batched path, where a chunked read makes the
+/// stakes higher: the counters live across the whole chunk loop, so a failure
+/// in a later chunk must not erase what earlier chunks already did.
+#[tokio::test]
+async fn batch_neighbors_counts_the_query_and_the_rows_returned_before_the_failure() {
+    let node = Uuid::new_v4();
+    let store = setup_store_with_a_corrupt_relation_row(node, 2);
+    let ctx = khive_storage::usage::UsageContext::new();
+
+    let sources = vec![node];
+    let result = khive_storage::usage::scope(ctx.clone(), async {
+        store.batch_neighbors(&sources, neighbor_query(10)).await
+    })
+    .await;
+
+    assert!(
+        result.is_err(),
+        "the corrupt relation row must fail conversion, or this test proves nothing"
+    );
+
+    let usage = ctx.snapshot();
+    assert_eq!(
+        usage
+            .get("db_round_trips")
+            .and_then(serde_json::Value::as_u64),
+        Some(1),
+        "the batched query executed and must be counted despite the error; got {usage}"
+    );
+    assert_eq!(
+        usage.get("graph_hops").and_then(serde_json::Value::as_u64),
+        Some(3),
+        "all three rows came back off the cursor before the conversion failed; got {usage}"
     );
 }
 
@@ -3379,50 +3502,5 @@ async fn traverse_counts_the_issued_chunk_when_the_query_fails() {
             .and_then(serde_json::Value::as_u64),
         Some(1),
         "the chunk query was issued and must be counted despite the error; got {usage}"
-    );
-}
-
-/// The batched adjacency path chunks its source list, so the same rule that
-/// protects `traverse` protects it: a failure in any chunk must not erase the
-/// round trips the earlier chunks already issued. This is the read path a
-/// caller reaches through multi-source neighbor expansion, and it took its own
-/// fix — sharing the doctrine with `neighbors` did not make it share the code.
-#[tokio::test]
-async fn batch_neighbors_counts_the_issued_round_trip_when_the_query_fails() {
-    let store = setup_memory_store_without_schema();
-    let ctx = khive_storage::usage::UsageContext::new();
-
-    let sources = vec![Uuid::new_v4(), Uuid::new_v4()];
-    let result = khive_storage::usage::scope(ctx.clone(), async {
-        store
-            .batch_neighbors(
-                &sources,
-                NeighborQuery {
-                    direction: Direction::Both,
-                    relations: None,
-                    limit: Some(10),
-                    min_weight: None,
-                },
-            )
-            .await
-    })
-    .await;
-
-    assert!(
-        result.is_err(),
-        "a store with no schema must fail the query, or this test proves nothing"
-    );
-
-    let usage = ctx.snapshot();
-    assert_eq!(
-        usage
-            .get("db_round_trips")
-            .and_then(serde_json::Value::as_u64),
-        Some(1),
-        "the batched query was issued and must be counted despite the error; got {usage}"
-    );
-    assert!(
-        usage.get("graph_hops").is_none(),
-        "no adjacency rows were returned, so graph_hops must be absent; got {usage}"
     );
 }

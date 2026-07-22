@@ -597,6 +597,28 @@ impl SqlGraphStore {
 // Helpers
 // =============================================================================
 
+/// Publish a graph read's accounting after the read resolves, on either
+/// outcome.
+///
+/// Both counters are collected inside the storage closure because that closure
+/// runs on a blocking thread where the task-local usage context is invisible,
+/// and because a value returned only on success reports nothing at all when
+/// the read fails partway. `queries` is incremented immediately before a
+/// statement executes, so a read that never got that far — a connection the
+/// pool could not hand out, a blocking task that died — counts no round trip.
+/// `rows` is incremented as each adjacency entry materialises, so entries
+/// storage already returned still count when a later row fails to convert.
+fn report_graph_usage(queries: &std::sync::atomic::AtomicU64, rows: &std::sync::atomic::AtomicU64) {
+    khive_storage::usage::count(
+        khive_storage::usage::UsageUnit::DbRoundTrips,
+        queries.load(std::sync::atomic::Ordering::Relaxed),
+    );
+    khive_storage::usage::count(
+        khive_storage::usage::UsageUnit::GraphHops,
+        rows.load(std::sync::atomic::Ordering::Relaxed),
+    );
+}
+
 fn read_edge(row: &rusqlite::Row<'_>) -> Result<Edge, rusqlite::Error> {
     let namespace: String = row.get(0)?;
     let id_str: String = row.get(1)?;
@@ -1253,11 +1275,17 @@ impl GraphStore for SqlGraphStore {
 
         let namespace = self.namespace.clone();
         let mut result: Vec<(Uuid, NeighborHit)> = Vec::new();
+        // Declared across the whole chunk loop, not per chunk: a failure in a
+        // later chunk must not erase what the earlier chunks already did.
+        let counted_queries = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counted_rows = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         for chunk in unique_sources.chunks(CHUNK_SIZE) {
             let chunk_owned: Vec<Uuid> = chunk.to_vec();
             let query_clone = query.clone();
             let ns = namespace.clone();
+            let closure_queries = Arc::clone(&counted_queries);
+            let closure_rows = Arc::clone(&counted_rows);
 
             let chunk_result = self
                 .with_reader("batch_neighbors", move |conn| {
@@ -1380,6 +1408,7 @@ impl GraphStore for SqlGraphStore {
                         all_params.iter().map(|p| p.as_ref()).collect();
 
                     let mut stmt = conn.prepare(&full_sql)?;
+                    closure_queries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let rows = stmt.query_map(param_refs.as_slice(), |row| {
                         let origin_str: String = row.get(0)?;
                         let nid_str: String = row.get(1)?;
@@ -1392,6 +1421,7 @@ impl GraphStore for SqlGraphStore {
                     let mut pairs = Vec::new();
                     for row in rows {
                         let (origin_str, nid_str, eid_str, relation_str, weight) = row?;
+                        closure_rows.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let origin = parse_uuid(&origin_str)?;
                         let node_id = parse_uuid(&nid_str)?;
                         let edge_id = parse_uuid(&eid_str)?;
@@ -1418,14 +1448,16 @@ impl GraphStore for SqlGraphStore {
                     Ok(pairs)
                 })
                 .await;
-            khive_storage::usage::count(khive_storage::usage::UsageUnit::DbRoundTrips, 1);
-            let pairs = chunk_result?;
-            khive_storage::usage::count(
-                khive_storage::usage::UsageUnit::GraphHops,
-                pairs.len() as u64,
-            );
+            let pairs = match chunk_result {
+                Ok(pairs) => pairs,
+                Err(e) => {
+                    report_graph_usage(&counted_queries, &counted_rows);
+                    return Err(e);
+                }
+            };
             result.extend(pairs);
         }
+        report_graph_usage(&counted_queries, &counted_rows);
 
         let requested: HashSet<Uuid> = unique_sources.iter().copied().collect();
         let mut grouped: HashMap<Uuid, Vec<NeighborHit>> =
@@ -1657,6 +1689,10 @@ impl GraphStore for SqlGraphStore {
         let namespace = self.namespace.clone();
         let node_str = node_id.to_string();
 
+        let counted_queries = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counted_rows = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let closure_queries = Arc::clone(&counted_queries);
+        let closure_rows = Arc::clone(&counted_rows);
         let result = self
             .with_reader("neighbors", move |conn| {
                 let base_out = "SELECT target_id AS node_id, id AS edge_id, relation, weight \
@@ -1694,6 +1730,7 @@ impl GraphStore for SqlGraphStore {
                 let param_refs: Vec<&dyn rusqlite::types::ToSql> =
                     all_params.iter().map(|p| p.as_ref()).collect();
 
+                closure_queries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let rows = stmt.query_map(param_refs.as_slice(), |row| {
                     let nid_str: String = row.get(0)?;
                     let eid_str: String = row.get(1)?;
@@ -1705,6 +1742,7 @@ impl GraphStore for SqlGraphStore {
                 let mut hits = Vec::new();
                 for row in rows {
                     let (nid_str, eid_str, relation_str, weight) = row?;
+                    closure_rows.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let relation = relation_str.parse::<EdgeRelation>().map_err(|e| {
                         rusqlite::Error::FromSqlConversionFailure(
                             2,
@@ -1727,16 +1765,7 @@ impl GraphStore for SqlGraphStore {
             })
             .await;
 
-        // The round trip was ISSUED whether or not it resolved, so it counts
-        // on both outcomes; `graph_hops` counts rows storage actually
-        // returned, so it counts only what came back.
-        khive_storage::usage::count(khive_storage::usage::UsageUnit::DbRoundTrips, 1);
-        if let Ok(hits) = &result {
-            khive_storage::usage::count(
-                khive_storage::usage::UsageUnit::GraphHops,
-                hits.len() as u64,
-            );
-        }
+        report_graph_usage(&counted_queries, &counted_rows);
         result
     }
 
@@ -1754,6 +1783,10 @@ impl GraphStore for SqlGraphStore {
         let namespace = self.namespace.clone();
         let node_str = node_id.to_string();
 
+        let counted_queries = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counted_rows = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let closure_queries = Arc::clone(&counted_queries);
+        let closure_rows = Arc::clone(&counted_rows);
         let result = self
             .with_reader("neighbors_both_directions", move |conn| {
                 let base_out = "SELECT target_id AS node_id, id AS edge_id, relation, weight, \
@@ -1793,6 +1826,7 @@ impl GraphStore for SqlGraphStore {
                 let param_refs: Vec<&dyn rusqlite::types::ToSql> =
                     all_params.iter().map(|p| p.as_ref()).collect();
 
+                closure_queries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let rows = stmt.query_map(param_refs.as_slice(), |row| {
                     let nid_str: String = row.get(0)?;
                     let eid_str: String = row.get(1)?;
@@ -1805,6 +1839,7 @@ impl GraphStore for SqlGraphStore {
                 let mut hits = Vec::new();
                 for row in rows {
                     let (nid_str, eid_str, relation_str, weight, dir_str) = row?;
+                    closure_rows.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let relation = relation_str.parse::<EdgeRelation>().map_err(|e| {
                         rusqlite::Error::FromSqlConversionFailure(
                             2,
@@ -1835,16 +1870,7 @@ impl GraphStore for SqlGraphStore {
             })
             .await;
 
-        // The round trip was ISSUED whether or not it resolved, so it counts
-        // on both outcomes; `graph_hops` counts rows storage actually
-        // returned, so it counts only what came back.
-        khive_storage::usage::count(khive_storage::usage::UsageUnit::DbRoundTrips, 1);
-        if let Ok(hits) = &result {
-            khive_storage::usage::count(
-                khive_storage::usage::UsageUnit::GraphHops,
-                hits.len() as u64,
-            );
-        }
+        report_graph_usage(&counted_queries, &counted_rows);
         result
     }
 
