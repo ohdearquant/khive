@@ -628,20 +628,40 @@ fn prepare_daemon_log_file(log_path: &std::path::Path) -> Option<std::fs::File> 
     prepare_daemon_log_file_with_cap(log_path, DAEMON_LOG_MAX_BYTES)
 }
 
-fn spawn_daemon() -> std::io::Result<std::process::Child> {
-    let exe = std::env::current_exe()?;
-    spawn_daemon_with_exe(&exe)
+fn daemon_args(config: Option<&std::path::Path>) -> Vec<std::ffi::OsString> {
+    let mut args = vec![
+        std::ffi::OsString::from("mcp"),
+        std::ffi::OsString::from("--daemon"),
+    ];
+    if let Some(path) = config {
+        args.push(std::ffi::OsString::from("--config"));
+        args.push(path.as_os_str().to_os_string());
+    }
+    args
 }
 
-fn spawn_daemon_with_exe(exe: &std::path::Path) -> std::io::Result<std::process::Child> {
+fn spawn_daemon() -> std::io::Result<std::process::Child> {
+    spawn_daemon_with_config(None)
+}
+
+fn spawn_daemon_with_config(
+    config: Option<&std::path::Path>,
+) -> std::io::Result<std::process::Child> {
+    let exe = std::env::current_exe()?;
+    spawn_daemon_with_exe_and_config(&exe, config)
+}
+
+fn spawn_daemon_with_exe_and_config(
+    exe: &std::path::Path,
+    config: Option<&std::path::Path>,
+) -> std::io::Result<std::process::Child> {
     #[cfg(test)]
     SPAWN_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
     // The binary is `kkernel`; the MCP server (and its daemon mode) live under
     // the `mcp` subcommand.
     let mut cmd = std::process::Command::new(exe);
-    cmd.arg("mcp")
-        .arg("--daemon")
+    cmd.args(daemon_args(config))
         .stdin(Stdio::null())
         .stdout(Stdio::null());
     // The daemon's tracing (including WAL/checkpoint telemetry) goes to
@@ -1710,12 +1730,31 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
     forward_or_spawn_with(frame, &spawn_daemon).await
 }
 
+/// Forward a request and propagate an explicitly selected config to any
+/// daemon process this call auto-spawns.
+pub async fn forward_or_spawn_with_config(
+    frame: &DaemonRequestFrame,
+    config: Option<&std::path::Path>,
+) -> Option<Result<String, McpError>> {
+    let spawn = || spawn_daemon_with_config(config);
+    forward_or_spawn_with(frame, &spawn).await
+}
+
 #[cfg(test)]
 async fn forward_or_spawn_with_exe(
     frame: &DaemonRequestFrame,
     exe: &std::path::Path,
 ) -> Option<Result<String, McpError>> {
-    let spawn = || spawn_daemon_with_exe(exe);
+    forward_or_spawn_with_exe_and_config(frame, exe, None).await
+}
+
+#[cfg(test)]
+async fn forward_or_spawn_with_exe_and_config(
+    frame: &DaemonRequestFrame,
+    exe: &std::path::Path,
+    config: Option<&std::path::Path>,
+) -> Option<Result<String, McpError>> {
+    let spawn = || spawn_daemon_with_exe_and_config(exe, config);
     forward_or_spawn_with(frame, &spawn).await
 }
 
@@ -2938,6 +2977,60 @@ mod tests {
         std::env::remove_var("KHIVE_LOCK");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn strict_auto_spawn_passes_selected_config() {
+        clear_daemon_env();
+        reset_fallback_counters();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let captured_args = dir.path().join("daemon-args");
+        let config = dir.path().join("selected-khive.toml");
+        std::env::set_var("KHIVE_SOCKET", dir.path().join("khived.sock"));
+        std::env::set_var("KHIVE_PID", dir.path().join("khived.pid"));
+        std::env::set_var("KHIVE_LOCK", dir.path().join("khived.recovery.lock"));
+        std::env::set_var("KHIVE_DAEMON_STRICT", "1");
+        std::env::set_var("KHIVE_TEST_DAEMON_ARGS", &captured_args);
+        std::env::remove_var("KHIVE_NO_DAEMON");
+        let exe = daemon_script_fixture(
+            &dir,
+            "capture-args",
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$KHIVE_TEST_DAEMON_ARGS\"\nsleep 10\n",
+        );
+
+        let out = forward_or_spawn_with_exe_and_config(
+            &unreachable_daemon_frame(CFG),
+            &exe,
+            Some(&config),
+        )
+        .await;
+
+        let error = match out {
+            Some(Err(error)) => error,
+            other => panic!(
+                "strict mode must reject the no-socket fallback after the spawn probe: {other:?}"
+            ),
+        };
+        let data = error.data.expect("strict fallback error data");
+        assert_eq!(data[STRICT_FALLBACK_MARKER], true);
+        assert_eq!(data["reason"], "no_socket");
+        let args = std::fs::read_to_string(&captured_args).expect("read captured daemon args");
+        assert_eq!(
+            args.lines().collect::<Vec<_>>(),
+            [
+                "mcp",
+                "--daemon",
+                "--config",
+                config.to_str().expect("UTF-8 config path")
+            ]
+        );
+
+        clear_daemon_env();
+        std::env::remove_var("KHIVE_LOCK");
+        std::env::remove_var("KHIVE_DAEMON_STRICT");
+        std::env::remove_var("KHIVE_TEST_DAEMON_ARGS");
+    }
+
     #[tokio::test]
     #[serial]
     async fn daemon_round_trip_dispatches_and_enforces_config_id() {
@@ -3584,6 +3677,22 @@ mod tests {
     fn argv_daemon_true_bare() {
         // Exact daemon argv as spawned by spawn_daemon().
         assert!(argv_is_khive_daemon("kkernel mcp --daemon"));
+    }
+
+    #[test]
+    fn daemon_args_include_selected_config() {
+        let config = std::path::Path::new("/tmp/selected-khive.toml");
+        let args = daemon_args(Some(config));
+
+        assert_eq!(
+            args,
+            [
+                std::ffi::OsString::from("mcp"),
+                std::ffi::OsString::from("--daemon"),
+                std::ffi::OsString::from("--config"),
+                config.as_os_str().to_os_string(),
+            ]
+        );
     }
 
     #[test]
