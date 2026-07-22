@@ -203,6 +203,7 @@ pub fn arm_rollback_cleanup_fail(ns: &str) {
 pub struct NoteSearchHit {
     pub note_id: Uuid,
     pub score: DeterministicScore,
+    pub source: crate::SearchSource,
     pub title: Option<String>,
     pub snippet: Option<String>,
 }
@@ -3556,6 +3557,7 @@ impl KhiveRuntime {
                 Some(NoteSearchHit {
                     note_id: hit.entity_id,
                     score: weighted,
+                    source: hit.source,
                     title: hit.title.or_else(|| note_title(note)),
                     snippet: hit.snippet.or_else(|| note_snippet(note)),
                 })

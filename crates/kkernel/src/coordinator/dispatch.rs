@@ -8,7 +8,7 @@ use tokio::task::JoinError;
 use uuid::Uuid;
 
 use khive_runtime::{
-    BackendId, EdgeEndpointKind, KhiveRuntime, NoteSearchHit, Resolved, SearchHit,
+    BackendId, EdgeEndpointKind, KhiveRuntime, NoteSearchHit, Resolved, SearchHit, SearchSource,
 };
 use khive_score::DeterministicScore;
 use khive_storage::EdgeRelation;
@@ -620,37 +620,49 @@ impl SubstrateCoordinator {
 
 // ---- RRF merge ----
 
+#[derive(Default)]
+struct RrfMergeBucket {
+    score: f64,
+    source: Option<SearchSource>,
+    title: Option<String>,
+    snippet: Option<String>,
+}
+
 /// Merge multiple ranked entity hit lists via Reciprocal Rank Fusion (k=60).
-fn rrf_merge_entity_hits(lists: Vec<Vec<SearchHit>>, limit: usize) -> Vec<SearchHit> {
+pub(super) fn rrf_merge_entity_hits(lists: Vec<Vec<SearchHit>>, limit: usize) -> Vec<SearchHit> {
     const K: f64 = 60.0;
 
-    let mut scores: HashMap<Uuid, (f64, Option<String>, Option<String>)> = HashMap::new();
+    let mut scores: HashMap<Uuid, RrfMergeBucket> = HashMap::new();
 
     for list in &lists {
         for (i, hit) in list.iter().enumerate() {
             let rank = (i + 1) as f64;
             let rrf = 1.0 / (K + rank);
-            let entry = scores.entry(hit.entity_id).or_insert((0.0, None, None));
-            entry.0 += rrf;
-            if entry.1.is_none() {
-                entry.1 = hit.title.clone();
+            let entry = scores.entry(hit.entity_id).or_default();
+            entry.score += rrf;
+            entry.source = Some(match entry.source {
+                Some(source) => source.union(hit.source),
+                None => hit.source,
+            });
+            if entry.title.is_none() {
+                entry.title = hit.title.clone();
             }
-            if entry.2.is_none() {
-                entry.2 = hit.snippet.clone();
+            if entry.snippet.is_none() {
+                entry.snippet = hit.snippet.clone();
             }
         }
     }
 
     let mut merged: Vec<SearchHit> = scores
         .into_iter()
-        .map(|(id, (score, title, snippet))| {
-            let det_score = DeterministicScore::from_f64(score);
+        .map(|(id, bucket)| {
+            let det_score = DeterministicScore::from_f64(bucket.score);
             SearchHit {
                 entity_id: id,
                 score: det_score,
-                source: khive_runtime::SearchSource::Both,
-                title,
-                snippet,
+                source: bucket.source.expect("each bucket gets a source"),
+                title: bucket.title,
+                snippet: bucket.snippet,
             }
         })
         .collect();
@@ -664,32 +676,37 @@ fn rrf_merge_entity_hits(lists: Vec<Vec<SearchHit>>, limit: usize) -> Vec<Search
 fn rrf_merge_note_hits(lists: Vec<Vec<NoteSearchHit>>, limit: usize) -> Vec<NoteSearchHit> {
     const K: f64 = 60.0;
 
-    let mut scores: HashMap<Uuid, (f64, Option<String>, Option<String>)> = HashMap::new();
+    let mut scores: HashMap<Uuid, RrfMergeBucket> = HashMap::new();
 
     for list in &lists {
         for (i, hit) in list.iter().enumerate() {
             let rank = (i + 1) as f64;
             let rrf = 1.0 / (K + rank);
-            let entry = scores.entry(hit.note_id).or_insert((0.0, None, None));
-            entry.0 += rrf;
-            if entry.1.is_none() {
-                entry.1 = hit.title.clone();
+            let entry = scores.entry(hit.note_id).or_default();
+            entry.score += rrf;
+            entry.source = Some(match entry.source {
+                Some(source) => source.union(hit.source),
+                None => hit.source,
+            });
+            if entry.title.is_none() {
+                entry.title = hit.title.clone();
             }
-            if entry.2.is_none() {
-                entry.2 = hit.snippet.clone();
+            if entry.snippet.is_none() {
+                entry.snippet = hit.snippet.clone();
             }
         }
     }
 
     let mut merged: Vec<NoteSearchHit> = scores
         .into_iter()
-        .map(|(id, (score, title, snippet))| {
-            let det_score = DeterministicScore::from_f64(score);
+        .map(|(id, bucket)| {
+            let det_score = DeterministicScore::from_f64(bucket.score);
             NoteSearchHit {
                 note_id: id,
                 score: det_score,
-                title,
-                snippet,
+                source: bucket.source.expect("each bucket gets a source"),
+                title: bucket.title,
+                snippet: bucket.snippet,
             }
         })
         .collect();

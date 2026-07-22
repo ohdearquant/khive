@@ -51,6 +51,28 @@ pub enum SearchSource {
     Both,
 }
 
+impl SearchSource {
+    /// Combine retrieval-leg membership from two appearances of the same hit.
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Text, Self::Text) => Self::Text,
+            (Self::Vector, Self::Vector) => Self::Vector,
+            _ => Self::Both,
+        }
+    }
+
+    /// Lowercase wire representation used by search serializers.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Vector => "vector",
+            Self::Text => "text",
+            Self::Both => "both",
+        }
+    }
+}
+
 /// RRF constant. Controls how strongly top ranks dominate.
 ///
 /// The paper's k=60 over-compresses scores at KG scale (tens–thousands of
