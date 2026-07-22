@@ -311,6 +311,43 @@ pub(crate) async fn handle_read(
         )));
     }
 
+    // #87: `read` mutates delivery state that belongs to the addressee — restrict
+    // it to the message's own `to_actor`, mirroring the strictness of the direction
+    // check above. Without this, any caller actor in the namespace could flip another
+    // actor's inbound message to read, corrupting the unread counts that fleet-wide
+    // wake/sweep logic polls. The error names only the caller's own actor, never the
+    // real addressee, so a non-addressee cannot use this to enumerate who a message
+    // was meant for.
+    //
+    // Pre-ADR-057 messages may carry no `to_actor` at all. That is treated as
+    // fail-open (with a warning), matching the inbox `EqOrMissing` filter's
+    // precedent (#199): those legacy messages are already visible to any caller via
+    // `comm.inbox` (no to_actor to filter on), so fail-closed here would leave them
+    // permanently unreadable and stuck "unread" — defeating the same wake/sweep logic
+    // this fix protects. The anonymous single-tenant default ("local") deployment is
+    // unaffected either way: caller and to_actor are both "local", so the equality
+    // check passes normally.
+    let caller_actor = token.actor().id.as_str();
+    if let Some(to_actor) = note
+        .properties
+        .as_ref()
+        .and_then(|p| p.get("to_actor"))
+        .and_then(Value::as_str)
+    {
+        if to_actor != caller_actor {
+            return Err(RuntimeError::InvalidInput(format!(
+                "read: message {id} is not addressed to caller actor {caller_actor:?}"
+            )));
+        }
+    } else {
+        tracing::warn!(
+            id = %id,
+            caller_actor = %caller_actor,
+            "comm.read: message has no `to_actor` (pre-ADR-057 legacy); allowing read \
+             without addressee verification (issue #87)"
+        );
+    }
+
     // Patch via a real `UPDATE`, not `upsert_note`'s `INSERT OR REPLACE` (#780
     // silently re-inserts the row on conflict). See docs/api/message-lifecycle.md#handlersrshandle_read
     let mut props = note.properties.clone().unwrap_or_else(|| json!({}));

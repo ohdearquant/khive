@@ -1131,6 +1131,184 @@ async fn test_read_rejects_outbound_message() {
     );
 }
 
+// ── #87 regression: read() is restricted to the message's addressee ─────────
+
+/// A caller whose actor label does not match a message's `to_actor` must not be
+/// able to flip it to read — read-state is delivery state owned by the addressee.
+/// The message must stay unread after the rejected attempt.
+#[tokio::test]
+async fn t87_non_addressee_read_rejected_and_stays_unread() {
+    let backend = shared_backend();
+    let (registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:a");
+    let (registry_b, rt_b) = build_actor_registry(backend.clone(), "lambda:b");
+
+    registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:b", "content": "for B's eyes only" }),
+        )
+        .await
+        .expect("A sends to B");
+
+    let local_tok = rt_b.authorize(Namespace::parse("local").unwrap()).unwrap();
+    let notes = rt_b
+        .list_notes(&local_tok, Some("message"), 100, 0)
+        .await
+        .unwrap();
+    let inbound_id = notes
+        .iter()
+        .find(|n| {
+            n.deleted_at.is_none()
+                && n.properties
+                    .as_ref()
+                    .and_then(|p| p.get("direction"))
+                    .and_then(|v| v.as_str())
+                    == Some("inbound")
+        })
+        .map(|n| n.id.as_hyphenated().to_string())
+        .expect("inbound copy addressed to lambda:b must exist");
+
+    // A (not the addressee) attempts to mark B's inbound message as read.
+    let result = registry_a
+        .dispatch("comm.read", serde_json::json!({ "id": inbound_id }))
+        .await;
+    assert!(
+        result.is_err(),
+        "#87: non-addressee read must be rejected; got {result:?}"
+    );
+    let err_msg = format!("{}", result.unwrap_err());
+    assert!(
+        err_msg.contains("lambda:a") && !err_msg.contains("lambda:b"),
+        "#87: error must name only the caller's own actor, never the real \
+         addressee; got {err_msg:?}"
+    );
+
+    // The message must remain unread.
+    let refetched = rt_b
+        .list_notes(&local_tok, Some("message"), 100, 0)
+        .await
+        .unwrap();
+    let still_unread = refetched
+        .iter()
+        .find(|n| n.id.as_hyphenated().to_string() == inbound_id)
+        .and_then(|n| n.properties.as_ref())
+        .and_then(|p| p.get("read"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    assert!(
+        !still_unread,
+        "#87: message must stay unread after a rejected non-addressee read attempt"
+    );
+
+    // B (the true addressee) can still mark it read.
+    let ok = registry_b
+        .dispatch("comm.read", serde_json::json!({ "id": inbound_id }))
+        .await
+        .expect("#87: addressee read must still succeed");
+    assert_eq!(
+        ok.get("read").and_then(|v| v.as_bool()),
+        Some(true),
+        "#87: addressee read must return read:true; got {ok}"
+    );
+}
+
+/// The anonymous/"local" single-actor deployment (no actor.id configured) must keep
+/// working: caller and to_actor both resolve to "local", so the equality check passes.
+#[tokio::test]
+async fn t87_anonymous_local_single_actor_read_still_works() {
+    let (registry, rt) = build_registry_for_ns("local");
+
+    registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "single-tenant read" }),
+        )
+        .await
+        .expect("send succeeds");
+
+    let caller_token = rt
+        .authorize(khive_runtime::Namespace::parse("local").unwrap())
+        .unwrap();
+    let notes = rt
+        .list_notes(&caller_token, Some("message"), 100, 0)
+        .await
+        .unwrap();
+    let inbound_full_id = notes
+        .iter()
+        .find(|n| {
+            n.deleted_at.is_none()
+                && n.properties
+                    .as_ref()
+                    .and_then(|p| p.get("direction"))
+                    .and_then(|v| v.as_str())
+                    == Some("inbound")
+        })
+        .expect("inbound copy must exist after self-send")
+        .id
+        .to_string();
+
+    let result = registry
+        .dispatch("comm.read", serde_json::json!({ "id": inbound_full_id }))
+        .await
+        .expect("#87: anonymous single-actor 'local' read must still succeed");
+    assert_eq!(
+        result.get("read").and_then(|v| v.as_bool()),
+        Some(true),
+        "#87: read returns read:true — got {result}"
+    );
+}
+
+/// Pre-ADR-057 legacy messages may carry no `to_actor` at all. Decision: fail-open
+/// (with a tracing warning) — mirrors the inbox `EqOrMissing` filter precedent (#199),
+/// where legacy to_actor-less messages stay visible to any caller. Failing closed here
+/// would leave such messages permanently unreadable and stuck "unread", defeating the
+/// unread-based wake/sweep logic this fix protects.
+#[tokio::test]
+async fn t87_legacy_message_without_to_actor_reads_fail_open() {
+    let (_registry, rt) = build_registry_for_ns("lambda:legacy");
+    let token = rt
+        .authorize(khive_runtime::Namespace::parse("local").unwrap())
+        .unwrap();
+
+    // Simulate a pre-ADR-057 row: kind=message, direction=inbound, no `to_actor` field.
+    let legacy_note = rt
+        .create_note(
+            &token,
+            "message",
+            None,
+            "legacy inbound, no to_actor",
+            None,
+            Some(serde_json::json!({
+                "from": "someone",
+                "to": "lambda:legacy",
+                "direction": "inbound",
+            })),
+            vec![],
+        )
+        .await
+        .expect("legacy note creation succeeds");
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(khive_pack_kg::KgPack::new(rt.clone()));
+    builder.register(CommPack::new(rt.clone()));
+    builder.with_default_namespace("local");
+    builder.with_actor_id(Some("lambda:legacy".to_string()));
+    let registry = builder.build().expect("registry builds");
+
+    let result = registry
+        .dispatch(
+            "comm.read",
+            serde_json::json!({ "id": legacy_note.id.as_hyphenated().to_string() }),
+        )
+        .await
+        .expect("#87: legacy message without to_actor must fail open on read");
+    assert_eq!(
+        result.get("read").and_then(|v| v.as_bool()),
+        Some(true),
+        "#87: legacy to_actor-less read returns read:true — got {result}"
+    );
+}
+
 // ── H3 regression: thread verb is registered and returns thread messages ──────
 
 /// thread(id=X) must return all messages in the thread in chronological order.
