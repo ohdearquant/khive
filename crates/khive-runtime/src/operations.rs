@@ -851,47 +851,85 @@ fn note_props_match(note_props: Option<&serde_json::Value>, filter: &serde_json:
 }
 
 /// Collapse per-namespace `GraphPath`s from [`KhiveRuntime::traverse`] down to
-/// exactly one entry per distinct `root_id`, in first-seen order.
+/// exactly one entry per distinct `root_id`.
 ///
 /// `traverse` queries every namespace in the token's visible set
-/// independently and concatenates the results. A root that is only visible
-/// via one namespace still gets queried against every OTHER visible
-/// namespace too; those namespaces contribute nothing real, but when
-/// `include_roots` is set they still produce a root-only `GraphPath` (the
-/// root node is pre-seeded in Rust before the per-namespace SQL query runs,
-/// with no check that the namespace actually owns it). Left unmerged, a
-/// single requested root can surface as two response entries: one populated,
-/// one degenerate. Merging by `root_id` and unioning nodes (deduped by
-/// `node_id`, first occurrence wins) restores the one-entry-per-root
-/// contract and, as a side effect, unions any node reachable only from a
-/// non-primary visible namespace into the same path instead of dropping it.
-fn merge_traversal_paths_by_root(paths: Vec<GraphPath>) -> Vec<GraphPath> {
+/// independently — including namespaces that don't own the root at all,
+/// which still contribute a root-only entry when `include_roots` is set —
+/// and each of those per-namespace calls already enforces `limit` on its own
+/// results. Concatenating them naively before this function would let a root
+/// visible in N namespaces return up to N * limit nodes, would keep
+/// whichever namespace's copy of a shared node happened to arrive first
+/// (wrong depth/`via_edge` when that wasn't the shortest path, and
+/// non-BFS ordering), and would rebuild a seen-set from scratch per
+/// namespace (quadratic in namespace count).
+///
+/// This merges by `(root_id, node_id)` keeping the node's shallowest depth
+/// and the `via_edge` that produced it (first-namespace-processed wins ties
+/// at equal depth — namespace processing order is deterministic but which
+/// tied edge is "more correct" is not otherwise decidable), reorders the
+/// merged result BFS-style (ascending depth), and re-applies `limit` to the
+/// merged non-root node count so the response honors the contract each
+/// individual namespace call already tried to.
+fn merge_traversal_paths_by_root(paths: Vec<GraphPath>, limit: Option<u32>) -> Vec<GraphPath> {
     let mut order: Vec<Uuid> = Vec::new();
     let mut merged: HashMap<Uuid, GraphPath> = HashMap::new();
+    // root_id -> (node_id -> index into merged[root_id].nodes), so a
+    // shallower depth for an already-seen node updates in place instead of
+    // rebuilding a seen-set from every prior namespace's contribution.
+    let mut node_index: HashMap<Uuid, HashMap<Uuid, usize>> = HashMap::new();
+
     for path in paths {
-        match merged.entry(path.root_id) {
-            std::collections::hash_map::Entry::Vacant(slot) => {
-                order.push(path.root_id);
-                slot.insert(path);
+        let existing = merged.entry(path.root_id).or_insert_with(|| {
+            order.push(path.root_id);
+            GraphPath {
+                root_id: path.root_id,
+                nodes: Vec::new(),
+                total_weight: 0.0,
             }
-            std::collections::hash_map::Entry::Occupied(mut slot) => {
-                let existing = slot.get_mut();
-                let mut seen: std::collections::HashSet<Uuid> =
-                    existing.nodes.iter().map(|n| n.node_id).collect();
-                for node in path.nodes {
-                    if seen.insert(node.node_id) {
-                        existing.nodes.push(node);
+        });
+        let index = node_index.entry(path.root_id).or_default();
+        for node in path.nodes {
+            match index.get(&node.node_id) {
+                Some(&i) => {
+                    if node.depth < existing.nodes[i].depth {
+                        existing.nodes[i] = node;
                     }
                 }
-                if path.total_weight > existing.total_weight {
-                    existing.total_weight = path.total_weight;
+                None => {
+                    index.insert(node.node_id, existing.nodes.len());
+                    existing.nodes.push(node);
                 }
             }
         }
+        if path.total_weight > existing.total_weight {
+            existing.total_weight = path.total_weight;
+        }
     }
+
     order
         .into_iter()
         .filter_map(|root_id| merged.remove(&root_id))
+        .map(|mut path| {
+            // BFS order: ascending depth, stable within a depth.
+            path.nodes.sort_by_key(|n| n.depth);
+            if let Some(lim) = limit {
+                let lim = lim as usize;
+                let mut non_root_kept = 0usize;
+                path.nodes.retain(|n| {
+                    if n.depth == 0 {
+                        return true;
+                    }
+                    if non_root_kept < lim {
+                        non_root_kept += 1;
+                        true
+                    } else {
+                        false
+                    }
+                });
+            }
+            path
+        })
         .collect()
 }
 
@@ -2348,16 +2386,10 @@ impl KhiveRuntime {
             let mut ns_paths = self.graph(&temp)?.traverse(request.clone()).await?;
             paths.append(&mut ns_paths);
         }
-        // Each visible namespace is queried independently above, so a root
-        // visible via more than one namespace (e.g. the caller's own
-        // namespace plus the always-appended `local`) produces one GraphPath
-        // per namespace it was queried against — including namespaces that
-        // do not own the root at all, which still emit a root-only entry
-        // because `include_roots` pre-seeds the root in Rust ahead of the
-        // per-namespace SQL query. Merge back down to one GraphPath per
-        // distinct root_id, unioning the discovered nodes, so the response
-        // count matches the requested root count.
-        let mut paths = merge_traversal_paths_by_root(paths);
+        // Reconcile the per-namespace GraphPaths back down to one per
+        // distinct root_id (see merge_traversal_paths_by_root for why this
+        // is needed and what it enforces).
+        let mut paths = merge_traversal_paths_by_root(paths, request.options.limit);
         self.enrich_path_nodes(token, &mut paths, request.include_properties)
             .await;
         // Filter out soft-deleted entity nodes from all path nodes.
@@ -10885,18 +10917,7 @@ mod tests {
     }
 
     // ── Single root visible in multiple namespaces must yield exactly one
-    //    traversal object, not one phantom root-only entry per extra
-    //    namespace ────────────────────────────────────────────────────────
-    //
-    // A caller's visible-namespace set commonly spans more than the root's
-    // owning namespace (e.g. `local` is always appended, see pack.rs
-    // extra_visible). Before the fix, `traverse` ran the storage-level
-    // traversal once per visible namespace and concatenated the results
-    // unconditionally. Because `include_roots` pre-seeds the root node in
-    // Rust before the SQL query even runs, a namespace that does not own the
-    // root's edges at all still produced a root-only "phantom" GraphPath —
-    // so a single-root request came back with two entries: one real, one
-    // degenerate.
+    //    traversal object (see merge_traversal_paths_by_root) ─────────────
     #[tokio::test]
     async fn traverse_single_root_across_visible_namespaces_yields_one_path() {
         use khive_storage::types::TraversalOptions;
@@ -10950,8 +10971,6 @@ mod tests {
              GraphPath, got {result:#?}"
         );
         assert_eq!(result[0].root_id, a.id);
-        // The populated path (root + the real neighbor via "owner-ns") must
-        // survive the merge, not the phantom root-only one.
         let node_ids: std::collections::HashSet<Uuid> =
             result[0].nodes.iter().map(|n| n.node_id).collect();
         assert!(node_ids.contains(&a.id));
@@ -12294,6 +12313,103 @@ mod tests {
             kind: None,
             properties: None,
         }
+    }
+
+    /// merge_traversal_paths_by_root: three namespaces each contribute the
+    /// same root plus 2 distinct non-root nodes (each namespace already at
+    /// its own `limit`, matching the per-namespace SQL-layer cap). The
+    /// union across namespaces is 6 distinct non-root nodes; the merge must
+    /// re-enforce `limit` on that union rather than passing it through.
+    #[test]
+    fn merge_traversal_paths_reenforces_limit_across_namespaces() {
+        let root = Uuid::new_v4();
+        let path_for = |n: usize| GraphPath {
+            root_id: root,
+            nodes: (0..n).map(|_| path_node(Uuid::new_v4(), 1)).collect(),
+            total_weight: 1.0,
+        };
+
+        let paths = vec![path_for(2), path_for(2), path_for(2)];
+        let merged = merge_traversal_paths_by_root(paths, Some(2));
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            merged[0].nodes.len(),
+            2,
+            "merge must re-enforce limit=2 on the unioned nodes, got {:?}",
+            merged[0].nodes
+        );
+    }
+
+    /// merge_traversal_paths_by_root: a node reachable at different depths
+    /// via two namespaces must report its shallowest depth and the
+    /// `via_edge` that produced that depth, and the merged node order must
+    /// be BFS (ascending depth) rather than the concatenation order of the
+    /// per-namespace inputs.
+    #[test]
+    fn merge_traversal_paths_keeps_shortest_depth_and_bfs_order() {
+        let root = Uuid::new_v4();
+        let shared = Uuid::new_v4();
+        let far_node = Uuid::new_v4();
+        let deep_edge = Uuid::new_v4();
+        let shallow_edge = Uuid::new_v4();
+
+        // Namespace processed first: an unrelated node at depth 1, and the
+        // shared node reached the long way, at depth 4.
+        let ns_first = GraphPath {
+            root_id: root,
+            nodes: vec![
+                path_node(far_node, 1),
+                PathNode {
+                    node_id: shared,
+                    via_edge: Some(deep_edge),
+                    depth: 4,
+                    name: None,
+                    kind: None,
+                    properties: None,
+                },
+            ],
+            total_weight: 1.0,
+        };
+        // Namespace processed second: the same shared node, reached at depth 2.
+        let ns_second = GraphPath {
+            root_id: root,
+            nodes: vec![PathNode {
+                node_id: shared,
+                via_edge: Some(shallow_edge),
+                depth: 2,
+                name: None,
+                kind: None,
+                properties: None,
+            }],
+            total_weight: 1.0,
+        };
+
+        let merged = merge_traversal_paths_by_root(vec![ns_first, ns_second], None);
+
+        assert_eq!(merged.len(), 1);
+        let nodes = &merged[0].nodes;
+        assert!(
+            nodes.windows(2).all(|w| w[0].depth <= w[1].depth),
+            "merged nodes must be in BFS (ascending depth) order, got {:?}",
+            nodes
+                .iter()
+                .map(|n| (n.node_id, n.depth))
+                .collect::<Vec<_>>()
+        );
+        let shared_node = nodes
+            .iter()
+            .find(|n| n.node_id == shared)
+            .expect("shared node must survive the merge");
+        assert_eq!(
+            shared_node.depth, 2,
+            "shared node must report its shortest depth across namespaces"
+        );
+        assert_eq!(
+            shared_node.via_edge,
+            Some(shallow_edge),
+            "shared node must carry the via_edge that produced the shortest path"
+        );
     }
 
     /// enrich_neighbor_hits: entity hit resolved, note hit resolved with
