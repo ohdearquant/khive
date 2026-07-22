@@ -89,6 +89,81 @@ impl EmbedderProvider for FakeDimProvider {
     }
 }
 
+// Controlled two-topic embedder for the degraded-candidate ranking test.  The
+// query and genuinely relevant domain share the first axis; the domain whose
+// title only collides lexically shares the second.  The failing variant still
+// embeds/indexes the corpus and embeds the ANN query, but rejects the later
+// query-plus-candidates batch so the fresh rerank is genuinely unavailable.
+struct ControlledRankingService {
+    fail_fresh_rerank: bool,
+}
+
+#[async_trait]
+impl EmbeddingService for ControlledRankingService {
+    async fn embed(
+        &self,
+        texts: &[String],
+        _model: EmbeddingModel,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        if self.fail_fresh_rerank
+            && texts.len() > 1
+            && texts[0].contains("speculative decoding inference acceleration")
+        {
+            return Err(EmbedError::InferenceFailed(
+                "controlled fresh-rerank failure".into(),
+            ));
+        }
+        Ok(texts
+            .iter()
+            .map(|text| {
+                let lower = text.to_lowercase();
+                if lower.contains("semantic_target")
+                    || lower.contains("speculative decoding inference acceleration")
+                {
+                    let mut vector = vec![0.0; DIM];
+                    vector[0] = 1.0;
+                    vector
+                } else if lower.contains("lexical_collision") {
+                    let mut vector = vec![0.0; DIM];
+                    vector[1] = 1.0;
+                    vector
+                } else {
+                    vec![1.0 / (DIM as f32).sqrt(); DIM]
+                }
+            })
+            .collect())
+    }
+
+    fn supports_model(&self, _model: EmbeddingModel) -> bool {
+        true
+    }
+
+    fn name(&self) -> &'static str {
+        "controlled-ranking"
+    }
+}
+
+struct ControlledRankingProvider {
+    fail_fresh_rerank: bool,
+}
+
+#[async_trait]
+impl EmbedderProvider for ControlledRankingProvider {
+    fn name(&self) -> &str {
+        MODEL_KEY
+    }
+
+    fn dimensions(&self) -> usize {
+        DIM
+    }
+
+    async fn build(&self) -> Result<Arc<dyn EmbeddingService>, khive_runtime::RuntimeError> {
+        Ok(Arc::new(ControlledRankingService {
+            fail_fresh_rerank: self.fail_fresh_rerank,
+        }))
+    }
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 fn rt_with_fake_embedder() -> KhiveRuntime {
@@ -108,6 +183,26 @@ fn rt_with_fake_embedder() -> KhiveRuntime {
     })
     .expect("in-memory runtime");
     rt.register_embedder(FakeDimProvider);
+    rt
+}
+
+fn rt_with_controlled_ranking(fail_fresh_rerank: bool) -> KhiveRuntime {
+    let rt = KhiveRuntime::new(RuntimeConfig {
+        git_write: Default::default(),
+        db_path: None,
+        default_namespace: Namespace::local(),
+        embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
+        additional_embedding_models: vec![],
+        gate: Arc::new(AllowAllGate),
+        packs: vec!["kg".to_string(), "knowledge".to_string()],
+        backend_id: BackendId::main(),
+        brain_profile: None,
+        visible_namespaces: vec![],
+        allowed_outbound_namespaces: vec![],
+        actor_id: None,
+    })
+    .expect("in-memory runtime");
+    rt.register_embedder(ControlledRankingProvider { fail_fresh_rerank });
     rt
 }
 
@@ -376,5 +471,144 @@ async fn warm_known_snapshots_loads_persisted_snapshot() {
             .is_some(),
         "search_loaded must return Some after warm_known_snapshots loads the snapshot; \
          model={model}, key={key:?}"
+    );
+}
+
+// ── P3: issue #91 — degraded-mode escalation + consequence semantics ──────────
+
+/// When ANN candidate retrieval times out, distinguish a successful fresh
+/// dense rerank from a genuinely lexical-only result.  Both cases use the same
+/// candidates: dense reranking promotes the semantically relevant domain,
+/// while an unavailable rerank leaves the lexical title collision first.
+#[tokio::test]
+async fn suggest_reports_degraded_candidates_or_lexical_only_from_ranking_consequence() {
+    let _serial = TIMEOUT_OVERRIDE_SERIAL.lock().await;
+    vamana::set_warm_wait_timeout_override_ms(50);
+    let _reset = TimeoutOverrideReset;
+
+    for (fail_fresh_rerank, expected_mode, expected_winner) in [
+        (false, "ann_candidates_degraded", "Opaque Systems Domain"),
+        (
+            true,
+            "lexical_only",
+            "Speculative Decoding Methods for Inference",
+        ),
+    ] {
+        let rt = rt_with_controlled_ranking(fail_fresh_rerank);
+        let registry = build_registry(&rt);
+        registry
+            .dispatch(
+                "knowledge.upsert_domains",
+                json!({"domains": [
+                    {
+                        "slug": "degrade-semantic-domain",
+                        "name": "Opaque Systems Domain",
+                        "description": "SEMANTIC_TARGET serving throughput latency batching cache scheduling gpu utilization request queuing parallelism autoscaling deployment topology load balancing production workloads resource management observability reliability"
+                    },
+                    {
+                        "slug": "degrade-lexical-collision",
+                        "name": "Speculative Decoding Methods for Inference",
+                        "description": "LEXICAL_COLLISION techniques for large language models emphasize decoding speculation, inference methods, acceleration strategies, model techniques, language processing, and unrelated terminology repeated for lexical matching"
+                    }
+                ]}),
+            )
+            .await
+            .expect("upsert domains");
+        registry
+            .dispatch("knowledge.index", json!({ "rebuild_ann": false }))
+            .await
+            .expect("index");
+
+        let ann = vamana::new_shared();
+        let key = vamana::AnnKey::new("local", rt.default_embedder_name());
+        vamana::simulate_warming_in_flight(&ann, key);
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        let result = KnowledgeHandlers::suggest(
+            &rt,
+            &token,
+            json!({
+                "query": "speculative decoding inference acceleration techniques for large language models"
+            }),
+            &ann,
+        )
+        .await
+        .expect("suggest must not Err");
+
+        assert_eq!(result["ann_unavailable"], true, "result: {result}");
+        assert_eq!(
+            result["degraded"]["mode"], expected_mode,
+            "result: {result}"
+        );
+        assert_eq!(
+            result["results"][0]["name"], expected_winner,
+            "result: {result}"
+        );
+    }
+}
+
+/// The zero-hit case (P1a's scenario) must ALSO carry the new `degraded`
+/// object with `mode: "no_match"`, distinguishing "couldn't check" from
+/// "lexical matching ran and found this particular set" (the P3 case above).
+#[tokio::test]
+async fn suggest_flags_degraded_no_match_when_hits_empty() {
+    let _serial = TIMEOUT_OVERRIDE_SERIAL.lock().await;
+    vamana::set_warm_wait_timeout_override_ms(50);
+    let _reset = TimeoutOverrideReset;
+
+    let rt = rt_with_fake_embedder();
+    let registry = build_registry(&rt);
+
+    // Non-domain atom: `suggest`'s type_filter="domain" drops it, so lexical
+    // hits are empty (mirrors P1a).
+    registry
+        .dispatch(
+            "knowledge.upsert_atoms",
+            json!({
+                "atoms": [{
+                    "slug": "degrade-suggest-atom-2",
+                    "name": "Degrade Suggest Atom 2",
+                    "content": "transformer neural network attention mechanism self-attention encoder decoder positional embedding layer normalization residual connection feed forward dense sparse retrieval vector index"
+                }]
+            }),
+        )
+        .await
+        .expect("upsert atom");
+
+    registry
+        .dispatch("knowledge.index", json!({ "rebuild_ann": false }))
+        .await
+        .expect("index");
+
+    let ann = vamana::new_shared();
+    let model = rt.default_embedder_name().to_string();
+    let key = vamana::AnnKey::new("local", &model);
+    vamana::simulate_warming_in_flight(&ann, key);
+
+    let token = rt.authorize(Namespace::local()).expect("authorize");
+    let result = KnowledgeHandlers::suggest(
+        &rt,
+        &token,
+        json!({ "query": "machine learning neural network transformer attention" }),
+        &ann,
+    )
+    .await
+    .expect("suggest must not Err");
+
+    assert_eq!(result.get("total").and_then(|v| v.as_u64()), Some(0));
+    assert_eq!(
+        result.get("ann_unavailable").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    let degraded = result
+        .get("degraded")
+        .unwrap_or_else(|| panic!("degraded object must be present; got: {result}"));
+    assert_eq!(
+        degraded.get("mode").and_then(|v| v.as_str()),
+        Some("no_match"),
+        "zero-hit degraded suggest must report mode=no_match, distinct from lexical_only; got: {result}"
+    );
+    assert_eq!(
+        degraded.get("cache_safe").and_then(|v| v.as_bool()),
+        Some(false)
     );
 }

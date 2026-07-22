@@ -23,7 +23,7 @@ use super::util::{
     atom_embed_text, atom_from_row, compose_item_char_cost, deser, domain_from_row,
     estimate_compose_item_tokens, explicitly_requested_status, is_stop, row_bool, row_str, sql_err,
     status_multiplier, status_sql_clause, status_values, CANDIDATE_POOL, CHARS_PER_TOKEN,
-    MIN_TERM_LEN,
+    D_SUGGEST_RERANK_ALPHA, MIN_TERM_LEN,
 };
 use super::vamana;
 use super::KnowledgeHandlers;
@@ -502,9 +502,9 @@ async fn rerank_with_embeddings(
     query: &str,
     hits: &mut [ScoredHit],
     alpha: f32,
-) -> Result<(), RuntimeError> {
+) -> Result<bool, RuntimeError> {
     if hits.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     let texts: Vec<String> = hits
         .iter()
@@ -526,8 +526,9 @@ async fn rerank_with_embeddings(
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| a.slug.cmp(&b.slug))
         });
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
@@ -1418,20 +1419,25 @@ impl KnowledgeHandlers {
                 {
                     ann_hits_opt = vamana::search_loaded(ann, &key, &query_emb, ann_k).await;
                 } else {
-                    // Still not ready after the wait.  If FTS already collected
-                    // non-empty hits, return those partial results rather than
-                    // erroring — mirrors the same guard in `search`.  Only set
-                    // ann_unavailable when FTS is also empty and the corpus is
-                    // non-empty (a genuinely misleading silent-zero case) (issue #322).
-                    if hits.is_empty() {
-                        let model = runtime.default_embedder_name();
-                        let corpus_non_empty = vamana::compute_fingerprint(runtime, token, model)
-                            .await
-                            .map(|fp| fp.vector_count > 0)
-                            .unwrap_or(false);
-                        if corpus_non_empty {
-                            ann_unavailable = true;
-                        }
+                    // Still not ready after the wait.  FTS/full-scan lexical hits
+                    // (if any) already sit in `hits` and are returned regardless —
+                    // ANN unavailability degrades candidate recall breadth, not
+                    // necessarily final ranking: the fresh embedding rerank below
+                    // can still apply a dense score to the lexical candidates.
+                    // A caller must not read non-empty `hits` here as evidence of
+                    // healthy candidate retrieval either.
+                    // Flag degraded whenever the corpus is genuinely non-empty,
+                    // in BOTH the empty-hits case (issue #322: total:0 could
+                    // mean "nothing exists" or "couldn't check") and the
+                    // non-empty case (issue #91: partial candidate retrieval looks
+                    // identical to a healthy response unless flagged).
+                    let model = runtime.default_embedder_name();
+                    let corpus_non_empty = vamana::compute_fingerprint(runtime, token, model)
+                        .await
+                        .map(|fp| fp.vector_count > 0)
+                        .unwrap_or(false);
+                    if corpus_non_empty {
+                        ann_unavailable = true;
                     }
                 }
             }
@@ -1449,7 +1455,8 @@ impl KnowledgeHandlers {
             }
         }
 
-        rerank_with_embeddings(runtime, &raw_query, &mut hits, 0.7).await?;
+        let fresh_rerank_applied =
+            rerank_with_embeddings(runtime, &raw_query, &mut hits, D_SUGGEST_RERANK_ALPHA).await?;
 
         // Safety net: retain only domain hits in case any non-domain survived above.
         hits.retain(|h| h.is_domain);
@@ -1477,7 +1484,42 @@ impl KnowledgeHandlers {
 
         let mut out = json!({ "results": results, "total": count });
         if ann_unavailable {
+            // issue #91: escalate degradation to a top-level, self-explaining
+            // signal instead of a bare total:0 or an unflagged partial list.
+            // `ann_unavailable` is kept unchanged for existing callers; `degraded`
+            // states the consequence so a caller does not have to infer it.
             out["ann_unavailable"] = json!(true);
+            let (mode, note): (&str, &str) = match (count, fresh_rerank_applied) {
+                (0, _) => (
+                    "no_match",
+                    "ANN index unavailable and lexical/FTS matching also found no \
+                     domain for this query. This does NOT confirm the corpus has \
+                     nothing relevant — only that this call could not find one. \
+                     Do not cache as an absence; retry once the index is healthy.",
+                ),
+                (_, true) => (
+                    "ann_candidates_degraded",
+                    "ANN index unavailable: candidate retrieval used lexical/FTS \
+                     matching, but fresh embedding cosine reranking was applied to \
+                     those candidates. Final ranking includes a dense signal, while \
+                     topically relevant domains outside the lexical candidate set may \
+                     still be missing. Do not cache; retry once the index is healthy.",
+                ),
+                (_, false) => (
+                    "lexical_only",
+                    "ANN index unavailable and fresh embedding reranking did not run: \
+                     these results were ranked by lexical/FTS matching only. Ranking \
+                     may be less precise than a healthy call, and topically relevant \
+                     domains outside the lexical match may be missing. Do not cache; \
+                     retry once the index is healthy.",
+                ),
+            };
+            out["degraded"] = json!({
+                "reason": "ann_unavailable",
+                "mode": mode,
+                "cache_safe": false,
+                "note": note,
+            });
         }
         Ok(out)
     }

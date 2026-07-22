@@ -20,6 +20,18 @@ pub(super) const D_EXPAND_DISCOUNT: f32 = 0.35;
 pub(super) const D_COVERAGE_ALPHA: f32 = 0.5;
 pub(super) const D_W_BIGRAM: f32 = 2.0;
 
+/// Final-blend weight given to the lexical/RRF-fused score in `suggest`'s
+/// domain ranking (issue #90). `suggest` picks *topics*, not keywords: a
+/// domain title that happens to contain a rare, polysemous query token
+/// (e.g. "decoding" meaning channel-coding vs. LLM token generation) earns
+/// an outsized TF-IDF name bonus (`D_W_EXACT_NAME`/`D_W_NAME`) purely from
+/// bag-of-words token overlap, which the FTS leg cannot sense-disambiguate.
+/// Embeddings carry distributional sense information FTS does not, so the
+/// final blend must let the freshly-computed cosine leg dominate rather
+/// than the lexical leg — the inverse of `knowledge.search`'s keyword-match
+/// use case, which keeps the general-purpose default weighting.
+pub(super) const D_SUGGEST_RERANK_ALPHA: f32 = 0.3;
+
 pub(super) const CANDIDATE_POOL: usize = 2000;
 pub(super) const MIN_TERM_LEN: usize = 3;
 /// Default embed/write batch when the caller does not pass `batch_size`. This is
