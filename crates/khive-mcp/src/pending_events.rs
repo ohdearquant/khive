@@ -1330,6 +1330,7 @@ mod tests {
             default_namespace: Namespace::parse("local").unwrap(),
             embedding_model: None,
             additional_embedding_models: vec![],
+            packs: vec!["kg".to_string()],
             actor_id: actor_id.map(str::to_string),
             // Pin the pack list explicitly rather than inheriting `KHIVE_PACKS`
             // from the ambient environment (#1269) — these tests only exercise

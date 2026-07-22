@@ -160,6 +160,7 @@ pub trait CoordinatorService: Send + Sync {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use khive_runtime::{NoteSearchHit, SearchHit, SearchSource};
     use std::sync::Arc;
 
     /// Minimal mock for server-routing tests (T6 in the test plan).
@@ -219,7 +220,7 @@ pub(crate) mod tests {
 
         async fn fan_out_search(
             &self,
-            _kind: &str,
+            kind: &str,
             _query: &str,
             _namespace: &Namespace,
             limit: u32,
@@ -231,13 +232,35 @@ pub(crate) mod tests {
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             self.last_limit
                 .store(limit, std::sync::atomic::Ordering::SeqCst);
+            let id = Uuid::from_u128(1);
+            let is_note = kind == "note";
             CoordSearchResult {
-                entity_hits: vec![],
-                note_hits: vec![],
+                entity_hits: if is_note {
+                    vec![]
+                } else {
+                    vec![SearchHit {
+                        entity_id: id,
+                        score: Default::default(),
+                        source: SearchSource::Both,
+                        title: Some("entity result".to_string()),
+                        snippet: None,
+                    }]
+                },
+                note_hits: if is_note {
+                    vec![NoteSearchHit {
+                        note_id: id,
+                        score: Default::default(),
+                        source: SearchSource::Vector,
+                        title: Some("note result".to_string()),
+                        snippet: None,
+                    }]
+                } else {
+                    vec![]
+                },
                 per_backend: vec![],
                 partial: false,
-                entity_kinds: std::collections::HashMap::new(),
-                note_kinds: std::collections::HashMap::new(),
+                entity_kinds: std::collections::HashMap::from([(id, "concept".to_string())]),
+                note_kinds: std::collections::HashMap::from([(id, "observation".to_string())]),
             }
         }
 
@@ -340,6 +363,38 @@ pub(crate) mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             "T6b: coordinator.fan_out_search must be called when a search op is dispatched through a multi-backend server"
         );
+    }
+
+    #[tokio::test]
+    async fn multi_backend_search_serializes_entity_and_note_sources() {
+        for (kind, expected_source) in [("entity", "both"), ("note", "vector")] {
+            let (registry, _runtime) = make_registry();
+            let coord = MockCoordinator::multi_backend();
+            let server = KhiveMcpServer::from_registry_with_meta(registry, "local", "test-cfg")
+                .with_coordinator(Arc::clone(&coord) as Arc<dyn CoordinatorService>);
+
+            let raw = server
+                .dispatch_request_local(RequestParams {
+                    ops: format!(r#"search(kind="{kind}", query="anything")"#),
+                    presentation: None,
+                    presentation_per_op: None,
+                    save_to: None,
+                    format: None,
+                    format_per_op: None,
+                    request_id: None,
+                })
+                .await
+                .expect("search dispatch must succeed");
+            let response: serde_json::Value =
+                serde_json::from_str(&raw).expect("response must be valid JSON");
+            let hit = &response["results"][0]["result"][0];
+
+            assert_eq!(
+                hit.get("source").and_then(serde_json::Value::as_str),
+                Some(expected_source),
+                "{kind} hit must expose its retrieval source; got: {hit}"
+            );
+        }
     }
 
     /// T6d: a multi-backend search with a malformed `tags` value must return a

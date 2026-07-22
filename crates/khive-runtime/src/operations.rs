@@ -86,14 +86,7 @@ pub fn arm_vector_fail_after(n: usize) {
 #[cfg(any(test, feature = "fault-injection"))]
 static FTS_FAIL_NS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-// Namespace-keyed one-shot set, same shape as `FTS_FAIL_NS` above and for the
-// same reason (#1263): a single `Option<String>` slot lets a concurrently
-// running test's `arm_vector_fail(other_ns)` overwrite this test's armed
-// namespace before its own `create_note`/`create_entity` call consumed it,
-// so the intended injection silently never fired. Keying by namespace fixes
-// that at the root — arming `ns_B` inserts `ns_B` without evicting `ns_A`.
-// Process-wide (not thread-local) for the same cross-OS-thread reason
-// documented on `arm_fts_fail` below.
+// Vector insertion failures use the same namespace-keyed one-shot semantics.
 #[cfg(any(test, feature = "fault-injection"))]
 static VECTOR_FAIL_NS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
@@ -139,7 +132,8 @@ pub fn arm_fts_fail(ns: &str) {
 ///
 /// The next `create_many` call whose namespace equals `ns` returns an injected
 /// error at the FTS upsert step (after entity rows are committed), then disarms.
-/// Calls on other namespaces are unaffected.
+/// Calls on other namespaces are unaffected, and concurrent arms of distinct
+/// namespaces do not overwrite each other.
 /// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
 #[cfg(any(test, feature = "fault-injection"))]
 pub fn arm_fts_fail_many(ns: &str) {
@@ -151,7 +145,8 @@ pub fn arm_fts_fail_many(ns: &str) {
 /// The next `create_many` call whose namespace equals `ns` returns
 /// `Ok(BatchWriteSummary { attempted: 2, affected: 1, failed: 1, ... })` from the
 /// FTS upsert step, exercising the `summary.failed > 0` rollback branch (as opposed
-/// to the hard-`Err` branch exercised by `arm_fts_fail_many`).  Then disarms.
+/// to the hard-`Err` branch exercised by `arm_fts_fail_many`). Then disarms only
+/// that namespace's entry.
 /// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
 #[cfg(any(test, feature = "fault-injection"))]
 pub fn arm_fts_fail_many_partial(ns: &str) {
@@ -179,7 +174,8 @@ pub fn arm_fts_search_fail(ns: &str) {
 ///
 /// The next `create_note` call whose note namespace equals `ns` returns an injected
 /// error at the first vector insert step, then disarms.  Calls on other namespaces
-/// are unaffected.
+/// are unaffected, and concurrent arms of distinct namespaces do not overwrite
+/// each other.
 /// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
 #[cfg(any(test, feature = "fault-injection"))]
 pub fn arm_vector_fail(ns: &str) {
@@ -209,6 +205,7 @@ pub fn arm_rollback_cleanup_fail(ns: &str) {
 pub struct NoteSearchHit {
     pub note_id: Uuid,
     pub score: DeterministicScore,
+    pub source: crate::SearchSource,
     pub title: Option<String>,
     pub snippet: Option<String>,
 }
@@ -463,8 +460,8 @@ fn accepted_pack_relations_for_pattern_entities(
 /// parallel table — issue #543 precedent, applied to GQL query-pattern hint
 /// derivation (issue #593).
 ///
-/// Pack rules are skipped for `crate::pack::SPECIAL_RELATIONS` (supersedes /
-/// supports / refutes): the live validator's special-relation branch
+/// Pack rules are skipped when `crate::pack::is_special_relation` is true
+/// (supersedes / supports / refutes): the live validator's special-relation branch
 /// (`validate_edge_relation_endpoints`, this file) resolves those relations
 /// before `pack_rule_allows` is ever reached, so a pack `EDGE_RULES` entry for
 /// one of them is never actually enforced (see `pack.rs`'s
@@ -477,7 +474,7 @@ fn accepted_entity_kind_pairs_for_relation(
     for src in khive_types::EntityKind::ALL {
         for tgt in khive_types::EntityKind::ALL {
             let allowed = base_entity_rule_allows(src.name(), relation, tgt.name())
-                || (!crate::pack::SPECIAL_RELATIONS.contains(&relation)
+                || (!crate::pack::is_special_relation(relation)
                     && accepted_pack_relations_for_pattern_entities(
                         pack_rules,
                         src.name(),
@@ -509,10 +506,15 @@ fn accepted_entity_kind_pairs_for_relation(
 /// `supports` / `refutes` (see [`accepted_entity_kind_pairs_for_relation`]):
 /// pack rules never make those triples possible, only the base allowlist does.
 fn static_impossible_edge_pattern_warnings(
+    language: khive_query::QueryLanguage,
     pattern: &khive_query::ast::MatchPattern,
     pack_rules: &[EdgeEndpointRule],
 ) -> Vec<String> {
     use khive_query::ast::{EdgeDirection, PatternElement};
+
+    if language != khive_query::QueryLanguage::Gql {
+        return Vec::new();
+    }
 
     let elements = &pattern.elements;
     let mut warnings = Vec::new();
@@ -548,7 +550,7 @@ fn static_impossible_edge_pattern_warnings(
         };
 
         let possible = base_entity_rule_allows(src_kind.name(), relation, tgt_kind.name())
-            || (!crate::pack::SPECIAL_RELATIONS.contains(&relation)
+            || (!crate::pack::is_special_relation(relation)
                 && accepted_pack_relations_for_pattern_entities(
                     pack_rules,
                     src_kind.name(),
@@ -1610,10 +1612,7 @@ impl KhiveRuntime {
                     "link target {target_id} not found"
                 )));
             }
-        } else if matches!(
-            relation,
-            EdgeRelation::Supersedes | EdgeRelation::Supports | EdgeRelation::Refutes
-        ) {
+        } else if crate::pack::is_special_relation(relation) {
             // supersedes / supports / refutes: same-substrate only (note→note or entity→entity).
             // Event and edge endpoints are invalid regardless of the other endpoint.
             // Endpoint resolution is by-ID and namespace-agnostic.
@@ -1822,10 +1821,7 @@ impl KhiveRuntime {
             return Ok(());
         }
 
-        if matches!(
-            relation,
-            EdgeRelation::Supersedes | EdgeRelation::Supports | EdgeRelation::Refutes
-        ) {
+        if crate::pack::is_special_relation(relation) {
             let rel_name = relation.as_str();
             let src = src.ok_or_else(|| {
                 RuntimeError::NotFound(format!("link source {source_id} not found"))
@@ -3562,6 +3558,7 @@ impl KhiveRuntime {
                 Some(NoteSearchHit {
                     note_id: hit.entity_id,
                     score: weighted,
+                    source: hit.source,
                     title: hit.title.or_else(|| note_title(note)),
                     snippet: hit.snippet.or_else(|| note_snippet(note)),
                 })
@@ -4202,7 +4199,7 @@ impl KhiveRuntime {
         use khive_query::QueryValue;
         use khive_storage::types::SqlValue;
 
-        let ast = khive_query::parse_auto(query)?;
+        let (language, ast) = khive_query::language::parse_auto_with_language(query)?;
         opts.scopes = token
             .visible_namespaces()
             .iter()
@@ -4212,23 +4209,9 @@ impl KhiveRuntime {
         let mut warnings = compiled.warnings;
         let truncation_check = compiled.truncation_check;
 
-        // Static schema-mismatch hint (issue #593): GQL-only by design — the
-        // hint is worded around GQL's `(kind)-[:relation]->(kind)` syntax, so
-        // it is scoped out of SPARQL even though SPARQL compiles to the same
-        // `MatchPattern` shape. Dialect is detected the same way `parse_auto`
-        // selects it, since neither the AST nor `CompiledQuery` retains it.
-        let is_sparql = query
-            .trim()
-            .as_bytes()
-            .get(..6)
-            .is_some_and(|p| p.eq_ignore_ascii_case(b"SELECT"));
-        if !is_sparql {
-            let pack_rules = self.pack_edge_rules();
-            warnings.extend(static_impossible_edge_pattern_warnings(
-                &ast.pattern,
-                &pack_rules,
-            ));
-        }
+        warnings.extend(self.with_pack_edge_rules(|pack_rules| {
+            static_impossible_edge_pattern_warnings(language, &ast.pattern, pack_rules)
+        }));
 
         // Convert QueryValue params (query-layer type) to SqlValue (storage-layer type)
         // at the query–storage boundary.
@@ -9923,7 +9906,7 @@ mod tests {
     // Inject a vector insertion failure after note row + FTS commit and assert
     // both the note row and the FTS document are removed (no stranded rows).
     // Uses a unique namespace (see create_note_fts_failure_rolls_back_note_row)
-    // so the process-global VECTOR_FAIL_NS flag is consumed only by this test.
+    // so only this test consumes its VECTOR_FAIL_NS entry.
     // Since the single registered provider fires embed_document before the
     // injection check, the injection converts the successful embedding into an
     // error just before the VectorStore insert, then disarms.
@@ -9968,6 +9951,57 @@ mod tests {
         assert!(
             notes.is_empty(),
             "compensation must remove note row after vector failure; got {notes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn vector_failure_injections_for_distinct_namespaces_do_not_overwrite_each_other() {
+        const MODEL: &str = "test-vec-inject-distinct-namespaces";
+        const DIMS: usize = 4;
+
+        let rt_a = KhiveRuntime::memory().unwrap();
+        let (provider_a, _counter_a) = ConstVecProvider::new(MODEL, DIMS);
+        rt_a.register_embedder(provider_a);
+        let ns_a = Namespace::parse("fault-vec-distinct-a").unwrap();
+        let tok_a = NamespaceToken::for_namespace(ns_a.clone());
+
+        let rt_b = KhiveRuntime::memory().unwrap();
+        let (provider_b, _counter_b) = ConstVecProvider::new(MODEL, DIMS);
+        rt_b.register_embedder(provider_b);
+        let ns_b = Namespace::parse("fault-vec-distinct-b").unwrap();
+        let tok_b = NamespaceToken::for_namespace(ns_b.clone());
+
+        arm_vector_fail(ns_a.as_str());
+        arm_vector_fail(ns_b.as_str());
+
+        let (result_a, result_b) = tokio::join!(
+            rt_a.create_note(
+                &tok_a,
+                "observation",
+                None,
+                "vector failure target A",
+                None,
+                None,
+                vec![],
+            ),
+            rt_b.create_note(
+                &tok_b,
+                "observation",
+                None,
+                "vector failure target B",
+                None,
+                None,
+                vec![],
+            ),
+        );
+
+        assert!(
+            result_a.is_err(),
+            "namespace A must retain its pending vector failure injection"
+        );
+        assert!(
+            result_b.is_err(),
+            "namespace B must retain its pending vector failure injection"
         );
     }
 
@@ -10845,8 +10879,7 @@ mod tests {
     // error; the test asserts zero rows in both `entities` and `fts_entities`.
     #[tokio::test]
     async fn create_many_fts_failure_rolls_back_both_substrates() {
-        // Use a unique namespace so the process-global one-shot is unaffected by
-        // other concurrent tests.
+        // Use a unique namespace so only this test consumes its failure entry.
         let ns = format!("fts-fail-many-{}", uuid::Uuid::new_v4().as_simple());
         let rt = rt();
         let tok = NamespaceToken::for_namespace(Namespace::parse(&ns).unwrap());
@@ -10899,6 +10932,54 @@ mod tests {
         assert_eq!(
             fts_count, 0,
             "fts_entities must be empty after FTS-failure rollback; found {fts_count}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_many_fts_failure_injections_for_distinct_namespaces_do_not_overwrite_each_other(
+    ) {
+        let rt_a = rt();
+        let ns_a = Namespace::parse("fts-fail-many-distinct-a").unwrap();
+        let tok_a = NamespaceToken::for_namespace(ns_a.clone());
+        let rt_b = rt();
+        let ns_b = Namespace::parse("fts-fail-many-distinct-b").unwrap();
+        let tok_b = NamespaceToken::for_namespace(ns_b.clone());
+
+        arm_fts_fail_many(ns_a.as_str());
+        arm_fts_fail_many(ns_b.as_str());
+
+        let (result_a, result_b) = tokio::join!(
+            rt_a.create_many(
+                &tok_a,
+                vec![EntityCreateSpec {
+                    kind: "concept".into(),
+                    entity_type: None,
+                    name: "FtsFailureTargetA".into(),
+                    description: None,
+                    properties: None,
+                    tags: vec![],
+                }],
+            ),
+            rt_b.create_many(
+                &tok_b,
+                vec![EntityCreateSpec {
+                    kind: "concept".into(),
+                    entity_type: None,
+                    name: "FtsFailureTargetB".into(),
+                    description: None,
+                    properties: None,
+                    tags: vec![],
+                }],
+            ),
+        );
+
+        assert!(
+            result_a.is_err(),
+            "namespace A must retain its pending create_many FTS failure injection"
+        );
+        assert!(
+            result_b.is_err(),
+            "namespace B must retain its pending create_many FTS failure injection"
         );
     }
 
@@ -10964,6 +11045,54 @@ mod tests {
         assert_eq!(
             fts_count, 0,
             "fts_entities must be empty after partial-FTS-failure rollback; found {fts_count}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_many_fts_partial_failure_injections_for_distinct_namespaces_do_not_overwrite_each_other(
+    ) {
+        let rt_a = rt();
+        let ns_a = Namespace::parse("fts-fail-many-partial-distinct-a").unwrap();
+        let tok_a = NamespaceToken::for_namespace(ns_a.clone());
+        let rt_b = rt();
+        let ns_b = Namespace::parse("fts-fail-many-partial-distinct-b").unwrap();
+        let tok_b = NamespaceToken::for_namespace(ns_b.clone());
+
+        arm_fts_fail_many_partial(ns_a.as_str());
+        arm_fts_fail_many_partial(ns_b.as_str());
+
+        let (result_a, result_b) = tokio::join!(
+            rt_a.create_many(
+                &tok_a,
+                vec![EntityCreateSpec {
+                    kind: "concept".into(),
+                    entity_type: None,
+                    name: "FtsPartialFailureTargetA".into(),
+                    description: None,
+                    properties: None,
+                    tags: vec![],
+                }],
+            ),
+            rt_b.create_many(
+                &tok_b,
+                vec![EntityCreateSpec {
+                    kind: "concept".into(),
+                    entity_type: None,
+                    name: "FtsPartialFailureTargetB".into(),
+                    description: None,
+                    properties: None,
+                    tags: vec![],
+                }],
+            ),
+        );
+
+        assert!(
+            result_a.is_err(),
+            "namespace A must retain its pending create_many partial FTS failure injection"
+        );
+        assert!(
+            result_b.is_err(),
+            "namespace B must retain its pending create_many partial FTS failure injection"
         );
     }
 
@@ -11658,8 +11787,7 @@ mod tests {
     }
 
     // Vector insert failure after entity row + FTS commit rolls back both.
-    // Uses a unique namespace to avoid consuming the VECTOR_FAIL_NS flag from
-    // a concurrent test's create_entity or create_note.
+    // Uses a unique namespace so only this test consumes its VECTOR_FAIL_NS entry.
     #[tokio::test]
     async fn create_entity_vector_failure_rolls_back_entity_row_and_fts() {
         const MODEL: &str = "test-entity-vec-inject";
