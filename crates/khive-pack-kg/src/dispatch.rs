@@ -218,6 +218,7 @@ impl PackRuntime for KgPack {
             "review" => self.handle_review(graph_token, params, registry).await,
             "withdraw" => self.handle_withdraw(graph_token, params).await,
             "stats" => self.handle_stats(graph_token, params).await,
+            "whoami" => self.handle_whoami(graph_token, params).await,
             "resolve" => self.handle_resolve(graph_token, params, registry).await,
             "merge" => self.handle_merge(graph_token, params, registry).await,
             // UUID-based: entities/edges use graph token, notes/events use caller token.
@@ -233,7 +234,7 @@ impl PackRuntime for KgPack {
 
 #[cfg(test)]
 mod tests {
-    use khive_runtime::{KhiveRuntime, Namespace, VerbRegistryBuilder};
+    use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig, VerbRegistryBuilder};
     use serde_json::json;
 
     use super::*;
@@ -330,6 +331,46 @@ mod tests {
                 .iter()
                 .all(|e| e.get("namespace").and_then(|v| v.as_str()) != Some("tenant-a")),
             "list from tenant-b must not include tenant-a entities; got {items:?}"
+        );
+    }
+
+    /// A configured actor whose id happens to be `"local"` is not the anonymous
+    /// kind — `ActorRef::is_anonymous()` is false — but the runtime's own
+    /// authorization/token-minting policy (`actor_is_unattributed`) still
+    /// treats any `"local"`-id actor as the unattributed fallback. `whoami`
+    /// must report the same verdict its caller will actually get from the
+    /// rest of the runtime.
+    #[tokio::test]
+    async fn kg_whoami_flags_configured_local_actor_as_unattributed() {
+        let rt = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            packs: vec!["kg".to_string()],
+            brain_profile: None,
+            actor_id: Some("local".to_string()),
+            ..RuntimeConfig::no_embeddings()
+        })
+        .expect("in-memory runtime with configured local actor");
+
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+        assert!(
+            !token.actor().is_anonymous(),
+            "a configured actor_id must not resolve to the anonymous kind"
+        );
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        let registry = builder.build().expect("registry build");
+
+        let pack = KgPack::new(rt.clone());
+        let result = pack
+            .dispatch("whoami", json!({}), &registry, &token)
+            .await
+            .expect("whoami must succeed");
+
+        assert_eq!(
+            result.get("unattributed").and_then(|v| v.as_bool()),
+            Some(true),
+            "a configured 'local' actor must report unattributed: true, got {result:?}"
         );
     }
 

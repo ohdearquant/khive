@@ -11,13 +11,15 @@ import pytest
 from khive_contract.client import KhiveMcpSession
 from khive_contract.fixtures import KG_VERBS as _KG_VERBS
 
-# KG verbs imported from fixtures.py — single source of truth (18 verbs).
+# KG verbs imported from fixtures.py — single source of truth (19 verbs).
 KG_VERBS = tuple(sorted(_KG_VERBS))
 
 GTD_VERBS = ("gtd.assign", "gtd.next", "gtd.complete", "gtd.tasks", "gtd.transition")
 MEMORY_VERBS = ("memory.remember", "memory.recall")
 
-# All 23 baseline product verbs (KG:16 + GTD:5 + memory:2).
+# All 23 baseline product verbs (KG:16 + GTD:5 + memory:2). The 16 KG verbs
+# exercised below are of the pack's 19 (context/resolve/whoami are the
+# remaining KG verbs not exercised by this module's reachability walk).
 # Written as a set literal so the manifest AST-introspector can parse it.
 VERBS_UNDER_TEST = {
     # KG substrate (16) — bare names; no pack prefix
@@ -44,7 +46,8 @@ def test_kg_bare_product_verbs_are_reachable(
     ADR: ADR-023
     section: kg bare substrate verbs
 
-    Ports smoke KG surface coverage; verifies all 11 KG verbs are registered
+    Ports smoke KG surface coverage; verifies the KG verbs named in
+    VERBS_UNDER_TEST are registered
     and return non-error results in the base kg session.
     """
     ns = temp_namespace

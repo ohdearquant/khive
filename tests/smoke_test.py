@@ -198,12 +198,13 @@ def main():
         # Surface-contract tripwire: the default config (no --pack, KHIVE_PACKS
         # unset) loads 12 production packs (kg, gtd, memory, brain, comm, schedule,
         # knowledge, session, git, code, workspace, blob), so verbs() returns exactly
-        # 85 user-facing MCP-callable verbs (count what verbs() returns, not internal
+        # 86 user-facing MCP-callable verbs (count what verbs() returns, not internal
         # dispatch arms). The session pack contributes 4 agent-facing T1 verbs
         # (store/list/resume/export), promoted from internal subhandlers to
         # Visibility::Verb per ADR-083; brain.register_adapter (#354), context
         # (ADR-089, the 17th kg-substrate bare verb), resolve (unified-verb
-        # draft ADR Slice 1, the 18th kg-substrate bare verb), comm.health
+        # draft ADR Slice 1, the 18th kg-substrate bare verb), whoami (caller
+        # identity introspection, the 19th kg-substrate bare verb), comm.health
         # (#606, verified live 2026-07-04), comm.probe (#644 read-only
         # inbound poll), and brain.event_counts (#724, ADR-103 Stage 1
         # windowed event read) are included in the count; git contributes
@@ -221,12 +222,13 @@ def main():
         # until a backend is installed via [storage.blob] or KHIVE_BLOB_ROOT.
         # Update this number when the pack set or verb surface changes; a
         # silent drift here is the bug this assertion exists to catch.
-        assert verbs_result["total"] == 85, (
-            f"expected 85 user-facing verbs from the 12 default packs "
+        assert verbs_result["total"] == 86, (
+            f"expected 86 user-facing verbs from the 12 default packs "
             f"(session contributes 4 T1 verbs promoted to Visibility::Verb per "
             f"ADR-083; context is the 17th kg-substrate bare verb per ADR-089; "
             f"resolve is the 18th kg-substrate bare verb per the unified-verb "
-            f"draft ADR Slice 1; comm.health is #606; comm.probe is #644; "
+            f"draft ADR Slice 1; whoami is the 19th kg-substrate bare verb "
+            f"(caller identity introspection); comm.health is #606; comm.probe is #644; "
             f"brain.event_counts is #724/ADR-103; git contributes git.digest plus "
             f"git.commit/git.branch/git.push (ADR-108); "
             f"code contributes code.ingest per ADR-085 Amendment 2 (PR #1039); "

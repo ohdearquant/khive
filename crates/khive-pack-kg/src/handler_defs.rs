@@ -1,4 +1,4 @@
-//! Static `KG_HANDLERS` table (18 `HandlerDef` entries) and the `verbs` introspection handler.
+//! Static `KG_HANDLERS` table (19 `HandlerDef` entries) and the `verbs` introspection handler.
 
 // Illocutionary classification (Searle 1976):
 //   Assertive  -- retrieves/presents state of affairs
@@ -14,7 +14,7 @@ use serde_json::Value;
 use khive_runtime::{RuntimeError, VerbRegistry};
 use khive_types::{HandlerDef, ParamDef, VerbCategory, Visibility};
 
-pub(crate) static KG_HANDLERS: [HandlerDef; 18] = [
+pub(crate) static KG_HANDLERS: [HandlerDef; 19] = [
     // Commissive: commits an entity or note to the namespace
     HandlerDef {
         name: "create",
@@ -899,6 +899,18 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 18] = [
                               bound. Default 5, max 20.",
             },
         ],
+    },
+    // Assertive: reports the caller's own resolved identity
+    HandlerDef {
+        name: "whoami",
+        description: "Report the caller's identity as the runtime already resolved it for \
+                      this request: actor_id, actor_kind, whether the actor is the \
+                      unattributed/anonymous fallback, the write namespace, and the \
+                      read-visible namespace set. Never returns tokens or credentials — \
+                      only labels the runtime already computed before dispatch.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
+        params: &[],
     },
     // Assertive: verb discovery (ue-help-introspection H5)
     HandlerDef {

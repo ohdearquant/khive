@@ -173,16 +173,16 @@ fn propose_params_no_actor_field() {
     assert_eq!(p.title, "Fix RoPE");
 }
 
-// KG pack must expose exactly 18 handlers including propose/review/withdraw/verbs/stats/context/resolve
+// KG pack must expose exactly 19 handlers including propose/review/withdraw/verbs/stats/context/resolve/whoami
 #[test]
-fn kg_pack_exposes_18_handlers() {
+fn kg_pack_exposes_19_handlers() {
     use crate::KgPack;
     use khive_types::Pack;
     let handlers = KgPack::HANDLERS;
     assert_eq!(
         handlers.len(),
-        18,
-        "kg pack must expose 18 handlers (was 17, +1 for resolve — unified-verb draft ADR Slice 1)"
+        19,
+        "kg pack must expose 19 handlers (was 18, +1 for whoami)"
     );
     let names: Vec<&str> = handlers.iter().map(|h| h.name).collect();
     assert!(names.contains(&"propose"), "propose must be in KG_HANDLERS");
