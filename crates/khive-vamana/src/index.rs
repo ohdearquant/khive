@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 #[cfg(feature = "mmap")]
 use std::{
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::Write,
     path::Path,
 };
@@ -861,11 +861,22 @@ impl VamanaIndex {
     /// atomically renames `metadata.bin.tmp` → `metadata.bin` as the commit record. A
     /// crash at any point before that rename leaves the previous `metadata.bin` (v1 or
     /// v2) valid and untouched — [`Self::load_or_build`] never observes a torn v2
-    /// commit. See crates/khive-vamana/docs/api/persistence.md#v2-crash-safe-save-load for
-    /// the staging/fsync sequence.
+    /// commit. Publication is serialized per directory; a candidate whose applied
+    /// sequence is lower than the incumbent returns
+    /// [`VamanaError::CheckpointSequenceRegression`] before staging any files. See
+    /// crates/khive-vamana/docs/api/persistence.md#v2-crash-safe-save-load for the
+    /// staging/fsync sequence.
     #[cfg(feature = "mmap")]
     pub fn save_atomic(&self, path: &Path) -> Result<()> {
         fs::create_dir_all(path)?;
+        let publication_lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path.join(".checkpoint.lock"))?;
+        publication_lock.lock()?;
+        reject_checkpoint_sequence_regression(path, self.last_applied_seq)?;
 
         // Stage under .v2new so a crash before the metadata rename leaves the previous
         // segments (v1 or v2) intact and readable.
@@ -2748,6 +2759,33 @@ struct ParsedLifecycle {
     free_slots: Vec<u32>,
     reverse_adj: Vec<Vec<u32>>,
     ops_since_consolidation: usize,
+}
+
+#[cfg(feature = "mmap")]
+fn reject_checkpoint_sequence_regression(path: &Path, candidate: Option<u64>) -> Result<()> {
+    let metadata = match fs::read(path.join("metadata.bin")) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.len() < V2_COMMIT_MAGIC.len()
+        || &metadata[..V2_COMMIT_MAGIC.len()] != V2_COMMIT_MAGIC
+    {
+        return Ok(());
+    }
+    let Ok(commit) = parse_v2_commit(&metadata) else {
+        return Ok(());
+    };
+    let Some(incumbent) = commit.last_applied_seq else {
+        return Ok(());
+    };
+    if candidate.is_none_or(|sequence| sequence < incumbent) {
+        return Err(VamanaError::CheckpointSequenceRegression {
+            candidate,
+            incumbent,
+        });
+    }
+    Ok(())
 }
 
 /// Write the KHVVAMG2 commit record including embedded v1 metadata fields.

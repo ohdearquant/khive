@@ -315,6 +315,38 @@ fn v2_roundtrip_preserves_lifecycle_state() {
     }
 }
 
+#[cfg(feature = "mmap")]
+#[test]
+fn v2_stale_checkpoint_cannot_replace_newer_commit() {
+    let dim = 4usize;
+    let cfg = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(4)
+        .with_search_list_size(8);
+    let newer_vectors = rand_unit_vectors(16, dim, 0x1138_0200);
+    let stale_vectors = rand_unit_vectors(8, dim, 0x1138_0100);
+    let mut newer = VamanaIndex::build(&newer_vectors, cfg.clone()).unwrap();
+    let mut stale = VamanaIndex::build(&stale_vectors, cfg).unwrap();
+    newer.set_last_applied_seq(Some(200));
+    stale.set_last_applied_seq(Some(100));
+
+    let dir = tempfile::tempdir().unwrap();
+    newer.save_atomic(dir.path()).unwrap();
+
+    let stale_result = stale.save_atomic(dir.path());
+    assert!(matches!(
+        stale_result,
+        Err(VamanaError::CheckpointSequenceRegression {
+            candidate: Some(100),
+            incumbent: 200,
+        })
+    ));
+
+    let persisted = VamanaIndex::load(dir.path()).unwrap();
+    assert_eq!(persisted.last_applied_seq(), Some(200));
+    assert_eq!(persisted.num_vectors(), newer.num_vectors());
+    assert_eq!(persisted.vectors().unwrap(), newer.vectors().unwrap());
+}
+
 /// Crash consistency: corrupt metadata.bin after writing segments → load_or_build rebuilds.
 #[cfg(feature = "mmap")]
 #[test]
