@@ -141,6 +141,19 @@ pub async fn run_pending_events(
     namespace: &str,
     verbose: bool,
 ) -> Result<DrainSummary> {
+    run_pending_events_with_config(db, None, namespace, verbose).await
+}
+
+/// One-shot drain using an explicit config selection.
+///
+/// This is the config-aware counterpart used by `kkernel exec` when
+/// `--config` or `KHIVE_CONFIG` selected a non-default instance.
+pub async fn run_pending_events_with_config(
+    db: Option<&str>,
+    config: Option<&std::path::Path>,
+    namespace: &str,
+    verbose: bool,
+) -> Result<DrainSummary> {
     // Resolve through the SAME multi-backend-aware construction the daemon
     // boot path uses (`khive-mcp::serve::build_server_with_explicit_namespace`),
     // rather than a throwaway `RuntimeConfig::default()` (PR #782):
@@ -155,11 +168,10 @@ pub async fn run_pending_events(
     // (single- or multi-backend), so replayed actions route through the
     // correct per-pack backend exactly like the daemon tick now does — not a
     // single runtime standing in for every pack (the same issue this fix
-    // closes for the daemon-resident tick). `kkernel exec` has no
-    // `--config` flag today (see `kkernel::exec::run_exec`'s own
-    // `resolve_runtime_config` call), so this mirrors that: `config: None`
-    // still triggers `khive.toml`'s standard cwd/home search order inside
-    // `resolve_runtime_config`.
+    // closes for the daemon-resident tick). `config` carries the same explicit
+    // `--config`/`KHIVE_CONFIG` selection as ordinary `kkernel exec`
+    // operations. `None` still triggers the standard cwd/database/home search
+    // order inside `resolve_runtime_config`.
     //
     // This does NOT call `crate::serve::build_server` directly (PR #782):
     // `build_server` derives BOTH
@@ -194,7 +206,7 @@ pub async fn run_pending_events(
         namespace: None,
         no_embed: false,
         pack: Vec::new(),
-        config: None,
+        config: config.map(std::path::Path::to_path_buf),
         daemon: false,
         transport: None,
         bind: None,

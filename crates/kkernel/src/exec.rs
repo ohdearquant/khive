@@ -26,7 +26,7 @@
 
 use std::collections::BTreeMap;
 use std::io::BufRead as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -62,12 +62,17 @@ type ForwardFuture<'a> = std::pin::Pin<
 
 /// Function pointer type for the daemon-forwarding seam.
 #[cfg(unix)]
-type ForwardFnPtr = for<'a> fn(&'a DaemonRequestFrame) -> ForwardFuture<'a>;
+type ForwardFnPtr = for<'a> fn(&'a DaemonRequestFrame, Option<&'a Path>) -> ForwardFuture<'a>;
 
-/// Adapts the real `forward_or_spawn` to the `ForwardFnPtr` signature.
+/// Adapts the real daemon forwarding path to the `ForwardFnPtr` signature.
 #[cfg(unix)]
-fn forward_or_spawn_boxed(frame: &DaemonRequestFrame) -> ForwardFuture<'_> {
-    Box::pin(khive_mcp::daemon::forward_or_spawn(frame))
+fn forward_or_spawn_boxed<'a>(
+    frame: &'a DaemonRequestFrame,
+    config: Option<&'a Path>,
+) -> ForwardFuture<'a> {
+    Box::pin(khive_mcp::daemon::forward_or_spawn_with_config(
+        frame, config,
+    ))
 }
 
 // The scheduled-event drain now lives in `khive-mcp` (ADR-106: the
@@ -197,6 +202,13 @@ pub struct ExecArgs {
     /// ephemeral in-memory database, matching `kkernel mcp`.
     #[arg(long, env = "KHIVE_DB")]
     pub db: Option<String>,
+
+    /// Path to a khive TOML config file.
+    ///
+    /// Overrides the standard cwd/database/home config discovery order and
+    /// matches `kkernel mcp` and `kkernel reindex` (`KHIVE_CONFIG`).
+    #[arg(long, env = "KHIVE_CONFIG")]
+    pub config: Option<PathBuf>,
 
     /// Namespace to operate in.
     #[arg(long, default_value = "local")]
@@ -498,9 +510,13 @@ async fn apply_ops_file(
 pub async fn run_exec(args: ExecArgs) -> Result<()> {
     // ── pending-events drain ─────────────────────────────────────────────────
     if args.pending_events {
-        let summary =
-            pending_events::run_pending_events(args.db.as_deref(), &args.namespace, args.verbose)
-                .await?;
+        let summary = pending_events::run_pending_events_with_config(
+            args.db.as_deref(),
+            args.config.as_deref(),
+            &args.namespace,
+            args.verbose,
+        )
+        .await?;
         pending_events::print_summary(&summary);
         return Ok(());
     }
@@ -536,7 +552,7 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
     let (cfg, db_anchor) =
         khive_mcp::serve::resolve_runtime_config_with_db_anchor(RuntimeConfigInputs {
             db: args.db.as_deref(),
-            config: None, // `kkernel exec` has no `--config` flag today
+            config: args.config.as_deref(),
             namespace,
             // `--namespace` has a clap `default_value = "local"`, so it is always
             // present — there is no way to distinguish "operator typed --namespace
@@ -571,6 +587,7 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
     let db_context = ExecDbContext {
         raw: args.db,
         anchor: db_anchor,
+        config: args.config,
     };
 
     match mode {
@@ -635,6 +652,7 @@ enum ExecMode {
 struct ExecDbContext {
     raw: Option<String>,
     anchor: Option<PathBuf>,
+    config: Option<PathBuf>,
 }
 
 async fn run_exec_inline(
@@ -710,8 +728,8 @@ async fn run_exec_inline_with_forward(
     // daemon's own boot path loads (`serve.rs`'s `build_server`:
     // `KhiveConfig::load_with_home_fallback(args.config.as_deref(),
     // config_discovery_db_anchor(args.db.as_deref()).as_deref())` —
-    // `kkernel exec` has no `--config` flag, so the first argument here is
-    // always `None`, exactly like there. The second argument is the raw
+    // The first argument is the same explicit `--config`/`KHIVE_CONFIG`
+    // selection used during initial resolution. The second argument is the raw
     // `--db`/`KHIVE_DB` discovery anchor (`None` unless `--db` was set) rather
     // than `cfg.db_path` — `cfg.db_path` materializes the `$HOME/.khive`
     // default when `--db` is unset (#689), which would incorrectly re-anchor
@@ -726,9 +744,12 @@ async fn run_exec_inline_with_forward(
     // `ConfigMismatch` and silently fell back to the cold in-process path on
     // every call.
     let db_path_for_config = config_discovery_db_anchor(db_context.raw.as_deref());
-    let khive_cfg = KhiveConfig::load_with_home_fallback(None, db_path_for_config.as_deref())
-        .map_err(|e| anyhow::anyhow!("config error: {e}"))?
-        .unwrap_or_default();
+    let khive_cfg = KhiveConfig::load_with_home_fallback(
+        db_context.config.as_deref(),
+        db_path_for_config.as_deref(),
+    )
+    .map_err(|e| anyhow::anyhow!("config error: {e}"))?
+    .unwrap_or_default();
 
     // #1226: apply the same --db/[[backends]] conflict guard the in-process
     // fallback below applies, BEFORE the daemon fast-path — otherwise a warm
@@ -775,7 +796,7 @@ async fn run_exec_inline_with_forward(
             from_wire: false,
             request_id: None,
         };
-        if let Some(res) = forward_fn(&frame).await {
+        if let Some(res) = forward_fn(&frame, db_context.config.as_deref()).await {
             let output = res.map_err(|e| anyhow::anyhow!("{}", e.message))?;
             println!("{output}");
             enforce_strict_batch_result(&output, strict)?;
@@ -893,9 +914,12 @@ async fn run_exec_ops_file(
     // path — see `build_local_fallback_server`.
     enforce_strict_actor_mode(cfg.actor_id.as_deref(), &cfg.packs)?;
     let db_path_for_config = config_discovery_db_anchor(db_context.raw.as_deref());
-    let khive_cfg = KhiveConfig::load_with_home_fallback(None, db_path_for_config.as_deref())
-        .map_err(|e| anyhow::anyhow!("config error: {e}"))?
-        .unwrap_or_default();
+    let khive_cfg = KhiveConfig::load_with_home_fallback(
+        db_context.config.as_deref(),
+        db_path_for_config.as_deref(),
+    )
+    .map_err(|e| anyhow::anyhow!("config error: {e}"))?
+    .unwrap_or_default();
 
     if atomic {
         let max_ops = atomic_max_ops.unwrap_or(khive_types::pack::ATOMIC_MAX_OPS_DEFAULT);
@@ -2463,37 +2487,48 @@ default = true
     std::thread_local! {
         static SPY_CAPTURED_CONFIG_ID: std::cell::RefCell<Option<String>> =
             const { std::cell::RefCell::new(None) };
+        static SPY_CAPTURED_CONFIG_PATH: std::cell::RefCell<Option<PathBuf>> =
+            const { std::cell::RefCell::new(None) };
     }
 
     #[cfg(unix)]
-    fn spy_capture_config_id(frame: &DaemonRequestFrame) -> super::ForwardFuture<'_> {
+    fn spy_capture_config_id<'a>(
+        frame: &'a DaemonRequestFrame,
+        config: Option<&'a Path>,
+    ) -> super::ForwardFuture<'a> {
         SPY_CAPTURED_CONFIG_ID.with(|c| *c.borrow_mut() = Some(frame.config_id.clone()));
-        Box::pin(async { None })
+        SPY_CAPTURED_CONFIG_PATH.with(|c| *c.borrow_mut() = config.map(Path::to_path_buf));
+        Box::pin(async {
+            Some(Ok(
+                r#"{"results":[],"summary":{"total":0,"succeeded":0,"failed":0,"aborted":0}}"#
+                    .to_string(),
+            ))
+        })
     }
 
     #[cfg(unix)]
     #[tokio::test]
     #[serial]
-    async fn exec_frame_config_id_matches_daemon_config_id_for_multi_backend_project_toml() {
+    async fn cli_only_config_reaches_strict_daemon_spawn_with_matching_config_id() {
         std::env::remove_var("KHIVE_EMBEDDING_MODEL");
         std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
         std::env::remove_var("KHIVE_ACTOR");
         std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+        let previous_config = std::env::var_os("KHIVE_CONFIG");
+        let previous_strict = std::env::var_os("KHIVE_DAEMON_STRICT");
+        std::env::remove_var("KHIVE_CONFIG");
+        std::env::set_var("KHIVE_DAEMON_STRICT", "1");
         let (prev_home, home_dir) = isolate_home_for_test();
         SPY_CAPTURED_CONFIG_ID.with(|c| *c.borrow_mut() = None);
+        SPY_CAPTURED_CONFIG_PATH.with(|c| *c.borrow_mut() = None);
 
-        // No explicit `--db` anywhere below — this mirrors the real multi-tenant
-        // deployment shape the bug affects: `~/.khive/config.toml` declares
-        // `[[backends]]` and `kkernel exec` relies on default discovery. An
-        // explicit `--db` would itself be rejected as ambiguous once backends
-        // are declared (ADR-028 §8, `build_registry_for_multi_backend`), so it
-        // is not a legitimate way to reach this scenario — default discovery is.
         let khive_dir = home_dir.path().join(".khive");
         std::fs::create_dir_all(&khive_dir).expect("mkdir .khive");
         let main_backend_path = khive_dir.join("main-backend.db");
         let sessions_backend_path = khive_dir.join("sessions-backend.db");
+        let config_path = home_dir.path().join("selected-khive.toml");
         std::fs::write(
-            khive_dir.join("config.toml"),
+            &config_path,
             format!(
                 r#"
 [[backends]]
@@ -2513,14 +2548,22 @@ backend = "sessions"
                 sessions_backend_path.display(),
             ),
         )
-        .expect("write multi-backend config.toml");
+        .expect("write selected config");
 
-        // `no_embed: true` keeps this test fast and network-independent — it is
-        // scoped to the backends-topology fold, not embedding-model resolution
-        // (a separate, already-covered concern in the sibling project-toml test).
+        let args = ExecArgs::parse_from([
+            "exec",
+            "stats()",
+            "--config",
+            config_path.to_str().expect("UTF-8 config path"),
+        ]);
+        assert!(
+            std::env::var_os("KHIVE_CONFIG").is_none(),
+            "the selected config must come only from the CLI"
+        );
+
         let cfg = resolve_runtime_config(RuntimeConfigInputs {
             db: None,
-            config: None,
+            config: args.config.as_deref(),
             namespace: Namespace::parse("local").expect("ns"),
             namespace_explicit: true,
             actor_explicit: false,
@@ -2539,7 +2582,10 @@ backend = "sessions"
             None,
             None,
             None,
-            ExecDbContext::default(),
+            ExecDbContext {
+                config: args.config.clone(),
+                ..ExecDbContext::default()
+            },
             false,
             spy_capture_config_id,
         )
@@ -2549,6 +2595,10 @@ backend = "sessions"
         let captured = SPY_CAPTURED_CONFIG_ID
             .with(|c| c.borrow_mut().take())
             .expect("spy must have captured a forwarded frame");
+        let captured_config_path = SPY_CAPTURED_CONFIG_PATH
+            .with(|c| c.borrow_mut().take())
+            .expect("spy must have captured the daemon spawn config");
+        assert_eq!(captured_config_path, config_path);
 
         // Independently compute what the DAEMON would compute for the exact
         // same on-disk config.toml + database, mirroring serve.rs's own boot
@@ -2558,7 +2608,7 @@ backend = "sessions"
         // serve.rs:916 does.
         let serve_cfg = resolve_runtime_config(RuntimeConfigInputs {
             db: None,
-            config: None,
+            config: Some(&config_path),
             namespace: Namespace::parse("local").expect("ns"),
             namespace_explicit: false,
             actor_explicit: false,
@@ -2570,9 +2620,10 @@ backend = "sessions"
             brain_profile: None,
         })
         .expect("resolve serve-shaped config");
-        let khive_cfg = KhiveConfig::load_with_home_fallback(None, serve_cfg.db_path.as_deref())
-            .expect("load multi-backend config.toml")
-            .expect("config.toml must be found at tier 3");
+        let khive_cfg =
+            KhiveConfig::load_with_home_fallback(Some(&config_path), serve_cfg.db_path.as_deref())
+                .expect("load selected config")
+                .expect("selected config must be found");
         assert!(
             !khive_cfg.backends.is_empty(),
             "sanity: the written config.toml must actually resolve with a non-empty \
@@ -2580,6 +2631,14 @@ backend = "sessions"
         );
         let daemon_config_id = compute_config_id(&serve_cfg, Some(&khive_cfg));
         restore_home(prev_home);
+        match previous_config {
+            Some(value) => std::env::set_var("KHIVE_CONFIG", value),
+            None => std::env::remove_var("KHIVE_CONFIG"),
+        }
+        match previous_strict {
+            Some(value) => std::env::set_var("KHIVE_DAEMON_STRICT", value),
+            None => std::env::remove_var("KHIVE_DAEMON_STRICT"),
+        }
 
         assert_eq!(
             captured, daemon_config_id,
@@ -2652,6 +2711,7 @@ backend = "sessions"
             ExecDbContext {
                 raw: Some(conflicting_override.display().to_string()),
                 anchor: None,
+                config: None,
             },
             false,
             spy_capture_config_id,
