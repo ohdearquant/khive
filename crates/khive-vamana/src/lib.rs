@@ -13,6 +13,7 @@ pub use error::{Result, VamanaError};
 #[cfg(feature = "mmap")]
 pub use external_ids::{
     read_external_ids_sidecar, segment_commit_digest, write_external_ids_sidecar,
+    ExternalIdsWriteError,
 };
 pub use graph::{GreedySearchResult, VamanaGraph, VisitedSet};
 #[cfg(feature = "mmap")]

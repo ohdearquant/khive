@@ -2512,6 +2512,7 @@ dependencies = [
  "bytemuck",
  "criterion",
  "khive-quant",
+ "libc",
  "memmap2",
  "rand 0.8.7",
  "rayon",
@@ -2521,6 +2522,7 @@ dependencies = [
  "thiserror 2.0.18",
  "toml",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
