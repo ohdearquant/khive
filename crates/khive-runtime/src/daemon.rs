@@ -1136,7 +1136,7 @@ fn ensure_socket_dir_is_trusted(parent: &std::path::Path) -> anyhow::Result<()> 
                 parent.display()
             )
         })?;
-        return ensure_socket_dir_ancestors_are_swap_resistant(parent, daemon_euid);
+        return ensure_socket_path_is_swap_resistant(parent, daemon_euid);
     }
 
     // Fail closed on the stat itself: not being able to read the metadata is
@@ -1175,16 +1175,23 @@ fn ensure_socket_dir_is_trusted(parent: &std::path::Path) -> anyhow::Result<()> 
         );
     }
 
-    ensure_socket_dir_ancestors_are_swap_resistant(parent, daemon_euid)
+    ensure_socket_path_is_swap_resistant(parent, daemon_euid)
 }
 
-/// Walk every ancestor of the (already-vetted) socket directory and refuse
-/// any that would let another local user *replace a path component*: rename
-/// the trusted final directory away and recreate it, re-rooting the socket
-/// path under attacker control without ever touching the vetted directory
-/// itself.
+/// Walk the socket directory path exactly as the kernel will traverse it at
+/// bind time — component by component, following symlinks — and refuse any
+/// node another local user could swap after this validation.
 ///
-/// The ancestor rule is deliberately weaker than the immediate parent's.
+/// Checking only the canonicalized result is not enough: bind and every
+/// client traverse the *original* path, so a symlink component owned by
+/// another user can resolve somewhere trusted while it is being validated
+/// and be retargeted before the socket is bound. Validating the nodes the
+/// traversal actually visits closes that gap: a symlink component is
+/// acceptable only when its owner — the only party besides root who can
+/// retarget it — is this daemon's euid or root, and every directory
+/// component is held to the ancestor rule below.
+///
+/// The directory rule is deliberately weaker than the immediate parent's.
 /// The parent hosts the socket file, where the threat is *creation* of the
 /// predictable path — the sticky bit does not restrict creating, so no
 /// sticky exception is sound there. An ancestor only threatens via
@@ -1194,57 +1201,123 @@ fn ensure_socket_dir_is_trusted(parent: &std::path::Path) -> anyhow::Result<()> 
 /// acceptable ancestor of a user-owned 0700 socket directory, while a
 /// non-sticky group/other-writable ancestor, or one owned by a third uid
 /// (who could rename the entry, or chmod the directory first), is refused.
-///
-/// The path is canonicalized first so a symlink component cannot smuggle in
-/// an unvetted real location; canonicalization failure fails closed.
+/// Every stat failure fails closed.
 #[cfg(unix)]
-fn ensure_socket_dir_ancestors_are_swap_resistant(
+fn ensure_socket_path_is_swap_resistant(
     parent: &std::path::Path,
     daemon_euid: u32,
 ) -> anyhow::Result<()> {
     use std::os::unix::fs::MetadataExt;
 
-    let canonical = std::fs::canonicalize(parent).map_err(|e| {
-        anyhow::anyhow!(
-            "refusing to start: cannot canonicalize socket directory {}: {e}. Ancestor \
-             trust cannot be checked through an unresolvable path.",
-            parent.display()
-        )
-    })?;
+    let absolute = if parent.is_absolute() {
+        parent.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "refusing to start: cannot resolve the working directory to absolutize \
+                     socket directory {}: {e}.",
+                    parent.display()
+                )
+            })?
+            .join(parent)
+    };
 
-    for ancestor in canonical.ancestors().skip(1) {
-        if ancestor.as_os_str().is_empty() {
-            break;
+    fn push_components(stack: &mut Vec<std::ffi::OsString>, path: &std::path::Path) {
+        let components: Vec<_> = path
+            .components()
+            .map(|c| c.as_os_str().to_os_string())
+            .collect();
+        stack.extend(components.into_iter().rev());
+    }
+
+    let mut stack: Vec<std::ffi::OsString> = Vec::new();
+    push_components(&mut stack, &absolute);
+    let mut resolved = std::path::PathBuf::new();
+    let mut symlinks_followed = 0u32;
+
+    while let Some(component) = stack.pop() {
+        if component == "/" {
+            resolved = std::path::PathBuf::from("/");
+            continue;
         }
-        let meta = std::fs::metadata(ancestor).map_err(|e| {
+        if component == "." {
+            continue;
+        }
+        if component == ".." {
+            resolved.pop();
+            continue;
+        }
+        let candidate = resolved.join(&component);
+        let meta = std::fs::symlink_metadata(&candidate).map_err(|e| {
             anyhow::anyhow!(
-                "refusing to start: cannot stat socket-path ancestor {}: {e}. An \
-                 unreadable ancestor is not a passing one.",
-                ancestor.display()
+                "refusing to start: cannot stat socket-path component {}: {e}. An \
+                 unreadable component is not a passing one.",
+                candidate.display()
             )
         })?;
         let owner = meta.uid();
-        let mode = meta.permissions().mode();
-        let sticky = mode & 0o1000 != 0;
-        if owner != daemon_euid && owner != 0 {
-            anyhow::bail!(
-                "refusing to start: socket-path ancestor {} is owned by uid {owner}, not \
-                 this daemon's uid ({daemon_euid}) or root — its owner could rename the \
-                 next path component and re-root the socket path. Point KHIVE_SOCKET \
-                 somewhere trusted end to end, or unset it for the default.",
-                ancestor.display()
-            );
+
+        if meta.file_type().is_symlink() {
+            symlinks_followed += 1;
+            if symlinks_followed > 40 {
+                anyhow::bail!(
+                    "refusing to start: socket path resolves through more than 40 symlinks \
+                     at {} — treating this as a loop.",
+                    candidate.display()
+                );
+            }
+            if owner != daemon_euid && owner != 0 {
+                anyhow::bail!(
+                    "refusing to start: socket-path symlink component {} is owned by uid \
+                     {owner}, not this daemon's uid ({daemon_euid}) or root — its owner \
+                     could retarget it after this check and re-root the socket path. Point \
+                     KHIVE_SOCKET somewhere trusted end to end, or unset it for the \
+                     default.",
+                    candidate.display()
+                );
+            }
+            let target = std::fs::read_link(&candidate).map_err(|e| {
+                anyhow::anyhow!(
+                    "refusing to start: cannot read socket-path symlink component {}: {e}.",
+                    candidate.display()
+                )
+            })?;
+            push_components(&mut stack, &target);
+            continue;
         }
-        if mode & 0o022 != 0 && !sticky {
-            anyhow::bail!(
-                "refusing to start: socket-path ancestor {} is mode {:04o} — writable by \
-                 group or other without the sticky bit, so another local user could rename \
-                 the next path component and re-root the socket path. Point KHIVE_SOCKET \
-                 somewhere trusted end to end, or unset it for the default.",
-                ancestor.display(),
-                mode & 0o7777
-            );
+
+        if meta.is_dir() {
+            let mode = meta.permissions().mode();
+            let sticky = mode & 0o1000 != 0;
+            if owner != daemon_euid && owner != 0 {
+                anyhow::bail!(
+                    "refusing to start: socket-path ancestor {} is owned by uid {owner}, not \
+                     this daemon's uid ({daemon_euid}) or root — its owner could rename the \
+                     next path component and re-root the socket path. Point KHIVE_SOCKET \
+                     somewhere trusted end to end, or unset it for the default.",
+                    candidate.display()
+                );
+            }
+            if mode & 0o022 != 0 && !sticky {
+                anyhow::bail!(
+                    "refusing to start: socket-path ancestor {} is mode {:04o} — writable by \
+                     group or other without the sticky bit, so another local user could rename \
+                     the next path component and re-root the socket path. Point KHIVE_SOCKET \
+                     somewhere trusted end to end, or unset it for the default.",
+                    candidate.display(),
+                    mode & 0o7777
+                );
+            }
+            resolved = candidate;
+            continue;
         }
+
+        anyhow::bail!(
+            "refusing to start: socket-path component {} is neither a directory nor a \
+             symlink — the socket path cannot traverse it.",
+            candidate.display()
+        );
     }
 
     Ok(())
@@ -2200,13 +2273,71 @@ mod tests {
         );
     }
 
+    /// The path walk validates what a symlink component points AT, not just
+    /// the symlink node: a trusted (self-owned) link into a group/other-
+    /// writable non-sticky directory is refused on the target directory's
+    /// metadata, proving the walk keeps traversing — and keeps applying the
+    /// directory rules — past the link, exactly as the kernel will at bind
+    /// time.
+    #[test]
+    fn symlink_component_to_untrusted_directory_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let open = dir.path().join("open-target");
+        std::fs::create_dir(&open).expect("create target");
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).expect("chmod");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&open, &link).expect("symlink");
+
+        // SAFETY: `geteuid` is always successful and takes no arguments.
+        let euid = unsafe { libc::geteuid() } as u32;
+        let err = ensure_socket_path_is_swap_resistant(&link, euid)
+            .expect_err("a link into a 0777 non-sticky directory must be refused");
+        assert!(
+            err.to_string().contains("open-target"),
+            "the refusal should name the untrusted target directory, got: {err}"
+        );
+    }
+
+    /// A symlink component owned by neither the daemon euid nor root is
+    /// refused on the symlink itself: its owner can retarget it after
+    /// validation, so where it currently points is irrelevant. A non-root
+    /// test cannot create a foreign-owned symlink, so this injects a
+    /// mismatched euid instead — and the fixture must live under an
+    /// all-root-owned chain (the platform `/tmp`), because under the test's
+    /// own tempdir the self-owned ancestor directories would already fail
+    /// the injected euid before the walk ever reached the link.
+    #[test]
+    fn foreign_owned_symlink_component_is_refused() {
+        let link =
+            std::path::PathBuf::from(format!("/tmp/khive-swaptest-link-{}", std::process::id()));
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink("/tmp", &link).expect("symlink");
+
+        // SAFETY: `geteuid` is always successful and takes no arguments.
+        let not_my_euid = (unsafe { libc::geteuid() } as u32).wrapping_add(1);
+        let result = ensure_socket_path_is_swap_resistant(&link, not_my_euid);
+        std::fs::remove_file(&link).expect("cleanup");
+
+        let err = result.expect_err("a symlink owned by another uid must be refused");
+        assert!(
+            err.to_string().contains("symlink component"),
+            "the refusal should strike the symlink itself, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("khive-swaptest-link"),
+            "the refusal should name the offending link, got: {err}"
+        );
+    }
+
     /// Directories this daemon can trust end to end are served as found:
     /// owner-only, and the umask-default 0755 every `tempfile::tempdir` and
     /// test runner produces (readable/traversable but writable only by the
-    /// owner). Foreign ownership is also refused by the same helper, but a
-    /// non-root test cannot chown a directory away from itself, so that arm
-    /// is exercised by the mode checks' shared fail-closed path rather than
-    /// a dedicated fixture.
+    /// owner). On macOS these fixtures also implicitly exercise the
+    /// symlink-accept arm, since the platform temp root itself resolves
+    /// through root-owned symlinks. Foreign ownership of a directory is
+    /// refused by the same helper, but a non-root test cannot chown a
+    /// directory away from itself, so that arm is exercised by the mode
+    /// checks' shared fail-closed path rather than a dedicated fixture.
     #[test]
     fn trusted_socket_dirs_are_accepted_unmodified() {
         let dir = tempfile::tempdir().expect("tempdir");
