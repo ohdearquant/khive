@@ -3745,6 +3745,24 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
+        loop {
+            let events = buffer.lock().unwrap().clone();
+            if events.iter().any(|e| {
+                e.tx_label.as_deref() == Some("checkpoint_task_writer_busy_sweep_test")
+                    && e.message
+                        .as_deref()
+                        .is_some_and(|m| m.contains("stale-op cap"))
+            }) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "expected the age sweep to fire even though every tick's writer checkout \
+                 was skipped within 10s, got: {events:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
         shutdown_tx.send(()).expect("send shutdown signal");
         tokio::time::timeout(Duration::from_secs(1), handle)
             .await
@@ -3753,18 +3771,6 @@ mod tests {
 
         drop(_writer_guard);
         drop(_tx_handle);
-
-        let events = buffer.lock().unwrap();
-        assert!(
-            events.iter().any(|e| {
-                e.tx_label.as_deref() == Some("checkpoint_task_writer_busy_sweep_test")
-                    && e.message
-                        .as_deref()
-                        .is_some_and(|m| m.contains("stale-op cap"))
-            }),
-            "expected the age sweep to fire even though every tick's writer checkout \
-             was skipped, got: {events:?}"
-        );
     }
 
     // ── ADR-091 Amendment 2: Plank A (session sweep), Plank B (walpin
