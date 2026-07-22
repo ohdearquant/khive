@@ -704,8 +704,7 @@ fn compile_single_condition(
         ))
     })?;
 
-    let col = where_property_to_column(&cond.property, kind)?;
-    let col_expr = format!("{alias}.{col}");
+    let col_expr = where_property_expression(&cond.property, kind, alias)?;
 
     compile_condition_predicate(&col_expr, cond, params)
 }
@@ -905,8 +904,7 @@ fn compile_var_len_condition(
         )));
     };
 
-    let col = where_property_to_column(&cond.property, &VarKind::Node)?;
-    let col_expr = format!("{col_alias}.{col}");
+    let col_expr = where_property_expression(&cond.property, &VarKind::Node, col_alias)?;
 
     let sql = compile_condition_predicate(&col_expr, cond, params)?;
     Ok((sql, col_alias))
@@ -1423,7 +1421,11 @@ fn property_to_column<'a>(prop: &'a str, kind: &VarKind) -> Result<&'a str, Quer
     }
 }
 
-fn where_property_to_column<'a>(prop: &'a str, kind: &VarKind) -> Result<&'a str, QueryError> {
+fn where_property_expression(
+    prop: &str,
+    kind: &VarKind,
+    alias: &str,
+) -> Result<String, QueryError> {
     let (projection_columns, kind_name) = property_columns(kind);
     let valid = if *kind == VarKind::Edge {
         EDGE_WHERE_COLUMNS
@@ -1431,7 +1433,12 @@ fn where_property_to_column<'a>(prop: &'a str, kind: &VarKind) -> Result<&'a str
         projection_columns
     };
     if valid.contains(&prop) {
-        Ok(prop)
+        Ok(format!("{alias}.{prop}"))
+    } else if projection_columns.contains(&"properties") {
+        Ok(format!(
+            "json_extract({alias}.properties, '$.{}')",
+            prop.replace('\'', "''")
+        ))
     } else {
         Err(QueryError::Compile(format!(
             "unknown {kind_name} property '{prop}' in WHERE clause. Valid: {}",
