@@ -94,8 +94,11 @@ impl KhiveRuntime {
         let model = parse_embedding_model_alias(model_name);
         let service = self.embedder(model_name).await?;
         let emb_model = model.unwrap_or_default();
-        let out = service.embed_one(text, emb_model).await;
+        // Issued-at-dispatch: count before the provider await so a call that
+        // was handed to the provider is counted even if this task is aborted
+        // while parked on the await (drain_embed_join_set cancellation path).
         crate::usage::count(crate::usage::UsageUnit::EmbedCalls, 1);
+        let out = service.embed_one(text, emb_model).await;
         Ok(out?)
     }
 
@@ -125,8 +128,9 @@ impl KhiveRuntime {
         let model = parse_embedding_model_alias(model_name);
         let service = self.embedder(model_name).await?;
         let emb_model = model.unwrap_or_default();
-        let embeddings = service.embed_passage(&[text.to_string()], emb_model).await;
+        // Issued-at-dispatch: counted before the await — see embed_with_model.
         crate::usage::count(crate::usage::UsageUnit::EmbedCalls, 1);
+        let embeddings = service.embed_passage(&[text.to_string()], emb_model).await;
         let out = embeddings?
             .into_iter()
             .next()
@@ -154,13 +158,14 @@ impl KhiveRuntime {
         let service = self.embedder(model_name).await?;
         let texts = [text.to_string()];
         let emb_model = model.unwrap_or_default();
+        // Issued-at-dispatch: counted before the await — see embed_with_model.
+        crate::usage::count(crate::usage::UsageUnit::EmbedCalls, 1);
         let embeddings = match emb_model {
             EmbeddingModel::BgeSmallEnV15
             | EmbeddingModel::BgeBaseEnV15
             | EmbeddingModel::BgeLargeEnV15 => service.embed(&texts, emb_model).await,
             _ => service.embed_query(&texts, emb_model).await,
         };
-        crate::usage::count(crate::usage::UsageUnit::EmbedCalls, 1);
         let out = embeddings?
             .into_iter()
             .next()

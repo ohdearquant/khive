@@ -950,11 +950,22 @@ fn recompute_total_weight(path: &mut GraphPath) {
 /// completion order (which is arrival order, not spawn order) be reassembled
 /// into the caller's model order. On the first failure (an embed error or a
 /// task panic), every remaining handle is aborted immediately rather than
-/// awaited to completion, so a fast provider failure no longer waits on a
-/// slow sibling. Aborted handles are still drained here — `join_next`
-/// keeps yielding until the set is empty, including a cancelled `JoinError`
-/// for each aborted task — so no embed task (and the `UsageContext` clone
-/// it holds) is still running once this function returns.
+/// awaited to completion, so a fast provider failure no longer waits for
+/// every sibling to run to completion. Aborted handles are still drained
+/// here — `join_next` keeps yielding until the set is empty, including a
+/// cancelled `JoinError` for each aborted task — so no embed task (and the
+/// `UsageContext` clone it holds) is still running once this function
+/// returns.
+///
+/// Precisely what the abort bounds: cancellation takes effect at a task's
+/// next await point. A sibling parked on a provider await (network call,
+/// model load, queue) cancels promptly; a sibling already inside the native
+/// provider's synchronous single-text inference completes that one call
+/// first, because the drain deliberately awaits it rather than detaching —
+/// detaching would let embed work (and its usage accounting) outlive the
+/// operation's response. Failure latency is therefore bounded by at most
+/// one in-flight synchronous inference call per sibling, not by every
+/// sibling's full embed-and-store completion as before.
 async fn drain_embed_join_set(
     mut join_set: tokio::task::JoinSet<(usize, RuntimeResult<Vec<f32>>)>,
     model_count: usize,
@@ -5563,23 +5574,32 @@ mod tests {
     }
 
     /// Embedder whose `embed` parks until a release that never comes — models
-    /// a hung provider. Only task abort can end its embed future.
+    /// a hung provider. Only task abort can end its embed future. `entered`
+    /// receives a permit when `embed` is reached, so a test can wait until the
+    /// parked task is provably past the dispatch point before acting on it.
     struct ParkedVecProvider {
         provider_name: String,
         dims: usize,
         release: Arc<tokio::sync::Notify>,
+        entered: Arc<tokio::sync::Notify>,
     }
 
     impl ParkedVecProvider {
-        fn new(name: &str, dims: usize) -> (Self, Arc<tokio::sync::Notify>) {
+        fn new(
+            name: &str,
+            dims: usize,
+        ) -> (Self, Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
             let release = Arc::new(tokio::sync::Notify::new());
+            let entered = Arc::new(tokio::sync::Notify::new());
             (
                 Self {
                     provider_name: name.to_owned(),
                     dims,
                     release: Arc::clone(&release),
+                    entered: Arc::clone(&entered),
                 },
                 release,
+                entered,
             )
         }
     }
@@ -5598,6 +5618,7 @@ mod tests {
             Ok(Arc::new(ParkedVecService {
                 dims: self.dims,
                 release: Arc::clone(&self.release),
+                entered: Arc::clone(&self.entered),
             }))
         }
     }
@@ -5605,6 +5626,7 @@ mod tests {
     struct ParkedVecService {
         dims: usize,
         release: Arc<tokio::sync::Notify>,
+        entered: Arc<tokio::sync::Notify>,
     }
 
     #[async_trait]
@@ -5614,6 +5636,9 @@ mod tests {
             texts: &[String],
             _model: EmbeddingModel,
         ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+            // notify_one stores a permit when no waiter is registered yet, so
+            // the entered signal cannot be lost to a start-order race.
+            self.entered.notify_one();
             self.release.notified().await;
             Ok(texts.iter().map(|_| vec![1.0_f32; self.dims]).collect())
         }
@@ -12064,15 +12089,18 @@ mod tests {
 
         let rt = KhiveRuntime::memory().unwrap();
         rt.register_embedder(FailFastProvider::new("latency-fail-fast"));
-        let (parked, _release) = ParkedVecProvider::new("latency-parked", DIMS);
+        let (parked, _release, _entered) = ParkedVecProvider::new("latency-parked", DIMS);
         rt.register_embedder(parked);
 
         let ns = Namespace::parse("usage-entity-latency").unwrap();
         let tok = NamespaceToken::for_namespace(ns.clone());
 
         let started = std::time::Instant::now();
-        let result = rt
-            .create_entity(
+        // Outer timeout so a regression to await-to-completion FAILS this test
+        // within the bound instead of hanging the suite on the parked sibling.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            rt.create_entity(
                 &tok,
                 "concept",
                 None,
@@ -12080,8 +12108,10 @@ mod tests {
                 Some("description so embed body is non-empty"),
                 None,
                 vec![],
-            )
-            .await;
+            ),
+        )
+        .await
+        .expect("create_entity must return within the timeout — a hang means the abort path regressed to await-to-completion");
         let elapsed = started.elapsed();
 
         assert!(
@@ -12092,6 +12122,46 @@ mod tests {
             elapsed < std::time::Duration::from_secs(5),
             "a fast embed failure must return without waiting on the hung \
              sibling (which parks forever); took {elapsed:?}"
+        );
+    }
+
+    // Issued-at-dispatch accounting: an embed call that was handed to the
+    // provider must count toward embed_calls even if the task is aborted
+    // while parked on the provider await — the increment sits before the
+    // await, so cancellation cannot undercount issued work.
+    #[tokio::test]
+    async fn aborted_embed_task_still_counts_issued_embed_call() {
+        const DIMS: usize = 4;
+
+        let rt = std::sync::Arc::new(KhiveRuntime::memory().unwrap());
+        let (parked, _release, entered) = ParkedVecProvider::new("abort-count-parked", DIMS);
+        rt.register_embedder(parked);
+
+        let ctx = crate::usage::UsageContext::new();
+        let task = {
+            let rt = std::sync::Arc::clone(&rt);
+            let ctx = ctx.clone();
+            tokio::spawn(crate::usage::scope(ctx, async move {
+                rt.embed_document_with_model("abort-count-parked", "abort count body")
+                    .await
+            }))
+        };
+
+        // Wait until the parked service's embed was entered — the dispatch
+        // point (and its count) is strictly before that entry.
+        entered.notified().await;
+        task.abort();
+        let joined = task.await;
+        assert!(
+            joined.is_err() && joined.unwrap_err().is_cancelled(),
+            "task must end as cancelled by the abort"
+        );
+
+        assert_eq!(
+            ctx.snapshot()["embed_calls"],
+            1,
+            "an issued embed call must be counted even when the task is \
+             aborted while parked on the provider await"
         );
     }
 
