@@ -43,14 +43,18 @@ fn comm_pack_declares_message_note_kind() {
 fn comm_pack_declares_nine_handlers() {
     assert_eq!(
         CommPack::HANDLERS.len(),
-        11,
-        "comm pack must declare 11 handlers: send, inbox, read, reply, thread, ingest, \
-         heartbeat, health, probe, cursor_get, cursor_commit (khive #449)"
+        12,
+        "comm pack must declare 12 handlers: send, inbox, read, unread, reply, thread, \
+         ingest, heartbeat, health, probe, cursor_get, cursor_commit (khive #449, #66)"
     );
     let names: Vec<&str> = CommPack::HANDLERS.iter().map(|h| h.name).collect();
     assert!(names.contains(&"comm.send"));
     assert!(names.contains(&"comm.inbox"));
     assert!(names.contains(&"comm.read"));
+    assert!(
+        names.contains(&"comm.unread"),
+        "comm.unread verb must be registered (khive #66)"
+    );
     assert!(names.contains(&"comm.reply"));
     assert!(
         names.contains(&"comm.thread"),
@@ -4567,7 +4571,7 @@ async fn reply_and_get_outbound_props(
 /// The reply must read `wire_message_id` and wrap it for the wire.
 #[tokio::test]
 async fn reply_sets_in_reply_to_for_inbound_originated_parent() {
-    let (registry, rt) = build_registry_for_ns("local");
+    let (registry, rt) = build_actor_registry(shared_backend(), "lambda:khive");
 
     let parent_id = plant_message_note(
         &rt,
@@ -4603,7 +4607,7 @@ async fn reply_sets_in_reply_to_for_inbound_originated_parent() {
 /// reply must reuse it verbatim.
 #[tokio::test]
 async fn reply_sets_in_reply_to_for_outbound_minted_parent() {
-    let (registry, rt) = build_registry_for_ns("local");
+    let (registry, rt) = build_actor_registry(shared_backend(), "lambda:khive");
 
     let parent_id = plant_message_note(
         &rt,
@@ -4636,7 +4640,7 @@ async fn reply_sets_in_reply_to_for_outbound_minted_parent() {
 /// fabricated, and the reply still succeeds exactly as before this feature.
 #[tokio::test]
 async fn reply_omits_in_reply_to_when_parent_has_no_wire_message_id() {
-    let (registry, rt) = build_registry_for_ns("local");
+    let (registry, rt) = build_actor_registry(shared_backend(), "lambda:khive");
 
     let parent_id = plant_message_note(
         &rt,
@@ -4789,7 +4793,7 @@ async fn ingest_omits_wire_references_when_absent() {
 /// Message-ID, and In-Reply-To must remain exactly the parent Message-ID.
 #[tokio::test]
 async fn reply_extends_existing_references_chain_of_two_or_more() {
-    let (registry, rt) = build_registry_for_ns("local");
+    let (registry, rt) = build_actor_registry(shared_backend(), "lambda:khive");
 
     let parent_id = plant_message_note(
         &rt,
@@ -4829,7 +4833,7 @@ async fn reply_extends_existing_references_chain_of_two_or_more() {
 /// alone, identical to pre-chain-preservation behavior.
 #[tokio::test]
 async fn reply_references_falls_back_to_parent_message_id_when_no_chain() {
-    let (registry, rt) = build_registry_for_ns("local");
+    let (registry, rt) = build_actor_registry(shared_backend(), "lambda:khive");
 
     let parent_id = plant_message_note(
         &rt,
@@ -4868,7 +4872,7 @@ async fn reply_references_falls_back_to_parent_message_id_when_no_chain() {
 /// `comm.reply` end-to-end, not just unit-tested on `parent_references_chain`.
 #[tokio::test]
 async fn reply_extends_references_chain_for_outbound_parent() {
-    let (registry, rt) = build_registry_for_ns("local");
+    let (registry, rt) = build_actor_registry(shared_backend(), "lambda:khive");
 
     let parent_id = plant_message_note(
         &rt,
@@ -4913,7 +4917,7 @@ async fn reply_extends_references_chain_for_outbound_parent() {
 /// rather than propagated into the reply's References header.
 #[tokio::test]
 async fn reply_skips_malformed_token_in_parent_references_chain() {
-    let (registry, rt) = build_registry_for_ns("local");
+    let (registry, rt) = build_actor_registry(shared_backend(), "lambda:khive");
 
     let parent_id = plant_message_note(
         &rt,
@@ -4952,7 +4956,7 @@ async fn reply_skips_malformed_token_in_parent_references_chain() {
 /// chain rather than being appended again at the end.
 #[tokio::test]
 async fn reply_dedups_tainted_parent_references_chain_containing_parent_id() {
-    let (registry, rt) = build_registry_for_ns("local");
+    let (registry, rt) = build_actor_registry(shared_backend(), "lambda:khive");
 
     let parent_id = plant_message_note(
         &rt,
@@ -7440,5 +7444,313 @@ async fn i820_anonymous_local_party_line_send_still_succeeds() {
         result.is_ok(),
         "unattributed to=local send must not be rejected by the #820 self-address guard; \
          got {result:?}"
+    );
+}
+
+// ── #113: reply is restricted to a thread participant ─────────────────────────
+
+/// A third party holding a message id (neither the sender nor the addressee)
+/// must not be able to reply to it.
+#[tokio::test]
+async fn i113_non_participant_reply_rejected() {
+    let backend = shared_backend();
+    let (registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:a");
+    let (registry_c, _rt_c) = build_actor_registry(backend.clone(), "lambda:c");
+
+    let send_result = registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:b", "content": "hello B from A" }),
+        )
+        .await
+        .expect("send succeeds");
+    let msg_id = send_result["full_id"]
+        .as_str()
+        .expect("full_id")
+        .to_string();
+
+    let err = registry_c
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({ "id": msg_id, "content": "forged reply from C" }),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("not addressed to or from caller actor"),
+        "non-participant reply must be rejected; got {err}"
+    );
+}
+
+/// An unattributed caller is still a distinct `local` actor and must not bypass
+/// participant checks for messages carrying explicit actor fields.
+#[tokio::test]
+async fn i113_anonymous_non_participant_reply_rejected() {
+    let backend = shared_backend();
+    let (registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:a");
+    let (registry_local, _rt_local) = build_crossns_registry(backend, "local", vec![]);
+
+    let send_result = registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:b", "content": "hello B from A" }),
+        )
+        .await
+        .expect("send succeeds");
+    let msg_id = send_result["full_id"]
+        .as_str()
+        .expect("full_id")
+        .to_string();
+
+    let err = registry_local
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({ "id": msg_id, "content": "forged anonymous reply" }),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("not addressed to or from caller actor"),
+        "anonymous non-participant reply must be rejected; got {err}"
+    );
+}
+
+/// The addressee (recipient) may reply — this is the common case.
+#[tokio::test]
+async fn i113_addressee_reply_succeeds() {
+    let backend = shared_backend();
+    let (registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:a");
+    let (registry_b, _rt_b) = build_actor_registry(backend.clone(), "lambda:b");
+
+    let send_result = registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:b", "content": "hello B from A" }),
+        )
+        .await
+        .expect("send succeeds");
+    let msg_id = send_result["full_id"]
+        .as_str()
+        .expect("full_id")
+        .to_string();
+
+    let reply = registry_b
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({ "id": msg_id, "content": "reply from B" }),
+        )
+        .await
+        .expect("addressee reply must succeed");
+    assert_eq!(reply["from"], "lambda:b");
+}
+
+/// The original sender may also reply to their own outbound message (e.g. a
+/// follow-up before the recipient has responded) — either party is a
+/// participant, not addressee-only.
+#[tokio::test]
+async fn i113_sender_reply_to_own_message_succeeds() {
+    let backend = shared_backend();
+    let (registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:a");
+
+    let send_result = registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:b", "content": "hello B from A" }),
+        )
+        .await
+        .expect("send succeeds");
+    let msg_id = send_result["full_id"]
+        .as_str()
+        .expect("full_id")
+        .to_string();
+
+    let reply = registry_a
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({ "id": msg_id, "content": "follow-up from A" }),
+        )
+        .await
+        .expect("sender reply to own message must succeed");
+    assert_eq!(reply["from"], "lambda:a");
+}
+
+/// A legacy message with neither `to_actor` nor `from_actor` fails open
+/// (no attributed party to restrict against), matching the #87/#94 precedent.
+#[tokio::test]
+async fn i113_legacy_message_without_actors_fails_open() {
+    use khive_storage::note::Note;
+
+    let (registry, rt) = build_registry_for_ns("local");
+    let token = rt
+        .authorize(khive_runtime::Namespace::parse("local").unwrap())
+        .unwrap();
+    let store = rt.notes(&token).expect("notes store");
+
+    let legacy =
+        Note::new("local", "message", "legacy message body").with_properties(serde_json::json!({
+            "direction": "inbound",
+            "sent_at": chrono::Utc::now().to_rfc3339(),
+        }));
+    let legacy_id = legacy.id;
+    store.upsert_note(legacy).await.expect("legacy note insert");
+
+    let reply = registry
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({ "id": legacy_id.to_string(), "content": "reply to legacy" }),
+        )
+        .await;
+    assert!(
+        reply.is_ok(),
+        "reply to a legacy message with no to_actor/from_actor must fail open; got {reply:?}"
+    );
+}
+
+// ── #66: comm.unread — count-only unread view ──────────────────────────────────
+
+#[tokio::test]
+async fn i66_unread_counts_only_matching_inbound_unread() {
+    let backend = shared_backend();
+    let (registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:a");
+    let (registry_b, _rt_b) = build_actor_registry(backend.clone(), "lambda:b");
+
+    registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:b", "content": "msg 1" }),
+        )
+        .await
+        .expect("send 1");
+    registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:b", "content": "msg 2" }),
+        )
+        .await
+        .expect("send 2");
+
+    let unread_before = registry_b
+        .dispatch("comm.unread", serde_json::json!({}))
+        .await
+        .expect("unread succeeds");
+    assert_eq!(unread_before["count"], 2);
+    assert_eq!(unread_before["actor"], "lambda:b");
+
+    // Mark B's own inbound copy of msg 2 read (the id `comm.inbox` returns for
+    // B, not the outbound `send` response's id); unread count must drop to 1.
+    let inbox = registry_b
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "unread", "limit": 50 }),
+        )
+        .await
+        .expect("inbox succeeds");
+    let msg2_inbound_id = inbox["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["preview"].as_str().unwrap_or("").contains("msg 2"))
+        .map(|m| m["full_id"].as_str().unwrap().to_string())
+        .expect("find B's inbound copy of msg 2");
+    registry_b
+        .dispatch("comm.read", serde_json::json!({ "id": msg2_inbound_id }))
+        .await
+        .expect("read succeeds");
+
+    let unread_after = registry_b
+        .dispatch("comm.unread", serde_json::json!({}))
+        .await
+        .expect("unread succeeds");
+    assert_eq!(unread_after["count"], 1);
+}
+
+/// `comm.unread` is caller-scoped and rejects the removed `assignee` override.
+#[tokio::test]
+async fn i66_unread_rejects_assignee_override() {
+    let backend = shared_backend();
+    let (registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:a");
+    let (registry_orch, _rt_o) = build_actor_registry(backend.clone(), "lambda:orch");
+
+    registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:b", "content": "msg for b" }),
+        )
+        .await
+        .expect("send succeeds");
+
+    let err = registry_orch
+        .dispatch("comm.unread", serde_json::json!({ "assignee": "lambda:b" }))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("unknown field `assignee`"),
+        "removed assignee override must be rejected as an unknown param; got {err}"
+    );
+
+    // Without the override, the orchestrator's own unread count is 0.
+    let own_unread = registry_orch
+        .dispatch("comm.unread", serde_json::json!({}))
+        .await
+        .expect("unread succeeds");
+    assert_eq!(own_unread["count"], 0);
+}
+
+/// `comm.inbox`'s response carries `unread_count` alongside `messages`/`count`.
+#[tokio::test]
+async fn i66_inbox_response_carries_unread_count() {
+    let backend = shared_backend();
+    let (registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:a");
+    let (registry_b, _rt_b) = build_actor_registry(backend.clone(), "lambda:b");
+
+    registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:b", "content": "msg 1" }),
+        )
+        .await
+        .expect("send 1");
+
+    let inbox = registry_b
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "unread", "limit": 50 }),
+        )
+        .await
+        .expect("inbox succeeds");
+    assert_eq!(inbox["count"], 1);
+    assert_eq!(
+        inbox["unread_count"], 1,
+        "unread_count must be present and match count when status=unread"
+    );
+}
+
+/// `limit=0` is the count-only inbox path: it returns no message payloads but
+/// still reports the caller's real unread total.
+#[tokio::test]
+async fn i66_inbox_limit_zero_carries_real_unread_count() {
+    let backend = shared_backend();
+    let (registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:a");
+    let (registry_b, _rt_b) = build_actor_registry(backend, "lambda:b");
+
+    registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:b", "content": "count me" }),
+        )
+        .await
+        .expect("send succeeds");
+
+    let inbox = registry_b
+        .dispatch("comm.inbox", serde_json::json!({ "limit": 0 }))
+        .await
+        .expect("limit=0 inbox succeeds");
+    assert_eq!(inbox["messages"], serde_json::json!([]));
+    assert_eq!(inbox["count"], 0);
+    assert_eq!(
+        inbox["unread_count"], 1,
+        "limit=0 must return the caller's real unread count"
     );
 }

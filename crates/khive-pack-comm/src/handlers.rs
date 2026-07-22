@@ -17,7 +17,7 @@ use khive_storage::types::{PageRequest, SqlValue};
 use crate::message::{dual_write_message, note_to_message_json, resolve_id, short_id};
 use crate::params::{
     deser, CursorCommitParams, CursorGetParams, HeartbeatParams, InboxParams, IngestParams,
-    ProbeParams, ReadParams, ReplyParams, SendParams, ThreadParams,
+    ProbeParams, ReadParams, ReplyParams, SendParams, ThreadParams, UnreadParams,
 };
 
 /// Validate an actor label: non-empty, no control characters, ≤255 bytes (ADR-057 Q1 loose).
@@ -150,7 +150,8 @@ pub(crate) async fn handle_inbox(
     let p: InboxParams = deser(params)?;
     let raw_limit = p.limit.unwrap_or(20);
     if raw_limit == 0 {
-        return Ok(json!({ "messages": [], "count": 0 }));
+        let unread_count = count_unread_messages(runtime, token, &token.actor().id).await?;
+        return Ok(json!({ "messages": [], "count": 0, "unread_count": unread_count }));
     }
     let limit = raw_limit.clamp(1, 200) as usize;
 
@@ -265,7 +266,96 @@ pub(crate) async fn handle_inbox(
         page.items.iter().map(note_to_message_json).collect()
     };
     let count = messages.len();
-    Ok(json!({ "messages": messages, "count": count }))
+    // #66: cheap derived stat over the page already fetched above — no extra
+    // DB round-trip. For `status="unread"` every returned message is unread
+    // by definition, so this equals `count`; for `"read"`/`"all"` it counts
+    // however many of the *returned* rows are unread (not a global total —
+    // `comm.unread` is the verb for that).
+    let unread_count = messages
+        .iter()
+        .filter(|m| !m["read"].as_bool().unwrap_or(false))
+        .count();
+    Ok(json!({ "messages": messages, "count": count, "unread_count": unread_count }))
+}
+
+/// `unread` — count-only view of the caller's unread inbound messages (#66):
+/// same filter stack as `inbox(status="unread")`.
+///
+/// `NoteStore` has no filtered `COUNT(*)` projection (only `count_notes`,
+/// which counts a whole namespace/kind with no property filter) — adding one
+/// is an OSS `khive-storage` change, out of scope here. This pages through
+/// `query_notes_filtered` the same way `handle_inbox`'s `#493` from_actor/
+/// from_prefix path already does, summing page lengths instead of fetching a
+/// bounded `limit` of full payloads — heavier than a real `COUNT(*)` but
+/// correct, and consistent with the pagination style already in this file.
+pub(crate) async fn handle_unread(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    params: Value,
+) -> Result<Value, RuntimeError> {
+    let _: UnreadParams = deser(params)?;
+    let caller_actor = token.actor().id.clone();
+    let count = count_unread_messages(runtime, token, &caller_actor).await?;
+
+    Ok(json!({ "count": count, "actor": caller_actor }))
+}
+
+async fn count_unread_messages(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    caller_actor: &str,
+) -> Result<u64, RuntimeError> {
+    let property_filters = vec![
+        PropertyFilter {
+            json_path: "$.direction".to_string(),
+            op: FilterOp::Eq,
+            value: SqlValue::Text("inbound".to_string()),
+        },
+        PropertyFilter {
+            json_path: "$.read".to_string(),
+            op: FilterOp::JsonTypeNeMissing,
+            value: SqlValue::Text("true".to_string()),
+        },
+        // ADR-057 Q3: EqOrMissing so legacy to_actor-less messages still count
+        // (same visibility rule `inbox` applies).
+        PropertyFilter {
+            json_path: "$.to_actor".to_string(),
+            op: FilterOp::EqOrMissing,
+            value: SqlValue::Text(caller_actor.to_string()),
+        },
+    ];
+
+    let filter = NoteFilter {
+        kind: Some("message".to_string()),
+        property_filters,
+        order_by: None,
+        ..Default::default()
+    };
+    let store = runtime.notes(token)?;
+
+    const PAGE_SIZE: u32 = 200;
+    let mut count: u64 = 0;
+    let mut db_offset: u32 = 0;
+    loop {
+        let page = store
+            .query_notes_filtered(
+                token.namespace().as_str(),
+                &filter,
+                PageRequest {
+                    limit: PAGE_SIZE,
+                    offset: db_offset.into(),
+                },
+            )
+            .await?;
+        let fetched = page.items.len() as u32;
+        count += u64::from(fetched);
+        if fetched < PAGE_SIZE {
+            break;
+        }
+        db_offset += PAGE_SIZE;
+    }
+
+    Ok(count)
 }
 
 /// `read` — mark a message as read.
@@ -431,6 +521,41 @@ pub(crate) async fn handle_reply(
         .get("to_actor")
         .and_then(Value::as_str)
         .map(|s| s.to_string());
+
+    // #113: sibling of #87 — `reply` never checked who the caller is, so a
+    // caller holding a message id could reply to a message addressed to a
+    // different actor entirely (the reply then routes via the "other party"
+    // logic below, which assumes the caller IS one of the two parties). The
+    // rule chosen is thread-participant, not addressee-only: either party to
+    // the exchange (the addressee or the original sender) may reply, mirroring
+    // #94's thread-visibility filter rather than #87's stricter read-only
+    // rule — a reply from either party is a normal continuation of the
+    // exchange, unlike a third party silently flipping delivery state. #85's
+    // read-mark scoping at `d782709` closed the read-state side of this hole;
+    // the reply itself was still open.
+    //
+    // Fail open only when the original carries neither `to_actor` nor
+    // `from_actor` (pre-ADR-057 legacy — no attributed party to restrict
+    // against, matching #87/#94's rule for such rows). An unattributed caller
+    // is still actor `local`, so it may reply to local party-line messages but
+    // not messages attributed to other participants.
+    if original_to_actor.is_some() || original_from_actor.is_some() {
+        let caller_actor = token.actor().id.as_str();
+        let is_participant = original_from_actor.as_deref() == Some(caller_actor)
+            || original_to_actor.as_deref() == Some(caller_actor);
+        if !is_participant {
+            return Err(RuntimeError::InvalidInput(format!(
+                "reply: message {id} is not addressed to or from caller actor {caller_actor:?}"
+            )));
+        }
+    } else {
+        tracing::warn!(
+            id = %id,
+            caller_actor = %token.actor().id,
+            "comm.reply: message has no `to_actor`/`from_actor` (pre-ADR-057 legacy); \
+             allowing reply without participant verification (issue #113)"
+        );
+    }
 
     let original_from = original_from_actor
         .as_deref()

@@ -48,6 +48,10 @@ pub(crate) struct ReadParams {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct UnreadParams {}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ReplyParams {
     pub id: String,
     pub content: String,
