@@ -322,7 +322,8 @@ pub async fn serve_server(
 /// #553). `[[backends]]` in `khive.toml` otherwise wins unconditionally, so an
 /// operator's `--db :memory:` isolation request was silently discarded whenever
 /// any backend was declared. `Some(":memory:")` forces every declared backend to
-/// in-memory for this invocation (loudly logged); any other concrete path is
+/// in-memory for this invocation (loudly logged). A concrete path matching the
+/// declared `main` backend is accepted as a no-op; any other concrete path is
 /// rejected rather than silently collapsing distinct declared backends onto one
 /// caller-supplied file.
 pub fn build_registry_for_multi_backend(
@@ -366,11 +367,13 @@ pub fn build_registry_for_multi_backend_with_db_anchor(
 /// forms disagreed about whether the override was legal because only one of
 /// them ever ran this check. Returns `Ok(true)` when the override forces
 /// every backend to in-memory (`:memory:`), `Ok(false)` when there is no
-/// override to apply.
+/// override to apply or the concrete override already names the declared
+/// `main` backend.
 pub fn validate_db_override_against_backends(
     cli_db_override: Option<&str>,
-    backend_count: usize,
+    backends: &[BackendConfig],
 ) -> anyhow::Result<bool> {
+    let backend_count = backends.len();
     match cli_db_override {
         Some(":memory:") => {
             tracing::warn!(
@@ -381,17 +384,46 @@ pub fn validate_db_override_against_backends(
             Ok(true)
         }
         Some(other) => {
-            anyhow::bail!(
-                "--db {other:?} (or KHIVE_DB) cannot be combined with [[backends]]: \
+            if override_matches_declared_main_backend(other, backends)? {
+                tracing::info!(
+                    "--db {other:?} (or KHIVE_DB) matches the path declared for the \
+                     \"main\" backend in khive.toml; proceeding because the override is a no-op"
+                );
+                Ok(false)
+            } else {
+                anyhow::bail!(
+                    "--db {other:?} (or KHIVE_DB) cannot be combined with [[backends]]: \
                  {backend_count} backend(s) are already declared in khive.toml, so applying \
                  this override here is ambiguous (it could silently collapse distinct \
                  declared backends onto a single file). Edit khive.toml directly to change \
                  backend paths, or pass --db :memory: to force all backends in-memory for \
                  this invocation."
-            );
+                );
+            }
         }
         None => Ok(false),
     }
+}
+
+fn override_matches_declared_main_backend(
+    override_path: &str,
+    backends: &[BackendConfig],
+) -> anyhow::Result<bool> {
+    let Some(main) = backends
+        .iter()
+        .find(|backend| backend.name == BackendId::MAIN)
+    else {
+        return Ok(false);
+    };
+    if main.kind != BackendKind::Sqlite {
+        return Ok(false);
+    }
+    let Some(main_path) = main.path.as_ref() else {
+        return Ok(false);
+    };
+
+    Ok(canonical_path_no_side_effects(main_path)?
+        == canonical_path_no_side_effects(std::path::Path::new(override_path))?)
 }
 
 fn build_registry_for_multi_backend_inner(
@@ -399,8 +431,7 @@ fn build_registry_for_multi_backend_inner(
     khive_cfg: &KhiveConfig,
     cli_db_override: Option<&str>,
 ) -> anyhow::Result<MultiBackendRegistry> {
-    let backend_count = khive_cfg.backends.len();
-    let force_memory = validate_db_override_against_backends(cli_db_override, backend_count)?;
+    let force_memory = validate_db_override_against_backends(cli_db_override, &khive_cfg.backends)?;
 
     // Open and migrate each declared backend, deduplicating SQLite backends by
     // canonical path (ADR-028 §8).
@@ -830,6 +861,35 @@ fn canonical_backend_path(cfg: &BackendConfig) -> anyhow::Result<Option<PathBuf>
         )
     })?;
     Ok(Some(canon_parent.join(file_name)))
+}
+
+fn canonical_path_no_side_effects(path: &std::path::Path) -> anyhow::Result<PathBuf> {
+    let expanded = expand_tilde(path);
+    let absolute = if expanded.is_absolute() {
+        expanded
+    } else {
+        std::env::current_dir()
+            .map_err(|e| anyhow::anyhow!("cannot resolve current directory: {e}"))?
+            .join(expanded)
+    };
+    if absolute.exists() {
+        return absolute
+            .canonicalize()
+            .map_err(|e| anyhow::anyhow!("cannot canonicalize {}: {e}", absolute.display()));
+    }
+    let Some(parent) = absolute.parent() else {
+        return Ok(absolute);
+    };
+    if !parent.exists() {
+        return Ok(absolute);
+    }
+    let canonical_parent = parent
+        .canonicalize()
+        .map_err(|e| anyhow::anyhow!("cannot canonicalize {}: {e}", parent.display()))?;
+    Ok(match absolute.file_name() {
+        Some(file_name) => canonical_parent.join(file_name),
+        None => canonical_parent,
+    })
 }
 
 /// Build a fully-wired multi-backend `KhiveMcpServer` (ADR-028).
@@ -3041,6 +3101,95 @@ region = "us-east-1"
             !secondary_path.exists(),
             "secondary backend's declared sqlite path must never be created on disk \
              when --db :memory: overrides it; found file at {secondary_path:?}"
+        );
+    }
+
+    fn sqlite_multi_backend_config(main_path: PathBuf, secondary_path: PathBuf) -> KhiveConfig {
+        use khive_runtime::PackConfig;
+
+        KhiveConfig {
+            backends: vec![
+                BackendConfig {
+                    name: "main".to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(main_path),
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: false,
+                },
+                BackendConfig {
+                    name: "secondary".to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(secondary_path),
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: false,
+                },
+            ],
+            packs: {
+                let mut packs = std::collections::HashMap::new();
+                packs.insert(
+                    "comm".to_string(),
+                    PackConfig {
+                        backend: "secondary".to_string(),
+                    },
+                );
+                packs
+            },
+            ..KhiveConfig::default()
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn concrete_db_override_matching_declared_main_backend_path_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("main.db");
+        let nested = dir.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let declared_main_path = nested.join("..").join("main.db");
+        assert_ne!(declared_main_path, main_path);
+        let secondary_path = dir.path().join("secondary.db");
+        let khive_cfg = sqlite_multi_backend_config(declared_main_path, secondary_path);
+        let override_value = main_path.to_str().unwrap();
+        let base_cfg = RuntimeConfig {
+            db_path: khive_runtime::resolve_db_anchor(Some(override_value)),
+            ..base_runtime_config_for_multi_backend()
+        };
+
+        let result = build_registry_for_multi_backend(base_cfg, &khive_cfg, Some(override_value));
+
+        if let Err(error) = result {
+            panic!(
+                "a concrete database override resolving to the declared main backend must be accepted: {error}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn concrete_db_override_diverging_from_declared_main_backend_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("main.db");
+        let secondary_path = dir.path().join("secondary.db");
+        let override_path = dir.path().join("override.db");
+        let khive_cfg = sqlite_multi_backend_config(main_path, secondary_path);
+        let override_value = override_path.to_str().unwrap();
+        let base_cfg = RuntimeConfig {
+            db_path: khive_runtime::resolve_db_anchor(Some(override_value)),
+            ..base_runtime_config_for_multi_backend()
+        };
+
+        let error =
+            match build_registry_for_multi_backend(base_cfg, &khive_cfg, Some(override_value)) {
+                Ok(_) => panic!("a divergent concrete database override must remain ambiguous"),
+                Err(error) => error,
+            };
+
+        assert!(error.to_string().contains("khive.toml"));
+        assert!(
+            !override_path.exists(),
+            "rejecting an override must not create its database path"
         );
     }
 

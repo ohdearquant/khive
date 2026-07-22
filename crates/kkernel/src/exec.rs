@@ -738,7 +738,7 @@ async fn run_exec_inline_with_forward(
     if !khive_cfg.backends.is_empty() {
         khive_mcp::serve::validate_db_override_against_backends(
             db_context.raw.as_deref(),
-            khive_cfg.backends.len(),
+            &khive_cfg.backends,
         )?;
     }
 
@@ -2472,6 +2472,12 @@ default = true
     }
 
     #[cfg(unix)]
+    fn spy_accept_and_capture_config_id(frame: &DaemonRequestFrame) -> super::ForwardFuture<'_> {
+        SPY_CAPTURED_CONFIG_ID.with(|c| *c.borrow_mut() = Some(frame.config_id.clone()));
+        Box::pin(async { Some(Ok("{}".to_string())) })
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     #[serial]
     async fn exec_frame_config_id_matches_daemon_config_id_for_multi_backend_project_toml() {
@@ -2484,10 +2490,10 @@ default = true
 
         // No explicit `--db` anywhere below — this mirrors the real multi-tenant
         // deployment shape the bug affects: `~/.khive/config.toml` declares
-        // `[[backends]]` and `kkernel exec` relies on default discovery. An
-        // explicit `--db` would itself be rejected as ambiguous once backends
-        // are declared (ADR-028 §8, `build_registry_for_multi_backend`), so it
-        // is not a legitimate way to reach this scenario — default discovery is.
+        // `[[backends]]` and `kkernel exec` relies on default discovery.
+        // A divergent explicit `--db` would be rejected as ambiguous once
+        // backends are declared; repeating the main path would be accepted but
+        // would not model this default-discovery scenario.
         let khive_dir = home_dir.path().join(".khive");
         std::fs::create_dir_all(&khive_dir).expect("mkdir .khive");
         let main_backend_path = khive_dir.join("main-backend.db");
@@ -2595,7 +2601,7 @@ backend = "sessions"
     #[cfg(unix)]
     #[tokio::test]
     #[serial]
-    async fn inline_db_override_conflicting_with_backends_is_rejected_before_daemon_forward() {
+    async fn inline_db_override_guard_accepts_main_and_rejects_conflict_before_daemon_forward() {
         std::env::remove_var("KHIVE_EMBEDDING_MODEL");
         std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
         std::env::remove_var("KHIVE_ACTOR");
@@ -2630,8 +2636,9 @@ backend = "sessions"
         )
         .expect("write multi-backend config.toml");
 
+        let matching_override = main_backend_path.display().to_string();
         let cfg = resolve_runtime_config(RuntimeConfigInputs {
-            db: None,
+            db: Some(&matching_override),
             config: None,
             namespace: Namespace::parse("local").expect("ns"),
             namespace_explicit: true,
@@ -2641,6 +2648,30 @@ backend = "sessions"
             brain_profile: None,
         })
         .expect("resolve exec-shaped config");
+
+        let matching_result = run_exec_inline_with_forward(
+            "stats()".to_string(),
+            cfg.clone(),
+            None,
+            None,
+            None,
+            ExecDbContext {
+                raw: Some(matching_override.clone()),
+                anchor: khive_runtime::resolve_db_anchor(Some(&matching_override)),
+            },
+            false,
+            spy_accept_and_capture_config_id,
+        )
+        .await;
+        assert!(
+            matching_result.is_ok(),
+            "an override matching the declared main backend must reach daemon forwarding: {matching_result:?}"
+        );
+        assert!(
+            SPY_CAPTURED_CONFIG_ID.with(|captured| captured.borrow().is_some()),
+            "the matching override must reach the daemon-forward boundary"
+        );
+        SPY_CAPTURED_CONFIG_ID.with(|captured| *captured.borrow_mut() = None);
 
         let conflicting_override = khive_dir.join("override.db");
         let result = run_exec_inline_with_forward(
