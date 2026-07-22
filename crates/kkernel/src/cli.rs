@@ -531,6 +531,9 @@ async fn cmd_db_migrate(args: DbMigrateArgs) -> Result<()> {
 }
 
 async fn cmd_db_check(args: DbCheckArgs) -> Result<()> {
+    const RECREATION_GUIDANCE: &str =
+        "predates the consolidated baseline; recreate it from the current schema because \
+         in-place upgrade is not supported";
     let latest = khive_db::MIGRATIONS.len() as u32;
 
     // A schema check must never mutate the database. Resolve the effective path
@@ -545,20 +548,23 @@ async fn cmd_db_check(args: DbCheckArgs) -> Result<()> {
     };
 
     // An absent file is an un-migrated database (version 0); do not create it.
-    let current_version: u32 = match resolved {
+    let (current_version, pre_consolidation) = match resolved {
         Some(ref p) if p.exists() => {
-            khive_db::inspect_schema_version(p).map_err(|e| anyhow::anyhow!("{e}"))?
+            let inspection = khive_db::inspect_schema(p).map_err(|e| anyhow::anyhow!("{e}"))?;
+            (inspection.version, inspection.pre_consolidation)
         }
-        _ => 0,
+        _ => (0, false),
     };
 
-    let is_current = current_version == latest;
+    let is_current = current_version == latest && !pre_consolidation;
     // A version beyond the latest known migration was written by a newer build.
     // Report it rather than treating it as current.
-    let ahead = current_version > latest;
+    let ahead = current_version > latest && !pre_consolidation;
 
     if args.human {
-        let state = if ahead {
+        let state = if pre_consolidation {
+            RECREATION_GUIDANCE
+        } else if ahead {
             "ahead — the binary is older than the store; upgrade the binary"
         } else if is_current {
             "current"
@@ -573,11 +579,16 @@ async fn cmd_db_check(args: DbCheckArgs) -> Result<()> {
             "current": is_current,
             "ahead": ahead,
             "pending": latest.saturating_sub(current_version),
+            "recreation_required": pre_consolidation,
+            "guidance": pre_consolidation.then_some(RECREATION_GUIDANCE),
         });
         println!("{}", serde_json::to_string(&json).expect("serialize"));
     }
 
     if args.strict && !is_current {
+        if pre_consolidation {
+            anyhow::bail!("database schema version {current_version} {RECREATION_GUIDANCE}");
+        }
         if ahead {
             anyhow::bail!(
                 "this binary knows migrations up to {latest} but the store is at version \

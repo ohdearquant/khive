@@ -1968,6 +1968,7 @@ dependencies = [
  "khive-vcs-adapters",
  "lattice-embed",
  "rmcp",
+ "rusqlite",
  "serde",
  "serde_json",
  "serial_test",

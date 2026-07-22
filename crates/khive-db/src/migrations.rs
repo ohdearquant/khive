@@ -212,20 +212,33 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
 
 const MIGRATION_TRACKING_TABLE: &str = include_str!("../sql/schema-migrations-table.sql");
 
+/// Read-only schema metadata used by administrative diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchemaInspection {
+    /// Highest version recorded in the migration ledger.
+    pub version: u32,
+    /// Whether the ledger belongs to the pre-consolidation migration lineage.
+    pub pre_consolidation: bool,
+}
+
+fn is_pre_consolidation_ledger(conn: &Connection) -> Result<bool, SqliteError> {
+    // V1 used the same name in both lineages; the historical V2 and V22 names
+    // are unambiguous signals that this ledger predates consolidation.
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM _schema_migrations \
+         WHERE (version = 2 AND name = ?1) OR (version = 22 AND name = ?2))",
+        ["add_name_to_notes", "knowledge_lifecycle_status"],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
 fn validate_schema_compatibility(
     conn: &Connection,
     store_version: u32,
     max_known_migration: u32,
 ) -> Result<(), SqliteError> {
-    // V1 used the same name in both lineages; the historical V2 and V22 names
-    // are unambiguous signals that this ledger predates consolidation.
-    let pre_consolidation: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM _schema_migrations \
-         WHERE (version = 2 AND name = ?1) OR (version = 22 AND name = ?2))",
-        ["add_name_to_notes", "knowledge_lifecycle_status"],
-        |row| row.get(0),
-    )?;
-    if pre_consolidation {
+    if is_pre_consolidation_ledger(conn)? {
         return Err(SqliteError::InvalidData(format!(
             "database schema version {store_version} predates the consolidated baseline; \
              recreate it from the current schema because in-place upgrade is not supported."
@@ -273,6 +286,21 @@ pub fn inspect_schema_version(path: &std::path::Path) -> Result<u32, SqliteError
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
     read_schema_version(&conn)
+}
+
+/// Open `path` read-only and inspect both its applied version and migration lineage.
+/// An absent migration ledger is reported as version 0 in the consolidated lineage.
+pub fn inspect_schema(path: &std::path::Path) -> Result<SchemaInspection, SqliteError> {
+    let conn = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let version = read_schema_version(&conn)?;
+    let pre_consolidation = version > 0 && is_pre_consolidation_ledger(&conn)?;
+    Ok(SchemaInspection {
+        version,
+        pre_consolidation,
+    })
 }
 
 #[cfg(test)]
