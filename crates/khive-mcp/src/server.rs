@@ -22,7 +22,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use khive_db::ConnectionPool;
-use khive_request::{parse_request, ArgValue, DslError, ExecutionMode, ParsedOp};
+use khive_request::{parse_request, ArgValue, DslError, ExecutionMode, ParsedOp, PrevFailure};
 use khive_runtime::{
     present, render_format, resolve_explicit_namespace, KhiveRuntime, OutputFormat, PackLoadError,
     PackRegistry, PresentationMode, RuntimeConfig, RuntimeError, VerbPresentationPolicy,
@@ -656,39 +656,31 @@ impl KhiveMcpServer {
         for (name, arg_val) in args {
             let needs_prev = !matches!(&arg_val, ArgValue::Value(_));
             let value = if needs_prev {
+                // `dispatch_op` only ever runs inside a chain (see `run_parsed`'s
+                // `ExecutionMode::Chain` arm); `prev_result` is `None` here
+                // exactly when this is the chain's first op, so there is no
+                // preceding result to substitute from at all.
                 let prev = prev_result.ok_or_else(|| {
                     (
                         tool.clone(),
                         json!({
                             "kind": "substitution_error",
+                            "reason": "no_preceding_op",
                             "message": format!(
-                                "argument {name:?}: $prev reference in non-chain context"
+                                "argument {name:?}: $prev has no preceding op to resolve \
+                                 against — this is the first operation in the chain. $prev \
+                                 always resolves against the immediately preceding op's result \
+                                 only; it cannot reach further back or forward. Move this op \
+                                 after the one that produces the value, or pass a literal value \
+                                 here instead of $prev."
                             )
                         }),
                     )
                 })?;
                 let resolved_val = arg_val.resolve_all(prev).ok_or_else(|| {
-                    // Include available top-level fields in the error message,
-                    // matching the UX of the bare-$prev guard.
-                    let fields_hint = if let Value::Object(map) = prev {
-                        let mut fields: Vec<&str> =
-                            map.keys().map(String::as_str).collect();
-                        fields.sort_unstable();
-                        format!(
-                            " Available top-level fields: [{}]",
-                            fields.join(", ")
-                        )
-                    } else {
-                        String::new()
-                    };
                     (
                         tool.clone(),
-                        json!({
-                            "kind": "substitution_error",
-                            "message": format!(
-                                "argument {name:?}: one or more $prev paths not found in prior result.{fields_hint}"
-                            ),
-                        }),
+                        substitution_error_payload(&name, &arg_val, prev),
                     )
                 })?;
                 // UE4-H1: bare `$prev` (no path) resolving to a map or array
@@ -702,6 +694,7 @@ impl KhiveMcpServer {
                                 tool.clone(),
                                 json!({
                                     "kind": "substitution_error",
+                                    "reason": "bare_ref_ambiguous",
                                     "message": format!(
                                         "argument {name:?}: $prev requires a dotted path \
                                          (e.g. $prev.id) when the prior result is a map. \
@@ -716,6 +709,7 @@ impl KhiveMcpServer {
                                 tool.clone(),
                                 json!({
                                     "kind": "substitution_error",
+                                    "reason": "bare_ref_ambiguous",
                                     "message": format!(
                                         "argument {name:?}: $prev requires a dotted path \
                                          (e.g. $prev.0) when the prior result is an array. \
@@ -1028,9 +1022,28 @@ impl KhiveMcpServer {
                 let mut aborted_from: Option<usize> = None;
 
                 for (i, op) in ops.into_iter().enumerate() {
-                    if aborted_from.is_some() {
-                        // A prior op failed — mark remaining as aborted.
-                        results.push(json!({ "ok": false, "tool": op.tool, "aborted": true }));
+                    if let Some(failed_at) = aborted_from {
+                        // A prior op failed — mark remaining as aborted, and say so
+                        // plainly: this op was never dispatched (its own $prev, if any,
+                        // was never attempted), so the failure to debug lives at the
+                        // earlier op, not here.
+                        let failed_index = failed_at - 1;
+                        let failed_tool = results
+                            .get(failed_index)
+                            .and_then(|r| r.get("tool"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("<unknown>");
+                        results.push(json!({
+                            "ok": false,
+                            "tool": op.tool,
+                            "aborted": true,
+                            "message": format!(
+                                "not executed: op #{failed_index} ({failed_tool:?}) failed \
+                                 earlier in this chain, so the chain aborted before reaching \
+                                 this op. Fix op #{failed_index} — this op's own arguments, \
+                                 including any $prev reference, were never evaluated."
+                            ),
+                        }));
                         continue;
                     }
                     let op_mode = mode_for_op(i);
@@ -1388,6 +1401,47 @@ fn drop_value_iteratively(value: Value) {
             _ => {}
         }
     }
+}
+
+/// Builds a `substitution_error` payload for a `$prev` argument that failed
+/// to resolve (`resolve_all` returned `None`). Uses [`ArgValue::find_prev_failure`]
+/// to identify exactly which lookup failed and why — a missing field/index, a
+/// path segment applied to the wrong JSON type, or unsupported bracket syntax
+/// — each worded differently so the caller isn't left with one generic
+/// "not found" for three different mistakes. Falls back to a generic message
+/// only if `find_prev_failure` cannot explain a miss `resolve_all` reported
+/// (defensive; the two are expected to always agree).
+fn substitution_error_payload(name: &str, arg_val: &ArgValue, prev: &Value) -> Value {
+    let Some(failure) = arg_val.find_prev_failure(prev) else {
+        let fields_hint = if let Value::Object(map) = prev {
+            let mut fields: Vec<&str> = map.keys().map(String::as_str).collect();
+            fields.sort_unstable();
+            format!(" Available top-level fields: [{}]", fields.join(", "))
+        } else {
+            String::new()
+        };
+        return json!({
+            "kind": "substitution_error",
+            "reason": "path_not_found",
+            "message": format!(
+                "argument {name:?}: one or more $prev paths not found in prior result.{fields_hint}"
+            ),
+        });
+    };
+    let reason = match &failure {
+        PrevFailure::NotFound { .. } => "path_not_found",
+        PrevFailure::WrongType { .. } => "path_wrong_type",
+        PrevFailure::Unsupported { .. } => "path_unsupported",
+    };
+    json!({
+        "kind": "substitution_error",
+        "reason": reason,
+        "message": format!(
+            "argument {name:?}: {failure}. $prev resolves only against the immediately \
+             preceding op's result — a non-adjacent dependency cannot be expressed inside \
+             one chain; split into separate calls and carry the value across yourself."
+        ),
+    })
 }
 
 /// ADR-103 Amendment 2: stamp the per-op envelope entry with the dispatch's
