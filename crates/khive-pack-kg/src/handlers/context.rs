@@ -499,36 +499,61 @@ impl KgPack {
         Ok(json!({
             "anchors": out_anchors,
             "truncated": truncated,
-            "dropped": { "anchors": dropped_anchors, "neighbors": dropped_neighbors },
+            // `stage` is additive: every drop this handler produces originates in the
+            // Stage-4 budget walk — `fanout`/`hops` bound the neighbor candidate pool
+            // upstream, before assembly, so they never show up as a "drop" here today.
+            "dropped": {
+                "anchors": dropped_anchors,
+                "neighbors": dropped_neighbors,
+                "stage": "budget",
+            },
         }))
     }
 }
 
-/// Deterministic-order budget walk over anchors + neighbors. See `docs/api/context-verb.md`.
+/// Two-pass deterministic budget walk over anchors + neighbors. See
+/// `docs/api/context-verb.md`.
+///
+/// Pass 1 reserves budget for every anchor's own entity record, in rank
+/// order, ignoring neighbors entirely. Pass 2 then fills neighbors for the
+/// anchors that made it through pass 1, again in rank order, spending
+/// whatever budget remains.
+///
+/// A single-pass walk (entity+neighbors per anchor before moving to the
+/// next) lets one anchor's neighbor fan-out (driven by `fanout`/`hops`,
+/// unrelated to how relevant that anchor is) exhaust the entire budget and
+/// starve every anchor ranked after it — including anchors that are more
+/// relevant to the query and would otherwise have made it into the result.
+/// Reserving entity space first guarantees every anchor that fits gets
+/// *some* representation before any anchor's neighbor list is allowed to
+/// consume shared budget.
 fn assemble_within_budget(
     blocks: &[AnchorBlock],
     budget: usize,
 ) -> (Vec<Value>, bool, usize, usize) {
-    let mut committed_anchor_entities = 0usize;
-    let mut committed_neighbors: Vec<usize> = vec![0; blocks.len()];
     let mut running = 0usize;
     let mut truncated = false;
-    let mut out_anchors: Vec<Value> = Vec::with_capacity(blocks.len());
+    let mut included: Vec<bool> = vec![false; blocks.len()];
 
-    'outer: for (i, block) in blocks.iter().enumerate() {
+    for (i, block) in blocks.iter().enumerate() {
         if running + block.entity_size > budget {
             truncated = true;
-            break 'outer;
+            break;
         }
         running += block.entity_size;
-        committed_anchor_entities += 1;
+        included[i] = true;
+    }
 
+    let mut out_anchors: Vec<Value> = Vec::with_capacity(blocks.len());
+    let mut committed_neighbors: Vec<usize> = vec![0; blocks.len()];
+    for (i, block) in blocks.iter().enumerate() {
+        if !included[i] {
+            continue;
+        }
         let mut neighbor_out: Vec<Value> = Vec::new();
-        let mut hit_budget_mid_anchor = false;
         for (nj, size) in &block.neighbor_jsons {
             if running + size > budget {
                 truncated = true;
-                hit_budget_mid_anchor = true;
                 break;
             }
             running += size;
@@ -539,11 +564,9 @@ fn assemble_within_budget(
             "entity": block.entity_json.clone(),
             "neighbors": neighbor_out,
         }));
-        if hit_budget_mid_anchor {
-            break 'outer;
-        }
     }
 
+    let committed_anchor_entities = out_anchors.len();
     let dropped_anchors = blocks.len() - committed_anchor_entities;
     let dropped_neighbors: usize = blocks
         .iter()
@@ -665,14 +688,39 @@ mod tests {
     }
 
     #[test]
-    fn assemble_within_budget_second_anchor_fully_dropped_when_budget_exhausted_by_first() {
-        let blocks = vec![anchor_block("a1", 4, &[4]), anchor_block("a2", 4, &[4, 4])];
-        let budget = blocks[0].entity_size + blocks[0].neighbor_jsons[0].1;
+    fn assemble_within_budget_first_anchor_bloated_neighbor_no_longer_starves_second_anchor() {
+        // Regression test for the context-verb anchor-starvation defect: a bloated
+        // neighbor list on a higher-ranked anchor must never push a lower-ranked
+        // (but still selected) anchor's own entity record out of the result. Only
+        // that first anchor's oversized neighbor should be dropped.
+        let blocks = vec![anchor_block("a1", 4, &[2000]), anchor_block("a2", 4, &[4])];
+        let budget = blocks[0].entity_size + blocks[1].entity_size + blocks[1].neighbor_jsons[0].1;
         let (out, truncated, d_anchors, d_neighbors) = assemble_within_budget(&blocks, budget);
         assert!(truncated);
-        assert_eq!(out.len(), 1, "only the first anchor was assembled");
-        assert_eq!(d_anchors, 1, "second anchor dropped entirely");
-        assert_eq!(d_neighbors, 2, "second anchor's two neighbors both dropped");
+        assert_eq!(
+            out.len(),
+            2,
+            "both anchors' entity records must survive a bloated sibling neighbor list"
+        );
+        assert_eq!(
+            out[1]["entity"]["id"], "a2",
+            "second anchor's entity must be present"
+        );
+        assert_eq!(d_anchors, 0, "no anchor entity is dropped");
+        assert_eq!(
+            d_neighbors, 1,
+            "only the oversized first-anchor neighbor is dropped"
+        );
+        assert_eq!(
+            out[0]["neighbors"].as_array().unwrap().len(),
+            0,
+            "first anchor's oversized neighbor did not fit"
+        );
+        assert_eq!(
+            out[1]["neighbors"].as_array().unwrap().len(),
+            1,
+            "second anchor's small neighbor still fits"
+        );
     }
 
     #[test]
