@@ -63,12 +63,12 @@ request(ops="[v1(...), v2(...), v3(...)]")             # parallel batch (max 100
 request(ops="[{\"tool\":\"v1\",\"args\":{...}}, ...]") # equivalent JSON form
 ```
 
-All 12 packs load by default, giving **85 verbs** out of the box (regenerate with
+All 12 packs load by default, giving **86 verbs** out of the box (regenerate with
 `request(ops="verbs()")` before editing this table):
 
 | Pack          | Prefix       | Verbs | What it does                                                                                   |
 | ------------- | ------------ | ----- | ---------------------------------------------------------------------------------------------- |
-| **kg**        | _(bare)_     | 18    | Entities, edges, notes, graph queries, reference resolution                                    |
+| **kg**        | _(bare)_     | 19    | Entities, edges, notes, graph queries, reference resolution, caller identity                   |
 | **gtd**       | `gtd.`       | 5     | Task lifecycle (inbox → next → active → done)                                                  |
 | **memory**    | `memory.`    | 5     | Salience-weighted remember / decay-ranked recall                                               |
 | **brain**     | `brain.`     | 15    | Bayesian user profiles + feedback loop                                                         |
@@ -188,7 +188,8 @@ The speedups over exhaustive search implied by these latencies (89x at 100K, 153
 at 1M) are computed against a back-derived brute-force baseline rather than a directly measured
 one (see [#167](https://github.com/ohdearquant/khive/issues/167)); treat them as indicative, not
 as a measured headline figure. The benchmark harness lives in `perf/`; raw data is in
-[`perf/ledger.csv`](perf/ledger.csv).
+[`perf/ledger.csv`](perf/ledger.csv). New latency and throughput claims used as decision evidence
+must follow the [cache-state and warm-up protocol](scripts/perf/README.md#benchmark-evidence-protocol).
 
 ---
 

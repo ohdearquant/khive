@@ -4,6 +4,53 @@ See `perf/README.md` for the Vamana scale-proof ledger (`perf/ledger.csv`).
 This file documents the trend-tracking tooling: `bench_track.py`,
 `publish_ledger.sh`, and the `bench-track.yml` CI workflow.
 
+## Benchmark evidence protocol
+
+Any latency or throughput result used as decision evidence in an issue, pull
+request, or design record must link to a measurement plan written before the
+run. The plan and result must use the same cache-state labels and warm-up
+boundary.
+
+### Cache states and warm-up
+
+Pre-register every state that will be measured and the procedure that
+establishes it. Treat cache state as a vector rather than a single `cold` or
+`warm` flag:
+
+- **Cold start:** state whether the process is new, which application caches
+  begin empty, and whether model or index initialization is included in the
+  timed interval.
+- **Warm process:** state the initialization or request sequence that makes
+  the process resident before measurement.
+- **SQLite cache:** state whether each sample uses a new connection or a warm
+  connection and how the SQLite page-cache condition is established.
+- **OS page cache:** state how the filesystem-cache condition is established.
+  If the runner cannot reliably establish a cold OS cache, report that state
+  as uncontrolled rather than calling it cold.
+
+Declare the warm-up boundary before measuring: the exact number of discarded
+requests, elapsed-time rule, or observable readiness condition. Only samples
+collected after that boundary are measurement samples. Preserve the cache-state
+label on every sample or on an unambiguous enclosing run record.
+
+### Analysis and isolation
+
+Report each cache-state vector independently. Never pool samples across cache
+states, and compute confidence intervals only from post-warm-up samples with
+the same state label. If a required state has too few samples, report it as
+insufficient rather than merging it with another state.
+
+The exclusive benchmark window and an isolated build directory remain
+required for decision evidence. They control resource contention and build
+interference; they do not establish application, SQLite, or OS cache state.
+
+### Write workloads
+
+In addition to the cache protocol, pre-register and report the offered and
+achieved write rate, overflow or backpressure policy, residency mode, vector
+dimensionality, and every tail-cap parameter. A write-workload result missing
+any of these fields is exploratory, not decision evidence.
+
 ## Trend ledger (`bench_track.py`)
 
 `bench_track.py` is a stdlib-only companion to `bench_calibrate.py`. Where
