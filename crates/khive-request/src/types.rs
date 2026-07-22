@@ -168,7 +168,7 @@ impl ArgValue {
                                     available.sort_unstable();
                                     return Some(PrevFailure::NotFound {
                                         arg_path: arg_path.to_string(),
-                                        prev_path: format!("$prev.{path}"),
+                                        prev_path: render_prev_path(path),
                                         resolved_prefix: prev_path_prefix(&resolved_prefix),
                                         missing: key.to_string(),
                                         available,
@@ -178,7 +178,7 @@ impl ArgValue {
                             other => {
                                 return Some(PrevFailure::WrongType {
                                     arg_path: arg_path.to_string(),
-                                    prev_path: format!("$prev.{path}"),
+                                    prev_path: render_prev_path(path),
                                     resolved_prefix: prev_path_prefix(&resolved_prefix),
                                     segment: key.to_string(),
                                     expected: "object",
@@ -195,7 +195,7 @@ impl ArgValue {
                                 None => {
                                     return Some(PrevFailure::NotFound {
                                         arg_path: arg_path.to_string(),
-                                        prev_path: format!("$prev.{path}"),
+                                        prev_path: render_prev_path(path),
                                         resolved_prefix: prev_path_prefix(&resolved_prefix),
                                         missing: format!("[{idx}]"),
                                         available: vec![format!(
@@ -208,7 +208,7 @@ impl ArgValue {
                             other => {
                                 return Some(PrevFailure::WrongType {
                                     arg_path: arg_path.to_string(),
-                                    prev_path: format!("$prev.{path}"),
+                                    prev_path: render_prev_path(path),
                                     resolved_prefix: prev_path_prefix(&resolved_prefix),
                                     segment: format!("[{idx}]"),
                                     expected: "array",
@@ -219,7 +219,7 @@ impl ArgValue {
                         crate::parser::PathSegment::Malformed(raw) => {
                             return Some(PrevFailure::Unsupported {
                                 arg_path: arg_path.to_string(),
-                                prev_path: format!("$prev.{path}"),
+                                prev_path: render_prev_path(path),
                                 segment: raw.to_string(),
                             });
                         }
@@ -240,6 +240,10 @@ impl ArgValue {
             }),
         }
     }
+}
+
+fn render_prev_path(path: &str) -> String {
+    format!("$prev.{path}").replace(".[", "[")
 }
 
 /// Renders the `$prev`-relative path successfully traversed before a failure,

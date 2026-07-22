@@ -1868,6 +1868,32 @@ fn find_prev_failure_reports_not_found_for_missing_field() {
 }
 
 #[test]
+fn find_prev_failure_renders_root_index_as_valid_dsl_path() {
+    let parsed = req(r#"list(kind="concept") | get(id=$prev[2])"#);
+    let failure = parsed.ops[1].args["id"]
+        .find_prev_failure(&json!([]))
+        .expect("out-of-range index must report a substitution failure");
+    let rendered = failure.to_string();
+    assert_eq!(
+        rendered.split_once(':').map(|(path, _)| path),
+        Some("$prev[2]")
+    );
+}
+
+#[test]
+fn find_prev_failure_renders_nested_index_as_valid_dsl_path() {
+    let parsed = req(r#"list(kind="concept") | get(id=$prev.items[0].id)"#);
+    let failure = parsed.ops[1].args["id"]
+        .find_prev_failure(&json!({"items": []}))
+        .expect("out-of-range index must report a substitution failure");
+    let rendered = failure.to_string();
+    assert_eq!(
+        rendered.split_once(':').map(|(path, _)| path),
+        Some("$prev.items[0].id")
+    );
+}
+
+#[test]
 fn find_prev_failure_reports_wrong_type_for_field_on_scalar() {
     let prev: JsonValue = json!({"name": "concept-1"});
     let failure = prev_ref("name.sub").find_prev_failure(&prev);
