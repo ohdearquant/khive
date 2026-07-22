@@ -72,7 +72,9 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
         name: "brain.event_counts",
         description: "Windowed event counts grouped by kind, actor, and verb over the event \
             plane (ADR-103 Stage 1, #724 Ask A); feedback_explicit events additionally split by \
-            served_by_profile_id; events carrying a work_class (today: phase_started / \
+            served_by_profile_id (by_profile), by signal (counts_by_signal), and by profile \
+            crossed with signal (by_profile_and_signal, for per-seat negative-share); events \
+            carrying a work_class (today: phase_started / \
             phase_completed / phase_cancelled payloads, checked before any future \
             payload.resource.work_class) split by counts_by_work_class. Events carrying \
             payload.resource.cost_unit (ADR-103 Amendment 1; stamped on every successful verb \
@@ -84,7 +86,14 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
             fields — and, to keep a page-scoped number from being read as the real window total, \
             each is renamed to an explicitly incomplete key (total_page_scoped, \
             total_cost_unit_page_scoped) instead of being returned under its normal name \
-            (issue #14). window_event_total always carries the true count regardless.",
+            (issue #14). window_event_total always carries the true count regardless. The \
+            unfiltered default view (no `kind`) segregates the high-volume `audit` kind from \
+            the shared truncation budget so it cannot crowd other kinds out of counts_by_kind. \
+            Pass exhaustive=true for an exact, non-sampled full-window aggregate (paginates \
+            internally; still one call) instead of a single bounded page — higher cost, use \
+            for coverage-panel/audit-style queries. Exhaustive windows matching more than \
+            2,000,000 events are rejected rather than returned as partial aggregates; narrow \
+            since/until or add actor/kind filters.",
         visibility: khive_types::Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[
@@ -114,6 +123,18 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 param_type: "string",
                 required: false,
                 description: "Filter to a single EventKind (e.g. \"recall_executed\", \"feedback_explicit\"). Omit for all kinds.",
+            },
+            khive_types::ParamDef {
+                name: "exhaustive",
+                param_type: "boolean",
+                required: false,
+                description: "When true, paginate through every matching event instead of a \
+                    single bounded page, returning an exact (non-sampled) full-window \
+                    aggregate in one call. Higher cost than the default bounded page \
+                    (internally issues multiple storage queries); intended for coverage-panel \
+                    / audit-style queries over large windows. Windows above the 2,000,000-event \
+                    exhaustive limit are rejected; narrow since/until or add filters. Default \
+                    false.",
             },
         ],
     },
@@ -719,6 +740,8 @@ impl BrainPack {
     /// storage trait with a grouped-count method was intentionally deferred
     /// rather than contorting `EventStore` for a case that is not yet load-bearing.
     const MAX_WINDOW_EVENTS: u32 = 50_000;
+    const EXHAUSTIVE_PAGE_SIZE: u32 = 10_000;
+    const MAX_EXHAUSTIVE_EVENTS: u64 = 40 * Self::MAX_WINDOW_EVENTS as u64;
 
     /// Issue #14: when the window's aggregation ran over a bounded page
     /// rather than the full window (`truncated`), a bare scalar total next
@@ -755,6 +778,12 @@ impl BrainPack {
             // serde's generic "missing field `since`" message.
             since: Option<String>,
             until: Option<String>,
+            // #21: opt into full-window aggregation (paginates through every
+            // matching event instead of a single bounded page) so a coverage
+            // panel gets exact per-verb/kind/actor counts in one call, without
+            // stitching sampled windows client-side. Default false — the
+            // bounded page is cheaper and sufficient for most callers.
+            exhaustive: Option<bool>,
         }
         let p: EventCountsParams = serde_json::from_value(params)
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
@@ -792,7 +821,7 @@ impl BrainPack {
         };
 
         let store = self.runtime.events(token)?;
-        let filter = EventFilter {
+        let base_filter = EventFilter {
             actors: actor_filters,
             kinds: kind_filter.into_iter().collect(),
             // Half-open window [since, until): `EventFilter.after` is a strict
@@ -804,19 +833,24 @@ impl BrainPack {
             ..EventFilter::default()
         };
 
-        let page = store
-            .query_events(
-                filter,
-                PageRequest {
-                    offset: 0,
-                    limit: Self::MAX_WINDOW_EVENTS,
-                },
+        let exhaustive = p.exhaustive.unwrap_or(false);
+        let (items, window_event_total, truncated) = if exhaustive {
+            fetch_event_counts_window_exhaustive(
+                store.as_ref(),
+                &base_filter,
+                Self::EXHAUSTIVE_PAGE_SIZE,
+                Self::MAX_EXHAUSTIVE_EVENTS,
             )
-            .await
-            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
-
-        let window_event_total = page.total.unwrap_or(page.items.len() as u64);
-        let truncated = window_event_total > page.items.len() as u64;
+            .await?
+        } else {
+            fetch_event_counts_window(
+                store.as_ref(),
+                &base_filter,
+                p.kind.is_none(),
+                Self::MAX_WINDOW_EVENTS,
+            )
+            .await?
+        };
 
         let mut counts_by_kind: std::collections::BTreeMap<String, u64> =
             std::collections::BTreeMap::new();
@@ -826,13 +860,24 @@ impl BrainPack {
             std::collections::BTreeMap::new();
         let mut by_profile: std::collections::BTreeMap<String, u64> =
             std::collections::BTreeMap::new();
+        // #34: signal breakdown for `feedback_explicit`, both flat (negative-signal
+        // saturation as a first-class metric) and crossed with the profile split
+        // above (negative-share per seat/profile) — same source field
+        // (`payload.signal`, stamped by `brain.feedback`/`brain.auto_feedback`) as
+        // `by_profile` reads `payload.served_by_profile_id` from.
+        let mut counts_by_signal: std::collections::BTreeMap<String, u64> =
+            std::collections::BTreeMap::new();
+        let mut by_profile_and_signal: std::collections::BTreeMap<
+            String,
+            std::collections::BTreeMap<String, u64>,
+        > = std::collections::BTreeMap::new();
         let mut counts_by_work_class: std::collections::BTreeMap<String, u64> =
             std::collections::BTreeMap::new();
         let mut total_cost_unit: i64 = 0;
         let mut cost_unit_by_verb: std::collections::BTreeMap<String, i64> =
             std::collections::BTreeMap::new();
 
-        for event in &page.items {
+        for event in &items {
             *counts_by_kind
                 .entry(event.kind.name().to_string())
                 .or_insert(0) += 1;
@@ -845,7 +890,19 @@ impl BrainPack {
                     .and_then(Value::as_str)
                     .unwrap_or("unspecified")
                     .to_string();
-                *by_profile.entry(profile).or_insert(0) += 1;
+                *by_profile.entry(profile.clone()).or_insert(0) += 1;
+                let signal = event
+                    .payload
+                    .get("signal")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unspecified")
+                    .to_string();
+                *counts_by_signal.entry(signal.clone()).or_insert(0) += 1;
+                *by_profile_and_signal
+                    .entry(profile)
+                    .or_default()
+                    .entry(signal)
+                    .or_insert(0) += 1;
             }
             if let Some(work_class) = event_work_class(&event.payload) {
                 *counts_by_work_class
@@ -869,10 +926,17 @@ impl BrainPack {
             "counts_by_verb": counts_by_verb,
             "truncated": truncated,
             "window_event_total": window_event_total,
+            "exhaustive": exhaustive,
         });
-        result[Self::truncatable_total_key("total", truncated)] = json!(page.items.len() as u64);
+        result[Self::truncatable_total_key("total", truncated)] = json!(items.len() as u64);
         if !by_profile.is_empty() {
             result["by_profile"] = json!(by_profile);
+        }
+        if !counts_by_signal.is_empty() {
+            result["counts_by_signal"] = json!(counts_by_signal);
+        }
+        if !by_profile_and_signal.is_empty() {
+            result["by_profile_and_signal"] = json!(by_profile_and_signal);
         }
         if !counts_by_work_class.is_empty() {
             result["counts_by_work_class"] = json!(counts_by_work_class);
@@ -1293,6 +1357,16 @@ impl BrainPack {
             // is rejected rather than silently coerced.
             scorer_run_id: Option<String>,
             serve_ledger_id: Option<String>,
+            // #35 cheap-half: `brain.auto_feedback` receives the serving `query`
+            // and the full `results` list but previously dropped both, keeping
+            // only `results.first()`'s id as `target_id`. Persisting what
+            // already arrives (emission-side only, no new join) unblocks
+            // "what else was on the candidate list this feedback was chosen
+            // from" without requiring the full RecallExecuted-linkage gap
+            // (#807's harder half) to close first. Both optional so a direct
+            // `brain.feedback` caller (no serving context) is unaffected.
+            query: Option<String>,
+            candidate_ids: Option<Vec<String>>,
         }
         let p: FeedbackParams = serde_json::from_value(params)
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
@@ -1306,8 +1380,7 @@ impl BrainPack {
             ));
         }
 
-        let target: uuid::Uuid =
-            resolve_auto_feedback_target(&self.runtime, token, &p.target_id).await?;
+        let target: uuid::Uuid = resolve_auto_feedback_target(&self.runtime, &p.target_id).await?;
 
         let signal = match p.signal.as_str() {
             "useful" => "useful",
@@ -1460,6 +1533,17 @@ impl BrainPack {
         {
             base_data["scorer_run_id"] = json!(scorer_run_id);
             base_data["serve_ledger_id"] = json!(serve_ledger_id);
+        }
+        // #35 cheap-half: persist what `brain.auto_feedback` already receives
+        // instead of dropping it. `candidate_ids` are the raw (pre-resolution)
+        // ids `auto_feedback` was handed — not necessarily equal to `target_id`
+        // (which is `results.first()`, resolved to a full UUID) — so a reader
+        // can see the full candidate set the choice was made from.
+        if let Some(ref query) = p.query {
+            base_data["query"] = json!(query);
+        }
+        if let Some(ref candidate_ids) = p.candidate_ids {
+            base_data["candidate_ids"] = json!(candidate_ids);
         }
 
         // ADR-081 §2: the bounded-mass fold gate applies only to implicit
@@ -1763,7 +1847,7 @@ impl BrainPack {
             }));
         };
 
-        let target = resolve_auto_feedback_target(&self.runtime, token, &first.id).await?;
+        let target = resolve_auto_feedback_target(&self.runtime, &first.id).await?;
 
         let mut feedback_params = json!({
             "target_id": target.to_string(),
@@ -1778,6 +1862,12 @@ impl BrainPack {
         if let Some(ref serve_ledger_id) = p.serve_ledger_id {
             feedback_params["serve_ledger_id"] = json!(serve_ledger_id);
         }
+        // #35 cheap-half: forward what already arrived instead of dropping it —
+        // the serving `query` and the raw (pre-resolution) candidate ids for
+        // every result, not just the chosen `first`.
+        feedback_params["query"] = json!(p.query);
+        feedback_params["candidate_ids"] =
+            json!(p.results.iter().map(|r| r.id.clone()).collect::<Vec<_>>());
 
         let mut out = self.handle_feedback(token, feedback_params).await?;
         out["verb"] = json!("brain.auto_feedback");
@@ -2339,6 +2429,164 @@ impl BrainPack {
     }
 }
 
+/// Fetch the event window for `brain.event_counts`, each bounded query capped at
+/// `page_limit` (`BrainPack::MAX_WINDOW_EVENTS` in production; a free function
+/// parameterized on the cap so a unit test can shrink it and exercise the
+/// crowd-out fix below deterministically, instead of needing tens of thousands
+/// of seeded rows to trigger it).
+///
+/// #26: the unfiltered default view (`unfiltered = true`, i.e. the caller
+/// passed no `kind`) must not let the high-volume `audit` kind crowd every
+/// other kind out of the shared budget. `query_events` orders by `created_at
+/// DESC`, so a single bounded fetch over "all kinds" returns whichever kind
+/// fired most densely in the tail of the window — measured at ~12x undercount
+/// for `feedback_explicit` when `audit` alone runs 37k-50k/week. Segregate
+/// `audit` into its own bounded query so each half gets the full `page_limit`
+/// independently — a quiet kind is never crowded out by a busy one. Only
+/// applies to the unfiltered default view: a caller who already passed `kind`
+/// has no crowding to fix (the single query is already scoped to one kind).
+///
+/// Returns the concatenated items, the true total matching the filter (exact,
+/// via `Page::total`'s unbounded `COUNT(*)` — see `khive-db`'s `query_events`),
+/// and whether either half was truncated against its own `page_limit`.
+pub(crate) async fn fetch_event_counts_window(
+    store: &dyn khive_storage::event::EventStore,
+    base_filter: &EventFilter,
+    unfiltered: bool,
+    page_limit: u32,
+) -> Result<(Vec<Event>, u64, bool), RuntimeError> {
+    if !unfiltered {
+        let page = store
+            .query_events(
+                base_filter.clone(),
+                PageRequest {
+                    offset: 0,
+                    limit: page_limit,
+                },
+            )
+            .await
+            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+        let window_event_total = page.total.unwrap_or(page.items.len() as u64);
+        let truncated = window_event_total > page.items.len() as u64;
+        return Ok((page.items, window_event_total, truncated));
+    }
+
+    let non_audit_kinds: Vec<khive_types::EventKind> = khive_types::EventKind::ALL
+        .iter()
+        .copied()
+        .filter(|k| *k != khive_types::EventKind::Audit)
+        .collect();
+    let audit_filter = EventFilter {
+        kinds: vec![khive_types::EventKind::Audit],
+        ..base_filter.clone()
+    };
+    let non_audit_filter = EventFilter {
+        kinds: non_audit_kinds,
+        ..base_filter.clone()
+    };
+
+    let audit_page = store
+        .query_events(
+            audit_filter,
+            PageRequest {
+                offset: 0,
+                limit: page_limit,
+            },
+        )
+        .await
+        .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+    let non_audit_page = store
+        .query_events(
+            non_audit_filter,
+            PageRequest {
+                offset: 0,
+                limit: page_limit,
+            },
+        )
+        .await
+        .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+
+    let audit_total = audit_page.total.unwrap_or(audit_page.items.len() as u64);
+    let non_audit_total = non_audit_page
+        .total
+        .unwrap_or(non_audit_page.items.len() as u64);
+    let truncated = audit_total > audit_page.items.len() as u64
+        || non_audit_total > non_audit_page.items.len() as u64;
+    let window_event_total = audit_total + non_audit_total;
+    let mut items = audit_page.items;
+    items.extend(non_audit_page.items);
+    Ok((items, window_event_total, truncated))
+}
+
+/// #21: full-window aggregation for `brain.event_counts(exhaustive=true)`.
+///
+/// `EventStore` has no SQL-side grouped-count primitive (`count_events` returns
+/// one scalar per filter, not a GROUP BY) — that would live in `khive-storage`/
+/// `khive-db`, outside this crate. Exact per-verb/kind/actor counts over an
+/// arbitrarily large window are achievable without one: paginate `query_events`
+/// with a fixed page size until exhausted, accumulating every page instead of
+/// stopping at a single bounded page. The caller still makes exactly ONE
+/// `brain.event_counts` call — the pagination loop is internal to this
+/// function — so a coverage panel that needed 19 stitched sampled windows
+/// becomes one exhaustive call.
+///
+/// `window_event_total` comes from a single `count_events` call: the SQL
+/// `COUNT(*)` for a given `WHERE` clause is invariant to `LIMIT`/`OFFSET`, so
+/// it is already exact regardless of how many pages the loop below walks —
+/// cheaper than trusting the last page's `Page::total` and doesn't require
+/// the loop to complete.
+///
+/// `max_events` is a safety bound, not a design limit: without one,
+/// a caller could open a pathological (multi-year, unfiltered) window and this
+/// function would loop until the process runs out of memory rather than
+/// returning. Set to 40x the bounded-mode cap (`BrainPack::MAX_WINDOW_EVENTS`)
+/// — comfortably above the multi-million-event/month volumes `exhaustive` is
+/// meant to serve — so it only binds on something pathological. A window above
+/// the bound is rejected before aggregation; exhaustive mode never returns a
+/// partial result.
+pub(crate) async fn fetch_event_counts_window_exhaustive(
+    store: &dyn khive_storage::event::EventStore,
+    base_filter: &EventFilter,
+    page_size: u32,
+    max_events: u64,
+) -> Result<(Vec<Event>, u64, bool), RuntimeError> {
+    let window_event_total = store
+        .count_events(base_filter.clone())
+        .await
+        .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+    if window_event_total > max_events {
+        return Err(RuntimeError::InvalidInput(format!(
+            "brain.event_counts window exceeds the exhaustive limit of {max_events} events \
+             ({window_event_total} matched); narrow `since`/`until` or add filters (`actor` or \
+             `kind`)"
+        )));
+    }
+
+    let mut items: Vec<Event> = Vec::new();
+    let mut offset: u64 = 0;
+    loop {
+        let page = store
+            .query_events(
+                base_filter.clone(),
+                PageRequest {
+                    offset,
+                    limit: page_size,
+                },
+            )
+            .await
+            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+        let page_len = page.items.len() as u64;
+        items.extend(page.items);
+        if page_len < page_size as u64 {
+            break;
+        }
+        offset += page_size as u64;
+    }
+
+    let truncated = (items.len() as u64) < window_event_total;
+    Ok((items, window_event_total, truncated))
+}
+
 /// Parse an ISO-8601/RFC-3339 datetime string into a microsecond epoch,
 /// naming the offending field/value in the error rather than a bare parse
 /// failure (`brain.event_counts`, ADR-103 Stage 1).
@@ -2518,9 +2766,21 @@ fn route_via_fann(context: &[f32]) -> Vec<f32> {
 /// Accepts a 36-char UUID directly, or an 8-char hex prefix (Agent-mode short
 /// form). Returns `InvalidInput` if neither form matches or the prefix is
 /// ambiguous.
+///
+/// #38: the full-UUID path above is already namespace-agnostic (ADR-007 Rev 6
+/// — by-ID resolution has no namespace check; the Gate, not storage-layer
+/// filtering, is the authz seam). The prefix path used to be scoped to the
+/// caller's own namespace via `resolve_prefix`, which broke the documented
+/// `memory.recall` -> `brain.auto_feedback` chain whenever the recalled
+/// record lived outside that scope: recall itself fans out cross-namespace by
+/// design (root CLAUDE.md "Rule 3b"), so a namespace-scoped prefix resolution
+/// could fail on an id recall had just served, with
+/// `"no record matches id prefix"`. `resolve_prefix_unfiltered` closes that
+/// asymmetry — same by-ID contract as the four CRUD-by-ID verbs
+/// (get/update/delete/merge) already use, no namespace filter, no `token`
+/// needed (there is no namespace to derive from one).
 pub(crate) async fn resolve_auto_feedback_target(
     runtime: &KhiveRuntime,
-    token: &NamespaceToken,
     raw: &str,
 ) -> Result<uuid::Uuid, RuntimeError> {
     if let Ok(uuid) = raw.parse::<uuid::Uuid>() {
@@ -2528,7 +2788,7 @@ pub(crate) async fn resolve_auto_feedback_target(
     }
     if raw.len() >= 8 && raw.chars().all(|c| c.is_ascii_hexdigit()) {
         return runtime
-            .resolve_prefix(token, raw)
+            .resolve_prefix_unfiltered(raw)
             .await
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?
             .ok_or_else(|| {

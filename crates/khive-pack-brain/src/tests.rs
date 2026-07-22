@@ -2977,6 +2977,105 @@ async fn brain_auto_feedback_emits_implicit_positive_for_first_result() {
     );
 }
 
+/// #35 cheap half: `brain.auto_feedback` must persist the `query` it received
+/// and the raw candidate ids for every result (not just the chosen `first`),
+/// instead of dropping both on emission.
+#[tokio::test]
+async fn brain_auto_feedback_persists_query_and_candidate_ids() {
+    let (pack, rt) = make_pack();
+    let registry = empty_registry();
+    let token = rt.authorize(Namespace::local()).unwrap();
+    let first = create_test_entity(&rt, &token).await;
+    let second = create_test_entity(&rt, &token).await;
+
+    let result = pack
+        .dispatch(
+            "brain.auto_feedback",
+            json!({
+                "query": "recall calibration target",
+                "results": [{ "id": first }, { "id": second }]
+            }),
+            &registry,
+            &token,
+        )
+        .await
+        .expect("auto_feedback succeeds");
+
+    assert_eq!(result["emitted"], json!(true), "got: {result}");
+    let event_id = uuid::Uuid::parse_str(
+        result["event_id"]
+            .as_str()
+            .expect("response must carry event_id"),
+    )
+    .expect("event_id must be a uuid");
+    let event = rt
+        .events(&token)
+        .expect("event store")
+        .get_event(event_id)
+        .await
+        .expect("get_event must not error")
+        .expect("emitted event must be readable back");
+
+    assert_eq!(
+        event.payload["query"],
+        json!("recall calibration target"),
+        "emitted event must persist the serving query, not drop it: {:?}",
+        event.payload
+    );
+    assert_eq!(
+        event.payload["candidate_ids"],
+        json!([first, second]),
+        "emitted event must persist every candidate id, not just results.first(): {:?}",
+        event.payload
+    );
+}
+
+/// #38: `memory.recall` fans results out across namespaces by design (root
+/// CLAUDE.md "Rule 3b"), so a caller's `auto_feedback` on a just-recalled
+/// short-prefix id must not fail just because the record lives outside the
+/// caller's OWN namespace. Prefix resolution here must match the by-ID
+/// contract's full-UUID path, which is already namespace-agnostic.
+#[tokio::test]
+async fn brain_auto_feedback_resolves_short_prefix_across_namespaces() {
+    use core::convert::TryFrom;
+    use khive_runtime::Namespace;
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let pack = BrainPack::new(rt.clone());
+    let registry = empty_registry();
+
+    let ns_a = Namespace::try_from("ns-a").expect("namespace a");
+    let ns_b = Namespace::try_from("ns-b").expect("namespace b");
+    let token_a = rt.authorize(ns_a).expect("token a");
+    let token_b = rt.authorize(ns_b).expect("token b");
+
+    // Entity lives in namespace A.
+    let target = create_test_entity(&rt, &token_a).await;
+    let prefix = &target[..8];
+
+    // Feedback dispatched under namespace B's token — the recalled record was
+    // never in B's own namespace, mirroring recall's cross-namespace fan-out.
+    let result = pack
+        .dispatch(
+            "brain.auto_feedback",
+            json!({
+                "query": "cross-namespace prefix resolution",
+                "results": [{ "id": prefix }]
+            }),
+            &registry,
+            &token_b,
+        )
+        .await
+        .expect("auto_feedback must resolve a short prefix across namespaces, not fail with \"no record matches id prefix\"");
+
+    assert_eq!(result["emitted"], json!(true), "got: {result}");
+    assert_eq!(
+        result["target_id"].as_str().unwrap_or(""),
+        target,
+        "resolved target_id must match the entity created in the OTHER namespace"
+    );
+}
+
 #[tokio::test]
 async fn brain_auto_feedback_empty_results_returns_no_emit() {
     let (pack, rt) = make_pack();
@@ -6032,6 +6131,241 @@ mod event_counts_tests {
         );
     }
 
+    /// #26: with a shrunk `page_limit`, a busy `audit` kind must not crowd a
+    /// quiet non-audit kind out of the unfiltered default view's shared budget.
+    /// Direct unit test of `fetch_event_counts_window` (rather than the full
+    /// `brain.event_counts` verb dispatch) because reproducing this at the real
+    /// `MAX_WINDOW_EVENTS = 50_000` cap would require seeding tens of thousands
+    /// of rows; the crowd-out mechanism is identical at any cap size.
+    #[tokio::test]
+    async fn audit_kind_does_not_crowd_out_non_audit_kinds_in_default_view() {
+        use khive_storage::event::EventFilter;
+
+        let (_, rt) = make_pack();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        // 5 audit events (the busy kind) vs. 1 non-audit event (the quiet kind),
+        // all in the same window. A shared, unsegregated 3-row budget ordered
+        // `created_at DESC` (audit seeded last, so audit sorts first) would
+        // return only audit rows and silently drop the lone `search_executed`
+        // row — exactly the ~12x undercount pattern reported in #26.
+        for i in 0..5 {
+            seed_event(
+                &rt,
+                &token,
+                "create",
+                EventKind::Audit,
+                "lambda:a",
+                1_000_000 + i,
+                json!({}),
+            )
+            .await;
+        }
+        seed_event(
+            &rt,
+            &token,
+            "search",
+            EventKind::SearchExecuted,
+            "lambda:a",
+            999_999,
+            json!({}),
+        )
+        .await;
+
+        let store = rt.events(&token).expect("event store");
+        let base_filter = EventFilter {
+            after: Some(0),
+            ..EventFilter::default()
+        };
+
+        let (items, window_event_total, truncated) = crate::handlers::fetch_event_counts_window(
+            store.as_ref(),
+            &base_filter,
+            /* unfiltered = */ true,
+            /* page_limit = */ 3,
+        )
+        .await
+        .expect("fetch_event_counts_window must succeed");
+
+        assert_eq!(
+            window_event_total, 6,
+            "the true total across both segregated queries must be exact, not \
+             page-limited: {items:?}"
+        );
+        assert!(
+            truncated,
+            "5 audit rows against a 3-row budget must report truncated=true"
+        );
+        let search_present = items.iter().any(|e| e.kind == EventKind::SearchExecuted);
+        assert!(
+            search_present,
+            "the lone non-audit event must survive a busy-audit-kind window even \
+             under a shared-looking budget: {items:?}"
+        );
+        let audit_count = items.iter().filter(|e| e.kind == EventKind::Audit).count();
+        assert_eq!(
+            audit_count, 3,
+            "the audit-kind half of the budget is independently capped at \
+             page_limit: {items:?}"
+        );
+    }
+
+    /// #21: a small injected page size makes this exercise three storage pages
+    /// while proving every page contributes to the final per-verb counts.
+    #[tokio::test]
+    async fn exhaustive_fetch_accumulates_counts_across_pages() {
+        let (_, rt) = make_pack();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        for i in 0..7 {
+            seed_event(
+                &rt,
+                &token,
+                "recall",
+                EventKind::RecallExecuted,
+                "lambda:a",
+                1_000_000 + i,
+                json!({}),
+            )
+            .await;
+        }
+        for i in 0..3 {
+            seed_event(
+                &rt,
+                &token,
+                "search",
+                EventKind::SearchExecuted,
+                "lambda:a",
+                2_000_000 + i,
+                json!({}),
+            )
+            .await;
+        }
+
+        let store = rt.events(&token).expect("event store");
+        let base_filter = EventFilter {
+            after: Some(0),
+            ..EventFilter::default()
+        };
+        let (items, window_event_total, truncated) =
+            crate::handlers::fetch_event_counts_window_exhaustive(
+                store.as_ref(),
+                &base_filter,
+                /* page_size = */ 4,
+                /* max_events = */ 20,
+            )
+            .await
+            .expect("multi-page exhaustive fetch must succeed");
+
+        let mut counts_by_verb = std::collections::BTreeMap::new();
+        for event in &items {
+            *counts_by_verb.entry(event.verb.as_str()).or_insert(0_u64) += 1;
+        }
+        assert_eq!(items.len(), 10);
+        assert_eq!(window_event_total, 10);
+        assert!(!truncated);
+        assert_eq!(counts_by_verb.get("recall"), Some(&7));
+        assert_eq!(counts_by_verb.get("search"), Some(&3));
+    }
+
+    /// The public handler must still identify a successful exhaustive response
+    /// as exact; pagination mechanics are covered separately with injected limits.
+    #[tokio::test]
+    async fn exhaustive_mode_returns_exact_response_shape() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        seed_event(
+            &rt,
+            &token,
+            "recall",
+            EventKind::RecallExecuted,
+            "lambda:a",
+            1_000_000,
+            json!({}),
+        )
+        .await;
+
+        let result = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({"since": micros_to_iso(0), "exhaustive": true}),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("exhaustive brain.event_counts must succeed");
+
+        assert_eq!(result["exhaustive"], json!(true), "got: {result}");
+        assert_eq!(result["truncated"], json!(false), "got: {result}");
+        assert_eq!(result["total"], json!(1), "got: {result}");
+        assert_eq!(result["window_event_total"], json!(1), "got: {result}");
+        assert_eq!(result["counts_by_verb"]["recall"], json!(1));
+    }
+
+    #[tokio::test]
+    async fn exhaustive_fetch_rejects_windows_over_the_cap() {
+        let (_, rt) = make_pack();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        for i in 0..6 {
+            seed_event(
+                &rt,
+                &token,
+                "recall",
+                EventKind::RecallExecuted,
+                "lambda:a",
+                1_000_000 + i,
+                json!({}),
+            )
+            .await;
+        }
+
+        let store = rt.events(&token).expect("event store");
+        let base_filter = EventFilter {
+            after: Some(0),
+            ..EventFilter::default()
+        };
+        let err = crate::handlers::fetch_event_counts_window_exhaustive(
+            store.as_ref(),
+            &base_filter,
+            /* page_size = */ 2,
+            /* max_events = */ 5,
+        )
+        .await
+        .expect_err("an exhaustive window above the safety cap must be rejected");
+
+        match err {
+            RuntimeError::InvalidInput(msg) => {
+                assert!(msg.contains("window exceeds the exhaustive limit of 5 events"));
+                assert!(msg.contains("narrow `since`/`until` or add filters"));
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    /// Default (non-exhaustive) calls must keep reporting `exhaustive: false`
+    /// so callers can distinguish an exact aggregate from a bounded-page one.
+    #[tokio::test]
+    async fn default_mode_reports_exhaustive_false() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        let result = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({"since": micros_to_iso(0)}),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("brain.event_counts must succeed");
+
+        assert_eq!(result["exhaustive"], json!(false), "got: {result}");
+    }
+
     #[tokio::test]
     async fn kind_filter_scopes_counts() {
         let (pack, rt) = make_pack();
@@ -6309,6 +6643,106 @@ mod event_counts_tests {
         );
         assert_eq!(
             result["by_profile"]["unspecified"],
+            json!(1),
+            "got: {result}"
+        );
+    }
+
+    /// #34: `counts_by_signal` (flat) and `by_profile_and_signal` (crossed with
+    /// `served_by_profile_id`) let a caller compute per-seat negative-signal share
+    /// in one call, mirroring the profile-only split above.
+    #[tokio::test]
+    async fn feedback_events_split_by_signal_and_crossed_with_profile() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        seed_event(
+            &rt,
+            &token,
+            "brain.feedback",
+            EventKind::FeedbackExplicit,
+            "lambda:a",
+            1_000_000,
+            json!({"served_by_profile_id": "balanced-recall-v1", "signal": "useful"}),
+        )
+        .await;
+        seed_event(
+            &rt,
+            &token,
+            "brain.feedback",
+            EventKind::FeedbackExplicit,
+            "lambda:a",
+            1_000_000,
+            json!({"served_by_profile_id": "balanced-recall-v1", "signal": "wrong"}),
+        )
+        .await;
+        seed_event(
+            &rt,
+            &token,
+            "brain.feedback",
+            EventKind::FeedbackExplicit,
+            "lambda:a",
+            1_000_000,
+            json!({"served_by_profile_id": "khive-recall-v1", "signal": "wrong"}),
+        )
+        .await;
+        // No `signal` field at all — must fall into "unspecified", same
+        // no-drop convention as the missing-profile case above.
+        seed_event(
+            &rt,
+            &token,
+            "brain.feedback",
+            EventKind::FeedbackExplicit,
+            "lambda:a",
+            1_000_000,
+            json!({"served_by_profile_id": "balanced-recall-v1"}),
+        )
+        .await;
+
+        let result = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({"since": micros_to_iso(0)}),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("brain.event_counts must succeed");
+
+        assert_eq!(result["total"], json!(4));
+        assert_eq!(
+            result["counts_by_signal"]["useful"],
+            json!(1),
+            "got: {result}"
+        );
+        assert_eq!(
+            result["counts_by_signal"]["wrong"],
+            json!(2),
+            "got: {result}"
+        );
+        assert_eq!(
+            result["counts_by_signal"]["unspecified"],
+            json!(1),
+            "got: {result}"
+        );
+        assert_eq!(
+            result["by_profile_and_signal"]["balanced-recall-v1"]["useful"],
+            json!(1),
+            "got: {result}"
+        );
+        assert_eq!(
+            result["by_profile_and_signal"]["balanced-recall-v1"]["wrong"],
+            json!(1),
+            "got: {result}"
+        );
+        assert_eq!(
+            result["by_profile_and_signal"]["balanced-recall-v1"]["unspecified"],
+            json!(1),
+            "got: {result}"
+        );
+        assert_eq!(
+            result["by_profile_and_signal"]["khive-recall-v1"]["wrong"],
             json!(1),
             "got: {result}"
         );
