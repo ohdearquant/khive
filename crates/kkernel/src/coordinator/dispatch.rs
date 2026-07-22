@@ -49,6 +49,8 @@ pub struct SubstrateCoordinator {
     locator: Arc<LocatorCache>,
     #[cfg(test)]
     pub(super) fail_backend_id: Option<String>,
+    #[cfg(test)]
+    pub(super) panic_backend_id: Option<String>,
 }
 
 impl SubstrateCoordinator {
@@ -59,6 +61,8 @@ impl SubstrateCoordinator {
             locator: Arc::new(LocatorCache::new()),
             #[cfg(test)]
             fail_backend_id: None,
+            #[cfg(test)]
+            panic_backend_id: None,
         }
     }
 
@@ -69,6 +73,8 @@ impl SubstrateCoordinator {
             locator: Arc::new(LocatorCache::with_ttl(ttl)),
             #[cfg(test)]
             fail_backend_id: None,
+            #[cfg(test)]
+            panic_backend_id: None,
         }
     }
 
@@ -81,6 +87,8 @@ impl SubstrateCoordinator {
             locator: Arc::new(LocatorCache::new()),
             #[cfg(test)]
             fail_backend_id: None,
+            #[cfg(test)]
+            panic_backend_id: None,
         }
     }
 
@@ -88,6 +96,13 @@ impl SubstrateCoordinator {
     #[cfg(test)]
     pub fn with_failing_backend(mut self, backend_id: &str) -> Self {
         self.fail_backend_id = Some(backend_id.to_string());
+        self
+    }
+
+    /// Test-only: force a named backend's fan-out task to panic.
+    #[cfg(test)]
+    pub fn with_panicking_backend(mut self, backend_id: &str) -> Self {
+        self.panic_backend_id = Some(backend_id.to_string());
         self
     }
 
@@ -510,6 +525,10 @@ impl SubstrateCoordinator {
         let fail_id: Option<String> = self.fail_backend_id.clone();
         #[cfg(not(test))]
         let fail_id: Option<String> = None;
+        #[cfg(test)]
+        let panic_id: Option<String> = self.panic_backend_id.clone();
+        #[cfg(not(test))]
+        let panic_id: Option<String> = None;
 
         let mut handles = Vec::with_capacity(entries.len());
         for (backend_id, runtime) in entries {
@@ -524,7 +543,15 @@ impl SubstrateCoordinator {
                 .as_deref()
                 .map(|id| id == backend_id.as_str())
                 .unwrap_or(false);
+            let should_panic = panic_id
+                .as_deref()
+                .map(|id| id == backend_id.as_str())
+                .unwrap_or(false);
+            let joined_backend_id = backend_id.clone();
             let handle = tokio::spawn(async move {
+                if should_panic {
+                    panic!("injected backend search panic");
+                }
                 if should_fail {
                     return (
                         backend_id,
@@ -566,23 +593,15 @@ impl SubstrateCoordinator {
                     }
                 }
             });
-            handles.push(handle);
+            handles.push((joined_backend_id, handle));
         }
-
-        type BackendOutcome = (
-            BackendId,
-            Result<Vec<SearchHit>, khive_runtime::RuntimeError>,
-            Option<Vec<NoteSearchHit>>,
-        );
-        let join_results: Vec<Result<BackendOutcome, JoinError>> =
-            futures_util::future::join_all(handles).await;
 
         let mut per_backend: Vec<BackendSearchResult> = Vec::new();
         let mut entity_ranked_lists: Vec<Vec<SearchHit>> = Vec::new();
         let mut note_ranked_lists: Vec<Vec<NoteSearchHit>> = Vec::new();
 
-        for join_result in join_results {
-            match join_result {
+        for (joined_backend_id, handle) in handles {
+            match handle.await {
                 Ok((backend_id, Ok(hits), note_hits_opt)) => {
                     let note_hits = note_hits_opt.unwrap_or_default();
                     if !hits.is_empty() {
@@ -607,7 +626,16 @@ impl SubstrateCoordinator {
                     });
                 }
                 Err(join_err) => {
-                    tracing::warn!(error = %join_err, "backend search task failed");
+                    let error = khive_runtime::RuntimeError::Internal(format!(
+                        "backend search task join failed: {join_err}"
+                    ));
+                    tracing::warn!(backend = %joined_backend_id, error = %error, "backend search task failed");
+                    per_backend.push(BackendSearchResult {
+                        backend_id: joined_backend_id,
+                        hits: vec![],
+                        note_hits: vec![],
+                        error: Some(error.to_string()),
+                    });
                 }
             }
         }
