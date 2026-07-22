@@ -1103,20 +1103,37 @@ impl KhiveRuntime {
             // with inserted_models tracking for rollback on partial failure.
             let rt_clone = self.clone();
             let body_owned = embed_body.clone();
+            let usage_ctx = crate::usage::current();
             let mut handles = Vec::with_capacity(embed_model_names.len());
             for model_name in &embed_model_names {
                 let rt = rt_clone.clone();
                 let text = body_owned.clone();
                 let name = model_name.clone();
+                let ctx = usage_ctx.clone();
                 handles.push(tokio::spawn(async move {
-                    rt.embed_document_with_model(&name, &text).await
+                    let fut = rt.embed_document_with_model(&name, &text);
+                    match ctx {
+                        Some(ctx) => crate::usage::scope(ctx, fut).await,
+                        None => fut.await,
+                    }
                 }));
             }
-            let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(embed_model_names.len());
+            // Await every handle before inspecting any result. Each handle holds a
+            // clone of the dispatch's UsageContext (ADR-103 Amendment 2); returning
+            // early on the first error would leave later handles un-awaited, so
+            // their embed tasks keep running (and incrementing embed_calls) after
+            // this function has already returned — the usage snapshot must never
+            // observe a task the dispatch didn't wait for.
+            let mut join_results = Vec::with_capacity(handles.len());
             for handle in handles {
-                let join_result = handle
-                    .await
-                    .map_err(|e| RuntimeError::Internal(format!("embed task panicked: {e}")));
+                join_results.push(
+                    handle
+                        .await
+                        .map_err(|e| RuntimeError::Internal(format!("embed task panicked: {e}"))),
+                );
+            }
+            let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(embed_model_names.len());
+            for join_result in join_results {
                 match join_result {
                     Err(e) => {
                         if let Ok(store) = self.entities(token) {
@@ -3093,20 +3110,37 @@ impl KhiveRuntime {
             // then insert one VectorRecord per model.
             let rt_clone = self.clone();
             let content_owned = embed_text.to_string();
+            let usage_ctx = crate::usage::current();
             let mut handles = Vec::with_capacity(embed_model_names.len());
             for model_name in &embed_model_names {
                 let rt = rt_clone.clone();
                 let text = content_owned.clone();
                 let name = model_name.clone();
+                let ctx = usage_ctx.clone();
                 handles.push(tokio::spawn(async move {
-                    rt.embed_document_with_model(&name, &text).await
+                    let fut = rt.embed_document_with_model(&name, &text);
+                    match ctx {
+                        Some(ctx) => crate::usage::scope(ctx, fut).await,
+                        None => fut.await,
+                    }
                 }));
             }
-            let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(embed_model_names.len());
+            // Await every handle before inspecting any result. Each handle holds a
+            // clone of the dispatch's UsageContext (ADR-103 Amendment 2); returning
+            // early on the first error would leave later handles un-awaited, so
+            // their embed tasks keep running (and incrementing embed_calls) after
+            // this function has already returned — the usage snapshot must never
+            // observe a task the dispatch didn't wait for.
+            let mut join_results = Vec::with_capacity(handles.len());
             for handle in handles {
-                let join_result = handle
-                    .await
-                    .map_err(|e| RuntimeError::Internal(format!("embed task panicked: {e}")));
+                join_results.push(
+                    handle
+                        .await
+                        .map_err(|e| RuntimeError::Internal(format!("embed task panicked: {e}"))),
+                );
+            }
+            let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(embed_model_names.len());
+            for join_result in join_results {
                 match join_result {
                     Err(e) => {
                         // Compensate note row + FTS (no vectors inserted yet).
@@ -3409,6 +3443,7 @@ impl KhiveRuntime {
                 .await
         };
 
+        crate::usage::count(crate::usage::UsageUnit::FtsPasses, 1);
         let text_hits = crate::error::fts_text_leg_or_err(
             text_search_result.map_err(RuntimeError::from),
             "search_notes",
@@ -4135,6 +4170,11 @@ pub struct QueryResult {
     pub rows: Vec<SqlRow>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    /// `true` when the server-side row cap bound this result — `rows` is a
+    /// prefix of the true match set, not the whole thing (#1168, #1247). A
+    /// structural flag so a caller can detect an incomplete result without
+    /// parsing the human-oriented `warnings` text.
+    pub truncated: bool,
 }
 
 impl KhiveRuntime {
@@ -4217,25 +4257,39 @@ impl KhiveRuntime {
         // result set — not the requested LIMIT — is the truncation signal
         // (a `LIMIT 1000` that only matches 20 rows must not warn, and a
         // query with no `LIMIT` that matches 501+ rows must).
+        let mut truncated = false;
         if let Some(check) = truncation_check {
             if rows.len() > check.max_limit {
                 rows.truncate(check.max_limit);
+                truncated = true;
+                // GQL has no SKIP/OFFSET/ORDER BY today (#1168) — the prior
+                // wording here recommended a paging path that does not exist.
+                // `truncated` is the structural signal (#1247); this message
+                // stays prose-only context for a human reader.
                 warnings.push(match check.requested_limit {
                     Some(requested) => format!(
                         "result set capped at {} rows; requested limit {requested} exceeds the \
-                         cap — use LIMIT/OFFSET to page through the remaining results",
+                         cap. This query language does not support SKIP/OFFSET paging yet — \
+                         check the `truncated` field, not this message, to detect an incomplete \
+                         result programmatically.",
                         check.max_limit
                     ),
                     None => format!(
                         "result set capped at {} rows; more than {} rows matched with no LIMIT \
-                         clause — use LIMIT/OFFSET to page through the remaining results",
+                         clause. This query language does not support SKIP/OFFSET paging yet — \
+                         check the `truncated` field, not this message, to detect an incomplete \
+                         result programmatically.",
                         check.max_limit, check.max_limit
                     ),
                 });
             }
         }
 
-        Ok(QueryResult { rows, warnings })
+        Ok(QueryResult {
+            rows,
+            warnings,
+            truncated,
+        })
     }
 
     /// Soft-delete or hard-delete an entity by ID (soft delete by default).
@@ -5415,6 +5469,95 @@ mod tests {
         async fn build(&self) -> crate::error::RuntimeResult<Arc<dyn EmbeddingService>> {
             self.build_count.fetch_add(1, Ordering::SeqCst);
             Ok(Arc::new(ConstVecService { dims: self.dims }))
+        }
+    }
+
+    /// Embedding service that sleeps briefly before returning, so its spawned
+    /// embed task is still in flight when a sibling model's task resolves
+    /// first — used to exercise the drain-before-return invariant on the
+    /// multi-model embed fan-out.
+    struct SlowVecService {
+        dims: usize,
+    }
+
+    #[async_trait]
+    impl EmbeddingService for SlowVecService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            Ok(texts.iter().map(|_| vec![1.0_f32; self.dims]).collect())
+        }
+
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "slow-vec"
+        }
+    }
+
+    struct SlowVecProvider {
+        provider_name: String,
+        dims: usize,
+    }
+
+    impl SlowVecProvider {
+        fn new(name: &str, dims: usize) -> Self {
+            Self {
+                provider_name: name.to_owned(),
+                dims,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl EmbedderProvider for SlowVecProvider {
+        fn name(&self) -> &str {
+            &self.provider_name
+        }
+
+        fn dimensions(&self) -> usize {
+            self.dims
+        }
+
+        async fn build(&self) -> crate::error::RuntimeResult<Arc<dyn EmbeddingService>> {
+            Ok(Arc::new(SlowVecService { dims: self.dims }))
+        }
+    }
+
+    /// Embedder provider whose `build()` always fails immediately — models
+    /// this provider's embed task resolving (with an error) well before a
+    /// slower sibling model's task completes.
+    struct FailFastProvider {
+        provider_name: String,
+    }
+
+    impl FailFastProvider {
+        fn new(name: &str) -> Self {
+            Self {
+                provider_name: name.to_owned(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl EmbedderProvider for FailFastProvider {
+        fn name(&self) -> &str {
+            &self.provider_name
+        }
+
+        fn dimensions(&self) -> usize {
+            4
+        }
+
+        async fn build(&self) -> crate::error::RuntimeResult<Arc<dyn EmbeddingService>> {
+            Err(RuntimeError::Internal(
+                "injected embed build failure".to_string(),
+            ))
         }
     }
 
@@ -11668,6 +11811,215 @@ mod tests {
         assert!(
             hits_b.is_empty(),
             "model-b vector store must be empty after rollback; got {hits_b:?}"
+        );
+    }
+
+    // ADR-103 Amendment 2 regression: multi-model create_entity spawns one
+    // embed task per configured model via tokio::spawn. Task-locals do not
+    // cross a spawn boundary, so each spawned task must re-enter the
+    // dispatch's usage scope explicitly for its embed to be counted.
+    #[tokio::test]
+    async fn create_entity_multi_model_counts_all_executed_embeds() {
+        const DIMS: usize = 4;
+
+        let rt = KhiveRuntime::memory().unwrap();
+        let (provider_a, _ca) = ConstVecProvider::new("usage-entity-model-a", DIMS);
+        let (provider_b, _cb) = ConstVecProvider::new("usage-entity-model-b", DIMS);
+        rt.register_embedder(provider_a);
+        rt.register_embedder(provider_b);
+
+        let ns = Namespace::parse("usage-entity-multi").unwrap();
+        let tok = NamespaceToken::for_namespace(ns.clone());
+
+        let ctx = crate::usage::UsageContext::new();
+        crate::usage::scope(ctx.clone(), async {
+            rt.create_entity(
+                &tok,
+                "concept",
+                None,
+                "usage-counted entity",
+                Some("description so embed body is non-empty"),
+                None,
+                vec![],
+            )
+            .await
+        })
+        .await
+        .expect("create_entity must succeed");
+
+        let snap = ctx.snapshot();
+        assert_eq!(
+            snap["embed_calls"], 2,
+            "both configured models' executed embeds must be counted; got {snap:?}"
+        );
+    }
+
+    // Same regression for the note create path's multi-model embed fan-out.
+    #[tokio::test]
+    async fn create_note_multi_model_counts_all_executed_embeds() {
+        const DIMS: usize = 4;
+
+        let rt = KhiveRuntime::memory().unwrap();
+        let (provider_a, _ca) = ConstVecProvider::new("usage-note-model-a", DIMS);
+        let (provider_b, _cb) = ConstVecProvider::new("usage-note-model-b", DIMS);
+        rt.register_embedder(provider_a);
+        rt.register_embedder(provider_b);
+
+        let ns = Namespace::parse("usage-note-multi").unwrap();
+        let tok = NamespaceToken::for_namespace(ns.clone());
+
+        let ctx = crate::usage::UsageContext::new();
+        crate::usage::scope(ctx.clone(), async {
+            rt.create_note(
+                &tok,
+                "observation",
+                None,
+                "usage-counted note body",
+                None,
+                None,
+                vec![],
+            )
+            .await
+        })
+        .await
+        .expect("create_note must succeed");
+
+        let snap = ctx.snapshot();
+        assert_eq!(
+            snap["embed_calls"], 2,
+            "both configured models' executed embeds must be counted; got {snap:?}"
+        );
+    }
+
+    // ADR-103 Amendment 2 regression: when one of several spawned embed tasks
+    // errors, create_entity must drain (await) every remaining handle before
+    // returning — each handle holds a clone of the dispatch's UsageContext, so
+    // an un-awaited handle keeps running and can increment embed_calls after
+    // the response has already gone out, making the counter nondeterministic.
+    // The fail-fast model resolves (with an error) first; the slow model's
+    // task is still in flight at that point — the drain must wait for it too.
+    #[tokio::test]
+    async fn create_entity_multi_model_error_drains_all_spawned_embeds_before_returning() {
+        const DIMS: usize = 4;
+
+        let rt = KhiveRuntime::memory().unwrap();
+        rt.register_embedder(FailFastProvider::new("usage-entity-fail-fast"));
+        rt.register_embedder(SlowVecProvider::new("usage-entity-slow", DIMS));
+
+        let ns = Namespace::parse("usage-entity-error-drain").unwrap();
+        let tok = NamespaceToken::for_namespace(ns.clone());
+
+        let ctx = crate::usage::UsageContext::new();
+        let result = crate::usage::scope(ctx.clone(), async {
+            rt.create_entity(
+                &tok,
+                "concept",
+                None,
+                "usage-drain entity",
+                Some("description so embed body is non-empty"),
+                None,
+                vec![],
+            )
+            .await
+        })
+        .await;
+
+        assert!(
+            result.is_err(),
+            "one model failing must fail the whole create_entity call"
+        );
+
+        let snap_immediately_after = ctx.snapshot();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let snap_after_delay = ctx.snapshot();
+
+        assert_eq!(
+            snap_immediately_after, snap_after_delay,
+            "no spawned embed task may still be running after create_entity returns \
+             its error — a late increment means a context-holding handle was left \
+             un-awaited; got immediately_after={snap_immediately_after:?} \
+             after_delay={snap_after_delay:?}"
+        );
+    }
+
+    // Same regression for the note create path's multi-model embed fan-out.
+    #[tokio::test]
+    async fn create_note_multi_model_error_drains_all_spawned_embeds_before_returning() {
+        const DIMS: usize = 4;
+
+        let rt = KhiveRuntime::memory().unwrap();
+        rt.register_embedder(FailFastProvider::new("usage-note-fail-fast"));
+        rt.register_embedder(SlowVecProvider::new("usage-note-slow", DIMS));
+
+        let ns = Namespace::parse("usage-note-error-drain").unwrap();
+        let tok = NamespaceToken::for_namespace(ns.clone());
+
+        let ctx = crate::usage::UsageContext::new();
+        let result = crate::usage::scope(ctx.clone(), async {
+            rt.create_note(
+                &tok,
+                "observation",
+                None,
+                "usage-drain note body",
+                None,
+                None,
+                vec![],
+            )
+            .await
+        })
+        .await;
+
+        assert!(
+            result.is_err(),
+            "one model failing must fail the whole create_note call"
+        );
+
+        let snap_immediately_after = ctx.snapshot();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let snap_after_delay = ctx.snapshot();
+
+        assert_eq!(
+            snap_immediately_after, snap_after_delay,
+            "no spawned embed task may still be running after create_note returns \
+             its error — a late increment means a context-holding handle was left \
+             un-awaited; got immediately_after={snap_immediately_after:?} \
+             after_delay={snap_after_delay:?}"
+        );
+    }
+
+    // Note search must count its FTS5 execution the same way entity
+    // hybrid_search does (retrieval.rs:435) — the search_notes FTS leg was
+    // silently uncounted.
+    #[tokio::test]
+    async fn search_notes_counts_one_fts_pass() {
+        let rt = KhiveRuntime::memory().unwrap();
+        let ns = Namespace::parse("usage-note-search").unwrap();
+        let tok = NamespaceToken::for_namespace(ns.clone());
+
+        rt.create_note(
+            &tok,
+            "observation",
+            None,
+            "usage counted note search body",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create_note must succeed");
+
+        let ctx = crate::usage::UsageContext::new();
+        crate::usage::scope(ctx.clone(), async {
+            rt.search_notes(&tok, "usage counted", None, 10, None, false, &[], None)
+                .await
+        })
+        .await
+        .expect("search_notes must succeed");
+
+        let snap = ctx.snapshot();
+        assert!(
+            snap["fts_passes"].as_u64().unwrap_or(0) >= 1,
+            "note search FTS execution must count fts_passes; got {snap:?}"
         );
     }
 

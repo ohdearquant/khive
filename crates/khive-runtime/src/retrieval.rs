@@ -94,7 +94,9 @@ impl KhiveRuntime {
         let model = parse_embedding_model_alias(model_name);
         let service = self.embedder(model_name).await?;
         let emb_model = model.unwrap_or_default();
-        Ok(service.embed_one(text, emb_model).await?)
+        let out = service.embed_one(text, emb_model).await;
+        crate::usage::count(crate::usage::UsageUnit::EmbedCalls, 1);
+        Ok(out?)
     }
 
     /// Embed a document/passage for indexing using the named model.
@@ -123,12 +125,13 @@ impl KhiveRuntime {
         let model = parse_embedding_model_alias(model_name);
         let service = self.embedder(model_name).await?;
         let emb_model = model.unwrap_or_default();
-        service
-            .embed_passage(&[text.to_string()], emb_model)
-            .await?
+        let embeddings = service.embed_passage(&[text.to_string()], emb_model).await;
+        crate::usage::count(crate::usage::UsageUnit::EmbedCalls, 1);
+        let out = embeddings?
             .into_iter()
             .next()
-            .ok_or_else(|| RuntimeError::Internal("embed_passage returned empty vec".into()))
+            .ok_or_else(|| RuntimeError::Internal("embed_passage returned empty vec".into()))?;
+        Ok(out)
     }
 
     /// Embed a query string for retrieval using the named model.
@@ -154,13 +157,15 @@ impl KhiveRuntime {
         let embeddings = match emb_model {
             EmbeddingModel::BgeSmallEnV15
             | EmbeddingModel::BgeBaseEnV15
-            | EmbeddingModel::BgeLargeEnV15 => service.embed(&texts, emb_model).await?,
-            _ => service.embed_query(&texts, emb_model).await?,
+            | EmbeddingModel::BgeLargeEnV15 => service.embed(&texts, emb_model).await,
+            _ => service.embed_query(&texts, emb_model).await,
         };
-        embeddings
+        crate::usage::count(crate::usage::UsageUnit::EmbedCalls, 1);
+        let out = embeddings?
             .into_iter()
             .next()
-            .ok_or_else(|| RuntimeError::Internal("embed_query returned empty vec".into()))
+            .ok_or_else(|| RuntimeError::Internal("embed_query returned empty vec".into()))?;
+        Ok(out)
     }
 
     /// Embed a document for indexing using the configured default model.
@@ -224,7 +229,9 @@ impl KhiveRuntime {
         let model = parse_embedding_model_alias(model_name);
         let service = self.embedder(model_name).await?;
         let emb_model = model.unwrap_or_default();
-        Ok(service.embed(texts, emb_model).await?)
+        let out = service.embed(texts, emb_model).await;
+        crate::usage::count(crate::usage::UsageUnit::EmbedCalls, texts.len() as u64);
+        Ok(out?)
     }
 
     /// Embed a batch of documents for indexing using the named model.
@@ -247,7 +254,9 @@ impl KhiveRuntime {
         let model = parse_embedding_model_alias(model_name);
         let service = self.embedder(model_name).await?;
         let emb_model = model.unwrap_or_default();
-        Ok(service.embed_passage(texts, emb_model).await?)
+        let out = service.embed_passage(texts, emb_model).await;
+        crate::usage::count(crate::usage::UsageUnit::EmbedCalls, texts.len() as u64);
+        Ok(out?)
     }
 
     /// Embed a batch of documents for indexing using the configured default model.
@@ -285,12 +294,14 @@ impl KhiveRuntime {
         let model = parse_embedding_model_alias(model_name);
         let service = self.embedder(model_name).await?;
         let emb_model = model.unwrap_or_default();
-        match emb_model {
+        let out = match emb_model {
             EmbeddingModel::BgeSmallEnV15
             | EmbeddingModel::BgeBaseEnV15
-            | EmbeddingModel::BgeLargeEnV15 => Ok(service.embed(texts, emb_model).await?),
-            _ => Ok(service.embed_query(texts, emb_model).await?),
-        }
+            | EmbeddingModel::BgeLargeEnV15 => service.embed(texts, emb_model).await,
+            _ => service.embed_query(texts, emb_model).await,
+        };
+        crate::usage::count(crate::usage::UsageUnit::EmbedCalls, texts.len() as u64);
+        Ok(out?)
     }
 
     /// Search vectors using either a caller-provided embedding or query text.
@@ -324,7 +335,7 @@ impl KhiveRuntime {
         };
 
         let ns = token.namespace().as_str().to_owned();
-        Ok(self
+        let hits = self
             .vectors(token)?
             .search(VectorSearchRequest {
                 query_vectors: vec![embedding],
@@ -335,7 +346,9 @@ impl KhiveRuntime {
                 filter: None,
                 backend_hints: None,
             })
-            .await?)
+            .await;
+        crate::usage::count(crate::usage::UsageUnit::VectorPasses, 1);
+        Ok(hits?)
     }
 
     /// Hybrid search: text (FTS5) + vector retrieval fused via Reciprocal Rank Fusion.
@@ -413,6 +426,7 @@ impl KhiveRuntime {
                 snippet_chars: 200,
             })
             .await;
+        crate::usage::count(crate::usage::UsageUnit::FtsPasses, 1);
         let text_hits = crate::error::fts_text_leg_or_err(
             text_search_result.map_err(RuntimeError::from),
             "hybrid_search",

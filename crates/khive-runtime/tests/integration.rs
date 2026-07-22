@@ -623,6 +623,10 @@ async fn no_explicit_limit_under_and_at_cap_emits_no_warning() {
         "499 matches under the cap must not warn: {:?}",
         result_499.warnings
     );
+    assert!(
+        !result_499.truncated,
+        "#1247: under the cap is not truncated"
+    );
 
     // Exactly 500 matches, no explicit LIMIT: right at the cap, no truncation, no warning.
     let tok_500 = seed_concepts(&rt, "trunc-500", 500).await;
@@ -639,6 +643,10 @@ async fn no_explicit_limit_under_and_at_cap_emits_no_warning() {
         result_500.warnings.is_empty(),
         "exactly 500 matches must not warn (nothing was dropped): {:?}",
         result_500.warnings
+    );
+    assert!(
+        !result_500.truncated,
+        "#1247: exactly at the cap is not truncated (nothing was dropped)"
     );
 }
 
@@ -666,6 +674,15 @@ async fn no_explicit_limit_over_cap_warns_and_strips_sentinel() {
     );
     assert_eq!(result.warnings.len(), 1, "warnings: {:?}", result.warnings);
     assert!(result.warnings[0].contains("500"), "{}", result.warnings[0]);
+    assert!(
+        !result.warnings[0].contains("LIMIT/OFFSET"),
+        "#1168: the warning must not recommend an unimplemented OFFSET path: {}",
+        result.warnings[0]
+    );
+    assert!(
+        result.truncated,
+        "#1247: truncated must be the structural signal, independent of warnings text"
+    );
 
     // The sentinel row must not leak into the returned set: every row must be
     // a distinct seeded entity.
@@ -703,6 +720,10 @@ async fn explicit_limit_variants_against_501_matches() {
     );
     assert!(above_cap.warnings[0].contains("600"));
     assert!(above_cap.warnings[0].contains("500"));
+    assert!(
+        above_cap.truncated,
+        "#1247: LIMIT above cap must set truncated"
+    );
 
     // LIMIT exactly at the cap: the cap never binds (requested <= max_limit),
     // so no sentinel is fetched and no warning fires, even though 501 rows
@@ -720,6 +741,10 @@ async fn explicit_limit_variants_against_501_matches() {
         at_cap.warnings.is_empty(),
         "LIMIT == cap must not warn: {:?}",
         at_cap.warnings
+    );
+    assert!(
+        !at_cap.truncated,
+        "#1247: an explicit LIMIT the caller chose is not server-side truncation"
     );
 
     // LIMIT below the cap: this is the false-positive regression
@@ -740,6 +765,10 @@ async fn explicit_limit_variants_against_501_matches() {
         below_cap.warnings.is_empty(),
         "LIMIT below cap must not warn: {:?}",
         below_cap.warnings
+    );
+    assert!(
+        !below_cap.truncated,
+        "#1247: LIMIT below cap is not truncated"
     );
 }
 
@@ -767,6 +796,10 @@ async fn explicit_limit_over_cap_with_few_real_matches_emits_no_warning() {
         result.warnings.is_empty(),
         "LIMIT above cap with fewer real matches than the cap must not warn: {:?}",
         result.warnings
+    );
+    assert!(
+        !result.truncated,
+        "#1247: fewer real matches than the cap is not truncation"
     );
 }
 

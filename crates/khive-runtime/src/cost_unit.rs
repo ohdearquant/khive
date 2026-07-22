@@ -184,7 +184,23 @@ pub fn resource_payload(
             map.insert("request_id".to_string(), serde_json::json!(id));
         }
     }
+    stamp_usage_units(&mut payload);
     payload
+}
+
+/// ADR-103 Amendment 2: freeze the dispatch-accounting context (first freeze
+/// wins) and stamp the snapshot as `resource.units`. The resource payload is
+/// built immediately before the enclosing audit row is appended, which is
+/// exactly the amendment's snapshot point — the same frozen object is what
+/// the response envelope later reads. No armed context (direct registry
+/// callers, background work) means no `units` key; reporting never fails the
+/// dispatch.
+fn stamp_usage_units(payload: &mut Value) {
+    if let Some(ctx) = crate::usage::current() {
+        if let Value::Object(map) = payload {
+            map.insert("units".to_string(), ctx.freeze());
+        }
+    }
 }
 
 /// Build the `resource` payload object for a dispatch that did not resolve
@@ -209,6 +225,7 @@ pub fn base_resource_payload(request_id: Option<u64>) -> Value {
             map.insert("request_id".to_string(), serde_json::json!(id));
         }
     }
+    stamp_usage_units(&mut payload);
     payload
 }
 

@@ -854,6 +854,58 @@ async fn search_entity_response_includes_entity_kind() {
     );
 }
 
+/// Regression for #1174: entity search rows carry `name`/`kind`/`created_at`
+/// matching the list()/get() projection, alongside the legacy `title`/
+/// `entity_kind` spellings — a consumer that filters on `row["name"]` after
+/// working with list/get must not read a real hit as an empty result.
+#[tokio::test]
+async fn search_entity_response_includes_list_shape_fields() {
+    let pack = pack();
+    pack.dispatch(
+        "create",
+        json!({"kind": "entity", "name": "GammaSearchShape", "entity_kind": "concept"}),
+    )
+    .await
+    .unwrap();
+
+    let resp = pack
+        .dispatch(
+            "search",
+            json!({"kind": "entity", "query": "GammaSearchShape"}),
+        )
+        .await
+        .expect("search must succeed");
+    let arr = resp.as_array().expect("array");
+    assert!(
+        !arr.is_empty(),
+        "search must return the entity we just created"
+    );
+    let hit = &arr[0];
+    assert_eq!(
+        hit.get("name").and_then(Value::as_str),
+        Some("GammaSearchShape"),
+        "#1174: search response must carry name matching list()/get(); got hit {hit}"
+    );
+    assert_eq!(
+        hit.get("kind").and_then(Value::as_str),
+        Some("concept"),
+        "#1174: search response must carry kind matching list()/get(); got hit {hit}"
+    );
+    assert!(
+        hit.get("created_at").and_then(Value::as_str).is_some(),
+        "#1174: search response must carry created_at; got hit {hit}"
+    );
+    // Legacy spellings stay present for the deprecation window.
+    assert_eq!(
+        hit.get("entity_kind").and_then(Value::as_str),
+        Some("concept")
+    );
+    assert_eq!(
+        hit.get("title").and_then(Value::as_str),
+        Some("GammaSearchShape")
+    );
+}
+
 /// Regression for #160 (note half): note search response includes `note_kind`.
 #[tokio::test]
 async fn search_note_response_includes_note_kind() {
@@ -886,6 +938,89 @@ async fn search_note_response_includes_note_kind() {
         hit.get("note_kind").and_then(Value::as_str),
         Some("insight"),
         "#160 (note half): search response must carry note_kind; got hit {hit}"
+    );
+}
+
+/// Regression for #1174 (note half): note search rows carry `kind`/`created_at`
+/// matching the list()/get() projection, alongside the legacy `note_kind` spelling.
+#[tokio::test]
+async fn search_note_response_includes_list_shape_fields() {
+    let pack = pack();
+    pack.dispatch(
+        "create",
+        json!({
+            "kind": "note",
+            "content": "DeltaInsight unique_marker_9182",
+            "note_kind": "insight"
+        }),
+    )
+    .await
+    .unwrap();
+
+    let resp = pack
+        .dispatch(
+            "search",
+            json!({"kind": "note", "query": "unique_marker_9182"}),
+        )
+        .await
+        .expect("note search must succeed");
+    let arr = resp.as_array().expect("array");
+    assert!(
+        !arr.is_empty(),
+        "note search must return the note we just created"
+    );
+    let hit = &arr[0];
+    assert_eq!(
+        hit.get("kind").and_then(Value::as_str),
+        Some("insight"),
+        "#1174: note search response must carry kind matching list()/get(); got hit {hit}"
+    );
+    assert!(
+        hit.get("created_at").and_then(Value::as_str).is_some(),
+        "#1174: note search response must carry created_at; got hit {hit}"
+    );
+    assert!(
+        hit.get("name").is_some(),
+        "#1174: note search response must carry a name field (may be null); got hit {hit}"
+    );
+}
+
+/// A nameless note's search row must carry `name: null` exactly as list()/get()
+/// do — `title` remains the display value, but `name` never inherits it.
+#[tokio::test]
+async fn search_nameless_note_name_is_null() {
+    let pack = pack();
+    pack.dispatch(
+        "create",
+        json!({
+            "kind": "note",
+            "content": "NamelessNote unique_marker_5527",
+            "note_kind": "observation"
+        }),
+    )
+    .await
+    .unwrap();
+
+    let resp = pack
+        .dispatch(
+            "search",
+            json!({"kind": "note", "query": "unique_marker_5527"}),
+        )
+        .await
+        .expect("note search must succeed");
+    let arr = resp.as_array().expect("array");
+    assert!(
+        !arr.is_empty(),
+        "note search must return the note we just created"
+    );
+    let hit = &arr[0];
+    assert!(
+        hit.get("name").is_some_and(Value::is_null),
+        "nameless note search row must carry name: null matching list()/get(); got hit {hit}"
+    );
+    assert!(
+        hit.get("title").and_then(Value::as_str).is_some(),
+        "title must remain populated as the display value; got hit {hit}"
     );
 }
 
@@ -11804,6 +11939,102 @@ async fn search_entity_hyphenated_adr_id_with_plain_terms_matches() {
     );
 }
 
+// ── ADR-103 Amendment 2: the frozen-usage invariant ─────────────────────────
+
+/// The response envelope and the per-dispatch audit row must carry the
+/// IDENTICAL usage object. That is the entire reason `freeze()` /
+/// `frozen_or_snapshot()` exist as a first-freeze-wins `OnceLock` rather than
+/// two independent reads of the same counters.
+///
+/// The guarantee holds only because the audit row's `freeze()` runs during
+/// dispatch, before the envelope's `frozen_or_snapshot()`. Nothing in the
+/// suite pinned that, so a refactor or a new envelope-assembly path could
+/// invert the order: the envelope would silently return a live snapshot, the
+/// two would disagree, and no test would fail — on numbers a customer can
+/// compare against their own audit trail.
+///
+/// This test pins the observable contract end to end: it runs a real dispatch
+/// inside an armed context exactly as `khive-mcp/src/server.rs` does, lands a
+/// large increment AFTER the dispatch (the exact stray-increment case the
+/// `OnceLock` defends), and then asserts the value the envelope stamps equals
+/// the real audit row's `resource.units` and that BOTH exclude the late
+/// increment. If the envelope ever reads live counters instead of the frozen
+/// object, the late increment leaks into it and this fails.
+///
+/// Limit, stated rather than implied: the envelope value is read through the
+/// same expression `stamp_usage` uses (`ctx.frozen_or_snapshot()`) rather than
+/// by driving the MCP server, because the audit row is only reachable from the
+/// pack surface. That one-line wrapper is not covered here.
+#[tokio::test]
+async fn envelope_usage_equals_audit_row_resource_units() {
+    use khive_runtime::usage::{UsageContext, UsageUnit};
+
+    const LATE: u64 = 1_000_000;
+
+    let pack = pack_with_events();
+    let ctx = UsageContext::new();
+
+    // Dispatch inside the armed scope, mirroring the MCP server's
+    // `usage::scope(usage_ctx.clone(), async { ... })`.
+    khive_runtime::usage::scope(ctx.clone(), async {
+        pack.dispatch(
+            "create",
+            json!({"kind": "concept", "name": "UsageFreezeTarget"}),
+        )
+        .await
+        .expect("create must succeed");
+    })
+    .await;
+
+    // A stray increment landing after the audit snapshot point. In production
+    // this is the post-audit dispatch hook; here it is deliberate and large
+    // enough that it cannot be confused with real measured work.
+    ctx.add(UsageUnit::DbRoundTrips, LATE);
+
+    // Exactly what the response envelope stamps.
+    let envelope_usage = ctx.frozen_or_snapshot();
+
+    let events = pack
+        .dispatch(
+            "list",
+            json!({"kind": "event", "verb": "create", "limit": 50}),
+        )
+        .await
+        .expect("list(kind=event) must succeed");
+    let rows: Vec<&Value> = events
+        .as_array()
+        .expect("list must return an array")
+        .iter()
+        .filter(|e| e.pointer("/payload/resource/units").is_some())
+        .collect();
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly one create audit row must carry resource.units; got {}: {events}",
+        rows.len()
+    );
+    let audit_units = rows[0]
+        .pointer("/payload/resource/units")
+        .expect("checked above");
+
+    assert_eq!(
+        &envelope_usage, audit_units,
+        "the response envelope's usage object and the same dispatch's audit-row \
+         resource.units must be identical; envelope={envelope_usage}, row={audit_units}"
+    );
+
+    let leaked = envelope_usage
+        .get("db_round_trips")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    assert!(
+        leaked < LATE,
+        "an increment landing after the freeze point must not appear in either \
+         read — the envelope carried db_round_trips={leaked}, which means it \
+         returned a live snapshot rather than the frozen object"
+    );
+}
+
 // ---- whoami verb ----
 
 #[tokio::test]
@@ -11928,4 +12159,41 @@ async fn whoami_appears_in_verbs_introspection() {
         names.contains(&"whoami"),
         "whoami must be registered as a public verb; got {names:?}"
     );
+}
+
+/// Regression for #1168/#1247: the `query()` wire response always carries a
+/// structural `truncated` boolean, present whether or not the cap fired, so
+/// a caller can check it directly instead of inferring "not truncated" from
+/// the absence of a `warnings` entry (whose text also used to recommend an
+/// unimplemented OFFSET/SKIP paging path).
+#[tokio::test]
+async fn query_response_always_carries_truncated_field() {
+    let pack = pack();
+    pack.dispatch(
+        "create",
+        json!({"kind": "entity", "name": "QueryTruncFieldProbe", "entity_kind": "concept"}),
+    )
+    .await
+    .expect("create must succeed");
+
+    let result = pack
+        .dispatch("query", json!({"query": "MATCH (a:concept) RETURN a"}))
+        .await
+        .expect("query must succeed");
+
+    assert_eq!(
+        result.get("truncated").and_then(Value::as_bool),
+        Some(false),
+        "#1247: an under-the-cap query result must still carry truncated:false, not omit the \
+         field; got {result}"
+    );
+    if let Some(warnings) = result.get("warnings").and_then(Value::as_array) {
+        for w in warnings {
+            let text = w.as_str().unwrap_or_default();
+            assert!(
+                !text.contains("LIMIT/OFFSET"),
+                "#1168: no warning may recommend the unimplemented OFFSET/SKIP path: {text}"
+            );
+        }
+    }
 }

@@ -888,5 +888,9 @@ pub(crate) fn render_query_result(result: QueryResult) -> Value {
     if !result.warnings.is_empty() {
         out.insert("warnings".to_string(), json!(result.warnings));
     }
+    // Always present (not gated on the cap having fired) so a caller can
+    // check it unconditionally rather than inferring "not truncated" from
+    // the field's absence (#1168, #1247).
+    out.insert("truncated".to_string(), json!(result.truncated));
     Value::Object(out)
 }
