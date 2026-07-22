@@ -3381,3 +3381,48 @@ async fn traverse_counts_the_issued_chunk_when_the_query_fails() {
         "the chunk query was issued and must be counted despite the error; got {usage}"
     );
 }
+
+/// The batched adjacency path chunks its source list, so the same rule that
+/// protects `traverse` protects it: a failure in any chunk must not erase the
+/// round trips the earlier chunks already issued. This is the read path a
+/// caller reaches through multi-source neighbor expansion, and it took its own
+/// fix — sharing the doctrine with `neighbors` did not make it share the code.
+#[tokio::test]
+async fn batch_neighbors_counts_the_issued_round_trip_when_the_query_fails() {
+    let store = setup_memory_store_without_schema();
+    let ctx = khive_storage::usage::UsageContext::new();
+
+    let sources = vec![Uuid::new_v4(), Uuid::new_v4()];
+    let result = khive_storage::usage::scope(ctx.clone(), async {
+        store
+            .batch_neighbors(
+                &sources,
+                NeighborQuery {
+                    direction: Direction::Both,
+                    relations: None,
+                    limit: Some(10),
+                    min_weight: None,
+                },
+            )
+            .await
+    })
+    .await;
+
+    assert!(
+        result.is_err(),
+        "a store with no schema must fail the query, or this test proves nothing"
+    );
+
+    let usage = ctx.snapshot();
+    assert_eq!(
+        usage
+            .get("db_round_trips")
+            .and_then(serde_json::Value::as_u64),
+        Some(1),
+        "the batched query was issued and must be counted despite the error; got {usage}"
+    );
+    assert!(
+        usage.get("graph_hops").is_none(),
+        "no adjacency rows were returned, so graph_hops must be absent; got {usage}"
+    );
+}

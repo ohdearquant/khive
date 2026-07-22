@@ -1259,7 +1259,7 @@ impl GraphStore for SqlGraphStore {
             let query_clone = query.clone();
             let ns = namespace.clone();
 
-            let pairs = self
+            let chunk_result = self
                 .with_reader("batch_neighbors", move |conn| {
                     let src_strs: Vec<String> = chunk_owned.iter().map(|u| u.to_string()).collect();
 
@@ -1417,8 +1417,9 @@ impl GraphStore for SqlGraphStore {
                     }
                     Ok(pairs)
                 })
-                .await?;
+                .await;
             khive_storage::usage::count(khive_storage::usage::UsageUnit::DbRoundTrips, 1);
+            let pairs = chunk_result?;
             khive_storage::usage::count(
                 khive_storage::usage::UsageUnit::GraphHops,
                 pairs.len() as u64,

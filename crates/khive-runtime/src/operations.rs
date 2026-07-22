@@ -3136,12 +3136,12 @@ impl KhiveRuntime {
                 .await
         };
 
+        crate::usage::count(crate::usage::UsageUnit::FtsPasses, 1);
         let text_hits = crate::error::fts_text_leg_or_err(
             text_search_result.map_err(RuntimeError::from),
             "search_notes",
             query_text,
         )?;
-        crate::usage::count(crate::usage::UsageUnit::FtsPasses, 1);
 
         // Vector search filtered to notes.
         let vector_hits = if query_vector.is_some() || self.config().embedding_model.is_some() {

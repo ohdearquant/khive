@@ -17,6 +17,18 @@
 //! Reporting is best-effort and can never fail a verb: every increment path
 //! is a no-op when no context is armed, and a dispatch whose counters cannot
 //! be trusted ships no `usage` object at all — never a partial one.
+//!
+//! **Issued vs returned.** Each counter's doc below says which it is, and the
+//! distinction decides where its increment goes relative to the `?` on the
+//! fallible call. An *issued* counter (`embed_calls`, `fts_passes`,
+//! `vector_passes`, `db_round_trips`) counts work handed to an engine or
+//! store, so it must be incremented whether or not the call resolved `Ok` —
+//! a request that ran real work and then failed reporting zero is the exact
+//! case a consumer of these numbers cannot afford. A *returned* counter
+//! (`graph_hops`, `ann_jobs_consumed`, `event_rows`) counts what came back,
+//! so a failed call legitimately contributes nothing. Increment an issued
+//! counter *after* the resource is resolved (so a lookup that never reached
+//! the engine counts nothing) and *before* the error propagates.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -26,23 +38,24 @@ use serde_json::Value;
 /// One executed-work counter in the closed Amendment 2 vocabulary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UsageUnit {
-    /// One text run through one embedding engine (a batch of k texts through
-    /// one engine counts k, per engine).
+    /// Issued. One text handed to one embedding engine (a batch of k texts
+    /// through one engine counts k, per engine).
     EmbedCalls,
-    /// One FTS5 query execution.
+    /// Issued. One FTS5 query execution.
     FtsPasses,
-    /// One vector/ANN probe, per engine per query.
+    /// Issued. One vector/ANN probe, per engine per query.
     VectorPasses,
-    /// One adjacency entry returned by storage during BFS/traversal, counted
-    /// before visited-set de-duplication.
+    /// Returned. One adjacency entry returned by storage during
+    /// BFS/traversal, counted before visited-set de-duplication.
     GraphHops,
-    /// One batched storage round-trip issued by the handler path.
+    /// Issued. One batched storage round-trip issued by the handler path.
     DbRoundTrips,
-    /// One `ann_write_log` job drained by the inline warm-path consumer.
+    /// Returned. One `ann_write_log` job drained by the inline warm-path
+    /// consumer.
     AnnJobsConsumed,
-    /// One event-plane row successfully appended by this dispatch, excluding
-    /// the enclosing per-dispatch audit row (the snapshot is frozen before
-    /// that row is written; it cannot count itself).
+    /// Returned. One event-plane row successfully appended by this dispatch,
+    /// excluding the enclosing per-dispatch audit row (the snapshot is frozen
+    /// before that row is written; it cannot count itself).
     EventRows,
 }
 
