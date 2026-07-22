@@ -94,7 +94,37 @@ phase_docs() {
 
 phase_tests() {
     echo "=== Tests ==="
+    # #1204 tripwire: RuntimeConfig::default() resolves db_path to
+    # $HOME/.khive/khive.db, and migrations apply on open (forward-only,
+    # ADR-015). A test that boots a runtime through a config path inheriting
+    # that default reaches the operator's/runner's real store instead of an
+    # isolated one. Snapshot the sentinel's existence + mtime before the
+    # suite and compare after; any change fails the gate loudly instead of
+    # leaving the drift for a later direct-open to discover.
+    sentinel="$HOME/.khive/khive.db"
+    sentinel_existed_before=0
+    sentinel_mtime_before=""
+    if [ -f "$sentinel" ]; then
+        sentinel_existed_before=1
+        sentinel_mtime_before=$(stat -f%m "$sentinel" 2>/dev/null || stat -c%Y "$sentinel")
+    fi
+
     cargo test --workspace
+
+    if [ -f "$sentinel" ]; then
+        if [ "$sentinel_existed_before" -eq 0 ]; then
+            echo "FAIL: workspace test suite created $sentinel — a test opened the real default store instead of an isolated db_path/HOME (#1204)" >&2
+            exit 1
+        fi
+        sentinel_mtime_after=$(stat -f%m "$sentinel" 2>/dev/null || stat -c%Y "$sentinel")
+        if [ "$sentinel_mtime_after" != "$sentinel_mtime_before" ]; then
+            echo "FAIL: workspace test suite modified $sentinel (mtime $sentinel_mtime_before -> $sentinel_mtime_after) — a test opened/migrated the real default store instead of an isolated db_path/HOME (#1204)" >&2
+            exit 1
+        fi
+    elif [ "$sentinel_existed_before" -eq 1 ]; then
+        echo "FAIL: workspace test suite removed $sentinel (#1204)" >&2
+        exit 1
+    fi
 }
 
 phase_no_default_features() {
