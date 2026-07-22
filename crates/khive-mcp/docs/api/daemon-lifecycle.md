@@ -23,7 +23,7 @@ own boot lock — before `confirm_genuinely_dead` runs, and holds it through
 kill + spawn. This makes recovery mutually exclusive across recoverers
 without risking a deadlock against a booting daemon: the daemon itself never
 acquires this lock, only `kill_and_respawn` does. A bounded, deadline-aware
-acquisition (`RECOVERER_LOCK_TIMEOUT_MS` = 8000, generous enough to cover a
+acquisition (`RECOVERER_LOCK_TIMEOUT_MS` = 20000, generous enough to cover a
 peer's full worst-case critical section) is used instead of an unbounded
 `flock` so a second recoverer never blocks forever on a wedged first one.
 
@@ -42,8 +42,14 @@ Outcomes: `Alive`/`Timeout` (initial or confirmed) → `Skipped`, no kill
 not dead). `LockContended` (confirm rounds could not establish quiescence) or
 the recoverer lock itself timing out → `Uncertain`, no kill — same safe
 behavior as `Skipped` but reported distinctly so it is never conflated with a
-positive "confirmed alive" result. `Dead` (confirmed, recoverer lock held) →
-kill + spawn → `Spawned`.
+positive "confirmed alive" result. `Dead` (confirmed, recoverer lock held)
+starts bounded eviction. Recovery sends `SIGTERM`, releases the boot lock so
+the incumbent can complete its own shutdown cleanup, and polls process
+liveness for up to 12 seconds. Only a confirmed exit permits stale-path
+cleanup and `Spawned`; a process still alive at the deadline yields
+`Uncertain` without unlinking or spawning. The boot lock is reacquired before
+cleanup and held through spawn, so no daemon boot can claim the rendezvous
+between those steps.
 
 Two test-only barriers (`RECOVERY_RACE_BARRIER`, `SPAWN_COMMIT_BARRIER`)
 force concurrent recoverers under test to reach, respectively, the
@@ -52,7 +58,7 @@ instant — without them, normal tokio scheduling lets one recoverer finish
 before the other's rounds even observe anything, and the two-recoverer
 regression test would pass even with the recoverer lock deleted.
 `SPAWN_COMMIT_BARRIER` falls through after its bound rather than waiting
-forever, since a recoverer still blocked on the *real* recoverer lock must
+forever, since a recoverer still blocked on the _real_ recoverer lock must
 not be forced to rendezvous.
 
 ## `confirm_genuinely_dead` — closing the fork-to-flock gap (#758)
@@ -72,8 +78,8 @@ shared boot/recovery lock (bounded by `BOOT_QUIESCENCE_LOCK_TIMEOUT_MS` =
 500ms), then re-probes daemon identity — successfully reacquiring-then-
 dropping the lock proves neither a peer's kill+spawn nor a daemon's own cold
 boot is currently mid-critical-section. Before #838 this used an unbounded
-blocking `flock`, so `DEAD_CONFIRM_ROUNDS` bounded probe *count* but not
-elapsed *time* — a wedged lock holder blocked recovery forever. A
+blocking `flock`, so `DEAD_CONFIRM_ROUNDS` bounded probe _count_ but not
+elapsed _time_ — a wedged lock holder blocked recovery forever. A
 deadline-elapsed or otherwise-failed acquisition returns the distinct
 `ProbeOutcome::LockContended` rather than collapsing into `Timeout` (which
 means something different: "the daemon itself answered slowly").
@@ -116,11 +122,11 @@ outstanding client request when the mismatch fires, only the request that
 triggered this arm gets the ambiguous-error-then-resume treatment; any other
 in-flight request loses its response the same way it would if the process
 crashed — a pre-existing risk, not introduced by this change.
-`fire_pending_self_heal` fires on the next successful flush of *any*
+`fire_pending_self_heal` fires on the next successful flush of _any_
 message, not specifically the mismatch response's own flush — on this
 bridge's dominant single-request-at-a-time usage those are the same event,
 but a genuinely concurrent second in-flight request could in principle flush
-first. Strictly better than the pre-fix timer (which could fire before *any*
+first. Strictly better than the pre-fix timer (which could fire before _any_
 flush completed), and the same class of pre-existing risk, not a new one.
 
 `SelfHealOnFlushTransport` wraps the transport (rather than the handler)
@@ -133,8 +139,11 @@ regardless of which task drives it.
 ## `forward_or_spawn` — the `None` contract (#644)
 
 Returns `None` only when nothing was ever written to the daemon and local
-dispatch is therefore safe: `KHIVE_NO_DAEMON` is set, or no daemon socket
-could be reached (`NoSocket`). It never returns `None` after the real frame
+dispatch is therefore safe: `KHIVE_NO_DAEMON` is set, or the socket is
+definitively absent/refused (`NoSocket`). A permission, policy, or other
+unclassified connect failure returns a caller-visible `daemon_unreachable`
+error and performs no lifecycle recovery, because that client cannot prove the
+daemon is absent. It never returns `None` after the real frame
 has been written — `Some(Ok)`/`Some(Err)` both mean the request's fate is
 already decided at the daemon and the caller must not dispatch locally.
 Under `KHIVE_DAEMON_STRICT=1`, the `NoSocket` case becomes `Some(Err(..))`

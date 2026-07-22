@@ -49,6 +49,13 @@ pub(crate) static SPAWN_COUNT: std::sync::atomic::AtomicUsize =
 pub(crate) static FORCE_PID_IS_DAEMON: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+#[cfg(test)]
+static FORCED_CONNECT_ERROR: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+#[cfg(test)]
+static STALE_DAEMON_EXIT_TIMEOUT_OVERRIDE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Counts how many times the daemon's dispatcher has been invoked for a
 /// NON-probe request.  The exactly-once test asserts this is exactly 1
 /// across the entire recovery path.  A reverted fix (real request used as
@@ -84,6 +91,8 @@ pub(crate) fn reset_counters() {
     KILL_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
     SPAWN_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
     FORCE_PID_IS_DAEMON.store(false, std::sync::atomic::Ordering::SeqCst);
+    FORCED_CONNECT_ERROR.store(0, std::sync::atomic::Ordering::SeqCst);
+    STALE_DAEMON_EXIT_TIMEOUT_OVERRIDE_MS.store(0, std::sync::atomic::Ordering::SeqCst);
     DAEMON_DISPATCH.store(0, std::sync::atomic::Ordering::SeqCst);
     *RECOVERY_RACE_BARRIER
         .lock()
@@ -412,8 +421,11 @@ impl daemon::DaemonDispatch for crate::server::KhiveMcpServer {
 enum ForwardOutcome {
     /// Successfully received and decoded a response frame.
     Response(Box<DaemonResponseFrame>),
-    /// Socket was unreachable (connection refused / no file).
+    /// Socket is definitively absent (connection refused / no file).
     NoSocket,
+    /// The socket may exist, but this process cannot establish whether a
+    /// daemon is listening. Recovery is forbidden because absence is unproven.
+    SocketUnreachable(std::io::Error),
     /// Connected but the response could not be decoded — most likely a stale
     /// daemon speaking a different wire format.
     ParseFailure,
@@ -427,11 +439,29 @@ enum ForwardOutcome {
     ProtocolMismatch,
 }
 
+fn classify_socket_connect_error(error: std::io::Error) -> ForwardOutcome {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+    ) {
+        ForwardOutcome::NoSocket
+    } else {
+        ForwardOutcome::SocketUnreachable(error)
+    }
+}
+
 async fn try_forward_inner(frame: &DaemonRequestFrame) -> ForwardOutcome {
     let sock = socket_path();
+    #[cfg(test)]
+    {
+        let forced_error = FORCED_CONNECT_ERROR.load(std::sync::atomic::Ordering::SeqCst);
+        if forced_error != 0 {
+            return classify_socket_connect_error(std::io::Error::from_raw_os_error(forced_error));
+        }
+    }
     let mut stream = match UnixStream::connect(&sock).await {
         Ok(s) => s,
-        Err(_) => return ForwardOutcome::NoSocket,
+        Err(error) => return classify_socket_connect_error(error),
     };
     let payload = match serde_json::to_vec(frame) {
         Ok(p) => p,
@@ -741,22 +771,70 @@ fn pid_is_khive_daemon(pid: u32) -> bool {
     }
 }
 
-/// Kill the daemon named by the PID file and remove its PID + socket files
-/// (caller holds the recovery lock).
+/// Signal the daemon named by the PID file, confirm it exited within a bounded
+/// deadline, and only then remove its PID + socket files.
 ///
 /// #645: the PID observed here (`expected_pid`) is captured once, before
 /// SIGTERM, and re-checked immediately before unlinking in
-/// [`remove_daemon_paths_if_still_stale`]. The recovery lock normally
-/// serializes this whole function against a concurrent daemon boot (which
-/// holds the same lock across its own cleanup → bind → pid-write), but that
-/// guarantee depends on the daemon side successfully acquiring the lock too.
-/// Re-checking ownership right before deleting is the defense that still
-/// holds if a booting daemon ever proceeds without the lock: this call must
-/// not delete a replacement daemon's live socket/PID out from under it.
-fn kill_stale_daemon_inner() {
+/// [`remove_daemon_paths_if_still_stale`]. The boot lock is released while
+/// waiting so the incumbent can acquire it for its own shutdown cleanup, then
+/// reacquired before unlinking. The returned guard keeps cleanup and any
+/// subsequent spawn atomic against another daemon boot.
+const STALE_DAEMON_EXIT_TIMEOUT_MS: u64 = 12_000;
+const STALE_DAEMON_EXIT_POLL_MS: u64 = 100;
+
+enum StaleDaemonOutcome {
+    Exited(std::fs::File),
+    Uncertain,
+}
+
+fn stale_daemon_exit_timeout() -> std::time::Duration {
+    #[cfg(test)]
+    {
+        let override_ms =
+            STALE_DAEMON_EXIT_TIMEOUT_OVERRIDE_MS.load(std::sync::atomic::Ordering::SeqCst);
+        if override_ms != 0 {
+            return std::time::Duration::from_millis(override_ms);
+        }
+    }
+    std::time::Duration::from_millis(STALE_DAEMON_EXIT_TIMEOUT_MS)
+}
+
+fn is_process_running(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: signal 0 is an existence/permission probe with no side effects.
+    let rc = unsafe { libc::kill(pid, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+async fn wait_for_process_exit(pid: u32, timeout: std::time::Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while is_process_running(pid) {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        tokio::time::sleep(
+            std::time::Duration::from_millis(STALE_DAEMON_EXIT_POLL_MS).min(deadline - now),
+        )
+        .await;
+    }
+    true
+}
+
+async fn kill_stale_daemon_inner() -> StaleDaemonOutcome {
     #[cfg(test)]
     KILL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
+    let Some(boot_lock) = acquire_recovery_lock() else {
+        tracing::warn!("could not acquire daemon boot/recovery lock before stale-daemon eviction");
+        return StaleDaemonOutcome::Uncertain;
+    };
     let pid_file = pid_path();
     let expected_pid = std::fs::read_to_string(&pid_file)
         .ok()
@@ -768,11 +846,31 @@ fn kill_stale_daemon_inner() {
                 if signed > 0 {
                     // SAFETY: SIGTERM is a standard termination signal with no
                     // side effects beyond asking the process to exit.
-                    unsafe {
-                        libc::kill(signed, libc::SIGTERM);
+                    let signal_result = unsafe { libc::kill(signed, libc::SIGTERM) };
+                    if signal_result != 0 {
+                        let error = std::io::Error::last_os_error();
+                        tracing::warn!(pid, error = %error, "failed to signal stale daemon");
                     }
                 }
             }
+            drop(boot_lock);
+            let exit_timeout = stale_daemon_exit_timeout();
+            if !wait_for_process_exit(pid, exit_timeout).await {
+                tracing::error!(
+                    pid,
+                    timeout_ms = exit_timeout.as_millis(),
+                    "stale daemon did not exit after SIGTERM; refusing to unlink or spawn a replacement"
+                );
+                return StaleDaemonOutcome::Uncertain;
+            }
+            let Some(cleanup_lock) = acquire_recovery_lock() else {
+                tracing::warn!(
+                    "could not reacquire daemon boot/recovery lock after stale daemon exited"
+                );
+                return StaleDaemonOutcome::Uncertain;
+            };
+            remove_daemon_paths_if_still_stale(&pid_file, expected_pid);
+            return StaleDaemonOutcome::Exited(cleanup_lock);
         } else {
             tracing::warn!(
                 pid,
@@ -782,6 +880,7 @@ fn kill_stale_daemon_inner() {
     }
 
     remove_daemon_paths_if_still_stale(&pid_file, expected_pid);
+    StaleDaemonOutcome::Exited(boot_lock)
 }
 
 /// Remove `pid_file`/the daemon socket only if ownership has not changed since
@@ -832,6 +931,9 @@ enum ProbeOutcome {
     Dead,
     /// Probe timed out — daemon may be alive but slow; do NOT kill.
     Timeout,
+    /// The client cannot reach the socket from its current execution context;
+    /// daemon absence is unproven, so lifecycle recovery is forbidden.
+    Unreachable,
     /// The boot/recovery lock ([`khive_runtime::daemon::lock_path`]) stayed
     /// contended past its bounded acquisition deadline while
     /// [`quiesce_then_probe_identity`] was trying to confirm no peer boot is
@@ -854,7 +956,7 @@ enum ProbeOutcome {
 /// Probe outcomes → kill decision:
 ///   `Alive`   → do NOT kill (identity-matching daemon is healthy)
 ///   `Dead`    → kill+spawn (definitively absent/crashed/mismatched)
-///   `Timeout` → do NOT kill (daemon may be healthy-but-busy; NEVER-KILL-SLOW)
+///   `Timeout`/`Unreachable` → do NOT kill (daemon absence is unproven)
 async fn probe_daemon_identity(config_id: &str, namespace: &str, timeout_ms: u64) -> ProbeOutcome {
     let probe = DaemonRequestFrame {
         ops: String::new(),
@@ -921,6 +1023,13 @@ async fn probe_daemon_identity(config_id: &str, namespace: &str, timeout_ms: u64
                 );
                 ProbeOutcome::Dead
             }
+        }
+        Ok(ForwardOutcome::SocketUnreachable(error)) => {
+            tracing::warn!(
+                error = %error,
+                "daemon identity probe cannot reach the socket from this process"
+            );
+            ProbeOutcome::Unreachable
         }
         Ok(
             ForwardOutcome::NoSocket
@@ -1060,7 +1169,7 @@ async fn confirm_genuinely_dead(config_id: &str, namespace: &str) -> ProbeOutcom
 /// cover a peer's full worst-case critical section so a healthy peer's turn
 /// is never mistaken for a wedge. See
 /// `crates/khive-mcp/docs/api/daemon-lifecycle.md`.
-const RECOVERER_LOCK_TIMEOUT_MS: u64 = 8_000;
+const RECOVERER_LOCK_TIMEOUT_MS: u64 = STALE_DAEMON_EXIT_TIMEOUT_MS + 8_000;
 
 /// Kill the stale daemon and spawn a fresh one, serialized against concurrent
 /// recoverers by a dedicated recoverer-only lock (#838 double-checked
@@ -1087,6 +1196,7 @@ where
         ProbeOutcome::Alive | ProbeOutcome::Timeout | ProbeOutcome::LockContended => {
             return Ok(RecoveryOutcome::Skipped);
         }
+        ProbeOutcome::Unreachable => return Ok(RecoveryOutcome::Uncertain),
         ProbeOutcome::Dead => {}
     }
 
@@ -1137,6 +1247,12 @@ where
 
     let outcome = match confirm_genuinely_dead(config_id, namespace).await {
         ProbeOutcome::Alive | ProbeOutcome::Timeout => Ok(RecoveryOutcome::Skipped),
+        ProbeOutcome::Unreachable => {
+            tracing::warn!(
+                "daemon socket is unreachable from this process; refusing lifecycle recovery"
+            );
+            Ok(RecoveryOutcome::Uncertain)
+        }
         ProbeOutcome::LockContended => {
             tracing::warn!(
                 "confirm_genuinely_dead could not establish quiescence within its \
@@ -1163,15 +1279,18 @@ where
                 }
             }
 
-            // Also take the shared boot/recovery lock for the kill+spawn step
-            // itself, matching `acquire_recovery_lock`'s existing role of
-            // serializing this against the daemon server's own
-            // cleanup→bind→pid-write critical section. No deadlock risk: this
-            // is a distinct lock file from `recoverer_guard` above, acquired
-            // and dropped entirely within this arm.
-            let _boot_lock = acquire_recovery_lock();
-            kill_stale_daemon_inner();
-            spawn().map(RecoveryOutcome::Spawned)
+            match kill_stale_daemon_inner().await {
+                StaleDaemonOutcome::Uncertain => Ok(RecoveryOutcome::Uncertain),
+                StaleDaemonOutcome::Exited(_boot_lock) => {
+                    match probe_daemon_identity(config_id, namespace, 500).await {
+                        ProbeOutcome::Alive => Ok(RecoveryOutcome::Skipped),
+                        ProbeOutcome::Timeout
+                        | ProbeOutcome::Unreachable
+                        | ProbeOutcome::LockContended => Ok(RecoveryOutcome::Uncertain),
+                        ProbeOutcome::Dead => spawn().map(RecoveryOutcome::Spawned),
+                    }
+                }
+            }
         }
     };
     drop(recoverer_guard);
@@ -1192,6 +1311,18 @@ fn ambiguous_forward_error() -> McpError {
         "daemon response lost after request was sent; not retrying or locally \
          dispatching to avoid duplicate execution",
         None,
+    )
+}
+
+fn daemon_unreachable_error(error: &std::io::Error) -> McpError {
+    tracing::error!(
+        error = %error,
+        os_error_code = error.raw_os_error(),
+        "daemon socket is unreachable from this process; lifecycle recovery suppressed"
+    );
+    McpError::internal_error(
+        "cannot reach daemon socket from this process; refusing daemon lifecycle recovery because the daemon may still be healthy",
+        Some(serde_json::json!({"reason": "daemon_unreachable"})),
     )
 }
 
@@ -1676,6 +1807,10 @@ async fn wait_for_boot_quiescence_then_reprobe(frame: &DaemonRequestFrame) -> Bo
              local dispatch to avoid racing a possibly still-initializing index",
             None,
         )),
+        ProbeOutcome::Unreachable => BootFenceOutcome::HardError(McpError::internal_error(
+            "cannot reach daemon socket after cold-boot quiescence; refusing lifecycle recovery because the daemon may still be healthy",
+            Some(serde_json::json!({"reason": "daemon_unreachable"})),
+        )),
         // `probe_daemon_identity` (unlike `quiesce_then_probe_identity`) never
         // constructs `LockContended` — it has no lock-acquisition step of its
         // own. Handled here only for match exhaustiveness over the shared
@@ -1692,13 +1827,15 @@ async fn wait_for_boot_quiescence_then_reprobe(frame: &DaemonRequestFrame) -> Bo
 /// Forward a request to the daemon, auto-spawning it if absent.
 ///
 /// Returns `None` only when nothing was ever written to the daemon and local
-/// dispatch is therefore safe: `KHIVE_NO_DAEMON` is set, or no daemon socket
-/// could be reached (`NoSocket`) — never after the real frame has been
-/// written. `Some(Ok)` / `Some(Err)` both mean the request's fate is already
+/// dispatch is therefore safe: `KHIVE_NO_DAEMON` is set, or the socket is
+/// definitively absent/refused (`NoSocket`) — never after the real frame has
+/// been written. Permission and policy errors are hard failures because this
+/// process cannot distinguish an absent daemon from a healthy daemon it cannot
+/// access. `Some(Ok)` / `Some(Err)` both mean the request's fate is already
 /// decided at the daemon and the caller must not dispatch locally. Under
-/// `KHIVE_DAEMON_STRICT=1` the `NoSocket` case instead becomes
-/// `Some(Err(..))` (`KHIVE_NO_DAEMON` is unaffected — it is an explicit
-/// caller opt-out, not a fallback).
+/// `KHIVE_DAEMON_STRICT=1` the `NoSocket` case instead becomes `Some(Err(..))`
+/// (`KHIVE_NO_DAEMON` is unaffected — it is an explicit caller opt-out, not a
+/// fallback).
 ///
 /// The real (possibly mutating) request frame is written to the daemon
 /// socket at most once per call; a `NoSocket` outcome never writes anything,
@@ -1737,6 +1874,9 @@ where
         ForwardOutcome::NoSocket => {
             // Nothing was written; fall through to the spawn/recover-then-send
             // path below.
+        }
+        ForwardOutcome::SocketUnreachable(error) => {
+            return Some(Err(daemon_unreachable_error(&error)))
         }
         ForwardOutcome::ParseFailure => {
             tracing::warn!(
@@ -1891,6 +2031,9 @@ where
             ForwardOutcome::NoSocket => {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
+            ForwardOutcome::SocketUnreachable(error) => {
+                return Some(Err(daemon_unreachable_error(&error)))
+            }
         }
     }
 }
@@ -1943,6 +2086,25 @@ mod tests {
         std::env::remove_var("KHIVE_NO_DAEMON");
         std::env::remove_var("KHIVE_LOCK");
         std::env::remove_var("KHIVE_RECOVERER_LOCK");
+    }
+
+    #[test]
+    #[ignore]
+    fn stale_daemon_process_fixture() {
+        let Some(ready_path) = std::env::var_os("KHIVE_TEST_SIGTERM_READY") else {
+            return;
+        };
+        if std::env::var_os("KHIVE_TEST_IGNORE_SIGTERM").is_some() {
+            // SAFETY: installing SIG_IGN for SIGTERM is process-local; this
+            // isolated child models an incumbent that cannot drain yet.
+            unsafe {
+                libc::signal(libc::SIGTERM, libc::SIG_IGN);
+            }
+        }
+        std::fs::write(ready_path, b"ready").expect("publish daemon fixture readiness");
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        }
     }
 
     async fn connect_when_ready(sock: &std::path::Path) -> UnixStream {
@@ -2580,6 +2742,55 @@ mod tests {
             from_wire: false,
             request_id: None,
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn inaccessible_daemon_socket_never_triggers_lifecycle_recovery() {
+        clear_daemon_env();
+        reset_counters();
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("KHIVE_SOCKET", dir.path().join("khived.sock"));
+        std::env::set_var("KHIVE_PID", dir.path().join("khived.pid"));
+        std::env::set_var("KHIVE_LOCK", dir.path().join("khived.recovery.lock"));
+        std::env::set_var(
+            "KHIVE_RECOVERER_LOCK",
+            dir.path().join("khived.recoverer.lock"),
+        );
+        FORCED_CONNECT_ERROR.store(libc::EPERM, std::sync::atomic::Ordering::SeqCst);
+
+        let spawn_calls = std::sync::atomic::AtomicUsize::new(0);
+        let spawn = || {
+            spawn_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "test spawn must not be attempted",
+            ))
+        };
+
+        let result = forward_or_spawn_with(&unreachable_daemon_frame(CFG), &spawn).await;
+        FORCED_CONNECT_ERROR.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        let error = result
+            .expect("inaccessible socket must be a hard error")
+            .expect_err("inaccessible socket must not dispatch successfully");
+        assert!(
+            error.message.contains("cannot reach daemon socket"),
+            "error must identify socket reachability without claiming stale PID: {error:?}"
+        );
+        assert_eq!(
+            KILL_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an access-restricted client must not signal the daemon"
+        );
+        assert_eq!(
+            spawn_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an access-restricted client must not attempt a daemon spawn"
+        );
+
+        reset_counters();
+        clear_daemon_env();
     }
 
     struct RespawnDisclosureFixture {
@@ -4348,6 +4559,176 @@ mod tests {
         reset_counters();
         clear_daemon_env();
         std::env::remove_var("KHIVE_LOCK");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn stale_daemon_must_exit_before_a_replacement_is_spawned() {
+        struct ChildGuard(std::process::Child);
+
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        clear_daemon_env();
+        reset_counters();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("khived.sock");
+        let pid_file = dir.path().join("khived.pid");
+        let lock_file = dir.path().join("khived.recovery.lock");
+        let recoverer_lock_file = dir.path().join("khived.recoverer.lock");
+        let ready_file = dir.path().join("sigterm-ready");
+
+        std::env::set_var("KHIVE_SOCKET", &sock);
+        std::env::set_var("KHIVE_PID", &pid_file);
+        std::env::set_var("KHIVE_LOCK", &lock_file);
+        std::env::set_var("KHIVE_RECOVERER_LOCK", &recoverer_lock_file);
+
+        let child = std::process::Command::new(std::env::current_exe().expect("current test exe"))
+            .args(["--ignored", "stale_daemon_process_fixture"])
+            .env("KHIVE_TEST_SIGTERM_READY", &ready_file)
+            .env("KHIVE_TEST_IGNORE_SIGTERM", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn SIGTERM-resistant incumbent");
+        let incumbent_pid = child.id();
+        let _child = ChildGuard(child);
+
+        let ready_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready_file.exists() {
+            assert!(
+                tokio::time::Instant::now() < ready_deadline,
+                "SIGTERM-resistant incumbent did not become ready"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        std::fs::write(&sock, b"stale socket placeholder").expect("write stale socket placeholder");
+        std::fs::write(&pid_file, incumbent_pid.to_string()).expect("write incumbent pid");
+        FORCE_PID_IS_DAEMON.store(true, std::sync::atomic::Ordering::SeqCst);
+        FORCED_CONNECT_ERROR.store(libc::ENOENT, std::sync::atomic::Ordering::SeqCst);
+        STALE_DAEMON_EXIT_TIMEOUT_OVERRIDE_MS.store(100, std::sync::atomic::Ordering::SeqCst);
+
+        let spawn_calls = std::sync::atomic::AtomicUsize::new(0);
+        let spawn = || {
+            spawn_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::process::Command::new(std::env::current_exe()?)
+                .arg("--list")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+        };
+
+        let outcome = kill_and_respawn(CFG, "test", &spawn)
+            .await
+            .expect("recovery returns an outcome");
+        FORCED_CONNECT_ERROR.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        assert!(
+            matches!(outcome, RecoveryOutcome::Uncertain),
+            "a still-running incumbent must leave recovery uncertain: {outcome:?}"
+        );
+        assert_eq!(
+            spawn_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "replacement spawn must wait for confirmed incumbent exit"
+        );
+        assert!(pid_file.exists(), "live incumbent pid file must remain");
+        assert!(sock.exists(), "live incumbent socket path must remain");
+
+        reset_counters();
+        clear_daemon_env();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn confirmed_stale_daemon_exit_allows_replacement_spawn() {
+        clear_daemon_env();
+        reset_counters();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("khived.sock");
+        let pid_file = dir.path().join("khived.pid");
+        let ready_file = dir.path().join("sigterm-ready");
+        std::env::set_var("KHIVE_SOCKET", &sock);
+        std::env::set_var("KHIVE_PID", &pid_file);
+        std::env::set_var("KHIVE_LOCK", dir.path().join("khived.recovery.lock"));
+        std::env::set_var(
+            "KHIVE_RECOVERER_LOCK",
+            dir.path().join("khived.recoverer.lock"),
+        );
+
+        let mut child =
+            std::process::Command::new(std::env::current_exe().expect("current test exe"))
+                .args(["--ignored", "stale_daemon_process_fixture"])
+                .env("KHIVE_TEST_SIGTERM_READY", &ready_file)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn cooperative incumbent");
+        let incumbent_pid = child.id();
+        let ready_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready_file.exists() {
+            assert!(
+                tokio::time::Instant::now() < ready_deadline,
+                "cooperative incumbent did not become ready"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let (reaped_tx, reaped_rx) = std::sync::mpsc::channel();
+        let reaper = std::thread::spawn(move || {
+            let result = child.wait();
+            let _ = reaped_tx.send(result);
+        });
+
+        std::fs::write(&sock, b"stale socket placeholder").expect("write stale socket placeholder");
+        std::fs::write(&pid_file, incumbent_pid.to_string()).expect("write incumbent pid");
+        FORCE_PID_IS_DAEMON.store(true, std::sync::atomic::Ordering::SeqCst);
+        FORCED_CONNECT_ERROR.store(libc::ENOENT, std::sync::atomic::Ordering::SeqCst);
+        STALE_DAEMON_EXIT_TIMEOUT_OVERRIDE_MS.store(1_000, std::sync::atomic::Ordering::SeqCst);
+
+        let spawn = || {
+            std::process::Command::new(std::env::current_exe()?)
+                .arg("--list")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+        };
+        let outcome = kill_and_respawn(CFG, "test", &spawn)
+            .await
+            .expect("recovery returns an outcome");
+        FORCED_CONNECT_ERROR.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        let reaped = reaped_rx.recv_timeout(std::time::Duration::from_secs(2));
+        if reaped.is_err() {
+            if let Ok(pid) = i32::try_from(incumbent_pid) {
+                // SAFETY: the child PID is retained solely for bounded test cleanup.
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+        }
+        reaper.join().expect("incumbent reaper must not panic");
+        assert!(reaped.is_ok(), "SIGTERM must terminate the incumbent");
+
+        match outcome {
+            RecoveryOutcome::Spawned(mut replacement) => {
+                replacement.wait().expect("reap replacement fixture");
+            }
+            other => panic!("confirmed incumbent exit must permit replacement spawn: {other:?}"),
+        }
+        assert!(!pid_file.exists(), "stale pid file must be removed");
+        assert!(!sock.exists(), "stale socket path must be removed");
+
+        reset_counters();
+        clear_daemon_env();
     }
 
     // ── #838: two concurrent recoverers
