@@ -16,8 +16,18 @@
 //!   ids_hash      32 bytes  blake3 of the raw id bytes that follow
 //!   count         8 bytes   u64 little-endian — number of UUIDs
 //!   ids           16 × count bytes — raw UUID bytes
+//!
+//! Sidecar mutations are pinned to a verified directory handle on Unix and
+//! Windows. Windows rejects reparse-point handles and compares the opened
+//! directory's final path with its expected canonical location before using
+//! handle-relative file operations. Only targets without handle-relative
+//! filesystem facilities use the documented best-effort path fallback.
 
 use uuid::Uuid;
+
+#[cfg(windows)]
+#[path = "external_ids_windows.rs"]
+mod windows;
 
 const SIDECAR_MAGIC: &[u8; 8] = b"KHVANID2";
 const HEADER_LEN: usize = 8 + 32 + 32 + 8;
@@ -78,10 +88,9 @@ pub fn segment_commit_digest(dir: &std::path::Path) -> Result<Option<[u8; 32]>, 
 
 /// Write `ids` to `dir/external_ids.bin` using a tmp-then-rename pattern,
 /// bound to the commit record identified by `commit_digest`. On Unix every
-/// original path component is opened without following symlinks. Ancestor
-/// symlinks are followed only when their ownership and parent directory are
-/// trusted; every filesystem step then runs relative to the resulting
-/// descriptor.
+/// filesystem step runs relative to a descriptor reached through a validated
+/// component walk. On Windows the directory's post-open attributes and final
+/// path are verified before every mutation runs relative to that handle.
 pub fn write_external_ids_sidecar(
     dir: &std::path::Path,
     commit_digest: &[u8; 32],
@@ -453,6 +462,27 @@ fn trusted_ancestor_symlink(
     owner_is_trusted(symlink_uid) && owner_is_trusted(parent_uid) && parent_mode & 0o022 == 0
 }
 
+#[cfg(any(windows, test))]
+const WINDOWS_FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+#[cfg(any(windows, test))]
+const WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+
+#[cfg(any(windows, test))]
+fn windows_attribute_tag_is_acceptable(
+    file_attributes: u32,
+    reparse_tag: u32,
+    require_directory: bool,
+) -> bool {
+    let is_directory = file_attributes & WINDOWS_FILE_ATTRIBUTE_DIRECTORY != 0;
+    let is_reparse = file_attributes & WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    is_directory == require_directory && !is_reparse && reparse_tag == 0
+}
+
+#[cfg(any(windows, test))]
+fn windows_final_path_matches(expected: &[u16], opened: &[u16]) -> bool {
+    expected == opened
+}
+
 #[cfg(any(not(unix), test))]
 fn ensure_not_symlink_or_reparse(
     path: &std::path::Path,
@@ -480,7 +510,7 @@ fn metadata_is_symlink_or_reparse(metadata: &std::fs::Metadata) -> bool {
     {
         use std::os::windows::fs::MetadataExt as _;
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
     }
     #[cfg(not(windows))]
     false
@@ -511,17 +541,20 @@ fn ensure_portable_ancestors_not_symlinks(
     Ok(())
 }
 
-/// Non-Unix `std` has no handle-relative no-follow rename, so this is a
-/// best-effort path-based fallback. It rejects pre-existing symlink/reparse
-/// points in the segment directory's ancestors and in the segment/sidecar
-/// entries. A component can still be replaced between a check and a later
-/// path-based mutation; portable `std` cannot close that check-to-use window.
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn write_via_dirfd(dir: &std::path::Path, buf: &[u8]) -> Result<(), ExternalIdsWriteError> {
+    windows::write_via_dir_handle(dir, buf)
+}
+
+/// Targets without Unix or Windows handle-relative facilities use this
+/// best-effort path fallback. It rejects pre-existing symlink entries, but a
+/// component can still be replaced between validation and path-based mutation.
+#[cfg(all(not(unix), not(windows)))]
 fn write_via_dirfd(dir: &std::path::Path, buf: &[u8]) -> Result<(), ExternalIdsWriteError> {
     write_via_paths(dir, buf)
 }
 
-#[cfg(any(not(unix), test))]
+#[cfg(any(all(not(unix), not(windows)), test))]
 fn write_via_paths(dir: &std::path::Path, buf: &[u8]) -> Result<(), ExternalIdsWriteError> {
     use std::io::Write as _;
 
@@ -564,17 +597,6 @@ fn write_via_paths(dir: &std::path::Path, buf: &[u8]) -> Result<(), ExternalIdsW
     ensure_not_symlink_or_reparse(dir, "reinspect segment dir")?;
     ensure_not_symlink_or_reparse(&tmp_path, "reinspect external_ids.bin.tmp")?;
     ensure_not_symlink_or_reparse(&final_path, "reinspect external_ids.bin")?;
-    #[cfg(windows)]
-    match std::fs::remove_file(&final_path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(ExternalIdsWriteError::io(
-                "remove previous external_ids.bin",
-                error,
-            ));
-        }
-    }
     std::fs::rename(&tmp_path, &final_path).map_err(|e| {
         ExternalIdsWriteError::io("rename external_ids.bin.tmp -> external_ids.bin", e)
     })
@@ -644,6 +666,33 @@ mod tests {
     fn tempdir() -> tempfile::TempDir {
         let root = std::fs::canonicalize(std::env::temp_dir()).expect("canonical temp root");
         tempfile::tempdir_in(root).expect("tempdir")
+    }
+
+    #[test]
+    fn windows_attribute_tag_acceptance_requires_expected_kind_without_reparse_data() {
+        const DIRECTORY: u32 = 0x10;
+        const REPARSE_POINT: u32 = 0x400;
+
+        assert!(windows_attribute_tag_is_acceptable(DIRECTORY, 0, true));
+        assert!(windows_attribute_tag_is_acceptable(0, 0, false));
+        assert!(!windows_attribute_tag_is_acceptable(0, 0, true));
+        assert!(!windows_attribute_tag_is_acceptable(DIRECTORY, 0, false));
+        assert!(!windows_attribute_tag_is_acceptable(
+            DIRECTORY | REPARSE_POINT,
+            0,
+            true
+        ));
+        assert!(!windows_attribute_tag_is_acceptable(DIRECTORY, 1, true));
+    }
+
+    #[test]
+    fn windows_final_path_comparison_requires_exact_handle_resolution() {
+        let expected: Vec<u16> = r"\\?\C:\segments\active".encode_utf16().collect();
+        let same: Vec<u16> = r"\\?\C:\segments\active".encode_utf16().collect();
+        let redirected: Vec<u16> = r"\\?\C:\attacker\active".encode_utf16().collect();
+
+        assert!(windows_final_path_matches(&expected, &same));
+        assert!(!windows_final_path_matches(&expected, &redirected));
     }
 
     #[test]
