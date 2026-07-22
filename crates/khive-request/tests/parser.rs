@@ -1711,3 +1711,93 @@ fn realistic_nested_payload_well_under_limit_still_parses() {
     );
     assert_eq!(r.mode, ExecutionMode::Single);
 }
+
+// ── ArgValue::find_prev_failure — $prev substitution error diagnosis ───────
+//
+// These exercise `find_prev_failure` directly against hand-built `ArgValue`s
+// rather than through `parse_request`, because the DSL parser (both the
+// unquoted `$prev[..]` grammar above and `quoted_prev_path_is_valid` for the
+// quoted-string form) already rejects malformed bracket syntax before an
+// `ArgValue::PrevRef` is ever constructed — that parser-level rejection is
+// covered in `khive-mcp`'s integration suite
+// (`test_prev_malformed_index_rejected_at_parse_time`). The substituter's own
+// `PrevFailure::Unsupported` defense is otherwise unreachable through the
+// public DSL surface today, so it is verified here, directly, as
+// defense-in-depth against a future caller that builds an `ArgValue` some
+// other way (e.g. a second parser front-end).
+
+use khive_request::PrevFailure;
+use serde_json::Value as JsonValue;
+
+fn prev_ref(path: &str) -> ArgValue {
+    ArgValue::PrevRef {
+        path: path.to_string(),
+    }
+}
+
+#[test]
+fn find_prev_failure_reports_not_found_for_missing_field() {
+    let prev: JsonValue = json!({"id": "abc", "kind": "concept"});
+    let failure = prev_ref("bogus").find_prev_failure(&prev);
+    match failure {
+        Some(PrevFailure::NotFound {
+            missing, available, ..
+        }) => {
+            assert_eq!(missing, "bogus");
+            assert!(available.contains(&"id".to_string()));
+        }
+        other => panic!("expected NotFound, got {other:?}"),
+    }
+}
+
+#[test]
+fn find_prev_failure_reports_wrong_type_for_field_on_scalar() {
+    let prev: JsonValue = json!({"name": "concept-1"});
+    let failure = prev_ref("name.sub").find_prev_failure(&prev);
+    match failure {
+        Some(PrevFailure::WrongType {
+            expected, found, ..
+        }) => {
+            assert_eq!(expected, "object");
+            assert_eq!(found, "string");
+        }
+        other => panic!("expected WrongType, got {other:?}"),
+    }
+}
+
+#[test]
+fn find_prev_failure_reports_wrong_type_for_index_on_object() {
+    let prev: JsonValue = json!({"items": {"not": "an array"}});
+    let failure = prev_ref("items[0]").find_prev_failure(&prev);
+    match failure {
+        Some(PrevFailure::WrongType {
+            expected, found, ..
+        }) => {
+            assert_eq!(expected, "array");
+            assert_eq!(found, "object");
+        }
+        other => panic!("expected WrongType, got {other:?}"),
+    }
+}
+
+#[test]
+fn find_prev_failure_reports_unsupported_for_malformed_bracket() {
+    // `ArgValue::PrevRef` built directly (bypassing the parser, which never
+    // produces this shape) to exercise the substituter's own defense.
+    let prev: JsonValue = json!({"id": "abc"});
+    let failure = prev_ref("[bad]").find_prev_failure(&prev);
+    match failure {
+        Some(PrevFailure::Unsupported { segment, .. }) => {
+            assert_eq!(segment, "[bad]");
+        }
+        other => panic!("expected Unsupported, got {other:?}"),
+    }
+}
+
+#[test]
+fn find_prev_failure_none_when_resolve_all_succeeds() {
+    let prev: JsonValue = json!({"id": "abc", "nested": {"x": 1}});
+    let arg = prev_ref("nested.x");
+    assert!(arg.resolve_all(&prev).is_some());
+    assert!(arg.find_prev_failure(&prev).is_none());
+}
