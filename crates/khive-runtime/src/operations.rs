@@ -7,6 +7,15 @@
 // surface stabilises post-retrieval-refactor, group by substrate (entity,
 // note, edge, search) into submodules under an `operations/` directory.
 //! High-level operations composing storage capabilities into user-facing verbs.
+//!
+//! # Fault-injection arm migration
+//!
+//! Namespace-targeted fault injection uses scoped guards. The former
+//! `arm_fts_fail`, `arm_fts_fail_many`, `arm_fts_fail_many_partial`, and
+//! `arm_vector_fail` names were removed in favor of their `_scoped` variants so
+//! stale statement-form calls fail to compile. Statement-form arming cannot be
+//! preserved because dropping the returned guard at the semicolon disarms an
+//! unconsumed injection.
 
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -62,7 +71,7 @@ std::thread_local! {
 
 /// Arm the count-targetable vector-INSERT fault: let `n` inserts succeed, then fail
 /// the next one (entity or note, single- or multi-model). Set `n = 0` to fail
-/// immediately on the first insert. Thread-local, so unlike `arm_vector_fail`
+/// immediately on the first insert. Thread-local, so unlike `arm_vector_fail_scoped`
 /// it cannot be won or disarmed by a concurrently-running test on another
 /// thread — prefer this one whenever the caller cannot guarantee it is the
 /// only test writing into the namespace it cares about.
@@ -74,7 +83,7 @@ pub fn arm_vector_fail_after(n: usize) {
 
 // Namespace-keyed one-shot arms, not a single `Option<String>` slot:
 // `create_note_inner` and `create_entity_inner` share this flag, and a
-// single-slot design let a concurrently running test's `arm_fts_fail(other_ns)`
+// single-slot design let a concurrently running test's `arm_fts_fail_scoped(other_ns)`
 // overwrite this test's armed namespace before its own create call consumed
 // it, so the intended injection silently never fired (#1095). Keying by
 // namespace fixes that at the root — arming `ns_B` inserts `ns_B` without
@@ -178,7 +187,7 @@ static FTS_SEARCH_FAIL_NS: std::sync::Mutex<Option<String>> = std::sync::Mutex::
 /// disarms an unconsumed injection.
 /// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
 #[cfg(any(test, feature = "fault-injection"))]
-pub fn arm_fts_fail(ns: &str) -> FaultInjectionArm {
+pub fn arm_fts_fail_scoped(ns: &str) -> FaultInjectionArm {
     arm_fault(&FTS_FAIL_NS, ns, MAX_FAULT_ARMS)
 }
 
@@ -192,7 +201,7 @@ pub fn arm_fts_fail(ns: &str) -> FaultInjectionArm {
 /// disarms an unconsumed injection.
 /// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
 #[cfg(any(test, feature = "fault-injection"))]
-pub fn arm_fts_fail_many(ns: &str) -> FaultInjectionArm {
+pub fn arm_fts_fail_many_scoped(ns: &str) -> FaultInjectionArm {
     arm_fault(&FTS_FAIL_MANY_NS, ns, MAX_FAULT_ARMS)
 }
 
@@ -201,13 +210,13 @@ pub fn arm_fts_fail_many(ns: &str) -> FaultInjectionArm {
 /// The next `create_many` call whose namespace equals `ns` returns
 /// `Ok(BatchWriteSummary { attempted: 2, affected: 1, failed: 1, ... })` from the
 /// FTS upsert step, exercising the `summary.failed > 0` rollback branch (as opposed
-/// to the hard-`Err` branch exercised by `arm_fts_fail_many`). Then disarms only
+/// to the hard-`Err` branch exercised by `arm_fts_fail_many_scoped`). Then disarms only
 /// that namespace's entry.
 /// Keep the returned guard alive until the triggering call completes; dropping it
 /// disarms an unconsumed injection.
 /// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
 #[cfg(any(test, feature = "fault-injection"))]
-pub fn arm_fts_fail_many_partial(ns: &str) -> FaultInjectionArm {
+pub fn arm_fts_fail_many_partial_scoped(ns: &str) -> FaultInjectionArm {
     arm_fault(&FTS_FAIL_MANY_PARTIAL_NS, ns, MAX_FAULT_ARMS)
 }
 
@@ -235,7 +244,7 @@ pub fn arm_fts_search_fail(ns: &str) {
 /// disarms an unconsumed injection.
 /// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
 #[cfg(any(test, feature = "fault-injection"))]
-pub fn arm_vector_fail(ns: &str) -> FaultInjectionArm {
+pub fn arm_vector_fail_scoped(ns: &str) -> FaultInjectionArm {
     arm_fault(&VECTOR_FAIL_NS, ns, MAX_FAULT_ARMS)
 }
 
@@ -3051,7 +3060,7 @@ impl KhiveRuntime {
 
         // FTS step — compensate note row on failure.
         {
-            // Injection: check FTS_FAIL_NS (armed by `arm_fts_fail(ns)`).
+            // Injection: check FTS_FAIL_NS (armed by `arm_fts_fail_scoped(ns)`).
             // Fires only when `ns` is in the armed set, removing it on the way
             // out (one-shot, atomic check-and-remove under the mutex). No lock
             // acquisition in release builds — the cfg(not) branch is a const
@@ -3097,7 +3106,7 @@ impl KhiveRuntime {
             let model_name = &embed_model_names[0];
             let vec_result = self.embed_document_with_model(model_name, embed_text).await;
 
-            // Injection: check VECTOR_FAIL_NS (armed by `arm_vector_fail(ns)`) or
+            // Injection: check VECTOR_FAIL_NS (armed by `arm_vector_fail_scoped(ns)`) or
             // VECTOR_FAIL_AFTER (armed by `arm_vector_fail_after(n)`). The former
             // fires only when the armed namespace matches this note's namespace;
             // callers that cannot guarantee no concurrently-running test also
@@ -5453,7 +5462,7 @@ mod tests {
         let ns = format!("fault-arm-drop-{}", uuid::Uuid::new_v4().as_simple());
 
         let panic_result = std::panic::catch_unwind(|| {
-            let _arm = arm_fts_fail(&ns);
+            let _arm = arm_fts_fail_scoped(&ns);
             panic!("leave the armed scope before consumption");
         });
 
@@ -9896,7 +9905,7 @@ mod tests {
     }
 
     // Inject an FTS failure after the note row is committed and assert the note
-    // row is removed (no stranded row).  arm_fts_fail() arms the flag before
+    // row is removed (no stranded row). arm_fts_fail_scoped() arms the flag before
     // the call and it resets automatically after one trigger.
     #[tokio::test]
     async fn create_note_fts_failure_rolls_back_note_row() {
@@ -9908,7 +9917,7 @@ mod tests {
         let ns = Namespace::parse("fault-fts-rollback").unwrap();
         let tok = NamespaceToken::for_namespace(ns.clone());
 
-        let _arm = arm_fts_fail(ns.as_str());
+        let _arm = arm_fts_fail_scoped(ns.as_str());
 
         let result = rt
             .create_note(
@@ -9954,7 +9963,7 @@ mod tests {
         let ns = Namespace::parse("fault-fts-rollback-cross-thread").unwrap();
         let tok = NamespaceToken::for_namespace(ns.clone());
 
-        let _arm = arm_fts_fail(ns.as_str());
+        let _arm = arm_fts_fail_scoped(ns.as_str());
 
         let thread_rt = std::sync::Arc::clone(&rt);
         let thread_tok = tok.clone();
@@ -10013,7 +10022,7 @@ mod tests {
         let ns = Namespace::parse("fault-vec-rollback").unwrap();
         let tok = NamespaceToken::for_namespace(ns.clone());
 
-        let _arm = arm_vector_fail(ns.as_str());
+        let _arm = arm_vector_fail_scoped(ns.as_str());
 
         let result = rt
             .create_note(
@@ -10062,8 +10071,8 @@ mod tests {
         let ns_b = Namespace::parse("fault-vec-distinct-b").unwrap();
         let tok_b = NamespaceToken::for_namespace(ns_b.clone());
 
-        let _arm_a = arm_vector_fail(ns_a.as_str());
-        let _arm_b = arm_vector_fail(ns_b.as_str());
+        let _arm_a = arm_vector_fail_scoped(ns_a.as_str());
+        let _arm_b = arm_vector_fail_scoped(ns_b.as_str());
 
         let (result_a, result_b) = tokio::join!(
             rt_a.create_note(
@@ -10107,7 +10116,7 @@ mod tests {
         let ns = Namespace::parse("fault-fts-rollback-embedding-content").unwrap();
         let tok = NamespaceToken::for_namespace(ns.clone());
 
-        let _arm = arm_fts_fail(ns.as_str());
+        let _arm = arm_fts_fail_scoped(ns.as_str());
 
         let full = "fts-fail rollback target with an embedding-content override";
         let head = &full[.."fts-fail rollback target".len()];
@@ -10156,7 +10165,7 @@ mod tests {
         let ns = Namespace::parse("fault-vec-rollback-embedding-content").unwrap();
         let tok = NamespaceToken::for_namespace(ns.clone());
 
-        let _arm = arm_vector_fail(ns.as_str());
+        let _arm = arm_vector_fail_scoped(ns.as_str());
 
         let full = "vec-fail rollback target with an embedding-content override";
         let head = &full[.."vec-fail rollback target".len()];
@@ -10966,7 +10975,7 @@ mod tests {
 
     // FTS failure in create_many rolls back both substrates.
     //
-    // Arm `arm_fts_fail_many` before the call; the FTS phase returns an injected
+    // Arm `arm_fts_fail_many_scoped` before the call; the FTS phase returns an injected
     // error; the test asserts zero rows in both `entities` and `fts_entities`.
     #[tokio::test]
     async fn create_many_fts_failure_rolls_back_both_substrates() {
@@ -10994,7 +11003,7 @@ mod tests {
             },
         ];
 
-        let _arm = arm_fts_fail_many(&ns);
+        let _arm = arm_fts_fail_many_scoped(&ns);
         let result = rt.create_many(&tok, specs).await;
 
         assert!(
@@ -11036,8 +11045,8 @@ mod tests {
         let ns_b = Namespace::parse("fts-fail-many-distinct-b").unwrap();
         let tok_b = NamespaceToken::for_namespace(ns_b.clone());
 
-        let _arm_a = arm_fts_fail_many(ns_a.as_str());
-        let _arm_b = arm_fts_fail_many(ns_b.as_str());
+        let _arm_a = arm_fts_fail_many_scoped(ns_a.as_str());
+        let _arm_b = arm_fts_fail_many_scoped(ns_b.as_str());
 
         let (result_a, result_b) = tokio::join!(
             rt_a.create_many(
@@ -11079,7 +11088,7 @@ mod tests {
     //
     // The production code has a distinct arm:
     //   Ok(summary) if summary.failed > 0 => return Err(...)
-    // This test exercises that arm by arming `arm_fts_fail_many_partial`, which
+    // This test exercises that arm by arming `arm_fts_fail_many_partial_scoped`, which
     // returns Ok(BatchWriteSummary { failed: 1, ... }) instead of a hard Err.
     // Both entity rows and FTS rows must be empty after rollback.
     #[tokio::test]
@@ -11107,7 +11116,7 @@ mod tests {
             },
         ];
 
-        let _arm = arm_fts_fail_many_partial(&ns);
+        let _arm = arm_fts_fail_many_partial_scoped(&ns);
         let result = rt.create_many(&tok, specs).await;
 
         assert!(
@@ -11149,8 +11158,8 @@ mod tests {
         let ns_b = Namespace::parse("fts-fail-many-partial-distinct-b").unwrap();
         let tok_b = NamespaceToken::for_namespace(ns_b.clone());
 
-        let _arm_a = arm_fts_fail_many_partial(ns_a.as_str());
-        let _arm_b = arm_fts_fail_many_partial(ns_b.as_str());
+        let _arm_a = arm_fts_fail_many_partial_scoped(ns_a.as_str());
+        let _arm_b = arm_fts_fail_many_partial_scoped(ns_b.as_str());
 
         let (result_a, result_b) = tokio::join!(
             rt_a.create_many(
@@ -11846,7 +11855,7 @@ mod tests {
         let ns = Namespace::parse("fault-entity-fts").unwrap();
         let tok = NamespaceToken::for_namespace(ns.clone());
 
-        let _arm = arm_fts_fail(ns.as_str());
+        let _arm = arm_fts_fail_scoped(ns.as_str());
 
         let result = rt
             .create_entity(
@@ -11891,7 +11900,7 @@ mod tests {
         let ns = Namespace::parse("fault-entity-vec").unwrap();
         let tok = NamespaceToken::for_namespace(ns.clone());
 
-        let _arm = arm_vector_fail(ns.as_str());
+        let _arm = arm_vector_fail_scoped(ns.as_str());
 
         let result = rt
             .create_entity(
