@@ -34,10 +34,10 @@ pub fn segment_commit_digest(dir: &std::path::Path) -> Result<Option<[u8; 32]>, 
 
 /// Write `ids` to `dir/external_ids.bin` using a tmp-then-rename pattern,
 /// bound to the commit record identified by `commit_digest`. On unix every
-/// filesystem step runs relative to a no-follow directory descriptor pinned
-/// before any byte is written, so a symlink planted at the segment dir, the
-/// tmp path, or the final path cannot redirect the write. Symlinked
-/// ancestors of the segment dir are out of scope (see `write_via_dirfd`).
+/// segment-directory path component is opened without following symlinks,
+/// then every filesystem step runs relative to the resulting descriptor.
+/// A symlink planted at an ancestor, the segment dir, the tmp path, or the
+/// final path cannot redirect the write.
 pub fn write_external_ids_sidecar(
     dir: &std::path::Path,
     commit_digest: &[u8; 32],
@@ -62,39 +62,18 @@ pub fn write_external_ids_sidecar(
 
 /// All sidecar filesystem operations run relative to a directory descriptor
 /// pinned BEFORE any byte is written (mirrors `khive-db`'s `walpin` sidecar
-/// write idiom). The descriptor is opened `O_NOFOLLOW`, so a symlink planted
-/// at the segment-dir path refuses before the tmp file exists; the tmp entry
-/// is unlinked (`unlinkat` never follows) and re-created `O_EXCL |
-/// O_NOFOLLOW` relative to that descriptor, so a symlink planted at the tmp
-/// path cannot redirect the write either. A symlinked ANCESTOR of the
-/// segment directory is deliberately out of scope: whoever controls the
-/// ancestry controls the store's files directly, and no per-write defense
-/// changes that.
+/// write idiom). Each named directory component is opened `O_NOFOLLOW`, so
+/// symlinked ancestors and segment-dir paths refuse before the tmp file
+/// exists; the tmp entry is unlinked (`unlinkat` never follows) and re-created
+/// `O_EXCL | O_NOFOLLOW` relative to that descriptor, so a symlink planted at
+/// the tmp path cannot redirect the write either.
 #[cfg(unix)]
 fn write_via_dirfd(dir: &std::path::Path, buf: &[u8]) -> Result<(), String> {
     use std::io::Write as _;
-    use std::os::unix::ffi::OsStrExt as _;
-    use std::os::unix::io::FromRawFd as _;
+    use std::os::unix::io::{AsRawFd as _, FromRawFd as _};
 
-    let c_dir = std::ffi::CString::new(dir.as_os_str().as_bytes())
-        .map_err(|e| format!("segment dir path: {e}"))?;
-    // SAFETY: `c_dir` is NUL-terminated for the call; the returned fd is
-    // uniquely owned by this call and wrapped immediately below.
-    let dir_fd = unsafe {
-        libc::open(
-            c_dir.as_ptr(),
-            libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if dir_fd < 0 {
-        return Err(format!(
-            "open segment dir: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    // SAFETY: `dir_fd` was just returned by the successful `open` above and
-    // is uniquely owned by this `File`, which closes it exactly once on drop.
-    let dir_file = unsafe { std::fs::File::from_raw_fd(dir_fd) };
+    let dir_file = open_dir_without_symlinks(dir)?;
+    let dir_fd = dir_file.as_raw_fd();
 
     const TMP_NAME: &std::ffi::CStr = c"external_ids.bin.tmp";
 
@@ -154,6 +133,70 @@ fn write_via_dirfd(dir: &std::path::Path, buf: &[u8]) -> Result<(), String> {
     dir_file
         .sync_all()
         .map_err(|e| format!("sync segment dir: {e}"))
+}
+
+#[cfg(unix)]
+fn open_dir_without_symlinks(dir: &std::path::Path) -> Result<std::fs::File, String> {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::io::{AsRawFd as _, FromRawFd as _};
+
+    if dir.as_os_str().is_empty() {
+        return Err("open segment dir: empty path".into());
+    }
+
+    let start = if dir.is_absolute() { c"/" } else { c"." };
+    // SAFETY: `start` is NUL-terminated; the returned fd is uniquely owned
+    // and wrapped immediately below.
+    let start_fd = unsafe {
+        libc::open(
+            start.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if start_fd < 0 {
+        return Err(format!(
+            "open segment dir root: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: `start_fd` was returned by the successful `open` above and is
+    // uniquely owned by this `File`.
+    let mut current = unsafe { std::fs::File::from_raw_fd(start_fd) };
+
+    for component in dir.components() {
+        let name = match component {
+            std::path::Component::RootDir | std::path::Component::CurDir => continue,
+            std::path::Component::ParentDir | std::path::Component::Normal(_) => {
+                std::ffi::CString::new(component.as_os_str().as_bytes())
+                    .map_err(|e| format!("segment dir path component: {e}"))?
+            }
+            std::path::Component::Prefix(_) => {
+                return Err("open segment dir: unsupported path prefix".into());
+            }
+        };
+
+        // SAFETY: `name` is NUL-terminated and `current` owns a live
+        // directory fd; the returned fd is wrapped immediately on success.
+        let next_fd = unsafe {
+            libc::openat(
+                current.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if next_fd < 0 {
+            return Err(format!(
+                "open segment dir component {:?}: {}",
+                component.as_os_str(),
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: `next_fd` was returned by the successful `openat` above
+        // and is uniquely owned by the replacement `File`.
+        current = unsafe { std::fs::File::from_raw_fd(next_fd) };
+    }
+
+    Ok(current)
 }
 
 /// Non-unix fallback: exclusive tmp create (no `O_NOFOLLOW` equivalent in
@@ -246,9 +289,14 @@ pub fn read_external_ids_sidecar(dir: &std::path::Path) -> Result<([u8; 32], Vec
 mod tests {
     use super::*;
 
+    fn tempdir() -> tempfile::TempDir {
+        let root = std::fs::canonicalize(std::env::temp_dir()).expect("canonical temp root");
+        tempfile::tempdir_in(root).expect("tempdir")
+    }
+
     #[test]
     fn sidecar_round_trip() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = tempdir();
         let digest = [7u8; 32];
         let ids: Vec<Uuid> = (0..5).map(|_| Uuid::new_v4()).collect();
         write_external_ids_sidecar(dir.path(), &digest, &ids).expect("write");
@@ -259,7 +307,7 @@ mod tests {
 
     #[test]
     fn sidecar_rejects_truncation() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = tempdir();
         let ids: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
         write_external_ids_sidecar(dir.path(), &[0u8; 32], &ids).expect("write");
         let path = dir.path().join("external_ids.bin");
@@ -270,7 +318,7 @@ mod tests {
 
     #[test]
     fn sidecar_rejects_overflowing_count() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = tempdir();
         write_external_ids_sidecar(dir.path(), &[0u8; 32], &[]).expect("write");
         let path = dir.path().join("external_ids.bin");
         let mut bytes = std::fs::read(&path).expect("read back");
@@ -287,7 +335,7 @@ mod tests {
 
     #[test]
     fn sidecar_rejects_flipped_id_byte() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = tempdir();
         let ids: Vec<Uuid> = (0..4).map(|_| Uuid::new_v4()).collect();
         write_external_ids_sidecar(dir.path(), &[0u8; 32], &ids).expect("write");
         let path = dir.path().join("external_ids.bin");
@@ -302,8 +350,8 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn write_external_ids_sidecar_refuses_symlinked_tmp_path() {
-        let segment_dir = tempfile::tempdir().expect("segment tempdir");
-        let victim_dir = tempfile::tempdir().expect("victim tempdir");
+        let segment_dir = tempdir();
+        let victim_dir = tempdir();
         let victim_path = victim_dir.path().join("victim.bin");
         std::fs::write(&victim_path, b"precious").expect("write victim");
 
@@ -330,8 +378,8 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn write_external_ids_sidecar_refuses_symlinked_segment_dir() {
-        let victim_dir = tempfile::tempdir().expect("victim tempdir");
-        let link_parent = tempfile::tempdir().expect("link tempdir");
+        let victim_dir = tempdir();
+        let link_parent = tempdir();
         let dir_link = link_parent.path().join("segment");
         std::os::unix::fs::symlink(victim_dir.path(), &dir_link).expect("symlink segment dir");
 
@@ -348,38 +396,34 @@ mod tests {
         );
     }
 
-    /// Documents the scope boundary rather than defending it: traversal
-    /// THROUGH a symlinked ancestor succeeds and lands at the real segment
-    /// dir, because `O_NOFOLLOW` guards only the final path component and a
-    /// complete ancestor defense (openat2/RESOLVE_BENEATH) does not exist on
-    /// every supported platform. An attacker who controls the ancestry
-    /// controls the store's files directly, so this is accepted, not missed.
     #[test]
     #[cfg(unix)]
-    fn write_external_ids_sidecar_traverses_symlinked_ancestor_by_design() {
-        let real_parent = tempfile::tempdir().expect("real parent tempdir");
+    fn write_external_ids_sidecar_refuses_symlinked_ancestor() {
+        let real_parent = tempdir();
         let real_segment = real_parent.path().join("segment");
         std::fs::create_dir(&real_segment).expect("create real segment dir");
 
-        let link_parent = tempfile::tempdir().expect("link tempdir");
+        let link_parent = tempdir();
         let parent_link = link_parent.path().join("parent");
         std::os::unix::fs::symlink(real_parent.path(), &parent_link).expect("symlink ancestor");
         let via_ancestor = parent_link.join("segment");
 
         let digest = [5u8; 32];
         let ids: Vec<Uuid> = (0..2).map(|_| Uuid::new_v4()).collect();
-        write_external_ids_sidecar(&via_ancestor, &digest, &ids)
-            .expect("ancestor traversal is in-scope for the filesystem, not this guard");
+        let err = write_external_ids_sidecar(&via_ancestor, &digest, &ids)
+            .expect_err("a symlinked ancestor must refuse before any byte is written");
+        assert!(err.contains("open segment dir"), "got: {err}");
 
-        let (read_digest, read_ids) =
-            read_external_ids_sidecar(&real_segment).expect("sidecar lands at the real dir");
-        assert_eq!(read_digest, digest);
-        assert_eq!(read_ids, ids);
+        assert!(
+            !real_segment.join("external_ids.bin.tmp").exists()
+                && !real_segment.join("external_ids.bin").exists(),
+            "nothing may be written through the ancestor symlink"
+        );
     }
 
     #[test]
     fn segment_commit_digest_absent_and_present() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = tempdir();
         assert_eq!(segment_commit_digest(dir.path()).expect("absent ok"), None);
         std::fs::write(dir.path().join("metadata.bin"), b"commit-bytes").expect("write");
         let digest = segment_commit_digest(dir.path())
