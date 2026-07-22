@@ -177,6 +177,153 @@ async fn create_bulk_items_without_top_level_kind_succeeds() {
     assert_eq!(result.get("failed").and_then(Value::as_u64), Some(0));
 }
 
+#[tokio::test]
+async fn create_bulk_items_supports_note_and_entity_shapes() {
+    let pack = pack();
+    let target = pack
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "BulkNoteTarget"}),
+        )
+        .await
+        .expect("annotation target must be created");
+    let target_id = target["id"].as_str().expect("target id");
+
+    let result = pack
+        .dispatch(
+            "create",
+            json!({
+                "items": [
+                    {
+                        "kind": "observation",
+                        "name": "Bulk observation",
+                        "content": "first bulk note",
+                        "salience": 0.8,
+                        "tags": ["bulk"],
+                        "annotates": [target_id]
+                    },
+                    {
+                        "kind": "note",
+                        "note_kind": "insight",
+                        "content": "second bulk note",
+                        "properties": {"source": "issue-890"}
+                    },
+                    {"kind": "concept", "name": "BulkMixedEntity"}
+                ],
+                "verbose": true
+            }),
+        )
+        .await
+        .expect("kind-aware bulk create must accept notes and entities");
+
+    assert_eq!(result["attempted"], 3);
+    assert_eq!(result["created"], 3);
+    assert_eq!(result["failed"], 0);
+    let notes = result["notes"].as_array().expect("verbose notes array");
+    assert_eq!(notes.len(), 2);
+    assert_eq!(notes[0]["kind"], "observation");
+    assert_eq!(notes[0]["properties"]["tags"], json!(["bulk"]));
+    assert_eq!(notes[1]["kind"], "insight");
+    assert_eq!(notes[1]["properties"]["source"], "issue-890");
+    let entities = result["entities"]
+        .as_array()
+        .expect("verbose entities array");
+    assert_eq!(entities.len(), 1);
+    assert_eq!(entities[0]["name"], "BulkMixedEntity");
+
+    let incoming = pack
+        .dispatch(
+            "neighbors",
+            json!({
+                "id": target_id,
+                "direction": "incoming",
+                "relations": ["annotates"]
+            }),
+        )
+        .await
+        .expect("annotation edge must be queryable");
+    assert_eq!(incoming.as_array().expect("neighbors array").len(), 1);
+}
+
+#[tokio::test]
+async fn create_bulk_items_atomic_failure_rolls_back_notes() {
+    let pack = pack();
+    let err = pack
+        .dispatch(
+            "create",
+            json!({
+                "items": [
+                    {"kind": "observation", "content": "must be rolled back"},
+                    {"kind": "concept", "name": ""}
+                ]
+            }),
+        )
+        .await
+        .expect_err("an invalid entity must reject the mixed atomic batch");
+    assert!(is_invalid_input(&err), "expected InvalidInput, got {err:?}");
+
+    let notes = pack
+        .dispatch("list", json!({"kind": "note"}))
+        .await
+        .expect("note list must succeed");
+    assert!(
+        notes.as_array().expect("note list array").is_empty(),
+        "atomic rejection must roll back notes; got {notes}"
+    );
+}
+
+#[tokio::test]
+async fn create_bulk_items_non_atomic_reports_per_item_results() {
+    let pack = pack();
+    let result = pack
+        .dispatch(
+            "create",
+            json!({
+                "items": [
+                    {"kind": "concept", "name": ""},
+                    {"kind": "observation", "content": "created note"},
+                    {"kind": "insight", "content": "invalid note", "salience": 2.0},
+                    {"kind": "concept", "name": "CreatedEntity"}
+                ],
+                "atomic": false,
+                "verbose": true
+            }),
+        )
+        .await
+        .expect("non-atomic bulk create must return per-item results");
+
+    assert_eq!(result["attempted"], 4);
+    assert_eq!(result["created"], 2);
+    assert_eq!(result["failed"], 2);
+    assert_eq!(result["errors"][0]["index"], 0);
+    assert_eq!(result["errors"][1]["index"], 2);
+    assert_eq!(result["notes"].as_array().expect("notes array").len(), 1);
+    assert_eq!(
+        result["entities"].as_array().expect("entities array").len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn create_bulk_items_rejects_fields_for_the_wrong_substrate() {
+    let pack = pack();
+    let invalid_items = [
+        json!({"kind": "concept", "name": "Entity", "content": "note field"}),
+        json!({"kind": "observation", "content": "Note", "description": "entity field"}),
+        json!({"kind": "concept"}),
+        json!({"kind": "observation"}),
+        json!({"kind": "edge", "name": "NotCreatable"}),
+    ];
+
+    for item in invalid_items {
+        let err = pack
+            .dispatch("create", json!({"items": [item]}))
+            .await
+            .expect_err("invalid kind-aware item shape must be rejected");
+        assert!(is_invalid_input(&err), "expected InvalidInput, got {err:?}");
+    }
+}
+
 // Regression: bulk create is atomic — one invalid item (empty name) rejects the
 // whole batch and writes nothing.
 #[tokio::test]

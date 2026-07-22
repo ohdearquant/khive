@@ -18,7 +18,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 19] = [
     // Commissive: commits an entity or note to the namespace
     HandlerDef {
         name: "create",
-        description: "Create an entity or note (singleton) or a batch of entities (bulk via `items`).",
+        description: "Create an entity or note, either singly or in a kind-aware bulk `items` batch.",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[
@@ -95,12 +95,13 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 19] = [
                 name: "items",
                 param_type: "array of object",
                 required: false,
-                description: "Bulk entity creation. Each element is an object with \
-                              `kind` (required), `name` (required), and optional \
-                              `entity_kind`, `entity_type`, `description`, `properties`, \
-                              `tags`. When present, the top-level `kind` is NOT required. \
-                              Capped at 1000 entries per request. Bulk-created entities \
-                              skip vector embedding and are not vector-searchable until \
+                description: "Kind-aware bulk entity and note creation. Each item requires \
+                              `kind`; entity items require `name` and accept `entity_kind`, \
+                              `entity_type`, and `description`, while note items require \
+                              `content` and accept `note_kind`, `name`, `salience`, and \
+                              `annotates`. Both accept `properties` and `tags`. When present, \
+                              the top-level `kind` is NOT required. Capped at 1000 entries \
+                              per request. Bulk-created entities skip vector embedding until \
                               a subsequent `reindex` call.",
             },
             ParamDef {
@@ -115,8 +116,8 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 19] = [
                 name: "verbose",
                 param_type: "bool",
                 required: false,
-                description: "Bulk path only. When true, the response includes the full \
-                              entity objects in an `entities` array.",
+                description: "Bulk path only. When true, the response includes full records \
+                              in `entities` and `notes` arrays.",
             },
         ],
     },

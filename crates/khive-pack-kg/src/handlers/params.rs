@@ -17,10 +17,14 @@ pub(crate) struct EdgeSpec {
 #[serde(deny_unknown_fields)]
 pub(crate) struct BulkCreateEntry {
     pub(crate) kind: String,
-    pub(crate) name: String,
+    pub(crate) name: Option<String>,
     pub(crate) entity_kind: Option<String>,
+    pub(crate) note_kind: Option<String>,
     pub(crate) entity_type: Option<String>,
     pub(crate) description: Option<String>,
+    pub(crate) content: Option<String>,
+    pub(crate) salience: Option<f64>,
+    pub(crate) annotates: Option<Vec<String>>,
     pub(crate) properties: Option<Value>,
     pub(crate) tags: Option<Vec<String>>,
 }
