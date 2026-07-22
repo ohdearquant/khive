@@ -150,7 +150,10 @@ pub(crate) struct MergeParams {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SearchParams {
-    pub(crate) kind: String,
+    /// Required, but kept `Option` at the wire boundary so a caller who omits
+    /// it entirely gets the enumerated-valid-kinds error from
+    /// `missing_kind_error` instead of a raw serde "missing field" message.
+    pub(crate) kind: Option<String>,
     pub(crate) query: String,
     pub(crate) limit: Option<u32>,
     pub(crate) entity_kind: Option<String>,
