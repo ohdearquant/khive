@@ -1218,21 +1218,30 @@ mod tests {
     // `PackRegError { unknown: "gtd", .. }`. A unit test's outcome must not
     // depend on ambient shell configuration.
     #[test]
-    #[serial(khive_packs_env)]
     fn isolated_server_ignores_ambient_khive_packs_naming_unavailable_pack() {
-        let prev = std::env::var("KHIVE_PACKS").ok();
-        std::env::set_var("KHIVE_PACKS", "kg,gtd");
+        const CHILD_MARKER: &str = "KKERNEL_KHIVE_PACKS_TEST_CHILD";
+        const TEST_NAME: &str =
+            "exec::tests::isolated_server_ignores_ambient_khive_packs_naming_unavailable_pack";
+
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let status = std::process::Command::new(
+                std::env::current_exe().expect("current test executable"),
+            )
+            .arg(TEST_NAME)
+            .arg("--exact")
+            .env("KHIVE_PACKS", "kg,gtd")
+            .env(CHILD_MARKER, "1")
+            .status()
+            .expect("spawn isolated KHIVE_PACKS test process");
+            assert!(status.success(), "isolated child test failed: {status}");
+            return;
+        }
 
         let db_file = NamedTempFile::new().expect("temp db");
         let db_path = db_file.path().to_str().expect("utf8").to_string();
         // Before the fix, this panicked inside `KhiveMcpServer::new` — the
         // helper inherited the ambient list above instead of pinning its own.
         let _server = isolated_server(&db_path);
-
-        match prev {
-            Some(v) => std::env::set_var("KHIVE_PACKS", v),
-            None => std::env::remove_var("KHIVE_PACKS"),
-        }
     }
 
     // ── exec-path / serve-path config_id parity (#581) ────────────────────────
