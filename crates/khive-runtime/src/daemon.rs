@@ -358,7 +358,7 @@ fn peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
         if rc != 0 {
             return Err(std::io::Error::last_os_error());
         }
-        Ok(cred.uid as u32)
+        Ok(cred.uid)
     }
 
     #[cfg(not(any(
