@@ -231,6 +231,71 @@ async fn traverse_multi_hop() {
     assert!(reachable_ids.contains(&c.id));
 }
 
+/// The soft-deleted-node screen removes nodes after storage has already
+/// summarised the path, so `total_weight` must be recomputed over what
+/// survives. Here the heaviest neighbour is the one soft-deleted: the
+/// response must not keep reporting a weight that only a screened-out node
+/// ever had.
+#[tokio::test]
+async fn traverse_total_weight_excludes_soft_deleted_nodes() {
+    let rt = rt();
+    let tok = rt.authorize(Namespace::local()).unwrap();
+
+    let a = rt
+        .create_entity(&tok, "concept", None, "A", None, None, vec![])
+        .await
+        .unwrap();
+    let light = rt
+        .create_entity(&tok, "concept", None, "light", None, None, vec![])
+        .await
+        .unwrap();
+    let heavy = rt
+        .create_entity(&tok, "concept", None, "heavy", None, None, vec![])
+        .await
+        .unwrap();
+
+    rt.link(&tok, a.id, light.id, EdgeRelation::Extends, 0.25, None)
+        .await
+        .unwrap();
+    rt.link(&tok, a.id, heavy.id, EdgeRelation::Extends, 0.9, None)
+        .await
+        .unwrap();
+
+    let request = || TraversalRequest {
+        roots: vec![a.id],
+        options: TraversalOptions {
+            max_depth: 1,
+            direction: Direction::Out,
+            relations: Some(vec![EdgeRelation::Extends]),
+            ..Default::default()
+        },
+        include_roots: false,
+        include_properties: false,
+    };
+
+    let before = rt.traverse(&tok, request()).await.unwrap();
+    assert_eq!(before.len(), 1);
+    assert_eq!(
+        before[0].total_weight, 0.9,
+        "baseline: the heavy neighbour sets total_weight while it is visible"
+    );
+
+    rt.delete_entity(&tok, heavy.id, false).await.unwrap(); // soft delete
+
+    let after = rt.traverse(&tok, request()).await.unwrap();
+    assert_eq!(after.len(), 1);
+    let ids: Vec<Uuid> = after[0].nodes.iter().map(|n| n.node_id).collect();
+    assert!(
+        !ids.contains(&heavy.id),
+        "soft-deleted node must be screened"
+    );
+    assert_eq!(
+        after[0].total_weight, 0.25,
+        "total_weight must fall to the surviving neighbour's weight, not stay \
+         at the soft-deleted node's 0.9"
+    );
+}
+
 // =============================================================================
 // Note (memory) operations
 // =============================================================================
@@ -558,6 +623,10 @@ async fn no_explicit_limit_under_and_at_cap_emits_no_warning() {
         "499 matches under the cap must not warn: {:?}",
         result_499.warnings
     );
+    assert!(
+        !result_499.truncated,
+        "#1247: under the cap is not truncated"
+    );
 
     // Exactly 500 matches, no explicit LIMIT: right at the cap, no truncation, no warning.
     let tok_500 = seed_concepts(&rt, "trunc-500", 500).await;
@@ -574,6 +643,10 @@ async fn no_explicit_limit_under_and_at_cap_emits_no_warning() {
         result_500.warnings.is_empty(),
         "exactly 500 matches must not warn (nothing was dropped): {:?}",
         result_500.warnings
+    );
+    assert!(
+        !result_500.truncated,
+        "#1247: exactly at the cap is not truncated (nothing was dropped)"
     );
 }
 
@@ -601,6 +674,15 @@ async fn no_explicit_limit_over_cap_warns_and_strips_sentinel() {
     );
     assert_eq!(result.warnings.len(), 1, "warnings: {:?}", result.warnings);
     assert!(result.warnings[0].contains("500"), "{}", result.warnings[0]);
+    assert!(
+        !result.warnings[0].contains("LIMIT/OFFSET"),
+        "#1168: the warning must not recommend an unimplemented OFFSET path: {}",
+        result.warnings[0]
+    );
+    assert!(
+        result.truncated,
+        "#1247: truncated must be the structural signal, independent of warnings text"
+    );
 
     // The sentinel row must not leak into the returned set: every row must be
     // a distinct seeded entity.
@@ -638,6 +720,10 @@ async fn explicit_limit_variants_against_501_matches() {
     );
     assert!(above_cap.warnings[0].contains("600"));
     assert!(above_cap.warnings[0].contains("500"));
+    assert!(
+        above_cap.truncated,
+        "#1247: LIMIT above cap must set truncated"
+    );
 
     // LIMIT exactly at the cap: the cap never binds (requested <= max_limit),
     // so no sentinel is fetched and no warning fires, even though 501 rows
@@ -655,6 +741,10 @@ async fn explicit_limit_variants_against_501_matches() {
         at_cap.warnings.is_empty(),
         "LIMIT == cap must not warn: {:?}",
         at_cap.warnings
+    );
+    assert!(
+        !at_cap.truncated,
+        "#1247: an explicit LIMIT the caller chose is not server-side truncation"
     );
 
     // LIMIT below the cap: this is the false-positive regression
@@ -675,6 +765,10 @@ async fn explicit_limit_variants_against_501_matches() {
         below_cap.warnings.is_empty(),
         "LIMIT below cap must not warn: {:?}",
         below_cap.warnings
+    );
+    assert!(
+        !below_cap.truncated,
+        "#1247: LIMIT below cap is not truncated"
     );
 }
 
@@ -702,6 +796,10 @@ async fn explicit_limit_over_cap_with_few_real_matches_emits_no_warning() {
         result.warnings.is_empty(),
         "LIMIT above cap with fewer real matches than the cap must not warn: {:?}",
         result.warnings
+    );
+    assert!(
+        !result.truncated,
+        "#1247: fewer real matches than the cap is not truncation"
     );
 }
 

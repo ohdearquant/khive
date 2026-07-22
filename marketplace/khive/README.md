@@ -1,7 +1,7 @@
 # khive — Claude Code plugin
 
 One plugin for the khive knowledge graph surface, served by a single MCP server
-(`kkernel mcp`) exposing one tool — `request` — that dispatches the 18 verbs of the
+(`kkernel mcp`) exposing one tool — `request` — that dispatches the 19 verbs of the
 `kg` pack.
 
 This plugin is **guidance, not a second runtime**. It ships the pattern skill that teaches an
@@ -21,9 +21,9 @@ The skill teaches the _reusable pattern_ for the `kg` pack, not a how-to for eve
 Per-verb parameter detail is always one call away at runtime:
 `request(ops="<verb>(help=true)")`.
 
-| Skill | Pack | The pattern it teaches                                                       |
-| ----- | ---- | ------------------------------------------------------------------------------ |
-| `kg`  | kg   | Search before you create; model as typed entities + edges; explore; propose  |
+| Skill | Pack | The pattern it teaches                                                      |
+| ----- | ---- | --------------------------------------------------------------------------- |
+| `kg`  | kg   | Search before you create; model as typed entities + edges; explore; propose |
 
 ## kg stewardship agents
 
@@ -49,7 +49,8 @@ workspace linking, blob storage, and brain profiles (`brain.*` verbs — Bayesia
 recall-tuning) are provided by commercially licensed extensions and are not part of this
 distribution; this plugin ships a pattern skill only for `kg`. Git provenance ingestion and
 write verbs (`git.digest`, `git.commit`, `git.branch`, `git.push`) are likewise a
-commercially licensed extension.
+commercially licensed extension. Code-quality and formal-methods ontology packs are also
+commercially licensed extensions and are not included in this plugin.
 See [INSTALL.md](../INSTALL.md) for setup, the actor config, and the smoke test.
 
 ## Links

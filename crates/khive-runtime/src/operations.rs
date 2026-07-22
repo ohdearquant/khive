@@ -86,17 +86,22 @@ pub fn arm_vector_fail_after(n: usize) {
 #[cfg(any(test, feature = "fault-injection"))]
 static FTS_FAIL_NS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+// Vector insertion failures use the same namespace-keyed one-shot semantics.
 #[cfg(any(test, feature = "fault-injection"))]
-static VECTOR_FAIL_NS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static VECTOR_FAIL_NS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 /// FTS failure injection for `create_many` — separate from `FTS_FAIL_NS` so that
 /// create_note_inner and create_many tests cannot disarm each other.
 #[cfg(any(test, feature = "fault-injection"))]
-static FTS_FAIL_MANY_NS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static FTS_FAIL_MANY_NS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 /// FTS partial-failure injection for `create_many` — returns `Ok(BatchWriteSummary)`
 /// with `failed > 0` so that the `summary.failed > 0` rollback branch is exercised.
 /// Distinct from `FTS_FAIL_MANY_NS` which injects a hard `Err`.
 #[cfg(any(test, feature = "fault-injection"))]
-static FTS_FAIL_MANY_PARTIAL_NS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static FTS_FAIL_MANY_PARTIAL_NS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 /// Non-parser FTS *search*-leg failure injection for `search_notes`: distinct
 /// from `FTS_FAIL_NS` (which injects at the FTS *upsert*/write step of
 /// `create_note_inner`). Injects a `StorageError::Timeout` at the `search()`
@@ -125,11 +130,12 @@ pub fn arm_fts_fail(ns: &str) {
 ///
 /// The next `create_many` call whose namespace equals `ns` returns an injected
 /// error at the FTS upsert step (after entity rows are committed), then disarms.
-/// Calls on other namespaces are unaffected.
+/// Calls on other namespaces are unaffected, and concurrent arms of distinct
+/// namespaces do not overwrite each other.
 /// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
 #[cfg(any(test, feature = "fault-injection"))]
 pub fn arm_fts_fail_many(ns: &str) {
-    *FTS_FAIL_MANY_NS.lock().unwrap() = Some(ns.to_string());
+    FTS_FAIL_MANY_NS.lock().unwrap().insert(ns.to_string());
 }
 
 /// Arm the FTS *partial*-failure injection for `create_many` targeting namespace `ns`.
@@ -137,11 +143,15 @@ pub fn arm_fts_fail_many(ns: &str) {
 /// The next `create_many` call whose namespace equals `ns` returns
 /// `Ok(BatchWriteSummary { attempted: 2, affected: 1, failed: 1, ... })` from the
 /// FTS upsert step, exercising the `summary.failed > 0` rollback branch (as opposed
-/// to the hard-`Err` branch exercised by `arm_fts_fail_many`).  Then disarms.
+/// to the hard-`Err` branch exercised by `arm_fts_fail_many`). Then disarms only
+/// that namespace's entry.
 /// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
 #[cfg(any(test, feature = "fault-injection"))]
 pub fn arm_fts_fail_many_partial(ns: &str) {
-    *FTS_FAIL_MANY_PARTIAL_NS.lock().unwrap() = Some(ns.to_string());
+    FTS_FAIL_MANY_PARTIAL_NS
+        .lock()
+        .unwrap()
+        .insert(ns.to_string());
 }
 
 /// Arm a non-parser FTS *search*-leg failure injection for `search_notes` targeting
@@ -162,11 +172,12 @@ pub fn arm_fts_search_fail(ns: &str) {
 ///
 /// The next `create_note` call whose note namespace equals `ns` returns an injected
 /// error at the first vector insert step, then disarms.  Calls on other namespaces
-/// are unaffected.
+/// are unaffected, and concurrent arms of distinct namespaces do not overwrite
+/// each other.
 /// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
 #[cfg(any(test, feature = "fault-injection"))]
 pub fn arm_vector_fail(ns: &str) {
-    *VECTOR_FAIL_NS.lock().unwrap() = Some(ns.to_string());
+    VECTOR_FAIL_NS.lock().unwrap().insert(ns.to_string());
 }
 
 /// Failure injection for `delete_note_row_first_for_compensation`'s post-row-removal
@@ -192,6 +203,7 @@ pub fn arm_rollback_cleanup_fail(ns: &str) {
 pub struct NoteSearchHit {
     pub note_id: Uuid,
     pub score: DeterministicScore,
+    pub source: crate::SearchSource,
     pub title: Option<String>,
     pub snippet: Option<String>,
 }
@@ -446,8 +458,8 @@ fn accepted_pack_relations_for_pattern_entities(
 /// parallel table — issue #543 precedent, applied to GQL query-pattern hint
 /// derivation (issue #593).
 ///
-/// Pack rules are skipped for `crate::pack::SPECIAL_RELATIONS` (supersedes /
-/// supports / refutes): the live validator's special-relation branch
+/// Pack rules are skipped when `crate::pack::is_special_relation` is true
+/// (supersedes / supports / refutes): the live validator's special-relation branch
 /// (`validate_edge_relation_endpoints`, this file) resolves those relations
 /// before `pack_rule_allows` is ever reached, so a pack `EDGE_RULES` entry for
 /// one of them is never actually enforced (see `pack.rs`'s
@@ -460,7 +472,7 @@ fn accepted_entity_kind_pairs_for_relation(
     for src in khive_types::EntityKind::ALL {
         for tgt in khive_types::EntityKind::ALL {
             let allowed = base_entity_rule_allows(src.name(), relation, tgt.name())
-                || (!crate::pack::SPECIAL_RELATIONS.contains(&relation)
+                || (!crate::pack::is_special_relation(relation)
                     && accepted_pack_relations_for_pattern_entities(
                         pack_rules,
                         src.name(),
@@ -492,10 +504,15 @@ fn accepted_entity_kind_pairs_for_relation(
 /// `supports` / `refutes` (see [`accepted_entity_kind_pairs_for_relation`]):
 /// pack rules never make those triples possible, only the base allowlist does.
 fn static_impossible_edge_pattern_warnings(
+    language: khive_query::QueryLanguage,
     pattern: &khive_query::ast::MatchPattern,
     pack_rules: &[EdgeEndpointRule],
 ) -> Vec<String> {
     use khive_query::ast::{EdgeDirection, PatternElement};
+
+    if language != khive_query::QueryLanguage::Gql {
+        return Vec::new();
+    }
 
     let elements = &pattern.elements;
     let mut warnings = Vec::new();
@@ -531,7 +548,7 @@ fn static_impossible_edge_pattern_warnings(
         };
 
         let possible = base_entity_rule_allows(src_kind.name(), relation, tgt_kind.name())
-            || (!crate::pack::SPECIAL_RELATIONS.contains(&relation)
+            || (!crate::pack::is_special_relation(relation)
                 && accepted_pack_relations_for_pattern_entities(
                     pack_rules,
                     src_kind.name(),
@@ -850,6 +867,99 @@ fn note_props_match(note_props: Option<&serde_json::Value>, filter: &serde_json:
         .all(|(k, v)| actual.get(k).is_some_and(|av| av == v))
 }
 
+/// Collapse per-namespace `GraphPath`s from [`KhiveRuntime::traverse`] down to
+/// exactly one entry per distinct `root_id`.
+///
+/// `traverse` queries every namespace in the token's visible set
+/// independently — including namespaces that don't own the root at all,
+/// which still contribute a root-only entry when `include_roots` is set —
+/// and each of those per-namespace calls already enforces `limit` on its own
+/// results. Concatenating them naively before this function would let a root
+/// visible in N namespaces return up to N * limit nodes, would keep
+/// whichever namespace's copy of a shared node happened to arrive first
+/// (wrong depth/`via_edge` when that wasn't the shortest path, and
+/// non-BFS ordering), and would rebuild a seen-set from scratch per
+/// namespace (quadratic in namespace count).
+///
+/// This merges by `(root_id, node_id)` keeping the node's shallowest depth
+/// and the `via_edge` that produced it (first-namespace-processed wins ties
+/// at equal depth — namespace processing order is deterministic but which
+/// tied edge is "more correct" is not otherwise decidable), reorders the
+/// merged result BFS-style (ascending depth), and re-applies `limit` to the
+/// merged non-root node count so the response honors the contract each
+/// individual namespace call already tried to.
+fn merge_traversal_paths_by_root(paths: Vec<GraphPath>, limit: Option<u32>) -> Vec<GraphPath> {
+    let mut order: Vec<Uuid> = Vec::new();
+    let mut merged: HashMap<Uuid, GraphPath> = HashMap::new();
+    // root_id -> (node_id -> index into merged[root_id].nodes), so a
+    // shallower depth for an already-seen node updates in place instead of
+    // rebuilding a seen-set from every prior namespace's contribution.
+    let mut node_index: HashMap<Uuid, HashMap<Uuid, usize>> = HashMap::new();
+
+    for path in paths {
+        let existing = merged.entry(path.root_id).or_insert_with(|| {
+            order.push(path.root_id);
+            GraphPath {
+                root_id: path.root_id,
+                nodes: Vec::new(),
+                total_weight: 0.0,
+            }
+        });
+        let index = node_index.entry(path.root_id).or_default();
+        for node in path.nodes {
+            match index.get(&node.node_id) {
+                Some(&i) => {
+                    if node.depth < existing.nodes[i].depth {
+                        existing.nodes[i] = node;
+                    }
+                }
+                None => {
+                    index.insert(node.node_id, existing.nodes.len());
+                    existing.nodes.push(node);
+                }
+            }
+        }
+    }
+
+    order
+        .into_iter()
+        .filter_map(|root_id| merged.remove(&root_id))
+        .map(|mut path| {
+            // BFS order: ascending depth, stable within a depth.
+            path.nodes.sort_by_key(|n| n.depth);
+            if let Some(lim) = limit {
+                let lim = lim as usize;
+                let mut non_root_kept = 0usize;
+                path.nodes.retain(|n| {
+                    if n.depth == 0 {
+                        return true;
+                    }
+                    if non_root_kept < lim {
+                        non_root_kept += 1;
+                        true
+                    } else {
+                        false
+                    }
+                });
+            }
+            recompute_total_weight(&mut path);
+            path
+        })
+        .collect()
+}
+
+/// Set `total_weight` to the maximum cumulative path weight among the nodes
+/// the path currently holds, matching how storage derives it for a
+/// single-namespace traversal.
+///
+/// Call this after any edit to `nodes`. Carrying a weight across an edit is
+/// what lets the field describe a node the caller was never shown: the
+/// highest-weighted candidate is exactly the one a `limit` or a
+/// soft-delete screen can remove while the summary keeps quoting it.
+fn recompute_total_weight(path: &mut GraphPath) {
+    path.total_weight = path.nodes.iter().map(|n| n.weight).fold(0.0_f64, f64::max);
+}
+
 impl KhiveRuntime {
     // ---- Entity operations ----
 
@@ -940,15 +1050,7 @@ impl KhiveRuntime {
                 .await;
 
             #[cfg(any(test, feature = "fault-injection"))]
-            let vec_inject = {
-                let mut g = VECTOR_FAIL_NS.lock().unwrap();
-                if g.as_deref() == Some(ns) {
-                    *g = None;
-                    true
-                } else {
-                    false
-                }
-            };
+            let vec_inject = VECTOR_FAIL_NS.lock().unwrap().remove(ns);
             #[cfg(not(any(test, feature = "fault-injection")))]
             let vec_inject = false;
             let vec_result: RuntimeResult<Vec<f32>> = if vec_inject {
@@ -1001,20 +1103,37 @@ impl KhiveRuntime {
             // with inserted_models tracking for rollback on partial failure.
             let rt_clone = self.clone();
             let body_owned = embed_body.clone();
+            let usage_ctx = crate::usage::current();
             let mut handles = Vec::with_capacity(embed_model_names.len());
             for model_name in &embed_model_names {
                 let rt = rt_clone.clone();
                 let text = body_owned.clone();
                 let name = model_name.clone();
+                let ctx = usage_ctx.clone();
                 handles.push(tokio::spawn(async move {
-                    rt.embed_document_with_model(&name, &text).await
+                    let fut = rt.embed_document_with_model(&name, &text);
+                    match ctx {
+                        Some(ctx) => crate::usage::scope(ctx, fut).await,
+                        None => fut.await,
+                    }
                 }));
             }
-            let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(embed_model_names.len());
+            // Await every handle before inspecting any result. Each handle holds a
+            // clone of the dispatch's UsageContext (ADR-103 Amendment 2); returning
+            // early on the first error would leave later handles un-awaited, so
+            // their embed tasks keep running (and incrementing embed_calls) after
+            // this function has already returned — the usage snapshot must never
+            // observe a task the dispatch didn't wait for.
+            let mut join_results = Vec::with_capacity(handles.len());
             for handle in handles {
-                let join_result = handle
-                    .await
-                    .map_err(|e| RuntimeError::Internal(format!("embed task panicked: {e}")));
+                join_results.push(
+                    handle
+                        .await
+                        .map_err(|e| RuntimeError::Internal(format!("embed task panicked: {e}"))),
+                );
+            }
+            let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(embed_model_names.len());
+            for join_result in join_results {
                 match join_result {
                     Err(e) => {
                         if let Ok(store) = self.entities(token) {
@@ -1491,10 +1610,7 @@ impl KhiveRuntime {
                     "link target {target_id} not found"
                 )));
             }
-        } else if matches!(
-            relation,
-            EdgeRelation::Supersedes | EdgeRelation::Supports | EdgeRelation::Refutes
-        ) {
+        } else if crate::pack::is_special_relation(relation) {
             // supersedes / supports / refutes: same-substrate only (note→note or entity→entity).
             // Event and edge endpoints are invalid regardless of the other endpoint.
             // Endpoint resolution is by-ID and namespace-agnostic.
@@ -1703,10 +1819,7 @@ impl KhiveRuntime {
             return Ok(());
         }
 
-        if matches!(
-            relation,
-            EdgeRelation::Supersedes | EdgeRelation::Supports | EdgeRelation::Refutes
-        ) {
+        if crate::pack::is_special_relation(relation) {
             let rel_name = relation.as_str();
             let src = src.ok_or_else(|| {
                 RuntimeError::NotFound(format!("link source {source_id} not found"))
@@ -2303,6 +2416,10 @@ impl KhiveRuntime {
             let mut ns_paths = self.graph(&temp)?.traverse(request.clone()).await?;
             paths.append(&mut ns_paths);
         }
+        // Reconcile the per-namespace GraphPaths back down to one per
+        // distinct root_id (see merge_traversal_paths_by_root for why this
+        // is needed and what it enforces).
+        let mut paths = merge_traversal_paths_by_root(paths, request.options.limit);
         self.enrich_path_nodes(token, &mut paths, request.include_properties)
             .await;
         // Filter out soft-deleted entity nodes from all path nodes.
@@ -2314,6 +2431,7 @@ impl KhiveRuntime {
         if !deleted.is_empty() {
             for path in paths.iter_mut() {
                 path.nodes.retain(|n| !deleted.contains(&n.node_id));
+                recompute_total_weight(path);
             }
             paths.retain(|p| !p.nodes.is_empty());
         }
@@ -2466,7 +2584,16 @@ impl KhiveRuntime {
     }
 
     /// Populate `name` and `kind` on each `PathNode` from the corresponding
-    /// entity record. Same best-effort policy as `enrich_neighbor_hits`.
+    /// entity record.
+    ///
+    /// Unlike `enrich_neighbor_hits`, this is entity-only by design: it does
+    /// not fall back to a note lookup for IDs that aren't entities.
+    /// A traversal can still reach note nodes (e.g. via an `annotates`
+    /// edge) — they are not filtered out of `GraphPath::nodes` — but they are
+    /// left with `name = None, kind = None` rather than resolved. Widening
+    /// this to notes would change every existing caller's enriched output
+    /// for note-reaching traversals, so it stays scoped to entities until
+    /// that is an intentional product decision.
     ///
     /// Uses `get_entities_by_ids_visible` so that path nodes whose entities
     /// live in extra-visible namespaces are enriched correctly. Node IDs that
@@ -2922,15 +3049,7 @@ impl KhiveRuntime {
             // the cfg(not) branch is a const false eliminating the if-branch.
             #[cfg(any(test, feature = "fault-injection"))]
             let vec_inject = {
-                let ns_inject = {
-                    let mut g = VECTOR_FAIL_NS.lock().unwrap();
-                    if g.as_deref() == Some(ns) {
-                        *g = None;
-                        true
-                    } else {
-                        false
-                    }
-                };
+                let ns_inject = VECTOR_FAIL_NS.lock().unwrap().remove(ns);
                 let count_inject = VECTOR_FAIL_AFTER.with(|cell| match cell.get() {
                     Some(0) => {
                         cell.set(None);
@@ -2985,20 +3104,37 @@ impl KhiveRuntime {
             // then insert one VectorRecord per model.
             let rt_clone = self.clone();
             let content_owned = embed_text.to_string();
+            let usage_ctx = crate::usage::current();
             let mut handles = Vec::with_capacity(embed_model_names.len());
             for model_name in &embed_model_names {
                 let rt = rt_clone.clone();
                 let text = content_owned.clone();
                 let name = model_name.clone();
+                let ctx = usage_ctx.clone();
                 handles.push(tokio::spawn(async move {
-                    rt.embed_document_with_model(&name, &text).await
+                    let fut = rt.embed_document_with_model(&name, &text);
+                    match ctx {
+                        Some(ctx) => crate::usage::scope(ctx, fut).await,
+                        None => fut.await,
+                    }
                 }));
             }
-            let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(embed_model_names.len());
+            // Await every handle before inspecting any result. Each handle holds a
+            // clone of the dispatch's UsageContext (ADR-103 Amendment 2); returning
+            // early on the first error would leave later handles un-awaited, so
+            // their embed tasks keep running (and incrementing embed_calls) after
+            // this function has already returned — the usage snapshot must never
+            // observe a task the dispatch didn't wait for.
+            let mut join_results = Vec::with_capacity(handles.len());
             for handle in handles {
-                let join_result = handle
-                    .await
-                    .map_err(|e| RuntimeError::Internal(format!("embed task panicked: {e}")));
+                join_results.push(
+                    handle
+                        .await
+                        .map_err(|e| RuntimeError::Internal(format!("embed task panicked: {e}"))),
+                );
+            }
+            let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(embed_model_names.len());
+            for join_result in join_results {
                 match join_result {
                     Err(e) => {
                         // Compensate note row + FTS (no vectors inserted yet).
@@ -3301,6 +3437,7 @@ impl KhiveRuntime {
                 .await
         };
 
+        crate::usage::count(crate::usage::UsageUnit::FtsPasses, 1);
         let text_hits = crate::error::fts_text_leg_or_err(
             text_search_result.map_err(RuntimeError::from),
             "search_notes",
@@ -3419,6 +3556,7 @@ impl KhiveRuntime {
                 Some(NoteSearchHit {
                     note_id: hit.entity_id,
                     score: weighted,
+                    source: hit.source,
                     title: hit.title.or_else(|| note_title(note)),
                     snippet: hit.snippet.or_else(|| note_snippet(note)),
                 })
@@ -4027,6 +4165,11 @@ pub struct QueryResult {
     pub rows: Vec<SqlRow>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    /// `true` when the server-side row cap bound this result — `rows` is a
+    /// prefix of the true match set, not the whole thing (#1168, #1247). A
+    /// structural flag so a caller can detect an incomplete result without
+    /// parsing the human-oriented `warnings` text.
+    pub truncated: bool,
 }
 
 impl KhiveRuntime {
@@ -4054,7 +4197,7 @@ impl KhiveRuntime {
         use khive_query::QueryValue;
         use khive_storage::types::SqlValue;
 
-        let ast = khive_query::parse_auto(query)?;
+        let (language, ast) = khive_query::language::parse_auto_with_language(query)?;
         opts.scopes = token
             .visible_namespaces()
             .iter()
@@ -4064,23 +4207,9 @@ impl KhiveRuntime {
         let mut warnings = compiled.warnings;
         let truncation_check = compiled.truncation_check;
 
-        // Static schema-mismatch hint (issue #593): GQL-only by design — the
-        // hint is worded around GQL's `(kind)-[:relation]->(kind)` syntax, so
-        // it is scoped out of SPARQL even though SPARQL compiles to the same
-        // `MatchPattern` shape. Dialect is detected the same way `parse_auto`
-        // selects it, since neither the AST nor `CompiledQuery` retains it.
-        let is_sparql = query
-            .trim()
-            .as_bytes()
-            .get(..6)
-            .is_some_and(|p| p.eq_ignore_ascii_case(b"SELECT"));
-        if !is_sparql {
-            let pack_rules = self.pack_edge_rules();
-            warnings.extend(static_impossible_edge_pattern_warnings(
-                &ast.pattern,
-                &pack_rules,
-            ));
-        }
+        warnings.extend(self.with_pack_edge_rules(|pack_rules| {
+            static_impossible_edge_pattern_warnings(language, &ast.pattern, pack_rules)
+        }));
 
         // Convert QueryValue params (query-layer type) to SqlValue (storage-layer type)
         // at the query–storage boundary.
@@ -4109,25 +4238,39 @@ impl KhiveRuntime {
         // result set — not the requested LIMIT — is the truncation signal
         // (a `LIMIT 1000` that only matches 20 rows must not warn, and a
         // query with no `LIMIT` that matches 501+ rows must).
+        let mut truncated = false;
         if let Some(check) = truncation_check {
             if rows.len() > check.max_limit {
                 rows.truncate(check.max_limit);
+                truncated = true;
+                // GQL has no SKIP/OFFSET/ORDER BY today (#1168) — the prior
+                // wording here recommended a paging path that does not exist.
+                // `truncated` is the structural signal (#1247); this message
+                // stays prose-only context for a human reader.
                 warnings.push(match check.requested_limit {
                     Some(requested) => format!(
                         "result set capped at {} rows; requested limit {requested} exceeds the \
-                         cap — use LIMIT/OFFSET to page through the remaining results",
+                         cap. This query language does not support SKIP/OFFSET paging yet — \
+                         check the `truncated` field, not this message, to detect an incomplete \
+                         result programmatically.",
                         check.max_limit
                     ),
                     None => format!(
                         "result set capped at {} rows; more than {} rows matched with no LIMIT \
-                         clause — use LIMIT/OFFSET to page through the remaining results",
+                         clause. This query language does not support SKIP/OFFSET paging yet — \
+                         check the `truncated` field, not this message, to detect an incomplete \
+                         result programmatically.",
                         check.max_limit, check.max_limit
                     ),
                 });
             }
         }
 
-        Ok(QueryResult { rows, warnings })
+        Ok(QueryResult {
+            rows,
+            warnings,
+            truncated,
+        })
     }
 
     /// Soft-delete or hard-delete an entity by ID (soft delete by default).
@@ -5123,30 +5266,14 @@ impl KhiveRuntime {
         let docs: Vec<_> = entities.iter().map(entity_fts_document).collect();
 
         #[cfg(any(test, feature = "fault-injection"))]
-        let fts_many_inject = {
-            let mut g = FTS_FAIL_MANY_NS.lock().unwrap();
-            if g.as_deref() == Some(ns) {
-                *g = None;
-                true
-            } else {
-                false
-            }
-        };
+        let fts_many_inject = FTS_FAIL_MANY_NS.lock().unwrap().remove(ns);
         #[cfg(not(any(test, feature = "fault-injection")))]
         let fts_many_inject = false;
 
         // Partial-failure seam: returns Ok(summary) with failed > 0 so the
         // `summary.failed > 0` rollback branch is exercised in tests.
         #[cfg(any(test, feature = "fault-injection"))]
-        let fts_many_inject_partial = {
-            let mut g = FTS_FAIL_MANY_PARTIAL_NS.lock().unwrap();
-            if g.as_deref() == Some(ns) {
-                *g = None;
-                true
-            } else {
-                false
-            }
-        };
+        let fts_many_inject_partial = FTS_FAIL_MANY_PARTIAL_NS.lock().unwrap().remove(ns);
         #[cfg(not(any(test, feature = "fault-injection")))]
         let fts_many_inject_partial = false;
 
@@ -5323,6 +5450,95 @@ mod tests {
         async fn build(&self) -> crate::error::RuntimeResult<Arc<dyn EmbeddingService>> {
             self.build_count.fetch_add(1, Ordering::SeqCst);
             Ok(Arc::new(ConstVecService { dims: self.dims }))
+        }
+    }
+
+    /// Embedding service that sleeps briefly before returning, so its spawned
+    /// embed task is still in flight when a sibling model's task resolves
+    /// first — used to exercise the drain-before-return invariant on the
+    /// multi-model embed fan-out.
+    struct SlowVecService {
+        dims: usize,
+    }
+
+    #[async_trait]
+    impl EmbeddingService for SlowVecService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            Ok(texts.iter().map(|_| vec![1.0_f32; self.dims]).collect())
+        }
+
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "slow-vec"
+        }
+    }
+
+    struct SlowVecProvider {
+        provider_name: String,
+        dims: usize,
+    }
+
+    impl SlowVecProvider {
+        fn new(name: &str, dims: usize) -> Self {
+            Self {
+                provider_name: name.to_owned(),
+                dims,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl EmbedderProvider for SlowVecProvider {
+        fn name(&self) -> &str {
+            &self.provider_name
+        }
+
+        fn dimensions(&self) -> usize {
+            self.dims
+        }
+
+        async fn build(&self) -> crate::error::RuntimeResult<Arc<dyn EmbeddingService>> {
+            Ok(Arc::new(SlowVecService { dims: self.dims }))
+        }
+    }
+
+    /// Embedder provider whose `build()` always fails immediately — models
+    /// this provider's embed task resolving (with an error) well before a
+    /// slower sibling model's task completes.
+    struct FailFastProvider {
+        provider_name: String,
+    }
+
+    impl FailFastProvider {
+        fn new(name: &str) -> Self {
+            Self {
+                provider_name: name.to_owned(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl EmbedderProvider for FailFastProvider {
+        fn name(&self) -> &str {
+            &self.provider_name
+        }
+
+        fn dimensions(&self) -> usize {
+            4
+        }
+
+        async fn build(&self) -> crate::error::RuntimeResult<Arc<dyn EmbeddingService>> {
+            Err(RuntimeError::Internal(
+                "injected embed build failure".to_string(),
+            ))
         }
     }
 
@@ -9688,7 +9904,7 @@ mod tests {
     // Inject a vector insertion failure after note row + FTS commit and assert
     // both the note row and the FTS document are removed (no stranded rows).
     // Uses a unique namespace (see create_note_fts_failure_rolls_back_note_row)
-    // so the process-global VECTOR_FAIL_NS flag is consumed only by this test.
+    // so only this test consumes its VECTOR_FAIL_NS entry.
     // Since the single registered provider fires embed_document before the
     // injection check, the injection converts the successful embedding into an
     // error just before the VectorStore insert, then disarms.
@@ -9733,6 +9949,57 @@ mod tests {
         assert!(
             notes.is_empty(),
             "compensation must remove note row after vector failure; got {notes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn vector_failure_injections_for_distinct_namespaces_do_not_overwrite_each_other() {
+        const MODEL: &str = "test-vec-inject-distinct-namespaces";
+        const DIMS: usize = 4;
+
+        let rt_a = KhiveRuntime::memory().unwrap();
+        let (provider_a, _counter_a) = ConstVecProvider::new(MODEL, DIMS);
+        rt_a.register_embedder(provider_a);
+        let ns_a = Namespace::parse("fault-vec-distinct-a").unwrap();
+        let tok_a = NamespaceToken::for_namespace(ns_a.clone());
+
+        let rt_b = KhiveRuntime::memory().unwrap();
+        let (provider_b, _counter_b) = ConstVecProvider::new(MODEL, DIMS);
+        rt_b.register_embedder(provider_b);
+        let ns_b = Namespace::parse("fault-vec-distinct-b").unwrap();
+        let tok_b = NamespaceToken::for_namespace(ns_b.clone());
+
+        arm_vector_fail(ns_a.as_str());
+        arm_vector_fail(ns_b.as_str());
+
+        let (result_a, result_b) = tokio::join!(
+            rt_a.create_note(
+                &tok_a,
+                "observation",
+                None,
+                "vector failure target A",
+                None,
+                None,
+                vec![],
+            ),
+            rt_b.create_note(
+                &tok_b,
+                "observation",
+                None,
+                "vector failure target B",
+                None,
+                None,
+                vec![],
+            ),
+        );
+
+        assert!(
+            result_a.is_err(),
+            "namespace A must retain its pending vector failure injection"
+        );
+        assert!(
+            result_b.is_err(),
+            "namespace B must retain its pending vector failure injection"
         );
     }
 
@@ -10610,8 +10877,7 @@ mod tests {
     // error; the test asserts zero rows in both `entities` and `fts_entities`.
     #[tokio::test]
     async fn create_many_fts_failure_rolls_back_both_substrates() {
-        // Use a unique namespace so the process-global one-shot is unaffected by
-        // other concurrent tests.
+        // Use a unique namespace so only this test consumes its failure entry.
         let ns = format!("fts-fail-many-{}", uuid::Uuid::new_v4().as_simple());
         let rt = rt();
         let tok = NamespaceToken::for_namespace(Namespace::parse(&ns).unwrap());
@@ -10664,6 +10930,54 @@ mod tests {
         assert_eq!(
             fts_count, 0,
             "fts_entities must be empty after FTS-failure rollback; found {fts_count}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_many_fts_failure_injections_for_distinct_namespaces_do_not_overwrite_each_other(
+    ) {
+        let rt_a = rt();
+        let ns_a = Namespace::parse("fts-fail-many-distinct-a").unwrap();
+        let tok_a = NamespaceToken::for_namespace(ns_a.clone());
+        let rt_b = rt();
+        let ns_b = Namespace::parse("fts-fail-many-distinct-b").unwrap();
+        let tok_b = NamespaceToken::for_namespace(ns_b.clone());
+
+        arm_fts_fail_many(ns_a.as_str());
+        arm_fts_fail_many(ns_b.as_str());
+
+        let (result_a, result_b) = tokio::join!(
+            rt_a.create_many(
+                &tok_a,
+                vec![EntityCreateSpec {
+                    kind: "concept".into(),
+                    entity_type: None,
+                    name: "FtsFailureTargetA".into(),
+                    description: None,
+                    properties: None,
+                    tags: vec![],
+                }],
+            ),
+            rt_b.create_many(
+                &tok_b,
+                vec![EntityCreateSpec {
+                    kind: "concept".into(),
+                    entity_type: None,
+                    name: "FtsFailureTargetB".into(),
+                    description: None,
+                    properties: None,
+                    tags: vec![],
+                }],
+            ),
+        );
+
+        assert!(
+            result_a.is_err(),
+            "namespace A must retain its pending create_many FTS failure injection"
+        );
+        assert!(
+            result_b.is_err(),
+            "namespace B must retain its pending create_many FTS failure injection"
         );
     }
 
@@ -10729,6 +11043,54 @@ mod tests {
         assert_eq!(
             fts_count, 0,
             "fts_entities must be empty after partial-FTS-failure rollback; found {fts_count}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_many_fts_partial_failure_injections_for_distinct_namespaces_do_not_overwrite_each_other(
+    ) {
+        let rt_a = rt();
+        let ns_a = Namespace::parse("fts-fail-many-partial-distinct-a").unwrap();
+        let tok_a = NamespaceToken::for_namespace(ns_a.clone());
+        let rt_b = rt();
+        let ns_b = Namespace::parse("fts-fail-many-partial-distinct-b").unwrap();
+        let tok_b = NamespaceToken::for_namespace(ns_b.clone());
+
+        arm_fts_fail_many_partial(ns_a.as_str());
+        arm_fts_fail_many_partial(ns_b.as_str());
+
+        let (result_a, result_b) = tokio::join!(
+            rt_a.create_many(
+                &tok_a,
+                vec![EntityCreateSpec {
+                    kind: "concept".into(),
+                    entity_type: None,
+                    name: "FtsPartialFailureTargetA".into(),
+                    description: None,
+                    properties: None,
+                    tags: vec![],
+                }],
+            ),
+            rt_b.create_many(
+                &tok_b,
+                vec![EntityCreateSpec {
+                    kind: "concept".into(),
+                    entity_type: None,
+                    name: "FtsPartialFailureTargetB".into(),
+                    description: None,
+                    properties: None,
+                    tags: vec![],
+                }],
+            ),
+        );
+
+        assert!(
+            result_a.is_err(),
+            "namespace A must retain its pending create_many partial FTS failure injection"
+        );
+        assert!(
+            result_b.is_err(),
+            "namespace B must retain its pending create_many partial FTS failure injection"
         );
     }
 
@@ -10818,6 +11180,186 @@ mod tests {
             )
             .await;
         assert!(result.is_ok(), "traverse must not error; got {:?}", result);
+    }
+
+    // ── Single root visible in multiple namespaces must yield exactly one
+    //    traversal object (see merge_traversal_paths_by_root) ─────────────
+    #[tokio::test]
+    async fn traverse_single_root_across_visible_namespaces_yields_one_path() {
+        use khive_storage::types::TraversalOptions;
+
+        let rt = rt();
+        let owner = NamespaceToken::for_namespace(Namespace::parse("owner-ns").unwrap());
+        let a = rt
+            .create_entity(&owner, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(&owner, "concept", None, "B", None, None, vec![])
+            .await
+            .unwrap();
+        rt.link(&owner, a.id, b.id, EdgeRelation::Extends, 1.0, None)
+            .await
+            .unwrap();
+
+        // Token whose primary namespace ("caller-ns") does not own the root,
+        // but whose visible set also includes "owner-ns" (where the root and
+        // its edge actually live) — the shape produced by pack.rs always
+        // widening visibility to include `local`.
+        let caller = NamespaceToken::mint_with_visibility(
+            Namespace::parse("caller-ns").unwrap(),
+            vec![Namespace::parse("owner-ns").unwrap()],
+            ActorRef::anonymous(),
+        );
+        assert_eq!(caller.visible_namespaces().len(), 2);
+
+        let result = rt
+            .traverse(
+                &caller,
+                TraversalRequest {
+                    roots: vec![a.id],
+                    options: TraversalOptions {
+                        max_depth: 1,
+                        direction: Direction::Out,
+                        ..Default::default()
+                    },
+                    include_roots: true,
+                    include_properties: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.len(),
+            1,
+            "one root visible across 2 namespaces must yield exactly one \
+             GraphPath, got {result:#?}"
+        );
+        assert_eq!(result[0].root_id, a.id);
+        let node_ids: std::collections::HashSet<Uuid> =
+            result[0].nodes.iter().map(|n| n.node_id).collect();
+        assert!(node_ids.contains(&a.id));
+        assert!(
+            node_ids.contains(&b.id),
+            "merged path must retain the neighbor discovered in the owning \
+             namespace, got {result:#?}"
+        );
+    }
+
+    // ── Multi-root traverse: one object per distinct root, including a
+    //    root supplied both as itself and as a duplicate re-resolution ────
+    #[tokio::test]
+    async fn traverse_multi_root_one_path_per_distinct_root() {
+        use khive_storage::types::TraversalOptions;
+
+        let rt = rt();
+        let owner = NamespaceToken::for_namespace(Namespace::parse("owner-ns2").unwrap());
+        let a = rt
+            .create_entity(&owner, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let c = rt
+            .create_entity(&owner, "concept", None, "C", None, None, vec![])
+            .await
+            .unwrap();
+
+        // `a` appears twice in the roots list — this is what the pack
+        // handler produces when a caller passes the same root once as a
+        // short prefix and once as the full UUID: both resolve to the same
+        // `Uuid` value by the time the request reaches the runtime.
+        let result = rt
+            .traverse(
+                &owner,
+                TraversalRequest {
+                    roots: vec![a.id, a.id, c.id],
+                    options: TraversalOptions {
+                        max_depth: 1,
+                        direction: Direction::Out,
+                        ..Default::default()
+                    },
+                    include_roots: true,
+                    include_properties: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        let root_ids: Vec<Uuid> = result.iter().map(|p| p.root_id).collect();
+        assert_eq!(
+            root_ids.len(),
+            2,
+            "duplicate root value must not produce a duplicate GraphPath, got {result:#?}"
+        );
+        assert!(root_ids.contains(&a.id));
+        assert!(root_ids.contains(&c.id));
+    }
+
+    // ── Note-kind nodes reached via traversal appear in the result but are
+    //    never enriched with name/kind (entity-only enrichment, unchanged
+    //    behavior — see `enrich_path_nodes`) ────────────────────────────────
+    //
+    // The recursive SQL walks `graph_edges` without any node-kind
+    // restriction, and the soft-delete screen consults both `entities` and
+    // `notes`, so a note reached via an `annotates` edge is NOT dropped from
+    // the traversal. What it does not get is enrichment: `enrich_path_nodes`
+    // only batch-fetches entities (a deliberate entity-only scope), unlike
+    // `enrich_neighbor_hits` which falls back to a note lookup. This test
+    // pins that documented split rather than changing it.
+    #[tokio::test]
+    async fn traverse_reaches_note_nodes_but_leaves_them_unenriched() {
+        use khive_storage::types::TraversalOptions;
+
+        let rt = rt();
+        let owner = NamespaceToken::for_namespace(Namespace::parse("owner-ns3").unwrap());
+        let a = rt
+            .create_entity(&owner, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let note = rt
+            .create_note(
+                &owner,
+                "observation",
+                None,
+                "note body",
+                None,
+                None,
+                vec![a.id],
+            )
+            .await
+            .unwrap();
+
+        let result = rt
+            .traverse(
+                &owner,
+                TraversalRequest {
+                    roots: vec![a.id],
+                    options: TraversalOptions {
+                        max_depth: 1,
+                        direction: Direction::In,
+                        ..Default::default()
+                    },
+                    include_roots: false,
+                    include_properties: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        let note_node = result[0]
+            .nodes
+            .iter()
+            .find(|n| n.node_id == note.id)
+            .unwrap_or_else(|| panic!("note must be present in traversal nodes, got {result:#?}"));
+        assert_eq!(
+            note_node.name, None,
+            "note enrichment is deliberately entity-only; name stays None"
+        );
+        assert_eq!(
+            note_node.kind, None,
+            "note enrichment is deliberately entity-only; kind stays None"
+        );
     }
 
     // ---- purge cascade must include already-soft-deleted edges ----
@@ -11243,8 +11785,7 @@ mod tests {
     }
 
     // Vector insert failure after entity row + FTS commit rolls back both.
-    // Uses a unique namespace to avoid consuming the VECTOR_FAIL_NS flag from
-    // a concurrent test's create_entity or create_note.
+    // Uses a unique namespace so only this test consumes its VECTOR_FAIL_NS entry.
     #[tokio::test]
     async fn create_entity_vector_failure_rolls_back_entity_row_and_fts() {
         const MODEL: &str = "test-entity-vec-inject";
@@ -11396,6 +11937,215 @@ mod tests {
         assert!(
             hits_b.is_empty(),
             "model-b vector store must be empty after rollback; got {hits_b:?}"
+        );
+    }
+
+    // ADR-103 Amendment 2 regression: multi-model create_entity spawns one
+    // embed task per configured model via tokio::spawn. Task-locals do not
+    // cross a spawn boundary, so each spawned task must re-enter the
+    // dispatch's usage scope explicitly for its embed to be counted.
+    #[tokio::test]
+    async fn create_entity_multi_model_counts_all_executed_embeds() {
+        const DIMS: usize = 4;
+
+        let rt = KhiveRuntime::memory().unwrap();
+        let (provider_a, _ca) = ConstVecProvider::new("usage-entity-model-a", DIMS);
+        let (provider_b, _cb) = ConstVecProvider::new("usage-entity-model-b", DIMS);
+        rt.register_embedder(provider_a);
+        rt.register_embedder(provider_b);
+
+        let ns = Namespace::parse("usage-entity-multi").unwrap();
+        let tok = NamespaceToken::for_namespace(ns.clone());
+
+        let ctx = crate::usage::UsageContext::new();
+        crate::usage::scope(ctx.clone(), async {
+            rt.create_entity(
+                &tok,
+                "concept",
+                None,
+                "usage-counted entity",
+                Some("description so embed body is non-empty"),
+                None,
+                vec![],
+            )
+            .await
+        })
+        .await
+        .expect("create_entity must succeed");
+
+        let snap = ctx.snapshot();
+        assert_eq!(
+            snap["embed_calls"], 2,
+            "both configured models' executed embeds must be counted; got {snap:?}"
+        );
+    }
+
+    // Same regression for the note create path's multi-model embed fan-out.
+    #[tokio::test]
+    async fn create_note_multi_model_counts_all_executed_embeds() {
+        const DIMS: usize = 4;
+
+        let rt = KhiveRuntime::memory().unwrap();
+        let (provider_a, _ca) = ConstVecProvider::new("usage-note-model-a", DIMS);
+        let (provider_b, _cb) = ConstVecProvider::new("usage-note-model-b", DIMS);
+        rt.register_embedder(provider_a);
+        rt.register_embedder(provider_b);
+
+        let ns = Namespace::parse("usage-note-multi").unwrap();
+        let tok = NamespaceToken::for_namespace(ns.clone());
+
+        let ctx = crate::usage::UsageContext::new();
+        crate::usage::scope(ctx.clone(), async {
+            rt.create_note(
+                &tok,
+                "observation",
+                None,
+                "usage-counted note body",
+                None,
+                None,
+                vec![],
+            )
+            .await
+        })
+        .await
+        .expect("create_note must succeed");
+
+        let snap = ctx.snapshot();
+        assert_eq!(
+            snap["embed_calls"], 2,
+            "both configured models' executed embeds must be counted; got {snap:?}"
+        );
+    }
+
+    // ADR-103 Amendment 2 regression: when one of several spawned embed tasks
+    // errors, create_entity must drain (await) every remaining handle before
+    // returning — each handle holds a clone of the dispatch's UsageContext, so
+    // an un-awaited handle keeps running and can increment embed_calls after
+    // the response has already gone out, making the counter nondeterministic.
+    // The fail-fast model resolves (with an error) first; the slow model's
+    // task is still in flight at that point — the drain must wait for it too.
+    #[tokio::test]
+    async fn create_entity_multi_model_error_drains_all_spawned_embeds_before_returning() {
+        const DIMS: usize = 4;
+
+        let rt = KhiveRuntime::memory().unwrap();
+        rt.register_embedder(FailFastProvider::new("usage-entity-fail-fast"));
+        rt.register_embedder(SlowVecProvider::new("usage-entity-slow", DIMS));
+
+        let ns = Namespace::parse("usage-entity-error-drain").unwrap();
+        let tok = NamespaceToken::for_namespace(ns.clone());
+
+        let ctx = crate::usage::UsageContext::new();
+        let result = crate::usage::scope(ctx.clone(), async {
+            rt.create_entity(
+                &tok,
+                "concept",
+                None,
+                "usage-drain entity",
+                Some("description so embed body is non-empty"),
+                None,
+                vec![],
+            )
+            .await
+        })
+        .await;
+
+        assert!(
+            result.is_err(),
+            "one model failing must fail the whole create_entity call"
+        );
+
+        let snap_immediately_after = ctx.snapshot();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let snap_after_delay = ctx.snapshot();
+
+        assert_eq!(
+            snap_immediately_after, snap_after_delay,
+            "no spawned embed task may still be running after create_entity returns \
+             its error — a late increment means a context-holding handle was left \
+             un-awaited; got immediately_after={snap_immediately_after:?} \
+             after_delay={snap_after_delay:?}"
+        );
+    }
+
+    // Same regression for the note create path's multi-model embed fan-out.
+    #[tokio::test]
+    async fn create_note_multi_model_error_drains_all_spawned_embeds_before_returning() {
+        const DIMS: usize = 4;
+
+        let rt = KhiveRuntime::memory().unwrap();
+        rt.register_embedder(FailFastProvider::new("usage-note-fail-fast"));
+        rt.register_embedder(SlowVecProvider::new("usage-note-slow", DIMS));
+
+        let ns = Namespace::parse("usage-note-error-drain").unwrap();
+        let tok = NamespaceToken::for_namespace(ns.clone());
+
+        let ctx = crate::usage::UsageContext::new();
+        let result = crate::usage::scope(ctx.clone(), async {
+            rt.create_note(
+                &tok,
+                "observation",
+                None,
+                "usage-drain note body",
+                None,
+                None,
+                vec![],
+            )
+            .await
+        })
+        .await;
+
+        assert!(
+            result.is_err(),
+            "one model failing must fail the whole create_note call"
+        );
+
+        let snap_immediately_after = ctx.snapshot();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let snap_after_delay = ctx.snapshot();
+
+        assert_eq!(
+            snap_immediately_after, snap_after_delay,
+            "no spawned embed task may still be running after create_note returns \
+             its error — a late increment means a context-holding handle was left \
+             un-awaited; got immediately_after={snap_immediately_after:?} \
+             after_delay={snap_after_delay:?}"
+        );
+    }
+
+    // Note search must count its FTS5 execution the same way entity
+    // hybrid_search does (retrieval.rs:435) — the search_notes FTS leg was
+    // silently uncounted.
+    #[tokio::test]
+    async fn search_notes_counts_one_fts_pass() {
+        let rt = KhiveRuntime::memory().unwrap();
+        let ns = Namespace::parse("usage-note-search").unwrap();
+        let tok = NamespaceToken::for_namespace(ns.clone());
+
+        rt.create_note(
+            &tok,
+            "observation",
+            None,
+            "usage counted note search body",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create_note must succeed");
+
+        let ctx = crate::usage::UsageContext::new();
+        crate::usage::scope(ctx.clone(), async {
+            rt.search_notes(&tok, "usage counted", None, 10, None, false, &[], None)
+                .await
+        })
+        .await
+        .expect("search_notes must succeed");
+
+        let snap = ctx.snapshot();
+        assert!(
+            snap["fts_passes"].as_u64().unwrap_or(0) >= 1,
+            "note search FTS execution must count fts_passes; got {snap:?}"
         );
     }
 
@@ -12036,7 +12786,146 @@ mod tests {
             name: None,
             kind: None,
             properties: None,
+            weight: 0.0,
         }
+    }
+
+    /// merge_traversal_paths_by_root: three namespaces each contribute the
+    /// same root plus 2 distinct non-root nodes (each namespace already at
+    /// its own `limit`, matching the per-namespace SQL-layer cap). The
+    /// union across namespaces is 6 distinct non-root nodes; the merge must
+    /// re-enforce `limit` on that union rather than passing it through.
+    #[test]
+    fn merge_traversal_paths_reenforces_limit_across_namespaces() {
+        let root = Uuid::new_v4();
+        let path_for = |n: usize| GraphPath {
+            root_id: root,
+            nodes: (0..n).map(|_| path_node(Uuid::new_v4(), 1)).collect(),
+            total_weight: 1.0,
+        };
+
+        let paths = vec![path_for(2), path_for(2), path_for(2)];
+        let merged = merge_traversal_paths_by_root(paths, Some(2));
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            merged[0].nodes.len(),
+            2,
+            "merge must re-enforce limit=2 on the unioned nodes, got {:?}",
+            merged[0].nodes
+        );
+    }
+
+    /// merge_traversal_paths_by_root: a node reachable at different depths
+    /// via two namespaces must report its shallowest depth and the
+    /// `via_edge` that produced that depth, and the merged node order must
+    /// be BFS (ascending depth) rather than the concatenation order of the
+    /// per-namespace inputs.
+    #[test]
+    fn merge_traversal_paths_keeps_shortest_depth_and_bfs_order() {
+        let root = Uuid::new_v4();
+        let shared = Uuid::new_v4();
+        let far_node = Uuid::new_v4();
+        let deep_edge = Uuid::new_v4();
+        let shallow_edge = Uuid::new_v4();
+
+        // Namespace processed first: an unrelated node at depth 1, and the
+        // shared node reached the long way, at depth 4.
+        let ns_first = GraphPath {
+            root_id: root,
+            nodes: vec![
+                path_node(far_node, 1),
+                PathNode {
+                    node_id: shared,
+                    via_edge: Some(deep_edge),
+                    depth: 4,
+                    name: None,
+                    kind: None,
+                    properties: None,
+                    weight: 0.0,
+                },
+            ],
+            total_weight: 1.0,
+        };
+        // Namespace processed second: the same shared node, reached at depth 2.
+        let ns_second = GraphPath {
+            root_id: root,
+            nodes: vec![PathNode {
+                node_id: shared,
+                via_edge: Some(shallow_edge),
+                depth: 2,
+                name: None,
+                kind: None,
+                properties: None,
+                weight: 0.0,
+            }],
+            total_weight: 1.0,
+        };
+
+        let merged = merge_traversal_paths_by_root(vec![ns_first, ns_second], None);
+
+        assert_eq!(merged.len(), 1);
+        let nodes = &merged[0].nodes;
+        assert!(
+            nodes.windows(2).all(|w| w[0].depth <= w[1].depth),
+            "merged nodes must be in BFS (ascending depth) order, got {:?}",
+            nodes
+                .iter()
+                .map(|n| (n.node_id, n.depth))
+                .collect::<Vec<_>>()
+        );
+        let shared_node = nodes
+            .iter()
+            .find(|n| n.node_id == shared)
+            .expect("shared node must survive the merge");
+        assert_eq!(
+            shared_node.depth, 2,
+            "shared node must report its shortest depth across namespaces"
+        );
+        assert_eq!(
+            shared_node.via_edge,
+            Some(shallow_edge),
+            "shared node must carry the via_edge that produced the shortest path"
+        );
+    }
+
+    /// merge_traversal_paths_by_root: `total_weight` must describe the nodes
+    /// the caller is actually handed. The heaviest node here sits deepest, so
+    /// re-applying `limit` to the merged union drops it — and the reported
+    /// weight has to drop with it rather than keep quoting a node that was
+    /// screened out.
+    #[test]
+    fn merge_traversal_paths_total_weight_drops_with_the_node_it_described() {
+        let root = Uuid::new_v4();
+        let weighted = |depth: usize, weight: f64| PathNode {
+            node_id: Uuid::new_v4(),
+            via_edge: None,
+            depth,
+            name: None,
+            kind: None,
+            properties: None,
+            weight,
+        };
+
+        let path = GraphPath {
+            root_id: root,
+            nodes: vec![weighted(1, 0.5), weighted(1, 0.4), weighted(2, 9.0)],
+            total_weight: 9.0,
+        };
+
+        let merged = merge_traversal_paths_by_root(vec![path], Some(2));
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            merged[0].nodes.len(),
+            2,
+            "limit=2 must drop the depth-2 node"
+        );
+        assert_eq!(
+            merged[0].total_weight, 0.5,
+            "total_weight must be the max over surviving nodes, not the 9.0 \
+             carried by the node the limit removed"
+        );
     }
 
     /// enrich_neighbor_hits: entity hit resolved, note hit resolved with

@@ -351,20 +351,34 @@ pub fn build_registry_for_multi_backend_with_db_anchor(
     build_registry_for_multi_backend_inner(base_config, khive_cfg, cli_db_override)
 }
 
-fn build_registry_for_multi_backend_inner(
-    base_config: RuntimeConfig,
-    khive_cfg: &KhiveConfig,
+/// Validate a `--db`/`KHIVE_DB` override against a non-empty `[[backends]]`
+/// declaration WITHOUT opening any backend — the same rule
+/// `build_registry_for_multi_backend_inner` enforces, factored out so a
+/// caller that hasn't yet decided whether it will construct backends in this
+/// process can apply the check up front.
+///
+/// This closes #1226: `kkernel exec`'s daemon-forward fast path (inline ops,
+/// used whenever a warm daemon answers) never called into this guard at all
+/// — only the in-process fallback did — so an inline invocation with a
+/// conflicting override silently forwarded to the daemon's own already-open
+/// backends instead of being rejected, while the same override on
+/// `--ops-file` (always in-process by design) correctly bailed. The two call
+/// forms disagreed about whether the override was legal because only one of
+/// them ever ran this check. Returns `Ok(true)` when the override forces
+/// every backend to in-memory (`:memory:`), `Ok(false)` when there is no
+/// override to apply.
+pub fn validate_db_override_against_backends(
     cli_db_override: Option<&str>,
-) -> anyhow::Result<MultiBackendRegistry> {
-    let backend_count = khive_cfg.backends.len();
-    let force_memory = match cli_db_override {
+    backend_count: usize,
+) -> anyhow::Result<bool> {
+    match cli_db_override {
         Some(":memory:") => {
             tracing::warn!(
                 "--db :memory: (or KHIVE_DB=:memory:) is overriding {backend_count} \
                  configured [[backends]] entries to in-memory storage for this invocation; \
                  khive.toml's declared backend paths will not be used this run"
             );
-            true
+            Ok(true)
         }
         Some(other) => {
             anyhow::bail!(
@@ -376,8 +390,17 @@ fn build_registry_for_multi_backend_inner(
                  this invocation."
             );
         }
-        None => false,
-    };
+        None => Ok(false),
+    }
+}
+
+fn build_registry_for_multi_backend_inner(
+    base_config: RuntimeConfig,
+    khive_cfg: &KhiveConfig,
+    cli_db_override: Option<&str>,
+) -> anyhow::Result<MultiBackendRegistry> {
+    let backend_count = khive_cfg.backends.len();
+    let force_memory = validate_db_override_against_backends(cli_db_override, backend_count)?;
 
     // Open and migrate each declared backend, deduplicating SQLite backends by
     // canonical path (ADR-028 §8).
@@ -996,7 +1019,12 @@ pub fn checkpoint_pool_for(main_backend: &StorageBackend) -> Option<Arc<Connecti
 /// tests) is non-fatal and leaves `KhiveRuntime::blob_store()` unset:
 /// nothing yet consumes it, and forcing a filesystem root onto every
 /// in-memory boot would be a behavior change nobody asked for.
-fn install_resolved_blob_store(
+///
+/// `pub` so `kkernel`'s `exec` local-dispatch fallback server (the
+/// single-backend branch of `build_local_fallback_server`) can install a
+/// `BlobStore` the same way the `serve` boot path does, instead of leaving
+/// `exec`'s in-process runtime without one (khive#1209).
+pub fn install_resolved_blob_store(
     rt: &KhiveRuntime,
     khive_cfg: &KhiveConfig,
     backend: &StorageBackend,
@@ -1443,6 +1471,10 @@ mod tests {
         path
     }
 
+    fn kg_test_packs() -> Vec<String> {
+        vec!["kg".to_string()]
+    }
+
     // The resolver MUST honor config-file `[[engines]]` over RuntimeConfig
     // defaults — otherwise `kkernel reindex` embeds for the wrong model set
     // versus what `kkernel mcp` serves recall from. Regression for PR #8
@@ -1485,7 +1517,7 @@ default = true
             namespace_explicit: false,
             actor_explicit: false,
             no_embed: false,
-            packs: None,
+            packs: Some(kg_test_packs()),
             brain_profile: None,
         })
         .expect("resolve config");
@@ -1536,7 +1568,7 @@ brain_profile = "unrelated"
             namespace_explicit: false,
             actor_explicit: false,
             no_embed: false,
-            packs: None,
+            packs: Some(kg_test_packs()),
             brain_profile: None,
         })
         .expect("resolve config");
@@ -1579,7 +1611,7 @@ brain_profile = "project-profile"
             namespace_explicit: false,
             actor_explicit: false,
             no_embed: false,
-            packs: None,
+            packs: Some(kg_test_packs()),
             brain_profile: None, // no explicit CLI flag
         })
         .expect("resolve config");
@@ -1618,7 +1650,7 @@ default = true
             namespace_explicit: false,
             actor_explicit: false,
             no_embed: false,
-            packs: None,
+            packs: Some(kg_test_packs()),
             brain_profile: None,
         })
         .expect("resolve config");
@@ -1654,7 +1686,7 @@ brain_profile = "project-profile"
             namespace_explicit: false,
             actor_explicit: false,
             no_embed: false,
-            packs: None,
+            packs: Some(kg_test_packs()),
             brain_profile: Some("cli-profile".to_string()), // explicit CLI
         })
         .expect("resolve config");
@@ -1692,7 +1724,7 @@ brain_profile = "project-profile"
             namespace_explicit: true,
             actor_explicit: true,
             no_embed: true,
-            packs: None,
+            packs: Some(kg_test_packs()),
             brain_profile: None,
         })
         .expect("resolve config");
@@ -1731,7 +1763,7 @@ brain_profile = "project-profile"
             namespace_explicit: true,
             actor_explicit: true,
             no_embed: true,
-            packs: None,
+            packs: Some(kg_test_packs()),
             brain_profile: None,
         })
         .expect("resolve no-embed config");
@@ -1764,7 +1796,7 @@ brain_profile = "project-profile"
             namespace_explicit: true,
             actor_explicit: true,
             no_embed: true,
-            packs: None,
+            packs: Some(kg_test_packs()),
             brain_profile: None,
         })
         .expect("resolve config");
@@ -1891,7 +1923,7 @@ brain_profile = "project-profile"
             namespace_explicit: false,
             actor_explicit: false,
             no_embed: true,
-            packs: None,
+            packs: Some(kg_test_packs()),
             brain_profile: None,
         })
         .expect("resolve seat-shaped config");
@@ -1955,7 +1987,7 @@ brain_profile = "project-profile"
             namespace_explicit: false,
             actor_explicit: false,
             no_embed: true,
-            packs: None,
+            packs: Some(kg_test_packs()),
             brain_profile: None,
         })
         .expect("resolve unset-db config");
@@ -1994,7 +2026,7 @@ brain_profile = "project-profile"
             namespace_explicit: true,
             actor_explicit: true,
             no_embed: true,
-            packs: None,
+            packs: Some(kg_test_packs()),
             brain_profile: None,
         })
         .expect("resolve config");
@@ -2032,7 +2064,7 @@ id = "lambda:project-actor"
             namespace_explicit: false,
             actor_explicit: false,
             no_embed: true,
-            packs: None,
+            packs: Some(kg_test_packs()),
             brain_profile: None,
         })
         .expect("resolve config with project actor");
@@ -2046,7 +2078,7 @@ id = "lambda:project-actor"
             namespace_explicit: false,
             actor_explicit: false,
             no_embed: true,
-            packs: None,
+            packs: Some(kg_test_packs()),
             brain_profile: None,
         })
         .expect("resolve config without project actor");
@@ -2102,7 +2134,7 @@ id = "lambda:project-actor"
             namespace_explicit,
             actor_explicit: namespace_explicit,
             no_embed: true,
-            packs: None,
+            packs: Some(kg_test_packs()),
             brain_profile: None,
         });
 
@@ -2154,7 +2186,7 @@ id = "lambda:project-actor"
             namespace_explicit,
             actor_explicit: namespace_explicit,
             no_embed: true,
-            packs: None,
+            packs: Some(kg_test_packs()),
             brain_profile: None,
         });
 
@@ -2223,7 +2255,7 @@ id = "lambda:project-actor"
             namespace_explicit: true,
             actor_explicit: true,
             no_embed: false,
-            packs: None,
+            packs: Some(kg_test_packs()),
             brain_profile: None,
         })
         .expect("resolve config");
@@ -2302,7 +2334,7 @@ id = "lambda:project-actor"
                 namespace_explicit: false,
                 actor_explicit: false,
                 no_embed: true,
-                packs: None,
+                packs: Some(kg_test_packs()),
                 brain_profile: None,
             })
             .expect("resolve config a")
@@ -2317,7 +2349,7 @@ id = "lambda:project-actor"
                 namespace_explicit: false,
                 actor_explicit: false,
                 no_embed: true,
-                packs: None,
+                packs: Some(kg_test_packs()),
                 brain_profile: None,
             })
             .expect("resolve config b")

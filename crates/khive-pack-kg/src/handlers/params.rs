@@ -95,6 +95,10 @@ pub(crate) struct ListParams {
 #[serde(deny_unknown_fields)]
 pub(crate) struct StatsParams {}
 
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WhoamiParams {}
+
 /// ADR-099 B3: `pub` so kkernel's `--atomic` seam can deserialize through this same
 /// canonical struct, reproducing `deny_unknown_fields` rejection. Fields stay
 /// `pub(crate)` — the atomic seam only needs the `Result<_, _>` outcome.
@@ -146,7 +150,10 @@ pub(crate) struct MergeParams {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SearchParams {
-    pub(crate) kind: String,
+    /// Required, but kept `Option` at the wire boundary so a caller who omits
+    /// it entirely gets the enumerated-valid-kinds error from
+    /// `missing_kind_error` instead of a raw serde "missing field" message.
+    pub(crate) kind: Option<String>,
     pub(crate) query: String,
     pub(crate) limit: Option<u32>,
     pub(crate) entity_kind: Option<String>,

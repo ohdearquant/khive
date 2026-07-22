@@ -83,7 +83,7 @@ ANNOTATES_SOURCE_MUST_BE_NOTE = True
 
 # ---------------------------------------------------------------------------
 # Product verb manifest (ADR-023 / ADR-025 / ADR-027)
-# KG pack ships 18 verbs; bare names (no pack prefix).
+# KG pack ships 19 verbs; bare names (no pack prefix).
 # Source of truth: crates/khive-pack-kg/src/handler_defs.rs KG_HANDLERS
 # ---------------------------------------------------------------------------
 
@@ -107,6 +107,7 @@ KG_VERBS: frozenset[str] = frozenset(
         "verbs",
         "context",
         "resolve",
+        "whoami",
     }
 )
 
@@ -116,15 +117,15 @@ KG_VERBS: frozenset[str] = frozenset(
 # this one. Their dotted pack.verb forms are therefore absent here.
 DISCOVERABLE_PRODUCT_VERBS: frozenset[str] = KG_VERBS
 
-# DISCOVERABLE_PRODUCT_VERBS (18) already meets this floor.
+# DISCOVERABLE_PRODUCT_VERBS (19) already meets this floor.
 PLAY_SPEC_MINIMUM_VERB_COUNT = 11
 
 # ADR-023 coverage-gate manifest: the curated set of product verbs every
 # contract test module's VERBS_UNDER_TEST must jointly cover. Narrower than
 # DISCOVERABLE_PRODUCT_VERBS above (which also counts admin/meta KG verbs
-# like stats/propose/review/withdraw/verbs/context/resolve that the coverage
-# gate does not track), so the two are intentionally not unioned or aliased
-# to each other.
+# like stats/propose/review/withdraw/verbs/context/resolve/whoami that the
+# coverage gate does not track), so the two are intentionally not unioned or
+# aliased to each other.
 PRODUCT_VERB_MANIFEST: frozenset[str] = frozenset({
     # KG substrate (11) — bare names; no pack prefix
     "create", "get", "list", "update", "delete", "merge",

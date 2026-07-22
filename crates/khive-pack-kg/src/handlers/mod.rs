@@ -14,6 +14,7 @@ mod resolve;
 mod search;
 mod stats;
 mod update;
+mod whoami;
 
 pub(crate) use common::{canonical_entity_kind, canonical_note_kind, parse_relation};
 

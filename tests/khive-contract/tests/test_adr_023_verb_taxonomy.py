@@ -10,10 +10,10 @@ import pytest
 
 from khive_contract.client import KhiveMcpSession
 
-# All 16 baseline KG substrate verbs exercised below. Written as a set literal
-# so the manifest AST-introspector can parse it (stats/propose/review/withdraw/
-# verbs/context/resolve are the remaining KG verbs not exercised by this
-# module's reachability walk; kg is the sole pack in the OSS distribution).
+# The 16 KG verbs exercised below, of the pack's 19. Written as a set literal
+# so the manifest AST-introspector can parse it (context/resolve/whoami are
+# the remaining KG verbs not exercised by this module's reachability walk;
+# kg is the sole pack in the OSS distribution).
 VERBS_UNDER_TEST = {
     # KG substrate (16) — bare names; no pack prefix
     "create", "get", "list", "update", "delete", "merge",
@@ -35,7 +35,8 @@ def test_kg_bare_product_verbs_are_reachable(
     ADR: ADR-023
     section: kg bare substrate verbs
 
-    Ports smoke KG surface coverage; verifies all 11 KG verbs are registered
+    Ports smoke KG surface coverage; verifies the KG verbs named in
+    VERBS_UNDER_TEST are registered
     and return non-error results in the base kg session.
     """
     ns = temp_namespace
