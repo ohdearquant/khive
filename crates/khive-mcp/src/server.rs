@@ -11,8 +11,9 @@
 // as a unit. The module is the authoritative implementation of request
 // dispatch and is intentionally co-located.
 
-use std::sync::Arc;
+use std::{future::Future, sync::Arc};
 
+use futures::{stream::FuturesUnordered, StreamExt};
 use rmcp::{
     handler::server::wrapper::Parameters,
     model::{Implementation, ServerCapabilities, ServerInfo},
@@ -33,6 +34,12 @@ use khive_storage::EdgeRelation;
 
 use crate::coordinator::CoordinatorService;
 use crate::tools::request::RequestParams;
+
+/// Per-request parallelism stays bounded even when the parser accepts 100 ops; must be nonzero.
+const MAX_BATCH_CONCURRENCY: usize = 8;
+
+/// Half the frame remains for the daemon's outer serialization and budget-error entries.
+const BATCH_RESPONSE_BUDGET_BYTES: usize = khive_runtime::daemon::MAX_FRAME_BYTES / 2;
 
 /// Fingerprint the engine-coherence parts of a resolved [`RuntimeConfig`].
 ///
@@ -777,8 +784,8 @@ impl KhiveMcpServer {
 
     /// Execute a parsed request, dispatching according to its [`ExecutionMode`].
     ///
-    /// - `Single` / `Parallel`: all ops run concurrently; per-op failure does
-    ///   not abort siblings. `aborted` count is always 0.
+    /// - `Single` / `Parallel`: at most [`MAX_BATCH_CONCURRENCY`] ops run at
+    ///   once; per-op failure does not abort siblings. `aborted` count is 0.
     /// - `Chain`: ops run sequentially; `$prev` from each op's result is
     ///   substituted into the next op's args. If any op fails (or a `$prev`
     ///   substitution fails), remaining ops appear as `aborted: true`.
@@ -812,6 +819,11 @@ impl KhiveMcpServer {
         from_wire: bool,
         identity: Option<&khive_runtime::RequestIdentity>,
     ) -> Value {
+        let response_budget = if mode == ExecutionMode::Parallel {
+            BATCH_RESPONSE_BUDGET_BYTES
+        } else {
+            usize::MAX
+        };
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .ok()
@@ -860,7 +872,9 @@ impl KhiveMcpServer {
                 // dispatch below, so the two can't drift out of sync per op.
                 let identity_owned: Option<khive_runtime::RequestIdentity> = identity.cloned();
 
-                // Independent dispatch — run all concurrently, results in input order.
+                let op_tools: Vec<String> = ops.iter().map(|op| op.tool.clone()).collect();
+
+                // Independent dispatch — bounded concurrency, results restored to input order.
                 let futures = ops.into_iter().enumerate().map(|(i, op)| {
                     let conflict_with: Option<String> = if conflict_indices.contains(&i) {
                         Some(format!(
@@ -995,21 +1009,11 @@ impl KhiveMcpServer {
                         })
                         .await;
                         stamp_usage(&mut entry, &usage_ctx);
-                        entry
+                        (i, entry)
                     }
                 });
-                let results: Vec<Value> = futures::future::join_all(futures).await;
-                let total = results.len();
-                let succeeded = results
-                    .iter()
-                    .filter(|r| r.get("ok").and_then(Value::as_bool) == Some(true))
-                    .count();
-                let failed = total - succeeded;
-                json!({
-                    "results": results,
-                    "summary": { "total": total, "succeeded": succeeded, "failed": failed, "aborted": 0 },
-                    "status": batch_status(failed, 0),
-                })
+                let results = execute_bounded_batch(futures, op_tools, response_budget).await;
+                parallel_batch_envelope(results)
             }
             ExecutionMode::Chain => {
                 // Sequential execution with $prev substitution and abort-on-failure.
@@ -1654,6 +1658,77 @@ fn batch_status(failed: usize, aborted: usize) -> &'static str {
     }
 }
 
+fn batch_budget_error(tool: &str, response_budget: usize) -> Value {
+    json!({
+        "ok": false,
+        "tool": tool,
+        "error": format!(
+            "batch response budget of {response_budget} serialized bytes exceeded"
+        ),
+    })
+}
+
+async fn execute_bounded_batch<I, F>(
+    futures: I,
+    tools: Vec<String>,
+    response_budget: usize,
+) -> Vec<Value>
+where
+    I: IntoIterator<Item = F>,
+    F: Future<Output = (usize, Value)>,
+{
+    let mut queued = futures.into_iter();
+    let mut in_flight = FuturesUnordered::new();
+    for _ in 0..MAX_BATCH_CONCURRENCY {
+        if let Some(future) = queued.next() {
+            in_flight.push(future);
+        }
+    }
+
+    let mut results: Vec<Option<Value>> = (0..tools.len()).map(|_| None).collect();
+    let mut accumulated_bytes = 0usize;
+
+    while let Some((index, entry)) = in_flight.next().await {
+        let serialized_bytes = serde_json::to_vec(&entry)
+            .expect("serde_json::Value is always serializable")
+            .len();
+        if serialized_bytes > response_budget.saturating_sub(accumulated_bytes) {
+            results[index] = Some(batch_budget_error(&tools[index], response_budget));
+            break;
+        }
+
+        accumulated_bytes += serialized_bytes;
+        results[index] = Some(entry);
+        if let Some(future) = queued.next() {
+            in_flight.push(future);
+        }
+    }
+    drop(in_flight);
+    drop(queued);
+
+    results
+        .into_iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            entry.unwrap_or_else(|| batch_budget_error(&tools[index], response_budget))
+        })
+        .collect()
+}
+
+fn parallel_batch_envelope(results: Vec<Value>) -> Value {
+    let total = results.len();
+    let succeeded = results
+        .iter()
+        .filter(|result| result.get("ok").and_then(Value::as_bool) == Some(true))
+        .count();
+    let failed = total - succeeded;
+    json!({
+        "results": results,
+        "summary": { "total": total, "succeeded": succeeded, "failed": failed, "aborted": 0 },
+        "status": batch_status(failed, 0),
+    })
+}
+
 /// Extract the fallback-reason string from a strict-mode rejection's
 /// [`McpError`] (#947), or `None` if `e` is not tagged with
 /// [`crate::daemon::STRICT_FALLBACK_MARKER`] — i.e. some other daemon-forward
@@ -2111,6 +2186,171 @@ mod tests {
     use khive_runtime::Namespace;
     use khive_storage::{EventFilter, PageRequest};
     use serial_test::serial;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    async fn observed_batch_entry(
+        index: usize,
+        delay_ms: u64,
+        entry: Value,
+        in_flight: Arc<AtomicUsize>,
+        max_in_flight: Arc<AtomicUsize>,
+    ) -> (usize, Value) {
+        let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        max_in_flight.fetch_max(current, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        in_flight.fetch_sub(1, Ordering::SeqCst);
+        (index, entry)
+    }
+
+    fn batch_tools(count: usize) -> Vec<String> {
+        (0..count).map(|_| "probe".to_string()).collect()
+    }
+
+    #[tokio::test]
+    async fn bounded_batch_preserves_input_order() {
+        let count = MAX_BATCH_CONCURRENCY + 3;
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let futures = (0..count).map(|index| {
+            observed_batch_entry(
+                index,
+                (count - index) as u64,
+                json!({"ok": true, "tool": "probe", "result": {"index": index}}),
+                in_flight.clone(),
+                max_in_flight.clone(),
+            )
+        });
+
+        let results = execute_bounded_batch(futures, batch_tools(count), usize::MAX).await;
+
+        let indices: Vec<u64> = results
+            .iter()
+            .map(|entry| entry["result"]["index"].as_u64().expect("result index"))
+            .collect();
+        assert_eq!(indices, (0..count as u64).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn bounded_batch_enforces_aggregate_response_budget() {
+        assert_eq!(
+            BATCH_RESPONSE_BUDGET_BYTES,
+            khive_runtime::daemon::MAX_FRAME_BYTES / 2
+        );
+        let count = MAX_BATCH_CONCURRENCY + 3;
+        let budget = BATCH_RESPONSE_BUDGET_BYTES;
+        let small = json!({
+            "ok": true,
+            "tool": "probe",
+            "result": "x".repeat(budget / 4 - 128),
+        });
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let futures = (0..count).map(|index| {
+            let (delay_ms, entry) = if index < 2 {
+                (index as u64, small.clone())
+            } else if index == 2 {
+                (
+                    30,
+                    json!({"ok": true, "tool": "probe", "result": "x".repeat(budget)}),
+                )
+            } else {
+                (
+                    5_000,
+                    json!({"ok": true, "tool": "probe", "result": "late"}),
+                )
+            };
+            observed_batch_entry(
+                index,
+                delay_ms,
+                entry,
+                in_flight.clone(),
+                max_in_flight.clone(),
+            )
+        });
+
+        let results = tokio::time::timeout(
+            Duration::from_secs(1),
+            execute_bounded_batch(futures, batch_tools(count), budget),
+        )
+        .await
+        .expect("a budget breach must fail unfinished ops without waiting for them");
+        let response = parallel_batch_envelope(results);
+
+        assert_eq!(
+            response["summary"],
+            json!({"total": count, "succeeded": 2, "failed": count - 2, "aborted": 0})
+        );
+        assert_eq!(response["results"][0]["ok"], true);
+        assert_eq!(response["results"][1]["ok"], true);
+        for entry in response["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .skip(2)
+        {
+            assert_eq!(entry["ok"], false);
+            let error = entry["error"].as_str().expect("budget error string");
+            assert!(error.contains("batch response budget"));
+            assert!(error.contains(&budget.to_string()));
+        }
+        serde_json::to_vec(&response).expect("budgeted response must serialize");
+    }
+
+    #[tokio::test]
+    async fn bounded_batch_op_error_does_not_abort_siblings() {
+        let count = 5;
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let futures = (0..count).map(|index| {
+            let entry = if index == 2 {
+                json!({"ok": false, "tool": "probe", "error": "expected failure"})
+            } else {
+                json!({"ok": true, "tool": "probe", "result": {"index": index}})
+            };
+            observed_batch_entry(
+                index,
+                (count - index) as u64,
+                entry,
+                in_flight.clone(),
+                max_in_flight.clone(),
+            )
+        });
+
+        let response = parallel_batch_envelope(
+            execute_bounded_batch(futures, batch_tools(count), usize::MAX).await,
+        );
+
+        assert_eq!(
+            response["summary"],
+            json!({"total": 5, "succeeded": 4, "failed": 1, "aborted": 0})
+        );
+        assert_eq!(response["results"][2]["error"], "expected failure");
+        assert!(response["results"][3]["ok"].as_bool().unwrap_or(false));
+        assert!(response["results"][4]["ok"].as_bool().unwrap_or(false));
+    }
+
+    #[tokio::test]
+    async fn bounded_batch_never_exceeds_concurrency_limit() {
+        let count = MAX_BATCH_CONCURRENCY * 3;
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let futures = (0..count).map(|index| {
+            observed_batch_entry(
+                index,
+                10,
+                json!({"ok": true, "tool": "probe", "result": index}),
+                in_flight.clone(),
+                max_in_flight.clone(),
+            )
+        });
+
+        let results = execute_bounded_batch(futures, batch_tools(count), usize::MAX).await;
+
+        assert_eq!(results.len(), count);
+        assert_eq!(max_in_flight.load(Ordering::SeqCst), MAX_BATCH_CONCURRENCY);
+        assert_eq!(in_flight.load(Ordering::SeqCst), 0);
+    }
 
     fn t(pack: &str, verb: &str, desc: &str) -> (String, String, String) {
         (pack.to_owned(), verb.to_owned(), desc.to_owned())
