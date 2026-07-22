@@ -1110,18 +1110,21 @@ pub async fn run_daemon<D: DaemonDispatch>(dispatcher: D) -> anyhow::Result<()> 
 /// worse — succeeded when privileged and stripped access for every other
 /// process on the machine. A directory we did not create is never modified.
 ///
-/// What the directory mode must actually prevent is narrower than "any access":
-/// the connection gate is the 0600 socket plus the accept-time peer-uid check,
-/// both of which fail closed on their own. The attack only the directory can
-/// enable is a *swap* — another writer unlinking the bound socket and binding
-/// its own at the same path, silently diverting clients. That requires the
-/// directory to be writable by others without the sticky bit (the sticky bit
-/// is exactly the guard that lets `/tmp` host per-user files safely). So:
-/// group/other-writable and non-sticky is refused; merely readable or
-/// traversable (0755, or 1777 with sticky) is served, since the socket's own
-/// mode and the peer check carry the guarantee there.
+/// What the directory must actually prevent is a *takeover of the socket
+/// path*: the connection gate is the 0600 socket plus the accept-time
+/// peer-uid check, but both defend the daemon's own socket — neither helps
+/// once another local user can put *their* listener at the path clients
+/// resolve. There are two ways a shared directory allows that, and the
+/// sticky bit closes neither: a writer can *pre-bind* the predictable path
+/// before this daemon starts (the sticky bit restricts unlinking, not
+/// creating), and the directory's *owner* can unlink and rebind even in a
+/// 1777 directory (sticky exempts the directory owner). So a caller-chosen
+/// directory is served only when it is trusted end to end: owned by this
+/// daemon's euid or root, and not writable by group or other at all. The
+/// umask-default 0755 stays acceptable; shared sticky directories like
+/// `/tmp` do not.
 #[cfg(unix)]
-fn ensure_socket_dir_is_swap_safe(parent: &std::path::Path) -> anyhow::Result<()> {
+fn ensure_socket_dir_is_trusted(parent: &std::path::Path) -> anyhow::Result<()> {
     if parent == khive_dir() {
         std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
             anyhow::anyhow!(
@@ -1133,28 +1136,39 @@ fn ensure_socket_dir_is_swap_safe(parent: &std::path::Path) -> anyhow::Result<()
         return Ok(());
     }
 
-    // Fail closed on the stat itself: not being able to read the mode is not
-    // the same as the mode passing.
-    let mode = std::fs::metadata(parent)
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "refusing to start: cannot stat {}: {e}. The socket directory's mode gates \
-                 socket-swap safety, and an unreadable mode is not a passing one.",
-                parent.display()
-            )
-        })?
-        .permissions()
-        .mode();
+    // Fail closed on the stat itself: not being able to read the metadata is
+    // not the same as the directory passing.
+    let meta = std::fs::metadata(parent).map_err(|e| {
+        anyhow::anyhow!(
+            "refusing to start: cannot stat {}: {e}. The socket directory gates \
+             socket-takeover safety, and unreadable metadata is not a passing state.",
+            parent.display()
+        )
+    })?;
 
-    let writable_by_others = mode & 0o022 != 0;
-    let sticky = mode & 0o1000 != 0;
-    if writable_by_others && !sticky {
+    use std::os::unix::fs::MetadataExt;
+    let owner = meta.uid();
+    // SAFETY: `geteuid` is always successful and takes no arguments.
+    let daemon_euid = unsafe { libc::geteuid() } as u32;
+    if owner != daemon_euid && owner != 0 {
+        anyhow::bail!(
+            "refusing to start: socket directory {} is owned by uid {owner}, not this \
+             daemon's uid ({daemon_euid}) or root. A directory owner can replace the \
+             socket regardless of mode bits. Point KHIVE_SOCKET at a directory you own, \
+             or unset it for the default.",
+            parent.display()
+        );
+    }
+
+    let mode = meta.permissions().mode();
+    if mode & 0o022 != 0 {
         anyhow::bail!(
             "refusing to start: socket directory {} is mode {:04o} — writable by group or \
-             other without the sticky bit, so another local user could replace the socket \
-             after this daemon binds it. Use a directory only you can write, a sticky \
-             world-writable directory, or unset KHIVE_SOCKET for the default. This daemon \
-             is not changing the permissions of a directory it does not own.",
+             other, so another local user could bind their own listener at the socket path \
+             (before this daemon starts, the sticky bit does not prevent creating the \
+             path). Use a directory only you can write, or unset KHIVE_SOCKET for the \
+             default. This daemon is not changing the permissions of a directory it does \
+             not own.",
             parent.display(),
             mode & 0o7777
         );
@@ -1185,7 +1199,7 @@ pub async fn run_daemon_with_boot_guard<D: DaemonDispatch>(
 
     if let Some(parent) = sock.parent() {
         std::fs::create_dir_all(parent)?;
-        ensure_socket_dir_is_swap_safe(parent)?;
+        ensure_socket_dir_is_trusted(parent)?;
     }
 
     // Hold the startup lock across cleanup → bind → pid-write so a concurrent
@@ -2044,58 +2058,61 @@ mod tests {
         assert_eq!(dispatch_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
-    /// Test 2: `wal_pages` reflects a real
-    /// checkpoint observation after writes, deterministically forced via a
-    /// A non-sticky directory writable by others is refused, and — the part
-    /// that matters — is left exactly as it was found.
+    /// Group/other-writable socket directories are refused whether or not the
+    /// sticky bit is set, and — the part that matters — are left exactly as
+    /// they were found.
     ///
-    /// This is the one shape the directory mode alone must gate: another
-    /// writer can unlink the bound socket and bind its own at the same path.
-    /// Re-permissioning someone else's directory on the way past is what the
-    /// second assertion pins against: run as a user who *can* chmod it, the
-    /// old unconditional call succeeded and revoked access for every other
-    /// process using that directory.
+    /// The sticky `/tmp` shape (1777) is in the refusal set deliberately: the
+    /// sticky bit restricts unlinking, not creating, so a shared directory
+    /// lets another user pre-bind the predictable socket path before this
+    /// daemon starts; and a sticky directory's owner may unlink and rebind
+    /// regardless. Re-permissioning someone else's directory on the way past
+    /// is what the second assertion pins against: run as a user who *can*
+    /// chmod it, the old unconditional call succeeded and revoked access for
+    /// every other process using that directory.
     #[test]
-    fn swappable_socket_dir_is_refused_without_being_modified() {
+    fn shared_writable_socket_dirs_are_refused_without_being_modified() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let shared = dir.path().join("shared");
-        std::fs::create_dir(&shared).expect("create");
-        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).expect("chmod");
+        for (name, mode) in [("open", 0o777u32), ("sticky-tmp", 0o1777u32)] {
+            let shared = dir.path().join(name);
+            std::fs::create_dir(&shared).expect("create");
+            std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(mode))
+                .expect("chmod");
 
-        let err = ensure_socket_dir_is_swap_safe(&shared).expect_err("must refuse non-sticky 0777");
-        assert!(
-            err.to_string().contains("0777"),
-            "the refusal should name the mode it saw, got: {err}"
-        );
-
-        let after = std::fs::metadata(&shared)
-            .expect("stat")
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(
-            after, 0o777,
-            "refusing must not re-permission a directory khive does not own"
-        );
+            let err = ensure_socket_dir_is_trusted(&shared)
+                .expect_err("group/other-writable must be refused, sticky or not");
+            assert!(
+                err.to_string().contains(&format!("{:04o}", mode & 0o7777)),
+                "the refusal should name the mode it saw, got: {err}"
+            );
+            let after = std::fs::metadata(&shared)
+                .expect("stat")
+                .permissions()
+                .mode()
+                & 0o7777;
+            assert_eq!(
+                after, mode,
+                "refusing must not re-permission a directory khive does not own"
+            );
+        }
     }
 
-    /// Directory modes that cannot host a socket swap are served as found:
-    /// owner-only, the umask-default 0755 every `tempfile::tempdir` and test
-    /// runner produces, and sticky world-writable (the `/tmp` shape, where the
-    /// sticky bit is exactly what stops another user unlinking the socket).
+    /// Directories this daemon can trust end to end are served as found:
+    /// owner-only, and the umask-default 0755 every `tempfile::tempdir` and
+    /// test runner produces (readable/traversable but writable only by the
+    /// owner). Foreign ownership is also refused by the same helper, but a
+    /// non-root test cannot chown a directory away from itself, so that arm
+    /// is exercised by the mode checks' shared fail-closed path rather than
+    /// a dedicated fixture.
     #[test]
-    fn swap_safe_socket_dirs_are_accepted_unmodified() {
+    fn trusted_socket_dirs_are_accepted_unmodified() {
         let dir = tempfile::tempdir().expect("tempdir");
-        for (name, mode) in [
-            ("private", 0o700),
-            ("listable", 0o755),
-            ("sticky-tmp", 0o1777),
-        ] {
+        for (name, mode) in [("private", 0o700), ("listable", 0o755)] {
             let d = dir.path().join(name);
             std::fs::create_dir(&d).expect("create");
             std::fs::set_permissions(&d, std::fs::Permissions::from_mode(mode)).expect("chmod");
 
-            ensure_socket_dir_is_swap_safe(&d)
+            ensure_socket_dir_is_trusted(&d)
                 .unwrap_or_else(|e| panic!("mode {mode:04o} must be accepted, got: {e}"));
 
             let after = std::fs::metadata(&d).expect("stat").permissions().mode() & 0o7777;
@@ -2106,6 +2123,8 @@ mod tests {
         }
     }
 
+    /// Test 2: `wal_pages` reflects a real
+    /// checkpoint observation after writes, deterministically forced via a
     /// direct `checkpoint_once` call rather than waiting on the async
     /// periodic task.
     #[tokio::test]
