@@ -62,11 +62,11 @@ pub fn apply_schema_plan(conn: &Connection, plan: &ServiceSchemaPlan) -> Result<
             continue;
         }
 
-        // Apply
-        conn.execute_batch(migration.up_sql)?;
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute_batch(migration.up_sql)?;
 
-        // Record
-        conn.execute(
+        tx.execute(
             "INSERT INTO _schema_versions (service, migration_id, applied_at) VALUES (?1, ?2, ?3)",
             rusqlite::params![
                 plan.service,
@@ -74,6 +74,7 @@ pub fn apply_schema_plan(conn: &Connection, plan: &ServiceSchemaPlan) -> Result<
                 chrono::Utc::now().timestamp_micros(),
             ],
         )?;
+        tx.commit()?;
     }
 
     Ok(())

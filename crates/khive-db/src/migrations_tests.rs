@@ -24,6 +24,46 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
 }
 
 #[test]
+fn apply_schema_plan_rolls_back_migration_when_ledger_insert_fails() {
+    static MIGRATIONS: &[Migration] = &[Migration {
+        id: "001_atomic",
+        up_sql: "CREATE TABLE migration_effect (id INTEGER PRIMARY KEY);",
+        down_sql: None,
+        is_already_applied: None,
+    }];
+    let plan = ServiceSchemaPlan {
+        service: "atomicity_test",
+        sqlite: MIGRATIONS,
+        postgres: &[],
+    };
+    let conn = open_memory();
+    conn.execute_batch(SCHEMA_VERSION_TABLE).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER reject_schema_version
+         BEFORE INSERT ON _schema_versions
+         BEGIN
+             SELECT RAISE(ABORT, 'injected ledger failure');
+         END;",
+    )
+    .unwrap();
+
+    apply_schema_plan(&conn, &plan).expect_err("ledger failure must abort the migration");
+
+    assert!(
+        !table_exists(&conn, "migration_effect"),
+        "migration body must roll back when its ledger insert fails"
+    );
+    let ledger_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM _schema_versions WHERE service = 'atomicity_test'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(ledger_rows, 0);
+}
+
+#[test]
 fn fresh_db_migrates_to_latest() {
     let mut conn = open_memory();
     let version = run_migrations(&mut conn).expect("migrations should succeed");
