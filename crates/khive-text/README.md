@@ -50,10 +50,9 @@ choosing an analyzer.
 
 ## Where this sits
 
-`khive-text` has no required khive-* dependencies and no current in-workspace
-consumers — it is a standalone tokenization library extracted for reuse by any
-future retrieval crate that needs a pluggable analyzer independent of
-`khive-bm25`'s built-in `SimpleTokenizer`.
+`khive-text` has no required khive-* dependencies. `khive-bm25` consumes its
+tokenizer trait and normalization filters while retaining `SimpleTokenizer` as
+its compatibility-oriented configuration wrapper.
 
 ## License
 

@@ -16,6 +16,7 @@ bench = false
 
 [dependencies]
 khive-score = { version = "0.6.0", path = "../khive-score" }
+khive-text = { version = "0.6.0", path = "../khive-text" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
