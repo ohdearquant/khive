@@ -1176,6 +1176,29 @@ pub async fn run_session_sweep_task(
     }
 }
 
+/// The event sink and namespace owned by one checkpoint task in a fan-out.
+///
+/// Backend role and lifecycle ownership are separate: a secondary task may
+/// own lifecycle emission when the deployment's main backend is in-memory.
+#[derive(Clone)]
+pub struct CheckpointLifecycleOwner {
+    event_store: Arc<dyn khive_storage::EventStore>,
+    namespace: String,
+}
+
+impl CheckpointLifecycleOwner {
+    /// Designate `event_store` as the lifecycle sink for one checkpoint task.
+    pub fn new(
+        event_store: Arc<dyn khive_storage::EventStore>,
+        namespace: impl Into<String>,
+    ) -> Self {
+        Self {
+            event_store,
+            namespace: namespace.into(),
+        }
+    }
+}
+
 /// Run the WAL checkpoint background task.
 ///
 /// Long-running async task — spawn with `tokio::spawn`. Loops until
@@ -1190,27 +1213,26 @@ pub async fn run_session_sweep_task(
 /// write traffic. A WARNING fires once per below→above threshold crossing,
 /// not every tick.
 ///
-/// `event_store` (ADR-094): when `Some`, appends a best-effort
+/// `lifecycle_owner` (ADR-094): exactly one task in a multi-backend fan-out
+/// should receive `Some`. That task appends a best-effort
 /// `CheckpointOutcomeRecorded` event on every at/above-`warn_pages` tick,
-/// plus one drain row when pressure falls back below `warn_pages`. `None` is
-/// a no-op. See `crates/khive-db/docs/api/checkpoint.md` for the full
-/// shutdown-mechanism and event-emission design history.
+/// plus one drain row when pressure falls back below `warn_pages`. `None`
+/// explicitly marks a non-owner. See `crates/khive-db/docs/api/checkpoint.md`
+/// for the full shutdown-mechanism and event-emission design history.
 ///
 /// `is_main` (ADR-091 Amendment 3): whether `pool` is the deployment's main
 /// backend. A daemon owning several file-backed backends spawns one task per
 /// backend, each with its own pool and shutdown-channel clone (the sender
-/// broadcasts to every receiver clone alike); exactly one call passes `true`
-/// and owns the process-level lifecycle event stream. See the `tx_filter`
-/// construction below for the registry-view selection.
+/// broadcasts to every receiver clone alike). Lifecycle ownership is selected
+/// independently through `lifecycle_owner`; `is_main` only controls registry
+/// filtering. See the `tx_filter` construction below.
 pub async fn run_checkpoint_task(
     pool: Arc<ConnectionPool>,
     config: CheckpointConfig,
-    event_store: Option<Arc<dyn khive_storage::EventStore>>,
-    namespace: String,
+    lifecycle_owner: Option<CheckpointLifecycleOwner>,
     mut shutdown_rx: tokio::sync::watch::Receiver<()>,
     is_main: bool,
 ) {
-    let event_store = if is_main { event_store } else { None };
     let mut interval = tokio::time::interval(config.interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut severity_state = CheckpointSeverityState::default();
@@ -1374,8 +1396,7 @@ pub async fn run_checkpoint_task(
                 above_truncate_high_water,
             };
             append_checkpoint_lifecycle_event(
-                event_store.as_ref(),
-                &namespace,
+                lifecycle_owner.as_ref(),
                 khive_types::EventKind::CheckpointOutcomeRecorded,
                 payload,
             )
@@ -1401,17 +1422,16 @@ fn checkpoint_outcome_should_emit(above_warn: bool, was_elevated: bool) -> bool 
 
 /// Append one ADR-094 lifecycle event on behalf of the checkpoint task.
 ///
-/// Best-effort: `event_store == None` is a no-op, and an append failure is
+/// Best-effort: `lifecycle_owner == None` is a no-op, and an append failure is
 /// logged and swallowed. No lifecycle-append error may ever interrupt or
 /// slow down checkpoint/TRUNCATE work — the checkpoint task's correctness
 /// does not depend on this succeeding.
 async fn append_checkpoint_lifecycle_event<P: serde::Serialize>(
-    store: Option<&Arc<dyn khive_storage::EventStore>>,
-    namespace: &str,
+    lifecycle_owner: Option<&CheckpointLifecycleOwner>,
     kind: khive_types::EventKind,
     payload: P,
 ) {
-    let Some(store) = store else {
+    let Some(owner) = lifecycle_owner else {
         return;
     };
     let payload_value = match serde_json::to_value(&payload) {
@@ -1426,14 +1446,14 @@ async fn append_checkpoint_lifecycle_event<P: serde::Serialize>(
         }
     };
     let event = khive_storage::Event::new(
-        namespace,
+        &owner.namespace,
         "checkpoint.lifecycle",
         kind,
         khive_types::SubstrateKind::Event,
         "daemon:checkpoint_task",
     )
     .with_payload(payload_value);
-    if let Err(err) = store.append_event(event).await {
+    if let Err(err) = owner.event_store.append_event(event).await {
         tracing::warn!(
             error = %err,
             event_kind = %kind.name(),
@@ -1578,9 +1598,6 @@ fn maybe_truncate(
         return;
     }
 
-    #[cfg(unix)]
-    let walpin_census = snapshot_walpin_census(pool);
-
     // Only now is this a genuine attempt: the writer is held, the threshold
     // and interval gates passed, and the busy_timeout override is in effect
     // immediately before the TRUNCATE pragma itself.
@@ -1616,7 +1633,7 @@ fn maybe_truncate(
                 );
                 log_tx_registry_snapshot_warn(wal_pages_after);
                 #[cfg(unix)]
-                log_walpin_sidecar_report(pool, walpin_census);
+                log_walpin_sidecar_report(pool);
                 log_wal_pin_depth(conn);
             }
 
@@ -1662,11 +1679,15 @@ fn note_truncate_outcome(
     TRUNCATE_CONSECUTIVE_FAILURES.store(state.consecutive_failures as u64, Ordering::Relaxed);
 }
 
-/// ADR-091 Amendment 2 Plank B: snapshot the OS holder census immediately
-/// before a TRUNCATE attempt. If the attempt makes no progress, enumerate the
-/// walpin sidecar and combine it with that snapshot so a short-lived holder
-/// present at attempt time is not replaced by a later process view. A no-op
-/// if the sidecar is disabled or this backend has no on-disk path.
+/// ADR-091 Amendment 2 Plank B: when a TRUNCATE attempt makes no progress,
+/// enumerate the walpin sidecar and combine it with an OS holder census. The
+/// census deliberately runs only on this consumed diagnostic path: a
+/// pre-attempt census would scan every process and file descriptor while the
+/// writer guard is held, including successful attempts that discard it. The
+/// tradeoff is that short-lived holders which exit during TRUNCATE may be
+/// absent; reported identities describe the no-progress outcome rather than
+/// the instant before the attempt. A no-op if the sidecar is disabled or this
+/// backend has no on-disk path.
 ///
 /// Sidecar-health attribution (ADR-091 Amendment 2):
 /// the sharper "unregistered/native mechanism" conclusion is licensed only
@@ -1676,19 +1697,7 @@ fn note_truncate_outcome(
 /// inconclusive, and the WARN below names exactly which PIDs are unresolved
 /// instead of silently exonerating them.
 #[cfg(unix)]
-type WalpinCensusSnapshot = Result<crate::walpin::CensusResult, String>;
-
-#[cfg(unix)]
-fn snapshot_walpin_census(pool: &ConnectionPool) -> Option<WalpinCensusSnapshot> {
-    let path = pool.canonical_path()?;
-    if !crate::walpin::sidecar_enabled(true) {
-        return None;
-    }
-    Some(crate::walpin::census_holders(path).map_err(|e| e.to_string()))
-}
-
-#[cfg(unix)]
-fn log_walpin_sidecar_report(pool: &ConnectionPool, census_snapshot: Option<WalpinCensusSnapshot>) {
+fn log_walpin_sidecar_report(pool: &ConnectionPool) {
     let Some(path) = pool.canonical_path() else {
         return;
     };
@@ -1712,6 +1721,7 @@ fn log_walpin_sidecar_report(pool: &ConnectionPool, census_snapshot: Option<Walp
             return;
         }
     };
+    let census = crate::walpin::census_holders(path).map_err(|e| e.to_string());
     let now = now_epoch_secs();
     for hb in report.reporting() {
         // ADR-091 Amendment 3 Plank F2 fail-closed reading rule: the
@@ -1740,11 +1750,11 @@ fn log_walpin_sidecar_report(pool: &ConnectionPool, census_snapshot: Option<Walp
     let mut unknown_pids: Vec<u32> = report.unknown_pids().collect();
 
     // The sidecar directory alone can only speak for PIDs that wrote
-    // something there. Widen the universe to every PID the OS reported as
-    // holding the database immediately before this TRUNCATE attempt; any
-    // holder absent from `report` is unknown.
-    match census_snapshot {
-        Some(Ok(census)) => {
+    // something there. Widen the universe to every PID the OS reports as
+    // holding the database after this no-progress outcome; any holder absent
+    // from `report` is unknown.
+    match census {
+        Ok(census) => {
             let sidecar_known: std::collections::HashSet<u32> = report
                 .reporting()
                 .map(|hb| hb.pid)
@@ -1790,7 +1800,7 @@ fn log_walpin_sidecar_report(pool: &ConnectionPool, census_snapshot: Option<Walp
                 }
             }
         }
-        Some(Err(e)) => {
+        Err(e) => {
             tracing::warn!(
                 error = %e,
                 "ADR-091 Amendment 2: OS-derived holder census failed; \
@@ -1799,14 +1809,6 @@ fn log_walpin_sidecar_report(pool: &ConnectionPool, census_snapshot: Option<Walp
             // A failed census is itself a health failure for the sharper
             // conclusion below — treat it as if at least one PID were
             // unresolved, without fabricating a specific PID number.
-            unknown_pids.push(0);
-        }
-        None => {
-            tracing::warn!(
-                "ADR-091 Amendment 2: OS-derived holder census was unavailable before the \
-                 TRUNCATE attempt; attribution cannot rule out an unregistered database \
-                 holder this tick"
-            );
             unknown_pids.push(0);
         }
     }
@@ -2207,14 +2209,7 @@ mod tests {
         };
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
-        let handle = tokio::spawn(run_checkpoint_task(
-            pool,
-            cfg,
-            None,
-            "local".to_string(),
-            shutdown_rx,
-            true,
-        ));
+        let handle = tokio::spawn(run_checkpoint_task(pool, cfg, None, shutdown_rx, true));
 
         shutdown_tx.send(()).expect("send shutdown signal");
 
@@ -2255,8 +2250,7 @@ mod tests {
         let handle = tokio::spawn(run_checkpoint_task(
             pool,
             cfg,
-            Some(event_store),
-            "local".to_string(),
+            Some(CheckpointLifecycleOwner::new(event_store, "local")),
             shutdown_rx,
             true,
         ));
@@ -3734,8 +3728,7 @@ mod tests {
         let handle = tokio::spawn(run_checkpoint_task(
             pool,
             cfg,
-            Some(store_dyn),
-            "local".to_string(),
+            Some(CheckpointLifecycleOwner::new(store_dyn, "local")),
             shutdown_rx,
             true,
         ));
@@ -3766,7 +3759,7 @@ mod tests {
 
     #[tokio::test]
     #[serial(checkpoint_skip_metrics)]
-    async fn secondary_checkpoint_task_does_not_duplicate_lifecycle_events() {
+    async fn secondary_checkpoint_task_with_lifecycle_ownership_emits_outcome_events() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("secondary_outcome.db");
         let pool = file_pool(&path);
@@ -3782,8 +3775,7 @@ mod tests {
         let handle = tokio::spawn(run_checkpoint_task(
             pool,
             cfg,
-            Some(store_dyn),
-            "local".to_string(),
+            Some(CheckpointLifecycleOwner::new(store_dyn, "local")),
             shutdown_rx,
             false,
         ));
@@ -3796,8 +3788,8 @@ mod tests {
             .expect("checkpoint task panicked");
 
         assert!(
-            store.events.lock().unwrap().is_empty(),
-            "only the main checkpoint task may append process-level lifecycle events"
+            !store.events.lock().unwrap().is_empty(),
+            "a designated secondary lifecycle owner must append outcome events"
         );
     }
 
@@ -3822,8 +3814,7 @@ mod tests {
         let handle = tokio::spawn(run_checkpoint_task(
             pool,
             cfg,
-            Some(store_dyn),
-            "local".to_string(),
+            Some(CheckpointLifecycleOwner::new(store_dyn, "local")),
             shutdown_rx,
             true,
         ));
@@ -3855,14 +3846,7 @@ mod tests {
         };
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
-        let handle = tokio::spawn(run_checkpoint_task(
-            pool,
-            cfg,
-            None,
-            "local".to_string(),
-            shutdown_rx,
-            true,
-        ));
+        let handle = tokio::spawn(run_checkpoint_task(pool, cfg, None, shutdown_rx, true));
 
         tokio::time::sleep(Duration::from_millis(40)).await;
         shutdown_tx.send(()).expect("send shutdown signal");
@@ -3916,14 +3900,7 @@ mod tests {
         };
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
-        let handle = tokio::spawn(run_checkpoint_task(
-            pool,
-            cfg,
-            None,
-            "local".to_string(),
-            shutdown_rx,
-            true,
-        ));
+        let handle = tokio::spawn(run_checkpoint_task(pool, cfg, None, shutdown_rx, true));
 
         tokio::time::sleep(Duration::from_millis(60)).await;
         shutdown_tx.send(()).expect("send shutdown signal");
@@ -3971,14 +3948,7 @@ mod tests {
         };
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
-        let handle = tokio::spawn(run_checkpoint_task(
-            pool,
-            cfg,
-            None,
-            "local".to_string(),
-            shutdown_rx,
-            true,
-        ));
+        let handle = tokio::spawn(run_checkpoint_task(pool, cfg, None, shutdown_rx, true));
 
         tokio::time::sleep(Duration::from_millis(40)).await;
         shutdown_tx.send(()).expect("send shutdown signal");
@@ -4047,7 +4017,6 @@ mod tests {
             Arc::clone(&pool),
             cfg,
             None,
-            "local".to_string(),
             shutdown_rx,
             true,
         ));
@@ -4522,7 +4491,6 @@ mod tests {
             pool_a,
             cfg,
             None,
-            "local".to_string(),
             shutdown_rx,
             false, // is_main: backend A is a secondary backend here
         ));
@@ -4596,7 +4564,6 @@ mod tests {
             pool,
             cfg,
             None,
-            "local".to_string(),
             shutdown_rx,
             false, // is_main: this is a secondary backend's own checkpoint task
         ));

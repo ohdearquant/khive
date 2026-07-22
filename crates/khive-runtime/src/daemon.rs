@@ -29,7 +29,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
 #[cfg(unix)]
-use khive_db::{run_checkpoint_task, CheckpointConfig, ConnectionPool};
+use khive_db::{run_checkpoint_task, CheckpointConfig, CheckpointLifecycleOwner, ConnectionPool};
 
 #[cfg(unix)]
 use crate::pack::RequestIdentity;
@@ -719,6 +719,44 @@ pub trait DaemonDispatch: Clone + Send + Sync + 'static {
     fn event_store_for_checkpoint(&self) -> Option<Arc<dyn khive_storage::EventStore>> {
         None
     }
+}
+
+struct CheckpointTaskSpec {
+    pool: Arc<ConnectionPool>,
+    lifecycle_owner: Option<CheckpointLifecycleOwner>,
+    is_main: bool,
+}
+
+/// Build checkpoint-task fan-out and designate one lifecycle owner.
+///
+/// The main checkpoint task owns lifecycle emission when it exists. If the
+/// main backend is in-memory and therefore has no checkpoint task, the first
+/// file-backed secondary owns emission instead. All remaining tasks are
+/// explicit non-owners.
+fn checkpoint_task_specs(
+    main_pool: Option<Arc<ConnectionPool>>,
+    secondary_pools: Vec<Arc<ConnectionPool>>,
+    event_store: Option<Arc<dyn khive_storage::EventStore>>,
+    namespace: String,
+) -> Vec<CheckpointTaskSpec> {
+    let mut tasks = Vec::with_capacity(usize::from(main_pool.is_some()) + secondary_pools.len());
+    if let Some(pool) = main_pool {
+        tasks.push(CheckpointTaskSpec {
+            pool,
+            lifecycle_owner: None,
+            is_main: true,
+        });
+    }
+    tasks.extend(secondary_pools.into_iter().map(|pool| CheckpointTaskSpec {
+        pool,
+        lifecycle_owner: None,
+        is_main: false,
+    }));
+
+    if let (Some(task), Some(event_store)) = (tasks.first_mut(), event_store) {
+        task.lifecycle_owner = Some(CheckpointLifecycleOwner::new(event_store, namespace));
+    }
+    tasks
 }
 
 // ── tracked background tasks ─────────────────────────────────────────────────
@@ -1438,26 +1476,22 @@ pub async fn run_daemon_with_boot_guard<D: DaemonDispatch>(
     // `secondary_pools_for_checkpoint` returns — sharing this one shutdown
     // channel (the sender broadcasts to every receiver clone), so the single
     // send below stops every spawned task before `drain()`.
-    let mut checkpoint_pools: Vec<(Arc<ConnectionPool>, bool)> = Vec::new();
-    if let Some(pool) = dispatcher.pool_for_checkpoint() {
-        checkpoint_pools.push((pool, true));
-    }
-    for pool in dispatcher.secondary_pools_for_checkpoint() {
-        checkpoint_pools.push((pool, false));
-    }
-    if !checkpoint_pools.is_empty() {
+    let checkpoint_tasks = checkpoint_task_specs(
+        dispatcher.pool_for_checkpoint(),
+        dispatcher.secondary_pools_for_checkpoint(),
+        dispatcher.event_store_for_checkpoint(),
+        dispatcher.namespace().to_string(),
+    );
+    if !checkpoint_tasks.is_empty() {
         let cfg = CheckpointConfig::from_env();
-        let event_store = dispatcher.event_store_for_checkpoint();
-        let namespace = dispatcher.namespace().to_string();
-        let checkpoint_task_count = checkpoint_pools.len();
-        for (pool, is_main) in checkpoint_pools {
+        let checkpoint_task_count = checkpoint_tasks.len();
+        for task in checkpoint_tasks {
             track_background_task(run_checkpoint_task(
-                pool,
+                task.pool,
                 cfg.clone(),
-                event_store.clone(),
-                namespace.clone(),
+                task.lifecycle_owner,
                 checkpoint_shutdown_rx.clone(),
-                is_main,
+                task.is_main,
             ));
         }
         tracing::info!(checkpoint_task_count, "WAL checkpoint task(s) started");
@@ -1815,6 +1849,83 @@ mod khive_root_tests {
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    #[tokio::test]
+    #[serial(checkpoint_skip_metrics)]
+    async fn secondary_only_checkpoint_topology_emits_lifecycle_outcome() {
+        let main_backend = khive_db::StorageBackend::memory().expect("in-memory main backend");
+        let event_store = main_backend.events().expect("main event store");
+        let secondary_dir = tempfile::tempdir().expect("secondary tempdir");
+        let secondary_backend =
+            khive_db::StorageBackend::sqlite(secondary_dir.path().join("secondary.db"))
+                .expect("file-backed secondary backend");
+
+        let mut tasks = checkpoint_task_specs(
+            None,
+            vec![secondary_backend.pool_arc()],
+            Some(Arc::clone(&event_store)),
+            "local".to_string(),
+        );
+        assert_eq!(tasks.len(), 1);
+        let task = tasks.pop().expect("one secondary checkpoint task");
+        assert!(!task.is_main, "the only checkpoint task must be secondary");
+        assert!(
+            task.lifecycle_owner.is_some(),
+            "the secondary task must own lifecycle emission when no main task exists"
+        );
+
+        let config = CheckpointConfig {
+            interval: std::time::Duration::from_millis(10),
+            warn_pages: 0,
+            ..CheckpointConfig::default()
+        };
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+        let handle = tokio::spawn(run_checkpoint_task(
+            task.pool,
+            config,
+            task.lifecycle_owner,
+            shutdown_rx,
+            task.is_main,
+        ));
+
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        shutdown_tx.send(()).expect("send checkpoint shutdown");
+        tokio::time::timeout(std::time::Duration::from_secs(1), handle)
+            .await
+            .expect("checkpoint task should exit within 1s")
+            .expect("checkpoint task panicked");
+
+        let events = event_store
+            .query_events(
+                khive_storage::EventFilter::default(),
+                khive_storage::PageRequest {
+                    limit: 100,
+                    offset: 0,
+                },
+            )
+            .await
+            .expect("query lifecycle events");
+        assert!(
+            !events.items.is_empty()
+                && events
+                    .items
+                    .iter()
+                    .all(|event| event.kind == khive_types::EventKind::CheckpointOutcomeRecorded),
+            "the designated secondary owner must emit CheckpointOutcomeRecorded"
+        );
+
+        let file_main_dir = tempfile::tempdir().expect("file-backed main tempdir");
+        let file_main = khive_db::StorageBackend::sqlite(file_main_dir.path().join("main.db"))
+            .expect("file-backed main backend");
+        let tasks = checkpoint_task_specs(
+            Some(file_main.pool_arc()),
+            vec![secondary_backend.pool_arc()],
+            Some(event_store),
+            "local".to_string(),
+        );
+        assert!(tasks[0].is_main && tasks[0].lifecycle_owner.is_some());
+        assert!(!tasks[1].is_main && tasks[1].lifecycle_owner.is_none());
+    }
 
     // Focused regression tests for the unsafe process probe (SAFETY: signal 0
     // is an existence check with no side effects; see is_process_running).
