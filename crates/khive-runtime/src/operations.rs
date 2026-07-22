@@ -943,6 +943,58 @@ fn recompute_total_weight(path: &mut GraphPath) {
     path.total_weight = path.nodes.iter().map(|n| n.weight).fold(0.0_f64, f64::max);
 }
 
+/// Await every spawned multi-model embed task in `join_set`, returning one
+/// vector per model (in model order) on full success.
+///
+/// `join_set` entries are `(model_index, embed_result)` — the index lets
+/// completion order (which is arrival order, not spawn order) be reassembled
+/// into the caller's model order. On the first failure (an embed error or a
+/// task panic), every remaining handle is aborted immediately rather than
+/// awaited to completion, so a fast provider failure no longer waits on a
+/// slow sibling. Aborted handles are still drained here — `join_next`
+/// keeps yielding until the set is empty, including a cancelled `JoinError`
+/// for each aborted task — so no embed task (and the `UsageContext` clone
+/// it holds) is still running once this function returns.
+async fn drain_embed_join_set(
+    mut join_set: tokio::task::JoinSet<(usize, RuntimeResult<Vec<f32>>)>,
+    model_count: usize,
+) -> RuntimeResult<Vec<Vec<f32>>> {
+    let mut vectors: Vec<Option<Vec<f32>>> = (0..model_count).map(|_| None).collect();
+    let mut first_err: Option<RuntimeError> = None;
+
+    while let Some(joined) = join_set.join_next().await {
+        match joined {
+            Ok((idx, Ok(vector))) => vectors[idx] = Some(vector),
+            Ok((_idx, Err(e))) => {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                    join_set.abort_all();
+                }
+            }
+            Err(join_err) => {
+                // A cancelled JoinError is the expected shape for every handle
+                // aborted by the `abort_all()` above; a genuine panic reaching
+                // here before `first_err` is set is itself the triggering
+                // failure.
+                if first_err.is_none() {
+                    first_err = Some(RuntimeError::Internal(format!(
+                        "embed task panicked: {join_err}"
+                    )));
+                    join_set.abort_all();
+                }
+            }
+        }
+    }
+
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(vectors
+            .into_iter()
+            .map(|v| v.expect("every model index observed exactly once by join_set drain"))
+            .collect()),
+    }
+}
+
 impl KhiveRuntime {
     // ---- Entity operations ----
 
@@ -1095,84 +1147,52 @@ impl KhiveRuntime {
             let rt_clone = self.clone();
             let body_owned = embed_body.clone();
             let usage_ctx = crate::usage::current();
-            let mut handles = Vec::with_capacity(embed_model_names.len());
-            for model_name in &embed_model_names {
+            let mut join_set = tokio::task::JoinSet::new();
+            for (idx, model_name) in embed_model_names.iter().enumerate() {
                 let rt = rt_clone.clone();
                 let text = body_owned.clone();
                 let name = model_name.clone();
                 let ctx = usage_ctx.clone();
-                handles.push(tokio::spawn(async move {
+                join_set.spawn(async move {
                     let fut = rt.embed_document_with_model(&name, &text);
-                    match ctx {
+                    let result = match ctx {
                         Some(ctx) => crate::usage::scope(ctx, fut).await,
                         None => fut.await,
-                    }
-                }));
+                    };
+                    (idx, result)
+                });
             }
-            // Await every handle before inspecting any result. Each handle holds a
-            // clone of the dispatch's UsageContext (ADR-103 Amendment 2); returning
-            // early on the first error would leave later handles un-awaited, so
-            // their embed tasks keep running (and incrementing embed_calls) after
-            // this function has already returned — the usage snapshot must never
-            // observe a task the dispatch didn't wait for.
-            let mut join_results = Vec::with_capacity(handles.len());
-            for handle in handles {
-                join_results.push(
-                    handle
-                        .await
-                        .map_err(|e| RuntimeError::Internal(format!("embed task panicked: {e}"))),
-                );
-            }
-            let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(embed_model_names.len());
-            for join_result in join_results {
-                match join_result {
-                    Err(e) => {
-                        if let Ok(store) = self.entities(token) {
-                            if let Err(ce) = store.delete_entity(entity.id, DeleteMode::Hard).await
-                            {
-                                tracing::error!(
-                                    error = %ce,
-                                    id = %entity.id,
-                                    "create_entity: failed to roll back entity row after embed task panic"
-                                );
-                            }
+            // Abort-then-await: the first failed/panicked handle triggers
+            // `abort_all()` on the rest so a slow sibling's embed task no
+            // longer stalls a fast provider failure, then every handle
+            // (including the aborted ones) is still drained to completion —
+            // each holds a clone of the dispatch's UsageContext (ADR-103
+            // Amendment 2), so none may outlive this function: the usage
+            // snapshot must never observe a task the dispatch didn't wait for.
+            let vectors = match drain_embed_join_set(join_set, embed_model_names.len()).await {
+                Ok(vectors) => vectors,
+                Err(e) => {
+                    if let Ok(store) = self.entities(token) {
+                        if let Err(ce) = store.delete_entity(entity.id, DeleteMode::Hard).await {
+                            tracing::error!(
+                                error = %ce,
+                                id = %entity.id,
+                                "create_entity: failed to roll back entity row after embed failure"
+                            );
                         }
-                        if let Ok(fts) = self.text(token) {
-                            if let Err(ce) = fts.delete_document(ns, entity.id).await {
-                                tracing::error!(
-                                    error = %ce,
-                                    id = %entity.id,
-                                    "create_entity: failed to roll back FTS document after embed task panic"
-                                );
-                            }
-                        }
-                        return Err(e);
                     }
-                    Ok(Err(e)) => {
-                        if let Ok(store) = self.entities(token) {
-                            if let Err(ce) = store.delete_entity(entity.id, DeleteMode::Hard).await
-                            {
-                                tracing::error!(
-                                    error = %ce,
-                                    id = %entity.id,
-                                    "create_entity: failed to roll back entity row after embed failure"
-                                );
-                            }
+                    if let Ok(fts) = self.text(token) {
+                        if let Err(ce) = fts.delete_document(ns, entity.id).await {
+                            tracing::error!(
+                                error = %ce,
+                                id = %entity.id,
+                                "create_entity: failed to roll back FTS document after embed failure"
+                            );
                         }
-                        if let Ok(fts) = self.text(token) {
-                            if let Err(ce) = fts.delete_document(ns, entity.id).await {
-                                tracing::error!(
-                                    error = %ce,
-                                    id = %entity.id,
-                                    "create_entity: failed to roll back FTS document after embed failure"
-                                );
-                            }
-                        }
-                        return Err(e);
                     }
-                    Ok(Ok(vec)) => vectors.push(vec),
+                    return Err(e);
                 }
-            }
+            };
             // TODO(P2): parallelize vector inserts
             let mut inserted_models: Vec<String> = Vec::with_capacity(embed_model_names.len());
             for (model_name, vector) in embed_model_names.iter().zip(vectors) {
@@ -3110,60 +3130,41 @@ impl KhiveRuntime {
             let rt_clone = self.clone();
             let content_owned = embed_text.to_string();
             let usage_ctx = crate::usage::current();
-            let mut handles = Vec::with_capacity(embed_model_names.len());
-            for model_name in &embed_model_names {
+            let mut join_set = tokio::task::JoinSet::new();
+            for (idx, model_name) in embed_model_names.iter().enumerate() {
                 let rt = rt_clone.clone();
                 let text = content_owned.clone();
                 let name = model_name.clone();
                 let ctx = usage_ctx.clone();
-                handles.push(tokio::spawn(async move {
+                join_set.spawn(async move {
                     let fut = rt.embed_document_with_model(&name, &text);
-                    match ctx {
+                    let result = match ctx {
                         Some(ctx) => crate::usage::scope(ctx, fut).await,
                         None => fut.await,
-                    }
-                }));
+                    };
+                    (idx, result)
+                });
             }
-            // Await every handle before inspecting any result. Each handle holds a
-            // clone of the dispatch's UsageContext (ADR-103 Amendment 2); returning
-            // early on the first error would leave later handles un-awaited, so
-            // their embed tasks keep running (and incrementing embed_calls) after
-            // this function has already returned — the usage snapshot must never
-            // observe a task the dispatch didn't wait for.
-            let mut join_results = Vec::with_capacity(handles.len());
-            for handle in handles {
-                join_results.push(
-                    handle
-                        .await
-                        .map_err(|e| RuntimeError::Internal(format!("embed task panicked: {e}"))),
-                );
-            }
-            let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(embed_model_names.len());
-            for join_result in join_results {
-                match join_result {
-                    Err(e) => {
-                        // Compensate note row + FTS (no vectors inserted yet).
-                        if let Ok(store) = self.notes(token) {
-                            let _ = store.delete_note(note.id, DeleteMode::Hard).await;
-                        }
-                        if let Ok(fts) = self.text_for_notes(token) {
-                            let _ = fts.delete_document(ns, note.id).await;
-                        }
-                        return Err(e);
+            // Abort-then-await: the first failed/panicked handle triggers
+            // `abort_all()` on the rest so a slow sibling's embed task no
+            // longer stalls a fast provider failure, then every handle
+            // (including the aborted ones) is still drained to completion —
+            // each holds a clone of the dispatch's UsageContext (ADR-103
+            // Amendment 2), so none may outlive this function: the usage
+            // snapshot must never observe a task the dispatch didn't wait for.
+            let vectors = match drain_embed_join_set(join_set, embed_model_names.len()).await {
+                Ok(vectors) => vectors,
+                Err(e) => {
+                    // Compensate note row + FTS (no vectors inserted yet).
+                    if let Ok(store) = self.notes(token) {
+                        let _ = store.delete_note(note.id, DeleteMode::Hard).await;
                     }
-                    Ok(Err(e)) => {
-                        // Embed call failed — compensate note row + FTS.
-                        if let Ok(store) = self.notes(token) {
-                            let _ = store.delete_note(note.id, DeleteMode::Hard).await;
-                        }
-                        if let Ok(fts) = self.text_for_notes(token) {
-                            let _ = fts.delete_document(ns, note.id).await;
-                        }
-                        return Err(e);
+                    if let Ok(fts) = self.text_for_notes(token) {
+                        let _ = fts.delete_document(ns, note.id).await;
                     }
-                    Ok(Ok(vec)) => vectors.push(vec),
+                    return Err(e);
                 }
-            }
+            };
             // TODO(P2): parallelize vector inserts
             let mut inserted_models: Vec<String> = Vec::with_capacity(embed_model_names.len());
             for (model_name, vector) in embed_model_names.iter().zip(vectors) {
@@ -3442,7 +3443,11 @@ impl KhiveRuntime {
                 .await
         };
 
-        crate::usage::count(crate::usage::UsageUnit::FtsPasses, 1);
+        // FtsPasses is counted inside the store's `search()` (khive-db
+        // stores/text.rs), only once a real FTS5 statement is prepared —
+        // an empty/fully-sanitized query short-circuits there before any
+        // statement exists and must not count (nor does the injected-failure
+        // branch above, which never reaches the store at all).
         let text_hits = crate::error::fts_text_leg_or_err(
             text_search_result.map_err(RuntimeError::from),
             "search_notes",
@@ -5554,6 +5559,71 @@ mod tests {
             Err(RuntimeError::Internal(
                 "injected embed build failure".to_string(),
             ))
+        }
+    }
+
+    /// Embedder whose `embed` parks until a release that never comes — models
+    /// a hung provider. Only task abort can end its embed future.
+    struct ParkedVecProvider {
+        provider_name: String,
+        dims: usize,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl ParkedVecProvider {
+        fn new(name: &str, dims: usize) -> (Self, Arc<tokio::sync::Notify>) {
+            let release = Arc::new(tokio::sync::Notify::new());
+            (
+                Self {
+                    provider_name: name.to_owned(),
+                    dims,
+                    release: Arc::clone(&release),
+                },
+                release,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl EmbedderProvider for ParkedVecProvider {
+        fn name(&self) -> &str {
+            &self.provider_name
+        }
+
+        fn dimensions(&self) -> usize {
+            self.dims
+        }
+
+        async fn build(&self) -> crate::error::RuntimeResult<Arc<dyn EmbeddingService>> {
+            Ok(Arc::new(ParkedVecService {
+                dims: self.dims,
+                release: Arc::clone(&self.release),
+            }))
+        }
+    }
+
+    struct ParkedVecService {
+        dims: usize,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl EmbeddingService for ParkedVecService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+            self.release.notified().await;
+            Ok(texts.iter().map(|_| vec![1.0_f32; self.dims]).collect())
+        }
+
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "parked-vec"
         }
     }
 
@@ -11980,6 +12050,48 @@ mod tests {
              its error — a late increment means a context-holding handle was left \
              un-awaited; got immediately_after={snap_immediately_after:?} \
              after_delay={snap_after_delay:?}"
+        );
+    }
+
+    // A fast provider failure must not wait on a slow sibling: the drain
+    // aborts remaining embed tasks on the first error instead of awaiting
+    // them to completion. The sibling here parks until a release that never
+    // fires, so under await-to-completion this call would never return —
+    // a bounded prompt error return is only reachable through the abort path.
+    #[tokio::test]
+    async fn create_entity_fast_embed_failure_does_not_wait_for_hung_sibling() {
+        const DIMS: usize = 4;
+
+        let rt = KhiveRuntime::memory().unwrap();
+        rt.register_embedder(FailFastProvider::new("latency-fail-fast"));
+        let (parked, _release) = ParkedVecProvider::new("latency-parked", DIMS);
+        rt.register_embedder(parked);
+
+        let ns = Namespace::parse("usage-entity-latency").unwrap();
+        let tok = NamespaceToken::for_namespace(ns.clone());
+
+        let started = std::time::Instant::now();
+        let result = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "latency entity",
+                Some("description so embed body is non-empty"),
+                None,
+                vec![],
+            )
+            .await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            result.is_err(),
+            "one model failing must fail the whole create_entity call"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "a fast embed failure must return without waiting on the hung \
+             sibling (which parks forever); took {elapsed:?}"
         );
     }
 

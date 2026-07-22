@@ -2307,3 +2307,99 @@ async fn test_search_hyphenated_id_with_plain_terms_matches_exact_id() {
         );
     }
 }
+
+// `fts_passes` is an issued counter (khive_storage::usage): it must count
+// one FTS5 statement actually prepared and executed. An empty/fully-sanitized
+// query short-circuits `search()` before any statement exists (`build_match_expr`
+// returns `None`) and must not count; a normal query that does reach
+// `conn.prepare` must count exactly once.
+#[tokio::test]
+async fn test_search_empty_query_does_not_count_fts_pass() {
+    let store = setup_memory_store("empty_query_no_count");
+
+    let ctx = khive_storage::usage::UsageContext::new();
+    let hits = khive_storage::usage::scope(ctx.clone(), async {
+        store
+            .search(TextSearchRequest {
+                query: String::new(),
+                mode: TextQueryMode::Plain,
+                filter: Some(ns_filter("test_ns")),
+                top_k: 10,
+                snippet_chars: 64,
+            })
+            .await
+    })
+    .await
+    .unwrap();
+
+    assert!(hits.is_empty(), "empty query must return no hits");
+    let snap = ctx.snapshot();
+    assert!(
+        snap.get("fts_passes").is_none(),
+        "an empty query must never prepare an FTS5 statement, so fts_passes \
+         must not count; got {snap:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_search_fully_sanitized_query_does_not_count_fts_pass() {
+    let store = setup_memory_store("sanitized_query_no_count");
+
+    // Pure FTS5 metacharacters — `sanitize_fts5_token_group` strips every
+    // token to nothing, so `build_match_expr` still returns `None`.
+    let ctx = khive_storage::usage::UsageContext::new();
+    let hits = khive_storage::usage::scope(ctx.clone(), async {
+        store
+            .search(TextSearchRequest {
+                query: "\"\"^^**".to_string(),
+                mode: TextQueryMode::Plain,
+                filter: Some(ns_filter("test_ns")),
+                top_k: 10,
+                snippet_chars: 64,
+            })
+            .await
+    })
+    .await
+    .unwrap();
+
+    assert!(hits.is_empty(), "fully-sanitized query must return no hits");
+    let snap = ctx.snapshot();
+    assert!(
+        snap.get("fts_passes").is_none(),
+        "a fully-sanitized query must never prepare an FTS5 statement, so \
+         fts_passes must not count; got {snap:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_search_normal_query_counts_exactly_one_fts_pass() {
+    let store = setup_memory_store("normal_query_counts_once");
+
+    let id = Uuid::new_v4();
+    store
+        .upsert_document(make_document(id, "counted", "fts pass accounting body"))
+        .await
+        .unwrap();
+
+    let ctx = khive_storage::usage::UsageContext::new();
+    let hits = khive_storage::usage::scope(ctx.clone(), async {
+        store
+            .search(TextSearchRequest {
+                query: "accounting".to_string(),
+                mode: TextQueryMode::Plain,
+                filter: Some(ns_filter("test_ns")),
+                top_k: 10,
+                snippet_chars: 64,
+            })
+            .await
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(hits.len(), 1, "query must match the upserted document");
+    let snap = ctx.snapshot();
+    assert_eq!(
+        snap["fts_passes"], 1,
+        "a query that reaches conn.prepare must count exactly one fts_pass; got {snap:?}"
+    );
+}

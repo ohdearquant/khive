@@ -426,7 +426,10 @@ impl KhiveRuntime {
                 snippet_chars: 200,
             })
             .await;
-        crate::usage::count(crate::usage::UsageUnit::FtsPasses, 1);
+        // FtsPasses is counted inside the store's `search()` (khive-db
+        // stores/text.rs), only once a real FTS5 statement is prepared —
+        // an empty/fully-sanitized query short-circuits there before any
+        // statement exists and must not count.
         let text_hits = crate::error::fts_text_leg_or_err(
             text_search_result.map_err(RuntimeError::from),
             "hybrid_search",
