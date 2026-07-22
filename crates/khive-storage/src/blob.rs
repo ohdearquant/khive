@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::capability::StorageCapability;
 use crate::error::StorageError;
+use crate::sql::SqlAccess;
 use crate::types::StorageResult;
 
 /// Number of hex characters in a BLAKE3-256 digest (32 bytes -> 64 hex chars).
@@ -198,8 +199,8 @@ pub trait BlobStore: Send + Sync + std::fmt::Debug + 'static {
     /// newly live between the snapshot and the sweep is deleted anyway.
     /// **Callers MUST quiesce entity writes** for the duration of
     /// snapshot-plus-sweep. See `crates/khive-storage/docs/api/blob-store.md`
-    /// for the race repro and the tracked transactional-sweep follow-up
-    /// (khive#924).
+    /// for the race repro. Concurrent callers must use
+    /// [`Self::transactional_orphan_sweep`] instead.
     async fn orphan_sweep(
         &self,
         config: &BlobOrphanSweepConfig,
@@ -209,6 +210,31 @@ pub trait BlobStore: Send + Sync + std::fmt::Debug + 'static {
             capability: StorageCapability::Blob,
             operation: "orphan_sweep".into(),
             message: "this backend does not support orphan sweep".into(),
+        })
+    }
+
+    /// Select live entity references and sweep orphaned blobs in one database
+    /// writer transaction.
+    ///
+    /// Unlike [`Self::orphan_sweep`], this operation obtains liveness itself
+    /// from `sql`; callers do not assemble a stale snapshot. `sql` must be the
+    /// same database capability used for the entity writes that own these
+    /// references. Implementations must also ensure an object published after
+    /// the sweep's candidate set is captured cannot be mistaken for an orphan,
+    /// including when it is published between selecting live references and
+    /// physical deletion.
+    /// Backends that cannot provide both guarantees return
+    /// `StorageError::Unsupported`.
+    async fn transactional_orphan_sweep(
+        &self,
+        sql: &dyn SqlAccess,
+        dry_run: bool,
+    ) -> StorageResult<BlobOrphanSweepResult> {
+        let _ = (sql, dry_run);
+        Err(StorageError::Unsupported {
+            capability: StorageCapability::Blob,
+            operation: "transactional_orphan_sweep".into(),
+            message: "this backend does not support a database-coordinated orphan sweep".into(),
         })
     }
 }

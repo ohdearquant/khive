@@ -19,8 +19,8 @@ use async_trait::async_trait;
 
 use khive_storage::blob::{BlobOrphanSweepConfig, BlobOrphanSweepResult, BlobStore, ContentRef};
 use khive_storage::error::StorageError;
-use khive_storage::types::StorageResult;
-use khive_storage::StorageCapability;
+use khive_storage::types::{SqlStatement, SqlValue, StorageResult};
+use khive_storage::{AtomicUnitOp, SqlAccess, StorageCapability};
 
 use crate::error::SqliteError;
 
@@ -187,6 +187,35 @@ fn walk_blob_files(root: &Path) -> std::io::Result<Vec<(ContentRef, PathBuf)>> {
         }
     }
     Ok(out)
+}
+
+fn sweep_blob_candidates(
+    files: Vec<(ContentRef, PathBuf)>,
+    live_refs: &std::collections::HashSet<ContentRef>,
+    dry_run: bool,
+) -> StorageResult<BlobOrphanSweepResult> {
+    let mut result = BlobOrphanSweepResult::default();
+    for (content_ref, path) in files {
+        result.scanned += 1;
+        if live_refs.contains(&content_ref) {
+            continue;
+        }
+        result.would_delete += 1;
+        if !dry_run {
+            fs::remove_file(&path).map_err(|e| map_io_err(e, "orphan_sweep_delete"))?;
+            result.deleted += 1;
+        }
+    }
+    Ok(result)
+}
+
+fn sweep_blob_files(
+    root: &Path,
+    live_refs: &std::collections::HashSet<ContentRef>,
+    dry_run: bool,
+) -> StorageResult<BlobOrphanSweepResult> {
+    let files = walk_blob_files(root).map_err(|e| map_io_err(e, "orphan_sweep_walk"))?;
+    sweep_blob_candidates(files, live_refs, dry_run)
 }
 
 /// Process-wide registry of per-canonical-root write locks.
@@ -378,35 +407,90 @@ impl BlobStore for FsBlobStore {
         let root = self.root.clone();
         let live_refs = config.live_refs.clone();
         let dry_run = config.dry_run;
-        tokio::task::spawn_blocking(move || {
-            let files = walk_blob_files(&root).map_err(|e| map_io_err(e, "orphan_sweep_walk"))?;
-            let mut scanned = 0u64;
-            let mut deleted = 0u64;
-            let mut would_delete = 0u64;
-            for (content_ref, path) in files {
-                scanned += 1;
-                if live_refs.contains(&content_ref) {
-                    continue;
-                }
-                would_delete += 1;
-                if !dry_run {
-                    fs::remove_file(&path).map_err(|e| map_io_err(e, "orphan_sweep_delete"))?;
-                    deleted += 1;
-                }
-            }
-            Ok(BlobOrphanSweepResult {
-                scanned,
-                deleted,
-                would_delete,
-            })
+        tokio::task::spawn_blocking(move || sweep_blob_files(&root, &live_refs, dry_run))
+            .await
+            .map_err(|e| StorageError::driver(StorageCapability::Blob, "orphan_sweep", e))?
+    }
+
+    async fn transactional_orphan_sweep(
+        &self,
+        sql: &dyn SqlAccess,
+        dry_run: bool,
+    ) -> StorageResult<BlobOrphanSweepResult> {
+        let owned_guard = self.write_lock.clone().lock_owned().await;
+        let root = self.root.clone();
+        let scan_root = root.clone();
+        let (owned_guard, candidates) = tokio::task::spawn_blocking(move || {
+            let candidates = walk_blob_files(&scan_root)
+                .map_err(|e| map_io_err(e, "transactional_orphan_sweep_walk"))?;
+            Ok::<_, StorageError>((owned_guard, candidates))
         })
         .await
-        .map_err(|e| StorageError::driver(StorageCapability::Blob, "orphan_sweep", e))?
+        .map_err(|e| {
+            StorageError::driver(
+                StorageCapability::Blob,
+                "transactional_orphan_sweep_walk",
+                e,
+            )
+        })??;
+        #[cfg(test)]
+        let hook = sync_hook::take(&root);
+        let op: AtomicUnitOp = Box::new(move |writer| {
+            Box::pin(async move {
+                let _owned_guard = owned_guard;
+                let rows = writer
+                    .query_all(SqlStatement {
+                        sql: "SELECT DISTINCT content_ref FROM entities \
+                              WHERE deleted_at IS NULL AND content_ref IS NOT NULL"
+                            .to_string(),
+                        params: vec![],
+                        label: Some("blob_live_refs".to_string()),
+                    })
+                    .await?;
+                let mut live_refs = std::collections::HashSet::with_capacity(rows.len());
+                for row in rows {
+                    let raw = match row.get("content_ref") {
+                        Some(SqlValue::Text(raw)) => raw,
+                        _ => {
+                            return Err(StorageError::InvalidInput {
+                                capability: StorageCapability::Blob,
+                                operation: "transactional_orphan_sweep".into(),
+                                message: "entities.content_ref contained a non-text value".into(),
+                            });
+                        }
+                    };
+                    let content_ref = ContentRef::from_hex(raw.clone()).map_err(|message| {
+                        StorageError::InvalidInput {
+                            capability: StorageCapability::Blob,
+                            operation: "transactional_orphan_sweep".into(),
+                            message,
+                        }
+                    })?;
+                    live_refs.insert(content_ref);
+                }
+                #[cfg(test)]
+                if let Some(hook) = &hook {
+                    let _ = hook.reached.send(());
+                    let _ = hook.release.recv();
+                }
+                let result = sweep_blob_candidates(candidates, &live_refs, dry_run)?;
+                Ok(Box::new(result) as Box<dyn std::any::Any + Send>)
+            })
+        });
+        let result = sql.atomic_unit(op).await?;
+        result
+            .downcast::<BlobOrphanSweepResult>()
+            .map(|result| *result)
+            .map_err(|_| {
+                StorageError::Internal(
+                    "transactional orphan sweep returned an unexpected result type".into(),
+                )
+            })
     }
 }
 
-/// Test-only synchronization seam into `put`'s write-lock-guarded critical
-/// section (added for PR #922).
+/// Test-only synchronization seam into blob write-lock-guarded critical
+/// sections (added for PR #922 and reused by the transactional sweep).
 ///
 /// The prior regression tests proved mutual exclusion and cancellation-
 /// safety with a fixed sleep before racing/aborting and a fixed-duration
@@ -437,9 +521,8 @@ mod sync_hook {
         REGISTRY.get_or_init(|| StdMutex::new(HashMap::new()))
     }
 
-    /// Queue a one-shot hook for the NEXT `put` against `root`'s canonical
-    /// path. Consumed exactly once, FIFO -- a test expecting several
-    /// sequential puts to each pause installs several hooks.
+    /// Queue a one-shot hook for the next instrumented operation against
+    /// `root`'s canonical path. Consumed exactly once, FIFO.
     pub(super) fn install(root: &Path) -> (Receiver<()>, Sender<()>, Receiver<()>) {
         let canonical = root
             .canonicalize()
@@ -890,6 +973,106 @@ mod tests {
              snapshot was taken — callers MUST quiesce entity writes before running it \
              (ADR-111 §8)"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn transactional_orphan_sweep_preserves_put_started_after_liveness_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("khive.db");
+        let backend = std::sync::Arc::new(crate::StorageBackend::sqlite(&db_path).unwrap());
+        {
+            let mut writer = backend.pool().writer().unwrap();
+            crate::run_migrations(writer.conn_mut()).unwrap();
+        }
+        let root = dir.path().join("blobs");
+        let store = std::sync::Arc::new(FsBlobStore::new(root.clone(), 0).unwrap());
+        let orphan = store.put(b"old orphan".to_vec()).await.unwrap();
+        let canonical_root = root.canonicalize().unwrap();
+        let (marked, release, _done) = sync_hook::install(&canonical_root);
+
+        let sweep = {
+            let store = store.clone();
+            let sql = backend.sql();
+            tokio::spawn(async move { store.transactional_orphan_sweep(sql.as_ref(), false).await })
+        };
+        assert!(
+            recv_blocking(marked).await,
+            "sweep must finish its liveness mark"
+        );
+
+        assert!(
+            store.write_lock.try_lock().is_err(),
+            "the sweep must hold the same root lock used by blob writers"
+        );
+        let new_ref = {
+            let root = root.clone();
+            tokio::task::spawn_blocking(move || {
+                // Model a writer in another process, outside this process's
+                // root-lock registry, publishing after the DB liveness mark.
+                put_blocking(&root, 0, b"new concurrent blob".to_vec())
+            })
+            .await
+            .unwrap()
+            .unwrap()
+        };
+
+        release.send(()).unwrap();
+        let sweep_result = sweep.await.unwrap().unwrap();
+
+        assert_eq!(sweep_result.deleted, 1);
+        assert!(!store.exists(&orphan).await.unwrap());
+        assert!(
+            store.exists(&new_ref).await.unwrap(),
+            "a blob put started between the liveness mark and physical sweep must survive"
+        );
+    }
+
+    #[tokio::test]
+    async fn transactional_orphan_sweep_uses_only_non_deleted_entity_refs_as_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("khive.db");
+        let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+        {
+            let mut writer = backend.pool().writer().unwrap();
+            crate::run_migrations(writer.conn_mut()).unwrap();
+        }
+        let store = FsBlobStore::new(dir.path().join("blobs"), 0).unwrap();
+        let live = store.put(b"live".to_vec()).await.unwrap();
+        let soft_deleted = store.put(b"soft deleted".to_vec()).await.unwrap();
+        let orphan = store.put(b"orphan".to_vec()).await.unwrap();
+        {
+            let writer = backend.pool().writer().unwrap();
+            writer
+                .conn()
+                .execute(
+                    "INSERT INTO entities \
+                     (id, namespace, kind, name, tags, created_at, updated_at, deleted_at, content_ref) \
+                     VALUES ('live', 'local', 'document', 'live', '[]', 1, 1, NULL, ?1), \
+                            ('deleted', 'local', 'document', 'deleted', '[]', 1, 1, 2, ?2)",
+                    rusqlite::params![live.as_str(), soft_deleted.as_str()],
+                )
+                .unwrap();
+        }
+
+        let dry_run = store
+            .transactional_orphan_sweep(backend.sql().as_ref(), true)
+            .await
+            .unwrap();
+        assert_eq!(dry_run.would_delete, 2);
+        assert_eq!(dry_run.deleted, 0);
+        assert!(store.exists(&soft_deleted).await.unwrap());
+        assert!(store.exists(&orphan).await.unwrap());
+
+        let result = store
+            .transactional_orphan_sweep(backend.sql().as_ref(), false)
+            .await
+            .unwrap();
+
+        assert_eq!(result.scanned, 3);
+        assert_eq!(result.deleted, 2);
+        assert!(store.exists(&live).await.unwrap());
+        assert!(!store.exists(&soft_deleted).await.unwrap());
+        assert!(!store.exists(&orphan).await.unwrap());
     }
 
     #[tokio::test]

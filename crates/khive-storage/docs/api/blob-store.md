@@ -60,10 +60,23 @@ which reproduces exactly this). This trait provides no transactional
 coordination with an entity writer. **Callers MUST quiesce entity writes**
 (nothing may create a new `content_ref` reference) for the duration of
 snapshot-plus-sweep — a maintenance window, a single-writer admin CLI
-invocation with no live traffic, or equivalent. A DB-coordinated,
-transactional sweep (select-and-delete under the entity writer's own
-transactional boundary) would close this hazard properly; that is tracked as
-a follow-up (khive#924), not built in this round.
+invocation with no live traffic, or equivalent.
+
+A DB-coordinated sweep is available separately as
+`BlobStore::transactional_orphan_sweep`. The filesystem implementation acquires
+the same canonical-root lock as `put`, captures a bounded candidate set, then
+selects every non-deleted entity's `content_ref` and deletes only those
+candidates inside one `SqlAccess::atomic_unit` writer transaction. Entity
+writes therefore cannot change liveness during the anti-join. A blob published
+after candidate capture, including between the liveness mark and physical
+deletion, is outside that sweep and survives even when the publisher is in
+another process. Backends that cannot provide both coordination boundaries
+return `Unsupported`.
+
+The original `orphan_sweep` remains an offline-maintenance API for callers that
+already have a trusted `live_refs` snapshot. It intentionally retains its
+quiescence requirement for compatibility; concurrent callers must use
+`transactional_orphan_sweep`.
 
 Default `orphan_sweep` implementation returns `StorageError::Unsupported`; the
 filesystem backend overrides it with a real directory walk. No silent no-op.
