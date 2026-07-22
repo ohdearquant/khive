@@ -954,6 +954,8 @@ fn recompute_total_weight(path: &mut GraphPath) {
 /// already inside synchronous native inference may finish that call in the
 /// background. Embed calls are counted when issued, before the provider
 /// await, so detached completion cannot change the operation's usage count.
+/// Each task owns cloned runtime/provider state and only computes an embedding;
+/// storage writes remain in the parent after this drain succeeds.
 async fn drain_embed_join_set(
     mut join_set: tokio::task::JoinSet<(usize, RuntimeResult<Vec<f32>>)>,
     model_count: usize,
@@ -5400,7 +5402,7 @@ mod tests {
     use async_trait::async_trait;
     use khive_storage::types::PathNode;
     use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
     fn rt() -> KhiveRuntime {
@@ -5528,17 +5530,25 @@ mod tests {
         }
     }
 
-    /// Embedder provider whose `build()` always fails immediately — models
-    /// this provider's embed task resolving (with an error) well before a
-    /// slower sibling model's task completes.
+    /// Embedder that fails inference immediately unless configured to wait for
+    /// a sibling's entry signal first.
     struct FailFastProvider {
         provider_name: String,
+        wait_for: Option<Arc<AtomicBool>>,
     }
 
     impl FailFastProvider {
         fn new(name: &str) -> Self {
             Self {
                 provider_name: name.to_owned(),
+                wait_for: None,
+            }
+        }
+
+        fn after_signal(name: &str, wait_for: Arc<AtomicBool>) -> Self {
+            Self {
+                provider_name: name.to_owned(),
+                wait_for: Some(wait_for),
             }
         }
     }
@@ -5554,9 +5564,131 @@ mod tests {
         }
 
         async fn build(&self) -> crate::error::RuntimeResult<Arc<dyn EmbeddingService>> {
-            Err(RuntimeError::Internal(
-                "injected embed build failure".to_string(),
+            Ok(Arc::new(FailFastService {
+                wait_for: self.wait_for.clone(),
+            }))
+        }
+    }
+
+    struct FailFastService {
+        wait_for: Option<Arc<AtomicBool>>,
+    }
+
+    #[async_trait]
+    impl EmbeddingService for FailFastService {
+        async fn embed(
+            &self,
+            _texts: &[String],
+            _model: EmbeddingModel,
+        ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+            if let Some(wait_for) = &self.wait_for {
+                while !wait_for.load(Ordering::Acquire) {
+                    tokio::task::yield_now().await;
+                }
+            }
+            Err(EmbedError::InferenceFailed(
+                "injected embed failure".to_string(),
             ))
+        }
+
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "fail-fast"
+        }
+    }
+
+    /// Embedder whose synchronous inference section is controlled by a
+    /// condition variable, matching native inference that cannot observe task
+    /// cancellation until the encode call returns.
+    struct BlockingVecProvider {
+        provider_name: String,
+        dims: usize,
+        release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        entered: Arc<AtomicBool>,
+        exited: Arc<tokio::sync::Notify>,
+    }
+
+    struct BlockingVecControls {
+        release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        entered: Arc<AtomicBool>,
+        exited: Arc<tokio::sync::Notify>,
+    }
+
+    impl BlockingVecProvider {
+        fn new(name: &str, dims: usize) -> (Self, BlockingVecControls) {
+            let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+            let entered = Arc::new(AtomicBool::new(false));
+            let exited = Arc::new(tokio::sync::Notify::new());
+            (
+                Self {
+                    provider_name: name.to_owned(),
+                    dims,
+                    release: Arc::clone(&release),
+                    entered: Arc::clone(&entered),
+                    exited: Arc::clone(&exited),
+                },
+                BlockingVecControls {
+                    release,
+                    entered,
+                    exited,
+                },
+            )
+        }
+    }
+
+    #[async_trait]
+    impl EmbedderProvider for BlockingVecProvider {
+        fn name(&self) -> &str {
+            &self.provider_name
+        }
+
+        fn dimensions(&self) -> usize {
+            self.dims
+        }
+
+        async fn build(&self) -> crate::error::RuntimeResult<Arc<dyn EmbeddingService>> {
+            Ok(Arc::new(BlockingVecService {
+                dims: self.dims,
+                release: Arc::clone(&self.release),
+                entered: Arc::clone(&self.entered),
+                exited: Arc::clone(&self.exited),
+            }))
+        }
+    }
+
+    struct BlockingVecService {
+        dims: usize,
+        release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        entered: Arc<AtomicBool>,
+        exited: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl EmbeddingService for BlockingVecService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+            self.entered.store(true, Ordering::Release);
+            let (released, wake) = &*self.release;
+            let guard = released.lock().expect("release lock must not be poisoned");
+            let _guard = wake
+                .wait_while(guard, |released| !*released)
+                .expect("release lock must not be poisoned");
+            self.exited.notify_one();
+            Ok(texts.iter().map(|_| vec![1.0_f32; self.dims]).collect())
+        }
+
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "blocking-vec"
         }
     }
 
@@ -12105,60 +12237,45 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn embed_drain_returns_error_while_sibling_is_in_synchronous_section() {
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let exited = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
-        let mut join_set = tokio::task::JoinSet::new();
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn create_entity_embed_failure_returns_while_sibling_encode_is_blocked() {
+        let rt = KhiveRuntime::memory().unwrap();
+        let (blocking, controls) = BlockingVecProvider::new("latency-blocking", 4);
+        rt.register_embedder(blocking);
+        rt.register_embedder(FailFastProvider::after_signal(
+            "latency-fail-after-entry",
+            Arc::clone(&controls.entered),
+        ));
 
-        join_set.spawn({
-            let entered = Arc::clone(&entered);
-            let exited = Arc::clone(&exited);
-            let release = Arc::clone(&release);
-            async move {
-                entered.notify_one();
-                let (released, wake) = &*release;
-                let guard = released.lock().expect("release lock must not be poisoned");
-                let _guard = wake
-                    .wait_while(guard, |released| !*released)
-                    .expect("release lock must not be poisoned");
-                exited.notify_one();
-                (0, Ok(vec![1.0_f32]))
-            }
-        });
-        join_set.spawn({
-            let entered = Arc::clone(&entered);
-            async move {
-                entered.notified().await;
-                (
-                    1,
-                    Err(RuntimeError::Internal(
-                        "injected embed failure after sibling entry".into(),
-                    )),
-                )
-            }
-        });
-
+        let tok = NamespaceToken::for_namespace(Namespace::parse("embed-failure-latency").unwrap());
         let result = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            drain_embed_join_set(join_set, 2),
+            std::time::Duration::from_secs(5),
+            rt.create_entity(
+                &tok,
+                "concept",
+                None,
+                "blocked sibling entity",
+                None,
+                None,
+                vec![],
+            ),
         )
         .await;
 
-        let (released, wake) = &*release;
+        let (released, wake) = &*controls.release;
         *released.lock().expect("release lock must not be poisoned") = true;
         wake.notify_all();
-        tokio::time::timeout(std::time::Duration::from_secs(2), exited.notified())
-            .await
-            .expect("blocked sibling must exit after release");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            controls.exited.notified(),
+        )
+        .await
+        .expect("blocked sibling must exit after release");
 
         let error = result
-            .expect("embed failure must return without waiting for the synchronous sibling")
-            .expect_err("one failed embed must fail the drain");
-        assert!(error
-            .to_string()
-            .contains("injected embed failure after sibling entry"));
+            .expect("embed failure must return without waiting for synchronous inference")
+            .expect_err("one failed model must fail entity creation");
+        assert!(error.to_string().contains("injected embed failure"));
     }
 
     // Issued-at-dispatch accounting: an embed call that was handed to the
