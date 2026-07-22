@@ -285,6 +285,7 @@ fn windows_owner_dacl_is_restricted(
     ace_flags: u8,
     access_mask: u32,
     owner_matches: bool,
+    owner_is_token_user: bool,
     dacl_protected: bool,
 ) -> bool {
     const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
@@ -296,6 +297,7 @@ fn windows_owner_dacl_is_restricted(
         && ace_flags == OBJECT_AND_CONTAINER_INHERIT
         && access_mask == FILE_ALL_ACCESS
         && owner_matches
+        && owner_is_token_user
         && dacl_protected
 }
 
@@ -1288,6 +1290,11 @@ mod windows_impl {
         let ace = unsafe { &*ace_ptr.cast::<ACCESS_ALLOWED_ACE>() };
         let ace_sid = (&raw const ace.SidStart).cast_mut().cast();
         let owner_matches = unsafe { EqualSid(owner, ace_sid) } != 0;
+        let token_storage = current_token_user()?;
+        // SAFETY: successful `GetTokenInformation(TokenUser)` initialized a
+        // `TOKEN_USER` at the start of the aligned output buffer.
+        let token_user_sid = unsafe { (*token_storage.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+        let owner_is_token_user = unsafe { EqualSid(owner, token_user_sid) } != 0;
         let mut control = 0;
         let mut revision = 0;
         // SAFETY: `descriptor` remains live under `_descriptor`; both scalar
@@ -1303,6 +1310,7 @@ mod windows_impl {
             ace.Header.AceFlags,
             ace.Mask,
             owner_matches,
+            owner_is_token_user,
             control & SE_DACL_PROTECTED != 0,
         );
         if !restricted {
@@ -3094,7 +3102,7 @@ mod tests {
     }
 
     #[test]
-    fn windows_owner_dacl_requires_one_protected_full_control_ace() {
+    fn windows_owner_dacl_accepts_token_user_owner_and_rejects_broader_shapes() {
         const ACCESS_ALLOWED: u8 = 0;
         const OBJECT_AND_CONTAINER_INHERIT: u8 = 0x03;
         const FILE_ALL_ACCESS: u32 = 0x001f_01ff;
@@ -3106,6 +3114,7 @@ mod tests {
             FILE_ALL_ACCESS,
             true,
             true,
+            true,
         ));
         assert!(!windows_owner_dacl_is_restricted(
             2,
@@ -3114,6 +3123,7 @@ mod tests {
             FILE_ALL_ACCESS,
             true,
             true,
+            true,
         ));
         assert!(!windows_owner_dacl_is_restricted(
             1,
@@ -3122,6 +3132,7 @@ mod tests {
             FILE_ALL_ACCESS,
             false,
             true,
+            true,
         ));
         assert!(!windows_owner_dacl_is_restricted(
             1,
@@ -3129,7 +3140,25 @@ mod tests {
             OBJECT_AND_CONTAINER_INHERIT,
             FILE_ALL_ACCESS,
             true,
+            true,
             false,
+        ));
+    }
+
+    #[test]
+    fn windows_owner_dacl_rejects_group_owner() {
+        const ACCESS_ALLOWED: u8 = 0;
+        const OBJECT_AND_CONTAINER_INHERIT: u8 = 0x03;
+        const FILE_ALL_ACCESS: u32 = 0x001f_01ff;
+
+        assert!(!windows_owner_dacl_is_restricted(
+            1,
+            ACCESS_ALLOWED,
+            OBJECT_AND_CONTAINER_INHERIT,
+            FILE_ALL_ACCESS,
+            true,
+            false,
+            true,
         ));
     }
 
