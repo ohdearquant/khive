@@ -86,6 +86,34 @@ fn newer_store_reports_binary_upgrade_action() {
 }
 
 #[test]
+fn pre_consolidation_store_reports_recreation_action() {
+    let mut conn = open_memory();
+    conn.execute_batch(MIGRATION_TRACKING_TABLE).unwrap();
+    for (version, name) in [
+        (1, "initial_schema"),
+        (2, "add_name_to_notes"),
+        (22, "knowledge_lifecycle_status"),
+    ] {
+        conn.execute(
+            "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (?1, ?2, 0)",
+            rusqlite::params![version, name],
+        )
+        .unwrap();
+    }
+
+    let err = run_migrations(&mut conn).expect_err("must reject a pre-consolidation ledger");
+    let SqliteError::InvalidData(message) = err else {
+        panic!("expected legacy-schema InvalidData diagnostic, got {err:?}");
+    };
+    assert!(
+        message.contains("predates the consolidated baseline"),
+        "{message}"
+    );
+    assert!(message.contains("recreate"), "{message}");
+    assert!(!message.contains("upgrade the binary"), "{message}");
+}
+
+#[test]
 fn core_tables_exist() {
     let mut conn = open_memory();
     run_migrations(&mut conn).expect("migrations");

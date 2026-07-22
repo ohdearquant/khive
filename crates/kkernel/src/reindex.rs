@@ -531,6 +531,7 @@ async fn repair_missing_embeddings(
                     break;
                 };
                 after = last_id.to_string();
+                // A selected subject may still have a stale row in another namespace.
                 errors += embed_and_store_batch(
                     rt,
                     token,
@@ -539,7 +540,7 @@ async fn repair_missing_embeddings(
                     &batch,
                     kind,
                     field,
-                    false,
+                    true,
                 )
                 .await;
                 match kind {
@@ -1133,6 +1134,51 @@ mod tests {
     use khive_storage::types::{SqlStatement, SqlValue};
     use serial_test::serial;
 
+    const REPAIR_MODEL: &str = "repair-test-model";
+    const REPAIR_TABLE: &str = "vec_repair_test_model";
+    const REPAIR_DIMS: usize = 4;
+
+    struct RepairEmbeddingService;
+
+    #[async_trait::async_trait]
+    impl lattice_embed::EmbeddingService for RepairEmbeddingService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: lattice_embed::EmbeddingModel,
+        ) -> Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+            Ok(vec![vec![0.75; REPAIR_DIMS]; texts.len()])
+        }
+
+        fn supports_model(&self, _model: lattice_embed::EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "repair-test"
+        }
+    }
+
+    struct RepairEmbedderProvider;
+
+    #[async_trait::async_trait]
+    impl khive_runtime::EmbedderProvider for RepairEmbedderProvider {
+        fn name(&self) -> &str {
+            REPAIR_MODEL
+        }
+
+        fn dimensions(&self) -> usize {
+            REPAIR_DIMS
+        }
+
+        async fn build(
+            &self,
+        ) -> Result<std::sync::Arc<dyn lattice_embed::EmbeddingService>, khive_runtime::RuntimeError>
+        {
+            Ok(std::sync::Arc::new(RepairEmbeddingService))
+        }
+    }
+
     #[tokio::test]
     async fn test_reindex_invalidates_vamana_snapshots() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
@@ -1446,6 +1492,67 @@ mod tests {
             .expect("select missing notes");
 
         assert_eq!(selected, vec![(missing.id, missing.content)]);
+    }
+
+    #[tokio::test]
+    async fn embeds_only_repair_replaces_stale_cross_namespace_vector() {
+        use khive_runtime::RuntimeConfig;
+        use khive_storage::types::VectorRecord;
+
+        let rt = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            ..RuntimeConfig::default()
+        })
+        .expect("runtime");
+        rt.register_embedder(RepairEmbedderProvider);
+        let token = rt
+            .authorize(Namespace::parse("local").expect("namespace"))
+            .expect("authorize");
+        let note = Note::new("local", "observation", "repair this embedding");
+        rt.notes(&token)
+            .expect("notes")
+            .upsert_note(note.clone())
+            .await
+            .expect("seed note");
+
+        let vectors = rt.vectors_for_model(&token, REPAIR_MODEL).expect("vectors");
+        vectors
+            .insert_batch(vec![VectorRecord {
+                subject_id: note.id,
+                kind: SubstrateKind::Note,
+                namespace: "stale-namespace".to_string(),
+                field: "note.content".to_string(),
+                embedding_model: Some(REPAIR_MODEL.to_string()),
+                vectors: vec![vec![0.1; REPAIR_DIMS]],
+                updated_at: chrono::Utc::now(),
+            }])
+            .await
+            .expect("seed stale vector");
+
+        let result =
+            repair_missing_embeddings(&rt, &token, &[REPAIR_MODEL.to_string()], "local", 100)
+                .await
+                .expect("repair embeddings");
+        assert_eq!(result, (0, 1, 0));
+
+        let mut reader = rt.sql().reader().await.expect("reader");
+        let rows = reader
+            .query_all(SqlStatement {
+                sql: format!(
+                    "SELECT namespace FROM {REPAIR_TABLE} WHERE subject_id = ?1 ORDER BY namespace"
+                ),
+                params: vec![SqlValue::Text(note.id.to_string())],
+                label: None,
+            })
+            .await
+            .expect("read repaired vector");
+        assert_eq!(rows.len(), 1, "repair must leave one vector row");
+        assert!(
+            matches!(rows[0].get("namespace"), Some(SqlValue::Text(value)) if value == "local"),
+            "repair must replace the stale row with the base row namespace"
+        );
     }
 
     // DB resolution parity with `kkernel exec` / `kkernel mcp`. The shared

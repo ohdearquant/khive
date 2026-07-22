@@ -212,6 +212,34 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
 
 const MIGRATION_TRACKING_TABLE: &str = include_str!("../sql/schema-migrations-table.sql");
 
+fn validate_schema_compatibility(
+    conn: &Connection,
+    store_version: u32,
+    max_known_migration: u32,
+) -> Result<(), SqliteError> {
+    // V1 used the same name in both lineages; the historical V2 and V22 names
+    // are unambiguous signals that this ledger predates consolidation.
+    let pre_consolidation: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM _schema_migrations \
+         WHERE (version = 2 AND name = ?1) OR (version = 22 AND name = ?2))",
+        ["add_name_to_notes", "knowledge_lifecycle_status"],
+        |row| row.get(0),
+    )?;
+    if pre_consolidation {
+        return Err(SqliteError::InvalidData(format!(
+            "database schema version {store_version} predates the consolidated baseline; \
+             recreate it from the current schema because in-place upgrade is not supported."
+        )));
+    }
+    if store_version > max_known_migration {
+        return Err(SqliteError::SchemaTooNew {
+            max_known_migration,
+            store_version,
+        });
+    }
+    Ok(())
+}
+
 /// Apply all unapplied migrations in order. Idempotent; each migration runs in its own transaction.
 /// Errors on non-contiguous version array or failed migration.
 /// Read the applied schema version from an open connection **without** running
@@ -330,16 +358,8 @@ fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
         }
     }
 
-    // A database whose recorded version is ahead of the latest known migration
-    // was written by a newer build. Running this binary would silently skip
-    // unknown schema changes, so fail with the upgrade action instead.
     let latest_version = MIGRATIONS.last().map(|m| m.version).unwrap_or(0);
-    if current_version > latest_version {
-        return Err(SqliteError::SchemaTooNew {
-            max_known_migration: latest_version,
-            store_version: current_version,
-        });
-    }
+    validate_schema_compatibility(conn, current_version, latest_version)?;
 
     let mut applied_version = current_version;
     // Floor advanced when a sibling's work is observed under the write lock,
@@ -406,16 +426,9 @@ fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
             }
         }
 
-        // The ahead-of-latest guard above ran on a pre-lock read; a newer
-        // build may have committed a version past ours while we waited for
-        // the write lock. Accepting it (clamped) would return Ok on a schema
-        // this binary does not understand — reject it the same way.
-        if sibling_version > latest_version {
-            return Err(SqliteError::SchemaTooNew {
-                max_known_migration: latest_version,
-                store_version: sibling_version,
-            });
-        }
+        // The first guard ran before the write lock; re-check both lineage and
+        // version in case another process advanced the ledger while we waited.
+        validate_schema_compatibility(&tx, sibling_version, latest_version)?;
 
         if sibling_version >= migration.version {
             #[cfg(test)]
