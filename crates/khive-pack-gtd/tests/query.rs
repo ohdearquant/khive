@@ -183,6 +183,129 @@ async fn tasks_priority_filter_excludes_terminal_by_default() {
     let _ = a["full_id"].as_str();
 }
 
+/// #96: an empty `gtd.tasks()` result must be distinguishable from "no such
+/// task" when the emptiness is caused by the default terminal-status filter.
+/// Complete the ONLY task in this runtime, then query with no `status` —
+/// the previous behavior was a bare `[]`, indistinguishable from the task
+/// never having existed. It must now carry the applied-filter signal.
+#[tokio::test]
+async fn tasks_empty_default_result_signals_terminal_filter_applied() {
+    let pack = pack(rt());
+
+    let t = assign(&pack, json!({"title": "solo task", "status": "inbox"})).await;
+    let t_id = t["full_id"].as_str().unwrap().to_string();
+    pack.dispatch("gtd.transition", json!({"id": t_id, "status": "done"}))
+        .await
+        .expect("inbox -> done");
+
+    let resp = pack.dispatch("gtd.tasks", json!({})).await.unwrap();
+    assert!(
+        resp.is_object(),
+        "empty-because-filtered result must be an object carrying the applied \
+         filter, not a bare array; got: {resp:?}"
+    );
+    let tasks = resp["tasks"]
+        .as_array()
+        .expect("the object must still carry the (empty) tasks array");
+    assert!(
+        tasks.is_empty(),
+        "no non-terminal tasks exist; got: {tasks:?}"
+    );
+    let excluded = resp["filter_excluded"]
+        .as_array()
+        .expect("filter_excluded must list the statuses the default filter excluded");
+    let excluded_strs: Vec<&str> = excluded.iter().filter_map(|v| v.as_str()).collect();
+    assert!(excluded_strs.contains(&"done"));
+    assert!(excluded_strs.contains(&"cancelled"));
+
+    // Confirm the task is NOT actually missing — it still exists, just
+    // filtered by default. Explicit status=done must surface it.
+    let done_resp = pack
+        .dispatch("gtd.tasks", json!({"status": "done"}))
+        .await
+        .unwrap();
+    let done_arr = done_resp
+        .as_array()
+        .expect("explicit status= must keep the bare-array shape");
+    assert_eq!(
+        done_arr.len(),
+        1,
+        "the completed task must still be readable by id/status"
+    );
+    assert_eq!(done_arr[0]["full_id"], t_id);
+}
+
+#[tokio::test]
+async fn tasks_empty_namespace_stays_bare_array() {
+    let pack = pack(rt());
+
+    let resp = pack.dispatch("gtd.tasks", json!({})).await.unwrap();
+    assert_eq!(
+        resp,
+        json!([]),
+        "a namespace with no tasks must keep the established empty-array response"
+    );
+}
+
+#[tokio::test]
+async fn tasks_unmatched_assignee_stays_bare_array() {
+    let pack = pack(rt());
+    let task = assign(
+        &pack,
+        json!({"title": "alice's task", "status": "inbox", "assignee": "alice"}),
+    )
+    .await;
+    pack.dispatch(
+        "gtd.transition",
+        json!({"id": task["full_id"], "status": "done"}),
+    )
+    .await
+    .expect("inbox -> done");
+
+    let resp = pack
+        .dispatch("gtd.tasks", json!({"assignee": "bob"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp,
+        json!([]),
+        "a terminal task for another assignee must not trigger the hint"
+    );
+}
+
+#[tokio::test]
+async fn tasks_offset_beyond_last_active_match_stays_bare_array() {
+    let pack = pack(rt());
+    assign(&pack, json!({"title": "only task", "status": "inbox"})).await;
+
+    let resp = pack
+        .dispatch("gtd.tasks", json!({"offset": 1}))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp,
+        json!([]),
+        "pagination past the final active task must keep the established empty-array response"
+    );
+}
+
+/// A non-empty default `gtd.tasks()` result must keep the plain bare-array
+/// shape every existing caller (`kkernel`, `li` surfaces, this crate's own
+/// tests) already depends on via `.as_array()` — the new object wrapper is
+/// strictly additive to the previously-uninformative empty case, never a
+/// change to the common (non-empty) path.
+#[tokio::test]
+async fn tasks_non_empty_default_result_stays_bare_array() {
+    let pack = pack(rt());
+    assign(&pack, json!({"title": "still open", "status": "inbox"})).await;
+
+    let resp = pack.dispatch("gtd.tasks", json!({})).await.unwrap();
+    assert!(
+        resp.is_array(),
+        "a non-empty default result must stay a bare array; got: {resp:?}"
+    );
+}
+
 #[tokio::test]
 async fn next_excludes_terminal_tasks() {
     let pack = pack(rt());

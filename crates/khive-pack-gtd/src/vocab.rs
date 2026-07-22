@@ -201,7 +201,13 @@ pub(crate) static GTD_HANDLERS: [HandlerDef; 5] = [
     // Assertive: retrieves filtered task listing
     HandlerDef {
         name: "gtd.tasks",
-        description: "List tasks filtered by status, assignee, priority",
+        description: "List tasks filtered by status, assignee, priority. DEFAULT (no `status` \
+                       given): excludes terminal statuses (done, cancelled) so the default \
+                       listing shows only active work. Pass status=\"done\" or \
+                       status=\"cancelled\" explicitly to see completed/cancelled tasks — an \
+                       empty result under the default filter does NOT mean the task doesn't \
+                       exist; the response carries `filter_excluded` when the default filter \
+                       is the reason the result is empty (issue #96).",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -211,7 +217,8 @@ pub(crate) static GTD_HANDLERS: [HandlerDef; 5] = [
                 required: false,
                 description: "Filter by status: inbox | next | waiting | someday | active | done | cancelled. \
                                Aliases also accepted: todo=inbox, in_progress=active, blocked=waiting, \
-                               later=someday, finished=done.",
+                               later=someday, finished=done. Omitted (default): excludes done \
+                               and cancelled (terminal statuses) from the result.",
             },
             ParamDef {
                 name: "assignee",

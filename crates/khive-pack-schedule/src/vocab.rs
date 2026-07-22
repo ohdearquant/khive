@@ -45,7 +45,20 @@ pub(crate) static SCHEDULE_HANDLERS: [HandlerDef; 4] = [
     },
     HandlerDef {
         name: "schedule.schedule",
-        description: "Schedule a future verb dispatch.",
+        description: "Schedule a future verb dispatch. NESTED-ACTION EXAMPLE (issue #110): \
+                       schedule.schedule(action=\"schedule.remind(content=\\\"renew the \
+                       domain\\\", at=\\\"2027-06-01T09:00:00Z\\\")\", \
+                       at=\"2027-05-25T09:00:00Z\") — the OUTER `at` (2027-05-25) is when \
+                       THIS schedule fires and the stored `action` gets dispatched (i.e. when \
+                       the reminder gets CREATED); the INNER `at` (2027-06-01) is the nested \
+                       `schedule.remind` call's own required argument and becomes THAT \
+                       reminder's trigger time (i.e. when the newly-created reminder itself \
+                       fires). The two are independent and commonly differ — this schedules \
+                       the creation of a reminder a week ahead of when the reminder should go \
+                       off. If the nested action's own verb requires `at` (or any other \
+                       required param), it must be supplied on the nested call, exactly as if \
+                       that verb were being called directly — replay dispatches the stored \
+                       `action` string verbatim with no injection from the outer `at`.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Commissive,
         params: &[
@@ -53,13 +66,23 @@ pub(crate) static SCHEDULE_HANDLERS: [HandlerDef; 4] = [
                 name: "action",
                 param_type: "string",
                 required: true,
-                description: "Verb dispatch payload to execute at the trigger time (e.g. \"schedule.remind(content=\\\"hello\\\")\"). Must not be empty.",
+                description: "Verb dispatch payload to execute at the trigger time — a \
+                               complete, self-sufficient verb call including ALL of that \
+                               verb's OWN required params (e.g. \
+                               \"schedule.remind(content=\\\"hello\\\", \
+                               at=\\\"2027-06-01T09:00:00Z\\\")\" — `schedule.remind` requires \
+                               its own `at`, separate from and independent of this verb's `at` \
+                               below; see the handler description for the full worked \
+                               example). Must not be empty.",
             },
             ParamDef {
                 name: "at",
                 param_type: "string",
                 required: true,
-                description: "Trigger time in RFC 3339 format (e.g. \"2026-06-01T09:00:00Z\"). Must not be empty.",
+                description: "Trigger time in RFC 3339 format (e.g. \"2026-06-01T09:00:00Z\") — \
+                               when THIS schedule fires and `action` gets dispatched. This is \
+                               independent of any `at` the nested `action` verb itself \
+                               requires (see the handler description). Must not be empty.",
             },
             ParamDef {
                 name: "repeat",

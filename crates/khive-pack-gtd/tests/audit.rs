@@ -268,6 +268,96 @@ async fn transition_upgrades_namespace_less_audit_table_and_writes_row() {
     );
 }
 
+/// #95: successive `gtd.transition` notes must all remain retrievable, not
+/// just the last one. `transition_note` (a top-level `properties` field)
+/// stays last-write-wins on purpose — every existing caller already reads it
+/// as "the current/latest note" — but `transition_history` (new, additive,
+/// same `properties` JSON blob — no schema change) must accumulate every
+/// transition's own from/to/note/at, in order. Walk a task through three
+/// distinct-note transitions and confirm all three survive a plain task read
+/// (via `gtd.tasks`, exercising the same `render_task` path every caller
+/// hits — not just a raw SQL query against `gtd_lifecycle_audit`).
+#[tokio::test]
+async fn transition_history_accumulates_across_multiple_transitions() {
+    let rt = rt();
+    let fixture = pack(rt.clone());
+
+    let resp = assign(
+        &fixture,
+        json!({"title": "history test task", "status": "inbox"}),
+    )
+    .await;
+    let task_id = resp["full_id"].as_str().unwrap().to_string();
+
+    fixture
+        .dispatch(
+            "gtd.transition",
+            json!({"id": task_id, "status": "next", "note": "triage note"}),
+        )
+        .await
+        .expect("inbox -> next");
+    fixture
+        .dispatch(
+            "gtd.transition",
+            json!({"id": task_id, "status": "active", "note": "start note"}),
+        )
+        .await
+        .expect("next -> active");
+    fixture
+        .dispatch(
+            "gtd.transition",
+            json!({"id": task_id, "status": "done", "note": "finish note"}),
+        )
+        .await
+        .expect("active -> done");
+
+    let tasks = fixture
+        .dispatch("gtd.tasks", json!({"status": "done"}))
+        .await
+        .expect("tasks(status=done) ok");
+    let arr = tasks.as_array().expect("tasks(status=..) stays bare array");
+    let task = arr
+        .iter()
+        .find(|t| t["full_id"] == task_id)
+        .expect("the transitioned task must be in the done listing");
+
+    // Latest-note field is unchanged behavior: still last-write-wins.
+    assert_eq!(
+        task["properties"]["transition_note"], "finish note",
+        "transition_note must still read as the LATEST note (unchanged behavior)"
+    );
+
+    let history = task["properties"]["transition_history"]
+        .as_array()
+        .expect("transition_history must be present and be an array");
+    assert_eq!(
+        history.len(),
+        3,
+        "all three transitions must be recorded; got: {history:?}"
+    );
+    let notes: Vec<&str> = history
+        .iter()
+        .map(|h| h["note"].as_str().unwrap_or("?"))
+        .collect();
+    assert_eq!(
+        notes,
+        vec!["triage note", "start note", "finish note"],
+        "every transition note must be individually retrievable in order; got: {notes:?}"
+    );
+    assert_eq!(history[0]["from"], "inbox");
+    assert_eq!(history[0]["to"], "next");
+    assert_eq!(history[1]["from"], "next");
+    assert_eq!(history[1]["to"], "active");
+    assert_eq!(history[2]["from"], "active");
+    assert_eq!(history[2]["to"], "done");
+    for entry in history {
+        assert!(
+            entry["at"].as_str().is_some(),
+            "every history entry must carry a timestamp; got: {entry:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn cc1_complete_cancelled_writes_audit_record() {
     let rt = rt();
