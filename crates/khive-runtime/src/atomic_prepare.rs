@@ -1778,7 +1778,7 @@ mod tests {
     /// dependency is needed at this layer, since the hook itself is
     /// generic.
     #[tokio::test]
-    async fn atomic_note_update_and_delete_post_commit_fire_the_note_mutation_hook() {
+    async fn atomic_note_update_and_delete_post_commit_effects_execute_exactly_once() {
         let runtime = scratch_runtime();
         let token = runtime
             .authorize(Namespace::parse("local").expect("ns"))
@@ -1866,14 +1866,13 @@ mod tests {
             .await
             .expect("apply post-commit effects (delete)");
 
-        let seen = fired.lock().expect("lock").clone();
-        assert!(
-            seen.contains(&("observation".to_string(), update_note_id)),
-            "the note-mutation hook must fire for the atomic UPDATE path: {seen:?}"
-        );
-        assert!(
-            seen.contains(&("observation".to_string(), delete_note_id)),
-            "the note-mutation hook must fire for the atomic DELETE path: {seen:?}"
+        assert_eq!(
+            *fired.lock().expect("lock"),
+            vec![
+                ("observation".to_string(), update_note_id),
+                ("observation".to_string(), delete_note_id),
+            ],
+            "each committed token must execute its note-mutation effect exactly once"
         );
     }
 

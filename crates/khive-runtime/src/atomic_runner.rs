@@ -156,7 +156,20 @@ pub enum AtomicOpFailure {
 /// phase-3 executor takes the token by value; no public API exposes the owned
 /// effect collection or accepts a prepare-time [`PostCommitEffect`] in its
 /// place.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// A committed token is a one-shot capability and cannot be cloned for
+/// replay:
+///
+/// ```compile_fail
+/// use khive_runtime::CommittedPostCommitEffects;
+///
+/// fn duplicate(
+///     committed: &CommittedPostCommitEffects,
+/// ) -> CommittedPostCommitEffects {
+///     committed.clone()
+/// }
+/// ```
+#[derive(Debug, PartialEq, Eq)]
 pub struct CommittedPostCommitEffects {
     effects: Vec<PostCommitEffect>,
 }
@@ -180,7 +193,7 @@ impl CommittedPostCommitEffects {
 /// The whole-unit outcome of a completed [`run_atomic_unit`] call — the
 /// commit pass ran to a clean, distinguishable verdict (never returned for
 /// a seam-level failure; see [`AtomicRunnerError`] for that case).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum AtomicRunOutcome {
     /// Every op's plan applied and the unit committed. Carries an opaque
     /// [`CommittedPostCommitEffects`] token containing the deferred effects
