@@ -1500,6 +1500,15 @@ async fn merge_entity_reason_forwarded_through_registry_dispatch() {
         "reason supplied through the registry dispatch route must land in the EntityMerged payload; got: {:?}",
         events.items[0].payload
     );
+    assert_eq!(
+        events.items[0]
+            .payload
+            .get("force")
+            .and_then(|v| v.as_bool()),
+        Some(true),
+        "force=true must be durable in the EntityMerged payload; got: {:?}",
+        events.items[0].payload
+    );
 }
 
 #[tokio::test]

@@ -83,10 +83,20 @@ fn names_are_similar(left: &str, right: &str) -> bool {
 }
 
 fn normalize_name(name: &str) -> String {
-    name.chars()
-        .flat_map(char::to_lowercase)
-        .filter(|ch| ch.is_alphanumeric())
-        .collect()
+    let mut normalized = String::with_capacity(name.len());
+    let mut pending_space = false;
+    for ch in name.chars().flat_map(char::to_lowercase) {
+        if ch.is_whitespace() {
+            pending_space = !normalized.is_empty();
+        } else {
+            if pending_space {
+                normalized.push(' ');
+                pending_space = false;
+            }
+            normalized.push(ch);
+        }
+    }
+    normalized
 }
 
 fn trigrams(value: &str) -> HashSet<[char; 3]> {
@@ -114,20 +124,37 @@ fn projects_are_disjoint(into: &Entity, from: &Entity) -> bool {
     else {
         return false;
     };
-    !into_projects.is_empty()
-        && !from_projects.is_empty()
-        && !into_projects.iter().any(|left| {
-            from_projects
-                .iter()
-                .any(|right| project_values_match(left, right))
-        })
+    if into_projects.is_empty() || from_projects.is_empty() {
+        return false;
+    }
+
+    // Project arrays are caller-controlled: index the smaller side to bound
+    // memory, scan each side once, and stop at the first match.
+    let (indexed, candidates) = if into_projects.len() <= from_projects.len() {
+        (into_projects, from_projects)
+    } else {
+        (from_projects, into_projects)
+    };
+    let mut indexed_strings = HashSet::new();
+    let mut indexed_values = HashSet::new();
+    for value in indexed {
+        if let Some(value) = value.as_str() {
+            indexed_strings.insert(normalize_project_string(value));
+        } else {
+            indexed_values.insert(value.clone());
+        }
+    }
+    !candidates.iter().any(|candidate| {
+        if let Some(candidate) = candidate.as_str() {
+            indexed_strings.contains(&normalize_project_string(candidate))
+        } else {
+            indexed_values.contains(candidate)
+        }
+    })
 }
 
-fn project_values_match(left: &Value, right: &Value) -> bool {
-    match (left.as_str(), right.as_str()) {
-        (Some(left), Some(right)) => left.trim().eq_ignore_ascii_case(right.trim()),
-        _ => left == right,
-    }
+fn normalize_project_string(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
 }
 
 impl KgPack {

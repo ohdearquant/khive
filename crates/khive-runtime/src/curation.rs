@@ -451,6 +451,7 @@ impl KhiveRuntime {
     }
 
     /// Merge two entities with an explicit override for the entity-kind guard.
+    /// A non-dry-run override is recorded as `force: true` in the merge event.
     // REASON: these arguments mirror the merge verb's policy, content strategy,
     // dry-run, audit-reason, and force fields; a builder would only move that surface.
     #[allow(clippy::too_many_arguments)]
@@ -586,6 +587,9 @@ impl KhiveRuntime {
             });
             if let Some(reason) = reason {
                 payload["reason"] = serde_json::Value::String(reason);
+            }
+            if force {
+                payload["force"] = serde_json::Value::Bool(true);
             }
             let event = khive_storage::event::Event::new(
                 updated_entity.namespace.clone(),

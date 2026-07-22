@@ -3307,6 +3307,10 @@ async fn curation_merge_entity_event_payload_has_adr014_fields() {
         payload.get("content_strategy").is_some(),
         "entity_merged payload must contain 'content_strategy' (PR #814); got {payload}"
     );
+    assert!(
+        payload.get("force").is_none(),
+        "ordinary entity merges must not carry a force marker; got {payload}"
+    );
 }
 
 /// Handler-wiring test for PR #814: `content_strategy`
@@ -5384,6 +5388,77 @@ async fn merge_same_kind_dissimilar_names_is_refused_by_name_guard() {
         err.details().and_then(|details| details.get("guard")),
         Some("name_similarity")
     );
+}
+
+#[tokio::test]
+async fn merge_punctuation_collision_is_refused_unless_forced() {
+    let pack = pack();
+    let into_id = pack
+        .dispatch("create", json!({"kind": "concept", "name": "C++"}))
+        .await
+        .expect("create C++ entity")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let from_id = pack
+        .dispatch("create", json!({"kind": "concept", "name": "C#"}))
+        .await
+        .expect("create C# entity")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let err = pack
+        .dispatch("merge", json!({"into_id": &into_id, "from_id": &from_id}))
+        .await
+        .expect_err("punctuation-distinct entity names must be refused");
+    let RuntimeError::Khive(err) = err else {
+        panic!("expected structured merge-guard error, got {err:?}");
+    };
+    assert_eq!(err.kind(), khive_types::ErrorKind::Conflict);
+    assert_eq!(
+        err.details().and_then(|details| details.get("guard")),
+        Some("name_similarity")
+    );
+
+    let result = pack
+        .dispatch(
+            "merge",
+            json!({"into_id": &into_id, "from_id": &from_id, "force": true}),
+        )
+        .await
+        .expect("force=true must override the name-similarity guard");
+    assert_eq!(result["removed_id"], from_id);
+}
+
+#[tokio::test]
+async fn merge_name_equality_ignores_case_and_collapsed_whitespace() {
+    for (into_name, from_name) in [
+        ("Case Fold", "cASE fOLD"),
+        ("Graph Neural Network", "  graph  neural\t network  "),
+    ] {
+        let pack = pack();
+        let into_id = pack
+            .dispatch("create", json!({"kind": "concept", "name": into_name}))
+            .await
+            .expect("create into entity")["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let from_id = pack
+            .dispatch("create", json!({"kind": "concept", "name": from_name}))
+            .await
+            .expect("create from entity")["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let result = pack
+            .dispatch("merge", json!({"into_id": into_id, "from_id": from_id}))
+            .await
+            .expect("case and whitespace differences must remain merge-compatible");
+        assert_eq!(result["removed_id"], from_id);
+    }
 }
 
 #[tokio::test]
