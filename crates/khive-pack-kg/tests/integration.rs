@@ -854,6 +854,58 @@ async fn search_entity_response_includes_entity_kind() {
     );
 }
 
+/// Regression for #1174: entity search rows carry `name`/`kind`/`created_at`
+/// matching the list()/get() projection, alongside the legacy `title`/
+/// `entity_kind` spellings — a consumer that filters on `row["name"]` after
+/// working with list/get must not read a real hit as an empty result.
+#[tokio::test]
+async fn search_entity_response_includes_list_shape_fields() {
+    let pack = pack();
+    pack.dispatch(
+        "create",
+        json!({"kind": "entity", "name": "GammaSearchShape", "entity_kind": "concept"}),
+    )
+    .await
+    .unwrap();
+
+    let resp = pack
+        .dispatch(
+            "search",
+            json!({"kind": "entity", "query": "GammaSearchShape"}),
+        )
+        .await
+        .expect("search must succeed");
+    let arr = resp.as_array().expect("array");
+    assert!(
+        !arr.is_empty(),
+        "search must return the entity we just created"
+    );
+    let hit = &arr[0];
+    assert_eq!(
+        hit.get("name").and_then(Value::as_str),
+        Some("GammaSearchShape"),
+        "#1174: search response must carry name matching list()/get(); got hit {hit}"
+    );
+    assert_eq!(
+        hit.get("kind").and_then(Value::as_str),
+        Some("concept"),
+        "#1174: search response must carry kind matching list()/get(); got hit {hit}"
+    );
+    assert!(
+        hit.get("created_at").and_then(Value::as_str).is_some(),
+        "#1174: search response must carry created_at; got hit {hit}"
+    );
+    // Legacy spellings stay present for the deprecation window.
+    assert_eq!(
+        hit.get("entity_kind").and_then(Value::as_str),
+        Some("concept")
+    );
+    assert_eq!(
+        hit.get("title").and_then(Value::as_str),
+        Some("GammaSearchShape")
+    );
+}
+
 /// Regression for #160 (note half): note search response includes `note_kind`.
 #[tokio::test]
 async fn search_note_response_includes_note_kind() {
@@ -886,6 +938,50 @@ async fn search_note_response_includes_note_kind() {
         hit.get("note_kind").and_then(Value::as_str),
         Some("insight"),
         "#160 (note half): search response must carry note_kind; got hit {hit}"
+    );
+}
+
+/// Regression for #1174 (note half): note search rows carry `kind`/`created_at`
+/// matching the list()/get() projection, alongside the legacy `note_kind` spelling.
+#[tokio::test]
+async fn search_note_response_includes_list_shape_fields() {
+    let pack = pack();
+    pack.dispatch(
+        "create",
+        json!({
+            "kind": "note",
+            "content": "DeltaInsight unique_marker_9182",
+            "note_kind": "insight"
+        }),
+    )
+    .await
+    .unwrap();
+
+    let resp = pack
+        .dispatch(
+            "search",
+            json!({"kind": "note", "query": "unique_marker_9182"}),
+        )
+        .await
+        .expect("note search must succeed");
+    let arr = resp.as_array().expect("array");
+    assert!(
+        !arr.is_empty(),
+        "note search must return the note we just created"
+    );
+    let hit = &arr[0];
+    assert_eq!(
+        hit.get("kind").and_then(Value::as_str),
+        Some("insight"),
+        "#1174: note search response must carry kind matching list()/get(); got hit {hit}"
+    );
+    assert!(
+        hit.get("created_at").and_then(Value::as_str).is_some(),
+        "#1174: note search response must carry created_at; got hit {hit}"
+    );
+    assert!(
+        hit.get("name").is_some(),
+        "#1174: note search response must carry a name field (may be null); got hit {hit}"
     );
 }
 
