@@ -204,6 +204,27 @@ mod help_tests {
         assert!(id.required, "read.id must be required");
     }
 
+    /// #93 instance 3: the top-level description must not contradict `actor`
+    /// being a required, non-inferred param — a caller reading only the
+    /// one-line description (not the full param list) must not be misled
+    /// into calling `comm.probe()` the way it can call `comm.inbox()`.
+    #[test]
+    fn probe_description_documents_required_actor() {
+        let h = find_handler("comm.probe");
+        assert!(
+            h.description.contains("actor") && h.description.contains("required"),
+            "comm.probe's top-level description must state that `actor` is \
+             required and not inferred from the caller (issue #93); got: {:?}",
+            h.description
+        );
+        let actor = h
+            .params
+            .iter()
+            .find(|p| p.name == "actor")
+            .expect("probe must have 'actor'");
+        assert!(actor.required, "probe.actor must be required");
+    }
+
     #[test]
     fn reply_has_required_id_and_content() {
         let h = find_handler("comm.reply");

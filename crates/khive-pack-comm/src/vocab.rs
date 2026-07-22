@@ -367,7 +367,9 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 11] = [
     },
     HandlerDef {
         name: "comm.probe",
-        description: "Read-only poll for new inbound message metadata and stale unread count.",
+        description: "Read-only poll for new inbound message metadata and stale unread count. \
+                      Unlike comm.inbox, the actor is not inferred from the caller — pass it \
+                      explicitly via the required `actor` param (khive #93).",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[
