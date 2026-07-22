@@ -88,7 +88,8 @@ const CANDIDATE_MULTIPLIER: u32 = 4;
 pub const EMBEDDING_INPUT_TRUNCATED_WARNING: &str =
     "embedding input was truncated to the embedder maximum; full content was stored unchanged";
 
-fn document_embedding_budget(model_name: &str) -> usize {
+/// Maximum document bytes accepted before the embedding service adds its model prefix.
+pub fn document_embedding_budget(model_name: &str) -> usize {
     parse_embedding_model_alias(model_name)
         .and_then(|model| model.document_instruction())
         .map_or(MAX_TEXT_CHARS, |prefix| {
@@ -96,7 +97,8 @@ fn document_embedding_budget(model_name: &str) -> usize {
         })
 }
 
-fn bounded_embedding_input(text: &str, max_bytes: usize) -> (&str, bool) {
+/// Return the longest UTF-8-safe prefix of `text` within `max_bytes` and whether it was shortened.
+pub fn bounded_embedding_input(text: &str, max_bytes: usize) -> (&str, bool) {
     if text.len() <= max_bytes {
         return (text, false);
     }
@@ -287,6 +289,7 @@ impl KhiveRuntime {
     ///
     /// Applies `EmbeddingService::embed_passage`. Use for all bulk
     /// index/backfill/reindex operations to apply the passage-side prefix.
+    /// Normal spans remain borrowed when a mixed batch also contains bounded items.
     ///
     /// **Reindex caveat**: see [`Self::embed_document_with_model`] — the same
     /// incomparability applies to batch-indexed vectors when switching models.
@@ -304,25 +307,46 @@ impl KhiveRuntime {
         let service = self.embedder(model_name).await?;
         let emb_model = model.unwrap_or_default();
         let budget = document_embedding_budget(model_name);
-        let bounded = texts.iter().any(|text| text.len() > budget).then(|| {
-            texts
-                .iter()
-                .map(|text| bounded_embedding_input(text, budget).0.to_string())
-                .collect::<Vec<_>>()
-        });
-        let embed_texts = bounded.as_deref().unwrap_or(texts);
-        let out = service.embed_passage(embed_texts, emb_model).await;
+        let out = if texts.iter().all(|text| text.len() <= budget) {
+            service.embed_passage(texts, emb_model).await
+        } else {
+            async {
+                let mut embeddings = Vec::with_capacity(texts.len());
+                let mut start = 0;
+                while start < texts.len() {
+                    if texts[start].len() > budget {
+                        let bounded =
+                            vec![bounded_embedding_input(&texts[start], budget).0.to_owned()];
+                        embeddings.extend(service.embed_passage(&bounded, emb_model).await?);
+                        start += 1;
+                        continue;
+                    }
+
+                    let end = texts[start..]
+                        .iter()
+                        .position(|text| text.len() > budget)
+                        .map_or(texts.len(), |offset| start + offset);
+                    embeddings.extend(service.embed_passage(&texts[start..end], emb_model).await?);
+                    start = end;
+                }
+                Ok(embeddings)
+            }
+            .await
+        };
         crate::usage::count(crate::usage::UsageUnit::EmbedCalls, texts.len() as u64);
         Ok(out?)
     }
 
     /// Whether any registered write embedder would receive a bounded form of `text`.
     pub fn document_embedding_input_will_be_truncated(&self, text: &str) -> bool {
+        self.document_embedding_input_len_will_be_truncated(text.len())
+    }
+
+    /// Whether any registered write embedder would truncate a document of `input_len` bytes.
+    pub fn document_embedding_input_len_will_be_truncated(&self, input_len: usize) -> bool {
         self.registered_embedding_model_names()
             .iter()
-            .any(|model_name| {
-                bounded_embedding_input(text, document_embedding_budget(model_name)).1
-            })
+            .any(|model_name| input_len > document_embedding_budget(model_name))
     }
 
     /// Embed a batch of documents for indexing using the configured default model.
@@ -1848,6 +1872,31 @@ mod tests {
                 ],
             ],
             "E5 must receive its query prefix through single and batch paths"
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_document_batch_only_rebuilds_over_limit_items() {
+        let model = EmbeddingModel::AllMiniLmL6V2;
+        let (runtime, captured) = runtime_with_capturing_embedder(model);
+        let texts = vec![
+            "first normal document".to_string(),
+            "x".repeat(MAX_TEXT_CHARS + 1),
+            "second normal document".to_string(),
+        ];
+
+        let embeddings = runtime
+            .embed_document_batch_with_model(&model.to_string(), &texts)
+            .await
+            .expect("mixed batch must embed");
+        assert_eq!(embeddings.len(), texts.len());
+        assert_eq!(
+            captured.lock().unwrap().as_slice(),
+            [
+                vec![texts[0].clone()],
+                vec!["x".repeat(MAX_TEXT_CHARS)],
+                vec![texts[2].clone()],
+            ]
         );
     }
 

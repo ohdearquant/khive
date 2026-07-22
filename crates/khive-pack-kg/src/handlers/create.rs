@@ -334,6 +334,18 @@ impl KgPack {
                 let tags = p.tags.unwrap_or_default();
                 let validated_type =
                     validate_entity_type(&canonical, p.entity_type.as_deref(), registry)?;
+                let embed_body_len = p
+                    .description
+                    .as_deref()
+                    .filter(|description| !description.is_empty())
+                    .map_or(name.len(), |description| {
+                        name.len()
+                            .saturating_add(1)
+                            .saturating_add(description.len())
+                    });
+                let truncated = self
+                    .runtime
+                    .document_embedding_input_len_will_be_truncated(embed_body_len);
                 let entity = self
                     .runtime
                     .create_entity(
@@ -347,10 +359,6 @@ impl KgPack {
                     )
                     .await?;
                 let id = entity.id;
-                let embed_body = khive_runtime::entity_fts_document(&entity).body;
-                let truncated = self
-                    .runtime
-                    .document_embedding_input_will_be_truncated(&embed_body);
                 (
                     normalize_entity_timestamps(to_json(&entity)?),
                     id,
