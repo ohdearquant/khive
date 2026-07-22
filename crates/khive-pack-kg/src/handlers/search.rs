@@ -257,9 +257,7 @@ impl KgPack {
                     .map(|h| {
                         let meta = note_meta.get(&h.note_id);
                         let note_kind = meta.map(|(k, _, _, _)| k.as_str());
-                        let name = meta
-                            .and_then(|(_, _, name, _)| name.clone())
-                            .or_else(|| h.title.clone());
+                        let name = meta.and_then(|(_, _, name, _)| name.clone());
                         let created_at = meta.map(|(_, _, _, c)| micros_to_iso(*c));
                         serde_json::json!({
                             "id": h.note_id.to_string(),

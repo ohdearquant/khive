@@ -985,6 +985,45 @@ async fn search_note_response_includes_list_shape_fields() {
     );
 }
 
+/// A nameless note's search row must carry `name: null` exactly as list()/get()
+/// do — `title` remains the display value, but `name` never inherits it.
+#[tokio::test]
+async fn search_nameless_note_name_is_null() {
+    let pack = pack();
+    pack.dispatch(
+        "create",
+        json!({
+            "kind": "note",
+            "content": "NamelessNote unique_marker_5527",
+            "note_kind": "observation"
+        }),
+    )
+    .await
+    .unwrap();
+
+    let resp = pack
+        .dispatch(
+            "search",
+            json!({"kind": "note", "query": "unique_marker_5527"}),
+        )
+        .await
+        .expect("note search must succeed");
+    let arr = resp.as_array().expect("array");
+    assert!(
+        !arr.is_empty(),
+        "note search must return the note we just created"
+    );
+    let hit = &arr[0];
+    assert!(
+        hit.get("name").is_some_and(Value::is_null),
+        "nameless note search row must carry name: null matching list()/get(); got hit {hit}"
+    );
+    assert!(
+        hit.get("title").and_then(Value::as_str).is_some(),
+        "title must remain populated as the display value; got hit {hit}"
+    );
+}
+
 /// Regression for #163: `search` accepts a `properties` filter that restricts
 /// results to entities whose properties contain the given key=value pairs.
 #[tokio::test]
