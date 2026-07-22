@@ -36,6 +36,7 @@ use khive_storage::EntityFilter;
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::operations::Resolved;
 use crate::reference_ring::ReferenceRing;
+use crate::retrieval::SearchSource;
 use crate::runtime::{KhiveRuntime, NamespaceToken};
 
 /// A candidate id surfaced when a reference did not resolve outright.
@@ -79,8 +80,10 @@ const EXACT_NAME_CONFIDENCE: f64 = 0.98;
 /// best" the way it can for the ring. Below the margin, every hit above the
 /// score floor is surfaced as a candidate instead.
 const SEARCH_MARGIN_RATIO: f64 = 2.0;
-/// Hybrid-search hits below this score never enter the candidate set at all.
-const SEARCH_SCORE_FLOOR: f64 = 0.0;
+/// Semantic-only hybrid-search hits below this score never enter the candidate
+/// set. Lexical hits remain admissible because RRF magnitude encodes rank, not
+/// textual relevance, and genuine partial-name matches score below this floor.
+const SEARCH_SCORE_FLOOR: f64 = 0.3;
 /// Confidence reported on a search-stage `Resolved` outcome: not the raw
 /// RRF score, which lives on a much smaller scale (`sum 1/(k + rank)`, e.g.
 /// ~0.016-0.033) and would never clear a 0..1 confidence bar. Fixed below
@@ -262,7 +265,9 @@ pub async fn resolve_reference(
         .await?;
     let candidates: Vec<ReferenceCandidate> = hits
         .into_iter()
-        .filter(|h| h.score.to_f64() > SEARCH_SCORE_FLOOR)
+        .filter(|h| {
+            !matches!(h.source, SearchSource::Vector) || h.score.to_f64() >= SEARCH_SCORE_FLOOR
+        })
         .map(|h| ReferenceCandidate {
             id: h.entity_id,
             name: h.title,
@@ -405,9 +410,73 @@ fn is_hex_prefix(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::NamespaceToken as TokenCtor;
+    use crate::config::{NamespaceToken as TokenCtor, RuntimeConfig};
+    use crate::embedder_registry::EmbedderProvider;
     use khive_gate::ActorRef;
     use khive_types::namespace::Namespace;
+    use lattice_embed::{EmbeddingModel, EmbeddingService};
+    use std::sync::Arc;
+
+    struct ConstantEmbeddingService {
+        dimensions: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl EmbeddingService for ConstantEmbeddingService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+            Ok(texts.iter().map(|_| vec![1.0; self.dimensions]).collect())
+        }
+
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "resolve-test-constant-embedding"
+        }
+    }
+
+    struct ConstantEmbedderProvider {
+        name: String,
+        dimensions: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl EmbedderProvider for ConstantEmbedderProvider {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn dimensions(&self) -> usize {
+            self.dimensions
+        }
+
+        async fn build(&self) -> RuntimeResult<Arc<dyn EmbeddingService>> {
+            Ok(Arc::new(ConstantEmbeddingService {
+                dimensions: self.dimensions,
+            }))
+        }
+    }
+
+    fn runtime_with_constant_embeddings() -> KhiveRuntime {
+        let model = EmbeddingModel::AllMiniLmL6V2;
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            embedding_model: Some(model),
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::no_embeddings()
+        })
+        .expect("in-memory runtime");
+        runtime.register_embedder(ConstantEmbedderProvider {
+            name: model.to_string(),
+            dimensions: model.dimensions(),
+        });
+        runtime
+    }
 
     fn actor_token(actor_id: &str) -> NamespaceToken {
         TokenCtor::mint_authorized(Namespace::local(), ActorRef::new("agent", actor_id))
@@ -811,6 +880,43 @@ mod tests {
             }
             other => panic!("expected Ambiguous on a genuine name tie, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn fallback_stage_drops_low_score_semantic_only_candidates() {
+        let rt = runtime_with_constant_embeddings();
+        let token = actor_token("resolver-test");
+        let ring = ReferenceRing::new();
+
+        for name in ["Unrelated Alpha", "Unrelated Beta"] {
+            rt.create_entity(&token, "concept", None, name, None, None, vec![])
+                .await
+                .expect("create unrelated entity");
+        }
+
+        let hits = rt
+            .hybrid_search(
+                &token,
+                "totally-nonexistent-zzz",
+                None,
+                5,
+                None,
+                None,
+                &[],
+                None,
+            )
+            .await
+            .expect("hybrid search");
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().all(|hit| {
+            hit.source == SearchSource::Vector && hit.score.to_f64() < SEARCH_SCORE_FLOOR
+        }));
+
+        let resolution = resolve_reference(&rt, &ring, &token, "totally-nonexistent-zzz", 5, None)
+            .await
+            .expect("resolve_reference");
+
+        assert_eq!(resolution, ReferenceResolution::NotFound);
     }
 
     // Regression for #908: garbage input that matches nothing must still be
