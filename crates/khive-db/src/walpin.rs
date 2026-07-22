@@ -1553,6 +1553,21 @@ pub struct CensusResult {
     pub truncated: bool,
 }
 
+#[cfg(target_os = "linux")]
+fn census_visible_self_pid() -> Option<u32> {
+    fs::read_link("/proc/self")
+        .ok()?
+        .file_name()?
+        .to_str()?
+        .parse()
+        .ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn census_visible_self_pid() -> Option<u32> {
+    Some(std::process::id())
+}
+
 impl CensusResult {
     /// Every discovered PID was either confirmed as a holder or positively
     /// ruled out (no PID's inspection failed outright), AND the walk itself
@@ -1565,14 +1580,19 @@ impl CensusResult {
     /// ADR-091 Amendment 2 self-canary: the sole caller
     /// (`log_walpin_sidecar_report`) always runs inside the process whose
     /// own SQLite connection pool holds `db_path` open, so a correct,
-    /// complete census must find `std::process::id()` among the holders it
-    /// discovered. Not finding it is positive proof the walk missed at
-    /// least one live holder. This is necessary but not sufficient — a
-    /// census that is complete apart from a *different* missed PID still
-    /// passes it — so every platform's `census_holders` applies this on top
-    /// of, never instead of, its own per-step incompleteness markers.
+    /// complete census must find the process identity visible through the
+    /// scanner's process source. On Linux that is `/proc/self`, which can
+    /// differ from `std::process::id()` when procfs and the caller occupy
+    /// different PID namespaces. Not finding the scanner-visible identity
+    /// is positive proof the walk missed at least one live holder. This is
+    /// necessary but not sufficient, so every platform applies this on top
+    /// of its own per-step incompleteness markers.
     fn apply_self_canary(&mut self) {
-        if !self.holders.contains(&std::process::id()) {
+        self.apply_self_canary_for(census_visible_self_pid());
+    }
+
+    fn apply_self_canary_for(&mut self, expected_self: Option<u32>) {
+        if expected_self.is_none_or(|pid| !self.holders.contains(&pid)) {
             self.truncated = true;
         }
     }
@@ -3660,6 +3680,10 @@ mod tests {
     #[test]
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn census_holders_discovers_holder_through_hard_link_path() {
+        let Some(self_pid) = census_visible_self_pid() else {
+            eprintln!("skipping census test: process identity source is unavailable");
+            return;
+        };
         let root = tempfile::tempdir().unwrap();
         let db_path = root.path().join("test.db");
         fs::File::create(&db_path).unwrap();
@@ -3669,7 +3693,7 @@ mod tests {
         let file = fs::File::open(&link_path).unwrap();
         let census = census_holders(&db_path).expect("census must succeed for a live target");
         assert!(
-            census.holders.contains(&std::process::id()),
+            census.holders.contains(&self_pid),
             "this process holds the db open via hard link {link_path:?} and must appear in the census for {db_path:?}"
         );
         drop(file);
@@ -3779,22 +3803,39 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn census_holders_linux_discovers_self_as_a_holder_of_an_open_db_file() {
+        let procfs_usable = fs::read_dir("/proc").is_ok()
+            && fs::read_dir("/proc/self/fd").is_ok()
+            && census_visible_self_pid().is_some();
+        if !procfs_usable {
+            eprintln!("skipping census test: procfs holder inspection is unavailable");
+            return;
+        }
+        let self_pid = census_visible_self_pid().expect("checked above");
         let root = tempfile::tempdir().unwrap();
         let db_path = root.path().join("test.db");
         let file = fs::File::create(&db_path).unwrap();
         let census = census_holders(&db_path).expect("census must succeed for a live target");
         assert!(
-            census.holders.contains(&std::process::id()),
+            census.holders.contains(&self_pid),
             "this process holds {db_path:?} open and must appear in its own OS-derived census"
         );
         // The self-canary must NOT fire when self genuinely is discovered —
         // it only forces `truncated` on a missing self-PID, never clears an
         // already-set flag from something else.
-        assert!(
-            !census.truncated,
-            "self was found; the self-canary (and the namespace check, when this test runs \
-             in the host's own PID namespace) must not report truncation on its own"
-        );
+        let global_census_supported = fs::metadata("/proc/self/ns/pid")
+            .is_ok_and(|meta| pid_ns_is_init(meta.ino()))
+            && proc_mount_is_visibility_restricted() == Some(false);
+        if global_census_supported {
+            assert!(
+                !census.truncated,
+                "self was found in an unrestricted init-namespace procfs census"
+            );
+        } else {
+            assert!(
+                census.truncated,
+                "a namespace- or mount-restricted procfs census must stay incomplete"
+            );
+        }
         // Not asserting `is_complete()` here: an unprivileged process
         // legitimately cannot inspect every other PID's open fds on a real,
         // busy machine (other users' / root's processes), so
@@ -3934,12 +3975,13 @@ mod tests {
 
     #[test]
     fn self_canary_marks_truncated_when_own_pid_missing() {
+        let scanner_pid = 41;
         let mut census = CensusResult {
-            holders: std::collections::HashSet::from([std::process::id().wrapping_add(1)]),
+            holders: std::collections::HashSet::from([42]),
             uninspectable_pids: Vec::new(),
             truncated: false,
         };
-        census.apply_self_canary();
+        census.apply_self_canary_for(Some(scanner_pid));
         assert!(
             census.truncated,
             "a census that discovered other holders but not the calling process itself is \
@@ -3949,12 +3991,13 @@ mod tests {
 
     #[test]
     fn self_canary_leaves_a_correct_census_untouched() {
+        let scanner_pid = 41;
         let mut census = CensusResult {
-            holders: std::collections::HashSet::from([std::process::id()]),
+            holders: std::collections::HashSet::from([scanner_pid]),
             uninspectable_pids: Vec::new(),
             truncated: false,
         };
-        census.apply_self_canary();
+        census.apply_self_canary_for(Some(scanner_pid));
         assert!(
             !census.truncated,
             "self was found; the canary must not fire"
@@ -3963,16 +4006,26 @@ mod tests {
 
     #[test]
     fn self_canary_does_not_clear_an_existing_truncated_flag() {
+        let scanner_pid = 41;
         let mut census = CensusResult {
-            holders: std::collections::HashSet::from([std::process::id()]),
+            holders: std::collections::HashSet::from([scanner_pid]),
             uninspectable_pids: Vec::new(),
             truncated: true,
         };
-        census.apply_self_canary();
+        census.apply_self_canary_for(Some(scanner_pid));
         assert!(
             census.truncated,
             "the self-canary only ever sets `truncated`; it must never clear a flag another \
              step already raised"
         );
+    }
+
+    #[test]
+    fn self_canary_fails_closed_when_process_identity_is_unavailable() {
+        let mut census = CensusResult::default();
+
+        census.apply_self_canary_for(None);
+
+        assert!(census.truncated);
     }
 }

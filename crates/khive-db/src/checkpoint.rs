@@ -630,10 +630,11 @@ fn log_tx_age_emission(emission: &TxAgeEmission) {
 
 /// ADR-091 Amendment 2 Plank B: per-process walpin sidecar state, carried
 /// across ticks by whichever sweep owns it (the daemon's `run_checkpoint_task`
-/// or a session's `run_session_sweep_task`). Writes this process's heartbeat
-/// on every tick the registry's oldest span exceeds `tx_warn_secs`, and
-/// removes it once on the tick the condition clears (and on shutdown) — a
-/// process that never crosses the threshold writes nothing.
+/// or a session's `run_session_sweep_task`). Once the registry's oldest span
+/// exceeds `tx_warn_secs`, the first observation and each content change
+/// rewrite the heartbeat body; unchanged ticks refresh only its mtime. The
+/// heartbeat is removed once when the condition clears (and on shutdown), so
+/// a process that never crosses the threshold writes no heartbeat body.
 struct WalpinSidecarState {
     dir: PathBuf,
     pid: u32,
@@ -1198,9 +1199,9 @@ pub async fn run_session_sweep_task(
 /// `is_main` (ADR-091 Amendment 3): whether `pool` is the deployment's main
 /// backend. A daemon owning several file-backed backends spawns one task per
 /// backend, each with its own pool and shutdown-channel clone (the sender
-/// broadcasts to every receiver clone alike); exactly one of those calls
-/// passes `true`. See the `tx_filter` construction below for what this
-/// selects.
+/// broadcasts to every receiver clone alike); exactly one call passes `true`
+/// and owns the process-level lifecycle event stream. See the `tx_filter`
+/// construction below for the registry-view selection.
 pub async fn run_checkpoint_task(
     pool: Arc<ConnectionPool>,
     config: CheckpointConfig,
@@ -1209,6 +1210,7 @@ pub async fn run_checkpoint_task(
     mut shutdown_rx: tokio::sync::watch::Receiver<()>,
     is_main: bool,
 ) {
+    let event_store = if is_main { event_store } else { None };
     let mut interval = tokio::time::interval(config.interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut severity_state = CheckpointSeverityState::default();
@@ -1576,6 +1578,9 @@ fn maybe_truncate(
         return;
     }
 
+    #[cfg(unix)]
+    let walpin_census = snapshot_walpin_census(pool);
+
     // Only now is this a genuine attempt: the writer is held, the threshold
     // and interval gates passed, and the busy_timeout override is in effect
     // immediately before the TRUNCATE pragma itself.
@@ -1611,7 +1616,7 @@ fn maybe_truncate(
                 );
                 log_tx_registry_snapshot_warn(wal_pages_after);
                 #[cfg(unix)]
-                log_walpin_sidecar_report(pool);
+                log_walpin_sidecar_report(pool, walpin_census);
                 log_wal_pin_depth(conn);
             }
 
@@ -1657,12 +1662,11 @@ fn note_truncate_outcome(
     TRUNCATE_CONSECUTIVE_FAILURES.store(state.consecutive_failures as u64, Ordering::Relaxed);
 }
 
-/// ADR-091 Amendment 2 Plank B: on a TRUNCATE no-progress event, enumerate
-/// the walpin sidecar directory and log every entry's sidecar-health
-/// classification (reporting / registered-silent / unknown), attributing the
-/// pin to a specific cross-process PID rather than only this process's own
-/// registry. A no-op if the sidecar is disabled or this backend has no
-/// on-disk path.
+/// ADR-091 Amendment 2 Plank B: snapshot the OS holder census immediately
+/// before a TRUNCATE attempt. If the attempt makes no progress, enumerate the
+/// walpin sidecar and combine it with that snapshot so a short-lived holder
+/// present at attempt time is not replaced by a later process view. A no-op
+/// if the sidecar is disabled or this backend has no on-disk path.
 ///
 /// Sidecar-health attribution (ADR-091 Amendment 2):
 /// the sharper "unregistered/native mechanism" conclusion is licensed only
@@ -1672,7 +1676,19 @@ fn note_truncate_outcome(
 /// inconclusive, and the WARN below names exactly which PIDs are unresolved
 /// instead of silently exonerating them.
 #[cfg(unix)]
-fn log_walpin_sidecar_report(pool: &ConnectionPool) {
+type WalpinCensusSnapshot = Result<crate::walpin::CensusResult, String>;
+
+#[cfg(unix)]
+fn snapshot_walpin_census(pool: &ConnectionPool) -> Option<WalpinCensusSnapshot> {
+    let path = pool.canonical_path()?;
+    if !crate::walpin::sidecar_enabled(true) {
+        return None;
+    }
+    Some(crate::walpin::census_holders(path).map_err(|e| e.to_string()))
+}
+
+#[cfg(unix)]
+fn log_walpin_sidecar_report(pool: &ConnectionPool, census_snapshot: Option<WalpinCensusSnapshot>) {
     let Some(path) = pool.canonical_path() else {
         return;
     };
@@ -1723,16 +1739,12 @@ fn log_walpin_sidecar_report(pool: &ConnectionPool) {
     }
     let mut unknown_pids: Vec<u32> = report.unknown_pids().collect();
 
-    // ADR-091 Amendment 2 (OS-derived census): the sidecar
-    // directory alone can only speak for PIDs that wrote SOMETHING there —
-    // a database holder that never registered a beacon at all (pre-feature
-    // binary, sidecar disabled, wedged before its first write) would
-    // otherwise be invisible. Widen the universe to every PID the OS
-    // reports as currently holding the database file open; any such PID
-    // absent from `report` entirely is `unknown` for the same reason a
-    // stale/unowned sidecar entry is.
-    match crate::walpin::census_holders(path) {
-        Ok(census) => {
+    // The sidecar directory alone can only speak for PIDs that wrote
+    // something there. Widen the universe to every PID the OS reported as
+    // holding the database immediately before this TRUNCATE attempt; any
+    // holder absent from `report` is unknown.
+    match census_snapshot {
+        Some(Ok(census)) => {
             let sidecar_known: std::collections::HashSet<u32> = report
                 .reporting()
                 .map(|hb| hb.pid)
@@ -1778,7 +1790,7 @@ fn log_walpin_sidecar_report(pool: &ConnectionPool) {
                 }
             }
         }
-        Err(e) => {
+        Some(Err(e)) => {
             tracing::warn!(
                 error = %e,
                 "ADR-091 Amendment 2: OS-derived holder census failed; \
@@ -1787,6 +1799,14 @@ fn log_walpin_sidecar_report(pool: &ConnectionPool) {
             // A failed census is itself a health failure for the sharper
             // conclusion below — treat it as if at least one PID were
             // unresolved, without fabricating a specific PID number.
+            unknown_pids.push(0);
+        }
+        None => {
+            tracing::warn!(
+                "ADR-091 Amendment 2: OS-derived holder census was unavailable before the \
+                 TRUNCATE attempt; attribution cannot rule out an unregistered database \
+                 holder this tick"
+            );
             unknown_pids.push(0);
         }
     }
@@ -3741,6 +3761,43 @@ mod tests {
         assert!(
             events.iter().all(|e| e.namespace == "local"),
             "events must be stamped with the namespace passed to run_checkpoint_task"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(checkpoint_skip_metrics)]
+    async fn secondary_checkpoint_task_does_not_duplicate_lifecycle_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secondary_outcome.db");
+        let pool = file_pool(&path);
+        let cfg = CheckpointConfig {
+            interval: Duration::from_millis(10),
+            warn_pages: 0,
+            ..CheckpointConfig::default()
+        };
+        let store = Arc::new(FakeEventStore::default());
+        let store_dyn: Arc<dyn khive_storage::EventStore> = store.clone();
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+        let handle = tokio::spawn(run_checkpoint_task(
+            pool,
+            cfg,
+            Some(store_dyn),
+            "local".to_string(),
+            shutdown_rx,
+            false,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        shutdown_tx.send(()).expect("send shutdown signal");
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("checkpoint task should exit within 1s")
+            .expect("checkpoint task panicked");
+
+        assert!(
+            store.events.lock().unwrap().is_empty(),
+            "only the main checkpoint task may append process-level lifecycle events"
         );
     }
 
