@@ -486,8 +486,36 @@ fn metadata_is_symlink_or_reparse(metadata: &std::fs::Metadata) -> bool {
     false
 }
 
+#[cfg(any(not(unix), test))]
+fn ensure_portable_ancestors_not_symlinks(
+    dir: &std::path::Path,
+    context: &'static str,
+) -> Result<(), ExternalIdsWriteError> {
+    const MAX_ANCESTORS: usize = 40;
+
+    let ancestors: Vec<_> = dir
+        .ancestors()
+        .skip(1)
+        .filter(|ancestor| !ancestor.as_os_str().is_empty())
+        .take(MAX_ANCESTORS + 1)
+        .collect();
+    if ancestors.len() > MAX_ANCESTORS {
+        return Err(ExternalIdsWriteError::InvalidPath {
+            context,
+            detail: format!("path has more than {MAX_ANCESTORS} ancestor components"),
+        });
+    }
+    for ancestor in ancestors.into_iter().rev() {
+        ensure_not_symlink_or_reparse(ancestor, context)?;
+    }
+    Ok(())
+}
+
 /// Non-Unix `std` has no handle-relative no-follow rename, so this is a
-/// best-effort path-based fallback with explicit symlink/reparse checks.
+/// best-effort path-based fallback. It rejects pre-existing symlink/reparse
+/// points in the segment directory's ancestors and in the segment/sidecar
+/// entries. A component can still be replaced between a check and a later
+/// path-based mutation; portable `std` cannot close that check-to-use window.
 #[cfg(not(unix))]
 fn write_via_dirfd(dir: &std::path::Path, buf: &[u8]) -> Result<(), ExternalIdsWriteError> {
     write_via_paths(dir, buf)
@@ -497,6 +525,7 @@ fn write_via_dirfd(dir: &std::path::Path, buf: &[u8]) -> Result<(), ExternalIdsW
 fn write_via_paths(dir: &std::path::Path, buf: &[u8]) -> Result<(), ExternalIdsWriteError> {
     use std::io::Write as _;
 
+    ensure_portable_ancestors_not_symlinks(dir, "inspect segment dir ancestor")?;
     let dir_metadata =
         ensure_not_symlink_or_reparse(dir, "inspect segment dir")?.ok_or_else(|| {
             ExternalIdsWriteError::io(
@@ -531,6 +560,7 @@ fn write_via_paths(dir: &std::path::Path, buf: &[u8]) -> Result<(), ExternalIdsW
         .map_err(|e| ExternalIdsWriteError::io("sync external_ids.bin.tmp", e))?;
     drop(file);
 
+    ensure_portable_ancestors_not_symlinks(dir, "reinspect segment dir ancestor")?;
     ensure_not_symlink_or_reparse(dir, "reinspect segment dir")?;
     ensure_not_symlink_or_reparse(&tmp_path, "reinspect external_ids.bin.tmp")?;
     ensure_not_symlink_or_reparse(&final_path, "reinspect external_ids.bin")?;
@@ -862,6 +892,37 @@ mod tests {
             .expect_err("portable writer must refuse a symlinked segment dir");
         assert!(matches!(err, ExternalIdsWriteError::InvalidPath { .. }));
         assert!(!real_dir.path().join("external_ids.bin").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn portable_writer_refuses_symlinked_ancestor() {
+        let real_parent = tempdir();
+        let real_segment = real_parent.path().join("regular").join("segment");
+        std::fs::create_dir_all(&real_segment).expect("create real segment dir");
+
+        let link_parent = tempdir();
+        let ancestor_link = link_parent.path().join("ancestor");
+        std::os::unix::fs::symlink(real_parent.path(), &ancestor_link)
+            .expect("create ancestor symlink");
+
+        let err = write_via_paths(&ancestor_link.join("regular").join("segment"), b"sidecar")
+            .expect_err("portable writer must refuse a symlinked ancestor");
+        assert!(matches!(err, ExternalIdsWriteError::InvalidPath { .. }));
+        assert!(!real_segment.join("external_ids.bin").exists());
+    }
+
+    #[test]
+    fn portable_writer_accepts_regular_ancestor_chain() {
+        let root = tempdir();
+        let segment_dir = root.path().join("one").join("two").join("segment");
+        std::fs::create_dir_all(&segment_dir).expect("create regular ancestor chain");
+
+        write_via_paths(&segment_dir, b"sidecar").expect("portable write");
+        assert_eq!(
+            std::fs::read(segment_dir.join("external_ids.bin")).expect("read sidecar"),
+            b"sidecar"
+        );
     }
 
     #[test]
