@@ -1598,6 +1598,9 @@ fn maybe_truncate(
         return;
     }
 
+    #[cfg(unix)]
+    let holder_census = capture_wal_holder_census(pool);
+
     // Only now is this a genuine attempt: the writer is held, the threshold
     // and interval gates passed, and the busy_timeout override is in effect
     // immediately before the TRUNCATE pragma itself.
@@ -1632,8 +1635,12 @@ fn maybe_truncate(
                      a long-lived reader may still be pinning the WAL snapshot"
                 );
                 log_tx_registry_snapshot_warn(wal_pages_after);
+                #[cfg(test)]
+                if let Some(path) = pool.canonical_path() {
+                    truncate_report_test_sync::after_no_progress_before_report(path);
+                }
                 #[cfg(unix)]
-                log_walpin_sidecar_report(pool);
+                log_walpin_sidecar_report(pool, holder_census);
                 log_wal_pin_depth(conn);
             }
 
@@ -1644,6 +1651,55 @@ fn maybe_truncate(
             log_tx_registry_snapshot_warn(wal_pages_before);
             note_truncate_outcome(config, wal_pages_before, truncate_state);
         }
+    }
+}
+
+#[cfg(test)]
+mod truncate_report_test_sync {
+    use std::path::{Path, PathBuf};
+    use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+    use std::sync::Mutex;
+
+    struct Hook {
+        db_path: PathBuf,
+        reached_tx: SyncSender<()>,
+        proceed_rx: Receiver<()>,
+    }
+
+    static HOOK: Mutex<Option<Hook>> = Mutex::new(None);
+
+    pub(crate) fn install(db_path: PathBuf) -> (Receiver<()>, SyncSender<()>) {
+        let (reached_tx, reached_rx) = sync_channel(0);
+        let (proceed_tx, proceed_rx) = sync_channel(0);
+        let replaced = HOOK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .replace(Hook {
+                db_path,
+                reached_tx,
+                proceed_rx,
+            });
+        assert!(replaced.is_none(), "truncate report hook already installed");
+        (reached_rx, proceed_tx)
+    }
+
+    pub(crate) fn uninstall() {
+        *HOOK.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+
+    pub(crate) fn after_no_progress_before_report(db_path: &Path) {
+        let hook = {
+            let mut guard = HOOK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            match guard.as_ref() {
+                Some(hook) if hook.db_path == db_path => guard.take(),
+                _ => None,
+            }
+        };
+        let Some(hook) = hook else {
+            return;
+        };
+        let _ = hook.reached_tx.send(());
+        let _ = hook.proceed_rx.recv();
     }
 }
 
@@ -1679,15 +1735,26 @@ fn note_truncate_outcome(
     TRUNCATE_CONSECUTIVE_FAILURES.store(state.consecutive_failures as u64, Ordering::Relaxed);
 }
 
-/// ADR-091 Amendment 2 Plank B: when a TRUNCATE attempt makes no progress,
-/// enumerate the walpin sidecar and combine it with an OS holder census. The
-/// census deliberately runs only on this consumed diagnostic path: a
-/// pre-attempt census would scan every process and file descriptor while the
-/// writer guard is held, including successful attempts that discard it. The
-/// tradeoff is that short-lived holders which exit during TRUNCATE may be
-/// absent; reported identities describe the no-progress outcome rather than
-/// the instant before the attempt. A no-op if the sidecar is disabled or this
-/// backend has no on-disk path.
+/// ADR-091 Amendment 2 Plank B: capture the OS holder census immediately
+/// before a TRUNCATE attempt so a holder that releases during the bounded wait
+/// remains attributable if the attempt reports no progress. A no-op if the
+/// sidecar is disabled or this backend has no on-disk path.
+#[cfg(unix)]
+fn capture_wal_holder_census(
+    pool: &ConnectionPool,
+) -> Option<Result<crate::walpin::CensusResult, String>> {
+    let path = pool.canonical_path()?;
+    if !crate::walpin::sidecar_enabled(true) {
+        return None;
+    }
+    Some(crate::walpin::census_holders(path).map_err(|e| e.to_string()))
+}
+
+/// When a TRUNCATE attempt makes no progress, enumerate the walpin sidecar and
+/// combine it with the holder census captured immediately before that attempt.
+/// Sidecar enumeration remains deferred until this consumed diagnostic path;
+/// holder identity cannot be deferred because a transient blocker may have
+/// released by then.
 ///
 /// Sidecar-health attribution (ADR-091 Amendment 2):
 /// the sharper "unregistered/native mechanism" conclusion is licensed only
@@ -1697,13 +1764,16 @@ fn note_truncate_outcome(
 /// inconclusive, and the WARN below names exactly which PIDs are unresolved
 /// instead of silently exonerating them.
 #[cfg(unix)]
-fn log_walpin_sidecar_report(pool: &ConnectionPool) {
+fn log_walpin_sidecar_report(
+    pool: &ConnectionPool,
+    census: Option<Result<crate::walpin::CensusResult, String>>,
+) {
+    let Some(census) = census else {
+        return;
+    };
     let Some(path) = pool.canonical_path() else {
         return;
     };
-    if !crate::walpin::sidecar_enabled(true) {
-        return;
-    }
     let dir = crate::walpin::sidecar_dir_for(path);
     // Each record carries its producer's own sweep cadence
     // (`sweep_interval_ms`), which is what freshness is judged against; the
@@ -1721,7 +1791,6 @@ fn log_walpin_sidecar_report(pool: &ConnectionPool) {
             return;
         }
     };
-    let census = crate::walpin::census_holders(path).map_err(|e| e.to_string());
     let now = now_epoch_secs();
     for hb in report.reporting() {
         // ADR-091 Amendment 3 Plank F2 fail-closed reading rule: the
@@ -1751,8 +1820,8 @@ fn log_walpin_sidecar_report(pool: &ConnectionPool) {
 
     // The sidecar directory alone can only speak for PIDs that wrote
     // something there. Widen the universe to every PID the OS reports as
-    // holding the database after this no-progress outcome; any holder absent
-    // from `report` is unknown.
+    // holding the database immediately before the TRUNCATE attempt; any holder
+    // absent from `report` is unknown.
     match census {
         Ok(census) => {
             let sidecar_known: std::collections::HashSet<u32> = report
@@ -1916,6 +1985,7 @@ mod tests {
         message: Option<String>,
         oldest_tx_label: Option<String>,
         tx_label: Option<String>,
+        census_only: Option<String>,
     }
 
     #[derive(Default)]
@@ -1941,6 +2011,7 @@ mod tests {
                 "message" => self.0.message = Some(cleaned),
                 "oldest_tx_label" => self.0.oldest_tx_label = Some(cleaned),
                 "tx_label" => self.0.tx_label = Some(cleaned),
+                "census_only" => self.0.census_only = Some(cleaned),
                 _ => {}
             }
         }
@@ -2145,6 +2216,182 @@ mod tests {
             ..PoolConfig::default()
         };
         Arc::new(ConnectionPool::new(cfg).expect("pool open"))
+    }
+
+    struct TruncateReportHookGuard;
+
+    impl Drop for TruncateReportHookGuard {
+        fn drop(&mut self) {
+            truncate_report_test_sync::uninstall();
+        }
+    }
+
+    struct ReaderProcess {
+        child: std::process::Child,
+        _stdout: std::io::BufReader<std::process::ChildStdout>,
+    }
+
+    impl ReaderProcess {
+        fn spawn(db_path: &std::path::Path) -> Self {
+            use std::io::BufRead;
+            use std::process::Stdio;
+
+            let mut child = std::process::Command::new(
+                std::env::current_exe().expect("resolve current test executable"),
+            )
+            .args([
+                "--exact",
+                "checkpoint::tests::walpin_transient_reader_process_helper",
+                "--nocapture",
+            ])
+            .env("KHIVE_CHECKPOINT_READER_HELPER_PATH", db_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn transient WAL reader helper");
+
+            let stdout = child.stdout.take().expect("capture helper stdout");
+            let mut reader = std::io::BufReader::new(stdout);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let bytes = reader
+                    .read_line(&mut line)
+                    .expect("read transient reader readiness signal");
+                assert!(bytes > 0, "reader helper exited before readiness signal");
+                if line.contains("KHIVE_CHECKPOINT_READER_READY") {
+                    break;
+                }
+            }
+            Self {
+                child,
+                _stdout: reader,
+            }
+        }
+
+        fn pid(&self) -> u32 {
+            self.child.id()
+        }
+
+        fn release(&mut self) {
+            use std::io::Write;
+
+            let mut stdin = self.child.stdin.take().expect("helper stdin is available");
+            stdin
+                .write_all(b"release\n")
+                .expect("release transient reader");
+            drop(stdin);
+            let status = self.child.wait().expect("wait for transient reader helper");
+            assert!(status.success(), "transient reader helper failed: {status}");
+        }
+    }
+
+    impl Drop for ReaderProcess {
+        fn drop(&mut self) {
+            if self.child.try_wait().ok().flatten().is_none() {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
+    }
+
+    #[test]
+    fn walpin_transient_reader_process_helper() {
+        use std::io::Write;
+
+        let Some(path) = std::env::var_os("KHIVE_CHECKPOINT_READER_HELPER_PATH") else {
+            return;
+        };
+        let conn = rusqlite::Connection::open(path).expect("helper opens database");
+        conn.execute_batch("BEGIN DEFERRED; SELECT * FROM t;")
+            .expect("helper pins a read snapshot");
+        println!("KHIVE_CHECKPOINT_READER_READY");
+        std::io::stdout().flush().expect("flush readiness signal");
+        let mut release = String::new();
+        std::io::stdin()
+            .read_line(&mut release)
+            .expect("wait for release signal");
+        conn.execute_batch("COMMIT")
+            .expect("helper releases read snapshot");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial(checkpoint_skip_metrics, walpin_report_seam)]
+    fn no_progress_report_keeps_holder_released_after_truncate_timeout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("transient-reader.db");
+        let pool = file_pool(&path);
+        {
+            let writer = pool.try_writer().expect("writer");
+            writer
+                .conn()
+                .execute_batch("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1);")
+                .expect("seed WAL before reader snapshot");
+        }
+
+        let mut reader = ReaderProcess::spawn(&path);
+        let reader_pid = reader.pid();
+        {
+            let writer = pool.try_writer().expect("writer");
+            writer
+                .conn()
+                .execute_batch("INSERT INTO t VALUES (2);")
+                .expect("append WAL behind reader snapshot");
+        }
+
+        let canonical_path = pool
+            .canonical_path()
+            .expect("file-backed pool has canonical path")
+            .to_path_buf();
+        let (reached_rx, proceed_tx) = truncate_report_test_sync::install(canonical_path.clone());
+        let _hook_guard = TruncateReportHookGuard;
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let thread_buffer = std::sync::Arc::clone(&buffer);
+        let checkpoint_pool = Arc::clone(&pool);
+        let checkpoint = std::thread::spawn(move || {
+            let subscriber = CaptureSubscriber {
+                events: thread_buffer,
+            };
+            tracing::subscriber::with_default(subscriber, || {
+                checkpoint_once(
+                    &checkpoint_pool,
+                    &CheckpointConfig {
+                        truncate_high_water_pages: 0,
+                        truncate_min_interval: Duration::ZERO,
+                        truncate_busy_timeout: Duration::from_millis(50),
+                        ..CheckpointConfig::default()
+                    },
+                    &mut TruncateState::default(),
+                )
+            })
+        });
+
+        reached_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("TRUNCATE must report no progress while the reader is pinned");
+        reader.release();
+        let post_attempt_census =
+            crate::walpin::census_holders(&canonical_path).expect("post-attempt holder census");
+        assert!(
+            !post_attempt_census.holders.contains(&reader_pid),
+            "released reader PID must be absent from a post-attempt census"
+        );
+        proceed_tx
+            .send(())
+            .expect("allow no-progress reporting to continue");
+        checkpoint.join().expect("checkpoint thread");
+
+        let events = buffer.lock().expect("captured events");
+        assert!(
+            events.iter().any(|event| {
+                event
+                    .census_only
+                    .as_deref()
+                    .is_some_and(|pids| pids.contains(&reader_pid.to_string()))
+            }),
+            "the no-progress report must retain PID {reader_pid} from the pre-attempt census: {events:?}"
+        );
     }
 
     // `checkpoint_once` -> `query_wal_pages` writes the process-wide

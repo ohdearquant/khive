@@ -166,11 +166,11 @@ snapshot is logged (reusing Plank 0's `tx_registry`) before the attempt.
 `busy_timeout` is temporarily lowered to `truncate_busy_timeout` for the
 PRAGMA call and restored immediately after, regardless of outcome. No
 transaction is ever killed here — enforcement is Plank 1's job, not this
-one's. The OS holder census is captured only after a TRUNCATE attempt makes no
-progress, when its result will be consumed. This avoids a full-process file
-descriptor scan on successful attempts while the writer guard is held. The
-reported identities therefore describe the no-progress diagnostic point;
-short-lived holders that exit during the TRUNCATE wait may be absent.
+one's. The OS holder census is captured immediately before the TRUNCATE
+attempt, then consumed only if that attempt makes no progress. The reported
+identities therefore include a transient holder that releases during the
+bounded TRUNCATE wait, before the no-progress diagnostic is emitted. Sidecar
+enumeration remains deferred to the no-progress path.
 
 ## `TxAgeSweepState` — identity tracking rationale
 

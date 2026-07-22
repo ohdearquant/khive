@@ -1577,8 +1577,8 @@ impl CensusResult {
         self.uninspectable_pids.is_empty() && !self.truncated
     }
 
-    /// ADR-091 Amendment 2 self-canary: the sole caller
-    /// (`log_walpin_sidecar_report`) always runs inside the process whose
+    /// ADR-091 Amendment 2 self-canary: the checkpoint census caller always
+    /// runs inside the process whose
     /// own SQLite connection pool holds `db_path` open, so a correct,
     /// complete census must find the process identity visible through the
     /// scanner's process source. On Linux that is `/proc/self`, which can
