@@ -1128,10 +1128,42 @@ mod tests {
             db_path: Some(PathBuf::from(db_path)),
             embedding_model: None,
             additional_embedding_models: vec![],
+            // Pin the pack list explicitly rather than inheriting `KHIVE_PACKS`
+            // from the ambient environment (#1276) — every caller of this
+            // helper only dispatches `kg` verbs, so the behavior under test
+            // shouldn't depend on a wider pack set a developer's shell exports.
+            packs: vec!["kg".to_string()],
             ..Default::default()
         };
         let rt = KhiveRuntime::new(cfg).expect("runtime on temp db");
         KhiveMcpServer::new(rt).expect("server on temp db")
+    }
+
+    // ── isolated_server ignores ambient KHIVE_PACKS (#1276) ───────────────────
+    //
+    // `cargo test -p kkernel` failed ~20 exec tests whenever a developer's
+    // shell exported `KHIVE_PACKS` naming a pack not compiled into this
+    // workspace (e.g. `kg,gtd`): every `RuntimeConfig` built by this test
+    // module's shared helpers fell through to `RuntimeConfig::default()`'s
+    // `packs` field, which reads that env var, so construction panicked with
+    // `PackRegError { unknown: "gtd", .. }`. A unit test's outcome must not
+    // depend on ambient shell configuration.
+    #[test]
+    #[serial(khive_packs_env)]
+    fn isolated_server_ignores_ambient_khive_packs_naming_unavailable_pack() {
+        let prev = std::env::var("KHIVE_PACKS").ok();
+        std::env::set_var("KHIVE_PACKS", "kg,gtd");
+
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        // Before the fix, this panicked inside `KhiveMcpServer::new` — the
+        // helper inherited the ambient list above instead of pinning its own.
+        let _server = isolated_server(&db_path);
+
+        match prev {
+            Some(v) => std::env::set_var("KHIVE_PACKS", v),
+            None => std::env::remove_var("KHIVE_PACKS"),
+        }
     }
 
     // ── exec-path / serve-path config_id parity (#581) ────────────────────────
@@ -1670,6 +1702,10 @@ default = true
                 db_path: Some(db_path),
                 embedding_model: None,
                 additional_embedding_models: vec![],
+                // Pin the pack list explicitly rather than inheriting
+                // `KHIVE_PACKS` from the ambient environment (#1276) — this
+                // race only exercises `kg` writes.
+                packs: vec!["kg".to_string()],
                 ..RuntimeConfig::default()
             };
             let khive_cfg = KhiveConfig::default();
@@ -1748,6 +1784,9 @@ default = true
                 db_path: Some(db_path),
                 embedding_model: None,
                 additional_embedding_models: vec![],
+                // Pin the pack list explicitly rather than inheriting
+                // `KHIVE_PACKS` from the ambient environment (#1276).
+                packs: vec!["kg".to_string()],
                 ..RuntimeConfig::default()
             };
             let khive_cfg = KhiveConfig::default();
@@ -2290,7 +2329,10 @@ backend = "sessions"
             namespace_explicit: true,
             actor_explicit: false,
             no_embed: true,
-            packs: None,
+            // Pin the pack list explicitly rather than inheriting `KHIVE_PACKS`
+            // from the ambient environment (#1276) — this test's assertion is
+            // about config_id parity, not about pack resolution.
+            packs: Some(vec!["kg".to_string()]),
             brain_profile: None,
         })
         .expect("resolve exec-shaped config");
@@ -2324,7 +2366,10 @@ backend = "sessions"
             namespace_explicit: false,
             actor_explicit: false,
             no_embed: true,
-            packs: None,
+            // Same pin as `cfg` above (#1276) — both sides of the parity
+            // comparison must resolve identically regardless of ambient
+            // `KHIVE_PACKS`.
+            packs: Some(vec!["kg".to_string()]),
             brain_profile: None,
         })
         .expect("resolve serve-shaped config");
@@ -2429,6 +2474,10 @@ backend = "sessions"
             db_path: Some(PathBuf::from(db_path)),
             embedding_model: None,
             additional_embedding_models: vec![],
+            // Pin the pack list explicitly rather than inheriting `KHIVE_PACKS`
+            // from the ambient environment (#1276) — every atomic-apply test
+            // using this helper only dispatches `kg` verbs.
+            packs: vec!["kg".to_string()],
             ..Default::default()
         }
     }
