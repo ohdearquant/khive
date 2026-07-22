@@ -12,6 +12,7 @@ import datetime
 import hashlib
 import json
 import pathlib
+import re
 import tempfile
 import unittest
 
@@ -19,6 +20,7 @@ import coverage_validator
 import flagship_schema
 
 MANIFEST_PATH = pathlib.Path(__file__).parent / "flagship_workloads.toml"
+KG_HANDLER_DEFS_PATH = pathlib.Path(__file__).parents[2] / "crates" / "khive-pack-kg" / "src" / "handler_defs.rs"
 
 
 def _base_scenario(**overrides) -> dict:
@@ -106,6 +108,18 @@ class ManifestTests(unittest.TestCase):
         data, errors = coverage_validator.load_manifest(MANIFEST_PATH)
         self.assertEqual(errors, [])
         self.assertGreater(len(data["scenario"]), 0)
+
+    def test_mcp_operation_allowlist_matches_shipped_kg_handlers(self):
+        handler_names = set(
+            re.findall(
+                r'HandlerDef\s*\{\s*name:\s*"([^"]+)"',
+                KG_HANDLER_DEFS_PATH.read_text(),
+            )
+        )
+        self.assertEqual(
+            coverage_validator.AVAILABLE_OPERATIONS_BY_SURFACE["mcp_daemon"],
+            handler_names,
+        )
 
     def test_every_feature_has_at_least_one_scenario(self):
         data, _ = coverage_validator.load_manifest(MANIFEST_PATH)
@@ -248,6 +262,37 @@ class ManifestTests(unittest.TestCase):
             path = self._write_manifest(pathlib.Path(tmp), [_base_scenario(surface="local_dispatch")])
             _, errors = coverage_validator.load_manifest(path)
             self.assertTrue(any("invalid surface" in e for e in errors), errors)
+
+    def test_unknown_mcp_operation_is_flagged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_manifest(
+                pathlib.Path(tmp),
+                [
+                    _base_scenario(
+                        scenario_id="f2.removed.command.warm",
+                        feature="F2",
+                        operation="removed.command",
+                    )
+                ],
+            )
+            _, errors = coverage_validator.load_manifest(path)
+            self.assertTrue(any("operation is not available on mcp_daemon" in e for e in errors), errors)
+
+    def test_removed_code_ingest_cli_is_flagged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_manifest(
+                pathlib.Path(tmp),
+                [
+                    _base_scenario(
+                        scenario_id="f6.code_ingest.cli.production",
+                        feature="F6",
+                        surface="admin_cli",
+                        operation="kkernel code-ingest",
+                    )
+                ],
+            )
+            _, errors = coverage_validator.load_manifest(path)
+            self.assertTrue(any("operation is not available on admin_cli" in e for e in errors), errors)
 
     def test_malformed_fixture_hash_is_flagged(self):
         with tempfile.TemporaryDirectory() as tmp:
