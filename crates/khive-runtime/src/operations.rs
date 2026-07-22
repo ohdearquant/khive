@@ -850,6 +850,51 @@ fn note_props_match(note_props: Option<&serde_json::Value>, filter: &serde_json:
         .all(|(k, v)| actual.get(k).is_some_and(|av| av == v))
 }
 
+/// Collapse per-namespace `GraphPath`s from [`KhiveRuntime::traverse`] down to
+/// exactly one entry per distinct `root_id`, in first-seen order.
+///
+/// `traverse` queries every namespace in the token's visible set
+/// independently and concatenates the results. A root that is only visible
+/// via one namespace still gets queried against every OTHER visible
+/// namespace too; those namespaces contribute nothing real, but when
+/// `include_roots` is set they still produce a root-only `GraphPath` (the
+/// root node is pre-seeded in Rust before the per-namespace SQL query runs,
+/// with no check that the namespace actually owns it). Left unmerged, a
+/// single requested root can surface as two response entries: one populated,
+/// one degenerate. Merging by `root_id` and unioning nodes (deduped by
+/// `node_id`, first occurrence wins) restores the one-entry-per-root
+/// contract and, as a side effect, unions any node reachable only from a
+/// non-primary visible namespace into the same path instead of dropping it.
+fn merge_traversal_paths_by_root(paths: Vec<GraphPath>) -> Vec<GraphPath> {
+    let mut order: Vec<Uuid> = Vec::new();
+    let mut merged: HashMap<Uuid, GraphPath> = HashMap::new();
+    for path in paths {
+        match merged.entry(path.root_id) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                order.push(path.root_id);
+                slot.insert(path);
+            }
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                let existing = slot.get_mut();
+                let mut seen: std::collections::HashSet<Uuid> =
+                    existing.nodes.iter().map(|n| n.node_id).collect();
+                for node in path.nodes {
+                    if seen.insert(node.node_id) {
+                        existing.nodes.push(node);
+                    }
+                }
+                if path.total_weight > existing.total_weight {
+                    existing.total_weight = path.total_weight;
+                }
+            }
+        }
+    }
+    order
+        .into_iter()
+        .filter_map(|root_id| merged.remove(&root_id))
+        .collect()
+}
+
 impl KhiveRuntime {
     // ---- Entity operations ----
 
@@ -2303,6 +2348,16 @@ impl KhiveRuntime {
             let mut ns_paths = self.graph(&temp)?.traverse(request.clone()).await?;
             paths.append(&mut ns_paths);
         }
+        // Each visible namespace is queried independently above, so a root
+        // visible via more than one namespace (e.g. the caller's own
+        // namespace plus the always-appended `local`) produces one GraphPath
+        // per namespace it was queried against — including namespaces that
+        // do not own the root at all, which still emit a root-only entry
+        // because `include_roots` pre-seeds the root in Rust ahead of the
+        // per-namespace SQL query. Merge back down to one GraphPath per
+        // distinct root_id, unioning the discovered nodes, so the response
+        // count matches the requested root count.
+        let mut paths = merge_traversal_paths_by_root(paths);
         self.enrich_path_nodes(token, &mut paths, request.include_properties)
             .await;
         // Filter out soft-deleted entity nodes from all path nodes.
@@ -2466,7 +2521,16 @@ impl KhiveRuntime {
     }
 
     /// Populate `name` and `kind` on each `PathNode` from the corresponding
-    /// entity record. Same best-effort policy as `enrich_neighbor_hits`.
+    /// entity record.
+    ///
+    /// Unlike `enrich_neighbor_hits`, this is entity-only by design: it does
+    /// not fall back to a note lookup for IDs that aren't entities.
+    /// A traversal can still reach note nodes (e.g. via an `annotates`
+    /// edge) — they are not filtered out of `GraphPath::nodes` — but they are
+    /// left with `name = None, kind = None` rather than resolved. Widening
+    /// this to notes would change every existing caller's enriched output
+    /// for note-reaching traversals, so it stays scoped to entities until
+    /// that is an intentional product decision.
     ///
     /// Uses `get_entities_by_ids_visible` so that path nodes whose entities
     /// live in extra-visible namespaces are enriched correctly. Node IDs that
@@ -10818,6 +10882,199 @@ mod tests {
             )
             .await;
         assert!(result.is_ok(), "traverse must not error; got {:?}", result);
+    }
+
+    // ── Single root visible in multiple namespaces must yield exactly one
+    //    traversal object, not one phantom root-only entry per extra
+    //    namespace ────────────────────────────────────────────────────────
+    //
+    // A caller's visible-namespace set commonly spans more than the root's
+    // owning namespace (e.g. `local` is always appended, see pack.rs
+    // extra_visible). Before the fix, `traverse` ran the storage-level
+    // traversal once per visible namespace and concatenated the results
+    // unconditionally. Because `include_roots` pre-seeds the root node in
+    // Rust before the SQL query even runs, a namespace that does not own the
+    // root's edges at all still produced a root-only "phantom" GraphPath —
+    // so a single-root request came back with two entries: one real, one
+    // degenerate.
+    #[tokio::test]
+    async fn traverse_single_root_across_visible_namespaces_yields_one_path() {
+        use khive_storage::types::TraversalOptions;
+
+        let rt = rt();
+        let owner = NamespaceToken::for_namespace(Namespace::parse("owner-ns").unwrap());
+        let a = rt
+            .create_entity(&owner, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(&owner, "concept", None, "B", None, None, vec![])
+            .await
+            .unwrap();
+        rt.link(&owner, a.id, b.id, EdgeRelation::Extends, 1.0, None)
+            .await
+            .unwrap();
+
+        // Token whose primary namespace ("caller-ns") does not own the root,
+        // but whose visible set also includes "owner-ns" (where the root and
+        // its edge actually live) — the shape produced by pack.rs always
+        // widening visibility to include `local`.
+        let caller = NamespaceToken::mint_with_visibility(
+            Namespace::parse("caller-ns").unwrap(),
+            vec![Namespace::parse("owner-ns").unwrap()],
+            ActorRef::anonymous(),
+        );
+        assert_eq!(caller.visible_namespaces().len(), 2);
+
+        let result = rt
+            .traverse(
+                &caller,
+                TraversalRequest {
+                    roots: vec![a.id],
+                    options: TraversalOptions {
+                        max_depth: 1,
+                        direction: Direction::Out,
+                        ..Default::default()
+                    },
+                    include_roots: true,
+                    include_properties: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.len(),
+            1,
+            "one root visible across 2 namespaces must yield exactly one \
+             GraphPath, got {result:#?}"
+        );
+        assert_eq!(result[0].root_id, a.id);
+        // The populated path (root + the real neighbor via "owner-ns") must
+        // survive the merge, not the phantom root-only one.
+        let node_ids: std::collections::HashSet<Uuid> =
+            result[0].nodes.iter().map(|n| n.node_id).collect();
+        assert!(node_ids.contains(&a.id));
+        assert!(
+            node_ids.contains(&b.id),
+            "merged path must retain the neighbor discovered in the owning \
+             namespace, got {result:#?}"
+        );
+    }
+
+    // ── Multi-root traverse: one object per distinct root, including a
+    //    root supplied both as itself and as a duplicate re-resolution ────
+    #[tokio::test]
+    async fn traverse_multi_root_one_path_per_distinct_root() {
+        use khive_storage::types::TraversalOptions;
+
+        let rt = rt();
+        let owner = NamespaceToken::for_namespace(Namespace::parse("owner-ns2").unwrap());
+        let a = rt
+            .create_entity(&owner, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let c = rt
+            .create_entity(&owner, "concept", None, "C", None, None, vec![])
+            .await
+            .unwrap();
+
+        // `a` appears twice in the roots list — this is what the pack
+        // handler produces when a caller passes the same root once as a
+        // short prefix and once as the full UUID: both resolve to the same
+        // `Uuid` value by the time the request reaches the runtime.
+        let result = rt
+            .traverse(
+                &owner,
+                TraversalRequest {
+                    roots: vec![a.id, a.id, c.id],
+                    options: TraversalOptions {
+                        max_depth: 1,
+                        direction: Direction::Out,
+                        ..Default::default()
+                    },
+                    include_roots: true,
+                    include_properties: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        let root_ids: Vec<Uuid> = result.iter().map(|p| p.root_id).collect();
+        assert_eq!(
+            root_ids.len(),
+            2,
+            "duplicate root value must not produce a duplicate GraphPath, got {result:#?}"
+        );
+        assert!(root_ids.contains(&a.id));
+        assert!(root_ids.contains(&c.id));
+    }
+
+    // ── Note-kind nodes reached via traversal appear in the result but are
+    //    never enriched with name/kind (entity-only enrichment, unchanged
+    //    behavior — see `enrich_path_nodes`) ────────────────────────────────
+    //
+    // The recursive SQL walks `graph_edges` without any node-kind
+    // restriction, and the soft-delete screen consults both `entities` and
+    // `notes`, so a note reached via an `annotates` edge is NOT dropped from
+    // the traversal. What it does not get is enrichment: `enrich_path_nodes`
+    // only batch-fetches entities (a deliberate entity-only scope), unlike
+    // `enrich_neighbor_hits` which falls back to a note lookup. This test
+    // pins that documented split rather than changing it.
+    #[tokio::test]
+    async fn traverse_reaches_note_nodes_but_leaves_them_unenriched() {
+        use khive_storage::types::TraversalOptions;
+
+        let rt = rt();
+        let owner = NamespaceToken::for_namespace(Namespace::parse("owner-ns3").unwrap());
+        let a = rt
+            .create_entity(&owner, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let note = rt
+            .create_note(
+                &owner,
+                "observation",
+                None,
+                "note body",
+                None,
+                None,
+                vec![a.id],
+            )
+            .await
+            .unwrap();
+
+        let result = rt
+            .traverse(
+                &owner,
+                TraversalRequest {
+                    roots: vec![a.id],
+                    options: TraversalOptions {
+                        max_depth: 1,
+                        direction: Direction::In,
+                        ..Default::default()
+                    },
+                    include_roots: false,
+                    include_properties: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        let note_node = result[0]
+            .nodes
+            .iter()
+            .find(|n| n.node_id == note.id)
+            .unwrap_or_else(|| panic!("note must be present in traversal nodes, got {result:#?}"));
+        assert_eq!(
+            note_node.name, None,
+            "note enrichment is deliberately entity-only; name stays None"
+        );
+        assert_eq!(
+            note_node.kind, None,
+            "note enrichment is deliberately entity-only; kind stays None"
+        );
     }
 
     // ---- purge cascade must include already-soft-deleted edges ----
