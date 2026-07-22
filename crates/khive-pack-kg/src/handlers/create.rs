@@ -176,15 +176,15 @@ impl KgPack {
         registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
         let attempted = entries.len();
-        let mut specs = Vec::with_capacity(attempted);
-        for (idx, entry) in entries.into_iter().enumerate() {
-            specs.push(
-                self.prepare_bulk_create_spec(token, idx, entry, registry)
-                    .await?,
-            );
-        }
 
         if atomic {
+            let mut specs = Vec::with_capacity(attempted);
+            for (idx, entry) in entries.into_iter().enumerate() {
+                specs.push(
+                    self.prepare_bulk_create_spec(token, idx, entry, registry)
+                        .await?,
+                );
+            }
             let mut entity_specs = Vec::new();
             let mut note_specs = Vec::new();
             for spec in specs {
@@ -221,7 +221,17 @@ impl KgPack {
         let mut errors = Vec::new();
         let mut entities = Vec::new();
         let mut notes = Vec::new();
-        for (idx, spec) in specs.into_iter().enumerate() {
+        for (idx, entry) in entries.into_iter().enumerate() {
+            let spec = match self
+                .prepare_bulk_create_spec(token, idx, entry, registry)
+                .await
+            {
+                Ok(spec) => spec,
+                Err(e) => {
+                    errors.push(json!({"index": idx, "error": e.to_string()}));
+                    continue;
+                }
+            };
             match spec {
                 BulkCreateSpec::Entity(spec) => {
                     match self.runtime.create_many(token, vec![spec]).await {

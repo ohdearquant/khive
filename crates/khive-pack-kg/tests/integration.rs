@@ -305,6 +305,37 @@ async fn create_bulk_items_non_atomic_reports_per_item_results() {
 }
 
 #[tokio::test]
+async fn create_bulk_items_non_atomic_collects_preparation_errors() {
+    let pack = pack();
+    let result = pack
+        .dispatch(
+            "create",
+            json!({
+                "items": [
+                    {"kind": "concept", "name": "CreatedDespiteInvalidSibling"},
+                    {"kind": "observation"}
+                ],
+                "atomic": false,
+                "verbose": true
+            }),
+        )
+        .await
+        .expect("non-atomic bulk create must collect preparation errors");
+
+    assert_eq!(result["attempted"], 2);
+    assert_eq!(result["created"], 1);
+    assert_eq!(result["failed"], 1);
+    assert_eq!(result["errors"][0]["index"], 1);
+    assert!(result["errors"][0]["error"]
+        .as_str()
+        .expect("error string")
+        .contains("note item requires 'content'"));
+    let entities = result["entities"].as_array().expect("entities array");
+    assert_eq!(entities.len(), 1);
+    assert_eq!(entities[0]["name"], "CreatedDespiteInvalidSibling");
+}
+
+#[tokio::test]
 async fn create_bulk_items_rejects_fields_for_the_wrong_substrate() {
     let pack = pack();
     let invalid_items = [

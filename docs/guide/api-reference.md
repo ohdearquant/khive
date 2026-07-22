@@ -138,7 +138,7 @@ Declaration = changes institutional status by fiat.
 
 ### `create` — Commissive
 
-Create an entity or note (singleton) or a batch of entities (bulk via `items`).
+Create an entity or note (singleton) or a batch of entities and notes (bulk via `items`).
 
 | Param               | Type            | Required    | Notes                                                                                                                                                                                                                                                                                      |
 | ------------------- | --------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -152,9 +152,9 @@ Create an entity or note (singleton) or a batch of entities (bulk via `items`).
 | `tags`              | array\<string\> | no          | Tag list.                                                                                                                                                                                                                                                                                  |
 | `entity_type`       | string          | no          | First-class type tag, e.g. `"paper"`, `"algorithm"`, `"tool"`.                                                                                                                                                                                                                             |
 | `properties`        | object          | no          | Arbitrary JSON properties.                                                                                                                                                                                                                                                                 |
-| `items`             | array\<object\> | no          | Bulk entity creation, each `{kind, name, entity_kind?, entity_type?, description?, properties?, tags?}`. Capped at 1000/request. Bulk-created entities skip embedding until a later `reindex`.                                                                                             |
+| `items`             | array\<object\> | no          | Kind-aware bulk creation. Each item requires `kind`. Entity items require `name` and accept `entity_kind`, `entity_type`, and `description`; note items require `content` and accept `note_kind`, `name`, `salience`, and `annotates`. Both accept `properties` and `tags`. Capped at 1000/request. Bulk-created entities skip embedding until a later `reindex`; notes embed immediately. |
 | `atomic`            | bool            | no          | Bulk path. Default true = all-or-nothing; false = per-item errors collected.                                                                                                                                                                                                               |
-| `verbose`           | bool            | no          | Bulk path. When true, response includes full entity objects.                                                                                                                                                                                                                               |
+| `verbose`           | bool            | no          | Bulk path. When true, response includes full records in `entities` and `notes` arrays.                                                                                                                                                                                                      |
 
 ```
 request(ops="create(kind=\"concept\", name=\"RoPE\", description=\"Rotary position embedding\")")
