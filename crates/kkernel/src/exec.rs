@@ -35,7 +35,7 @@ use clap::Parser;
 use khive_mcp::serve::resolve_runtime_config;
 use khive_mcp::serve::{
     apply_env_output_format, build_server_multi_backend_with_db_anchor, config_discovery_db_anchor,
-    enforce_strict_actor_mode, RuntimeConfigInputs,
+    enforce_strict_actor_mode, install_resolved_blob_store, RuntimeConfigInputs,
 };
 #[cfg(unix)]
 use khive_mcp::server::compute_config_id;
@@ -823,6 +823,12 @@ fn build_local_fallback_server(
     let _boot_guard = acquire_local_construction_guard(&cfg)?;
     if khive_cfg.backends.is_empty() {
         let rt = KhiveRuntime::new(cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
+        // Mirror the `serve` boot path's single-backend branch (ADR-111
+        // Amendment 2): without this, `exec`'s in-process fallback server
+        // never installs a `BlobStore`, so `blob.put`/`blob.get`/`blob.stat`
+        // fail as "unconfigured" here even when `serve` resolves one from
+        // the same config and backend (khive#1209).
+        install_resolved_blob_store(&rt, khive_cfg, rt.backend())?;
         let env_fmt = apply_env_output_format(khive_cfg.runtime.default_output_format);
         Ok(KhiveMcpServer::new(rt)
             .map_err(|e| anyhow::anyhow!("{e}"))?
@@ -1682,6 +1688,42 @@ default = true
             result.is_ok(),
             "exec fallback must use the anchor captured with RuntimeConfig after HOME changes: {}",
             result.err().unwrap()
+        );
+    }
+
+    // ── single-backend fallback installs a BlobStore (khive#1209) ────────────
+    //
+    // Before this fix, `build_local_fallback_server`'s single-backend branch
+    // constructed `KhiveRuntime`/`KhiveMcpServer` without ever calling
+    // `install_resolved_blob_store`, so `blob.*` verbs dispatched through
+    // `kkernel exec`'s in-process fallback always saw an unconfigured
+    // `BlobStore` even when the same config/backend combination resolves one
+    // for the `serve` daemon boot path. `KhiveMcpServer` does not expose its
+    // wrapped runtime, so this asserts the same *observable* side effect the
+    // `serve` path's own tests rely on: `FsBlobStore::new` (khive-db
+    // `stores/blob.rs`) creates its root directory eagerly. With no
+    // `[storage.blob]` config and no `KHIVE_BLOB_ROOT`, resolution falls
+    // back to `<db_dir>/blobs` — that directory existing after construction
+    // is proof the install call ran.
+    #[test]
+    fn build_local_fallback_server_installs_blob_store_single_backend() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("exec_blob.db");
+        let cfg = RuntimeConfig {
+            db_path: Some(db_path),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            ..RuntimeConfig::default()
+        };
+        let khive_cfg = KhiveConfig::default();
+
+        let _server = build_local_fallback_server(cfg, &khive_cfg, None, None)
+            .expect("single-backend local-exec construction must succeed");
+
+        assert!(
+            dir.path().join("blobs").is_dir(),
+            "default <db_dir>/blobs root must exist after construction, proving \
+             install_resolved_blob_store ran for the single-backend fallback path"
         );
     }
 
