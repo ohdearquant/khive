@@ -1468,6 +1468,7 @@ async fn merge_entity_reason_forwarded_through_registry_dispatch() {
                 "into_id": into.id.to_string(),
                 "from_id": from.id.to_string(),
                 "reason": "duplicate via dispatch",
+                "force": true,
             }),
         )
         .await
@@ -1497,6 +1498,15 @@ async fn merge_entity_reason_forwarded_through_registry_dispatch() {
         events.items[0].payload.get("reason").and_then(|v| v.as_str()),
         Some("duplicate via dispatch"),
         "reason supplied through the registry dispatch route must land in the EntityMerged payload; got: {:?}",
+        events.items[0].payload
+    );
+    assert_eq!(
+        events.items[0]
+            .payload
+            .get("force")
+            .and_then(|v| v.as_bool()),
+        Some(true),
+        "force=true must be durable in the EntityMerged payload; got: {:?}",
         events.items[0].payload
     );
 }
@@ -1595,6 +1605,7 @@ async fn get_dispatch_after_merge_discloses_kept_id() {
                 "kind": "entity",
                 "into_id": into.id.to_string(),
                 "from_id": from.id.to_string(),
+                "force": true,
             }),
         )
         .await
@@ -1728,6 +1739,7 @@ async fn resolve_dispatch_on_merged_uuid_stays_bare_not_found() {
                 "kind": "entity",
                 "into_id": into.id.to_string(),
                 "from_id": from.id.to_string(),
+                "force": true,
             }),
         )
         .await

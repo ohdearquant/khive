@@ -3307,6 +3307,10 @@ async fn curation_merge_entity_event_payload_has_adr014_fields() {
         payload.get("content_strategy").is_some(),
         "entity_merged payload must contain 'content_strategy' (PR #814); got {payload}"
     );
+    assert!(
+        payload.get("force").is_none(),
+        "ordinary entity merges must not carry a force marker; got {payload}"
+    );
 }
 
 /// Handler-wiring test for PR #814: `content_strategy`
@@ -3348,7 +3352,12 @@ async fn merge_handler_wires_explicit_prefer_from_content_strategy() {
     // onto the entity policy, the into-description ("desc A") survives instead.
     p.dispatch(
         "merge",
-        json!({"into_id": &into_id, "from_id": &from_id, "content_strategy": "prefer_from"}),
+        json!({
+            "into_id": &into_id,
+            "from_id": &from_id,
+            "content_strategy": "prefer_from",
+            "force": true,
+        }),
     )
     .await
     .expect("merge must succeed");
@@ -5232,6 +5241,270 @@ async fn singleton_link_updates_weight_and_metadata_on_existing_triple() {
 }
 
 // ---- Merge symmetric-relation canonicalization regression (ADR-002 §134) ----
+
+#[tokio::test]
+async fn merge_dissimilar_cross_kind_is_refused_by_entity_kind_guard() {
+    let pack = pack();
+    let into_id = pack
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "Quantum Annealing"}),
+        )
+        .await
+        .expect("create into entity")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let from_id = pack
+        .dispatch(
+            "create",
+            json!({"kind": "project", "name": "Renaissance Painting"}),
+        )
+        .await
+        .expect("create from entity")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let err = pack
+        .dispatch("merge", json!({"into_id": into_id, "from_id": from_id}))
+        .await
+        .expect_err("cross-kind merge must be refused");
+    let RuntimeError::Khive(err) = err else {
+        panic!("expected structured merge-guard error, got {err:?}");
+    };
+    assert_eq!(err.kind(), khive_types::ErrorKind::Conflict);
+    assert_eq!(
+        err.details().and_then(|details| details.get("guard")),
+        Some("entity_kind")
+    );
+}
+
+#[tokio::test]
+async fn merge_dissimilar_cross_kind_force_overrides_guards() {
+    let pack = pack();
+    let into_id = pack
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "Quantum Annealing"}),
+        )
+        .await
+        .expect("create into entity")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let from_id = pack
+        .dispatch(
+            "create",
+            json!({"kind": "project", "name": "Renaissance Painting"}),
+        )
+        .await
+        .expect("create from entity")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let result = pack
+        .dispatch(
+            "merge",
+            json!({"into_id": into_id, "from_id": from_id, "force": true}),
+        )
+        .await
+        .expect("force=true must override all entity merge guards");
+    assert_eq!(result["removed_id"], from_id);
+}
+
+#[tokio::test]
+async fn merge_legitimate_near_duplicate_passes_safety_floor() {
+    let pack = pack();
+    let into_id = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "concept",
+                "name": "Attention Flash",
+                "properties": {"projects": ["transformers", "inference"]},
+            }),
+        )
+        .await
+        .expect("create into entity")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let from_id = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "concept",
+                "name": "Flash Attention",
+                "properties": {"projects": ["inference", "kernels"]},
+            }),
+        )
+        .await
+        .expect("create from entity")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let result = pack
+        .dispatch("merge", json!({"into_id": into_id, "from_id": from_id}))
+        .await
+        .expect("near-duplicate names with compatible projects must merge");
+    assert_eq!(result["removed_id"], from_id);
+}
+
+#[tokio::test]
+async fn merge_same_kind_dissimilar_names_is_refused_by_name_guard() {
+    let pack = pack();
+    let into_id = pack
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "Quantum Annealing"}),
+        )
+        .await
+        .expect("create into entity")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let from_id = pack
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "Renaissance Painting"}),
+        )
+        .await
+        .expect("create from entity")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let err = pack
+        .dispatch("merge", json!({"into_id": into_id, "from_id": from_id}))
+        .await
+        .expect_err("dissimilar entity names must be refused");
+    let RuntimeError::Khive(err) = err else {
+        panic!("expected structured merge-guard error, got {err:?}");
+    };
+    assert_eq!(
+        err.details().and_then(|details| details.get("guard")),
+        Some("name_similarity")
+    );
+}
+
+#[tokio::test]
+async fn merge_punctuation_collision_is_refused_unless_forced() {
+    let pack = pack();
+    let into_id = pack
+        .dispatch("create", json!({"kind": "concept", "name": "C++"}))
+        .await
+        .expect("create C++ entity")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let from_id = pack
+        .dispatch("create", json!({"kind": "concept", "name": "C#"}))
+        .await
+        .expect("create C# entity")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let err = pack
+        .dispatch("merge", json!({"into_id": &into_id, "from_id": &from_id}))
+        .await
+        .expect_err("punctuation-distinct entity names must be refused");
+    let RuntimeError::Khive(err) = err else {
+        panic!("expected structured merge-guard error, got {err:?}");
+    };
+    assert_eq!(err.kind(), khive_types::ErrorKind::Conflict);
+    assert_eq!(
+        err.details().and_then(|details| details.get("guard")),
+        Some("name_similarity")
+    );
+
+    let result = pack
+        .dispatch(
+            "merge",
+            json!({"into_id": &into_id, "from_id": &from_id, "force": true}),
+        )
+        .await
+        .expect("force=true must override the name-similarity guard");
+    assert_eq!(result["removed_id"], from_id);
+}
+
+#[tokio::test]
+async fn merge_name_equality_ignores_case_and_collapsed_whitespace() {
+    for (into_name, from_name) in [
+        ("Case Fold", "cASE fOLD"),
+        ("Graph Neural Network", "  graph  neural\t network  "),
+    ] {
+        let pack = pack();
+        let into_id = pack
+            .dispatch("create", json!({"kind": "concept", "name": into_name}))
+            .await
+            .expect("create into entity")["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let from_id = pack
+            .dispatch("create", json!({"kind": "concept", "name": from_name}))
+            .await
+            .expect("create from entity")["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let result = pack
+            .dispatch("merge", json!({"into_id": into_id, "from_id": from_id}))
+            .await
+            .expect("case and whitespace differences must remain merge-compatible");
+        assert_eq!(result["removed_id"], from_id);
+    }
+}
+
+#[tokio::test]
+async fn merge_disjoint_projects_is_refused_by_properties_guard() {
+    let pack = pack();
+    let into_id = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "concept",
+                "name": "Vector Search",
+                "properties": {"projects": ["search-service"]},
+            }),
+        )
+        .await
+        .expect("create into entity")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let from_id = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "concept",
+                "name": "vector-search",
+                "properties": {"projects": ["recommendation-service"]},
+            }),
+        )
+        .await
+        .expect("create from entity")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let err = pack
+        .dispatch("merge", json!({"into_id": into_id, "from_id": from_id}))
+        .await
+        .expect_err("disjoint project ownership must be refused");
+    let RuntimeError::Khive(err) = err else {
+        panic!("expected structured merge-guard error, got {err:?}");
+    };
+    assert_eq!(
+        err.details().and_then(|details| details.get("guard")),
+        Some("project_compatibility")
+    );
+}
 
 /// After merging B into A, B's `competes_with` edge to C is rewired to A→C.
 /// If A already has a `competes_with` edge to C, the rewire is a conflict:

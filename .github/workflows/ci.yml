@@ -561,6 +561,14 @@ jobs:
           tool: cargo-llvm-cov
       - name: Compute coverage
         working-directory: crates
+        # #705: this job runs every workspace test binary alongside instrumented
+        # (and therefore slower) execution, which widens the writer-checkout
+        # contention window some tests are hardened against at a plain-run
+        # timeout. Raise the floor for this job specifically instead of paying
+        # the cost on every CI run — the contention-sensitive test takes the
+        # max of this and its own floor, so this only ever widens the margin.
+        env:
+          KHIVE_CHECKOUT_TIMEOUT_SECS: "300"
         run: |
           # Extract TOTAL *line* coverage from the structured JSON export, not by
           # column position. In `--summary-only` text the TOTAL row has Regions%
