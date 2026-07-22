@@ -129,8 +129,9 @@ impl Default for PoolConfig {
 /// the runtime `KHIVE_TEST_HARNESS=1` marker; production/installed binaries do
 /// not receive that workspace Cargo environment.
 ///
-/// `KHIVE_ALLOW_HOME_STORE=1` is an operator-only escape hatch for a deliberate
-/// in-repository `cargo run`. Automated tests must never set or inherit it.
+/// `KHIVE_ALLOW_HOME_STORE=<absolute database path>` is an operator-only escape
+/// hatch for a deliberate in-repository `cargo run`. It bypasses the guard only
+/// when the canonicalized override identifies the configured database path.
 /// Existing path ancestors are canonicalized before comparison, resolving
 /// traversal, symlinks, and filesystem-provided case (including APFS case
 /// folding). Missing trailing components remain lexical because they have no
@@ -138,9 +139,6 @@ impl Default for PoolConfig {
 /// to reproduce SQLite's URI normalization rules.
 fn refuse_home_data_store_in_tests(config: &PoolConfig) -> Result<(), SqliteError> {
     if std::env::var(TEST_HARNESS_ENV).as_deref() != Ok("1") {
-        return Ok(());
-    }
-    if std::env::var(ALLOW_HOME_STORE_ENV).as_deref() == Ok("1") {
         return Ok(());
     }
 
@@ -155,7 +153,8 @@ fn refuse_home_data_store_in_tests(config: &PoolConfig) -> Result<(), SqliteErro
     {
         return Err(SqliteError::InvalidData(format!(
             "test harness refused SQLite URI database path {}; use a filesystem path outside \
-             HOME/.khive (KHIVE_ALLOW_HOME_STORE=1 is for deliberate operator use only)",
+             HOME/.khive (a deliberate operator override must name the exact absolute database \
+             path)",
             path.display()
         )));
     }
@@ -167,9 +166,21 @@ fn refuse_home_data_store_in_tests(config: &PoolConfig) -> Result<(), SqliteErro
     let canonical_home_data_dir =
         canonicalize_deepest_existing(&PathBuf::from(home).join(".khive"))?;
     if canonical_path.starts_with(&canonical_home_data_dir) {
+        let override_matches = std::env::var_os(ALLOW_HOME_STORE_ENV).is_some_and(|value| {
+            let override_path = PathBuf::from(value);
+            override_path.is_absolute()
+                && canonicalize_deepest_existing(&override_path)
+                    .is_ok_and(|canonical_override| canonical_override == canonical_path)
+        });
+        if override_matches {
+            return Ok(());
+        }
+
         return Err(SqliteError::InvalidData(format!(
             "test harness refused to open SQLite database under HOME/.khive: {} \
-             (KHIVE_ALLOW_HOME_STORE=1 is for deliberate operator use only)",
+             (set KHIVE_ALLOW_HOME_STORE to the exact absolute database path to allow this store: \
+             {})",
+            canonical_path.display(),
             canonical_path.display()
         )));
     }

@@ -36,6 +36,24 @@ fn restore_env(key: &str, value: Option<OsString>) {
 }
 
 fn assert_harness_refuses(path: PathBuf) {
+    let message = harness_refusal(path);
+    assert!(
+        message.contains("test harness refused"),
+        "unexpected guard error: {message}"
+    );
+}
+
+fn assert_harness_refuses_with_path_instruction(path: PathBuf) {
+    let expected_path = path.display().to_string();
+    let message = harness_refusal(path);
+    assert!(
+        message.contains("set KHIVE_ALLOW_HOME_STORE to the exact absolute database path")
+            && message.contains(&expected_path),
+        "refusal did not explain the path-valued override: {message}"
+    );
+}
+
+fn harness_refusal(path: PathBuf) -> String {
     let error = match ConnectionPool::new(PoolConfig {
         path: Some(path),
         ..PoolConfig::default()
@@ -43,10 +61,7 @@ fn assert_harness_refuses(path: PathBuf) {
         Ok(_) => panic!("test harness opened a database under HOME/.khive"),
         Err(error) => error,
     };
-    assert!(
-        error.to_string().contains("test harness refused"),
-        "unexpected guard error: {error}"
-    );
+    error.to_string()
 }
 
 fn fake_home() -> (tempfile::TempDir, PathBuf) {
@@ -68,7 +83,51 @@ fn release_dependency_refuses_home_store() {
     let _home = HomeGuard::install(home.path());
     let database = home_data_dir.join("release.db");
 
-    assert_harness_refuses(database.clone());
+    assert_harness_refuses_with_path_instruction(database.clone());
+
+    assert!(!database.exists(), "guard must run before SQLite opens");
+}
+
+#[test]
+#[serial_test::serial(home_store_guard)]
+fn legacy_boolean_override_does_not_allow_home_store() {
+    let (home, home_data_dir) = fake_home();
+    let _home = HomeGuard::install(home.path());
+    let database = home_data_dir.join("legacy-override.db");
+    std::env::set_var(ALLOW_HOME_STORE_ENV, "1");
+
+    assert_harness_refuses_with_path_instruction(database.clone());
+
+    assert!(!database.exists(), "guard must run before SQLite opens");
+}
+
+#[test]
+#[serial_test::serial(home_store_guard)]
+fn exact_path_override_allows_home_store() {
+    let (home, home_data_dir) = fake_home();
+    let _home = HomeGuard::install(home.path());
+    let database = home_data_dir.join("exact-override.db");
+    std::env::set_var(ALLOW_HOME_STORE_ENV, &database);
+
+    let pool = ConnectionPool::new(PoolConfig {
+        path: Some(database.clone()),
+        ..PoolConfig::default()
+    })
+    .expect("exact database path override should allow the store");
+    drop(pool);
+
+    assert!(database.exists(), "SQLite should open the allowed database");
+}
+
+#[test]
+#[serial_test::serial(home_store_guard)]
+fn different_path_override_does_not_allow_home_store() {
+    let (home, home_data_dir) = fake_home();
+    let _home = HomeGuard::install(home.path());
+    let database = home_data_dir.join("requested.db");
+    std::env::set_var(ALLOW_HOME_STORE_ENV, home_data_dir.join("allowed.db"));
+
+    assert_harness_refuses_with_path_instruction(database.clone());
 
     assert!(!database.exists(), "guard must run before SQLite opens");
 }
