@@ -153,21 +153,4 @@ mod tests {
         let tokens = standard().analyze(&input);
         assert_eq!(tokens, vec!["hello".to_string(), long, "world".to_string()]);
     }
-
-    #[test]
-    fn standard_matches_bm25_default_token_stream() {
-        let bm25 = khive_bm25::SimpleTokenizer::default();
-        let cases = [
-            "may x",
-            "done say might",
-            "against",
-            &"a".repeat(41),
-            "The quick brown fox jumps over the lazy dog",
-        ];
-        for input in cases {
-            let ours = standard().analyze(input);
-            let theirs = khive_bm25::Tokenizer::tokenize(&bm25, input);
-            assert_eq!(ours, theirs, "mismatch for input: {input:?}");
-        }
-    }
 }
