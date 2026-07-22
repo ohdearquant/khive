@@ -812,9 +812,22 @@ fn is_process_running(pid: u32) -> bool {
     rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+fn reap_exited_child(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    let mut status = 0;
+    // SAFETY: WNOHANG makes this a non-blocking probe and only reaps the exact
+    // child PID. Non-child processes return ECHILD and use the liveness probe.
+    (unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) }) == pid
+}
+
 async fn wait_for_process_exit(pid: u32, timeout: std::time::Duration) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
-    while is_process_running(pid) {
+    while !reap_exited_child(pid) && is_process_running(pid) {
         let now = tokio::time::Instant::now();
         if now >= deadline {
             return false;
@@ -2105,6 +2118,49 @@ mod tests {
         loop {
             std::thread::sleep(std::time::Duration::from_secs(60));
         }
+    }
+
+    #[tokio::test]
+    async fn wait_for_process_exit_reaps_child_dropped_without_wait() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ready_file = dir.path().join("sigterm-ready");
+        let child = std::process::Command::new(std::env::current_exe().expect("current test exe"))
+            .args(["--ignored", "stale_daemon_process_fixture"])
+            .env("KHIVE_TEST_SIGTERM_READY", &ready_file)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn cooperative child");
+        let child_pid = child.id();
+        let child_pid_i32 = i32::try_from(child_pid).expect("child pid fits i32");
+
+        let ready_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready_file.exists() {
+            assert!(
+                tokio::time::Instant::now() < ready_deadline,
+                "cooperative child did not become ready"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        drop(child);
+        // SAFETY: the fixture is this process's child and is retained solely for this test.
+        assert_eq!(unsafe { libc::kill(child_pid_i32, libc::SIGTERM) }, 0);
+        let exited = wait_for_process_exit(child_pid, std::time::Duration::from_millis(500)).await;
+
+        let mut status = 0;
+        // SAFETY: this only reaps the exact child PID created above.
+        let cleanup_result = unsafe { libc::waitpid(child_pid_i32, &mut status, libc::WNOHANG) };
+        if cleanup_result == 0 {
+            // SAFETY: waitpid confirmed the exact child created above is still running.
+            unsafe {
+                libc::kill(child_pid_i32, libc::SIGKILL);
+                libc::waitpid(child_pid_i32, &mut status, 0);
+            }
+        }
+
+        assert!(exited, "an exited child must not remain live as a zombie");
     }
 
     async fn connect_when_ready(sock: &std::path::Path) -> UnixStream {
