@@ -35,7 +35,8 @@ use clap::Parser;
 use khive_mcp::serve::resolve_runtime_config;
 use khive_mcp::serve::{
     apply_env_output_format, build_server_multi_backend_with_db_anchor, config_discovery_db_anchor,
-    enforce_strict_actor_mode, install_resolved_blob_store, RuntimeConfigInputs,
+    enforce_strict_actor_mode, install_resolved_blob_store, normalize_redundant_db_override,
+    RuntimeConfigInputs,
 };
 #[cfg(unix)]
 use khive_mcp::server::compute_config_id;
@@ -687,11 +688,11 @@ async fn run_exec_inline(
 #[allow(clippy::too_many_arguments)]
 async fn run_exec_inline_with_forward(
     ops: String,
-    cfg: RuntimeConfig,
+    mut cfg: RuntimeConfig,
     presentation: Option<String>,
     output_format: Option<String>,
     save_file: Option<String>,
-    db_context: ExecDbContext,
+    mut db_context: ExecDbContext,
     strict: bool,
     #[cfg(unix)] forward_fn: ForwardFnPtr,
 ) -> Result<()> {
@@ -734,12 +735,14 @@ async fn run_exec_inline_with_forward(
     // fallback below applies, BEFORE the daemon fast-path — otherwise a warm
     // daemon answers this request without the override ever being checked at
     // all, while the identical override on `--ops-file` (always in-process)
-    // correctly rejects it. See `validate_db_override_against_backends`.
+    // correctly rejects it. A matching concrete override is redundant, so its
+    // fingerprint and captured construction anchor are normalized to the same
+    // values used when no override is supplied.
     if !khive_cfg.backends.is_empty() {
-        khive_mcp::serve::validate_db_override_against_backends(
-            db_context.raw.as_deref(),
-            &khive_cfg.backends,
-        )?;
+        normalize_redundant_db_override(&mut cfg, db_context.raw.as_deref(), &khive_cfg.backends)?;
+        if matches!(db_context.raw.as_deref(), Some(path) if path != ":memory:") {
+            db_context.anchor = cfg.db_path.clone();
+        }
     }
 
     // ── daemon fast-path (Unix only) ─────────────────────────────────────────
@@ -2472,12 +2475,6 @@ default = true
     }
 
     #[cfg(unix)]
-    fn spy_accept_and_capture_config_id(frame: &DaemonRequestFrame) -> super::ForwardFuture<'_> {
-        SPY_CAPTURED_CONFIG_ID.with(|c| *c.borrow_mut() = Some(frame.config_id.clone()));
-        Box::pin(async { Some(Ok("{}".to_string())) })
-    }
-
-    #[cfg(unix)]
     #[tokio::test]
     #[serial]
     async fn exec_frame_config_id_matches_daemon_config_id_for_multi_backend_project_toml() {
@@ -2601,7 +2598,7 @@ backend = "sessions"
     #[cfg(unix)]
     #[tokio::test]
     #[serial]
-    async fn inline_db_override_guard_accepts_main_and_rejects_conflict_before_daemon_forward() {
+    async fn inline_db_override_guard_normalizes_main_config_id_and_rejects_conflict() {
         std::env::remove_var("KHIVE_EMBEDDING_MODEL");
         std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
         std::env::remove_var("KHIVE_ACTOR");
@@ -2636,6 +2633,36 @@ backend = "sessions"
         )
         .expect("write multi-backend config.toml");
 
+        let no_override_cfg = resolve_runtime_config(RuntimeConfigInputs {
+            db: None,
+            config: None,
+            namespace: Namespace::parse("local").expect("ns"),
+            namespace_explicit: true,
+            actor_explicit: false,
+            no_embed: true,
+            packs: None,
+            brain_profile: None,
+        })
+        .expect("resolve exec-shaped config without override");
+        let no_override_result = run_exec_inline_with_forward(
+            "stats()".to_string(),
+            no_override_cfg,
+            None,
+            None,
+            None,
+            ExecDbContext::default(),
+            false,
+            spy_capture_config_id,
+        )
+        .await;
+        assert!(
+            no_override_result.is_ok(),
+            "no-override dispatch must succeed: {no_override_result:?}"
+        );
+        let no_override_config_id = SPY_CAPTURED_CONFIG_ID
+            .with(|captured| captured.borrow_mut().take())
+            .expect("no-override frame must be captured");
+
         let matching_override = main_backend_path.display().to_string();
         let cfg = resolve_runtime_config(RuntimeConfigInputs {
             db: Some(&matching_override),
@@ -2660,18 +2687,16 @@ backend = "sessions"
                 anchor: khive_runtime::resolve_db_anchor(Some(&matching_override)),
             },
             false,
-            spy_accept_and_capture_config_id,
+            spy_capture_config_id,
         )
         .await;
         assert!(
             matching_result.is_ok(),
             "an override matching the declared main backend must reach daemon forwarding: {matching_result:?}"
         );
-        assert!(
-            SPY_CAPTURED_CONFIG_ID.with(|captured| captured.borrow().is_some()),
-            "the matching override must reach the daemon-forward boundary"
-        );
-        SPY_CAPTURED_CONFIG_ID.with(|captured| *captured.borrow_mut() = None);
+        let matching_config_id = SPY_CAPTURED_CONFIG_ID
+            .with(|captured| captured.borrow_mut().take())
+            .expect("matching-override frame must be captured");
 
         let conflicting_override = khive_dir.join("override.db");
         let result = run_exec_inline_with_forward(
@@ -2699,6 +2724,10 @@ backend = "sessions"
             SPY_CAPTURED_CONFIG_ID.with(|c| c.borrow().is_none()),
             "the conflict must be caught BEFORE any daemon-forward attempt — the spy must \
              never have been called"
+        );
+        assert_eq!(
+            matching_config_id, no_override_config_id,
+            "a matching --db override must emit the same config_id as no override for the same multi-backend config"
         );
     }
 

@@ -405,6 +405,25 @@ pub fn validate_db_override_against_backends(
     }
 }
 
+/// Validate a database override and normalize a redundant concrete override
+/// to the same fingerprint anchor used when no override is supplied.
+///
+/// Once a concrete path is proven to name the declared `main` backend, the
+/// backend topology fully identifies storage and the override has no remaining
+/// semantic effect. Retaining it in `RuntimeConfig.db_path` would nevertheless
+/// change `compute_config_id` and prevent sharing the default warm daemon.
+pub fn normalize_redundant_db_override(
+    config: &mut RuntimeConfig,
+    cli_db_override: Option<&str>,
+    backends: &[BackendConfig],
+) -> anyhow::Result<bool> {
+    let force_memory = validate_db_override_against_backends(cli_db_override, backends)?;
+    if matches!(cli_db_override, Some(path) if path != ":memory:") {
+        config.db_path = khive_runtime::resolve_db_anchor(None);
+    }
+    Ok(force_memory)
+}
+
 fn override_matches_declared_main_backend(
     override_path: &str,
     backends: &[BackendConfig],
@@ -427,11 +446,12 @@ fn override_matches_declared_main_backend(
 }
 
 fn build_registry_for_multi_backend_inner(
-    base_config: RuntimeConfig,
+    mut base_config: RuntimeConfig,
     khive_cfg: &KhiveConfig,
     cli_db_override: Option<&str>,
 ) -> anyhow::Result<MultiBackendRegistry> {
-    let force_memory = validate_db_override_against_backends(cli_db_override, &khive_cfg.backends)?;
+    let force_memory =
+        normalize_redundant_db_override(&mut base_config, cli_db_override, &khive_cfg.backends)?;
 
     // Open and migrate each declared backend, deduplicating SQLite backends by
     // canonical path (ADR-028 §8).
