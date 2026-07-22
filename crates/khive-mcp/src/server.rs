@@ -47,6 +47,12 @@ struct BatchTask<F> {
     future: F,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DispatchOrigin {
+    Local,
+    Daemon,
+}
+
 #[derive(Clone, Copy)]
 struct RunParsedContext<'a> {
     enforce_response_budget: bool,
@@ -1878,14 +1884,16 @@ impl KhiveMcpServer {
     /// may still synthesize an identity carrying those same baked scalars if
     /// `p.request_id` is set, purely so the audit row is correlatable.
     pub async fn dispatch_request_local(&self, p: RequestParams) -> Result<String, McpError> {
-        self.dispatch_request_inner(p, false, None).await
+        self.dispatch_request_inner(p, false, None, DispatchOrigin::Local)
+            .await
     }
 
     /// Wire-surface dispatch: same as [`Self::dispatch_request_local`] but
     /// enforces verb visibility (`Visibility::Subhandler` verbs are rejected).
     /// Used by the stdio `request` tool's local-fallback path.
     pub(crate) async fn dispatch_request_wire(&self, p: RequestParams) -> Result<String, McpError> {
-        self.dispatch_request_inner(p, true, None).await
+        self.dispatch_request_inner(p, true, None, DispatchOrigin::Local)
+            .await
     }
 
     /// Shared body for both dispatch surfaces. `from_wire` decides whether the
@@ -1895,6 +1903,8 @@ impl KhiveMcpServer {
     /// frame (ADR-096 Fork 1, see `crate::daemon`'s `DaemonDispatch` impl).
     /// `None` for every local (non-daemon-served) call — this server's own
     /// baked identity applies, exactly as before this parameter existed.
+    /// `origin` independently controls daemon-frame response fitting; wire
+    /// visibility does not imply that the response travels through the daemon.
     ///
     /// khive#948: when `identity` is `None` (every local-dispatch call —
     /// `KHIVE_NO_DAEMON`/soft daemon-fallback and the `save_to` bypass both
@@ -1911,6 +1921,7 @@ impl KhiveMcpServer {
         p: RequestParams,
         from_wire: bool,
         identity: Option<khive_runtime::RequestIdentity>,
+        origin: DispatchOrigin,
     ) -> Result<String, McpError> {
         let save_to = p.save_to.clone();
         let identity = identity.or_else(|| {
@@ -2012,7 +2023,7 @@ impl KhiveMcpServer {
             presentation,
             &presentation_per_op,
             &self.registry,
-            &self.config_id,
+            (origin == DispatchOrigin::Daemon).then_some(self.config_id.as_str()),
         ))
     }
 }
@@ -2063,11 +2074,11 @@ fn parse_output_format(s: Option<&str>) -> Result<Option<OutputFormat>, String> 
 ///   pre-pass (ADR-078 §7 + §8.4; mirrors `run_parsed`).
 ///
 /// The outer envelope (`{results:[...], summary:{...}}`) is always compact JSON (§8.4).
-/// Rendered entries that would exceed the daemon-frame allowance fall back to
-/// compact JSON. If even the compact envelope is too large after active tasks
-/// settle, payload details are omitted while each entry's outcome stays intact.
-/// Every fit decision serializes the actual daemon response-frame shape so JSON
-/// string escaping is included in the measurement.
+/// Daemon-served responses are rendered before fitting. If the rendered envelope
+/// exceeds the frame allowance, entries fall back to compact JSON before payload
+/// details are omitted. Local dispatch has no daemon-frame allowance and returns
+/// the requested representation without fitting. Every daemon fit decision
+/// serializes the actual response-frame shape so JSON string escaping is included.
 fn render_result(
     value: serde_json::Value,
     batch_format: OutputFormat,
@@ -2075,94 +2086,49 @@ fn render_result(
     presentation: PresentationMode,
     presentation_per_op: &Option<Vec<Option<PresentationMode>>>,
     registry: &VerbRegistry,
-    served_config_id: &str,
+    daemon_frame_config_id: Option<&str>,
 ) -> String {
     // Try to detect the compound batch envelope shape: { results: [...], summary: {...} }
     if let serde_json::Value::Object(ref map) = value {
         if let Some(serde_json::Value::Array(results)) = map.get("results") {
-            let (mut out_map, mut out_results) =
-                fit_compact_batch_envelope(map, results, served_config_id);
-            for (i, entry) in results.iter().enumerate() {
-                let per_op_fmt = format_per_op
-                    .as_ref()
-                    .and_then(|v| v.get(i))
-                    .and_then(|x| *x)
-                    .unwrap_or(batch_format);
-
-                // Resolve per-op presentation: per-op entry overrides batch default,
-                // then the AlwaysVerbose verb policy forces Verbose — mirroring the
-                // resolution `run_parsed` applies before presentation. Without this,
-                // a policy-verbose verb (get/link/query/traverse/neighbors)
-                // dispatched under format=auto/table with the default
-                // Agent presentation would be redundancy-dropped at the format seam,
-                // stripping the namespace/properties it is declared AlwaysVerbose
-                // precisely to preserve.
-                let base_presentation = presentation_per_op
-                    .as_ref()
-                    .and_then(|v| v.get(i))
-                    .and_then(|o| *o)
-                    .unwrap_or(presentation);
-                let effective_presentation =
-                    match entry.get("tool").and_then(serde_json::Value::as_str) {
-                        Some(tool)
-                            if registry.presentation_policy_for(tool)
-                                == VerbPresentationPolicy::AlwaysVerbose =>
-                        {
-                            PresentationMode::Verbose
-                        }
-                        _ => base_presentation,
-                    };
-
-                // Error entries are never reformatted (§8.2).
-                let is_ok = entry
-                    .get("ok")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false);
-                if !is_ok
-                    || per_op_fmt == OutputFormat::Json
-                    || out_results[i].get("result_omitted").is_some()
-                {
-                    continue;
+            let out_results = results
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| {
+                    render_batch_entry(
+                        index,
+                        entry,
+                        batch_format,
+                        format_per_op,
+                        presentation,
+                        presentation_per_op,
+                        registry,
+                    )
+                })
+                .collect();
+            let out_map = match daemon_frame_config_id {
+                Some(config_id) => {
+                    fit_rendered_batch_envelope(map, results, out_results, config_id)
                 }
-
-                // For successful entries, render the `result` sub-value with the
-                // effective presentation so verbose ops skip the redundancy drop.
-                if let Some(result_val) = entry.get("result") {
-                    let rendered =
-                        render_format(result_val.clone(), per_op_fmt, effective_presentation);
-                    // Replace `result` with the rendered string.
-                    let mut new_entry = entry.clone();
-                    if let serde_json::Value::Object(ref mut emap) = new_entry {
-                        emap.insert("result".to_string(), serde_json::Value::String(rendered));
-                    }
-                    let compact_entry = std::mem::replace(&mut out_results[i], new_entry);
-                    out_map.insert(
-                        "results".to_string(),
-                        serde_json::Value::Array(out_results.clone()),
-                    );
-                    if !response_value_fits_daemon_frame(
-                        &serde_json::Value::Object(out_map.clone()),
-                        served_config_id,
-                    ) {
-                        out_results[i] = compact_entry;
-                        out_map.insert(
-                            "results".to_string(),
-                            serde_json::Value::Array(out_results.clone()),
-                        );
-                    }
+                None => {
+                    let mut out_map = map.clone();
+                    out_map.insert("results".to_string(), Value::Array(out_results));
+                    out_map
                 }
-            }
-
+            };
             return serialize_response_value(&serde_json::Value::Object(out_map));
         }
     }
 
     let rendered = render_format(value.clone(), batch_format, presentation);
-    if rendered_response_fits_daemon_frame(&rendered, served_config_id) {
+    let Some(config_id) = daemon_frame_config_id else {
+        return rendered;
+    };
+    if rendered_response_fits_daemon_frame(&rendered, config_id) {
         return rendered;
     }
     let compact = serialize_response_value(&value);
-    if rendered_response_fits_daemon_frame(&compact, served_config_id) {
+    if rendered_response_fits_daemon_frame(&compact, config_id) {
         return compact;
     }
     serde_json::to_string(&json!({
@@ -2172,13 +2138,62 @@ fn render_result(
     .expect("static frame-budget error is serializable")
 }
 
-fn fit_compact_batch_envelope(
+fn render_batch_entry(
+    index: usize,
+    entry: &Value,
+    batch_format: OutputFormat,
+    format_per_op: &Option<Vec<Option<OutputFormat>>>,
+    presentation: PresentationMode,
+    presentation_per_op: &Option<Vec<Option<PresentationMode>>>,
+    registry: &VerbRegistry,
+) -> Value {
+    let per_op_format = format_per_op
+        .as_ref()
+        .and_then(|formats| formats.get(index))
+        .and_then(|format| *format)
+        .unwrap_or(batch_format);
+    let is_ok = entry.get("ok").and_then(Value::as_bool).unwrap_or(false);
+    if !is_ok || per_op_format == OutputFormat::Json {
+        return entry.clone();
+    }
+
+    let base_presentation = presentation_per_op
+        .as_ref()
+        .and_then(|modes| modes.get(index))
+        .and_then(|mode| *mode)
+        .unwrap_or(presentation);
+    let effective_presentation = match entry.get("tool").and_then(Value::as_str) {
+        Some(tool)
+            if registry.presentation_policy_for(tool) == VerbPresentationPolicy::AlwaysVerbose =>
+        {
+            PresentationMode::Verbose
+        }
+        _ => base_presentation,
+    };
+    let Some(result) = entry.get("result") else {
+        return entry.clone();
+    };
+    let mut rendered_entry = entry.clone();
+    if let Value::Object(ref mut fields) = rendered_entry {
+        fields.insert(
+            "result".to_string(),
+            Value::String(render_format(
+                result.clone(),
+                per_op_format,
+                effective_presentation,
+            )),
+        );
+    }
+    rendered_entry
+}
+
+fn fit_rendered_batch_envelope(
     map: &serde_json::Map<String, Value>,
-    results: &[Value],
+    compact_results: &[Value],
+    mut out_results: Vec<Value>,
     served_config_id: &str,
-) -> (serde_json::Map<String, Value>, Vec<Value>) {
+) -> serde_json::Map<String, Value> {
     let mut out_map = map.clone();
-    let mut out_results = results.to_vec();
     out_map.insert(
         "results".to_string(),
         serde_json::Value::Array(out_results.clone()),
@@ -2187,7 +2202,38 @@ fn fit_compact_batch_envelope(
         &serde_json::Value::Object(out_map.clone()),
         served_config_id,
     ) {
-        return (out_map, out_results);
+        return out_map;
+    }
+
+    let rendered_frame_bytes = response_value_daemon_frame_len(
+        &serde_json::Value::Object(out_map.clone()),
+        served_config_id,
+    );
+    let mut compact_fallbacks: Vec<(usize, usize)> = compact_results
+        .iter()
+        .zip(&out_results)
+        .enumerate()
+        .filter_map(|(index, (compact, rendered))| {
+            if compact == rendered {
+                return None;
+            }
+            let mut candidate_results = out_results.clone();
+            candidate_results[index] = compact.clone();
+            let mut candidate_map = out_map.clone();
+            candidate_map.insert("results".to_string(), Value::Array(candidate_results));
+            let compact_frame_bytes =
+                response_value_daemon_frame_len(&Value::Object(candidate_map), served_config_id);
+            (compact_frame_bytes < rendered_frame_bytes)
+                .then_some((index, rendered_frame_bytes - compact_frame_bytes))
+        })
+        .collect();
+    compact_fallbacks.sort_unstable_by_key(|&(_, saved_bytes)| std::cmp::Reverse(saved_bytes));
+    for (index, _) in compact_fallbacks {
+        out_results[index] = compact_results[index].clone();
+        out_map.insert("results".to_string(), Value::Array(out_results.clone()));
+        if response_value_fits_daemon_frame(&Value::Object(out_map.clone()), served_config_id) {
+            return out_map;
+        }
     }
 
     let mut by_size: Vec<(usize, usize)> = out_results
@@ -2197,7 +2243,7 @@ fn fit_compact_batch_envelope(
         .collect();
     by_size.sort_unstable_by_key(|&(_, bytes)| std::cmp::Reverse(bytes));
     for (index, _) in by_size {
-        out_results[index] = frame_budget_omission(&out_results[index]);
+        out_results[index] = frame_budget_omission(&compact_results[index]);
         out_map.insert(
             "results".to_string(),
             serde_json::Value::Array(out_results.clone()),
@@ -2209,7 +2255,7 @@ fn fit_compact_batch_envelope(
             break;
         }
     }
-    (out_map, out_results)
+    out_map
 }
 
 fn frame_budget_omission(entry: &Value) -> Value {
@@ -2245,10 +2291,20 @@ fn serialize_response_value(value: &Value) -> String {
 }
 
 fn response_value_fits_daemon_frame(value: &Value, served_config_id: &str) -> bool {
-    rendered_response_fits_daemon_frame(&serialize_response_value(value), served_config_id)
+    response_value_daemon_frame_len(value, served_config_id)
+        <= khive_runtime::daemon::MAX_FRAME_BYTES
+}
+
+fn response_value_daemon_frame_len(value: &Value, served_config_id: &str) -> usize {
+    rendered_response_daemon_frame_len(&serialize_response_value(value), served_config_id)
 }
 
 fn rendered_response_fits_daemon_frame(rendered: &str, served_config_id: &str) -> bool {
+    rendered_response_daemon_frame_len(rendered, served_config_id)
+        <= khive_runtime::daemon::MAX_FRAME_BYTES
+}
+
+fn rendered_response_daemon_frame_len(rendered: &str, served_config_id: &str) -> usize {
     let frame = khive_runtime::DaemonResponseFrame {
         ok: true,
         result: Some(rendered.to_string()),
@@ -2264,7 +2320,6 @@ fn rendered_response_fits_daemon_frame(rendered: &str, served_config_id: &str) -
     serde_json::to_vec(&frame)
         .expect("daemon response frame is always serializable")
         .len()
-        <= khive_runtime::daemon::MAX_FRAME_BYTES
 }
 
 /// Build the `initialize` instructions string from the verb catalog and the
@@ -2400,6 +2455,17 @@ mod tests {
             _registry: &VerbRegistry,
             _token: &khive_runtime::NamespaceToken,
         ) -> Result<Value, RuntimeError> {
+            if let Some(bytes) = params
+                .get("table_bytes")
+                .and_then(Value::as_u64)
+                .and_then(|n| usize::try_from(n).ok())
+            {
+                let payload = "x".repeat(bytes);
+                return Ok(json!([
+                    {"payload": payload},
+                    {"payload": payload},
+                ]));
+            }
             let bytes = params
                 .get("bytes")
                 .and_then(Value::as_u64)
@@ -2407,6 +2473,18 @@ mod tests {
                 .expect("test supplies a valid byte count");
             Ok(json!("x".repeat(bytes)))
         }
+    }
+
+    async fn dispatch_large_result_through_daemon(
+        server: &KhiveMcpServer,
+        ops: String,
+        format: Option<String>,
+    ) -> String {
+        khive_runtime::daemon::DaemonDispatch::dispatch(
+            server, ops, None, None, format, None, false, None,
+        )
+        .await
+        .expect("daemon dispatch")
     }
 
     fn large_result_test_server() -> KhiveMcpServer {
@@ -2544,6 +2622,7 @@ mod tests {
                 },
                 false,
                 None,
+                DispatchOrigin::Local,
             )
             .await
             .expect("save_to dispatch");
@@ -2564,6 +2643,80 @@ mod tests {
                 result_bytes
             );
         }
+    }
+
+    #[tokio::test]
+    async fn local_dispatch_returns_result_larger_than_daemon_frame() {
+        let server = large_result_test_server();
+        let result_bytes = khive_runtime::daemon::MAX_FRAME_BYTES + 1_024;
+        let response = server
+            .dispatch_request_local(RequestParams {
+                ops: format!("large_result(bytes={result_bytes})"),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .expect("local dispatch");
+
+        let envelope: Value = serde_json::from_str(&response).expect("response envelope");
+        assert_eq!(envelope["results"][0]["ok"], true);
+        assert_eq!(
+            envelope["results"][0]["result"]
+                .as_str()
+                .expect("full local result")
+                .len(),
+            result_bytes
+        );
+        assert!(envelope["results"][0].get("result_omitted").is_none());
+    }
+
+    #[tokio::test]
+    async fn daemon_dispatch_degrades_result_larger_than_frame() {
+        let server = large_result_test_server();
+        let result_bytes = khive_runtime::daemon::MAX_FRAME_BYTES + 1_024;
+        let response = dispatch_large_result_through_daemon(
+            &server,
+            format!("large_result(bytes={result_bytes})"),
+            None,
+        )
+        .await;
+
+        let envelope: Value = serde_json::from_str(&response).expect("response envelope");
+        assert_eq!(envelope["results"][0]["ok"], true);
+        assert!(envelope["results"][0].get("result").is_none());
+        assert!(envelope["results"][0].get("result_omitted").is_some());
+        assert!(rendered_response_fits_daemon_frame(
+            &response,
+            &server.config_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn daemon_batch_keeps_rendered_result_when_compact_result_exceeds_frame() {
+        let server = large_result_test_server();
+        let row_bytes = khive_runtime::daemon::MAX_FRAME_BYTES / 2;
+        let response = dispatch_large_result_through_daemon(
+            &server,
+            format!("large_result(table_bytes={row_bytes})"),
+            Some("auto".to_string()),
+        )
+        .await;
+
+        let envelope: Value = serde_json::from_str(&response).expect("response envelope");
+        let entry = &envelope["results"][0];
+        assert_eq!(entry["ok"], true);
+        assert!(entry.get("result_omitted").is_none());
+        let rendered = entry["result"].as_str().expect("rendered table result");
+        assert!(rendered.starts_with("| payload |"));
+        assert!(rendered.len() < row_bytes);
+        assert!(rendered_response_fits_daemon_frame(
+            &response,
+            &server.config_id
+        ));
     }
 
     #[test]
@@ -2590,7 +2743,7 @@ mod tests {
             PresentationMode::Agent,
             &None,
             &large_result_test_server().registry,
-            "test",
+            Some("test"),
         );
         let rendered_value: Value = serde_json::from_str(&rendered).expect("response envelope");
         assert_eq!(rendered_value["status"], "success");
