@@ -3470,11 +3470,12 @@ async fn batch_neighbors_counts_the_query_and_the_rows_returned_before_the_failu
     );
 }
 
-/// Same rule on the traversal path, where the stakes are higher: a traversal
-/// chunks its root set, so a failure in a later chunk discards the round trips
-/// every earlier chunk already made unless the counters survive the error.
+/// Same rule as the `neighbors` twin, on the traversal path: a chunk whose
+/// statement never prepared issued nothing to the store, so it must count
+/// nothing — the increment sits after `prepare` succeeds, exactly where the
+/// neighbors and batch paths put theirs.
 #[tokio::test]
-async fn traverse_counts_the_issued_chunk_when_the_query_fails() {
+async fn traverse_counts_nothing_when_the_statement_never_prepared() {
     let store = setup_memory_store_without_schema();
     let ctx = khive_storage::usage::UsageContext::new();
 
@@ -3496,12 +3497,9 @@ async fn traverse_counts_the_issued_chunk_when_the_query_fails() {
     );
 
     let usage = ctx.snapshot();
-    assert_eq!(
-        usage
-            .get("db_round_trips")
-            .and_then(serde_json::Value::as_u64),
-        Some(1),
-        "the chunk query was issued and must be counted despite the error; got {usage}"
+    assert!(
+        usage.get("db_round_trips").is_none(),
+        "the chunk statement never prepared, so no round trip may be counted; got {usage}"
     );
 }
 

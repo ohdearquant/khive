@@ -1378,11 +1378,6 @@ fn drop_value_iteratively(value: Value) {
     }
 }
 
-/// Chain-mode (`dispatch_op`) success path: check the raw handler `result`
-/// against the depth guard before it is ever cloned into `$prev` context or
-/// wrapped in the response envelope. On violation returns a `result_too_deep`
-/// error that does not embed the oversized value, and discards the rejected
-/// value iteratively so its own drop can't overflow the stack either.
 /// ADR-103 Amendment 2: stamp the per-op envelope entry with the dispatch's
 /// frozen usage snapshot. All-or-nothing: an empty snapshot (nothing measured
 /// counted, but the context WAS armed) still stamps `{}`; the key is absent
@@ -1393,6 +1388,11 @@ fn stamp_usage(entry: &mut Value, ctx: &khive_runtime::usage::UsageContext) {
     }
 }
 
+/// Chain-mode (`dispatch_op`) success path: check the raw handler `result`
+/// against the depth guard before it is ever cloned into `$prev` context or
+/// wrapped in the response envelope. On violation returns a `result_too_deep`
+/// error that does not embed the oversized value, and discards the rejected
+/// value iteratively so its own drop can't overflow the stack either.
 fn chain_ok_envelope_or_depth_error(tool: String, result: Value) -> Result<Value, (String, Value)> {
     if !result_within_depth_limit(&result) {
         drop_value_iteratively(result);

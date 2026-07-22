@@ -2052,7 +2052,6 @@ impl GraphStore for SqlGraphStore {
                 }
 
                 for chunk in roots.chunks(CHUNK_ROOTS) {
-                    chunks_executed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let n_chunk = chunk.len();
 
                     // Param layout (per-chunk, not total):
@@ -2140,6 +2139,7 @@ impl GraphStore for SqlGraphStore {
                     // Queries run on `conn`; reads are connection-level and participate
                     // in the open `tx` deferred snapshot.
                     let mut stmt = conn.prepare(&cte_sql)?;
+                    chunks_executed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let rows_iter = stmt.query_map(param_refs.as_slice(), |row| {
                         let root_str: String = row.get(0)?;
                         let node_str: String = row.get(1)?;
