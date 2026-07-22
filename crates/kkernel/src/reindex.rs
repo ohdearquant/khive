@@ -5,7 +5,7 @@
 //! FTS index. It is NOT a pack verb — it operates on the raw runtime stores
 //! regardless of which packs are loaded.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -500,16 +500,19 @@ async fn missing_embedding_batch(
         .collect()
 }
 
-async fn repair_missing_embeddings(
+struct RepairModelTarget {
+    model_name: String,
+    embedding_model: String,
+    vector_table: String,
+}
+
+async fn prepare_repair_models(
     rt: &KhiveRuntime,
     token: &khive_runtime::NamespaceToken,
     model_names: &[String],
-    namespace: &str,
-    batch_size: u32,
-) -> Result<(u64, u64, u64)> {
-    let mut entities_processed = 0u64;
-    let mut notes_processed = 0u64;
-    let mut errors = 0u64;
+) -> Result<Vec<RepairModelTarget>> {
+    let mut targets = Vec::with_capacity(model_names.len());
+    let mut identities_by_table = BTreeMap::<String, BTreeSet<String>>::new();
 
     for model_name in model_names {
         let vectors = rt
@@ -525,6 +528,43 @@ async fn repair_missing_embeddings(
             .map(|model| model.to_string())
             .unwrap_or_else(|_| model_name.clone());
 
+        identities_by_table
+            .entry(vector_table.clone())
+            .or_default()
+            .insert(embedding_model.clone());
+        targets.push(RepairModelTarget {
+            model_name: model_name.clone(),
+            embedding_model,
+            vector_table,
+        });
+    }
+
+    if let Some((table, identities)) = identities_by_table
+        .into_iter()
+        .find(|(_, identities)| identities.len() > 1)
+    {
+        let identities: Vec<_> = identities.into_iter().collect();
+        anyhow::bail!(
+            "embeds-only repair models {identities:?} share vector table {table:?}; colliding registered model names cannot be repaired or served from one table"
+        );
+    }
+
+    Ok(targets)
+}
+
+async fn repair_missing_embeddings(
+    rt: &KhiveRuntime,
+    token: &khive_runtime::NamespaceToken,
+    model_names: &[String],
+    namespace: &str,
+    batch_size: u32,
+) -> Result<(u64, u64, u64)> {
+    let targets = prepare_repair_models(rt, token, model_names).await?;
+    let mut entities_processed = 0u64;
+    let mut notes_processed = 0u64;
+    let mut errors = 0u64;
+
+    for target in targets {
         for (kind, field) in [
             (SubstrateKind::Entity, "entity.body"),
             (SubstrateKind::Note, "note.content"),
@@ -534,8 +574,8 @@ async fn repair_missing_embeddings(
                 let batch = missing_embedding_batch(
                     rt,
                     namespace,
-                    &vector_table,
-                    &embedding_model,
+                    &target.vector_table,
+                    &target.embedding_model,
                     kind,
                     &after,
                     batch_size,
@@ -549,7 +589,7 @@ async fn repair_missing_embeddings(
                 errors += embed_and_store_batch(
                     rt,
                     token,
-                    std::slice::from_ref(model_name),
+                    std::slice::from_ref(&target.model_name),
                     namespace,
                     &batch,
                     kind,
@@ -1643,6 +1683,66 @@ mod tests {
         assert!(
             matches!(rows[0].get("embedding_model"), Some(SqlValue::Text(value)) if value == MODEL_B),
             "repair must replace the colliding model A row with model B"
+        );
+    }
+
+    #[tokio::test]
+    async fn embeds_only_repair_refuses_colliding_models_before_vector_writes() {
+        use khive_runtime::RuntimeConfig;
+
+        const MODEL_A: &str = "collision-model";
+        const MODEL_B: &str = "collision_model";
+        const TABLE: &str = "vec_collision_model";
+
+        let rt = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            ..RuntimeConfig::default()
+        })
+        .expect("runtime");
+        rt.register_embedder(RepairEmbedderProvider {
+            model_name: MODEL_A,
+        });
+        rt.register_embedder(RepairEmbedderProvider {
+            model_name: MODEL_B,
+        });
+        let token = rt
+            .authorize(Namespace::parse("local").expect("namespace"))
+            .expect("authorize");
+        let note = Note::new("local", "observation", "do not repair colliding models");
+        rt.notes(&token)
+            .expect("notes")
+            .upsert_note(note)
+            .await
+            .expect("seed note");
+        let vectors = rt.vectors_for_model(&token, MODEL_A).expect("vectors");
+        assert_eq!(vectors.count().await.expect("count before repair"), 0);
+
+        let error = repair_missing_embeddings(
+            &rt,
+            &token,
+            &[MODEL_A.to_string(), MODEL_B.to_string()],
+            "local",
+            100,
+        )
+        .await
+        .expect_err("colliding repair models must be refused");
+
+        let message = error.to_string();
+        assert!(message.contains(MODEL_A), "missing first model: {message}");
+        assert!(message.contains(MODEL_B), "missing second model: {message}");
+        assert!(message.contains(TABLE), "missing shared table: {message}");
+        assert!(
+            message.contains(
+                "colliding registered model names cannot be repaired or served from one table"
+            ),
+            "missing refusal rationale: {message}"
+        );
+        assert_eq!(
+            vectors.count().await.expect("count after refusal"),
+            0,
+            "collision refusal must happen before vector writes"
         );
     }
 
