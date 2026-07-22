@@ -73,5 +73,32 @@ else
     exit 1
 fi
 
+echo "--- case 5: SemVer excludes have one source consumed by both release gates ---"
+SEMVER_EXCLUDES_FILE="$SCRIPT_DIR/lib/semver_excludes.txt"
+PUBLISH_SCRIPT="$SCRIPT_DIR/publish.sh"
+RELEASE_WORKFLOW="$SCRIPT_DIR/../.github/workflows/release.yml"
+if grep -qE '^(<<<<<<<|=======|>>>>>>>)' "$PUBLISH_SCRIPT" "$RELEASE_WORKFLOW"; then
+    echo "FAIL: unresolved conflict markers remain in a SemVer policy consumer" >&2
+    exit 1
+fi
+if ! grep -q 'lib/semver_excludes.txt' "$PUBLISH_SCRIPT" ||
+    ! grep -q 'scripts/lib/semver_excludes.txt' "$RELEASE_WORKFLOW"; then
+    echo "FAIL: both release gates must consume scripts/lib/semver_excludes.txt" >&2
+    exit 1
+fi
+if grep -qE -- '--exclude[[:space:]]+khive-' "$PUBLISH_SCRIPT" ||
+    grep -qE 'exclude:[[:space:]]+khive-' "$RELEASE_WORKFLOW"; then
+    echo "FAIL: a SemVer exclusion is duplicated outside the shared policy file" >&2
+    exit 1
+fi
+while IFS= read -r crate; do
+    [[ -n "$crate" ]] || continue
+    if ! grep -qF "\"$crate\"" "$SCRIPT_DIR/../crates/Cargo.toml"; then
+        echo "FAIL: SemVer exclusion is not a current workspace member: $crate" >&2
+        exit 1
+    fi
+done < <(grep -v '^[[:space:]]*#' "$SEMVER_EXCLUDES_FILE" | grep -v '^[[:space:]]*$')
+echo "PASS"
+
 echo ""
 echo "=== publish-guard-test: all cases passed ==="

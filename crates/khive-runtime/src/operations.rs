@@ -17,20 +17,23 @@ use uuid::Uuid;
 use khive_score::DeterministicScore;
 use khive_storage::note::Note;
 use khive_storage::types::{
-    BatchWriteSummary, DeleteMode, DirectedNeighborHit, Direction, EdgeSortField, GraphPath,
-    LinkId, NeighborHit, NeighborQuery, Page, PageRequest, SortOrder, SqlRow, SqlStatement,
-    SqlValue, TextFilter, TextQueryMode, TextSearchRequest, TraversalRequest,
+    DeleteMode, DirectedNeighborHit, Direction, EdgeSortField, GraphPath, LinkId, NeighborHit,
+    NeighborQuery, Page, PageRequest, SortOrder, SqlRow, SqlStatement, SqlValue, TextFilter,
+    TextQueryMode, TextSearchRequest, TraversalRequest,
 };
 use khive_storage::{Edge, EdgeRelation, Entity, EntityFilter, Event, EventFilter};
 use khive_types::{EdgeEndpointRule, EndpointKind, EventKind, SubstrateKind};
 
-use khive_db::stores::entity::entity_hard_delete_statement;
+use khive_db::stores::entity::{entity_hard_delete_statement, entity_upsert_statement};
 use khive_db::stores::graph::{edge_hard_delete_statement, purge_incident_edges_statement};
 use khive_db::stores::note::note_hard_delete_statement;
+use khive_db::stores::text::insert_document_statement;
 use khive_db::SqliteError;
 use rusqlite::OptionalExtension;
 
-use crate::atomic_plan::{AffectedRowGuard, DeletePlan, PlanStatement, PostCommitEffect};
+use crate::atomic_plan::{
+    AddEntityPlan, AffectedRowGuard, DeletePlan, PlanStatement, PostCommitEffect,
+};
 use crate::atomic_runner::{run_atomic_unit, AtomicOpFailure, AtomicOpPlan, AtomicRunOutcome};
 use crate::curation::{entity_fts_document, note_fts_document};
 use crate::error::{GuardedWriteFailure, RuntimeError, RuntimeResult};
@@ -131,7 +134,7 @@ pub fn arm_fts_fail(ns: &str) {
 /// Arm the FTS failure injection for `create_many` targeting namespace `ns`.
 ///
 /// The next `create_many` call whose namespace equals `ns` returns an injected
-/// error at the FTS upsert step (after entity rows are committed), then disarms.
+/// error at the first FTS statement inside the atomic batch, then disarms.
 /// Calls on other namespaces are unaffected, and concurrent arms of distinct
 /// namespaces do not overwrite each other.
 /// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
@@ -140,13 +143,11 @@ pub fn arm_fts_fail_many(ns: &str) {
     FTS_FAIL_MANY_NS.lock().unwrap().insert(ns.to_string());
 }
 
-/// Arm the FTS *partial*-failure injection for `create_many` targeting namespace `ns`.
+/// Arm a mid-batch FTS failure for `create_many` targeting namespace `ns`.
 ///
-/// The next `create_many` call whose namespace equals `ns` returns
-/// `Ok(BatchWriteSummary { attempted: 2, affected: 1, failed: 1, ... })` from the
-/// FTS upsert step, exercising the `summary.failed > 0` rollback branch (as opposed
-/// to the hard-`Err` branch exercised by `arm_fts_fail_many`). Then disarms only
-/// that namespace's entry.
+/// The next matching call fails the second FTS statement when the batch contains at
+/// least two entities, after one entity/FTS pair has executed in the transaction.
+/// A one-entity batch fails its first FTS statement. Then disarms only that namespace.
 /// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
 #[cfg(any(test, feature = "fault-injection"))]
 pub fn arm_fts_fail_many_partial(ns: &str) {
@@ -5161,15 +5162,10 @@ impl KhiveRuntime {
     /// (unknown kind, empty name, secret-gate violation), the method returns
     /// that error and no entities are written.
     ///
-    /// Storage writes are issued as ONE `upsert_entities` call followed by ONE
-    /// `upsert_documents` call — the same primitives that the single-entity path
-    /// uses, but batched. Embedding is intentionally skipped: bulk structural
-    /// ingest is the expected use-case, and dense vectors are backfilled later
-    /// via a `reindex` call. Callers that need immediate vector search
-    /// immediately after creation should use per-entity `create_entity` instead.
-    ///
-    /// On FTS failure, every newly written entity row is hard-deleted to maintain
-    /// consistency (mirrors the single-entity rollback in `create_entity`).
+    /// Entity rows and their FTS documents are written in one SQLite transaction.
+    /// Any statement failure rolls back the entire batch across both surfaces.
+    /// Embedding is intentionally skipped: bulk structural ingest is the expected
+    /// use-case, and dense vectors are backfilled later via a `reindex` call.
     pub async fn create_many(
         &self,
         token: &NamespaceToken,
@@ -5218,124 +5214,72 @@ impl KhiveRuntime {
             entities.push(entity);
         }
 
-        // Phase 2: single bulk entity write.
-        // Capture the BatchWriteSummary to detect partial failures.
-        // The store commits the transaction even when some rows fail (per-row error
-        // isolation). If any row failed, compensate by hard-deleting the rows that DID
-        // land, then return Err so the caller sees zero net writes.
-        //
-        // NOTE: this compensation path (delete-on-partial-failure) is a stopgap until
-        // a true single-transaction bulk primitive is available in the entity store.
-        // That primitive (writing entity rows and FTS rows in one SQL transaction) is
-        // tracked as a follow-up issue.
-        let entity_summary = self
-            .entities(token)?
-            .upsert_entities(entities.clone())
-            .await?;
-
-        if entity_summary.failed > 0 {
-            // Compensate: hard-delete any entity rows that did land.
-            if let Ok(store) = self.entities(token) {
-                for entity in &entities {
-                    if let Err(ce) = store.delete_entity(entity.id, DeleteMode::Hard).await {
-                        tracing::error!(
-                            error = %ce,
-                            id = %entity.id,
-                            "create_many: failed to roll back entity row after partial entity write"
-                        );
-                    }
-                }
-            }
-            return Err(RuntimeError::Internal(format!(
-                "create_many: {}/{} entity rows failed to write (first error: {}); \
-                 all rows rolled back",
-                entity_summary.failed, entity_summary.attempted, entity_summary.first_error
-            )));
-        }
-
-        // Phase 3: single bulk FTS write.
-        //
-        // The FTS store commits partial batches and signals per-document failures
-        // via BatchWriteSummary.failed (same as the entity store in Phase 2).
-        // We must capture the summary and treat failed > 0 as an error.
-        //
-        // Compensation is symmetric: on any FTS failure (Err or failed > 0),
-        // we first delete any FTS documents that may have landed, then
-        // hard-delete the entity rows.  This order matters: the entity delete
-        // is the authoritative write; FTS is a derived index.  Cleaning FTS
-        // first avoids a window where entity rows are gone but stale FTS rows
-        // survive.
-        let docs: Vec<_> = entities.iter().map(entity_fts_document).collect();
-
         #[cfg(any(test, feature = "fault-injection"))]
         let fts_many_inject = FTS_FAIL_MANY_NS.lock().unwrap().remove(ns);
         #[cfg(not(any(test, feature = "fault-injection")))]
         let fts_many_inject = false;
 
-        // Partial-failure seam: returns Ok(summary) with failed > 0 so the
-        // `summary.failed > 0` rollback branch is exercised in tests.
         #[cfg(any(test, feature = "fault-injection"))]
         let fts_many_inject_partial = FTS_FAIL_MANY_PARTIAL_NS.lock().unwrap().remove(ns);
         #[cfg(not(any(test, feature = "fault-injection")))]
         let fts_many_inject_partial = false;
 
-        let fts_summary_result: RuntimeResult<BatchWriteSummary> = if fts_many_inject {
-            Err(RuntimeError::Internal(
-                "injected FTS failure for create_many".to_string(),
-            ))
+        let injected_failure_index = if fts_many_inject {
+            Some(0)
         } else if fts_many_inject_partial {
-            Ok(BatchWriteSummary {
-                attempted: docs.len() as u64,
-                affected: docs.len().saturating_sub(1) as u64,
-                failed: 1,
-                first_error: "injected partial FTS failure for create_many".to_string(),
-            })
+            Some(usize::from(entities.len() > 1))
         } else {
-            match self.text(token) {
-                Ok(fts) => fts.upsert_documents(docs).await.map_err(RuntimeError::from),
-                Err(e) => Err(e),
-            }
+            None
         };
 
-        let fts_err: Option<RuntimeError> = match fts_summary_result {
-            Err(e) => Some(e),
-            Ok(summary) if summary.failed > 0 => Some(RuntimeError::Internal(format!(
-                "create_many: {}/{} FTS rows failed to index (first error: {}); \
-                 all rows rolled back",
-                summary.failed, summary.attempted, summary.first_error
+        let _ = self.entities(token)?;
+        let _ = self.text(token)?;
+
+        let plans = entities
+            .iter()
+            .enumerate()
+            .map(|(index, entity)| {
+                let mut fts_statement =
+                    insert_document_statement("fts_entities", &entity_fts_document(entity));
+                if injected_failure_index == Some(index) {
+                    fts_statement = SqlStatement {
+                        sql: "INSERT INTO __khive_create_many_injected_failure__ DEFAULT VALUES"
+                            .to_string(),
+                        params: vec![],
+                        label: Some("fts-insert-injected-failure".to_string()),
+                    };
+                }
+                AtomicOpPlan::AddEntity(AddEntityPlan {
+                    entity_id: entity.id,
+                    statements: vec![
+                        PlanStatement {
+                            statement: entity_upsert_statement(entity),
+                            guard: Some(AffectedRowGuard::exactly(1)),
+                        },
+                        PlanStatement {
+                            statement: fts_statement,
+                            guard: None,
+                        },
+                    ],
+                    post_commit: PostCommitEffect::None,
+                })
+            })
+            .collect();
+
+        match run_atomic_unit(self.sql().as_ref(), plans).await {
+            Ok(AtomicRunOutcome::Committed { .. }) => Ok(entities),
+            Ok(AtomicRunOutcome::RolledBack {
+                failed_op_index,
+                failure,
+            }) => Err(RuntimeError::Internal(format!(
+                "create_many: atomic batch rolled back at entity index {failed_op_index}: \
+                 {failure:?}"
             ))),
-            Ok(_) => None,
-        };
-
-        if let Some(e) = fts_err {
-            // Clean up any FTS docs that landed before deleting entity rows.
-            if let Ok(fts) = self.text(token) {
-                for entity in &entities {
-                    if let Err(ce) = fts.delete_document(ns, entity.id).await {
-                        tracing::error!(
-                            error = %ce,
-                            id = %entity.id,
-                            "create_many: failed to remove FTS doc during rollback"
-                        );
-                    }
-                }
-            }
-            if let Ok(store) = self.entities(token) {
-                for entity in &entities {
-                    if let Err(ce) = store.delete_entity(entity.id, DeleteMode::Hard).await {
-                        tracing::error!(
-                            error = %ce,
-                            id = %entity.id,
-                            "create_many: failed to roll back entity row after FTS failure"
-                        );
-                    }
-                }
-            }
-            return Err(e);
+            Err(e) => Err(RuntimeError::Internal(format!(
+                "create_many: atomic batch failed: {}",
+                e.0
+            ))),
         }
-
-        // Embedding is skipped intentionally — see doc comment above.
-        Ok(entities)
     }
 }
 
@@ -10983,16 +10927,10 @@ mod tests {
         );
     }
 
-    // FTS partial-failure (Ok(summary) with summary.failed > 0) rolls back
-    // both substrates.
-    //
-    // The production code has a distinct arm:
-    //   Ok(summary) if summary.failed > 0 => return Err(...)
-    // This test exercises that arm by arming `arm_fts_fail_many_partial`, which
-    // returns Ok(BatchWriteSummary { failed: 1, ... }) instead of a hard Err.
-    // Both entity rows and FTS rows must be empty after rollback.
+    // A failure after the first entity and FTS document have been written rolls
+    // back both substrates for the entire batch.
     #[tokio::test]
-    async fn create_many_fts_partial_failure_rolls_back_both_substrates() {
+    async fn create_many_mid_batch_storage_failure_rolls_back_both_substrates() {
         let ns = format!("fts-fail-partial-{}", uuid::Uuid::new_v4().as_simple());
         let rt = rt();
         let tok = NamespaceToken::for_namespace(Namespace::parse(&ns).unwrap());
@@ -11021,7 +10959,12 @@ mod tests {
 
         assert!(
             result.is_err(),
-            "create_many must return Err when FTS summary.failed > 0"
+            "create_many must return Err when an FTS write fails mid-batch"
+        );
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains("atomic batch rolled back at entity index 1"),
+            "the failure must occur inside the atomic batch after one complete row; got: {error}"
         );
 
         // Entity substrate must be empty — entity rows must have been rolled back.
@@ -11029,7 +10972,7 @@ mod tests {
         assert_eq!(
             entity_rows.len(),
             0,
-            "entity rows must be rolled back when FTS summary.failed > 0; found {entity_rows:?}"
+            "entity rows must be empty after a mid-batch FTS failure; found {entity_rows:?}"
         );
 
         // FTS substrate must be empty — no stale fts_entities rows.
@@ -11044,7 +10987,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             fts_count, 0,
-            "fts_entities must be empty after partial-FTS-failure rollback; found {fts_count}"
+            "fts_entities must be empty after a mid-batch FTS failure; found {fts_count}"
         );
     }
 

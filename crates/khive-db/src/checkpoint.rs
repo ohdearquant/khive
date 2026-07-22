@@ -3995,14 +3995,38 @@ mod tests {
             true,
         ));
 
-        // Several 10ms intervals, every one of them writer-busy.
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        // Wait until the task has actually recorded a writer-busy Skipped
+        // tick rather than sleeping a fixed real-time budget: each tick also
+        // does registry queries and sidecar filesystem writes, so under
+        // instrumented (coverage) or loaded runners a fixed sleep races the
+        // first completed tick. Bounded, fail-loud.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while checkpoint_skipped_ticks() == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "test setup must actually drive at least one Skipped tick for this \
+                 regression to mean anything (none within 10s)"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
 
-        assert!(
-            checkpoint_skipped_ticks() > 0,
-            "test setup must actually drive at least one Skipped tick for this \
-             regression to mean anything"
-        );
+        loop {
+            let events = buffer.lock().unwrap().clone();
+            if events.iter().any(|e| {
+                e.tx_label.as_deref() == Some("checkpoint_task_writer_busy_sweep_test")
+                    && e.message
+                        .as_deref()
+                        .is_some_and(|m| m.contains("stale-op cap"))
+            }) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "expected the age sweep to fire even though every tick's writer checkout \
+                 was skipped within 10s, got: {events:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
 
         shutdown_tx.send(()).expect("send shutdown signal");
         tokio::time::timeout(Duration::from_secs(1), handle)
@@ -4012,18 +4036,6 @@ mod tests {
 
         drop(_writer_guard);
         drop(_tx_handle);
-
-        let events = buffer.lock().unwrap();
-        assert!(
-            events.iter().any(|e| {
-                e.tx_label.as_deref() == Some("checkpoint_task_writer_busy_sweep_test")
-                    && e.message
-                        .as_deref()
-                        .is_some_and(|m| m.contains("stale-op cap"))
-            }),
-            "expected the age sweep to fire even though every tick's writer checkout \
-             was skipped, got: {events:?}"
-        );
     }
 
     // ── ADR-091 Amendment 2: Plank A (session sweep), Plank B (walpin

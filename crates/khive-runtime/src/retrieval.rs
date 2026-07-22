@@ -1030,7 +1030,11 @@ fn rrf_fuse(
     let mut buckets: HashMap<Uuid, Bucket> = HashMap::new();
 
     let query_lower = query_text.to_lowercase();
+    let mut text_seen = HashSet::with_capacity(text_hits.len());
     for (i, hit) in text_hits.into_iter().enumerate() {
+        if !text_seen.insert(hit.subject_id) {
+            continue;
+        }
         let rank = i + 1; // RRF is 1-indexed
         let entry = buckets.entry(hit.subject_id).or_default();
         entry.score = entry.score + rrf_score(rank, RRF_K);
@@ -1052,7 +1056,11 @@ fn rrf_fuse(
         }
     }
 
+    let mut vector_seen = HashSet::with_capacity(vector_hits.len());
     for (i, hit) in vector_hits.into_iter().enumerate() {
+        if !vector_seen.insert(hit.subject_id) {
+            continue;
+        }
         let rank = i + 1;
         let entry = buckets.entry(hit.subject_id).or_default();
         entry.score = entry.score + rrf_score(rank, RRF_K);
@@ -1133,6 +1141,40 @@ mod tests {
         let hits = rrf_fuse(text, vec, 10, "query");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].source, SearchSource::Both);
+    }
+
+    #[test]
+    fn rrf_fuse_preserves_unique_leg_scores_exactly() {
+        let text_only = Uuid::new_v4();
+        let both = Uuid::new_v4();
+        let vector_only = Uuid::new_v4();
+        let text = vec![text_hit(text_only, 1, "A"), text_hit(both, 2, "B")];
+        let vector = vec![vector_hit(both, 1), vector_hit(vector_only, 2)];
+
+        let hits = rrf_fuse(text, vector, 10, "query");
+        let score_for = |id| {
+            hits.iter()
+                .find(|hit| hit.entity_id == id)
+                .expect("expected fused hit")
+                .score
+        };
+
+        assert_eq!(score_for(text_only), rrf_score(1, RRF_K));
+        assert_eq!(score_for(both), rrf_score(2, RRF_K) + rrf_score(1, RRF_K));
+        assert_eq!(score_for(vector_only), rrf_score(2, RRF_K));
+    }
+
+    #[test]
+    fn rrf_fuse_counts_duplicate_once_per_leg() {
+        let id = Uuid::new_v4();
+        let text = vec![text_hit(id, 1, "A"), text_hit(id, 2, "A duplicate")];
+        let vector = vec![vector_hit(id, 1), vector_hit(id, 2)];
+
+        let hits = rrf_fuse(text, vector, 10, "query");
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].source, SearchSource::Both);
+        assert_eq!(hits[0].score, rrf_score(1, RRF_K) + rrf_score(1, RRF_K));
     }
 
     #[test]

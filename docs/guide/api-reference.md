@@ -30,7 +30,8 @@ provided by commercially licensed extensions and are not part of this distributi
 installed, they load the same way, via `KHIVE_PACKS`/`--pack`. Git provenance ingestion
 (`git.digest`, the `commit`/`issue`/`pull_request` note kinds) and the `git.commit` /
 `git.branch` / `git.push` write verbs (ADR-108) are likewise a commercially licensed
-extension.
+extension. The code-quality and formal-methods ontology packs are also distributed as
+commercially licensed extensions rather than as part of this repository.
 
 The default binary (no `KHIVE_PACKS`/`--pack` override) loads the `kg` pack: **19 verbs**.
 

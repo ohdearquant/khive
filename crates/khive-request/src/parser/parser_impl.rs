@@ -553,7 +553,7 @@ fn serde_error_byte_offset(e: &serde_json::Error, text: &str) -> Option<usize> {
 }
 
 /// Enriches a `serde_json` string-decode failure with the ADR-016 escape
-/// grammar and the MCP double-escape gotcha (ADR-084 §3c). Enrichment is
+/// grammar. Enrichment is
 /// gated on the failure being AT the recorded [`ControlByteHit`]: the serde
 /// error's `(line, column)` is mapped to a byte offset in `normalized.text`
 /// via [`serde_error_byte_offset`], then compared against
@@ -602,9 +602,7 @@ fn describe_quoted_string_parse_error(
     format!(
         "{base} — byte {idx} of the value is {c:?} (U+{:04X}). DSL string escapes follow JSON: \
          \\n, \\t, \\\", \\\\ (raw newline/CR/tab are also accepted literally; other control \
-         bytes must be escaped). If `ops` is sent through a JSON transport, the transport \
-         decodes one escape level before the DSL parser runs, so a literal \
-         backslash-escape must be doubled on the wire — e.g. send \\\\n to produce \\n here.",
+         bytes must be escaped).",
         c as u32
     )
 }

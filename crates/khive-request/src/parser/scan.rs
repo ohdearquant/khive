@@ -108,15 +108,9 @@ pub(crate) struct NormalizedQuotedString<'a> {
 /// does not follow. The control byte it lands on there belongs to that
 /// surrogate failure, not to a fresh broken `\<ctrl>` pair, so it is likewise
 /// not recorded as a [`ControlByteHit`]: recording it would attach the
-/// double-escape teaching to a malformed-surrogate error it does not explain.
+/// control-character guidance to a malformed-surrogate error it does not explain.
 pub(crate) fn normalize_quoted_string(raw: &str) -> NormalizedQuotedString<'_> {
-    if !raw.bytes().any(|b| b < 0x20) {
-        return NormalizedQuotedString {
-            text: Cow::Borrowed(raw),
-            first_control_byte: None,
-        };
-    }
-    let mut out = String::with_capacity(raw.len() + 8);
+    let mut out = None;
     let mut first_control_byte = None;
     let mut chars = raw.char_indices().peekable();
     let mut hex_slots_remaining = 0u32;
@@ -130,7 +124,14 @@ pub(crate) fn normalize_quoted_string(raw: &str) -> NormalizedQuotedString<'_> {
                 Some(d) => hex_acc = (hex_acc << 4) | d,
                 None => hex_valid = false,
             }
-            out.push(c);
+            if (c as u32) < 0x20 && out.is_none() {
+                let mut owned = String::with_capacity(raw.len() + 8);
+                owned.push_str(&raw[..pos]);
+                out = Some(owned);
+            }
+            if let Some(out) = out.as_mut() {
+                out.push(c);
+            }
             if hex_slots_remaining == 0 {
                 after_high_surrogate = hex_valid && (0xD800..=0xDBFF).contains(&hex_acc);
             }
@@ -142,11 +143,15 @@ pub(crate) fn normalize_quoted_string(raw: &str) -> NormalizedQuotedString<'_> {
         let prev_was_high_surrogate = after_high_surrogate;
         after_high_surrogate = false;
         if c == '\\' {
-            out.push(c);
+            if let Some(out) = out.as_mut() {
+                out.push(c);
+            }
             if let Some(&(next_pos, next_c)) = chars.peek() {
                 chars.next();
                 if next_c == 'u' {
-                    out.push(next_c);
+                    if let Some(out) = out.as_mut() {
+                        out.push(next_c);
+                    }
                     hex_slots_remaining = 4;
                     hex_acc = 0;
                     hex_valid = true;
@@ -156,6 +161,11 @@ pub(crate) fn normalize_quoted_string(raw: &str) -> NormalizedQuotedString<'_> {
                     && !prev_was_high_surrogate
                     && first_control_byte.is_none()
                 {
+                    let out = out.get_or_insert_with(|| {
+                        let mut owned = String::with_capacity(raw.len() + 8);
+                        owned.push_str(&raw[..next_pos]);
+                        owned
+                    });
                     first_control_byte = Some(ControlByteHit {
                         normalized_pos: out.len(),
                         raw_pos: next_pos,
@@ -163,15 +173,37 @@ pub(crate) fn normalize_quoted_string(raw: &str) -> NormalizedQuotedString<'_> {
                         preceded_by_backslash: true,
                     });
                 }
-                out.push(next_c);
+                if (next_c as u32) < 0x20 && out.is_none() {
+                    let mut owned = String::with_capacity(raw.len() + 8);
+                    owned.push_str(&raw[..next_pos]);
+                    out = Some(owned);
+                }
+                if let Some(out) = out.as_mut() {
+                    out.push(next_c);
+                }
             }
             continue;
         }
         match c {
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
+            '\n' | '\r' | '\t' => {
+                let out = out.get_or_insert_with(|| {
+                    let mut owned = String::with_capacity(raw.len() + 8);
+                    owned.push_str(&raw[..pos]);
+                    owned
+                });
+                match c {
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    '\t' => out.push_str("\\t"),
+                    _ => unreachable!(),
+                }
+            }
             c if (c as u32) < 0x20 => {
+                let out = out.get_or_insert_with(|| {
+                    let mut owned = String::with_capacity(raw.len() + 8);
+                    owned.push_str(&raw[..pos]);
+                    owned
+                });
                 if first_control_byte.is_none() {
                     first_control_byte = Some(ControlByteHit {
                         normalized_pos: out.len(),
@@ -182,11 +214,15 @@ pub(crate) fn normalize_quoted_string(raw: &str) -> NormalizedQuotedString<'_> {
                 }
                 out.push(c);
             }
-            c => out.push(c),
+            c => {
+                if let Some(out) = out.as_mut() {
+                    out.push(c);
+                }
+            }
         }
     }
     NormalizedQuotedString {
-        text: Cow::Owned(out),
+        text: out.map_or(Cow::Borrowed(raw), Cow::Owned),
         first_control_byte,
     }
 }
@@ -297,5 +333,13 @@ mod tests {
             "must record the earliest hit, not a later one"
         );
         assert_eq!(hit.byte, 0);
+    }
+
+    #[test]
+    fn control_free_string_stays_borrowed_after_single_scan() {
+        let raw = r#""quoted key""#;
+        let normalized = normalize_quoted_string(raw);
+        assert!(matches!(normalized.text, Cow::Borrowed(_)));
+        assert!(normalized.first_control_byte.is_none());
     }
 }

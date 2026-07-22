@@ -1,32 +1,10 @@
 //! Pluggable tokenizer trait with a simple English whitespace default.
 
-use std::collections::HashSet;
-use std::sync::{Arc, LazyLock};
+use khive_text::filter::{Bm25StopWordFilter, LowercaseFilter, MinLengthFilter};
+use khive_text::tokenizer::WhitespaceTokenizer;
+use khive_text::TokenFilter;
 
-/// Deterministic, thread-safe term extraction for BM25 indexing.
-///
-/// See `crates/khive-bm25/docs/api/tokenizer.md`.
-pub trait Tokenizer: Send + Sync {
-    /// Tokenize text into terms. Returns empty vec for empty input.
-    fn tokenize(&self, text: &str) -> Vec<String>;
-}
-
-/// Box type for tokenizers (enables dynamic dispatch).
-pub type BoxedTokenizer = Arc<dyn Tokenizer>;
-
-/// English stop words filtered from BM25 postings to reduce index size.
-static STOP_WORDS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
-    HashSet::from([
-        "a", "an", "and", "are", "as", "at", "be", "been", "being", "but", "by", "can", "did",
-        "do", "does", "doing", "done", "for", "from", "had", "has", "have", "having", "he", "her",
-        "here", "hers", "him", "his", "how", "i", "if", "in", "into", "is", "it", "its", "just",
-        "may", "me", "might", "my", "no", "nor", "not", "of", "on", "or", "our", "out", "own",
-        "say", "she", "should", "so", "some", "such", "than", "that", "the", "their", "them",
-        "then", "there", "these", "they", "this", "those", "through", "to", "too", "up", "us",
-        "very", "was", "we", "were", "what", "when", "where", "which", "while", "who", "whom",
-        "why", "will", "with", "would", "you", "your",
-    ])
-});
+pub use khive_text::{BoxedTokenizer, Tokenizer};
 
 /// Configurable whitespace tokenizer with punctuation, case, length, and stop-word processing.
 ///
@@ -64,40 +42,25 @@ impl SimpleTokenizer {
 
 impl Tokenizer for SimpleTokenizer {
     fn tokenize(&self, text: &str) -> Vec<String> {
-        // Average English word length gives a useful allocation estimate.
-        let estimated_tokens = text.len() / 6 + 1;
-        let mut result = Vec::with_capacity(estimated_tokens.min(32));
-
-        for word in text.split_whitespace() {
-            let trimmed = word.trim_matches(|c: char| c.is_ascii_punctuation());
-
-            if trimmed.len() < self.min_length {
-                continue;
-            }
-
-            // Avoid Unicode lowercase allocation for the common ASCII path.
-            let token = if self.lowercase {
-                if trimmed.is_ascii() {
-                    let mut s = String::with_capacity(trimmed.len());
-                    for &byte in trimmed.as_bytes() {
-                        s.push(byte.to_ascii_lowercase() as char);
-                    }
-                    s
+        WhitespaceTokenizer
+            .tokenize(text)
+            .into_iter()
+            .filter_map(|token| MinLengthFilter(self.min_length).apply(token))
+            .filter_map(|token| {
+                if self.lowercase {
+                    LowercaseFilter.apply(token)
                 } else {
-                    trimmed.to_lowercase()
+                    Some(token)
                 }
-            } else {
-                trimmed.to_string()
-            };
-
-            if self.filter_stop_words && STOP_WORDS.contains(token.as_str()) {
-                continue;
-            }
-
-            result.push(token);
-        }
-
-        result
+            })
+            .filter_map(|token| {
+                if self.filter_stop_words {
+                    Bm25StopWordFilter.apply(token)
+                } else {
+                    Some(token)
+                }
+            })
+            .collect()
     }
 }
 
@@ -108,6 +71,8 @@ pub fn tokenize(text: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
 
     #[test]
@@ -165,6 +130,34 @@ mod tests {
         let tokens = tokenizer.tokenize("I am a cat");
         // "I", "am", "a" filtered by min_length; also stop words
         assert_eq!(tokens, vec!["cat"]);
+    }
+
+    #[test]
+    fn test_simple_tokenizer_min_length_counts_unicode_characters() {
+        let tokenizer = SimpleTokenizer::new(true, 2);
+        assert_eq!(tokenizer.tokenize("你 rust"), vec!["rust"]);
+    }
+
+    #[test]
+    fn test_default_tokenizer_matches_shared_standard_analyzer() {
+        use khive_text::{preset, Analyzer};
+
+        let tokenizer = SimpleTokenizer::default();
+        let analyzer = preset::standard();
+        let cases = [
+            "may x",
+            "done say might",
+            "against",
+            &"a".repeat(41),
+            "The quick brown fox jumps over the lazy dog",
+        ];
+        for input in cases {
+            assert_eq!(
+                tokenizer.tokenize(input),
+                analyzer.analyze(input),
+                "mismatch for input: {input:?}"
+            );
+        }
     }
 
     #[test]
