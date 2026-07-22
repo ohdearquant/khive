@@ -798,9 +798,17 @@ impl KhiveMcpServer {
     /// ```json
     /// {
     ///   "results": [...],
-    ///   "summary": { "total": N, "succeeded": K, "failed": M, "aborted": A }
+    ///   "summary": { "total": N, "succeeded": K, "failed": M, "aborted": A },
+    ///   "status": "success" | "partial"
     /// }
     /// ```
+    ///
+    /// `status` is a structural signal for a partially-failed batch (#1220):
+    /// per-op `results` entries and `summary.failed`/`summary.aborted` counts
+    /// already carry this information, but a caller that checks only for the
+    /// absence of a top-level RPC error has nothing to branch on. `"partial"`
+    /// means at least one op in this response failed or was aborted;
+    /// `"success"` means every op in `results` reports `ok: true`.
     async fn run_parsed(
         &self,
         ops: Vec<ParsedOp>,
@@ -997,6 +1005,7 @@ impl KhiveMcpServer {
                 json!({
                     "results": results,
                     "summary": { "total": total, "succeeded": succeeded, "failed": failed, "aborted": 0 },
+                    "status": batch_status(failed, 0),
                 })
             }
             ExecutionMode::Chain => {
@@ -1077,6 +1086,7 @@ impl KhiveMcpServer {
                 json!({
                     "results": results,
                     "summary": { "total": total, "succeeded": succeeded, "failed": failed, "aborted": aborted },
+                    "status": batch_status(failed, aborted),
                 })
             }
         }
@@ -1495,11 +1505,14 @@ Response shape:
 
   {
     "results": [ {"ok": true, "tool": "verb", "result": {...}}, ... ],
-    "summary": { "total": N, "succeeded": N, "failed": N, "aborted": N }
+    "summary": { "total": N, "succeeded": N, "failed": N, "aborted": N },
+    "status": "success" | "partial"
   }
 
 Parallel: a failed op does NOT abort siblings. Chain: failure aborts remaining
 ops (reported as {"ok": false, "aborted": true}). Committed ops are not rolled back.
+`status` is "partial" whenever summary.failed or summary.aborted is non-zero — check
+it (or summary) rather than relying on the absence of a top-level error.
 
 Verb discovery: install the `kg` / `gtd` plugins for usage skills. The verbs
 currently registered on this server (pack-derived) are listed below. Argument
@@ -1544,6 +1557,19 @@ result (e.g. create then link with the new entity's id)."#)]
             }
         }
         self.dispatch_request_wire(p).await
+    }
+}
+
+/// Response-envelope `status` for a batch of `failed`/`aborted` counts
+/// (#1220): `"partial"` when either is non-zero, `"success"` otherwise. A
+/// caller that only checks for the absence of a top-level RPC error has
+/// nothing else to branch on for a batch where some ops failed or were
+/// skipped after a chain abort.
+fn batch_status(failed: usize, aborted: usize) -> &'static str {
+    if failed == 0 && aborted == 0 {
+        "success"
+    } else {
+        "partial"
     }
 }
 
@@ -1613,6 +1639,7 @@ fn strict_fallback_envelope_response(
     Ok(serde_json::to_string(&json!({
         "results": results,
         "summary": { "total": total, "succeeded": 0, "failed": failed, "aborted": aborted },
+        "status": batch_status(failed, aborted),
     }))
     .expect("envelope of string/bool JSON values always serializes"))
 }
@@ -2877,5 +2904,103 @@ mod tests {
 
         crate::daemon::reset_fallback_counters();
         clear_daemon_env();
+    }
+
+    // ── #1220: top-level `status` distinguishes a partially-failed batch ──────
+
+    fn in_memory_kg_server() -> KhiveMcpServer {
+        let config = RuntimeConfig {
+            db_path: None,
+            default_namespace: Namespace::local(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        };
+        let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
+        KhiveMcpServer::new(runtime).expect("server builds with kg")
+    }
+
+    #[tokio::test]
+    async fn request_status_is_success_when_every_op_in_batch_succeeds() {
+        let server = in_memory_kg_server();
+        let resp = server
+            .dispatch_request_local(RequestParams {
+                ops: "[create(kind=\"entity\", entity_kind=\"concept\", name=\"status-ok-1\"), \
+                       create(kind=\"entity\", entity_kind=\"concept\", name=\"status-ok-2\")]"
+                    .to_string(),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .expect("batch dispatch must succeed");
+        let parsed: Value = serde_json::from_str(&resp).expect("envelope must be JSON");
+        assert_eq!(parsed["summary"]["failed"], 0);
+        assert_eq!(
+            parsed["status"], "success",
+            "an all-succeeding batch must report status=success; got {parsed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_status_is_partial_when_a_batch_op_fails() {
+        let server = in_memory_kg_server();
+        // The second op targets an unknown kind and fails; the first succeeds.
+        let resp = server
+            .dispatch_request_local(RequestParams {
+                ops:
+                    "[create(kind=\"entity\", entity_kind=\"concept\", name=\"status-partial-1\"), \
+                       search(kind=\"not_a_real_kind\", query=\"x\")]"
+                        .to_string(),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .expect("batch dispatch must succeed at the RPC level even with a failed op");
+        let parsed: Value = serde_json::from_str(&resp).expect("envelope must be JSON");
+        assert!(
+            parsed["summary"]["failed"].as_u64().unwrap_or(0) > 0,
+            "expected at least one failed op; got {parsed}"
+        );
+        assert_eq!(
+            parsed["status"], "partial",
+            "a batch with a failed op must report status=partial; got {parsed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_status_is_partial_when_a_chain_op_is_aborted() {
+        let server = in_memory_kg_server();
+        let resp = server
+            .dispatch_request_local(RequestParams {
+                ops: "search(kind=\"not_a_real_kind\", query=\"x\") | \
+                      create(kind=\"entity\", entity_kind=\"concept\", name=\"status-chain-aborted\")"
+                    .to_string(),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .expect("chain dispatch must succeed at the RPC level even with an aborted op");
+        let parsed: Value = serde_json::from_str(&resp).expect("envelope must be JSON");
+        assert!(
+            parsed["summary"]["aborted"].as_u64().unwrap_or(0) > 0,
+            "expected the second chain op to be aborted; got {parsed}"
+        );
+        assert_eq!(
+            parsed["status"], "partial",
+            "a chain with an aborted op must report status=partial; got {parsed}"
+        );
     }
 }

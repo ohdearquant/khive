@@ -278,6 +278,16 @@ pub struct ExecArgs {
     /// meaningful with `--atomic`.
     #[arg(long, requires = "atomic")]
     pub atomic_max_ops: Option<usize>,
+
+    /// Exit non-zero when any op in the batch fails (or, for `--ops-file`,
+    /// when any applied op fails). Without this flag the process exits 0
+    /// whenever the request itself was dispatched, even if every op inside
+    /// it failed — the per-op `results` entries and the `summary`/`status`
+    /// fields in the printed output are the only signal (#1220). Not
+    /// meaningful with `--atomic`, which already fails the whole file on
+    /// any rejected op.
+    #[arg(long)]
+    pub strict: bool,
 }
 
 /// A single parsed op entry from an ops-file line.
@@ -385,6 +395,7 @@ async fn apply_ops_file(
     server: &KhiveMcpServer,
     ops: Vec<OpsFileEntry>,
     presentation: Option<String>,
+    strict: bool,
 ) -> Result<()> {
     let total = ops.len();
     let mut total_succeeded: usize = 0;
@@ -459,6 +470,11 @@ async fn apply_ops_file(
         "{}",
         serde_json::to_string_pretty(&summary).expect("serialize summary")
     );
+    if strict && total_failed > 0 {
+        anyhow::bail!(
+            "--strict: {total_failed} op(s) failed out of {total} (see printed summary above)"
+        );
+    }
     Ok(())
 }
 
@@ -566,6 +582,7 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
                 args.output_format,
                 args.save_file,
                 db_context,
+                args.strict,
             )
             .await
         }
@@ -578,10 +595,35 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
                 db_context,
                 args.atomic,
                 args.atomic_max_ops,
+                args.strict,
             )
             .await
         }
     }
+}
+
+/// Returns `Err` describing the failed/aborted op counts when `strict` is set
+/// and the parsed response envelope's `summary` reports either as non-zero
+/// (#1220). `raw` must be the exact envelope string already printed to
+/// stdout — the caller prints first, unconditionally, then this decides the
+/// exit code; a caller piping the output still sees the full result either way.
+fn enforce_strict_batch_result(raw: &str, strict: bool) -> Result<()> {
+    if !strict {
+        return Ok(());
+    }
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw) else {
+        // Non-JSON output (e.g. --output-format table/auto): nothing to
+        // inspect here. `--strict` only applies to the default JSON shape.
+        return Ok(());
+    };
+    let failed = parsed["summary"]["failed"].as_u64().unwrap_or(0);
+    let aborted = parsed["summary"]["aborted"].as_u64().unwrap_or(0);
+    if failed > 0 || aborted > 0 {
+        anyhow::bail!(
+            "--strict: {failed} op(s) failed, {aborted} op(s) aborted (see printed output above)"
+        );
+    }
+    Ok(())
 }
 
 enum ExecMode {
@@ -602,6 +644,7 @@ async fn run_exec_inline(
     output_format: Option<String>,
     save_file: Option<String>,
     db_context: ExecDbContext,
+    strict: bool,
 ) -> Result<()> {
     #[cfg(unix)]
     return run_exec_inline_with_forward(
@@ -611,6 +654,7 @@ async fn run_exec_inline(
         output_format,
         save_file,
         db_context,
+        strict,
         forward_or_spawn_boxed,
     )
     .await;
@@ -622,6 +666,7 @@ async fn run_exec_inline(
         output_format,
         save_file,
         db_context,
+        strict,
     )
     .await;
 }
@@ -639,6 +684,7 @@ async fn run_exec_inline(
 /// enables the latter: tests pass a spy `forward_fn` and assert it is never
 /// called when the gate should have rejected.
 #[cfg_attr(not(unix), allow(unused_variables))]
+#[allow(clippy::too_many_arguments)]
 async fn run_exec_inline_with_forward(
     ops: String,
     cfg: RuntimeConfig,
@@ -646,6 +692,7 @@ async fn run_exec_inline_with_forward(
     output_format: Option<String>,
     save_file: Option<String>,
     db_context: ExecDbContext,
+    strict: bool,
     #[cfg(unix)] forward_fn: ForwardFnPtr,
 ) -> Result<()> {
     // ── strict-actor gate (before any forwarding) ─────────────────────────────
@@ -719,6 +766,7 @@ async fn run_exec_inline_with_forward(
         if let Some(res) = forward_fn(&frame).await {
             let output = res.map_err(|e| anyhow::anyhow!("{}", e.message))?;
             println!("{output}");
+            enforce_strict_batch_result(&output, strict)?;
             return Ok(());
         }
     }
@@ -754,6 +802,7 @@ async fn run_exec_inline_with_forward(
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     println!("{output}");
+    enforce_strict_batch_result(&output, strict)?;
     Ok(())
 }
 
@@ -783,6 +832,7 @@ fn build_local_fallback_server(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_exec_ops_file(
     path: PathBuf,
     cfg: RuntimeConfig,
@@ -791,6 +841,7 @@ async fn run_exec_ops_file(
     db_context: ExecDbContext,
     atomic: bool,
     atomic_max_ops: Option<usize>,
+    strict: bool,
 ) -> Result<()> {
     // Parse the whole file first — fail before any writes if any line is bad.
     let ops = parse_ops_file(&path)?;
@@ -847,7 +898,7 @@ async fn run_exec_ops_file(
         db_context.anchor.as_deref(),
     )?;
 
-    apply_ops_file(&server, ops, presentation).await
+    apply_ops_file(&server, ops, presentation, strict).await
 }
 
 #[cfg(test)]
@@ -1917,7 +1968,7 @@ default = true
 
         let ops = parse_ops_file(&f.path().to_path_buf()).unwrap();
         assert_eq!(ops.len(), 3);
-        apply_ops_file(&server, ops, None).await.unwrap();
+        apply_ops_file(&server, ops, None, false).await.unwrap();
 
         // Verify all 3 entities are present.
         let params = RequestParams {
@@ -1941,6 +1992,83 @@ default = true
             count, 3,
             "all 3 entities should be present after apply\nraw: {resp}"
         );
+    }
+
+    // ── #1220: --strict exit-code signal for partially-failed batches ─────────
+
+    #[test]
+    fn enforce_strict_batch_result_ok_when_strict_off_regardless_of_failures() {
+        let raw = serde_json::json!({
+            "results": [],
+            "summary": {"total": 1, "succeeded": 0, "failed": 1, "aborted": 0},
+        })
+        .to_string();
+        assert!(enforce_strict_batch_result(&raw, false).is_ok());
+    }
+
+    #[test]
+    fn enforce_strict_batch_result_ok_when_strict_on_and_nothing_failed() {
+        let raw = serde_json::json!({
+            "results": [],
+            "summary": {"total": 2, "succeeded": 2, "failed": 0, "aborted": 0},
+        })
+        .to_string();
+        assert!(enforce_strict_batch_result(&raw, true).is_ok());
+    }
+
+    #[test]
+    fn enforce_strict_batch_result_errs_when_strict_on_and_a_failure_present() {
+        let raw = serde_json::json!({
+            "results": [],
+            "summary": {"total": 2, "succeeded": 1, "failed": 1, "aborted": 0},
+        })
+        .to_string();
+        let err = enforce_strict_batch_result(&raw, true).unwrap_err();
+        assert!(format!("{err}").contains("1 op(s) failed"));
+    }
+
+    #[test]
+    fn enforce_strict_batch_result_errs_when_strict_on_and_chain_aborted() {
+        let raw = serde_json::json!({
+            "results": [],
+            "summary": {"total": 2, "succeeded": 0, "failed": 1, "aborted": 1},
+        })
+        .to_string();
+        assert!(enforce_strict_batch_result(&raw, true).is_err());
+    }
+
+    #[test]
+    fn enforce_strict_batch_result_ok_on_non_json_output() {
+        // --output-format table/auto renders a non-JSON string; --strict has
+        // nothing to inspect and must not itself error out on that shape.
+        assert!(enforce_strict_batch_result("| a | b |\n", true).is_ok());
+    }
+
+    #[tokio::test]
+    async fn apply_ops_file_strict_errs_when_an_op_fails() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        let server = isolated_server(&db_path);
+
+        // First op succeeds; second targets an unknown kind and fails.
+        let mut f = NamedTempFile::new().unwrap();
+        use std::io::Write as _;
+        f.write_all(
+            b"{\"tool\":\"create\",\"args\":{\"kind\":\"concept\",\"name\":\"StrictOne\"}}\n",
+        )
+        .unwrap();
+        f.write_all(
+            b"{\"tool\":\"search\",\"args\":{\"kind\":\"not_a_real_kind\",\"query\":\"x\"}}\n",
+        )
+        .unwrap();
+
+        let ops = parse_ops_file(&f.path().to_path_buf()).unwrap();
+        assert_eq!(ops.len(), 2);
+
+        let err = apply_ops_file(&server, ops, None, true)
+            .await
+            .expect_err("strict mode must surface the per-op failure as a process error");
+        assert!(format!("{err}").contains("1 op(s) failed"));
     }
 
     // ── ADR-099 B1 inertness (golden shape) ────────────────────────────────────
@@ -2038,8 +2166,8 @@ default = true
             .collect();
         assert_eq!(
             top_level_keys,
-            std::collections::BTreeSet::from(["results", "summary"]),
-            "non-atomic envelope must carry exactly results+summary, no `atomic` block: {resp}"
+            std::collections::BTreeSet::from(["results", "summary", "status"]),
+            "non-atomic envelope must carry exactly results+summary+status, no `atomic` block (#1220 added `status`): {resp}"
         );
 
         let summary_keys: std::collections::BTreeSet<&str> = resp["summary"]
@@ -2094,6 +2222,7 @@ default = true
             ExecDbContext::default(),
             false,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -2147,6 +2276,7 @@ default = true
             None,
             None,
             ExecDbContext::default(),
+            false,
         )
         .await;
 
@@ -2192,6 +2322,7 @@ default = true
             None,
             None,
             ExecDbContext::default(),
+            false,
         )
         .await;
 
@@ -2302,6 +2433,7 @@ backend = "sessions"
             None,
             None,
             ExecDbContext::default(),
+            false,
             spy_capture_config_id,
         )
         .await;
