@@ -117,6 +117,34 @@ FRESHNESS_DAYS_HOSTED = 7
 FRESHNESS_DAYS_SELF_HOSTED = 14
 HOSTED_RUNNER_CLASSES = {"hosted_hash"}
 
+AVAILABLE_OPERATIONS_BY_SURFACE = {
+    "mcp_daemon": frozenset(
+        {
+            "context",
+            "create",
+            "delete",
+            "get",
+            "link",
+            "list",
+            "merge",
+            "neighbors",
+            "propose",
+            "query",
+            "resolve",
+            "review",
+            "search",
+            "stats",
+            "traverse",
+            "update",
+            "verbs",
+            "whoami",
+            "withdraw",
+        }
+    ),
+    "admin_cli": frozenset(),
+    "raw_daemon_control": frozenset({"probe_only"}),
+}
+
 # The manifest declares no `manifest_version`/`manifest_hash` field of its
 # own (checked: `flagship_workloads.toml` has no such key), so the current
 # manifest's identity is derived here rather than read - MANIFEST_VERSION is
@@ -153,9 +181,10 @@ class ManifestError(Exception):
 def load_manifest(path: pathlib.Path) -> tuple[dict, list[str]]:
     """Parse and structurally validate the manifest. Returns (data, errors).
     `errors` is non-empty for duplicate scenario_ids, invalid `surface`
-    values, malformed `fixture_hash` values, or missing required fields -
-    the manifest is still returned (best-effort) so callers can inspect
-    what did parse even when validation flags a problem.
+    values, operations unavailable on their declared surface, malformed
+    `fixture_hash` values, or missing required fields - the manifest is still
+    returned (best-effort) so callers can inspect what did parse even when
+    validation flags a problem.
     """
     with path.open("rb") as fh:
         data = tomllib.load(fh)
@@ -191,8 +220,23 @@ def load_manifest(path: pathlib.Path) -> tuple[dict, list[str]]:
                 f"{label}: invalid feature {sc['feature']!r} (expected one of {flagship_schema.MANIFEST_FEATURES})"
             )
 
-        if sc["surface"] not in flagship_schema.SURFACES:
-            errors.append(f"{label}: invalid surface {sc['surface']!r} (expected one of {flagship_schema.SURFACES})")
+        surface = sc["surface"]
+        operation = sc["operation"]
+        if not isinstance(surface, str):
+            errors.append(f"{label}: surface must be a string, got {type(surface).__name__}: {surface!r}")
+        elif surface not in flagship_schema.SURFACES:
+            errors.append(f"{label}: invalid surface {surface!r} (expected one of {flagship_schema.SURFACES})")
+
+        if not isinstance(operation, str):
+            errors.append(f"{label}: operation must be a string, got {type(operation).__name__}: {operation!r}")
+        elif isinstance(surface, str):
+            available_operations = AVAILABLE_OPERATIONS_BY_SURFACE.get(surface)
+            if available_operations is not None and operation not in available_operations:
+                available = ", ".join(sorted(available_operations)) or "none"
+                errors.append(
+                    f"{label}: operation is not available on {surface}: {operation!r} "
+                    f"(available: {available})"
+                )
 
         if sc["embedder"] not in flagship_schema.EMBEDDERS:
             errors.append(f"{label}: invalid embedder {sc['embedder']!r} (expected one of {flagship_schema.EMBEDDERS})")
@@ -573,7 +617,7 @@ def main(argv: list[str] | None = None) -> int:
         "--strict",
         action="store_true",
         help="exit nonzero if the manifest itself fails structural validation "
-        "(duplicate ids, invalid enums, malformed fixture hashes, missing fields)",
+        "(duplicate ids, invalid enums, unavailable operations, malformed fixture hashes, missing fields)",
     )
     args = ap.parse_args(argv)
 
