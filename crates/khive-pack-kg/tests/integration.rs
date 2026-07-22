@@ -2059,6 +2059,11 @@ async fn search_kind_entity_still_works_alongside_memory_pack() {
             hit.get("id").is_some(),
             "entity-substrate hit must have 'id'; got: {hit}"
         );
+        assert_eq!(
+            hit.get("source").and_then(Value::as_str),
+            Some("text"),
+            "entity-substrate hit must expose its retrieval source; got: {hit}"
+        );
     }
 }
 
