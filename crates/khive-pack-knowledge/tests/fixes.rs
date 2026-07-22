@@ -955,6 +955,59 @@ async fn w10_import_section_only_markdown_synthesizes_atom_content() {
     );
 }
 
+// ── issue #25: import must finalize atoms so search/suggest can retrieve them ──
+
+#[tokio::test]
+async fn issue25_imported_atom_is_finalized_and_retrievable_via_search() {
+    let f = pack(rt());
+    let dir = std::env::temp_dir().join("khive_fixes_test_issue25");
+    std::fs::create_dir_all(&dir).ok();
+    let md_path = dir.join("retrievable-doc.md");
+    std::fs::write(
+        &md_path,
+        "# Retrievable Doc\n\nContent about zephyroquine dosage covering dense sparse vector search ranking fusion embedding reranking latency gradient transformer attention nearest neighbor index corpus benchmark pipeline cosine.\n",
+    )
+    .expect("write md");
+
+    let resp = f
+        .dispatch(
+            "knowledge.import",
+            json!({ "path": md_path.to_str().unwrap() }),
+        )
+        .await
+        .expect("import ok");
+    assert!(
+        resp["imported_atoms"].as_i64().unwrap_or(0) > 0,
+        "expected at least 1 imported atom"
+    );
+
+    let atom = f
+        .dispatch("knowledge.get", json!({ "id": "retrievable-doc" }))
+        .await
+        .expect("get");
+    assert_eq!(
+        atom["status"].as_str(),
+        Some("reviewed"),
+        "imported atoms must be finalized (status=reviewed), not left at the draft default \
+         that knowledge.search/suggest exclude"
+    );
+
+    // The regression this fix closes: default knowledge.search (no include_drafts, no
+    // status=) must actually surface a freshly-imported atom by its unique content term.
+    let search_resp = f
+        .dispatch(
+            "knowledge.search",
+            json!({ "query": "zephyroquine dosage", "rerank": false }),
+        )
+        .await
+        .expect("search ok");
+    let results = search_resp["results"].as_array().expect("results array");
+    assert!(
+        results.iter().any(|r| r["id"] == atom["id"]),
+        "imported atom must be retrievable via default knowledge.search, got: {search_resp}"
+    );
+}
+
 // ── S4: upsert-on-duplicate-slug updates in place (ADR-007 Rev 2: single local ns) ──
 
 #[tokio::test]

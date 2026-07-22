@@ -477,6 +477,13 @@ impl KnowledgeHandlers {
                 properties.insert("atlas_id".to_string(), Value::String(id.clone()));
             }
 
+            // finalized=true so imported atoms land at status="reviewed" instead of the
+            // upsert_atoms default "draft" — knowledge.search/suggest exclude "draft" by
+            // default (SearchParams::include_drafts defaults false), so a bulk-imported
+            // corpus was previously present (knowledge.list, no default status filter)
+            // but unretrievable through search/suggest until someone finalized every atom
+            // individually. Imported content is externally-authored source material the
+            // caller already chose to ingest, not an agent-proposed draft pending review.
             let upsert_params = serde_json::json!({
                 "atoms": [{
                     "slug": slug,
@@ -485,6 +492,7 @@ impl KnowledgeHandlers {
                     "properties": Value::Object(properties),
                     "source_uri": source_uri,
                     "source_type": source_type,
+                    "finalized": true,
                 }]
             });
             KnowledgeHandlers::upsert_atoms(runtime, token, upsert_params).await?;
