@@ -111,6 +111,20 @@ fn compile_rejects_unknown_relation_in_where() {
 }
 
 #[test]
+fn compile_rejects_unknown_node_property_in_where() {
+    let q = parse(
+        QueryLanguage::Gql,
+        "MATCH (a)-[:extends]->(b) WHERE a.domain = 'query' RETURN a.name",
+    )
+    .unwrap();
+    let err = compile(&q, &opts()).unwrap_err();
+    assert!(
+        matches!(err, QueryError::Compile(ref msg) if msg.contains("unknown node property 'domain' in WHERE clause") && msg.contains("Valid:")),
+        "got {err:?}"
+    );
+}
+
+#[test]
 fn compile_kind_in_where_passes_through_unchanged() {
     let q = parse(
         QueryLanguage::Gql,
@@ -167,6 +181,20 @@ fn return_unknown_node_property_rejected() {
 }
 
 #[test]
+fn return_unknown_depth_property_rejected() {
+    let q = parse(
+        QueryLanguage::Gql,
+        "MATCH (a)-[:precedes*1..3]->(b) RETURN b._depth",
+    )
+    .unwrap();
+    let err = compile(&q, &opts()).unwrap_err();
+    assert!(
+        matches!(err, QueryError::Compile(ref msg) if msg.contains("unknown node property '_depth'") && msg.contains("Valid:")),
+        "got {err:?}"
+    );
+}
+
+#[test]
 fn return_unknown_edge_property_rejected() {
     let q = parse(
         QueryLanguage::Gql,
@@ -197,6 +225,35 @@ fn return_valid_edge_property_compiles() {
         compiled.sql.contains(".weight AS e_weight"),
         "sql: {}",
         compiled.sql
+    );
+}
+
+#[test]
+fn variable_length_where_valid_node_property_compiles() {
+    let q = parse(
+        QueryLanguage::Gql,
+        r#"MATCH (a)-[:precedes*1..3]->(b) WHERE a.name LIKE "%SpecInfer%" RETURN b.name"#,
+    )
+    .unwrap();
+    let compiled = compile(&q, &opts()).unwrap();
+    assert!(
+        compiled.sql.contains("s.name LIKE ?"),
+        "sql: {}",
+        compiled.sql
+    );
+}
+
+#[test]
+fn variable_length_where_unknown_depth_property_rejected() {
+    let q = parse(
+        QueryLanguage::Gql,
+        r#"MATCH (a)-[:precedes*1..3]->(b) WHERE a.name LIKE "%SpecInfer%" AND b._depth > 1 RETURN b.name"#,
+    )
+    .unwrap();
+    let err = compile(&q, &opts()).unwrap_err();
+    assert!(
+        matches!(err, QueryError::Compile(ref msg) if msg.contains("unknown node property '_depth' in WHERE clause") && msg.contains("Valid:")),
+        "got {err:?}"
     );
 }
 
@@ -846,7 +903,7 @@ fn gql_inline_property_map_i64_min_binds_exact() {
 fn gql_where_equality_large_integer_binds_exact_i64_not_lossy_float() {
     let q = parse(
         QueryLanguage::Gql,
-        "MATCH (n:artifact) WHERE n.number = 9007199254740993 RETURN n",
+        "MATCH (n:artifact) WHERE n.created_at = 9007199254740993 RETURN n",
     )
     .unwrap();
     let compiled = compile(&q, &opts()).unwrap();
@@ -865,7 +922,7 @@ fn gql_where_equality_i64_bounds_bind_exact() {
     for bound in [i64::MIN, i64::MAX] {
         let q = parse(
             QueryLanguage::Gql,
-            &format!("MATCH (n:artifact) WHERE n.number = {bound} RETURN n"),
+            &format!("MATCH (n:artifact) WHERE n.created_at = {bound} RETURN n"),
         )
         .unwrap();
         let compiled = compile(&q, &opts()).unwrap();
@@ -887,7 +944,7 @@ fn variable_length_where_i64_bounds_bind_exact() {
     for bound in [i64::MIN, i64::MAX] {
         let q = parse(
             QueryLanguage::Gql,
-            &format!("MATCH (a)-[:extends*1..3]->(b) WHERE b.number = {bound} RETURN b"),
+            &format!("MATCH (a)-[:extends*1..3]->(b) WHERE b.created_at = {bound} RETURN b"),
         )
         .unwrap();
         let compiled = compile(&q, &opts()).unwrap();
@@ -1031,7 +1088,7 @@ fn gql_inline_property_map_well_formed_float_still_parses() {
 fn extended_where_operators_compile_with_bound_parameters() {
     let q = parse(
         QueryLanguage::Gql,
-        r#"MATCH (n) WHERE n.name CONTAINS "%_\' OR 1=1 --" AND n.name STARTS WITH "pre%_\" AND n.kind IN ["concept", "' OR 1=1 --"] AND n.domain IS NOT NULL RETURN n"#,
+        r#"MATCH (n) WHERE n.name CONTAINS "%_\' OR 1=1 --" AND n.name STARTS WITH "pre%_\" AND n.kind IN ["concept", "' OR 1=1 --"] AND n.description IS NOT NULL RETURN n"#,
     )
     .unwrap();
     let compiled = compile(&q, &opts()).unwrap();
@@ -1052,9 +1109,7 @@ fn extended_where_operators_compile_with_bound_parameters() {
         compiled.sql
     );
     assert!(
-        compiled
-            .sql
-            .contains("json_extract(n0.properties, '$.domain') IS NOT NULL"),
+        compiled.sql.contains("n0.description IS NOT NULL"),
         "sql: {}",
         compiled.sql
     );
@@ -1084,7 +1139,7 @@ fn extended_where_operators_compile_for_variable_length_patterns() {
         QueryLanguage::Gql,
         "MATCH (a)-[:extends*1..2]->(b) WHERE a.name CONTAINS 'Lo' \
          AND a.name STARTS WITH 'L' AND b.kind IN ['concept', 'document'] \
-         AND b.domain IS NOT NULL RETURN b",
+         AND b.description IS NOT NULL RETURN b",
     )
     .unwrap();
     let compiled = compile(&q, &opts()).unwrap();
@@ -1105,9 +1160,7 @@ fn extended_where_operators_compile_for_variable_length_patterns() {
         compiled.sql
     );
     assert!(
-        compiled
-            .sql
-            .contains("json_extract(r.properties, '$.domain') IS NOT NULL"),
+        compiled.sql.contains("r.description IS NOT NULL"),
         "sql: {}",
         compiled.sql
     );
@@ -1328,23 +1381,21 @@ mod substrate_labels {
     }
 
     #[test]
-    fn is_not_null_filters_json_property_presence_end_to_end() {
+    fn is_not_null_filters_valid_column_end_to_end() {
         let conn = fixture_db();
-        insert_entity(
-            &conn,
-            "e-with-domain",
-            "with domain",
-            r#"{"domain":"attention"}"#,
-        );
-        insert_entity(&conn, "e-without-domain", "without domain", "{}");
+        conn.execute(
+            "UPDATE entities SET description = 'attention' WHERE id = 'e-fixture-1'",
+            [],
+        )
+        .unwrap();
         let q = parse(
             QueryLanguage::Gql,
-            "MATCH (e:entity) WHERE e.domain IS NOT NULL RETURN e.id",
+            "MATCH (e:entity) WHERE e.description IS NOT NULL RETURN e.id",
         )
         .unwrap();
         let compiled = compile(&q, &opts()).unwrap();
 
-        assert_eq!(run(&conn, &compiled), vec!["e-with-domain"]);
+        assert_eq!(run(&conn, &compiled), vec!["e-fixture-1"]);
     }
 
     /// `fixture_db()` plus a second entity and a `graph_edges` row connecting

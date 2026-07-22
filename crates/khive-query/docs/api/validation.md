@@ -37,4 +37,4 @@ Namespace scope is runtime input through `CompileOptions.scopes`; `namespace` in
 
 Node kinds are pack-agnostic strings and are neither validated nor renamed in this crate. In particular, historical aliases such as `paper` do not become `document` here.
 
-Condition validation is binding-aware. `relation` is taxonomy-checked only on an edge variable, while `kind` has node semantics only on a node variable; the same names on the opposite substrate remain ordinary JSON property keys. Operators that require a particular value shape, including list-valued `IN` and operand-free `IS NOT NULL`, are checked before compilation.
+Condition validation is binding-aware. Node, event, and observation-target predicates accept only the columns exposed by their corresponding projection whitelist; edge predicates accept `relation` and `weight`. Unknown columns are rejected with the valid list instead of being lowered to a JSON lookup that silently returns null. `relation` values on edge variables are taxonomy-checked. Operators that require a particular value shape, including list-valued `IN` and operand-free `IS NOT NULL`, are checked before compilation.

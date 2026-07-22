@@ -704,51 +704,8 @@ fn compile_single_condition(
         ))
     })?;
 
-    let col_expr = match kind {
-        VarKind::Node => {
-            if cond.property == "name"
-                || cond.property == "kind"
-                || cond.property == "entity_type"
-                || cond.property == "namespace"
-            {
-                format!("{alias}.{}", cond.property)
-            } else {
-                format!(
-                    "json_extract({alias}.properties, '$.{}')",
-                    cond.property.replace('\'', "''")
-                )
-            }
-        }
-        VarKind::ObservationTargetNode => {
-            if OBSERVATION_TARGET_COLUMNS.contains(&cond.property.as_str()) {
-                format!("{alias}.{}", cond.property)
-            } else {
-                format!(
-                    "json_extract({alias}.properties, '$.{}')",
-                    cond.property.replace('\'', "''")
-                )
-            }
-        }
-        VarKind::EventNode => {
-            if EVENT_COLUMNS.contains(&cond.property.as_str()) {
-                format!("{alias}.{}", cond.property)
-            } else {
-                return Err(QueryError::Validation(format!(
-                    "event property '{}' not queryable; valid columns: {}",
-                    cond.property,
-                    EVENT_COLUMNS.join(", ")
-                )));
-            }
-        }
-        VarKind::Edge => match cond.property.as_str() {
-            "relation" | "weight" => format!("{alias}.{}", cond.property),
-            other => {
-                return Err(QueryError::Validation(format!(
-                    "edge property '{other}' not queryable; use 'relation' or 'weight'"
-                )))
-            }
-        },
-    };
+    let col = where_property_to_column(&cond.property, kind)?;
+    let col_expr = format!("{alias}.{col}");
 
     compile_condition_predicate(&col_expr, cond, params)
 }
@@ -948,15 +905,8 @@ fn compile_var_len_condition(
         )));
     };
 
-    let col_expr =
-        if cond.property == "name" || cond.property == "kind" || cond.property == "entity_type" {
-            format!("{col_alias}.{}", cond.property)
-        } else {
-            format!(
-                "json_extract({col_alias}.properties, '$.{}')",
-                cond.property.replace('\'', "''")
-            )
-        };
+    let col = where_property_to_column(&cond.property, &VarKind::Node)?;
+    let col_expr = format!("{col_alias}.{col}");
 
     let sql = compile_condition_predicate(&col_expr, cond, params)?;
     Ok((sql, col_alias))
@@ -1449,20 +1399,42 @@ const EVENT_COLUMNS: &[&str] = &[
     "created_at",
 ];
 const EDGE_COLUMNS: &[&str] = &["id", "source_id", "target_id", "relation", "weight"];
+const EDGE_WHERE_COLUMNS: &[&str] = &["relation", "weight"];
 
-fn property_to_column<'a>(prop: &'a str, kind: &VarKind) -> Result<&'a str, QueryError> {
-    let (valid, kind_name) = match kind {
+fn property_columns(kind: &VarKind) -> (&'static [&'static str], &'static str) {
+    match kind {
         VarKind::Node => (NODE_COLUMNS, "node"),
         VarKind::ObservationTargetNode => (OBSERVATION_TARGET_COLUMNS, "observation target"),
         VarKind::EventNode => (EVENT_COLUMNS, "event"),
         VarKind::Edge => (EDGE_COLUMNS, "edge"),
-    };
+    }
+}
+
+fn property_to_column<'a>(prop: &'a str, kind: &VarKind) -> Result<&'a str, QueryError> {
+    let (valid, kind_name) = property_columns(kind);
     if valid.contains(&prop) {
         Ok(prop)
     } else {
         Err(QueryError::Compile(format!(
             "unknown {kind_name} property '{prop}' in RETURN projection. \
              Valid: {}",
+            valid.join(", ")
+        )))
+    }
+}
+
+fn where_property_to_column<'a>(prop: &'a str, kind: &VarKind) -> Result<&'a str, QueryError> {
+    let (projection_columns, kind_name) = property_columns(kind);
+    let valid = if *kind == VarKind::Edge {
+        EDGE_WHERE_COLUMNS
+    } else {
+        projection_columns
+    };
+    if valid.contains(&prop) {
+        Ok(prop)
+    } else {
+        Err(QueryError::Compile(format!(
+            "unknown {kind_name} property '{prop}' in WHERE clause. Valid: {}",
             valid.join(", ")
         )))
     }

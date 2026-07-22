@@ -24,7 +24,7 @@ The execution site removes the sentinel and truncates to `TruncationCheck.max_li
 
 All scope values, relation filters, property values, depths, and limits are bound parameters. Integer values remain `INTEGER`, finite decimals remain `REAL`, booleans use integer `0`/`1`, and text equality uses `COLLATE NOCASE`. Non-finite floats in hand-built ASTs return `InvalidInput`.
 
-Inline property equality maps dedicated fields such as `name` or `content` to their columns and other keys to `json_extract(alias.properties, '$.key')`. `entity_type` always uses its dedicated column. For `LIKE`-family operations, literal `%`, `_`, and `\` are escaped before compiler-supplied wildcards are added.
+Inline property equality maps dedicated fields such as `name` or `content` to their columns and other keys to `json_extract(alias.properties, '$.key')`. `WHERE` predicates instead require a known column for the bound substrate; unknown names are rejected with the valid list. `entity_type` always uses its dedicated column. For `LIKE`-family operations, literal `%`, `_`, and `\` are escaped before compiler-supplied wildcards are added.
 
 Node kind labels `entity`, `note`, `event`, and `edge` select a substrate in the primary-node union; granular values such as `concept` or `task` filter the stored `kind`. No stored row is expected to have the literal granular kind `entity` (issue #849).
 
@@ -32,7 +32,7 @@ Node kind labels `entity`, `note`, `event`, and `edge` select a substrate in the
 
 Canonical edges bind through `graph_edges`, while endpoint nodes bind through a union of entities, notes, events, and graph edges. This substrate-agnostic source is necessary because relations such as `annotates` can target several substrates and epistemic relations can connect notes (issue #467).
 
-The compiler preserves edge direction, filters soft-deleted rows, applies namespace scope to every bound substrate, preserves `AND`/`OR` grouping, and validates RETURN projections against the bound variable's column whitelist.
+The compiler preserves edge direction, filters soft-deleted rows, applies namespace scope to every bound substrate, preserves `AND`/`OR` grouping, and validates WHERE predicates and RETURN projections against the bound variable's column whitelist.
 
 ## Synthetic observation edges
 
