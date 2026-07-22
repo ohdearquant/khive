@@ -4832,6 +4832,83 @@ async fn verbs_dispatch_pack_filter_fake_excludes_subhandler() {
     );
 }
 
+/// `verbs()` output must carry enough of each verb's param schema that a
+/// caller can build a request that parses without first calling it wrong.
+/// Regression: `verbs()` used to list only name/pack/description/category,
+/// so learning a verb's required params meant reading source or eating a
+/// failed call.
+#[tokio::test]
+async fn verbs_dispatch_signature_is_enough_to_construct_a_parsing_call() {
+    let pack = pack();
+    let result = pack
+        .dispatch("verbs", json!({}))
+        .await
+        .expect("verbs() must succeed");
+
+    let verbs_arr = result["verbs"].as_array().expect("verbs must be an array");
+    let search_row = verbs_arr
+        .iter()
+        .find(|v| v["verb"].as_str() == Some("search"))
+        .expect("search must appear in verbs()");
+    let signature = search_row["signature"]
+        .as_str()
+        .expect("verbs() row must carry a 'signature' field");
+    let inner = signature
+        .trim_start_matches("search(")
+        .trim_end_matches(')');
+    let param_tokens: Vec<&str> = inner.split(", ").collect();
+    assert!(
+        param_tokens.contains(&"kind") && param_tokens.contains(&"query"),
+        "search's signature must name its required params kind and query, \
+         unmarked (not optional); got: {signature:?}"
+    );
+
+    // Build a call using exactly the required param names the signature
+    // named, with real values, and confirm it parses and executes rather
+    // than failing on a missing/unknown required field.
+    let call_result = pack
+        .dispatch("search", json!({"kind": "entity", "query": "anything"}))
+        .await;
+    assert!(
+        call_result.is_ok(),
+        "a call built from the signature's required params must parse; got: {call_result:?}"
+    );
+}
+
+/// `search` omitted entirely without `kind` must return the same
+/// enumerated-valid-kinds error as an unrecognized `kind` value, and the
+/// enumeration must be sourced from the registry (a kind contributed by
+/// another loaded pack must appear), not a hardcoded list or a raw serde
+/// "missing field" message.
+#[tokio::test]
+async fn search_missing_kind_lists_registry_kinds_including_other_packs() {
+    let fixture = pack_with_memory();
+
+    let err = fixture
+        .dispatch("search", json!({"query": "anything"}))
+        .await
+        .unwrap_err();
+
+    assert!(
+        is_invalid_input(&err),
+        "missing kind must be InvalidInput; got: {err:?}"
+    );
+    let msg = invalid_input_message(&err);
+    assert!(
+        msg.contains("entity") && msg.contains("note"),
+        "error must enumerate substrate kinds: {msg}"
+    );
+    assert!(
+        msg.contains("memory"),
+        "error must list 'memory' contributed by the extra pack, proving the \
+         enumeration is registry-sourced, not hardcoded: {msg}"
+    );
+    assert!(
+        !msg.to_ascii_lowercase().contains("missing field"),
+        "error must not be a raw serde deserialization message; got: {msg}"
+    );
+}
+
 // Concurrency regression: three parallel singleton link() calls for the same
 // (source, target, relation) triple must all return the same edge ID and the
 // database must contain exactly one edge row for that triple.

@@ -16,8 +16,9 @@ use khive_storage::types::PageRequest;
 use khive_storage::EntityFilter;
 
 use super::common::{
-    canonical_entity_kind, canonical_note_kind, deser, props_match, reconcile_specific,
-    resolve_kind_spec, tags_match_any, to_json, validate_entity_type, KindSpec, SearchParams,
+    canonical_entity_kind, canonical_note_kind, deser, missing_kind_error, props_match,
+    reconcile_specific, resolve_kind_spec, tags_match_any, to_json, validate_entity_type, KindSpec,
+    SearchParams,
 };
 use crate::KgPack;
 
@@ -31,7 +32,11 @@ impl KgPack {
         let search_start = Instant::now();
         let p: SearchParams = deser(params)?;
         let limit = p.limit.unwrap_or(10).min(100);
-        let spec = resolve_kind_spec(&p.kind, registry)?;
+        let kind_raw = p
+            .kind
+            .as_deref()
+            .ok_or_else(|| missing_kind_error("kind", registry))?;
+        let spec = resolve_kind_spec(kind_raw, registry)?;
         match spec {
             KindSpec::Entity { specific } => {
                 let kind_filter = reconcile_specific(
