@@ -8,8 +8,10 @@ Run: python3 -m unittest scripts.perf.test_flagship_coverage -v
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import hashlib
+import io
 import json
 import pathlib
 import re
@@ -262,6 +264,42 @@ class ManifestTests(unittest.TestCase):
             path = self._write_manifest(pathlib.Path(tmp), [_base_scenario(surface="local_dispatch")])
             _, errors = coverage_validator.load_manifest(path)
             self.assertTrue(any("invalid surface" in e for e in errors), errors)
+
+    def test_non_string_surface_and_operation_are_flagged(self):
+        for field, bad_value, value_type in (
+            ("surface", ["mcp_daemon"], "list"),
+            ("surface", {"name": "mcp_daemon"}, "dict"),
+            ("operation", ["list"], "list"),
+            ("operation", {"name": "list"}, "dict"),
+        ):
+            with self.subTest(field=field, value_type=value_type), tempfile.TemporaryDirectory() as tmp:
+                scenario = _base_scenario(scenario_id="f2.list.warm.real", feature="F2", operation="list")
+                scenario[field] = bad_value
+                path = self._write_manifest(pathlib.Path(tmp), [scenario])
+                _, errors = coverage_validator.load_manifest(path)
+                self.assertEqual(len(errors), 1, errors)
+                self.assertTrue(
+                    any(field in error and value_type in error for error in errors),
+                    errors,
+                )
+
+    def test_strict_reports_non_string_surface_and_operation(self):
+        for field, bad_value, value_type in (
+            ("surface", ["mcp_daemon"], "list"),
+            ("surface", {"name": "mcp_daemon"}, "dict"),
+            ("operation", ["list"], "list"),
+            ("operation", {"name": "list"}, "dict"),
+        ):
+            with self.subTest(field=field, value_type=value_type), tempfile.TemporaryDirectory() as tmp:
+                scenario = _base_scenario(scenario_id="f2.list.warm.real", feature="F2", operation="list")
+                scenario[field] = bad_value
+                path = self._write_manifest(pathlib.Path(tmp), [scenario])
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    exit_code = coverage_validator.main(["--manifest", str(path), "--strict"])
+                self.assertEqual(exit_code, 1)
+                self.assertIn(field, stderr.getvalue())
+                self.assertIn(value_type, stderr.getvalue())
 
     def test_unknown_mcp_operation_is_flagged(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -220,16 +220,23 @@ def load_manifest(path: pathlib.Path) -> tuple[dict, list[str]]:
                 f"{label}: invalid feature {sc['feature']!r} (expected one of {flagship_schema.MANIFEST_FEATURES})"
             )
 
-        if sc["surface"] not in flagship_schema.SURFACES:
-            errors.append(f"{label}: invalid surface {sc['surface']!r} (expected one of {flagship_schema.SURFACES})")
+        surface = sc["surface"]
+        operation = sc["operation"]
+        if not isinstance(surface, str):
+            errors.append(f"{label}: surface must be a string, got {type(surface).__name__}: {surface!r}")
+        elif surface not in flagship_schema.SURFACES:
+            errors.append(f"{label}: invalid surface {surface!r} (expected one of {flagship_schema.SURFACES})")
 
-        available_operations = AVAILABLE_OPERATIONS_BY_SURFACE.get(sc["surface"])
-        if available_operations is not None and sc["operation"] not in available_operations:
-            available = ", ".join(sorted(available_operations)) or "none"
-            errors.append(
-                f"{label}: operation is not available on {sc['surface']}: {sc['operation']!r} "
-                f"(available: {available})"
-            )
+        if not isinstance(operation, str):
+            errors.append(f"{label}: operation must be a string, got {type(operation).__name__}: {operation!r}")
+        elif isinstance(surface, str):
+            available_operations = AVAILABLE_OPERATIONS_BY_SURFACE.get(surface)
+            if available_operations is not None and operation not in available_operations:
+                available = ", ".join(sorted(available_operations)) or "none"
+                errors.append(
+                    f"{label}: operation is not available on {surface}: {operation!r} "
+                    f"(available: {available})"
+                )
 
         if sc["embedder"] not in flagship_schema.EMBEDDERS:
             errors.append(f"{label}: invalid embedder {sc['embedder']!r} (expected one of {flagship_schema.EMBEDDERS})")
