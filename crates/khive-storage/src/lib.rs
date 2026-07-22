@@ -13,6 +13,7 @@ pub mod telemetry;
 pub mod text;
 pub mod tx_registry;
 pub mod types;
+pub mod usage;
 pub mod vectors;
 
 pub use blob::{BlobOrphanSweepConfig, BlobOrphanSweepResult, BlobStore, ContentRef};

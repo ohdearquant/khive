@@ -30,6 +30,7 @@ pub mod resource;
 pub mod retrieval;
 pub mod runtime;
 pub mod secret_gate;
+pub use khive_storage::usage;
 pub mod validation;
 
 pub use actor_identity::{actor_is_unattributed, resolve_actor, should_warn_unattributed_actor};

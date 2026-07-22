@@ -2652,6 +2652,65 @@ async fn traverse_chunks_root_binds_over_host_param_limit() {
     }
 }
 
+/// ADR-103 Amendment 2 regression: `DbRoundTrips` must count one increment
+/// per executed chunk query, not one flat increment per `traverse` call.
+/// Pre-fix, the single `.inspect` after the `with_reader` closure counted a
+/// flat `1` regardless of how many `CHUNK_ROOTS`-sized (400) SQL executions
+/// actually ran — a 1 000-root call executes 3 chunk queries (400 + 400 +
+/// 200) but reported only 1 round trip.
+#[tokio::test]
+async fn traverse_over_chunk_limit_counts_one_db_round_trip_per_chunk() {
+    let store = setup_memory_store();
+
+    const N: usize = 1_000;
+    const CHUNK_ROOTS: usize = 400;
+    let expected_chunks = N.div_ceil(CHUNK_ROOTS) as u64;
+
+    let mut roots: Vec<Uuid> = Vec::with_capacity(N);
+    for _ in 0..N {
+        let root = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        store
+            .upsert_edge(make_edge(root, child, EdgeRelation::Extends, 1.0))
+            .await
+            .unwrap();
+        roots.push(root);
+    }
+
+    let ctx = khive_storage::usage::UsageContext::new();
+    let paths = khive_storage::usage::scope(ctx.clone(), async {
+        store
+            .traverse(TraversalRequest {
+                roots: roots.clone(),
+                options: TraversalOptions {
+                    max_depth: 1,
+                    direction: Direction::Out,
+                    relations: None,
+                    min_weight: None,
+                    limit: None,
+                },
+                include_roots: false,
+                include_properties: false,
+            })
+            .await
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        paths.len(),
+        N,
+        "traverse over {N} roots must return one GraphPath per root"
+    );
+
+    let snap = ctx.snapshot();
+    assert_eq!(
+        snap["db_round_trips"], expected_chunks,
+        "a {N}-root traverse split into {expected_chunks} chunk queries must count \
+         {expected_chunks} db_round_trips, not a flat 1; got {snap:?}"
+    );
+}
+
 /// STORAGE-AUD-003 / #485: PageRequest.offset > i64::MAX must return
 /// InvalidInput instead of silently narrowing to a negative i64 offset.
 #[tokio::test]
@@ -3226,6 +3285,221 @@ async fn upsert_edge_guarded_probe_is_atomic_with_insert_on_file_backed_singleto
     assert!(
         store.get_edge(edge_id).await.unwrap().is_none(),
         "no dangling edge may be persisted"
+    );
+}
+
+/// A store whose schema was never created, so statement preparation fails
+/// before any query reaches the database. Used to pin the negative case: a
+/// read that never got as far as executing must count no round trip.
+fn setup_memory_store_without_schema() -> SqlGraphStore {
+    let config = PoolConfig {
+        path: None,
+        ..PoolConfig::default()
+    };
+    let pool = Arc::new(ConnectionPool::new(config).unwrap());
+    SqlGraphStore::new_scoped(pool, false, "default")
+}
+
+/// A store holding `good` valid edges out of `node`, plus one row whose
+/// `relation` column is not a member of the closed relation enum.
+///
+/// Written through raw SQL because the typed write path cannot express it —
+/// which is the point: the row models a database that has drifted from the
+/// binary reading it, the one shape where a query prepares, executes, and
+/// returns rows, and then fails partway through converting them. Weights
+/// order the valid rows ahead of the corrupt one, so the number of entries
+/// storage returns before the failure is fixed rather than incidental.
+fn setup_store_with_a_corrupt_relation_row(node: Uuid, good: usize) -> SqlGraphStore {
+    let config = PoolConfig {
+        path: None,
+        ..PoolConfig::default()
+    };
+    let pool = Arc::new(ConnectionPool::new(config).unwrap());
+    {
+        let writer = pool.writer().unwrap();
+        writer.conn().execute_batch(GRAPH_DDL).unwrap();
+        let now = Utc::now().timestamp_micros();
+        for i in 0..good {
+            writer
+                .conn()
+                .execute(
+                    "INSERT INTO graph_edges \
+                     (namespace, id, source_id, target_id, relation, weight, created_at, updated_at) \
+                     VALUES ('default', ?1, ?2, ?3, 'extends', ?4, ?5, ?5)",
+                    rusqlite::params![
+                        Uuid::new_v4().to_string(),
+                        node.to_string(),
+                        Uuid::new_v4().to_string(),
+                        1.0 - (i as f64) * 0.01,
+                        now,
+                    ],
+                )
+                .unwrap();
+        }
+        writer
+            .conn()
+            .execute(
+                "INSERT INTO graph_edges \
+                 (namespace, id, source_id, target_id, relation, weight, created_at, updated_at) \
+                 VALUES ('default', ?1, ?2, ?3, 'not_a_relation', 0.1, ?4, ?4)",
+                rusqlite::params![
+                    Uuid::new_v4().to_string(),
+                    node.to_string(),
+                    Uuid::new_v4().to_string(),
+                    now,
+                ],
+            )
+            .unwrap();
+    }
+    SqlGraphStore::new_scoped(pool, false, "default")
+}
+
+fn neighbor_query(limit: u32) -> NeighborQuery {
+    NeighborQuery {
+        direction: Direction::Out,
+        relations: None,
+        limit: Some(limit),
+        min_weight: None,
+    }
+}
+
+/// `db_round_trips` counts round trips ISSUED. A read that executed and then
+/// failed did real database work, and reporting zero for it is the failure
+/// mode a consumer of these numbers cannot afford.
+///
+/// `graph_hops` counts adjacency entries storage RETURNED, which is a
+/// statement about the database rather than about our types: all three rows
+/// here came back off the cursor, and the third then failed to convert into
+/// an `EdgeRelation`. So the expected count is `good + 1`, matching where the
+/// traversal path increments — immediately after the row is read, before any
+/// parsing. Counting after conversion would attribute our own decoding failure
+/// to storage having done less work than it did.
+#[tokio::test]
+async fn neighbors_counts_the_query_and_the_rows_returned_before_the_failure() {
+    let node = Uuid::new_v4();
+    let store = setup_store_with_a_corrupt_relation_row(node, 2);
+    let ctx = khive_storage::usage::UsageContext::new();
+
+    let result = khive_storage::usage::scope(ctx.clone(), async {
+        store.neighbors(node, neighbor_query(10)).await
+    })
+    .await;
+
+    assert!(
+        result.is_err(),
+        "the corrupt relation row must fail conversion, or this test proves nothing"
+    );
+
+    let usage = ctx.snapshot();
+    assert_eq!(
+        usage
+            .get("db_round_trips")
+            .and_then(serde_json::Value::as_u64),
+        Some(1),
+        "the query executed and must be counted despite the error; got {usage}"
+    );
+    assert_eq!(
+        usage.get("graph_hops").and_then(serde_json::Value::as_u64),
+        Some(3),
+        "all three rows came back off the cursor before the conversion failed; got {usage}"
+    );
+}
+
+/// The other direction, and the one an unconditional post-await increment gets
+/// wrong: a read whose statement never prepared issued nothing, so it must
+/// count nothing. Counting it would inflate the number with work that did not
+/// happen, which is the same class of error as dropping work that did.
+#[tokio::test]
+async fn neighbors_counts_nothing_when_the_statement_never_prepared() {
+    let store = setup_memory_store_without_schema();
+    let ctx = khive_storage::usage::UsageContext::new();
+
+    let result = khive_storage::usage::scope(ctx.clone(), async {
+        store.neighbors(Uuid::new_v4(), neighbor_query(10)).await
+    })
+    .await;
+
+    assert!(
+        result.is_err(),
+        "a store with no schema must fail to prepare, or this test proves nothing"
+    );
+
+    let usage = ctx.snapshot();
+    assert!(
+        usage.get("db_round_trips").is_none(),
+        "no statement executed, so no round trip may be counted; got {usage}"
+    );
+    assert!(
+        usage.get("graph_hops").is_none(),
+        "no rows were returned; got {usage}"
+    );
+}
+
+/// Both directions again on the batched path, where a chunked read makes the
+/// stakes higher: the counters live across the whole chunk loop, so a failure
+/// in a later chunk must not erase what earlier chunks already did.
+#[tokio::test]
+async fn batch_neighbors_counts_the_query_and_the_rows_returned_before_the_failure() {
+    let node = Uuid::new_v4();
+    let store = setup_store_with_a_corrupt_relation_row(node, 2);
+    let ctx = khive_storage::usage::UsageContext::new();
+
+    let sources = vec![node];
+    let result = khive_storage::usage::scope(ctx.clone(), async {
+        store.batch_neighbors(&sources, neighbor_query(10)).await
+    })
+    .await;
+
+    assert!(
+        result.is_err(),
+        "the corrupt relation row must fail conversion, or this test proves nothing"
+    );
+
+    let usage = ctx.snapshot();
+    assert_eq!(
+        usage
+            .get("db_round_trips")
+            .and_then(serde_json::Value::as_u64),
+        Some(1),
+        "the batched query executed and must be counted despite the error; got {usage}"
+    );
+    assert_eq!(
+        usage.get("graph_hops").and_then(serde_json::Value::as_u64),
+        Some(3),
+        "all three rows came back off the cursor before the conversion failed; got {usage}"
+    );
+}
+
+/// Same rule as the `neighbors` twin, on the traversal path: a chunk whose
+/// statement never prepared issued nothing to the store, so it must count
+/// nothing — the increment sits after `prepare` succeeds, exactly where the
+/// neighbors and batch paths put theirs.
+#[tokio::test]
+async fn traverse_counts_nothing_when_the_statement_never_prepared() {
+    let store = setup_memory_store_without_schema();
+    let ctx = khive_storage::usage::UsageContext::new();
+
+    let result = khive_storage::usage::scope(ctx.clone(), async {
+        store
+            .traverse(TraversalRequest {
+                roots: vec![Uuid::new_v4()],
+                options: TraversalOptions::new(2).with_direction(Direction::Out),
+                include_roots: false,
+                include_properties: false,
+            })
+            .await
+    })
+    .await;
+
+    assert!(
+        result.is_err(),
+        "a store with no schema must fail the traversal, or this test proves nothing"
+    );
+
+    let usage = ctx.snapshot();
+    assert!(
+        usage.get("db_round_trips").is_none(),
+        "the chunk statement never prepared, so no round trip may be counted; got {usage}"
     );
 }
 

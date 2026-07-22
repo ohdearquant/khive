@@ -301,6 +301,136 @@ async fn create_then_list_across_separate_request_calls() -> anyhow::Result<()> 
     Ok(())
 }
 
+// ── ADR-103 Amendment 2: per-op `usage` object ──────────────────────────────
+
+#[tokio::test]
+async fn every_parallel_entry_carries_a_usage_object() -> anyhow::Result<()> {
+    let client = connect().await?;
+    let response = call(
+        &client,
+        "request",
+        json!({
+            "ops": r#"[create(kind="entity", entity_kind="concept", name="usage-a"), create(kind="badkind", name="usage-b")]"#
+        }),
+    )
+    .await?;
+    let body: Value = serde_json::from_str(&first_text(&response))?;
+    let results = body["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 2);
+    for entry in results {
+        assert!(
+            entry["usage"].is_object(),
+            "every entry (ok and failed alike) carries a usage object: {entry}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn traverse_usage_counts_graph_work_per_op() -> anyhow::Result<()> {
+    let client = connect().await?;
+    let root = ok_one(
+        &client,
+        r#"create(kind="entity", entity_kind="concept", name="usage-traverse-root")"#,
+    )
+    .await?;
+    let leaf = ok_one(
+        &client,
+        r#"create(kind="entity", entity_kind="concept", name="usage-traverse-leaf")"#,
+    )
+    .await?;
+    let root_id = root["id"].as_str().expect("root id");
+    let leaf_id = leaf["id"].as_str().expect("leaf id");
+    ok_one(
+        &client,
+        &format!(r#"link(source_id="{root_id}", target_id="{leaf_id}", relation="extends")"#),
+    )
+    .await?;
+
+    let response = call(
+        &client,
+        "request",
+        json!({
+            "ops": format!(r#"traverse(roots=["{root_id}"], max_depth=1)"#),
+            "presentation": "verbose"
+        }),
+    )
+    .await?;
+    let body: Value = serde_json::from_str(&first_text(&response))?;
+    let entry = &body["results"][0];
+    assert_eq!(entry["ok"], json!(true), "traverse failed: {entry}");
+    let usage = entry["usage"].as_object().expect("usage object");
+    assert!(
+        usage
+            .get("db_round_trips")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            >= 1,
+        "traverse issues at least one batched storage round-trip: {usage:?}"
+    );
+    assert!(
+        usage.get("graph_hops").and_then(Value::as_u64).unwrap_or(0) >= 1,
+        "traverse returns at least one adjacency entry: {usage:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn propose_usage_counts_request_owned_event_rows() -> anyhow::Result<()> {
+    let client = connect().await?;
+    let response = call(
+        &client,
+        "request",
+        json!({
+            "ops": r#"propose(title="usage event-rows probe", description="request-owned event append must count", changeset={"kind": "add_entity", "entity": {"kind": "concept", "name": "UsageEventRowsEntity"}})"#,
+            "presentation": "verbose"
+        }),
+    )
+    .await?;
+    let body: Value = serde_json::from_str(&first_text(&response))?;
+    let entry = &body["results"][0];
+    assert_eq!(entry["ok"], json!(true), "propose failed: {entry}");
+    let usage = entry["usage"].as_object().expect("usage object");
+    assert!(
+        usage.get("event_rows").and_then(Value::as_u64).unwrap_or(0) >= 1,
+        "propose appends a request-owned lifecycle event row that must count: {usage:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn chain_entries_each_carry_their_own_usage() -> anyhow::Result<()> {
+    let client = connect().await?;
+    let target = ok_one(
+        &client,
+        r#"create(kind="entity", entity_kind="concept", name="usage-chain-target")"#,
+    )
+    .await?;
+    let target_id = target["id"].as_str().expect("target id");
+    let response = call(
+        &client,
+        "request",
+        json!({
+            "ops": format!(
+                r#"create(kind="entity", entity_kind="concept", name="usage-chain-source") | link(source_id=$prev.id, target_id="{target_id}", relation="extends")"#
+            ),
+            "presentation": "verbose"
+        }),
+    )
+    .await?;
+    let body: Value = serde_json::from_str(&first_text(&response))?;
+    let results = body["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 2);
+    for entry in results {
+        assert_eq!(entry["ok"], json!(true), "chain op failed: {entry}");
+        assert!(
+            entry["usage"].is_object(),
+            "each chain entry carries its own usage object: {entry}"
+        );
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn invalid_kind_failure_does_not_abort_batch() -> anyhow::Result<()> {
     let client = connect().await?;
