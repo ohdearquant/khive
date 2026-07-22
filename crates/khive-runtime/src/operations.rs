@@ -93,12 +93,15 @@ static VECTOR_FAIL_NS: std::sync::LazyLock<std::sync::Mutex<std::collections::Ha
 /// FTS failure injection for `create_many` — separate from `FTS_FAIL_NS` so that
 /// create_note_inner and create_many tests cannot disarm each other.
 #[cfg(any(test, feature = "fault-injection"))]
-static FTS_FAIL_MANY_NS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static FTS_FAIL_MANY_NS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 /// FTS partial-failure injection for `create_many` — returns `Ok(BatchWriteSummary)`
 /// with `failed > 0` so that the `summary.failed > 0` rollback branch is exercised.
 /// Distinct from `FTS_FAIL_MANY_NS` which injects a hard `Err`.
 #[cfg(any(test, feature = "fault-injection"))]
-static FTS_FAIL_MANY_PARTIAL_NS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static FTS_FAIL_MANY_PARTIAL_NS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 /// Non-parser FTS *search*-leg failure injection for `search_notes`: distinct
 /// from `FTS_FAIL_NS` (which injects at the FTS *upsert*/write step of
 /// `create_note_inner`). Injects a `StorageError::Timeout` at the `search()`
@@ -127,11 +130,12 @@ pub fn arm_fts_fail(ns: &str) {
 ///
 /// The next `create_many` call whose namespace equals `ns` returns an injected
 /// error at the FTS upsert step (after entity rows are committed), then disarms.
-/// Calls on other namespaces are unaffected.
+/// Calls on other namespaces are unaffected, and concurrent arms of distinct
+/// namespaces do not overwrite each other.
 /// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
 #[cfg(any(test, feature = "fault-injection"))]
 pub fn arm_fts_fail_many(ns: &str) {
-    *FTS_FAIL_MANY_NS.lock().unwrap() = Some(ns.to_string());
+    FTS_FAIL_MANY_NS.lock().unwrap().insert(ns.to_string());
 }
 
 /// Arm the FTS *partial*-failure injection for `create_many` targeting namespace `ns`.
@@ -139,11 +143,15 @@ pub fn arm_fts_fail_many(ns: &str) {
 /// The next `create_many` call whose namespace equals `ns` returns
 /// `Ok(BatchWriteSummary { attempted: 2, affected: 1, failed: 1, ... })` from the
 /// FTS upsert step, exercising the `summary.failed > 0` rollback branch (as opposed
-/// to the hard-`Err` branch exercised by `arm_fts_fail_many`).  Then disarms.
+/// to the hard-`Err` branch exercised by `arm_fts_fail_many`). Then disarms only
+/// that namespace's entry.
 /// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
 #[cfg(any(test, feature = "fault-injection"))]
 pub fn arm_fts_fail_many_partial(ns: &str) {
-    *FTS_FAIL_MANY_PARTIAL_NS.lock().unwrap() = Some(ns.to_string());
+    FTS_FAIL_MANY_PARTIAL_NS
+        .lock()
+        .unwrap()
+        .insert(ns.to_string());
 }
 
 /// Arm a non-parser FTS *search*-leg failure injection for `search_notes` targeting
@@ -5271,30 +5279,14 @@ impl KhiveRuntime {
         let docs: Vec<_> = entities.iter().map(entity_fts_document).collect();
 
         #[cfg(any(test, feature = "fault-injection"))]
-        let fts_many_inject = {
-            let mut g = FTS_FAIL_MANY_NS.lock().unwrap();
-            if g.as_deref() == Some(ns) {
-                *g = None;
-                true
-            } else {
-                false
-            }
-        };
+        let fts_many_inject = FTS_FAIL_MANY_NS.lock().unwrap().remove(ns);
         #[cfg(not(any(test, feature = "fault-injection")))]
         let fts_many_inject = false;
 
         // Partial-failure seam: returns Ok(summary) with failed > 0 so the
         // `summary.failed > 0` rollback branch is exercised in tests.
         #[cfg(any(test, feature = "fault-injection"))]
-        let fts_many_inject_partial = {
-            let mut g = FTS_FAIL_MANY_PARTIAL_NS.lock().unwrap();
-            if g.as_deref() == Some(ns) {
-                *g = None;
-                true
-            } else {
-                false
-            }
-        };
+        let fts_many_inject_partial = FTS_FAIL_MANY_PARTIAL_NS.lock().unwrap().remove(ns);
         #[cfg(not(any(test, feature = "fault-injection")))]
         let fts_many_inject_partial = false;
 
@@ -10898,8 +10890,7 @@ mod tests {
     // error; the test asserts zero rows in both `entities` and `fts_entities`.
     #[tokio::test]
     async fn create_many_fts_failure_rolls_back_both_substrates() {
-        // Use a unique namespace so the process-global one-shot is unaffected by
-        // other concurrent tests.
+        // Use a unique namespace so only this test consumes its failure entry.
         let ns = format!("fts-fail-many-{}", uuid::Uuid::new_v4().as_simple());
         let rt = rt();
         let tok = NamespaceToken::for_namespace(Namespace::parse(&ns).unwrap());
@@ -10952,6 +10943,54 @@ mod tests {
         assert_eq!(
             fts_count, 0,
             "fts_entities must be empty after FTS-failure rollback; found {fts_count}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_many_fts_failure_injections_for_distinct_namespaces_do_not_overwrite_each_other(
+    ) {
+        let rt_a = rt();
+        let ns_a = Namespace::parse("fts-fail-many-distinct-a").unwrap();
+        let tok_a = NamespaceToken::for_namespace(ns_a.clone());
+        let rt_b = rt();
+        let ns_b = Namespace::parse("fts-fail-many-distinct-b").unwrap();
+        let tok_b = NamespaceToken::for_namespace(ns_b.clone());
+
+        arm_fts_fail_many(ns_a.as_str());
+        arm_fts_fail_many(ns_b.as_str());
+
+        let (result_a, result_b) = tokio::join!(
+            rt_a.create_many(
+                &tok_a,
+                vec![EntityCreateSpec {
+                    kind: "concept".into(),
+                    entity_type: None,
+                    name: "FtsFailureTargetA".into(),
+                    description: None,
+                    properties: None,
+                    tags: vec![],
+                }],
+            ),
+            rt_b.create_many(
+                &tok_b,
+                vec![EntityCreateSpec {
+                    kind: "concept".into(),
+                    entity_type: None,
+                    name: "FtsFailureTargetB".into(),
+                    description: None,
+                    properties: None,
+                    tags: vec![],
+                }],
+            ),
+        );
+
+        assert!(
+            result_a.is_err(),
+            "namespace A must retain its pending create_many FTS failure injection"
+        );
+        assert!(
+            result_b.is_err(),
+            "namespace B must retain its pending create_many FTS failure injection"
         );
     }
 
@@ -11017,6 +11056,54 @@ mod tests {
         assert_eq!(
             fts_count, 0,
             "fts_entities must be empty after partial-FTS-failure rollback; found {fts_count}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_many_fts_partial_failure_injections_for_distinct_namespaces_do_not_overwrite_each_other(
+    ) {
+        let rt_a = rt();
+        let ns_a = Namespace::parse("fts-fail-many-partial-distinct-a").unwrap();
+        let tok_a = NamespaceToken::for_namespace(ns_a.clone());
+        let rt_b = rt();
+        let ns_b = Namespace::parse("fts-fail-many-partial-distinct-b").unwrap();
+        let tok_b = NamespaceToken::for_namespace(ns_b.clone());
+
+        arm_fts_fail_many_partial(ns_a.as_str());
+        arm_fts_fail_many_partial(ns_b.as_str());
+
+        let (result_a, result_b) = tokio::join!(
+            rt_a.create_many(
+                &tok_a,
+                vec![EntityCreateSpec {
+                    kind: "concept".into(),
+                    entity_type: None,
+                    name: "FtsPartialFailureTargetA".into(),
+                    description: None,
+                    properties: None,
+                    tags: vec![],
+                }],
+            ),
+            rt_b.create_many(
+                &tok_b,
+                vec![EntityCreateSpec {
+                    kind: "concept".into(),
+                    entity_type: None,
+                    name: "FtsPartialFailureTargetB".into(),
+                    description: None,
+                    properties: None,
+                    tags: vec![],
+                }],
+            ),
+        );
+
+        assert!(
+            result_a.is_err(),
+            "namespace A must retain its pending create_many partial FTS failure injection"
+        );
+        assert!(
+            result_b.is_err(),
+            "namespace B must retain its pending create_many partial FTS failure injection"
         );
     }
 
