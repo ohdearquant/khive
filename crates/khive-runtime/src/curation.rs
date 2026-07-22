@@ -437,6 +437,34 @@ impl KhiveRuntime {
         dry_run: bool,
         reason: Option<String>,
     ) -> RuntimeResult<MergeSummary> {
+        self.merge_entity_with_reason_and_force(
+            token,
+            into_id,
+            from_id,
+            strategy,
+            content_strategy,
+            dry_run,
+            reason,
+            false,
+        )
+        .await
+    }
+
+    /// Merge two entities with an explicit override for the entity-kind guard.
+    // REASON: these arguments mirror the merge verb's policy, content strategy,
+    // dry-run, audit-reason, and force fields; a builder would only move that surface.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn merge_entity_with_reason_and_force(
+        &self,
+        token: &NamespaceToken,
+        into_id: Uuid,
+        from_id: Uuid,
+        strategy: EntityDedupMergePolicy,
+        content_strategy: ContentMergeStrategy,
+        dry_run: bool,
+        reason: Option<String>,
+        force: bool,
+    ) -> RuntimeResult<MergeSummary> {
         if let Some(reason) = reason.as_deref() {
             crate::secret_gate::check(reason)?;
         }
@@ -447,7 +475,7 @@ impl KhiveRuntime {
         }
         // Enforce the same-kind constraint here too: any direct runtime caller
         // (CLI, tests, future SDK) would bypass the handler-level guard otherwise.
-        {
+        if !force {
             let into_entity = self.get_entity(token, into_id).await?;
             let from_entity = self.get_entity(token, from_id).await?;
             if into_entity.kind != from_entity.kind {

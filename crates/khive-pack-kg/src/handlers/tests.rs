@@ -1468,6 +1468,7 @@ async fn merge_entity_reason_forwarded_through_registry_dispatch() {
                 "into_id": into.id.to_string(),
                 "from_id": from.id.to_string(),
                 "reason": "duplicate via dispatch",
+                "force": true,
             }),
         )
         .await
@@ -1595,6 +1596,7 @@ async fn get_dispatch_after_merge_discloses_kept_id() {
                 "kind": "entity",
                 "into_id": into.id.to_string(),
                 "from_id": from.id.to_string(),
+                "force": true,
             }),
         )
         .await
@@ -1728,6 +1730,7 @@ async fn resolve_dispatch_on_merged_uuid_stays_bare_not_found() {
                 "kind": "entity",
                 "into_id": into.id.to_string(),
                 "from_id": from.id.to_string(),
+                "force": true,
             }),
         )
         .await
