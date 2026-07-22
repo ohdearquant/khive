@@ -902,9 +902,6 @@ fn merge_traversal_paths_by_root(paths: Vec<GraphPath>, limit: Option<u32>) -> V
                 }
             }
         }
-        if path.total_weight > existing.total_weight {
-            existing.total_weight = path.total_weight;
-        }
     }
 
     order
@@ -928,9 +925,22 @@ fn merge_traversal_paths_by_root(paths: Vec<GraphPath>, limit: Option<u32>) -> V
                     }
                 });
             }
+            recompute_total_weight(&mut path);
             path
         })
         .collect()
+}
+
+/// Set `total_weight` to the maximum cumulative path weight among the nodes
+/// the path currently holds, matching how storage derives it for a
+/// single-namespace traversal.
+///
+/// Call this after any edit to `nodes`. Carrying a weight across an edit is
+/// what lets the field describe a node the caller was never shown: the
+/// highest-weighted candidate is exactly the one a `limit` or a
+/// soft-delete screen can remove while the summary keeps quoting it.
+fn recompute_total_weight(path: &mut GraphPath) {
+    path.total_weight = path.nodes.iter().map(|n| n.weight).fold(0.0_f64, f64::max);
 }
 
 impl KhiveRuntime {
@@ -2401,6 +2411,7 @@ impl KhiveRuntime {
         if !deleted.is_empty() {
             for path in paths.iter_mut() {
                 path.nodes.retain(|n| !deleted.contains(&n.node_id));
+                recompute_total_weight(path);
             }
             paths.retain(|p| !p.nodes.is_empty());
         }
@@ -12312,6 +12323,7 @@ mod tests {
             name: None,
             kind: None,
             properties: None,
+            weight: 0.0,
         }
     }
 
@@ -12367,6 +12379,7 @@ mod tests {
                     name: None,
                     kind: None,
                     properties: None,
+                    weight: 0.0,
                 },
             ],
             total_weight: 1.0,
@@ -12381,6 +12394,7 @@ mod tests {
                 name: None,
                 kind: None,
                 properties: None,
+                weight: 0.0,
             }],
             total_weight: 1.0,
         };
@@ -12409,6 +12423,45 @@ mod tests {
             shared_node.via_edge,
             Some(shallow_edge),
             "shared node must carry the via_edge that produced the shortest path"
+        );
+    }
+
+    /// merge_traversal_paths_by_root: `total_weight` must describe the nodes
+    /// the caller is actually handed. The heaviest node here sits deepest, so
+    /// re-applying `limit` to the merged union drops it — and the reported
+    /// weight has to drop with it rather than keep quoting a node that was
+    /// screened out.
+    #[test]
+    fn merge_traversal_paths_total_weight_drops_with_the_node_it_described() {
+        let root = Uuid::new_v4();
+        let weighted = |depth: usize, weight: f64| PathNode {
+            node_id: Uuid::new_v4(),
+            via_edge: None,
+            depth,
+            name: None,
+            kind: None,
+            properties: None,
+            weight,
+        };
+
+        let path = GraphPath {
+            root_id: root,
+            nodes: vec![weighted(1, 0.5), weighted(1, 0.4), weighted(2, 9.0)],
+            total_weight: 9.0,
+        };
+
+        let merged = merge_traversal_paths_by_root(vec![path], Some(2));
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            merged[0].nodes.len(),
+            2,
+            "limit=2 must drop the depth-2 node"
+        );
+        assert_eq!(
+            merged[0].total_weight, 0.5,
+            "total_weight must be the max over surviving nodes, not the 9.0 \
+             carried by the node the limit removed"
         );
     }
 
