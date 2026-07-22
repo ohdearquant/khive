@@ -304,6 +304,103 @@ fn socket_identity(path: &std::path::Path) -> Option<SocketIdentity> {
     })
 }
 
+// ── connection principal ──────────────────────────────────────────────────────
+
+/// The uid on the other end of an accepted connection, read from the kernel.
+///
+/// This is the only identity on this socket the caller cannot choose. Every
+/// identity field on the request frame — `namespace`, `actor_id`,
+/// `visible_namespaces`, `config_id` — is supplied by the connecting process,
+/// so none of them can answer "who is this". A check reading self-asserted
+/// fields is not a weak gate, it is not a gate: anyone who wants to pass it
+/// asserts the passing values.
+///
+/// `getpeereid(2)` on macOS/BSD, `SO_PEERCRED` on Linux. Both report the peer's
+/// credentials as recorded by the kernel at connect time.
+#[cfg(unix)]
+fn peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
+    use std::os::fd::AsRawFd;
+    let fd = stream.as_raw_fd();
+
+    #[cfg(any(target_os = "macos", target_os = "ios", target_vendor = "apple"))]
+    {
+        let mut uid: libc::uid_t = 0;
+        let mut gid: libc::gid_t = 0;
+        // SAFETY: `fd` is a live connected socket owned by `stream` for the
+        // duration of this call; both out-params are valid initialized locals.
+        let rc = unsafe { libc::getpeereid(fd, &mut uid, &mut gid) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(uid as u32)
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let mut cred = libc::ucred {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+        };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: `fd` is a live connected socket owned by `stream`; `cred` is
+        // an initialized local of exactly `len` bytes, which is what
+        // SO_PEERCRED writes.
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&mut cred as *mut libc::ucred).cast::<libc::c_void>(),
+                &mut len,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(cred.uid as u32)
+    }
+
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_vendor = "apple"
+    )))]
+    {
+        let _ = fd;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "peer-credential capture is not implemented for this platform",
+        ))
+    }
+}
+
+/// Whether a connection from `uid` may be served by this daemon.
+///
+/// ADR-096 accepted per-request identity threading **for the single-principal
+/// owner-only socket only**, and rested that on three things: the `0600`
+/// socket, all connections being the same uid, and the database being already
+/// same-uid-accessible. The socket mode is asserted at bind. This asserts the
+/// second, which previously had no representation in the code at all — nothing
+/// read peer identity, so nothing could notice when it stopped being true.
+///
+/// **Principal is not attribution.** Many `actor_id`s over one socket is
+/// exactly what ADR-096 shipped and what every seat on a normal host does;
+/// refusing a second distinct actor would break the accepted design. The
+/// principal is the uid, and this refuses only a genuinely foreign one.
+///
+/// **There is deliberately no configuration escape hatch.** A flag permitting
+/// other uids would not weaken this assertion, it would delete it, in the way
+/// hardest to notice later: the check still exists, its tests still pass, and
+/// the deployment that matters has it off. A deployment that genuinely needs
+/// multiple uids needs a code change and a gated ADR — which is precisely the
+/// decision that should be impossible to make by accident.
+#[cfg(unix)]
+fn uid_is_permitted(peer: u32, daemon_euid: u32) -> bool {
+    peer == daemon_euid
+}
+
 // ── wire types ────────────────────────────────────────────────────────────────
 
 /// Request frame sent from a client to the daemon.
@@ -1026,9 +1123,18 @@ pub async fn run_daemon_with_boot_guard<D: DaemonDispatch>(
 
     if let Some(parent) = sock.parent() {
         std::fs::create_dir_all(parent)?;
-        if let Err(e) = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)) {
-            tracing::warn!(error = %e, path = ?parent, "failed to chmod 0700 khive dir");
-        }
+        // Fail closed. ADR-096 condition 2 rests the single-principal safety on
+        // the owner-only socket and its owner-only directory; a daemon that
+        // cannot prove that mode must not serve. Warn-and-continue here would
+        // leave the process running on whatever mode the umask happened to
+        // give, with the warning the only trace.
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
+            anyhow::anyhow!(
+                "refusing to start: cannot chmod 0700 {}: {e}. The khive directory must be \
+                 owner-only — it is half of the single-principal guarantee this daemon enforces.",
+                parent.display()
+            )
+        })?;
     }
 
     // Hold the startup lock across cleanup → bind → pid-write so a concurrent
@@ -1052,8 +1158,17 @@ pub async fn run_daemon_with_boot_guard<D: DaemonDispatch>(
     }
 
     let listener = UnixListener::bind(&sock)?;
+    // Fail closed, same reason as the directory above. If this chmod fails the
+    // socket is world-reachable in a way the accepted design never covered, so
+    // the bound listener is dropped and the entry removed rather than served.
     if let Err(e) = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600)) {
-        tracing::warn!(error = %e, path = ?sock, "failed to chmod 0600 socket");
+        drop(listener);
+        let _ = std::fs::remove_file(&sock);
+        return Err(anyhow::anyhow!(
+            "refusing to start: cannot chmod 0600 {}: {e}. The daemon socket must be owner-only \
+             — it is half of the single-principal guarantee this daemon enforces.",
+            sock.display()
+        ));
     }
     // Captured while still holding the startup lock, immediately after
     // bind, so shutdown cleanup can later prove "this is still the same socket
@@ -1153,11 +1268,41 @@ pub async fn run_daemon_with_boot_guard<D: DaemonDispatch>(
         }
     };
 
+    // SAFETY: `geteuid` is always successful and takes no arguments.
+    let daemon_euid = unsafe { libc::geteuid() } as u32;
+
     tokio::select! {
         _ = async {
             loop {
                 match listener.accept().await {
                     Ok((stream, _)) => {
+                        // Refuse a foreign principal before any frame is read.
+                        // Fails CLOSED: an error reading peer credentials is
+                        // "cannot prove same-uid", which is the same answer as
+                        // "is not same-uid" — never a pass.
+                        match peer_uid(&stream) {
+                            Ok(peer) if uid_is_permitted(peer, daemon_euid) => {}
+                            Ok(peer) => {
+                                tracing::error!(
+                                    peer_uid = peer,
+                                    daemon_euid,
+                                    "refusing connection from a foreign uid: this daemon serves a \
+                                     single principal (ADR-096 condition 2); multi-principal \
+                                     serving requires a gated ADR, not a configuration change"
+                                );
+                                drop(stream);
+                                continue;
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    error = %e,
+                                    "refusing connection: cannot read peer credentials, so \
+                                     same-uid cannot be proven"
+                                );
+                                drop(stream);
+                                continue;
+                            }
+                        }
                         let d = dispatcher.clone();
                         let active = Arc::clone(&active);
                         tokio::spawn(async move {
@@ -2414,6 +2559,74 @@ mod tests {
             "the surviving pid file must contain the winner's pid — both threads \
              share this process's pid, so an unexpected value would also prove a \
              lost/garbled write raced through"
+        );
+    }
+
+    // ── connection principal (ADR-096 condition 2) ────────────────────────────
+
+    /// The peer-credential syscall must actually work on this platform and
+    /// report the real uid, not error or return a placeholder.
+    ///
+    /// This matters more than it looks because the accept path fails CLOSED: if
+    /// `peer_uid` errored unconditionally — wrong syscall, wrong socket option,
+    /// an unimplemented platform arm — every connection would be refused and
+    /// the daemon would be silently unreachable. A test that only exercised the
+    /// decision function would not catch that.
+    #[tokio::test]
+    async fn peer_uid_reports_the_connecting_process_uid() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("peer.sock");
+        let listener = UnixListener::bind(&sock).expect("bind");
+
+        let connect_path = sock.clone();
+        let client = tokio::spawn(async move { UnixStream::connect(&connect_path).await });
+
+        let (server_side, _) = listener.accept().await.expect("accept");
+        let client_side = client.await.expect("join").expect("connect");
+
+        // SAFETY: `geteuid` is always successful and takes no arguments.
+        let expected = unsafe { libc::geteuid() } as u32;
+
+        assert_eq!(
+            peer_uid(&server_side).expect("peer_uid must succeed on a live connection"),
+            expected,
+            "the uid read from the kernel for a same-process connection must be \
+             this process's euid"
+        );
+        // Symmetric: both ends report the same peer on a same-uid connection.
+        assert_eq!(
+            peer_uid(&client_side).expect("peer_uid must succeed on the client end"),
+            expected
+        );
+    }
+
+    /// The refusal rule itself: the principal is the uid, and only a foreign
+    /// uid is refused.
+    ///
+    /// The second assertion is the load-bearing one and it is a regression
+    /// guard, not a formality. ADR-096 shipped many `actor_id`s over one
+    /// socket; every seat on a normal host is a distinct attribution at the
+    /// same uid. A check that conflated attribution with principal would refuse
+    /// them all, so "same uid is permitted" must stay true no matter how the
+    /// rule is later tightened.
+    #[test]
+    fn only_a_foreign_uid_is_refused() {
+        // SAFETY: `geteuid` is always successful and takes no arguments.
+        let euid = unsafe { libc::geteuid() } as u32;
+
+        assert!(
+            uid_is_permitted(euid, euid),
+            "a connection from the daemon's own uid must be served — this is \
+             every seat on the host, and ADR-096 accepted exactly this shape"
+        );
+        assert!(
+            !uid_is_permitted(euid.wrapping_add(1), euid),
+            "a connection from any other uid must be refused"
+        );
+        assert!(
+            !uid_is_permitted(0, euid.wrapping_add(1)),
+            "root is not special-cased: the rule is equality with the daemon's \
+             euid, not a privilege comparison"
         );
     }
 }
