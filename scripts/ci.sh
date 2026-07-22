@@ -98,31 +98,36 @@ phase_tests() {
     # $HOME/.khive/khive.db, and migrations apply on open (forward-only,
     # ADR-015). A test that boots a runtime through a config path inheriting
     # that default reaches the operator's/runner's real store instead of an
-    # isolated one. Snapshot the sentinel's existence + mtime before the
-    # suite and compare after; any change fails the gate loudly instead of
-    # leaving the drift for a later direct-open to discover.
-    sentinel="$HOME/.khive/khive.db"
-    sentinel_existed_before=0
-    sentinel_mtime_before=""
-    if [ -f "$sentinel" ]; then
-        sentinel_existed_before=1
-        sentinel_mtime_before=$(stat -f%m "$sentinel" 2>/dev/null || stat -c%Y "$sentinel")
-    fi
+    # isolated one. Fingerprint the sentinel file SET before the suite and
+    # compare after; any change fails the gate loudly instead of leaving the
+    # drift for a later direct-open to discover. The set covers the WAL
+    # sidecars, not just the main db file: a WAL-mode open lands its writes
+    # in khive.db-wal/-shm and may leave the main file's mtime untouched
+    # until a checkpoint, so watching khive.db alone misses live
+    # contamination. Size is fingerprinted alongside mtime to catch writes
+    # inside the filesystem's mtime granularity.
+    sentinel_fingerprint() {
+        for f in "$HOME/.khive/khive.db" "$HOME/.khive/khive.db-wal" "$HOME/.khive/khive.db-shm"; do
+            if [ -f "$f" ]; then
+                m=$(stat -f%m "$f" 2>/dev/null || stat -c%Y "$f")
+                s=$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f")
+                printf '%s mtime=%s size=%s\n' "$f" "$m" "$s"
+            else
+                printf '%s absent\n' "$f"
+            fi
+        done
+    }
+    sentinel_before=$(sentinel_fingerprint)
 
     cargo test --workspace
 
-    if [ -f "$sentinel" ]; then
-        if [ "$sentinel_existed_before" -eq 0 ]; then
-            echo "FAIL: workspace test suite created $sentinel — a test opened the real default store instead of an isolated db_path/HOME (#1204)" >&2
-            exit 1
-        fi
-        sentinel_mtime_after=$(stat -f%m "$sentinel" 2>/dev/null || stat -c%Y "$sentinel")
-        if [ "$sentinel_mtime_after" != "$sentinel_mtime_before" ]; then
-            echo "FAIL: workspace test suite modified $sentinel (mtime $sentinel_mtime_before -> $sentinel_mtime_after) — a test opened/migrated the real default store instead of an isolated db_path/HOME (#1204)" >&2
-            exit 1
-        fi
-    elif [ "$sentinel_existed_before" -eq 1 ]; then
-        echo "FAIL: workspace test suite removed $sentinel (#1204)" >&2
+    sentinel_after=$(sentinel_fingerprint)
+    if [ "$sentinel_after" != "$sentinel_before" ]; then
+        echo "FAIL: workspace test suite touched the real default store under \$HOME/.khive — a test opened/migrated it instead of an isolated db_path/HOME (#1204)" >&2
+        echo "before:" >&2
+        printf '%s\n' "$sentinel_before" >&2
+        echo "after:" >&2
+        printf '%s\n' "$sentinel_after" >&2
         exit 1
     fi
 }
