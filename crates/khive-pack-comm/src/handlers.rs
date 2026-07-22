@@ -43,6 +43,16 @@ fn validate_actor_label(verb: &str, label: &str, field: &str) -> Result<(), Runt
 /// `send` — create a message note in the caller's namespace (outbound) AND
 /// deliver an inbound copy addressed to the actor label in `to` (ADR-057).
 /// Both copies land in the caller's namespace; no cross-namespace write occurs.
+///
+/// Known gap (external desk review, 2026-07-21): there is no idempotency
+/// guard here, so a retrying caller that repeats an identical `send` (same
+/// `to`/`content`) produces a fresh duplicate outbound+inbound pair every
+/// call. `comm.ingest`'s `external_id` dedup key is a different mechanism
+/// (transport-level dedup for channel-delivered inbound mail) and does not
+/// apply to caller-composed sends. Fixing this needs a caller-supplied
+/// idempotency key param on `SendParams` (additive) — a content-hash dedup
+/// invented here would risk collapsing legitimate repeated messages, so this
+/// is left as a design decision rather than implemented speculatively.
 /// See crates/khive-pack-comm/docs/api/message-lifecycle.md#handlersrshandle_send
 pub(crate) async fn handle_send(
     runtime: &KhiveRuntime,
