@@ -141,13 +141,15 @@ impl GitPack {
             DigestSource::Remote { canonical, gh_slug } => {
                 let cloned = cache::ensure_clone(canonical).map_err(|e| {
                     RuntimeError::InvalidInput(format!(
-                        "remote clone/fetch of {canonical:?} failed: {e}"
+                        "remote clone/fetch of {:?} failed: {e}",
+                        redact_repo_url(canonical)
                     ))
                 })?;
                 if gh_slug.is_none() {
                     warnings.push(format!(
-                        "host for {canonical:?} is not github.com; issue/pull_request \
-                         ingestion is skipped (commits-only degradation, ADR-088 Amendment 1)"
+                        "host for {:?} is not github.com; issue/pull_request \
+                         ingestion is skipped (commits-only degradation, ADR-088 Amendment 1)",
+                        redact_repo_url(canonical)
                     ));
                 }
                 (cloned, gh_slug.is_some())

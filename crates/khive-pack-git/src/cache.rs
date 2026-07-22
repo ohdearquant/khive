@@ -20,7 +20,7 @@ use std::time::SystemTime;
 
 use uuid::Uuid;
 
-use crate::source::cache_key;
+use crate::source::{cache_key, redact_repo_url};
 
 pub const DEFAULT_MAX_REPOS: usize = 5;
 pub const DEFAULT_MAX_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -268,7 +268,8 @@ fn refetch_clone_locked(root: &Path, canonical_url: &str) -> Result<PathBuf, Cac
     let repo_dir = root.join(&key);
     if !repo_dir.join(".git").exists() {
         return Err(CacheError::Git(format!(
-            "refetch requested for {canonical_url:?} but no cache slot exists at {}",
+            "refetch requested for {:?} but no cache slot exists at {}",
+            redact_repo_url(canonical_url),
             repo_dir.display()
         )));
     }
@@ -408,7 +409,8 @@ fn clone(url: &str, dest: &Path) -> Result<(), CacheError> {
         .map_err(|e| CacheError::Git(format!("spawning git clone: {e}")))?;
     if !status.success() {
         return Err(CacheError::Git(format!(
-            "git clone {url} failed (exit {status})"
+            "git clone {:?} failed (exit {status})",
+            redact_repo_url(url)
         )));
     }
     Ok(())
@@ -1226,6 +1228,56 @@ mod tests {
         assert!(
             matches!(err, CacheError::Git(_)),
             "expected CacheError::Git, got {err:?}"
+        );
+
+        std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
+    }
+
+    /// Issue #7: a "no cache slot exists" error must not leak an embedded
+    /// credential or query-string token from the caller-supplied URL.
+    #[test]
+    fn refetch_clone_no_slot_error_redacts_credential_bearing_url() {
+        let _guard = ENV_MUTEX.blocking_lock();
+        let scratch = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT", scratch.path());
+
+        let err =
+            refetch_clone("https://user:tok3n@example.invalid/never-cloned/repo?token=SECRET")
+                .expect_err("no slot exists yet");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("tok3n") && !msg.contains("SECRET"),
+            "issue #7: refetch-no-slot error must not leak embedded credentials/token: {msg}"
+        );
+        assert!(
+            msg.contains("example.invalid"),
+            "redaction must preserve the host for diagnosability: {msg}"
+        );
+
+        std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
+    }
+
+    /// Issue #7: a `git clone` failure's error message must not leak an
+    /// embedded credential or query-string token from the caller-supplied
+    /// URL. Port 1 is a reserved low port unlikely to have anything
+    /// listening, so the clone fails fast on connection refusal rather than
+    /// waiting on a real network timeout.
+    #[test]
+    fn ensure_clone_failure_message_redacts_credential_bearing_url() {
+        let _guard = ENV_MUTEX.blocking_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT", dir.path());
+
+        let result = ensure_clone("https://user:tok3n@127.0.0.1:1/org/repo?token=SECRET");
+        let err = result.expect_err("clone against a closed port must fail");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("tok3n") && !msg.contains("SECRET"),
+            "issue #7: clone failure message must not leak embedded credentials/token: {msg}"
+        );
+        assert!(
+            msg.contains("127.0.0.1"),
+            "redaction must preserve the host for diagnosability: {msg}"
         );
 
         std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
