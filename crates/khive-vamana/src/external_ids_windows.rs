@@ -17,19 +17,34 @@ use windows_sys::Win32::Foundation::{
     UNICODE_STRING,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FileAttributeTagInfo, FileDispositionInfo, FileRenameInfo,
+    CreateFileW, FileAttributeTagInfo, FileDispositionInfo, FileRenameInfoEx,
     GetFileInformationByHandleEx, GetFinalPathNameByHandleW, SetFileInformationByHandle, DELETE,
     FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_TAG_INFO, FILE_DISPOSITION_INFO,
     FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED,
     FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_RENAME_INFO_0, FILE_SHARE_DELETE, FILE_SHARE_READ,
     FILE_SHARE_WRITE, OPEN_EXISTING, SYNCHRONIZE, VOLUME_NAME_DOS,
 };
+use windows_sys::Win32::System::WindowsProgramming::{
+    FILE_RENAME_FLAG_POSIX_SEMANTICS, FILE_RENAME_FLAG_REPLACE_IF_EXISTS,
+};
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
 const TMP_NAME: &str = "external_ids.bin.tmp";
 const FINAL_NAME: &str = "external_ids.bin";
 
+#[cfg(test)]
+#[path = "external_ids_windows_tests.rs"]
+mod tests;
+
 pub(super) fn write_via_dir_handle(dir: &Path, buf: &[u8]) -> Result<(), ExternalIdsWriteError> {
+    write_via_dir_handle_with(dir, buf, rename_relative)
+}
+
+fn write_via_dir_handle_with(
+    dir: &Path,
+    buf: &[u8],
+    rename: impl FnOnce(&std::fs::File, &std::fs::File, &str) -> std::io::Result<()>,
+) -> Result<(), ExternalIdsWriteError> {
     lexical_prefilter(dir)?;
     let expected = std::fs::canonicalize(dir)
         .map_err(|error| ExternalIdsWriteError::io("canonicalize segment dir", error))?;
@@ -59,8 +74,7 @@ pub(super) fn write_via_dir_handle(dir: &Path, buf: &[u8]) -> Result<(), Externa
         .sync_all()
         .map_err(|error| ExternalIdsWriteError::io("sync external_ids.bin.tmp", error))?;
 
-    remove_relative_if_exists(&dir_file, FINAL_NAME, "remove previous external_ids.bin")?;
-    rename_relative(&tmp_file, &dir_file, FINAL_NAME).map_err(|error| {
+    rename(&tmp_file, &dir_file, FINAL_NAME).map_err(|error| {
         ExternalIdsWriteError::io("rename external_ids.bin.tmp -> external_ids.bin", error)
     })
 }
@@ -291,7 +305,7 @@ fn rename_relative(
     // the fixed header plus the complete relative target name.
     unsafe {
         (*info).Anonymous = FILE_RENAME_INFO_0 {
-            ReplaceIfExists: false,
+            Flags: FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS,
         };
         (*info).RootDirectory = dir.as_raw_handle();
         (*info).FileNameLength = name_bytes;
@@ -302,11 +316,11 @@ fn rename_relative(
         );
     }
     // SAFETY: both handles are live, the source was opened with `DELETE`, and
-    // `info` points at the initialized `total_size`-byte input buffer.
+    // `info` points at the initialized `total_size`-byte replacement input.
     let ok = unsafe {
         SetFileInformationByHandle(
             file.as_raw_handle(),
-            FileRenameInfo,
+            FileRenameInfoEx,
             info.cast::<c_void>(),
             total_size as u32,
         )
