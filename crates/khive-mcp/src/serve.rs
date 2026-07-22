@@ -351,20 +351,34 @@ pub fn build_registry_for_multi_backend_with_db_anchor(
     build_registry_for_multi_backend_inner(base_config, khive_cfg, cli_db_override)
 }
 
-fn build_registry_for_multi_backend_inner(
-    base_config: RuntimeConfig,
-    khive_cfg: &KhiveConfig,
+/// Validate a `--db`/`KHIVE_DB` override against a non-empty `[[backends]]`
+/// declaration WITHOUT opening any backend — the same rule
+/// `build_registry_for_multi_backend_inner` enforces, factored out so a
+/// caller that hasn't yet decided whether it will construct backends in this
+/// process can apply the check up front.
+///
+/// This closes #1226: `kkernel exec`'s daemon-forward fast path (inline ops,
+/// used whenever a warm daemon answers) never called into this guard at all
+/// — only the in-process fallback did — so an inline invocation with a
+/// conflicting override silently forwarded to the daemon's own already-open
+/// backends instead of being rejected, while the same override on
+/// `--ops-file` (always in-process by design) correctly bailed. The two call
+/// forms disagreed about whether the override was legal because only one of
+/// them ever ran this check. Returns `Ok(true)` when the override forces
+/// every backend to in-memory (`:memory:`), `Ok(false)` when there is no
+/// override to apply.
+pub fn validate_db_override_against_backends(
     cli_db_override: Option<&str>,
-) -> anyhow::Result<MultiBackendRegistry> {
-    let backend_count = khive_cfg.backends.len();
-    let force_memory = match cli_db_override {
+    backend_count: usize,
+) -> anyhow::Result<bool> {
+    match cli_db_override {
         Some(":memory:") => {
             tracing::warn!(
                 "--db :memory: (or KHIVE_DB=:memory:) is overriding {backend_count} \
                  configured [[backends]] entries to in-memory storage for this invocation; \
                  khive.toml's declared backend paths will not be used this run"
             );
-            true
+            Ok(true)
         }
         Some(other) => {
             anyhow::bail!(
@@ -376,8 +390,17 @@ fn build_registry_for_multi_backend_inner(
                  this invocation."
             );
         }
-        None => false,
-    };
+        None => Ok(false),
+    }
+}
+
+fn build_registry_for_multi_backend_inner(
+    base_config: RuntimeConfig,
+    khive_cfg: &KhiveConfig,
+    cli_db_override: Option<&str>,
+) -> anyhow::Result<MultiBackendRegistry> {
+    let backend_count = khive_cfg.backends.len();
+    let force_memory = validate_db_override_against_backends(cli_db_override, backend_count)?;
 
     // Open and migrate each declared backend, deduplicating SQLite backends by
     // canonical path (ADR-028 §8).
