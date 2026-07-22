@@ -93,11 +93,16 @@ static FTS_FAIL_NS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashS
 #[cfg(any(test, feature = "fault-injection"))]
 static VECTOR_FAIL_NS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-/// Fail the first FTS statement inside `create_many`'s atomic write.
+/// FTS failure injection for `create_many` — separate from `FTS_FAIL_NS` so that
+/// create_note_inner and create_many tests cannot disarm each other. Namespace-keyed
+/// set (not a single `Option<String>` slot) for the same reason as `VECTOR_FAIL_NS` (#1263).
 #[cfg(any(test, feature = "fault-injection"))]
 static FTS_FAIL_MANY_NS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-/// Fail an FTS statement after one complete entity/FTS pair when the batch permits it.
+/// FTS partial-failure injection for `create_many` — returns `Ok(BatchWriteSummary)`
+/// with `failed > 0` so that the `summary.failed > 0` rollback branch is exercised.
+/// Distinct from `FTS_FAIL_MANY_NS` which injects a hard `Err`. Namespace-keyed set
+/// for the same reason as `VECTOR_FAIL_NS` (#1263).
 #[cfg(any(test, feature = "fault-injection"))]
 static FTS_FAIL_MANY_PARTIAL_NS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashSet<String>>,
