@@ -270,19 +270,27 @@ impl KhiveRuntime {
                 edges_skipped += 1;
                 continue;
             }
-            if let Err(e) = self
+            // Only a contract verdict (InvalidInput) or an endpoint-resolution
+            // miss (NotFound) is a property of the edge being imported; any
+            // other error is an operational failure of the check itself and
+            // must abort the import rather than silently discard a valid edge.
+            match self
                 .validate_edge_relation_endpoints(token, ee.source, ee.target, ee.relation)
                 .await
             {
-                tracing::warn!(
-                    source = %ee.source,
-                    target = %ee.target,
-                    relation = ?ee.relation,
-                    error = %e,
-                    "import_kg: skipping edge — endpoint contract violation in namespace {ns:?}"
-                );
-                edges_skipped += 1;
-                continue;
+                Ok(()) => {}
+                Err(e @ (RuntimeError::InvalidInput(_) | RuntimeError::NotFound(_))) => {
+                    tracing::warn!(
+                        source = %ee.source,
+                        target = %ee.target,
+                        relation = ?ee.relation,
+                        error = %e,
+                        "import_kg: skipping edge — endpoint contract violation in namespace {ns:?}"
+                    );
+                    edges_skipped += 1;
+                    continue;
+                }
+                Err(e) => return Err(e),
             }
             let now = Utc::now();
             let edge = khive_storage::types::Edge {
