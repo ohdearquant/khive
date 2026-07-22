@@ -730,6 +730,18 @@ async fn run_exec_inline_with_forward(
         .map_err(|e| anyhow::anyhow!("config error: {e}"))?
         .unwrap_or_default();
 
+    // #1226: apply the same --db/[[backends]] conflict guard the in-process
+    // fallback below applies, BEFORE the daemon fast-path — otherwise a warm
+    // daemon answers this request without the override ever being checked at
+    // all, while the identical override on `--ops-file` (always in-process)
+    // correctly rejects it. See `validate_db_override_against_backends`.
+    if !khive_cfg.backends.is_empty() {
+        khive_mcp::serve::validate_db_override_against_backends(
+            db_context.raw.as_deref(),
+            khive_cfg.backends.len(),
+        )?;
+    }
+
     // ── daemon fast-path (Unix only) ─────────────────────────────────────────
     // The daemon path does not support --save-file (the daemon returns a string;
     // we would need to parse it back to apply the sink).  Skip daemon forwarding
@@ -2575,6 +2587,86 @@ backend = "sessions"
              daemon must be byte-identical to what the daemon computes for the same \
              multi-backend config.toml (D1 acceptance gate, exercised end-to-end through \
              the real call site rather than a standalone compute_config_id comparison)"
+        );
+    }
+
+    // ── #1226: inline --db/[[backends]] guard must fire before daemon-forward ──
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn inline_db_override_conflicting_with_backends_is_rejected_before_daemon_forward() {
+        std::env::remove_var("KHIVE_EMBEDDING_MODEL");
+        std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
+        std::env::remove_var("KHIVE_ACTOR");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+        let (prev_home, home_dir) = isolate_home_for_test();
+        SPY_CAPTURED_CONFIG_ID.with(|c| *c.borrow_mut() = None);
+
+        let khive_dir = home_dir.path().join(".khive");
+        std::fs::create_dir_all(&khive_dir).expect("mkdir .khive");
+        let main_backend_path = khive_dir.join("main-backend.db");
+        let sessions_backend_path = khive_dir.join("sessions-backend.db");
+        std::fs::write(
+            khive_dir.join("config.toml"),
+            format!(
+                r#"
+[[backends]]
+name = "main"
+kind = "sqlite"
+path = "{}"
+
+[[backends]]
+name = "sessions"
+kind = "sqlite"
+path = "{}"
+
+[packs.session]
+backend = "sessions"
+"#,
+                main_backend_path.display(),
+                sessions_backend_path.display(),
+            ),
+        )
+        .expect("write multi-backend config.toml");
+
+        let cfg = resolve_runtime_config(RuntimeConfigInputs {
+            db: None,
+            config: None,
+            namespace: Namespace::parse("local").expect("ns"),
+            namespace_explicit: true,
+            actor_explicit: false,
+            no_embed: true,
+            packs: None,
+            brain_profile: None,
+        })
+        .expect("resolve exec-shaped config");
+
+        let conflicting_override = khive_dir.join("override.db");
+        let result = run_exec_inline_with_forward(
+            "stats()".to_string(),
+            cfg,
+            None,
+            None,
+            None,
+            ExecDbContext {
+                raw: Some(conflicting_override.display().to_string()),
+                anchor: None,
+            },
+            spy_capture_config_id,
+        )
+        .await;
+        restore_home(prev_home);
+
+        assert!(
+            result.is_err(),
+            "a --db/KHIVE_DB override that conflicts with a declared [[backends]] topology \
+             must be rejected on the inline path too, not only on --ops-file; got: {result:?}"
+        );
+        assert!(
+            SPY_CAPTURED_CONFIG_ID.with(|c| c.borrow().is_none()),
+            "the conflict must be caught BEFORE any daemon-forward attempt — the spy must \
+             never have been called"
         );
     }
 
