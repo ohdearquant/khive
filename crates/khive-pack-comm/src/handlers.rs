@@ -621,6 +621,54 @@ pub(crate) async fn handle_reply(
     )
     .await?;
 
+    // Replying is the strongest possible read signal, and callers universally
+    // chained `reply | read` to say so — fold it in. Skips only an explicitly
+    // outbound original, matching handle_read's rejection exactly rather than
+    // requiring a literal "inbound" (legacy messages may carry no direction).
+    // Best-effort: the reply is already committed above, so a failed or
+    // no-op patch degrades to `marked_read: false` rather than failing a
+    // delivered reply.
+    //
+    // The mark is also addressee-scoped: "I read it" is only a claim the
+    // addressee can make. Replying does not give a third party the right to
+    // flip someone else's message, which is the same rule handle_read
+    // enforces. A legacy original with no `to_actor` fails open, matching
+    // handle_inbox's EqOrMissing visibility — a message anyone can see in
+    // their inbox must stay markable by someone, or it inflates unread
+    // counts forever.
+    let original_direction = orig_props
+        .get("direction")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let caller_is_addressee = original_to_actor
+        .as_deref()
+        .is_none_or(|addressee| addressee == from_actor_label);
+    let marked_read = if original_direction == "outbound" || !caller_is_addressee {
+        None
+    } else {
+        // Re-fetch: `orig_props` predates the dual write above, so writing it
+        // back wholesale would erase any property another writer set in that
+        // window (the store replaces `properties`, it does not merge).
+        let current = store
+            .get_note(id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|n| n.properties)
+            .unwrap_or_else(|| orig_props.clone());
+        let mut props = current;
+        props["read"] = json!(true);
+        let updated_at = Utc::now().timestamp_micros();
+        // `Ok(false)` means no live row was updated (e.g. the original was
+        // soft-deleted mid-flight) — that is not a successful mark.
+        Some(
+            store
+                .update_note_properties(id, Some(props), updated_at)
+                .await
+                .unwrap_or(false),
+        )
+    };
+
     Ok(json!({
         "id": short_id(reply_note.id),
         "full_id": reply_note.id.as_hyphenated().to_string(),
@@ -629,6 +677,7 @@ pub(crate) async fn handle_reply(
         "to": reply_to,
         "subject": reply_subject,
         "sent_at": sent_at,
+        "marked_read": marked_read,
     }))
 }
 

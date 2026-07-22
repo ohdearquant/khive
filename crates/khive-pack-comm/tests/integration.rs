@@ -763,6 +763,311 @@ async fn test_reply_from_recipient_routes_to_sender() {
     );
 }
 
+/// reply() to an inbound message marks the original read — callers previously
+/// chained `reply | read`; the read is now folded into reply itself.
+#[tokio::test]
+async fn test_reply_marks_inbound_original_read() {
+    let backend = shared_backend();
+    let (registry, _rt) = build_actor_registry(backend, "lambda:khive");
+
+    registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:khive", "content": "needs an answer", "self_send": true }),
+        )
+        .await
+        .expect("self-send succeeds");
+
+    let inbox = registry
+        .dispatch("comm.inbox", serde_json::json!({ "status": "unread" }))
+        .await
+        .expect("inbox succeeds");
+    let msgs = inbox
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .expect("messages array");
+    assert_eq!(msgs.len(), 1, "must have 1 unread inbound message");
+    let inbound_full_id = msgs[0]
+        .get("full_id")
+        .and_then(|v| v.as_str())
+        .expect("full_id on inbound message")
+        .to_string();
+
+    let reply = registry
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({ "id": inbound_full_id, "content": "answered" }),
+        )
+        .await
+        .expect("reply succeeds");
+    assert_eq!(
+        reply.get("marked_read").and_then(|v| v.as_bool()),
+        Some(true),
+        "reply to an inbound message must report marked_read=true; got {reply}"
+    );
+
+    let inbox_after = registry
+        .dispatch("comm.inbox", serde_json::json!({ "status": "unread" }))
+        .await
+        .expect("inbox succeeds after reply");
+    let unread_after = inbox_after
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .expect("messages array");
+    assert!(
+        unread_after
+            .iter()
+            .all(|m| m.get("full_id").and_then(|v| v.as_str()) != Some(inbound_full_id.as_str())),
+        "the replied-to inbound message must no longer be unread"
+    );
+}
+
+/// reply() to an outbound original performs no read-marking (read is a
+/// recipient action); `marked_read` is null.
+#[tokio::test]
+async fn test_reply_to_outbound_original_does_not_mark_read() {
+    let (registry, _rt) = build_registry();
+
+    let original = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "root message" }),
+        )
+        .await
+        .expect("send succeeds");
+    let outbound_id = original
+        .get("full_id")
+        .and_then(|v| v.as_str())
+        .expect("send returns full_id");
+
+    let reply = registry
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({ "id": outbound_id, "content": "follow-up" }),
+        )
+        .await
+        .expect("reply to own outbound succeeds");
+    assert!(
+        reply
+            .get("marked_read")
+            .map(|v| v.is_null())
+            .unwrap_or(false),
+        "reply to an outbound original must report marked_read=null; got {reply}"
+    );
+}
+
+/// A legacy message carrying no `direction` property is still markable —
+/// reply() skips only an explicitly outbound original, exactly as read() does.
+/// Before this, requiring a literal "inbound" made a directionless legacy
+/// record report `marked_read: null`, which is specified to mean "outbound".
+#[tokio::test]
+async fn test_reply_marks_directionless_legacy_original() {
+    use khive_storage::note::Note;
+    use uuid::Uuid;
+    let (registry, rt) = build_registry();
+    let token = rt.authorize(khive_runtime::Namespace::local()).unwrap();
+    let store = rt.notes(&token).expect("notes store");
+    let now = chrono::Utc::now().timestamp_micros();
+    let id = Uuid::parse_str("dd110000-3333-4000-8000-000000000003").unwrap();
+
+    store
+        .upsert_note(Note {
+            id,
+            namespace: token.namespace().as_str().to_string(),
+            kind: "message".into(),
+            status: "active".into(),
+            name: None,
+            content: "legacy message with no direction".into(),
+            salience: None,
+            decay_factor: None,
+            expires_at: None,
+            // No `direction` — the pre-ADR-057 shape.
+            properties: Some(serde_json::json!({ "from": "x", "to": "local" })),
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+        })
+        .await
+        .expect("insert legacy message");
+
+    let reply = registry
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({ "id": id.as_hyphenated().to_string(), "content": "answered" }),
+        )
+        .await
+        .expect("reply to legacy message succeeds");
+    assert_eq!(
+        reply.get("marked_read").and_then(|v| v.as_bool()),
+        Some(true),
+        "a directionless legacy original must be marked, not reported null; got {reply}"
+    );
+
+    let stored = store
+        .get_note(id)
+        .await
+        .expect("get_note")
+        .expect("legacy message still present");
+    assert_eq!(
+        stored
+            .properties
+            .as_ref()
+            .and_then(|p| p.get("read"))
+            .and_then(|v| v.as_bool()),
+        Some(true),
+        "the legacy original must actually carry read=true"
+    );
+}
+
+/// The read-patch must not clobber properties written between the original's
+/// fetch and the patch: reply re-reads current properties before setting
+/// `read`, since the store replaces the properties object wholesale.
+#[tokio::test]
+async fn test_reply_read_patch_preserves_concurrent_properties() {
+    use khive_storage::note::Note;
+    use uuid::Uuid;
+    let (registry, rt) = build_registry();
+    let token = rt.authorize(khive_runtime::Namespace::local()).unwrap();
+    let store = rt.notes(&token).expect("notes store");
+    let now = chrono::Utc::now().timestamp_micros();
+    let id = Uuid::parse_str("dd110000-4444-4000-8000-000000000004").unwrap();
+
+    store
+        .upsert_note(Note {
+            id,
+            namespace: token.namespace().as_str().to_string(),
+            kind: "message".into(),
+            status: "active".into(),
+            name: None,
+            content: "message that gains a property mid-flight".into(),
+            salience: None,
+            decay_factor: None,
+            expires_at: None,
+            properties: Some(
+                serde_json::json!({ "direction": "inbound", "from": "x", "to": "local", "read": false }),
+            ),
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+        })
+        .await
+        .expect("insert message");
+
+    // Stand in for another writer stamping metadata after the original was
+    // fetched: patch a new property directly, then reply.
+    let mut with_stamp = serde_json::json!({
+        "direction": "inbound", "from": "x", "to": "local", "read": false,
+        "delivery_stamp": "channel-email"
+    });
+    with_stamp["read"] = serde_json::json!(false);
+    store
+        .update_note_properties(id, Some(with_stamp), now + 1)
+        .await
+        .expect("stamp applied");
+
+    registry
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({ "id": id.as_hyphenated().to_string(), "content": "answered" }),
+        )
+        .await
+        .expect("reply succeeds");
+
+    let stored = store
+        .get_note(id)
+        .await
+        .expect("get_note")
+        .expect("message present");
+    let props = stored.properties.expect("properties");
+    assert_eq!(
+        props.get("read").and_then(|v| v.as_bool()),
+        Some(true),
+        "read must be set"
+    );
+    assert_eq!(
+        props.get("delivery_stamp").and_then(|v| v.as_str()),
+        Some("channel-email"),
+        "the concurrently written property must survive the read patch; got {props}"
+    );
+}
+
+/// A non-participant may reach a message id, but replying must be rejected
+/// without flipping someone else's message to read.
+#[tokio::test]
+async fn test_reply_by_non_participant_is_rejected_without_marking_read() {
+    let backend = shared_backend();
+    let (registry_a, rt_a) = build_actor_registry(backend.clone(), "lambda:a");
+    let (registry_b, _rt_b) = build_actor_registry(backend.clone(), "lambda:b");
+    let (registry_c, _rt_c) = build_actor_registry(backend.clone(), "lambda:c");
+
+    registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:b", "content": "for b only" }),
+        )
+        .await
+        .expect("send succeeds");
+
+    let token = rt_a.authorize(khive_runtime::Namespace::local()).unwrap();
+    let notes = rt_a
+        .list_notes(&token, Some("message"), 100, 0)
+        .await
+        .unwrap();
+    let inbound = notes
+        .iter()
+        .find(|n| {
+            n.properties.as_ref().is_some_and(|p| {
+                p.get("direction").and_then(|v| v.as_str()) == Some("inbound")
+                    && p.get("to_actor").and_then(|v| v.as_str()) == Some("lambda:b")
+            })
+        })
+        .expect("b's inbound copy exists");
+    let id = inbound.id.as_hyphenated().to_string();
+
+    let err = registry_c
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({ "id": id.clone(), "content": "not mine to read" }),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("not addressed to or from caller actor"),
+        "a non-participant reply must be rejected; got {err}"
+    );
+
+    let store = rt_a.notes(&token).expect("notes store");
+    let after = store
+        .get_note(inbound.id)
+        .await
+        .expect("get_note")
+        .expect("message present");
+    assert_eq!(
+        after
+            .properties
+            .as_ref()
+            .and_then(|p| p.get("read"))
+            .and_then(|v| v.as_bool()),
+        Some(false),
+        "the original must remain unread after a rejected reply"
+    );
+
+    // The real addressee replying still marks it.
+    let by_b = registry_b
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({ "id": id, "content": "mine, and read" }),
+        )
+        .await
+        .expect("addressee reply succeeds");
+    assert_eq!(
+        by_b["marked_read"].as_bool(),
+        Some(true),
+        "the addressee's reply must still mark the original read; got {by_b}"
+    );
+}
+
 // ── UE6-H2: reply thread_id must be full 36-char UUID ───────────────────────
 
 /// reply thread_id must be the full 36-char hyphenated UUID of the root message.
