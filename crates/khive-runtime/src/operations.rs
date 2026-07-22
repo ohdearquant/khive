@@ -86,8 +86,10 @@ pub fn arm_vector_fail_after(n: usize) {
 #[cfg(any(test, feature = "fault-injection"))]
 static FTS_FAIL_NS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+// Vector insertion failures use the same namespace-keyed one-shot semantics.
 #[cfg(any(test, feature = "fault-injection"))]
-static VECTOR_FAIL_NS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static VECTOR_FAIL_NS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 /// FTS failure injection for `create_many` — separate from `FTS_FAIL_NS` so that
 /// create_note_inner and create_many tests cannot disarm each other.
 #[cfg(any(test, feature = "fault-injection"))]
@@ -162,11 +164,12 @@ pub fn arm_fts_search_fail(ns: &str) {
 ///
 /// The next `create_note` call whose note namespace equals `ns` returns an injected
 /// error at the first vector insert step, then disarms.  Calls on other namespaces
-/// are unaffected.
+/// are unaffected, and concurrent arms of distinct namespaces do not overwrite
+/// each other.
 /// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
 #[cfg(any(test, feature = "fault-injection"))]
 pub fn arm_vector_fail(ns: &str) {
-    *VECTOR_FAIL_NS.lock().unwrap() = Some(ns.to_string());
+    VECTOR_FAIL_NS.lock().unwrap().insert(ns.to_string());
 }
 
 /// Failure injection for `delete_note_row_first_for_compensation`'s post-row-removal
@@ -1033,15 +1036,7 @@ impl KhiveRuntime {
                 .await;
 
             #[cfg(any(test, feature = "fault-injection"))]
-            let vec_inject = {
-                let mut g = VECTOR_FAIL_NS.lock().unwrap();
-                if g.as_deref() == Some(ns) {
-                    *g = None;
-                    true
-                } else {
-                    false
-                }
-            };
+            let vec_inject = VECTOR_FAIL_NS.lock().unwrap().remove(ns);
             #[cfg(not(any(test, feature = "fault-injection")))]
             let vec_inject = false;
             let vec_result: RuntimeResult<Vec<f32>> = if vec_inject {
@@ -3046,15 +3041,7 @@ impl KhiveRuntime {
             // the cfg(not) branch is a const false eliminating the if-branch.
             #[cfg(any(test, feature = "fault-injection"))]
             let vec_inject = {
-                let ns_inject = {
-                    let mut g = VECTOR_FAIL_NS.lock().unwrap();
-                    if g.as_deref() == Some(ns) {
-                        *g = None;
-                        true
-                    } else {
-                        false
-                    }
-                };
+                let ns_inject = VECTOR_FAIL_NS.lock().unwrap().remove(ns);
                 let count_inject = VECTOR_FAIL_AFTER.with(|cell| match cell.get() {
                     Some(0) => {
                         cell.set(None);
@@ -9938,7 +9925,7 @@ mod tests {
     // Inject a vector insertion failure after note row + FTS commit and assert
     // both the note row and the FTS document are removed (no stranded rows).
     // Uses a unique namespace (see create_note_fts_failure_rolls_back_note_row)
-    // so the process-global VECTOR_FAIL_NS flag is consumed only by this test.
+    // so only this test consumes its VECTOR_FAIL_NS entry.
     // Since the single registered provider fires embed_document before the
     // injection check, the injection converts the successful embedding into an
     // error just before the VectorStore insert, then disarms.
@@ -9983,6 +9970,57 @@ mod tests {
         assert!(
             notes.is_empty(),
             "compensation must remove note row after vector failure; got {notes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn vector_failure_injections_for_distinct_namespaces_do_not_overwrite_each_other() {
+        const MODEL: &str = "test-vec-inject-distinct-namespaces";
+        const DIMS: usize = 4;
+
+        let rt_a = KhiveRuntime::memory().unwrap();
+        let (provider_a, _counter_a) = ConstVecProvider::new(MODEL, DIMS);
+        rt_a.register_embedder(provider_a);
+        let ns_a = Namespace::parse("fault-vec-distinct-a").unwrap();
+        let tok_a = NamespaceToken::for_namespace(ns_a.clone());
+
+        let rt_b = KhiveRuntime::memory().unwrap();
+        let (provider_b, _counter_b) = ConstVecProvider::new(MODEL, DIMS);
+        rt_b.register_embedder(provider_b);
+        let ns_b = Namespace::parse("fault-vec-distinct-b").unwrap();
+        let tok_b = NamespaceToken::for_namespace(ns_b.clone());
+
+        arm_vector_fail(ns_a.as_str());
+        arm_vector_fail(ns_b.as_str());
+
+        let (result_a, result_b) = tokio::join!(
+            rt_a.create_note(
+                &tok_a,
+                "observation",
+                None,
+                "vector failure target A",
+                None,
+                None,
+                vec![],
+            ),
+            rt_b.create_note(
+                &tok_b,
+                "observation",
+                None,
+                "vector failure target B",
+                None,
+                None,
+                vec![],
+            ),
+        );
+
+        assert!(
+            result_a.is_err(),
+            "namespace A must retain its pending vector failure injection"
+        );
+        assert!(
+            result_b.is_err(),
+            "namespace B must retain its pending vector failure injection"
         );
     }
 
@@ -11673,8 +11711,7 @@ mod tests {
     }
 
     // Vector insert failure after entity row + FTS commit rolls back both.
-    // Uses a unique namespace to avoid consuming the VECTOR_FAIL_NS flag from
-    // a concurrent test's create_entity or create_note.
+    // Uses a unique namespace so only this test consumes its VECTOR_FAIL_NS entry.
     #[tokio::test]
     async fn create_entity_vector_failure_rolls_back_entity_row_and_fts() {
         const MODEL: &str = "test-entity-vec-inject";
