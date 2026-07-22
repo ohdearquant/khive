@@ -41,6 +41,7 @@ pub use atomic_plan::{
 };
 pub use atomic_runner::{
     run_atomic_unit, AtomicOpFailure, AtomicOpPlan, AtomicRunOutcome, AtomicRunnerError,
+    CommittedPostCommitEffects,
 };
 pub use blob::resolve_blob_store;
 pub use cost_unit::{base_resource_payload, cost_unit_for_dispatch, resource_payload};
