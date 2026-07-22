@@ -1129,6 +1129,59 @@ impl VerbRegistry {
         }
     }
 
+    /// Apply the registry's verb gate to an operation handled outside pack dispatch.
+    ///
+    /// Multi-backend transports use this before routing an operation through a
+    /// coordinator. The request construction and decision semantics match
+    /// [`Self::dispatch_with_identity`]: deny is authoritative and gate errors
+    /// fail open.
+    pub fn authorize_intercepted_dispatch(
+        &self,
+        verb: &str,
+        params: &Value,
+        identity: Option<&RequestIdentity>,
+    ) -> Result<Namespace, RuntimeError> {
+        let gate_req = self.gate_request_with_identity(verb, params, identity)?;
+        match self.gate.check(&gate_req) {
+            Ok(decision) => {
+                let audit = AuditEvent::from_check(&gate_req, &decision, self.gate.impl_name());
+                tracing::info!(
+                    audit_event = %serde_json::to_string(&audit)
+                        .unwrap_or_else(|_| "{\"error\":\"serialize\"}".into()),
+                    "gate.check"
+                );
+                match decision {
+                    GateDecision::Deny { reason } => Err(RuntimeError::PermissionDenied {
+                        verb: verb.to_string(),
+                        reason,
+                    }),
+                    _ => Ok(gate_req.namespace),
+                }
+            }
+            Err(err) => {
+                tracing::warn!(verb, error = %err, "gate check failed (fail-open)");
+                Ok(gate_req.namespace)
+            }
+        }
+    }
+
+    fn gate_request_with_identity(
+        &self,
+        verb: &str,
+        params: &Value,
+        identity: Option<&RequestIdentity>,
+    ) -> Result<GateRequest, RuntimeError> {
+        let default_namespace = identity
+            .map(|id| id.namespace.as_str())
+            .unwrap_or(self.default_namespace.as_str());
+        let namespace = resolve_explicit_namespace(params, default_namespace)?;
+        let actor_id = identity
+            .map(|id| id.actor_id.as_deref())
+            .unwrap_or(self.actor_id.as_deref());
+        let actor = crate::actor_identity::resolve_actor(actor_id);
+        Ok(GateRequest::new(actor, namespace, verb, params.clone()))
+    }
+
     /// Dispatch a verb to the first pack that handles it.
     ///
     /// Routes through the gate, then invokes the matching pack handler. When
@@ -1178,24 +1231,14 @@ impl VerbRegistry {
         // here so it is in scope for every audit-append site below,
         // including the ones that run before pack dispatch is attempted.
         let request_id: Option<u64> = identity.as_ref().and_then(|id| id.request_id);
-        // A supplied per-request identity overrides the baked
-        // default_namespace/actor_id/visible_namespaces for this call only.
-        let default_namespace_str: &str = identity
-            .as_ref()
-            .map(|id| id.namespace.as_str())
-            .unwrap_or(self.default_namespace.as_str());
-        let ns = resolve_explicit_namespace(&params, default_namespace_str)?;
-        let actor_id_str: Option<&str> = match identity.as_ref() {
-            Some(id) => id.actor_id.as_deref(),
-            None => self.actor_id.as_deref(),
-        };
         // Thread the configured actor identity into the gate request so the
         // gate can distinguish human vs agent callers at the dispatch seam.
         // Resolved once via the shared actor-identity policy and reused for
         // token minting below, so the gate's notion of "who is the caller"
         // and the storage token's notion can never drift apart.
-        let resolved_actor = crate::actor_identity::resolve_actor(actor_id_str);
-        let gate_req = GateRequest::new(resolved_actor.clone(), ns.clone(), verb, params.clone());
+        let gate_req = self.gate_request_with_identity(verb, &params, identity.as_ref())?;
+        let ns = gate_req.namespace.clone();
+        let resolved_actor = gate_req.actor.clone();
 
         // Consult the gate.
         //

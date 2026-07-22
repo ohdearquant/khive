@@ -273,19 +273,28 @@ pub(crate) mod tests {
 
     use crate::server::KhiveMcpServer;
     use crate::tools::request::RequestParams;
-    use khive_runtime::{KhiveRuntime, Namespace as RuntimeNamespace, RuntimeConfig};
+    use khive_runtime::{
+        AllowAllGate, Gate, GateDecision, GateError, GateRef, GateRequest, KhiveRuntime,
+        Namespace as RuntimeNamespace, RuntimeConfig,
+    };
 
     fn make_registry() -> (khive_runtime::VerbRegistry, khive_runtime::KhiveRuntime) {
+        make_registry_with_gate(Arc::new(AllowAllGate))
+    }
+
+    fn make_registry_with_gate(
+        gate: GateRef,
+    ) -> (khive_runtime::VerbRegistry, khive_runtime::KhiveRuntime) {
         let config = RuntimeConfig {
             db_path: None,
             default_namespace: RuntimeNamespace::parse("local").unwrap(),
             embedding_model: None,
             additional_embedding_models: vec![],
             packs: vec!["kg".to_string()],
+            gate: Arc::clone(&gate),
             ..RuntimeConfig::default()
         };
         let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
-        let gate = runtime.config().gate.clone();
         let default_ns = runtime.config().default_namespace.clone();
         let actor_id = runtime.config().actor_id.clone();
         let mut builder = khive_runtime::VerbRegistryBuilder::new();
@@ -301,6 +310,18 @@ pub(crate) mod tests {
         let registry = builder.build().expect("build registry");
         runtime.install_edge_rules(registry.all_edge_rules());
         (registry, runtime)
+    }
+
+    #[derive(Debug, Default)]
+    struct CapturingGate {
+        requests: std::sync::Mutex<Vec<GateRequest>>,
+    }
+
+    impl Gate for CapturingGate {
+        fn check(&self, req: &GateRequest) -> Result<GateDecision, GateError> {
+            self.requests.lock().unwrap().push(req.clone());
+            Ok(GateDecision::allow())
+        }
     }
 
     /// T6a: a multi-backend server MUST route `link` through the coordinator.
@@ -363,6 +384,60 @@ pub(crate) mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             "T6b: coordinator.fan_out_search must be called when a search op is dispatched through a multi-backend server"
         );
+    }
+
+    #[tokio::test]
+    async fn coordinator_and_registry_routes_submit_equivalent_link_and_search_gate_requests() {
+        let direct_gate = Arc::new(CapturingGate::default());
+        let coordinator_gate = Arc::new(CapturingGate::default());
+        let (direct_registry, _direct_runtime) =
+            make_registry_with_gate(Arc::clone(&direct_gate) as GateRef);
+        let (coordinator_registry, _coordinator_runtime) =
+            make_registry_with_gate(Arc::clone(&coordinator_gate) as GateRef);
+        let direct_server =
+            KhiveMcpServer::from_registry_with_meta(direct_registry, "local", "test-cfg");
+        let coord = MockCoordinator::multi_backend();
+        let coordinator_server =
+            KhiveMcpServer::from_registry_with_meta(coordinator_registry, "local", "test-cfg")
+                .with_coordinator(Arc::clone(&coord) as Arc<dyn CoordinatorService>);
+
+        let source_id = Uuid::new_v4();
+        let target_id = Uuid::new_v4();
+        let operations = [
+            format!(
+                r#"link(source_id="{source_id}", target_id="{target_id}", relation="implements", namespace="tenant-a")"#
+            ),
+            r#"search(kind="entity", query="gate parity", limit=7, namespace="tenant-a")"#
+                .to_string(),
+        ];
+
+        for ops in operations {
+            for server in [&direct_server, &coordinator_server] {
+                server
+                    .dispatch_request_local(RequestParams {
+                        ops: ops.clone(),
+                        presentation: None,
+                        presentation_per_op: None,
+                        save_to: None,
+                        format: None,
+                        format_per_op: None,
+                        request_id: None,
+                    })
+                    .await
+                    .expect("dispatch returns a per-operation result");
+            }
+        }
+
+        let direct_requests = direct_gate.requests.lock().unwrap().clone();
+        let coordinator_requests = coordinator_gate.requests.lock().unwrap().clone();
+        assert_eq!(direct_requests.len(), 2);
+        assert_eq!(coordinator_requests.len(), 2);
+        for (direct, coordinated) in direct_requests.iter().zip(&coordinator_requests) {
+            assert_eq!(
+                serde_json::to_value(direct).unwrap(),
+                serde_json::to_value(coordinated).unwrap()
+            );
+        }
     }
 
     #[tokio::test]

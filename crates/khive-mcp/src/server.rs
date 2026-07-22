@@ -24,9 +24,9 @@ use sha2::{Digest, Sha256};
 use khive_db::ConnectionPool;
 use khive_request::{parse_request, ArgValue, DslError, ExecutionMode, ParsedOp};
 use khive_runtime::{
-    present, render_format, resolve_explicit_namespace, KhiveRuntime, OutputFormat, PackLoadError,
-    PackRegistry, PresentationMode, RuntimeConfig, RuntimeError, VerbPresentationPolicy,
-    VerbRegistry, VerbRegistryBuilder,
+    present, render_format, KhiveRuntime, OutputFormat, PackLoadError, PackRegistry,
+    PresentationMode, RuntimeConfig, RuntimeError, VerbPresentationPolicy, VerbRegistry,
+    VerbRegistryBuilder,
 };
 
 use khive_storage::EdgeRelation;
@@ -499,10 +499,8 @@ impl KhiveMcpServer {
         if coord.is_single_backend() {
             return None;
         }
-        let default_namespace = identity
-            .map(|id| id.namespace.as_str())
-            .unwrap_or(self.default_namespace.as_str());
-        dispatch_via_coordinator_inner(coord.as_ref(), tool, args_value, default_namespace).await
+        dispatch_via_coordinator_inner(coord.as_ref(), &self.registry, tool, args_value, identity)
+            .await
     }
 
     /// Namespace this server's registry was built for.
@@ -860,7 +858,6 @@ impl KhiveMcpServer {
 
                 // Clone coordinator and namespace for use in the per-op closures (ADR-029 D3/D4).
                 let coordinator: Option<Arc<dyn CoordinatorService>> = self.coordinator.clone();
-                let default_namespace = self.default_namespace.clone();
                 // ADR-096 Fork 1: a per-request identity overrides the default
                 // namespace for both the coordinator intercept and the registry
                 // dispatch below, so the two can't drift out of sync per op.
@@ -879,10 +876,6 @@ impl KhiveMcpServer {
 
                     let registry = self.registry.clone();
                     let coord = coordinator.clone();
-                    let ns_str = identity_owned
-                        .as_ref()
-                        .map(|id| id.namespace.clone())
-                        .unwrap_or_else(|| default_namespace.clone());
                     let op_identity = identity_owned.clone();
                     let op_mode = mode_for_op(i);
                     async move {
@@ -959,9 +952,10 @@ impl KhiveMcpServer {
                             if !active_coord.is_single_backend() {
                                 if let Some(coord_result) = dispatch_via_coordinator_inner(
                                     active_coord.as_ref(),
+                                    &registry,
                                     &tool,
                                     &args_value,
-                                    &ns_str,
+                                    op_identity.as_ref(),
                                 )
                                 .await
                                 {
@@ -1118,30 +1112,15 @@ impl KhiveMcpServer {
 /// `crates/khive-mcp/docs/api/coordinator.md`.
 async fn dispatch_via_coordinator_inner(
     coord: &dyn CoordinatorService,
+    registry: &VerbRegistry,
     tool: &str,
     args_value: &Value,
-    default_namespace_str: &str,
+    identity: Option<&khive_runtime::RequestIdentity>,
 ) -> Option<Result<Value, (String, Value)>> {
-    // Only link/search are ever intercepted here — resolve/validate the
-    // namespace only for those verbs so unrelated verbs (which always
-    // fall through to `None` below) don't pay for a parse they don't need.
+    // Only link/search are ever intercepted here.
     if !matches!(tool, "link" | "search") {
         return None;
     }
-
-    let namespace = match resolve_explicit_namespace(args_value, default_namespace_str) {
-        Ok(ns) => ns,
-        Err(e) => {
-            return Some(Err(match e {
-                RuntimeError::Khive(k) => {
-                    let error_payload = serde_json::to_value(&k)
-                        .unwrap_or_else(|_| json!({"kind": "internal", "message": k.to_string()}));
-                    (tool.to_string(), error_payload)
-                }
-                other => (tool.to_string(), json!(other.to_string())),
-            }));
-        }
-    };
 
     match tool {
         "link" => {
@@ -1159,6 +1138,11 @@ async fn dispatch_via_coordinator_inner(
             let source_id: uuid::Uuid = source_str.parse().ok()?;
             let target_id: uuid::Uuid = target_str.parse().ok()?;
             let relation: EdgeRelation = relation_str.parse().ok()?;
+            let namespace =
+                match registry.authorize_intercepted_dispatch(tool, args_value, identity) {
+                    Ok(namespace) => namespace,
+                    Err(error) => return Some(Err(runtime_error_payload(tool, error))),
+                };
 
             let weight = args_value
                 .get("weight")
@@ -1206,6 +1190,11 @@ async fn dispatch_via_coordinator_inner(
         "search" => {
             let kind = args_value.get("kind")?.as_str()?;
             let query = args_value.get("query")?.as_str()?;
+            let namespace =
+                match registry.authorize_intercepted_dispatch(tool, args_value, identity) {
+                    Ok(namespace) => namespace,
+                    Err(error) => return Some(Err(runtime_error_payload(tool, error))),
+                };
             // Parse strictly as u32 (matching the single-backend `SearchParams { limit:
             // Option<u32> }` contract) instead of parsing as u64 and casting — `as u32`
             // wraps values above `u32::MAX` (e.g. 4294967297 as u32 == 1) before the
@@ -1334,6 +1323,17 @@ async fn dispatch_via_coordinator_inner(
             Some(Ok(result_val))
         }
         _ => None,
+    }
+}
+
+fn runtime_error_payload(tool: &str, error: RuntimeError) -> (String, Value) {
+    match error {
+        RuntimeError::Khive(k) => {
+            let error_payload = serde_json::to_value(&k)
+                .unwrap_or_else(|_| json!({"kind": "internal", "message": k.to_string()}));
+            (tool.to_string(), error_payload)
+        }
+        other => (tool.to_string(), json!(other.to_string())),
     }
 }
 
