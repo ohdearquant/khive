@@ -1331,6 +1331,12 @@ mod tests {
             embedding_model: None,
             additional_embedding_models: vec![],
             actor_id: actor_id.map(str::to_string),
+            // Pin the pack list explicitly rather than inheriting `KHIVE_PACKS`
+            // from the ambient environment (#1269) — these tests only exercise
+            // `kg` verbs (`stats()`, `create(...)`, `get(...)`) via their fixture
+            // action DSL strings, so the drain semantics under test don't depend
+            // on any wider pack set a developer's shell happens to export.
+            packs: vec!["kg".to_string()],
             ..Default::default()
         };
         KhiveRuntime::new(cfg).expect("runtime")
