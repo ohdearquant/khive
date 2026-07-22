@@ -166,6 +166,22 @@ pub struct EdgeNaturalKey {
 /// Write plan for an `update` op (entity or note shape — ADR-099 D3's
 /// `update` caveat covers both substrates the same way: row/FTS DML in the
 /// plan, any reindex deferred to `post_commit`).
+///
+/// Deferred effects are assigned by this crate's prepare pass and cannot be
+/// supplied by callers constructing a plan directly:
+///
+/// ```compile_fail
+/// use khive_runtime::{PostCommitEffect, UpdatePlan};
+/// use uuid::Uuid;
+///
+/// let id = Uuid::nil();
+/// let plan = UpdatePlan {
+///     target_id: id,
+///     statements: Vec::new(),
+///     post_commit: PostCommitEffect::ReindexEntity { entity_id: id },
+///     edge_natural_key: None,
+/// };
+/// ```
 #[derive(Debug, Clone)]
 pub struct UpdatePlan {
     /// The id of the entity or note being updated. For a symmetric edge
@@ -177,8 +193,9 @@ pub struct UpdatePlan {
     /// statement that follows it is unguarded (its target row's existence
     /// was already asserted by the row-update statement's own guard).
     pub statements: Vec<PlanStatement>,
-    /// Deferred reindex, if the update changed name/description/content.
-    pub post_commit: PostCommitEffect,
+    /// Deferred reindex assigned by the prepare pass when the update changed
+    /// name, description, or content.
+    pub(crate) post_commit: PostCommitEffect,
     /// `Some` only for a symmetric edge update — the natural key a caller
     /// must use to derive the committed surviving row post-commit, rather
     /// than trusting `target_id`. `None` for every other update shape
@@ -199,8 +216,9 @@ pub struct AddEntityPlan {
     /// FTS-insert statement that follows it is unguarded (an ordinary
     /// `INSERT` into a virtual table with no conflicting row).
     pub statements: Vec<PlanStatement>,
-    /// Reindex the committed entity after the transaction closes.
-    pub post_commit: PostCommitEffect,
+    /// Reindex the committed entity after the transaction closes, as
+    /// assigned by the prepare pass.
+    pub(crate) post_commit: PostCommitEffect,
 }
 
 /// Write plan for an `AddNote` proposal change: a fresh note row plus its FTS
@@ -212,11 +230,30 @@ pub struct AddNotePlan {
     /// Row + FTS insert statements to apply inside the atomic unit, in
     /// order, mirroring [`AddEntityPlan::statements`].
     pub statements: Vec<PlanStatement>,
-    /// Reindex the committed note after the transaction closes.
-    pub post_commit: PostCommitEffect,
+    /// Reindex the committed note after the transaction closes, as assigned
+    /// by the prepare pass.
+    pub(crate) post_commit: PostCommitEffect,
 }
 
 /// Write plan for a `delete` op (soft or hard).
+///
+/// Deferred effects are assigned by this crate's prepare pass and cannot be
+/// attached to a statement-free plan by external callers:
+///
+/// ```compile_fail
+/// use khive_runtime::{DeletePlan, PostCommitEffect};
+/// use uuid::Uuid;
+///
+/// let id = Uuid::nil();
+/// let plan = DeletePlan {
+///     target_id: id,
+///     statements: Vec::new(),
+///     post_commit: PostCommitEffect::NoteDeleted {
+///         note_id: id,
+///         kind: "observation".to_owned(),
+///     },
+/// };
+/// ```
 #[derive(Debug, Clone)]
 pub struct DeletePlan {
     /// The id of the entity or note being deleted.
@@ -227,10 +264,10 @@ pub struct DeletePlan {
     /// delete only) is unguarded — it may legitimately affect zero rows if
     /// the target had no incident edges.
     pub statements: Vec<PlanStatement>,
-    /// Deferred note-mutation-hook fire, for a note delete (#750
-    /// 2). `PostCommitEffect::None` for entity and edge deletes — the hook
-    /// system is note-only.
-    pub post_commit: PostCommitEffect,
+    /// Deferred note-mutation-hook fire assigned by the prepare pass for a
+    /// note delete (#750 2). `PostCommitEffect::None` for entity and edge
+    /// deletes — the hook system is note-only.
+    pub(crate) post_commit: PostCommitEffect,
 }
 
 /// Write plan for a `link` op (create a typed directed edge). Endpoint
@@ -286,11 +323,11 @@ pub struct GtdTransitionPlan {
     /// round) — canonical performs no write in that case either
     /// (`handlers.rs:995-1005`).
     pub statements: Vec<PlanStatement>,
-    /// Deferred lifecycle audit row (GAP-5): `PostCommitEffect::
-    /// None` for the idempotent no-op case, matching canonical's early
-    /// return before its own `ensure_audit_schema`/`write_audit_record`
-    /// call.
-    pub post_commit: PostCommitEffect,
+    /// Deferred lifecycle audit row assigned by the prepare pass (GAP-5):
+    /// `PostCommitEffect::None` for the idempotent no-op case, matching
+    /// canonical's early return before its own
+    /// `ensure_audit_schema`/`write_audit_record` call.
+    pub(crate) post_commit: PostCommitEffect,
 }
 
 /// Write plan for a `gtd.complete` op (task lifecycle terminal transition).
@@ -302,9 +339,9 @@ pub struct GtdCompletePlan {
     /// validated the task was in a completable state); the `completed_at`
     /// write targets the same already-guarded row and is unguarded.
     pub statements: Vec<PlanStatement>,
-    /// Deferred lifecycle audit row (GAP-5): mirrors
-    /// `handle_complete`'s best-effort `write_audit_record` call.
-    pub post_commit: PostCommitEffect,
+    /// Deferred lifecycle audit row assigned by the prepare pass (GAP-5):
+    /// mirrors `handle_complete`'s best-effort `write_audit_record` call.
+    pub(crate) post_commit: PostCommitEffect,
 }
 
 /// Which governance verb (`propose` / `review` / `withdraw`) a

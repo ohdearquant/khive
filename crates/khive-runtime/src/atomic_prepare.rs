@@ -3435,6 +3435,14 @@ mod tests {
             other => panic!("expected the whole unit to commit: {other:?}"),
         };
         assert_eq!(
+            post_commit.as_slice(),
+            &[
+                PostCommitEffect::ReindexEntity { entity_id },
+                PostCommitEffect::ReindexNote { note_id },
+            ],
+            "prepare-derived effects must reach the committed token unchanged"
+        );
+        assert_eq!(
             vec_store.count().await.expect("count before effects"),
             0,
             "commit returns deferred effects without materializing vectors"

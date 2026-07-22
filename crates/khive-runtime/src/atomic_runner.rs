@@ -152,9 +152,10 @@ pub enum AtomicOpFailure {
 /// Deferred effects whose owning atomic unit has committed successfully.
 ///
 /// Only [`run_atomic_unit`] can construct this token. Consumers may inspect
-/// the effects, but vector materialization APIs require the token itself so a
-/// prepare-time [`PostCommitEffect`] cannot be executed as if it were backed
-/// by committed rows.
+/// its effects through [`CommittedPostCommitEffects::as_slice`], while the
+/// phase-3 executor takes the token by value; no public API exposes the owned
+/// effect collection or accepts a prepare-time [`PostCommitEffect`] in its
+/// place.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommittedPostCommitEffects {
     effects: Vec<PostCommitEffect>,
@@ -181,13 +182,13 @@ impl CommittedPostCommitEffects {
 /// a seam-level failure; see [`AtomicRunnerError`] for that case).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AtomicRunOutcome {
-    /// Every op's plan applied and the unit committed. Carries every op's
-    /// deferred post-commit effect, in op order. Draining this list
-    /// (running the actual reindex/embedding side effects) is phase 3 of
-    /// ADR-099 D1 and is out of scope for B2 — **the B3 wiring point**: a
-    /// production caller runs these after `run_atomic_unit` returns, outside
-    /// any transaction; a test caller in this file only asserts on the
-    /// list's contents.
+    /// Every op's plan applied and the unit committed. Carries an opaque
+    /// [`CommittedPostCommitEffects`] token containing the deferred effects
+    /// in op order. Phase 3 consumes that token through
+    /// [`crate::atomic_prepare::apply_post_commit_effects`] after
+    /// `run_atomic_unit` returns and outside any transaction; callers can
+    /// inspect the effects without converting them back into an executable
+    /// raw collection.
     Committed {
         post_commit: CommittedPostCommitEffects,
     },
