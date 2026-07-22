@@ -1,0 +1,86 @@
+name: Unlocked dependency resolution
+
+on:
+  schedule:
+    - cron: "23 7 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unlocked-dependency-resolution
+  cancel-in-progress: false
+
+jobs:
+  unlocked-resolution:
+    name: Check latest compatible dependencies
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@1.94.1
+
+      - name: Create throwaway workspace
+        run: git worktree add --detach "$RUNNER_TEMP/khive-unlocked" "$GITHUB_SHA"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ runner.temp }}/khive-unlocked/crates
+          shared-key: unlocked-dependencies
+          cache-on-failure: true
+
+      - name: Resolve latest compatible dependencies
+        id: update
+        continue-on-error: true
+        working-directory: ${{ runner.temp }}/khive-unlocked/crates
+        run: cargo update
+
+      - name: Check workspace
+        id: check
+        if: steps.update.outcome == 'success'
+        continue-on-error: true
+        working-directory: ${{ runner.temp }}/khive-unlocked/crates
+        run: cargo check --workspace --all-targets --all-features
+
+      - name: Test workspace
+        id: test
+        if: steps.update.outcome == 'success'
+        continue-on-error: true
+        working-directory: ${{ runner.temp }}/khive-unlocked/crates
+        run: cargo test --workspace --all-features
+
+      - name: Write workflow summary
+        if: always()
+        env:
+          UPDATE_OUTCOME: ${{ steps.update.outcome }}
+          CHECK_OUTCOME: ${{ steps.check.outcome }}
+          TEST_OUTCOME: ${{ steps.test.outcome }}
+        run: |
+          {
+            echo "# Unlocked dependency resolution"
+            echo
+            echo "This scheduled check resolves the latest versions allowed by the workspace manifests in a throwaway lockfile."
+            echo
+            echo "| Phase | Outcome |"
+            echo "|---|---|"
+            echo "| cargo update | ${UPDATE_OUTCOME} |"
+            echo "| cargo check --workspace | ${CHECK_OUTCOME} |"
+            echo "| cargo test --workspace | ${TEST_OUTCOME} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report advisory failure
+        if: always()
+        env:
+          UPDATE_OUTCOME: ${{ steps.update.outcome }}
+          CHECK_OUTCOME: ${{ steps.check.outcome }}
+          TEST_OUTCOME: ${{ steps.test.outcome }}
+        run: |
+          if [ "$UPDATE_OUTCOME" != success ] || [ "$CHECK_OUTCOME" != success ] || [ "$TEST_OUTCOME" != success ]; then
+            echo "::error::Latest compatible dependency resolution did not pass; see the workflow summary."
+            exit 1
+          fi
