@@ -2038,6 +2038,17 @@ default = true
     }
 
     #[test]
+    fn enforce_strict_batch_result_errs_on_save_manifest_with_failures() {
+        // The save-file path prints a manifest, not the raw envelope; the
+        // manifest carries the envelope's summary through (khive-mcp
+        // save_sink) precisely so --strict works on this path too.
+        let raw = r#"{"path":"/tmp/out.jsonl","rows":2,"checksum":"ab","summary":{"total":2,"succeeded":1,"failed":1,"aborted":0}}"#;
+        assert!(enforce_strict_batch_result(raw, true).is_err());
+        let clean = r#"{"path":"/tmp/out.jsonl","rows":2,"checksum":"ab","summary":{"total":2,"succeeded":2,"failed":0,"aborted":0}}"#;
+        assert!(enforce_strict_batch_result(clean, true).is_ok());
+    }
+
+    #[test]
     fn enforce_strict_batch_result_ok_on_non_json_output() {
         // --output-format table/auto renders a non-JSON string; --strict has
         // nothing to inspect and must not itself error out on that shape.
