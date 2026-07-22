@@ -1,7 +1,7 @@
 [env]
 # Cargo propagates this marker to unit tests, integration tests, and test-spawned
 # binaries. The store-open guard checks it at runtime in every build profile.
-# Deliberate `cargo run` sessions may set KHIVE_ALLOW_HOME_STORE to the exact
-# absolute database path being opened. Boolean or different-path values do not
-# bypass the guard.
+# There is no environment override: deliberate sessions against a real store
+# run the built binary directly (outside the Cargo environment), which never
+# receives this marker.
 KHIVE_TEST_HARNESS = { value = "1", force = true }

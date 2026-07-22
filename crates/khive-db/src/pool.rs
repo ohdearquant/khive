@@ -23,7 +23,6 @@ const DEFAULT_JOURNAL_SIZE_LIMIT_BYTES: i64 = 67_108_864; // 64 MiB
 const DEFAULT_WRITE_QUEUE_CAPACITY: usize = 256;
 
 const TEST_HARNESS_ENV: &str = "KHIVE_TEST_HARNESS";
-const ALLOW_HOME_STORE_ENV: &str = "KHIVE_ALLOW_HOME_STORE";
 
 /// Configuration for the connection pool.
 #[derive(Clone, Debug)]
@@ -129,9 +128,12 @@ impl Default for PoolConfig {
 /// the runtime `KHIVE_TEST_HARNESS=1` marker; production/installed binaries do
 /// not receive that workspace Cargo environment.
 ///
-/// `KHIVE_ALLOW_HOME_STORE=<absolute database path>` is an operator-only escape
-/// hatch for a deliberate in-repository `cargo run`. It bypasses the guard only
-/// when the canonicalized override identifies the configured database path.
+/// There is deliberately no environment override: any inheritable escape
+/// hatch set for one Cargo invocation leaks into the next `cargo test` in the
+/// same shell and re-opens the store the guard exists to protect. A deliberate
+/// session against the real store runs the built binary directly (for example
+/// `target/release/...` or an installed binary), which never receives the
+/// workspace Cargo environment and therefore never trips this guard.
 /// Existing path ancestors are canonicalized before comparison, resolving
 /// traversal, symlinks, and filesystem-provided case (including APFS case
 /// folding). Missing trailing components remain lexical because they have no
@@ -153,8 +155,8 @@ fn refuse_home_data_store_in_tests(config: &PoolConfig) -> Result<(), SqliteErro
     {
         return Err(SqliteError::InvalidData(format!(
             "test harness refused SQLite URI database path {}; use a filesystem path outside \
-             HOME/.khive (a deliberate operator override must name the exact absolute database \
-             path)",
+             HOME/.khive (deliberate sessions against a real store run the built binary \
+             directly, outside the Cargo test environment)",
             path.display()
         )));
     }
@@ -166,21 +168,10 @@ fn refuse_home_data_store_in_tests(config: &PoolConfig) -> Result<(), SqliteErro
     let canonical_home_data_dir =
         canonicalize_deepest_existing(&PathBuf::from(home).join(".khive"))?;
     if canonical_path.starts_with(&canonical_home_data_dir) {
-        let override_matches = std::env::var_os(ALLOW_HOME_STORE_ENV).is_some_and(|value| {
-            let override_path = PathBuf::from(value);
-            override_path.is_absolute()
-                && canonicalize_deepest_existing(&override_path)
-                    .is_ok_and(|canonical_override| canonical_override == canonical_path)
-        });
-        if override_matches {
-            return Ok(());
-        }
-
         return Err(SqliteError::InvalidData(format!(
             "test harness refused to open SQLite database under HOME/.khive: {} \
-             (set KHIVE_ALLOW_HOME_STORE to the exact absolute database path to allow this store: \
-             {})",
-            canonical_path.display(),
+             (deliberate sessions against a real store run the built binary directly, \
+             outside the Cargo test environment)",
             canonical_path.display()
         )));
     }
