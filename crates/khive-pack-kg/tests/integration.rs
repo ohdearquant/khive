@@ -11725,3 +11725,99 @@ async fn search_entity_hyphenated_adr_id_with_plain_terms_matches() {
         "#1064 hyphenated query must surface ADR-086 entity; got titles={titles:?}, full={result}"
     );
 }
+
+// ── ADR-103 Amendment 2: the frozen-usage invariant ─────────────────────────
+
+/// The response envelope and the per-dispatch audit row must carry the
+/// IDENTICAL usage object. That is the entire reason `freeze()` /
+/// `frozen_or_snapshot()` exist as a first-freeze-wins `OnceLock` rather than
+/// two independent reads of the same counters.
+///
+/// The guarantee holds only because the audit row's `freeze()` runs during
+/// dispatch, before the envelope's `frozen_or_snapshot()`. Nothing in the
+/// suite pinned that, so a refactor or a new envelope-assembly path could
+/// invert the order: the envelope would silently return a live snapshot, the
+/// two would disagree, and no test would fail — on numbers a customer can
+/// compare against their own audit trail.
+///
+/// This test pins the observable contract end to end: it runs a real dispatch
+/// inside an armed context exactly as `khive-mcp/src/server.rs` does, lands a
+/// large increment AFTER the dispatch (the exact stray-increment case the
+/// `OnceLock` defends), and then asserts the value the envelope stamps equals
+/// the real audit row's `resource.units` and that BOTH exclude the late
+/// increment. If the envelope ever reads live counters instead of the frozen
+/// object, the late increment leaks into it and this fails.
+///
+/// Limit, stated rather than implied: the envelope value is read through the
+/// same expression `stamp_usage` uses (`ctx.frozen_or_snapshot()`) rather than
+/// by driving the MCP server, because the audit row is only reachable from the
+/// pack surface. That one-line wrapper is not covered here.
+#[tokio::test]
+async fn envelope_usage_equals_audit_row_resource_units() {
+    use khive_runtime::usage::{UsageContext, UsageUnit};
+
+    const LATE: u64 = 1_000_000;
+
+    let pack = pack_with_events();
+    let ctx = UsageContext::new();
+
+    // Dispatch inside the armed scope, mirroring the MCP server's
+    // `usage::scope(usage_ctx.clone(), async { ... })`.
+    khive_runtime::usage::scope(ctx.clone(), async {
+        pack.dispatch(
+            "create",
+            json!({"kind": "concept", "name": "UsageFreezeTarget"}),
+        )
+        .await
+        .expect("create must succeed");
+    })
+    .await;
+
+    // A stray increment landing after the audit snapshot point. In production
+    // this is the post-audit dispatch hook; here it is deliberate and large
+    // enough that it cannot be confused with real measured work.
+    ctx.add(UsageUnit::DbRoundTrips, LATE);
+
+    // Exactly what the response envelope stamps.
+    let envelope_usage = ctx.frozen_or_snapshot();
+
+    let events = pack
+        .dispatch(
+            "list",
+            json!({"kind": "event", "verb": "create", "limit": 50}),
+        )
+        .await
+        .expect("list(kind=event) must succeed");
+    let rows: Vec<&Value> = events
+        .as_array()
+        .expect("list must return an array")
+        .iter()
+        .filter(|e| e.pointer("/payload/resource/units").is_some())
+        .collect();
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly one create audit row must carry resource.units; got {}: {events}",
+        rows.len()
+    );
+    let audit_units = rows[0]
+        .pointer("/payload/resource/units")
+        .expect("checked above");
+
+    assert_eq!(
+        &envelope_usage, audit_units,
+        "the response envelope's usage object and the same dispatch's audit-row \
+         resource.units must be identical; envelope={envelope_usage}, row={audit_units}"
+    );
+
+    let leaked = envelope_usage
+        .get("db_round_trips")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    assert!(
+        leaked < LATE,
+        "an increment landing after the freeze point must not appear in either \
+         read — the envelope carried db_round_trips={leaked}, which means it \
+         returned a live snapshot rather than the frozen object"
+    );
+}
