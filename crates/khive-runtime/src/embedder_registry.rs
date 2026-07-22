@@ -42,17 +42,23 @@ impl<S: EmbeddingService + 'static> BlockingEmbeddingService<S> {
         let inner = Arc::clone(&self.inner);
         let texts = texts.to_vec();
         let runtime = tokio::runtime::Handle::current();
-        tokio::task::spawn_blocking(move || {
-            runtime.block_on(async move {
-                match call {
-                    EmbeddingCall::Generic => inner.embed(&texts, model).await,
-                    EmbeddingCall::Query => inner.embed_query(&texts, model).await,
-                    EmbeddingCall::Passage => inner.embed_passage(&texts, model).await,
-                }
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        std::thread::Builder::new()
+            .name("khive-embedding".to_owned())
+            .spawn(move || {
+                let result = runtime.block_on(async move {
+                    match call {
+                        EmbeddingCall::Generic => inner.embed(&texts, model).await,
+                        EmbeddingCall::Query => inner.embed_query(&texts, model).await,
+                        EmbeddingCall::Passage => inner.embed_passage(&texts, model).await,
+                    }
+                });
+                let _ = sender.send(result);
             })
-        })
-        .await
-        .map_err(|error| lattice_embed::EmbedError::Internal(error.to_string()))?
+            .map_err(|error| lattice_embed::EmbedError::Internal(error.to_string()))?;
+        receiver
+            .await
+            .map_err(|error| lattice_embed::EmbedError::Internal(error.to_string()))?
     }
 }
 
@@ -295,7 +301,8 @@ impl EmbedderProvider for LatticeEmbedderProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
 
     struct ConstVecProvider {
         name: String,
@@ -353,6 +360,60 @@ mod tests {
             self.build_calls.fetch_add(1, Ordering::SeqCst);
             Ok(Arc::new(ConstVecService { dims: self.dims }))
         }
+    }
+
+    struct FirstLoadBlockingService {
+        loaded: AtomicBool,
+    }
+
+    #[async_trait]
+    impl EmbeddingService for FirstLoadBlockingService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> lattice_embed::Result<Vec<Vec<f32>>> {
+            if !self.loaded.swap(true, Ordering::SeqCst) {
+                tokio::task::spawn_blocking(|| {})
+                    .await
+                    .map_err(|error| lattice_embed::EmbedError::Internal(error.to_string()))?;
+            }
+            Ok(texts.iter().map(|_| vec![1.0]).collect())
+        }
+
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "first-load-blocking-service"
+        }
+    }
+
+    #[test]
+    fn blocking_adapter_first_use_completes_with_single_blocking_thread() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .max_blocking_threads(1)
+            .build()
+            .expect("current-thread runtime must build");
+        let service = BlockingEmbeddingService::new(Arc::new(FirstLoadBlockingService {
+            loaded: AtomicBool::new(false),
+        }));
+
+        let result = runtime.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                service.embed(&["first use".to_owned()], EmbeddingModel::default()),
+            )
+            .await
+        });
+        runtime.shutdown_timeout(Duration::from_secs(1));
+
+        let embeddings = result
+            .expect("first-use embedding must not exhaust the blocking pool")
+            .expect("first-use embedding must succeed");
+        assert_eq!(embeddings, vec![vec![1.0]]);
     }
 
     #[test]
