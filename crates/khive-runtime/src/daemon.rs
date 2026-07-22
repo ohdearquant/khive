@@ -1101,6 +1101,55 @@ pub async fn run_daemon<D: DaemonDispatch>(dispatcher: D) -> anyhow::Result<()> 
     run_daemon_with_boot_guard(dispatcher, boot_guard).await
 }
 
+/// Require the socket's parent directory to be owner-only, and re-permission it
+/// only when it is the directory khive owns by convention.
+///
+/// ADR-096 condition 2 rests the same-uid safety on an owner-only socket inside
+/// an owner-only directory, so a daemon that cannot establish that mode must not
+/// serve. That justifies refusing; it does not justify *rewriting* a directory
+/// the operator handed us. `KHIVE_SOCKET` takes an arbitrary path, so chmodding
+/// its parent unconditionally is wrong in both directions: pointed at a shared
+/// parent like `/tmp` it either fails outright for an ordinary user, or — worse
+/// — succeeds when privileged and strips access for every other process on the
+/// machine. A directory we did not create is checked, never modified.
+#[cfg(unix)]
+fn ensure_socket_dir_is_owner_only(parent: &std::path::Path) -> anyhow::Result<()> {
+    if parent == khive_dir() {
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
+            anyhow::anyhow!(
+                "refusing to start: cannot chmod 0700 {}: {e}. The khive directory must be \
+                 owner-only — it is half of the same-uid guarantee this daemon enforces.",
+                parent.display()
+            )
+        })?;
+    }
+
+    let mode = std::fs::metadata(parent)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "refusing to start: cannot stat {}: {e}. The socket directory's mode is half \
+                 of the same-uid guarantee this daemon enforces, and an unreadable mode is \
+                 not a passing one.",
+                parent.display()
+            )
+        })?
+        .permissions()
+        .mode()
+        & 0o777;
+
+    if mode & 0o077 != 0 {
+        anyhow::bail!(
+            "refusing to start: socket directory {} is mode {mode:04o}, which grants access \
+             beyond its owner. Point KHIVE_SOCKET at a directory only you can reach, or unset \
+             it to use the default. This daemon is not changing the permissions of a directory \
+             it does not own.",
+            parent.display()
+        );
+    }
+
+    Ok(())
+}
+
 /// Run the daemon using a startup lock acquired by the caller *before*
 /// building `dispatcher`, so a second process racing to boot (e.g. two
 /// `kkernel mcp --daemon` spawns before either has bound its socket) cannot
@@ -1123,18 +1172,7 @@ pub async fn run_daemon_with_boot_guard<D: DaemonDispatch>(
 
     if let Some(parent) = sock.parent() {
         std::fs::create_dir_all(parent)?;
-        // Fail closed. ADR-096 condition 2 rests the single-principal safety on
-        // the owner-only socket and its owner-only directory; a daemon that
-        // cannot prove that mode must not serve. Warn-and-continue here would
-        // leave the process running on whatever mode the umask happened to
-        // give, with the warning the only trace.
-        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
-            anyhow::anyhow!(
-                "refusing to start: cannot chmod 0700 {}: {e}. The khive directory must be \
-                 owner-only — it is half of the single-principal guarantee this daemon enforces.",
-                parent.display()
-            )
-        })?;
+        ensure_socket_dir_is_owner_only(parent)?;
     }
 
     // Hold the startup lock across cleanup → bind → pid-write so a concurrent
@@ -1995,6 +2033,50 @@ mod tests {
 
     /// Test 2: `wal_pages` reflects a real
     /// checkpoint observation after writes, deterministically forced via a
+    /// A shared socket directory is refused, and — the part that matters — is
+    /// left exactly as it was found.
+    ///
+    /// `KHIVE_SOCKET` accepts any path, so this stands in for pointing it at
+    /// `/tmp`. Refusing is correct. Re-permissioning someone else's directory
+    /// on the way past is what this pins against: run as a user who *can*
+    /// chmod it, the old unconditional call succeeded and revoked access for
+    /// every other process using that directory.
+    #[test]
+    fn shared_socket_dir_is_refused_without_being_modified() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shared = dir.path().join("shared");
+        std::fs::create_dir(&shared).expect("create");
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).expect("chmod");
+
+        let err = ensure_socket_dir_is_owner_only(&shared).expect_err("must refuse 0777");
+        assert!(
+            err.to_string().contains("0777"),
+            "the refusal should name the mode it saw, got: {err}"
+        );
+
+        let after = std::fs::metadata(&shared)
+            .expect("stat")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            after, 0o777,
+            "refusing must not re-permission a directory khive does not own"
+        );
+    }
+
+    /// An operator-chosen directory that is already owner-only is accepted as
+    /// found, so the check gates on the mode rather than on the location.
+    #[test]
+    fn owner_only_socket_dir_outside_khive_home_is_accepted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let private = dir.path().join("private");
+        std::fs::create_dir(&private).expect("create");
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+
+        ensure_socket_dir_is_owner_only(&private).expect("0700 dir must be accepted");
+    }
+
     /// direct `checkpoint_once` call rather than waiting on the async
     /// periodic task.
     #[tokio::test]
