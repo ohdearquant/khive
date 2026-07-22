@@ -545,6 +545,91 @@ async fn t2_cross_backend_link_stamps_target_backend() {
     assert_eq!(edge.target_id, tgt.id, "T2: correct target_id");
 }
 
+#[tokio::test]
+async fn cross_backend_link_rejects_second_distinct_origin_for_concept() {
+    let rt_main = memory_runtime();
+    let rt_lore = memory_runtime();
+    let rt_archive = memory_runtime();
+
+    let mut registry = BackendRegistry::new();
+    registry.register(BackendId::new("main"), Arc::clone(&rt_main));
+    registry.register(BackendId::new("lore"), Arc::clone(&rt_lore));
+    registry.register(BackendId::new("archive"), Arc::clone(&rt_archive));
+    let coord = SubstrateCoordinator::new(registry);
+    let ns = Namespace::local();
+    let tok_main = rt_main.authorize(ns.clone()).unwrap();
+    let tok_lore = rt_lore.authorize(ns.clone()).unwrap();
+    let tok_archive = rt_archive.authorize(ns.clone()).unwrap();
+
+    let concept = rt_main
+        .create_entity(&tok_main, "concept", None, "Method", None, None, vec![])
+        .await
+        .unwrap();
+    let origin_a = rt_lore
+        .create_entity(
+            &tok_lore,
+            "document",
+            None,
+            "Original paper",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+    let origin_b = rt_archive
+        .create_entity(
+            &tok_archive,
+            "document",
+            None,
+            "Later survey",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+
+    coord
+        .link_cross_backend(
+            &ns,
+            concept.id,
+            origin_a.id,
+            EdgeRelation::IntroducedBy,
+            1.0,
+            None,
+        )
+        .await
+        .unwrap();
+    let error = coord
+        .link_cross_backend(
+            &ns,
+            concept.id,
+            origin_b.id,
+            EdgeRelation::IntroducedBy,
+            1.0,
+            None,
+        )
+        .await
+        .expect_err("a concept may not acquire a second origin");
+    assert!(error.contains("introduced_by origin"), "{error}");
+
+    let stored = rt_main
+        .list_edges(
+            &tok_main,
+            khive_runtime::curation::EdgeListFilter {
+                source_id: Some(concept.id),
+                relations: vec![EdgeRelation::IntroducedBy],
+                ..Default::default()
+            },
+            10,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(stored.len(), 1, "exactly one origin may persist");
+}
+
 // ---- T3: Fan-out merged from multiple backends ----
 
 /// T3: Fan-out entity search over two backends merges results from both.

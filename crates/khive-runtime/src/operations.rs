@@ -36,6 +36,37 @@ use crate::curation::{entity_fts_document, note_fts_document};
 use crate::error::{GuardedWriteFailure, RuntimeError, RuntimeResult};
 use crate::runtime::{KhiveRuntime, NamespaceToken};
 
+#[cfg(test)]
+static INTRODUCED_BY_WRITE_BARRIERS: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<Uuid, std::sync::Arc<tokio::sync::Barrier>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+async fn wait_at_introduced_by_write_barrier(source_id: Uuid) {
+    let barrier = INTRODUCED_BY_WRITE_BARRIERS
+        .lock()
+        .expect("introduced_by barrier lock")
+        .get(&source_id)
+        .cloned();
+    if let Some(barrier) = barrier {
+        if barrier.wait().await.is_leader() {
+            INTRODUCED_BY_WRITE_BARRIERS
+                .lock()
+                .expect("introduced_by barrier lock")
+                .remove(&source_id);
+        }
+    }
+}
+
+fn map_edge_write_error(error: khive_storage::StorageError) -> RuntimeError {
+    match error {
+        khive_storage::StorageError::Conflict { message, .. } => {
+            RuntimeError::InvalidInput(message)
+        }
+        other => RuntimeError::Storage(other),
+    }
+}
+
 // Test-only failure injection for `create_note_inner`. Namespace-targeted so only
 // calls for the armed namespace fire, avoiding cross-test races without `#[serial]`.
 // Gated behind `cfg(any(test, feature = "fault-injection"))` so no lock acquisitions
@@ -1824,7 +1855,7 @@ impl KhiveRuntime {
             .filter(|edge| target.created_at > edge.created_at.timestamp_micros())
             .map(|edge| {
                 vec![format!(
-                    "introduced_by target document {target_id} was created after existing evidence edge {} attached to source concept {}; direction may be reversed",
+                    "ingestion-order advice: introduced_by target document {target_id} was ingested after existing evidence edge {} attached to source concept {}",
                     edge.id, source.id
                 )]
             })
@@ -2127,6 +2158,10 @@ impl KhiveRuntime {
         let warnings = self
             .validate_edge_relation_endpoints_with_warnings(token, source_id, target_id, relation)
             .await?;
+        #[cfg(test)]
+        if relation == EdgeRelation::IntroducedBy {
+            wait_at_introduced_by_write_barrier(source_id).await;
+        }
         let (source_id, target_id) = canonical_edge_endpoints(relation, source_id, target_id);
         let metadata = if relation == EdgeRelation::DependsOn {
             // By-ID, unfiltered — matches the namespace-agnostic endpoint validation
@@ -2170,7 +2205,12 @@ impl KhiveRuntime {
         // fact: a second concurrent write landing between the refusal and a
         // post-hoc read could otherwise misreport which endpoint was actually
         // missing at write time.
-        match self.graph(token)?.upsert_edge_guarded(edge).await? {
+        match self
+            .graph(token)?
+            .upsert_edge_guarded(edge)
+            .await
+            .map_err(map_edge_write_error)?
+        {
             khive_storage::GuardedWriteOutcome::Written => {}
             khive_storage::GuardedWriteOutcome::Refused(missing) => {
                 return Err(RuntimeError::GuardedWriteFailed(GuardedWriteFailure {
@@ -2247,7 +2287,10 @@ impl KhiveRuntime {
             metadata,
             target_backend,
         };
-        self.graph(token)?.upsert_edge(edge).await?;
+        self.graph(token)?
+            .upsert_edge(edge)
+            .await
+            .map_err(map_edge_write_error)?;
         let persisted = self
             .list_edges(
                 token,
@@ -5307,7 +5350,8 @@ impl KhiveRuntime {
         let outcome = self
             .graph(token)?
             .upsert_edges_guarded(edges.clone())
-            .await?;
+            .await
+            .map_err(map_edge_write_error)?;
         if let Some(refusal) = outcome.refused {
             return Err(RuntimeError::GuardedWriteFailed(GuardedWriteFailure {
                 entry_index: Some(refusal.entry_index),
@@ -13720,6 +13764,72 @@ mod tests {
         assert!(msg.contains(&concept.id.to_string()), "{msg}");
         assert!(msg.contains(&first_origin.id.to_string()), "{msg}");
         assert!(msg.contains(&conflicting_origin.id.to_string()), "{msg}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_links_allow_exactly_one_distinct_origin_for_concept() {
+        let rt = Arc::new(rt());
+        let tok = NamespaceToken::local();
+        let concept = rt
+            .create_entity(&tok, "concept", None, "Method", None, None, vec![])
+            .await
+            .unwrap();
+        let origin_a = rt
+            .create_entity(&tok, "document", None, "Paper A", None, None, vec![])
+            .await
+            .unwrap();
+        let origin_b = rt
+            .create_entity(&tok, "document", None, "Paper B", None, None, vec![])
+            .await
+            .unwrap();
+
+        INTRODUCED_BY_WRITE_BARRIERS
+            .lock()
+            .unwrap()
+            .insert(concept.id, Arc::new(tokio::sync::Barrier::new(2)));
+
+        let link = |target_id| {
+            let rt = Arc::clone(&rt);
+            let tok = tok.clone();
+            tokio::spawn(async move {
+                rt.link(
+                    &tok,
+                    concept.id,
+                    target_id,
+                    EdgeRelation::IntroducedBy,
+                    1.0,
+                    None,
+                )
+                .await
+            })
+        };
+        let (result_a, result_b) = tokio::join!(link(origin_a.id), link(origin_b.id));
+        let results = [result_a.unwrap(), result_b.unwrap()];
+
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        let loser = results
+            .into_iter()
+            .find_map(Result::err)
+            .expect("one concurrent link must lose");
+        assert!(
+            matches!(loser, RuntimeError::InvalidInput(_)),
+            "loser must receive a typed invalid-input error, got {loser:?}"
+        );
+
+        let stored = rt
+            .list_edges(
+                &tok,
+                EdgeListFilter {
+                    source_id: Some(concept.id),
+                    relations: vec![EdgeRelation::IntroducedBy],
+                    ..Default::default()
+                },
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 1, "exactly one origin may persist");
     }
 
     #[tokio::test]

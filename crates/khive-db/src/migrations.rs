@@ -124,6 +124,8 @@ const V11_UP: &str = include_str!("../sql/011-ann-write-log.sql");
 
 const V12_UP: &str = include_str!("../sql/012-ann-write-log-model-seq-index.sql");
 
+const V13_UP: &str = include_str!("../sql/013-concept-single-origin.sql");
+
 /// DDL for the `ann_write_log` delta table.
 ///
 /// Shared between migration V11 and the belt-and-suspenders creation in
@@ -207,6 +209,11 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         version: 12,
         name: "ann_write_log_model_seq_index",
         up: V12_UP,
+    },
+    VersionedMigration {
+        version: 13,
+        name: "concept_single_origin",
+        up: V13_UP,
     },
 ];
 

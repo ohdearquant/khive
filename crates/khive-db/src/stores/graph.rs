@@ -26,6 +26,17 @@ use crate::writer_task::WriterTaskHandle;
 
 /// Map a rusqlite error to `StorageError` with `Graph` capability.
 fn map_err(e: rusqlite::Error, op: &'static str) -> StorageError {
+    if matches!(
+        &e,
+        rusqlite::Error::SqliteFailure(_, Some(message))
+            if message == "concept already has a different introduced_by origin"
+    ) {
+        return StorageError::Conflict {
+            capability: StorageCapability::Graph,
+            operation: op.into(),
+            message: "concept already has a different introduced_by origin".to_string(),
+        };
+    }
     StorageError::driver(StorageCapability::Graph, op, e)
 }
 
