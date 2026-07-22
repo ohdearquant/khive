@@ -1276,19 +1276,27 @@ pub async fn run_daemon_with_boot_guard<D: DaemonDispatch>(
             loop {
                 match listener.accept().await {
                     Ok((stream, _)) => {
-                        // Refuse a foreign principal before any frame is read.
+                        // Refuse a foreign uid before any frame is read.
                         // Fails CLOSED: an error reading peer credentials is
                         // "cannot prove same-uid", which is the same answer as
                         // "is not same-uid" — never a pass.
+                        //
+                        // Scope: this is a same-UID check, which is strictly
+                        // weaker than same-PRINCIPAL. Several distinct actors
+                        // running under one uid all pass here, so this does not
+                        // by itself establish that the daemon serves a single
+                        // principal, and nothing downstream refuses or degrades
+                        // on observing more than one. Do not describe it as a
+                        // multi-principal guard — it bounds the process boundary,
+                        // not the identity one.
                         match peer_uid(&stream) {
                             Ok(peer) if uid_is_permitted(peer, daemon_euid) => {}
                             Ok(peer) => {
                                 tracing::error!(
                                     peer_uid = peer,
                                     daemon_euid,
-                                    "refusing connection from a foreign uid: this daemon serves a \
-                                     single principal (ADR-096 condition 2); multi-principal \
-                                     serving requires a gated ADR, not a configuration change"
+                                    "refusing connection from a foreign uid: this daemon accepts \
+                                     only peers running as its own uid"
                                 );
                                 drop(stream);
                                 continue;
