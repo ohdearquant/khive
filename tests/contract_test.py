@@ -28,6 +28,9 @@ Concretely, these tests cover:
   9. Epistemic edge endpoint enforcement — supports/refutes legal pairs are
      accepted; illegal pairs (wrong target kind, cross-substrate) are rejected
      with clear error messages (ADR-055 + ADR-002 §"Epistemic relations").
+ 10. Batch outcome status — full success reports ``status=success`` while a
+     mixed success/failure batch preserves per-op results and reports
+     ``status=partial`` with the corresponding summary counts.
 
 How to run
 ----------
@@ -994,6 +997,48 @@ def test_epistemic_edge_endpoints(proc: subprocess.Popen) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Contract 10 — Batch outcome status
+# ---------------------------------------------------------------------------
+
+def test_batch_outcome_status(proc: subprocess.Popen) -> None:
+    """Batch status distinguishes full success from a mixed outcome."""
+    successful = _request_raw(
+        proc,
+        json.dumps([
+            {"tool": "stats", "args": {}},
+            {"tool": "list", "args": {"kind": "entity", "limit": 1}},
+        ]),
+    )
+    assert successful.get("status") == "success", successful
+    assert successful.get("summary") == {
+        "total": 2,
+        "succeeded": 2,
+        "failed": 0,
+        "aborted": 0,
+    }, successful
+
+    partial = _request_raw(
+        proc,
+        json.dumps([
+            {"tool": "stats", "args": {}},
+            {"tool": "search", "args": {"kind": "not_a_real_kind", "query": "x"}},
+        ]),
+    )
+    assert partial.get("status") == "partial", partial
+    assert partial.get("summary") == {
+        "total": 2,
+        "succeeded": 1,
+        "failed": 1,
+        "aborted": 0,
+    }, partial
+
+    results = partial.get("results") or []
+    assert len(results) == 2, partial
+    assert results[0].get("ok") is True and "result" in results[0], results[0]
+    assert results[1].get("ok") is False and "error" in results[1], results[1]
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1015,6 +1060,7 @@ def main() -> int:
         ("merge_semantics", test_merge_semantics),
         ("annotates_source_must_be_note", test_annotates_source_must_be_note),
         ("epistemic_edge_endpoints", test_epistemic_edge_endpoints),
+        ("batch_outcome_status", test_batch_outcome_status),
     ]
 
     for name, fn in tests:

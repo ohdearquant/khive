@@ -163,18 +163,21 @@ jobs:
           echo "Manual releases must dispatch from main so the current SemVer gate applies." >&2
           exit 1
       - uses: actions/checkout@v4
+      - name: Load semver-gate excludes
+        # Single source of truth (#568) for crates with no crates.io baseline
+        # yet — also consumed by scripts/publish.sh, so the release gate here
+        # and the publish-boundary gate there cannot drift out of sync.
+        id: semver-excludes
+        run: |
+          list=$(awk 'BEGIN { sep = "" } !/^[[:space:]]*(#|$)/ { printf "%s%s", sep, $0; sep = "," } END { print "" }' scripts/lib/semver_excludes.txt)
+          echo "list=$list" >> "$GITHUB_OUTPUT"
       - name: Check semver vs crates.io baseline
         # Pinned to a commit SHA, not the mutable @v2 tag (same drift rationale
         # as the #215 cargo-deny installer pin): a release gate must not drift.
         uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2.9
         with:
           manifest-path: crates/Cargo.toml
-          # These crates have never been published, so they have no crates.io
-          # baseline and make the check un-runnable if left in scope. Keep this
-          # list synchronized with the semver-gate excludes in
-          # scripts/publish.sh; drop each entry after its first crates.io
-          # release so it is gated too.
-          exclude: khive-changeset
+          exclude: ${{ steps.semver-excludes.outputs.list }}
 
   # ─────────────────────────────────────────────────────────────────────────
   # Phase 2: Publish all subpackages + umbrella atomically in a single job.

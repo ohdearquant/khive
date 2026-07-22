@@ -382,6 +382,20 @@ FIXTURE
             fi
         done
 
+        # Line attribution advances with the forward macro scan. Check more
+        # than one location so a future cursor change cannot silently report
+        # every finding relative to the previous macro or to byte zero.
+        for location in \
+            "crates/fixture-crate/src/lib.rs:4: unreachable!" \
+            "crates/fixture-crate/src/lib.rs:11: panic!"
+        do
+            if ! grep -qF "$location" "$tmp/fail.log"; then
+                echo "self-test FAILED: expected finding location missing: $location"
+                cat "$tmp/fail.log"
+                status=1
+            fi
+        done
+
         # the ci_log_forgery_stub and c1_csi_forgery_stub messages carry raw
         # control bytes (an ANSI ESC, a single-byte C1 CSI decoded from \u{9b}, an
         # embedded newline) plus a literal "::error::forged" workflow-command
@@ -434,33 +448,12 @@ PYCTL
         status=1
     fi
 
-    # The committed allowlist is validated by running the scanner over the real
-    # tree with it: the unused-entry guard fails loud on any entry that suppresses
-    # no current finding (stale, moved, or pre-planted), and the malformed-line
-    # guard fails loud on a no-TAB entry. That is the scanner's own contract, so a
-    # comment-only file (its state today) passes and a legitimate committed
-    # suppression -- one that matches a current finding -- passes too, where a
-    # blunt "no active line" assertion would wrongly reject it. Any offending
-    # entry is named through the scanner's own sanitize_for_ci output, never
-    # echoed raw from the file. The committed file carries NO self-test fixture
-    # anchor: a committed entry is a real, PR-recreatable suppression, so a fixture
-    # there would let a PR add that exact path+message and suppress its own stub.
-    # Suppression is exercised via a temp copy below.
-    #
-    # This repeats the production scan's full-tree pass; removing that duplication
-    # is the self-test/production structure work tracked in #1108.
-    committed_allowlist="$SCRIPT_DIR/stub-marker-allowlist.txt"
-    if ! STUB_MARKER_ALLOWLIST="$committed_allowlist" scan "$ROOT" git > "$tmp/committed.log" 2>&1; then
-        echo "self-test FAILED: the committed allowlist did not pass the scanner over the real tree -- a malformed, stale, or pre-planted allowlist entry, or an un-suppressed placeholder stub in the tree (named below):"
-        cat "$tmp/committed.log"
-        status=1
-    fi
-
-    # Suppression is exercised against a TEMP allowlist: a copy of the committed
-    # file (so a committed parse/format break still surfaces) with a fixture
-    # anchor appended. The anchor entry suppresses the matching finding, so it is
-    # used and the unused-entry guard stays satisfied; a sibling with a different
-    # message at the same path still surfaces, checking exact-match both ways.
+    # Suppression is exercised against an isolated fixture allowlist. Production
+    # validates the committed allowlist during the normal full-tree scan; keeping
+    # that state out of the self-test avoids scanning the real tree twice and lets
+    # legitimate production entries coexist with fixture-only paths. The anchor
+    # suppresses its exact finding while a sibling message at the same path still
+    # surfaces, checking exact-match both ways.
     mkdir -p "$tmp/case-allowlist/crates/fixture-crate/src"
     cat > "$tmp/case-allowlist/crates/fixture-crate/src/lib.rs" <<'ALWFIXTURE'
 pub fn allowlisted_stub() -> u32 {
@@ -469,12 +462,11 @@ pub fn allowlisted_stub() -> u32 {
 
 pub fn not_allowlisted_stub() -> u32 {
     panic!("todo: this one is NOT allowlisted and must still be caught")
-}
+    }
 ALWFIXTURE
     temp_allowlist="$tmp/case-allowlist-allowlist.txt"
-    cp "$committed_allowlist" "$temp_allowlist"
     printf 'crates/fixture-crate/src/lib.rs\ttodo: this one is allowlisted and must be suppressed\n' \
-        >> "$temp_allowlist"
+        > "$temp_allowlist"
 
     if STUB_MARKER_ALLOWLIST="$temp_allowlist" scan "$tmp/case-allowlist" find > "$tmp/allowlist.log" 2>&1; then
         echo "self-test FAILED: the non-allowlisted sibling finding should have failed the scan"
@@ -1051,12 +1043,11 @@ with open(out_symlinks, "wb") as fh:
         allowlist_is_override=0
     fi
 
-    # `|| rc=$?` keeps set -e from exiting the script the moment python3 returns
-    # non-zero (findings present, or the allowlist-path guard failing): the temp
-    # file_list below must still be removed on that path, and the caller needs
-    # the real exit code, not a set-e-induced abort.
+    # Keep the heredoc command in an explicit conditional so set -e cannot exit
+    # before the temp lists are removed. Handling the status after the heredoc
+    # terminator also keeps the Python/shell boundary unambiguous.
     rc=0
-    python3 - "$file_list" "$allowlist" "$root" "$symlink_list" "$allowlist_is_override" <<'PY' || rc=$?
+    if python3 - "$file_list" "$allowlist" "$root" "$symlink_list" "$allowlist_is_override" <<'PY'
 import errno
 import os
 import re
@@ -1710,7 +1701,11 @@ for path in files:
     clean = strip_comments_and_char_lits(text)
     code_only = blank_strings(clean)
 
+    line_no = 1
+    line_cursor = 0
     for m in MACRO_CALL_RE.finditer(code_only):
+        line_no += clean.count("\n", line_cursor, m.start())
+        line_cursor = m.start()
         call_start = m.end() - 1  # the opening delimiter char (`(`/`{`/`[`)
         # The first argument is the format template; every later argument is a
         # positional value or a `name = value` named value. Each literal
@@ -1747,7 +1742,6 @@ for path in files:
         if idx is not None:
             allowlist_used[idx] = True
             continue
-        line_no = clean.count("\n", 0, m.start()) + 1
         macro_name = m.group(1)
         findings.append(
             f'{sanitize_for_ci(rel_path)}:{line_no}: {macro_name}!("{sanitize_for_ci(message)}") '
@@ -1782,6 +1776,11 @@ if failed:
 
 print(f"stub-marker lint: {len(files)} file(s) OK")
 PY
+    then
+        rc=0
+    else
+        rc=$?
+    fi
     rm -f "$file_list" "$symlink_list"
     return "$rc"
 }

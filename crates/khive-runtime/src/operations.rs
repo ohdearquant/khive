@@ -17,20 +17,23 @@ use uuid::Uuid;
 use khive_score::DeterministicScore;
 use khive_storage::note::Note;
 use khive_storage::types::{
-    BatchWriteSummary, DeleteMode, DirectedNeighborHit, Direction, EdgeSortField, GraphPath,
-    LinkId, NeighborHit, NeighborQuery, Page, PageRequest, SortOrder, SqlRow, SqlStatement,
-    SqlValue, TextFilter, TextQueryMode, TextSearchRequest, TraversalRequest,
+    DeleteMode, DirectedNeighborHit, Direction, EdgeSortField, GraphPath, LinkId, NeighborHit,
+    NeighborQuery, Page, PageRequest, SortOrder, SqlRow, SqlStatement, SqlValue, TextFilter,
+    TextQueryMode, TextSearchRequest, TraversalRequest,
 };
 use khive_storage::{Edge, EdgeRelation, Entity, EntityFilter, Event, EventFilter};
 use khive_types::{EdgeEndpointRule, EndpointKind, EventKind, SubstrateKind};
 
-use khive_db::stores::entity::entity_hard_delete_statement;
+use khive_db::stores::entity::{entity_hard_delete_statement, entity_upsert_statement};
 use khive_db::stores::graph::{edge_hard_delete_statement, purge_incident_edges_statement};
 use khive_db::stores::note::note_hard_delete_statement;
+use khive_db::stores::text::insert_document_statement;
 use khive_db::SqliteError;
 use rusqlite::OptionalExtension;
 
-use crate::atomic_plan::{AffectedRowGuard, DeletePlan, PlanStatement, PostCommitEffect};
+use crate::atomic_plan::{
+    AddEntityPlan, AffectedRowGuard, DeletePlan, PlanStatement, PostCommitEffect,
+};
 use crate::atomic_runner::{run_atomic_unit, AtomicOpFailure, AtomicOpPlan, AtomicRunOutcome};
 use crate::curation::{entity_fts_document, note_fts_document};
 use crate::error::{GuardedWriteFailure, RuntimeError, RuntimeResult};
@@ -86,17 +89,24 @@ pub fn arm_vector_fail_after(n: usize) {
 #[cfg(any(test, feature = "fault-injection"))]
 static FTS_FAIL_NS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+// Vector insertion failures use the same namespace-keyed one-shot semantics.
 #[cfg(any(test, feature = "fault-injection"))]
-static VECTOR_FAIL_NS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static VECTOR_FAIL_NS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 /// FTS failure injection for `create_many` — separate from `FTS_FAIL_NS` so that
-/// create_note_inner and create_many tests cannot disarm each other.
+/// create_note_inner and create_many tests cannot disarm each other. Namespace-keyed
+/// set (not a single `Option<String>` slot) for the same reason as `VECTOR_FAIL_NS` (#1263).
 #[cfg(any(test, feature = "fault-injection"))]
-static FTS_FAIL_MANY_NS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static FTS_FAIL_MANY_NS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 /// FTS partial-failure injection for `create_many` — returns `Ok(BatchWriteSummary)`
 /// with `failed > 0` so that the `summary.failed > 0` rollback branch is exercised.
-/// Distinct from `FTS_FAIL_MANY_NS` which injects a hard `Err`.
+/// Distinct from `FTS_FAIL_MANY_NS` which injects a hard `Err`. Namespace-keyed set
+/// for the same reason as `VECTOR_FAIL_NS` (#1263).
 #[cfg(any(test, feature = "fault-injection"))]
-static FTS_FAIL_MANY_PARTIAL_NS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static FTS_FAIL_MANY_PARTIAL_NS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 /// Non-parser FTS *search*-leg failure injection for `search_notes`: distinct
 /// from `FTS_FAIL_NS` (which injects at the FTS *upsert*/write step of
 /// `create_note_inner`). Injects a `StorageError::Timeout` at the `search()`
@@ -124,24 +134,27 @@ pub fn arm_fts_fail(ns: &str) {
 /// Arm the FTS failure injection for `create_many` targeting namespace `ns`.
 ///
 /// The next `create_many` call whose namespace equals `ns` returns an injected
-/// error at the FTS upsert step (after entity rows are committed), then disarms.
-/// Calls on other namespaces are unaffected.
+/// error at the first FTS statement inside the atomic batch, then disarms.
+/// Calls on other namespaces are unaffected, and concurrent arms of distinct
+/// namespaces do not overwrite each other.
 /// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
 #[cfg(any(test, feature = "fault-injection"))]
 pub fn arm_fts_fail_many(ns: &str) {
-    *FTS_FAIL_MANY_NS.lock().unwrap() = Some(ns.to_string());
+    FTS_FAIL_MANY_NS.lock().unwrap().insert(ns.to_string());
 }
 
-/// Arm the FTS *partial*-failure injection for `create_many` targeting namespace `ns`.
+/// Arm a mid-batch FTS failure for `create_many` targeting namespace `ns`.
 ///
-/// The next `create_many` call whose namespace equals `ns` returns
-/// `Ok(BatchWriteSummary { attempted: 2, affected: 1, failed: 1, ... })` from the
-/// FTS upsert step, exercising the `summary.failed > 0` rollback branch (as opposed
-/// to the hard-`Err` branch exercised by `arm_fts_fail_many`).  Then disarms.
+/// The next matching call fails the second FTS statement when the batch contains at
+/// least two entities, after one entity/FTS pair has executed in the transaction.
+/// A one-entity batch fails its first FTS statement. Then disarms only that namespace.
 /// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
 #[cfg(any(test, feature = "fault-injection"))]
 pub fn arm_fts_fail_many_partial(ns: &str) {
-    *FTS_FAIL_MANY_PARTIAL_NS.lock().unwrap() = Some(ns.to_string());
+    FTS_FAIL_MANY_PARTIAL_NS
+        .lock()
+        .unwrap()
+        .insert(ns.to_string());
 }
 
 /// Arm a non-parser FTS *search*-leg failure injection for `search_notes` targeting
@@ -162,11 +175,12 @@ pub fn arm_fts_search_fail(ns: &str) {
 ///
 /// The next `create_note` call whose note namespace equals `ns` returns an injected
 /// error at the first vector insert step, then disarms.  Calls on other namespaces
-/// are unaffected.
+/// are unaffected, and concurrent arms of distinct namespaces do not overwrite
+/// each other.
 /// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
 #[cfg(any(test, feature = "fault-injection"))]
 pub fn arm_vector_fail(ns: &str) {
-    *VECTOR_FAIL_NS.lock().unwrap() = Some(ns.to_string());
+    VECTOR_FAIL_NS.lock().unwrap().insert(ns.to_string());
 }
 
 /// Failure injection for `delete_note_row_first_for_compensation`'s post-row-removal
@@ -192,6 +206,7 @@ pub fn arm_rollback_cleanup_fail(ns: &str) {
 pub struct NoteSearchHit {
     pub note_id: Uuid,
     pub score: DeterministicScore,
+    pub source: crate::SearchSource,
     pub title: Option<String>,
     pub snippet: Option<String>,
 }
@@ -446,8 +461,8 @@ fn accepted_pack_relations_for_pattern_entities(
 /// parallel table — issue #543 precedent, applied to GQL query-pattern hint
 /// derivation (issue #593).
 ///
-/// Pack rules are skipped for `crate::pack::SPECIAL_RELATIONS` (supersedes /
-/// supports / refutes): the live validator's special-relation branch
+/// Pack rules are skipped when `crate::pack::is_special_relation` is true
+/// (supersedes / supports / refutes): the live validator's special-relation branch
 /// (`validate_edge_relation_endpoints`, this file) resolves those relations
 /// before `pack_rule_allows` is ever reached, so a pack `EDGE_RULES` entry for
 /// one of them is never actually enforced (see `pack.rs`'s
@@ -460,7 +475,7 @@ fn accepted_entity_kind_pairs_for_relation(
     for src in khive_types::EntityKind::ALL {
         for tgt in khive_types::EntityKind::ALL {
             let allowed = base_entity_rule_allows(src.name(), relation, tgt.name())
-                || (!crate::pack::SPECIAL_RELATIONS.contains(&relation)
+                || (!crate::pack::is_special_relation(relation)
                     && accepted_pack_relations_for_pattern_entities(
                         pack_rules,
                         src.name(),
@@ -492,10 +507,15 @@ fn accepted_entity_kind_pairs_for_relation(
 /// `supports` / `refutes` (see [`accepted_entity_kind_pairs_for_relation`]):
 /// pack rules never make those triples possible, only the base allowlist does.
 fn static_impossible_edge_pattern_warnings(
+    language: khive_query::QueryLanguage,
     pattern: &khive_query::ast::MatchPattern,
     pack_rules: &[EdgeEndpointRule],
 ) -> Vec<String> {
     use khive_query::ast::{EdgeDirection, PatternElement};
+
+    if language != khive_query::QueryLanguage::Gql {
+        return Vec::new();
+    }
 
     let elements = &pattern.elements;
     let mut warnings = Vec::new();
@@ -531,7 +551,7 @@ fn static_impossible_edge_pattern_warnings(
         };
 
         let possible = base_entity_rule_allows(src_kind.name(), relation, tgt_kind.name())
-            || (!crate::pack::SPECIAL_RELATIONS.contains(&relation)
+            || (!crate::pack::is_special_relation(relation)
                 && accepted_pack_relations_for_pattern_entities(
                     pack_rules,
                     src_kind.name(),
@@ -1074,15 +1094,7 @@ impl KhiveRuntime {
                 .await;
 
             #[cfg(any(test, feature = "fault-injection"))]
-            let vec_inject = {
-                let mut g = VECTOR_FAIL_NS.lock().unwrap();
-                if g.as_deref() == Some(ns) {
-                    *g = None;
-                    true
-                } else {
-                    false
-                }
-            };
+            let vec_inject = VECTOR_FAIL_NS.lock().unwrap().remove(ns);
             #[cfg(not(any(test, feature = "fault-injection")))]
             let vec_inject = false;
             let vec_result: RuntimeResult<Vec<f32>> = if vec_inject {
@@ -1606,10 +1618,7 @@ impl KhiveRuntime {
                     "link target {target_id} not found"
                 )));
             }
-        } else if matches!(
-            relation,
-            EdgeRelation::Supersedes | EdgeRelation::Supports | EdgeRelation::Refutes
-        ) {
+        } else if crate::pack::is_special_relation(relation) {
             // supersedes / supports / refutes: same-substrate only (note→note or entity→entity).
             // Event and edge endpoints are invalid regardless of the other endpoint.
             // Endpoint resolution is by-ID and namespace-agnostic.
@@ -1818,10 +1827,7 @@ impl KhiveRuntime {
             return Ok(());
         }
 
-        if matches!(
-            relation,
-            EdgeRelation::Supersedes | EdgeRelation::Supports | EdgeRelation::Refutes
-        ) {
+        if crate::pack::is_special_relation(relation) {
             let rel_name = relation.as_str();
             let src = src.ok_or_else(|| {
                 RuntimeError::NotFound(format!("link source {source_id} not found"))
@@ -3051,15 +3057,7 @@ impl KhiveRuntime {
             // the cfg(not) branch is a const false eliminating the if-branch.
             #[cfg(any(test, feature = "fault-injection"))]
             let vec_inject = {
-                let ns_inject = {
-                    let mut g = VECTOR_FAIL_NS.lock().unwrap();
-                    if g.as_deref() == Some(ns) {
-                        *g = None;
-                        true
-                    } else {
-                        false
-                    }
-                };
+                let ns_inject = VECTOR_FAIL_NS.lock().unwrap().remove(ns);
                 let count_inject = VECTOR_FAIL_AFTER.with(|cell| match cell.get() {
                     Some(0) => {
                         cell.set(None);
@@ -3547,6 +3545,7 @@ impl KhiveRuntime {
                 Some(NoteSearchHit {
                     note_id: hit.entity_id,
                     score: weighted,
+                    source: hit.source,
                     title: hit.title.or_else(|| note_title(note)),
                     snippet: hit.snippet.or_else(|| note_snippet(note)),
                 })
@@ -4187,7 +4186,7 @@ impl KhiveRuntime {
         use khive_query::QueryValue;
         use khive_storage::types::SqlValue;
 
-        let ast = khive_query::parse_auto(query)?;
+        let (language, ast) = khive_query::language::parse_auto_with_language(query)?;
         opts.scopes = token
             .visible_namespaces()
             .iter()
@@ -4197,23 +4196,9 @@ impl KhiveRuntime {
         let mut warnings = compiled.warnings;
         let truncation_check = compiled.truncation_check;
 
-        // Static schema-mismatch hint (issue #593): GQL-only by design — the
-        // hint is worded around GQL's `(kind)-[:relation]->(kind)` syntax, so
-        // it is scoped out of SPARQL even though SPARQL compiles to the same
-        // `MatchPattern` shape. Dialect is detected the same way `parse_auto`
-        // selects it, since neither the AST nor `CompiledQuery` retains it.
-        let is_sparql = query
-            .trim()
-            .as_bytes()
-            .get(..6)
-            .is_some_and(|p| p.eq_ignore_ascii_case(b"SELECT"));
-        if !is_sparql {
-            let pack_rules = self.pack_edge_rules();
-            warnings.extend(static_impossible_edge_pattern_warnings(
-                &ast.pattern,
-                &pack_rules,
-            ));
-        }
+        warnings.extend(self.with_pack_edge_rules(|pack_rules| {
+            static_impossible_edge_pattern_warnings(language, &ast.pattern, pack_rules)
+        }));
 
         // Convert QueryValue params (query-layer type) to SqlValue (storage-layer type)
         // at the query–storage boundary.
@@ -5163,15 +5148,10 @@ impl KhiveRuntime {
     /// (unknown kind, empty name, secret-gate violation), the method returns
     /// that error and no entities are written.
     ///
-    /// Storage writes are issued as ONE `upsert_entities` call followed by ONE
-    /// `upsert_documents` call — the same primitives that the single-entity path
-    /// uses, but batched. Embedding is intentionally skipped: bulk structural
-    /// ingest is the expected use-case, and dense vectors are backfilled later
-    /// via a `reindex` call. Callers that need immediate vector search
-    /// immediately after creation should use per-entity `create_entity` instead.
-    ///
-    /// On FTS failure, every newly written entity row is hard-deleted to maintain
-    /// consistency (mirrors the single-entity rollback in `create_entity`).
+    /// Entity rows and their FTS documents are written in one SQLite transaction.
+    /// Any statement failure rolls back the entire batch across both surfaces.
+    /// Embedding is intentionally skipped: bulk structural ingest is the expected
+    /// use-case, and dense vectors are backfilled later via a `reindex` call.
     pub async fn create_many(
         &self,
         token: &NamespaceToken,
@@ -5220,140 +5200,72 @@ impl KhiveRuntime {
             entities.push(entity);
         }
 
-        // Phase 2: single bulk entity write.
-        // Capture the BatchWriteSummary to detect partial failures.
-        // The store commits the transaction even when some rows fail (per-row error
-        // isolation). If any row failed, compensate by hard-deleting the rows that DID
-        // land, then return Err so the caller sees zero net writes.
-        //
-        // NOTE: this compensation path (delete-on-partial-failure) is a stopgap until
-        // a true single-transaction bulk primitive is available in the entity store.
-        // That primitive (writing entity rows and FTS rows in one SQL transaction) is
-        // tracked as a follow-up issue.
-        let entity_summary = self
-            .entities(token)?
-            .upsert_entities(entities.clone())
-            .await?;
-
-        if entity_summary.failed > 0 {
-            // Compensate: hard-delete any entity rows that did land.
-            if let Ok(store) = self.entities(token) {
-                for entity in &entities {
-                    if let Err(ce) = store.delete_entity(entity.id, DeleteMode::Hard).await {
-                        tracing::error!(
-                            error = %ce,
-                            id = %entity.id,
-                            "create_many: failed to roll back entity row after partial entity write"
-                        );
-                    }
-                }
-            }
-            return Err(RuntimeError::Internal(format!(
-                "create_many: {}/{} entity rows failed to write (first error: {}); \
-                 all rows rolled back",
-                entity_summary.failed, entity_summary.attempted, entity_summary.first_error
-            )));
-        }
-
-        // Phase 3: single bulk FTS write.
-        //
-        // The FTS store commits partial batches and signals per-document failures
-        // via BatchWriteSummary.failed (same as the entity store in Phase 2).
-        // We must capture the summary and treat failed > 0 as an error.
-        //
-        // Compensation is symmetric: on any FTS failure (Err or failed > 0),
-        // we first delete any FTS documents that may have landed, then
-        // hard-delete the entity rows.  This order matters: the entity delete
-        // is the authoritative write; FTS is a derived index.  Cleaning FTS
-        // first avoids a window where entity rows are gone but stale FTS rows
-        // survive.
-        let docs: Vec<_> = entities.iter().map(entity_fts_document).collect();
-
         #[cfg(any(test, feature = "fault-injection"))]
-        let fts_many_inject = {
-            let mut g = FTS_FAIL_MANY_NS.lock().unwrap();
-            if g.as_deref() == Some(ns) {
-                *g = None;
-                true
-            } else {
-                false
-            }
-        };
+        let fts_many_inject = FTS_FAIL_MANY_NS.lock().unwrap().remove(ns);
         #[cfg(not(any(test, feature = "fault-injection")))]
         let fts_many_inject = false;
 
-        // Partial-failure seam: returns Ok(summary) with failed > 0 so the
-        // `summary.failed > 0` rollback branch is exercised in tests.
         #[cfg(any(test, feature = "fault-injection"))]
-        let fts_many_inject_partial = {
-            let mut g = FTS_FAIL_MANY_PARTIAL_NS.lock().unwrap();
-            if g.as_deref() == Some(ns) {
-                *g = None;
-                true
-            } else {
-                false
-            }
-        };
+        let fts_many_inject_partial = FTS_FAIL_MANY_PARTIAL_NS.lock().unwrap().remove(ns);
         #[cfg(not(any(test, feature = "fault-injection")))]
         let fts_many_inject_partial = false;
 
-        let fts_summary_result: RuntimeResult<BatchWriteSummary> = if fts_many_inject {
-            Err(RuntimeError::Internal(
-                "injected FTS failure for create_many".to_string(),
-            ))
+        let injected_failure_index = if fts_many_inject {
+            Some(0)
         } else if fts_many_inject_partial {
-            Ok(BatchWriteSummary {
-                attempted: docs.len() as u64,
-                affected: docs.len().saturating_sub(1) as u64,
-                failed: 1,
-                first_error: "injected partial FTS failure for create_many".to_string(),
-            })
+            Some(usize::from(entities.len() > 1))
         } else {
-            match self.text(token) {
-                Ok(fts) => fts.upsert_documents(docs).await.map_err(RuntimeError::from),
-                Err(e) => Err(e),
-            }
+            None
         };
 
-        let fts_err: Option<RuntimeError> = match fts_summary_result {
-            Err(e) => Some(e),
-            Ok(summary) if summary.failed > 0 => Some(RuntimeError::Internal(format!(
-                "create_many: {}/{} FTS rows failed to index (first error: {}); \
-                 all rows rolled back",
-                summary.failed, summary.attempted, summary.first_error
+        let _ = self.entities(token)?;
+        let _ = self.text(token)?;
+
+        let plans = entities
+            .iter()
+            .enumerate()
+            .map(|(index, entity)| {
+                let mut fts_statement =
+                    insert_document_statement("fts_entities", &entity_fts_document(entity));
+                if injected_failure_index == Some(index) {
+                    fts_statement = SqlStatement {
+                        sql: "INSERT INTO __khive_create_many_injected_failure__ DEFAULT VALUES"
+                            .to_string(),
+                        params: vec![],
+                        label: Some("fts-insert-injected-failure".to_string()),
+                    };
+                }
+                AtomicOpPlan::AddEntity(AddEntityPlan {
+                    entity_id: entity.id,
+                    statements: vec![
+                        PlanStatement {
+                            statement: entity_upsert_statement(entity),
+                            guard: Some(AffectedRowGuard::exactly(1)),
+                        },
+                        PlanStatement {
+                            statement: fts_statement,
+                            guard: None,
+                        },
+                    ],
+                    post_commit: PostCommitEffect::None,
+                })
+            })
+            .collect();
+
+        match run_atomic_unit(self.sql().as_ref(), plans).await {
+            Ok(AtomicRunOutcome::Committed { .. }) => Ok(entities),
+            Ok(AtomicRunOutcome::RolledBack {
+                failed_op_index,
+                failure,
+            }) => Err(RuntimeError::Internal(format!(
+                "create_many: atomic batch rolled back at entity index {failed_op_index}: \
+                 {failure:?}"
             ))),
-            Ok(_) => None,
-        };
-
-        if let Some(e) = fts_err {
-            // Clean up any FTS docs that landed before deleting entity rows.
-            if let Ok(fts) = self.text(token) {
-                for entity in &entities {
-                    if let Err(ce) = fts.delete_document(ns, entity.id).await {
-                        tracing::error!(
-                            error = %ce,
-                            id = %entity.id,
-                            "create_many: failed to remove FTS doc during rollback"
-                        );
-                    }
-                }
-            }
-            if let Ok(store) = self.entities(token) {
-                for entity in &entities {
-                    if let Err(ce) = store.delete_entity(entity.id, DeleteMode::Hard).await {
-                        tracing::error!(
-                            error = %ce,
-                            id = %entity.id,
-                            "create_many: failed to roll back entity row after FTS failure"
-                        );
-                    }
-                }
-            }
-            return Err(e);
+            Err(e) => Err(RuntimeError::Internal(format!(
+                "create_many: atomic batch failed: {}",
+                e.0
+            ))),
         }
-
-        // Embedding is skipped intentionally — see doc comment above.
-        Ok(entities)
     }
 }
 
@@ -10123,7 +10035,7 @@ mod tests {
     // Inject a vector insertion failure after note row + FTS commit and assert
     // both the note row and the FTS document are removed (no stranded rows).
     // Uses a unique namespace (see create_note_fts_failure_rolls_back_note_row)
-    // so the process-global VECTOR_FAIL_NS flag is consumed only by this test.
+    // so only this test consumes its VECTOR_FAIL_NS entry.
     // Since the single registered provider fires embed_document before the
     // injection check, the injection converts the successful embedding into an
     // error just before the VectorStore insert, then disarms.
@@ -10168,6 +10080,57 @@ mod tests {
         assert!(
             notes.is_empty(),
             "compensation must remove note row after vector failure; got {notes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn vector_failure_injections_for_distinct_namespaces_do_not_overwrite_each_other() {
+        const MODEL: &str = "test-vec-inject-distinct-namespaces";
+        const DIMS: usize = 4;
+
+        let rt_a = KhiveRuntime::memory().unwrap();
+        let (provider_a, _counter_a) = ConstVecProvider::new(MODEL, DIMS);
+        rt_a.register_embedder(provider_a);
+        let ns_a = Namespace::parse("fault-vec-distinct-a").unwrap();
+        let tok_a = NamespaceToken::for_namespace(ns_a.clone());
+
+        let rt_b = KhiveRuntime::memory().unwrap();
+        let (provider_b, _counter_b) = ConstVecProvider::new(MODEL, DIMS);
+        rt_b.register_embedder(provider_b);
+        let ns_b = Namespace::parse("fault-vec-distinct-b").unwrap();
+        let tok_b = NamespaceToken::for_namespace(ns_b.clone());
+
+        arm_vector_fail(ns_a.as_str());
+        arm_vector_fail(ns_b.as_str());
+
+        let (result_a, result_b) = tokio::join!(
+            rt_a.create_note(
+                &tok_a,
+                "observation",
+                None,
+                "vector failure target A",
+                None,
+                None,
+                vec![],
+            ),
+            rt_b.create_note(
+                &tok_b,
+                "observation",
+                None,
+                "vector failure target B",
+                None,
+                None,
+                vec![],
+            ),
+        );
+
+        assert!(
+            result_a.is_err(),
+            "namespace A must retain its pending vector failure injection"
+        );
+        assert!(
+            result_b.is_err(),
+            "namespace B must retain its pending vector failure injection"
         );
     }
 
@@ -11045,8 +11008,7 @@ mod tests {
     // error; the test asserts zero rows in both `entities` and `fts_entities`.
     #[tokio::test]
     async fn create_many_fts_failure_rolls_back_both_substrates() {
-        // Use a unique namespace so the process-global one-shot is unaffected by
-        // other concurrent tests.
+        // Use a unique namespace so only this test consumes its failure entry.
         let ns = format!("fts-fail-many-{}", uuid::Uuid::new_v4().as_simple());
         let rt = rt();
         let tok = NamespaceToken::for_namespace(Namespace::parse(&ns).unwrap());
@@ -11102,16 +11064,58 @@ mod tests {
         );
     }
 
-    // FTS partial-failure (Ok(summary) with summary.failed > 0) rolls back
-    // both substrates.
-    //
-    // The production code has a distinct arm:
-    //   Ok(summary) if summary.failed > 0 => return Err(...)
-    // This test exercises that arm by arming `arm_fts_fail_many_partial`, which
-    // returns Ok(BatchWriteSummary { failed: 1, ... }) instead of a hard Err.
-    // Both entity rows and FTS rows must be empty after rollback.
     #[tokio::test]
-    async fn create_many_fts_partial_failure_rolls_back_both_substrates() {
+    async fn create_many_fts_failure_injections_for_distinct_namespaces_do_not_overwrite_each_other(
+    ) {
+        let rt_a = rt();
+        let ns_a = Namespace::parse("fts-fail-many-distinct-a").unwrap();
+        let tok_a = NamespaceToken::for_namespace(ns_a.clone());
+        let rt_b = rt();
+        let ns_b = Namespace::parse("fts-fail-many-distinct-b").unwrap();
+        let tok_b = NamespaceToken::for_namespace(ns_b.clone());
+
+        arm_fts_fail_many(ns_a.as_str());
+        arm_fts_fail_many(ns_b.as_str());
+
+        let (result_a, result_b) = tokio::join!(
+            rt_a.create_many(
+                &tok_a,
+                vec![EntityCreateSpec {
+                    kind: "concept".into(),
+                    entity_type: None,
+                    name: "FtsFailureTargetA".into(),
+                    description: None,
+                    properties: None,
+                    tags: vec![],
+                }],
+            ),
+            rt_b.create_many(
+                &tok_b,
+                vec![EntityCreateSpec {
+                    kind: "concept".into(),
+                    entity_type: None,
+                    name: "FtsFailureTargetB".into(),
+                    description: None,
+                    properties: None,
+                    tags: vec![],
+                }],
+            ),
+        );
+
+        assert!(
+            result_a.is_err(),
+            "namespace A must retain its pending create_many FTS failure injection"
+        );
+        assert!(
+            result_b.is_err(),
+            "namespace B must retain its pending create_many FTS failure injection"
+        );
+    }
+
+    // A failure after the first entity and FTS document have been written rolls
+    // back both substrates for the entire batch.
+    #[tokio::test]
+    async fn create_many_mid_batch_storage_failure_rolls_back_both_substrates() {
         let ns = format!("fts-fail-partial-{}", uuid::Uuid::new_v4().as_simple());
         let rt = rt();
         let tok = NamespaceToken::for_namespace(Namespace::parse(&ns).unwrap());
@@ -11140,7 +11144,12 @@ mod tests {
 
         assert!(
             result.is_err(),
-            "create_many must return Err when FTS summary.failed > 0"
+            "create_many must return Err when an FTS write fails mid-batch"
+        );
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains("atomic batch rolled back at entity index 1"),
+            "the failure must occur inside the atomic batch after one complete row; got: {error}"
         );
 
         // Entity substrate must be empty — entity rows must have been rolled back.
@@ -11148,7 +11157,7 @@ mod tests {
         assert_eq!(
             entity_rows.len(),
             0,
-            "entity rows must be rolled back when FTS summary.failed > 0; found {entity_rows:?}"
+            "entity rows must be empty after a mid-batch FTS failure; found {entity_rows:?}"
         );
 
         // FTS substrate must be empty — no stale fts_entities rows.
@@ -11163,7 +11172,55 @@ mod tests {
             .unwrap();
         assert_eq!(
             fts_count, 0,
-            "fts_entities must be empty after partial-FTS-failure rollback; found {fts_count}"
+            "fts_entities must be empty after a mid-batch FTS failure; found {fts_count}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_many_fts_partial_failure_injections_for_distinct_namespaces_do_not_overwrite_each_other(
+    ) {
+        let rt_a = rt();
+        let ns_a = Namespace::parse("fts-fail-many-partial-distinct-a").unwrap();
+        let tok_a = NamespaceToken::for_namespace(ns_a.clone());
+        let rt_b = rt();
+        let ns_b = Namespace::parse("fts-fail-many-partial-distinct-b").unwrap();
+        let tok_b = NamespaceToken::for_namespace(ns_b.clone());
+
+        arm_fts_fail_many_partial(ns_a.as_str());
+        arm_fts_fail_many_partial(ns_b.as_str());
+
+        let (result_a, result_b) = tokio::join!(
+            rt_a.create_many(
+                &tok_a,
+                vec![EntityCreateSpec {
+                    kind: "concept".into(),
+                    entity_type: None,
+                    name: "FtsPartialFailureTargetA".into(),
+                    description: None,
+                    properties: None,
+                    tags: vec![],
+                }],
+            ),
+            rt_b.create_many(
+                &tok_b,
+                vec![EntityCreateSpec {
+                    kind: "concept".into(),
+                    entity_type: None,
+                    name: "FtsPartialFailureTargetB".into(),
+                    description: None,
+                    properties: None,
+                    tags: vec![],
+                }],
+            ),
+        );
+
+        assert!(
+            result_a.is_err(),
+            "namespace A must retain its pending create_many partial FTS failure injection"
+        );
+        assert!(
+            result_b.is_err(),
+            "namespace B must retain its pending create_many partial FTS failure injection"
         );
     }
 
@@ -11858,8 +11915,7 @@ mod tests {
     }
 
     // Vector insert failure after entity row + FTS commit rolls back both.
-    // Uses a unique namespace to avoid consuming the VECTOR_FAIL_NS flag from
-    // a concurrent test's create_entity or create_note.
+    // Uses a unique namespace so only this test consumes its VECTOR_FAIL_NS entry.
     #[tokio::test]
     async fn create_entity_vector_failure_rolls_back_entity_row_and_fts() {
         const MODEL: &str = "test-entity-vec-inject";

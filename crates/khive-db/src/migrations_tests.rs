@@ -24,6 +24,46 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
 }
 
 #[test]
+fn apply_schema_plan_rolls_back_migration_when_ledger_insert_fails() {
+    static MIGRATIONS: &[Migration] = &[Migration {
+        id: "001_atomic",
+        up_sql: "CREATE TABLE migration_effect (id INTEGER PRIMARY KEY);",
+        down_sql: None,
+        is_already_applied: None,
+    }];
+    let plan = ServiceSchemaPlan {
+        service: "atomicity_test",
+        sqlite: MIGRATIONS,
+        postgres: &[],
+    };
+    let conn = open_memory();
+    conn.execute_batch(SCHEMA_VERSION_TABLE).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER reject_schema_version
+         BEFORE INSERT ON _schema_versions
+         BEGIN
+             SELECT RAISE(ABORT, 'injected ledger failure');
+         END;",
+    )
+    .unwrap();
+
+    apply_schema_plan(&conn, &plan).expect_err("ledger failure must abort the migration");
+
+    assert!(
+        !table_exists(&conn, "migration_effect"),
+        "migration body must roll back when its ledger insert fails"
+    );
+    let ledger_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM _schema_versions WHERE service = 'atomicity_test'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(ledger_rows, 0);
+}
+
+#[test]
 fn fresh_db_migrates_to_latest() {
     let mut conn = open_memory();
     let version = run_migrations(&mut conn).expect("migrations should succeed");
@@ -57,24 +97,122 @@ fn v4_creates_consolidated_fts_tables() {
 }
 
 #[test]
-fn rejects_pre_consolidation_ledger() {
+fn newer_store_reports_binary_upgrade_action() {
     let mut conn = open_memory();
-    // Simulate a database carrying the old, pre-consolidation V1..V22 ledger.
+    let latest = MIGRATIONS.last().expect("at least one migration").version;
+    let store_version = latest + 1;
     conn.execute_batch(MIGRATION_TRACKING_TABLE).unwrap();
     conn.execute(
-        "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (22, 'legacy', 0)",
-        [],
+        "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (?1, 'future', 0)",
+        [store_version],
     )
     .unwrap();
 
     let err = run_migrations(&mut conn).expect_err("must reject a version ahead of latest");
-    match err {
-        SqliteError::InvalidData(msg) => assert!(
-            msg.contains("ahead of the latest known migration"),
-            "unexpected message: {msg}"
-        ),
-        other => panic!("expected InvalidData, got {other:?}"),
+    assert!(matches!(
+        &err,
+        SqliteError::SchemaTooNew {
+            store_version: found,
+            max_known_migration,
+        } if *found == store_version && *max_known_migration == latest
+    ));
+    let message = err.to_string();
+    assert!(
+        message.contains("the binary is older than the store"),
+        "{message}"
+    );
+    assert!(message.contains("upgrade the binary"), "{message}");
+    assert!(!message.contains("recreate"), "{message}");
+}
+
+#[test]
+fn pre_consolidation_store_reports_recreation_action() {
+    let mut conn = open_memory();
+    conn.execute_batch(MIGRATION_TRACKING_TABLE).unwrap();
+    for (version, name) in [
+        (1, "initial_schema"),
+        (2, "add_name_to_notes"),
+        (22, "knowledge_lifecycle_status"),
+    ] {
+        conn.execute(
+            "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (?1, ?2, 0)",
+            rusqlite::params![version, name],
+        )
+        .unwrap();
     }
+
+    let err = run_migrations(&mut conn).expect_err("must reject a pre-consolidation ledger");
+    let SqliteError::InvalidData(message) = err else {
+        panic!("expected legacy-schema InvalidData diagnostic, got {err:?}");
+    };
+    assert!(
+        message.contains("predates the consolidated baseline"),
+        "{message}"
+    );
+    assert!(message.contains("recreate"), "{message}");
+    assert!(!message.contains("upgrade the binary"), "{message}");
+}
+
+#[test]
+fn legacy_v1_only_store_reports_recreation_before_current_v2() {
+    let mut conn = open_memory();
+    conn.execute_batch(
+        "CREATE TABLE events (\
+             id TEXT PRIMARY KEY,\
+             namespace TEXT NOT NULL,\
+             verb TEXT NOT NULL,\
+             substrate TEXT NOT NULL,\
+             actor TEXT NOT NULL,\
+             outcome TEXT NOT NULL,\
+             data TEXT,\
+             duration_us INTEGER NOT NULL DEFAULT 0,\
+             target_id TEXT,\
+             created_at INTEGER NOT NULL\
+         );",
+    )
+    .expect("create legacy V1 schema marker");
+    conn.execute_batch(MIGRATION_TRACKING_TABLE).unwrap();
+    conn.execute(
+        "INSERT INTO _schema_migrations (version, name, applied_at) \
+         VALUES (1, 'initial_schema', 0)",
+        [],
+    )
+    .unwrap();
+
+    let err = run_migrations(&mut conn).expect_err("legacy V1 must require recreation");
+    let SqliteError::InvalidData(message) = err else {
+        panic!("expected legacy-schema InvalidData diagnostic, got {err:?}");
+    };
+    assert!(
+        message.contains("predates the consolidated baseline"),
+        "{message}"
+    );
+    assert!(message.contains("recreate"), "{message}");
+    assert_eq!(
+        read_schema_version(&conn).expect("read unchanged ledger"),
+        1,
+        "the current V2 migration must not run"
+    );
+}
+
+#[test]
+fn consolidated_v1_only_store_migrates_normally() {
+    let mut conn = open_memory();
+    conn.execute_batch(MIGRATION_TRACKING_TABLE).unwrap();
+    conn.execute_batch(MIGRATIONS[0].up)
+        .expect("apply consolidated V1 schema");
+    conn.execute(
+        "INSERT INTO _schema_migrations (version, name, applied_at) \
+         VALUES (1, 'initial_schema', 0)",
+        [],
+    )
+    .unwrap();
+
+    let version = run_migrations(&mut conn).expect("consolidated V1 must migrate");
+    assert_eq!(
+        version,
+        MIGRATIONS.last().expect("latest migration").version
+    );
 }
 
 #[test]
@@ -822,13 +960,11 @@ fn mixed_version_boot_rejects_newer_schema_under_lock() {
         .join()
         .expect("thread join")
         .expect_err("a schema version above latest must be rejected, not clamped");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("ahead of the latest known migration"),
-        "unexpected error: {msg}"
-    );
-    assert!(
-        msg.contains("migration write lock"),
-        "the under-lock guard, not the pre-lock guard, must fire: {msg}"
-    );
+    assert!(matches!(
+        err,
+        SqliteError::SchemaTooNew {
+            store_version,
+            max_known_migration,
+        } if store_version == latest + 1 && max_known_migration == latest
+    ));
 }
