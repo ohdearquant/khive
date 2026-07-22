@@ -941,10 +941,38 @@ mod tests {
         "KHIVE_WRITE_QUEUE_CAPACITY",
     ];
 
-    fn clear_pool_env() {
+    struct PoolEnvGuard {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl PoolEnvGuard {
+        fn capture() -> Self {
+            Self {
+                saved: POOL_ENV_VARS
+                    .into_iter()
+                    .map(|key| (key, std::env::var_os(key)))
+                    .collect(),
+            }
+        }
+    }
+
+    impl Drop for PoolEnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.saved {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    fn clear_pool_env() -> PoolEnvGuard {
+        let guard = PoolEnvGuard::capture();
         for var in POOL_ENV_VARS {
             std::env::remove_var(var);
         }
+        guard
     }
 
     #[test]
@@ -953,7 +981,7 @@ mod tests {
         // Ensure defaults are not accidentally changed. The process env may
         // legitimately carry overrides (CI jobs set KHIVE_CHECKOUT_TIMEOUT_SECS),
         // so clear them first — this test asserts the constants, not the env.
-        clear_pool_env();
+        let _pool_env = clear_pool_env();
         let cfg = PoolConfig::default();
         assert_eq!(
             cfg.wal_autocheckpoint_pages,
@@ -1006,10 +1034,27 @@ mod tests {
     #[test]
     #[serial]
     fn pool_config_write_queue_defaults_off() {
-        clear_pool_env();
+        let _pool_env = clear_pool_env();
         let cfg = PoolConfig::default();
         assert!(!cfg.write_queue_enabled);
         assert_eq!(cfg.write_queue_capacity, DEFAULT_WRITE_QUEUE_CAPACITY);
+    }
+
+    #[test]
+    #[serial]
+    fn clear_pool_env_restores_overrides_on_drop() {
+        let _ambient_env = PoolEnvGuard::capture();
+        std::env::set_var("KHIVE_BUSY_TIMEOUT_SECS", "73");
+
+        {
+            let _pool_env = clear_pool_env();
+            assert_eq!(std::env::var_os("KHIVE_BUSY_TIMEOUT_SECS"), None);
+        }
+
+        assert_eq!(
+            std::env::var_os("KHIVE_BUSY_TIMEOUT_SECS"),
+            Some(std::ffi::OsString::from("73"))
+        );
     }
 
     #[test]
