@@ -1,4 +1,6 @@
 [env]
 # Cargo propagates this marker to unit tests, integration tests, and test-spawned
-# binaries. The store-open guard compiles it out of release builds.
+# binaries. The store-open guard checks it at runtime in every build profile.
+# Deliberate `cargo run` sessions may set KHIVE_ALLOW_HOME_STORE=1; automated
+# tests must never set that operator-only override.
 KHIVE_TEST_HARNESS = { value = "1", force = true }

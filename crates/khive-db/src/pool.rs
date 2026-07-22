@@ -22,8 +22,8 @@ const DEFAULT_WAL_AUTOCHECKPOINT_PAGES: u32 = 4000;
 const DEFAULT_JOURNAL_SIZE_LIMIT_BYTES: i64 = 67_108_864; // 64 MiB
 const DEFAULT_WRITE_QUEUE_CAPACITY: usize = 256;
 
-#[cfg(any(test, debug_assertions))]
 const TEST_HARNESS_ENV: &str = "KHIVE_TEST_HARNESS";
+const ALLOW_HOME_STORE_ENV: &str = "KHIVE_ALLOW_HOME_STORE";
 
 /// Configuration for the connection pool.
 #[derive(Clone, Debug)]
@@ -124,24 +124,91 @@ impl Default for PoolConfig {
     }
 }
 
-#[cfg(any(test, debug_assertions))]
+/// Prevent Cargo-launched tests and test subprocesses from opening the
+/// operator's default data tree in every build profile. Activation is solely
+/// the runtime `KHIVE_TEST_HARNESS=1` marker; production/installed binaries do
+/// not receive that workspace Cargo environment.
+///
+/// `KHIVE_ALLOW_HOME_STORE=1` is an operator-only escape hatch for a deliberate
+/// in-repository `cargo run`. Automated tests must never set or inherit it.
+/// Existing path ancestors are canonicalized before comparison, resolving
+/// traversal, symlinks, and filesystem-provided case (including APFS case
+/// folding). Missing trailing components remain lexical because they have no
+/// filesystem identity yet. SQLite URI paths are rejected rather than trying
+/// to reproduce SQLite's URI normalization rules.
 fn refuse_home_data_store_in_tests(config: &PoolConfig) -> Result<(), SqliteError> {
-    let under_test = cfg!(test) || std::env::var(TEST_HARNESS_ENV).is_ok_and(|value| value == "1");
-    if !under_test {
+    if std::env::var(TEST_HARNESS_ENV).as_deref() != Ok("1") {
+        return Ok(());
+    }
+    if std::env::var(ALLOW_HOME_STORE_ENV).as_deref() == Ok("1") {
         return Ok(());
     }
 
-    let (Some(path), Some(home)) = (config.path.as_deref(), std::env::var_os("HOME")) else {
+    let Some(path) = config.path.as_deref() else {
         return Ok(());
     };
-    let home_data_dir = PathBuf::from(home).join(".khive");
-    if path.starts_with(&home_data_dir) {
+    if path
+        .as_os_str()
+        .as_encoded_bytes()
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"file:"))
+    {
         return Err(SqliteError::InvalidData(format!(
-            "test harness refused to open SQLite database under the HOME data directory: {}",
+            "test harness refused SQLite URI database path {}; use a filesystem path outside \
+             HOME/.khive (KHIVE_ALLOW_HOME_STORE=1 is for deliberate operator use only)",
             path.display()
         )));
     }
+
+    let Some(home) = std::env::var_os("HOME") else {
+        return Ok(());
+    };
+    let canonical_path = canonicalize_deepest_existing(path)?;
+    let canonical_home_data_dir =
+        canonicalize_deepest_existing(&PathBuf::from(home).join(".khive"))?;
+    if canonical_path.starts_with(&canonical_home_data_dir) {
+        return Err(SqliteError::InvalidData(format!(
+            "test harness refused to open SQLite database under HOME/.khive: {} \
+             (KHIVE_ALLOW_HOME_STORE=1 is for deliberate operator use only)",
+            canonical_path.display()
+        )));
+    }
     Ok(())
+}
+
+fn canonicalize_deepest_existing(path: &Path) -> Result<PathBuf, SqliteError> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().map_err(SqliteError::Io)?.join(path)
+    };
+
+    for ancestor in absolute.ancestors() {
+        match fs::canonicalize(ancestor) {
+            Ok(mut canonical) => {
+                let missing = absolute.strip_prefix(ancestor).map_err(|error| {
+                    SqliteError::InvalidData(format!(
+                        "failed to preserve missing path components for {}: {error}",
+                        absolute.display()
+                    ))
+                })?;
+                canonical.push(missing);
+                return Ok(canonical);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(SqliteError::InvalidData(format!(
+                    "failed to canonicalize database path ancestor {}: {error}",
+                    ancestor.display()
+                )));
+            }
+        }
+    }
+
+    Err(SqliteError::InvalidData(format!(
+        "database path has no canonicalizable ancestor: {}",
+        absolute.display()
+    )))
 }
 
 /// A read-write connection pool for SQLite.
@@ -304,7 +371,6 @@ impl ConnectionPool {
     /// WAL is disabled or unavailable, the pool falls back to single-connection
     /// mode.
     pub fn new(config: PoolConfig) -> Result<Self, SqliteError> {
-        #[cfg(any(test, debug_assertions))]
         refuse_home_data_store_in_tests(&config)?;
 
         let writer = open_writer_connection(&config)?;
