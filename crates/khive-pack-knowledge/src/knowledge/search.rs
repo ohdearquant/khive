@@ -20,9 +20,10 @@ use super::scoring::{
     Candidate, Weights,
 };
 use super::util::{
-    atom_embed_text, atom_from_row, deser, domain_from_row, explicitly_requested_status, is_stop,
-    row_bool, row_str, sql_err, status_multiplier, status_sql_clause, status_values,
-    CANDIDATE_POOL, MIN_TERM_LEN,
+    atom_embed_text, atom_from_row, compose_item_char_cost, deser, domain_from_row,
+    estimate_compose_item_tokens, explicitly_requested_status, is_stop, row_bool, row_str, sql_err,
+    status_multiplier, status_sql_clause, status_values, CANDIDATE_POOL, CHARS_PER_TOKEN,
+    MIN_TERM_LEN,
 };
 use super::vamana;
 use super::KnowledgeHandlers;
@@ -809,6 +810,65 @@ fn parse_domain_members(domain: &Domain) -> Result<Vec<String>, RuntimeError> {
     })
 }
 
+async fn load_domain_member_token_sizes(
+    runtime: &KhiveRuntime,
+    ns: &str,
+    domain_ids: &[String],
+) -> Result<HashMap<String, usize>, RuntimeError> {
+    let mut sizes: HashMap<String, usize> = domain_ids.iter().map(|id| (id.clone(), 0)).collect();
+    if domain_ids.is_empty() {
+        return Ok(sizes);
+    }
+
+    let placeholders = domain_ids
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("?{}", i + 2))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut params = vec![SqlValue::Text(ns.to_owned())];
+    params.extend(domain_ids.iter().cloned().map(SqlValue::Text));
+
+    let sql = runtime.sql();
+    let mut reader = sql
+        .reader()
+        .await
+        .map_err(|e| sql_err("suggest member size reader", e))?;
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: format!(
+                "SELECT d.id AS domain_id, a.name, a.content \
+                 FROM knowledge_domains AS d \
+                 JOIN json_each(d.members) AS member ON 1 = 1 \
+                 JOIN knowledge_atoms AS a \
+                   ON a.namespace = d.namespace \
+                  AND a.slug = member.value \
+                  AND a.deleted_at IS NULL \
+                 WHERE d.namespace = ?1 \
+                   AND d.id IN ({placeholders}) \
+                   AND d.deleted_at IS NULL"
+            ),
+            params,
+            label: None,
+        })
+        .await
+        .map_err(|e| sql_err("suggest member size query", e))?;
+
+    for row in rows {
+        let Some(domain_id) = row_str(&row, "domain_id") else {
+            continue;
+        };
+        let Some(content) = row_str(&row, "content") else {
+            continue;
+        };
+        let name = row_str(&row, "name").unwrap_or_default();
+        let size = sizes.entry(domain_id).or_default();
+        *size = size.saturating_add(estimate_compose_item_tokens(&name, &content));
+    }
+
+    Ok(sizes)
+}
+
 async fn rerank_text_items(
     runtime: &KhiveRuntime,
     query: &str,
@@ -974,7 +1034,7 @@ fn trim_kg_entities_to_budget(hits: Vec<KgEntityHit>, remaining_budget: usize) -
     let mut used = 0usize;
     hits.into_iter()
         .take_while(|h| {
-            let cost = h.name.len() + h.description.len() + 40;
+            let cost = compose_item_char_cost(&h.name, &h.description);
             if used + cost > remaining_budget {
                 return false;
             }
@@ -1395,9 +1455,23 @@ impl KnowledgeHandlers {
         hits.retain(|h| h.is_domain);
         hits.truncate(limit);
 
+        let domain_ids: Vec<String> = hits.iter().map(|h| h.id.clone()).collect();
+        let member_token_sizes = load_domain_member_token_sizes(runtime, &ns, &domain_ids).await?;
+
+        // Price the member atom bodies that compose expands, not the much smaller
+        // domain mirror description used for retrieval. The batched join keeps the
+        // suggest -> fold budget in compose's estimated-token unit without an N+1
+        // hydration pass.
         let results: Vec<Value> = hits
             .iter()
-            .map(|h| json!({ "id": h.id, "name": h.name, "score": h.score }))
+            .map(|h| {
+                json!({
+                    "id": h.id,
+                    "name": h.name,
+                    "score": h.score,
+                    "size": member_token_sizes.get(&h.id).copied().unwrap_or_default(),
+                })
+            })
             .collect();
         let count = results.len();
 
@@ -1660,7 +1734,6 @@ impl KnowledgeHandlers {
         timing.begin(Phase::Trim);
 
         let max_tokens = p.max_tokens.unwrap_or(8000).clamp(500, 100_000);
-        const CHARS_PER_TOKEN: usize = 4;
         let char_budget = max_tokens * CHARS_PER_TOKEN;
 
         // Tracks characters consumed by the atom/section body so blended KG
@@ -1670,7 +1743,7 @@ impl KnowledgeHandlers {
 
         if !section_results.is_empty() {
             section_results.retain(|s| {
-                let cost = s.heading.len() + s.content.len() + 40;
+                let cost = compose_item_char_cost(&s.heading, &s.content);
                 if body_used + cost > char_budget {
                     return false;
                 }
@@ -1723,7 +1796,7 @@ impl KnowledgeHandlers {
                         .map(|a| (a, item.score))
                 })
                 .take_while(|(a, _)| {
-                    let cost = a.name.len() + a.content.len() + 40;
+                    let cost = compose_item_char_cost(&a.name, &a.content);
                     if body_used + cost > char_budget {
                         return false;
                     }

@@ -90,6 +90,21 @@ pub(super) fn deser<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, 
         .map_err(|e| RuntimeError::InvalidInput(format!("bad params: {e}")))
 }
 
+// ─── token estimation ────────────────────────────────────────────────────────
+
+/// Same token unit `compose`'s `max_tokens` budgeting uses.
+pub(super) const CHARS_PER_TOKEN: usize = 4;
+
+pub(super) fn compose_item_char_cost(title: &str, content: &str) -> usize {
+    title.len().saturating_add(content.len()).saturating_add(40)
+}
+
+pub(super) fn estimate_compose_item_tokens(title: &str, content: &str) -> usize {
+    compose_item_char_cost(title, content)
+        .div_ceil(CHARS_PER_TOKEN)
+        .max(1)
+}
+
 // ─── SQL helpers ─────────────────────────────────────────────────────────────
 
 pub(super) fn now_us() -> i64 {

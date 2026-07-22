@@ -7,7 +7,7 @@ use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::types::{SqlStatement, SqlValue};
 
 use super::schema::{
-    DeleteAtomsParams, GetParams, ListParams, UpsertAtomsParams, UpsertDomainsParams,
+    DeleteAtomsParams, GetParams, ListParams, StatsParams, UpsertAtomsParams, UpsertDomainsParams,
 };
 use super::sections::{section_from_row, section_to_json};
 use super::util::{
@@ -698,8 +698,9 @@ impl KnowledgeHandlers {
     pub(crate) async fn stats(
         runtime: &KhiveRuntime,
         token: &NamespaceToken,
-        _params: Value,
+        params: Value,
     ) -> Result<Value, RuntimeError> {
+        let _: StatsParams = deser(params)?;
         let ns = token.namespace().as_str().to_owned();
         let sql = runtime.sql();
         let mut reader = sql.reader().await.map_err(|e| sql_err("stats reader", e))?;

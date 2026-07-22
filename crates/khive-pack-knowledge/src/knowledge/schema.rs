@@ -82,6 +82,7 @@ pub(crate) struct Domain {
 // ── upsert_atoms ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AtomInput {
     pub slug: String,
     pub name: String,
@@ -101,6 +102,7 @@ pub(crate) struct AtomInput {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct UpsertAtomsParams {
     pub atoms: Vec<AtomInput>,
     #[serde(default)]
@@ -126,6 +128,7 @@ pub(crate) struct DomainInput {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct UpsertDomainsParams {
     pub domains: Vec<DomainInput>,
 }
@@ -133,6 +136,7 @@ pub(crate) struct UpsertDomainsParams {
 // ── get ───────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct GetParams {
     pub id: String,
     /// When `true`, include the atom's sections in the response under a `sections` key.
@@ -144,6 +148,7 @@ pub(crate) struct GetParams {
 // ── list ─────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ListParams {
     #[serde(rename = "type", alias = "kind", default)]
     pub kind: Option<String>,
@@ -157,9 +162,19 @@ pub(crate) struct ListParams {
     pub exclude_status: Option<String>,
 }
 
+// ── stats ────────────────────────────────────────────────────────────────────
+
+/// `knowledge.stats` takes no filter arguments; the empty struct exists purely
+/// so unknown/typo'd params (e.g. a caller expecting a `domain` filter that
+/// doesn't exist) are rejected instead of silently ignored.
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StatsParams {}
+
 // ── delete_atoms ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct DeleteAtomsParams {
     pub ids: Vec<String>,
     #[serde(default)]
@@ -171,6 +186,7 @@ pub(crate) struct DeleteAtomsParams {
 // ── index ─────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct IndexParams {
     #[serde(default)]
     pub ids: Option<Vec<String>>,
@@ -185,6 +201,7 @@ pub(crate) struct IndexParams {
 // ── fold ─────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct FoldParams {
     pub candidates: Vec<FoldCandidate>,
     pub budget: usize,
@@ -199,10 +216,17 @@ pub(crate) struct FoldParams {
 }
 
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct FoldCandidate {
     pub id: String,
     pub score: f32,
     pub size: usize,
+    /// Display name, e.g. from `knowledge.suggest`'s `{id, name, score, size}`
+    /// output — accepted (and echoed back on `selected` items) so `suggest`'s
+    /// results feed `fold`'s `candidates` unmodified (issue #105); not used by
+    /// the selection algorithm itself.
+    #[serde(default)]
+    pub name: Option<String>,
     #[serde(default)]
     pub content: Option<Value>,
     #[serde(default)]
@@ -214,6 +238,7 @@ pub(crate) struct FoldCandidate {
 // ── search ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SearchParams {
     pub query: String,
     #[serde(rename = "type", alias = "kind", default)]
@@ -249,6 +274,7 @@ pub(crate) struct SearchParams {
 
 /// Tunable TF-IDF weight parameters.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SearchWeights {
     pub w_exact_name: Option<f64>,
     pub w_name: Option<f64>,
@@ -262,6 +288,7 @@ pub(crate) struct SearchWeights {
 // ── suggest ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SuggestParams {
     pub query: String,
     #[serde(default)]
@@ -273,6 +300,7 @@ pub(crate) struct SuggestParams {
 // ── compose ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ComposeParams {
     #[serde(default)]
     pub domain_ids: Option<Vec<String>>,
@@ -297,6 +325,7 @@ pub(crate) struct ComposeParams {
 
 /// One section update within a `knowledge.edit` call.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SectionUpdate {
     /// Section type (must be a valid `SectionType` canonical name).
     pub section_type: String,
@@ -311,6 +340,7 @@ pub(crate) struct SectionUpdate {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct EditParams {
     /// Atom UUID or slug to edit sections for.
     pub id: String,
@@ -321,6 +351,7 @@ pub(crate) struct EditParams {
 // ── challenge / adjudicate ────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ChallengeParams {
     /// Atom UUID or slug.
     pub atom_id: String,
@@ -337,6 +368,7 @@ pub(crate) struct ChallengeParams {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AdjudicateParams {
     /// Atom UUID or slug.
     pub atom_id: String,
@@ -354,6 +386,7 @@ pub(crate) struct AdjudicateParams {
 // ── import ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ImportParams {
     /// Filesystem path to a markdown file or directory.
     pub path: String,

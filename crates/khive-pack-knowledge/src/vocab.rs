@@ -163,7 +163,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 19] = [
                 name: "candidates",
                 param_type: "array<object>",
                 required: true,
-                description: "Scored items: {id, score, size, content?, category?, information_gain?}",
+                description: "Scored items: {id, score, size, name?, content?, category?, information_gain?}. `knowledge.suggest`'s `results` feed this directly.",
             },
             ParamDef {
                 name: "budget",
@@ -291,7 +291,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 19] = [
     },
     HandlerDef {
         name: "knowledge.suggest",
-        description: "Suggest relevant knowledge domains for a query. Draft and deprecated domain atoms are excluded by default (same quality default as knowledge.search).",
+        description: "Suggest relevant knowledge domains for a query. Draft and deprecated domain atoms are excluded by default (same quality default as knowledge.search). Each result carries {id, name, score, size} — `size` is the aggregate estimated-token cost of the domain's member atom bodies that compose expands, in the same unit as `knowledge.fold`'s `budget`, so results feed `knowledge.fold(candidates=...)` directly with no caller-side field construction.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[

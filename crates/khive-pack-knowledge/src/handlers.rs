@@ -86,6 +86,19 @@ struct TopicParams {
     limit: Option<u32>,
 }
 
+// `feedback`'s two top-level fields (`target_id`, `section_signals`) are a fixed,
+// closed shape — not open content — so deny_unknown_fields applies here too.
+// `section_signals`'s *inner* keys stay a free-form map (section-type names are
+// validated dynamically below against `SectionType::from_str_loose`, which gives
+// a better error than a derive-time enum could).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FeedbackParams {
+    #[serde(default)]
+    target_id: Option<String>,
+    section_signals: Value,
+}
+
 // ── handler implementations ───────────────────────────────────────────────────
 
 impl KnowledgePack {
@@ -331,19 +344,14 @@ impl KnowledgePack {
         params: Value,
         registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
-        let target_id_str = params
-            .get("target_id")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned);
+        let p: FeedbackParams = deser(params)?;
+        let target_id_str = p.target_id;
 
-        let raw = params
-            .get("section_signals")
-            .and_then(|v| v.as_object())
-            .ok_or_else(|| {
-                RuntimeError::InvalidInput(
-                    "section_signals is required and must be an object".to_string(),
-                )
-            })?;
+        let raw = p.section_signals.as_object().ok_or_else(|| {
+            RuntimeError::InvalidInput(
+                "section_signals is required and must be an object".to_string(),
+            )
+        })?;
 
         let mut signals: Vec<(SectionType, FeedbackSignal)> = Vec::with_capacity(raw.len());
         for (key, val) in raw {
@@ -370,7 +378,7 @@ impl KnowledgePack {
         }
 
         let ns = token.namespace().as_str().to_string();
-        let section_signals_val = params.get("section_signals").cloned().unwrap_or_default();
+        let section_signals_val = p.section_signals.clone();
 
         // Tier 1: explicit profile from config — route exclusively to brain.feedback.
         if let Some(ref profile_id) = self.brain_profile {

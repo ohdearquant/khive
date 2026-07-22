@@ -105,6 +105,7 @@ impl KnowledgeHandlers {
                     "id": item.id,
                     "score": item.score,
                     "size": item.size,
+                    "name": item.content.name,
                     "content": item.content.content,
                     "category": item.content.category,
                 })
