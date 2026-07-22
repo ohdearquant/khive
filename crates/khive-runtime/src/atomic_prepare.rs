@@ -231,6 +231,30 @@ fn purge_index_row_statement(
     }
 }
 
+fn log_vector_row_delete_statement(
+    table: &str,
+    namespace: &str,
+    subject_id: Uuid,
+    label: &str,
+) -> PlanStatement {
+    PlanStatement {
+        statement: SqlStatement {
+            sql: format!(
+                "INSERT INTO ann_write_log \
+                 (namespace, embedding_model, kind, field, subject_id, op) \
+                 SELECT namespace, embedding_model, kind, field, subject_id, 'delete' \
+                 FROM {table} WHERE namespace = ?1 AND subject_id = ?2"
+            ),
+            params: vec![
+                SqlValue::Text(namespace.to_string()),
+                SqlValue::Text(subject_id.to_string()),
+            ],
+            label: Some(label.to_string()),
+        },
+        guard: None,
+    }
+}
+
 /// `true` iff a table named `table` currently exists in the backing SQLite
 /// database (`sqlite_master` probe, read-only — safe in async prepare, does
 /// NOT open/create the vector store, so it cannot lazily create the table
@@ -283,6 +307,12 @@ async fn push_index_purge_statements(
     ));
     for vec_table in vector_table_names(runtime) {
         if vector_table_exists(runtime, &vec_table).await? {
+            statements.push(log_vector_row_delete_statement(
+                &vec_table,
+                namespace,
+                subject_id,
+                &format!("{label_prefix}-log-delete-vec-{vec_table}"),
+            ));
             statements.push(purge_index_row_statement(
                 &vec_table,
                 namespace,
@@ -2009,6 +2039,72 @@ mod tests {
                 "vector row must be purged after atomic delete (hard={hard})"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn atomic_delete_entity_and_note_logs_vector_delete_rows() {
+        let runtime = scratch_runtime();
+        runtime.register_embedder(StubProvider);
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+
+        let entity = khive_storage::Entity::new("local", "concept", "ann-delete-entity");
+        let entity_id = entity.id;
+        runtime
+            .entities(&token)
+            .expect("entities store")
+            .upsert_entity(entity.clone())
+            .await
+            .expect("seed entity");
+        runtime
+            .reindex_entity(&token, &entity)
+            .await
+            .expect("seed entity vector row");
+        let note = khive_storage::note::Note::new("local", "observation", "ann-delete-note");
+        let note_id = note.id;
+        runtime
+            .notes(&token)
+            .expect("notes store")
+            .upsert_note(note.clone())
+            .await
+            .expect("seed note");
+        runtime
+            .reindex_note(&token, &note)
+            .await
+            .expect("seed note vector row");
+
+        for id in [entity_id, note_id] {
+            let plan = prepare_delete(&runtime, &token, &json!({"id": id.to_string()}), None)
+                .await
+                .expect("prepare delete");
+            let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+                .await
+                .expect("seam call ok");
+            assert!(matches!(
+                outcome,
+                crate::atomic_runner::AtomicRunOutcome::Committed { .. }
+            ));
+        }
+
+        let mut reader = runtime.sql().reader().await.expect("sql reader");
+        let count = reader
+            .query_scalar(SqlStatement {
+                sql: "SELECT COUNT(*) FROM ann_write_log \
+                      WHERE namespace = 'local' AND embedding_model = ?1 AND op = 'delete' \
+                      AND ((kind = 'entity' AND field = 'entity.body' AND subject_id = ?2) \
+                        OR (kind = 'note' AND field = 'note.content' AND subject_id = ?3))"
+                    .to_string(),
+                params: vec![
+                    SqlValue::Text(STUB_MODEL.to_string()),
+                    SqlValue::Text(entity_id.to_string()),
+                    SqlValue::Text(note_id.to_string()),
+                ],
+                label: Some("test-atomic-delete-ann-write-log".to_string()),
+            })
+            .await
+            .expect("query ANN write log");
+        assert!(matches!(count, Some(SqlValue::Integer(2))));
     }
 
     /// Atomic link must persist an explicit top-level `dependency_kind`
