@@ -141,32 +141,33 @@ impl EmbedderRegistry {
             .ok_or_else(|| RuntimeError::UnknownModel(name.to_string()))?
             .clone();
 
-        entry.resolve().await
+        Ok(entry.resolve().await?.0)
     }
 }
 
 impl EmbedderEntry {
     /// Lazily initialise and return the embedding service for this entry.
     ///
-    /// The `OnceCell` guarantees that `build` is called at most once even
-    /// under concurrent access. Callers hold no external lock while awaiting.
+    /// The `OnceCell` retains the first completed build. Concurrent callers may
+    /// race provider builds, but only the caller that populates the cell reports timing.
     ///
     /// Returns `RuntimeError` if `build()` fails, rather than panicking.
-    pub(crate) async fn resolve(self) -> RuntimeResult<Arc<dyn EmbeddingService>> {
-        // `OnceCell` has no fallible init, so failure is handled manually; a losing
-        // racer's build() result is simply discarded since both are equivalent.
+    pub(crate) async fn resolve(self) -> RuntimeResult<(Arc<dyn EmbeddingService>, Option<i64>)> {
+        // `OnceCell` has no fallible init, so failure is handled manually.
         if let Some(svc) = self.cell.get() {
-            return Ok(Arc::clone(svc));
+            return Ok((Arc::clone(svc), None));
         }
+        let init_start = std::time::Instant::now();
         let svc = self.provider.build().await.map_err(|e| {
             crate::error::RuntimeError::Internal(format!(
                 "EmbedderProvider '{}' build() failed: {e}",
                 self.provider.name()
             ))
         })?;
-        // A losing `set` (raced by another task) is fine: the two results are equivalent.
-        let _ = self.cell.set(Arc::clone(&svc));
-        Ok(svc)
+        let init_duration_us = init_start.elapsed().as_micros() as i64;
+        // A losing `set` is fine: its caller receives an equivalent service.
+        let initialized = self.cell.set(Arc::clone(&svc)).is_ok();
+        Ok((svc, initialized.then_some(init_duration_us)))
     }
 }
 
@@ -205,6 +206,7 @@ impl EmbedderProvider for LatticeEmbedderProvider {
 
     async fn build(&self) -> RuntimeResult<Arc<dyn EmbeddingService>> {
         let native = Arc::new(NativeEmbeddingService::with_model(self.model));
+        native.ensure_loaded().await?;
         let cached = CachedEmbeddingService::with_default_cache(native);
         Ok(Arc::new(cached) as Arc<dyn EmbeddingService>)
     }

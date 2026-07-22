@@ -2155,6 +2155,7 @@ mod embedder_registry_tests {
         }
 
         async fn build(&self) -> Result<Arc<dyn EmbeddingService>, RuntimeError> {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             Ok(Arc::new(MockEmbeddingService { dims: self.dims }))
         }
     }
@@ -2204,6 +2205,44 @@ mod embedder_registry_tests {
     }
 
     // ── Test: registered names include custom provider ────────────────────────
+
+    #[tokio::test]
+    async fn embedder_initialization_writes_event() {
+        let rt = memory_rt_no_model();
+        let token = rt
+            .authorize(Namespace::local())
+            .expect("authorize local namespace");
+        let event_store = rt.events(&token).expect("event store must be available");
+        rt.register_embedder(MockEmbedderProvider::new("event-test-encoder", 64));
+
+        rt.embedder("event-test-encoder")
+            .await
+            .expect("embedder initialization must succeed");
+
+        let page = event_store
+            .query_events(
+                khive_storage::EventFilter::default(),
+                khive_storage::PageRequest {
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .await
+            .expect("query embedder initialization event");
+        let event = page
+            .items
+            .iter()
+            .find(|event| event.verb == "embedder.init")
+            .expect("embedder initialization event must be written");
+
+        assert_eq!(event.kind, khive_types::EventKind::EmbedderInitialized);
+        assert_eq!(event.payload["model_name"], "event-test-encoder");
+        let duration_us = event.payload["duration_us"]
+            .as_i64()
+            .expect("duration_us must be an integer");
+        assert!(duration_us > 0);
+        assert_eq!(event.duration_us, duration_us);
+    }
 
     #[tokio::test]
     async fn registered_names_includes_custom_provider() {

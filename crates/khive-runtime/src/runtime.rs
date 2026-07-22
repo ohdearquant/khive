@@ -9,8 +9,8 @@ use khive_db::StorageBackend;
 #[cfg(test)]
 use khive_gate::AllowAllGate;
 use khive_gate::GateRequest;
-use khive_storage::{EntityStore, EventStore, GraphStore, NoteStore, SqlAccess};
-use khive_types::{EdgeEndpointRule, Namespace};
+use khive_storage::{EntityStore, Event, EventStore, GraphStore, NoteStore, SqlAccess};
+use khive_types::{EdgeEndpointRule, EventKind, Namespace, SubstrateKind};
 use lattice_embed::{EmbeddingModel, EmbeddingService};
 
 use crate::config::{
@@ -825,7 +825,36 @@ impl KhiveRuntime {
                 .get_entry(&canonical_key)
                 .ok_or_else(|| crate::RuntimeError::UnknownModel(name.to_string()))?
         };
-        entry.resolve().await
+        let (service, init_duration_us) = entry.resolve().await?;
+        if let Some(duration_us) = init_duration_us {
+            self.emit_embedder_initialized(&canonical_key, duration_us)
+                .await;
+        }
+        Ok(service)
+    }
+
+    async fn emit_embedder_initialized(&self, model_name: &str, duration_us: i64) {
+        let Ok(token) = self.authorize(self.config.default_namespace.clone()) else {
+            return;
+        };
+        let Ok(store) = self.events(&token) else {
+            return;
+        };
+        let event = Event::new(
+            token.namespace().as_str(),
+            "embedder.init",
+            EventKind::EmbedderInitialized,
+            SubstrateKind::Event,
+            format!("{}:{}", token.actor().kind, token.actor().id),
+        )
+        .with_payload(serde_json::json!({
+            "model_name": model_name,
+            "duration_us": duration_us,
+        }))
+        .with_duration_us(duration_us);
+        if let Err(err) = store.append_event(event).await {
+            tracing::warn!(error = %err, model_name, "embedder initialization event append failed");
+        }
     }
 
     /// Register a custom embedding provider with this runtime.
