@@ -35,7 +35,7 @@ use clap::Parser;
 use khive_mcp::serve::resolve_runtime_config;
 use khive_mcp::serve::{
     apply_env_output_format, build_server_multi_backend_with_db_anchor, config_discovery_db_anchor,
-    enforce_strict_actor_mode, RuntimeConfigInputs,
+    enforce_strict_actor_mode, install_resolved_blob_store, RuntimeConfigInputs,
 };
 #[cfg(unix)]
 use khive_mcp::server::compute_config_id;
@@ -278,6 +278,16 @@ pub struct ExecArgs {
     /// meaningful with `--atomic`.
     #[arg(long, requires = "atomic")]
     pub atomic_max_ops: Option<usize>,
+
+    /// Exit non-zero when any op in the batch fails (or, for `--ops-file`,
+    /// when any applied op fails). Without this flag the process exits 0
+    /// whenever the request itself was dispatched, even if every op inside
+    /// it failed — the per-op `results` entries and the `summary`/`status`
+    /// fields in the printed output are the only signal (#1220). Not
+    /// meaningful with `--atomic`, which already fails the whole file on
+    /// any rejected op.
+    #[arg(long)]
+    pub strict: bool,
 }
 
 /// A single parsed op entry from an ops-file line.
@@ -385,6 +395,7 @@ async fn apply_ops_file(
     server: &KhiveMcpServer,
     ops: Vec<OpsFileEntry>,
     presentation: Option<String>,
+    strict: bool,
 ) -> Result<()> {
     let total = ops.len();
     let mut total_succeeded: usize = 0;
@@ -459,6 +470,11 @@ async fn apply_ops_file(
         "{}",
         serde_json::to_string_pretty(&summary).expect("serialize summary")
     );
+    if strict && total_failed > 0 {
+        anyhow::bail!(
+            "--strict: {total_failed} op(s) failed out of {total} (see printed summary above)"
+        );
+    }
     Ok(())
 }
 
@@ -566,6 +582,7 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
                 args.output_format,
                 args.save_file,
                 db_context,
+                args.strict,
             )
             .await
         }
@@ -578,10 +595,35 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
                 db_context,
                 args.atomic,
                 args.atomic_max_ops,
+                args.strict,
             )
             .await
         }
     }
+}
+
+/// Returns `Err` describing the failed/aborted op counts when `strict` is set
+/// and the parsed response envelope's `summary` reports either as non-zero
+/// (#1220). `raw` must be the exact envelope string already printed to
+/// stdout — the caller prints first, unconditionally, then this decides the
+/// exit code; a caller piping the output still sees the full result either way.
+fn enforce_strict_batch_result(raw: &str, strict: bool) -> Result<()> {
+    if !strict {
+        return Ok(());
+    }
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw) else {
+        // Non-JSON output (e.g. --output-format table/auto): nothing to
+        // inspect here. `--strict` only applies to the default JSON shape.
+        return Ok(());
+    };
+    let failed = parsed["summary"]["failed"].as_u64().unwrap_or(0);
+    let aborted = parsed["summary"]["aborted"].as_u64().unwrap_or(0);
+    if failed > 0 || aborted > 0 {
+        anyhow::bail!(
+            "--strict: {failed} op(s) failed, {aborted} op(s) aborted (see printed output above)"
+        );
+    }
+    Ok(())
 }
 
 enum ExecMode {
@@ -602,6 +644,7 @@ async fn run_exec_inline(
     output_format: Option<String>,
     save_file: Option<String>,
     db_context: ExecDbContext,
+    strict: bool,
 ) -> Result<()> {
     #[cfg(unix)]
     return run_exec_inline_with_forward(
@@ -611,6 +654,7 @@ async fn run_exec_inline(
         output_format,
         save_file,
         db_context,
+        strict,
         forward_or_spawn_boxed,
     )
     .await;
@@ -622,6 +666,7 @@ async fn run_exec_inline(
         output_format,
         save_file,
         db_context,
+        strict,
     )
     .await;
 }
@@ -639,6 +684,7 @@ async fn run_exec_inline(
 /// enables the latter: tests pass a spy `forward_fn` and assert it is never
 /// called when the gate should have rejected.
 #[cfg_attr(not(unix), allow(unused_variables))]
+#[allow(clippy::too_many_arguments)]
 async fn run_exec_inline_with_forward(
     ops: String,
     cfg: RuntimeConfig,
@@ -646,6 +692,7 @@ async fn run_exec_inline_with_forward(
     output_format: Option<String>,
     save_file: Option<String>,
     db_context: ExecDbContext,
+    strict: bool,
     #[cfg(unix)] forward_fn: ForwardFnPtr,
 ) -> Result<()> {
     // ── strict-actor gate (before any forwarding) ─────────────────────────────
@@ -683,6 +730,18 @@ async fn run_exec_inline_with_forward(
         .map_err(|e| anyhow::anyhow!("config error: {e}"))?
         .unwrap_or_default();
 
+    // #1226: apply the same --db/[[backends]] conflict guard the in-process
+    // fallback below applies, BEFORE the daemon fast-path — otherwise a warm
+    // daemon answers this request without the override ever being checked at
+    // all, while the identical override on `--ops-file` (always in-process)
+    // correctly rejects it. See `validate_db_override_against_backends`.
+    if !khive_cfg.backends.is_empty() {
+        khive_mcp::serve::validate_db_override_against_backends(
+            db_context.raw.as_deref(),
+            khive_cfg.backends.len(),
+        )?;
+    }
+
     // ── daemon fast-path (Unix only) ─────────────────────────────────────────
     // The daemon path does not support --save-file (the daemon returns a string;
     // we would need to parse it back to apply the sink).  Skip daemon forwarding
@@ -719,6 +778,7 @@ async fn run_exec_inline_with_forward(
         if let Some(res) = forward_fn(&frame).await {
             let output = res.map_err(|e| anyhow::anyhow!("{}", e.message))?;
             println!("{output}");
+            enforce_strict_batch_result(&output, strict)?;
             return Ok(());
         }
     }
@@ -754,6 +814,7 @@ async fn run_exec_inline_with_forward(
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     println!("{output}");
+    enforce_strict_batch_result(&output, strict)?;
     Ok(())
 }
 
@@ -774,6 +835,12 @@ fn build_local_fallback_server(
     let _boot_guard = acquire_local_construction_guard(&cfg)?;
     if khive_cfg.backends.is_empty() {
         let rt = KhiveRuntime::new(cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
+        // Mirror the `serve` boot path's single-backend branch (ADR-111
+        // Amendment 2): without this, `exec`'s in-process fallback server
+        // never installs a `BlobStore`, so `blob.put`/`blob.get`/`blob.stat`
+        // fail as "unconfigured" here even when `serve` resolves one from
+        // the same config and backend (khive#1209).
+        install_resolved_blob_store(&rt, khive_cfg, rt.backend())?;
         let env_fmt = apply_env_output_format(khive_cfg.runtime.default_output_format);
         Ok(KhiveMcpServer::new(rt)
             .map_err(|e| anyhow::anyhow!("{e}"))?
@@ -783,6 +850,7 @@ fn build_local_fallback_server(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_exec_ops_file(
     path: PathBuf,
     cfg: RuntimeConfig,
@@ -791,6 +859,7 @@ async fn run_exec_ops_file(
     db_context: ExecDbContext,
     atomic: bool,
     atomic_max_ops: Option<usize>,
+    strict: bool,
 ) -> Result<()> {
     // Parse the whole file first — fail before any writes if any line is bad.
     let ops = parse_ops_file(&path)?;
@@ -847,7 +916,7 @@ async fn run_exec_ops_file(
         db_context.anchor.as_deref(),
     )?;
 
-    apply_ops_file(&server, ops, presentation).await
+    apply_ops_file(&server, ops, presentation, strict).await
 }
 
 #[cfg(test)]
@@ -1128,10 +1197,42 @@ mod tests {
             db_path: Some(PathBuf::from(db_path)),
             embedding_model: None,
             additional_embedding_models: vec![],
+            // Pin the pack list explicitly rather than inheriting `KHIVE_PACKS`
+            // from the ambient environment (#1276) — every caller of this
+            // helper only dispatches `kg` verbs, so the behavior under test
+            // shouldn't depend on a wider pack set a developer's shell exports.
+            packs: vec!["kg".to_string()],
             ..Default::default()
         };
         let rt = KhiveRuntime::new(cfg).expect("runtime on temp db");
         KhiveMcpServer::new(rt).expect("server on temp db")
+    }
+
+    // ── isolated_server ignores ambient KHIVE_PACKS (#1276) ───────────────────
+    //
+    // `cargo test -p kkernel` failed ~20 exec tests whenever a developer's
+    // shell exported `KHIVE_PACKS` naming a pack not compiled into this
+    // workspace (e.g. `kg,gtd`): every `RuntimeConfig` built by this test
+    // module's shared helpers fell through to `RuntimeConfig::default()`'s
+    // `packs` field, which reads that env var, so construction panicked with
+    // `PackRegError { unknown: "gtd", .. }`. A unit test's outcome must not
+    // depend on ambient shell configuration.
+    #[test]
+    #[serial(khive_packs_env)]
+    fn isolated_server_ignores_ambient_khive_packs_naming_unavailable_pack() {
+        let prev = std::env::var("KHIVE_PACKS").ok();
+        std::env::set_var("KHIVE_PACKS", "kg,gtd");
+
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        // Before the fix, this panicked inside `KhiveMcpServer::new` — the
+        // helper inherited the ambient list above instead of pinning its own.
+        let _server = isolated_server(&db_path);
+
+        match prev {
+            Some(v) => std::env::set_var("KHIVE_PACKS", v),
+            None => std::env::remove_var("KHIVE_PACKS"),
+        }
     }
 
     // ── exec-path / serve-path config_id parity (#581) ────────────────────────
@@ -1602,6 +1703,42 @@ default = true
         );
     }
 
+    // ── single-backend fallback installs a BlobStore (khive#1209) ────────────
+    //
+    // Before this fix, `build_local_fallback_server`'s single-backend branch
+    // constructed `KhiveRuntime`/`KhiveMcpServer` without ever calling
+    // `install_resolved_blob_store`, so `blob.*` verbs dispatched through
+    // `kkernel exec`'s in-process fallback always saw an unconfigured
+    // `BlobStore` even when the same config/backend combination resolves one
+    // for the `serve` daemon boot path. `KhiveMcpServer` does not expose its
+    // wrapped runtime, so this asserts the same *observable* side effect the
+    // `serve` path's own tests rely on: `FsBlobStore::new` (khive-db
+    // `stores/blob.rs`) creates its root directory eagerly. With no
+    // `[storage.blob]` config and no `KHIVE_BLOB_ROOT`, resolution falls
+    // back to `<db_dir>/blobs` — that directory existing after construction
+    // is proof the install call ran.
+    #[test]
+    fn build_local_fallback_server_installs_blob_store_single_backend() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("exec_blob.db");
+        let cfg = RuntimeConfig {
+            db_path: Some(db_path),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            ..RuntimeConfig::default()
+        };
+        let khive_cfg = KhiveConfig::default();
+
+        let _server = build_local_fallback_server(cfg, &khive_cfg, None, None)
+            .expect("single-backend local-exec construction must succeed");
+
+        assert!(
+            dir.path().join("blobs").is_dir(),
+            "default <db_dir>/blobs root must exist after construction, proving \
+             install_resolved_blob_store ran for the single-backend fallback path"
+        );
+    }
+
     // ── guarded local construction races a guarded boot (#667/#645) ──────────
     //
     // Mirrors `khive-runtime/tests/cold_boot_fts_race.rs`'s deterministic
@@ -1670,6 +1807,10 @@ default = true
                 db_path: Some(db_path),
                 embedding_model: None,
                 additional_embedding_models: vec![],
+                // Pin the pack list explicitly rather than inheriting
+                // `KHIVE_PACKS` from the ambient environment (#1276) — this
+                // race only exercises `kg` writes.
+                packs: vec!["kg".to_string()],
                 ..RuntimeConfig::default()
             };
             let khive_cfg = KhiveConfig::default();
@@ -1748,6 +1889,9 @@ default = true
                 db_path: Some(db_path),
                 embedding_model: None,
                 additional_embedding_models: vec![],
+                // Pin the pack list explicitly rather than inheriting
+                // `KHIVE_PACKS` from the ambient environment (#1276).
+                packs: vec!["kg".to_string()],
                 ..RuntimeConfig::default()
             };
             let khive_cfg = KhiveConfig::default();
@@ -1917,7 +2061,7 @@ default = true
 
         let ops = parse_ops_file(&f.path().to_path_buf()).unwrap();
         assert_eq!(ops.len(), 3);
-        apply_ops_file(&server, ops, None).await.unwrap();
+        apply_ops_file(&server, ops, None, false).await.unwrap();
 
         // Verify all 3 entities are present.
         let params = RequestParams {
@@ -1941,6 +2085,94 @@ default = true
             count, 3,
             "all 3 entities should be present after apply\nraw: {resp}"
         );
+    }
+
+    // ── #1220: --strict exit-code signal for partially-failed batches ─────────
+
+    #[test]
+    fn enforce_strict_batch_result_ok_when_strict_off_regardless_of_failures() {
+        let raw = serde_json::json!({
+            "results": [],
+            "summary": {"total": 1, "succeeded": 0, "failed": 1, "aborted": 0},
+        })
+        .to_string();
+        assert!(enforce_strict_batch_result(&raw, false).is_ok());
+    }
+
+    #[test]
+    fn enforce_strict_batch_result_ok_when_strict_on_and_nothing_failed() {
+        let raw = serde_json::json!({
+            "results": [],
+            "summary": {"total": 2, "succeeded": 2, "failed": 0, "aborted": 0},
+        })
+        .to_string();
+        assert!(enforce_strict_batch_result(&raw, true).is_ok());
+    }
+
+    #[test]
+    fn enforce_strict_batch_result_errs_when_strict_on_and_a_failure_present() {
+        let raw = serde_json::json!({
+            "results": [],
+            "summary": {"total": 2, "succeeded": 1, "failed": 1, "aborted": 0},
+        })
+        .to_string();
+        let err = enforce_strict_batch_result(&raw, true).unwrap_err();
+        assert!(format!("{err}").contains("1 op(s) failed"));
+    }
+
+    #[test]
+    fn enforce_strict_batch_result_errs_when_strict_on_and_chain_aborted() {
+        let raw = serde_json::json!({
+            "results": [],
+            "summary": {"total": 2, "succeeded": 0, "failed": 1, "aborted": 1},
+        })
+        .to_string();
+        assert!(enforce_strict_batch_result(&raw, true).is_err());
+    }
+
+    #[test]
+    fn enforce_strict_batch_result_errs_on_save_manifest_with_failures() {
+        // The save-file path prints a manifest, not the raw envelope; the
+        // manifest carries the envelope's summary through (khive-mcp
+        // save_sink) precisely so --strict works on this path too.
+        let raw = r#"{"path":"/tmp/out.jsonl","rows":2,"checksum":"ab","summary":{"total":2,"succeeded":1,"failed":1,"aborted":0}}"#;
+        assert!(enforce_strict_batch_result(raw, true).is_err());
+        let clean = r#"{"path":"/tmp/out.jsonl","rows":2,"checksum":"ab","summary":{"total":2,"succeeded":2,"failed":0,"aborted":0}}"#;
+        assert!(enforce_strict_batch_result(clean, true).is_ok());
+    }
+
+    #[test]
+    fn enforce_strict_batch_result_ok_on_non_json_output() {
+        // --output-format table/auto renders a non-JSON string; --strict has
+        // nothing to inspect and must not itself error out on that shape.
+        assert!(enforce_strict_batch_result("| a | b |\n", true).is_ok());
+    }
+
+    #[tokio::test]
+    async fn apply_ops_file_strict_errs_when_an_op_fails() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        let server = isolated_server(&db_path);
+
+        // First op succeeds; second targets an unknown kind and fails.
+        let mut f = NamedTempFile::new().unwrap();
+        use std::io::Write as _;
+        f.write_all(
+            b"{\"tool\":\"create\",\"args\":{\"kind\":\"concept\",\"name\":\"StrictOne\"}}\n",
+        )
+        .unwrap();
+        f.write_all(
+            b"{\"tool\":\"search\",\"args\":{\"kind\":\"not_a_real_kind\",\"query\":\"x\"}}\n",
+        )
+        .unwrap();
+
+        let ops = parse_ops_file(&f.path().to_path_buf()).unwrap();
+        assert_eq!(ops.len(), 2);
+
+        let err = apply_ops_file(&server, ops, None, true)
+            .await
+            .expect_err("strict mode must surface the per-op failure as a process error");
+        assert!(format!("{err}").contains("1 op(s) failed"));
     }
 
     // ── ADR-099 B1 inertness (golden shape) ────────────────────────────────────
@@ -2038,8 +2270,8 @@ default = true
             .collect();
         assert_eq!(
             top_level_keys,
-            std::collections::BTreeSet::from(["results", "summary"]),
-            "non-atomic envelope must carry exactly results+summary, no `atomic` block: {resp}"
+            std::collections::BTreeSet::from(["results", "summary", "status"]),
+            "non-atomic envelope must carry exactly results+summary+status, no `atomic` block (#1220 added `status`): {resp}"
         );
 
         let summary_keys: std::collections::BTreeSet<&str> = resp["summary"]
@@ -2094,6 +2326,7 @@ default = true
             ExecDbContext::default(),
             false,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -2147,6 +2380,7 @@ default = true
             None,
             None,
             ExecDbContext::default(),
+            false,
         )
         .await;
 
@@ -2192,6 +2426,7 @@ default = true
             None,
             None,
             ExecDbContext::default(),
+            false,
         )
         .await;
 
@@ -2290,7 +2525,10 @@ backend = "sessions"
             namespace_explicit: true,
             actor_explicit: false,
             no_embed: true,
-            packs: None,
+            // Pin the pack list explicitly rather than inheriting `KHIVE_PACKS`
+            // from the ambient environment (#1276) — this test's assertion is
+            // about config_id parity, not about pack resolution.
+            packs: Some(vec!["kg".to_string()]),
             brain_profile: None,
         })
         .expect("resolve exec-shaped config");
@@ -2302,6 +2540,7 @@ backend = "sessions"
             None,
             None,
             ExecDbContext::default(),
+            false,
             spy_capture_config_id,
         )
         .await;
@@ -2324,7 +2563,10 @@ backend = "sessions"
             namespace_explicit: false,
             actor_explicit: false,
             no_embed: true,
-            packs: None,
+            // Same pin as `cfg` above (#1276) — both sides of the parity
+            // comparison must resolve identically regardless of ambient
+            // `KHIVE_PACKS`.
+            packs: Some(vec!["kg".to_string()]),
             brain_profile: None,
         })
         .expect("resolve serve-shaped config");
@@ -2345,6 +2587,87 @@ backend = "sessions"
              daemon must be byte-identical to what the daemon computes for the same \
              multi-backend config.toml (D1 acceptance gate, exercised end-to-end through \
              the real call site rather than a standalone compute_config_id comparison)"
+        );
+    }
+
+    // ── #1226: inline --db/[[backends]] guard must fire before daemon-forward ──
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn inline_db_override_conflicting_with_backends_is_rejected_before_daemon_forward() {
+        std::env::remove_var("KHIVE_EMBEDDING_MODEL");
+        std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
+        std::env::remove_var("KHIVE_ACTOR");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+        let (prev_home, home_dir) = isolate_home_for_test();
+        SPY_CAPTURED_CONFIG_ID.with(|c| *c.borrow_mut() = None);
+
+        let khive_dir = home_dir.path().join(".khive");
+        std::fs::create_dir_all(&khive_dir).expect("mkdir .khive");
+        let main_backend_path = khive_dir.join("main-backend.db");
+        let sessions_backend_path = khive_dir.join("sessions-backend.db");
+        std::fs::write(
+            khive_dir.join("config.toml"),
+            format!(
+                r#"
+[[backends]]
+name = "main"
+kind = "sqlite"
+path = "{}"
+
+[[backends]]
+name = "sessions"
+kind = "sqlite"
+path = "{}"
+
+[packs.session]
+backend = "sessions"
+"#,
+                main_backend_path.display(),
+                sessions_backend_path.display(),
+            ),
+        )
+        .expect("write multi-backend config.toml");
+
+        let cfg = resolve_runtime_config(RuntimeConfigInputs {
+            db: None,
+            config: None,
+            namespace: Namespace::parse("local").expect("ns"),
+            namespace_explicit: true,
+            actor_explicit: false,
+            no_embed: true,
+            packs: None,
+            brain_profile: None,
+        })
+        .expect("resolve exec-shaped config");
+
+        let conflicting_override = khive_dir.join("override.db");
+        let result = run_exec_inline_with_forward(
+            "stats()".to_string(),
+            cfg,
+            None,
+            None,
+            None,
+            ExecDbContext {
+                raw: Some(conflicting_override.display().to_string()),
+                anchor: None,
+            },
+            false,
+            spy_capture_config_id,
+        )
+        .await;
+        restore_home(prev_home);
+
+        assert!(
+            result.is_err(),
+            "a --db/KHIVE_DB override that conflicts with a declared [[backends]] topology \
+             must be rejected on the inline path too, not only on --ops-file; got: {result:?}"
+        );
+        assert!(
+            SPY_CAPTURED_CONFIG_ID.with(|c| c.borrow().is_none()),
+            "the conflict must be caught BEFORE any daemon-forward attempt — the spy must \
+             never have been called"
         );
     }
 
@@ -2429,6 +2752,10 @@ backend = "sessions"
             db_path: Some(PathBuf::from(db_path)),
             embedding_model: None,
             additional_embedding_models: vec![],
+            // Pin the pack list explicitly rather than inheriting `KHIVE_PACKS`
+            // from the ambient environment (#1276) — every atomic-apply test
+            // using this helper only dispatches `kg` verbs.
+            packs: vec!["kg".to_string()],
             ..Default::default()
         }
     }

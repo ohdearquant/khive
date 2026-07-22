@@ -202,12 +202,30 @@ pub fn write_and_manifest(
     let abs_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let null_counts_val: Value = serde_json::to_value(&null_counts).unwrap_or_else(|_| json!({}));
 
+    // Carry the envelope's op-outcome summary through: the manifest is the
+    // only output the caller sees on the save path, and without the counts a
+    // strict caller (`kkernel exec --strict --save-file`) cannot distinguish
+    // an all-green batch from one whose failures are sitting in the file.
+    let summary = results_envelope.get("summary").cloned().unwrap_or_else(|| {
+        let succeeded = results_arr
+            .iter()
+            .filter(|r| r.get("ok").and_then(Value::as_bool) == Some(true))
+            .count();
+        json!({
+            "total": rows,
+            "succeeded": succeeded,
+            "failed": rows - succeeded,
+            "aborted": 0,
+        })
+    });
+
     Ok(json!({
         "path": abs_path.to_string_lossy(),
         "rows": rows,
         "per_column_null_counts": null_counts_val,
         "schema_fingerprint": schema_fingerprint,
         "checksum": checksum,
+        "summary": summary,
     }))
 }
 
@@ -274,6 +292,22 @@ mod tests {
             "results": results,
             "summary": { "total": total, "succeeded": succeeded, "failed": failed, "aborted": 0 }
         })
+    }
+
+    #[test]
+    fn manifest_carries_the_envelope_summary() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("out.jsonl");
+
+        let envelope = make_envelope(vec![
+            json!({ "ok": true, "tool": "stats", "result": {} }),
+            json!({ "ok": false, "tool": "get", "error": "not found" }),
+        ]);
+
+        let manifest = write_and_manifest(&envelope, &path, false).unwrap();
+        assert_eq!(manifest["summary"]["total"], json!(2));
+        assert_eq!(manifest["summary"]["succeeded"], json!(1));
+        assert_eq!(manifest["summary"]["failed"], json!(1));
     }
 
     #[test]
