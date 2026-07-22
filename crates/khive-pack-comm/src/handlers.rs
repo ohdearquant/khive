@@ -4,7 +4,7 @@
 //! `message` notes in the standard notes table. Message-specific metadata lives
 //! in the `properties` JSON column; `content` is the message body.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
@@ -626,6 +626,100 @@ pub(crate) async fn handle_thread(
             json: note_to_message_json(&root_note),
         });
     }
+
+    // #94 fix 1/2 — actor visibility: mirror `handle_inbox`'s EqOrMissing model
+    // (ADR-057 Q3) instead of the unfiltered namespace-wide read `thread` had
+    // before. A caller may see a row iff they are a party to it (its sender or
+    // its addressee) or the row predates actor labeling (`to_actor` absent,
+    // back-compat visible-to-all — same rule `inbox` already applies). Before
+    // this filter, any caller who could resolve a thread id saw every actor's
+    // copies in that thread, including another actor's unread inbound state
+    // (issue #94 symptom 1/2: thread crossed the caller boundary that inbox
+    // already enforced).
+    let caller_actor = token.actor().id.clone();
+    rows.retain(|r| {
+        let props = r.json.get("properties");
+        let to_actor = props
+            .and_then(|p| p.get("to_actor"))
+            .and_then(Value::as_str);
+        let from_actor = props
+            .and_then(|p| p.get("from_actor"))
+            .and_then(Value::as_str);
+        from_actor == Some(caller_actor.as_str())
+            || to_actor.is_none()
+            || to_actor == Some(caller_actor.as_str())
+    });
+
+    // #94 fix 2/2 — collapse the ADR-057 dual-write pair (outbound copy +
+    // inbound copy) of one logical message into a single thread entry. The
+    // inbound copy's `properties.outbound_ref` names its outbound twin's
+    // note id (set by `dual_write_message`); a row without that link (a
+    // directly-ingested inbound message, or legacy data) is its own logical
+    // message. Without this, `thread` rendered both dual-write copies as two
+    // entries — a reply appeared twice with no marker distinguishing the
+    // copies (issue #94 symptom 3). The outbound copy (always the physically
+    // earlier row — `dual_write_message` creates it first) is kept as the
+    // canonical entry; the inbound twin's `read` state is folded in, since
+    // that is the only field where the two copies can differ meaningfully.
+    fn logical_id(row: &ThreadRow) -> Uuid {
+        let props = row.json.get("properties");
+        let direction = props
+            .and_then(|p| p.get("direction"))
+            .and_then(Value::as_str);
+        if direction == Some("inbound") {
+            if let Some(oref) = props
+                .and_then(|p| p.get("outbound_ref"))
+                .and_then(Value::as_str)
+            {
+                if let Ok(u) = oref.parse::<Uuid>() {
+                    return u;
+                }
+            }
+        }
+        row.full_id
+    }
+    fn is_outbound(row: &ThreadRow) -> bool {
+        row.json
+            .get("properties")
+            .and_then(|p| p.get("direction"))
+            .and_then(Value::as_str)
+            == Some("outbound")
+    }
+
+    let mut canonical_order: Vec<Uuid> = Vec::new();
+    let mut canonical: HashMap<Uuid, ThreadRow> = HashMap::new();
+    for row in rows {
+        let lid = logical_id(&row);
+        match canonical.get_mut(&lid) {
+            None => {
+                canonical_order.push(lid);
+                canonical.insert(lid, row);
+            }
+            Some(existing) => {
+                // Prefer the outbound copy as the canonical entry (earlier,
+                // and it is what `comm.send`/`comm.reply` return as `id`),
+                // but carry the inbound twin's `read` state across either way.
+                if is_outbound(&row) && !is_outbound(existing) {
+                    let read = existing.json.get("read").cloned();
+                    let mut promoted = row;
+                    if let (Some(read), Some(obj)) = (read, promoted.json.as_object_mut()) {
+                        obj.insert("read".to_string(), read);
+                    }
+                    *existing = promoted;
+                } else if !is_outbound(&row) && is_outbound(existing) {
+                    if let (Some(read), Some(obj)) =
+                        (row.json.get("read").cloned(), existing.json.as_object_mut())
+                    {
+                        obj.insert("read".to_string(), read);
+                    }
+                }
+            }
+        }
+    }
+    let mut rows: Vec<ThreadRow> = canonical_order
+        .into_iter()
+        .filter_map(|lid| canonical.remove(&lid))
+        .collect();
 
     // #494: `after` cursor — message id or RFC 3339 timestamp; a hard error if
     // neither. See crates/khive-pack-comm/docs/api/message-lifecycle.md#handlersrshandle_thread

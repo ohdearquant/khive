@@ -6202,9 +6202,11 @@ async fn t494_thread_default_order_truncates_head_unchanged() {
             .unwrap_or_else(|e| panic!("reply-{i} succeeds: {e:?}"));
     }
 
-    // 5 logical messages (root + 4 replies) = 10 physical notes (outbound+inbound
-    // pairs). limit=2 with no order= must return the OLDEST 2 physical notes —
-    // both copies of "root" — matching pre-#494 truncate-from-head behavior.
+    // 5 logical messages (root + 4 replies), each an ADR-057 dual-write pair
+    // (outbound+inbound) collapsed by #94's dedup fix into ONE thread entry
+    // per logical message. limit=2 with no order= must return the OLDEST 2
+    // logical messages: root, reply-1 — no duplicate "root" entry anymore
+    // (pre-#94-fix behavior returned both physical copies of "root").
     let result = registry
         .dispatch(
             "comm.thread",
@@ -6220,8 +6222,9 @@ async fn t494_thread_default_order_truncates_head_unchanged() {
         .collect();
     assert_eq!(
         contents,
-        vec!["root", "root"],
-        "default order must truncate from the tail (keep the head), unchanged from before #494"
+        vec!["root", "reply-1"],
+        "default order must truncate from the tail (keep the head), one entry per \
+         logical message post-#94 dedup"
     );
 }
 
@@ -6265,9 +6268,10 @@ async fn t494_thread_order_desc_returns_newest_messages() {
         .collect();
     assert_eq!(
         contents,
-        vec!["reply-4", "reply-4"],
-        "order=desc + limit=2 must return the newest 2 physical notes — both copies \
-         of the last reply — not the oldest (#494 fix: the tail is now reachable)"
+        vec!["reply-4", "reply-3"],
+        "order=desc + limit=2 must return the newest 2 logical messages — not the \
+         oldest (#494 fix: the tail is now reachable), one entry per logical message \
+         post-#94 dedup (no duplicate 'reply-4' entry)"
     );
 }
 
@@ -6304,9 +6308,10 @@ async fn t494_thread_invalid_order_rejected() {
 
 /// `after` accepts a message id cursor and returns only messages strictly after it
 /// (enables incremental polling without re-fetching history). The cursor resolves
-/// to the OUTBOUND copy's `full_id` (what `comm.reply` returns); its own inbound
-/// copy — created a moment later in the same dual-write call — is strictly after
-/// it and so is included.
+/// to the OUTBOUND copy's `full_id` (what `comm.reply` returns), which post-#94 is
+/// also the canonical id of the "reply-1" logical message itself — so it is
+/// excluded by the strict `>` comparison, and there is nothing after it (reply-1
+/// was the last message sent).
 #[tokio::test]
 async fn t494_thread_after_id_cursor_returns_strictly_later_messages() {
     let (registry, _rt) = build_registry_for_ns("local");
@@ -6346,9 +6351,9 @@ async fn t494_thread_after_id_cursor_returns_strictly_later_messages() {
         .collect();
     assert_eq!(
         contents,
-        vec!["reply-1"],
-        "after=reply-1's outbound id must return only its own inbound copy \
-         (strictly later), excluding root and reply-1's own outbound copy; got {contents:?}"
+        Vec::<&str>::new(),
+        "after=reply-1's own canonical (outbound) id excludes reply-1 itself post-#94 \
+         dedup, and reply-1 was the last message sent, so nothing remains; got {contents:?}"
     );
 }
 
@@ -6574,11 +6579,11 @@ async fn t494_thread_order_desc_with_after_id_cursor_returns_strictly_older_in_d
 
     // `comm.send(to="local", ...)` is a self-send: ADR-057 dual-write stores
     // both an outbound and an inbound copy of "root", both real-clock (and so
-    // both strictly older than the synthetic 2099 timestamps). Full desc
-    // sequence is therefore [msg-c, msg-b, msg-a, root, root]. `after=msg-b`
-    // must return only what comes strictly after it in THAT sequence —
-    // msg-a and both root copies — never msg-c, even though msg-c is also
-    // `>` msg-b in wall-clock terms.
+    // both strictly older than the synthetic 2099 timestamps) — collapsed by
+    // #94's dedup fix into a single "root" thread entry. Full desc sequence
+    // is therefore [msg-c, msg-b, msg-a, root]. `after=msg-b` must return
+    // only what comes strictly after it in THAT sequence — msg-a and root —
+    // never msg-c, even though msg-c is also `>` msg-b in wall-clock terms.
     let result = registry
         .dispatch(
             "comm.thread",
@@ -6594,15 +6599,16 @@ async fn t494_thread_order_desc_with_after_id_cursor_returns_strictly_older_in_d
         .collect();
     assert_eq!(
         contents,
-        vec!["msg-a", "root", "root"],
+        vec!["msg-a", "root"],
         "order=desc + after=msg-b must return only rows strictly older than msg-b \
-         (further along the desc sequence), in desc order — both self-send root \
-         copies included, msg-c excluded; got {contents:?}"
+         (further along the desc sequence), in desc order — one 'root' entry \
+         post-#94 dedup, msg-c excluded; got {contents:?}"
     );
 }
 
-/// Absent `order`/`after` preserves today's behavior exactly: same messages, same order,
-/// same truncation as before #494 (regression guard alongside the existing #485 test).
+/// Absent `order`/`after` preserves the #494 ordering/truncation behavior; the message
+/// count itself changed under #94's dedup fix (one entry per logical message, not one
+/// per ADR-057 dual-write physical copy) — see the updated assertions below.
 #[tokio::test]
 async fn t494_thread_without_new_params_unchanged() {
     let (registry, _rt) = build_registry_for_ns("local");
@@ -6631,14 +6637,202 @@ async fn t494_thread_without_new_params_unchanged() {
     let msgs = result["messages"].as_array().expect("messages array");
     assert_eq!(
         msgs.len(),
-        4,
-        "root (outbound+inbound) + reply-1 (outbound+inbound) = 4 physical notes"
+        2,
+        "root + reply-1 = 2 logical messages post-#94 dedup (each was an ADR-057 \
+         dual-write outbound+inbound pair, now collapsed to one thread entry)"
     );
     let contents: Vec<&str> = msgs
         .iter()
         .map(|m| m["content"].as_str().unwrap_or(""))
         .collect();
-    assert_eq!(contents, vec!["root", "root", "reply-1", "reply-1"]);
+    assert_eq!(contents, vec!["root", "reply-1"]);
+}
+
+// ── #94: dual-write dedup + actor-scoped thread visibility ───────────────────
+
+/// Full round trip: A sends to B, B replies, A replies again. `comm.thread`
+/// must return exactly 3 logical messages (not 6 ADR-057 dual-write physical
+/// copies), in chronological order, each attributed to the actor that
+/// actually sent it, with no duplicate entries (issue #94 symptom 3).
+#[tokio::test]
+async fn t94_thread_round_trip_returns_deduped_logical_messages() {
+    let backend = shared_backend();
+    let (registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:a");
+    let (registry_b, _rt_b) = build_actor_registry(backend.clone(), "lambda:b");
+
+    // 1. A -> B.
+    let sent = registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:b", "content": "hello from A" }),
+        )
+        .await
+        .expect("A sends to B");
+    let root_id = sent["full_id"].as_str().expect("full_id").to_string();
+
+    // 2. B finds it in inbox and replies.
+    let b_inbox = registry_b
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "all", "limit": 10 }),
+        )
+        .await
+        .expect("B inbox");
+    let b_msgs = b_inbox["messages"].as_array().expect("messages");
+    assert_eq!(b_msgs.len(), 1, "B sees exactly 1 inbound message");
+    let b_inbound_id = b_msgs[0]["full_id"].as_str().expect("full_id").to_string();
+    registry_b
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({ "id": b_inbound_id, "content": "reply from B" }),
+        )
+        .await
+        .expect("B replies");
+
+    // 3. A finds B's reply in inbox and replies again.
+    let a_inbox = registry_a
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "all", "limit": 10 }),
+        )
+        .await
+        .expect("A inbox");
+    let a_msgs = a_inbox["messages"].as_array().expect("messages");
+    assert_eq!(a_msgs.len(), 1, "A sees exactly B's reply");
+    let a_inbound_id = a_msgs[0]["full_id"].as_str().expect("full_id").to_string();
+    registry_a
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({ "id": a_inbound_id, "content": "reply from A again" }),
+        )
+        .await
+        .expect("A replies again");
+
+    // 4. thread() must show exactly 3 logical messages, in order, correctly
+    // attributed, with no duplicates — from either party's point of view.
+    let thread = registry_a
+        .dispatch("comm.thread", serde_json::json!({ "id": root_id }))
+        .await
+        .expect("A reads the thread");
+    let count = thread["count"].as_u64().expect("count");
+    assert_eq!(
+        count, 3,
+        "3 logical messages (not 6 dual-write physical copies); got {thread}"
+    );
+    let msgs = thread["messages"].as_array().expect("messages array");
+    let contents: Vec<&str> = msgs
+        .iter()
+        .map(|m| m["content"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        contents,
+        vec!["hello from A", "reply from B", "reply from A again"],
+        "messages in chronological order with no duplicates; got {contents:?}"
+    );
+    let from_actors: Vec<&str> = msgs
+        .iter()
+        .map(|m| m["from"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        from_actors,
+        vec!["lambda:a", "lambda:b", "lambda:a"],
+        "each entry attributed to the actor that actually sent it; got {from_actors:?}"
+    );
+
+    // B's view must match exactly — the same 3 deduped, correctly attributed entries.
+    let thread_from_b = registry_b
+        .dispatch("comm.thread", serde_json::json!({ "id": root_id }))
+        .await
+        .expect("B reads the thread");
+    assert_eq!(thread_from_b["count"].as_u64().unwrap_or(0), 3);
+}
+
+/// A message addressed to one actor pair must not be visible to an unrelated
+/// third actor who merely knows (or can resolve) the thread's root id — the
+/// caller-boundary gap between `thread` (previously unfiltered by actor) and
+/// `inbox` (already actor-scoped) from issue #94 symptom 1/2.
+#[tokio::test]
+async fn t94_thread_excludes_messages_not_addressed_to_or_from_caller() {
+    let backend = shared_backend();
+    let (registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:a");
+    let (registry_c, _rt_c) = build_actor_registry(backend, "lambda:c");
+
+    let sent = registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:b", "content": "private to B" }),
+        )
+        .await
+        .expect("A sends to B");
+    let root_id = sent["full_id"].as_str().expect("full_id").to_string();
+
+    // C is neither the sender nor the addressee of any row in this thread, even
+    // though C shares the same namespace and can resolve the root id.
+    let thread_from_c = registry_c
+        .dispatch("comm.thread", serde_json::json!({ "id": root_id }))
+        .await
+        .expect("C can resolve the root id but must see zero messages");
+    assert_eq!(
+        thread_from_c["count"].as_u64().unwrap_or(99),
+        0,
+        "an actor who is neither sender nor addressee must see zero thread messages \
+         (issue #94: thread previously exposed every actor's copies unfiltered); \
+         got {thread_from_c}"
+    );
+
+    // A, the actual sender, still sees it.
+    let thread_from_a = registry_a
+        .dispatch("comm.thread", serde_json::json!({ "id": root_id }))
+        .await
+        .expect("A reads own thread");
+    assert_eq!(thread_from_a["count"].as_u64().unwrap_or(0), 1);
+}
+
+/// A legacy message note lacking `to_actor` (pre-ADR-057 data, or directly
+/// store-inserted content) must remain visible via `comm.thread`'s actor
+/// scoping — the same EqOrMissing rule `comm.inbox` already applies for
+/// exactly this shape (ADR-057 Q3).
+#[tokio::test]
+async fn t94_thread_legacy_message_without_to_actor_stays_visible() {
+    let (registry, rt) = build_registry_for_ns("local");
+
+    let root = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "root" }),
+        )
+        .await
+        .expect("root send succeeds");
+    let root_full_id = root["full_id"].as_str().expect("root full_id").to_string();
+    let root_uuid = uuid::Uuid::parse_str(&root_full_id).unwrap();
+
+    // insert_thread_message stores only `from`/`to` (no from_actor/to_actor) —
+    // exactly the legacy shape this test guards.
+    let legacy_id = uuid::Uuid::new_v4();
+    insert_thread_message(
+        &rt,
+        "local",
+        legacy_id,
+        root_uuid,
+        chrono::Utc::now().timestamp_micros(),
+        "legacy no-to_actor",
+    )
+    .await;
+
+    let thread = registry
+        .dispatch("comm.thread", serde_json::json!({ "id": root_full_id }))
+        .await
+        .expect("thread succeeds");
+    let contents: Vec<&str> = thread["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["content"].as_str().unwrap_or(""))
+        .collect();
+    assert!(
+        contents.contains(&"legacy no-to_actor"),
+        "a message without to_actor must stay visible (EqOrMissing); got {contents:?}"
+    );
 }
 
 // ── #495: comm.send / comm.reply metadata (tags) passthrough ────────────────
