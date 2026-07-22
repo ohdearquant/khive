@@ -868,6 +868,11 @@ impl VamanaIndex {
     /// staging/fsync sequence.
     #[cfg(feature = "mmap")]
     pub fn save_atomic(&self, path: &Path) -> Result<()> {
+        self.save_atomic_with_lock_hook(path, || {})
+    }
+
+    #[cfg(feature = "mmap")]
+    fn save_atomic_with_lock_hook(&self, path: &Path, after_lock: impl FnOnce()) -> Result<()> {
         fs::create_dir_all(path)?;
         let publication_lock = OpenOptions::new()
             .create(true)
@@ -876,6 +881,7 @@ impl VamanaIndex {
             .write(true)
             .open(path.join(".checkpoint.lock"))?;
         publication_lock.lock()?;
+        after_lock();
         reject_checkpoint_sequence_regression(path, self.last_applied_seq)?;
 
         // Stage under .v2new so a crash before the metadata rename leaves the previous
@@ -994,7 +1000,26 @@ impl VamanaIndex {
         corpus_vectors: &[f32],
         fallback_config: VamanaConfig,
     ) -> Result<Self> {
+        Self::load_or_build_with_sequence(path, corpus_vectors, fallback_config, None)
+    }
+
+    /// Fingerprint-gated restore with the write-log sequence to use if the index
+    /// must be rebuilt and persisted. The caller owns the log and must supply the
+    /// highest sequence reflected in `corpus_vectors`.
+    #[cfg(feature = "mmap")]
+    pub fn load_or_build_with_sequence(
+        path: &Path,
+        corpus_vectors: &[f32],
+        fallback_config: VamanaConfig,
+        rebuild_last_applied_seq: Option<u64>,
+    ) -> Result<Self> {
         let metadata_path = path.join("metadata.bin");
+        let rebuild_and_persist = |config| {
+            let mut index = Self::rebuild_from_corpus(corpus_vectors, config)?;
+            index.set_last_applied_seq(rebuild_last_applied_seq);
+            index.save_atomic(path)?;
+            Ok(index)
+        };
 
         let metadata_bytes = match fs::read(&metadata_path) {
             Ok(b) => b,
@@ -1007,26 +1032,20 @@ impl VamanaIndex {
                 ] {
                     let _ = fs::remove_file(path.join(suffix));
                 }
-                let index = Self::rebuild_from_corpus(corpus_vectors, fallback_config)?;
-                index.save_atomic(path)?;
-                return Ok(index);
+                return rebuild_and_persist(fallback_config);
             }
             Err(e) => return Err(e.into()),
         };
 
         if metadata_bytes.len() < 8 {
-            let index = Self::rebuild_from_corpus(corpus_vectors, fallback_config)?;
-            index.save_atomic(path)?;
-            return Ok(index);
+            return rebuild_and_persist(fallback_config);
         }
 
         if &metadata_bytes[..8] == V2_COMMIT_MAGIC {
             let commit = match parse_v2_commit(&metadata_bytes) {
                 Ok(c) => c,
                 Err(_) => {
-                    let index = Self::rebuild_from_corpus(corpus_vectors, fallback_config)?;
-                    index.save_atomic(path)?;
-                    return Ok(index);
+                    return rebuild_and_persist(fallback_config);
                 }
             };
 
@@ -1040,9 +1059,7 @@ impl VamanaIndex {
                         search_list_size: commit.index_meta.search_list_size,
                         alpha: commit.index_meta.alpha,
                     };
-                    let index = Self::rebuild_from_corpus(corpus_vectors, config)?;
-                    index.save_atomic(path)?;
-                    return Ok(index);
+                    return rebuild_and_persist(config);
                 }
                 Err(e) => return Err(e.into()),
             };
@@ -1055,9 +1072,7 @@ impl VamanaIndex {
                         search_list_size: commit.index_meta.search_list_size,
                         alpha: commit.index_meta.alpha,
                     };
-                    let index = Self::rebuild_from_corpus(corpus_vectors, config)?;
-                    index.save_atomic(path)?;
-                    return Ok(index);
+                    return rebuild_and_persist(config);
                 }
                 Err(e) => return Err(e.into()),
             };
@@ -1070,9 +1085,7 @@ impl VamanaIndex {
                         search_list_size: commit.index_meta.search_list_size,
                         alpha: commit.index_meta.alpha,
                     };
-                    let index = Self::rebuild_from_corpus(corpus_vectors, config)?;
-                    index.save_atomic(path)?;
-                    return Ok(index);
+                    return rebuild_and_persist(config);
                 }
                 Err(e) => return Err(e.into()),
             };
@@ -1091,9 +1104,7 @@ impl VamanaIndex {
                     search_list_size: commit.index_meta.search_list_size,
                     alpha: commit.index_meta.alpha,
                 };
-                let index = Self::rebuild_from_corpus(corpus_vectors, config)?;
-                index.save_atomic(path)?;
-                return Ok(index);
+                return rebuild_and_persist(config);
             }
 
             // codes.bin is checksum-gated exactly like the other segments whenever the
@@ -1110,9 +1121,7 @@ impl VamanaIndex {
                         search_list_size: commit.index_meta.search_list_size,
                         alpha: commit.index_meta.alpha,
                     };
-                    let index = Self::rebuild_from_corpus(corpus_vectors, config)?;
-                    index.save_atomic(path)?;
-                    return Ok(index);
+                    return rebuild_and_persist(config);
                 }
             }
 
@@ -1125,9 +1134,7 @@ impl VamanaIndex {
                     search_list_size: commit.index_meta.search_list_size,
                     alpha: commit.index_meta.alpha,
                 };
-                let index = Self::rebuild_from_corpus(corpus_vectors, config)?;
-                index.save_atomic(path)?;
-                return Ok(index);
+                return rebuild_and_persist(config);
             }
             let live_count = corpus_vectors.len() / dim;
             let live_content_hash = *blake3::hash(cast_slice(corpus_vectors)).as_bytes();
@@ -1143,9 +1150,7 @@ impl VamanaIndex {
                     search_list_size: commit.index_meta.search_list_size,
                     alpha: commit.index_meta.alpha,
                 };
-                let index = Self::rebuild_from_corpus(corpus_vectors, config)?;
-                index.save_atomic(path)?;
-                return Ok(index);
+                return rebuild_and_persist(config);
             }
 
             // Fast path: load all segments, restore lifecycle state.
@@ -1162,9 +1167,7 @@ impl VamanaIndex {
                         search_list_size: commit.index_meta.search_list_size,
                         alpha: commit.index_meta.alpha,
                     };
-                    let index = Self::rebuild_from_corpus(corpus_vectors, config)?;
-                    index.save_atomic(path)?;
-                    Ok(index)
+                    rebuild_and_persist(config)
                 }
                 Err(e) => Err(e),
             }
@@ -1180,15 +1183,14 @@ impl VamanaIndex {
             let mut index = Self::load(path)?;
             // Release the mmap before save_atomic overwrites the same files.
             index.ensure_owned()?;
+            index.set_last_applied_seq(rebuild_last_applied_seq);
             index.save_atomic(path)?;
             Ok(index)
         } else {
             // Unknown or garbage magic: treat as corrupt snapshot and rebuild.
             // VamanaIndex::load (direct v1 callers) remains strict; load_or_build always
             // recovers because the caller supplies a corpus and fallback config.
-            let index = Self::rebuild_from_corpus(corpus_vectors, fallback_config)?;
-            index.save_atomic(path)?;
-            Ok(index)
+            rebuild_and_persist(fallback_config)
         }
     }
 
@@ -2776,6 +2778,31 @@ fn reject_checkpoint_sequence_regression(path: &Path, candidate: Option<u64>) ->
     let Ok(commit) = parse_v2_commit(&metadata) else {
         return Ok(());
     };
+    let segments = [
+        ("vectors.bin", commit.vectors_hash),
+        ("graph.bin", commit.graph_hash),
+        ("lifecycle.bin", commit.lifecycle_hash),
+    ];
+    for (name, expected) in segments {
+        let data = match fs::read(path.join(name)) {
+            Ok(data) => data,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        if blake3::hash(&data).as_bytes() != &expected {
+            return Ok(());
+        }
+    }
+    if let Some(expected) = commit.codes_hash {
+        let data = match fs::read(path.join("codes.bin")) {
+            Ok(data) => data,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        if blake3::hash(&data).as_bytes() != &expected {
+            return Ok(());
+        }
+    }
     let Some(incumbent) = commit.last_applied_seq else {
         return Ok(());
     };
@@ -5245,6 +5272,64 @@ mod tests {
             via_lob.search(&query, 5).unwrap(),
             "raw load and load_or_build fast path must produce identical results"
         );
+    }
+
+    #[cfg(feature = "mmap")]
+    #[test]
+    fn overlapping_checkpoint_writers_linearize_sequence_validation() {
+        let vectors = rand_unit_vectors(30, 8, 0x1138_0200);
+        let stale_vectors = rand_unit_vectors(20, 8, 0x1138_0100);
+        let config = VamanaConfig::with_dimensions(8)
+            .with_max_degree(8)
+            .with_search_list_size(16);
+        let mut newer = VamanaIndex::build(&vectors, config.clone()).unwrap();
+        let mut stale = VamanaIndex::build(&stale_vectors, config).unwrap();
+        newer.set_last_applied_seq(Some(200));
+        stale.set_last_applied_seq(Some(100));
+
+        let dir = tempfile::tempdir().unwrap();
+        let newer_path = dir.path().to_path_buf();
+        let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let newer_handle = std::thread::spawn(move || {
+            newer.save_atomic_with_lock_hook(&newer_path, || {
+                locked_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })
+        });
+        locked_rx.recv().unwrap();
+
+        let stale_path = dir.path().to_path_buf();
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(0);
+        let stale_handle = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = stale.save_atomic(&stale_path);
+            result_tx.send(result).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(matches!(
+            result_rx.recv_timeout(std::time::Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        release_tx.send(()).unwrap();
+        newer_handle.join().unwrap().unwrap();
+        let stale_result = result_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        assert!(matches!(
+            stale_result,
+            Err(VamanaError::CheckpointSequenceRegression {
+                candidate: Some(100),
+                incumbent: 200,
+            })
+        ));
+        stale_handle.join().unwrap();
+
+        let persisted = VamanaIndex::load(dir.path()).unwrap();
+        assert_eq!(persisted.last_applied_seq(), Some(200));
+        assert_eq!(persisted.vectors().unwrap(), vectors);
     }
 
     #[cfg(feature = "mmap")]
