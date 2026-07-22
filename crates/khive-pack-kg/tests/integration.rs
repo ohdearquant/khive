@@ -10451,6 +10451,102 @@ async fn context_budget_truncation_sets_flag_and_dropped_counts() {
 }
 
 #[tokio::test]
+async fn context_bloated_anchor_neighbors_do_not_starve_a_later_relevant_anchor() {
+    // Regression test: a higher-ranked anchor with a large neighbor fan-out must
+    // not consume the entire budget and push a lower-ranked (but still
+    // query-relevant) anchor's own entity record out of the response. Before the
+    // fix, `assemble_within_budget` walked each anchor's entity *and* neighbors
+    // before moving to the next anchor, so one anchor's neighbor sprawl could
+    // exhaust the budget and drop every anchor ranked after it — including
+    // anchors a plain entity search on the same query would have surfaced.
+    let pack = pack();
+
+    let bloat = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "CtxStarveBloatAnchor", "entity_kind": "concept", "description": "ctxstarve shared regression phrase alpha"}),
+        )
+        .await
+        .expect("create bloat anchor");
+    let bloat_id = bloat["id"].as_str().unwrap().to_string();
+
+    for i in 0..15 {
+        let n = pack
+            .dispatch(
+                "create",
+                json!({"kind": "entity", "name": format!("CtxStarveBloatNeighbor{i}"), "entity_kind": "concept", "description": "a verbose neighbor description with enough text to consume budget quickly"}),
+            )
+            .await
+            .expect("create bloat neighbor");
+        let n_id = n["id"].as_str().unwrap().to_string();
+        pack.dispatch(
+            "link",
+            json!({"source_id": bloat_id, "target_id": n_id, "relation": "extends"}),
+        )
+        .await
+        .expect("link bloat anchor -> neighbor");
+    }
+
+    let on_topic = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "CtxStarveOnTopicAnchor", "entity_kind": "concept", "description": "ctxstarve shared regression phrase beta"}),
+        )
+        .await
+        .expect("create on-topic anchor");
+    let on_topic_id = on_topic["id"].as_str().unwrap().to_string();
+
+    let query = "ctxstarve shared regression phrase";
+
+    // A plain entity search on the same query surfaces the on-topic anchor.
+    let search_resp = pack
+        .dispatch(
+            "search",
+            json!({"kind": "entity", "query": query, "limit": 5}),
+        )
+        .await
+        .expect("search must succeed");
+    let search_hits = search_resp.as_array().unwrap();
+    assert!(
+        search_hits.iter().any(|h| h["id"] == on_topic_id),
+        "plain entity search must surface the on-topic anchor; got: {search_hits:?}"
+    );
+
+    // A budget that comfortably fits both anchor entity records, but not the
+    // bloated anchor's 15 verbose neighbors.
+    let resp = pack
+        .dispatch(
+            "context",
+            json!({"query": query, "hops": 1, "fanout": 20, "limit": 5, "budget": 900}),
+        )
+        .await
+        .expect("context must succeed");
+
+    let anchors = resp["anchors"].as_array().unwrap();
+    assert!(
+        anchors.iter().any(|a| a["entity"]["id"] == on_topic_id),
+        "the on-topic anchor's entity record must survive a sibling's bloated \
+         neighbor list; got anchors: {anchors:?}"
+    );
+    assert_eq!(
+        resp["dropped"]["anchors"], 0,
+        "no anchor entity should be dropped"
+    );
+    assert!(
+        resp["truncated"] == true,
+        "the bloated neighbor list must still trigger truncation"
+    );
+    assert!(
+        resp["dropped"]["neighbors"].as_i64().unwrap() > 0,
+        "the bloated anchor's neighbors must be the thing that gets dropped"
+    );
+    assert_eq!(
+        resp["dropped"]["stage"], "budget",
+        "drop accounting must name the stage responsible for the drop"
+    );
+}
+
+#[tokio::test]
 async fn context_ample_budget_reports_no_truncation() {
     let pack = pack();
     let a = pack
