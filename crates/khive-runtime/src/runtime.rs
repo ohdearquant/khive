@@ -809,6 +809,22 @@ impl KhiveRuntime {
     /// First call for any name loads the underlying service (cold start cost);
     /// subsequent calls are cheap (registry caches the `Arc`).
     pub async fn embedder(&self, name: &str) -> RuntimeResult<Arc<dyn EmbeddingService>> {
+        self.embedder_inner(name, None).await
+    }
+
+    pub(crate) async fn embedder_with_token(
+        &self,
+        token: &NamespaceToken,
+        name: &str,
+    ) -> RuntimeResult<Arc<dyn EmbeddingService>> {
+        self.embedder_inner(name, Some(token)).await
+    }
+
+    async fn embedder_inner(
+        &self,
+        name: &str,
+        token: Option<&NamespaceToken>,
+    ) -> RuntimeResult<Arc<dyn EmbeddingService>> {
         // Fall back to the literal name (not the alias table) so custom
         // providers registered with non-lattice names stay reachable.
         let canonical_key = match parse_embedding_model_alias(name) {
@@ -827,17 +843,24 @@ impl KhiveRuntime {
         };
         let (service, init_duration_us) = entry.resolve().await?;
         if let Some(duration_us) = init_duration_us {
-            self.emit_embedder_initialized(&canonical_key, duration_us)
-                .await;
+            if let Some(token) = token {
+                self.emit_embedder_initialized(token, &canonical_key, duration_us)
+                    .await;
+            } else if let Ok(token) = self.authorize(self.config.default_namespace.clone()) {
+                self.emit_embedder_initialized(&token, &canonical_key, duration_us)
+                    .await;
+            }
         }
         Ok(service)
     }
 
-    async fn emit_embedder_initialized(&self, model_name: &str, duration_us: i64) {
-        let Ok(token) = self.authorize(self.config.default_namespace.clone()) else {
-            return;
-        };
-        let Ok(store) = self.events(&token) else {
+    async fn emit_embedder_initialized(
+        &self,
+        token: &NamespaceToken,
+        model_name: &str,
+        duration_us: i64,
+    ) {
+        let Ok(store) = self.events(token) else {
             return;
         };
         let event = Event::new(
