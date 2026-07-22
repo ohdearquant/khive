@@ -5,12 +5,14 @@
 //! during runtime construction and require no opt-in.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use lattice_embed::{
     CachedEmbeddingService, EmbeddingModel, EmbeddingService, NativeEmbeddingService,
+    DEFAULT_MAX_BATCH_SIZE, MAX_TEXT_CHARS,
 };
 use tokio::sync::OnceCell;
 
@@ -24,12 +26,55 @@ enum EmbeddingCall {
 }
 
 const EMBEDDING_QUEUE_CAPACITY: usize = 32;
+const EMBEDDING_MAX_JOB_BYTES: usize = DEFAULT_MAX_BATCH_SIZE * MAX_TEXT_CHARS;
+// 32 queue slots × the normal 128-text batch × 32 KiB/text = 128 MiB in flight.
+const EMBEDDING_QUEUE_BYTE_BUDGET: usize = EMBEDDING_QUEUE_CAPACITY * 128 * MAX_TEXT_CHARS;
+
+struct InFlightBytes {
+    counter: Arc<AtomicUsize>,
+    bytes: usize,
+}
+
+impl InFlightBytes {
+    fn reserve(
+        counter: Arc<AtomicUsize>,
+        byte_budget: usize,
+        bytes: usize,
+    ) -> lattice_embed::Result<Self> {
+        let mut current = counter.load(Ordering::Acquire);
+        loop {
+            let Some(next) = current.checked_add(bytes) else {
+                return Err(lattice_embed::EmbedError::Internal(format!(
+                    "embedding worker byte budget exceeded: in-flight byte count overflowed the {byte_budget}-byte budget"
+                )));
+            };
+            if next > byte_budget {
+                return Err(lattice_embed::EmbedError::Internal(format!(
+                    "embedding worker byte budget exceeded: {current} in flight + {bytes} job bytes > {byte_budget}"
+                )));
+            }
+            match counter.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return Ok(Self { counter, bytes }),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+impl Drop for InFlightBytes {
+    fn drop(&mut self) {
+        let previous = self.counter.fetch_sub(self.bytes, Ordering::AcqRel);
+        debug_assert!(previous >= self.bytes, "embedding byte counter underflow");
+    }
+}
 
 struct EmbeddingJob {
     texts: Vec<String>,
     model: EmbeddingModel,
     call: EmbeddingCall,
     reply: tokio::sync::oneshot::Sender<lattice_embed::Result<Vec<Vec<f32>>>>,
+    _in_flight: InFlightBytes,
 }
 
 /// Bounds non-cancellable native inference to one worker and a fixed queue.
@@ -37,6 +82,8 @@ struct EmbeddingJob {
 pub(crate) struct BlockingEmbeddingService<S> {
     inner: Arc<S>,
     worker: OnceLock<Result<SyncSender<EmbeddingJob>, String>>,
+    in_flight_bytes: Arc<AtomicUsize>,
+    byte_budget: usize,
 }
 
 impl<S> BlockingEmbeddingService<S> {
@@ -44,11 +91,56 @@ impl<S> BlockingEmbeddingService<S> {
         Self {
             inner,
             worker: OnceLock::new(),
+            in_flight_bytes: Arc::new(AtomicUsize::new(0)),
+            byte_budget: EMBEDDING_QUEUE_BYTE_BUDGET,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_byte_budget(inner: Arc<S>, byte_budget: usize) -> Self {
+        Self {
+            inner,
+            worker: OnceLock::new(),
+            in_flight_bytes: Arc::new(AtomicUsize::new(0)),
+            byte_budget,
         }
     }
 }
 
 impl<S: EmbeddingService + 'static> BlockingEmbeddingService<S> {
+    fn input_bytes(texts: &[String]) -> lattice_embed::Result<usize> {
+        if texts.is_empty() {
+            return Err(lattice_embed::EmbedError::InvalidInput(
+                "no texts provided".to_owned(),
+            ));
+        }
+        let input_bytes = texts.iter().try_fold(0usize, |total, text| {
+            total.checked_add(text.len()).ok_or_else(|| {
+                lattice_embed::EmbedError::InvalidInput(format!(
+                    "embedding job input exceeds the {EMBEDDING_MAX_JOB_BYTES}-byte maximum"
+                ))
+            })
+        })?;
+        if input_bytes > EMBEDDING_MAX_JOB_BYTES {
+            return Err(lattice_embed::EmbedError::InvalidInput(format!(
+                "embedding job input is {input_bytes} bytes; maximum is {EMBEDDING_MAX_JOB_BYTES} bytes"
+            )));
+        }
+        if texts.len() > DEFAULT_MAX_BATCH_SIZE {
+            return Err(lattice_embed::EmbedError::InvalidInput(format!(
+                "batch size {} exceeds maximum {DEFAULT_MAX_BATCH_SIZE}",
+                texts.len()
+            )));
+        }
+        if let Some(text) = texts.iter().find(|text| text.len() > MAX_TEXT_CHARS) {
+            return Err(lattice_embed::EmbedError::TextTooLong {
+                length: text.len(),
+                max: MAX_TEXT_CHARS,
+            });
+        }
+        Ok(input_bytes)
+    }
+
     fn worker(&self) -> lattice_embed::Result<&SyncSender<EmbeddingJob>> {
         self.worker
             .get_or_init(|| {
@@ -91,14 +183,22 @@ impl<S: EmbeddingService + 'static> BlockingEmbeddingService<S> {
         model: EmbeddingModel,
         call: EmbeddingCall,
     ) -> lattice_embed::Result<Vec<Vec<f32>>> {
+        let input_bytes = Self::input_bytes(texts)?;
+        let sender = self.worker()?;
+        let in_flight = InFlightBytes::reserve(
+            Arc::clone(&self.in_flight_bytes),
+            self.byte_budget,
+            input_bytes,
+        )?;
         let (reply, receiver) = tokio::sync::oneshot::channel();
         let job = EmbeddingJob {
             texts: texts.to_vec(),
             model,
             call,
             reply,
+            _in_flight: in_flight,
         };
-        self.worker()?.try_send(job).map_err(|error| match error {
+        sender.try_send(job).map_err(|error| match error {
             TrySendError::Full(_) => {
                 lattice_embed::EmbedError::Internal("embedding worker queue is full".to_owned())
             }
@@ -651,6 +751,12 @@ mod tests {
                 model: EmbeddingModel::default(),
                 call: EmbeddingCall::Generic,
                 reply,
+                _in_flight: InFlightBytes::reserve(
+                    Arc::clone(&service.in_flight_bytes),
+                    service.byte_budget,
+                    0,
+                )
+                .expect("zero-byte test job must fit the byte budget"),
             });
             assert!(queued.is_ok(), "bounded queue must accept its capacity");
             queued_receivers.push(receiver);
@@ -674,6 +780,132 @@ mod tests {
             overflow.to_string().contains("queue is full"),
             "queue saturation must use the embedding failure path: {overflow}"
         );
+    }
+
+    #[tokio::test]
+    async fn blocking_adapter_rejects_oversized_job_before_enqueue() {
+        let service = BlockingEmbeddingService::new(Arc::new(ConstVecService { dims: 1 }));
+        let oversized =
+            "x".repeat(lattice_embed::DEFAULT_MAX_BATCH_SIZE * lattice_embed::MAX_TEXT_CHARS + 1);
+
+        let error = service
+            .embed(&[oversized], EmbeddingModel::default())
+            .await
+            .expect_err("an oversized embedding job must be rejected");
+
+        assert!(
+            error.to_string().contains("embedding job input"),
+            "oversized admission must use the embedding error path: {error}"
+        );
+        assert!(
+            service.worker.get().is_none(),
+            "oversized work must be rejected before the worker queue is initialized"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocking_adapter_byte_budget_rejects_excess_and_queued_jobs_complete() {
+        const ADMITTED_JOBS: usize = 4;
+        let byte_budget = ADMITTED_JOBS * EMBEDDING_MAX_JOB_BYTES;
+        let inner = Arc::new(BlockingTestService::new());
+        let service = Arc::new(BlockingEmbeddingService::with_byte_budget(
+            Arc::clone(&inner),
+            byte_budget,
+        ));
+        let max_texts = Arc::new(vec![
+            "x".repeat(lattice_embed::MAX_TEXT_CHARS);
+            lattice_embed::DEFAULT_MAX_BATCH_SIZE
+        ]);
+        let mut admitted = Vec::with_capacity(ADMITTED_JOBS);
+
+        for _ in 0..ADMITTED_JOBS {
+            let service = Arc::clone(&service);
+            let texts = Arc::clone(&max_texts);
+            admitted.push(tokio::spawn(async move {
+                service.embed(&texts, EmbeddingModel::default()).await
+            }));
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while service.in_flight_bytes.load(Ordering::Acquire) < byte_budget {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all jobs within the byte budget must be admitted");
+
+        let overflow = tokio::time::timeout(
+            Duration::from_millis(100),
+            service.embed(&max_texts, EmbeddingModel::default()),
+        )
+        .await
+        .expect("a byte-budget overflow must fail without waiting")
+        .expect_err("a byte-budget overflow must return an embedding error");
+
+        inner.release();
+        for call in admitted {
+            call.await
+                .expect("admitted embedding task must not panic")
+                .expect("admitted embedding job must complete");
+        }
+        assert!(
+            overflow.to_string().contains("byte budget"),
+            "byte saturation must use the embedding failure path: {overflow}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocking_adapter_releases_byte_budget_after_completion_and_skipped_job() {
+        let byte_budget = "first".len() + "abandoned".len();
+        let inner = Arc::new(BlockingTestService::new());
+        let service = Arc::new(BlockingEmbeddingService::with_byte_budget(
+            Arc::clone(&inner),
+            byte_budget,
+        ));
+
+        let first_service = Arc::clone(&service);
+        let first = tokio::spawn(async move {
+            first_service
+                .embed(&["first".to_owned()], EmbeddingModel::default())
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while inner.entered.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first embedding call must occupy the native worker");
+
+        let abandoned = tokio::time::timeout(
+            Duration::from_millis(50),
+            service.embed(&["abandoned".to_owned()], EmbeddingModel::default()),
+        )
+        .await;
+        assert!(abandoned.is_err(), "queued embedding call must time out");
+        assert_eq!(
+            service.in_flight_bytes.load(Ordering::Acquire),
+            byte_budget,
+            "running and queued jobs must both consume the byte budget"
+        );
+
+        inner.release();
+        first
+            .await
+            .expect("first embedding task must not panic")
+            .expect("first embedding call must succeed");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while service.in_flight_bytes.load(Ordering::Acquire) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completed and skipped jobs must release their byte reservations");
+
+        let later = service
+            .embed(&["later".to_owned()], EmbeddingModel::default())
+            .await
+            .expect("a later call must succeed after the byte budget is released");
+        assert_eq!(later, vec![vec![1.0]]);
     }
 
     #[test]
