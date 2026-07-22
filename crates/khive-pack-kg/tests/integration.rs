@@ -81,14 +81,14 @@ fn invalid_input_message(err: &RuntimeError) -> &str {
 // ADR-046 (cluster-22) added propose, review, and withdraw — bringing the
 // handler count from 11 to 14, then 15 with verbs introspection, then 16
 // with stats, then 17 with context (ADR-089), then 18 with resolve
-// (unified-verb draft ADR Slice 1).
+// (unified-verb draft ADR Slice 1), then 19 with whoami.
 #[test]
-fn pack_verbs_returns_eighteen() {
+fn pack_verbs_returns_nineteen() {
     let pack = pack();
     assert_eq!(
         pack.verbs().len(),
-        18,
-        "KgPack must expose exactly 18 verbs (17 previous + resolve)"
+        19,
+        "KgPack must expose exactly 19 verbs (18 previous + whoami)"
     );
 }
 
@@ -115,6 +115,7 @@ fn pack_verbs_names_are_correct() {
         "verbs",
         "context",
         "resolve",
+        "whoami",
     ] {
         assert!(names.contains(expected), "verbs() missing {expected:?}");
     }
@@ -11723,5 +11724,131 @@ async fn search_entity_hyphenated_adr_id_with_plain_terms_matches() {
     assert!(
         titles.iter().any(|t| t.contains("ADR-086")),
         "#1064 hyphenated query must surface ADR-086 entity; got titles={titles:?}, full={result}"
+    );
+}
+
+// ---- whoami verb ----
+
+#[tokio::test]
+async fn whoami_reports_configured_actor_and_namespace() {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime must succeed");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.with_actor_id(Some("lambda:khive".to_string()));
+    builder.register(KgPack::new(rt));
+    let registry = builder.build().expect("registry builds");
+
+    let result = registry
+        .dispatch("whoami", json!({}))
+        .await
+        .expect("whoami must succeed");
+
+    assert_eq!(
+        result.get("actor_id").and_then(Value::as_str),
+        Some("lambda:khive"),
+        "whoami must report the configured actor id; got: {result}"
+    );
+    assert_eq!(
+        result.get("actor_kind").and_then(Value::as_str),
+        Some("actor"),
+        "a configured actor id resolves to kind=\"actor\"; got: {result}"
+    );
+    assert_eq!(
+        result.get("unattributed").and_then(Value::as_bool),
+        Some(false),
+        "a configured actor must not be reported unattributed; got: {result}"
+    );
+    assert_eq!(
+        result.get("namespace").and_then(Value::as_str),
+        Some("local"),
+        "default namespace with no explicit override is 'local'; got: {result}"
+    );
+    let visible = result
+        .get("visible_namespaces")
+        .and_then(Value::as_array)
+        .expect("visible_namespaces must be an array");
+    assert!(
+        visible.iter().any(|v| v.as_str() == Some("local")),
+        "visible_namespaces must include the write namespace; got: {result}"
+    );
+}
+
+// A cold caller in a single-actor deployment (no configured actor_id) is
+// exactly who most needs whoami — it must answer honestly, not error.
+#[tokio::test]
+async fn whoami_reports_unattributed_when_no_actor_configured() {
+    let pack = pack();
+    let result = pack
+        .dispatch("whoami", json!({}))
+        .await
+        .expect("whoami must succeed");
+
+    assert_eq!(
+        result.get("unattributed").and_then(Value::as_bool),
+        Some(true),
+        "no configured actor_id must report unattributed=true; got: {result}"
+    );
+    assert_eq!(
+        result.get("actor_id").and_then(Value::as_str),
+        Some("local"),
+        "unattributed caller's actor_id is the anonymous fallback 'local'; got: {result}"
+    );
+    assert!(
+        result.get("namespace").and_then(Value::as_str).is_some(),
+        "whoami must always report a namespace, even for the unattributed caller; got: {result}"
+    );
+}
+
+#[tokio::test]
+async fn whoami_rejects_unknown_params() {
+    let pack = pack();
+    let err = pack
+        .dispatch("whoami", json!({"bogus": true}))
+        .await
+        .unwrap_err();
+    assert!(
+        is_invalid_input(&err),
+        "unknown whoami param must be InvalidInput; got {err:?}"
+    );
+}
+
+// Never expose anything that could authenticate — only labels.
+#[tokio::test]
+async fn whoami_never_exposes_secret_shaped_fields() {
+    let pack = pack();
+    let result = pack
+        .dispatch("whoami", json!({}))
+        .await
+        .expect("whoami must succeed");
+    let obj = result.as_object().expect("whoami must return an object");
+    for forbidden in [
+        "token",
+        "secret",
+        "credential",
+        "api_key",
+        "password",
+        "key",
+    ] {
+        assert!(
+            !obj.contains_key(forbidden),
+            "whoami must never expose a {forbidden:?} field; got: {result}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn whoami_appears_in_verbs_introspection() {
+    let pack = pack();
+    let result = pack
+        .dispatch("verbs", json!({}))
+        .await
+        .expect("verbs must succeed");
+    let verbs = result.get("verbs").and_then(|v| v.as_array()).unwrap();
+    let names: Vec<&str> = verbs
+        .iter()
+        .filter_map(|v| v.get("verb").and_then(|n| n.as_str()))
+        .collect();
+    assert!(
+        names.contains(&"whoami"),
+        "whoami must be registered as a public verb; got {names:?}"
     );
 }
