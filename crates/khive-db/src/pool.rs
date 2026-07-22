@@ -932,10 +932,28 @@ mod tests {
         }
     }
 
+    const POOL_ENV_VARS: [&str; 6] = [
+        "KHIVE_BUSY_TIMEOUT_SECS",
+        "KHIVE_CHECKOUT_TIMEOUT_SECS",
+        "KHIVE_WAL_AUTOCHECKPOINT_PAGES",
+        "KHIVE_JOURNAL_SIZE_LIMIT_BYTES",
+        "KHIVE_WRITE_QUEUE",
+        "KHIVE_WRITE_QUEUE_CAPACITY",
+    ];
+
+    fn clear_pool_env() {
+        for var in POOL_ENV_VARS {
+            std::env::remove_var(var);
+        }
+    }
+
     #[test]
     #[serial]
     fn pool_config_default_values_match_constants() {
-        // Ensure defaults are not accidentally changed.
+        // Ensure defaults are not accidentally changed. The process env may
+        // legitimately carry overrides (CI jobs set KHIVE_CHECKOUT_TIMEOUT_SECS),
+        // so clear them first — this test asserts the constants, not the env.
+        clear_pool_env();
         let cfg = PoolConfig::default();
         assert_eq!(
             cfg.wal_autocheckpoint_pages,
@@ -988,6 +1006,7 @@ mod tests {
     #[test]
     #[serial]
     fn pool_config_write_queue_defaults_off() {
+        clear_pool_env();
         let cfg = PoolConfig::default();
         assert!(!cfg.write_queue_enabled);
         assert_eq!(cfg.write_queue_capacity, DEFAULT_WRITE_QUEUE_CAPACITY);
