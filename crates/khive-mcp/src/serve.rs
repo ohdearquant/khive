@@ -2699,6 +2699,10 @@ mod tests {
         path
     }
 
+    fn kg_test_packs() -> Vec<String> {
+        vec!["kg".to_string()]
+    }
+
     // The resolver MUST honor config-file `[[engines]]` over RuntimeConfig
     // defaults — otherwise `kkernel reindex` embeds for the wrong model set
     // versus what `kkernel mcp` serves recall from. Regression for PR #8
@@ -2741,7 +2745,7 @@ default = true
             namespace_explicit: false,
             actor_explicit: false,
             no_embed: false,
-            packs: None,
+            packs: Some(kg_test_packs()),
             brain_profile: None,
         })
         .expect("resolve config");
@@ -2792,7 +2796,7 @@ brain_profile = "unrelated"
             namespace_explicit: false,
             actor_explicit: false,
             no_embed: false,
-            packs: None,
+            packs: Some(kg_test_packs()),
             brain_profile: None,
         })
         .expect("resolve config");
@@ -2835,7 +2839,7 @@ brain_profile = "project-profile"
             namespace_explicit: false,
             actor_explicit: false,
             no_embed: false,
-            packs: None,
+            packs: Some(kg_test_packs()),
             brain_profile: None, // no explicit CLI flag
         })
         .expect("resolve config");
@@ -2874,7 +2878,7 @@ default = true
             namespace_explicit: false,
             actor_explicit: false,
             no_embed: false,
-            packs: None,
+            packs: Some(kg_test_packs()),
             brain_profile: None,
         })
         .expect("resolve config");
@@ -2910,7 +2914,7 @@ brain_profile = "project-profile"
             namespace_explicit: false,
             actor_explicit: false,
             no_embed: false,
-            packs: None,
+            packs: Some(kg_test_packs()),
             brain_profile: Some("cli-profile".to_string()), // explicit CLI
         })
         .expect("resolve config");
@@ -2948,7 +2952,7 @@ brain_profile = "project-profile"
             namespace_explicit: true,
             actor_explicit: true,
             no_embed: true,
-            packs: None,
+            packs: Some(kg_test_packs()),
             brain_profile: None,
         })
         .expect("resolve config");
@@ -2987,7 +2991,7 @@ brain_profile = "project-profile"
             namespace_explicit: true,
             actor_explicit: true,
             no_embed: true,
-            packs: None,
+            packs: Some(kg_test_packs()),
             brain_profile: None,
         })
         .expect("resolve no-embed config");
@@ -3020,7 +3024,7 @@ brain_profile = "project-profile"
             namespace_explicit: true,
             actor_explicit: true,
             no_embed: true,
-            packs: None,
+            packs: Some(kg_test_packs()),
             brain_profile: None,
         })
         .expect("resolve config");
@@ -3147,7 +3151,7 @@ brain_profile = "project-profile"
             namespace_explicit: false,
             actor_explicit: false,
             no_embed: true,
-            packs: None,
+            packs: Some(kg_test_packs()),
             brain_profile: None,
         })
         .expect("resolve seat-shaped config");
@@ -3211,7 +3215,7 @@ brain_profile = "project-profile"
             namespace_explicit: false,
             actor_explicit: false,
             no_embed: true,
-            packs: None,
+            packs: Some(kg_test_packs()),
             brain_profile: None,
         })
         .expect("resolve unset-db config");
@@ -3250,7 +3254,7 @@ brain_profile = "project-profile"
             namespace_explicit: true,
             actor_explicit: true,
             no_embed: true,
-            packs: None,
+            packs: Some(kg_test_packs()),
             brain_profile: None,
         })
         .expect("resolve config");
@@ -3288,7 +3292,7 @@ id = "lambda:project-actor"
             namespace_explicit: false,
             actor_explicit: false,
             no_embed: true,
-            packs: None,
+            packs: Some(kg_test_packs()),
             brain_profile: None,
         })
         .expect("resolve config with project actor");
@@ -3302,7 +3306,7 @@ id = "lambda:project-actor"
             namespace_explicit: false,
             actor_explicit: false,
             no_embed: true,
-            packs: None,
+            packs: Some(kg_test_packs()),
             brain_profile: None,
         })
         .expect("resolve config without project actor");
@@ -3358,7 +3362,7 @@ id = "lambda:project-actor"
             namespace_explicit,
             actor_explicit: namespace_explicit,
             no_embed: true,
-            packs: None,
+            packs: Some(kg_test_packs()),
             brain_profile: None,
         });
 
@@ -3410,7 +3414,7 @@ id = "lambda:project-actor"
             namespace_explicit,
             actor_explicit: namespace_explicit,
             no_embed: true,
-            packs: None,
+            packs: Some(kg_test_packs()),
             brain_profile: None,
         });
 
@@ -3479,7 +3483,7 @@ id = "lambda:project-actor"
             namespace_explicit: true,
             actor_explicit: true,
             no_embed: false,
-            packs: None,
+            packs: Some(kg_test_packs()),
             brain_profile: None,
         })
         .expect("resolve config");
@@ -3558,7 +3562,7 @@ id = "lambda:project-actor"
                 namespace_explicit: false,
                 actor_explicit: false,
                 no_embed: true,
-                packs: None,
+                packs: Some(kg_test_packs()),
                 brain_profile: None,
             })
             .expect("resolve config a")
@@ -3573,7 +3577,7 @@ id = "lambda:project-actor"
                 namespace_explicit: false,
                 actor_explicit: false,
                 no_embed: true,
-                packs: None,
+                packs: Some(kg_test_packs()),
                 brain_profile: None,
             })
             .expect("resolve config b")
