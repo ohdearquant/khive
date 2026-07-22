@@ -996,7 +996,12 @@ pub fn checkpoint_pool_for(main_backend: &StorageBackend) -> Option<Arc<Connecti
 /// tests) is non-fatal and leaves `KhiveRuntime::blob_store()` unset:
 /// nothing yet consumes it, and forcing a filesystem root onto every
 /// in-memory boot would be a behavior change nobody asked for.
-fn install_resolved_blob_store(
+///
+/// `pub` so `kkernel`'s `exec` local-dispatch fallback server (the
+/// single-backend branch of `build_local_fallback_server`) can install a
+/// `BlobStore` the same way the `serve` boot path does, instead of leaving
+/// `exec`'s in-process runtime without one (khive#1209).
+pub fn install_resolved_blob_store(
     rt: &KhiveRuntime,
     khive_cfg: &KhiveConfig,
     backend: &StorageBackend,
