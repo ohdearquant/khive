@@ -59,6 +59,12 @@
 # ── [runtime] — runtime knobs ────────────────────────────────────────────────────
 
 [runtime]
+# Packs loaded into the verb registry. This is distinct from [packs.<name>],
+# which only assigns an already-selected pack to a backend. An empty or absent
+# list preserves the built-in kg-only default.
+# Precedence (high→low): --pack → KHIVE_PACKS → this key → ["kg"].
+# packs = ["kg", "gtd", "memory"]
+
 # Brain profile id used by memory.feedback / knowledge.feedback and for recall-time
 # score boosting. Absent → the namespace-bound profile (brain.resolve) is tried,
 # then the global tuning prior. Mirrors --brain-profile / KHIVE_BRAIN_PROFILE.
@@ -186,7 +192,8 @@ fusion_weight = 0.5
 #   KHIVE_NO_EMBED=false         Disable the local embedding model (skips vector indexing).
 #                                STRICT bool: only "true"/"false" — "1" is a startup error.
 #   KHIVE_PACKS=kg,gtd,memory,brain,comm,schedule,knowledge,session,code,workspace
-#                                Packs to load when --pack is absent. Comma / space separated.
+#                                Packs to load when --pack is absent. Comma / space separated;
+#                                overrides [runtime].packs.
 #   KHIVE_CONFIG=./khive.toml    Path to THIS config file. Also --config. Overrides the search order.
 #   KHIVE_LOG=warn               Stderr log level (JSON results on stdout are unaffected).
 #   KHIVE_BRAIN_PROFILE=         Brain profile id. Tier 3 — after --brain-profile and

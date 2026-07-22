@@ -113,6 +113,8 @@
 - Pack factories are discovered via `inventory` at link time; missing dependencies are a boot error
 - Missing dependencies are not silently auto-added; the requested set must be explicit
 - `PackRegistry` performs topological sort of packs using Kahn's algorithm
+- Startup selection precedence is `--pack` → `KHIVE_PACKS` → `[runtime].packs` → `kg` only;
+  `[packs.<name>]` assigns backends and does not select packs for loading
 
 ### Gate Authorization (ADR-029)
 

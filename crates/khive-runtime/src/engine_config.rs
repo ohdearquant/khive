@@ -408,6 +408,11 @@ pub struct KhiveConfig {
 /// defaults.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct RuntimeSectionConfig {
+    /// Packs to load when neither `--pack` nor `KHIVE_PACKS` selects them.
+    /// An absent or empty list preserves the built-in `kg`-only default.
+    #[serde(default)]
+    pub packs: Option<Vec<String>>,
+
     /// Brain profile ID to use for `memory.feedback` / `knowledge.feedback`
     /// and recall-time score boosting (brain profile configuration).
     ///
