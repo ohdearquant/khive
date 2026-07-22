@@ -81,14 +81,14 @@ fn invalid_input_message(err: &RuntimeError) -> &str {
 // ADR-046 (cluster-22) added propose, review, and withdraw — bringing the
 // handler count from 11 to 14, then 15 with verbs introspection, then 16
 // with stats, then 17 with context (ADR-089), then 18 with resolve
-// (unified-verb draft ADR Slice 1).
+// (unified-verb draft ADR Slice 1), then 19 with whoami.
 #[test]
-fn pack_verbs_returns_eighteen() {
+fn pack_verbs_returns_nineteen() {
     let pack = pack();
     assert_eq!(
         pack.verbs().len(),
-        18,
-        "KgPack must expose exactly 18 verbs (17 previous + resolve)"
+        19,
+        "KgPack must expose exactly 19 verbs (18 previous + whoami)"
     );
 }
 
@@ -115,6 +115,7 @@ fn pack_verbs_names_are_correct() {
         "verbs",
         "context",
         "resolve",
+        "whoami",
     ] {
         assert!(names.contains(expected), "verbs() missing {expected:?}");
     }
@@ -4828,6 +4829,83 @@ async fn verbs_dispatch_pack_filter_fake_excludes_subhandler() {
         names,
         vec!["fake.pub"],
         "verbs(pack=fake) must return exactly [fake.pub], not the subhandler"
+    );
+}
+
+/// `verbs()` output must carry enough of each verb's param schema that a
+/// caller can build a request that parses without first calling it wrong.
+/// Regression: `verbs()` used to list only name/pack/description/category,
+/// so learning a verb's required params meant reading source or eating a
+/// failed call.
+#[tokio::test]
+async fn verbs_dispatch_signature_is_enough_to_construct_a_parsing_call() {
+    let pack = pack();
+    let result = pack
+        .dispatch("verbs", json!({}))
+        .await
+        .expect("verbs() must succeed");
+
+    let verbs_arr = result["verbs"].as_array().expect("verbs must be an array");
+    let search_row = verbs_arr
+        .iter()
+        .find(|v| v["verb"].as_str() == Some("search"))
+        .expect("search must appear in verbs()");
+    let signature = search_row["signature"]
+        .as_str()
+        .expect("verbs() row must carry a 'signature' field");
+    let inner = signature
+        .trim_start_matches("search(")
+        .trim_end_matches(')');
+    let param_tokens: Vec<&str> = inner.split(", ").collect();
+    assert!(
+        param_tokens.contains(&"kind") && param_tokens.contains(&"query"),
+        "search's signature must name its required params kind and query, \
+         unmarked (not optional); got: {signature:?}"
+    );
+
+    // Build a call using exactly the required param names the signature
+    // named, with real values, and confirm it parses and executes rather
+    // than failing on a missing/unknown required field.
+    let call_result = pack
+        .dispatch("search", json!({"kind": "entity", "query": "anything"}))
+        .await;
+    assert!(
+        call_result.is_ok(),
+        "a call built from the signature's required params must parse; got: {call_result:?}"
+    );
+}
+
+/// `search` omitted entirely without `kind` must return the same
+/// enumerated-valid-kinds error as an unrecognized `kind` value, and the
+/// enumeration must be sourced from the registry (a kind contributed by
+/// another loaded pack must appear), not a hardcoded list or a raw serde
+/// "missing field" message.
+#[tokio::test]
+async fn search_missing_kind_lists_registry_kinds_including_other_packs() {
+    let fixture = pack_with_memory();
+
+    let err = fixture
+        .dispatch("search", json!({"query": "anything"}))
+        .await
+        .unwrap_err();
+
+    assert!(
+        is_invalid_input(&err),
+        "missing kind must be InvalidInput; got: {err:?}"
+    );
+    let msg = invalid_input_message(&err);
+    assert!(
+        msg.contains("entity") && msg.contains("note"),
+        "error must enumerate substrate kinds: {msg}"
+    );
+    assert!(
+        msg.contains("memory"),
+        "error must list 'memory' contributed by the extra pack, proving the \
+         enumeration is registry-sourced, not hardcoded: {msg}"
+    );
+    assert!(
+        !msg.to_ascii_lowercase().contains("missing field"),
+        "error must not be a raw serde deserialization message; got: {msg}"
     );
 }
 
@@ -11819,5 +11897,131 @@ async fn envelope_usage_equals_audit_row_resource_units() {
         "an increment landing after the freeze point must not appear in either \
          read — the envelope carried db_round_trips={leaked}, which means it \
          returned a live snapshot rather than the frozen object"
+    );
+}
+
+// ---- whoami verb ----
+
+#[tokio::test]
+async fn whoami_reports_configured_actor_and_namespace() {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime must succeed");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.with_actor_id(Some("lambda:khive".to_string()));
+    builder.register(KgPack::new(rt));
+    let registry = builder.build().expect("registry builds");
+
+    let result = registry
+        .dispatch("whoami", json!({}))
+        .await
+        .expect("whoami must succeed");
+
+    assert_eq!(
+        result.get("actor_id").and_then(Value::as_str),
+        Some("lambda:khive"),
+        "whoami must report the configured actor id; got: {result}"
+    );
+    assert_eq!(
+        result.get("actor_kind").and_then(Value::as_str),
+        Some("actor"),
+        "a configured actor id resolves to kind=\"actor\"; got: {result}"
+    );
+    assert_eq!(
+        result.get("unattributed").and_then(Value::as_bool),
+        Some(false),
+        "a configured actor must not be reported unattributed; got: {result}"
+    );
+    assert_eq!(
+        result.get("namespace").and_then(Value::as_str),
+        Some("local"),
+        "default namespace with no explicit override is 'local'; got: {result}"
+    );
+    let visible = result
+        .get("visible_namespaces")
+        .and_then(Value::as_array)
+        .expect("visible_namespaces must be an array");
+    assert!(
+        visible.iter().any(|v| v.as_str() == Some("local")),
+        "visible_namespaces must include the write namespace; got: {result}"
+    );
+}
+
+// A cold caller in a single-actor deployment (no configured actor_id) is
+// exactly who most needs whoami — it must answer honestly, not error.
+#[tokio::test]
+async fn whoami_reports_unattributed_when_no_actor_configured() {
+    let pack = pack();
+    let result = pack
+        .dispatch("whoami", json!({}))
+        .await
+        .expect("whoami must succeed");
+
+    assert_eq!(
+        result.get("unattributed").and_then(Value::as_bool),
+        Some(true),
+        "no configured actor_id must report unattributed=true; got: {result}"
+    );
+    assert_eq!(
+        result.get("actor_id").and_then(Value::as_str),
+        Some("local"),
+        "unattributed caller's actor_id is the anonymous fallback 'local'; got: {result}"
+    );
+    assert!(
+        result.get("namespace").and_then(Value::as_str).is_some(),
+        "whoami must always report a namespace, even for the unattributed caller; got: {result}"
+    );
+}
+
+#[tokio::test]
+async fn whoami_rejects_unknown_params() {
+    let pack = pack();
+    let err = pack
+        .dispatch("whoami", json!({"bogus": true}))
+        .await
+        .unwrap_err();
+    assert!(
+        is_invalid_input(&err),
+        "unknown whoami param must be InvalidInput; got {err:?}"
+    );
+}
+
+// Never expose anything that could authenticate — only labels.
+#[tokio::test]
+async fn whoami_never_exposes_secret_shaped_fields() {
+    let pack = pack();
+    let result = pack
+        .dispatch("whoami", json!({}))
+        .await
+        .expect("whoami must succeed");
+    let obj = result.as_object().expect("whoami must return an object");
+    for forbidden in [
+        "token",
+        "secret",
+        "credential",
+        "api_key",
+        "password",
+        "key",
+    ] {
+        assert!(
+            !obj.contains_key(forbidden),
+            "whoami must never expose a {forbidden:?} field; got: {result}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn whoami_appears_in_verbs_introspection() {
+    let pack = pack();
+    let result = pack
+        .dispatch("verbs", json!({}))
+        .await
+        .expect("verbs must succeed");
+    let verbs = result.get("verbs").and_then(|v| v.as_array()).unwrap();
+    let names: Vec<&str> = verbs
+        .iter()
+        .filter_map(|v| v.get("verb").and_then(|n| n.as_str()))
+        .collect();
+    assert!(
+        names.contains(&"whoami"),
+        "whoami must be registered as a public verb; got {names:?}"
     );
 }

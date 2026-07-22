@@ -443,6 +443,16 @@ pub struct PathNode {
     pub node_id: Uuid,
     pub via_edge: Option<Uuid>,
     pub depth: usize,
+    /// Cumulative edge weight along the path that reached this node.
+    ///
+    /// Not part of the wire shape — it exists so that `GraphPath.total_weight`
+    /// stays derivable after the node list is edited. Every layer above
+    /// storage edits that list (the visible-namespace merge, the merged limit
+    /// re-application, the soft-deleted-node screen), and a `total_weight`
+    /// carried forward from before an edit can end up describing a node the
+    /// caller was never shown.
+    #[serde(skip)]
+    pub weight: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

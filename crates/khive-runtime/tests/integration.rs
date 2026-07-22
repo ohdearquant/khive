@@ -231,6 +231,71 @@ async fn traverse_multi_hop() {
     assert!(reachable_ids.contains(&c.id));
 }
 
+/// The soft-deleted-node screen removes nodes after storage has already
+/// summarised the path, so `total_weight` must be recomputed over what
+/// survives. Here the heaviest neighbour is the one soft-deleted: the
+/// response must not keep reporting a weight that only a screened-out node
+/// ever had.
+#[tokio::test]
+async fn traverse_total_weight_excludes_soft_deleted_nodes() {
+    let rt = rt();
+    let tok = rt.authorize(Namespace::local()).unwrap();
+
+    let a = rt
+        .create_entity(&tok, "concept", None, "A", None, None, vec![])
+        .await
+        .unwrap();
+    let light = rt
+        .create_entity(&tok, "concept", None, "light", None, None, vec![])
+        .await
+        .unwrap();
+    let heavy = rt
+        .create_entity(&tok, "concept", None, "heavy", None, None, vec![])
+        .await
+        .unwrap();
+
+    rt.link(&tok, a.id, light.id, EdgeRelation::Extends, 0.25, None)
+        .await
+        .unwrap();
+    rt.link(&tok, a.id, heavy.id, EdgeRelation::Extends, 0.9, None)
+        .await
+        .unwrap();
+
+    let request = || TraversalRequest {
+        roots: vec![a.id],
+        options: TraversalOptions {
+            max_depth: 1,
+            direction: Direction::Out,
+            relations: Some(vec![EdgeRelation::Extends]),
+            ..Default::default()
+        },
+        include_roots: false,
+        include_properties: false,
+    };
+
+    let before = rt.traverse(&tok, request()).await.unwrap();
+    assert_eq!(before.len(), 1);
+    assert_eq!(
+        before[0].total_weight, 0.9,
+        "baseline: the heavy neighbour sets total_weight while it is visible"
+    );
+
+    rt.delete_entity(&tok, heavy.id, false).await.unwrap(); // soft delete
+
+    let after = rt.traverse(&tok, request()).await.unwrap();
+    assert_eq!(after.len(), 1);
+    let ids: Vec<Uuid> = after[0].nodes.iter().map(|n| n.node_id).collect();
+    assert!(
+        !ids.contains(&heavy.id),
+        "soft-deleted node must be screened"
+    );
+    assert_eq!(
+        after[0].total_weight, 0.25,
+        "total_weight must fall to the surviving neighbour's weight, not stay \
+         at the soft-deleted node's 0.9"
+    );
+}
+
 // =============================================================================
 // Note (memory) operations
 // =============================================================================

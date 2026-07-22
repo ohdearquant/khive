@@ -2045,6 +2045,7 @@ impl GraphStore for SqlGraphStore {
                                 name: None,
                                 kind: None,
                                 properties: None,
+                                weight: 0.0,
                             },
                             0.0,
                         ));
@@ -2170,6 +2171,7 @@ impl GraphStore for SqlGraphStore {
                                 name: None,
                                 kind: None,
                                 properties: None,
+                                weight: total_weight,
                             },
                             total_weight,
                         ));

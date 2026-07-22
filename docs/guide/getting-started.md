@@ -9,7 +9,7 @@ graph, and link concepts together.
 khive is a research knowledge graph runtime. When you read papers, form
 concepts, link ideas, and record decisions, khive gives that work a
 typed, queryable graph that persists across sessions. Everything is accessible
-through the 18 verbs of the `kg` pack, dispatched through a single MCP tool.
+through the 19 verbs of the `kg` pack, dispatched through a single MCP tool.
 
 ## Install
 

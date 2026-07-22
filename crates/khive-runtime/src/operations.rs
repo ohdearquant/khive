@@ -850,6 +850,99 @@ fn note_props_match(note_props: Option<&serde_json::Value>, filter: &serde_json:
         .all(|(k, v)| actual.get(k).is_some_and(|av| av == v))
 }
 
+/// Collapse per-namespace `GraphPath`s from [`KhiveRuntime::traverse`] down to
+/// exactly one entry per distinct `root_id`.
+///
+/// `traverse` queries every namespace in the token's visible set
+/// independently — including namespaces that don't own the root at all,
+/// which still contribute a root-only entry when `include_roots` is set —
+/// and each of those per-namespace calls already enforces `limit` on its own
+/// results. Concatenating them naively before this function would let a root
+/// visible in N namespaces return up to N * limit nodes, would keep
+/// whichever namespace's copy of a shared node happened to arrive first
+/// (wrong depth/`via_edge` when that wasn't the shortest path, and
+/// non-BFS ordering), and would rebuild a seen-set from scratch per
+/// namespace (quadratic in namespace count).
+///
+/// This merges by `(root_id, node_id)` keeping the node's shallowest depth
+/// and the `via_edge` that produced it (first-namespace-processed wins ties
+/// at equal depth — namespace processing order is deterministic but which
+/// tied edge is "more correct" is not otherwise decidable), reorders the
+/// merged result BFS-style (ascending depth), and re-applies `limit` to the
+/// merged non-root node count so the response honors the contract each
+/// individual namespace call already tried to.
+fn merge_traversal_paths_by_root(paths: Vec<GraphPath>, limit: Option<u32>) -> Vec<GraphPath> {
+    let mut order: Vec<Uuid> = Vec::new();
+    let mut merged: HashMap<Uuid, GraphPath> = HashMap::new();
+    // root_id -> (node_id -> index into merged[root_id].nodes), so a
+    // shallower depth for an already-seen node updates in place instead of
+    // rebuilding a seen-set from every prior namespace's contribution.
+    let mut node_index: HashMap<Uuid, HashMap<Uuid, usize>> = HashMap::new();
+
+    for path in paths {
+        let existing = merged.entry(path.root_id).or_insert_with(|| {
+            order.push(path.root_id);
+            GraphPath {
+                root_id: path.root_id,
+                nodes: Vec::new(),
+                total_weight: 0.0,
+            }
+        });
+        let index = node_index.entry(path.root_id).or_default();
+        for node in path.nodes {
+            match index.get(&node.node_id) {
+                Some(&i) => {
+                    if node.depth < existing.nodes[i].depth {
+                        existing.nodes[i] = node;
+                    }
+                }
+                None => {
+                    index.insert(node.node_id, existing.nodes.len());
+                    existing.nodes.push(node);
+                }
+            }
+        }
+    }
+
+    order
+        .into_iter()
+        .filter_map(|root_id| merged.remove(&root_id))
+        .map(|mut path| {
+            // BFS order: ascending depth, stable within a depth.
+            path.nodes.sort_by_key(|n| n.depth);
+            if let Some(lim) = limit {
+                let lim = lim as usize;
+                let mut non_root_kept = 0usize;
+                path.nodes.retain(|n| {
+                    if n.depth == 0 {
+                        return true;
+                    }
+                    if non_root_kept < lim {
+                        non_root_kept += 1;
+                        true
+                    } else {
+                        false
+                    }
+                });
+            }
+            recompute_total_weight(&mut path);
+            path
+        })
+        .collect()
+}
+
+/// Set `total_weight` to the maximum cumulative path weight among the nodes
+/// the path currently holds, matching how storage derives it for a
+/// single-namespace traversal.
+///
+/// Call this after any edit to `nodes`. Carrying a weight across an edit is
+/// what lets the field describe a node the caller was never shown: the
+/// highest-weighted candidate is exactly the one a `limit` or a
+/// soft-delete screen can remove while the summary keeps quoting it.
+fn recompute_total_weight(path: &mut GraphPath) {
+    path.total_weight = path.nodes.iter().map(|n| n.weight).fold(0.0_f64, f64::max);
+}
+
 impl KhiveRuntime {
     // ---- Entity operations ----
 
@@ -2320,6 +2413,10 @@ impl KhiveRuntime {
             let mut ns_paths = self.graph(&temp)?.traverse(request.clone()).await?;
             paths.append(&mut ns_paths);
         }
+        // Reconcile the per-namespace GraphPaths back down to one per
+        // distinct root_id (see merge_traversal_paths_by_root for why this
+        // is needed and what it enforces).
+        let mut paths = merge_traversal_paths_by_root(paths, request.options.limit);
         self.enrich_path_nodes(token, &mut paths, request.include_properties)
             .await;
         // Filter out soft-deleted entity nodes from all path nodes.
@@ -2331,6 +2428,7 @@ impl KhiveRuntime {
         if !deleted.is_empty() {
             for path in paths.iter_mut() {
                 path.nodes.retain(|n| !deleted.contains(&n.node_id));
+                recompute_total_weight(path);
             }
             paths.retain(|p| !p.nodes.is_empty());
         }
@@ -2483,7 +2581,16 @@ impl KhiveRuntime {
     }
 
     /// Populate `name` and `kind` on each `PathNode` from the corresponding
-    /// entity record. Same best-effort policy as `enrich_neighbor_hits`.
+    /// entity record.
+    ///
+    /// Unlike `enrich_neighbor_hits`, this is entity-only by design: it does
+    /// not fall back to a note lookup for IDs that aren't entities.
+    /// A traversal can still reach note nodes (e.g. via an `annotates`
+    /// edge) — they are not filtered out of `GraphPath::nodes` — but they are
+    /// left with `name = None, kind = None` rather than resolved. Widening
+    /// this to notes would change every existing caller's enriched output
+    /// for note-reaching traversals, so it stays scoped to entities until
+    /// that is an intentional product decision.
     ///
     /// Uses `get_entities_by_ids_visible` so that path nodes whose entities
     /// live in extra-visible namespaces are enriched correctly. Node IDs that
@@ -10944,6 +11051,186 @@ mod tests {
         assert!(result.is_ok(), "traverse must not error; got {:?}", result);
     }
 
+    // ── Single root visible in multiple namespaces must yield exactly one
+    //    traversal object (see merge_traversal_paths_by_root) ─────────────
+    #[tokio::test]
+    async fn traverse_single_root_across_visible_namespaces_yields_one_path() {
+        use khive_storage::types::TraversalOptions;
+
+        let rt = rt();
+        let owner = NamespaceToken::for_namespace(Namespace::parse("owner-ns").unwrap());
+        let a = rt
+            .create_entity(&owner, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(&owner, "concept", None, "B", None, None, vec![])
+            .await
+            .unwrap();
+        rt.link(&owner, a.id, b.id, EdgeRelation::Extends, 1.0, None)
+            .await
+            .unwrap();
+
+        // Token whose primary namespace ("caller-ns") does not own the root,
+        // but whose visible set also includes "owner-ns" (where the root and
+        // its edge actually live) — the shape produced by pack.rs always
+        // widening visibility to include `local`.
+        let caller = NamespaceToken::mint_with_visibility(
+            Namespace::parse("caller-ns").unwrap(),
+            vec![Namespace::parse("owner-ns").unwrap()],
+            ActorRef::anonymous(),
+        );
+        assert_eq!(caller.visible_namespaces().len(), 2);
+
+        let result = rt
+            .traverse(
+                &caller,
+                TraversalRequest {
+                    roots: vec![a.id],
+                    options: TraversalOptions {
+                        max_depth: 1,
+                        direction: Direction::Out,
+                        ..Default::default()
+                    },
+                    include_roots: true,
+                    include_properties: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.len(),
+            1,
+            "one root visible across 2 namespaces must yield exactly one \
+             GraphPath, got {result:#?}"
+        );
+        assert_eq!(result[0].root_id, a.id);
+        let node_ids: std::collections::HashSet<Uuid> =
+            result[0].nodes.iter().map(|n| n.node_id).collect();
+        assert!(node_ids.contains(&a.id));
+        assert!(
+            node_ids.contains(&b.id),
+            "merged path must retain the neighbor discovered in the owning \
+             namespace, got {result:#?}"
+        );
+    }
+
+    // ── Multi-root traverse: one object per distinct root, including a
+    //    root supplied both as itself and as a duplicate re-resolution ────
+    #[tokio::test]
+    async fn traverse_multi_root_one_path_per_distinct_root() {
+        use khive_storage::types::TraversalOptions;
+
+        let rt = rt();
+        let owner = NamespaceToken::for_namespace(Namespace::parse("owner-ns2").unwrap());
+        let a = rt
+            .create_entity(&owner, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let c = rt
+            .create_entity(&owner, "concept", None, "C", None, None, vec![])
+            .await
+            .unwrap();
+
+        // `a` appears twice in the roots list — this is what the pack
+        // handler produces when a caller passes the same root once as a
+        // short prefix and once as the full UUID: both resolve to the same
+        // `Uuid` value by the time the request reaches the runtime.
+        let result = rt
+            .traverse(
+                &owner,
+                TraversalRequest {
+                    roots: vec![a.id, a.id, c.id],
+                    options: TraversalOptions {
+                        max_depth: 1,
+                        direction: Direction::Out,
+                        ..Default::default()
+                    },
+                    include_roots: true,
+                    include_properties: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        let root_ids: Vec<Uuid> = result.iter().map(|p| p.root_id).collect();
+        assert_eq!(
+            root_ids.len(),
+            2,
+            "duplicate root value must not produce a duplicate GraphPath, got {result:#?}"
+        );
+        assert!(root_ids.contains(&a.id));
+        assert!(root_ids.contains(&c.id));
+    }
+
+    // ── Note-kind nodes reached via traversal appear in the result but are
+    //    never enriched with name/kind (entity-only enrichment, unchanged
+    //    behavior — see `enrich_path_nodes`) ────────────────────────────────
+    //
+    // The recursive SQL walks `graph_edges` without any node-kind
+    // restriction, and the soft-delete screen consults both `entities` and
+    // `notes`, so a note reached via an `annotates` edge is NOT dropped from
+    // the traversal. What it does not get is enrichment: `enrich_path_nodes`
+    // only batch-fetches entities (a deliberate entity-only scope), unlike
+    // `enrich_neighbor_hits` which falls back to a note lookup. This test
+    // pins that documented split rather than changing it.
+    #[tokio::test]
+    async fn traverse_reaches_note_nodes_but_leaves_them_unenriched() {
+        use khive_storage::types::TraversalOptions;
+
+        let rt = rt();
+        let owner = NamespaceToken::for_namespace(Namespace::parse("owner-ns3").unwrap());
+        let a = rt
+            .create_entity(&owner, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let note = rt
+            .create_note(
+                &owner,
+                "observation",
+                None,
+                "note body",
+                None,
+                None,
+                vec![a.id],
+            )
+            .await
+            .unwrap();
+
+        let result = rt
+            .traverse(
+                &owner,
+                TraversalRequest {
+                    roots: vec![a.id],
+                    options: TraversalOptions {
+                        max_depth: 1,
+                        direction: Direction::In,
+                        ..Default::default()
+                    },
+                    include_roots: false,
+                    include_properties: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        let note_node = result[0]
+            .nodes
+            .iter()
+            .find(|n| n.node_id == note.id)
+            .unwrap_or_else(|| panic!("note must be present in traversal nodes, got {result:#?}"));
+        assert_eq!(
+            note_node.name, None,
+            "note enrichment is deliberately entity-only; name stays None"
+        );
+        assert_eq!(
+            note_node.kind, None,
+            "note enrichment is deliberately entity-only; kind stays None"
+        );
+    }
+
     // ---- purge cascade must include already-soft-deleted edges ----
     //
     // Hard delete must cascade ALL incident edges synchronously. A cascade driven
@@ -12369,7 +12656,146 @@ mod tests {
             name: None,
             kind: None,
             properties: None,
+            weight: 0.0,
         }
+    }
+
+    /// merge_traversal_paths_by_root: three namespaces each contribute the
+    /// same root plus 2 distinct non-root nodes (each namespace already at
+    /// its own `limit`, matching the per-namespace SQL-layer cap). The
+    /// union across namespaces is 6 distinct non-root nodes; the merge must
+    /// re-enforce `limit` on that union rather than passing it through.
+    #[test]
+    fn merge_traversal_paths_reenforces_limit_across_namespaces() {
+        let root = Uuid::new_v4();
+        let path_for = |n: usize| GraphPath {
+            root_id: root,
+            nodes: (0..n).map(|_| path_node(Uuid::new_v4(), 1)).collect(),
+            total_weight: 1.0,
+        };
+
+        let paths = vec![path_for(2), path_for(2), path_for(2)];
+        let merged = merge_traversal_paths_by_root(paths, Some(2));
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            merged[0].nodes.len(),
+            2,
+            "merge must re-enforce limit=2 on the unioned nodes, got {:?}",
+            merged[0].nodes
+        );
+    }
+
+    /// merge_traversal_paths_by_root: a node reachable at different depths
+    /// via two namespaces must report its shallowest depth and the
+    /// `via_edge` that produced that depth, and the merged node order must
+    /// be BFS (ascending depth) rather than the concatenation order of the
+    /// per-namespace inputs.
+    #[test]
+    fn merge_traversal_paths_keeps_shortest_depth_and_bfs_order() {
+        let root = Uuid::new_v4();
+        let shared = Uuid::new_v4();
+        let far_node = Uuid::new_v4();
+        let deep_edge = Uuid::new_v4();
+        let shallow_edge = Uuid::new_v4();
+
+        // Namespace processed first: an unrelated node at depth 1, and the
+        // shared node reached the long way, at depth 4.
+        let ns_first = GraphPath {
+            root_id: root,
+            nodes: vec![
+                path_node(far_node, 1),
+                PathNode {
+                    node_id: shared,
+                    via_edge: Some(deep_edge),
+                    depth: 4,
+                    name: None,
+                    kind: None,
+                    properties: None,
+                    weight: 0.0,
+                },
+            ],
+            total_weight: 1.0,
+        };
+        // Namespace processed second: the same shared node, reached at depth 2.
+        let ns_second = GraphPath {
+            root_id: root,
+            nodes: vec![PathNode {
+                node_id: shared,
+                via_edge: Some(shallow_edge),
+                depth: 2,
+                name: None,
+                kind: None,
+                properties: None,
+                weight: 0.0,
+            }],
+            total_weight: 1.0,
+        };
+
+        let merged = merge_traversal_paths_by_root(vec![ns_first, ns_second], None);
+
+        assert_eq!(merged.len(), 1);
+        let nodes = &merged[0].nodes;
+        assert!(
+            nodes.windows(2).all(|w| w[0].depth <= w[1].depth),
+            "merged nodes must be in BFS (ascending depth) order, got {:?}",
+            nodes
+                .iter()
+                .map(|n| (n.node_id, n.depth))
+                .collect::<Vec<_>>()
+        );
+        let shared_node = nodes
+            .iter()
+            .find(|n| n.node_id == shared)
+            .expect("shared node must survive the merge");
+        assert_eq!(
+            shared_node.depth, 2,
+            "shared node must report its shortest depth across namespaces"
+        );
+        assert_eq!(
+            shared_node.via_edge,
+            Some(shallow_edge),
+            "shared node must carry the via_edge that produced the shortest path"
+        );
+    }
+
+    /// merge_traversal_paths_by_root: `total_weight` must describe the nodes
+    /// the caller is actually handed. The heaviest node here sits deepest, so
+    /// re-applying `limit` to the merged union drops it — and the reported
+    /// weight has to drop with it rather than keep quoting a node that was
+    /// screened out.
+    #[test]
+    fn merge_traversal_paths_total_weight_drops_with_the_node_it_described() {
+        let root = Uuid::new_v4();
+        let weighted = |depth: usize, weight: f64| PathNode {
+            node_id: Uuid::new_v4(),
+            via_edge: None,
+            depth,
+            name: None,
+            kind: None,
+            properties: None,
+            weight,
+        };
+
+        let path = GraphPath {
+            root_id: root,
+            nodes: vec![weighted(1, 0.5), weighted(1, 0.4), weighted(2, 9.0)],
+            total_weight: 9.0,
+        };
+
+        let merged = merge_traversal_paths_by_root(vec![path], Some(2));
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            merged[0].nodes.len(),
+            2,
+            "limit=2 must drop the depth-2 node"
+        );
+        assert_eq!(
+            merged[0].total_weight, 0.5,
+            "total_weight must be the max over surviving nodes, not the 9.0 \
+             carried by the node the limit removed"
+        );
     }
 
     /// enrich_neighbor_hits: entity hit resolved, note hit resolved with
