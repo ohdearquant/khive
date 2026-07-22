@@ -270,6 +270,20 @@ impl KhiveRuntime {
                 edges_skipped += 1;
                 continue;
             }
+            if let Err(e) = self
+                .validate_edge_relation_endpoints(token, ee.source, ee.target, ee.relation)
+                .await
+            {
+                tracing::warn!(
+                    source = %ee.source,
+                    target = %ee.target,
+                    relation = ?ee.relation,
+                    error = %e,
+                    "import_kg: skipping edge — endpoint contract violation in namespace {ns:?}"
+                );
+                edges_skipped += 1;
+                continue;
+            }
             let now = Utc::now();
             let edge = khive_storage::types::Edge {
                 id: LinkId::from(ee.edge_id),
@@ -701,7 +715,11 @@ mod tests {
                     edge_id: Uuid::new_v4(),
                     source: b.id,
                     target: c.id,
-                    relation: EdgeRelation::DependsOn,
+                    // #1235: concept->concept is not in depends_on's endpoint
+                    // contract; use variant_of (concept->concept is valid) so
+                    // this fixture exercises "one dangling edge skipped" only,
+                    // not an endpoint-contract violation this test isn't about.
+                    relation: EdgeRelation::VariantOf,
                     weight: 0.9,
                 },
                 ExportedEdge {
@@ -751,6 +769,88 @@ mod tests {
         assert_eq!(
             summary.edges_skipped, 0,
             "no edges should be skipped when all endpoints exist"
+        );
+    }
+
+    /// #1235: an edge whose (source kind, relation, target kind) triple violates the
+    /// endpoint contract (here: `precedes` between two `concept` entities — `precedes`
+    /// is restricted to document/dataset/artifact/service/project pairs) must be
+    /// skipped by import the same way a dangling endpoint is, not written straight
+    /// through with `graph.upsert_edge`.
+    #[tokio::test]
+    async fn import_edge_violating_endpoint_contract_is_skipped() {
+        let src = make_rt().await;
+        let tok = NamespaceToken::local();
+        let e1 = src
+            .create_entity(&tok, "concept", None, "E1", None, None, vec![])
+            .await
+            .unwrap();
+        let e2 = src
+            .create_entity(&tok, "concept", None, "E2", None, None, vec![])
+            .await
+            .unwrap();
+
+        let archive = KgArchive {
+            format: "khive-kg".to_string(),
+            version: "0.1".to_string(),
+            namespace: "local".to_string(),
+            exported_at: Utc::now(),
+            entities: vec![
+                ExportedEntity {
+                    id: e1.id,
+                    kind: "concept".to_string(),
+                    entity_type: None,
+                    name: "E1".to_string(),
+                    description: None,
+                    properties: None,
+                    tags: vec![],
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                },
+                ExportedEntity {
+                    id: e2.id,
+                    kind: "concept".to_string(),
+                    entity_type: None,
+                    name: "E2".to_string(),
+                    description: None,
+                    properties: None,
+                    tags: vec![],
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                },
+            ],
+            edges: vec![ExportedEdge {
+                edge_id: Uuid::new_v4(),
+                source: e1.id,
+                target: e2.id,
+                relation: EdgeRelation::Precedes,
+                weight: 1.0,
+            }],
+        };
+
+        let dst = make_rt().await;
+        let summary = dst.import_kg(&archive, &tok).await.unwrap();
+        assert_eq!(summary.entities_imported, 2);
+        assert_eq!(
+            summary.edges_imported, 0,
+            "an endpoint-contract-violating edge must not be imported"
+        );
+        assert_eq!(
+            summary.edges_skipped, 1,
+            "an endpoint-contract-violating edge must be counted as skipped"
+        );
+        assert!(
+            dst.neighbors(
+                &tok,
+                e1.id,
+                khive_storage::types::Direction::Out,
+                None,
+                None
+            )
+            .await
+            .unwrap()
+            .is_empty(),
+            "the contract-violating edge must not exist in the destination graph"
         );
     }
 
