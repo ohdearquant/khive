@@ -5,7 +5,8 @@
 //! during runtime construction and require no opt-in.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use lattice_embed::{
@@ -22,40 +23,89 @@ enum EmbeddingCall {
     Passage,
 }
 
+const EMBEDDING_QUEUE_CAPACITY: usize = 32;
+
+struct EmbeddingJob {
+    texts: Vec<String>,
+    model: EmbeddingModel,
+    call: EmbeddingCall,
+    reply: tokio::sync::oneshot::Sender<lattice_embed::Result<Vec<Vec<f32>>>>,
+}
+
+/// Bounds non-cancellable native inference to one worker and a fixed queue.
+/// Callers can detach safely because closed queued jobs are skipped before inference.
 pub(crate) struct BlockingEmbeddingService<S> {
     inner: Arc<S>,
+    worker: OnceLock<Result<SyncSender<EmbeddingJob>, String>>,
 }
 
 impl<S> BlockingEmbeddingService<S> {
     pub(crate) fn new(inner: Arc<S>) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            worker: OnceLock::new(),
+        }
     }
 }
 
 impl<S: EmbeddingService + 'static> BlockingEmbeddingService<S> {
+    fn worker(&self) -> lattice_embed::Result<&SyncSender<EmbeddingJob>> {
+        self.worker
+            .get_or_init(|| {
+                let (sender, receiver) = mpsc::sync_channel(EMBEDDING_QUEUE_CAPACITY);
+                let inner = Arc::clone(&self.inner);
+                let runtime = tokio::runtime::Handle::current();
+                std::thread::Builder::new()
+                    .name("khive-embedding".to_owned())
+                    .spawn(move || Self::run_worker(inner, runtime, receiver))
+                    .map(|_| sender)
+                    .map_err(|error| error.to_string())
+            })
+            .as_ref()
+            .map_err(|error| lattice_embed::EmbedError::Internal(error.clone()))
+    }
+
+    fn run_worker(
+        inner: Arc<S>,
+        runtime: tokio::runtime::Handle,
+        receiver: Receiver<EmbeddingJob>,
+    ) {
+        while let Ok(job) = receiver.recv() {
+            if job.reply.is_closed() {
+                continue;
+            }
+            let result = runtime.block_on(async {
+                match job.call {
+                    EmbeddingCall::Generic => inner.embed(&job.texts, job.model).await,
+                    EmbeddingCall::Query => inner.embed_query(&job.texts, job.model).await,
+                    EmbeddingCall::Passage => inner.embed_passage(&job.texts, job.model).await,
+                }
+            });
+            let _ = job.reply.send(result);
+        }
+    }
+
     async fn run(
         &self,
         texts: &[String],
         model: EmbeddingModel,
         call: EmbeddingCall,
     ) -> lattice_embed::Result<Vec<Vec<f32>>> {
-        let inner = Arc::clone(&self.inner);
-        let texts = texts.to_vec();
-        let runtime = tokio::runtime::Handle::current();
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-        std::thread::Builder::new()
-            .name("khive-embedding".to_owned())
-            .spawn(move || {
-                let result = runtime.block_on(async move {
-                    match call {
-                        EmbeddingCall::Generic => inner.embed(&texts, model).await,
-                        EmbeddingCall::Query => inner.embed_query(&texts, model).await,
-                        EmbeddingCall::Passage => inner.embed_passage(&texts, model).await,
-                    }
-                });
-                let _ = sender.send(result);
-            })
-            .map_err(|error| lattice_embed::EmbedError::Internal(error.to_string()))?;
+        let (reply, receiver) = tokio::sync::oneshot::channel();
+        let job = EmbeddingJob {
+            texts: texts.to_vec(),
+            model,
+            call,
+            reply,
+        };
+        self.worker()?.try_send(job).map_err(|error| match error {
+            TrySendError::Full(_) => {
+                lattice_embed::EmbedError::Internal("embedding worker queue is full".to_owned())
+            }
+            TrySendError::Disconnected(_) => lattice_embed::EmbedError::Internal(
+                "embedding worker channel is disconnected".to_owned(),
+            ),
+        })?;
         receiver
             .await
             .map_err(|error| lattice_embed::EmbedError::Internal(error.to_string()))?
@@ -301,7 +351,9 @@ impl EmbedderProvider for LatticeEmbedderProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Condvar, Mutex};
     use std::time::Duration;
 
     struct ConstVecProvider {
@@ -390,6 +442,71 @@ mod tests {
         }
     }
 
+    struct BlockingTestService {
+        calls: Mutex<Vec<String>>,
+        entered: AtomicUsize,
+        release: (Mutex<bool>, Condvar),
+        thread_ids: Mutex<HashSet<std::thread::ThreadId>>,
+    }
+
+    impl BlockingTestService {
+        fn new() -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                entered: AtomicUsize::new(0),
+                release: (Mutex::new(false), Condvar::new()),
+                thread_ids: Mutex::new(HashSet::new()),
+            }
+        }
+
+        fn release(&self) {
+            *self
+                .release
+                .0
+                .lock()
+                .expect("release lock must not be poisoned") = true;
+            self.release.1.notify_all();
+        }
+    }
+
+    #[async_trait]
+    impl EmbeddingService for BlockingTestService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> lattice_embed::Result<Vec<Vec<f32>>> {
+            let text = texts.first().cloned().unwrap_or_default();
+            self.thread_ids
+                .lock()
+                .expect("thread id lock must not be poisoned")
+                .insert(std::thread::current().id());
+            self.calls
+                .lock()
+                .expect("call lock must not be poisoned")
+                .push(text.clone());
+            self.entered.fetch_add(1, Ordering::Release);
+
+            if text != "later" {
+                let (released, wake) = &self.release;
+                let guard = released.lock().expect("release lock must not be poisoned");
+                let _guard = wake
+                    .wait_while(guard, |released| !*released)
+                    .expect("release lock must not be poisoned");
+            }
+
+            Ok(texts.iter().map(|_| vec![1.0]).collect())
+        }
+
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "blocking-test-service"
+        }
+    }
+
     #[test]
     fn blocking_adapter_first_use_completes_with_single_blocking_thread() {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -414,6 +531,149 @@ mod tests {
             .expect("first-use embedding must not exhaust the blocking pool")
             .expect("first-use embedding must succeed");
         assert_eq!(embeddings, vec![vec![1.0]]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn blocking_adapter_uses_one_worker_for_concurrent_calls() {
+        const CALL_COUNT: usize = 32;
+        let inner = Arc::new(BlockingTestService::new());
+        let service = Arc::new(BlockingEmbeddingService::new(Arc::clone(&inner)));
+        let mut calls = Vec::with_capacity(CALL_COUNT);
+
+        for index in 0..CALL_COUNT {
+            let service = Arc::clone(&service);
+            calls.push(tokio::spawn(async move {
+                service
+                    .embed(&[format!("request-{index}")], EmbeddingModel::default())
+                    .await
+            }));
+        }
+
+        let _ = tokio::time::timeout(Duration::from_millis(250), async {
+            while inner.entered.load(Ordering::Acquire) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        inner.release();
+
+        for call in calls {
+            call.await
+                .expect("embedding task must not panic")
+                .expect("embedding call must succeed");
+        }
+        assert_eq!(
+            inner
+                .thread_ids
+                .lock()
+                .expect("thread id lock must not be poisoned")
+                .len(),
+            1,
+            "concurrent calls must share one native worker thread"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocking_adapter_skips_timed_out_call_and_serves_later_call() {
+        let inner = Arc::new(BlockingTestService::new());
+        let service = Arc::new(BlockingEmbeddingService::new(Arc::clone(&inner)));
+
+        let first_service = Arc::clone(&service);
+        let first = tokio::spawn(async move {
+            first_service
+                .embed(&["first".to_owned()], EmbeddingModel::default())
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while inner.entered.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first embedding call must enter the native service");
+
+        let abandoned = tokio::time::timeout(
+            Duration::from_millis(50),
+            service.embed(&["abandoned".to_owned()], EmbeddingModel::default()),
+        )
+        .await;
+        let later_service = Arc::clone(&service);
+        let later = tokio::spawn(async move {
+            later_service
+                .embed(&["later".to_owned()], EmbeddingModel::default())
+                .await
+        });
+        inner.release();
+
+        first
+            .await
+            .expect("first embedding task must not panic")
+            .expect("first embedding call must succeed");
+        let later_result = tokio::time::timeout(Duration::from_secs(1), later)
+            .await
+            .expect("later embedding call must be served")
+            .expect("later embedding task must not panic")
+            .expect("later embedding call must succeed");
+
+        assert!(abandoned.is_err(), "queued embedding call must time out");
+        assert_eq!(later_result, vec![vec![1.0]]);
+        assert_eq!(
+            *inner.calls.lock().expect("call lock must not be poisoned"),
+            vec!["first".to_owned(), "later".to_owned()],
+            "the worker must skip a queued call whose receiver is closed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocking_adapter_rejects_call_when_queue_is_full() {
+        let inner = Arc::new(BlockingTestService::new());
+        let service = Arc::new(BlockingEmbeddingService::new(Arc::clone(&inner)));
+        let first_service = Arc::clone(&service);
+        let first = tokio::spawn(async move {
+            first_service
+                .embed(&["first".to_owned()], EmbeddingModel::default())
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while inner.entered.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first embedding call must occupy the native worker");
+
+        let sender = service.worker().expect("worker must be running");
+        let mut queued_receivers = Vec::with_capacity(EMBEDDING_QUEUE_CAPACITY);
+        for index in 0..EMBEDDING_QUEUE_CAPACITY {
+            let (reply, receiver) = tokio::sync::oneshot::channel();
+            let queued = sender.try_send(EmbeddingJob {
+                texts: vec![format!("queued-{index}")],
+                model: EmbeddingModel::default(),
+                call: EmbeddingCall::Generic,
+                reply,
+            });
+            assert!(queued.is_ok(), "bounded queue must accept its capacity");
+            queued_receivers.push(receiver);
+        }
+
+        let overflow = tokio::time::timeout(
+            Duration::from_millis(100),
+            service.embed(&["overflow".to_owned()], EmbeddingModel::default()),
+        )
+        .await
+        .expect("a full embedding queue must fail without waiting")
+        .expect_err("a full embedding queue must return an embedding error");
+
+        drop(queued_receivers);
+        inner.release();
+        first
+            .await
+            .expect("first embedding task must not panic")
+            .expect("first embedding call must succeed");
+        assert!(
+            overflow.to_string().contains("queue is full"),
+            "queue saturation must use the embedding failure path: {overflow}"
+        );
     }
 
     #[test]
