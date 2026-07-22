@@ -350,6 +350,34 @@ pub fn endpoint_matches(
     }
 }
 
+/// `true` if `spec` matches the given substrate + kind + entity_type triple,
+/// treating an *absent* `entity_type` on the query side as unconstrained
+/// rather than an exact match against "no subtype".
+///
+/// Used only by the static GQL impossibility hint (`static_impossible_edge_pattern_warnings`,
+/// `accepted_entity_kind_pairs_for_relation`), which reasons over a *pattern*
+/// endpoint, not a resolved entity. A pattern endpoint that names a kind but
+/// no `entity_type` (`(a:concept)-[:depends_on]->(b:concept)`) has not ruled
+/// out any subtype, so an `EntityOfType` rule for that kind still makes the
+/// triple possible — unlike `endpoint_matches`, which the live link
+/// validator applies to *resolved* entities, where a `None` `entity_type`
+/// means the entity genuinely has no subtype and must be an exact miss
+/// against a typed rule. Do not use this for validation.
+fn pattern_endpoint_matches(
+    spec: &EndpointKind,
+    substrate: &str,
+    kind: &str,
+    entity_type: Option<&str>,
+) -> bool {
+    match spec {
+        EndpointKind::EntityOfType {
+            kind: k,
+            entity_type: t,
+        } => substrate == "entity" && *k == kind && entity_type.is_none_or(|et| et == *t),
+        _ => endpoint_matches(spec, substrate, kind, entity_type),
+    }
+}
+
 /// Relations that a composed pack `EDGE_RULES` set accepts for a given
 /// `(entity_kind, entity_type)` endpoint pair, using the EXACT SAME
 /// `endpoint_matches` semantics `pack_rule_allows` applies internally
@@ -381,6 +409,160 @@ pub fn accepted_pack_relations_for_entities(
     relations.sort_by_key(|r| r.as_str());
     relations.dedup();
     relations
+}
+
+/// Hint-only counterpart to [`accepted_pack_relations_for_entities`] that
+/// matches via [`pattern_endpoint_matches`] instead of [`endpoint_matches`],
+/// so an absent `entity_type` is treated as unconstrained rather than an
+/// exact-match miss against `EntityOfType` rules. Used exclusively by the
+/// static GQL impossibility hint — never by validation.
+fn accepted_pack_relations_for_pattern_entities(
+    rules: &[EdgeEndpointRule],
+    src_kind: &str,
+    src_entity_type: Option<&str>,
+    tgt_kind: &str,
+    tgt_entity_type: Option<&str>,
+) -> Vec<EdgeRelation> {
+    let mut relations: Vec<EdgeRelation> = rules
+        .iter()
+        .filter(|r| {
+            pattern_endpoint_matches(&r.source, "entity", src_kind, src_entity_type)
+                && pattern_endpoint_matches(&r.target, "entity", tgt_kind, tgt_entity_type)
+        })
+        .map(|r| r.relation)
+        .collect();
+    relations.sort_by_key(|r| r.as_str());
+    relations.dedup();
+    relations
+}
+
+/// All `(source_kind, target_kind)` entity-kind pairs — restricted to the closed
+/// 8-kind base [`khive_types::EntityKind`] taxonomy — that accept `relation`
+/// under the composed base allowlist plus pack `EDGE_RULES`.
+///
+/// Reuses [`base_entity_rule_allows`] and [`accepted_pack_relations_for_pattern_entities`]
+/// (the pattern-side, unconstrained-`None` counterpart of the functions the live
+/// validator consults) over the closed kind set, rather than re-deriving a
+/// parallel table — issue #543 precedent, applied to GQL query-pattern hint
+/// derivation (issue #593).
+///
+/// Pack rules are skipped for `crate::pack::SPECIAL_RELATIONS` (supersedes /
+/// supports / refutes): the live validator's special-relation branch
+/// (`validate_edge_relation_endpoints`, this file) resolves those relations
+/// before `pack_rule_allows` is ever reached, so a pack `EDGE_RULES` entry for
+/// one of them is never actually enforced (see `pack.rs`'s
+/// `edge_endpoint_table` doc comment for the authoritative statement of this).
+fn accepted_entity_kind_pairs_for_relation(
+    pack_rules: &[EdgeEndpointRule],
+    relation: EdgeRelation,
+) -> Vec<(&'static str, &'static str)> {
+    let mut pairs = Vec::new();
+    for src in khive_types::EntityKind::ALL {
+        for tgt in khive_types::EntityKind::ALL {
+            let allowed = base_entity_rule_allows(src.name(), relation, tgt.name())
+                || (!crate::pack::SPECIAL_RELATIONS.contains(&relation)
+                    && accepted_pack_relations_for_pattern_entities(
+                        pack_rules,
+                        src.name(),
+                        None,
+                        tgt.name(),
+                        None,
+                    )
+                    .contains(&relation));
+            if allowed {
+                pairs.push((src.name(), tgt.name()));
+            }
+        }
+    }
+    pairs
+}
+
+/// Scans a GQL `MATCH` pattern for edges that name an explicit relation and
+/// explicit entity kinds on both endpoints — a single mandatory hop, a fixed
+/// direction — where the `(source_kind, relation, target_kind)` triple can
+/// never match under the composed edge endpoint contract. Returns one warning
+/// per statically-impossible edge.
+///
+/// Deliberately conservative: unlabeled nodes, unlabeled/multi-relation edges,
+/// undirected edges, variable-length hops, and note-kind endpoints are left
+/// unchecked, since none of those name a single static triple to test against
+/// the validator (issue #593).
+///
+/// Mirrors the validator's special-relation precedence for `supersedes` /
+/// `supports` / `refutes` (see [`accepted_entity_kind_pairs_for_relation`]):
+/// pack rules never make those triples possible, only the base allowlist does.
+fn static_impossible_edge_pattern_warnings(
+    pattern: &khive_query::ast::MatchPattern,
+    pack_rules: &[EdgeEndpointRule],
+) -> Vec<String> {
+    use khive_query::ast::{EdgeDirection, PatternElement};
+
+    let elements = &pattern.elements;
+    let mut warnings = Vec::new();
+
+    for (i, el) in elements.iter().enumerate() {
+        let PatternElement::Edge(edge) = el else {
+            continue;
+        };
+        if edge.relations.len() != 1 || edge.min_hops != 1 || edge.max_hops != 1 {
+            continue;
+        }
+        let (left, right) = match (elements.get(i.wrapping_sub(1)), elements.get(i + 1)) {
+            (Some(PatternElement::Node(l)), Some(PatternElement::Node(r))) => (l, r),
+            _ => continue,
+        };
+        let (src_node, tgt_node) = match edge.direction {
+            EdgeDirection::Out => (left, right),
+            EdgeDirection::In => (right, left),
+            EdgeDirection::Both => continue,
+        };
+        let (Some(src_raw), Some(tgt_raw)) = (src_node.kind.as_deref(), tgt_node.kind.as_deref())
+        else {
+            continue;
+        };
+        let (Ok(src_kind), Ok(tgt_kind)) = (
+            src_raw.parse::<khive_types::EntityKind>(),
+            tgt_raw.parse::<khive_types::EntityKind>(),
+        ) else {
+            continue;
+        };
+        let Ok(relation) = edge.relations[0].parse::<EdgeRelation>() else {
+            continue;
+        };
+
+        let possible = base_entity_rule_allows(src_kind.name(), relation, tgt_kind.name())
+            || (!crate::pack::SPECIAL_RELATIONS.contains(&relation)
+                && accepted_pack_relations_for_pattern_entities(
+                    pack_rules,
+                    src_kind.name(),
+                    src_node.entity_type.as_deref(),
+                    tgt_kind.name(),
+                    tgt_node.entity_type.as_deref(),
+                )
+                .contains(&relation));
+        if possible {
+            continue;
+        }
+
+        let accepted = accepted_entity_kind_pairs_for_relation(pack_rules, relation);
+        let accepted_str = if accepted.is_empty() {
+            "none".to_string()
+        } else {
+            accepted
+                .iter()
+                .map(|(s, t)| format!("{s}->{t}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        warnings.push(format!(
+            "pattern ({src})-[:{relation}]->({tgt}) can never match: '{relation}' does not accept \
+             {src}->{tgt} endpoints; accepted source->target kinds for '{relation}': {accepted_str}",
+            src = src_kind.name(),
+            tgt = tgt_kind.name(),
+        ));
+    }
+
+    warnings
 }
 
 /// `true` if any pack-declared edge endpoint rule allows the
@@ -980,11 +1162,28 @@ impl KhiveRuntime {
     /// Retrieve an entity by ID.
     ///
     /// UUID v4 is globally unique: no namespace filter on by-ID ops.
+    ///
+    /// Interim identifier-continuity disclosure (precedes the full transitive
+    /// redirect chase): a miss is probed once against the tombstone row. If
+    /// the id was consumed by `merge(into_id, from_id)` — `merged_into` set —
+    /// the `NotFound` message names the kept id so the caller can requery it
+    /// directly. Single-level only: it does not chase a chain of merges and
+    /// does not return the kept entity in place of the miss. The probe only
+    /// runs after the live-row lookup misses, so the happy path pays no
+    /// extra query.
     pub async fn get_entity(&self, token: &NamespaceToken, id: Uuid) -> RuntimeResult<Entity> {
-        self.entities(token)?
-            .get_entity(id)
-            .await?
-            .ok_or_else(|| RuntimeError::NotFound(format!("entity {id}")))
+        let store = self.entities(token)?;
+        if let Some(entity) = store.get_entity(id).await? {
+            return Ok(entity);
+        }
+        if let Some(tombstone) = store.get_entity_including_deleted(id).await? {
+            if let Some(kept_id) = tombstone.merged_into {
+                return Err(RuntimeError::NotFound(format!(
+                    "{id} was merged into {kept_id}; query the kept id"
+                )));
+            }
+        }
+        Err(RuntimeError::NotFound(format!("entity {id}")))
     }
 
     /// Retrieve an entity by ID including soft-deleted rows.
@@ -3899,6 +4098,24 @@ impl KhiveRuntime {
         let compiled = khive_query::compile(&ast, &opts)?;
         let mut warnings = compiled.warnings;
         let truncation_check = compiled.truncation_check;
+
+        // Static schema-mismatch hint (issue #593): GQL-only by design — the
+        // hint is worded around GQL's `(kind)-[:relation]->(kind)` syntax, so
+        // it is scoped out of SPARQL even though SPARQL compiles to the same
+        // `MatchPattern` shape. Dialect is detected the same way `parse_auto`
+        // selects it, since neither the AST nor `CompiledQuery` retains it.
+        let is_sparql = query
+            .trim()
+            .as_bytes()
+            .get(..6)
+            .is_some_and(|p| p.eq_ignore_ascii_case(b"SELECT"));
+        if !is_sparql {
+            let pack_rules = self.pack_edge_rules();
+            warnings.extend(static_impossible_edge_pattern_warnings(
+                &ast.pattern,
+                &pack_rules,
+            ));
+        }
 
         // Convert QueryValue params (query-layer type) to SqlValue (storage-layer type)
         // at the query–storage boundary.

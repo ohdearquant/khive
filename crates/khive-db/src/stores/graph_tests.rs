@@ -3504,3 +3504,146 @@ async fn traverse_counts_the_issued_chunk_when_the_query_fails() {
         "the chunk query was issued and must be counted despite the error; got {usage}"
     );
 }
+
+/// khive#1229: `Direction::Both`'s recursive-CTE join predicate used to be a
+/// single `(e.source_id = t.node_id OR e.target_id = t.node_id)` arm, which
+/// SQLite cannot satisfy with one index seek — it falls back to a full
+/// namespace scan of `graph_edges` per frontier row. This asserts the fixed
+/// `traverse_recursive_member_sql` shape plans as two separately-indexed
+/// `SEARCH` operations (one on `idx_graph_edges_ns_src_rel` binding
+/// `source_id=?`, one on `idx_graph_edges_ns_tgt_rel` binding `target_id=?`),
+/// not a scan qualified by `namespace=?` alone.
+#[tokio::test]
+async fn traverse_both_direction_recursive_member_seeks_by_source_and_target_id() {
+    let store = setup_memory_store();
+    // Same schema `traverse()` runs against; EXPLAIN QUERY PLAN doesn't
+    // execute the statement, so no rows need to exist.
+    let seeds = "(?1, ?1, NULL, 0, ?1, 0.0)";
+    let recursive_member = traverse_recursive_member_sql(Direction::Both, 2, 3, "", "");
+    let cte_sql = format!(
+        "WITH RECURSIVE traversal(\
+             root_id, node_id, edge_id, depth, path, total_weight\
+         ) AS (\
+             VALUES {seeds} \
+             UNION ALL \
+             {recursive_member} \
+         ) \
+         SELECT root_id, node_id, edge_id, depth, total_weight \
+         FROM traversal WHERE depth > 0 \
+         ORDER BY root_id, depth",
+        seeds = seeds,
+        recursive_member = recursive_member,
+    );
+
+    let reader = store.pool.reader().unwrap();
+    let plan_sql = format!("EXPLAIN QUERY PLAN {cte_sql}");
+    let mut stmt = reader.conn().prepare(&plan_sql).unwrap();
+    let params: [&str; 3] = ["root", "default", "2"];
+    let details: Vec<String> = stmt
+        .query_map(rusqlite::params_from_iter(params.iter()), |row| row.get(3))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+
+    assert!(
+        details
+            .iter()
+            .any(|d| d.contains("idx_graph_edges_ns_src_rel") && d.contains("source_id=?")),
+        "expected an out-arm SEARCH binding source_id=? via idx_graph_edges_ns_src_rel, got: {details:?}"
+    );
+    assert!(
+        details
+            .iter()
+            .any(|d| d.contains("idx_graph_edges_ns_tgt_rel") && d.contains("target_id=?")),
+        "expected an in-arm SEARCH binding target_id=? via idx_graph_edges_ns_tgt_rel, got: {details:?}"
+    );
+    assert!(
+        !details.iter().any(|d| d.contains("SCAN e")),
+        "no arm may fall back to a full graph_edges scan, got: {details:?}"
+    );
+}
+
+/// khive#1229 correctness: a hub node with mixed out- and in-edges to its
+/// spokes, each spoke extending one hop further to its own tail node.
+/// `Direction::Both` at `max_depth=2` from the hub must return every spoke
+/// (reached via whichever direction connects it to the hub) AND every tail
+/// (reached via the spoke's outgoing edge), regardless of which arm of the
+/// recursive member found the spoke. This is the exact shape the OR-predicate
+/// bug silently returned correct results for at small scale but 380x slower
+/// at hub scale — this test locks the result set the perf fix must preserve.
+#[tokio::test]
+async fn traverse_both_direction_hub_depth_two_returns_full_node_set() {
+    let store = setup_memory_store();
+
+    let hub = Uuid::new_v4();
+    let mut expected_depth1 = HashSet::new();
+    let mut expected_depth2 = HashSet::new();
+
+    const SPOKES: usize = 40;
+    for i in 0..SPOKES {
+        let spoke = Uuid::new_v4();
+        let tail = Uuid::new_v4();
+        expected_depth1.insert(spoke);
+        expected_depth2.insert(tail);
+
+        if i % 2 == 0 {
+            // hub --out--> spoke
+            store
+                .upsert_edge(make_edge(hub, spoke, EdgeRelation::Extends, 1.0))
+                .await
+                .unwrap();
+        } else {
+            // spoke --out--> hub (hub reaches it via the in-arm)
+            store
+                .upsert_edge(make_edge(spoke, hub, EdgeRelation::Extends, 1.0))
+                .await
+                .unwrap();
+        }
+        // spoke --out--> tail, reachable regardless of which arm found spoke
+        store
+            .upsert_edge(make_edge(spoke, tail, EdgeRelation::VariantOf, 1.0))
+            .await
+            .unwrap();
+    }
+
+    let paths = store
+        .traverse(TraversalRequest {
+            roots: vec![hub],
+            options: TraversalOptions::new(2).with_direction(Direction::Both),
+            include_roots: false,
+            include_properties: false,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(paths.len(), 1);
+    let path = &paths[0];
+    assert_eq!(path.root_id, hub);
+
+    let got_depth1: HashSet<Uuid> = path
+        .nodes
+        .iter()
+        .filter(|n| n.depth == 1)
+        .map(|n| n.node_id)
+        .collect();
+    let got_depth2: HashSet<Uuid> = path
+        .nodes
+        .iter()
+        .filter(|n| n.depth == 2)
+        .map(|n| n.node_id)
+        .collect();
+
+    assert_eq!(
+        got_depth1, expected_depth1,
+        "every spoke must be reached at depth 1 regardless of edge direction"
+    );
+    assert_eq!(
+        got_depth2, expected_depth2,
+        "every tail must be reached at depth 2 through its spoke's out-edge"
+    );
+    assert_eq!(
+        path.nodes.len(),
+        expected_depth1.len() + expected_depth2.len(),
+        "no duplicate or spurious nodes"
+    );
+}

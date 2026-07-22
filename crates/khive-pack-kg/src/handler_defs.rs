@@ -141,8 +141,8 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 18] = [
                 required: false,
                 description:
                     "If true, return soft-deleted entities (with deleted_at populated). Default false. \
-                     Requires a full UUID — short prefix resolution filters deleted records; \
-                     the delete response always returns the full UUID for this purpose.",
+                     Accepts a full UUID or a unique short hex prefix — prefix resolution falls back \
+                     to soft-deleted entities when no live record matches.",
             },
         ],
     },
@@ -469,7 +469,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 18] = [
     // Assertive: retrieves and presents search results
     HandlerDef {
         name: "search",
-        description: "Hybrid FTS + vector search",
+        description: "Hybrid FTS + vector search over knowledge-graph entities and notes. Corpora owned by other packs (for example teaching or document corpora with their own search verbs) are disjoint and are not searched here.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[

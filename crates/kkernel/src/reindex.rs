@@ -301,7 +301,11 @@ async fn embed_and_store_batch(
             continue;
         }
 
-        let texts: Vec<String> = subset.iter().map(|(_, t)| truncate_text(t)).collect();
+        let budget = embed_budget(model_name);
+        let texts: Vec<String> = subset
+            .iter()
+            .map(|(_, t)| truncate_text(t, budget))
+            .collect();
         match rt.embed_document_batch_with_model(model_name, &texts).await {
             Ok(embeddings) if embeddings.len() == subset.len() => {
                 // No pre-delete: SqliteVecStore::insert wraps DELETE+INSERT in
@@ -862,11 +866,25 @@ async fn count_notes(rt: &KhiveRuntime, ns: &str) -> u64 {
     }
 }
 
-fn truncate_text(t: &str) -> String {
-    if t.len() <= MAX_EMBED_BYTES {
+// The embed service prepends the model's document instruction (e.g. "passage: "
+// for multilingual-e5) AFTER this truncation, and its input guard rejects the
+// combined length. Reserve the prefix bytes here or a text truncated exactly to
+// the cap fails the whole batch post-prefix.
+fn embed_budget(model_name: &str) -> usize {
+    let normalized = model_name.trim().to_ascii_lowercase().replace('_', "-");
+    let prefix_len = normalized
+        .parse::<lattice_embed::EmbeddingModel>()
+        .ok()
+        .and_then(|m| m.document_instruction())
+        .map_or(0, str::len);
+    MAX_EMBED_BYTES - prefix_len
+}
+
+fn truncate_text(t: &str, max_bytes: usize) -> String {
+    if t.len() <= max_bytes {
         t.to_string()
     } else {
-        let mut end = MAX_EMBED_BYTES;
+        let mut end = max_bytes;
         while !t.is_char_boundary(end) {
             end -= 1;
         }
@@ -914,6 +932,29 @@ fn print_report(report: &ReindexReport, human: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn embed_budget_reserves_document_prefix_bytes() {
+        // multilingual-e5 prepends "passage: " (9 bytes) after truncation; the
+        // budget must reserve it or exactly-at-cap texts fail the whole batch.
+        assert_eq!(embed_budget("multilingual-e5-base"), MAX_EMBED_BYTES - 9);
+        assert_eq!(embed_budget("multilingual_e5_small"), MAX_EMBED_BYTES - 9);
+        assert_eq!(embed_budget("all-minilm-l6-v2"), MAX_EMBED_BYTES);
+        assert_eq!(embed_budget("unknown-model"), MAX_EMBED_BYTES);
+    }
+
+    #[test]
+    fn truncate_text_respects_budget_and_char_boundaries() {
+        let long = "a".repeat(MAX_EMBED_BYTES + 100);
+        assert_eq!(
+            truncate_text(&long, MAX_EMBED_BYTES - 9).len(),
+            MAX_EMBED_BYTES - 9
+        );
+        let cjk = "\u{4e2d}".repeat(20_000); // 3 bytes each
+        let out = truncate_text(&cjk, 32_759);
+        assert!(out.len() <= 32_759);
+        assert!(out.chars().all(|c| c == '\u{4e2d}'));
+    }
+
     use crate::dbpath::resolve_db_override;
     use clap::Parser;
     use khive_storage::types::{SqlStatement, SqlValue};
