@@ -763,11 +763,27 @@ fn build_edge_filter_sql(
     namespace: &str,
     filter: &EdgeFilter,
 ) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
-    let mut conditions: Vec<String> = vec![
-        "namespace = ?1".to_string(),
-        "deleted_at IS NULL".to_string(),
-    ];
-    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(namespace.to_string())];
+    build_edge_filter_sql_for_namespaces(&[namespace.to_string()], filter)
+}
+
+fn build_edge_filter_sql_for_namespaces(
+    namespaces: &[String],
+    filter: &EdgeFilter,
+) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = namespaces
+        .iter()
+        .map(|namespace| -> Box<dyn rusqlite::types::ToSql> { Box::new(namespace.clone()) })
+        .collect();
+    let namespace_condition = match namespaces.len() {
+        0 => "0".to_string(),
+        1 => "namespace = ?1".to_string(),
+        _ => {
+            let placeholders: Vec<String> =
+                (1..=namespaces.len()).map(|i| format!("?{i}")).collect();
+            format!("namespace IN ({})", placeholders.join(", "))
+        }
+    };
+    let mut conditions = vec![namespace_condition, "deleted_at IS NULL".to_string()];
 
     if !filter.ids.is_empty() {
         let placeholders: Vec<String> = filter
@@ -1677,6 +1693,24 @@ impl GraphStore for SqlGraphStore {
         .await
     }
 
+    async fn count_edges_in_namespaces(
+        &self,
+        namespaces: &[String],
+        filter: EdgeFilter,
+    ) -> Result<u64, StorageError> {
+        let namespaces = namespaces.to_vec();
+        self.with_reader("count_edges_in_namespaces", move |conn| {
+            let (where_clause, params) = build_edge_filter_sql_for_namespaces(&namespaces, &filter);
+            let sql = format!("SELECT COUNT(*) FROM graph_edges{where_clause}");
+            let mut stmt = conn.prepare(&sql)?;
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|p| p.as_ref()).collect();
+            let count: i64 = stmt.query_row(param_refs.as_slice(), |row| row.get(0))?;
+            Ok(count as u64)
+        })
+        .await
+    }
+
     async fn count_edges_by_relation(&self) -> Result<Vec<(EdgeRelation, u64)>, StorageError> {
         let namespace = self.namespace.clone();
         self.with_reader("count_edges_by_relation", move |conn| {
@@ -1685,6 +1719,42 @@ impl GraphStore for SqlGraphStore {
                        GROUP BY relation";
             let mut stmt = conn.prepare(sql)?;
             let rows = stmt.query_map([&namespace], |row| {
+                let relation_str: String = row.get(0)?;
+                let count: i64 = row.get(1)?;
+                Ok((relation_str, count))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (relation_str, count) = row?;
+                let relation = relation_str.parse::<EdgeRelation>().map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
+                out.push((relation, count as u64));
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn count_edges_by_relation_in_namespaces(
+        &self,
+        namespaces: &[String],
+    ) -> Result<Vec<(EdgeRelation, u64)>, StorageError> {
+        let namespaces = namespaces.to_vec();
+        self.with_reader("count_edges_by_relation_in_namespaces", move |conn| {
+            let (where_clause, params) =
+                build_edge_filter_sql_for_namespaces(&namespaces, &EdgeFilter::default());
+            let sql = format!(
+                "SELECT relation, COUNT(*) FROM graph_edges{where_clause} GROUP BY relation"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|p| p.as_ref()).collect();
+            let rows = stmt.query_map(param_refs.as_slice(), |row| {
                 let relation_str: String = row.get(0)?;
                 let count: i64 = row.get(1)?;
                 Ok((relation_str, count))

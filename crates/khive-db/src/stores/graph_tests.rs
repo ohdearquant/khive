@@ -238,6 +238,69 @@ async fn test_count_edges() {
     assert_eq!(store.count_edges(EdgeFilter::default()).await.unwrap(), 5);
 }
 
+#[tokio::test]
+async fn batched_namespace_edge_counts_match_per_namespace_counts() {
+    let config = PoolConfig {
+        path: None,
+        ..PoolConfig::default()
+    };
+    let pool = Arc::new(ConnectionPool::new(config).unwrap());
+    pool.writer()
+        .unwrap()
+        .conn()
+        .execute_batch(GRAPH_DDL)
+        .unwrap();
+    let store_a = SqlGraphStore::new_scoped(Arc::clone(&pool), false, "stats-a");
+    let store_b = SqlGraphStore::new_scoped(Arc::clone(&pool), false, "stats-b");
+
+    let mut edge_a = make_edge(Uuid::new_v4(), Uuid::new_v4(), EdgeRelation::Extends, 1.0);
+    edge_a.namespace = "stats-a".to_string();
+    let mut deleted_edge = make_edge(Uuid::new_v4(), Uuid::new_v4(), EdgeRelation::Enables, 1.0);
+    deleted_edge.namespace = "stats-a".to_string();
+    let deleted_edge_id = deleted_edge.id;
+    let mut edge_b = make_edge(Uuid::new_v4(), Uuid::new_v4(), EdgeRelation::DependsOn, 1.0);
+    edge_b.namespace = "stats-b".to_string();
+
+    store_a.upsert_edge(edge_a).await.unwrap();
+    store_a.upsert_edge(deleted_edge).await.unwrap();
+    store_b.upsert_edge(edge_b).await.unwrap();
+    assert!(store_a
+        .delete_edge(deleted_edge_id, DeleteMode::Soft)
+        .await
+        .unwrap());
+
+    let per_namespace_total = store_a.count_edges(EdgeFilter::default()).await.unwrap()
+        + store_b.count_edges(EdgeFilter::default()).await.unwrap();
+    let mut per_namespace_relations: HashMap<EdgeRelation, u64> = store_a
+        .count_edges_by_relation()
+        .await
+        .unwrap()
+        .into_iter()
+        .collect();
+    for (relation, count) in store_b.count_edges_by_relation().await.unwrap() {
+        *per_namespace_relations.entry(relation).or_insert(0) += count;
+    }
+    let namespaces = vec!["stats-a".to_string(), "stats-b".to_string()];
+
+    assert_eq!(
+        store_a
+            .count_edges_in_namespaces(&namespaces, EdgeFilter::default())
+            .await
+            .unwrap(),
+        per_namespace_total
+    );
+    assert_eq!(per_namespace_total, 2);
+    assert_eq!(
+        store_a
+            .count_edges_by_relation_in_namespaces(&namespaces)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect::<HashMap<_, _>>(),
+        per_namespace_relations
+    );
+}
+
 // `#[serial(neighbor_select_count)]`: shares the key with the tests that
 // assert on the process-wide `NEIGHBOR_SELECT_COUNT` so a concurrent
 // `neighbors()` call from this test can't corrupt their count.

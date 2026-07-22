@@ -76,10 +76,44 @@ pub trait GraphStore: Send + Sync + 'static {
     ) -> StorageResult<Page<Edge>>;
     /// Count edges matching the given filter.
     async fn count_edges(&self, filter: EdgeFilter) -> StorageResult<u64>;
+    /// Count edges across the given namespaces in one aggregate query.
+    /// Backends without batched namespace support retain the single-namespace
+    /// path and reject multi-namespace requests explicitly.
+    async fn count_edges_in_namespaces(
+        &self,
+        namespaces: &[String],
+        filter: EdgeFilter,
+    ) -> StorageResult<u64> {
+        match namespaces.len() {
+            0 => Ok(0),
+            1 => self.count_edges(filter).await,
+            _ => Err(StorageError::Unsupported {
+                capability: StorageCapability::Graph,
+                operation: "count_edges_in_namespaces".into(),
+                message: "this backend does not implement batched namespace edge counts".into(),
+            }),
+        }
+    }
     /// Count edges grouped by relation, ignoring soft-deleted rows. Cheap
     /// aggregate (`GROUP BY relation`) used to report the true per-relation
     /// population for full-graph audits (#702.3).
     async fn count_edges_by_relation(&self) -> StorageResult<Vec<(EdgeRelation, u64)>>;
+    /// Count edges grouped by relation across the given namespaces in one
+    /// aggregate query.
+    async fn count_edges_by_relation_in_namespaces(
+        &self,
+        namespaces: &[String],
+    ) -> StorageResult<Vec<(EdgeRelation, u64)>> {
+        match namespaces.len() {
+            0 => Ok(Vec::new()),
+            1 => self.count_edges_by_relation().await,
+            _ => Err(StorageError::Unsupported {
+                capability: StorageCapability::Graph,
+                operation: "count_edges_by_relation_in_namespaces".into(),
+                message: "this backend does not implement batched namespace relation counts".into(),
+            }),
+        }
+    }
     /// Seek-pagination page of edges ordered by `id` ascending, using an
     /// indexed range scan (`id > after`) against the `(namespace, id)`
     /// primary key instead of `OFFSET`. `after` is exclusive; `None` starts

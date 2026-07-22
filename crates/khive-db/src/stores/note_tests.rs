@@ -111,6 +111,36 @@ async fn test_namespace_isolation() {
     assert_eq!(count_ns2, 1);
 }
 
+#[tokio::test]
+async fn batched_namespace_note_count_matches_per_namespace_counts() {
+    let store = setup_memory_store();
+    let live_a = make_note("stats-a", "observation", "live-a");
+    let deleted_a = make_note("stats-a", "observation", "deleted-a");
+    let deleted_a_id = deleted_a.id;
+    let live_b = make_note("stats-b", "insight", "live-b");
+
+    store.upsert_note(live_a).await.unwrap();
+    store.upsert_note(deleted_a).await.unwrap();
+    store.upsert_note(live_b).await.unwrap();
+    assert!(store
+        .delete_note(deleted_a_id, DeleteMode::Soft)
+        .await
+        .unwrap());
+
+    let per_namespace_total = store.count_notes("stats-a", None).await.unwrap()
+        + store.count_notes("stats-b", None).await.unwrap();
+    let namespaces = vec!["stats-a".to_string(), "stats-b".to_string()];
+
+    assert_eq!(
+        store
+            .count_notes_in_namespaces(&namespaces, None)
+            .await
+            .unwrap(),
+        per_namespace_total
+    );
+    assert_eq!(per_namespace_total, 2);
+}
+
 /// query_notes and count_notes use the namespace parameter as passed.
 #[tokio::test]
 async fn test_query_and_count_use_caller_namespace() {

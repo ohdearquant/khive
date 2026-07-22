@@ -471,6 +471,34 @@ fn build_note_where(
     (clause, params)
 }
 
+fn build_note_where_for_namespaces(
+    namespaces: &[String],
+    kind: Option<&str>,
+) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = namespaces
+        .iter()
+        .map(|namespace| -> Box<dyn rusqlite::types::ToSql> { Box::new(namespace.clone()) })
+        .collect();
+    let namespace_condition = match namespaces.len() {
+        0 => "0".to_string(),
+        1 => "namespace = ?1".to_string(),
+        _ => {
+            let placeholders: Vec<String> =
+                (1..=namespaces.len()).map(|i| format!("?{i}")).collect();
+            format!("namespace IN ({})", placeholders.join(", "))
+        }
+    };
+    let mut conditions = vec![namespace_condition, "deleted_at IS NULL".to_string()];
+
+    if let Some(kind) = kind {
+        params.push(Box::new(kind.to_string()));
+        conditions.push(format!("kind = ?{}", params.len()));
+    }
+
+    let clause = format!(" WHERE {}", conditions.join(" AND "));
+    (clause, params)
+}
+
 /// Validate that a json_path is safe to interpolate into SQL.
 /// Accepts only `$.field` or `$.field.subfield` paths with alphanumeric/underscore segments.
 fn validate_json_path(path: &str) -> Result<(), StorageError> {
@@ -1072,6 +1100,26 @@ impl NoteStore for SqlNoteStore {
         self.with_reader("count_notes", move |conn| {
             let (where_sql, params) = build_note_where(&namespace, kind.as_deref());
             let sql = format!("SELECT COUNT(*) FROM notes{}", where_sql);
+            let mut stmt = conn.prepare(&sql)?;
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|p| p.as_ref()).collect();
+            let count: i64 = stmt.query_row(param_refs.as_slice(), |row| row.get(0))?;
+            Ok(count as u64)
+        })
+        .await
+    }
+
+    async fn count_notes_in_namespaces(
+        &self,
+        namespaces: &[String],
+        kind: Option<&str>,
+    ) -> Result<u64, StorageError> {
+        let namespaces = namespaces.to_vec();
+        let kind = kind.map(str::to_string);
+
+        self.with_reader("count_notes_in_namespaces", move |conn| {
+            let (where_sql, params) = build_note_where_for_namespaces(&namespaces, kind.as_deref());
+            let sql = format!("SELECT COUNT(*) FROM notes{where_sql}");
             let mut stmt = conn.prepare(&sql)?;
             let param_refs: Vec<&dyn rusqlite::types::ToSql> =
                 params.iter().map(|p| p.as_ref()).collect();
