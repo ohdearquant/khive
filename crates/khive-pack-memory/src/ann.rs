@@ -14,7 +14,8 @@ use khive_storage::types::{SqlStatement, SqlValue};
 use khive_storage::StorageError;
 use khive_vamana::{
     read_commit_fingerprint, read_commit_info, read_external_ids_sidecar, segment_commit_digest,
-    write_external_ids_sidecar, CorpusFingerprint, VamanaConfig, VamanaIndex,
+    write_external_ids_sidecar, CorpusFingerprint, ExternalIdsWriteError, VamanaConfig,
+    VamanaIndex,
 };
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
@@ -50,6 +51,38 @@ pub(crate) struct AnnBridge {
     pub(crate) generation: u64,
     /// Durable corpus epoch observed at build or snapshot load time.
     pub(crate) epoch_baseline: u64,
+}
+
+#[derive(Debug)]
+pub(crate) enum AnnSaveError {
+    SegmentSave(String),
+    TornCommitRecord { cause: String },
+    TornSegmentSidecarPair { source: ExternalIdsWriteError },
+}
+
+impl std::fmt::Display for AnnSaveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SegmentSave(message) => f.write_str(message),
+            Self::TornCommitRecord { cause } => write!(
+                f,
+                "torn Vamana commit state after segment save: {cause}; recovery: remove the segment directory and rebuild from the corpus"
+            ),
+            Self::TornSegmentSidecarPair { source } => write!(
+                f,
+                "torn segment/sidecar pair after the Vamana segment commit: {source}; recovery: remove the segment directory and rebuild from the corpus"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AnnSaveError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::TornSegmentSidecarPair { source } => Some(source),
+            Self::SegmentSave(_) | Self::TornCommitRecord { .. } => None,
+        }
+    }
 }
 
 /// Shared model-index cache with single-flight and freshness coordination.
@@ -450,28 +483,32 @@ impl AnnBridge {
         Ok(())
     }
 
-    /// Save this bridge to `dir` atomically: v2 Vamana segments (the commit
-    /// record is the gate), then the id-map sidecar bound to the blake3 digest
-    /// of the just-committed record. A crash between the two writes leaves the
-    /// sidecar's stored digest mismatched against the on-disk commit record,
-    /// which `load` detects as a torn pair.
-    pub(crate) fn save_atomic(&self, dir: &std::path::Path) -> Result<(), String> {
+    /// Save this bridge to `dir`: v2 Vamana segments (the commit record is the
+    /// gate), then the id-map sidecar bound to the blake3 digest of the
+    /// just-committed record. The segment promotion belongs to `khive-vamana`,
+    /// so the bridge cannot stage its sidecar inside that commit; a sidecar
+    /// failure after promotion returns [`AnnSaveError::TornSegmentSidecarPair`]
+    /// with the recovery action. `load` detects the same state after a crash.
+    pub(crate) fn save_atomic(&self, dir: &std::path::Path) -> Result<(), AnnSaveError> {
         let count = self.id_map.len();
         if count != self.index.num_vectors() {
-            return Err(format!(
+            return Err(AnnSaveError::SegmentSave(format!(
                 "id_map length {count} != index.num_vectors() {}",
                 self.index.num_vectors()
-            ));
+            )));
         }
         self.index
             .save_atomic(dir)
-            .map_err(|e| format!("VamanaIndex::save_atomic: {e}"))?;
+            .map_err(|e| AnnSaveError::SegmentSave(format!("VamanaIndex::save_atomic: {e}")))?;
         let digest = segment_commit_digest(dir)
-            .map_err(|e| format!("segment_commit_digest after save: {e}"))?
-            .ok_or_else(|| {
-                "save_atomic succeeded but metadata.bin is absent (torn commit)".to_string()
+            .map_err(|e| AnnSaveError::TornCommitRecord {
+                cause: format!("segment_commit_digest after save: {e}"),
+            })?
+            .ok_or_else(|| AnnSaveError::TornCommitRecord {
+                cause: "save_atomic succeeded but metadata.bin is absent".to_string(),
             })?;
         write_external_ids_sidecar(dir, &digest, &self.id_map)
+            .map_err(|source| AnnSaveError::TornSegmentSidecarPair { source })
     }
 
     /// Load a bridge from a segment directory written by `save_atomic`. Any
@@ -2340,6 +2377,43 @@ mod tests {
         // query with wrong dimension (2 instead of 3)
         let result = bridge.search(&[1.0, 0.0], 1);
         assert!(result.is_err(), "wrong dimension must return Err");
+    }
+
+    #[test]
+    fn ann_bridge_save_atomic_sidecar_failure_reports_recoverable_torn_state() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let bridge_a = AnnBridge::build(
+            vec![1.0f32, 0.0, 0.0, 0.0],
+            4,
+            vec![Uuid::new_v4()],
+            HashSet::new(),
+        )
+        .expect("build bridge A");
+        bridge_a.save_atomic(dir.path()).expect("save bridge A");
+
+        std::fs::create_dir(dir.path().join("external_ids.bin.tmp"))
+            .expect("block sidecar tmp creation");
+        let bridge_b = AnnBridge::build(
+            vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            4,
+            vec![Uuid::new_v4(), Uuid::new_v4()],
+            HashSet::new(),
+        )
+        .expect("build bridge B");
+        let err = bridge_b
+            .save_atomic(dir.path())
+            .expect_err("sidecar failure after segment commit must surface");
+        assert!(matches!(&err, AnnSaveError::TornSegmentSidecarPair { .. }));
+        let message = err.to_string();
+
+        assert!(
+            message.contains("torn segment/sidecar pair"),
+            "got: {message}"
+        );
+        assert!(
+            message.contains("remove the segment directory and rebuild from the corpus"),
+            "got: {message}"
+        );
     }
 
     /// #1150 regression: a tombstoned ordinal's stale id-map entry must not

@@ -22,6 +22,41 @@ use uuid::Uuid;
 const SIDECAR_MAGIC: &[u8; 8] = b"KHVANID2";
 const HEADER_LEN: usize = 8 + 32 + 32 + 8;
 
+/// Fail-closed errors from an external-id sidecar write.
+#[derive(Debug, thiserror::Error)]
+pub enum ExternalIdsWriteError {
+    #[error("{context}: {source}")]
+    Io {
+        context: String,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("{context}: {detail}")]
+    InvalidPath {
+        context: &'static str,
+        detail: String,
+    },
+
+    #[error("open segment dir: path identity changed during canonicalization")]
+    DirectoryIdentityChanged,
+
+    #[error(
+        "secure external-id sidecar writes are unsupported on {platform}: no no-follow, handle-relative directory operations are available; refusing write"
+    )]
+    UnsupportedPlatform { platform: &'static str },
+}
+
+impl ExternalIdsWriteError {
+    #[cfg(unix)]
+    fn io(context: impl Into<String>, source: std::io::Error) -> Self {
+        Self::Io {
+            context: context.into(),
+            source,
+        }
+    }
+}
+
 /// Blake3 digest of `dir/metadata.bin` — the identity of one specific segment
 /// commit. `Ok(None)` when the file is absent (no committed segment).
 pub fn segment_commit_digest(dir: &std::path::Path) -> Result<Option<[u8; 32]>, String> {
@@ -33,16 +68,17 @@ pub fn segment_commit_digest(dir: &std::path::Path) -> Result<Option<[u8; 32]>, 
 }
 
 /// Write `ids` to `dir/external_ids.bin` using a tmp-then-rename pattern,
-/// bound to the commit record identified by `commit_digest`. On unix every
-/// segment-directory path component is opened without following symlinks,
-/// then every filesystem step runs relative to the resulting descriptor.
-/// A symlink planted at an ancestor, the segment dir, the tmp path, or the
-/// final path cannot redirect the write.
+/// bound to the commit record identified by `commit_digest`. On unix the
+/// segment directory is canonicalized, every canonical path component is
+/// opened without following symlinks, and every filesystem step runs relative
+/// to the resulting descriptor. Legitimate symlinked ancestors are accepted,
+/// while a symlink planted at the segment dir, tmp path, or final path cannot
+/// redirect the write.
 pub fn write_external_ids_sidecar(
     dir: &std::path::Path,
     commit_digest: &[u8; 32],
     ids: &[Uuid],
-) -> Result<(), String> {
+) -> Result<(), ExternalIdsWriteError> {
     let mut id_bytes: Vec<u8> = Vec::with_capacity(ids.len() * 16);
     for id in ids {
         id_bytes.extend_from_slice(id.as_bytes());
@@ -62,17 +98,21 @@ pub fn write_external_ids_sidecar(
 
 /// All sidecar filesystem operations run relative to a directory descriptor
 /// pinned BEFORE any byte is written (mirrors `khive-db`'s `walpin` sidecar
-/// write idiom). Each named directory component is opened `O_NOFOLLOW`, so
-/// symlinked ancestors and segment-dir paths refuse before the tmp file
-/// exists; the tmp entry is unlinked (`unlinkat` never follows) and re-created
-/// `O_EXCL | O_NOFOLLOW` relative to that descriptor, so a symlink planted at
-/// the tmp path cannot redirect the write either.
+/// write idiom). Canonicalization admits legitimate symlinked ancestors; each
+/// canonical component is then opened `O_NOFOLLOW`, and the caller's original
+/// final component is independently opened `O_NOFOLLOW` and identity-checked
+/// before the tmp file exists. The tmp entry is unlinked (`unlinkat` never
+/// follows) and re-created `O_EXCL | O_NOFOLLOW` relative to that descriptor,
+/// so a symlink planted at the tmp path cannot redirect the write either.
 #[cfg(unix)]
-fn write_via_dirfd(dir: &std::path::Path, buf: &[u8]) -> Result<(), String> {
+fn write_via_dirfd(dir: &std::path::Path, buf: &[u8]) -> Result<(), ExternalIdsWriteError> {
     use std::io::Write as _;
     use std::os::unix::io::{AsRawFd as _, FromRawFd as _};
 
-    let dir_file = open_dir_without_symlinks(dir)?;
+    let canonical_dir = std::fs::canonicalize(dir)
+        .map_err(|e| ExternalIdsWriteError::io("canonicalize segment dir", e))?;
+    let dir_file = open_dir_without_symlinks(&canonical_dir)?;
+    verify_original_dir_identity(dir, &dir_file)?;
     let dir_fd = dir_file.as_raw_fd();
 
     const TMP_NAME: &std::ffi::CStr = c"external_ids.bin.tmp";
@@ -83,7 +123,10 @@ fn write_via_dirfd(dir: &std::path::Path, buf: &[u8]) -> Result<(), String> {
     if rc != 0 {
         let err = std::io::Error::last_os_error();
         if err.raw_os_error() != Some(libc::ENOENT) {
-            return Err(format!("remove stale external_ids.bin.tmp: {err}"));
+            return Err(ExternalIdsWriteError::io(
+                "remove stale external_ids.bin.tmp",
+                err,
+            ));
         }
     }
 
@@ -98,18 +141,18 @@ fn write_via_dirfd(dir: &std::path::Path, buf: &[u8]) -> Result<(), String> {
         )
     };
     if tmp_fd < 0 {
-        return Err(format!(
-            "create external_ids.bin.tmp: {}",
-            std::io::Error::last_os_error()
+        return Err(ExternalIdsWriteError::io(
+            "create external_ids.bin.tmp",
+            std::io::Error::last_os_error(),
         ));
     }
     // SAFETY: `tmp_fd` was just returned by the successful `openat` above and
     // is uniquely owned by this `File`, which closes it exactly once on drop.
     let mut f = unsafe { std::fs::File::from_raw_fd(tmp_fd) };
     f.write_all(buf)
-        .map_err(|e| format!("write external_ids.bin.tmp: {e}"))?;
+        .map_err(|e| ExternalIdsWriteError::io("write external_ids.bin.tmp", e))?;
     f.sync_all()
-        .map_err(|e| format!("sync external_ids.bin.tmp: {e}"))?;
+        .map_err(|e| ExternalIdsWriteError::io("sync external_ids.bin.tmp", e))?;
     drop(f);
 
     // SAFETY: both names are NUL-terminated C strings; `dir_fd` is a live,
@@ -124,24 +167,74 @@ fn write_via_dirfd(dir: &std::path::Path, buf: &[u8]) -> Result<(), String> {
         )
     };
     if rc != 0 {
-        return Err(format!(
-            "rename external_ids.bin.tmp -> external_ids.bin: {}",
-            std::io::Error::last_os_error()
+        return Err(ExternalIdsWriteError::io(
+            "rename external_ids.bin.tmp -> external_ids.bin",
+            std::io::Error::last_os_error(),
         ));
     }
 
     dir_file
         .sync_all()
-        .map_err(|e| format!("sync segment dir: {e}"))
+        .map_err(|e| ExternalIdsWriteError::io("sync segment dir", e))
 }
 
 #[cfg(unix)]
-fn open_dir_without_symlinks(dir: &std::path::Path) -> Result<std::fs::File, String> {
+fn verify_original_dir_identity(
+    dir: &std::path::Path,
+    canonical_dir: &std::fs::File,
+) -> Result<(), ExternalIdsWriteError> {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::MetadataExt as _;
+    use std::os::unix::io::FromRawFd as _;
+
+    let c_dir = std::ffi::CString::new(dir.as_os_str().as_bytes()).map_err(|e| {
+        ExternalIdsWriteError::InvalidPath {
+            context: "segment dir path",
+            detail: e.to_string(),
+        }
+    })?;
+    // SAFETY: `c_dir` is NUL-terminated for the call; the returned fd is
+    // uniquely owned and wrapped immediately below.
+    let original_fd = unsafe {
+        libc::open(
+            c_dir.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if original_fd < 0 {
+        return Err(ExternalIdsWriteError::io(
+            "open original segment dir without following final component",
+            std::io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: `original_fd` was returned by the successful `open` above and
+    // is uniquely owned by this `File`.
+    let original_dir = unsafe { std::fs::File::from_raw_fd(original_fd) };
+    let original_meta = original_dir
+        .metadata()
+        .map_err(|e| ExternalIdsWriteError::io("stat original segment dir", e))?;
+    let canonical_meta = canonical_dir
+        .metadata()
+        .map_err(|e| ExternalIdsWriteError::io("stat canonical segment dir", e))?;
+    if original_meta.dev() != canonical_meta.dev() || original_meta.ino() != canonical_meta.ino() {
+        return Err(ExternalIdsWriteError::DirectoryIdentityChanged);
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_dir_without_symlinks(
+    dir: &std::path::Path,
+) -> Result<std::fs::File, ExternalIdsWriteError> {
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::io::{AsRawFd as _, FromRawFd as _};
 
     if dir.as_os_str().is_empty() {
-        return Err("open segment dir: empty path".into());
+        return Err(ExternalIdsWriteError::InvalidPath {
+            context: "open segment dir",
+            detail: "empty path".into(),
+        });
     }
 
     let start = if dir.is_absolute() { c"/" } else { c"." };
@@ -154,9 +247,9 @@ fn open_dir_without_symlinks(dir: &std::path::Path) -> Result<std::fs::File, Str
         )
     };
     if start_fd < 0 {
-        return Err(format!(
-            "open segment dir root: {}",
-            std::io::Error::last_os_error()
+        return Err(ExternalIdsWriteError::io(
+            "open segment dir root",
+            std::io::Error::last_os_error(),
         ));
     }
     // SAFETY: `start_fd` was returned by the successful `open` above and is
@@ -167,11 +260,18 @@ fn open_dir_without_symlinks(dir: &std::path::Path) -> Result<std::fs::File, Str
         let name = match component {
             std::path::Component::RootDir | std::path::Component::CurDir => continue,
             std::path::Component::ParentDir | std::path::Component::Normal(_) => {
-                std::ffi::CString::new(component.as_os_str().as_bytes())
-                    .map_err(|e| format!("segment dir path component: {e}"))?
+                std::ffi::CString::new(component.as_os_str().as_bytes()).map_err(|e| {
+                    ExternalIdsWriteError::InvalidPath {
+                        context: "segment dir path component",
+                        detail: e.to_string(),
+                    }
+                })?
             }
             std::path::Component::Prefix(_) => {
-                return Err("open segment dir: unsupported path prefix".into());
+                return Err(ExternalIdsWriteError::InvalidPath {
+                    context: "open segment dir",
+                    detail: "unsupported path prefix".into(),
+                });
             }
         };
 
@@ -185,10 +285,9 @@ fn open_dir_without_symlinks(dir: &std::path::Path) -> Result<std::fs::File, Str
             )
         };
         if next_fd < 0 {
-            return Err(format!(
-                "open segment dir component {:?}: {}",
-                component.as_os_str(),
-                std::io::Error::last_os_error()
+            return Err(ExternalIdsWriteError::io(
+                format!("open segment dir component {:?}", component.as_os_str()),
+                std::io::Error::last_os_error(),
             ));
         }
         // SAFETY: `next_fd` was returned by the successful `openat` above
@@ -199,33 +298,13 @@ fn open_dir_without_symlinks(dir: &std::path::Path) -> Result<std::fs::File, Str
     Ok(current)
 }
 
-/// Non-unix fallback: exclusive tmp create (no `O_NOFOLLOW` equivalent in
-/// `std` off unix) then a plain path-based rename.
+/// Non-Unix `std` cannot express the no-follow, descriptor-relative unlink,
+/// create, rename, and sync sequence. Refuse before mutating the filesystem.
 #[cfg(not(unix))]
-fn write_via_dirfd(dir: &std::path::Path, buf: &[u8]) -> Result<(), String> {
-    use std::io::Write as _;
-
-    let tmp_path = dir.join("external_ids.bin.tmp");
-    let final_path = dir.join("external_ids.bin");
-
-    match std::fs::remove_file(&tmp_path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(format!("remove stale external_ids.bin.tmp: {e}")),
-    }
-
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp_path)
-        .map_err(|e| format!("create external_ids.bin.tmp: {e}"))?;
-    f.write_all(buf)
-        .map_err(|e| format!("write external_ids.bin.tmp: {e}"))?;
-    f.sync_all()
-        .map_err(|e| format!("sync external_ids.bin.tmp: {e}"))?;
-    drop(f);
-    std::fs::rename(&tmp_path, &final_path)
-        .map_err(|e| format!("rename external_ids.bin.tmp -> external_ids.bin: {e}"))
+fn write_via_dirfd(_dir: &std::path::Path, _buf: &[u8]) -> Result<(), ExternalIdsWriteError> {
+    Err(ExternalIdsWriteError::UnsupportedPlatform {
+        platform: std::env::consts::OS,
+    })
 }
 
 /// Read `dir/external_ids.bin` and return `(commit_digest, ids)`.
@@ -387,7 +466,7 @@ mod tests {
         let ids: Vec<Uuid> = (0..2).map(|_| Uuid::new_v4()).collect();
         let err = write_external_ids_sidecar(&dir_link, &digest, &ids)
             .expect_err("a symlinked segment dir must refuse before any byte is written");
-        assert!(err.contains("open segment dir"), "got: {err}");
+        assert!(err.to_string().contains("segment dir"), "got: {err}");
 
         assert!(
             !victim_dir.path().join("external_ids.bin.tmp").exists()
@@ -398,7 +477,7 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn write_external_ids_sidecar_refuses_symlinked_ancestor() {
+    fn write_external_ids_sidecar_accepts_symlinked_ancestor() {
         let real_parent = tempdir();
         let real_segment = real_parent.path().join("segment");
         std::fs::create_dir(&real_segment).expect("create real segment dir");
@@ -410,15 +489,13 @@ mod tests {
 
         let digest = [5u8; 32];
         let ids: Vec<Uuid> = (0..2).map(|_| Uuid::new_v4()).collect();
-        let err = write_external_ids_sidecar(&via_ancestor, &digest, &ids)
-            .expect_err("a symlinked ancestor must refuse before any byte is written");
-        assert!(err.contains("open segment dir"), "got: {err}");
+        write_external_ids_sidecar(&via_ancestor, &digest, &ids)
+            .expect("a legitimate symlinked ancestor must be canonicalized");
 
-        assert!(
-            !real_segment.join("external_ids.bin.tmp").exists()
-                && !real_segment.join("external_ids.bin").exists(),
-            "nothing may be written through the ancestor symlink"
-        );
+        let (read_digest, read_ids) =
+            read_external_ids_sidecar(&real_segment).expect("sidecar lands in canonical dir");
+        assert_eq!(read_digest, digest);
+        assert_eq!(read_ids, ids);
     }
 
     #[test]
