@@ -458,8 +458,8 @@ fn accepted_pack_relations_for_pattern_entities(
 /// parallel table — issue #543 precedent, applied to GQL query-pattern hint
 /// derivation (issue #593).
 ///
-/// Pack rules are skipped for `crate::pack::SPECIAL_RELATIONS` (supersedes /
-/// supports / refutes): the live validator's special-relation branch
+/// Pack rules are skipped when `crate::pack::is_special_relation` is true
+/// (supersedes / supports / refutes): the live validator's special-relation branch
 /// (`validate_edge_relation_endpoints`, this file) resolves those relations
 /// before `pack_rule_allows` is ever reached, so a pack `EDGE_RULES` entry for
 /// one of them is never actually enforced (see `pack.rs`'s
@@ -472,7 +472,7 @@ fn accepted_entity_kind_pairs_for_relation(
     for src in khive_types::EntityKind::ALL {
         for tgt in khive_types::EntityKind::ALL {
             let allowed = base_entity_rule_allows(src.name(), relation, tgt.name())
-                || (!crate::pack::SPECIAL_RELATIONS.contains(&relation)
+                || (!crate::pack::is_special_relation(relation)
                     && accepted_pack_relations_for_pattern_entities(
                         pack_rules,
                         src.name(),
@@ -504,10 +504,15 @@ fn accepted_entity_kind_pairs_for_relation(
 /// `supports` / `refutes` (see [`accepted_entity_kind_pairs_for_relation`]):
 /// pack rules never make those triples possible, only the base allowlist does.
 fn static_impossible_edge_pattern_warnings(
+    language: khive_query::QueryLanguage,
     pattern: &khive_query::ast::MatchPattern,
     pack_rules: &[EdgeEndpointRule],
 ) -> Vec<String> {
     use khive_query::ast::{EdgeDirection, PatternElement};
+
+    if language != khive_query::QueryLanguage::Gql {
+        return Vec::new();
+    }
 
     let elements = &pattern.elements;
     let mut warnings = Vec::new();
@@ -543,7 +548,7 @@ fn static_impossible_edge_pattern_warnings(
         };
 
         let possible = base_entity_rule_allows(src_kind.name(), relation, tgt_kind.name())
-            || (!crate::pack::SPECIAL_RELATIONS.contains(&relation)
+            || (!crate::pack::is_special_relation(relation)
                 && accepted_pack_relations_for_pattern_entities(
                     pack_rules,
                     src_kind.name(),
@@ -1605,10 +1610,7 @@ impl KhiveRuntime {
                     "link target {target_id} not found"
                 )));
             }
-        } else if matches!(
-            relation,
-            EdgeRelation::Supersedes | EdgeRelation::Supports | EdgeRelation::Refutes
-        ) {
+        } else if crate::pack::is_special_relation(relation) {
             // supersedes / supports / refutes: same-substrate only (note→note or entity→entity).
             // Event and edge endpoints are invalid regardless of the other endpoint.
             // Endpoint resolution is by-ID and namespace-agnostic.
@@ -1817,10 +1819,7 @@ impl KhiveRuntime {
             return Ok(());
         }
 
-        if matches!(
-            relation,
-            EdgeRelation::Supersedes | EdgeRelation::Supports | EdgeRelation::Refutes
-        ) {
+        if crate::pack::is_special_relation(relation) {
             let rel_name = relation.as_str();
             let src = src.ok_or_else(|| {
                 RuntimeError::NotFound(format!("link source {source_id} not found"))
@@ -4198,7 +4197,7 @@ impl KhiveRuntime {
         use khive_query::QueryValue;
         use khive_storage::types::SqlValue;
 
-        let ast = khive_query::parse_auto(query)?;
+        let (language, ast) = khive_query::language::parse_auto_with_language(query)?;
         opts.scopes = token
             .visible_namespaces()
             .iter()
@@ -4208,23 +4207,9 @@ impl KhiveRuntime {
         let mut warnings = compiled.warnings;
         let truncation_check = compiled.truncation_check;
 
-        // Static schema-mismatch hint (issue #593): GQL-only by design — the
-        // hint is worded around GQL's `(kind)-[:relation]->(kind)` syntax, so
-        // it is scoped out of SPARQL even though SPARQL compiles to the same
-        // `MatchPattern` shape. Dialect is detected the same way `parse_auto`
-        // selects it, since neither the AST nor `CompiledQuery` retains it.
-        let is_sparql = query
-            .trim()
-            .as_bytes()
-            .get(..6)
-            .is_some_and(|p| p.eq_ignore_ascii_case(b"SELECT"));
-        if !is_sparql {
-            let pack_rules = self.pack_edge_rules();
-            warnings.extend(static_impossible_edge_pattern_warnings(
-                &ast.pattern,
-                &pack_rules,
-            ));
-        }
+        warnings.extend(self.with_pack_edge_rules(|pack_rules| {
+            static_impossible_edge_pattern_warnings(language, &ast.pattern, pack_rules)
+        }));
 
         // Convert QueryValue params (query-layer type) to SqlValue (storage-layer type)
         // at the query–storage boundary.

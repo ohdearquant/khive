@@ -34,24 +34,27 @@ pub fn parse(language: QueryLanguage, input: &str) -> Result<GqlQuery, QueryErro
 /// Returns [`QueryError`] when syntax is invalid, write-shaped, or unsupported.
 /// See `crates/khive-query/docs/api/parsing.md` for detection and guard behavior.
 pub fn parse_auto(input: &str) -> Result<GqlQuery, QueryError> {
+    parse_auto_with_language(input).map(|(_, query)| query)
+}
+
+/// Auto-detects and parses `input`, retaining the selected query language.
+///
+/// # Errors
+///
+/// Returns [`QueryError`] when syntax is invalid, write-shaped, or unsupported.
+pub fn parse_auto_with_language(input: &str) -> Result<(QueryLanguage, GqlQuery), QueryError> {
     let trimmed = input.trim();
     reject_write(trimmed)?;
-    if trimmed
+    let language = if trimmed
         .as_bytes()
         .get(..6)
         .is_some_and(|p| p.eq_ignore_ascii_case(b"SELECT"))
     {
-        parsers::sparql::parse(trimmed)
-    } else if trimmed
-        .as_bytes()
-        .get(..5)
-        .is_some_and(|p| p.eq_ignore_ascii_case(b"MATCH"))
-    {
-        parsers::gql::parse(trimmed)
+        QueryLanguage::Sparql
     } else {
-        // Preserve compatibility for inputs without a recognized leading keyword.
-        parsers::gql::parse(trimmed)
-    }
+        QueryLanguage::Gql
+    };
+    parse(language, trimmed).map(|query| (language, query))
 }
 
 /// Rejects GQL/Cypher mutations and SPARQL Update before dialect dispatch.
@@ -138,6 +141,16 @@ mod tests {
             !q.pattern.elements.is_empty(),
             "valid SPARQL SELECT must parse"
         );
+    }
+
+    #[test]
+    fn parse_auto_with_language_reports_selected_parser() {
+        let (gql_language, _) = parse_auto_with_language("MATCH (a:concept) RETURN a").unwrap();
+        assert_eq!(gql_language, QueryLanguage::Gql);
+
+        let (sparql_language, _) =
+            parse_auto_with_language("SELECT ?a WHERE { ?a :extends ?b . }").unwrap();
+        assert_eq!(sparql_language, QueryLanguage::Sparql);
     }
 
     #[test]
