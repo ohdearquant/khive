@@ -1,12 +1,11 @@
 //! `merge` verb handler.
 
-use std::collections::HashSet;
-
 use serde_json::Value;
 
-use khive_runtime::{NamespaceToken, RuntimeError, VerbRegistry};
-use khive_storage::Entity;
-use khive_types::{Details, KhiveError};
+use khive_runtime::{
+    entity_merge_guard_error, validate_entity_merge_floor, NamespaceToken, RuntimeError,
+    VerbRegistry,
+};
 
 use super::common::{
     deser, ensure_entity_kind, ensure_note_kind, immutable_event_error, parse_content_strategy,
@@ -14,148 +13,6 @@ use super::common::{
     MergeParams,
 };
 use crate::KgPack;
-
-#[derive(Clone, Copy)]
-enum EntityMergeGuard {
-    EntityKind,
-    NameSimilarity,
-    ProjectCompatibility,
-}
-
-impl EntityMergeGuard {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::EntityKind => "entity_kind",
-            Self::NameSimilarity => "name_similarity",
-            Self::ProjectCompatibility => "project_compatibility",
-        }
-    }
-}
-
-fn merge_guard_error(guard: EntityMergeGuard) -> RuntimeError {
-    RuntimeError::Khive(
-        KhiveError::conflict(format!(
-            "entity merge refused by {} guard; use force=true only when the caller accepts responsibility",
-            guard.as_str()
-        ))
-        .with_details(Details::new([
-            ("guard", guard.as_str()),
-            ("override", "force=true"),
-        ])),
-    )
-}
-
-fn validate_entity_merge_floor(into: &Entity, from: &Entity) -> Result<(), RuntimeError> {
-    if into.kind != from.kind {
-        return Err(merge_guard_error(EntityMergeGuard::EntityKind));
-    }
-    if !names_are_similar(&into.name, &from.name) {
-        return Err(merge_guard_error(EntityMergeGuard::NameSimilarity));
-    }
-    if projects_are_disjoint(into, from) {
-        return Err(merge_guard_error(EntityMergeGuard::ProjectCompatibility));
-    }
-    Ok(())
-}
-
-fn names_are_similar(left: &str, right: &str) -> bool {
-    let left = normalize_name(left);
-    let right = normalize_name(right);
-    if left.is_empty() || right.is_empty() {
-        return false;
-    }
-    if left == right {
-        return true;
-    }
-
-    let shorter_len = left.chars().count().min(right.chars().count());
-    if shorter_len >= 3 && (left.starts_with(&right) || right.starts_with(&left)) {
-        return true;
-    }
-
-    let left_trigrams = trigrams(&left);
-    let right_trigrams = trigrams(&right);
-    if left_trigrams.is_empty() || right_trigrams.is_empty() {
-        return false;
-    }
-    let overlap = left_trigrams.intersection(&right_trigrams).count();
-    overlap.saturating_mul(4) >= left_trigrams.len().saturating_add(right_trigrams.len())
-}
-
-fn normalize_name(name: &str) -> String {
-    let mut normalized = String::with_capacity(name.len());
-    let mut pending_space = false;
-    for ch in name.chars().flat_map(char::to_lowercase) {
-        if ch.is_whitespace() {
-            pending_space = !normalized.is_empty();
-        } else {
-            if pending_space {
-                normalized.push(' ');
-                pending_space = false;
-            }
-            normalized.push(ch);
-        }
-    }
-    normalized
-}
-
-fn trigrams(value: &str) -> HashSet<[char; 3]> {
-    let chars: Vec<char> = value.chars().collect();
-    chars
-        .windows(3)
-        .map(|window| [window[0], window[1], window[2]])
-        .collect()
-}
-
-fn projects_are_disjoint(into: &Entity, from: &Entity) -> bool {
-    let Some(into_projects) = into
-        .properties
-        .as_ref()
-        .and_then(|properties| properties.get("projects"))
-        .and_then(Value::as_array)
-    else {
-        return false;
-    };
-    let Some(from_projects) = from
-        .properties
-        .as_ref()
-        .and_then(|properties| properties.get("projects"))
-        .and_then(Value::as_array)
-    else {
-        return false;
-    };
-    if into_projects.is_empty() || from_projects.is_empty() {
-        return false;
-    }
-
-    // Project arrays are caller-controlled: index the smaller side to bound
-    // memory, scan each side once, and stop at the first match.
-    let (indexed, candidates) = if into_projects.len() <= from_projects.len() {
-        (into_projects, from_projects)
-    } else {
-        (from_projects, into_projects)
-    };
-    let mut indexed_strings = HashSet::new();
-    let mut indexed_values = HashSet::new();
-    for value in indexed {
-        if let Some(value) = value.as_str() {
-            indexed_strings.insert(normalize_project_string(value));
-        } else {
-            indexed_values.insert(value.clone());
-        }
-    }
-    !candidates.iter().any(|candidate| {
-        if let Some(candidate) = candidate.as_str() {
-            indexed_strings.contains(&normalize_project_string(candidate))
-        } else {
-            indexed_values.contains(candidate)
-        }
-    })
-}
-
-fn normalize_project_string(value: &str) -> String {
-    value.trim().to_ascii_lowercase()
-}
 
 impl KgPack {
     pub(crate) async fn handle_merge(
@@ -185,7 +42,8 @@ impl KgPack {
                 let into_entity = self.runtime.get_entity(token, into_id).await?;
                 let from_entity = self.runtime.get_entity(token, from_id).await?;
                 if !force {
-                    validate_entity_merge_floor(&into_entity, &from_entity)?;
+                    validate_entity_merge_floor(&into_entity, &from_entity)
+                        .map_err(entity_merge_guard_error)?;
                 }
                 self.runtime
                     .merge_entity_with_reason_and_force(
