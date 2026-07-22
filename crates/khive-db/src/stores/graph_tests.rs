@@ -239,7 +239,7 @@ async fn test_count_edges() {
 }
 
 #[tokio::test]
-async fn batched_namespace_edge_counts_match_per_namespace_counts() {
+async fn batched_namespace_edge_counts_exceed_sqlite_variable_limit() {
     let config = PoolConfig {
         path: None,
         ..PoolConfig::default()
@@ -280,7 +280,14 @@ async fn batched_namespace_edge_counts_match_per_namespace_counts() {
     for (relation, count) in store_b.count_edges_by_relation().await.unwrap() {
         *per_namespace_relations.entry(relation).or_insert(0) += count;
     }
-    let namespaces = vec!["stats-a".to_string(), "stats-b".to_string()];
+    pool.writer()
+        .unwrap()
+        .conn()
+        .set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_VARIABLE_NUMBER, 999)
+        .unwrap();
+    let mut namespaces = vec!["stats-a".to_string(), "stats-b".to_string()];
+    namespaces.extend((0..999).map(|i| format!("empty-{i}")));
+    assert_eq!(namespaces.len(), 1_001);
 
     assert_eq!(
         store_a

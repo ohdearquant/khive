@@ -112,8 +112,9 @@ async fn test_namespace_isolation() {
 }
 
 #[tokio::test]
-async fn batched_namespace_note_count_matches_per_namespace_counts() {
-    let store = setup_memory_store();
+async fn batched_namespace_note_count_exceeds_sqlite_variable_limit() {
+    let pool = setup_pool();
+    let store = SqlNoteStore::new(Arc::clone(&pool), false);
     let live_a = make_note("stats-a", "observation", "live-a");
     let deleted_a = make_note("stats-a", "observation", "deleted-a");
     let deleted_a_id = deleted_a.id;
@@ -129,7 +130,14 @@ async fn batched_namespace_note_count_matches_per_namespace_counts() {
 
     let per_namespace_total = store.count_notes("stats-a", None).await.unwrap()
         + store.count_notes("stats-b", None).await.unwrap();
-    let namespaces = vec!["stats-a".to_string(), "stats-b".to_string()];
+    pool.writer()
+        .unwrap()
+        .conn()
+        .set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_VARIABLE_NUMBER, 999)
+        .unwrap();
+    let mut namespaces = vec!["stats-a".to_string(), "stats-b".to_string()];
+    namespaces.extend((0..999).map(|i| format!("empty-{i}")));
+    assert_eq!(namespaces.len(), 1_001);
 
     assert_eq!(
         store
@@ -137,6 +145,13 @@ async fn batched_namespace_note_count_matches_per_namespace_counts() {
             .await
             .unwrap(),
         per_namespace_total
+    );
+    assert_eq!(
+        store
+            .count_notes_in_namespaces(&namespaces, Some("observation"))
+            .await
+            .unwrap(),
+        1
     );
     assert_eq!(per_namespace_total, 2);
 }

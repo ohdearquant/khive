@@ -33,6 +33,8 @@ fn map_sqlite_err(e: SqliteError, op: &'static str) -> StorageError {
     StorageError::driver(StorageCapability::Graph, op, e)
 }
 
+const NAMESPACE_COUNT_CHUNK_SIZE: usize = 500;
+
 // ---------------------------------------------------------------------------
 // Pure statement builders (ADR-099 B3 r6 structural cut) — see entity.rs's
 // sibling block for the full rationale. `upsert_edge`/`delete_edge` below and
@@ -1700,13 +1702,17 @@ impl GraphStore for SqlGraphStore {
     ) -> Result<u64, StorageError> {
         let namespaces = namespaces.to_vec();
         self.with_reader("count_edges_in_namespaces", move |conn| {
-            let (where_clause, params) = build_edge_filter_sql_for_namespaces(&namespaces, &filter);
-            let sql = format!("SELECT COUNT(*) FROM graph_edges{where_clause}");
-            let mut stmt = conn.prepare(&sql)?;
-            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                params.iter().map(|p| p.as_ref()).collect();
-            let count: i64 = stmt.query_row(param_refs.as_slice(), |row| row.get(0))?;
-            Ok(count as u64)
+            let mut total = 0;
+            for chunk in namespaces.chunks(NAMESPACE_COUNT_CHUNK_SIZE) {
+                let (where_clause, params) = build_edge_filter_sql_for_namespaces(chunk, &filter);
+                let sql = format!("SELECT COUNT(*) FROM graph_edges{where_clause}");
+                let mut stmt = conn.prepare(&sql)?;
+                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    params.iter().map(|p| p.as_ref()).collect();
+                let count: i64 = stmt.query_row(param_refs.as_slice(), |row| row.get(0))?;
+                total += count as u64;
+            }
+            Ok(total)
         })
         .await
     }
@@ -1746,32 +1752,34 @@ impl GraphStore for SqlGraphStore {
     ) -> Result<Vec<(EdgeRelation, u64)>, StorageError> {
         let namespaces = namespaces.to_vec();
         self.with_reader("count_edges_by_relation_in_namespaces", move |conn| {
-            let (where_clause, params) =
-                build_edge_filter_sql_for_namespaces(&namespaces, &EdgeFilter::default());
-            let sql = format!(
-                "SELECT relation, COUNT(*) FROM graph_edges{where_clause} GROUP BY relation"
-            );
-            let mut stmt = conn.prepare(&sql)?;
-            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                params.iter().map(|p| p.as_ref()).collect();
-            let rows = stmt.query_map(param_refs.as_slice(), |row| {
-                let relation_str: String = row.get(0)?;
-                let count: i64 = row.get(1)?;
-                Ok((relation_str, count))
-            })?;
-            let mut out = Vec::new();
-            for row in rows {
-                let (relation_str, count) = row?;
-                let relation = relation_str.parse::<EdgeRelation>().map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
+            let mut totals = HashMap::new();
+            for chunk in namespaces.chunks(NAMESPACE_COUNT_CHUNK_SIZE) {
+                let (where_clause, params) =
+                    build_edge_filter_sql_for_namespaces(chunk, &EdgeFilter::default());
+                let sql = format!(
+                    "SELECT relation, COUNT(*) FROM graph_edges{where_clause} GROUP BY relation"
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    params.iter().map(|p| p.as_ref()).collect();
+                let rows = stmt.query_map(param_refs.as_slice(), |row| {
+                    let relation_str: String = row.get(0)?;
+                    let count: i64 = row.get(1)?;
+                    Ok((relation_str, count))
                 })?;
-                out.push((relation, count as u64));
+                for row in rows {
+                    let (relation_str, count) = row?;
+                    let relation = relation_str.parse::<EdgeRelation>().map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?;
+                    *totals.entry(relation).or_insert(0) += count as u64;
+                }
             }
-            Ok(out)
+            Ok(totals.into_iter().collect())
         })
         .await
     }

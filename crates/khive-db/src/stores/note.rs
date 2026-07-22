@@ -26,6 +26,8 @@ fn map_sqlite_err(e: SqliteError, op: &'static str) -> StorageError {
     StorageError::driver(StorageCapability::Notes, op, e)
 }
 
+const NAMESPACE_COUNT_CHUNK_SIZE: usize = 500;
+
 // ---------------------------------------------------------------------------
 // Pure statement builders (ADR-099 B3 r6 structural cut) — see entity.rs's
 // sibling block for the full rationale. `upsert_note`/`delete_note` below
@@ -1118,13 +1120,17 @@ impl NoteStore for SqlNoteStore {
         let kind = kind.map(str::to_string);
 
         self.with_reader("count_notes_in_namespaces", move |conn| {
-            let (where_sql, params) = build_note_where_for_namespaces(&namespaces, kind.as_deref());
-            let sql = format!("SELECT COUNT(*) FROM notes{where_sql}");
-            let mut stmt = conn.prepare(&sql)?;
-            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                params.iter().map(|p| p.as_ref()).collect();
-            let count: i64 = stmt.query_row(param_refs.as_slice(), |row| row.get(0))?;
-            Ok(count as u64)
+            let mut total = 0;
+            for chunk in namespaces.chunks(NAMESPACE_COUNT_CHUNK_SIZE) {
+                let (where_sql, params) = build_note_where_for_namespaces(chunk, kind.as_deref());
+                let sql = format!("SELECT COUNT(*) FROM notes{where_sql}");
+                let mut stmt = conn.prepare(&sql)?;
+                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    params.iter().map(|p| p.as_ref()).collect();
+                let count: i64 = stmt.query_row(param_refs.as_slice(), |row| row.get(0))?;
+                total += count as u64;
+            }
+            Ok(total)
         })
         .await
     }
