@@ -267,13 +267,7 @@ fn merge_rewire_endpoint_contract_allows(
     }
     // Same-substrate relations permit any note→note pair unconditionally,
     // matching `validate_edge_relation_endpoints`'s `(Note, Note) => {}` arm.
-    if src_sub == "note"
-        && tgt_sub == "note"
-        && matches!(
-            relation,
-            EdgeRelation::Supersedes | EdgeRelation::Supports | EdgeRelation::Refutes
-        )
-    {
+    if src_sub == "note" && tgt_sub == "note" && crate::pack::is_special_relation(relation) {
         return true;
     }
     if src_sub == "entity"
