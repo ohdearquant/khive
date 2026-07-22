@@ -949,61 +949,37 @@ fn recompute_total_weight(path: &mut GraphPath) {
 /// `join_set` entries are `(model_index, embed_result)` — the index lets
 /// completion order (which is arrival order, not spawn order) be reassembled
 /// into the caller's model order. On the first failure (an embed error or a
-/// task panic), every remaining handle is aborted immediately rather than
-/// awaited to completion, so a fast provider failure no longer waits for
-/// every sibling to run to completion. Aborted handles are still drained
-/// here — `join_next` keeps yielding until the set is empty, including a
-/// cancelled `JoinError` for each aborted task — so no embed task (and the
-/// `UsageContext` clone it holds) is still running once this function
-/// returns.
-///
-/// Precisely what the abort bounds: cancellation takes effect at a task's
-/// next await point. A sibling parked on a provider await (network call,
-/// model load, queue) cancels promptly; a sibling already inside the native
-/// provider's synchronous single-text inference completes that one call
-/// first, because the drain deliberately awaits it rather than detaching —
-/// detaching would let embed work (and its usage accounting) outlive the
-/// operation's response. Failure latency is therefore bounded by at most
-/// one in-flight synchronous inference call per sibling, not by every
-/// sibling's full embed-and-store completion as before.
+/// task panic), every remaining handle is aborted and detached so the error
+/// return is not gated on a sibling reaching a cancellation point. A sibling
+/// already inside synchronous native inference may finish that call in the
+/// background. Embed calls are counted when issued, before the provider
+/// await, so detached completion cannot change the operation's usage count.
 async fn drain_embed_join_set(
     mut join_set: tokio::task::JoinSet<(usize, RuntimeResult<Vec<f32>>)>,
     model_count: usize,
 ) -> RuntimeResult<Vec<Vec<f32>>> {
     let mut vectors: Vec<Option<Vec<f32>>> = (0..model_count).map(|_| None).collect();
-    let mut first_err: Option<RuntimeError> = None;
 
     while let Some(joined) = join_set.join_next().await {
         match joined {
             Ok((idx, Ok(vector))) => vectors[idx] = Some(vector),
             Ok((_idx, Err(e))) => {
-                if first_err.is_none() {
-                    first_err = Some(e);
-                    join_set.abort_all();
-                }
+                join_set.abort_all();
+                return Err(e);
             }
             Err(join_err) => {
-                // A cancelled JoinError is the expected shape for every handle
-                // aborted by the `abort_all()` above; a genuine panic reaching
-                // here before `first_err` is set is itself the triggering
-                // failure.
-                if first_err.is_none() {
-                    first_err = Some(RuntimeError::Internal(format!(
-                        "embed task panicked: {join_err}"
-                    )));
-                    join_set.abort_all();
-                }
+                join_set.abort_all();
+                return Err(RuntimeError::Internal(format!(
+                    "embed task panicked: {join_err}"
+                )));
             }
         }
     }
 
-    match first_err {
-        Some(e) => Err(e),
-        None => Ok(vectors
-            .into_iter()
-            .map(|v| v.expect("every model index observed exactly once by join_set drain"))
-            .collect()),
-    }
+    Ok(vectors
+        .into_iter()
+        .map(|v| v.expect("every model index observed exactly once by join_set drain"))
+        .collect())
 }
 
 impl KhiveRuntime {
@@ -1173,13 +1149,9 @@ impl KhiveRuntime {
                     (idx, result)
                 });
             }
-            // Abort-then-await: the first failed/panicked handle triggers
-            // `abort_all()` on the rest so a slow sibling's embed task no
-            // longer stalls a fast provider failure, then every handle
-            // (including the aborted ones) is still drained to completion —
-            // each holds a clone of the dispatch's UsageContext (ADR-103
-            // Amendment 2), so none may outlive this function: the usage
-            // snapshot must never observe a task the dispatch didn't wait for.
+            // The first failed or panicked handle aborts and detaches its
+            // siblings. Embed usage is counted at dispatch, so a synchronous
+            // provider winding down in the background cannot change it.
             let vectors = match drain_embed_join_set(join_set, embed_model_names.len()).await {
                 Ok(vectors) => vectors,
                 Err(e) => {
@@ -3156,13 +3128,9 @@ impl KhiveRuntime {
                     (idx, result)
                 });
             }
-            // Abort-then-await: the first failed/panicked handle triggers
-            // `abort_all()` on the rest so a slow sibling's embed task no
-            // longer stalls a fast provider failure, then every handle
-            // (including the aborted ones) is still drained to completion —
-            // each holds a clone of the dispatch's UsageContext (ADR-103
-            // Amendment 2), so none may outlive this function: the usage
-            // snapshot must never observe a task the dispatch didn't wait for.
+            // The first failed or panicked handle aborts and detaches its
+            // siblings. Embed usage is counted at dispatch, so a synchronous
+            // provider winding down in the background cannot change it.
             let vectors = match drain_embed_join_set(join_set, embed_model_names.len()).await {
                 Ok(vectors) => vectors,
                 Err(e) => {
@@ -11982,15 +11950,10 @@ mod tests {
         );
     }
 
-    // ADR-103 Amendment 2 regression: when one of several spawned embed tasks
-    // errors, create_entity must drain (await) every remaining handle before
-    // returning — each handle holds a clone of the dispatch's UsageContext, so
-    // an un-awaited handle keeps running and can increment embed_calls after
-    // the response has already gone out, making the counter nondeterministic.
-    // The fail-fast model resolves (with an error) first; the slow model's
-    // task is still in flight at that point — the drain must wait for it too.
+    // Embed calls are counted when issued, so detached completion after a
+    // sibling failure cannot change the response's usage snapshot.
     #[tokio::test]
-    async fn create_entity_multi_model_error_drains_all_spawned_embeds_before_returning() {
+    async fn create_entity_multi_model_error_keeps_issued_usage_stable() {
         const DIMS: usize = 4;
 
         let rt = KhiveRuntime::memory().unwrap();
@@ -12026,16 +11989,15 @@ mod tests {
 
         assert_eq!(
             snap_immediately_after, snap_after_delay,
-            "no spawned embed task may still be running after create_entity returns \
-             its error — a late increment means a context-holding handle was left \
-             un-awaited; got immediately_after={snap_immediately_after:?} \
+            "embed completion after create_entity returns must not change issued \
+             usage; got immediately_after={snap_immediately_after:?} \
              after_delay={snap_after_delay:?}"
         );
     }
 
     // Same regression for the note create path's multi-model embed fan-out.
     #[tokio::test]
-    async fn create_note_multi_model_error_drains_all_spawned_embeds_before_returning() {
+    async fn create_note_multi_model_error_keeps_issued_usage_stable() {
         const DIMS: usize = 4;
 
         let rt = KhiveRuntime::memory().unwrap();
@@ -12071,9 +12033,8 @@ mod tests {
 
         assert_eq!(
             snap_immediately_after, snap_after_delay,
-            "no spawned embed task may still be running after create_note returns \
-             its error — a late increment means a context-holding handle was left \
-             un-awaited; got immediately_after={snap_immediately_after:?} \
+            "embed completion after create_note returns must not change issued \
+             usage; got immediately_after={snap_immediately_after:?} \
              after_delay={snap_after_delay:?}"
         );
     }
@@ -12123,6 +12084,62 @@ mod tests {
             "a fast embed failure must return without waiting on the hung \
              sibling (which parks forever); took {elapsed:?}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn embed_drain_returns_error_while_sibling_is_in_synchronous_section() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let exited = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let mut join_set = tokio::task::JoinSet::new();
+
+        join_set.spawn({
+            let entered = Arc::clone(&entered);
+            let exited = Arc::clone(&exited);
+            let release = Arc::clone(&release);
+            async move {
+                entered.notify_one();
+                let (released, wake) = &*release;
+                let guard = released.lock().expect("release lock must not be poisoned");
+                let _guard = wake
+                    .wait_while(guard, |released| !*released)
+                    .expect("release lock must not be poisoned");
+                exited.notify_one();
+                (0, Ok(vec![1.0_f32]))
+            }
+        });
+        join_set.spawn({
+            let entered = Arc::clone(&entered);
+            async move {
+                entered.notified().await;
+                (
+                    1,
+                    Err(RuntimeError::Internal(
+                        "injected embed failure after sibling entry".into(),
+                    )),
+                )
+            }
+        });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            drain_embed_join_set(join_set, 2),
+        )
+        .await;
+
+        let (released, wake) = &*release;
+        *released.lock().expect("release lock must not be poisoned") = true;
+        wake.notify_all();
+        tokio::time::timeout(std::time::Duration::from_secs(2), exited.notified())
+            .await
+            .expect("blocked sibling must exit after release");
+
+        let error = result
+            .expect("embed failure must return without waiting for the synchronous sibling")
+            .expect_err("one failed embed must fail the drain");
+        assert!(error
+            .to_string()
+            .contains("injected embed failure after sibling entry"));
     }
 
     // Issued-at-dispatch accounting: an embed call that was handed to the
