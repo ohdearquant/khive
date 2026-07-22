@@ -198,6 +198,13 @@ pub struct ExecArgs {
     #[arg(long, env = "KHIVE_DB")]
     pub db: Option<String>,
 
+    /// Path to a khive TOML config file.
+    ///
+    /// Overrides the standard cwd/database/home config discovery order and
+    /// matches `kkernel mcp` and `kkernel reindex` (`KHIVE_CONFIG`).
+    #[arg(long, env = "KHIVE_CONFIG")]
+    pub config: Option<PathBuf>,
+
     /// Namespace to operate in.
     #[arg(long, default_value = "local")]
     pub namespace: String,
@@ -498,9 +505,13 @@ async fn apply_ops_file(
 pub async fn run_exec(args: ExecArgs) -> Result<()> {
     // ── pending-events drain ─────────────────────────────────────────────────
     if args.pending_events {
-        let summary =
-            pending_events::run_pending_events(args.db.as_deref(), &args.namespace, args.verbose)
-                .await?;
+        let summary = pending_events::run_pending_events_with_config(
+            args.db.as_deref(),
+            args.config.as_deref(),
+            &args.namespace,
+            args.verbose,
+        )
+        .await?;
         pending_events::print_summary(&summary);
         return Ok(());
     }
@@ -536,7 +547,7 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
     let (cfg, db_anchor) =
         khive_mcp::serve::resolve_runtime_config_with_db_anchor(RuntimeConfigInputs {
             db: args.db.as_deref(),
-            config: None, // `kkernel exec` has no `--config` flag today
+            config: args.config.as_deref(),
             namespace,
             // `--namespace` has a clap `default_value = "local"`, so it is always
             // present — there is no way to distinguish "operator typed --namespace
@@ -571,6 +582,7 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
     let db_context = ExecDbContext {
         raw: args.db,
         anchor: db_anchor,
+        config: args.config,
     };
 
     match mode {
@@ -635,6 +647,7 @@ enum ExecMode {
 struct ExecDbContext {
     raw: Option<String>,
     anchor: Option<PathBuf>,
+    config: Option<PathBuf>,
 }
 
 async fn run_exec_inline(
@@ -710,8 +723,8 @@ async fn run_exec_inline_with_forward(
     // daemon's own boot path loads (`serve.rs`'s `build_server`:
     // `KhiveConfig::load_with_home_fallback(args.config.as_deref(),
     // config_discovery_db_anchor(args.db.as_deref()).as_deref())` —
-    // `kkernel exec` has no `--config` flag, so the first argument here is
-    // always `None`, exactly like there. The second argument is the raw
+    // The first argument is the same explicit `--config`/`KHIVE_CONFIG`
+    // selection used during initial resolution. The second argument is the raw
     // `--db`/`KHIVE_DB` discovery anchor (`None` unless `--db` was set) rather
     // than `cfg.db_path` — `cfg.db_path` materializes the `$HOME/.khive`
     // default when `--db` is unset (#689), which would incorrectly re-anchor
@@ -726,9 +739,12 @@ async fn run_exec_inline_with_forward(
     // `ConfigMismatch` and silently fell back to the cold in-process path on
     // every call.
     let db_path_for_config = config_discovery_db_anchor(db_context.raw.as_deref());
-    let khive_cfg = KhiveConfig::load_with_home_fallback(None, db_path_for_config.as_deref())
-        .map_err(|e| anyhow::anyhow!("config error: {e}"))?
-        .unwrap_or_default();
+    let khive_cfg = KhiveConfig::load_with_home_fallback(
+        db_context.config.as_deref(),
+        db_path_for_config.as_deref(),
+    )
+    .map_err(|e| anyhow::anyhow!("config error: {e}"))?
+    .unwrap_or_default();
 
     // #1226: apply the same --db/[[backends]] conflict guard the in-process
     // fallback below applies, BEFORE the daemon fast-path — otherwise a warm
@@ -893,9 +909,12 @@ async fn run_exec_ops_file(
     // path — see `build_local_fallback_server`.
     enforce_strict_actor_mode(cfg.actor_id.as_deref(), &cfg.packs)?;
     let db_path_for_config = config_discovery_db_anchor(db_context.raw.as_deref());
-    let khive_cfg = KhiveConfig::load_with_home_fallback(None, db_path_for_config.as_deref())
-        .map_err(|e| anyhow::anyhow!("config error: {e}"))?
-        .unwrap_or_default();
+    let khive_cfg = KhiveConfig::load_with_home_fallback(
+        db_context.config.as_deref(),
+        db_path_for_config.as_deref(),
+    )
+    .map_err(|e| anyhow::anyhow!("config error: {e}"))?
+    .unwrap_or_default();
 
     if atomic {
         let max_ops = atomic_max_ops.unwrap_or(khive_types::pack::ATOMIC_MAX_OPS_DEFAULT);
@@ -2652,6 +2671,7 @@ backend = "sessions"
             ExecDbContext {
                 raw: Some(conflicting_override.display().to_string()),
                 anchor: None,
+                config: None,
             },
             false,
             spy_capture_config_id,

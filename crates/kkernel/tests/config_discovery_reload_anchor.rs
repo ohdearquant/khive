@@ -110,6 +110,7 @@ path = "{}"
         ops: Some("stats()".to_string()),
         pending_events: false,
         db: None, // the repro shape: --db left unset
+        config: None,
         namespace: "local".to_string(),
         presentation: Some("agent".to_string()),
         output_format: None,
