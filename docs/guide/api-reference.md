@@ -593,14 +593,14 @@ request(ops="withdraw(id=\"<proposal-id>\")")
 Resolve natural-language references to ids. Each ref in `refs` is resolved through:
 (1) id-string passthrough (UUID or 8+ hex prefix) via the existing by-ID path; (2) this
 actor's recently-referenced ring; (3) a case-sensitive exact match on `entities.name`;
-(4) hybrid search over the namespace, with semantic-only hits below the server-side `0.3`
-relevance floor discarded. Returns one of
+(4) hybrid search over the namespace, with vector hits below the server-side `0.3` raw
+cosine-similarity floor discarded before RRF fusion. Returns one of
 `Resolved{id,confidence}` | `Ambiguous{candidates}` | `NotFound` per ref — never a
 silent pick among close candidates. Read-only: performs no mutation.
 
 The id-string stage resolves entities only. Note, edge, and event UUIDs or hex prefixes
 return `NotFound` through `resolve` under every `kind`; use `get` when the substrate should
-be auto-detected. The relevance floor removes low-confidence ANN neighbors while preserving
+be auto-detected. The similarity floor removes low-confidence ANN neighbors while preserving
 lexical partial-name matches, whose RRF score encodes rank rather than textual relevance.
 
 | Param   | Type            | Required | Notes                                                                                                           |

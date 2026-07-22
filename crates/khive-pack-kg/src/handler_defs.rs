@@ -863,8 +863,8 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 19] = [
                        deterministically regardless of search rank (one match \
                        -> Resolved; several identically-named entities -> \
                        Ambiguous over exactly that set); (4) hybrid search over \
-                       the namespace, discarding semantic-only hits scored \
-                       below 0.3. Returns one of Resolved{id,confidence} | \
+                       the namespace, discarding vector hits with raw cosine similarity \
+                       below 0.3 before RRF fusion. Returns one of Resolved{id,confidence} | \
                        Ambiguous{candidates} | NotFound per ref — never a silent \
                        pick among close candidates. For a non-exact ref that \
                        stays ambiguous, `candidates` is a bounded sample capped \

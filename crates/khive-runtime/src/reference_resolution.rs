@@ -36,7 +36,6 @@ use khive_storage::EntityFilter;
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::operations::Resolved;
 use crate::reference_ring::ReferenceRing;
-use crate::retrieval::SearchSource;
 use crate::runtime::{KhiveRuntime, NamespaceToken};
 
 /// A candidate id surfaced when a reference did not resolve outright.
@@ -80,10 +79,10 @@ const EXACT_NAME_CONFIDENCE: f64 = 0.98;
 /// best" the way it can for the ring. Below the margin, every hit above the
 /// score floor is surfaced as a candidate instead.
 const SEARCH_MARGIN_RATIO: f64 = 2.0;
-/// Semantic-only hybrid-search hits below this score never enter the candidate
-/// set. Lexical hits remain admissible because RRF magnitude encodes rank, not
-/// textual relevance, and genuine partial-name matches score below this floor.
-const SEARCH_SCORE_FLOOR: f64 = 0.3;
+/// Vector hits below this raw cosine-similarity score are removed before RRF
+/// fusion. Lexical hits remain admissible because RRF magnitude encodes rank,
+/// not textual relevance, and genuine partial-name matches score below this floor.
+const SEARCH_VECTOR_SIMILARITY_FLOOR: f64 = 0.3;
 /// Confidence reported on a search-stage `Resolved` outcome: not the raw
 /// RRF score, which lives on a much smaller scale (`sum 1/(k + rank)`, e.g.
 /// ~0.016-0.033) and would never clear a 0..1 confidence bar. Fixed below
@@ -252,7 +251,7 @@ pub async fn resolve_reference(
     let candidate_limit = limit.max(1);
     let search_limit = candidate_limit.max(STAGE4_MIN_SEARCH_LIMIT);
     let hits = runtime
-        .hybrid_search(
+        .hybrid_search_with_vector_similarity_floor(
             token,
             trimmed,
             None,
@@ -261,13 +260,11 @@ pub async fn resolve_reference(
             None,
             &[],
             None,
+            SEARCH_VECTOR_SIMILARITY_FLOOR,
         )
         .await?;
     let candidates: Vec<ReferenceCandidate> = hits
         .into_iter()
-        .filter(|h| {
-            !matches!(h.source, SearchSource::Vector) || h.score.to_f64() >= SEARCH_SCORE_FLOOR
-        })
         .map(|h| ReferenceCandidate {
             id: h.entity_id,
             name: h.title,
@@ -412,8 +409,9 @@ mod tests {
     use super::*;
     use crate::config::{NamespaceToken as TokenCtor, RuntimeConfig};
     use crate::embedder_registry::EmbedderProvider;
+    use crate::retrieval::SearchSource;
     use khive_gate::ActorRef;
-    use khive_types::namespace::Namespace;
+    use khive_types::{namespace::Namespace, SubstrateKind};
     use lattice_embed::{EmbeddingModel, EmbeddingService};
     use std::sync::Arc;
 
@@ -883,34 +881,97 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fallback_stage_drops_low_score_semantic_only_candidates() {
+    async fn fallback_stage_resolves_high_similarity_semantic_only_candidate() {
         let rt = runtime_with_constant_embeddings();
         let token = actor_token("resolver-test");
         let ring = ReferenceRing::new();
 
-        for name in ["Unrelated Alpha", "Unrelated Beta"] {
-            rt.create_entity(&token, "concept", None, name, None, None, vec![])
-                .await
-                .expect("create unrelated entity");
-        }
+        let entity = rt
+            .create_entity(&token, "concept", None, "Canine", None, None, vec![])
+            .await
+            .expect("create semantic match");
 
-        let hits = rt
-            .hybrid_search(
+        let raw_hits = rt
+            .vector_search(
                 &token,
-                "totally-nonexistent-zzz",
                 None,
+                Some("domestic dog"),
                 5,
-                None,
-                None,
-                &[],
-                None,
+                Some(SubstrateKind::Entity),
             )
             .await
+            .expect("vector search");
+        assert_eq!(raw_hits.len(), 1);
+        assert_eq!(raw_hits[0].subject_id, entity.id);
+        assert!(raw_hits[0].score.to_f64() >= SEARCH_VECTOR_SIMILARITY_FLOOR);
+
+        let hits = rt
+            .hybrid_search(&token, "domestic dog", None, 5, None, None, &[], None)
+            .await
             .expect("hybrid search");
-        assert_eq!(hits.len(), 2);
-        assert!(hits.iter().all(|hit| {
-            hit.source == SearchSource::Vector && hit.score.to_f64() < SEARCH_SCORE_FLOOR
-        }));
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].source, SearchSource::Vector);
+
+        let resolution = resolve_reference(&rt, &ring, &token, "domestic dog", 5, None)
+            .await
+            .expect("resolve_reference");
+
+        assert_eq!(
+            resolution,
+            ReferenceResolution::Resolved {
+                id: entity.id,
+                confidence: SEARCH_RESOLVED_CONFIDENCE,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_stage_drops_low_similarity_semantic_only_candidates() {
+        let rt = runtime_with_constant_embeddings();
+        let token = actor_token("resolver-test");
+        let ring = ReferenceRing::new();
+        let dimensions = EmbeddingModel::AllMiniLmL6V2.dimensions();
+
+        let entity = rt
+            .create_entity(
+                &token,
+                "concept",
+                None,
+                "Unrelated Alpha",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect("create unrelated entity");
+        let vectors = rt.vectors(&token).expect("vector store");
+        vectors
+            .delete(entity.id)
+            .await
+            .expect("delete generated vector");
+        vectors
+            .insert(
+                entity.id,
+                SubstrateKind::Entity,
+                token.namespace().as_str(),
+                "entity.body",
+                vec![vec![-1.0; dimensions]],
+            )
+            .await
+            .expect("insert opposite vector");
+
+        let raw_hits = rt
+            .vector_search(
+                &token,
+                None,
+                Some("totally-nonexistent-zzz"),
+                5,
+                Some(SubstrateKind::Entity),
+            )
+            .await
+            .expect("vector search");
+        assert_eq!(raw_hits.len(), 1);
+        assert!(raw_hits[0].score.to_f64() < SEARCH_VECTOR_SIMILARITY_FLOOR);
 
         let resolution = resolve_reference(&rt, &ring, &token, "totally-nonexistent-zzz", 5, None)
             .await
