@@ -925,6 +925,29 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 18] = [
     },
 ];
 
+/// Render a `HandlerDef`'s params as a one-line call shape a caller can copy
+/// and fill in, e.g. `search(kind, query, limit?, entity_kind?, ...)`.
+///
+/// Required params are listed bare; optional params carry a trailing `?`.
+/// This is deliberately compact (names only, no types/descriptions) — the
+/// full schema is still available per-verb via `help=true`; `verbs()` is a
+/// catalog, not a `help=true` dump for every row.
+fn compact_signature(handler: &HandlerDef) -> String {
+    let params = handler
+        .params
+        .iter()
+        .map(|p| {
+            if p.required {
+                p.name.to_string()
+            } else {
+                format!("{}?", p.name)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{}({params})", handler.name)
+}
+
 /// Handle the `verbs` introspection verb — returns all public verbs, with optional category/pack filters.
 pub(crate) fn handle_verbs(params: Value, registry: &VerbRegistry) -> Result<Value, RuntimeError> {
     #[derive(serde::Deserialize, Default)]
@@ -955,6 +978,7 @@ pub(crate) fn handle_verbs(params: Value, registry: &VerbRegistry) -> Result<Val
                 "pack": pack_name,
                 "description": handler.description,
                 "category": format!("{:?}", handler.category),
+                "signature": compact_signature(handler),
             })
         })
         .collect();
