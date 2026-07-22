@@ -141,26 +141,9 @@ Higher `decay_factor` means faster decay:
 
 ## Brain integration
 
-The Brain pack provides Bayesian profile tuning based on feedback signals. After
-recalling memories, you can feed back which results were useful:
-
-### Auto-feedback (recommended)
-
-```
-request(ops="brain.auto_feedback(results=[{\"id\": \"<mem1_uuid>\", \"used\": true}, {\"id\": \"<mem2_uuid>\", \"used\": false}])")
-```
-
-Call this after `memory.recall` to automatically signal which results you
-actually used. The brain profile adjusts its tuning over time.
-
-### Manual feedback
-
-```
-request(ops="brain.feedback(target_id=\"<full_uuid>\", signal=\"useful\")")
-```
-
-Signals: `useful`, `not_useful`, `wrong`, `explicit_positive`,
-`explicit_negative`, `correction`.
+Bayesian profile tuning of recall ranking from feedback signals (`brain.*` verbs) is a
+commercially licensed extension distributed separately; it is not part of this
+distribution.
 
 Note: `target_id` must be a full UUID (not a short prefix).
 
@@ -179,7 +162,7 @@ request(ops="memory.remember(content=\"SESSION: Completed FlashAttention-3 bench
 When you discover something reusable:
 
 ```
-request(ops="memory.remember(content=\"INSIGHT: knowledge.search with rerank=true gives normalized 0-1 scores vs raw RRF ~0.016. Always use rerank for score comparison.\", salience=0.75, memory_type=\"semantic\")")
+request(ops="memory.remember(content=\"INSIGHT: search returns raw RRF fusion scores (~0.01-0.03); do not compare them across queries as if they were normalized [0,1] scores.\", salience=0.75, memory_type=\"semantic\")")
 ```
 
 ### Session start recall

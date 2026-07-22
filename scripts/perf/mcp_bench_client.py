@@ -1,19 +1,14 @@
 #!/usr/bin/env python3
 """Shared stdio-MCP / daemon client plumbing for the perf scripts (stdlib-only).
 
-Extracted from `bench_pipeline_daemon.py` (the stdio MCP handshake/`tools/call`
-layer, daemon-engagement proof, live-DB safety guard, and process teardown)
-and from `bench_load_harness.py` (the raw daemon-socket frame protocol used
-by its metrics-snapshot oracle channel), per the benchmark-overhaul DESIGN.md
-PR 2 slice ("one reusable real-MCP client and daemon lifecycle module").
-
-Both scripts import this module instead of re-implementing the same wire
-protocol twice. This is a pure extraction: no CLI, no output shape, and no
-existing script's observable behavior changes as a result of this module
-existing. `bench_pipeline_daemon.py` and `bench_load_harness.py` re-export
-the names their own module-level code already referenced (e.g.
-`bench_pipeline_daemon._call_verb`), so neither script's internals had to
-change beyond the import.
+Originally extracted from the pipeline/load bench harnesses (the stdio MCP
+handshake/`tools/call` layer, daemon-engagement proof, live-DB safety guard,
+process teardown, and the raw daemon-socket frame protocol used by the
+metrics-snapshot oracle channel), per the benchmark-overhaul DESIGN.md PR 2
+slice ("one reusable real-MCP client and daemon lifecycle module"). Those
+harnesses now ship with the commercially licensed extension packs they
+exercise; this module remains the shared client plumbing for the perf
+scripts in this repository.
 
 Three layers live here:
 
@@ -62,7 +57,7 @@ PROTOCOL_VERSION = 3
 # Default production pack set (must match RuntimeConfig::default().packs in
 # crates/khive-runtime/src/config.rs so config_id agrees between front-end
 # and daemon child).
-DEFAULT_PACKS = "kg,gtd,memory,brain,comm,schedule,knowledge,session,git,code,workspace"
+DEFAULT_PACKS = "kg"
 
 # ── Live-DB safety guard ──────────────────────────────────────────────────────
 
@@ -448,8 +443,7 @@ def join_request_ids(samples: list[dict], audit_events: list[dict]) -> list[dict
     this function does not read them, only passes them through unchanged).
 
     `audit_events`: the persisted audit rows read back for the run's
-    namespace/verb/time window (e.g. via `brain.event_counts` or a direct
-    event-store query). Each event's `resource.request_id` (if present) is
+    namespace/verb/time window (e.g. via a direct event-store query). Each event's `resource.request_id` (if present) is
     the correlation key; `duration_us` is the server-side dispatch time to
     pull across for the client/server latency decomposition.
 

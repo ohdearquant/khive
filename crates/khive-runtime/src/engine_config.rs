@@ -320,7 +320,7 @@ pub struct GitWriteEntryConfig {
 }
 
 /// `[git_write]` section — the closed repo/branch allowlist consulted by
-/// `khive-pack-git`'s write verbs at the handler level (ADR-108 Amendment),
+/// a git-integration pack's write verbs at the handler level (ADR-108 Amendment),
 /// independent of Gate policy. Absent or empty `allowed` is the fail-closed
 /// default: the write verbs report themselves unavailable rather than
 /// defaulting open.
@@ -390,7 +390,7 @@ pub struct KhiveConfig {
     pub packs: std::collections::HashMap<String, PackConfig>,
 
     /// Git-write policy allowlist (ADR-108 Amendment). Absent or empty
-    /// `allowed` fails closed — `khive-pack-git`'s write verbs are
+    /// `allowed` fails closed — a git-integration pack's write verbs are
     /// unavailable until this section is populated.
     #[serde(default)]
     pub git_write: GitWriteSectionConfig,
@@ -409,7 +409,7 @@ pub struct KhiveConfig {
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct RuntimeSectionConfig {
     /// Brain profile ID to use for `memory.feedback` / `knowledge.feedback`
-    /// and recall-time score boosting (ADR-035 §Brain profile configuration).
+    /// and recall-time score boosting (brain profile configuration).
     ///
     /// Mirrors `--brain-profile` / `KHIVE_BRAIN_PROFILE`. When absent, the
     /// namespace-bound profile (via `brain.resolve`) is tried, then the
@@ -781,7 +781,11 @@ impl KhiveConfig {
 /// operators to migrate to `~/.khive/config.toml`.
 ///
 /// The primary model (`KHIVE_EMBEDDING_MODEL`) becomes the `default = true`
-/// engine; additional models become non-default secondary engines.
+/// engine; additional models become non-default secondary engines. When only
+/// `KHIVE_ADDITIONAL_EMBEDDING_MODELS` is set, the built-in default model is
+/// synthesized as the primary — the additional list is additive, never a
+/// replacement for the primary (khive#1221; matches `RuntimeConfig::default()`,
+/// which resolves an unset `KHIVE_EMBEDDING_MODEL` to the built-in default).
 pub fn config_from_env() -> KhiveConfig {
     let primary_model = std::env::var("KHIVE_EMBEDDING_MODEL")
         .ok()
@@ -802,19 +806,29 @@ pub fn config_from_env() -> KhiveConfig {
         "using env-var embedding config; consider migrating to .khive/config.toml in your project root"
     );
 
+    config_from_env_parts(primary_model, additional)
+}
+
+/// Pure core of [`config_from_env`], separated so the engine-list derivation
+/// is testable without mutating process-global environment variables.
+fn config_from_env_parts(primary_model: Option<String>, additional: Vec<String>) -> KhiveConfig {
     let mut engines = Vec::new();
 
-    if let Some(model) = primary_model {
-        engines.push(EngineConfig {
-            name: "default".to_string(),
-            model,
-            default: true,
-            fusion_weight: None,
-            dims: None,
-        });
-    }
+    let primary =
+        primary_model.unwrap_or_else(|| lattice_embed::EmbeddingModel::AllMiniLmL6V2.to_string());
+    engines.push(EngineConfig {
+        name: "default".to_string(),
+        model: primary.clone(),
+        default: true,
+        fusion_weight: None,
+        dims: None,
+    });
 
     for (i, model) in additional.into_iter().enumerate() {
+        // The additional list restating the primary is a no-op, not a second engine.
+        if model.eq_ignore_ascii_case(&primary) {
+            continue;
+        }
         engines.push(EngineConfig {
             name: format!("engine-{}", i + 1),
             model,
@@ -822,12 +836,6 @@ pub fn config_from_env() -> KhiveConfig {
             fusion_weight: None,
             dims: None,
         });
-    }
-
-    // If no primary was specified but there are additional models, promote the
-    // first additional model as the default so the list stays valid.
-    if !engines.is_empty() && !engines.iter().any(|e| e.default) {
-        engines[0].default = true;
     }
 
     KhiveConfig {
@@ -848,6 +856,45 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(&path, content).unwrap();
         path
+    }
+
+    // khive#1221: with no primary set, the additional list must ADD to the
+    // built-in default primary, never replace it.
+    #[test]
+    fn env_additional_only_keeps_builtin_primary() {
+        let cfg = super::config_from_env_parts(
+            None,
+            vec!["paraphrase-multilingual-minilm-l12-v2".to_string()],
+        );
+        assert_eq!(cfg.engines.len(), 2);
+        let default_engine = cfg.default_engine().expect("a default engine");
+        assert_eq!(default_engine.model, "all-minilm-l6-v2");
+        assert!(
+            cfg.engines
+                .iter()
+                .any(|e| !e.default && e.model == "paraphrase-multilingual-minilm-l12-v2"),
+            "additional model must be a non-default secondary engine"
+        );
+    }
+
+    #[test]
+    fn env_explicit_primary_stays_primary() {
+        let cfg = super::config_from_env_parts(
+            Some("paraphrase-multilingual-minilm-l12-v2".to_string()),
+            vec![],
+        );
+        assert_eq!(cfg.engines.len(), 1);
+        assert_eq!(
+            cfg.default_engine().expect("default").model,
+            "paraphrase-multilingual-minilm-l12-v2"
+        );
+    }
+
+    #[test]
+    fn env_additional_restating_primary_is_deduped() {
+        let cfg = super::config_from_env_parts(None, vec!["all-minilm-l6-v2".to_string()]);
+        assert_eq!(cfg.engines.len(), 1);
+        assert!(cfg.engines[0].default);
     }
 
     #[test]

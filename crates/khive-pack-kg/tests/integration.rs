@@ -81,14 +81,14 @@ fn invalid_input_message(err: &RuntimeError) -> &str {
 // ADR-046 (cluster-22) added propose, review, and withdraw — bringing the
 // handler count from 11 to 14, then 15 with verbs introspection, then 16
 // with stats, then 17 with context (ADR-089), then 18 with resolve
-// (unified-verb draft ADR Slice 1).
+// (unified-verb draft ADR Slice 1), then 19 with whoami.
 #[test]
-fn pack_verbs_returns_eighteen() {
+fn pack_verbs_returns_nineteen() {
     let pack = pack();
     assert_eq!(
         pack.verbs().len(),
-        18,
-        "KgPack must expose exactly 18 verbs (17 previous + resolve)"
+        19,
+        "KgPack must expose exactly 19 verbs (18 previous + whoami)"
     );
 }
 
@@ -115,6 +115,7 @@ fn pack_verbs_names_are_correct() {
         "verbs",
         "context",
         "resolve",
+        "whoami",
     ] {
         assert!(names.contains(expected), "verbs() missing {expected:?}");
     }
@@ -853,6 +854,58 @@ async fn search_entity_response_includes_entity_kind() {
     );
 }
 
+/// Regression for #1174: entity search rows carry `name`/`kind`/`created_at`
+/// matching the list()/get() projection, alongside the legacy `title`/
+/// `entity_kind` spellings — a consumer that filters on `row["name"]` after
+/// working with list/get must not read a real hit as an empty result.
+#[tokio::test]
+async fn search_entity_response_includes_list_shape_fields() {
+    let pack = pack();
+    pack.dispatch(
+        "create",
+        json!({"kind": "entity", "name": "GammaSearchShape", "entity_kind": "concept"}),
+    )
+    .await
+    .unwrap();
+
+    let resp = pack
+        .dispatch(
+            "search",
+            json!({"kind": "entity", "query": "GammaSearchShape"}),
+        )
+        .await
+        .expect("search must succeed");
+    let arr = resp.as_array().expect("array");
+    assert!(
+        !arr.is_empty(),
+        "search must return the entity we just created"
+    );
+    let hit = &arr[0];
+    assert_eq!(
+        hit.get("name").and_then(Value::as_str),
+        Some("GammaSearchShape"),
+        "#1174: search response must carry name matching list()/get(); got hit {hit}"
+    );
+    assert_eq!(
+        hit.get("kind").and_then(Value::as_str),
+        Some("concept"),
+        "#1174: search response must carry kind matching list()/get(); got hit {hit}"
+    );
+    assert!(
+        hit.get("created_at").and_then(Value::as_str).is_some(),
+        "#1174: search response must carry created_at; got hit {hit}"
+    );
+    // Legacy spellings stay present for the deprecation window.
+    assert_eq!(
+        hit.get("entity_kind").and_then(Value::as_str),
+        Some("concept")
+    );
+    assert_eq!(
+        hit.get("title").and_then(Value::as_str),
+        Some("GammaSearchShape")
+    );
+}
+
 /// Regression for #160 (note half): note search response includes `note_kind`.
 #[tokio::test]
 async fn search_note_response_includes_note_kind() {
@@ -885,6 +938,89 @@ async fn search_note_response_includes_note_kind() {
         hit.get("note_kind").and_then(Value::as_str),
         Some("insight"),
         "#160 (note half): search response must carry note_kind; got hit {hit}"
+    );
+}
+
+/// Regression for #1174 (note half): note search rows carry `kind`/`created_at`
+/// matching the list()/get() projection, alongside the legacy `note_kind` spelling.
+#[tokio::test]
+async fn search_note_response_includes_list_shape_fields() {
+    let pack = pack();
+    pack.dispatch(
+        "create",
+        json!({
+            "kind": "note",
+            "content": "DeltaInsight unique_marker_9182",
+            "note_kind": "insight"
+        }),
+    )
+    .await
+    .unwrap();
+
+    let resp = pack
+        .dispatch(
+            "search",
+            json!({"kind": "note", "query": "unique_marker_9182"}),
+        )
+        .await
+        .expect("note search must succeed");
+    let arr = resp.as_array().expect("array");
+    assert!(
+        !arr.is_empty(),
+        "note search must return the note we just created"
+    );
+    let hit = &arr[0];
+    assert_eq!(
+        hit.get("kind").and_then(Value::as_str),
+        Some("insight"),
+        "#1174: note search response must carry kind matching list()/get(); got hit {hit}"
+    );
+    assert!(
+        hit.get("created_at").and_then(Value::as_str).is_some(),
+        "#1174: note search response must carry created_at; got hit {hit}"
+    );
+    assert!(
+        hit.get("name").is_some(),
+        "#1174: note search response must carry a name field (may be null); got hit {hit}"
+    );
+}
+
+/// A nameless note's search row must carry `name: null` exactly as list()/get()
+/// do — `title` remains the display value, but `name` never inherits it.
+#[tokio::test]
+async fn search_nameless_note_name_is_null() {
+    let pack = pack();
+    pack.dispatch(
+        "create",
+        json!({
+            "kind": "note",
+            "content": "NamelessNote unique_marker_5527",
+            "note_kind": "observation"
+        }),
+    )
+    .await
+    .unwrap();
+
+    let resp = pack
+        .dispatch(
+            "search",
+            json!({"kind": "note", "query": "unique_marker_5527"}),
+        )
+        .await
+        .expect("note search must succeed");
+    let arr = resp.as_array().expect("array");
+    assert!(
+        !arr.is_empty(),
+        "note search must return the note we just created"
+    );
+    let hit = &arr[0];
+    assert!(
+        hit.get("name").is_some_and(Value::is_null),
+        "nameless note search row must carry name: null matching list()/get(); got hit {hit}"
+    );
+    assert!(
+        hit.get("title").and_then(Value::as_str).is_some(),
+        "title must remain populated as the display value; got hit {hit}"
     );
 }
 
@@ -1922,6 +2058,11 @@ async fn search_kind_entity_still_works_alongside_memory_pack() {
         assert!(
             hit.get("id").is_some(),
             "entity-substrate hit must have 'id'; got: {hit}"
+        );
+        assert_eq!(
+            hit.get("source").and_then(Value::as_str),
+            Some("text"),
+            "entity-substrate hit must expose its retrieval source; got: {hit}"
         );
     }
 }
@@ -4831,6 +4972,83 @@ async fn verbs_dispatch_pack_filter_fake_excludes_subhandler() {
     );
 }
 
+/// `verbs()` output must carry enough of each verb's param schema that a
+/// caller can build a request that parses without first calling it wrong.
+/// Regression: `verbs()` used to list only name/pack/description/category,
+/// so learning a verb's required params meant reading source or eating a
+/// failed call.
+#[tokio::test]
+async fn verbs_dispatch_signature_is_enough_to_construct_a_parsing_call() {
+    let pack = pack();
+    let result = pack
+        .dispatch("verbs", json!({}))
+        .await
+        .expect("verbs() must succeed");
+
+    let verbs_arr = result["verbs"].as_array().expect("verbs must be an array");
+    let search_row = verbs_arr
+        .iter()
+        .find(|v| v["verb"].as_str() == Some("search"))
+        .expect("search must appear in verbs()");
+    let signature = search_row["signature"]
+        .as_str()
+        .expect("verbs() row must carry a 'signature' field");
+    let inner = signature
+        .trim_start_matches("search(")
+        .trim_end_matches(')');
+    let param_tokens: Vec<&str> = inner.split(", ").collect();
+    assert!(
+        param_tokens.contains(&"kind") && param_tokens.contains(&"query"),
+        "search's signature must name its required params kind and query, \
+         unmarked (not optional); got: {signature:?}"
+    );
+
+    // Build a call using exactly the required param names the signature
+    // named, with real values, and confirm it parses and executes rather
+    // than failing on a missing/unknown required field.
+    let call_result = pack
+        .dispatch("search", json!({"kind": "entity", "query": "anything"}))
+        .await;
+    assert!(
+        call_result.is_ok(),
+        "a call built from the signature's required params must parse; got: {call_result:?}"
+    );
+}
+
+/// `search` omitted entirely without `kind` must return the same
+/// enumerated-valid-kinds error as an unrecognized `kind` value, and the
+/// enumeration must be sourced from the registry (a kind contributed by
+/// another loaded pack must appear), not a hardcoded list or a raw serde
+/// "missing field" message.
+#[tokio::test]
+async fn search_missing_kind_lists_registry_kinds_including_other_packs() {
+    let fixture = pack_with_memory();
+
+    let err = fixture
+        .dispatch("search", json!({"query": "anything"}))
+        .await
+        .unwrap_err();
+
+    assert!(
+        is_invalid_input(&err),
+        "missing kind must be InvalidInput; got: {err:?}"
+    );
+    let msg = invalid_input_message(&err);
+    assert!(
+        msg.contains("entity") && msg.contains("note"),
+        "error must enumerate substrate kinds: {msg}"
+    );
+    assert!(
+        msg.contains("memory"),
+        "error must list 'memory' contributed by the extra pack, proving the \
+         enumeration is registry-sourced, not hardcoded: {msg}"
+    );
+    assert!(
+        !msg.to_ascii_lowercase().contains("missing field"),
+        "error must not be a raw serde deserialization message; got: {msg}"
+    );
+}
+
 // Concurrency regression: three parallel singleton link() calls for the same
 // (source, target, relation) triple must all return the same edge ID and the
 // database must contain exactly one edge row for that triple.
@@ -7508,9 +7726,7 @@ async fn hard_delete_soft_deleted_note_cross_namespace_succeeds() {
 // tests lock in the fix: prefix resolution is now unfiltered too, matching
 // the full-UUID contract. by-ID CRUD has no visibility boundary at all; the
 // Gate is the authz seam (ADR-007 Rev 6). This shares the namespace-agnostic
-// by-ID contract that `brain.feedback` now follows
-// (`brain_feedback_accepts_foreign_namespace_target_id` in
-// `khive-pack-brain/tests/dispatch_hook.rs`, #498).
+// by-ID contract other packs' feedback-style verbs follow (#498).
 
 /// `get` by short prefix from a caller in a DIFFERENT namespace than the
 /// record must now succeed (was `NotFound` pre-#391).
@@ -8629,121 +8845,6 @@ async fn search_note_combined_property_and_tag_filter() {
         ids[0], note_a_id,
         "#223: only note_a matches both predicates; got {ids:?}"
     );
-}
-
-// ---- Formal pack gate: default-vs-formal control test ----
-//
-// These tests prove that the formal pack's EDGE_RULES are actually wired into
-// the link path — not just that the rule table is non-empty. Specifically:
-//
-// - With only `kg` loaded (default surface), `depends_on` between typed formal
-//   concept entities (theorem→definition) MUST be rejected.
-// - With `kg,formal` loaded, the same link MUST be accepted.
-//
-// This mirrors what the MCP transport does at startup (ADR-031): build the
-// VerbRegistry, then call `rt.install_edge_rules(registry.all_edge_rules())`.
-
-fn pack_kg_only() -> (Fixture, KhiveRuntime) {
-    let rt = KhiveRuntime::memory().expect("in-memory runtime must succeed");
-    let mut builder = VerbRegistryBuilder::new();
-    builder.register(KgPack::new(rt.clone()));
-    let registry = builder.build().expect("kg-only registry builds");
-    rt.install_edge_rules(registry.all_edge_rules());
-    (Fixture { registry }, rt)
-}
-
-fn pack_kg_and_formal() -> (Fixture, KhiveRuntime) {
-    use khive_pack_formal::FormalPack;
-
-    let rt = KhiveRuntime::memory().expect("in-memory runtime must succeed");
-    let mut builder = VerbRegistryBuilder::new();
-    builder.register(KgPack::new(rt.clone()));
-    builder.register(FormalPack::new(rt.clone()));
-    let registry = builder.build().expect("kg+formal registry builds");
-    rt.install_edge_rules(registry.all_edge_rules());
-    (Fixture { registry }, rt)
-}
-
-/// Without formal pack: depends_on between typed concept entities (theorem→definition)
-/// must be rejected. Proves the formal rules are not present in the default surface.
-#[tokio::test]
-async fn formal_depends_on_rejected_without_formal_pack() {
-    let (f, _rt) = pack_kg_only();
-
-    let thm = f
-        .dispatch(
-            "create",
-            json!({ "kind": "concept", "entity_type": "theorem", "name": "Nat.add_comm" }),
-        )
-        .await
-        .expect("create theorem concept");
-
-    let def = f
-        .dispatch(
-            "create",
-            json!({ "kind": "concept", "entity_type": "definition", "name": "Nat.add" }),
-        )
-        .await
-        .expect("create definition concept");
-
-    let result = f
-        .dispatch(
-            "link",
-            json!({
-                "source_id": thm["id"],
-                "target_id": def["id"],
-                "relation": "depends_on",
-            }),
-        )
-        .await;
-
-    assert!(
-        result.is_err(),
-        "depends_on between theorem→definition must be rejected without formal pack loaded; \
-         got: {result:?}"
-    );
-}
-
-/// With formal pack: depends_on between typed concept entities (theorem→definition)
-/// must be accepted. Proves the pack installs its EDGE_RULES into the link path.
-#[tokio::test]
-async fn formal_depends_on_accepted_with_formal_pack() {
-    let (f, _rt) = pack_kg_and_formal();
-
-    let thm = f
-        .dispatch(
-            "create",
-            json!({ "kind": "concept", "entity_type": "theorem", "name": "Nat.add_comm" }),
-        )
-        .await
-        .expect("create theorem concept");
-
-    let def = f
-        .dispatch(
-            "create",
-            json!({ "kind": "concept", "entity_type": "definition", "name": "Nat.add" }),
-        )
-        .await
-        .expect("create definition concept");
-
-    let result = f
-        .dispatch(
-            "link",
-            json!({
-                "source_id": thm["id"],
-                "target_id": def["id"],
-                "relation": "depends_on",
-            }),
-        )
-        .await;
-
-    assert!(
-        result.is_ok(),
-        "depends_on between theorem→definition must succeed with formal pack loaded; \
-         got: {result:?}"
-    );
-    let edge = result.unwrap();
-    assert_eq!(edge["relation"], "depends_on");
 }
 
 // ── Med-1 regression: malformed `items` must not fall through to singleton ──────
@@ -10350,6 +10451,102 @@ async fn context_budget_truncation_sets_flag_and_dropped_counts() {
 }
 
 #[tokio::test]
+async fn context_bloated_anchor_neighbors_do_not_starve_a_later_relevant_anchor() {
+    // Regression test: a higher-ranked anchor with a large neighbor fan-out must
+    // not consume the entire budget and push a lower-ranked (but still
+    // query-relevant) anchor's own entity record out of the response. Before the
+    // fix, `assemble_within_budget` walked each anchor's entity *and* neighbors
+    // before moving to the next anchor, so one anchor's neighbor sprawl could
+    // exhaust the budget and drop every anchor ranked after it — including
+    // anchors a plain entity search on the same query would have surfaced.
+    let pack = pack();
+
+    let bloat = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "CtxStarveBloatAnchor", "entity_kind": "concept", "description": "ctxstarve shared regression phrase alpha"}),
+        )
+        .await
+        .expect("create bloat anchor");
+    let bloat_id = bloat["id"].as_str().unwrap().to_string();
+
+    for i in 0..15 {
+        let n = pack
+            .dispatch(
+                "create",
+                json!({"kind": "entity", "name": format!("CtxStarveBloatNeighbor{i}"), "entity_kind": "concept", "description": "a verbose neighbor description with enough text to consume budget quickly"}),
+            )
+            .await
+            .expect("create bloat neighbor");
+        let n_id = n["id"].as_str().unwrap().to_string();
+        pack.dispatch(
+            "link",
+            json!({"source_id": bloat_id, "target_id": n_id, "relation": "extends"}),
+        )
+        .await
+        .expect("link bloat anchor -> neighbor");
+    }
+
+    let on_topic = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "CtxStarveOnTopicAnchor", "entity_kind": "concept", "description": "ctxstarve shared regression phrase beta"}),
+        )
+        .await
+        .expect("create on-topic anchor");
+    let on_topic_id = on_topic["id"].as_str().unwrap().to_string();
+
+    let query = "ctxstarve shared regression phrase";
+
+    // A plain entity search on the same query surfaces the on-topic anchor.
+    let search_resp = pack
+        .dispatch(
+            "search",
+            json!({"kind": "entity", "query": query, "limit": 5}),
+        )
+        .await
+        .expect("search must succeed");
+    let search_hits = search_resp.as_array().unwrap();
+    assert!(
+        search_hits.iter().any(|h| h["id"] == on_topic_id),
+        "plain entity search must surface the on-topic anchor; got: {search_hits:?}"
+    );
+
+    // A budget that comfortably fits both anchor entity records, but not the
+    // bloated anchor's 15 verbose neighbors.
+    let resp = pack
+        .dispatch(
+            "context",
+            json!({"query": query, "hops": 1, "fanout": 20, "limit": 5, "budget": 900}),
+        )
+        .await
+        .expect("context must succeed");
+
+    let anchors = resp["anchors"].as_array().unwrap();
+    assert!(
+        anchors.iter().any(|a| a["entity"]["id"] == on_topic_id),
+        "the on-topic anchor's entity record must survive a sibling's bloated \
+         neighbor list; got anchors: {anchors:?}"
+    );
+    assert_eq!(
+        resp["dropped"]["anchors"], 0,
+        "no anchor entity should be dropped"
+    );
+    assert!(
+        resp["truncated"] == true,
+        "the bloated neighbor list must still trigger truncation"
+    );
+    assert!(
+        resp["dropped"]["neighbors"].as_i64().unwrap() > 0,
+        "the bloated anchor's neighbors must be the thing that gets dropped"
+    );
+    assert_eq!(
+        resp["dropped"]["stage"], "budget",
+        "drop accounting must name the stage responsible for the drop"
+    );
+}
+
+#[tokio::test]
 async fn context_ample_budget_reports_no_truncation() {
     let pack = pack();
     let a = pack
@@ -11841,4 +12038,263 @@ async fn search_entity_hyphenated_adr_id_with_plain_terms_matches() {
         titles.iter().any(|t| t.contains("ADR-086")),
         "#1064 hyphenated query must surface ADR-086 entity; got titles={titles:?}, full={result}"
     );
+}
+
+// ── ADR-103 Amendment 2: the frozen-usage invariant ─────────────────────────
+
+/// The response envelope and the per-dispatch audit row must carry the
+/// IDENTICAL usage object. That is the entire reason `freeze()` /
+/// `frozen_or_snapshot()` exist as a first-freeze-wins `OnceLock` rather than
+/// two independent reads of the same counters.
+///
+/// The guarantee holds only because the audit row's `freeze()` runs during
+/// dispatch, before the envelope's `frozen_or_snapshot()`. Nothing in the
+/// suite pinned that, so a refactor or a new envelope-assembly path could
+/// invert the order: the envelope would silently return a live snapshot, the
+/// two would disagree, and no test would fail — on numbers a customer can
+/// compare against their own audit trail.
+///
+/// This test pins the observable contract end to end: it runs a real dispatch
+/// inside an armed context exactly as `khive-mcp/src/server.rs` does, lands a
+/// large increment AFTER the dispatch (the exact stray-increment case the
+/// `OnceLock` defends), and then asserts the value the envelope stamps equals
+/// the real audit row's `resource.units` and that BOTH exclude the late
+/// increment. If the envelope ever reads live counters instead of the frozen
+/// object, the late increment leaks into it and this fails.
+///
+/// Limit, stated rather than implied: the envelope value is read through the
+/// same expression `stamp_usage` uses (`ctx.frozen_or_snapshot()`) rather than
+/// by driving the MCP server, because the audit row is only reachable from the
+/// pack surface. That one-line wrapper is not covered here.
+#[tokio::test]
+async fn envelope_usage_equals_audit_row_resource_units() {
+    use khive_runtime::usage::{UsageContext, UsageUnit};
+
+    const LATE: u64 = 1_000_000;
+
+    let pack = pack_with_events();
+    let ctx = UsageContext::new();
+
+    // Dispatch inside the armed scope, mirroring the MCP server's
+    // `usage::scope(usage_ctx.clone(), async { ... })`.
+    khive_runtime::usage::scope(ctx.clone(), async {
+        pack.dispatch(
+            "create",
+            json!({"kind": "concept", "name": "UsageFreezeTarget"}),
+        )
+        .await
+        .expect("create must succeed");
+    })
+    .await;
+
+    // A stray increment landing after the audit snapshot point. In production
+    // this is the post-audit dispatch hook; here it is deliberate and large
+    // enough that it cannot be confused with real measured work.
+    ctx.add(UsageUnit::DbRoundTrips, LATE);
+
+    // Exactly what the response envelope stamps.
+    let envelope_usage = ctx.frozen_or_snapshot();
+
+    let events = pack
+        .dispatch(
+            "list",
+            json!({"kind": "event", "verb": "create", "limit": 50}),
+        )
+        .await
+        .expect("list(kind=event) must succeed");
+    let rows: Vec<&Value> = events
+        .as_array()
+        .expect("list must return an array")
+        .iter()
+        .filter(|e| e.pointer("/payload/resource/units").is_some())
+        .collect();
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly one create audit row must carry resource.units; got {}: {events}",
+        rows.len()
+    );
+    let audit_units = rows[0]
+        .pointer("/payload/resource/units")
+        .expect("checked above");
+
+    assert_eq!(
+        &envelope_usage, audit_units,
+        "the response envelope's usage object and the same dispatch's audit-row \
+         resource.units must be identical; envelope={envelope_usage}, row={audit_units}"
+    );
+
+    let leaked = envelope_usage
+        .get("db_round_trips")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    assert!(
+        leaked < LATE,
+        "an increment landing after the freeze point must not appear in either \
+         read — the envelope carried db_round_trips={leaked}, which means it \
+         returned a live snapshot rather than the frozen object"
+    );
+}
+
+// ---- whoami verb ----
+
+#[tokio::test]
+async fn whoami_reports_configured_actor_and_namespace() {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime must succeed");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.with_actor_id(Some("lambda:khive".to_string()));
+    builder.register(KgPack::new(rt));
+    let registry = builder.build().expect("registry builds");
+
+    let result = registry
+        .dispatch("whoami", json!({}))
+        .await
+        .expect("whoami must succeed");
+
+    assert_eq!(
+        result.get("actor_id").and_then(Value::as_str),
+        Some("lambda:khive"),
+        "whoami must report the configured actor id; got: {result}"
+    );
+    assert_eq!(
+        result.get("actor_kind").and_then(Value::as_str),
+        Some("actor"),
+        "a configured actor id resolves to kind=\"actor\"; got: {result}"
+    );
+    assert_eq!(
+        result.get("unattributed").and_then(Value::as_bool),
+        Some(false),
+        "a configured actor must not be reported unattributed; got: {result}"
+    );
+    assert_eq!(
+        result.get("namespace").and_then(Value::as_str),
+        Some("local"),
+        "default namespace with no explicit override is 'local'; got: {result}"
+    );
+    let visible = result
+        .get("visible_namespaces")
+        .and_then(Value::as_array)
+        .expect("visible_namespaces must be an array");
+    assert!(
+        visible.iter().any(|v| v.as_str() == Some("local")),
+        "visible_namespaces must include the write namespace; got: {result}"
+    );
+}
+
+// A cold caller in a single-actor deployment (no configured actor_id) is
+// exactly who most needs whoami — it must answer honestly, not error.
+#[tokio::test]
+async fn whoami_reports_unattributed_when_no_actor_configured() {
+    let pack = pack();
+    let result = pack
+        .dispatch("whoami", json!({}))
+        .await
+        .expect("whoami must succeed");
+
+    assert_eq!(
+        result.get("unattributed").and_then(Value::as_bool),
+        Some(true),
+        "no configured actor_id must report unattributed=true; got: {result}"
+    );
+    assert_eq!(
+        result.get("actor_id").and_then(Value::as_str),
+        Some("local"),
+        "unattributed caller's actor_id is the anonymous fallback 'local'; got: {result}"
+    );
+    assert!(
+        result.get("namespace").and_then(Value::as_str).is_some(),
+        "whoami must always report a namespace, even for the unattributed caller; got: {result}"
+    );
+}
+
+#[tokio::test]
+async fn whoami_rejects_unknown_params() {
+    let pack = pack();
+    let err = pack
+        .dispatch("whoami", json!({"bogus": true}))
+        .await
+        .unwrap_err();
+    assert!(
+        is_invalid_input(&err),
+        "unknown whoami param must be InvalidInput; got {err:?}"
+    );
+}
+
+// Never expose anything that could authenticate — only labels.
+#[tokio::test]
+async fn whoami_never_exposes_secret_shaped_fields() {
+    let pack = pack();
+    let result = pack
+        .dispatch("whoami", json!({}))
+        .await
+        .expect("whoami must succeed");
+    let obj = result.as_object().expect("whoami must return an object");
+    for forbidden in [
+        "token",
+        "secret",
+        "credential",
+        "api_key",
+        "password",
+        "key",
+    ] {
+        assert!(
+            !obj.contains_key(forbidden),
+            "whoami must never expose a {forbidden:?} field; got: {result}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn whoami_appears_in_verbs_introspection() {
+    let pack = pack();
+    let result = pack
+        .dispatch("verbs", json!({}))
+        .await
+        .expect("verbs must succeed");
+    let verbs = result.get("verbs").and_then(|v| v.as_array()).unwrap();
+    let names: Vec<&str> = verbs
+        .iter()
+        .filter_map(|v| v.get("verb").and_then(|n| n.as_str()))
+        .collect();
+    assert!(
+        names.contains(&"whoami"),
+        "whoami must be registered as a public verb; got {names:?}"
+    );
+}
+
+/// Regression for #1168/#1247: the `query()` wire response always carries a
+/// structural `truncated` boolean, present whether or not the cap fired, so
+/// a caller can check it directly instead of inferring "not truncated" from
+/// the absence of a `warnings` entry (whose text also used to recommend an
+/// unimplemented OFFSET/SKIP paging path).
+#[tokio::test]
+async fn query_response_always_carries_truncated_field() {
+    let pack = pack();
+    pack.dispatch(
+        "create",
+        json!({"kind": "entity", "name": "QueryTruncFieldProbe", "entity_kind": "concept"}),
+    )
+    .await
+    .expect("create must succeed");
+
+    let result = pack
+        .dispatch("query", json!({"query": "MATCH (a:concept) RETURN a"}))
+        .await
+        .expect("query must succeed");
+
+    assert_eq!(
+        result.get("truncated").and_then(Value::as_bool),
+        Some(false),
+        "#1247: an under-the-cap query result must still carry truncated:false, not omit the \
+         field; got {result}"
+    );
+    if let Some(warnings) = result.get("warnings").and_then(Value::as_array) {
+        for w in warnings {
+            let text = w.as_str().unwrap_or_default();
+            assert!(
+                !text.contains("LIMIT/OFFSET"),
+                "#1168: no warning may recommend the unimplemented OFFSET/SKIP path: {text}"
+            );
+        }
+    }
 }

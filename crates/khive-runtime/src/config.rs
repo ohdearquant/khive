@@ -226,9 +226,9 @@ pub struct RuntimeConfig {
     /// Single-backend deployments use the default `BackendId::MAIN`.
     pub backend_id: BackendId,
     /// Brain profile to use for `memory.feedback` / `knowledge.feedback` and
-    /// recall-time score boosting (ADR-035 §Brain profile configuration).
+    /// recall-time score boosting (brain profile configuration).
     ///
-    /// Resolution order (highest to lowest, ADR-035): CLI flag, then
+    /// Resolution order (highest to lowest): CLI flag, then
     /// `runtime.brain_profile` in project/global `khive.toml`, then the
     /// `KHIVE_BRAIN_PROFILE` env var as fallback default. Callers must keep
     /// env OUT of the base config they pass in (see `khive-mcp` serve.rs).
@@ -263,7 +263,7 @@ pub struct RuntimeConfig {
     /// Resolved `[git_write]` policy allowlist (ADR-108 Amendment), populated
     /// from `khive.toml`'s `[[git_write.allowed]]` entries by
     /// [`runtime_config_from_khive_config`]. Threaded through so
-    /// `khive-pack-git`'s write-verb handlers read an already-resolved policy
+    /// a git-integration pack's write-verb handlers read an already-resolved policy
     /// instead of re-running config discovery (which would ignore an
     /// explicit `--config` path not also exported as `KHIVE_CONFIG`).
     pub git_write: crate::engine_config::GitWriteSectionConfig,
@@ -300,25 +300,7 @@ impl Default for RuntimeConfig {
             .ok()
             .map(|s| parse_pack_list(&s))
             .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| {
-                vec![
-                    "kg",
-                    "gtd",
-                    "memory",
-                    "brain",
-                    "comm",
-                    "schedule",
-                    "knowledge",
-                    "session",
-                    "git",
-                    "code",
-                    "workspace",
-                    "blob",
-                ]
-                .into_iter()
-                .map(String::from)
-                .collect()
-            });
+            .unwrap_or_else(|| vec!["kg"].into_iter().map(String::from).collect());
         let brain_profile = std::env::var("KHIVE_BRAIN_PROFILE")
             .ok()
             .filter(|s| !s.trim().is_empty());

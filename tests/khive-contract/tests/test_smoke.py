@@ -1,7 +1,7 @@
-"""Smoke tests — full verb surface coverage across KG, GTD, and memory packs.
+"""Smoke tests — full KG verb surface coverage.
 
 ADR: ADR-027
-section: Single-tool surface; KG verb coverage; GTD pack verbs; Memory pack verbs
+section: Single-tool surface; KG verb coverage
 """
 
 from __future__ import annotations
@@ -15,8 +15,6 @@ from khive_contract.client import KhiveMcpSession, KhiveRpcError
 VERBS_UNDER_TEST = {
     "create", "get", "list", "update", "delete", "merge",
     "search", "link", "neighbors", "traverse", "query",
-    "gtd.assign", "gtd.next", "gtd.complete", "gtd.tasks", "gtd.transition",
-    "memory.remember", "memory.recall",
 }
 
 
@@ -271,133 +269,3 @@ def test_kg_smoke(
     assert summary.get("total") == 3 and summary.get("failed") == 0, (
         f"parallel batch must have total=3, failed=0: {summary}"
     )
-
-
-@pytest.mark.adr_027
-@pytest.mark.slow
-def test_gtd_smoke(
-    khive_gtd_session: KhiveMcpSession,
-    temp_namespace: str,
-) -> None:
-    """GTD pack smoke test: assign→next→tasks→transition→complete round-trip.
-
-    ADR: ADR-027
-    section: GTD pack verbs
-
-    Ports gtd_smoke() from smoke_test.py into pytest.
-    """
-    ns = temp_namespace
-
-    # assign
-    assigned = khive_gtd_session.verb("gtd.assign", {
-        "title": "smoke-gtd task",
-        "status": "next",
-        "priority": "p0",
-        "namespace": ns,
-    })
-    assert assigned.get("kind") == "task", f"gtd.assign must return kind=task: {assigned}"
-    assert assigned.get("status") == "next", f"gtd.assign status mismatch: {assigned}"
-    task_full_id = assigned.get("full_id") or assigned.get("id")
-    assert task_full_id, f"gtd.assign must return a task id: {assigned}"
-
-    # next
-    ready = khive_gtd_session.verb("gtd.next", {"namespace": ns})
-    assert isinstance(ready, list), f"gtd.next must return a list: {ready}"
-    assert any(t.get("full_id") == task_full_id for t in ready), (
-        f"assigned task must appear in gtd.next(): {ready}"
-    )
-
-    # tasks
-    waiting_task = khive_gtd_session.verb("gtd.assign", {
-        "title": "waiting-task",
-        "status": "waiting",
-        "priority": "p1",
-        "namespace": ns,
-    })
-    inbox_task = khive_gtd_session.verb("gtd.assign", {
-        "title": "inbox-task",
-        "status": "inbox",
-        "priority": "p2",
-        "namespace": ns,
-    })
-    waiting_tasks = khive_gtd_session.verb("gtd.tasks", {"status": "waiting", "namespace": ns})
-    assert isinstance(waiting_tasks, list), f"gtd.tasks must return a list: {waiting_tasks}"
-    waiting_ids = [t.get("full_id") for t in waiting_tasks]
-    assert waiting_task.get("full_id") in waiting_ids, (
-        f"waiting task must appear in gtd.tasks(status=waiting): {waiting_ids}"
-    )
-    assert inbox_task.get("full_id") not in waiting_ids, (
-        f"inbox task must NOT appear in gtd.tasks(status=waiting): {waiting_ids}"
-    )
-
-    # transition
-    trans = khive_gtd_session.verb("gtd.transition", {
-        "id": inbox_task.get("full_id"),
-        "status": "next",
-        "note": "promoted from inbox",
-        "namespace": ns,
-    })
-    assert trans.get("transitioned") is True, f"gtd.transition must set transitioned=True: {trans}"
-    assert trans.get("to") == "next", f"gtd.transition must report to=next: {trans}"
-
-    # idempotent transition
-    trans_idem = khive_gtd_session.verb("gtd.transition", {
-        "id": inbox_task.get("full_id"),
-        "status": "next",
-        "namespace": ns,
-    })
-    assert trans_idem.get("transitioned") is False, (
-        f"idempotent gtd.transition must set transitioned=False: {trans_idem}"
-    )
-
-    # complete
-    done = khive_gtd_session.verb("gtd.complete", {
-        "id": task_full_id,
-        "result": "smoke-test pass",
-        "namespace": ns,
-    })
-    assert done.get("to") == "done", f"gtd.complete must return to=done: {done}"
-
-
-@pytest.mark.adr_027
-@pytest.mark.slow
-def test_memory_smoke(
-    khive_memory_session: KhiveMcpSession,
-    temp_namespace: str,
-) -> None:
-    """Memory pack smoke test: remember + recall round-trip.
-
-    ADR: ADR-027
-    section: Memory pack verbs
-
-    Ports memory_smoke() from smoke_test.py into pytest.
-    """
-    ns = temp_namespace
-
-    # remember first memory
-    mem = khive_memory_session.verb("memory.remember", {
-        "content": "khive uses SQLite with FTS5 and sqlite-vec for hybrid search",
-        "salience": 0.9,
-        "memory_type": "semantic",
-        "namespace": ns,
-    })
-    assert mem is not None, "memory.remember must return a result"
-    mem_id = mem["id"]
-    assert mem_id, f"memory.remember must return an id: {mem}"
-
-    # remember second memory
-    mem2 = khive_memory_session.verb("memory.remember", {
-        "content": "The runtime enforces namespace isolation for every ID-based operation",
-        "salience": 0.7,
-        "memory_type": "semantic",
-        "namespace": ns,
-    })
-    assert mem2 is not None, "second memory.remember must return a result"
-
-    # recall
-    hits = khive_memory_session.verb("memory.recall", {
-        "query": "SQLite hybrid search",
-        "limit": 5,
-        "namespace": ns,
-    })
-    assert isinstance(hits, list), f"memory.recall must return a list, got: {hits}"

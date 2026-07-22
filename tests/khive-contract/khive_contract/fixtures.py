@@ -83,7 +83,7 @@ ANNOTATES_SOURCE_MUST_BE_NOTE = True
 
 # ---------------------------------------------------------------------------
 # Product verb manifest (ADR-023 / ADR-025 / ADR-027)
-# KG pack ships 18 verbs; bare names (no pack prefix).
+# KG pack ships 19 verbs; bare names (no pack prefix).
 # Source of truth: crates/khive-pack-kg/src/handler_defs.rs KG_HANDLERS
 # ---------------------------------------------------------------------------
 
@@ -107,48 +107,29 @@ KG_VERBS: frozenset[str] = frozenset(
         "verbs",
         "context",
         "resolve",
+        "whoami",
     }
 )
 
-GTD_VERBS: frozenset[str] = frozenset(
-    {
-        "assign",
-        "next",
-        "complete",
-        "tasks",
-        "transition",
-    }
-)
+# kg is the sole pack in this OSS distribution — gtd/memory/comm/schedule/
+# session/blob are commercially licensed extensions (see repo CLAUDE.md) that
+# load the same way (KHIVE_PACKS / --pack) but ship in a separate binary, not
+# this one. Their dotted pack.verb forms are therefore absent here.
+DISCOVERABLE_PRODUCT_VERBS: frozenset[str] = KG_VERBS
 
-MEMORY_VERBS: frozenset[str] = frozenset(
-    {
-        "remember",
-        "recall",
-    }
-)
-
-DISCOVERABLE_PRODUCT_VERBS: frozenset[str] = KG_VERBS | GTD_VERBS | MEMORY_VERBS
-
-# The play spec says "15 product verbs"; the baseline exposes 24
-# (KG:17 + GTD:5 + memory:2). DISCOVERABLE_PRODUCT_VERBS (24) subsumes
-# the stated minimum (15).
-PLAY_SPEC_MINIMUM_VERB_COUNT = 15
+# DISCOVERABLE_PRODUCT_VERBS (19) already meets this floor.
+PLAY_SPEC_MINIMUM_VERB_COUNT = 11
 
 # ADR-023 coverage-gate manifest: the curated set of product verbs every
-# contract test module's VERBS_UNDER_TEST must jointly cover — dotted
-# pack.verb form for GTD/memory, bare for the core KG substrate. This is
-# narrower than DISCOVERABLE_PRODUCT_VERBS above (which also counts
-# admin/meta KG verbs like stats/propose/review/withdraw/verbs/context that
-# the coverage gate does not track), so the two are intentionally not
-# unioned or aliased to each other.
+# contract test module's VERBS_UNDER_TEST must jointly cover. Narrower than
+# DISCOVERABLE_PRODUCT_VERBS above (which also counts admin/meta KG verbs
+# like stats/propose/review/withdraw/verbs/context/resolve/whoami that the
+# coverage gate does not track), so the two are intentionally not unioned or
+# aliased to each other.
 PRODUCT_VERB_MANIFEST: frozenset[str] = frozenset({
     # KG substrate (11) — bare names; no pack prefix
     "create", "get", "list", "update", "delete", "merge",
     "search", "link", "neighbors", "traverse", "query",
-    # GTD (5) — dotted pack.verb form
-    "gtd.assign", "gtd.next", "gtd.complete", "gtd.tasks", "gtd.transition",
-    # Memory (2) — dotted pack.verb form
-    "memory.remember", "memory.recall",
 })
 
 # ---------------------------------------------------------------------------

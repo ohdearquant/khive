@@ -1,17 +1,15 @@
 # khive-gate Design
 
-## ADR Compliance
+## Design contract
 
-### ADR-018: Authorization Gate
+### Authorization gate
 
-Full spec: `docs/adr/ADR-018-authorization-gate.md` (repo root).
-
-This crate implements the public types and default gate defined by ADR-018:
+This crate implements the public types and default gate defined by the authorization-gate design record:
 
 - **`Gate` trait** — the authorization hook consulted before each verb dispatch.
   The `check` method returns `Ok(GateDecision)` or `Err(GateError)`. A `Deny`
-  decision blocks dispatch; an `Err` (infrastructure failure) is fail-open per
-  the ADR — dispatch proceeds with a tracing warning, no audit event emitted.
+  decision blocks dispatch; an `Err` (infrastructure failure) is fail-open by
+  design — dispatch proceeds with a tracing warning, no audit event emitted.
 
 - **`impl_name()`** — stable string identifier per `Gate` implementation.
   Default returns `std::any::type_name::<Self>()`. Concrete impls override for
@@ -27,7 +25,7 @@ This crate implements the public types and default gate defined by ADR-018:
   The JSON field names (`actor`, `namespace`, `verb`, `decision`, `deny_reason`,
   `obligations`, `gate_impl`, `session_id`, `timestamp`) are a **stable public
   contract**. Adding fields is non-breaking; removing or renaming requires an
-  ADR amendment.
+  design-record amendment.
 
 - **`Obligation::Custom { value }`** — the struct-like variant (with named field
   `value`) is mandatory. A newtype variant cannot merge serde's internally-tagged
@@ -38,7 +36,7 @@ This crate implements the public types and default gate defined by ADR-018:
   `input.verb`, `input.args`) are the policy input contract (e.g., for Rego). Any
   field rename is a breaking change.
 
-### Namespace (ADR-007)
+### Namespace (attribution-only)
 
 `GateRequest.namespace` must reflect exactly what the runtime sees, with no coercion
 at the gate layer. Coercing an empty namespace to a default inside the gate would
@@ -49,7 +47,7 @@ the same logic.
 
 - **`Obligation::RateLimit` and `Custom` are declared but not enforced in v0.**
   Policy authors can return these obligations; the runtime records them in the audit
-  event but does not enforce rate limits or custom semantics. A future ADR adds
+  event but does not enforce rate limits or custom semantics. A future design record adds
   per-actor rate-limit enforcement.
 
 - **`AuditEvent` obligations field always serializes** (even as `[]` on Deny) so

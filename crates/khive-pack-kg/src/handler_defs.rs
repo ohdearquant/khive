@@ -1,4 +1,4 @@
-//! Static `KG_HANDLERS` table (18 `HandlerDef` entries) and the `verbs` introspection handler.
+//! Static `KG_HANDLERS` table (19 `HandlerDef` entries) and the `verbs` introspection handler.
 
 // Illocutionary classification (Searle 1976):
 //   Assertive  -- retrieves/presents state of affairs
@@ -14,7 +14,7 @@ use serde_json::Value;
 use khive_runtime::{RuntimeError, VerbRegistry};
 use khive_types::{HandlerDef, ParamDef, VerbCategory, Visibility};
 
-pub(crate) static KG_HANDLERS: [HandlerDef; 18] = [
+pub(crate) static KG_HANDLERS: [HandlerDef; 19] = [
     // Commissive: commits an entity or note to the namespace
     HandlerDef {
         name: "create",
@@ -141,8 +141,8 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 18] = [
                 required: false,
                 description:
                     "If true, return soft-deleted entities (with deleted_at populated). Default false. \
-                     Requires a full UUID — short prefix resolution filters deleted records; \
-                     the delete response always returns the full UUID for this purpose.",
+                     Accepts a full UUID or a unique short hex prefix — prefix resolution falls back \
+                     to soft-deleted entities when no live record matches.",
             },
         ],
     },
@@ -469,7 +469,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 18] = [
     // Assertive: retrieves and presents search results
     HandlerDef {
         name: "search",
-        description: "Hybrid FTS + vector search",
+        description: "Hybrid FTS + vector search over knowledge-graph entities and notes. Corpora owned by other packs (for example teaching or document corpora with their own search verbs) are disjoint and are not searched here.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -623,7 +623,9 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 18] = [
     // Assertive: retrieves multi-hop traversal results
     HandlerDef {
         name: "traverse",
-        description: "Multi-hop BFS traversal",
+        description: "Multi-hop BFS traversal. Can reach note nodes (e.g. via an \
+                      `annotates` edge) but only enriches entity nodes with name/kind; \
+                      note nodes come back with those fields absent.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -898,6 +900,18 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 18] = [
             },
         ],
     },
+    // Assertive: reports the caller's own resolved identity
+    HandlerDef {
+        name: "whoami",
+        description: "Report the caller's identity as the runtime already resolved it for \
+                      this request: actor_id, actor_kind, whether the actor is the \
+                      unattributed/anonymous fallback, the write namespace, and the \
+                      read-visible namespace set. Never returns tokens or credentials — \
+                      only labels the runtime already computed before dispatch.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
+        params: &[],
+    },
     // Assertive: verb discovery (ue-help-introspection H5)
     HandlerDef {
         name: "verbs",
@@ -924,6 +938,29 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 18] = [
         ],
     },
 ];
+
+/// Render a `HandlerDef`'s params as a one-line call shape a caller can copy
+/// and fill in, e.g. `search(kind, query, limit?, entity_kind?, ...)`.
+///
+/// Required params are listed bare; optional params carry a trailing `?`.
+/// This is deliberately compact (names only, no types/descriptions) — the
+/// full schema is still available per-verb via `help=true`; `verbs()` is a
+/// catalog, not a `help=true` dump for every row.
+fn compact_signature(handler: &HandlerDef) -> String {
+    let params = handler
+        .params
+        .iter()
+        .map(|p| {
+            if p.required {
+                p.name.to_string()
+            } else {
+                format!("{}?", p.name)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{}({params})", handler.name)
+}
 
 /// Handle the `verbs` introspection verb — returns all public verbs, with optional category/pack filters.
 pub(crate) fn handle_verbs(params: Value, registry: &VerbRegistry) -> Result<Value, RuntimeError> {
@@ -955,6 +992,7 @@ pub(crate) fn handle_verbs(params: Value, registry: &VerbRegistry) -> Result<Val
                 "pack": pack_name,
                 "description": handler.description,
                 "category": format!("{:?}", handler.category),
+                "signature": compact_signature(handler),
             })
         })
         .collect();

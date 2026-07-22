@@ -1,13 +1,12 @@
 //! kkernel — khive admin/management library.
 
 mod atomic_apply;
+pub mod cli;
 pub mod code_audit;
-pub mod code_ingest;
 pub mod coordinator;
 pub mod dbpath;
 pub mod engine;
 pub mod exec;
-pub mod git_ingest;
 pub mod kg;
 pub mod pack_introspect;
 pub mod reindex;
@@ -33,15 +32,17 @@ pub mod vector;
 #[doc(hidden)]
 #[allow(unused_imports)]
 mod _pack_links {
-    use khive_pack_brain::BrainPack as _;
-    use khive_pack_code::CodePack as _;
-    use khive_pack_comm::CommPack as _;
-    use khive_pack_formal::FormalPack as _;
-    use khive_pack_git::GitPack as _;
-    use khive_pack_gtd::GtdPack as _;
     use khive_pack_kg::KgPack as _;
-    use khive_pack_knowledge::KnowledgePack as _;
-    use khive_pack_memory::MemoryPack as _;
-    use khive_pack_schedule::SchedulePack as _;
-    use khive_pack_session::SessionPack as _;
+}
+
+// Test-only: force-link `khive-pack-template` (a dev-dependency) so its
+// `inventory::submit!` registration is visible to this crate's test binary —
+// tests that need a second, non-`kg` pack (for registry/taxonomy variety,
+// multi-backend routing, etc.) dispatch through `template.my_verb` / the
+// `template_note` note kind instead of a removed pack.
+#[cfg(test)]
+#[doc(hidden)]
+#[allow(unused_imports)]
+mod _test_pack_links {
+    use khive_pack_template::TemplatePack as _;
 }

@@ -7,26 +7,16 @@ khive gives your agent:
 1. **A knowledge graph** — typed entities + edges you build as you work
 2. **Notes** — observations, insights, questions, decisions, references that persist across sessions
 3. **Pattern matching queries** — GQL/SPARQL traverse over the graph
-4. **Task management** — GTD lifecycle (inbox → next → active → done)
-5. **Memory** — salience- and decay-weighted recall across sessions
-6. **Communication** — namespaced message passing between agents
-7. **Scheduling** — time-triggered reminders and future verb dispatch
-8. **Knowledge corpus** — atom/domain CRUD, FTS + embedding search, compose briefings
-9. **Brain** — Bayesian profile tuning from feedback signals
-10. **Session** — persist and resume agent-session records
 
-All 11 packs load by default. **82 public verbs** across the packs: the `git` pack
-contributes the `git.digest` verb plus the commit/issue/pull_request provenance note kinds
-and a batch ingester, and three write verbs, `git.commit` / `git.branch` / `git.push`
-(ADR-108), that shell to system git with hardened, allowlisted argv construction — no
-tag/merge/checkout/pull/fetch, no force-push under any argument combination; the `code`
-pack contributes one verb, `code.ingest` (L1 manifest + L1.5 import-scan source ingestion
-into a dedicated map database, ADR-085 Amendment 2); its `finding` note kind is still
-written only through the `kkernel code-ingest` admin CLI path (ADR-085 D1, Amendment 3);
-the `workspace` pack contributes zero verbs, adding only the `workspace` entity kind and
-`contains` endpoint rules to git/gtd/session notes (#873). Regenerate via
-`request(ops="verbs()")`
-before editing this line.
+The `kg` pack loads by default, giving the `request` tool a 19-verb catalog. Task
+management (GTD lifecycle), memory (salience- and decay-weighted recall), communication
+(namespaced message passing between agents), scheduling (time-triggered reminders and
+future verb dispatch), session continuity (persist and resume agent-session records),
+workspace linking, and blob storage are provided by commercially licensed extensions and
+are not part of the open-source distribution. Git provenance ingestion and write verbs
+(`git.digest`, `git.commit`, `git.branch`, `git.push`) and code-quality and
+formal-methods (Lean) ontology packs are likewise commercially licensed extensions.
+Regenerate via `request(ops="verbs()")` before editing this line.
 
 If you're working on khive itself (writing code in this repo), see `CLAUDE.md` instead.
 
@@ -35,11 +25,11 @@ If you're working on khive itself (writing code in this repo), see `CLAUDE.md` i
 ## Core verbs
 
 All verbs are dispatched through a single MCP tool, `request`, which accepts a function-call DSL
-or JSON form ([ADR-016](docs/adr/ADR-016-request-dsl.md),
-[ADR-027](docs/adr/ADR-027-dynamic-pack-loading.md)). Verb semantics and namespace contract are
-defined in [ADR-023](docs/adr/ADR-023-declarative-pack-format.md).
+or JSON form (ADR-016,
+ADR-027). Verb semantics and namespace contract are
+defined in ADR-023.
 
-### KG pack — 18 verbs (bare names, no prefix)
+### KG pack — 19 verbs (bare names, no prefix)
 
 | Verb        | What it does                                                                                     | When to use                                                             |
 | ----------- | ------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------- |
@@ -61,6 +51,7 @@ defined in [ADR-023](docs/adr/ADR-023-declarative-pack-format.md).
 | `resolve`   | Resolve natural-language references to ids (id passthrough, recent-ring, hybrid search fallback) | Turning a fuzzy reference ("the old record") into an id before acting   |
 | `verbs`     | List all registered verbs on this server                                                         | Discovery — see what's available                                        |
 | `context`   | Entity-anchored graph context in one call (anchors + 1-2 hop expansion, budget-packed)           | Feeding an agent "everything relevant near X" in one call — see ADR-089 |
+| `whoami`    | Report the caller's actor reference, write namespace, and read-visible namespace set             | Checking whether writes are attributed before relying on it             |
 
 `get`, `update`, `delete` are by-ID — they auto-detect whether the record is an entity, note, or
 edge. The `id` parameter is resolved in three steps: (1) a full UUID (36-char dashed or 32-char
@@ -69,7 +60,7 @@ prefix lookup, but in practice only the exact 8-char compact ID returned by writ
 because stored UUIDs carry a dash at position 9, so a 9+ pure-hex string never matches; (3) anything
 else falls through to an exact, case-insensitive entity-name lookup. `create`, `list`, `search`
 take a `kind` discriminant, but accepted values differ per verb: `list` accepts substrate names
-(`entity`, `note`, `edge`, `event` per [ADR-022](docs/adr/ADR-022-events-query-surface.md),
+(`entity`, `note`, `edge`, `event` per ADR-022,
 `proposal`) plus any pack-registered granular kind (`concept`, `document`, `task`, `observation`,
 …); `create` and `search` accept `entity`/`note` and the granular kinds but reject `edge`, `event`,
 and `proposal` (proposals are created via `propose` and browsed via `list`, not `create`/`search`).
@@ -97,140 +88,15 @@ request(ops='resolve(refs=["RoPE"], kind="concept", limit=5)')
 request(ops='create(kind="concept", name="RoPE", description="...", skip_dedup_check=true)')
 ```
 
-### GTD pack — 5 verbs (`gtd.` prefix, [ADR-019](docs/adr/ADR-019-gtd-pack.md))
+### Other packs
 
-| Verb             | What it does                                            | When to use                              |
-| ---------------- | ------------------------------------------------------- | ---------------------------------------- |
-| `gtd.assign`     | Create a task (note with kind=task)                     | New work item, bug, follow-up            |
-| `gtd.next`       | List actionable tasks (status=next/active), by priority | "What should I work on?"                 |
-| `gtd.complete`   | Mark a task done or cancelled                           | Finishing work                           |
-| `gtd.tasks`      | Filtered task listing                                   | Browse tasks by status/assignee/priority |
-| `gtd.transition` | Explicit lifecycle change (inbox→next→active→done)      | Moving a task through its lifecycle      |
-
-`gtd.assign` accepts `context_entity_id` to anchor a task to a KG entity.
-
-Full `gtd.transition` allowed transitions:
-`inbox` → next | waiting | someday | active | done | cancelled;
-`next` → active | waiting | someday | done | cancelled (skipping `active` with `next -> done` is valid);
-`active` → next | waiting | done | cancelled;
-`waiting` | `someday` → next | active | done | cancelled;
-`done` and `cancelled` are terminal.
-
-`gtd.transition` returns one of two shapes. On a real transition: `{transitioned: true, id, full_id,
-from, to, is_terminal, title, priority, assignee, due}` — `is_terminal: true` when the task reaches
-`done` or `cancelled`. On an idempotent no-op (the task is already in the requested status): `{transitioned:
-false, id, full_id, from, to, note: "already in target status"}` — the task fields (`title`, `priority`,
-`assignee`, `due`, `is_terminal`) are omitted. Branch on `transitioned` before reading those fields.
-
-### Memory pack — 5 verbs (`memory.` prefix, [ADR-021](docs/adr/ADR-021-memory-pack.md))
-
-| Verb              | What it does                                                  | When to use                                         |
-| ----------------- | ------------------------------------------------------------- | --------------------------------------------------- |
-| `memory.remember` | Store a memory with salience and decay                        | Cross-session context, agent state                  |
-| `memory.recall`   | Hybrid FTS + vector recall with decay-weighted ranking        | Retrieve what you stored in prior sessions          |
-| `memory.feedback` | Emit explicit feedback on a recalled memory                   | Signal useful/not_useful to tune posteriors         |
-| `memory.prune`    | Soft-delete memories below a salience threshold               | Trim low-value memories to prevent unbounded growth |
-| `memory.vacuum`   | Run SQLite VACUUM to reclaim space freed by soft-deleted rows | Periodic maintenance after heavy prune runs         |
-
-`memory.recall` supports `tags` and `tag_mode` ("any"|"all") for tag-based post-filtering.
-Composite scores are always in [0,1]. Typical production floor: 0.3-0.7.
-
-### Brain pack — 15 verbs (`brain.` prefix)
-
-| Verb                     | What it does                                                                             | When to use                                                     |
-| ------------------------ | ---------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
-| `brain.event_counts`     | Windowed event counts by kind/actor/verb (+ feedback by_profile split, cost_unit totals) | Flywheel metrics, feedback-coverage reporting, cost attribution |
-| `brain.profiles`         | List profiles (optionally filtered by lifecycle)                                         | See what profiles exist                                         |
-| `brain.profile`          | Full detail: metadata, snapshot, state summary                                           | Inspect a specific profile                                      |
-| `brain.create_profile`   | Create a new profile with optional seed priors                                           | Custom tuning for a new consumer                                |
-| `brain.resolve`          | Which profile serves a given consumer context?                                           | Before recall — check active tuning                             |
-| `brain.activate`         | Start live update loop for a profile                                                     | Enable feedback-driven tuning                                   |
-| `brain.deactivate`       | Stop live updates, retain state                                                          | Pause tuning without losing progress                            |
-| `brain.archive`          | Read-only, audit-retained                                                                | Retire a profile permanently                                    |
-| `brain.reset`            | Reset posteriors to priors (preserves event history)                                     | Start tuning fresh                                              |
-| `brain.feedback`         | Emit explicit feedback event                                                             | Rate a recall result as useful/not_useful/wrong                 |
-| `brain.auto_feedback`    | Emit implicit feedback for recall results                                                | Convenience: agents call after memory.recall                    |
-| `brain.bind`             | Bind a profile to an actor + consumer                                                    | Route a specific caller to a specific profile                   |
-| `brain.unbind`           | Remove a binding                                                                         | Stop routing                                                    |
-| `brain.bindings`         | List binding rows                                                                        | Audit profile routing                                           |
-| `brain.register_adapter` | Register an adapter integrity record                                                     | Gate adapter composition to the active base-model revision      |
-
-### Comm pack — 7 verbs (`comm.` prefix)
-
-| Verb          | What it does                                                           | When to use                                   |
-| ------------- | ---------------------------------------------------------------------- | --------------------------------------------- |
-| `comm.send`   | Send a message (optionally threaded)                                   | Inter-agent or inter-namespace messaging      |
-| `comm.inbox`  | List inbound messages                                                  | Check what's waiting                          |
-| `comm.read`   | Mark an **inbound** message as read                                    | Acknowledge receipt (recipient action)        |
-| `comm.reply`  | Reply to a message (threading linkage)                                 | Respond in-thread                             |
-| `comm.thread` | Retrieve full conversation thread                                      | Read the whole conversation                   |
-| `comm.health` | Per-channel health snapshot (no args)                                  | Check daemon channel-poll state               |
-| `comm.probe`  | Read-only poll for new inbound message metadata and stale unread count | Cheap wake-up check without a full inbox scan |
-
-**Inbox shape (ADR-057).** `comm.inbox` is scannable: each entry carries top-level `from`, `to`,
-`subject`, `read`, `direction`, and a derived `preview` (whitespace-collapsed, truncated to 80
-chars) — triage without a `get` per message. Delivery is actor-addressed: `comm.send(to="lambda:x")`
-stamps `from_actor` from the server's configured actor and lands in `x`'s inbox, and `comm.inbox`
-returns only messages addressed to you. Set that actor via `--actor` / `KHIVE_ACTOR`; an unset actor
-sends and reads as the shared `"local"` party line.
-
-**`comm.read` is inbound-only.** It marks a received message as read; calling it on an outbound
-(sent) message returns `read: message <uuid> is outbound; only received (inbound) messages can be
-marked as read`. To confirm a sent message was received, read it from the recipient's `comm.inbox`
-or `comm.thread`.
-
-### Schedule pack — 4 verbs (`schedule.` prefix)
-
-| Verb                | What it does                                  | When to use                                                   |
-| ------------------- | --------------------------------------------- | ------------------------------------------------------------- |
-| `schedule.remind`   | Deliver a reminder to your inbox at fire time | "Remind me to X at Y"                                         |
-| `schedule.schedule` | Schedule a future verb dispatch               | Deferred or cross-actor actions (action is a DSL verb string) |
-| `schedule.agenda`   | List upcoming scheduled events                | "What's on the calendar?"                                     |
-| `schedule.cancel`   | Cancel a scheduled event                      | Remove a pending reminder/action                              |
-
-### Knowledge pack — 19 verbs (`knowledge.` prefix)
-
-| Verb                       | What it does                                            | When to use                                  |
-| -------------------------- | ------------------------------------------------------- | -------------------------------------------- |
-| `knowledge.upsert_atoms`   | Bulk insert/update atoms by slug                        | Ingesting knowledge corpus                   |
-| `knowledge.upsert_domains` | Bulk insert/update domain groupings                     | Organizing atoms into domains                |
-| `knowledge.get`            | Fetch atom/domain by UUID or slug                       | Read a specific knowledge entry              |
-| `knowledge.list`           | Paginated listing of atoms or domains                   | Browse the corpus                            |
-| `knowledge.search`         | TF-IDF search with embedding rerank (default on)        | Finding relevant knowledge                   |
-| `knowledge.suggest`        | Orient query against domains for composition            | "Which domains cover topic X?"               |
-| `knowledge.compose`        | Compose a markdown briefing from selected atoms/domains | Build a context briefing for an agent        |
-| `knowledge.edit`           | Upsert sections for an atom                             | Update part of an atom without wiping others |
-| `knowledge.import`         | Ingest markdown files as atoms                          | Batch import from filesystem                 |
-| `knowledge.delete_atoms`   | Soft-delete atoms by slug or ID                         | Retire stale knowledge                       |
-| `knowledge.stats`          | Corpus statistics: atom/domain/coverage counts          | Health check                                 |
-| `knowledge.index`          | Backfill embeddings + FTS                               | After bulk import or reindex                 |
-| `knowledge.fold`           | Budget-constrained knapsack selection                   | Token-aware subset picking                   |
-| `knowledge.challenge`      | Mark a section as disputed                              | Flag incorrect content                       |
-| `knowledge.adjudicate`     | Resolve a disputed section                              | Accept or reject a challenge                 |
-| `knowledge.learn`          | Register a concept entity with domain/tags              | Quick concept creation                       |
-| `knowledge.cite`           | Link concept → paper/person/org (introduced_by edge)    | Attribution                                  |
-| `knowledge.topic`          | List concepts by domain or free-text                    | Explore the concept graph                    |
-| `knowledge.feedback`       | Route feedback to brain for knowledge recall tuning     | Signal useful/not_useful on compose results  |
-
-`knowledge.search` supports `decompose=true` for multi-concept query splitting (avoids FTS edge
-cases). Scores are normalized to [0,1] when `rerank` is active (default).
-Pass `kind=` (`"atom"` or `"domain"`) to filter by result type; `type=` is accepted as a legacy
-alias. `knowledge.list` accepts the same `kind=`/`type=` discriminant.
-
-`knowledge.edit` takes `sections=[{section_type, content, heading?, sort_order?}]`. `section_type`
-is a **closed enum** — valid values: `overview` | `core_model` | `boundary_conditions` |
-`formalism` | `operational_guidance` | `examples` | `failure_modes` | `expert_lens` |
-`references` | `other`. Content must be **at least 80 characters**. Shorter content or an
-unrecognized `section_type` returns a validation error listing the valid values.
-
-### Session pack — 4 verbs (`session.` prefix)
-
-| Verb             | What it does                                      | When to use                              |
-| ---------------- | ------------------------------------------------- | ---------------------------------------- |
-| `session.store`  | Persist an agent-session record as a session note | Checkpoint/save a completed session      |
-| `session.list`   | List stored sessions, newest first                | "What sessions have I run?"              |
-| `session.resume` | Fetch one session's full content by UUID/prefix   | Continue or reference a specific session |
-| `session.export` | Serialize one session as JSON or markdown         | Share or archive a session outside khive |
+Task management (`gtd.` prefix), memory (`memory.` prefix), inter-agent communication
+(`comm.` prefix), scheduling (`schedule.` prefix), session continuity (`session.`
+prefix), workspace linking, blob storage, brain profiles (`brain.` prefix), and
+knowledge composition (`knowledge.` prefix) are provided by commercially licensed
+extensions and are not part of the open-source distribution. Git provenance ingestion
+and write verbs (`git.digest`, `git.commit`, `git.branch`, `git.push`) are likewise a
+commercially licensed extension. This distribution ships the `kg` pack only.
 
 ### How to call a verb
 
@@ -275,7 +141,7 @@ failure does not abort the rest, and the limit is 100 ops per batch. Orient at s
 call instead of three:
 
 ```text
-request(ops="[gtd.next(limit=10), gtd.tasks(status=\"active\"), comm.inbox(limit=10)]")
+request(ops="[search(kind=\"entity\", query=\"LoRA\"), search(kind=\"note\", query=\"LoRA\"), stats()]")
 ```
 
 The response carries each op's result alongside a `summary` with `total`, `succeeded`, and `failed`.
@@ -289,12 +155,12 @@ request(ops="create(kind=\"concept\", name=\"LoRA\") | link(source_id=$prev.id, 
 ```
 
 `$prev` reads fields by dotted path and arrays by index, such as `$prev.id` or `$prev[0].id`.
-Reference the field the previous verb actually returns; create, remember, and the other write verbs
-return the new record's `id`. Recording a corrected memory and marking the old one superseded is then
-one call:
+Reference the field the previous verb actually returns; `create` and the other write verbs
+return the new record's `id`. Recording a corrected note and marking the old one superseded is
+then one call:
 
 ```text
-request(ops="memory.remember(content=\"corrected fact\", salience=0.8) | link(source_id=$prev.id, target_id=\"<old-uuid>\", relation=\"supersedes\")")
+request(ops="create(kind=\"note\", note_kind=\"observation\", content=\"corrected fact\") | link(source_id=$prev.id, target_id=\"<old-uuid>\", relation=\"supersedes\")")
 ```
 
 `$prev` refers to the immediately preceding op only. In a three-op chain `A | B | C`, the `$prev` in
@@ -316,7 +182,7 @@ form. Use the function-call form shown above for chaining.
 ### Output format
 
 The `request` envelope accepts a `format` parameter that controls how the response is serialized
-([ADR-078](docs/adr/ADR-078-output-format-shape-aware-rendering.md)):
+(ADR-078):
 
 | Value   | Description                                                                                                                                                                                      | Default for                                                        |
 | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------ |
@@ -329,10 +195,10 @@ costs ~11-17% more tokens than compact JSON for record arrays, so it never beats
 
 ```text
 # Default is compact json everywhere — parseable, lossless, $prev-safe
-request(ops="gtd.tasks(limit=10)")
+request(ops="list(kind=\"entity\", limit=10)")
 
 # Opt into a markdown table when an agent is reading (not parsing) the output
-request(ops="gtd.tasks(limit=10)", format="auto")
+request(ops="list(kind=\"entity\", limit=10)", format="auto")
 ```
 
 `format=json` (the default) is the machine contract: any caller that chains `$prev`, parses the
@@ -341,7 +207,7 @@ _view_ for agents reading rather than parsing — they truncate long cells and a
 In a compounded request (batch/chain) the format applies **per-op** to each op's `result`; the
 `results`/`summary` envelope stays compact JSON, and error entries are never reformatted. The
 per-op override is `format_per_op` (mirrors `presentation_per_op`). Verbs whose policy is
-AlwaysVerbose (`get`, `link`, `query`, `traverse`, `neighbors`, `brain.feedback`) are exempt from
+AlwaysVerbose (`get`, `link`, `query`, `traverse`, `neighbors`) are exempt from
 the redundancy-drop even under `auto`/`table`, so agents still get their full output.
 
 **Precedence** (ADR-078 §2, highest to lowest):
@@ -367,7 +233,7 @@ Use `create(kind="note", note_kind="observation", ...)` for notes.
 
 ---
 
-## The 9 entity kinds (closed set — [ADR-001](docs/adr/ADR-001-entity-kind-taxonomy.md), [ADR-048](docs/adr/ADR-048-knowledge-section-profiles.md))
+## The 9 entity kinds (closed set — ADR-001, ADR-048)
 
 | Kind       | What it represents                                                         |
 | ---------- | -------------------------------------------------------------------------- |
@@ -386,7 +252,7 @@ Use `create(kind="note", note_kind="observation", ...)` for notes.
 
 ---
 
-## The 5 note kinds (closed set — [ADR-013](docs/adr/ADR-013-note-kind-taxonomy.md))
+## The 5 note kinds (closed set — ADR-013)
 
 | Kind          | What it records                               |
 | ------------- | --------------------------------------------- |
@@ -401,7 +267,7 @@ annotates=[entity_id], ...)`.
 
 ---
 
-## The 17-relation ontology (closed set — [ADR-002](docs/adr/ADR-002-edge-ontology.md) base 15; [ADR-055](docs/adr/ADR-055-epistemic-edge-relations.md) +2 epistemic)
+## The 17-relation ontology (closed set — ADR-002 base 15; ADR-055 +2 epistemic)
 
 When you `link` nodes, use ONLY these relations:
 
@@ -457,7 +323,7 @@ probably a property on the entity, not an edge.
 
 ## Tool schemas (required → **bold**, optional → normal)
 
-These are the KG pack verbs. Other packs are documented in their verb tables above.
+These are the KG pack verbs — the only pack in the open-source distribution (see _Other packs_ above).
 
 | Tool        | Fields                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             | Example                                                        |
 | ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
@@ -651,7 +517,7 @@ If you are an AI agent authoring PRs, issues, or comments via someone's CLI:
 
 ---
 
-## Pack authoring pattern (governance — [ADR-023](docs/adr/ADR-023-declarative-pack-format.md), [ADR-095](docs/adr/ADR-095-verb-surface-consolidation.md))
+## Pack authoring pattern (governance — ADR-023, ADR-095)
 
 If you are adding a new pack or a new verb to an existing pack:
 
@@ -664,7 +530,7 @@ If you are adding a new pack or a new verb to an existing pack:
    that dispatch-by-kind cannot express.
 2. **Put per-kind create-time field validation in `KindHook::prepare_create`.** Enum checks,
    format checks, and cross-field guards for a kind belong in that kind's `KindHook`
-   implementation ([ADR-017](docs/adr/ADR-017-pack-standard.md)), not in a parallel handler
+   implementation (ADR-017), not in a parallel handler
    that duplicates the same checks outside the hook seam.
 
 ---
@@ -672,7 +538,7 @@ If you are adding a new pack or a new verb to an existing pack:
 ## Daemon and warm startup
 
 The `kkernel` binary auto-spawns a background daemon (`kkernel mcp --daemon`) on the first request. The daemon
-keeps the ANN index and embedding model warm so `knowledge.search` and `memory.recall` are fast on
+keeps the ANN index and embedding model warm so `search` is fast on
 subsequent calls. Users do not need to configure or manage the daemon — it starts automatically and
 cleans up on exit.
 
@@ -688,8 +554,8 @@ default. It is attribution, not isolation: queryable and filterable as a data co
 storage boundary.
 
 By-ID operations (`get`, `update`, `delete`, `merge`) are namespace-agnostic. They resolve the
-globally-unique UUID with no namespace check at any layer. Authorization is enforced at the Gate
-(ADR-018), not in storage or by-ID post-fetch checks.
+globally-unique UUID with no namespace check at any layer. Authorization is enforced at the Gate,
+not in storage or by-ID post-fetch checks.
 
 Multi-record operations (`list`, `search`, `recall`, `neighbors`, `traverse`, `query`) default to
 `WHERE namespace='local'`. The only way to target a different namespace is an explicit `namespace=`
@@ -708,5 +574,4 @@ agent-facing operations go through the `request` tool.
 ## See also
 
 - `CLAUDE.md` — for working on khive itself
-- `docs/adr/` — Architecture Decision Records (the design contract)
-- `docs/adr/README.md` — full ADR index
+- Design records are maintained by the project maintainers outside this repository.

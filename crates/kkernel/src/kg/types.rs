@@ -205,9 +205,9 @@ pub struct StatusArgs {
 
 /// CLI arguments for `kkernel kg commit`.
 ///
-/// Restores the `kg commit` primitive [ADR-020](../../../docs/adr/ADR-020-git-native-kg-implementation.md)
+/// Restores the `kg commit` primitive ADR-020
 /// §5 specified but never shipped, scoped per
-/// [ADR-102](../../../docs/adr/ADR-102-tiered-validate-and-merge.md)'s Amendment
+/// ADR-102's Amendment
 /// to ADR-020: the tier-2 commit step for an already-reviewed staged
 /// change-set, against this ADR's own local-only change-set/snapshot
 /// repository (D6) — not the project-repository-embedded `.khive/kg/` layout

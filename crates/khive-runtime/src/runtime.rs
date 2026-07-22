@@ -749,6 +749,14 @@ impl KhiveRuntime {
             .unwrap_or_default()
     }
 
+    /// Borrow the installed pack edge rules for a synchronous calculation.
+    pub(crate) fn with_pack_edge_rules<T>(&self, f: impl FnOnce(&[EdgeEndpointRule]) -> T) -> T {
+        match self.edge_rules.read() {
+            Ok(rules) => f(&rules),
+            Err(_) => f(&[]),
+        }
+    }
+
     /// Return the name of the default embedding model (empty string if none configured).
     pub fn default_embedder_name(&self) -> &str {
         self.default_embedder_name.as_ref()
@@ -1141,32 +1149,17 @@ mod tests {
     }
 
     #[test]
-    fn default_config_packs_loads_all_production_packs() {
+    fn default_config_packs_loads_kg_only() {
         let prior = std::env::var("KHIVE_PACKS").ok();
         // SAFETY: test function runs single-threaded; no other threads read or write KHIVE_PACKS.
         unsafe {
             std::env::remove_var("KHIVE_PACKS");
         }
+        // The open-source distribution ships a single production pack: kg.
+        // Extension packs are commercially licensed, distributed separately,
+        // and opt in via KHIVE_PACKS / --pack against a binary that links them.
         let cfg = RuntimeConfig::default();
-        assert!(cfg.packs.contains(&"kg".to_string()));
-        assert!(cfg.packs.contains(&"gtd".to_string()));
-        assert!(cfg.packs.contains(&"memory".to_string()));
-        assert!(cfg.packs.contains(&"brain".to_string()));
-        assert!(cfg.packs.contains(&"comm".to_string()));
-        assert!(cfg.packs.contains(&"schedule".to_string()));
-        assert!(cfg.packs.contains(&"knowledge".to_string()));
-        // session loads by default so its background mirror warm-hook runs in
-        // production; its handlers are all operator-only subhandlers (0 wire verbs).
-        assert!(cfg.packs.contains(&"session".to_string()));
-        assert!(cfg.packs.contains(&"git".to_string()));
-        assert!(cfg.packs.contains(&"code".to_string()));
-        assert!(cfg.packs.contains(&"workspace".to_string()));
-        // blob loads by default; a normal file-backed boot installs a
-        // default FsBlobStore beside the database file with no config
-        // needed, so its verbs are live in default deployments too (only an
-        // in-memory backend leaves them unconfigured).
-        assert!(cfg.packs.contains(&"blob".to_string()));
-        assert_eq!(cfg.packs.len(), 12);
+        assert_eq!(cfg.packs, vec!["kg".to_string()]);
         if let Some(v) = prior {
             // SAFETY: single-threaded test cleanup; restores KHIVE_PACKS to its prior value.
             unsafe {

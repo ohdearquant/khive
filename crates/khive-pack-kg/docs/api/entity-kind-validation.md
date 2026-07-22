@@ -17,7 +17,7 @@ this crate directly, so this is not a crate-graph inversion.
 `resolve_uuid_unfiltered` implements the ADR-007 Rev 6 by-ID contract: UUID resolution for
 get/update/delete/merge is namespace-agnostic — the Gate is the authz seam, not storage-layer
 filtering. Full-UUID inputs were already unfiltered (`resolve_by_id`); this function closes
-the gap for the *prefix* form, which previously fell through to the primary-namespace-only
+the gap for the _prefix_ form, which previously fell through to the primary-namespace-only
 `resolve_prefix` and was invisible for any row stamped with a non-primary namespace (#391
 §3). It is an exact copy of `resolve_uuid_async` except the prefix-resolution branch.
 
@@ -43,8 +43,7 @@ pack `EDGE_RULES`, matched through
 `endpoint_matches` semantics `pack_rule_allows` applies internally (`EntityOfKind`,
 `EntityOfType`, `NoteOfKind`). There is no separate hand-authored table and no local
 re-filter of endpoint kinds here: a hint can no longer diverge from what the validator itself
-accepts, including pack rules scoped to a granular `entity_type` (e.g. `khive-pack-formal`'s
-typed `theorem -> definition` `depends_on` rule).
+accepts, including pack rules scoped to a granular `entity_type` via `EntityOfType`.
 
 Note-scoped pack rules (e.g. GTD's `task` -> `task` `depends_on`, declared as `NoteOfKind`)
 cannot match here regardless of the shared matcher, because this function is only ever
@@ -64,10 +63,9 @@ the set of relations the REAL production validator (`KhiveRuntime::link` ->
 `validate_edge_relation_endpoints`) actually accepts for that pair. This calls production code
 on both sides — it never re-implements the rule check inline.
 
-Issue #621 flagged that a five-pair spot check missed an `EntityOfType`-scoped divergence
-(see `valid_relations_hint_covers_formal_pack_entity_of_type_rules`); this test sweeps the
-full closed kind space so a future divergence at any pair fails loudly rather than only at
-hand-picked pairs.
+Issue #621 flagged that a five-pair spot check missed an `EntityOfType`-scoped divergence;
+this test sweeps the full closed kind space so a future divergence at any pair fails loudly
+rather than only at hand-picked pairs.
 
 `annotates` requires a note source (never an entity), so it can never be accepted for an
 entity→entity pair regardless of kind and is skipped (matches the hint function's own scope,

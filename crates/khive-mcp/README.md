@@ -44,16 +44,15 @@ mcp` both call.
 ## Where this sits
 
 `khive-mcp` depends on `khive-db`, `khive-runtime`, `khive-storage`, `khive-request`, and
-every first-party pack crate (`khive-pack-kg`, `-gtd`, `-memory`, `-brain`, `-comm`,
-`-schedule`, `-knowledge`, `-session`) so their `inventory::submit!` verb registrations link
+the `khive-pack-kg` pack crate so its `inventory::submit!` verb registrations link
 into any binary that depends on this crate. `kkernel` is that binary: its `mcp` subcommand
 parses `khive_mcp::args::Args`, builds the runtime and pack registry, and calls into
 `khive_mcp::serve::run`.
 
-Governed by [ADR-016](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-016-request-dsl.md)
-(the `request` tool contract) and [ADR-049](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-049-khived-daemon.md)
+Governed by ADR-016
+(the `request` tool contract) and ADR-049
 (the warm daemon protocol this crate's client/daemon config-fingerprint matching supports).
 
 ## License
 
-Apache-2.0.
+BUSL-1.1. See the repository [LICENSE](https://github.com/ohdearquant/khive/blob/main/LICENSE).

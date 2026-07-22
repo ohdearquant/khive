@@ -5,7 +5,7 @@ Agent) backend for [`khive-gate`](https://crates.io/crates/khive-gate)'s `Gate` 
 powered by [`regorus`](https://crates.io/crates/regorus).
 
 This is the **reference policy backend** for khive's authorization gate
-([ADR-018](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-018-authorization-gate.md)).
+(the authorization-gate design record).
 It is opt-in: a deployment that wants Rego-based authorization adds this crate as a
 dependency and installs a `RegoGate` as the runtime gate. Consumers that do not need
 Rego (e.g. the personal-local OSS binary, which runs the permissive `AllowAllGate`
@@ -94,7 +94,7 @@ Load every `*.rego` file under a directory (non-recursive, deterministic order) 
 
 ## Semantics
 
-Per [ADR-018](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-018-authorization-gate.md):
+Per the authorization-gate design record:
 
 - **`Deny` is authoritative.** A `Deny` decision aborts dispatch with
   `RuntimeError::PermissionDenied`.
@@ -107,16 +107,16 @@ Per [ADR-018](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-018-au
   fails to serialize, or the result is not a `GateDecision` shape — the gate converts
   it to an explicit `Ok(GateDecision::Deny)` with a diagnostic reason. Only failures
   before evaluation (e.g. request serialization, `GateError::Internal`) surface as
-  `Err(GateError)`, which the runtime treats as an infrastructure failure per ADR-018.
+  `Err(GateError)`, which the runtime treats as an infrastructure failure by contract.
   Declaring a `default decision := {deny ...}` is still good practice so unmatched
   requests deny with a policy-authored reason instead of the generic fail-closed one.
 
 ## Where this sits
 
-- `khive-gate` (Apache-2.0) — the public `Gate` trait, `AllowAllGate` default, and the
+- `khive-gate` (BUSL-1.1) — the public `Gate` trait, `AllowAllGate` default, and the
   `AuditEvent` contract.
-- **`khive-gate-rego` (Apache-2.0)** — this crate; the OSS reference Rego backend.
+- **`khive-gate-rego` (BUSL-1.1)** — this crate; the OSS reference Rego backend.
 
 ## License
 
-Apache-2.0.
+BUSL-1.1. See the repository [LICENSE](https://github.com/ohdearquant/khive/blob/main/LICENSE).

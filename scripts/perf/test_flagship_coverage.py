@@ -8,10 +8,13 @@ Run: python3 -m unittest scripts.perf.test_flagship_coverage -v
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import hashlib
+import io
 import json
 import pathlib
+import re
 import tempfile
 import unittest
 
@@ -19,6 +22,7 @@ import coverage_validator
 import flagship_schema
 
 MANIFEST_PATH = pathlib.Path(__file__).parent / "flagship_workloads.toml"
+KG_HANDLER_DEFS_PATH = pathlib.Path(__file__).parents[2] / "crates" / "khive-pack-kg" / "src" / "handler_defs.rs"
 
 
 def _base_scenario(**overrides) -> dict:
@@ -107,10 +111,22 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertGreater(len(data["scenario"]), 0)
 
+    def test_mcp_operation_allowlist_matches_shipped_kg_handlers(self):
+        handler_names = set(
+            re.findall(
+                r'HandlerDef\s*\{\s*name:\s*"([^"]+)"',
+                KG_HANDLER_DEFS_PATH.read_text(),
+            )
+        )
+        self.assertEqual(
+            coverage_validator.AVAILABLE_OPERATIONS_BY_SURFACE["mcp_daemon"],
+            handler_names,
+        )
+
     def test_every_feature_has_at_least_one_scenario(self):
         data, _ = coverage_validator.load_manifest(MANIFEST_PATH)
         by_feature = coverage_validator._required_scenario_ids_by_feature(data["scenario"])
-        for feature in flagship_schema.FEATURES:
+        for feature in flagship_schema.MANIFEST_FEATURES:
             self.assertTrue(by_feature.get(feature), f"{feature} has zero manifest scenarios")
 
     def test_no_duplicate_scenario_ids_in_real_manifest(self):
@@ -132,14 +148,14 @@ class ManifestTests(unittest.TestCase):
 
     def test_oq1_admin_surface_scenario_ids_match_manifest(self):
         """khive#946 Amendment 1 §2: exactly two admin-surface exceptions are
-        named and bounded (F6 git-ingest/code-ingest, F10 daemon-control
+        named and bounded (F10 daemon-control
         probe) - every other scenario is real-MCP coverage by default."""
         data, _ = coverage_validator.load_manifest(MANIFEST_PATH)
         rulings = data["oq_rulings"]
         admin_surface_ids = set(rulings["oq1_admin_surface_scenario_ids"])
         self.assertEqual(
             admin_surface_ids,
-            {"f6.git_ingest.cli.production", "f6.code_ingest.cli.production", "f10.daemon.probe_only.floor"},
+            {"f10.daemon.probe_only.floor"},
         )
         by_id = {sc["scenario_id"]: sc for sc in data["scenario"]}
         for scenario_id in admin_surface_ids:
@@ -149,12 +165,12 @@ class ManifestTests(unittest.TestCase):
             if scenario_id not in admin_surface_ids:
                 self.assertEqual(sc["surface"], "mcp_daemon", f"{scenario_id} is not in the admin-surface exception list but is not mcp_daemon either")
 
-    def test_f1_and_f4_have_500k_cohort(self):
-        """Amendment 1 §7: F1 and F4 scenario sets gain a 500K cohort before
-        any "exact cohort" claim is made."""
+    def test_f4_has_500k_cohort(self):
+        """Amendment 1 §7: the F4 scenario set gains a 500K cohort before any
+        "exact cohort" claim is made (the F1 half of the original obligation
+        left with the memory pack extraction)."""
         data, _ = coverage_validator.load_manifest(MANIFEST_PATH)
         scale_by_id = {sc["scenario_id"]: sc["scale"] for sc in data["scenario"]}
-        self.assertEqual(scale_by_id.get("f1.recall.warm.real.n500k", {}).get("memories"), 500000)
         self.assertEqual(scale_by_id.get("f4.traverse.powerlaw.n500000.depth3.real", {}).get("nodes"), 500000)
 
     def test_f10_payload_size_curve_scenario_is_absent(self):
@@ -248,6 +264,73 @@ class ManifestTests(unittest.TestCase):
             path = self._write_manifest(pathlib.Path(tmp), [_base_scenario(surface="local_dispatch")])
             _, errors = coverage_validator.load_manifest(path)
             self.assertTrue(any("invalid surface" in e for e in errors), errors)
+
+    def test_non_string_surface_and_operation_are_flagged(self):
+        for field, bad_value, value_type in (
+            ("surface", ["mcp_daemon"], "list"),
+            ("surface", {"name": "mcp_daemon"}, "dict"),
+            ("operation", ["list"], "list"),
+            ("operation", {"name": "list"}, "dict"),
+        ):
+            with self.subTest(field=field, value_type=value_type), tempfile.TemporaryDirectory() as tmp:
+                scenario = _base_scenario(scenario_id="f2.list.warm.real", feature="F2", operation="list")
+                scenario[field] = bad_value
+                path = self._write_manifest(pathlib.Path(tmp), [scenario])
+                _, errors = coverage_validator.load_manifest(path)
+                self.assertEqual(len(errors), 1, errors)
+                self.assertTrue(
+                    any(field in error and value_type in error for error in errors),
+                    errors,
+                )
+
+    def test_strict_reports_non_string_surface_and_operation(self):
+        for field, bad_value, value_type in (
+            ("surface", ["mcp_daemon"], "list"),
+            ("surface", {"name": "mcp_daemon"}, "dict"),
+            ("operation", ["list"], "list"),
+            ("operation", {"name": "list"}, "dict"),
+        ):
+            with self.subTest(field=field, value_type=value_type), tempfile.TemporaryDirectory() as tmp:
+                scenario = _base_scenario(scenario_id="f2.list.warm.real", feature="F2", operation="list")
+                scenario[field] = bad_value
+                path = self._write_manifest(pathlib.Path(tmp), [scenario])
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    exit_code = coverage_validator.main(["--manifest", str(path), "--strict"])
+                self.assertEqual(exit_code, 1)
+                self.assertIn(field, stderr.getvalue())
+                self.assertIn(value_type, stderr.getvalue())
+
+    def test_unknown_mcp_operation_is_flagged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_manifest(
+                pathlib.Path(tmp),
+                [
+                    _base_scenario(
+                        scenario_id="f2.removed.command.warm",
+                        feature="F2",
+                        operation="removed.command",
+                    )
+                ],
+            )
+            _, errors = coverage_validator.load_manifest(path)
+            self.assertTrue(any("operation is not available on mcp_daemon" in e for e in errors), errors)
+
+    def test_removed_code_ingest_cli_is_flagged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_manifest(
+                pathlib.Path(tmp),
+                [
+                    _base_scenario(
+                        scenario_id="f6.code_ingest.cli.production",
+                        feature="F6",
+                        surface="admin_cli",
+                        operation="kkernel code-ingest",
+                    )
+                ],
+            )
+            _, errors = coverage_validator.load_manifest(path)
+            self.assertTrue(any("operation is not available on admin_cli" in e for e in errors), errors)
 
     def test_malformed_fixture_hash_is_flagged(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -584,7 +667,7 @@ class CoverageStatusTests(unittest.TestCase):
         report = coverage_validator.compute_coverage(data, [], self.NOW)
         self.assertEqual(report["percent_measured"], 0.0)
         self.assertEqual(report["counts"]["missing"], report["total_scenarios"])
-        self.assertEqual(sorted(report["features_with_zero_measured"]), sorted(flagship_schema.FEATURES))
+        self.assertEqual(sorted(report["features_with_zero_measured"]), sorted(flagship_schema.MANIFEST_FEATURES))
 
     def test_fresh_matching_record_is_measured(self):
         scenario = _base_scenario()

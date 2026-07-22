@@ -181,9 +181,6 @@ jobs:
       - name: Workspace tests
         if: env.CI_SUITE == 'full'
         run: ../scripts/ci.sh tests
-      - name: Channel-email feature tests
-        if: env.CI_SUITE == 'full'
-        run: ../scripts/ci.sh channel-email
       - name: No-default-features check
         if: env.CI_SUITE == 'full'
         run: ../scripts/ci.sh no-default-features
@@ -441,7 +438,7 @@ jobs:
             echo "no comparable base SHA -- running the MinIO leg to be safe"
             exit 0
           fi
-          if git diff --name-only "$base" HEAD -- .. | grep -qE '^(crates/khive-db/|crates/khive-storage/|docs/adr/ADR-111)'; then
+          if git diff --name-only "$base" HEAD -- .. | grep -qE '^(crates/khive-db/|crates/khive-storage/)'; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"

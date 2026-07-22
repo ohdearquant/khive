@@ -4,7 +4,10 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use khive_runtime::Namespace as RuntimeNamespace;
-use khive_runtime::{BackendId, KhiveRuntime, PackRegistry, VerbRegistryBuilder};
+use khive_runtime::{
+    BackendId, KhiveRuntime, PackRegistry, SearchHit, SearchSource, VerbRegistryBuilder,
+};
+use khive_score::DeterministicScore;
 use khive_storage::EdgeRelation;
 use khive_types::namespace::Namespace;
 
@@ -12,6 +15,16 @@ use super::{BackendRegistry, LocatorCache, SubstrateCoordinator, SubstrateCoordi
 
 fn memory_runtime() -> Arc<KhiveRuntime> {
     Arc::new(KhiveRuntime::memory().expect("memory runtime"))
+}
+
+fn search_hit(entity_id: Uuid, source: SearchSource) -> SearchHit {
+    SearchHit {
+        entity_id,
+        score: DeterministicScore::from_f64(1.0),
+        source,
+        title: None,
+        snippet: None,
+    }
 }
 
 /// Build a VerbRegistry with the given packs loaded, using the given runtime.
@@ -243,6 +256,50 @@ async fn fan_out_search_two_backends_merged() {
         !merged_hits.is_empty(),
         "merged results should not be empty"
     );
+}
+
+#[test]
+fn cross_backend_entity_merge_preserves_retrieval_leg_membership() {
+    let text_only = Uuid::new_v4();
+    let vector_only = Uuid::new_v4();
+    let both_only = Uuid::new_v4();
+    let text_and_vector = Uuid::new_v4();
+    let text_on_both = Uuid::new_v4();
+    let vector_on_both = Uuid::new_v4();
+    let both_and_vector = Uuid::new_v4();
+
+    let merged = super::dispatch::rrf_merge_entity_hits(
+        vec![
+            vec![
+                search_hit(text_only, SearchSource::Text),
+                search_hit(both_only, SearchSource::Both),
+                search_hit(text_and_vector, SearchSource::Text),
+                search_hit(text_on_both, SearchSource::Text),
+                search_hit(vector_on_both, SearchSource::Vector),
+                search_hit(both_and_vector, SearchSource::Both),
+            ],
+            vec![
+                search_hit(vector_only, SearchSource::Vector),
+                search_hit(text_and_vector, SearchSource::Vector),
+                search_hit(text_on_both, SearchSource::Text),
+                search_hit(vector_on_both, SearchSource::Vector),
+                search_hit(both_and_vector, SearchSource::Vector),
+            ],
+        ],
+        10,
+    );
+    let sources: std::collections::HashMap<Uuid, SearchSource> = merged
+        .into_iter()
+        .map(|hit| (hit.entity_id, hit.source))
+        .collect();
+
+    assert_eq!(sources[&text_only], SearchSource::Text);
+    assert_eq!(sources[&vector_only], SearchSource::Vector);
+    assert_eq!(sources[&both_only], SearchSource::Both);
+    assert_eq!(sources[&text_and_vector], SearchSource::Both);
+    assert_eq!(sources[&text_on_both], SearchSource::Text);
+    assert_eq!(sources[&vector_on_both], SearchSource::Vector);
+    assert_eq!(sources[&both_and_vector], SearchSource::Both);
 }
 
 #[tokio::test]
@@ -1207,17 +1264,19 @@ async fn t7c_multi_backend_search_min_score_applied() {
     );
 }
 
-/// T7d (#439): multi-backend search for the `session` note kind must route to
-/// note FTS through the coordinator, not fall through to entity search.
+/// T7d (#439): multi-backend search for the `template_note` note kind must
+/// route to note FTS through the coordinator, not fall through to entity
+/// search.
 ///
-/// RED before fix: `is_note_substrate` was a hardcoded list omitting `session`,
-/// so `search(kind="session")` searched entity FTS with an entity-kind filter
-/// and never found the seeded session note.
+/// RED before fix: `is_note_substrate` was a hardcoded list omitting
+/// `template_note`, so `search(kind="template_note")` searched entity FTS
+/// with an entity-kind filter and never found the seeded note.
 /// GREEN after fix: substrate classification is driven by the merged
 /// `VerbRegistry` note-kind set (installed on `SubstrateCoordinatorService`),
-/// so `session` (registered by `khive-pack-session`) routes to note FTS.
+/// so `template_note` (registered by `khive-pack-template`) routes to note
+/// FTS.
 #[tokio::test]
-async fn t7d_multi_backend_search_session_kind_routes_to_note_substrate() {
+async fn t7d_multi_backend_search_template_note_kind_routes_to_note_substrate() {
     let rt_a = memory_runtime();
     let rt_b = memory_runtime();
     let ns = RuntimeNamespace::local();
@@ -1225,7 +1284,7 @@ async fn t7d_multi_backend_search_session_kind_routes_to_note_substrate() {
     let tok_a = rt_a.authorize(ns.clone()).unwrap();
     rt_a.create_note(
         &tok_a,
-        "session",
+        "template_note",
         Some("Daily standup"),
         "standup notes for the team",
         None,
@@ -1233,16 +1292,16 @@ async fn t7d_multi_backend_search_session_kind_routes_to_note_substrate() {
         vec![],
     )
     .await
-    .expect("T7d: create session note on alpha");
+    .expect("T7d: create template_note on alpha");
 
     let _ = rt_b.authorize(ns.clone()).unwrap();
 
     let server =
-        two_backend_server_with_packs(Arc::clone(&rt_a), Arc::clone(&rt_b), &["kg", "session"]);
+        two_backend_server_with_packs(Arc::clone(&rt_a), Arc::clone(&rt_b), &["kg", "template"]);
 
     let result_str = server
         .dispatch_request_local(khive_mcp::tools::request::RequestParams {
-            ops: r#"search(kind="session", query="standup")"#.to_string(),
+            ops: r#"search(kind="template_note", query="standup")"#.to_string(),
             presentation: None,
             presentation_per_op: None,
             save_to: None,
@@ -1263,13 +1322,13 @@ async fn t7d_multi_backend_search_session_kind_routes_to_note_substrate() {
     let hits = op["result"].as_array().expect("T7d: result array");
     assert!(
         !hits.is_empty(),
-        "T7d: session note must be found through the coordinator path"
+        "T7d: template_note must be found through the coordinator path"
     );
     for hit in hits {
         assert_eq!(
             hit.get("note_kind").and_then(|v| v.as_str()),
-            Some("session"),
-            "T7d: hit must be note-shaped with note_kind='session', got: {hit}"
+            Some("template_note"),
+            "T7d: hit must be note-shaped with note_kind='template_note', got: {hit}"
         );
         assert!(
             hit.get("entity_kind").map(|v| v.is_null()).unwrap_or(true),

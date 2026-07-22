@@ -3,9 +3,9 @@
 **Scope:** Design rationale and usage guidance for the scoring algorithms in `khive-score`:
 fixed-point representation, distance conversion, aggregation, and deterministic ranking.
 
-**ADRs:** [ADR-006 Deterministic Scoring](../../../../docs/adr/ADR-006-deterministic-scoring.md) |
-[ADR-012 Retrieval Composition](../../../../docs/adr/ADR-012-retrieval-composition.md) |
-[ADR-024 Fold Cognitive Primitives](../../../../docs/adr/ADR-024-fold-cognitive-primitives.md)
+**ADRs:** ADR-006 Deterministic Scoring |
+ADR-012 Retrieval Composition |
+ADR-024 Fold Cognitive Primitives
 
 **Sources:**
 - [`crates/khive-score/src/score.rs`](../src/score.rs) — `DeterministicScore`

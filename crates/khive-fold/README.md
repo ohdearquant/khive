@@ -4,7 +4,7 @@ Cognitive primitives shared across khive's runtime: `Fold` (streaming state
 reduction), `Anchor` (causal provenance graphs), `Objective` (deterministic
 candidate scoring and selection), and `Selector` (budget-constrained packing).
 Depends only on `khive-types` and `khive-score` — see
-[ADR-024](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-024-fold-cognitive-primitives.md).
+ADR-024.
 
 ## Usage
 
@@ -84,4 +84,4 @@ context packing without pulling in storage or query machinery.
 
 ## License
 
-Apache-2.0.
+BUSL-1.1. See the repository [LICENSE](https://github.com/ohdearquant/khive/blob/main/LICENSE).

@@ -3,7 +3,7 @@
 //! This is the bootstrap that the `kkernel mcp` subcommand drives. Logging is
 //! initialized by the binary, not here.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -62,10 +62,6 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
     };
     let (server, schedule_rt) = build_server(&args)?;
 
-    #[cfg(feature = "channel-email")]
-    spawn_email_channel_loops_if_daemon(&server, &args);
-    #[cfg(feature = "channel-telegram")]
-    spawn_telegram_channel_loops_if_daemon(&server, &args);
     spawn_schedule_tick_loop_if_daemon(&args, &server, schedule_rt);
 
     #[cfg(unix)]
@@ -86,24 +82,6 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
     // observe-only session sweep (never PASSIVE/TRUNCATE checkpointing —
     // that stays daemon-owned).
     serve_with_session_sweep(server, &args, registry).await
-}
-
-/// Whether this process owns the email channel loops (#602).
-///
-/// Channel loops (IMAP poll + outbox scan) are a daemon-role responsibility:
-/// before this gate, `spawn_email_channel_loops` was called unconditionally
-/// from EVERY serve entrypoint, so every stdio `kkernel mcp` client process
-/// (one per Claude Code session, agent, etc.) spawned its own independent IMAP
-/// poll loop against the same mailbox. Nine concurrent pollers exhausted
-/// Exchange Online's per-mailbox connection slots and took inbound email down
-/// for ~19h on 2026-07-04. `args.daemon` is the same flag `run`/`serve_server`
-/// already use to decide whether to hand off to
-/// `khive_runtime::daemon::run_daemon`, so gating on it keeps daemon-role
-/// detection in one place shared by both boot paths, matching the
-/// `checkpoint_pool_for` pattern (#601/#604).
-#[cfg(feature = "channel-email")]
-fn is_daemon_role(args: &Args) -> bool {
-    args.daemon
 }
 
 /// Handle for the ADR-091 Amendment 2 Plank A session sweep task. Dropping
@@ -133,9 +111,11 @@ impl SessionSweepHandle {
     }
 }
 
-/// Spawn the ADR-091 Amendment 2 Plank A observe-only session sweep task for
-/// this process's checkpoint pool, if it has one (a checkpoint pool is only
-/// wired for file-backed backends — see `checkpoint_pool_for`). Returns a
+/// Spawn the ADR-091 Amendment 2 Plank A observe-only session sweep task,
+/// fanned out over every file-backed backend this server carries: `pool` as
+/// the main backend, plus one entry per pool in `secondary_pools` (ADR-091
+/// Amendment 3). Returns `None` only when the server has no file-backed
+/// backend at all (a purely in-memory or registry-only server). Returns a
 /// [`SessionSweepHandle`] the caller MUST hold for the session's run scope
 /// and shut down explicitly (see [`SessionSweepHandle::shutdown`]) — mirrors
 /// `run_checkpoint_task`'s shutdown-channel contract on the daemon side.
@@ -155,12 +135,26 @@ impl SessionSweepHandle {
 /// classifies as `reporting`/`registered-silent` (not a permanent `unknown`)
 /// whenever a Unix daemon does enumerate the shared sidecar directory.
 fn spawn_session_walpin_sweep(server: &KhiveMcpServer) -> Option<SessionSweepHandle> {
-    let pool = server.pool()?;
-    let db_path = pool.config().path.clone();
+    let mut backends = Vec::new();
+    if let Some(pool) = server.pool() {
+        backends.push(khive_db::SweepBackend {
+            pool,
+            is_main: true,
+        });
+    }
+    for pool in server.secondary_pools() {
+        backends.push(khive_db::SweepBackend {
+            pool,
+            is_main: false,
+        });
+    }
+    if backends.is_empty() {
+        return None;
+    }
     let config = khive_db::SessionSweepConfig::from_env();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
     let join = tokio::spawn(khive_db::run_session_sweep_task(
-        db_path,
+        backends,
         config,
         shutdown_rx,
     ));
@@ -220,28 +214,9 @@ async fn serve_holding_sweep(
     result
 }
 
-/// Spawn the email channel loops if — and only if — `args` indicates this
-/// process is the daemon (#602). Shared by both serve entrypoints (`run` and
-/// `serve_server`) so the role gate lives in exactly one place instead of
-/// being duplicated at each call site. Emits one `tracing::info!` line either
-/// way so the decision is visible at startup (seeds #606's health surface).
-///
-/// If no daemon is running, mail is simply not polled until one starts — that
-/// is the intended behavior, not a silent failure; the log line makes it
-/// observable.
-#[cfg(feature = "channel-email")]
-fn spawn_email_channel_loops_if_daemon(server: &KhiveMcpServer, args: &Args) {
-    if is_daemon_role(args) {
-        tracing::info!("email channel loops: spawning (daemon role)");
-        spawn_email_channel_loops(server);
-    } else {
-        tracing::info!("email channel loops: skipped (client role; daemon owns channel loops)");
-    }
-}
-
 /// Spawn the daemon-resident schedule-event tick loop (ADR-106) iff `args`
-/// indicates this process is the daemon (mirrors
-/// [`spawn_email_channel_loops_if_daemon`]'s role gate, #602). `schedule_rt`
+/// indicates this process is the daemon (mirrors the daemon-role gate
+/// pattern used by the (now-extracted) channel loops, #602). `schedule_rt`
 /// MUST be the daemon's own already-resolved `"schedule"`-pack runtime
 /// (never a fresh `RuntimeConfig`, PR #782); `None` means either this isn't
 /// the daemon role or the pack set has no `"schedule"`. `server` MUST be the
@@ -277,1181 +252,6 @@ fn spawn_schedule_tick_loop_if_daemon(
     ));
 }
 
-/// Spawn the email channel polling + outbox loops if the `channel-email`
-/// feature is enabled and `KHIVE_EMAIL_*` config resolves. Non-fatal: logs a
-/// warning and returns on incomplete config. Only call this when
-/// [`is_daemon_role`] is true — use [`spawn_email_channel_loops_if_daemon`],
-/// which both serve entrypoints (`run` and `serve_server`) call.
-#[cfg(feature = "channel-email")]
-fn spawn_email_channel_loops(server: &KhiveMcpServer) {
-    use khive_channel::ChannelRegistry;
-    use khive_channel_email::EmailChannel;
-    use std::sync::Arc;
-
-    match EmailChannel::from_env() {
-        Ok(email_ch) => {
-            let email_ch = Arc::new(email_ch);
-            let mut ch_registry = ChannelRegistry::new();
-            let dyn_ch: Arc<dyn khive_channel::Channel> = email_ch.clone();
-            ch_registry.register(dyn_ch);
-            let ch_registry = Arc::new(ch_registry);
-            let verb_reg = server.verb_registry_clone();
-            let ingest_ns = ingest_namespace_from_env();
-            let default_actor = default_inbound_actor_from_env();
-            let mut allowlist = allowed_recipients_from_env();
-            if allowlist.is_empty() {
-                allowlist.push(email_ch.maintainer_address().to_string());
-            }
-            let mailbox = email_ch.mailbox().to_string();
-
-            let ingest_ns_clone = ingest_ns.clone();
-            let default_actor_clone = default_actor.clone();
-            let verb_reg_poll = verb_reg.clone();
-            let verb_reg_outbox = verb_reg.clone();
-            let ingest_ns_outbox = ingest_ns.clone();
-            let allowlist_clone = allowlist.clone();
-            let mailbox_clone = mailbox.clone();
-            let email_ch_clone = Arc::clone(&email_ch);
-
-            let spawned = run_if_authorized(&ingest_ns, &verb_reg, || {
-                tokio::task::spawn(channel_poll_loop(
-                    ch_registry,
-                    verb_reg_poll,
-                    ingest_ns_clone,
-                    default_actor_clone,
-                ));
-                tokio::task::spawn(channel_outbox_loop(
-                    email_ch_clone,
-                    verb_reg_outbox,
-                    ingest_ns_outbox,
-                    mailbox_clone,
-                    allowlist_clone,
-                ));
-                tracing::info!("email channel polling and outbox loops started");
-            });
-            if !spawned {
-                tracing::error!(
-                    namespace = %ingest_ns,
-                    "email channel loops NOT started: ingest namespace authorization failed (fail-closed)"
-                );
-            }
-        }
-        Err(e) => {
-            tracing::warn!(
-                "channel-email feature is enabled but configuration is incomplete: {e}; \
-                 email polling is disabled"
-            );
-        }
-    }
-}
-
-/// Resolve the target namespace for ingested channel messages.
-///
-/// Reads `KHIVE_EMAIL_INGEST_NAMESPACE`; falls back to `"local"` when the
-/// variable is unset or blank. Called once at server startup before the poll
-/// loop is spawned.
-#[cfg(feature = "channel-email")]
-fn ingest_namespace_from_env() -> String {
-    std::env::var("KHIVE_EMAIL_INGEST_NAMESPACE")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "local".to_string())
-}
-
-/// Resolve the default inbound actor for fresh (uncorrelated) email messages.
-///
-/// Reads `KHIVE_EMAIL_DEFAULT_ACTOR`; falls back to `"lambda:leo"` when the
-/// variable is unset or blank. Called once at server startup alongside
-/// `ingest_namespace_from_env`.
-#[cfg(feature = "channel-email")]
-fn default_inbound_actor_from_env() -> String {
-    std::env::var("KHIVE_EMAIL_DEFAULT_ACTOR")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "lambda:leo".to_string())
-}
-
-/// Parse the outbox allowlist from `KHIVE_EMAIL_SEND_ALLOWED_RECIPIENTS`.
-///
-/// Returns a `Vec` of trimmed, non-empty address strings. When the env var is
-/// unset or blank the returned vec is empty; callers should fall back to the
-/// channel maintainer address in that case.
-#[cfg(feature = "channel-email")]
-fn allowed_recipients_from_env() -> Vec<String> {
-    std::env::var("KHIVE_EMAIL_SEND_ALLOWED_RECIPIENTS")
-        .ok()
-        .map(|s| {
-            s.split(',')
-                .map(|r| r.trim().to_string())
-                .filter(|r| !r.is_empty())
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Run `on_authorized` only when the ingest namespace passes the preflight check.
-///
-/// Returns `true` when the closure was called (preflight passed), `false`
-/// otherwise.  Tests can inject a counting closure to verify the loop is not
-/// started when preflight fails (ADR-056 §6 fail-closed contract).
-#[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
-fn run_if_authorized(
-    ns_str: &str,
-    registry: &khive_runtime::VerbRegistry,
-    on_authorized: impl FnOnce(),
-) -> bool {
-    if preflight_ingest_namespace(ns_str, registry) {
-        on_authorized();
-        true
-    } else {
-        false
-    }
-}
-
-/// Validate and authorize the ingest namespace before spawning the poll loop.
-///
-/// Returns `true` when `ns_str` parses to a valid namespace AND the registry
-/// gate permits it.  Returns `false` on any parse failure or authorization
-/// denial, after logging the reason.  The caller must not spawn the poll loop
-/// when this returns `false` (fail-closed, ADR-056 §6).
-#[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
-fn preflight_ingest_namespace(ns_str: &str, registry: &khive_runtime::VerbRegistry) -> bool {
-    match khive_runtime::Namespace::parse(ns_str) {
-        Ok(ns) => match registry.authorize_namespace(ns) {
-            Ok(()) => true,
-            Err(e) => {
-                tracing::error!(
-                    namespace = %ns_str,
-                    error = %e,
-                    "ingest namespace authorization denied; email polling will not start"
-                );
-                false
-            }
-        },
-        Err(e) => {
-            tracing::error!(
-                namespace = %ns_str,
-                error = %e,
-                "invalid ingest namespace string; email polling will not start"
-            );
-            false
-        }
-    }
-}
-
-/// Background task that polls all registered channels every 5 seconds and
-/// ingests new inbound messages via `comm.ingest`.
-///
-/// #605: the 5s cadence is the happy-path default only. A connect/auth
-/// failure (classified by `khive_channel_email::is_backoff_eligible`) starts
-/// a per-channel-kind jittered exponential backoff (`ImapBackoff`,
-/// 5s -> 10s -> ... capped at ~10min) instead of retrying flat every 5s; a
-/// success resets that channel's backoff to base, and the loop returns to
-/// the normal 5s cadence. This is process-side pressure relief on top of the
-/// per-credential single-flight guard inside `LiveImap` itself. Eligible
-/// failures log via [`log_eligible_poll_failure`]: `warn!` only on an
-/// escalation edge, `debug!` while riding the same capped step — never one
-/// `warn!` per retry.
-///
-/// Only compiled when the `channel-email` feature is enabled.
-#[cfg(feature = "channel-email")]
-async fn channel_poll_loop(
-    channels: std::sync::Arc<khive_channel::ChannelRegistry>,
-    registry: khive_runtime::VerbRegistry,
-    ingest_namespace: String,
-    default_inbound_actor: String,
-) {
-    use chrono::{DateTime, Utc};
-    use khive_channel_email::{is_backoff_eligible, ImapBackoff};
-    use serde_json::json;
-    use std::collections::HashMap;
-    use std::time::Duration;
-
-    const HAPPY_PATH_INTERVAL: Duration = Duration::from_secs(5);
-
-    // Per-channel bootstrap "since" floor (issue #449). This
-    // only feeds the date-based SINCE search used while a channel has no
-    // committed UID high-water yet (first-ever poll, or a UIDVALIDITY
-    // reset); once a checkpoint has a high-water, polling is UID-ranged and
-    // this floor is unused for that channel. Each entry only advances to the
-    // poll tick's timestamp once that channel's full cycle -- cursor_get,
-    // poll_page, every comm.ingest, and cursor_commit -- succeeds this tick.
-    // Advancing it unconditionally (as a shared `last_poll` timestamp used
-    // to) would drop the earlier floor on any bootstrap-cycle failure, and
-    // if that failure spans a calendar-day boundary the next checkpoint-less
-    // poll's SINCE clause would use the newer date, permanently skipping the
-    // previous day's uncommitted mail.
-    let mut bootstrap_since: HashMap<(String, String), DateTime<Utc>> = HashMap::new();
-    // One backoff state per (kind, slug) — i.e. per credential (#606).
-    // Keying by kind alone would throttle a
-    // second same-kind credential (e.g. a second mailbox) whenever the first
-    // one's connection fails, even though the two are independent
-    // credentials with independent connectivity.
-    let mut backoffs: HashMap<(String, String), ImapBackoff> = HashMap::new();
-    // ADR-094: tracks the error class of the most recent unresolved failure
-    // per (kind, slug), so `ChannelPollFailed` fires once per failure episode
-    // (first failure since success, or a change in error class) rather than
-    // once per retry. Cleared on every success.
-    let mut last_error_class: HashMap<(String, String), &'static str> = HashMap::new();
-    let mut next_interval = HAPPY_PATH_INTERVAL;
-    let event_store = registry.event_store();
-    // Captured before the loop's first sleep (issue #449 follow-up).
-    // A channel's very first bootstrap floor must reflect
-    // when the daemon actually started, not whenever its first tick happens
-    // to fire: `tokio::time::sleep` below runs before any polling, so
-    // computing `now` after it (as the loop used to) can land on the far
-    // side of a calendar-day boundary the daemon started before. Every
-    // vacant `bootstrap_since` entry -- on tick 1 or any later tick a
-    // channel is first seen on -- uses this single startup timestamp
-    // instead of that tick's own `now`.
-    let startup_since = Utc::now();
-
-    loop {
-        tokio::time::sleep(next_interval).await;
-        next_interval = HAPPY_PATH_INTERVAL;
-
-        let now = Utc::now();
-
-        for (kind, slug, channel) in channels.iter() {
-            let backoff_key = (kind.to_string(), slug.to_string());
-            let since = *bootstrap_since
-                .entry(backoff_key.clone())
-                .or_insert(startup_since);
-            // Set once this channel's cycle durably completes (a fresh
-            // commit, or nothing new to commit); gates whether `since`
-            // advances past this tick's `now` for next time.
-            let mut bootstrap_floor_advances = false;
-
-            append_channel_lifecycle_event(
-                event_store.as_ref(),
-                khive_types::EventKind::ChannelPollStarted,
-                khive_storage::ChannelPollStartedPayload {
-                    channel_kind: kind.to_string(),
-                    channel_slug: slug.to_string(),
-                    since_rfc3339: since.to_rfc3339(),
-                },
-            )
-            .await;
-
-            // Durable checkpoint path (issue #449): cursor_get -> poll_page ->
-            // every comm.ingest -> cursor_commit, committing only when the
-            // whole page durably ingested. A cursor_get failure means we
-            // cannot trust what progress to poll from, so this channel is
-            // skipped for the cycle rather than risk polling from an empty
-            // checkpoint and silently discarding durable state.
-            let checkpoint = match load_channel_cursor(&registry, kind, slug).await {
-                Ok(cp) => cp,
-                Err(e) => {
-                    tracing::warn!(
-                        channel = kind,
-                        "comm.cursor_get failed; skipping this channel's poll this cycle: {e}"
-                    );
-                    continue;
-                }
-            };
-
-            match channel.poll_page(since, checkpoint.as_ref()).await {
-                Ok(page) => {
-                    let prior_attempt =
-                        backoffs.get(&backoff_key).map(|b| b.attempt()).unwrap_or(0);
-                    if let Some(backoff) = backoffs.get_mut(&backoff_key) {
-                        backoff.record_success();
-                    }
-                    last_error_class.remove(&backoff_key);
-
-                    // Only a recovery from a prior failure/backoff episode is
-                    // an interesting lifecycle transition — an unbroken
-                    // string of healthy polls never had ChannelPollFailed
-                    // fire, so there is nothing to report recovering from.
-                    if prior_attempt > 0 {
-                        append_channel_lifecycle_event(
-                            event_store.as_ref(),
-                            khive_types::EventKind::ChannelPollSucceeded,
-                            khive_storage::ChannelPollSucceededPayload {
-                                channel_kind: kind.to_string(),
-                                channel_slug: slug.to_string(),
-                                envelope_count: page.envelopes.len(),
-                                previous_backoff_attempt: prior_attempt,
-                            },
-                        )
-                        .await;
-                        append_channel_lifecycle_event(
-                            event_store.as_ref(),
-                            khive_types::EventKind::ChannelBackoffReset,
-                            khive_storage::ChannelBackoffResetPayload {
-                                channel_kind: kind.to_string(),
-                                channel_slug: slug.to_string(),
-                                previous_backoff_attempt: prior_attempt,
-                            },
-                        )
-                        .await;
-                    }
-
-                    record_channel_heartbeat(
-                        &registry,
-                        kind,
-                        slug,
-                        HeartbeatOutcome::Success,
-                        event_store.as_ref(),
-                    )
-                    .await;
-
-                    // Every envelope in the page must durably ingest before
-                    // the cursor is allowed to advance past it (issue #449):
-                    // a partial-page ingest failure must leave
-                    // the checkpoint untouched so the next poll re-selects
-                    // the whole page -- comm.ingest's `INSERT OR IGNORE`
-                    // dedup then skips re-storing the messages that already
-                    // succeeded, and only the failed one is retried.
-                    let mut page_fully_ingested = true;
-                    for env in page.envelopes {
-                        let params = json!({
-                            "namespace": ingest_namespace,
-                            "from": env.from,
-                            "to": env.to,
-                            "content": env.content,
-                            "subject": env.subject,
-                            "channel_kind": kind,
-                            "external_id": env.external_id,
-                            "sent_at": env.sent_at.map(|ts| ts.to_rfc3339()),
-                            "correlation_external_id": env.correlation_external_id,
-                            "default_inbound_actor": default_inbound_actor,
-                            "wire_message_id": env.wire_message_id,
-                            "wire_references": env.wire_references,
-                            "metadata": env.metadata,
-                        });
-                        if let Err(e) = registry.dispatch("comm.ingest", params).await {
-                            tracing::warn!(
-                                channel = kind,
-                                "comm.ingest failed for inbound message: {e}"
-                            );
-                            page_fully_ingested = false;
-                        }
-                    }
-
-                    if page_fully_ingested {
-                        match page.next_checkpoint {
-                            Some(next_checkpoint) => {
-                                match commit_channel_cursor(&registry, kind, slug, &next_checkpoint)
-                                    .await
-                                {
-                                    Ok(()) => bootstrap_floor_advances = true,
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            channel = kind,
-                                            "comm.cursor_commit failed; progress not durably \
-                                             advanced, next poll will retry: {e}"
-                                        );
-                                    }
-                                }
-                            }
-                            // Nothing new to commit this tick is not a
-                            // failure -- safe to advance the bootstrap floor.
-                            None => bootstrap_floor_advances = true,
-                        }
-                    } else {
-                        tracing::warn!(
-                            channel = kind,
-                            "not committing IMAP cursor: at least one message in this page \
-                             failed comm.ingest; the whole page will be retried next poll"
-                        );
-                    }
-                }
-                Err(e) => {
-                    let class = channel_error_class(&e);
-                    record_channel_heartbeat(
-                        &registry,
-                        kind,
-                        slug,
-                        HeartbeatOutcome::Failure {
-                            class,
-                            message: e.to_string(),
-                        },
-                        event_store.as_ref(),
-                    )
-                    .await;
-
-                    // First failure since success or since the error class
-                    // changed — a run of identical retries at the same class
-                    // does not re-fire this event.
-                    if last_error_class.get(&backoff_key) != Some(&class) {
-                        last_error_class.insert(backoff_key.clone(), class);
-                        append_channel_lifecycle_event(
-                            event_store.as_ref(),
-                            khive_types::EventKind::ChannelPollFailed,
-                            khive_storage::ChannelPollFailedPayload {
-                                channel_kind: kind.to_string(),
-                                channel_slug: slug.to_string(),
-                                error_class: class.to_string(),
-                                error_message: e.to_string(),
-                            },
-                        )
-                        .await;
-                    }
-
-                    if is_backoff_eligible(&e) {
-                        let backoff = backoffs.entry(backoff_key).or_default();
-                        let tick = backoff.record_failure();
-                        log_eligible_poll_failure(kind, &e, &tick);
-                        next_interval = next_interval.max(tick.delay);
-
-                        if tick.should_warn {
-                            append_channel_lifecycle_event(
-                                event_store.as_ref(),
-                                khive_types::EventKind::ChannelBackoffArmed,
-                                khive_storage::ChannelBackoffArmedPayload {
-                                    channel_kind: kind.to_string(),
-                                    channel_slug: slug.to_string(),
-                                    attempt: tick.attempt,
-                                    step_ms: tick.step.as_millis() as u64,
-                                    delay_ms: tick.delay.as_millis() as u64,
-                                },
-                            )
-                            .await;
-                        }
-                    } else {
-                        // Non-eligible failures (config/gate errors, never
-                        // produced by poll/connect in practice) are not
-                        // connectivity pressure, so they keep the pre-#605
-                        // warn-every-retry behavior at the normal cadence.
-                        tracing::warn!(channel = kind, "channel poll failed: {e}");
-                    }
-                }
-            }
-
-            if bootstrap_floor_advances {
-                bootstrap_since.insert((kind.to_string(), slug.to_string()), now);
-            }
-        }
-    }
-}
-
-/// Append one ADR-094 channel lifecycle event, namespaced and attributed the
-/// same way as `record_channel_heartbeat`'s persisted rows.
-///
-/// Best-effort: `store == None` is a no-op, and a serialize/append failure is
-/// logged and swallowed — no lifecycle-append error may ever interrupt or
-/// slow down channel polling.
-#[cfg(feature = "channel-email")]
-async fn append_channel_lifecycle_event<P: serde::Serialize>(
-    store: Option<&std::sync::Arc<dyn khive_storage::EventStore>>,
-    kind: khive_types::EventKind,
-    payload: P,
-) {
-    let Some(store) = store else {
-        return;
-    };
-    let payload_value = match serde_json::to_value(&payload) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                event_kind = %kind.name(),
-                "failed to serialize channel lifecycle event payload"
-            );
-            return;
-        }
-    };
-    let event = khive_storage::Event::new(
-        khive_pack_comm::CHANNEL_HEALTH_NAMESPACE,
-        "channel.poll_lifecycle",
-        kind,
-        khive_types::SubstrateKind::Event,
-        "daemon:channel_poll_loop",
-    )
-    .with_payload(payload_value);
-    if let Err(err) = store.append_event(event).await {
-        tracing::warn!(
-            error = %err,
-            event_kind = %kind.name(),
-            "channel lifecycle event append failed"
-        );
-    }
-}
-
-/// One poll attempt's outcome, as reported to `comm.heartbeat` (#606).
-#[cfg(feature = "channel-email")]
-enum HeartbeatOutcome {
-    Success,
-    Failure {
-        class: &'static str,
-        message: String,
-    },
-}
-
-/// Map a [`khive_channel::ChannelError`] to the `comm.heartbeat` `error_class`
-/// open string enum (#606: `auth | transport | config`
-/// in v1, callers must tolerate unknown classes). `Auth`/`Transport` are the
-/// connectivity classes `is_backoff_eligible` already distinguishes;
-/// `Config`/`UnauthorizedSender`/`InvalidEnvelope` are static/attribution
-/// failures, never produced by `poll`/`connect` in practice (see
-/// `is_backoff_eligible`'s doc comment), so they all map to `"config"`.
-#[cfg(feature = "channel-email")]
-fn channel_error_class(err: &khive_channel::ChannelError) -> &'static str {
-    match err {
-        khive_channel::ChannelError::Auth(_) => "auth",
-        khive_channel::ChannelError::Transport(_) => "transport",
-        khive_channel::ChannelError::Config(_)
-        | khive_channel::ChannelError::UnauthorizedSender(_)
-        | khive_channel::ChannelError::InvalidEnvelope(_) => "config",
-    }
-}
-
-/// Persist one poll attempt's outcome via the `comm.heartbeat` subhandler
-/// (#606). Best-effort: a failed write is logged, never interrupts the poll
-/// loop. Takes NO `namespace` param — heartbeat rows are always dispatched
-/// against `khive_pack_comm::CHANNEL_HEALTH_NAMESPACE` regardless of the
-/// daemon's configured `KHIVE_EMAIL_INGEST_NAMESPACE` (2026-07-04); an
-/// explicitly-scoped `comm.health` read may see a different namespace
-/// (khive #877).
-#[cfg(feature = "channel-email")]
-async fn record_channel_heartbeat(
-    registry: &khive_runtime::VerbRegistry,
-    channel_kind: &str,
-    channel_slug: &str,
-    outcome: HeartbeatOutcome,
-    event_store: Option<&std::sync::Arc<dyn khive_storage::EventStore>>,
-) {
-    use serde_json::json;
-
-    let namespace = khive_pack_comm::CHANNEL_HEALTH_NAMESPACE;
-    let params = match &outcome {
-        HeartbeatOutcome::Success => json!({
-            "namespace": namespace,
-            "channel_kind": channel_kind,
-            "channel_slug": channel_slug,
-            "outcome": "success",
-        }),
-        HeartbeatOutcome::Failure { class, message } => json!({
-            "namespace": namespace,
-            "channel_kind": channel_kind,
-            "channel_slug": channel_slug,
-            "outcome": "failure",
-            "error_class": class,
-            "error_message": message,
-        }),
-    };
-    if let Err(e) = registry.dispatch("comm.heartbeat", params).await {
-        tracing::warn!(
-            channel = channel_kind,
-            "comm.heartbeat failed to persist poll outcome: {e}"
-        );
-        append_channel_lifecycle_event(
-            event_store,
-            khive_types::EventKind::ChannelHeartbeatPersistFailed,
-            khive_storage::ChannelHeartbeatPersistFailedPayload {
-                channel_kind: channel_kind.to_string(),
-                channel_slug: channel_slug.to_string(),
-                error: e.to_string(),
-            },
-        )
-        .await;
-    }
-}
-
-/// Load the durable poll checkpoint for `(channel_kind, channel_slug)` via
-/// `comm.cursor_get` (issue #449). Returns `Ok(None)` on first-run
-/// (`comm.cursor_get` returns JSON `null`). A dispatch failure or a
-/// malformed response is returned as `Err` so the caller skips this
-/// channel's poll for the cycle rather than risk polling with empty
-/// progress and silently discarding durable state.
-#[cfg(feature = "channel-email")]
-async fn load_channel_cursor(
-    registry: &khive_runtime::VerbRegistry,
-    channel_kind: &str,
-    channel_slug: &str,
-) -> Result<Option<khive_channel::StoredChannelCheckpoint>, khive_runtime::RuntimeError> {
-    use serde_json::json;
-
-    let value = registry
-        .dispatch(
-            "comm.cursor_get",
-            json!({
-                "channel_kind": channel_kind,
-                "channel_slug": channel_slug,
-            }),
-        )
-        .await?;
-    if value.is_null() {
-        return Ok(None);
-    }
-    serde_json::from_value(value).map(Some).map_err(|e| {
-        khive_runtime::RuntimeError::Internal(format!(
-            "comm.cursor_get returned a malformed checkpoint: {e}"
-        ))
-    })
-}
-
-/// Persist the durable poll checkpoint for `(channel_kind, channel_slug)`
-/// via `comm.cursor_commit` (issue #449).
-///
-/// Callers MUST only call this after every envelope in the page has
-/// returned `Ok` from `comm.ingest` -- see `channel_poll_loop`. Committing
-/// on a partial page would advance the cursor past a message that was never
-/// durably ingested, permanently skipping it.
-#[cfg(feature = "channel-email")]
-async fn commit_channel_cursor(
-    registry: &khive_runtime::VerbRegistry,
-    channel_kind: &str,
-    channel_slug: &str,
-    checkpoint: &khive_channel::ChannelCheckpoint,
-) -> Result<(), khive_runtime::RuntimeError> {
-    use serde_json::json;
-
-    registry
-        .dispatch(
-            "comm.cursor_commit",
-            json!({
-                "channel_kind": channel_kind,
-                "channel_slug": channel_slug,
-                "source": checkpoint.source,
-                "generation": checkpoint.generation,
-                "high_water": checkpoint.high_water,
-            }),
-        )
-        .await?;
-    Ok(())
-}
-
-/// Log a backoff-eligible poll failure at the level ADR-091's `crossing_warn`
-/// discipline calls for: `warn!` only on an escalation edge
-/// (`tick.should_warn`, i.e. the computed step just changed), `debug!` on a
-/// repeat at the same step. Regression fix (2026-07-04): the poll loop
-/// previously emitted a generic `warn!` on every eligible retry in addition
-/// to the escalation-edge warn, so sustained pressure spammed warn-level logs
-/// once per retry instead of once per escalation. Extracted to a standalone
-/// function so the level decision is unit-testable without driving the full
-/// poll loop.
-#[cfg(feature = "channel-email")]
-fn log_eligible_poll_failure(
-    kind: &str,
-    err: &khive_channel::ChannelError,
-    tick: &khive_channel_email::BackoffTick,
-) {
-    if tick.should_warn {
-        tracing::warn!(
-            channel = kind,
-            attempt = tick.attempt,
-            delay_secs = tick.delay.as_secs_f64(),
-            "IMAP poll backoff escalating after connect/auth failure: {err}"
-        );
-    } else {
-        tracing::debug!(
-            channel = kind,
-            attempt = tick.attempt,
-            delay_secs = tick.delay.as_secs_f64(),
-            "channel poll failed, holding at current backoff step: {err}"
-        );
-    }
-}
-
-/// True if a note's `delivered_at` property marks it as already delivered.
-///
-/// Must match the `list` query predicate's null handling (`list.rs`): a
-/// present-but-null `delivered_at` is undelivered, not delivered. Checking
-/// `.is_some()` alone would treat an explicit null (e.g. left by a curation
-/// `update`) as delivered and strand the note in the outbox forever.
-#[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
-fn note_already_delivered(props: &serde_json::Map<String, serde_json::Value>) -> bool {
-    props
-        .get("delivered_at")
-        .map(|v| !v.is_null())
-        .unwrap_or(false)
-}
-
-/// Background task that delivers undelivered outbound email notes every 5 seconds.
-///
-/// Implements AT-LEAST-ONCE delivery: the `external_id` (= RFC 822 Message-ID) is
-/// persisted to the note BEFORE sending. A crash between the SMTP success and the
-/// `delivered_at` write causes a duplicate send on restart; the duplicate carries
-/// the same Message-ID so receiving MTAs typically collapse it.
-///
-/// Only compiled when the `channel-email` feature is enabled.
-#[cfg(feature = "channel-email")]
-async fn channel_outbox_loop(
-    email_channel: std::sync::Arc<khive_channel_email::EmailChannel>,
-    registry: khive_runtime::VerbRegistry,
-    ingest_namespace: String,
-    mailbox: String,
-    allowlist: Vec<String>,
-) {
-    use chrono::Utc;
-    use khive_channel::{Channel, ChannelEnvelope};
-    use serde_json::json;
-
-    let domain = mailbox.split('@').nth(1).unwrap_or("localhost").to_string();
-
-    loop {
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-
-        // Query outbound messages via the registry. The note `list` handler applies
-        // the `direction` filter server-side (scanning up to its internal cap) and
-        // returns a bare JSON array of full note objects. There is no `delivered_at`
-        // or recipient-prefix filter, so the `email:` prefix and the
-        // already-delivered check are applied per-note below.
-        let list_params = json!({
-            "namespace": ingest_namespace,
-            "kind": "message",
-            "direction": "outbound",
-            "delivered": false,
-            "limit": 200,
-        });
-        let list_result = match registry.dispatch("list", list_params).await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(error = %e, "outbox loop: list failed");
-                continue;
-            }
-        };
-
-        let notes = match list_result.as_array() {
-            Some(arr) => arr.clone(),
-            None => continue,
-        };
-
-        for note_val in notes {
-            let props = match note_val.get("properties") {
-                Some(serde_json::Value::Object(m)) => m.clone(),
-                _ => continue,
-            };
-
-            // Only outbound direction. The `delivered=false` filter on the list query
-            // ensures only undelivered notes are returned; this check is a cheap
-            // defensive guard for any note that slips through.
-            if props.get("direction").and_then(|v| v.as_str()) != Some("outbound") {
-                continue;
-            }
-
-            // Only email-addressed notes.
-            let to_actor = match props.get("to_actor").and_then(|v| v.as_str()) {
-                Some(a) if a.starts_with("email:") => a.to_string(),
-                _ => continue,
-            };
-
-            // Defensive: skip already-delivered notes in case the query filter missed any.
-            if note_already_delivered(&props) {
-                continue;
-            }
-
-            let note_id = match note_val.get("id").and_then(|v| v.as_str()) {
-                Some(id) => id.to_string(),
-                None => continue,
-            };
-
-            let recipient = to_actor
-                .strip_prefix("email:")
-                .unwrap_or(to_actor.as_str())
-                .to_string();
-
-            // Allowlist check.
-            if !allowlist.is_empty() && !allowlist.contains(&recipient) {
-                tracing::warn!(
-                    note_id = %note_id,
-                    recipient = %recipient,
-                    "outbox loop: recipient not in allowlist; skipping"
-                );
-                continue;
-            }
-
-            let subject = props
-                .get("subject")
-                .and_then(|v| v.as_str())
-                .unwrap_or("(no subject)")
-                .to_string();
-
-            let content = match note_val.get("content").and_then(|v| v.as_str()) {
-                Some(c) => c.to_string(),
-                None => continue,
-            };
-
-            let thread_id = props
-                .get("thread_id")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-
-            // Issue #403: the parent's wire Message-ID, computed at reply time by
-            // comm.reply (khive-pack-comm) and stored on this note. Forwarded
-            // verbatim so the SMTP layer can set In-Reply-To for native MUA
-            // conversation grouping; absent for non-reply sends.
-            let in_reply_to = props
-                .get("in_reply_to_message_id")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-
-            // Issue #403: the full References chain (parent's existing
-            // chain, if any, followed by the parent's Message-ID), computed at
-            // reply time by comm.reply. Forwarded verbatim so the SMTP layer can
-            // set References without truncating ancestry; absent for non-reply sends.
-            let references = props
-                .get("references_chain")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-
-            // Mint-before-send: derive or reuse the Message-ID.
-            let message_id = match props.get("external_id").and_then(|v| v.as_str()) {
-                Some(eid) if !eid.is_empty() => eid.to_string(),
-                _ => {
-                    let mid = format!("<{note_id}@{domain}>");
-                    // Persist the claimed external_id before sending.
-                    let claim_result = registry
-                        .dispatch(
-                            "update",
-                            json!({
-                                "namespace": ingest_namespace,
-                                "id": note_id,
-                                "properties": { "external_id": mid.clone() },
-                            }),
-                        )
-                        .await;
-                    if let Err(e) = claim_result {
-                        tracing::warn!(
-                            note_id = %note_id,
-                            error = %e,
-                            "outbox loop: failed to claim external_id; skipping"
-                        );
-                        continue;
-                    }
-                    mid
-                }
-            };
-
-            // Build and send the envelope.
-            let mut env = ChannelEnvelope::new(
-                format!("email:{mailbox}"),
-                format!("email:{recipient}"),
-                content,
-            )
-            .with_subject(subject)
-            .with_message_id(message_id.clone());
-
-            if let Some(tid) = thread_id {
-                env = env.with_correlation(tid);
-            }
-            if let Some(irt) = in_reply_to {
-                env = env.with_in_reply_to(irt);
-            }
-            if let Some(refs) = references {
-                env = env.with_references(refs);
-            }
-
-            match email_channel.send(env).await {
-                Ok(()) => {
-                    let delivered_at = Utc::now().to_rfc3339();
-                    let mark_result = registry
-                        .dispatch(
-                            "update",
-                            json!({
-                                "namespace": ingest_namespace,
-                                "id": note_id,
-                                "properties": { "delivered_at": delivered_at },
-                            }),
-                        )
-                        .await;
-                    match mark_result {
-                        Ok(_) => {
-                            tracing::info!(
-                                note_id = %note_id,
-                                recipient = %recipient,
-                                message_id = %message_id,
-                                "outbox loop: delivered"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                note_id = %note_id,
-                                error = %e,
-                                "outbox loop: failed to set delivered_at (AT-LEAST-ONCE: will retry)"
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        note_id = %note_id,
-                        recipient = %recipient,
-                        error = %e,
-                        "outbox loop: send failed; will retry next cycle"
-                    );
-                }
-            }
-        }
-    }
-}
-
-/// Whether this process owns the Telegram channel loops. Mirrors
-/// [`is_daemon_role`]'s email-channel role gate (#602): channel loops are a
-/// daemon-role responsibility, never spawned per client process.
-#[cfg(feature = "channel-telegram")]
-fn is_telegram_daemon_role(args: &Args) -> bool {
-    args.daemon
-}
-
-/// Spawn the Telegram channel loops if — and only if — `args` indicates this
-/// process is the daemon. Mirrors
-/// [`spawn_email_channel_loops_if_daemon`]. If no daemon is running, Telegram
-/// is simply not polled until one starts.
-#[cfg(feature = "channel-telegram")]
-fn spawn_telegram_channel_loops_if_daemon(server: &KhiveMcpServer, args: &Args) {
-    if is_telegram_daemon_role(args) {
-        tracing::info!("telegram channel loops: spawning (daemon role)");
-        spawn_telegram_channel_loops(server);
-    } else {
-        tracing::info!("telegram channel loops: skipped (client role; daemon owns channel loops)");
-    }
-}
-
-/// Spawn the Telegram channel polling + outbox loops if the `channel-telegram`
-/// feature is enabled and `KHIVE_TELEGRAM_*` config resolves. Non-fatal: logs
-/// a warning and returns on incomplete config. Only call this when
-/// [`is_telegram_daemon_role`] is true — use
-/// [`spawn_telegram_channel_loops_if_daemon`].
-///
-/// Unlike the email adapter, Telegram's poll offset is held in memory inside
-/// `TelegramChannel` itself (ADR-056 Amendment 2026-07-05, "Poll offset and
-/// restart durability") — there is no per-channel checkpoint/cursor
-/// persistence, backoff escalation, or ADR-094 lifecycle-event surface for
-/// this adapter; those are email-specific hardening (#605/#606/ADR-094)
-/// this ADR explicitly does not require for Telegram's simpler getUpdates
-/// durability model.
-#[cfg(feature = "channel-telegram")]
-fn spawn_telegram_channel_loops(server: &KhiveMcpServer) {
-    use khive_channel_telegram::TelegramChannel;
-    use std::sync::Arc;
-
-    match TelegramChannel::from_env() {
-        Ok(tg_ch) => {
-            let tg_ch = Arc::new(tg_ch);
-            let verb_reg = server.verb_registry_clone();
-            let ingest_ns = telegram_ingest_namespace_from_env();
-
-            let verb_reg_poll = verb_reg.clone();
-            let verb_reg_outbox = verb_reg.clone();
-            let ingest_ns_poll = ingest_ns.clone();
-            let ingest_ns_outbox = ingest_ns.clone();
-            let tg_ch_poll = Arc::clone(&tg_ch);
-            let tg_ch_outbox = Arc::clone(&tg_ch);
-
-            let spawned = run_if_authorized(&ingest_ns, &verb_reg, || {
-                tokio::task::spawn(telegram_poll_loop(
-                    tg_ch_poll,
-                    verb_reg_poll,
-                    ingest_ns_poll,
-                ));
-                tokio::task::spawn(telegram_outbox_loop(
-                    tg_ch_outbox,
-                    verb_reg_outbox,
-                    ingest_ns_outbox,
-                ));
-                tracing::info!("telegram channel polling and outbox loops started");
-            });
-            if !spawned {
-                tracing::error!(
-                    namespace = %ingest_ns,
-                    "telegram channel loops NOT started: ingest namespace authorization failed (fail-closed)"
-                );
-            }
-        }
-        Err(e) => {
-            tracing::warn!(
-                "channel-telegram feature is enabled but configuration is incomplete: {e}; \
-                 telegram polling is disabled"
-            );
-        }
-    }
-}
-
-/// Resolve the target namespace for ingested Telegram messages.
-///
-/// Reads `KHIVE_TELEGRAM_INGEST_NAMESPACE`; falls back to `"local"` when the
-/// variable is unset or blank. Called once at server startup before the poll
-/// loop is spawned.
-#[cfg(feature = "channel-telegram")]
-fn telegram_ingest_namespace_from_env() -> String {
-    std::env::var("KHIVE_TELEGRAM_INGEST_NAMESPACE")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "local".to_string())
-}
-
-/// Background task that polls the Telegram channel via `getUpdates` long
-/// polling and ingests new inbound messages via `comm.ingest`. No
-/// backoff/heartbeat/lifecycle-event surface — see
-/// [`spawn_telegram_channel_loops`]'s doc comment for why this is a
-/// deliberately smaller loop than `channel_poll_loop`.
-///
-/// The Bot API `getUpdates` call itself blocks server-side for the
-/// connector's long-poll timeout awaiting new updates (ADR-056 Amendment
-/// 2026-07-05 requires long polling, not short polling), so the success path
-/// adds no extra sleep between requests — the long poll paces the loop.
-/// Only the error path sleeps, so a failing Bot API does not hot-loop.
-///
-/// A fetched batch's offset is committed (acknowledged to Telegram) only
-/// after every authorized envelope in it durably ingests via `comm.ingest`
-/// — mirrors the IMAP cursor-commit discipline at `channel_poll_loop`
-/// without importing its IMAP-specific machinery (issue #113).
-#[cfg(feature = "channel-telegram")]
-async fn telegram_poll_loop(
-    telegram_channel: std::sync::Arc<khive_channel_telegram::TelegramChannel>,
-    registry: khive_runtime::VerbRegistry,
-    ingest_namespace: String,
-) {
-    use chrono::Utc;
-    use khive_channel::Channel;
-    use serde_json::json;
-
-    const ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
-
-    loop {
-        match telegram_channel.poll(Utc::now()).await {
-            Ok(envelopes) => {
-                let kind = telegram_channel.kind();
-                let mut all_ingested = true;
-                for env in envelopes {
-                    let params = json!({
-                        "namespace": ingest_namespace,
-                        "from": env.from,
-                        "to": env.to,
-                        "content": env.content,
-                        "channel_kind": kind,
-                        "external_id": env.external_id,
-                        "sent_at": env.sent_at.map(|ts| ts.to_rfc3339()),
-                    });
-                    if let Err(e) = registry.dispatch("comm.ingest", params).await {
-                        tracing::warn!(
-                            channel = kind,
-                            "comm.ingest failed for inbound telegram message: {e}"
-                        );
-                        all_ingested = false;
-                    }
-                }
-
-                if all_ingested {
-                    telegram_channel.commit_offset();
-                } else {
-                    tracing::warn!(
-                        channel = kind,
-                        "not committing telegram offset: at least one message in this batch \
-                         failed comm.ingest; the whole batch will be retried next poll"
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    channel = telegram_channel.kind(),
-                    "telegram channel poll failed: {e}"
-                );
-                tokio::time::sleep(ERROR_BACKOFF).await;
-            }
-        }
-    }
-}
-
-/// Background task that delivers undelivered outbound notes addressed to a
-/// `telegram:` recipient every 5 seconds. Mirrors `channel_outbox_loop`'s
-/// note-scan/send/mark-delivered shape without the Message-ID minting logic
-/// (Telegram has no RFC 822 Message-ID concept).
-#[cfg(feature = "channel-telegram")]
-async fn telegram_outbox_loop(
-    telegram_channel: std::sync::Arc<khive_channel_telegram::TelegramChannel>,
-    registry: khive_runtime::VerbRegistry,
-    ingest_namespace: String,
-) {
-    use chrono::Utc;
-    use khive_channel::{Channel, ChannelEnvelope};
-    use serde_json::json;
-
-    loop {
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-
-        let list_params = json!({
-            "namespace": ingest_namespace,
-            "kind": "message",
-            "direction": "outbound",
-            "delivered": false,
-            "limit": 200,
-        });
-        let list_result = match registry.dispatch("list", list_params).await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(error = %e, "telegram outbox loop: list failed");
-                continue;
-            }
-        };
-
-        let notes = match list_result.as_array() {
-            Some(arr) => arr.clone(),
-            None => continue,
-        };
-
-        for note_val in notes {
-            let props = match note_val.get("properties") {
-                Some(serde_json::Value::Object(m)) => m.clone(),
-                _ => continue,
-            };
-
-            if props.get("direction").and_then(|v| v.as_str()) != Some("outbound") {
-                continue;
-            }
-
-            let to_actor = match props.get("to_actor").and_then(|v| v.as_str()) {
-                Some(a) if a.starts_with("telegram:") => a.to_string(),
-                _ => continue,
-            };
-
-            if note_already_delivered(&props) {
-                continue;
-            }
-
-            let note_id = match note_val.get("id").and_then(|v| v.as_str()) {
-                Some(id) => id.to_string(),
-                None => continue,
-            };
-
-            let content = match note_val.get("content").and_then(|v| v.as_str()) {
-                Some(c) => c.to_string(),
-                None => continue,
-            };
-
-            let env = ChannelEnvelope::new("telegram:bot", to_actor, content);
-
-            match telegram_channel.send(env).await {
-                Ok(()) => {
-                    let delivered_at = Utc::now().to_rfc3339();
-                    let mark_result = registry
-                        .dispatch(
-                            "update",
-                            json!({
-                                "namespace": ingest_namespace,
-                                "id": note_id,
-                                "properties": { "delivered_at": delivered_at },
-                            }),
-                        )
-                        .await;
-                    match mark_result {
-                        Ok(_) => {
-                            tracing::info!(note_id = %note_id, "telegram outbox loop: delivered");
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                note_id = %note_id,
-                                error = %e,
-                                "telegram outbox loop: failed to set delivered_at (AT-LEAST-ONCE: will retry)"
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        note_id = %note_id,
-                        error = %e,
-                        "telegram outbox loop: send failed; will retry next cycle"
-                    );
-                }
-            }
-        }
-    }
-}
-
 /// Serve a pre-built server (ADR-029 Phase 2 boot path).
 ///
 /// Extracted from `run()` so that `kkernel`'s `Command::Mcp` arm can build a
@@ -1485,10 +285,6 @@ pub async fn serve_server(
              in-place re-exec triggered by a stale daemon-protocol mismatch (#714)"
         );
     }
-    #[cfg(feature = "channel-email")]
-    spawn_email_channel_loops_if_daemon(&server, args);
-    #[cfg(feature = "channel-telegram")]
-    spawn_telegram_channel_loops_if_daemon(&server, args);
     spawn_schedule_tick_loop_if_daemon(args, &server, schedule_rt);
 
     #[cfg(unix)]
@@ -1555,20 +351,34 @@ pub fn build_registry_for_multi_backend_with_db_anchor(
     build_registry_for_multi_backend_inner(base_config, khive_cfg, cli_db_override)
 }
 
-fn build_registry_for_multi_backend_inner(
-    base_config: RuntimeConfig,
-    khive_cfg: &KhiveConfig,
+/// Validate a `--db`/`KHIVE_DB` override against a non-empty `[[backends]]`
+/// declaration WITHOUT opening any backend — the same rule
+/// `build_registry_for_multi_backend_inner` enforces, factored out so a
+/// caller that hasn't yet decided whether it will construct backends in this
+/// process can apply the check up front.
+///
+/// This closes #1226: `kkernel exec`'s daemon-forward fast path (inline ops,
+/// used whenever a warm daemon answers) never called into this guard at all
+/// — only the in-process fallback did — so an inline invocation with a
+/// conflicting override silently forwarded to the daemon's own already-open
+/// backends instead of being rejected, while the same override on
+/// `--ops-file` (always in-process by design) correctly bailed. The two call
+/// forms disagreed about whether the override was legal because only one of
+/// them ever ran this check. Returns `Ok(true)` when the override forces
+/// every backend to in-memory (`:memory:`), `Ok(false)` when there is no
+/// override to apply.
+pub fn validate_db_override_against_backends(
     cli_db_override: Option<&str>,
-) -> anyhow::Result<MultiBackendRegistry> {
-    let backend_count = khive_cfg.backends.len();
-    let force_memory = match cli_db_override {
+    backend_count: usize,
+) -> anyhow::Result<bool> {
+    match cli_db_override {
         Some(":memory:") => {
             tracing::warn!(
                 "--db :memory: (or KHIVE_DB=:memory:) is overriding {backend_count} \
                  configured [[backends]] entries to in-memory storage for this invocation; \
                  khive.toml's declared backend paths will not be used this run"
             );
-            true
+            Ok(true)
         }
         Some(other) => {
             anyhow::bail!(
@@ -1580,8 +390,17 @@ fn build_registry_for_multi_backend_inner(
                  this invocation."
             );
         }
-        None => false,
-    };
+        None => Ok(false),
+    }
+}
+
+fn build_registry_for_multi_backend_inner(
+    base_config: RuntimeConfig,
+    khive_cfg: &KhiveConfig,
+    cli_db_override: Option<&str>,
+) -> anyhow::Result<MultiBackendRegistry> {
+    let backend_count = khive_cfg.backends.len();
+    let force_memory = validate_db_override_against_backends(cli_db_override, backend_count)?;
 
     // Open and migrate each declared backend, deduplicating SQLite backends by
     // canonical path (ADR-028 §8).
@@ -2078,6 +897,11 @@ pub fn build_server_from_multi_backend_registry(
     // only present for file-backed databases; in-memory backends return None here
     // so that checkpoint_once never runs on a non-WAL connection.
     let pool = checkpoint_pool_for(multi.main_backend.as_ref());
+    // ADR-091 Amendment 3: every OTHER file-backed backend this registry
+    // wired, so the session sweep (`spawn_session_walpin_sweep`) and the
+    // daemon's checkpoint task can attribute and checkpoint them instead of
+    // leaving them permanently invisible to cross-process WAL-pin attribution.
+    let secondary_pools = secondary_file_backed_pools(&multi);
     let fmt = apply_env_output_format(khive_cfg.runtime.default_output_format);
 
     let server = KhiveMcpServer::from_registry_with_meta(
@@ -2085,7 +909,8 @@ pub fn build_server_from_multi_backend_registry(
         &multi.default_namespace,
         &multi.config_id,
     )
-    .with_default_output_format(fmt);
+    .with_default_output_format(fmt)
+    .with_secondary_pools(secondary_pools);
 
     let server = match coordinator {
         Some(c) => server.with_coordinator(c),
@@ -2096,6 +921,46 @@ pub fn build_server_from_multi_backend_registry(
         Some(p) => server.with_pool(p),
         None => server,
     }
+}
+
+/// Distinct file-backed backend pools among `multi`'s per-pack runtimes,
+/// excluding the main backend's own pool (wired separately via
+/// [`checkpoint_pool_for`]) — ADR-091 Amendment 3 fan-out needs exactly one
+/// entry per additional file-backed backend the registry wired, not one per
+/// pack, since several packs can share a backend.
+///
+/// Dedup is by canonical database identity (each pool's [`TxOrigin::Database`]
+/// origin, minted from its canonical path — see `ConnectionPool::origin`),
+/// never by pool pointer: two backends configured with alias spellings of
+/// the SAME file (a direct path and a symlinked path, say) mint two distinct
+/// `Arc<ConnectionPool>` but converge on one canonical sidecar, and admitting
+/// both would race two `SweepBackend`s on the same heartbeat file.
+fn secondary_file_backed_pools(multi: &MultiBackendRegistry) -> Vec<Arc<ConnectionPool>> {
+    use khive_storage::tx_registry::TxOrigin;
+
+    let mut seen: HashSet<khive_storage::tx_registry::DbIdentity> = HashSet::new();
+    if let TxOrigin::Database(id) = multi.main_backend.pool_arc().origin() {
+        seen.insert(id);
+    }
+    let mut pools = Vec::new();
+    for rt in multi.per_pack_runtimes.values() {
+        let backend = rt.backend();
+        if !backend.is_file_backed() {
+            continue;
+        }
+        let pool = backend.pool_arc();
+        let TxOrigin::Database(id) = pool.origin() else {
+            // A file-backed backend always mints a `Database` origin
+            // (`ConnectionPool::origin`'s own contract); anything else here
+            // has no canonical identity to dedup on, so it cannot be
+            // admitted as a secondary fan-out target.
+            continue;
+        };
+        if seen.insert(id) {
+            pools.push(pool);
+        }
+    }
+    pools
 }
 
 /// Construction-time facts that every multi-backend boot path must agree on
@@ -2109,15 +974,6 @@ pub struct WiringSurface {
     pub has_checkpoint_pool: bool,
     /// The resolved ADR-078 default output format.
     pub output_format: OutputFormat,
-    /// Whether the default ingest namespace would authorize the email
-    /// channel loops to start if this process runs in the daemon role
-    /// (#503/#602). The actual spawn is arg-driven at `run`/`serve_server`
-    /// (#610), not construction time, but the *authorization* outcome is a
-    /// function of how the registry's gate was wired during construction —
-    /// this field is the construction-time state that decision reads.
-    /// Only meaningful when the `channel-email` feature is compiled in.
-    #[cfg(feature = "channel-email")]
-    pub channel_loop_eligible: bool,
 }
 
 impl WiringSurface {
@@ -2126,11 +982,6 @@ impl WiringSurface {
         Self {
             has_checkpoint_pool: server.pool().is_some(),
             output_format: server.default_output_format(),
-            #[cfg(feature = "channel-email")]
-            channel_loop_eligible: preflight_ingest_namespace(
-                &ingest_namespace_from_env(),
-                &server.verb_registry_clone(),
-            ),
         }
     }
 }
@@ -2168,7 +1019,12 @@ pub fn checkpoint_pool_for(main_backend: &StorageBackend) -> Option<Arc<Connecti
 /// tests) is non-fatal and leaves `KhiveRuntime::blob_store()` unset:
 /// nothing yet consumes it, and forcing a filesystem root onto every
 /// in-memory boot would be a behavior change nobody asked for.
-fn install_resolved_blob_store(
+///
+/// `pub` so `kkernel`'s `exec` local-dispatch fallback server (the
+/// single-backend branch of `build_local_fallback_server`) can install a
+/// `BlobStore` the same way the `serve` boot path does, instead of leaving
+/// `exec`'s in-process runtime without one (khive#1209).
+pub fn install_resolved_blob_store(
     rt: &KhiveRuntime,
     khive_cfg: &KhiveConfig,
     backend: &StorageBackend,
@@ -2576,6 +1432,12 @@ mod tests {
     use serial_test::serial;
     use std::io::Write;
 
+    // Force-link khive-pack-template (a dev-dependency only) so its
+    // `inventory::submit!` registration is visible to this test binary's
+    // `PackRegistry` — mirrors the same force-link in tests/integration.rs.
+    #[allow(unused_imports)]
+    use khive_pack_template::TemplatePack as _TemplatePack;
+
     // #689: `config_discovery_db_anchor` is a pure function (no env/cwd
     // dependency), so its explicit-vs-unset contract is covered here without
     // the env-mutation isolation the cwd/HOME-dependent tests below require.
@@ -2607,6 +1469,10 @@ mod tests {
         let mut f = std::fs::File::create(&path).expect("create config file");
         f.write_all(body.as_bytes()).expect("write config");
         path
+    }
+
+    fn kg_test_packs() -> Vec<String> {
+        vec!["kg".to_string()]
     }
 
     // The resolver MUST honor config-file `[[engines]]` over RuntimeConfig
@@ -2651,7 +1517,7 @@ default = true
             namespace_explicit: false,
             actor_explicit: false,
             no_embed: false,
-            packs: None,
+            packs: Some(kg_test_packs()),
             brain_profile: None,
         })
         .expect("resolve config");
@@ -2702,7 +1568,7 @@ brain_profile = "unrelated"
             namespace_explicit: false,
             actor_explicit: false,
             no_embed: false,
-            packs: None,
+            packs: Some(kg_test_packs()),
             brain_profile: None,
         })
         .expect("resolve config");
@@ -2720,7 +1586,7 @@ brain_profile = "unrelated"
     /// Regression for PR #52: project-toml brain_profile
     /// MUST win over KHIVE_BRAIN_PROFILE env var.
     ///
-    /// Merged ADR-035 §Precedence: CLI > project toml > global toml > env > default.
+    /// Merged config precedence: CLI > project toml > global toml > env > default.
     /// Before the fix, the env var was bound into the clap `brain_profile` arg and
     /// placed at tier-1 via RuntimeConfig::default() in the base_config spread,
     /// causing env to override TOML.
@@ -2745,7 +1611,7 @@ brain_profile = "project-profile"
             namespace_explicit: false,
             actor_explicit: false,
             no_embed: false,
-            packs: None,
+            packs: Some(kg_test_packs()),
             brain_profile: None, // no explicit CLI flag
         })
         .expect("resolve config");
@@ -2784,7 +1650,7 @@ default = true
             namespace_explicit: false,
             actor_explicit: false,
             no_embed: false,
-            packs: None,
+            packs: Some(kg_test_packs()),
             brain_profile: None,
         })
         .expect("resolve config");
@@ -2820,7 +1686,7 @@ brain_profile = "project-profile"
             namespace_explicit: false,
             actor_explicit: false,
             no_embed: false,
-            packs: None,
+            packs: Some(kg_test_packs()),
             brain_profile: Some("cli-profile".to_string()), // explicit CLI
         })
         .expect("resolve config");
@@ -2858,7 +1724,7 @@ brain_profile = "project-profile"
             namespace_explicit: true,
             actor_explicit: true,
             no_embed: true,
-            packs: None,
+            packs: Some(kg_test_packs()),
             brain_profile: None,
         })
         .expect("resolve config");
@@ -2897,7 +1763,7 @@ brain_profile = "project-profile"
             namespace_explicit: true,
             actor_explicit: true,
             no_embed: true,
-            packs: None,
+            packs: Some(kg_test_packs()),
             brain_profile: None,
         })
         .expect("resolve no-embed config");
@@ -2930,7 +1796,7 @@ brain_profile = "project-profile"
             namespace_explicit: true,
             actor_explicit: true,
             no_embed: true,
-            packs: None,
+            packs: Some(kg_test_packs()),
             brain_profile: None,
         })
         .expect("resolve config");
@@ -3057,7 +1923,7 @@ brain_profile = "project-profile"
             namespace_explicit: false,
             actor_explicit: false,
             no_embed: true,
-            packs: None,
+            packs: Some(kg_test_packs()),
             brain_profile: None,
         })
         .expect("resolve seat-shaped config");
@@ -3121,7 +1987,7 @@ brain_profile = "project-profile"
             namespace_explicit: false,
             actor_explicit: false,
             no_embed: true,
-            packs: None,
+            packs: Some(kg_test_packs()),
             brain_profile: None,
         })
         .expect("resolve unset-db config");
@@ -3160,7 +2026,7 @@ brain_profile = "project-profile"
             namespace_explicit: true,
             actor_explicit: true,
             no_embed: true,
-            packs: None,
+            packs: Some(kg_test_packs()),
             brain_profile: None,
         })
         .expect("resolve config");
@@ -3198,7 +2064,7 @@ id = "lambda:project-actor"
             namespace_explicit: false,
             actor_explicit: false,
             no_embed: true,
-            packs: None,
+            packs: Some(kg_test_packs()),
             brain_profile: None,
         })
         .expect("resolve config with project actor");
@@ -3212,7 +2078,7 @@ id = "lambda:project-actor"
             namespace_explicit: false,
             actor_explicit: false,
             no_embed: true,
-            packs: None,
+            packs: Some(kg_test_packs()),
             brain_profile: None,
         })
         .expect("resolve config without project actor");
@@ -3268,7 +2134,7 @@ id = "lambda:project-actor"
             namespace_explicit,
             actor_explicit: namespace_explicit,
             no_embed: true,
-            packs: None,
+            packs: Some(kg_test_packs()),
             brain_profile: None,
         });
 
@@ -3320,7 +2186,7 @@ id = "lambda:project-actor"
             namespace_explicit,
             actor_explicit: namespace_explicit,
             no_embed: true,
-            packs: None,
+            packs: Some(kg_test_packs()),
             brain_profile: None,
         });
 
@@ -3389,7 +2255,7 @@ id = "lambda:project-actor"
             namespace_explicit: true,
             actor_explicit: true,
             no_embed: false,
-            packs: None,
+            packs: Some(kg_test_packs()),
             brain_profile: None,
         })
         .expect("resolve config");
@@ -3468,7 +2334,7 @@ id = "lambda:project-actor"
                 namespace_explicit: false,
                 actor_explicit: false,
                 no_embed: true,
-                packs: None,
+                packs: Some(kg_test_packs()),
                 brain_profile: None,
             })
             .expect("resolve config a")
@@ -3483,7 +2349,7 @@ id = "lambda:project-actor"
                 namespace_explicit: false,
                 actor_explicit: false,
                 no_embed: true,
-                packs: None,
+                packs: Some(kg_test_packs()),
                 brain_profile: None,
             })
             .expect("resolve config b")
@@ -3518,7 +2384,7 @@ id = "lambda:project-actor"
     // --- multi-backend boot path (ADR-028) ---
 
     /// Build a `RuntimeConfig` suitable for multi-backend tests: in-memory db,
-    /// AllowAllGate, "local" namespace, no embedder, both kg and comm packs.
+    /// AllowAllGate, "local" namespace, no embedder, both kg and template packs.
     ///
     /// `db_path` mirrors what `resolve_runtime_config` sets for a `--db`-unset
     /// invocation (every call site below passes `cli_db_override: None` to
@@ -3533,14 +2399,14 @@ id = "lambda:project-actor"
             default_namespace: Namespace::parse("local").expect("ns"),
             embedding_model: None,
             additional_embedding_models: vec![],
-            packs: vec!["kg".to_string(), "comm".to_string()],
+            packs: vec!["kg".to_string(), "template".to_string()],
             backend_id: BackendId::main(),
             ..RuntimeConfig::default()
         }
     }
 
     /// Two in-memory backends — `main` plus a second named `secondary`.
-    /// The `comm` pack is pinned to `secondary`; `kg` defaults to `main`.
+    /// The `template` pack is pinned to `secondary`; `kg` defaults to `main`.
     /// Positive test: `build_server_multi_backend` must return `Ok` and both
     /// packs must be functional.
     #[tokio::test]
@@ -3571,7 +2437,7 @@ id = "lambda:project-actor"
             packs: {
                 let mut m = std::collections::HashMap::new();
                 m.insert(
-                    "comm".to_string(),
+                    "template".to_string(),
                     PackConfig {
                         backend: "secondary".to_string(),
                     },
@@ -3610,10 +2476,11 @@ id = "lambda:project-actor"
             "kg create must succeed; response: {kg_resp}"
         );
 
-        // comm round-trip: send a message on the secondary backend.
-        let comm_resp = server
+        // template round-trip: dispatch template's stateless verb on the
+        // secondary backend.
+        let template_resp = server
             .dispatch_request_local(RequestParams {
-                ops: r#"comm.send(to="local", content="multi-backend-test")"#.to_string(),
+                ops: r#"template.my_verb(name="multi-backend-test")"#.to_string(),
                 presentation: None,
                 presentation_per_op: None,
                 save_to: None,
@@ -3622,69 +2489,15 @@ id = "lambda:project-actor"
                 request_id: None,
             })
             .await
-            .expect("comm dispatch must not error");
+            .expect("template dispatch must not error");
 
-        let comm_json: serde_json::Value =
-            serde_json::from_str(&comm_resp).expect("comm response is valid JSON");
-        let first_comm_ok = comm_json["results"][0]["ok"].as_bool();
+        let template_json: serde_json::Value =
+            serde_json::from_str(&template_resp).expect("template response is valid JSON");
+        let first_template_ok = template_json["results"][0]["ok"].as_bool();
         assert_eq!(
-            first_comm_ok,
+            first_template_ok,
             Some(true),
-            "comm.send must succeed; response: {comm_resp}"
-        );
-    }
-
-    /// #658 multi-backend regression: `build_registry_for_multi_backend` — the
-    /// production multi-backend wiring path — must also wire the brain
-    /// dispatch hook produced by `PackFactory::create_install`, observing the
-    /// same `BrainPack` instance the registry dispatches `brain.*` verbs to.
-    /// Mirrors `server::tests::brain_dispatch_hook_updates_state_visible_through_same_instance`
-    /// (single-backend path) using this file's multi-backend entry point instead.
-    #[tokio::test]
-    #[serial]
-    async fn multi_backend_brain_dispatch_hook_updates_state_visible_through_same_instance() {
-        let khive_cfg = KhiveConfig {
-            backends: vec![BackendConfig {
-                name: "main".to_string(),
-                kind: BackendKind::Memory,
-                path: None,
-                cache_mb: None,
-                journal_mode: None,
-                read_only: false,
-            }],
-            ..KhiveConfig::default()
-        };
-
-        let mut base_cfg = base_runtime_config_for_multi_backend();
-        base_cfg.packs = vec!["kg".to_string(), "brain".to_string()];
-
-        let multi = build_registry_for_multi_backend(base_cfg, &khive_cfg, None)
-            .expect("multi-backend registry build must succeed");
-
-        multi
-            .registry
-            .dispatch("brain.state", serde_json::Value::Null)
-            .await
-            .expect("brain.state loads the default namespace into the active slot");
-
-        multi
-            .registry
-            .dispatch("stats", serde_json::json!({}))
-            .await
-            .expect("kg.stats dispatch succeeds");
-
-        let state = multi
-            .registry
-            .dispatch("brain.state", serde_json::Value::Null)
-            .await
-            .expect("brain.state dispatch");
-        let total_events = state["balanced_recall"]["total_events"]
-            .as_u64()
-            .unwrap_or(0);
-        assert!(
-            total_events > 0,
-            "multi-backend dispatch hook must update the same BrainPack instance \
-             the registry dispatches brain.* verbs to; got snapshot {state:?}"
+            "template.my_verb must succeed; response: {template_resp}"
         );
     }
 
@@ -3935,47 +2748,6 @@ region = "us-east-1"
         }
     }
 
-    /// RAII guard: clears the `KHIVE_*` variables that would otherwise
-    /// override the temp `khive.toml` the boot tests write, restoring each
-    /// prior value (or absence) on drop, even on panic/unwind. `#[serial]`
-    /// serializes access but does not restore process-global state; this
-    /// guard does.
-    struct ClearedKhiveEnvGuard {
-        prev: Vec<(&'static str, Option<std::ffi::OsString>)>,
-    }
-
-    impl ClearedKhiveEnvGuard {
-        const VARS: [&'static str; 4] = [
-            "KHIVE_DB",
-            "KHIVE_ACTOR",
-            "KHIVE_PACKS",
-            "KHIVE_REQUIRE_ATTRIBUTED_ACTOR",
-        ];
-
-        fn clear() -> Self {
-            let prev = Self::VARS
-                .iter()
-                .map(|name| {
-                    let value = std::env::var_os(name);
-                    std::env::remove_var(name);
-                    (*name, value)
-                })
-                .collect();
-            Self { prev }
-        }
-    }
-
-    impl Drop for ClearedKhiveEnvGuard {
-        fn drop(&mut self) {
-            for (name, value) in self.prev.drain(..) {
-                match value {
-                    Some(v) => std::env::set_var(name, v),
-                    None => std::env::remove_var(name),
-                }
-            }
-        }
-    }
-
     fn s3_blob_config() -> BlobConfig {
         BlobConfig::S3 {
             bucket: "khive-blobs".to_string(),
@@ -3984,63 +2756,6 @@ region = "us-east-1"
             prefix: None,
             allow_http: None,
         }
-    }
-
-    /// Positive counterpart to `single_backend_boot_wires_configured_s3_blob_store`:
-    /// with valid (dummy) AWS credentials present, the single-backend startup
-    /// path's `install_resolved_blob_store` call (`:1826`) must actually
-    /// install an `S3BlobStore`, not merely fail closed when credentials are
-    /// absent. Round-4 remediation: drives the real `build_server` boot entry
-    /// (not `KhiveRuntime::new` + a direct `install_resolved_blob_store` call)
-    /// via a temporary `khive.toml` + parsed `Args`, selecting the `schedule`
-    /// pack so its already-installed runtime (`:1847`) is returned for
-    /// inspection.
-    #[test]
-    #[serial]
-    fn single_backend_boot_installs_s3_blob_store_on_successful_selection() {
-        let _env = ClearedKhiveEnvGuard::clear();
-        let _creds = DummyAwsCredsGuard::set();
-
-        let dir = tempfile::tempdir().expect("temp dir");
-        let config_path = write_config(
-            dir.path(),
-            r#"
-[storage.blob]
-backend = "s3"
-bucket = "khive-blobs"
-region = "us-east-1"
-"#,
-        );
-
-        use clap::Parser;
-        let args = Args::parse_from([
-            "mcp",
-            "--db",
-            ":memory:",
-            "--pack",
-            "kg",
-            "--pack",
-            "schedule",
-            "--config",
-            config_path.to_str().expect("utf8 path"),
-        ]);
-
-        let (_server, schedule_rt) = build_server(&args).expect(
-            "valid dummy AWS credentials must resolve and install an S3BlobStore through the \
-             real single-backend boot path",
-        );
-        let runtime = schedule_rt
-            .expect("the schedule pack was selected so its installed runtime must be returned");
-
-        let installed = runtime.blob_store().expect(
-            "install_resolved_blob_store must call KhiveRuntime::install_blob_store at the \
-             real :1826 call site",
-        );
-        let debug = format!("{installed:?}");
-        assert!(
-            debug.contains("S3BlobStore"),
-            "expected the installed store to be an S3BlobStore, got: {debug}"
-        );
     }
 
     /// Positive counterpart to `multi_backend_boot_wires_configured_s3_blob_store`:
@@ -4087,76 +2802,6 @@ region = "us-east-1"
         }
     }
 
-    /// Guards the ADR-111 Amendment 2 fs-default promise (`docs/adr/ADR-111-blob-store.md:538-541`):
-    /// with no `[storage.blob]` section at all, the single-backend startup
-    /// path must still install a usable `FsBlobStore` rooted beside the
-    /// database file, and that store must actually round-trip a blob --
-    /// not merely construct without error. Round-4 remediation: drives the
-    /// real `build_server` boot entry via a temporary (sectionless)
-    /// `khive.toml` + parsed `Args`, selecting the `schedule` pack so its
-    /// already-installed runtime (`:1847`) is returned for inspection.
-    #[tokio::test]
-    #[serial]
-    async fn single_backend_boot_default_fs_blob_store_is_usable_without_storage_section() {
-        let _env = ClearedKhiveEnvGuard::clear();
-
-        let dir = tempfile::tempdir().expect("temp dir");
-        let db_path = dir.path().join("main.db");
-        let config_path = write_config(dir.path(), "");
-
-        use clap::Parser;
-        let args = Args::parse_from([
-            "mcp",
-            "--db",
-            db_path.to_str().expect("utf8 path"),
-            "--pack",
-            "kg",
-            "--pack",
-            "schedule",
-            "--config",
-            config_path.to_str().expect("utf8 path"),
-        ]);
-
-        let (_server, schedule_rt) = build_server(&args)
-            .expect("absent [storage.blob] must resolve the fs default through the real single-backend boot path");
-        let runtime = schedule_rt
-            .expect("the schedule pack was selected so its installed runtime must be returned");
-
-        let installed = runtime.blob_store().expect(
-            "install_resolved_blob_store must call KhiveRuntime::install_blob_store at the \
-             real :1826 call site for a file-backed backend",
-        );
-        let debug = format!("{installed:?}");
-        assert!(
-            debug.contains("FsBlobStore"),
-            "expected the default store to be an FsBlobStore, got: {debug}"
-        );
-
-        // The absent-section default keeps FsBlobStore's 100 GB free-space
-        // floor — that default is exactly what this test locks in, and a CI
-        // runner legitimately may not clear it. A CapacityFloor rejection can
-        // only come from inside FsBlobStore::put, so it is equally valid
-        // proof that the boot path wired a live fs-default store; round-trip
-        // only when the volume has room.
-        match installed
-            .put(b"adr-111 fs-default regression".to_vec())
-            .await
-        {
-            Ok(content_ref) => {
-                let round_tripped = installed
-                    .get(&content_ref)
-                    .await
-                    .expect("fs-default store must serve back what it just accepted");
-                assert_eq!(
-                    round_tripped, b"adr-111 fs-default regression",
-                    "fs-default store must round-trip the exact bytes written"
-                );
-            }
-            Err(khive_storage::StorageError::CapacityFloor { .. }) => {}
-            Err(other) => panic!("fs-default store must accept a write: {other:?}"),
-        }
-    }
-
     /// Regression for ADR-073: a pack assigned to a secondary backend must
     /// have `core_backend` wired at boot so that `rt.core().backend_id()` returns "main".
     ///
@@ -4192,7 +2837,7 @@ region = "us-east-1"
             packs: {
                 let mut m = std::collections::HashMap::new();
                 m.insert(
-                    "comm".to_string(),
+                    "template".to_string(),
                     PackConfig {
                         backend: "secondary".to_string(),
                     },
@@ -4207,27 +2852,127 @@ region = "us-east-1"
         let result = build_registry_for_multi_backend(base_cfg, &khive_cfg, None)
             .expect("multi-backend registry must boot");
 
-        let comm_rt = result
+        let template_rt = result
             .per_pack_runtimes
-            .get("comm")
-            .expect("comm pack runtime must be present in per_pack_runtimes");
+            .get("template")
+            .expect("template pack runtime must be present in per_pack_runtimes");
 
         // Own backend_id is "secondary" — not main.
         assert_eq!(
-            comm_rt.backend_id().as_str(),
+            template_rt.backend_id().as_str(),
             "secondary",
-            "comm pack runtime's own backend_id must be \"secondary\""
+            "template pack runtime's own backend_id must be \"secondary\""
         );
 
         // ADR-073 contract: core() on a secondary-backend pack must return a
         // main-bound handle, not a clone of self. Failure here means the
         // build_pack_runtime wiring was not applied.
         assert_eq!(
-            comm_rt.core().backend_id().as_str(),
+            template_rt.core().backend_id().as_str(),
             BackendId::MAIN,
             "secondary-backend pack must have core_backend wired to main (ADR-073); \
              core().backend_id() returned {:?} — build_pack_runtime wiring missing",
-            comm_rt.core().backend_id().as_str()
+            template_rt.core().backend_id().as_str()
+        );
+    }
+
+    /// ADR-091 Amendment 3 fan-out regression: two backends declared at
+    /// alias spellings of the SAME database file (a direct path and a
+    /// symlinked path) must mint the same canonical `DbIdentity` and
+    /// therefore dedup to exactly one secondary pool. The pointer-identity
+    /// dedup this replaced would have kept both `Arc<ConnectionPool>`
+    /// instances distinct, letting two `SweepBackend`s race on one
+    /// heartbeat file.
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn secondary_pools_dedup_by_canonical_identity_across_alias_spellings() {
+        use khive_runtime::PackConfig;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_path = dir.path().join("khive.db");
+        std::fs::write(&real_path, b"").unwrap();
+        let alias_path = dir.path().join("khive_alias.db");
+        std::os::unix::fs::symlink(&real_path, &alias_path).unwrap();
+
+        let khive_cfg = KhiveConfig {
+            backends: vec![
+                BackendConfig {
+                    name: "main".to_string(),
+                    kind: BackendKind::Memory,
+                    path: None,
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: false,
+                },
+                BackendConfig {
+                    name: "direct".to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(real_path.clone()),
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: false,
+                },
+                BackendConfig {
+                    name: "alias".to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(alias_path.clone()),
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: false,
+                },
+            ],
+            packs: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(
+                    "kg".to_string(),
+                    PackConfig {
+                        backend: "direct".to_string(),
+                    },
+                );
+                m.insert(
+                    "comm".to_string(),
+                    PackConfig {
+                        backend: "alias".to_string(),
+                    },
+                );
+                m
+            },
+            ..KhiveConfig::default()
+        };
+
+        let base_cfg = base_runtime_config_for_multi_backend();
+        let multi = build_registry_for_multi_backend(base_cfg, &khive_cfg, None)
+            .expect("multi-backend registry with alias-spelled backends must boot");
+
+        let secondary = secondary_file_backed_pools(&multi);
+        assert_eq!(
+            secondary.len(),
+            1,
+            "two backends aliasing the same database file must dedup to exactly one \
+             secondary pool by canonical identity, got {} pools",
+            secondary.len()
+        );
+
+        let server = build_server_from_multi_backend_registry(multi, &khive_cfg, None);
+        let mut backends = Vec::new();
+        if let Some(pool) = server.pool() {
+            backends.push(khive_db::SweepBackend {
+                pool,
+                is_main: true,
+            });
+        }
+        for pool in server.secondary_pools() {
+            backends.push(khive_db::SweepBackend {
+                pool,
+                is_main: false,
+            });
+        }
+        assert_eq!(
+            backends.len(),
+            1,
+            "exactly one SweepBackend must survive dedup for the alias pair — the \
+             in-memory main backend contributes no pool of its own"
         );
     }
 
@@ -4369,109 +3114,6 @@ region = "us-east-1"
         }
     }
 
-    /// Regression: the multi-backend boot path
-    /// MUST thread the configured actor identity (issue #75) into the registry,
-    /// exactly as the single-backend path does. If `with_actor_id` is dropped,
-    /// dispatch mints `ActorRef::anonymous()` and `comm.inbox` reverts to
-    /// party-line — silently re-opening the cross-actor leak #75 fixed. With a
-    /// configured actor `"actor-b"`, a message addressed to `"actor-a"` must NOT
-    /// appear in `actor-b`'s inbox, while one addressed to `"actor-b"` must.
-    #[tokio::test]
-    #[serial]
-    async fn multi_backend_preserves_actor_filtering() {
-        use crate::tools::request::RequestParams;
-        use khive_runtime::PackConfig;
-
-        let khive_cfg = KhiveConfig {
-            backends: vec![
-                BackendConfig {
-                    name: "main".to_string(),
-                    kind: BackendKind::Memory,
-                    path: None,
-                    cache_mb: None,
-                    journal_mode: None,
-                    read_only: false,
-                },
-                BackendConfig {
-                    name: "secondary".to_string(),
-                    kind: BackendKind::Memory,
-                    path: None,
-                    cache_mb: None,
-                    journal_mode: None,
-                    read_only: false,
-                },
-            ],
-            packs: {
-                let mut m = std::collections::HashMap::new();
-                m.insert(
-                    "comm".to_string(),
-                    PackConfig {
-                        backend: "secondary".to_string(),
-                    },
-                );
-                m
-            },
-            ..KhiveConfig::default()
-        };
-
-        // Configured actor — the value #75 threads end-to-end.
-        let base_cfg = RuntimeConfig {
-            actor_id: Some("actor-b".to_string()),
-            ..base_runtime_config_for_multi_backend()
-        };
-
-        let server = build_server_multi_backend(base_cfg, &khive_cfg, None)
-            .expect("multi-backend boot must succeed");
-
-        let dispatch = |ops: String| {
-            let server = &server;
-            async move {
-                let resp = server
-                    .dispatch_request_local(RequestParams {
-                        ops,
-                        presentation: None,
-                        presentation_per_op: None,
-                        save_to: None,
-                        format: None,
-                        format_per_op: None,
-                        request_id: None,
-                    })
-                    .await
-                    .expect("dispatch must not error");
-                serde_json::from_str::<serde_json::Value>(&resp).expect("valid JSON")
-            }
-        };
-
-        // One message to a different actor, one explicit message to ourselves.
-        let to_a = dispatch(r#"comm.send(to="actor-a", content="for-a")"#.to_string()).await;
-        assert_eq!(to_a["results"][0]["ok"].as_bool(), Some(true), "{to_a}");
-        let to_b =
-            dispatch(r#"comm.send(to="actor-b", content="for-b", self_send=true)"#.to_string())
-                .await;
-        assert_eq!(to_b["results"][0]["ok"].as_bool(), Some(true), "{to_b}");
-
-        // Inbox for the configured actor (actor-b) must be filtered by to_actor.
-        let inbox = dispatch(r#"comm.inbox()"#.to_string()).await;
-        let result = &inbox["results"][0]["result"];
-        let messages = result["messages"]
-            .as_array()
-            .expect("inbox returns a messages array");
-
-        let contents: Vec<&str> = messages
-            .iter()
-            .filter_map(|m| m["content"].as_str())
-            .collect();
-        assert!(
-            contents.contains(&"for-b"),
-            "actor-b must see the message addressed to it; got {contents:?}"
-        );
-        assert!(
-            !contents.contains(&"for-a"),
-            "actor-b must NOT see the message addressed to actor-a (leak #75); \
-             got {contents:?} — actor identity was not threaded into the multi-backend registry"
-        );
-    }
-
     /// Negative test: `[[backends]]` is declared but there is no entry named
     /// `"main"`. `build_server_multi_backend` must return an error whose
     /// message mentions `"main"` so operators know what to fix.
@@ -4530,7 +3172,7 @@ region = "us-east-1"
             packs: {
                 let mut m = std::collections::HashMap::new();
                 m.insert(
-                    "comm".to_string(),
+                    "template".to_string(),
                     PackConfig {
                         backend: "archive".to_string(),
                     },
@@ -4554,7 +3196,7 @@ region = "us-east-1"
         if let Err(err) = result {
             let msg = err.to_string();
             assert!(
-                msg.contains("packs.comm"),
+                msg.contains("packs.template"),
                 "error must name the pack; got: {msg}"
             );
             assert!(
@@ -4588,7 +3230,7 @@ region = "us-east-1"
             packs: {
                 let mut m = std::collections::HashMap::new();
                 m.insert(
-                    "comm".to_string(),
+                    "template".to_string(),
                     PackConfig {
                         backend: "archive".to_string(),
                     },
@@ -4609,7 +3251,7 @@ region = "us-east-1"
         if let Err(err) = result {
             let msg = err.to_string();
             assert!(
-                msg.contains("packs.comm"),
+                msg.contains("packs.template"),
                 "error must name the pack; got: {msg}"
             );
             assert!(
@@ -5079,495 +3721,6 @@ region = "us-east-1"
         );
     }
 
-    /// Physical isolation guard: a record written through a pack pinned to backend B's
-    /// SQLite file MUST NOT appear in backend A's file, and vice versa.
-    ///
-    /// This is the "billing data must not mix with agent memory" guarantee.
-    /// The test opens each file independently with rusqlite after the server is
-    /// dropped to confirm cross-file absence in both directions.
-    ///
-    /// Schema facts discovered from crates/khive-db/sql/:
-    ///   entities table — column `name` holds the entity name (entities-ddl.sql)
-    ///   notes table    — column `content` holds the message body; `kind` = "message"
-    ///                    for comm.send output (notes-ddl.sql + comm handlers.rs)
-    ///
-    /// Relies on `base_runtime_config_for_multi_backend` leaving `embedding_model`
-    /// unset: no embedder means no `vec0` virtual table is created, so the plain
-    /// `rusqlite::Connection::open` below (which does not load the vec0 extension)
-    /// can read both files. If an embedder is ever added to that helper, this test
-    /// must load the extension or query through a runtime instead.
-    #[tokio::test]
-    #[serial]
-    async fn multi_backend_isolates_pack_data_to_separate_files() {
-        use crate::tools::request::RequestParams;
-        use khive_runtime::PackConfig;
-        use rusqlite::Connection;
-
-        let dir = tempfile::tempdir().expect("temp dir");
-        let main_path = dir.path().join("main.db");
-        let second_path = dir.path().join("second.db");
-
-        let khive_cfg = KhiveConfig {
-            backends: vec![
-                BackendConfig {
-                    name: "main".to_string(),
-                    kind: BackendKind::Sqlite,
-                    path: Some(main_path.clone()),
-                    cache_mb: None,
-                    journal_mode: None,
-                    read_only: false,
-                },
-                BackendConfig {
-                    name: "second".to_string(),
-                    kind: BackendKind::Sqlite,
-                    path: Some(second_path.clone()),
-                    cache_mb: None,
-                    journal_mode: None,
-                    read_only: false,
-                },
-            ],
-            packs: {
-                let mut m = std::collections::HashMap::new();
-                m.insert(
-                    "comm".to_string(),
-                    PackConfig {
-                        backend: "second".to_string(),
-                    },
-                );
-                m
-            },
-            ..KhiveConfig::default()
-        };
-
-        let base_cfg = base_runtime_config_for_multi_backend();
-
-        let server = build_server_multi_backend(base_cfg, &khive_cfg, None)
-            .expect("multi-backend boot must succeed");
-
-        let dispatch = |ops: String| {
-            let server = &server;
-            async move {
-                server
-                    .dispatch_request_local(RequestParams {
-                        ops,
-                        presentation: None,
-                        presentation_per_op: None,
-                        save_to: None,
-                        format: None,
-                        format_per_op: None,
-                        request_id: None,
-                    })
-                    .await
-                    .expect("dispatch must not error")
-            }
-        };
-
-        // kg → main.db: create an entity
-        let kg_resp =
-            dispatch(r#"create(kind="concept", name="MainOnlyEntity")"#.to_string()).await;
-        let kg_json: serde_json::Value =
-            serde_json::from_str(&kg_resp).expect("kg response is valid JSON");
-        assert_eq!(
-            kg_json["results"][0]["ok"].as_bool(),
-            Some(true),
-            "kg create must succeed; response: {kg_resp}"
-        );
-
-        // comm → second.db: send a message
-        let comm_resp =
-            dispatch(r#"comm.send(to="local", content="SecondOnlyMsg")"#.to_string()).await;
-        let comm_json: serde_json::Value =
-            serde_json::from_str(&comm_resp).expect("comm response is valid JSON");
-        assert_eq!(
-            comm_json["results"][0]["ok"].as_bool(),
-            Some(true),
-            "comm.send must succeed; response: {comm_resp}"
-        );
-
-        // Drop the server so WAL is checkpointed and files are fully flushed
-        // before we open them with rusqlite.
-        drop(server);
-
-        // --- Verify main.db ---
-        let main_conn = Connection::open(&main_path).expect("open main.db");
-
-        let main_entity_count: i64 = main_conn
-            .query_row(
-                "SELECT COUNT(*) FROM entities WHERE name = 'MainOnlyEntity' AND deleted_at IS NULL",
-                [],
-                |row| row.get(0),
-            )
-            .expect("query entities in main.db");
-        assert_eq!(
-            main_entity_count, 1,
-            "main.db MUST contain MainOnlyEntity (written via kg pack); got count={main_entity_count}"
-        );
-
-        let main_msg_count: i64 = main_conn
-            .query_row(
-                "SELECT COUNT(*) FROM notes WHERE kind = 'message'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("query notes in main.db");
-        assert_eq!(
-            main_msg_count, 0,
-            "main.db MUST NOT contain any message notes (comm is pinned to second.db); \
-             got count={main_msg_count}"
-        );
-
-        // --- Verify second.db ---
-        let second_conn = Connection::open(&second_path).expect("open second.db");
-
-        let second_msg_count: i64 = second_conn
-            .query_row(
-                "SELECT COUNT(*) FROM notes WHERE kind = 'message' AND content = 'SecondOnlyMsg'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("query notes in second.db");
-        assert_eq!(
-            second_msg_count, 2,
-            "second.db MUST contain SecondOnlyMsg (dual-write: 1 outbound + 1 inbound copy); \
-             got count={second_msg_count}"
-        );
-
-        let second_entity_count: i64 = second_conn
-            .query_row(
-                "SELECT COUNT(*) FROM entities WHERE name = 'MainOnlyEntity'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("query entities in second.db");
-        assert_eq!(
-            second_entity_count, 0,
-            "second.db MUST NOT contain MainOnlyEntity (kg is pinned to main.db); \
-             got count={second_entity_count}"
-        );
-    }
-
-    // --- ingest_namespace_from_env (Fix 4: namespace env var) ---
-
-    #[cfg(feature = "channel-email")]
-    mod ingest_ns_tests {
-        use super::*;
-
-        #[test]
-        #[serial]
-        fn ingest_namespace_defaults_to_local() {
-            std::env::remove_var("KHIVE_EMAIL_INGEST_NAMESPACE");
-            assert_eq!(ingest_namespace_from_env(), "local");
-        }
-
-        #[test]
-        #[serial]
-        fn ingest_namespace_reads_env_var() {
-            std::env::set_var("KHIVE_EMAIL_INGEST_NAMESPACE", "lambda:mybot");
-            let ns = ingest_namespace_from_env();
-            std::env::remove_var("KHIVE_EMAIL_INGEST_NAMESPACE");
-            assert_eq!(ns, "lambda:mybot");
-        }
-
-        #[test]
-        #[serial]
-        fn ingest_namespace_ignores_blank_env_var() {
-            std::env::set_var("KHIVE_EMAIL_INGEST_NAMESPACE", "  ");
-            let ns = ingest_namespace_from_env();
-            std::env::remove_var("KHIVE_EMAIL_INGEST_NAMESPACE");
-            assert_eq!(ns, "local", "blank env var must fall back to default");
-        }
-
-        #[test]
-        fn preflight_fails_on_invalid_namespace_string() {
-            let registry = khive_runtime::VerbRegistryBuilder::new()
-                .build()
-                .expect("build empty registry");
-            // An empty string is not a valid namespace; parse must fail.
-            assert!(
-                !preflight_ingest_namespace("", &registry),
-                "preflight must return false for an invalid namespace string"
-            );
-        }
-
-        #[test]
-        fn preflight_fails_when_gate_denies_namespace() {
-            use khive_runtime::{Gate, GateDecision, GateError, GateRequest};
-            use std::fmt;
-
-            #[derive(Debug)]
-            struct AlwaysDenyGate;
-            impl fmt::Display for AlwaysDenyGate {
-                fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                    write!(f, "AlwaysDenyGate")
-                }
-            }
-            impl Gate for AlwaysDenyGate {
-                fn check(&self, _req: &GateRequest) -> Result<GateDecision, GateError> {
-                    Ok(GateDecision::deny("test: always deny"))
-                }
-            }
-
-            let mut builder = khive_runtime::VerbRegistryBuilder::new();
-            builder.with_gate(std::sync::Arc::new(AlwaysDenyGate));
-            let registry = builder.build().expect("build registry with deny gate");
-            assert!(
-                !preflight_ingest_namespace("local", &registry),
-                "preflight must return false when the gate denies the namespace"
-            );
-        }
-
-        #[test]
-        fn preflight_succeeds_with_allow_gate_and_valid_namespace() {
-            let registry = khive_runtime::VerbRegistryBuilder::new()
-                .build()
-                .expect("build registry with default allow-all gate");
-            assert!(
-                preflight_ingest_namespace("local", &registry),
-                "preflight must return true for a valid namespace when the gate allows"
-            );
-        }
-
-        // --- spawn-seam tests: verify the loop is NOT started on preflight failure ---
-
-        #[test]
-        fn spawn_not_called_when_gate_denies() {
-            use khive_runtime::{Gate, GateDecision, GateError, GateRequest};
-            use std::fmt;
-
-            #[derive(Debug)]
-            struct AlwaysDenyGate2;
-            impl fmt::Display for AlwaysDenyGate2 {
-                fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                    write!(f, "AlwaysDenyGate2")
-                }
-            }
-            impl Gate for AlwaysDenyGate2 {
-                fn check(&self, _req: &GateRequest) -> Result<GateDecision, GateError> {
-                    Ok(GateDecision::deny("spawn seam test: always deny"))
-                }
-            }
-
-            let mut builder = khive_runtime::VerbRegistryBuilder::new();
-            builder.with_gate(std::sync::Arc::new(AlwaysDenyGate2));
-            let registry = builder.build().expect("build registry with deny gate");
-
-            let mut spawn_count = 0usize;
-            let authorized = run_if_authorized("local", &registry, || {
-                spawn_count += 1;
-            });
-
-            assert!(
-                !authorized,
-                "run_if_authorized must return false when gate denies"
-            );
-            assert_eq!(
-                spawn_count, 0,
-                "spawn must not be called when preflight fails"
-            );
-        }
-
-        #[test]
-        fn spawn_not_called_when_namespace_invalid() {
-            let registry = khive_runtime::VerbRegistryBuilder::new()
-                .build()
-                .expect("build empty registry");
-
-            let mut spawn_count = 0usize;
-            let authorized = run_if_authorized("", &registry, || {
-                spawn_count += 1;
-            });
-
-            assert!(
-                !authorized,
-                "run_if_authorized must return false for invalid namespace"
-            );
-            assert_eq!(
-                spawn_count, 0,
-                "spawn must not be called when namespace is invalid"
-            );
-        }
-    }
-
-    // --- log_eligible_poll_failure: edge-triggered warn ---
-
-    #[cfg(feature = "channel-email")]
-    mod eligible_poll_failure_log_tests {
-        use super::*;
-        use khive_channel::ChannelError;
-        use khive_channel_email::BackoffTick;
-        use std::sync::{Arc, Mutex};
-        use std::time::Duration;
-        use tracing::field::{Field, Visit};
-
-        #[derive(Clone, Debug, Default)]
-        struct CapturedEvent {
-            level: Option<tracing::Level>,
-            message: Option<String>,
-        }
-
-        #[derive(Default)]
-        struct CapturedEventVisitor(Option<String>);
-
-        impl Visit for CapturedEventVisitor {
-            fn record_str(&mut self, field: &Field, value: &str) {
-                if field.name() == "message" {
-                    self.0 = Some(value.to_string());
-                }
-            }
-            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-                if field.name() == "message" {
-                    let formatted = format!("{value:?}");
-                    self.0 = Some(
-                        formatted
-                            .trim_start_matches('"')
-                            .trim_end_matches('"')
-                            .to_string(),
-                    );
-                }
-            }
-        }
-
-        /// Minimal `tracing::Subscriber` capturing (level, message) pairs into
-        /// a thread-local vec, installed via `tracing::subscriber::with_default`.
-        /// Mirrors `khive-db/src/checkpoint.rs`'s `CaptureSubscriber` (same
-        /// ADR-091 `crossing_warn` test discipline: prove the log fires on
-        /// the escalation edge and stays silent on a same-step repeat).
-        struct CaptureSubscriber {
-            events: Arc<Mutex<Vec<CapturedEvent>>>,
-        }
-
-        impl tracing::Subscriber for CaptureSubscriber {
-            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
-                true
-            }
-            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-                tracing::span::Id::from_u64(1)
-            }
-            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-            fn event(&self, event: &tracing::Event<'_>) {
-                let mut visitor = CapturedEventVisitor::default();
-                event.record(&mut visitor);
-                self.events.lock().unwrap().push(CapturedEvent {
-                    level: Some(*event.metadata().level()),
-                    message: visitor.0,
-                });
-            }
-            fn enter(&self, _: &tracing::span::Id) {}
-            fn exit(&self, _: &tracing::span::Id) {}
-        }
-
-        fn tick(should_warn: bool, attempt: u32) -> BackoffTick {
-            BackoffTick {
-                delay: Duration::from_secs(10),
-                step: Duration::from_secs(10),
-                attempt,
-                should_warn,
-            }
-        }
-
-        #[test]
-        fn escalation_edge_logs_warn_not_debug() {
-            let buffer = Arc::new(Mutex::new(Vec::new()));
-            let subscriber = CaptureSubscriber {
-                events: Arc::clone(&buffer),
-            };
-            let err = ChannelError::Transport("boom".into());
-
-            tracing::subscriber::with_default(subscriber, || {
-                log_eligible_poll_failure("email", &err, &tick(true, 1));
-            });
-
-            let events = buffer.lock().unwrap();
-            assert_eq!(
-                events.len(),
-                1,
-                "expected exactly one log event, got {events:?}"
-            );
-            assert_eq!(events[0].level, Some(tracing::Level::WARN));
-        }
-
-        #[test]
-        fn same_step_repeat_logs_debug_not_warn() {
-            let buffer = Arc::new(Mutex::new(Vec::new()));
-            let subscriber = CaptureSubscriber {
-                events: Arc::clone(&buffer),
-            };
-            let err = ChannelError::Transport("boom".into());
-
-            tracing::subscriber::with_default(subscriber, || {
-                log_eligible_poll_failure("email", &err, &tick(false, 2));
-            });
-
-            let events = buffer.lock().unwrap();
-            assert_eq!(
-                events.len(),
-                1,
-                "expected exactly one log event, got {events:?}"
-            );
-            assert_eq!(events[0].level, Some(tracing::Level::DEBUG));
-        }
-
-        #[test]
-        fn sustained_capped_pressure_produces_exactly_one_warn() {
-            // Simulate one escalation edge followed by several repeats at the
-            // same (capped) step, as the poll loop would emit them across
-            // consecutive ticks, reproducing the "riding the cap" scenario
-            // that previously spammed a WARN per retry.
-            let buffer = Arc::new(Mutex::new(Vec::new()));
-            let subscriber = CaptureSubscriber {
-                events: Arc::clone(&buffer),
-            };
-            let err = ChannelError::Auth("authenticated but not connected".into());
-
-            tracing::subscriber::with_default(subscriber, || {
-                log_eligible_poll_failure("email", &err, &tick(true, 8)); // escalation edge
-                for attempt in 9..=15 {
-                    log_eligible_poll_failure("email", &err, &tick(false, attempt));
-                    // repeats at cap
-                }
-            });
-
-            let events = buffer.lock().unwrap();
-            let warn_count = events
-                .iter()
-                .filter(|e| e.level == Some(tracing::Level::WARN))
-                .count();
-            let debug_count = events
-                .iter()
-                .filter(|e| e.level == Some(tracing::Level::DEBUG))
-                .count();
-            assert_eq!(
-                warn_count, 1,
-                "exactly one WARN expected across the whole sequence, got {warn_count} in {events:?}"
-            );
-            assert_eq!(
-                debug_count, 7,
-                "the 7 same-step repeats must log at debug, not warn"
-            );
-        }
-
-        #[test]
-        fn warn_message_contains_error_text() {
-            let buffer = Arc::new(Mutex::new(Vec::new()));
-            let subscriber = CaptureSubscriber {
-                events: Arc::clone(&buffer),
-            };
-            let err = ChannelError::Auth("IMAP LOGIN failed: slot exhausted".into());
-
-            tracing::subscriber::with_default(subscriber, || {
-                log_eligible_poll_failure("email", &err, &tick(true, 1));
-            });
-
-            let events = buffer.lock().unwrap();
-            let message = events[0].message.as_deref().unwrap_or_default();
-            assert!(
-                message.contains("slot exhausted"),
-                "escalation warn must carry the underlying error text, got: {message}"
-            );
-        }
-    }
-
     // --- should_warn_unattributed predicate ---
 
     fn packs(names: &[&str]) -> Vec<String> {
@@ -5758,63 +3911,6 @@ region = "us-east-1"
 
     #[test]
     #[serial]
-    fn build_server_schedule_tick_uses_the_configured_backend_not_the_home_default() {
-        let seat_dir = tempfile::tempdir().expect("seat tempdir");
-        let _seat_env = SeatEnv::enter(seat_dir.path());
-        std::env::remove_var("KHIVE_DB");
-        std::env::remove_var("KHIVE_ACTOR");
-        std::env::remove_var("KHIVE_PACKS");
-        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
-
-        let configured_db = seat_dir.path().join("configured-schedule-backend.db");
-
-        use clap::Parser;
-        let args = Args::parse_from(["mcp", "--db", configured_db.to_str().expect("utf8 path")]);
-
-        let (_server, schedule_rt) = build_server(&args).expect("build_server must succeed");
-        let rt = schedule_rt
-            .expect("the default pack set includes \"schedule\" — a runtime must be returned");
-
-        assert_eq!(
-            rt.config().db_path.as_deref(),
-            Some(configured_db.as_path()),
-            "the tick's runtime must target the exact --db this daemon was configured with, \
-             not RuntimeConfig::default()'s $HOME/.khive/khive.db fallback"
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn build_server_schedule_tick_uses_the_configured_actor_identity() {
-        let seat_dir = tempfile::tempdir().expect("seat tempdir");
-        let _seat_env = SeatEnv::enter(seat_dir.path());
-        std::env::remove_var("KHIVE_DB");
-        std::env::remove_var("KHIVE_ACTOR");
-        std::env::remove_var("KHIVE_PACKS");
-        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
-
-        use clap::Parser;
-        let args = Args::parse_from([
-            "mcp",
-            "--db",
-            ":memory:",
-            "--actor",
-            "lambda:adr106-tick-actor",
-        ]);
-
-        let (_server, schedule_rt) = build_server(&args).expect("build_server must succeed");
-        let rt = schedule_rt.expect("schedule pack is loaded by default");
-
-        assert_eq!(
-            rt.config().actor_id.as_deref(),
-            Some("lambda:adr106-tick-actor"),
-            "the tick's runtime must carry the daemon's own resolved --actor identity, \
-             not RuntimeConfig::default()'s unattributed actor_id=None"
-        );
-    }
-
-    #[test]
-    #[serial]
     fn build_server_schedule_tick_is_none_when_schedule_pack_is_not_in_the_restricted_pack_set() {
         let seat_dir = tempfile::tempdir().expect("seat tempdir");
         let _seat_env = SeatEnv::enter(seat_dir.path());
@@ -5834,1991 +3930,6 @@ region = "us-east-1"
              nothing to drain against — never silently falling back to a runtime that can \
              dispatch through a pack the daemon was not configured to load"
         );
-    }
-
-    #[test]
-    #[serial]
-    fn build_server_schedule_tick_runtime_satisfies_strict_actor_mode_like_the_live_server() {
-        // Regression for the exact "strict actor mode can make every tick
-        // fail" scenario this fix addressed: before this fix, the
-        // tick's separately-reconstructed `RuntimeConfig::default()` carried
-        // NO actor regardless of what `--actor` the daemon itself was given,
-        // so a strict-mode daemon's tick would trip `enforce_strict_actor_mode`
-        // on every single pass even though the live server's own actor was
-        // configured correctly. `build_server` must both (a) succeed under
-        // strict mode when an actor IS configured, and (b) hand back a
-        // schedule-tick runtime carrying that SAME actor — proving the tick
-        // no longer performs its own, separately-failing resolution.
-        let seat_dir = tempfile::tempdir().expect("seat tempdir");
-        let _seat_env = SeatEnv::enter(seat_dir.path());
-        std::env::remove_var("KHIVE_DB");
-        std::env::remove_var("KHIVE_ACTOR");
-        std::env::remove_var("KHIVE_PACKS");
-        let prev_strict = std::env::var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR").ok();
-        std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", "1");
-
-        use clap::Parser;
-        let args = Args::parse_from([
-            "mcp",
-            "--db",
-            ":memory:",
-            "--actor",
-            "lambda:strict-mode-tenant",
-            "--pack",
-            "kg",
-            "--pack",
-            "comm",
-            "--pack",
-            "schedule",
-        ]);
-
-        let result = build_server(&args);
-
-        match prev_strict {
-            Some(v) => std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", v),
-            None => std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR"),
-        }
-
-        let (_server, schedule_rt) = result.expect(
-            "build_server must succeed under strict mode when --actor is properly configured",
-        );
-        let rt = schedule_rt.expect("\"schedule\" pack was explicitly requested");
-        assert_eq!(
-            rt.config().actor_id.as_deref(),
-            Some("lambda:strict-mode-tenant"),
-            "the tick's runtime must carry the same actor identity that satisfied strict \
-             mode at daemon boot, not a separately-resolved, unattributed default"
-        );
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn build_server_schedule_tick_uses_the_declared_multi_backend_not_main() {
-        // Multi-backend (ADR-028 [[backends]]) config-backed targeting: the
-        // "schedule" pack is explicitly routed to its OWN backend, distinct
-        // from "main". `build_server`'s returned schedule-tick runtime must
-        // WRITE INTO that declared backend's file, not main's — proving the
-        // correct per-pack runtime is threaded through for
-        // multi-backend boots too, not only the single-backend common case.
-        // (`RuntimeConfig.db_path` is not itself a reliable signal here —
-        // per-pack multi-backend runtimes only override `backend_id`, not
-        // `db_path` — so this test verifies the actual bound storage file by
-        // writing a marker row and re-opening both declared backend files
-        // independently.)
-        let seat_dir = tempfile::tempdir().expect("seat tempdir");
-        let _seat_env = SeatEnv::enter(seat_dir.path());
-        std::env::remove_var("KHIVE_DB");
-        std::env::remove_var("KHIVE_ACTOR");
-        std::env::remove_var("KHIVE_PACKS");
-        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
-
-        let main_db = seat_dir.path().join("main.db");
-        let schedule_db = seat_dir.path().join("schedule-backend.db");
-        let config_path = write_config(
-            seat_dir.path(),
-            &format!(
-                r#"
-[[backends]]
-name = "main"
-kind = "sqlite"
-path = "{main}"
-
-[[backends]]
-name = "schedule-backend"
-kind = "sqlite"
-path = "{schedule}"
-
-[packs.schedule]
-backend = "schedule-backend"
-"#,
-                main = main_db.display(),
-                schedule = schedule_db.display(),
-            ),
-        );
-
-        use clap::Parser;
-        let args = Args::parse_from(["mcp", "--config", config_path.to_str().expect("utf8 path")]);
-
-        let (_server, schedule_rt) = build_server(&args).expect("build_server must succeed");
-        let rt = schedule_rt.expect("schedule pack is loaded by default and declared here");
-
-        let marker_content = "adr106-multi-backend-schedule-marker";
-        let ns = Namespace::parse("local").expect("ns");
-        let token = rt.authorize(ns).expect("authorize schedule runtime");
-        let store = rt.notes(&token).expect("notes store");
-        store
-            .upsert_note(khive_storage::note::Note::new(
-                "local",
-                "observation",
-                marker_content,
-            ))
-            .await
-            .expect("write marker note through the tick's runtime");
-
-        // Re-open each declared backend file independently (the original
-        // `_server`/`rt` are dropped-in-scope-still-alive but this is a
-        // sequential, not concurrent, re-open) and confirm the marker landed
-        // in "schedule-backend.db" only.
-        let count_marker_notes = |path: std::path::PathBuf| async move {
-            let cfg = RuntimeConfig {
-                db_path: Some(path),
-                default_namespace: Namespace::parse("local").unwrap(),
-                embedding_model: None,
-                additional_embedding_models: vec![],
-                ..RuntimeConfig::default()
-            };
-            let probe_rt = KhiveRuntime::new(cfg).expect("reopen backend file");
-            let ns = Namespace::parse("local").unwrap();
-            let token = probe_rt.authorize(ns).expect("authorize probe");
-            let store = probe_rt.notes(&token).expect("notes store");
-            let page = store
-                .query_notes(
-                    "local",
-                    Some("observation"),
-                    khive_storage::types::PageRequest {
-                        limit: 10,
-                        offset: 0,
-                    },
-                )
-                .await
-                .expect("query observation notes");
-            page.items
-                .into_iter()
-                .filter(|n| n.content == marker_content)
-                .count()
-        };
-
-        assert_eq!(
-            count_marker_notes(schedule_db.clone()).await,
-            1,
-            "the marker written through the tick's runtime must be present in the declared \
-             \"schedule-backend\" backend file"
-        );
-        assert_eq!(
-            count_marker_notes(main_db.clone()).await,
-            0,
-            "the marker must be ABSENT from \"main\" — the tick's runtime must not have \
-             silently written into the main backend instead of the declared schedule backend"
-        );
-    }
-
-    /// Multi-backend ACTION-DISPATCH routing (PR #782):
-    /// `schedule` defaults to "main" (no `[packs.schedule]`
-    /// entry declared), while `kg` — the pack whose `create` verb the stored
-    /// action below replays — is routed to a SEPARATE declared backend. A due
-    /// scheduled event whose action writes through `kg` must land its side
-    /// effect in `kg`'s OWN declared backend, never "main".
-    ///
-    /// This is the regression the prior fix was missing: it
-    /// fixed SCANNING (`scheduled_event` rows now correctly read from
-    /// `schedule`'s own backend, proven by
-    /// `build_server_schedule_tick_uses_the_declared_multi_backend_not_main`
-    /// above) but not DISPATCH — the drain replayed every stored action
-    /// through a throwaway `KhiveMcpServer::new(schedule_rt.clone())`, which
-    /// registers EVERY pack against the schedule backend alone. This test
-    /// drives the drain through `run_pending_events_on(&rt, &server, ..)`
-    /// with the daemon's REAL, fully-wired `server` (as
-    /// `spawn_schedule_tick_loop_if_daemon` now passes it) and asserts the
-    /// replayed action's own write shows up only in `kg`'s declared backend.
-    #[tokio::test]
-    #[serial]
-    async fn build_server_schedule_tick_dispatches_actions_through_the_declared_multi_backend_not_schedule(
-    ) {
-        let seat_dir = tempfile::tempdir().expect("seat tempdir");
-        let _seat_env = SeatEnv::enter(seat_dir.path());
-        std::env::remove_var("KHIVE_DB");
-        std::env::remove_var("KHIVE_ACTOR");
-        std::env::remove_var("KHIVE_PACKS");
-        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
-
-        let main_db = seat_dir.path().join("main.db");
-        let kg_db = seat_dir.path().join("kg-backend.db");
-        let config_path = write_config(
-            seat_dir.path(),
-            &format!(
-                r#"
-[[backends]]
-name = "main"
-kind = "sqlite"
-path = "{main}"
-
-[[backends]]
-name = "kg-backend"
-kind = "sqlite"
-path = "{kg}"
-
-[packs.kg]
-backend = "kg-backend"
-"#,
-                main = main_db.display(),
-                kg = kg_db.display(),
-            ),
-        );
-
-        use clap::Parser;
-        let args = Args::parse_from([
-            "mcp",
-            "--config",
-            config_path.to_str().expect("utf8 path"),
-            "--no-embed",
-        ]);
-
-        let (server, schedule_rt) = build_server(&args).expect("build_server must succeed");
-        // No `[packs.schedule]` entry above, so it defaults to "main".
-        let rt = schedule_rt.expect("schedule pack is loaded by default");
-        assert!(
-            rt.config().embedding_model.is_none()
-                && rt.config().additional_embedding_models.is_empty(),
-            "the backend-routing fixture must remain independent of external embedding models"
-        );
-
-        let marker = "adr106-multi-backend-dispatch-marker";
-        let action_dsl = format!("create(kind=\"observation\", content=\"{marker}\")");
-        let past = (chrono::Utc::now() - chrono::Duration::seconds(5)).to_rfc3339();
-        let repeat: Option<&str> = None;
-        let fired_at: Option<&str> = None;
-        let cancelled_at: Option<&str> = None;
-        let props = serde_json::json!({
-            "trigger_at": past,
-            "repeat": repeat,
-            "status": "pending",
-            "event_type": "schedule",
-            "payload": action_dsl,
-            "fired_at": fired_at,
-            "cancelled_at": cancelled_at,
-        });
-        let ns = Namespace::parse("local").expect("ns");
-        let token = rt.authorize(ns).expect("authorize schedule runtime");
-        rt.create_note(
-            &token,
-            "scheduled_event",
-            None,
-            &action_dsl,
-            None,
-            Some(props),
-            vec![],
-        )
-        .await
-        .expect("create scheduled_event through the schedule runtime");
-
-        let summary = crate::pending_events::run_pending_events_on(&rt, &server, false)
-            .await
-            .expect("drain");
-        assert_eq!(
-            summary.fired + summary.advanced,
-            1,
-            "the due event must be dispatched, got summary={summary:?}"
-        );
-        assert_eq!(summary.failed, 0, "dispatch must not fail: {summary:?}");
-
-        let count_marker_notes = |path: std::path::PathBuf| async move {
-            let cfg = RuntimeConfig {
-                db_path: Some(path),
-                default_namespace: Namespace::parse("local").unwrap(),
-                embedding_model: None,
-                additional_embedding_models: vec![],
-                ..RuntimeConfig::default()
-            };
-            let probe_rt = KhiveRuntime::new(cfg).expect("reopen backend file");
-            let ns = Namespace::parse("local").unwrap();
-            let token = probe_rt.authorize(ns).expect("authorize probe");
-            let store = probe_rt.notes(&token).expect("notes store");
-            let page = store
-                .query_notes(
-                    "local",
-                    Some("observation"),
-                    khive_storage::types::PageRequest {
-                        limit: 10,
-                        offset: 0,
-                    },
-                )
-                .await
-                .expect("query observation notes");
-            page.items
-                .into_iter()
-                .filter(|n| n.content == marker)
-                .count()
-        };
-
-        assert_eq!(
-            count_marker_notes(kg_db.clone()).await,
-            1,
-            "the replayed create(kind=\"observation\") action must land in the kg pack's OWN \
-             declared backend (\"kg-backend\"), not the schedule backend"
-        );
-        assert_eq!(
-            count_marker_notes(main_db.clone()).await,
-            0,
-            "the marker must be ABSENT from \"main\" (the schedule backend) — dispatching \
-             through a throwaway single-runtime server built from the schedule runtime alone \
-             would have written it here instead"
-        );
-    }
-
-    // --- channel_error_class / record_channel_heartbeat (khive #606) ---
-
-    #[cfg(feature = "channel-email")]
-    mod channel_heartbeat_tests {
-        use super::*;
-        use khive_channel::ChannelError;
-        use khive_runtime::{KhiveRuntime, VerbRegistryBuilder};
-
-        #[test]
-        fn auth_maps_to_auth_class() {
-            assert_eq!(channel_error_class(&ChannelError::Auth("x".into())), "auth");
-        }
-
-        #[test]
-        fn transport_maps_to_transport_class() {
-            assert_eq!(
-                channel_error_class(&ChannelError::Transport("x".into())),
-                "transport"
-            );
-        }
-
-        #[test]
-        fn config_maps_to_config_class() {
-            assert_eq!(
-                channel_error_class(&ChannelError::Config("x".into())),
-                "config"
-            );
-        }
-
-        #[test]
-        fn unauthorized_sender_and_invalid_envelope_map_to_config_class() {
-            // Never produced by poll/connect in practice (see is_backoff_eligible's doc
-            // comment), but the mapping must still be total and defensible if it ever
-            // does surface from a future adapter.
-            assert_eq!(
-                channel_error_class(&ChannelError::UnauthorizedSender("x".into())),
-                "config"
-            );
-            assert_eq!(
-                channel_error_class(&ChannelError::InvalidEnvelope("x".into())),
-                "config"
-            );
-        }
-
-        /// `record_channel_heartbeat` must be best-effort: a heartbeat dispatch
-        /// failure (comm pack not loaded) must not panic the poll loop.
-        #[tokio::test]
-        async fn record_heartbeat_is_best_effort_when_comm_pack_absent() {
-            let registry = VerbRegistryBuilder::new()
-                .build()
-                .expect("empty registry builds");
-
-            // comm pack is not loaded, so "comm.heartbeat" is an unknown verb — this
-            // must return without panicking (the caller only logs a warning).
-            record_channel_heartbeat(
-                &registry,
-                "email",
-                "recipient@example.com",
-                HeartbeatOutcome::Success,
-                None,
-            )
-            .await;
-        }
-
-        /// End-to-end: a successful poll outcome persists via `comm.heartbeat` and
-        /// is readable via `comm.health` — the same wiring the live poll loop uses.
-        #[tokio::test]
-        async fn record_heartbeat_success_is_visible_via_comm_health() {
-            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
-            let mut builder = VerbRegistryBuilder::new();
-            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
-            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
-            let registry = builder.build().expect("registry builds");
-
-            record_channel_heartbeat(
-                &registry,
-                "email",
-                "recipient@example.com",
-                HeartbeatOutcome::Success,
-                None,
-            )
-            .await;
-
-            let health = registry
-                .dispatch("comm.health", serde_json::json!({}))
-                .await
-                .expect("health succeeds");
-            let channels = health["channels"].as_array().expect("channels array");
-            assert_eq!(channels.len(), 1);
-            assert_eq!(channels[0]["channel_kind"].as_str(), Some("email"));
-            assert_eq!(
-                channels[0]["channel_slug"].as_str(),
-                Some("recipient@example.com")
-            );
-        }
-
-        /// #606: a daemon polling under a
-        /// non-local `KHIVE_EMAIL_INGEST_NAMESPACE` must not cause a client-role
-        /// no-arg `comm.health()` to report empty state. `record_channel_heartbeat`
-        /// takes no `namespace` parameter — the write is unconditionally pinned to
-        /// `khive_pack_comm::CHANNEL_HEALTH_NAMESPACE` — so this regression proves
-        /// the heartbeat row is visible via the default (local-scoped) `comm.health`
-        /// read even though this daemon's *messages* are configured to ingest into
-        /// a completely different namespace.
-        #[tokio::test]
-        async fn heartbeat_visible_via_health_regardless_of_configured_ingest_namespace() {
-            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
-            let mut builder = VerbRegistryBuilder::new();
-            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
-            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
-            let registry = builder.build().expect("registry builds");
-
-            // Simulates `KHIVE_EMAIL_INGEST_NAMESPACE=lambda:mybot`: comm.ingest for
-            // an inbound message would target this namespace, but the heartbeat
-            // write must ignore it entirely.
-            let configured_ingest_namespace = "lambda:mybot";
-            let ingest_params = serde_json::json!({
-                "namespace": configured_ingest_namespace,
-                "from": "email:sender@example.com",
-                "to": "email:recipient@example.com",
-                "content": "hello",
-                "channel_kind": "email",
-                "external_id": "test-msg-1",
-                "default_inbound_actor": "lambda:leo",
-            });
-            registry
-                .dispatch("comm.ingest", ingest_params)
-                .await
-                .expect("message ingest into the configured namespace succeeds");
-
-            record_channel_heartbeat(
-                &registry,
-                "email",
-                "recipient@example.com",
-                HeartbeatOutcome::Success,
-                None,
-            )
-            .await;
-
-            // A no-arg client-role comm.health() call must see the heartbeat row —
-            // it must NOT report role="client" with an empty channels array just
-            // because messages are configured to ingest into a non-local namespace.
-            let health = registry
-                .dispatch("comm.health", serde_json::json!({}))
-                .await
-                .expect("health succeeds");
-            assert_eq!(health["role"].as_str(), Some("daemon"));
-            let channels = health["channels"].as_array().expect("channels array");
-            assert_eq!(
-                channels.len(),
-                1,
-                "heartbeat row must be visible to a no-arg client comm.health() call \
-                 regardless of the configured message-ingest namespace"
-            );
-            assert_eq!(channels[0]["channel_kind"].as_str(), Some("email"));
-            assert_eq!(
-                channels[0]["channel_slug"].as_str(),
-                Some("recipient@example.com")
-            );
-        }
-    }
-
-    // --- ChannelRegistry composite-key production path ---
-
-    #[cfg(feature = "channel-email")]
-    mod composite_key_registry_tests {
-        use super::*;
-        use async_trait::async_trait;
-        use chrono::{DateTime, Utc};
-        use khive_channel::{Channel, ChannelEnvelope, ChannelError, ChannelRegistry};
-        use khive_runtime::{KhiveRuntime, VerbRegistryBuilder};
-        use std::sync::Arc;
-
-        /// Two independent inboxes that both report `kind() == "email"` but
-        /// distinct `slug()` mailbox addresses, exactly like two configured
-        /// `EmailChannel` credentials would.
-        struct TwoMailboxChannel {
-            slug: String,
-        }
-
-        #[async_trait]
-        impl Channel for TwoMailboxChannel {
-            fn kind(&self) -> &'static str {
-                "email"
-            }
-
-            fn slug(&self) -> String {
-                self.slug.clone()
-            }
-
-            async fn send(&self, _envelope: ChannelEnvelope) -> Result<(), ChannelError> {
-                Ok(())
-            }
-
-            async fn poll(
-                &self,
-                _since: DateTime<Utc>,
-            ) -> Result<Vec<ChannelEnvelope>, ChannelError> {
-                Ok(vec![])
-            }
-        }
-
-        /// #606 regression guard: a PRODUCTION `ChannelRegistry` populated
-        /// through the real `register()` path (not a pack-level dispatch
-        /// bypassing registration) with two same-kind, different-slug adapters.
-        /// Both must be registered (not collapsed) and both must be pollable by
-        /// the production poll loop, producing two independent `comm.health()`
-        /// rows and two independent backoff states. This test FAILS against a
-        /// `kind`-only-keyed `ChannelRegistry` (both registrations collapse to
-        /// `len() == 1`) and PASSES against the `(kind, slug)`-composite-keyed
-        /// registry.
-        #[tokio::test]
-        async fn two_same_kind_channels_both_poll_and_both_persist_health_rows() {
-            let mut ch_registry = ChannelRegistry::new();
-            ch_registry.register(Arc::new(TwoMailboxChannel {
-                slug: "mailbox-a@example.com".to_string(),
-            }));
-            ch_registry.register(Arc::new(TwoMailboxChannel {
-                slug: "mailbox-b@example.com".to_string(),
-            }));
-            assert_eq!(
-                ch_registry.len(),
-                2,
-                "two same-kind, different-slug adapters must both register, not collapse"
-            );
-
-            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
-            let mut builder = VerbRegistryBuilder::new();
-            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
-            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
-            let registry = builder.build().expect("registry builds");
-
-            // Drive exactly what the production poll loop does per tick: iterate
-            // the registry and record a heartbeat for every (kind, slug, channel).
-            for (kind, slug, _channel) in ch_registry.iter() {
-                record_channel_heartbeat(&registry, kind, slug, HeartbeatOutcome::Success, None)
-                    .await;
-            }
-
-            let health = registry
-                .dispatch("comm.health", serde_json::json!({}))
-                .await
-                .expect("health succeeds");
-            let channels = health["channels"].as_array().expect("channels array");
-            assert_eq!(
-                channels.len(),
-                2,
-                "both mailboxes must produce independent comm.health rows"
-            );
-            let slugs: std::collections::BTreeSet<&str> = channels
-                .iter()
-                .map(|c| c["channel_slug"].as_str().expect("channel_slug present"))
-                .collect();
-            assert_eq!(
-                slugs,
-                std::collections::BTreeSet::from([
-                    "mailbox-a@example.com",
-                    "mailbox-b@example.com"
-                ])
-            );
-        }
-
-        /// Backoff state independence: the production poll loop keys its
-        /// `HashMap<(String, String), ImapBackoff>` by the same composite
-        /// identity, so a failure on one mailbox must never throttle the other.
-        #[test]
-        fn backoff_state_is_independent_per_kind_slug_pair() {
-            use khive_channel_email::ImapBackoff;
-            use std::collections::HashMap;
-
-            let mut backoffs: HashMap<(String, String), ImapBackoff> = HashMap::new();
-            let key_a = ("email".to_string(), "mailbox-a@example.com".to_string());
-            let key_b = ("email".to_string(), "mailbox-b@example.com".to_string());
-
-            let tick_a = backoffs.entry(key_a.clone()).or_default().record_failure();
-            assert!(
-                !backoffs.contains_key(&key_b),
-                "mailbox-b must have no backoff state after only mailbox-a fails"
-            );
-            assert!(tick_a.delay.as_secs() >= 1, "mailbox-a backoff engaged");
-
-            // mailbox-b independently starts fresh and succeeds immediately.
-            let backoff_b = backoffs.entry(key_b).or_default();
-            backoff_b.record_success();
-            assert_eq!(
-                backoffs.get(&key_a).unwrap().attempt(),
-                1,
-                "mailbox-a's backoff attempt count must be unaffected by mailbox-b's success"
-            );
-        }
-    }
-
-    // --- note_already_delivered: outbox defensive-guard regression ---
-
-    #[cfg(feature = "channel-email")]
-    mod outbox_delivered_guard_tests {
-        use super::*;
-        use serde_json::json;
-
-        #[test]
-        fn missing_delivered_at_is_undelivered() {
-            let props = json!({}).as_object().unwrap().clone();
-            assert!(!note_already_delivered(&props));
-        }
-
-        #[test]
-        fn explicit_null_delivered_at_is_undelivered() {
-            // Regression: a note with delivered_at explicitly set to null (e.g. via a
-            // curation `update`) must be treated as undelivered, matching the query
-            // predicate in list.rs — not skipped forever by `.is_some()`.
-            let props = json!({ "delivered_at": null }).as_object().unwrap().clone();
-            assert!(!note_already_delivered(&props));
-        }
-
-        #[test]
-        fn present_non_null_delivered_at_is_delivered() {
-            let props = json!({ "delivered_at": "2026-06-30T12:00:00Z" })
-                .as_object()
-                .unwrap()
-                .clone();
-            assert!(note_already_delivered(&props));
-        }
-    }
-
-    // --- spawn_email_channel_loops: shared helper regression (multi-backend gap fix) ---
-    //
-    // Both `run` and `serve_server` call this same extracted fn (source-verified —
-    // see serve.rs's `run` and `serve_server` bodies); a Rust unit test cannot assert
-    // "both call sites exist" directly, so this test instead locks in that the
-    // extracted helper itself is safe to call in isolation with no `KHIVE_EMAIL_*`
-    // env present: it must hit the `Err` arm and return without panicking. No
-    // network I/O is exercised (the missing `KHIVE_EMAIL_SMTP_HOST` fails closed
-    // before any socket is opened).
-
-    #[cfg(feature = "channel-email")]
-    mod spawn_email_channel_loops_tests {
-        use super::*;
-
-        const EMAIL_ENV_VARS: [&str; 9] = [
-            "KHIVE_EMAIL_SMTP_HOST",
-            "KHIVE_EMAIL_IMAP_HOST",
-            "KHIVE_EMAIL_USERNAME",
-            "KHIVE_EMAIL_MAINTAINER_ADDRESS",
-            "KHIVE_EMAIL_AUTHSERV_ID",
-            "KHIVE_EMAIL_PASSWORD",
-            "KHIVE_EMAIL_OAUTH_TENANT_ID",
-            "KHIVE_EMAIL_OAUTH_CLIENT_ID",
-            "KHIVE_EMAIL_OAUTH_CLIENT_SECRET",
-        ];
-
-        /// RAII guard: snapshots each `KHIVE_EMAIL_*` var's current value, clears it,
-        /// and restores the original value (or leaves it removed) on drop — including
-        /// on panic, so a failing assertion never leaks env taint to later tests.
-        struct EmailEnvGuard {
-            snapshot: Vec<(&'static str, Option<String>)>,
-        }
-
-        impl EmailEnvGuard {
-            fn clear() -> Self {
-                let snapshot = EMAIL_ENV_VARS
-                    .iter()
-                    .map(|&var| (var, std::env::var(var).ok()))
-                    .collect();
-                for var in EMAIL_ENV_VARS {
-                    std::env::remove_var(var);
-                }
-                Self { snapshot }
-            }
-        }
-
-        impl Drop for EmailEnvGuard {
-            fn drop(&mut self) {
-                for (var, prev) in &self.snapshot {
-                    match prev {
-                        Some(v) => std::env::set_var(var, v),
-                        None => std::env::remove_var(var),
-                    }
-                }
-            }
-        }
-
-        #[tokio::test]
-        #[serial]
-        async fn missing_env_hits_err_arm_without_panic() {
-            let _env_guard = EmailEnvGuard::clear();
-
-            // Prove the branch the helper depends on is actually taken: with every
-            // KHIVE_EMAIL_* var cleared, EmailChannel::from_env() must fail closed.
-            // Without this, the test below would pass even if from_env() wrongly hit
-            // the Ok arm (it only checks "no panic").
-            assert!(
-                khive_channel_email::EmailChannel::from_env().is_err(),
-                "with KHIVE_EMAIL_* cleared, from_env must fail closed (the Err arm the helper depends on)"
-            );
-
-            let config = RuntimeConfig {
-                db_path: None,
-                default_namespace: Namespace::parse("test").unwrap(),
-                embedding_model: None,
-                additional_embedding_models: vec![],
-                packs: vec!["kg".to_string()],
-                ..RuntimeConfig::default()
-            };
-            let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
-            let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
-
-            // Must not panic: EmailChannel::from_env() fails closed on the missing
-            // KHIVE_EMAIL_SMTP_HOST and the fn logs a warning and returns.
-            spawn_email_channel_loops(&server);
-        }
-
-        /// Regression for #602: `spawn_email_channel_loops_if_daemon` is the
-        /// SAME wrapper `run` and `serve_server` call (source-verified — see
-        /// those fns' bodies above) — no reimplementation of the role check
-        /// here. Actual tokio task spawning cannot be observed from a unit
-        /// test, so this pair instead exercises `is_daemon_role` (the pure
-        /// predicate) directly against real `Args` values, and drives the
-        /// production wrapper through both roles to prove neither branch
-        /// panics — the same "no-panic" scope the sibling test above uses.
-        #[test]
-        fn is_daemon_role_true_for_daemon_args() {
-            use clap::Parser;
-            let args = Args::parse_from(["mcp", "--daemon"]);
-            assert!(
-                is_daemon_role(&args),
-                "--daemon must resolve to daemon role"
-            );
-        }
-
-        #[test]
-        fn is_daemon_role_false_for_client_args() {
-            use clap::Parser;
-            let args = Args::parse_from(["mcp"]);
-            assert!(
-                !is_daemon_role(&args),
-                "a plain stdio client (no --daemon) must not resolve to daemon role"
-            );
-        }
-
-        #[tokio::test]
-        #[serial]
-        async fn daemon_role_gate_spawns_without_panic() {
-            use clap::Parser;
-            let _env_guard = EmailEnvGuard::clear();
-            let args = Args::parse_from(["mcp", "--daemon"]);
-
-            let config = RuntimeConfig {
-                db_path: None,
-                default_namespace: Namespace::parse("test").unwrap(),
-                embedding_model: None,
-                additional_embedding_models: vec![],
-                packs: vec!["kg".to_string()],
-                ..RuntimeConfig::default()
-            };
-            let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
-            let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
-
-            // Daemon role: the wrapper must take the spawn branch (still fails
-            // closed on missing KHIVE_EMAIL_* — no network I/O — but must not
-            // panic reaching it).
-            spawn_email_channel_loops_if_daemon(&server, &args);
-        }
-
-        #[tokio::test]
-        #[serial]
-        async fn client_role_gate_skips_without_panic() {
-            use clap::Parser;
-            let _env_guard = EmailEnvGuard::clear();
-            let args = Args::parse_from(["mcp"]);
-
-            let config = RuntimeConfig {
-                db_path: None,
-                default_namespace: Namespace::parse("test").unwrap(),
-                embedding_model: None,
-                additional_embedding_models: vec![],
-                packs: vec!["kg".to_string()],
-                ..RuntimeConfig::default()
-            };
-            let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
-            let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
-
-            // Client role: the wrapper must take the skip branch and never
-            // attempt to construct an EmailChannel at all.
-            spawn_email_channel_loops_if_daemon(&server, &args);
-        }
-    }
-
-    // --- channel_poll_loop: ADR-094 lifecycle event sequencing (#623) ---
-
-    #[cfg(feature = "channel-email")]
-    mod channel_lifecycle_sequencing_tests {
-        use super::*;
-        use async_trait::async_trait;
-        use chrono::{DateTime, Utc};
-        use khive_channel::{Channel, ChannelEnvelope, ChannelError, ChannelRegistry};
-        use khive_runtime::{KhiveRuntime, VerbRegistryBuilder};
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::{Arc, Mutex};
-
-        /// A channel whose first `poll()` fails with a backoff-eligible
-        /// transport error and whose every later `poll()` succeeds — the
-        /// minimal fixture needed to drive the loop through one full
-        /// fail-then-recover lifecycle episode.
-        struct FlakyOnceChannel {
-            call_count: AtomicUsize,
-        }
-
-        #[async_trait]
-        impl Channel for FlakyOnceChannel {
-            fn kind(&self) -> &'static str {
-                "mock"
-            }
-
-            async fn send(&self, _envelope: ChannelEnvelope) -> Result<(), ChannelError> {
-                Ok(())
-            }
-
-            async fn poll(
-                &self,
-                _since: DateTime<Utc>,
-            ) -> Result<Vec<ChannelEnvelope>, ChannelError> {
-                if self.call_count.fetch_add(1, Ordering::SeqCst) == 0 {
-                    Err(ChannelError::Transport("synthetic connect failure".into()))
-                } else {
-                    Ok(vec![])
-                }
-            }
-        }
-
-        /// In-memory `EventStore` fake that just records every appended event
-        /// in append order, so the test can inspect exactly what the poll
-        /// loop persisted without standing up a SQL backend.
-        #[derive(Default)]
-        struct FakeEventStore {
-            events: Mutex<Vec<khive_storage::Event>>,
-        }
-
-        #[async_trait]
-        impl khive_storage::EventStore for FakeEventStore {
-            async fn append_event(
-                &self,
-                event: khive_storage::Event,
-            ) -> khive_storage::StorageResult<()> {
-                self.events.lock().unwrap().push(event);
-                Ok(())
-            }
-
-            async fn append_events(
-                &self,
-                events: Vec<khive_storage::Event>,
-            ) -> khive_storage::StorageResult<khive_storage::BatchWriteSummary> {
-                let n = events.len() as u64;
-                self.events.lock().unwrap().extend(events);
-                Ok(khive_storage::BatchWriteSummary {
-                    attempted: n,
-                    affected: n,
-                    failed: 0,
-                    first_error: String::new(),
-                })
-            }
-
-            async fn get_event(
-                &self,
-                id: uuid::Uuid,
-            ) -> khive_storage::StorageResult<Option<khive_storage::Event>> {
-                Ok(self
-                    .events
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .find(|e| e.id == id)
-                    .cloned())
-            }
-
-            async fn query_events(
-                &self,
-                _filter: khive_storage::EventFilter,
-                _page: khive_storage::PageRequest,
-            ) -> khive_storage::StorageResult<khive_storage::Page<khive_storage::Event>>
-            {
-                let items = self.events.lock().unwrap().clone();
-                let total = items.len() as u64;
-                Ok(khive_storage::Page {
-                    items,
-                    total: Some(total),
-                })
-            }
-
-            async fn count_events(
-                &self,
-                _filter: khive_storage::EventFilter,
-            ) -> khive_storage::StorageResult<u64> {
-                Ok(self.events.lock().unwrap().len() as u64)
-            }
-        }
-
-        /// The ADR-094 lifecycle-event subsequence the sequencing test
-        /// asserts on. The shared `FakeEventStore` also receives every
-        /// dispatch's audit event and each `comm.heartbeat` write, so raw
-        /// `store.events.len()` is not a proxy for "how many lifecycle
-        /// events landed" -- it inflates far faster than the six events
-        /// this test actually cares about, which is why convergence must
-        /// be checked against this filtered view, not the raw count.
-        fn lifecycle_sequence(store: &FakeEventStore) -> Vec<khive_types::EventKind> {
-            store
-                .events
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|e| e.kind)
-                .filter(|k| {
-                    matches!(
-                        k,
-                        khive_types::EventKind::ChannelPollStarted
-                            | khive_types::EventKind::ChannelPollSucceeded
-                            | khive_types::EventKind::ChannelPollFailed
-                            | khive_types::EventKind::ChannelBackoffArmed
-                            | khive_types::EventKind::ChannelBackoffReset
-                    )
-                })
-                .collect()
-        }
-
-        /// Drive the paused virtual clock forward in small steps, yielding
-        /// after each one, until the fake store has recorded at least
-        /// `target` lifecycle events (see [`lifecycle_sequence`]). A single
-        /// big `advance` can outrun a timer the polled task hasn't
-        /// registered yet (the task only arms its next `sleep` after
-        /// cooperative scheduling lets it run back around the loop), so
-        /// this steps forward repeatedly instead of guessing one jump that
-        /// is simultaneously long enough to fire the next timer and short
-        /// enough not to skip past it unregistered.
-        ///
-        /// The loop's own `comm.*` dispatches land on `spawn_blocking`
-        /// (`khive-db`'s writer runs on tokio's real OS-thread blocking
-        /// pool), so how many `advance`/`yield_now` rounds this needs to
-        /// converge depends on real thread-pool scheduling latency, not on
-        /// virtual time -- a fixed iteration count is really a proxy for
-        /// real wall-clock patience, and a bigger fixed count doesn't buy
-        /// more of it if the loop itself runs each round near-instantly in
-        /// real time. Bounding on an actual wall-clock deadline instead
-        /// gives the blocking pool as much real time as it needs under
-        /// load, while still failing fast (with a clear message) if the
-        /// condition is genuinely never met.
-        async fn advance_until(store: &FakeEventStore, target: usize) {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-            loop {
-                if lifecycle_sequence(store).len() >= target {
-                    return;
-                }
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "lifecycle event sequence did not reach {target} events within 60s of \
-                     wall-clock time; got {:?}",
-                    lifecycle_sequence(store)
-                );
-                tokio::time::advance(std::time::Duration::from_millis(250)).await;
-                for _ in 0..10 {
-                    tokio::task::yield_now().await;
-                }
-            }
-        }
-
-        /// ADR-094 sequencing invariant (#623): a channel that fails once and
-        /// then recovers must produce exactly this six-event lifecycle
-        /// sequence, in this order — `query_events` in production orders on
-        /// `idx_events_ns_created_id`, i.e. append order, which this fake
-        /// preserves directly. Swapping any two entries (e.g. emitting
-        /// `ChannelBackoffArmed` before `ChannelPollFailed`, or letting the
-        /// second `ChannelPollStarted` land after `ChannelPollSucceeded`)
-        /// makes this assertion fail: it is an order check, not a mere
-        /// presence/count check.
-        #[tokio::test(start_paused = true)]
-        async fn channel_lifecycle_events_are_sequenced_across_a_failure_then_recovery() {
-            let mut ch_registry = ChannelRegistry::new();
-            ch_registry.register(Arc::new(FlakyOnceChannel {
-                call_count: AtomicUsize::new(0),
-            }));
-
-            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
-            let mut builder = VerbRegistryBuilder::new();
-            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
-            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
-            let store = Arc::new(FakeEventStore::default());
-            builder.with_event_store(store.clone());
-            let registry = builder.build().expect("registry builds");
-
-            let task = tokio::spawn(channel_poll_loop(
-                Arc::new(ch_registry),
-                registry,
-                "test-ns".to_string(),
-                "actor:test".to_string(),
-            ));
-
-            // Iteration 1 (happy-path 5s sleep elapses, poll fails, backoff
-            // arms) then iteration 2 (backoff delay elapses, poll succeeds,
-            // backoff resets) — six lifecycle events total.
-            advance_until(&store, 6).await;
-
-            task.abort();
-
-            let sequence = lifecycle_sequence(&store);
-
-            assert_eq!(
-                sequence,
-                vec![
-                    khive_types::EventKind::ChannelPollStarted,
-                    khive_types::EventKind::ChannelPollFailed,
-                    khive_types::EventKind::ChannelBackoffArmed,
-                    khive_types::EventKind::ChannelPollStarted,
-                    khive_types::EventKind::ChannelPollSucceeded,
-                    khive_types::EventKind::ChannelBackoffReset,
-                ],
-                "ADR-094 lifecycle events must be sequenced exactly as the poll \
-                 loop drives them: started -> failed -> backoff armed -> \
-                 started -> succeeded -> backoff reset. Got: {sequence:?}"
-            );
-        }
-
-        /// Edge case: with no `EventStore` configured, the loop must run the
-        /// same fail-then-recover cycle without panicking or blocking on the
-        /// (absent) lifecycle-append path.
-        #[tokio::test(start_paused = true)]
-        async fn channel_lifecycle_events_are_a_no_op_without_an_event_store() {
-            let mut ch_registry = ChannelRegistry::new();
-            ch_registry.register(Arc::new(FlakyOnceChannel {
-                call_count: AtomicUsize::new(0),
-            }));
-
-            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
-            let mut builder = VerbRegistryBuilder::new();
-            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
-            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
-            let registry = builder.build().expect("registry builds");
-            assert!(
-                registry.event_store().is_none(),
-                "no event store was configured for this registry"
-            );
-
-            let task = tokio::spawn(channel_poll_loop(
-                Arc::new(ch_registry),
-                registry,
-                "test-ns".to_string(),
-                "actor:test".to_string(),
-            ));
-
-            // Step the paused clock through both iterations; with no store
-            // configured there is no event count to converge on, so this
-            // just needs to comfortably clear the failure backoff delay.
-            for _ in 0..48 {
-                tokio::time::advance(std::time::Duration::from_millis(250)).await;
-                tokio::task::yield_now().await;
-            }
-
-            task.abort();
-        }
-    }
-
-    /// Regression tests for issue #449's daemon wiring: the
-    /// poll loop must drive `cursor_get` -> `poll_page` -> every
-    /// `comm.ingest` -> `cursor_commit`, committing the cursor only when
-    /// every envelope in the page durably ingested.
-    #[cfg(feature = "channel-email")]
-    mod cursor_commit_gating_tests {
-        use super::*;
-        use async_trait::async_trait;
-        use chrono::{DateTime, Utc};
-        use khive_channel::{
-            Channel, ChannelCheckpoint, ChannelEnvelope, ChannelError, ChannelPollPage,
-            ChannelRegistry, StoredChannelCheckpoint,
-        };
-        use khive_runtime::{KhiveRuntime, VerbRegistryBuilder};
-        use serde_json::json;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::{Arc, Mutex};
-
-        const SOURCE: &str = "imap+tls:h:993:m:INBOX";
-
-        /// First `poll_page` call returns one message that ingests cleanly
-        /// and one that permanently fails `comm.ingest` validation (empty
-        /// content) -- simulating a partial-page ingest failure. Every
-        /// subsequent call returns only the message that already succeeded,
-        /// mirroring the daemon's next-poll re-delivery of the whole
-        /// unresolved page. Each call's observed checkpoint is recorded
-        /// (rather than asserted inline, since a panic inside a
-        /// `tokio::spawn`ed task is otherwise silently swallowed by
-        /// `task.abort()`) so the test body can assert on it after the loop
-        /// task is done.
-        struct PartialFailureChannel {
-            call_count: AtomicUsize,
-            observed_checkpoints: Arc<Mutex<Vec<Option<StoredChannelCheckpoint>>>>,
-        }
-
-        #[async_trait]
-        impl Channel for PartialFailureChannel {
-            fn kind(&self) -> &'static str {
-                "mock"
-            }
-
-            async fn send(&self, _envelope: ChannelEnvelope) -> Result<(), ChannelError> {
-                Ok(())
-            }
-
-            async fn poll(
-                &self,
-                _since: DateTime<Utc>,
-            ) -> Result<Vec<ChannelEnvelope>, ChannelError> {
-                panic!("the daemon poll loop must call poll_page, not poll");
-            }
-
-            async fn poll_page(
-                &self,
-                _since: DateTime<Utc>,
-                checkpoint: Option<&StoredChannelCheckpoint>,
-            ) -> Result<ChannelPollPage, ChannelError> {
-                let call = self.call_count.fetch_add(1, Ordering::SeqCst);
-                self.observed_checkpoints
-                    .lock()
-                    .unwrap()
-                    .push(checkpoint.cloned());
-                let good = ChannelEnvelope::new(
-                    "email:sender@example.com",
-                    "email:me@example.com",
-                    "good body",
-                )
-                .with_external_id("imap:h:1:1");
-
-                if call == 0 {
-                    let bad = ChannelEnvelope::new(
-                        "email:sender@example.com",
-                        "email:me@example.com",
-                        "",
-                    );
-                    Ok(ChannelPollPage {
-                        envelopes: vec![good, bad],
-                        next_checkpoint: Some(ChannelCheckpoint {
-                            source: SOURCE.to_string(),
-                            generation: 1,
-                            high_water: Some(2),
-                        }),
-                    })
-                } else {
-                    Ok(ChannelPollPage {
-                        envelopes: vec![good],
-                        next_checkpoint: Some(ChannelCheckpoint {
-                            source: SOURCE.to_string(),
-                            generation: 1,
-                            high_water: Some(1),
-                        }),
-                    })
-                }
-            }
-        }
-
-        #[tokio::test(start_paused = true)]
-        async fn partial_ingest_failure_does_not_advance_cursor_and_dedup_prevents_double_store() {
-            let observed_checkpoints = Arc::new(Mutex::new(Vec::new()));
-            let mut ch_registry = ChannelRegistry::new();
-            ch_registry.register(Arc::new(PartialFailureChannel {
-                call_count: AtomicUsize::new(0),
-                observed_checkpoints: observed_checkpoints.clone(),
-            }));
-
-            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
-            let mut builder = VerbRegistryBuilder::new();
-            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
-            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
-            let registry = builder.build().expect("registry builds");
-
-            let task = tokio::spawn(channel_poll_loop(
-                Arc::new(ch_registry),
-                registry.clone(),
-                "test-ns".to_string(),
-                "actor:test".to_string(),
-            ));
-
-            // Three happy-path 5s ticks: the first drives the partial-failure
-            // page, the second drives the retry the fix must produce, and the
-            // third observes the checkpoint the retry committed -- proving
-            // the retry's `comm.ingest` (and its dedup) actually completed and
-            // was durably persisted, not merely that a second `poll_page` call
-            // was made while the retry was still in flight. Poll for that
-            // directly (rather than blindly running a fixed number of ticks)
-            // and bound the wait by a real wall-clock deadline, not a
-            // virtual-time/iteration budget -- the loop's `comm.*` dispatches
-            // land on `spawn_blocking`'s real OS-thread pool, so how many
-            // advance/yield rounds this needs depends on real thread-pool
-            // scheduling latency, which a fixed count cannot account for
-            // under load.
-            let expected_committed_checkpoint = ChannelCheckpoint {
-                source: SOURCE.to_string(),
-                generation: 1,
-                high_water: Some(1),
-            };
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-            loop {
-                if observed_checkpoints
-                    .lock()
-                    .unwrap()
-                    .get(2)
-                    .is_some_and(|c| {
-                        c.as_ref().map(|stored| &stored.checkpoint)
-                            == Some(&expected_committed_checkpoint)
-                    })
-                {
-                    break;
-                }
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "the retry must have committed its checkpoint (observable on the \
-                     third poll_page call) within 60s of wall-clock time: {:?}",
-                    observed_checkpoints.lock().unwrap()
-                );
-                tokio::time::advance(std::time::Duration::from_secs(5)).await;
-                for _ in 0..20 {
-                    tokio::task::yield_now().await;
-                }
-            }
-            task.abort();
-
-            let calls = observed_checkpoints.lock().unwrap().clone();
-            assert!(
-                calls.len() >= 3,
-                "the loop must have retried and then re-polled with the retry's \
-                 committed checkpoint: {calls:?}"
-            );
-            assert!(
-                calls[0].is_none(),
-                "the first poll must see no persisted checkpoint"
-            );
-            assert!(
-                calls[1].is_none(),
-                "the cursor must NOT have advanced past the partially-failed page \
-                 -- the retry must still see no committed checkpoint: {calls:?}"
-            );
-            assert_eq!(
-                calls[2].as_ref().map(|stored| &stored.checkpoint),
-                Some(&expected_committed_checkpoint),
-                "the third poll must observe the checkpoint the retry committed, \
-                 proving the retry's comm.ingest (and its dedup) actually completed: \
-                 {calls:?}"
-            );
-
-            let inbox = registry
-                .dispatch(
-                    "list",
-                    json!({"namespace": "test-ns", "kind": "message", "limit": 50}),
-                )
-                .await
-                .expect("list must succeed");
-            let notes = inbox.as_array().expect("list returns an array").clone();
-            let matching: Vec<_> = notes
-                .iter()
-                .filter(|n| {
-                    n.get("properties")
-                        .and_then(|p| p.get("external_id"))
-                        .and_then(|v| v.as_str())
-                        == Some("imap:h:1:1")
-                })
-                .collect();
-            assert_eq!(
-                matching.len(),
-                1,
-                "the message that succeeded on the failed page must not be \
-                 double-stored once the retry re-delivers the whole page: {notes:?}"
-            );
-        }
-
-        /// A channel whose every `poll_page` call returns an empty page with
-        /// a `next_checkpoint` that `comm.cursor_commit` itself rejects
-        /// (`generation: 0` is outside its documented `1..=i64::MAX` range).
-        /// Exercises the daemon's `commit_channel_cursor`-`Err` branch
-        /// (issue #449): every other test in this module drives
-        /// a `cursor_get` failure or a `comm.ingest` failure, never a
-        /// rejected commit itself, so that branch was otherwise dead from
-        /// this suite's perspective.
-        struct CommitRejectedChannel {
-            call_count: AtomicUsize,
-        }
-
-        #[async_trait]
-        impl Channel for CommitRejectedChannel {
-            fn kind(&self) -> &'static str {
-                "mock_commit_rejected"
-            }
-
-            async fn send(&self, _envelope: ChannelEnvelope) -> Result<(), ChannelError> {
-                Ok(())
-            }
-
-            async fn poll(
-                &self,
-                _since: DateTime<Utc>,
-            ) -> Result<Vec<ChannelEnvelope>, ChannelError> {
-                panic!("the daemon poll loop must call poll_page, not poll");
-            }
-
-            async fn poll_page(
-                &self,
-                _since: DateTime<Utc>,
-                _checkpoint: Option<&StoredChannelCheckpoint>,
-            ) -> Result<ChannelPollPage, ChannelError> {
-                self.call_count.fetch_add(1, Ordering::SeqCst);
-                Ok(ChannelPollPage {
-                    envelopes: vec![],
-                    next_checkpoint: Some(ChannelCheckpoint {
-                        source: SOURCE.to_string(),
-                        generation: 0,
-                        high_water: Some(1),
-                    }),
-                })
-            }
-        }
-
-        #[tokio::test(start_paused = true)]
-        async fn rejected_cursor_commit_leaves_no_committed_checkpoint() {
-            let channel = Arc::new(CommitRejectedChannel {
-                call_count: AtomicUsize::new(0),
-            });
-            let mut ch_registry = ChannelRegistry::new();
-            ch_registry.register(channel.clone());
-
-            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
-            let mut builder = VerbRegistryBuilder::new();
-            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
-            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
-            let registry = builder.build().expect("registry builds");
-
-            let task = tokio::spawn(channel_poll_loop(
-                Arc::new(ch_registry),
-                registry.clone(),
-                "test-ns".to_string(),
-                "actor:test".to_string(),
-            ));
-
-            // Wait for at least two poll_page calls (deterministic condition
-            // on the channel's own call counter, not a fixed tick budget):
-            // the second call proves the loop went all the way around after
-            // the first call's rejected commit, giving that commit's async
-            // dispatch chain every chance to finish before asserting on its
-            // durable effect. Bounded on real wall-clock time, not virtual
-            // time, since the underlying `comm.*` dispatches land on
-            // `spawn_blocking`'s real OS-thread pool.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-            loop {
-                if channel.call_count.load(Ordering::SeqCst) >= 2 {
-                    break;
-                }
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "poll_page was not called at least twice within 60s of wall-clock time"
-                );
-                tokio::time::advance(std::time::Duration::from_millis(250)).await;
-                for _ in 0..10 {
-                    tokio::task::yield_now().await;
-                }
-            }
-            task.abort();
-
-            let restored =
-                load_channel_cursor(&registry, "mock_commit_rejected", "mock_commit_rejected")
-                    .await
-                    .expect("cursor_get must succeed");
-            assert!(
-                restored.is_none(),
-                "a rejected cursor_commit must not leave a committed checkpoint: {restored:?}"
-            );
-        }
-
-        /// A channel whose one and only `poll_page` call returns a single
-        /// quarantine-shaped envelope -- exactly the field shape
-        /// `EmailChannel::disposition` produces for a permanently
-        /// unparseable UID (see
-        /// `khive-channel-email`'s
-        /// `poll_page_malformed_uid_produces_a_stable_external_id_and_quarantine_metadata`) --
-        /// so this test can drive it through the daemon's real
-        /// `comm.ingest` call and query the durably persisted note.
-        struct QuarantineOnceChannel {
-            envelope: Mutex<Option<ChannelEnvelope>>,
-        }
-
-        #[async_trait]
-        impl Channel for QuarantineOnceChannel {
-            fn kind(&self) -> &'static str {
-                "mock_quarantine"
-            }
-
-            async fn send(&self, _envelope: ChannelEnvelope) -> Result<(), ChannelError> {
-                Ok(())
-            }
-
-            async fn poll(
-                &self,
-                _since: DateTime<Utc>,
-            ) -> Result<Vec<ChannelEnvelope>, ChannelError> {
-                panic!("the daemon poll loop must call poll_page, not poll");
-            }
-
-            async fn poll_page(
-                &self,
-                _since: DateTime<Utc>,
-                _checkpoint: Option<&StoredChannelCheckpoint>,
-            ) -> Result<ChannelPollPage, ChannelError> {
-                let Some(envelope) = self.envelope.lock().unwrap().take() else {
-                    return Ok(ChannelPollPage {
-                        envelopes: vec![],
-                        next_checkpoint: None,
-                    });
-                };
-                Ok(ChannelPollPage {
-                    envelopes: vec![envelope],
-                    next_checkpoint: Some(ChannelCheckpoint {
-                        source: SOURCE.to_string(),
-                        generation: 9,
-                        high_water: Some(1),
-                    }),
-                })
-            }
-        }
-
-        /// khive #449 follow-up: the connector- and
-        /// channel-level poison-UID tests prove a malformed message becomes
-        /// a quarantine-shaped `ChannelEnvelope`, but neither proves the
-        /// daemon actually turns that into a durable, queryable record.
-        /// Drives a quarantine envelope through the real `channel_poll_loop`
-        /// -> `comm.ingest` path and queries the stored note back out,
-        /// asserting its stable external ID and quarantine metadata
-        /// persisted exactly -- and that the cursor committed, since a
-        /// quarantine envelope must durably ingest like any other message.
-        #[tokio::test(start_paused = true)]
-        async fn malformed_message_durably_quarantines_with_stable_external_id_and_metadata() {
-            let mut envelope = ChannelEnvelope::new(
-                "email:quarantine",
-                "email:maintainer@example.com",
-                "(khive: IMAP message UID 1 could not be parsed and was quarantined)",
-            )
-            .with_external_id("imap:h:9:1");
-            envelope
-                .metadata
-                .insert("quarantined".to_string(), "true".to_string());
-            envelope
-                .metadata
-                .insert("quarantine_reason".to_string(), "missing-body".to_string());
-
-            let mut ch_registry = ChannelRegistry::new();
-            ch_registry.register(Arc::new(QuarantineOnceChannel {
-                envelope: Mutex::new(Some(envelope)),
-            }));
-
-            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
-            let mut builder = VerbRegistryBuilder::new();
-            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
-            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
-            let registry = builder.build().expect("registry builds");
-
-            let task = tokio::spawn(channel_poll_loop(
-                Arc::new(ch_registry),
-                registry.clone(),
-                "test-ns".to_string(),
-                "actor:test".to_string(),
-            ));
-
-            for _ in 0..2000 {
-                let restored = load_channel_cursor(&registry, "mock_quarantine", "mock_quarantine")
-                    .await
-                    .expect("cursor_get must succeed");
-                if restored.is_some() {
-                    break;
-                }
-                tokio::time::advance(std::time::Duration::from_millis(250)).await;
-                for _ in 0..10 {
-                    tokio::task::yield_now().await;
-                }
-            }
-            task.abort();
-
-            let restored = load_channel_cursor(&registry, "mock_quarantine", "mock_quarantine")
-                .await
-                .expect("cursor_get must succeed")
-                .expect(
-                    "the cursor must have committed -- a quarantine envelope must ingest \
-                     durably like any other message",
-                );
-            assert_eq!(restored.checkpoint.high_water, Some(1));
-
-            let inbox = registry
-                .dispatch(
-                    "list",
-                    json!({"namespace": "test-ns", "kind": "message", "limit": 50}),
-                )
-                .await
-                .expect("list must succeed");
-            let notes = inbox.as_array().expect("list returns an array").clone();
-            let quarantined = notes
-                .iter()
-                .find(|n| {
-                    n.get("properties")
-                        .and_then(|p| p.get("external_id"))
-                        .and_then(|v| v.as_str())
-                        == Some("imap:h:9:1")
-                })
-                .expect(
-                    "the quarantined message must be durably queryable by its stable \
-                         external_id, not just held as an intermediate value",
-                );
-
-            let props = quarantined
-                .get("properties")
-                .expect("stored note must carry properties");
-            assert_eq!(
-                props.get("quarantined").and_then(|v| v.as_str()),
-                Some("true"),
-                "durable quarantine metadata must survive comm.ingest: {props:?}"
-            );
-            assert_eq!(
-                props.get("quarantine_reason").and_then(|v| v.as_str()),
-                Some("missing-body"),
-                "the quarantine reason must survive comm.ingest: {props:?}"
-            );
-        }
-
-        /// Restart-across-a-checkpoint round-trip (issue #449 part b): once a
-        /// page fully ingests and the cursor commits, a fresh call to
-        /// `comm.cursor_get` (simulating a daemon restart reading the
-        /// persisted row) must return the exact checkpoint that was
-        /// committed -- proving the durable path round-trips independent of
-        /// any in-process state.
-        #[tokio::test]
-        async fn committed_cursor_round_trips_across_a_fresh_cursor_get() {
-            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
-            let mut builder = VerbRegistryBuilder::new();
-            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
-            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
-            let registry = builder.build().expect("registry builds");
-
-            // Simulates a poll that crosses an IMAP UIDVALIDITY/date-window
-            // boundary: commit once, then read it back as a brand-new
-            // process (a new `comm.cursor_get` call, no shared in-memory
-            // cursor) would on restart.
-            commit_channel_cursor(
-                &registry,
-                "mock",
-                "mailbox-a",
-                &ChannelCheckpoint {
-                    source: SOURCE.to_string(),
-                    generation: 7,
-                    high_water: Some(123),
-                },
-            )
-            .await
-            .expect("cursor_commit must succeed");
-
-            let restored = load_channel_cursor(&registry, "mock", "mailbox-a")
-                .await
-                .expect("cursor_get must succeed")
-                .expect("a committed checkpoint must round-trip, not read back as absent");
-
-            assert_eq!(restored.checkpoint.source, SOURCE);
-            assert_eq!(restored.checkpoint.generation, 7);
-            assert_eq!(restored.checkpoint.high_water, Some(123));
-        }
-    }
-
-    /// Regression tests for issue #449: a channel's
-    /// bootstrap `since` floor (the date used in the IMAP `SINCE` clause
-    /// while no UID high-water is committed yet) must only advance once
-    /// `cursor_get`, `poll_page`, every `comm.ingest`, and `cursor_commit`
-    /// have all succeeded for that channel's cycle. A cursor_get failure or
-    /// an ingest failure that blocks the first commit must leave the floor
-    /// exactly where it was, so a later successful cycle still searches from
-    /// the original floor rather than a newer date -- otherwise, if the
-    /// failing cycles spanned a calendar-day boundary, mail from the earlier
-    /// day would be permanently skipped.
-    #[cfg(feature = "channel-email")]
-    mod bootstrap_since_floor_tests {
-        use super::*;
-        use async_trait::async_trait;
-        use chrono::{DateTime, Utc};
-        use khive_channel::{
-            Channel, ChannelEnvelope, ChannelError, ChannelPollPage, ChannelRegistry,
-            StoredChannelCheckpoint,
-        };
-        use khive_runtime::{KhiveRuntime, VerbRegistryBuilder};
-        use khive_storage::types::{SqlStatement, SqlValue};
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::{Arc, Mutex};
-
-        /// A channel that just records the `since` it is called with on
-        /// every `poll_page` call and always reports a clean, empty page --
-        /// harmless to call repeatedly, so the test can drive many ticks and
-        /// inspect only the recorded `since` history.
-        struct RecordingChannel {
-            kind: &'static str,
-            since_calls: Arc<Mutex<Vec<DateTime<Utc>>>>,
-        }
-
-        #[async_trait]
-        impl Channel for RecordingChannel {
-            fn kind(&self) -> &'static str {
-                self.kind
-            }
-
-            async fn send(&self, _envelope: ChannelEnvelope) -> Result<(), ChannelError> {
-                Ok(())
-            }
-
-            async fn poll(
-                &self,
-                _since: DateTime<Utc>,
-            ) -> Result<Vec<ChannelEnvelope>, ChannelError> {
-                panic!("the daemon poll loop must call poll_page, not poll");
-            }
-
-            async fn poll_page(
-                &self,
-                since: DateTime<Utc>,
-                _checkpoint: Option<&StoredChannelCheckpoint>,
-            ) -> Result<ChannelPollPage, ChannelError> {
-                self.since_calls.lock().unwrap().push(since);
-                Ok(ChannelPollPage {
-                    envelopes: vec![],
-                    next_checkpoint: None,
-                })
-            }
-        }
-
-        /// A channel whose first `poll_page` call returns one envelope that
-        /// permanently fails `comm.ingest` validation (empty `content`),
-        /// blocking that cycle's first-ever commit; every later call returns
-        /// no envelopes so the cycle cleanly completes. Also records `since`
-        /// on every call.
-        struct IngestFailsOnceChannel {
-            call_count: AtomicUsize,
-            since_calls: Arc<Mutex<Vec<DateTime<Utc>>>>,
-        }
-
-        #[async_trait]
-        impl Channel for IngestFailsOnceChannel {
-            fn kind(&self) -> &'static str {
-                "mock_ingest_fails_once"
-            }
-
-            async fn send(&self, _envelope: ChannelEnvelope) -> Result<(), ChannelError> {
-                Ok(())
-            }
-
-            async fn poll(
-                &self,
-                _since: DateTime<Utc>,
-            ) -> Result<Vec<ChannelEnvelope>, ChannelError> {
-                panic!("the daemon poll loop must call poll_page, not poll");
-            }
-
-            async fn poll_page(
-                &self,
-                since: DateTime<Utc>,
-                _checkpoint: Option<&StoredChannelCheckpoint>,
-            ) -> Result<ChannelPollPage, ChannelError> {
-                self.since_calls.lock().unwrap().push(since);
-                if self.call_count.fetch_add(1, Ordering::SeqCst) == 0 {
-                    let bad = ChannelEnvelope::new(
-                        "email:sender@example.com",
-                        "email:me@example.com",
-                        "",
-                    );
-                    Ok(ChannelPollPage {
-                        envelopes: vec![bad],
-                        next_checkpoint: None,
-                    })
-                } else {
-                    Ok(ChannelPollPage {
-                        envelopes: vec![],
-                        next_checkpoint: None,
-                    })
-                }
-            }
-        }
-
-        /// Drive the paused virtual clock forward in small steps, yielding
-        /// after each one, until `calls` has recorded at least `target`
-        /// entries (mirrors `cursor_commit_gating_tests`' convergence
-        /// pattern: the loop's `comm.*` dispatches need several cooperative
-        /// sleep/wake round-trips under a paused clock to settle, so a
-        /// single large `advance` can outrun a timer the task has not
-        /// re-armed yet).
-        async fn advance_until_calls(calls: &Mutex<Vec<DateTime<Utc>>>, target: usize) {
-            for _ in 0..2000 {
-                if calls.lock().unwrap().len() >= target {
-                    return;
-                }
-                tokio::time::advance(std::time::Duration::from_millis(250)).await;
-                for _ in 0..10 {
-                    tokio::task::yield_now().await;
-                }
-            }
-        }
-
-        /// Cross-date regression (issue #449 High, failure shape 1): a
-        /// `comm.cursor_get` failure on a channel's first cycle must not
-        /// lose that channel's bootstrap floor. This corrupts the durable
-        /// cursor row for `mock_broken_cursor_get` directly (an unparseable
-        /// `generation` column) so its very first `cursor_get` fails and the
-        /// channel is skipped for that tick, then repairs the row before the
-        /// next tick. A `mock_control` channel with no corruption is polled
-        /// on every tick as a same-run reference for what the *first* tick's
-        /// floor actually was -- if the fix works, the broken channel's
-        /// first successful `poll_page` call (after recovery) sees the exact
-        /// same `since` as the control channel's very first call, proving
-        /// the floor survived the cursor_get failure instead of jumping
-        /// forward to a later tick's timestamp (which, across a calendar-day
-        /// boundary, would silently drop the previous day's mail from the
-        /// IMAP `SINCE` search).
-        #[tokio::test(start_paused = true)]
-        async fn cursor_get_failure_preserves_the_bootstrap_floor() {
-            const BROKEN_KIND: &str = "mock_broken_cursor_get";
-
-            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
-            let mut builder = VerbRegistryBuilder::new();
-            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
-            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
-            let registry = builder.build().expect("registry builds");
-
-            // Seed a valid row (also bootstraps the pack-owned schema), then
-            // corrupt `generation` in place so cursor_get's column-type match
-            // falls through to its "malformed" error arm.
-            commit_channel_cursor(
-                &registry,
-                BROKEN_KIND,
-                BROKEN_KIND,
-                &khive_channel::ChannelCheckpoint {
-                    source: "seed".to_string(),
-                    generation: 1,
-                    high_water: Some(1),
-                },
-            )
-            .await
-            .expect("seed cursor_commit must succeed");
-
-            let sql = runtime.sql();
-            {
-                let mut w = sql.writer().await.expect("writer");
-                w.execute(SqlStatement {
-                    sql: "UPDATE comm_channel_cursor SET generation = 1.5 \
-                          WHERE channel_kind = ?1 AND channel_slug = ?2"
-                        .into(),
-                    params: vec![
-                        SqlValue::Text(BROKEN_KIND.to_string()),
-                        SqlValue::Text(BROKEN_KIND.to_string()),
-                    ],
-                    label: Some("test_corrupt_generation".into()),
-                })
-                .await
-                .expect("corrupting update must succeed");
-            }
-
-            let control_calls = Arc::new(Mutex::new(Vec::new()));
-            let broken_calls = Arc::new(Mutex::new(Vec::new()));
-
-            let mut ch_registry = ChannelRegistry::new();
-            ch_registry.register(Arc::new(RecordingChannel {
-                kind: "mock_control",
-                since_calls: control_calls.clone(),
-            }));
-            ch_registry.register(Arc::new(RecordingChannel {
-                kind: BROKEN_KIND,
-                since_calls: broken_calls.clone(),
-            }));
-
-            let task = tokio::spawn(channel_poll_loop(
-                Arc::new(ch_registry),
-                registry.clone(),
-                "test-ns".to_string(),
-                "actor:test".to_string(),
-            ));
-
-            // Tick 1: control succeeds (records the tick's floor); the
-            // broken channel's cursor_get fails on the corrupted row, so it
-            // is skipped and records nothing.
-            advance_until_calls(&control_calls, 1).await;
-            assert_eq!(
-                control_calls.lock().unwrap().len(),
-                1,
-                "control channel must be polled on the first tick"
-            );
-            assert_eq!(
-                broken_calls.lock().unwrap().len(),
-                0,
-                "the broken channel must be skipped while cursor_get fails"
-            );
-
-            // Repair the row so cursor_get succeeds from the next tick on.
-            {
-                let mut w = sql.writer().await.expect("writer");
-                w.execute(SqlStatement {
-                    sql: "UPDATE comm_channel_cursor SET generation = 1 \
-                          WHERE channel_kind = ?1 AND channel_slug = ?2"
-                        .into(),
-                    params: vec![
-                        SqlValue::Text(BROKEN_KIND.to_string()),
-                        SqlValue::Text(BROKEN_KIND.to_string()),
-                    ],
-                    label: Some("test_repair_generation".into()),
-                })
-                .await
-                .expect("repairing update must succeed");
-            }
-
-            // Tick 2: cursor_get now succeeds and the broken channel is
-            // finally polled for the first time.
-            advance_until_calls(&broken_calls, 1).await;
-            task.abort();
-
-            let control_first = control_calls.lock().unwrap()[0];
-            let broken_first = *broken_calls
-                .lock()
-                .unwrap()
-                .first()
-                .expect("the broken channel must have been polled after recovery");
-
-            assert_eq!(
-                broken_first, control_first,
-                "the broken channel's first poll_page call must see the SAME \
-                 bootstrap floor as the control channel's very first call \
-                 ({control_first:?}), not a later tick's timestamp \
-                 ({broken_first:?}) -- the cursor_get failure must not have \
-                 lost the earlier floor"
-            );
-        }
-
-        /// Cross-date regression (issue #449 High, failure shape 2): an
-        /// ingest failure that blocks a channel's first-ever `cursor_commit`
-        /// must not lose that channel's bootstrap floor either. Uses the
-        /// same same-run control-channel comparison as the cursor_get test
-        /// above.
-        #[tokio::test(start_paused = true)]
-        async fn quarantine_ingest_failure_blocking_first_commit_preserves_the_bootstrap_floor() {
-            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
-            let mut builder = VerbRegistryBuilder::new();
-            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
-            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
-            let registry = builder.build().expect("registry builds");
-
-            let control_calls = Arc::new(Mutex::new(Vec::new()));
-            let failing_calls = Arc::new(Mutex::new(Vec::new()));
-
-            let mut ch_registry = ChannelRegistry::new();
-            ch_registry.register(Arc::new(RecordingChannel {
-                kind: "mock_control",
-                since_calls: control_calls.clone(),
-            }));
-            ch_registry.register(Arc::new(IngestFailsOnceChannel {
-                call_count: AtomicUsize::new(0),
-                since_calls: failing_calls.clone(),
-            }));
-
-            let task = tokio::spawn(channel_poll_loop(
-                Arc::new(ch_registry),
-                registry.clone(),
-                "test-ns".to_string(),
-                "actor:test".to_string(),
-            ));
-
-            // Tick 1: control succeeds; the ingest-failing channel is polled
-            // (records `since`) but its one envelope fails comm.ingest, so
-            // no checkpoint is committed for it this tick.
-            advance_until_calls(&control_calls, 1).await;
-            advance_until_calls(&failing_calls, 1).await;
-            assert_eq!(control_calls.lock().unwrap().len(), 1);
-            assert_eq!(
-                failing_calls.lock().unwrap().len(),
-                1,
-                "poll_page is still called even though ingest will fail"
-            );
-
-            // Tick 2: the channel is polled again (its envelope now ingests
-            // cleanly with no bad message), and its cycle finally succeeds.
-            advance_until_calls(&failing_calls, 2).await;
-            task.abort();
-
-            let control_first = control_calls.lock().unwrap()[0];
-            let failing_calls = failing_calls.lock().unwrap();
-            assert_eq!(
-                failing_calls.len(),
-                2,
-                "the channel must have been polled again on the second tick"
-            );
-
-            assert_eq!(
-                failing_calls[0], control_first,
-                "the first poll_page call's `since` must match the control \
-                 channel's first-tick floor"
-            );
-            assert_eq!(
-                failing_calls[1], control_first,
-                "the SECOND poll_page call's `since` must still match the \
-                 same original floor ({control_first:?}), not a fresh \
-                 timestamp from the tick where the ingest failure blocked \
-                 the first commit ({:?}) -- otherwise a failure spanning a \
-                 calendar-day boundary would permanently skip the earlier \
-                 day's uncommitted mail",
-                failing_calls[1]
-            );
-        }
-
-        /// First-tick regression (issue #449): the
-        /// very first bootstrap floor a channel ever sees must be seeded
-        /// from when the daemon started, not from whenever the loop's
-        /// first sleep happens to finish. Runs on a live (unpaused) clock
-        /// on purpose -- `tokio::time::pause` only fast-forwards the
-        /// virtual timer, not `Utc::now()`, so it cannot observe a
-        /// regression where `since` is captured after the sleep instead of
-        /// before the loop is entered. If the loop ever goes back to
-        /// computing that floor post-sleep, a daemon started just before
-        /// UTC midnight whose first tick lands just after it would seed
-        /// the new day and permanently skip the previous day's mail.
-        #[tokio::test]
-        async fn first_tick_uses_startup_time_not_post_sleep_time() {
-            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
-            let mut builder = VerbRegistryBuilder::new();
-            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
-            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
-            let registry = builder.build().expect("registry builds");
-
-            let calls = Arc::new(Mutex::new(Vec::new()));
-            let mut ch_registry = ChannelRegistry::new();
-            ch_registry.register(Arc::new(RecordingChannel {
-                kind: "mock_startup_clock",
-                since_calls: calls.clone(),
-            }));
-
-            let startup = Utc::now();
-            let task = tokio::spawn(channel_poll_loop(
-                Arc::new(ch_registry),
-                registry.clone(),
-                "test-ns".to_string(),
-                "actor:test".to_string(),
-            ));
-
-            // Real-time wait for the loop's first (~5s) tick to fire.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-            loop {
-                if !calls.lock().unwrap().is_empty() {
-                    break;
-                }
-                assert!(
-                    std::time::Instant::now() <= deadline,
-                    "first poll_page call did not arrive within 15s"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-            task.abort();
-
-            let first_since = calls.lock().unwrap()[0];
-            let drift_ms = (first_since - startup).num_milliseconds().abs();
-            assert!(
-                drift_ms < 2_000,
-                "the first poll_page call's `since` ({first_since:?}) must \
-                 reflect the daemon's startup time ({startup:?}), not a \
-                 timestamp captured after the loop's first ~5s sleep -- a \
-                 {drift_ms}ms drift means the floor is still seeded \
-                 post-sleep, which would drop a full day of mail if that \
-                 sleep happened to cross a calendar-day boundary"
-            );
-        }
     }
 
     /// The sweep-lifecycle guard funnels every serve-path early return

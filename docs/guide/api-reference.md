@@ -1,15 +1,15 @@
 # API Reference
 
-khive exposes exactly one MCP tool, `request`. Everything else, 85 verbs across 12
-production packs, is dispatched through that single tool via a small request DSL.
-This page documents the DSL grammar, the response envelope, and every verb's full
-parameter contract, so an agent can call khive correctly without reading Rust source.
+khive exposes exactly one MCP tool, `request`. Everything else, 19 verbs in the `kg`
+pack, is dispatched through that single tool via a small request DSL. This page
+documents the DSL grammar, the response envelope, and every verb's full parameter
+contract, so an agent can call khive correctly without reading Rust source.
 
-This page is verified against the live registry (`request(ops="verbs()")`, run
-2026-07-17) and the pack source (`crates/khive-pack-*/src/*.rs` `HandlerDef`/`ParamDef`
-struct literals). Verb count: **85**, matching both the live registry `total` field and
-the sum of the 12 pack counts below. If your server reports a different total, your
-`KHIVE_PACKS` configuration loads a different pack set than the default — run
+This page is verified against the live registry (`request(ops="verbs()")`) and the pack
+source (`crates/khive-pack-kg/src/*.rs` `HandlerDef`/`ParamDef` struct literals). Verb
+count: **19**, matching the live registry `total` field for the default `kg`-only pack
+set. If your server reports a different total, your `KHIVE_PACKS` configuration loads
+additional (commercially licensed) packs beyond the open-source default — run
 `request(ops="verbs()")` against your own server to get the authoritative list.
 
 An always-machine-readable copy of this page is at
@@ -19,51 +19,25 @@ An always-machine-readable copy of this page is at
 
 ## Packs at a glance
 
-| Pack        | Verbs | Load with                                  | Optional?           |
-| ----------- | ----- | ------------------------------------------ | ------------------- |
-| `kg`        | 18    | `KHIVE_PACKS=kg` (default)                 | No — base substrate |
-| `gtd`       | 5     | `KHIVE_PACKS=kg,gtd`                       | Yes                 |
-| `memory`    | 5     | `KHIVE_PACKS=kg,memory`                    | Yes                 |
-| `brain`     | 15    | `KHIVE_PACKS=kg,brain`                     | Yes                 |
-| `comm`      | 7     | `KHIVE_PACKS=kg,comm`                      | Yes                 |
-| `schedule`  | 4     | `KHIVE_PACKS=kg,schedule`                  | Yes                 |
-| `knowledge` | 19    | `KHIVE_PACKS=kg,knowledge`                 | Yes                 |
-| `session`   | 4     | `KHIVE_PACKS=kg,session`                   | Yes                 |
-| `git`       | 4     | `KHIVE_PACKS=kg,git`                       | Yes                 |
-| `code`      | 1     | `KHIVE_PACKS=kg,code`                      | Yes                 |
-| `workspace` | 0     | `KHIVE_PACKS=kg,git,gtd,session,workspace` | Yes                 |
-| `blob`      | 3     | `KHIVE_PACKS=kg,blob`                      | Yes                 |
+| Pack | Verbs | Load with                  | Optional?           |
+| ---- | ----- | -------------------------- | ------------------- |
+| `kg` | 19    | `KHIVE_PACKS=kg` (default) | No — base substrate |
 
-`git` also registers the `commit` / `issue` / `pull_request` note kinds and the shared
-`run_ingest` core (`crates/khive-pack-git/src/ingest.rs`) that both `git.digest` and the
-`kkernel git-ingest` CLI drive. Its four verbs are `git.digest` (read/ingest) plus three
-write verbs, `git.commit` / `git.branch` / `git.push` (ADR-108), that shell to system git
-with hardened, allowlisted argv construction.
+This distribution ships one production pack, `kg`, loaded by default. Task management,
+memory, inter-agent communication, scheduling, session continuity, workspace linking,
+blob storage, and the profile-oriented feedback/learning-loop pack (`brain.*`) are
+provided by commercially licensed extensions and are not part of this distribution; when
+installed, they load the same way, via `KHIVE_PACKS`/`--pack`. Git provenance ingestion
+(`git.digest`, the `commit`/`issue`/`pull_request` note kinds) and the `git.commit` /
+`git.branch` / `git.push` write verbs (ADR-108) are likewise a commercially licensed
+extension. The code-quality and formal-methods ontology packs are also distributed as
+commercially licensed extensions rather than as part of this repository.
 
-`workspace` requires `kg`, `git`, `gtd`, and `session` to be loaded alongside it (the runtime rejects a pack set that omits a declared dependency), so its minimal example lists all four.
+The default binary (no `KHIVE_PACKS`/`--pack` override) loads the `kg` pack: **19 verbs**.
 
-`schedule` requires `kg`. `schedule.remind` additionally requires `comm.send` at
-creation time and persists nothing when that delivery capability is absent; the other
-three schedule verbs remain available without `comm`.
-
-`code` registers the `finding` note kind and edge rules, plus the `code.ingest` verb (L1
-manifest + L1.5 import-scan source ingest, ADR-085 Amendment 2 — see below); its
-`findings.json` batch ingest still runs only through the `kkernel code-ingest` admin CLI
-path, not the MCP verb surface.
-
-`blob` registers no note or entity kinds; its three verbs (`blob.put` / `blob.get` /
-`blob.stat`) dispatch over the `BlobStore` content-addressed storage trait (ADR-111). A
-normal file-backed boot installs a default `FsBlobStore` rooted beside the database file
-even with no `[storage.blob]` section and no `KHIVE_BLOB_ROOT` set; the verbs only stay
-unconfigured (erroring until a backend is installed) when the server boots against an
-in-memory backend, which has no directory to default a root beside.
-
-The default binary (no `KHIVE_PACKS`/`--pack` override) loads all 12 packs: 18 + 5 + 5 +
-15 + 7 + 4 + 19 + 4 + 4 + 1 + 0 + 3 = **85 verbs**.
-
-Verb names in the `kg` pack are bare (`create`, `search`, `link`, …). Every other pack
-namespaces its verbs with a `pack.` prefix (`gtd.assign`, `memory.recall`,
-`brain.feedback`, `comm.send`, `schedule.remind`, `knowledge.search`, `session.store`).
+Verb names in the `kg` pack are bare (`create`, `search`, `link`, …). Extension packs
+namespace their verbs with a `pack.` prefix (`gtd.assign`, `memory.recall`,
+`comm.send`, `schedule.remind`, `session.store`).
 
 ---
 
@@ -82,7 +56,7 @@ request(ops="search(kind=\"entity\", query=\"LoRA\")")
 Up to 100 ops, run with no ordering guarantee between them:
 
 ```
-request(ops="[memory.recall(query=\"x\"), memory.remember(content=\"y\")]")
+request(ops="[search(kind=\"entity\", query=\"x\"), stats()]")
 ```
 
 ### Chain
@@ -157,7 +131,7 @@ parallel batches, since parallel failures do not cascade.
 
 ---
 
-## `kg` pack — 18 verbs
+## `kg` pack — 19 verbs
 
 Base substrate verbs, bare names (no `kg.` prefix). Category is the illocutionary act
 (Searle 1976): Assertive = retrieves state, Commissive = commits a persistent change,
@@ -191,10 +165,10 @@ request(ops="create(kind=\"concept\", name=\"RoPE\", description=\"Rotary positi
 
 Fetch any record by UUID (auto-detects entity/note/edge/event/proposal).
 
-| Param             | Type | Required | Notes                                                                  |
-| ----------------- | ---- | -------- | ---------------------------------------------------------------------- |
-| `id`              | uuid | yes      | Full UUID or short hex prefix (min 8 chars).                           |
-| `include_deleted` | bool | no       | Return soft-deleted records too (default false); requires a full UUID. |
+| Param             | Type | Required | Notes                                                                 |
+| ----------------- | ---- | -------- | --------------------------------------------------------------------- |
+| `id`              | uuid | yes      | Full UUID or short hex prefix (min 8 chars).                          |
+| `include_deleted` | bool | no       | Return soft-deleted records too (default false); full UUID or prefix. |
 
 ```
 request(ops="get(id=\"3f2a9c1e\")")
@@ -264,12 +238,13 @@ compacted to a relative or minute-truncated form; and `salience`/`decay_factor` 
 - **`kind="note"`**: `{id, namespace, kind, status, name, content, salience, decay_factor,
   expires_at, properties, created_at, updated_at, deleted_at}`. Notes have **no top-level
   `tags` field**: unlike entities, tags live inside `properties.tags`. If the note's
-  `properties.status` is set (e.g. a `gtd` task's lifecycle status, or a `comm` message's
-  delivery state), the row's substrate-level `status` (normally `"active"`) is renamed to
-  `lifecycle`, and the top-level `status` is replaced with the `properties.status` value,
-  so a `gtd`/`comm` consumer reads the pack-level status directly off the row instead of
-  digging into `properties`. When no `properties.status` is set, `status` stays the raw
-  substrate value and there is no `lifecycle` key.
+  `properties.status` is set (e.g. a task's lifecycle status, or a message's delivery
+  state — fields set by note kinds that extension packs register), the row's
+  substrate-level `status` (normally `"active"`) is renamed to `lifecycle`, and the
+  top-level `status` is replaced with the `properties.status` value, so a consumer reads
+  the pack-level status directly off the row instead of digging into `properties`. When no
+  `properties.status` is set, `status` stays the raw substrate value and there is no
+  `lifecycle` key.
 - **`kind="edge"`**: `{id, namespace, source_id, target_id, relation, weight, created_at,
   updated_at, deleted_at, metadata, target_backend}`.
 - **`kind="event"`**: `{id, namespace, verb, substrate, actor, kind, outcome, payload,
@@ -499,7 +474,7 @@ request(ops="traverse(roots=[\"<uuid>\"], max_depth=2)")
 
 ### `context` — Assertive
 
-Entity-anchored graph context in one call ([ADR-089](../adr/ADR-089-context-verb.md)).
+Entity-anchored graph context in one call (ADR-089).
 Resolves anchors from `query` and/or `entity_ids`, expands 1-2 hops via the same
 runtime op behind `neighbors`, and assembles a budgeted, deterministically-ordered
 response — replacing a caller-side `search | neighbors` chain with a single
@@ -633,15 +608,37 @@ silent pick among close candidates. Read-only: performs no mutation.
 request(ops="resolve(refs=[\"the old record\", \"<uuid>\"])")
 ```
 
+### `whoami` — Assertive
+
+Report the caller's identity as the runtime already resolved it for this request:
+`actor_id`, `actor_kind`, whether the actor is the unattributed/anonymous fallback,
+the write namespace, and the read-visible namespace set. A projection of existing
+per-request state, not new state; never returns tokens or credentials. Takes no
+parameters.
+
+```
+request(ops="whoami()")
+```
+
+```json
+{
+  "actor_id": "local",
+  "actor_kind": "anonymous",
+  "unattributed": true,
+  "namespace": "local",
+  "visible_namespaces": ["local"]
+}
+```
+
 ### `verbs` — Assertive
 
 List all MCP-callable verbs registered on this server. Internal subhandlers are
 excluded.
 
-| Param      | Type   | Required | Notes                                                                                                    |
-| ---------- | ------ | -------- | -------------------------------------------------------------------------------------------------------- |
-| `category` | string | no       | Filter: `Assertive`\|`Commissive`\|`Declaration`\|`Directive`.                                           |
-| `pack`     | string | no       | Filter by pack name (`kg`, `gtd`, `memory`, `brain`, `comm`, `schedule`, `knowledge`, `session`, `git`). |
+| Param      | Type   | Required | Notes                                                                      |
+| ---------- | ------ | -------- | -------------------------------------------------------------------------- |
+| `category` | string | no       | Filter: `Assertive`\|`Commissive`\|`Declaration`\|`Directive`.             |
+| `pack`     | string | no       | Filter by pack name (`kg` in this distribution; extension packs add more). |
 
 ```
 request(ops="verbs()")
@@ -649,1071 +646,22 @@ request(ops="verbs()")
 
 ---
 
-## `gtd` pack — 5 verbs
+## Other packs
 
-GTD task lifecycle over notes (`kind="task"`). Optional; load with
-`KHIVE_PACKS=kg,gtd`.
-
-### `gtd.assign` — Directive
-
-Create a GTD task (note with `kind=task`).
-
-| Param               | Type            | Required | Notes                                                                                                                                                                |
-| ------------------- | --------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `title`             | string          | yes      | Task title.                                                                                                                                                          |
-| `status`            | string          | no       | `inbox`\|`next`\|`waiting`\|`someday`\|`active` (default `inbox`). Aliases: `todo`=inbox, `in_progress`=active, `blocked`=waiting, `later`=someday, `finished`=done. |
-| `priority`          | string          | no       | `p0`\|`p1`\|`p2`\|`p3` (default `p2`).                                                                                                                               |
-| `assignee`          | string          | no       | Assignee identifier.                                                                                                                                                 |
-| `due`               | string          | no       | ISO-8601 due date.                                                                                                                                                   |
-| `depends_on`        | array\<uuid\>   | no       | Blocking task UUIDs.                                                                                                                                                 |
-| `context_entity_id` | uuid            | no       | Full UUID of a related KG entity.                                                                                                                                    |
-| `tags`              | array\<string\> | no       | Tag list.                                                                                                                                                            |
-
-```
-request(ops="gtd.assign(title=\"Ship API reference\", priority=\"p1\", assignee=\"agent:docs\")")
-```
-
-### `gtd.next` — Assertive
-
-List actionable tasks (status `next` or `active`) by priority.
-
-| Param      | Type    | Required | Notes                    |
-| ---------- | ------- | -------- | ------------------------ |
-| `limit`    | integer | no       | Default 10.              |
-| `assignee` | string  | no       | Filter to this assignee. |
-
-```
-request(ops="gtd.next(assignee=\"agent:docs\", limit=10)")
-```
-
-### `gtd.complete` — Declaration
-
-Mark a task done (or cancelled) with an optional result note.
-
-| Param    | Type   | Required | Notes                                             |
-| -------- | ------ | -------- | ------------------------------------------------- |
-| `id`     | uuid   | yes      | Task to complete.                                 |
-| `result` | string | no       | Completion note.                                  |
-| `status` | string | no       | Terminal status: `done` (default) or `cancelled`. |
-
-```
-request(ops="gtd.complete(id=\"<task-id>\", result=\"shipped in PR #600\")")
-```
-
-### `gtd.tasks` — Assertive
-
-List tasks filtered by status, assignee, priority.
-
-| Param      | Type    | Required | Notes                                                                                              |
-| ---------- | ------- | -------- | -------------------------------------------------------------------------------------------------- |
-| `status`   | string  | no       | `inbox`\|`next`\|`waiting`\|`someday`\|`active`\|`done`\|`cancelled` (aliases as in `gtd.assign`). |
-| `assignee` | string  | no       | Filter by assignee.                                                                                |
-| `priority` | string  | no       | `p0`\|`p1`\|`p2`\|`p3`.                                                                            |
-| `limit`    | integer | no       | Default 20.                                                                                        |
-| `offset`   | integer | no       | Default 0.                                                                                         |
-
-```
-request(ops="gtd.tasks(status=\"active\", assignee=\"agent:docs\")")
-```
-
-### `gtd.transition` — Declaration
-
-Explicit GTD status transition with lifecycle validation.
-
-| Param    | Type   | Required | Notes                                      |
-| -------- | ------ | -------- | ------------------------------------------ |
-| `id`     | uuid   | yes      | Task to transition.                        |
-| `status` | string | yes      | Target status (same set/aliases as above). |
-| `note`   | string | no       | Note attached to the transition.           |
-
-```
-request(ops="gtd.transition(id=\"<task-id>\", status=\"active\")")
-```
+Task management (`gtd.*`), memory (`memory.*`), inter-agent communication (`comm.*`),
+scheduling (`schedule.*`), session continuity (`session.*`), and content-addressed blob
+storage (`blob.*`, ADR-111) are provided by commercially licensed extensions and are not
+part of this distribution; when installed, they load the same way, via
+`KHIVE_PACKS`/`--pack`.
 
 ---
 
-## `memory` pack — 5 verbs
-
-Salience- and decay-weighted memory notes. Optional; load with
-`KHIVE_PACKS=kg,memory`.
-
-### `memory.remember` — Commissive
-
-Create a memory note with salience and decay.
-
-| Param             | Type   | Required | Notes                                                                                                                       |
-| ----------------- | ------ | -------- | --------------------------------------------------------------------------------------------------------------------------- |
-| `content`         | string | yes      | Memory content.                                                                                                             |
-| `salience`        | number | no       | 0.0–1.0. Type-differentiated default: episodic=0.3, semantic=0.5.                                                           |
-| `decay_factor`    | number | no       | >= 0. Type-differentiated default: episodic=0.02 (~35d half-life), semantic=0.005 (~139d half-life). Higher = faster decay. |
-| `memory_type`     | string | no       | `episodic`\|`semantic` (default `episodic`); no other values accepted.                                                      |
-| `source_id`       | string | no       | UUID or 8-char short ID of the entity/note this memory annotates.                                                           |
-| `embedding_model` | string | no       | Registered model name; defaults to pack config.                                                                             |
-| `tags`            | array  | no       | Stored in `properties.tags`.                                                                                                |
-| `namespace`       | string | no       | Write namespace override. Default: episodic → caller's namespace, semantic → `local`.                                       |
-
-```
-request(ops="memory.remember(content=\"ADR-016 fixes the DSL grammar\", salience=0.7, memory_type=\"semantic\")")
-```
-
-### `memory.recall` — Assertive
-
-Recall memory notes with decay-aware hybrid ranking. Each hit carries resolved
-(read-model) values — `memory_type` defaults to `episodic` when unset; `salience` and
-`decay_factor` reflect the effective defaults used for ranking.
-
-| Param               | Type    | Required | Notes                                                                     |
-| ------------------- | ------- | -------- | ------------------------------------------------------------------------- |
-| `query`             | string  | yes      | Semantic recall query.                                                    |
-| `limit`             | integer | no       | Default 10.                                                               |
-| `top_k`             | integer | no       | Overrides `limit` (max 100).                                              |
-| `min_score`         | number  | no       | Composite score floor, always in [0,1]. Typical production floor 0.3–0.7. |
-| `score_floor`       | number  | no       | Alias for `min_score`.                                                    |
-| `min_salience`      | number  | no       | Salience floor.                                                           |
-| `memory_type`       | string  | no       | Filter to this type.                                                      |
-| `fusion_strategy`   | string  | no       | `rrf`\|`weighted`\|`union`\|`vector_only`\|`keyword_only`.                |
-| `embedding_model`   | string  | no       | Registered model name; defaults to pack config.                           |
-| `include_breakdown` | bool    | no       | Include per-component score breakdown.                                    |
-| `entity_names`      | array   | no       | Names to boost; matches get a 1.3x multiplier.                            |
-| `full_content`      | bool    | no       | Default true; false truncates content to 200 chars.                       |
-| `tags`              | array   | no       | Filter by `properties.tags`.                                              |
-| `tag_mode`          | string  | no       | `any` (default, OR) or `all` (AND).                                       |
-
-```
-request(ops="memory.recall(query=\"ADR-016 DSL grammar\", limit=5, min_score=0.3)")
-```
-
-### `memory.feedback` — Commissive
-
-Emit explicit feedback on a recalled entity; updates recall-domain posteriors.
-
-| Param       | Type   | Required | Notes                                                                                                                              |
-| ----------- | ------ | -------- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| `target_id` | string | yes      | UUID of the recalled entity or memory.                                                                                             |
-| `signal`    | string | yes      | `useful`\|`not_useful`\|`wrong`\|`explicit_positive`\|`explicit_negative`\|`implicit_positive`\|`implicit_negative`\|`correction`. |
-
-```
-request(ops="memory.feedback(target_id=\"<uuid>\", signal=\"useful\")")
-```
-
-### `memory.prune` — Commissive
-
-Soft-delete memories below a salience threshold and/or past `expires_at`
-(curation-layer, ADR-014).
-
-| Param          | Type    | Required | Notes                                                                                                               |
-| -------------- | ------- | -------- | ------------------------------------------------------------------------------------------------------------------- |
-| `min_salience` | number  | no       | Soft-delete memories strictly below this value.                                                                     |
-| `before`       | integer | no       | Soft-delete memories expired at/before this Unix microsecond timestamp; defaults to now; 0 skips the expiry filter. |
-| `namespace`    | string  | no       | Defaults to `local`.                                                                                                |
-| `dry_run`      | bool    | no       | Default false; when true, counts candidates without deleting.                                                       |
-
-```
-request(ops="memory.prune(min_salience=0.2, dry_run=true)")
-```
-
-### `memory.vacuum` — Commissive
-
-Run SQLite `VACUUM` to reclaim space freed by soft-deleted rows. No params.
-
-```
-request(ops="memory.vacuum()")
-```
-
----
-
-## `brain` pack — 15 verbs
-
-Recall-tuning profiles: Beta-posterior scoring, profile lifecycle, and the actor/
-namespace/consumer-kind resolution table that picks which profile serves a given
-caller. Optional; load with `KHIVE_PACKS=kg,brain`.
-
-### `brain.event_counts` — Assertive
-
-Windowed event counts grouped by kind, actor, and verb over the event plane (ADR-103
-Stage 1, #724 Ask A). `feedback_explicit` events are additionally split by
-`served_by_profile_id`. Events carrying a `work_class` (today:
-`phase_started`/`phase_completed`/`phase_cancelled` payloads, or `payload.resource.work_class`
-on a dispatch audit row) split by `counts_by_work_class`. Events carrying
-`payload.resource.cost_unit` (ADR-103 Amendment 1, stamped on every successful verb dispatch
-since PR #927) sum into `total_cost_unit` and `cost_unit_by_verb`; both are omitted, not
-zero-filled, when no event in the window carries `cost_unit`. Events without a `cost_unit`
-(pre-Amendment-1 events, or errored/denied dispatches) simply do not contribute. When
-`truncated` is `true`, these sums are computed over the fetched page only, same as the other
-`counts_by_*` fields.
-
-| Param   | Type   | Required | Notes                                                                                                                                                       |
-| ------- | ------ | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `since` | string | yes      | Window start, ISO-8601/RFC-3339 datetime. Inclusive.                                                                                                        |
-| `until` | string | no       | Window end, ISO-8601/RFC-3339 datetime. Exclusive. Defaults to now.                                                                                         |
-| `actor` | string | no       | Filter to a single actor. Stored actor strings are prefixed (`actor:lambda:khive`); bare (`lambda:khive`) or prefixed form both match. Omit for all actors. |
-| `kind`  | string | no       | Filter to a single EventKind (e.g. `"recall_executed"`). Omit for all.                                                                                      |
-
-```
-request(ops="brain.event_counts(since=\"2026-07-01T00:00:00Z\")")
-```
-
-### `brain.profiles` — Assertive
-
-List profiles, optionally filtered by lifecycle.
-
-| Param       | Type   | Required | Notes                                           |
-| ----------- | ------ | -------- | ----------------------------------------------- |
-| `lifecycle` | string | no       | `active`\|`inactive`\|`archived`; omit for all. |
-
-```
-request(ops="brain.profiles(lifecycle=\"active\")")
-```
-
-### `brain.profile` — Assertive
-
-Profile metadata, latest snapshot, current state summary.
-
-| Param        | Type   | Required | Notes                                                         |
-| ------------ | ------ | -------- | ------------------------------------------------------------- |
-| `profile_id` | string | yes      | Profile ID string (e.g. `"balanced-recall-v1"`) — not a UUID. |
-
-```
-request(ops="brain.profile(profile_id=\"implementer-recall-v1\")")
-```
-
-### `brain.resolve` — Assertive
-
-Show which profile would serve a caller context.
-
-| Param           | Type   | Required | Notes                                                        |
-| --------------- | ------ | -------- | ------------------------------------------------------------ |
-| `consumer_kind` | string | yes      | Verb/operation type about to be performed (e.g. `"recall"`). |
-| `actor`         | string | no       | Default `*` (wildcard match).                                |
-| `namespace`     | string | no       | Default `*` (wildcard match).                                |
-
-```
-request(ops="brain.resolve(consumer_kind=\"recall\", actor=\"agent:docs\")")
-```
-
-### `brain.activate` — Commissive
-
-Move a profile to Active (starts the live update loop).
-
-| Param        | Type   | Required | Notes                |
-| ------------ | ------ | -------- | -------------------- |
-| `profile_id` | string | yes      | Profile to activate. |
-
-```
-request(ops="brain.activate(profile_id=\"implementer-recall-v1\")")
-```
-
-### `brain.deactivate` — Commissive
-
-Move a profile to Inactive (stop live updates, retain state).
-
-| Param        | Type   | Required | Notes                  |
-| ------------ | ------ | -------- | ---------------------- |
-| `profile_id` | string | yes      | Profile to deactivate. |
-
-```
-request(ops="brain.deactivate(profile_id=\"implementer-recall-v1\")")
-```
-
-### `brain.archive` — Declaration
-
-Move a profile to Archived (read-only, audit-retained).
-
-| Param        | Type   | Required | Notes               |
-| ------------ | ------ | -------- | ------------------- |
-| `profile_id` | string | yes      | Profile to archive. |
-
-```
-request(ops="brain.archive(profile_id=\"deprecated-recall-v0\")")
-```
-
-### `brain.reset` — Declaration
-
-Reset posteriors to priors (preserves event history).
-
-| Param        | Type   | Required | Notes                                                         |
-| ------------ | ------ | -------- | ------------------------------------------------------------- |
-| `profile_id` | string | no       | Must exist and be active. Defaults to `"balanced-recall-v1"`. |
-
-```
-request(ops="brain.reset(profile_id=\"implementer-recall-v1\")")
-```
-
-### `brain.feedback` — Commissive
-
-Emit a `FeedbackExplicit` event into the shared log.
-
-| Param                  | Type   | Required | Notes                                                                                                      |
-| ---------------------- | ------ | -------- | ---------------------------------------------------------------------------------------------------------- |
-| `target_id`            | uuid   | yes      | Memory note or entity the feedback applies to.                                                             |
-| `signal`               | string | yes      | Same signal set as `memory.feedback`.                                                                      |
-| `served_by_profile_id` | string | no       | Profile that served the rated result.                                                                      |
-| `section_signals`      | object | no       | Per-section signals for `knowledge_compose` profiles: `{"section_name": "useful"\|"not_useful"\|"wrong"}`. |
-| `scorer_run_id`        | string | no       | ADR-081 scorer-pass id; must pair with `serve_ledger_id`.                                                  |
-| `serve_ledger_id`      | string | no       | ADR-081 `brain_serve_ledger` row id; must pair with `scorer_run_id`.                                       |
-
-```
-request(ops="brain.feedback(target_id=\"<uuid>\", signal=\"useful\")")
-```
-
-### `brain.auto_feedback` — Commissive
-
-Emit implicit feedback for recall results supplied by an agent — the convenience verb
-to call right after `memory.recall` instead of hand-building `brain.feedback`.
-
-| Param                  | Type   | Required | Notes                                                                 |
-| ---------------------- | ------ | -------- | --------------------------------------------------------------------- |
-| `query`                | string | yes      | The recall query that produced the results.                           |
-| `results`              | array  | yes      | Recall result objects; the first object's `id` is credited.           |
-| `signal`               | string | no       | Defaults to `implicit_positive`.                                      |
-| `served_by_profile_id` | string | no       | Profile that served the recall.                                       |
-| `scorer_run_id`        | string | no       | Forwarded verbatim to `brain.feedback`; pairs with `serve_ledger_id`. |
-| `serve_ledger_id`      | string | no       | Forwarded verbatim to `brain.feedback`; pairs with `scorer_run_id`.   |
-
-```
-request(ops="memory.recall(query=\"x\", limit=5) | brain.auto_feedback(query=\"x\", results=[{\"id\": \"$prev.items[0].id\"}])")
-```
-
-### `brain.bind` — Declaration
-
-Write a row in the profile resolution table.
-
-| Param           | Type    | Required | Notes                                        |
-| --------------- | ------- | -------- | -------------------------------------------- |
-| `profile_id`    | string  | yes      | Must exist.                                  |
-| `actor`         | string  | no       | Default `*` (all actors).                    |
-| `namespace`     | string  | no       | Default `*` (all namespaces).                |
-| `consumer_kind` | string  | no       | Default `*` (all kinds).                     |
-| `priority`      | integer | no       | Higher wins on multiple matches (default 0). |
-
-```
-request(ops="brain.bind(profile_id=\"implementer-recall-v1\", actor=\"role:implementer\")")
-```
-
-### `brain.unbind` — Declaration
-
-Remove rows from the profile resolution table. At least one filter is required.
-
-| Param           | Type   | Required | Notes                            |
-| --------------- | ------ | -------- | -------------------------------- |
-| `profile_id`    | string | no       | AND-combined with other filters. |
-| `actor`         | string | no       |                                  |
-| `namespace`     | string | no       |                                  |
-| `consumer_kind` | string | no       |                                  |
-
-```
-request(ops="brain.unbind(actor=\"role:implementer\")")
-```
-
-### `brain.bindings` — Assertive
-
-List rows in the profile resolution table, optionally filtered.
-
-| Param           | Type   | Required | Notes |
-| --------------- | ------ | -------- | ----- |
-| `profile_id`    | string | no       |       |
-| `actor`         | string | no       |       |
-| `namespace`     | string | no       |       |
-| `consumer_kind` | string | no       |       |
-
-```
-request(ops="brain.bindings(consumer_kind=\"recall\")")
-```
-
-### `brain.create_profile` — Declaration
-
-Create a new brain profile with a given name and optional seed priors.
-
-| Param           | Type   | Required | Notes                                                                                                                                                               |
-| --------------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `name`          | string | yes      | Profile ID (alphanumeric + hyphens), must be unique.                                                                                                                |
-| `description`   | string | no       | Human-readable description.                                                                                                                                         |
-| `consumer_kind` | string | no       | Default `"recall"`.                                                                                                                                                 |
-| `seed_priors`   | object | no       | For `knowledge_compose`: `{"section_posteriors": {"overview": {"alpha": 2.0, "beta": 2.0}, ...}}`; for `recall`: `{"relevance": {"alpha": 7.0, "beta": 3.0}, ...}`. |
-
-```
-request(ops="brain.create_profile(name=\"implementer-recall-v2\", consumer_kind=\"recall\")")
-```
-
-### `brain.register_adapter` — Declaration
-
-Register an adapter integrity record so the router only composes adapters matching the
-active base model revision.
-
-| Param                 | Type   | Required | Notes                                                       |
-| --------------------- | ------ | -------- | ----------------------------------------------------------- |
-| `adapter_id`          | string | yes      | Stable adapter identifier (used as the entity name).        |
-| `content_hash`        | string | yes      | Content hash of the adapter weights.                        |
-| `base_model_revision` | string | yes      | Must match the active revision or registration is rejected. |
-| `metadata`            | object | no       | Merged into entity properties.                              |
-
-```
-request(ops="brain.register_adapter(adapter_id=\"lora-v3\", content_hash=\"<sha256>\", base_model_revision=\"2026-07-01\")")
-```
-
----
-
-## `comm` pack — 7 verbs
-
-Actor-to-actor messaging with threading. Optional; load with `KHIVE_PACKS=kg,comm`.
-
-### `comm.send` — Commissive
-
-Send a message, optionally threaded.
-
-| Param       | Type   | Required | Notes                                                                                                                                                                                           |
-| ----------- | ------ | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `to`        | string | yes      | Actor label, e.g. `"lambda:leo"`. Both copies land in the caller's namespace; no cross-namespace write occurs.                                                                                  |
-| `content`   | string | yes      | Non-empty message body.                                                                                                                                                                         |
-| `subject`   | string | no       | Optional subject line.                                                                                                                                                                          |
-| `thread_id` | uuid   | no       | Groups the message into an existing thread.                                                                                                                                                     |
-| `self_send` | bool   | no       | Default false. Required when `to` matches the configured sender actor; otherwise the send is rejected. The anonymous `local` fallback is exempt. Use true only for an intentional note to self. |
-
-```
-request(ops="comm.send(to=\"lambda:leo\", subject=\"PR ready\", content=\"#600 is open for review\")")
-```
-
-### `comm.inbox` — Assertive
-
-List inbound messages for the caller.
-
-| Param    | Type    | Required | Notes                              |
-| -------- | ------- | -------- | ---------------------------------- |
-| `limit`  | integer | no       | Default 20, max 200.               |
-| `status` | string  | no       | `unread` (default)\|`read`\|`all`. |
-
-```
-request(ops="comm.inbox(limit=10)")
-```
-
-### `comm.read` — Declaration
-
-Mark an inbound message as read. Outbound messages cannot be marked read.
-
-| Param | Type   | Required | Notes                                              |
-| ----- | ------ | -------- | -------------------------------------------------- |
-| `id`  | string | yes      | 8-char prefix or full UUID of the inbound message. |
-
-```
-request(ops="comm.read(id=\"<message-id>\")")
-```
-
-### `comm.reply` — Commissive
-
-Reply to a message, threading linkage.
-
-| Param     | Type   | Required | Notes                                                       |
-| --------- | ------ | -------- | ----------------------------------------------------------- |
-| `id`      | string | yes      | 8-char prefix or full UUID of the message being replied to. |
-| `content` | string | yes      | Non-empty reply body.                                       |
-
-```
-request(ops="comm.reply(id=\"<message-id>\", content=\"On it.\")")
-```
-
-### `comm.thread` — Assertive
-
-Retrieve all messages in a conversation thread, ordered chronologically.
-
-| Param   | Type    | Required | Notes                                                               |
-| ------- | ------- | -------- | ------------------------------------------------------------------- |
-| `id`    | string  | yes      | Thread root: 8-char prefix or full UUID of the originating message. |
-| `limit` | integer | no       | Default 100, max 500.                                               |
-
-```
-request(ops="comm.thread(id=\"<thread-root-id>\")")
-```
-
-### `comm.probe` — Assertive
-
-Strictly read-only poll for new inbound message metadata and a stale-unread count. No
-read-flag mutation, no writes: designed for monitors polling every ~30 seconds, served by
-a single cheap indexed query. Returns a `cursor_us` high-water mark, a `stale_unread_count`
-of inbound messages unread past the staleness window, and a `new_messages` array of up to
-100 inbound rows `{id, created_at_us, from_actor, subject?}` newer than `since_us`.
-
-`cursor_us`/`since_us` is an opaque, monotonically increasing token, not a Unix microsecond
-timestamp: round-trip whatever the previous `comm.probe` response returned as the next
-call's `since_us`, and omit it for a baseline-first probe.
-
-| Param           | Type    | Required | Notes                                               |
-| --------------- | ------- | -------- | --------------------------------------------------- |
-| `actor`         | string  | yes      | Actor label whose inbound mail is probed.           |
-| `since_us`      | integer | no       | Opaque cursor from a prior response's `cursor_us`.  |
-| `stale_minutes` | integer | no       | Staleness window for the unread count (default 20). |
-
-```
-request(ops="comm.probe(actor=\"lambda:leo\")")
-request(ops="comm.probe(actor=\"lambda:leo\", since_us=42)")
-```
-
-### `comm.health` — Assertive
-
-Read-only per-channel health snapshot. Returns the daemon-persisted heartbeat row for
-every known channel: timestamps and consecutive-failure counts only, never a computed
-healthy bool. Health judgment belongs to the caller. Rows are read from the caller's
-injected namespace (`namespace=`, defaulting to `local` like every other comm verb) —
-`comm.heartbeat` is the only handler pinned to the fixed `local` operational namespace.
-The response echoes the namespace actually read in a `namespace` field, so an empty
-`channels` array is unambiguous even under a scoped read. See the
-[communication guide](communication.md) for the full response contract.
-
-No parameters.
-
-```
-request(ops="comm.health()")
-```
-
----
-
-## `schedule` pack — 4 verbs
-
-Time-triggered reminders and deferred verb dispatch. Optional; load with
-`KHIVE_PACKS=kg,schedule`. Add `comm` to create reminders.
-
-### `schedule.remind` — Commissive
-
-Create a time-triggered reminder.
-
-| Param     | Type   | Required | Notes                                                                                                                                            |
-| --------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `content` | string | yes      | Non-empty reminder message.                                                                                                                      |
-| `at`      | string | yes      | RFC 3339 trigger time, e.g. `"2026-06-01T09:00:00Z"`.                                                                                            |
-| `repeat`  | string | no       | `daily`\|`weekly`\|`monthly`, or a limited 5-field cron form using only `*` or one in-range integer per field (steps/ranges/lists not accepted). |
-
-```
-request(ops="schedule.remind(content=\"check PR #600 CI\", at=\"2026-07-05T09:00:00Z\")")
-```
-
-### `schedule.schedule` — Commissive
-
-Schedule a future verb dispatch.
-
-| Param    | Type   | Required | Notes                                                               |
-| -------- | ------ | -------- | ------------------------------------------------------------------- |
-| `action` | string | yes      | Verb dispatch payload, e.g. `"schedule.remind(content=\"hello\")"`. |
-| `at`     | string | yes      | RFC 3339 trigger time.                                              |
-| `repeat` | string | no       | Same recurrence grammar as `schedule.remind`.                       |
-
-```
-request(ops="schedule.schedule(action=\"gtd.next(assignee=\\\"agent:docs\\\")\", at=\"2026-07-05T09:00:00Z\")")
-```
-
-### `schedule.agenda` — Assertive
-
-List upcoming scheduled events.
-
-| Param   | Type    | Required | Notes                                                                 |
-| ------- | ------- | -------- | --------------------------------------------------------------------- |
-| `from`  | string  | no       | RFC 3339 window start; omit to start from the earliest pending event. |
-| `to`    | string  | no       | RFC 3339 window end; omit for all future events.                      |
-| `limit` | integer | no       | Default 20, max 200.                                                  |
-
-```
-request(ops="schedule.agenda(limit=10)")
-```
-
-### `schedule.cancel` — Declaration
-
-Cancel a scheduled event.
-
-| Param | Type   | Required | Notes                             |
-| ----- | ------ | -------- | --------------------------------- |
-| `id`  | string | yes      | Full UUID of the scheduled event. |
-
-```
-request(ops="schedule.cancel(id=\"<event-id>\")")
-```
-
----
-
-## `knowledge` pack — 19 verbs
-
-The knowledge-atom corpus: bulk ingest, TF-IDF + embedding search, domain composition,
-section-level review/dispute, and KG-sugar verbs for citing sources. Optional; load
-with `KHIVE_PACKS=kg,knowledge`.
-
-### `knowledge.upsert_atoms` — Commissive
-
-Bulk insert or update knowledge atoms by slug.
-
-| Param        | Type            | Required | Notes                                                             |
-| ------------ | --------------- | -------- | ----------------------------------------------------------------- |
-| `atoms`      | array\<object\> | yes      | `{slug, name, content, tags?, properties?, finalized?}` per atom. |
-| `chunk_size` | integer         | no       | Client-side chunking hint, max 5000.                              |
-
-```
-request(ops="[{\"tool\":\"knowledge.upsert_atoms\",\"args\":{\"atoms\":[{\"slug\":\"rope\",\"name\":\"RoPE\",\"content\":\"Rotary position embedding...\"}]}}]")
-```
-
-### `knowledge.upsert_domains` — Commissive
-
-Bulk insert or update domain groupings of atoms.
-
-| Param     | Type            | Required | Notes                                                     |
-| --------- | --------------- | -------- | --------------------------------------------------------- |
-| `domains` | array\<object\> | yes      | `{slug, name, description?, tags?, members?}` per domain. |
-
-```
-request(ops="[{\"tool\":\"knowledge.upsert_domains\",\"args\":{\"domains\":[{\"slug\":\"attention\",\"name\":\"Attention mechanisms\"}]}}]")
-```
-
-### `knowledge.get` — Assertive
-
-Fetch a single atom or domain by UUID or slug.
-
-| Param              | Type   | Required | Notes                                                                                                                                                                                                                                                                           |
-| ------------------ | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `id`               | string | yes      | Atom/domain UUID or slug.                                                                                                                                                                                                                                                       |
-| `include_sections` | bool   | no       | Include the atom's sections under a `sections` key (ignored for domains). Each section: `id, atom_id, namespace, section_type, heading, content, content_hash, status, tokens, sort_order, created_at, updated_at`, ordered by `sort_order`, `created_at`, `id`. Default false. |
-
-```
-request(ops="knowledge.get(id=\"rope\", include_sections=true)")
-```
-
-### `knowledge.list` — Assertive
-
-Paginated listing of atoms or domains.
-
-| Param    | Type    | Required | Notes                              |
-| -------- | ------- | -------- | ---------------------------------- |
-| `type`   | string  | no       | `atom`\|`domain` (default `atom`). |
-| `limit`  | integer | no       | Default 20, max 500.               |
-| `offset` | integer | no       | Pagination offset.                 |
-
-```
-request(ops="knowledge.list(type=\"domain\", limit=50)")
-```
-
-### `knowledge.delete_atoms` — Commissive
-
-Soft-delete atoms by slug or ID.
-
-| Param | Type            | Required | Notes                |
-| ----- | --------------- | -------- | -------------------- |
-| `ids` | array\<string\> | yes      | Atom slugs or UUIDs. |
-
-```
-request(ops="knowledge.delete_atoms(ids=[\"stale-atom-slug\"])")
-```
-
-### `knowledge.stats` — Assertive
-
-Corpus statistics: atom count, domain count, coverage. No params.
-
-```
-request(ops="knowledge.stats()")
-```
-
-### `knowledge.index` — Commissive
-
-Backfill embeddings + FTS for atoms/domains.
-
-| Param         | Type            | Required | Notes                                                   |
-| ------------- | --------------- | -------- | ------------------------------------------------------- |
-| `ids`         | array\<string\> | no       | Atom slugs/IDs to index; omit to index all.             |
-| `batch_size`  | integer         | no       | Default 500, max 1000.                                  |
-| `insert_only` | bool            | no       | Deprecated no-op, accepted for API compatibility only.  |
-| `rebuild_ann` | bool            | no       | Rebuild the in-memory Vamana ANN index (default false). |
-
-```
-request(ops="knowledge.index(rebuild_ann=true)")
-```
-
-### `knowledge.fold` — Assertive
-
-Budget-constrained knapsack selection of scored candidates.
-
-| Param              | Type            | Required | Notes                                                   |
-| ------------------ | --------------- | -------- | ------------------------------------------------------- |
-| `candidates`       | array\<object\> | yes      | `{id, score, size, content?, category?}` per candidate. |
-| `budget`           | integer         | yes      | Token/size budget for the selected set.                 |
-| `min_score`        | number          | no       | Default 0.0.                                            |
-| `category_weights` | object          | no       | Per-category score multipliers.                         |
-
-```
-request(ops="[{\"tool\":\"knowledge.fold\",\"args\":{\"candidates\":[{\"id\":\"a\",\"score\":0.8,\"size\":400}],\"budget\":4000}}]")
-```
-
-### `knowledge.search` — Assertive
-
-TF-IDF ranked search over the knowledge corpus with embedding rerank (default when an
-embedder is configured). Draft and deprecated atoms are excluded by default. Score
-bands: `score>=0.46` reliably on-target, `0.42<=score<0.46` mixed quality, `score<0.42`
-mostly off-target.
-
-| Param                 | Type    | Required | Notes                                                                                   |
-| --------------------- | ------- | -------- | --------------------------------------------------------------------------------------- |
-| `query`               | string  | yes      | Search query text.                                                                      |
-| `type`                | string  | no       | `atom`\|`domain` (default both).                                                        |
-| `include_drafts`      | bool    | no       | Default false; no-op when `status` is set.                                              |
-| `status`              | string  | no       | Exact status filter: `draft`\|`reviewed`\|`deprecated`; overrides `include_drafts`.     |
-| `exclude_status`      | string  | no       | Exclude an exact status; only used when `status` unset.                                 |
-| `role`                | string  | no       | Agent role hint, prepended to the query for scoring.                                    |
-| `limit`               | integer | no       | Default 10, max 100.                                                                    |
-| `min_score`           | number  | no       | Default 0.0.                                                                            |
-| `weights`             | object  | no       | `{w_name, w_tags, w_content, w_exact_name, w_bigram, expand_discount, coverage_alpha}`. |
-| `decompose`           | bool    | no       | Default false; enables query decomposition.                                             |
-| `decompose_threshold` | integer | no       | Default 4 non-stop terms to trigger decomposition.                                      |
-| `intersection_bonus`  | number  | no       | Default 0.25; score multiplier for multi-sub-query hits.                                |
-| `rerank`              | bool    | no       | Default true; embedding rerank; no-op with no embedder configured.                      |
-| `rerank_alpha`        | number  | no       | Default 0.7 (TF-IDF-dominant blend).                                                    |
-
-```
-request(ops="knowledge.search(query=\"FastAPI JWT middleware\", rerank=true, limit=10)")
-```
-
-### `knowledge.suggest` — Assertive
-
-Suggest relevant knowledge domains for a query. Draft/deprecated domain atoms excluded
-by default.
-
-| Param   | Type    | Required | Notes                   |
-| ------- | ------- | -------- | ----------------------- |
-| `query` | string  | yes      | Orientation query text. |
-| `role`  | string  | no       | Agent role hint.        |
-| `limit` | integer | no       | Default 8, max 100.     |
-
-```
-request(ops="knowledge.suggest(query=\"async middleware retry circuit breaker patterns\", role=\"implementer\")")
-```
-
-### `knowledge.compose` — Assertive
-
-Compose a markdown briefing from selected knowledge domains and atoms.
-
-| Param        | Type            | Required | Notes                                             |
-| ------------ | --------------- | -------- | ------------------------------------------------- |
-| `domain_ids` | array\<string\> | no       | Domain UUIDs/slugs whose member atoms to include. |
-| `atom_ids`   | array\<string\> | no       | Atom UUIDs/slugs to include directly.             |
-| `query`      | string          | yes      | Reranks the selected atom bodies.                 |
-
-```
-request(ops="knowledge.compose(query=\"FastAPI JWT middleware validation patterns\", domain_ids=[\"attention\"])")
-```
-
-### `knowledge.edit` — Commissive
-
-Upsert sections for an atom without wiping other sections.
-
-| Param      | Type            | Required | Notes                                                                                                                                                                                                                                                                             |
-| ---------- | --------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `id`       | string          | yes      | Atom UUID or slug.                                                                                                                                                                                                                                                                |
-| `sections` | array\<object\> | yes      | `[{section_type, content, heading?, sort_order?}]`. `section_type` is a closed enum: `overview`\|`core_model`\|`boundary_conditions`\|`formalism`\|`operational_guidance`\|`examples`\|`failure_modes`\|`expert_lens`\|`references`\|`other`. `content` must be >= 80 characters. |
-
-```
-request(ops="[{\"tool\":\"knowledge.edit\",\"args\":{\"id\":\"rope\",\"sections\":[{\"section_type\":\"overview\",\"content\":\"Rotary position embedding rotates query/key vectors by an angle proportional to position...\"}]}}]")
-```
-
-### `knowledge.import` — Commissive
-
-Ingest atlas markdown file(s) as atoms with parsed sections.
-
-| Param            | Type   | Required | Notes                                                                         |
-| ---------------- | ------ | -------- | ----------------------------------------------------------------------------- |
-| `path`           | string | yes      | Filesystem path to a markdown file or directory.                              |
-| `format`         | string | no       | Only `atlas_md` supported (default).                                          |
-| `chunk_strategy` | string | no       | `section` (default, one section per atom) or `atom` (whole file as one atom). |
-
-```
-request(ops="knowledge.import(path=\"/path/to/atlas/rope.md\")")
-```
-
-### `knowledge.challenge` — Commissive
-
-Mark a section as disputed and increment the atom's `dispute_count`.
-
-| Param          | Type   | Required | Notes                                                             |
-| -------------- | ------ | -------- | ----------------------------------------------------------------- |
-| `atom_id`      | string | yes      | Atom UUID or slug.                                                |
-| `section_type` | string | yes      | Section type to challenge.                                        |
-| `content_hash` | string | no       | Required when more than one eligible section of that type exists. |
-| `reason`       | string | no       | Optional challenge reason.                                        |
-
-```
-request(ops="knowledge.challenge(atom_id=\"rope\", section_type=\"formalism\", reason=\"formula sign error\")")
-```
-
-### `knowledge.adjudicate` — Commissive
-
-Resolve a disputed section and decrement the atom's `dispute_count`.
-
-| Param          | Type   | Required | Notes                                                             |
-| -------------- | ------ | -------- | ----------------------------------------------------------------- |
-| `atom_id`      | string | yes      | Atom UUID or slug.                                                |
-| `section_type` | string | yes      | Section type to adjudicate.                                       |
-| `content_hash` | string | no       | Required when more than one disputed section of that type exists. |
-| `resolution`   | string | yes      | `accept` (marks verified) or `reject` (marks reviewed).           |
-
-```
-request(ops="knowledge.adjudicate(atom_id=\"rope\", section_type=\"formalism\", resolution=\"accept\")")
-```
-
-### `knowledge.learn` — Commissive
-
-Register a concept entity with optional domain and tags.
-
-| Param         | Type            | Required | Notes                            |
-| ------------- | --------------- | -------- | -------------------------------- |
-| `name`        | string          | yes      | Concept name.                    |
-| `description` | string          | no       | Optional description.            |
-| `domain`      | string          | no       | Folded into `properties.domain`. |
-| `tags`        | array\<string\> | no       | Optional tag list.               |
-
-```
-request(ops="knowledge.learn(name=\"GQA\", domain=\"attention\", description=\"Grouped-query attention\")")
-```
-
-### `knowledge.cite` — Commissive
-
-Link a concept to the paper or source that introduced it.
-
-| Param        | Type  | Required | Notes                                                                                                |
-| ------------ | ----- | -------- | ---------------------------------------------------------------------------------------------------- |
-| `concept_id` | uuid  | yes      | Concept entity ID.                                                                                   |
-| `source_id`  | uuid  | yes      | Source entity ID; must be `kind=document`, `kind=person`, or `kind=org` (`introduced_by` edge rule). |
-| `weight`     | float | no       | Defaults to 1.0.                                                                                     |
-
-```
-request(ops="knowledge.cite(concept_id=\"<concept-uuid>\", source_id=\"<paper-uuid>\")")
-```
-
-### `knowledge.topic` — Assertive
-
-List concepts filtered by domain or free-text query.
-
-| Param    | Type    | Required | Notes                                       |
-| -------- | ------- | -------- | ------------------------------------------- |
-| `domain` | string  | no       | Filter to concepts tagged with this domain. |
-| `query`  | string  | no       | Free-text search across name + description. |
-| `limit`  | integer | no       | Default 20, max 100.                        |
-
-```
-request(ops="knowledge.topic(domain=\"attention\")")
-```
-
-### `knowledge.feedback` — Commissive
-
-Apply per-section feedback signals to update section posterior weights.
-
-| Param             | Type   | Required | Notes                                                                                                                         |
-| ----------------- | ------ | -------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `section_signals` | object | yes      | `{section_type: signal}`, e.g. `{"overview": "useful", "formalism": "not_useful"}`. Signals: `useful`\|`not_useful`\|`wrong`. |
-| `target_id`       | string | no       | UUID of the rated atom/entity. When paired with a configured brain profile, also forwards to `brain.feedback`.                |
-
-```
-request(ops="knowledge.feedback(target_id=\"rope\", section_signals={\"overview\": \"useful\"})")
-```
-
----
-
-## `session` pack — 4 verbs
-
-Cross-provider agent-session continuity records. Optional; load with
-`KHIVE_PACKS=kg,session`.
-
-### `session.store` — Directive
-
-Persist an agent-session record as a session note.
-
-| Param                 | Type            | Required | Notes                                                  |
-| --------------------- | --------------- | -------- | ------------------------------------------------------ |
-| `content`             | string          | yes      | Verbatim transcript or summary content.                |
-| `title`               | string          | no       | Stored as `note.name`.                                 |
-| `provider`            | string          | no       | Provider label, e.g. `codex`, `claude_code`, `openai`. |
-| `provider_session_id` | string          | no       | Provider-native continuity anchor.                     |
-| `tags`                | array\<string\> | no       | Stored in `properties.tags`.                           |
-
-```
-request(ops="session.store(content=\"...\", provider=\"claude_code\", title=\"pages revamp session\")")
-```
-
-### `session.list` — Assertive
-
-List stored sessions newest first.
-
-| Param      | Type    | Required | Notes                                  |
-| ---------- | ------- | -------- | -------------------------------------- |
-| `limit`    | integer | no       | 1–200, default 20.                     |
-| `offset`   | integer | no       | Default 0.                             |
-| `provider` | string  | no       | Exact filter on `properties.provider`. |
-
-```
-request(ops="session.list(provider=\"claude_code\", limit=10)")
-```
-
-### `session.resume` — Assertive
-
-Fetch one session's full content by UUID or 8+ hex prefix.
-
-| Param | Type   | Required | Notes                             |
-| ----- | ------ | -------- | --------------------------------- |
-| `id`  | string | yes      | Full UUID or 8+ hex short prefix. |
-
-```
-request(ops="session.resume(id=\"<session-id>\")")
-```
-
-### `session.export` — Assertive
-
-Serialize one stored session as json or markdown.
-
-| Param    | Type   | Required | Notes                               |
-| -------- | ------ | -------- | ----------------------------------- |
-| `id`     | string | yes      | Full UUID or 8+ hex short prefix.   |
-| `format` | string | no       | `json`\|`markdown`, default `json`. |
-
-```
-request(ops="session.export(id=\"<session-id>\", format=\"markdown\")")
-```
-
----
-
-## `git` pack — 4 verbs
-
-Git-history ingester plus a hardened write surface (ADR-088, ADR-088 Amendment 1,
-ADR-108). Optional; load with `KHIVE_PACKS=kg,git`. Also registers the `commit` /
-`issue` / `pull_request` note kinds, used by `git.digest` below and by the `kkernel
-git-ingest` CLI (both drive the same underlying ingest core, so ingest enrichment —
-readable `name`s, `Closes #N` reference edges, parent→child commit `precedes` edges —
-applies identically either way).
-
-### `git.digest` — Commissive
-
-Walk a local repository path or clone/fetch a remote `https://` URL, then ingest commits
-and (when the source is a github.com repo and the `gh` CLI is available) issues and pull
-requests as provenance notes, resolving or auto-creating the repo-anchor `project` entity.
-Bounded and cursor-resumable: call again with the same `source`/`project` while the
-response's `done` field is `false`.
-
-| Param       | Type            | Required | Notes                                                                                                                                                                                                                                     |
-| ----------- | --------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `source`    | string          | yes      | A local filesystem path (must contain `.git`) or an `https://` URL. Any `https` host is accepted; non-github.com hosts degrade to commits-only. `ssh://`, `git://`, `http://`, and scp-shorthand (`user@host:path`) sources are rejected. |
-| `project`   | string          | no       | UUID or 8+ hex prefix of the repo-anchor `project` entity. When absent, resolved by matching `properties.repo_url` or `name`, or created if none is found (see the response's `project_id` and `project_created`).                        |
-| `max_items` | integer         | no       | Bounded work for this call, counted across commits + issues + PRs (default 500, clamped to 1..=2000). Cursor-resumable: call again while the response's `done` field is `false`.                                                          |
-| `include`   | array\<string\> | no       | Which record kinds to ingest this call: any of `commits` \| `issues` \| `pull_requests` (default: all three).                                                                                                                             |
-
-```
-request(ops="git.digest(source=\"https://github.com/org/repo\", max_items=500)")
-```
-
-### `git.commit` / `git.branch` / `git.push` — Commissive (ADR-108)
-
-Thin write verbs that shell to system git (`std::process::Command::args`, no shell
-interpolation). Branch/ref names, remotes, messages, and authors are validated before they
-enter fixed argv shapes. Commit paths are bounded, repository-relative, traversal-free,
-and internally converted to Git literal pathspecs, so characters such as `*`, `?`, brackets,
-Unicode, and caller text such as `:(top)` remain literal filename text. `force` on
-`git.push` is always rejected when `true` — no policy or argument combination authorizes a
-force-push through this surface.
-
-The handler-level `[git_write]` allowlist is mandatory and independent of Gate policy
-(ADR-018). With no `[[git_write.allowed]]` entries, all three write verbs deny every request,
-including under `AllowAllGate`. Repository paths are compared after canonicalization, so an
-entry names exactly one real repository; branch patterns are exact names or a glob containing
-at most one `*` wildcard.
-
-```toml
-[[git_write.allowed]]
-repo = "/abs/path/repo"
-branches = ["main", "feat/*", "release-*"]
-```
-
-| Verb         | Param     | Type            | Required | Notes                                                                                                                                                                          |
-| ------------ | --------- | --------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `git.commit` | `repo`    | string          | yes      | Absolute local path to a git repository (must contain a `.git` entry).                                                                                                         |
-|              | `message` | string          | yes      | Commit message, passed as a single `-m` argument value.                                                                                                                        |
-|              | `paths`   | array\<string\> | no       | Relative paths to stage and scope the commit to. Absent commits everything currently staged/modified in tracked files (`git commit -a`) — never auto-adds new untracked files. |
-|              | `author`  | string          | no       | Override the commit author, e.g. `"Name <email>"`.                                                                                                                             |
-| `git.branch` | `repo`    | string          | yes      | Same as above.                                                                                                                                                                 |
-|              | `name`    | string          | yes      | New branch name.                                                                                                                                                               |
-|              | `from`    | string          | no       | Ref or SHA to branch from. Absent uses the repo's current HEAD.                                                                                                                |
-| `git.push`   | `repo`    | string          | yes      | Same as above.                                                                                                                                                                 |
-|              | `branch`  | string          | yes      | Branch to push.                                                                                                                                                                |
-|              | `remote`  | string          | no       | Remote to push to (default `origin`).                                                                                                                                          |
-|              | `force`   | bool            | no       | Always rejected when `true` (ADR-108 hard rule 1) — present only so an explicit `force=true` request fails loudly instead of being silently ignored.                           |
-
-```
-request(ops="git.commit(repo=\"/abs/path/repo\", message=\"fix: thing\") | git.push(repo=\"/abs/path/repo\", branch=\"main\")")
-```
-
----
-
-## `code` pack — 1 verb
-
-Deterministic source-code map ingest (ADR-085 Amendment 2, PR #1039). Optional; load
-with `KHIVE_PACKS=kg,code`. Also registers the `finding` note kind used by the
-`kkernel code-ingest` admin CLI's `findings.json` batch ingest (not reachable via this
-MCP verb surface).
-
-### `code.ingest` — Commissive
-
-Walk a source folder and ingest L1 manifest-declared dependency edges
-(`Cargo.toml` / `pyproject.toml` / `package.json`) plus L1.5 regex-based import-scan
-module and project edges, into a dedicated map database — never the shared production
-graph. A folder with no governing manifest anywhere above its source files still
-ingests, using the basename of the ingested folder as its `source_project` identity.
-Idempotent: entity and edge ids are `uuid5`-derived from identity, so re-ingesting the
-same path upserts rather than duplicates, and a synchronous re-resolve pass
-materializes edges for any import that only resolves once a later-scanned file's module
-becomes known.
-
-| Param       | Type            | Required | Notes                                                                                                                                                                                                                                        |
-| ----------- | --------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `path`      | string          | yes      | Folder to ingest — a monorepo subtree (a single crate/package) is first-class, not a special case of whole-repo ingest.                                                                                                                      |
-| `db`        | string          | no       | Target map database path. Defaults to `<path>/.khive/code-map.db`. The shared production database — its default `$HOME/.khive/khive.db` location and the calling server's actual configured database — is always rejected, with no override. |
-| `languages` | array\<string\> | no       | Restrict ingest to a subset of `rust` \| `python` \| `typescript`. Defaults to all three (auto-detected from manifests found under `path`).                                                                                                  |
-
-```
-request(ops="code.ingest(path=\"/repo/crates/my-crate\")")
-```
-
----
-
-## `blob` pack — 3 verbs
-
-Content-addressed binary object storage (ADR-111). Optional; load with
-`KHIVE_PACKS=kg,blob`. Registers no note or entity kinds. A normal file-backed boot
-installs a default `FsBlobStore` rooted beside the database file even with no
-`[storage.blob]` section in `khive.toml` and no `KHIVE_BLOB_ROOT` set; the verbs stay
-unconfigured (erroring until a backend is installed) only when the server boots against
-an in-memory backend, which has no directory to default a root beside.
-
-### `blob.put` — Commissive
-
-Store bytes (base64) in the content-addressed blob store; returns the BLAKE3
-`ContentRef`. Idempotent: identical content returns the same ref without a re-write.
-
-| Param   | Type   | Required | Notes                                                                                                   |
-| ------- | ------ | -------- | ------------------------------------------------------------------------------------------------------- |
-| `bytes` | string | yes      | Base64-encoded object content. Decoded size is capped at 64 MiB per call (ADR-111's v1 object ceiling). |
-
-### `blob.get` — Assertive
-
-Read an object back by `content_ref`, base64-encoded in the response, with an optional
-byte range. The object is rejected before any bytes are hydrated if it exceeds the
-64 MiB ceiling this verb will fetch, or if the requested slice would base64-encode to a
-response exceeding the daemon's IPC frame cap. Concurrent `blob.get` hydration is bounded
-by a small pack-level semaphore.
-
-| Param         | Type   | Required | Notes                                                                                                                             |
-| ------------- | ------ | -------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| `content_ref` | string | yes      | 64-char lowercase-hex BLAKE3 content reference returned by `blob.put`.                                                            |
-| `range`       | object | no       | `{offset, length}`, both non-negative integers when present. Applied to the fetched object as a slice, not a streamed range read. |
-
-### `blob.stat` — Assertive
-
-Report whether an object exists and its size, answered by a single metadata read with
-no bytes hydrated.
-
-| Param         | Type   | Required | Notes                                                                  |
-| ------------- | ------ | -------- | ---------------------------------------------------------------------- |
-| `content_ref` | string | yes      | 64-char lowercase-hex BLAKE3 content reference returned by `blob.put`. |
-
-```
-request(ops="blob.put(bytes=\"aGVsbG8=\")")
-request(ops="blob.stat(content_ref=\"<64-char-hex>\")")
-```
+## `git` pack
+
+Git-history ingestion (`git.digest`) and the hardened write surface (`git.commit` /
+`git.branch` / `git.push`, ADR-108), along with the `commit`/`issue`/`pull_request`
+note kinds they register, are provided by a commercially licensed extension and are
+not part of this distribution.
 
 ---
 
@@ -1725,5 +673,5 @@ request(ops="blob.stat(content_ref=\"<64-char-hex>\")")
 - [Search and Retrieval](search.html): FTS, vector, hybrid fusion, reranking.
 - [GTD Task Management](tasks.html): task lifecycle in depth.
 - [Prompt Cookbook](prompt-cookbook.html): ready-to-use verb patterns.
-- [ADR-016: request DSL](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-016-request-dsl.md)
-- [ADR-002: Closed Edge Ontology](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-002-edge-ontology.md)
+- ADR-016: request DSL
+- ADR-002: Closed Edge Ontology

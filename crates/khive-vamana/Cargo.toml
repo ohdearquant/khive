@@ -27,7 +27,7 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 blake3 = { workspace = true }
 uuid = { workspace = true, optional = true }
-khive-quant = { version = "0.5.0", path = "../khive-quant", default-features = false }
+khive-quant = { version = "0.6.0", path = "../khive-quant", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

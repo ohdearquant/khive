@@ -73,13 +73,13 @@ ADR-012 composition layer and the `kg`/`memory` packs that call into it for
 hybrid FTS5+vector search.
 
 Governing ADRs:
-[ADR-030](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-030-retrieval-stack-port.md)
+ADR-030
 (this crate's charter — engine/adapter ownership split from ADR-012),
-[ADR-012](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-012-retrieval-composition.md)
+ADR-012
 (the still-live high-level composition contract), and
-[ADR-031](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-031-multi-engine-retrieval.md)
+ADR-031
 (multi-engine embedder registry and pack fan-out this crate composes with).
 
 ## License
 
-Apache-2.0.
+BUSL-1.1. See the repository [LICENSE](https://github.com/ohdearquant/khive/blob/main/LICENSE).

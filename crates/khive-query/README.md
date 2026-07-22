@@ -74,8 +74,8 @@ types -> score -> storage -> db -> query -> runtime -> pack-* -> mcp
 `khive-runtime` calls `parse_auto`/`parse` and `compile` to serve the `query` verb
 (GQL/SPARQL pattern matching), then executes the resulting `CompiledQuery` through
 `khive-db`'s `SqlAccess`. Parser/validator/compiler separation is governed by
-[ADR-008](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-008-query-layer-separation.md).
+ADR-008.
 
 ## License
 
-Apache-2.0.
+BUSL-1.1. See the repository [LICENSE](https://github.com/ohdearquant/khive/blob/main/LICENSE).

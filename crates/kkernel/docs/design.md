@@ -39,16 +39,17 @@
 - `pack_introspect` module builds an in-memory `VerbRegistry` from all `inventory!`-
   registered packs and exposes `list_packs()` and `pack_handler(name)`.
 - Handler `visibility` distinguishes MCP-exposed `Verb` entries from internal
-  `Subhandler` entries (e.g. `memory.recall_embed`).
+  `Subhandler` entries.
 
 ### Verb namespace contract (ADR-023)
 
-- The kg substrate pack owns 17 bare verb names (no dot prefix): `create`, `get`,
+- The kg substrate pack owns 19 bare verb names (no dot prefix): `create`, `get`,
   `list`, `stats`, `update`, `delete`, `search`, `link`, `neighbors`, `traverse`,
-  `query`, `merge`, `propose`, `review`, `withdraw`, `verbs`, `context` (ADR-089).
-- Every other pack must prefix verbs with `<pack>.` (e.g. `memory.recall`).
-- Sub-variants use underscore, not nested dots: `memory.recall_embed`, not
-  `memory.recall.embed`.
+  `query`, `merge`, `propose`, `review`, `withdraw`, `resolve`, `verbs`, `context`
+  (ADR-089), `whoami`.
+- A commercially licensed extension pack, when installed, must prefix its verbs with
+  `<pack>.` (e.g. `<pack>.verb`); sub-variants use underscore, not nested dots
+  (`<pack>.verb_variant`, not `<pack>.verb.variant`).
 - Enforced by the integration test in `tests/verb_namespace_contract.rs`.
 
 ### Dynamic pack loading (self-registration via inventory!) (ADR-027)
@@ -97,22 +98,17 @@
 ### Proposal lifecycle (ADR-046)
 
 - The kg pack exposes `propose`, `review`, and `withdraw` verbs as part of the
-  17 kg-substrate bare verbs. These are validated by the contract test.
+  19 kg-substrate bare verbs. These are validated by the contract test.
 
 ### Atomic `exec --ops-file --atomic` execution path (ADR-099 Slice B3)
 
 `atomic_apply.rs` is the CLI-boundary orchestrator for `kkernel exec --ops-file --atomic`.
-It runs, in order:
+This distribution ships the `kg` pack only, so `--atomic` admits KG-substrate verbs.
+`atomic_apply.rs` runs, in order:
 
 1. Parse-time admissibility (`khive_request::atomic::check_atomic_admissible`, B1) plus the
    op-count guard — both run BEFORE building any runtime or touching the database.
-2. The async prepare pass: KG-substrate verbs via `khive_runtime::atomic_prepare::prepare_op`;
-   `gtd.transition`/`gtd.complete` via two `prepare_gtd_*` adapters in this module that wrap
-   the SAME decide functions (`khive_pack_gtd::handlers::prepare_transition`/
-   `prepare_complete`) the canonical non-atomic `handle_transition`/`handle_complete` call —
-   the decide logic is not duplicated, only adapted into an `AtomicOpPlan`. The adapters live
-   in `kkernel` (not `khive-pack-gtd`) because `AtomicOpPlan`/`PlanStatement` are
-   `khive-runtime` atomic-plan vocabulary this CLI orchestrator owns.
+2. The async prepare pass over KG-substrate verbs via `khive_runtime::atomic_prepare::prepare_op`.
 3. The synchronous commit pass (`khive_runtime::atomic_runner::run_atomic_unit`, B2).
 4. The async post-commit reindex pass (`khive_runtime::atomic_prepare::apply_post_commit_effects`).
 
@@ -133,16 +129,6 @@ non-atomic merge verb`).
 The returned envelope is additive-only and lives entirely outside `dispatch_request_local`'s
 response shape — non-atomic `--ops-file` runs (and every other exec path) are untouched.
 
-**`apply_gtd_audit_post_commit_effects`** applies every `PostCommitEffect::GtdAudit` by
-calling the SAME `ensure_audit_schema`/`write_audit_record` functions the canonical
-`handle_transition`/`handle_complete` handlers call (GAP-5). It lives in `kkernel` rather
-than `khive-runtime::atomic_prepare` because those two functions are owned by
-`khive-pack-gtd`, which depends on `khive-runtime` — not the other way around; `kkernel` is
-the first crate in the dependency graph that can see both. Non-`GtdAudit` effects are
-ignored here (they are `atomic_prepare::apply_post_commit_effects`'s job, called
-separately). Best-effort by construction: both callee functions log-and-swallow their own
-errors, so this function itself cannot fail.
-
 **`validate_atomic_args`** closes an ADR-099 B3 parity gap: the canonical (non-atomic)
 handlers deserialize their args through a `#[serde(deny_unknown_fields)]` param struct, so a
 typo like `conten` (for `content`) is rejected rather than silently ignored. The pre-fix
@@ -150,14 +136,14 @@ typo like `conten` (for `content`) is rejected rather than silently ignored. The
 about, so a typo'd key was dropped on the floor and the op reported `ok:true` with every
 OTHER field reset to its current value, silently losing the caller's intended change. The
 fix reuses (rather than reimplements) the canonical param structs: `kkernel` already depends
-on `khive-pack-kg`/`khive-pack-gtd` directly, and their param structs
-(`UpdateParams`/`DeleteParams`/`LinkParams`/`TransitionParams`/`CompleteParams`) are
-re-exported `pub` specifically for this seam. Deserializing an op's args through the same
-struct the canonical handler uses reproduces its `deny_unknown_fields` rejection and exact
-error message for free, with no duplicated key list to drift out of sync — the deserialized
-value itself is discarded; `prepare_*` still reads the raw `Value` map. `merge`, `create`,
-and the read/governance verbs are out of scope: they are already rejected earlier at
-`check_atomic_admissible`, or are not part of the v1 admissible set at all.
+on `khive-pack-kg` directly, and its param structs (`UpdateParams`/`DeleteParams`/
+`LinkParams`) are re-exported `pub` specifically for this seam. Deserializing an op's args
+through the same struct the canonical handler uses reproduces its `deny_unknown_fields`
+rejection and exact error message for free, with no duplicated key list to drift out of
+sync — the deserialized value itself is discarded; `prepare_*` still reads the raw `Value`
+map. `merge`, `create`, and the read/governance verbs are out of scope: they are already
+rejected earlier at `check_atomic_admissible`, or are not part of the v1 admissible set at
+all.
 
 **`delete_expected_kind`/`update_expected_kind`** resolve a caller-supplied `kind=...`
 string into the `AtomicDeleteKind`/`AtomicUpdateKind` enum `prepare_delete`/`prepare_update`
@@ -211,26 +197,10 @@ re-reads a changed `HOME`.
   DOES still reject is a non-null, non-string `name` (e.g. `name: 123`) — pre-fix, atomic
   silently treated that as absent too, reporting success for an invalid update.
 
-### `reindex` memory Vamana epoch protocol (#812, ADR-107 §4)
+### `reindex` (`src/reindex.rs`)
 
-`begin_reindex_epoch` (`src/reindex.rs`) durably marks the reindex-in-progress epoch
-BEFORE any vector mutation in the pass. The previous design bumped the durable epoch only
-as a best-effort step AFTER every vector mutation had already committed; a crash between the
-last commit and that bump — or a silently swallowed bump error — left an already-warm daemon
-with no durable signal at all, serving pre-reindex vectors indefinitely. Bumping first closes
-that gap: a daemon that observes this epoch mid-reindex (via
-`khive_pack_memory::ann::maybe_check_durable_epoch`, sampled from the recall path) rebuilds
-conservatively against whatever partial corpus is on disk at that moment — never worse than
-trusting a stale index forever — and the completion bump at the end of the pass forces one
-more rebuild once the corpus reaches its final, fully re-embedded state. Together the two
-durable bumps form an in-progress/completed epoch protocol: any observer landing anywhere
-between them still converges. `kkernel reindex` runs directly against a raw `KhiveRuntime`
-without a pack-registry boot applying `MemoryPack::SCHEMA_PLAN`, so this function also
-ensures the `memory_ann_epoch` table exists before its first bump.
-
-**Fail-closed, not warn-and-continue**: an error here (schema creation OR the epoch write
-itself) aborts the whole reindex before any mutation runs. A swallowed failure here is
-exactly the bug ADR-107 §4 was written to close.
+`kkernel reindex` rebuilds embedding vectors and FTS documents for entities and notes in
+this distribution's `kg` substrate.
 
 ## Consistency Notes
 

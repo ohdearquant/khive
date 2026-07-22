@@ -16,7 +16,6 @@ use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
-#[cfg(unix)]
 use std::path::PathBuf;
 
 #[cfg(unix)]
@@ -53,10 +52,45 @@ const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 10;
 
 // ── paths ─────────────────────────────────────────────────────────────────────
 
-#[cfg(unix)]
+/// Base `.khive` directory used to anchor every advisory lock/socket/pid
+/// path below. Pure path computation — portable on every target, even
+/// though most of its callers (socket/pid paths) are unix-only.
+///
+/// Resolution order: `HOME`, then `USERPROFILE` (the conventional Windows
+/// home variable), then a platform-specific last resort. On non-unix targets
+/// the last resort is the OS temp directory (per-user on Windows), so the
+/// lock path can never be working-directory-relative there: two processes
+/// opening the same database from different working directories must resolve
+/// the same lock file. On unix the last resort stays the historical `"."` —
+/// a shared world-writable anchor such as `/tmp` would be worse, since a
+/// local attacker could pre-claim the directory and the socket/lock files
+/// under it before the daemon's first run.
 fn khive_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".khive")
+    khive_root_from(
+        std::env::var("HOME").ok(),
+        std::env::var("USERPROFILE").ok(),
+    )
+}
+
+/// Env-free core of [`khive_dir`], split out so the fallback chain is
+/// testable without mutating process-global environment variables.
+fn khive_root_from(home: Option<String>, userprofile: Option<String>) -> PathBuf {
+    home.filter(|v| !v.trim().is_empty())
+        .or_else(|| userprofile.filter(|v| !v.trim().is_empty()))
+        .map(PathBuf::from)
+        .unwrap_or_else(last_resort_root)
+        .join(".khive")
+}
+
+/// See [`khive_dir`] for why the two arms differ.
+#[cfg(unix)]
+fn last_resort_root() -> PathBuf {
+    PathBuf::from(".")
+}
+
+#[cfg(not(unix))]
+fn last_resort_root() -> PathBuf {
+    std::env::temp_dir()
 }
 
 /// Unix socket path the daemon binds and clients connect to.
@@ -86,10 +120,13 @@ pub fn pid_path() -> PathBuf {
 }
 
 /// Advisory lock file used to serialize stale-daemon recovery across concurrent
-/// clients (flock on the file; released when the lock file handle is dropped).
+/// clients (flock/`File::lock` on the file; released when the lock file
+/// handle is dropped). Path computation is portable; `kkernel exec`'s
+/// non-unix local-construction guard (`kkernel::exec::acquire_local_construction_guard`)
+/// shares this exact path with the unix daemon-boot guard so the two stay
+/// mutually exclusive.
 ///
 /// Overridable via the `KHIVE_LOCK` env var (for tests).
-#[cfg(unix)]
 pub fn lock_path() -> PathBuf {
     if let Ok(p) = std::env::var("KHIVE_LOCK") {
         if !p.is_empty() {
@@ -265,6 +302,103 @@ fn socket_identity(path: &std::path::Path) -> Option<SocketIdentity> {
         dev: meta.dev(),
         ino: meta.ino(),
     })
+}
+
+// ── connection principal ──────────────────────────────────────────────────────
+
+/// The uid on the other end of an accepted connection, read from the kernel.
+///
+/// This is the only identity on this socket the caller cannot choose. Every
+/// identity field on the request frame — `namespace`, `actor_id`,
+/// `visible_namespaces`, `config_id` — is supplied by the connecting process,
+/// so none of them can answer "who is this". A check reading self-asserted
+/// fields is not a weak gate, it is not a gate: anyone who wants to pass it
+/// asserts the passing values.
+///
+/// `getpeereid(2)` on macOS/BSD, `SO_PEERCRED` on Linux. Both report the peer's
+/// credentials as recorded by the kernel at connect time.
+#[cfg(unix)]
+fn peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
+    use std::os::fd::AsRawFd;
+    let fd = stream.as_raw_fd();
+
+    #[cfg(any(target_os = "macos", target_os = "ios", target_vendor = "apple"))]
+    {
+        let mut uid: libc::uid_t = 0;
+        let mut gid: libc::gid_t = 0;
+        // SAFETY: `fd` is a live connected socket owned by `stream` for the
+        // duration of this call; both out-params are valid initialized locals.
+        let rc = unsafe { libc::getpeereid(fd, &mut uid, &mut gid) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(uid as u32)
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let mut cred = libc::ucred {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+        };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: `fd` is a live connected socket owned by `stream`; `cred` is
+        // an initialized local of exactly `len` bytes, which is what
+        // SO_PEERCRED writes.
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&mut cred as *mut libc::ucred).cast::<libc::c_void>(),
+                &mut len,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(cred.uid)
+    }
+
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_vendor = "apple"
+    )))]
+    {
+        let _ = fd;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "peer-credential capture is not implemented for this platform",
+        ))
+    }
+}
+
+/// Whether a connection from `uid` may be served by this daemon.
+///
+/// ADR-096 accepted per-request identity threading **for the single-principal
+/// owner-only socket only**, and rested that on three things: the `0600`
+/// socket, all connections being the same uid, and the database being already
+/// same-uid-accessible. The socket mode is asserted at bind. This asserts the
+/// second, which previously had no representation in the code at all — nothing
+/// read peer identity, so nothing could notice when it stopped being true.
+///
+/// **Principal is not attribution.** Many `actor_id`s over one socket is
+/// exactly what ADR-096 shipped and what every seat on a normal host does;
+/// refusing a second distinct actor would break the accepted design. The
+/// principal is the uid, and this refuses only a genuinely foreign one.
+///
+/// **There is deliberately no configuration escape hatch.** A flag permitting
+/// other uids would not weaken this assertion, it would delete it, in the way
+/// hardest to notice later: the check still exists, its tests still pass, and
+/// the deployment that matters has it off. A deployment that genuinely needs
+/// multiple uids needs a code change and a gated ADR — which is precisely the
+/// decision that should be impossible to make by accident.
+#[cfg(unix)]
+fn uid_is_permitted(peer: u32, daemon_euid: u32) -> bool {
+    peer == daemon_euid
 }
 
 // ── wire types ────────────────────────────────────────────────────────────────
@@ -560,6 +694,19 @@ pub trait DaemonDispatch: Clone + Send + Sync + 'static {
         None
     }
 
+    /// File-backed backend pools beyond [`Self::pool_for_checkpoint`]'s pool
+    /// (ADR-091 Amendment 3): one checkpoint task is spawned per entry here,
+    /// in addition to the one spawned for the primary pool, so a
+    /// multi-backend deployment gets PASSIVE/TRUNCATE checkpointing and
+    /// sidecar enumeration on every file-backed backend it wired, not only
+    /// the main one.
+    ///
+    /// The default implementation returns an empty `Vec` — an implementor
+    /// with only one backend (or none) needs no override.
+    fn secondary_pools_for_checkpoint(&self) -> Vec<Arc<ConnectionPool>> {
+        Vec::new()
+    }
+
     /// Return the audit `EventStore` the checkpoint task should append
     /// ADR-094 lifecycle events (`CheckpointOutcomeRecorded`) to, if any.
     ///
@@ -710,6 +857,12 @@ pub fn active_phase_names() -> Vec<String> {
 #[cfg(unix)]
 fn build_metrics_snapshot<D: DaemonDispatch>(dispatcher: &D) -> MetricsSnapshot {
     let open_tx_count = khive_storage::tx_registry::snapshot().len();
+    // ADR-091 Amendment 3: deliberately the process-wide aggregate, not a
+    // backend-attributed view — this gauge reports "oldest pinned tx in this
+    // process" across every wired backend, not an attribution claim about
+    // which database it belongs to. Attribution consumers (the session sweep,
+    // the per-backend checkpoint tasks) use the scoped `oldest_for` views in
+    // khive-db instead.
     let (oldest_pinned_tx_micros, oldest_pinned_tx_label) =
         match khive_storage::tx_registry::oldest() {
             Some((_id, age, label)) => (Some(age.as_micros() as u64), label),
@@ -948,6 +1101,228 @@ pub async fn run_daemon<D: DaemonDispatch>(dispatcher: D) -> anyhow::Result<()> 
     run_daemon_with_boot_guard(dispatcher, boot_guard).await
 }
 
+/// Vet the socket's parent directory, re-permissioning it only when it is the
+/// directory khive owns by convention.
+///
+/// `KHIVE_SOCKET` takes an arbitrary path, and the previous unconditional
+/// chmod-0700 of its parent was wrong in both directions: pointed at a shared
+/// parent like `/tmp` it either failed outright for an ordinary user, or —
+/// worse — succeeded when privileged and stripped access for every other
+/// process on the machine. A directory we did not create is never modified.
+///
+/// What the directory must actually prevent is a *takeover of the socket
+/// path*: the connection gate is the 0600 socket plus the accept-time
+/// peer-uid check, but both defend the daemon's own socket — neither helps
+/// once another local user can put *their* listener at the path clients
+/// resolve. There are two ways a shared directory allows that, and the
+/// sticky bit closes neither: a writer can *pre-bind* the predictable path
+/// before this daemon starts (the sticky bit restricts unlinking, not
+/// creating), and the directory's *owner* can unlink and rebind even in a
+/// 1777 directory (sticky exempts the directory owner). So a caller-chosen
+/// directory is served only when it is trusted end to end: owned by this
+/// daemon's euid or root, and not writable by group or other at all. The
+/// umask-default 0755 stays acceptable; shared sticky directories like
+/// `/tmp` do not.
+#[cfg(unix)]
+fn ensure_socket_dir_is_trusted(parent: &std::path::Path) -> anyhow::Result<()> {
+    // SAFETY: `geteuid` is always successful and takes no arguments.
+    let daemon_euid = unsafe { libc::geteuid() } as u32;
+
+    if parent == khive_dir() {
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
+            anyhow::anyhow!(
+                "refusing to start: cannot chmod 0700 {}: {e}. The khive directory must be \
+                 owner-only — it is half of the same-uid guarantee this daemon enforces.",
+                parent.display()
+            )
+        })?;
+        return ensure_socket_path_is_swap_resistant(parent, daemon_euid);
+    }
+
+    // Fail closed on the stat itself: not being able to read the metadata is
+    // not the same as the directory passing.
+    let meta = std::fs::metadata(parent).map_err(|e| {
+        anyhow::anyhow!(
+            "refusing to start: cannot stat {}: {e}. The socket directory gates \
+             socket-takeover safety, and unreadable metadata is not a passing state.",
+            parent.display()
+        )
+    })?;
+
+    use std::os::unix::fs::MetadataExt;
+    let owner = meta.uid();
+    if owner != daemon_euid && owner != 0 {
+        anyhow::bail!(
+            "refusing to start: socket directory {} is owned by uid {owner}, not this \
+             daemon's uid ({daemon_euid}) or root. A directory owner can replace the \
+             socket regardless of mode bits. Point KHIVE_SOCKET at a directory you own, \
+             or unset it for the default.",
+            parent.display()
+        );
+    }
+
+    let mode = meta.permissions().mode();
+    if mode & 0o022 != 0 {
+        anyhow::bail!(
+            "refusing to start: socket directory {} is mode {:04o} — writable by group or \
+             other, so another local user could bind their own listener at the socket path \
+             (before this daemon starts, the sticky bit does not prevent creating the \
+             path). Use a directory only you can write, or unset KHIVE_SOCKET for the \
+             default. This daemon is not changing the permissions of a directory it does \
+             not own.",
+            parent.display(),
+            mode & 0o7777
+        );
+    }
+
+    ensure_socket_path_is_swap_resistant(parent, daemon_euid)
+}
+
+/// Walk the socket directory path exactly as the kernel will traverse it at
+/// bind time — component by component, following symlinks — and refuse any
+/// node another local user could swap after this validation.
+///
+/// Checking only the canonicalized result is not enough: bind and every
+/// client traverse the *original* path, so a symlink component owned by
+/// another user can resolve somewhere trusted while it is being validated
+/// and be retargeted before the socket is bound. Validating the nodes the
+/// traversal actually visits closes that gap: a symlink component is
+/// acceptable only when its owner — the only party besides root who can
+/// retarget it — is this daemon's euid or root, and every directory
+/// component is held to the ancestor rule below.
+///
+/// The directory rule is deliberately weaker than the immediate parent's.
+/// The parent hosts the socket file, where the threat is *creation* of the
+/// predictable path — the sticky bit does not restrict creating, so no
+/// sticky exception is sound there. An ancestor only threatens via
+/// *rename/unlink of an existing entry we own*, which the sticky bit does
+/// restrict: in a sticky directory, only the entry's owner, the directory's
+/// owner, or root may rename it. So a root-owned `/tmp` (1777) is an
+/// acceptable ancestor of a user-owned 0700 socket directory, while a
+/// non-sticky group/other-writable ancestor, or one owned by a third uid
+/// (who could rename the entry, or chmod the directory first), is refused.
+/// Every stat failure fails closed.
+#[cfg(unix)]
+fn ensure_socket_path_is_swap_resistant(
+    parent: &std::path::Path,
+    daemon_euid: u32,
+) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let absolute = if parent.is_absolute() {
+        parent.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "refusing to start: cannot resolve the working directory to absolutize \
+                     socket directory {}: {e}.",
+                    parent.display()
+                )
+            })?
+            .join(parent)
+    };
+
+    fn push_components(stack: &mut Vec<std::ffi::OsString>, path: &std::path::Path) {
+        let components: Vec<_> = path
+            .components()
+            .map(|c| c.as_os_str().to_os_string())
+            .collect();
+        stack.extend(components.into_iter().rev());
+    }
+
+    let mut stack: Vec<std::ffi::OsString> = Vec::new();
+    push_components(&mut stack, &absolute);
+    let mut resolved = std::path::PathBuf::new();
+    let mut symlinks_followed = 0u32;
+
+    while let Some(component) = stack.pop() {
+        if component == "/" {
+            resolved = std::path::PathBuf::from("/");
+            continue;
+        }
+        if component == "." {
+            continue;
+        }
+        if component == ".." {
+            resolved.pop();
+            continue;
+        }
+        let candidate = resolved.join(&component);
+        let meta = std::fs::symlink_metadata(&candidate).map_err(|e| {
+            anyhow::anyhow!(
+                "refusing to start: cannot stat socket-path component {}: {e}. An \
+                 unreadable component is not a passing one.",
+                candidate.display()
+            )
+        })?;
+        let owner = meta.uid();
+
+        if meta.file_type().is_symlink() {
+            symlinks_followed += 1;
+            if symlinks_followed > 40 {
+                anyhow::bail!(
+                    "refusing to start: socket path resolves through more than 40 symlinks \
+                     at {} — treating this as a loop.",
+                    candidate.display()
+                );
+            }
+            if owner != daemon_euid && owner != 0 {
+                anyhow::bail!(
+                    "refusing to start: socket-path symlink component {} is owned by uid \
+                     {owner}, not this daemon's uid ({daemon_euid}) or root — its owner \
+                     could retarget it after this check and re-root the socket path. Point \
+                     KHIVE_SOCKET somewhere trusted end to end, or unset it for the \
+                     default.",
+                    candidate.display()
+                );
+            }
+            let target = std::fs::read_link(&candidate).map_err(|e| {
+                anyhow::anyhow!(
+                    "refusing to start: cannot read socket-path symlink component {}: {e}.",
+                    candidate.display()
+                )
+            })?;
+            push_components(&mut stack, &target);
+            continue;
+        }
+
+        if meta.is_dir() {
+            let mode = meta.permissions().mode();
+            let sticky = mode & 0o1000 != 0;
+            if owner != daemon_euid && owner != 0 {
+                anyhow::bail!(
+                    "refusing to start: socket-path ancestor {} is owned by uid {owner}, not \
+                     this daemon's uid ({daemon_euid}) or root — its owner could rename the \
+                     next path component and re-root the socket path. Point KHIVE_SOCKET \
+                     somewhere trusted end to end, or unset it for the default.",
+                    candidate.display()
+                );
+            }
+            if mode & 0o022 != 0 && !sticky {
+                anyhow::bail!(
+                    "refusing to start: socket-path ancestor {} is mode {:04o} — writable by \
+                     group or other without the sticky bit, so another local user could rename \
+                     the next path component and re-root the socket path. Point KHIVE_SOCKET \
+                     somewhere trusted end to end, or unset it for the default.",
+                    candidate.display(),
+                    mode & 0o7777
+                );
+            }
+            resolved = candidate;
+            continue;
+        }
+
+        anyhow::bail!(
+            "refusing to start: socket-path component {} is neither a directory nor a \
+             symlink — the socket path cannot traverse it.",
+            candidate.display()
+        );
+    }
+
+    Ok(())
+}
+
 /// Run the daemon using a startup lock acquired by the caller *before*
 /// building `dispatcher`, so a second process racing to boot (e.g. two
 /// `kkernel mcp --daemon` spawns before either has bound its socket) cannot
@@ -970,9 +1345,7 @@ pub async fn run_daemon_with_boot_guard<D: DaemonDispatch>(
 
     if let Some(parent) = sock.parent() {
         std::fs::create_dir_all(parent)?;
-        if let Err(e) = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)) {
-            tracing::warn!(error = %e, path = ?parent, "failed to chmod 0700 khive dir");
-        }
+        ensure_socket_dir_is_trusted(parent)?;
     }
 
     // Hold the startup lock across cleanup → bind → pid-write so a concurrent
@@ -996,8 +1369,17 @@ pub async fn run_daemon_with_boot_guard<D: DaemonDispatch>(
     }
 
     let listener = UnixListener::bind(&sock)?;
+    // Fail closed, same reason as the directory above. If this chmod fails the
+    // socket is world-reachable in a way the accepted design never covered, so
+    // the bound listener is dropped and the entry removed rather than served.
     if let Err(e) = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600)) {
-        tracing::warn!(error = %e, path = ?sock, "failed to chmod 0600 socket");
+        drop(listener);
+        let _ = std::fs::remove_file(&sock);
+        return Err(anyhow::anyhow!(
+            "refusing to start: cannot chmod 0600 {}: {e}. The daemon socket must be owner-only \
+             — it is half of the single-principal guarantee this daemon enforces.",
+            sock.display()
+        ));
     }
     // Captured while still holding the startup lock, immediately after
     // bind, so shutdown cleanup can later prove "this is still the same socket
@@ -1051,18 +1433,34 @@ pub async fn run_daemon_with_boot_guard<D: DaemonDispatch>(
     // scope and signalled as the first action once shutdown is observed,
     // below.
     let (checkpoint_shutdown_tx, checkpoint_shutdown_rx) = tokio::sync::watch::channel(());
+    // ADR-091 Amendment 3: one checkpoint task per file-backed backend the
+    // dispatcher wired — the primary pool plus every entry
+    // `secondary_pools_for_checkpoint` returns — sharing this one shutdown
+    // channel (the sender broadcasts to every receiver clone), so the single
+    // send below stops every spawned task before `drain()`.
+    let mut checkpoint_pools: Vec<(Arc<ConnectionPool>, bool)> = Vec::new();
     if let Some(pool) = dispatcher.pool_for_checkpoint() {
+        checkpoint_pools.push((pool, true));
+    }
+    for pool in dispatcher.secondary_pools_for_checkpoint() {
+        checkpoint_pools.push((pool, false));
+    }
+    if !checkpoint_pools.is_empty() {
         let cfg = CheckpointConfig::from_env();
         let event_store = dispatcher.event_store_for_checkpoint();
         let namespace = dispatcher.namespace().to_string();
-        track_background_task(run_checkpoint_task(
-            pool,
-            cfg,
-            event_store,
-            namespace,
-            checkpoint_shutdown_rx,
-        ));
-        tracing::info!("WAL checkpoint task started");
+        let checkpoint_task_count = checkpoint_pools.len();
+        for (pool, is_main) in checkpoint_pools {
+            track_background_task(run_checkpoint_task(
+                pool,
+                cfg.clone(),
+                event_store.clone(),
+                namespace.clone(),
+                checkpoint_shutdown_rx.clone(),
+                is_main,
+            ));
+        }
+        tracing::info!(checkpoint_task_count, "WAL checkpoint task(s) started");
     }
 
     let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1081,11 +1479,49 @@ pub async fn run_daemon_with_boot_guard<D: DaemonDispatch>(
         }
     };
 
+    // SAFETY: `geteuid` is always successful and takes no arguments.
+    let daemon_euid = unsafe { libc::geteuid() } as u32;
+
     tokio::select! {
         _ = async {
             loop {
                 match listener.accept().await {
                     Ok((stream, _)) => {
+                        // Refuse a foreign uid before any frame is read.
+                        // Fails CLOSED: an error reading peer credentials is
+                        // "cannot prove same-uid", which is the same answer as
+                        // "is not same-uid" — never a pass.
+                        //
+                        // Scope: this is a same-UID check, which is strictly
+                        // weaker than same-PRINCIPAL. Several distinct actors
+                        // running under one uid all pass here, so this does not
+                        // by itself establish that the daemon serves a single
+                        // principal, and nothing downstream refuses or degrades
+                        // on observing more than one. Do not describe it as a
+                        // multi-principal guard — it bounds the process boundary,
+                        // not the identity one.
+                        match peer_uid(&stream) {
+                            Ok(peer) if uid_is_permitted(peer, daemon_euid) => {}
+                            Ok(peer) => {
+                                tracing::error!(
+                                    peer_uid = peer,
+                                    daemon_euid,
+                                    "refusing connection from a foreign uid: this daemon accepts \
+                                     only peers running as its own uid"
+                                );
+                                drop(stream);
+                                continue;
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    error = %e,
+                                    "refusing connection: cannot read peer credentials, so \
+                                     same-uid cannot be proven"
+                                );
+                                drop(stream);
+                                continue;
+                            }
+                        }
                         let d = dispatcher.clone();
                         let active = Arc::clone(&active);
                         tokio::spawn(async move {
@@ -1325,6 +1761,54 @@ pub fn env_truthy(key: &str) -> bool {
             !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
         })
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod khive_root_tests {
+    use super::khive_root_from;
+    use std::path::PathBuf;
+
+    #[test]
+    fn home_wins_when_set() {
+        assert_eq!(
+            khive_root_from(Some("/base/home".into()), Some("/other".into())),
+            PathBuf::from("/base/home/.khive")
+        );
+    }
+
+    #[test]
+    fn userprofile_backfills_missing_home() {
+        assert_eq!(
+            khive_root_from(None, Some("/profile/home".into())),
+            PathBuf::from("/profile/home/.khive")
+        );
+    }
+
+    #[test]
+    fn blank_values_are_skipped() {
+        assert_eq!(
+            khive_root_from(Some("  ".into()), Some("/profile/home".into())),
+            PathBuf::from("/profile/home/.khive")
+        );
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn fallback_is_never_cwd_relative() {
+        // On non-unix the lock anchor must not depend on the caller's working
+        // directory even when no home variable is set — a relative path here
+        // would give the same database different lock files per cwd.
+        assert!(khive_root_from(None, None).is_absolute());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_fallback_stays_historical_not_shared_tmp() {
+        // On unix the no-HOME last resort deliberately stays "./.khive"
+        // rather than a shared world-writable anchor like /tmp, which a
+        // local attacker could pre-claim to intercept the daemon socket.
+        assert_eq!(khive_root_from(None, None), PathBuf::from("./.khive"));
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -1718,6 +2202,159 @@ mod tests {
         assert!(normal_resp.ok);
         assert!(normal_resp.metrics.is_none());
         assert_eq!(dispatch_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Group/other-writable socket directories are refused whether or not the
+    /// sticky bit is set, and — the part that matters — are left exactly as
+    /// they were found.
+    ///
+    /// The sticky `/tmp` shape (1777) is in the refusal set deliberately: the
+    /// sticky bit restricts unlinking, not creating, so a shared directory
+    /// lets another user pre-bind the predictable socket path before this
+    /// daemon starts; and a sticky directory's owner may unlink and rebind
+    /// regardless. Re-permissioning someone else's directory on the way past
+    /// is what the second assertion pins against: run as a user who *can*
+    /// chmod it, the old unconditional call succeeded and revoked access for
+    /// every other process using that directory.
+    #[test]
+    fn shared_writable_socket_dirs_are_refused_without_being_modified() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (name, mode) in [("open", 0o777u32), ("sticky-tmp", 0o1777u32)] {
+            let shared = dir.path().join(name);
+            std::fs::create_dir(&shared).expect("create");
+            std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(mode))
+                .expect("chmod");
+
+            let err = ensure_socket_dir_is_trusted(&shared)
+                .expect_err("group/other-writable must be refused, sticky or not");
+            assert!(
+                err.to_string().contains(&format!("{:04o}", mode & 0o7777)),
+                "the refusal should name the mode it saw, got: {err}"
+            );
+            let after = std::fs::metadata(&shared)
+                .expect("stat")
+                .permissions()
+                .mode()
+                & 0o7777;
+            assert_eq!(
+                after, mode,
+                "refusing must not re-permission a directory khive does not own"
+            );
+        }
+    }
+
+    /// A vetted final directory is still refused when an ANCESTOR would let
+    /// another local user rename it away and recreate it: a non-sticky
+    /// group/other-writable ancestor re-roots the whole socket path without
+    /// the final directory's own metadata ever changing. The sticky-ancestor
+    /// arm (a root-owned 1777 `/tmp` above a user-owned 0700 directory is
+    /// acceptable) is exercised implicitly by every accepting test below,
+    /// whose tempdirs live under the platform temp root.
+    #[test]
+    fn writable_non_sticky_ancestor_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let open_mid = dir.path().join("open-mid");
+        std::fs::create_dir(&open_mid).expect("create mid");
+        let inner = open_mid.join("private");
+        std::fs::create_dir(&inner).expect("create inner");
+        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        std::fs::set_permissions(&open_mid, std::fs::Permissions::from_mode(0o777))
+            .expect("chmod mid");
+
+        let err = ensure_socket_dir_is_trusted(&inner)
+            .expect_err("a 0777 non-sticky ancestor must be refused");
+        assert!(
+            err.to_string().contains("ancestor"),
+            "the refusal should say it was an ancestor that failed, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("open-mid"),
+            "the refusal should name the failing ancestor, got: {err}"
+        );
+    }
+
+    /// The path walk validates what a symlink component points AT, not just
+    /// the symlink node: a trusted (self-owned) link into a group/other-
+    /// writable non-sticky directory is refused on the target directory's
+    /// metadata, proving the walk keeps traversing — and keeps applying the
+    /// directory rules — past the link, exactly as the kernel will at bind
+    /// time.
+    #[test]
+    fn symlink_component_to_untrusted_directory_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let open = dir.path().join("open-target");
+        std::fs::create_dir(&open).expect("create target");
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).expect("chmod");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&open, &link).expect("symlink");
+
+        // SAFETY: `geteuid` is always successful and takes no arguments.
+        let euid = unsafe { libc::geteuid() } as u32;
+        let err = ensure_socket_path_is_swap_resistant(&link, euid)
+            .expect_err("a link into a 0777 non-sticky directory must be refused");
+        assert!(
+            err.to_string().contains("open-target"),
+            "the refusal should name the untrusted target directory, got: {err}"
+        );
+    }
+
+    /// A symlink component owned by neither the daemon euid nor root is
+    /// refused on the symlink itself: its owner can retarget it after
+    /// validation, so where it currently points is irrelevant. A non-root
+    /// test cannot create a foreign-owned symlink, so this injects a
+    /// mismatched euid instead — and the fixture must live under an
+    /// all-root-owned chain (the platform `/tmp`), because under the test's
+    /// own tempdir the self-owned ancestor directories would already fail
+    /// the injected euid before the walk ever reached the link.
+    #[test]
+    fn foreign_owned_symlink_component_is_refused() {
+        let link =
+            std::path::PathBuf::from(format!("/tmp/khive-swaptest-link-{}", std::process::id()));
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink("/tmp", &link).expect("symlink");
+
+        // SAFETY: `geteuid` is always successful and takes no arguments.
+        let not_my_euid = (unsafe { libc::geteuid() } as u32).wrapping_add(1);
+        let result = ensure_socket_path_is_swap_resistant(&link, not_my_euid);
+        std::fs::remove_file(&link).expect("cleanup");
+
+        let err = result.expect_err("a symlink owned by another uid must be refused");
+        assert!(
+            err.to_string().contains("symlink component"),
+            "the refusal should strike the symlink itself, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("khive-swaptest-link"),
+            "the refusal should name the offending link, got: {err}"
+        );
+    }
+
+    /// Directories this daemon can trust end to end are served as found:
+    /// owner-only, and the umask-default 0755 every `tempfile::tempdir` and
+    /// test runner produces (readable/traversable but writable only by the
+    /// owner). On macOS these fixtures also implicitly exercise the
+    /// symlink-accept arm, since the platform temp root itself resolves
+    /// through root-owned symlinks. Foreign ownership of a directory is
+    /// refused by the same helper, but a non-root test cannot chown a
+    /// directory away from itself, so that arm is exercised by the mode
+    /// checks' shared fail-closed path rather than a dedicated fixture.
+    #[test]
+    fn trusted_socket_dirs_are_accepted_unmodified() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (name, mode) in [("private", 0o700), ("listable", 0o755)] {
+            let d = dir.path().join(name);
+            std::fs::create_dir(&d).expect("create");
+            std::fs::set_permissions(&d, std::fs::Permissions::from_mode(mode)).expect("chmod");
+
+            ensure_socket_dir_is_trusted(&d)
+                .unwrap_or_else(|e| panic!("mode {mode:04o} must be accepted, got: {e}"));
+
+            let after = std::fs::metadata(&d).expect("stat").permissions().mode() & 0o7777;
+            assert_eq!(
+                after, mode,
+                "acceptance must not re-permission the directory either"
+            );
+        }
     }
 
     /// Test 2: `wal_pages` reflects a real
@@ -2294,6 +2931,74 @@ mod tests {
             "the surviving pid file must contain the winner's pid — both threads \
              share this process's pid, so an unexpected value would also prove a \
              lost/garbled write raced through"
+        );
+    }
+
+    // ── connection principal (ADR-096 condition 2) ────────────────────────────
+
+    /// The peer-credential syscall must actually work on this platform and
+    /// report the real uid, not error or return a placeholder.
+    ///
+    /// This matters more than it looks because the accept path fails CLOSED: if
+    /// `peer_uid` errored unconditionally — wrong syscall, wrong socket option,
+    /// an unimplemented platform arm — every connection would be refused and
+    /// the daemon would be silently unreachable. A test that only exercised the
+    /// decision function would not catch that.
+    #[tokio::test]
+    async fn peer_uid_reports_the_connecting_process_uid() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("peer.sock");
+        let listener = UnixListener::bind(&sock).expect("bind");
+
+        let connect_path = sock.clone();
+        let client = tokio::spawn(async move { UnixStream::connect(&connect_path).await });
+
+        let (server_side, _) = listener.accept().await.expect("accept");
+        let client_side = client.await.expect("join").expect("connect");
+
+        // SAFETY: `geteuid` is always successful and takes no arguments.
+        let expected = unsafe { libc::geteuid() } as u32;
+
+        assert_eq!(
+            peer_uid(&server_side).expect("peer_uid must succeed on a live connection"),
+            expected,
+            "the uid read from the kernel for a same-process connection must be \
+             this process's euid"
+        );
+        // Symmetric: both ends report the same peer on a same-uid connection.
+        assert_eq!(
+            peer_uid(&client_side).expect("peer_uid must succeed on the client end"),
+            expected
+        );
+    }
+
+    /// The refusal rule itself: the principal is the uid, and only a foreign
+    /// uid is refused.
+    ///
+    /// The second assertion is the load-bearing one and it is a regression
+    /// guard, not a formality. ADR-096 shipped many `actor_id`s over one
+    /// socket; every seat on a normal host is a distinct attribution at the
+    /// same uid. A check that conflated attribution with principal would refuse
+    /// them all, so "same uid is permitted" must stay true no matter how the
+    /// rule is later tightened.
+    #[test]
+    fn only_a_foreign_uid_is_refused() {
+        // SAFETY: `geteuid` is always successful and takes no arguments.
+        let euid = unsafe { libc::geteuid() } as u32;
+
+        assert!(
+            uid_is_permitted(euid, euid),
+            "a connection from the daemon's own uid must be served — this is \
+             every seat on the host, and ADR-096 accepted exactly this shape"
+        );
+        assert!(
+            !uid_is_permitted(euid.wrapping_add(1), euid),
+            "a connection from any other uid must be refused"
+        );
+        assert!(
+            !uid_is_permitted(0, euid.wrapping_add(1)),
+            "root is not special-cased: the rule is equality with the daemon's \
+             euid, not a privilege comparison"
         );
     }
 }

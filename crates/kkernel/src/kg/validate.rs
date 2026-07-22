@@ -15,6 +15,26 @@ use super::types::{
     OutputFormat, RuleResult, ValidateArgs, ValidationReport, ValidationSummary, Violation,
 };
 
+/// Read an edge record's source endpoint id, accepting either canonical
+/// serialization spelling: `source` (khive-vcs sync, kkernel archive, and
+/// the runtime portability export all write this) or `source_id` (accepted
+/// for forward compatibility with any other producer). See #1225 — every
+/// canonical NDJSON writer emits `source`/`target`, not `source_id`/
+/// `target_id`, and a validator that only recognized the latter silently
+/// skipped the endpoint checks on every record those writers produce.
+fn edge_source_id(v: &serde_json::Value) -> Option<&str> {
+    v.get("source")
+        .or_else(|| v.get("source_id"))
+        .and_then(|x| x.as_str())
+}
+
+/// Target-endpoint counterpart of [`edge_source_id`].
+fn edge_target_id(v: &serde_json::Value) -> Option<&str> {
+    v.get("target")
+        .or_else(|| v.get("target_id"))
+        .and_then(|x| x.as_str())
+}
+
 /// Taxonomy sets derived from the loaded pack registry; `pub(super)` so
 /// `kg::commit` (ADR-102) can reuse them. See
 /// `crates/kkernel/docs/kg-rules.md#build_taxonomy--strict-actor-mode-exemption`.
@@ -261,10 +281,16 @@ fn check_schema_compliance(
             let line_no = idx + 1;
             match serde_json::from_str::<serde_json::Value>(line) {
                 Ok(v) => {
-                    let missing: Vec<&str> = ["source_id", "target_id", "relation"]
-                        .into_iter()
-                        .filter(|f| v.get(f).and_then(|x| x.as_str()).is_none())
-                        .collect();
+                    let mut missing: Vec<&str> = Vec::new();
+                    if edge_source_id(&v).is_none() {
+                        missing.push("source (or source_id)");
+                    }
+                    if edge_target_id(&v).is_none() {
+                        missing.push("target (or target_id)");
+                    }
+                    if v.get("relation").and_then(|x| x.as_str()).is_none() {
+                        missing.push("relation");
+                    }
                     if !missing.is_empty() {
                         violations.push(schema_violation(
                             "edges.ndjson",
@@ -469,16 +495,8 @@ fn check_valid_edge_relations(edges_path: &Path) -> RuleResult {
                             .or_else(|| v.get("id").and_then(|i| i.as_str()))
                             .unwrap_or("")
                             .to_string();
-                        let src = v
-                            .get("source_id")
-                            .and_then(|i| i.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let tgt = v
-                            .get("target_id")
-                            .and_then(|i| i.as_str())
-                            .unwrap_or("")
-                            .to_string();
+                        let src = edge_source_id(&v).unwrap_or("").to_string();
+                        let tgt = edge_target_id(&v).unwrap_or("").to_string();
                         let id_display = if !edge_id.is_empty() {
                             edge_id.clone()
                         } else if !src.is_empty() && !tgt.is_empty() {
@@ -588,8 +606,8 @@ fn check_sort_order(entities_path: &Path, edges_path: &Path) -> RuleResult {
             .filter(|l| !l.trim().is_empty())
             .filter_map(|l| {
                 let v: serde_json::Value = serde_json::from_str(l).ok()?;
-                let s = v.get("source_id")?.as_str()?.to_string();
-                let t = v.get("target_id")?.as_str()?.to_string();
+                let s = edge_source_id(&v)?.to_string();
+                let t = edge_target_id(&v)?.to_string();
                 let r = v.get("relation")?.as_str()?.to_string();
                 Some((s, t, r))
             })
@@ -687,8 +705,11 @@ fn check_referential_integrity(
     if let Ok(content) = std::fs::read_to_string(edges_path) {
         for line in content.lines().filter(|l| !l.trim().is_empty()) {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                for field in &["source_id", "target_id"] {
-                    if let Some(id) = v.get(field).and_then(|i| i.as_str()) {
+                for (label, id) in [
+                    ("source", edge_source_id(&v)),
+                    ("target", edge_target_id(&v)),
+                ] {
+                    if let Some(id) = id {
                         if !known_ids.contains(id) {
                             violations.push(Violation {
                                 entity_id: Some(id.to_string()),
@@ -696,14 +717,7 @@ fn check_referential_integrity(
                                 entity_kind: None,
                                 rule_id: "referential-integrity".into(),
                                 severity: "error",
-                                message: format!(
-                                    "Edge {} references unknown record: {id}",
-                                    if *field == "source_id" {
-                                        "source"
-                                    } else {
-                                        "target"
-                                    }
-                                ),
+                                message: format!("Edge {label} references unknown record: {id}"),
                                 fixable: false,
                             });
                         }
@@ -1175,8 +1189,8 @@ fn evaluate_rule(rule: &RuleConfig, path: &Path) -> Vec<Violation> {
 
         if let Some((field, expected)) = condition {
             if field == "source_id" && expected == "target_id" {
-                let src = v.get("source_id").and_then(|s| s.as_str()).unwrap_or("");
-                let tgt = v.get("target_id").and_then(|s| s.as_str()).unwrap_or("");
+                let src = edge_source_id(&v).unwrap_or("");
+                let tgt = edge_target_id(&v).unwrap_or("");
                 if src == tgt {
                     violations.push(Violation {
                         entity_id: Some(src.to_owned()),
@@ -1381,10 +1395,10 @@ fn check_edge_endpoint_types(
             let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
                 continue;
             };
-            let Some(src_id) = v.get("source_id").and_then(|s| s.as_str()) else {
+            let Some(src_id) = edge_source_id(&v) else {
                 continue;
             };
-            let Some(tgt_id) = v.get("target_id").and_then(|s| s.as_str()) else {
+            let Some(tgt_id) = edge_target_id(&v) else {
                 continue;
             };
             let Some(rel_str) = v.get("relation").and_then(|r| r.as_str()) else {
@@ -1485,10 +1499,10 @@ fn check_edge_direction_conventions(
             let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
                 continue;
             };
-            let Some(src_id) = v.get("source_id").and_then(|s| s.as_str()) else {
+            let Some(src_id) = edge_source_id(&v) else {
                 continue;
             };
-            let Some(tgt_id) = v.get("target_id").and_then(|s| s.as_str()) else {
+            let Some(tgt_id) = edge_target_id(&v) else {
                 continue;
             };
             let Some(rel_str) = v.get("relation").and_then(|r| r.as_str()) else {
@@ -1570,8 +1584,11 @@ fn check_dangling_refs(
     if let Ok(content) = std::fs::read_to_string(edges_path) {
         for line in content.lines().filter(|l| !l.trim().is_empty()) {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                for field in &["source_id", "target_id"] {
-                    if let Some(id) = v.get(*field).and_then(|i| i.as_str()) {
+                for (field, id) in [
+                    ("source", edge_source_id(&v)),
+                    ("target", edge_target_id(&v)),
+                ] {
+                    if let Some(id) = id {
                         if !known_ids.contains(id) {
                             violations.push(Violation {
                                 entity_id: Some(id.to_string()),
@@ -1874,13 +1891,13 @@ fn fix_sort_order_edges(path: &Path) -> Result<()> {
     }
     lines.sort_by(|a, b| {
         let ak = (
-            a.get("source_id").and_then(|v| v.as_str()).unwrap_or(""),
-            a.get("target_id").and_then(|v| v.as_str()).unwrap_or(""),
+            edge_source_id(a).unwrap_or(""),
+            edge_target_id(a).unwrap_or(""),
             a.get("relation").and_then(|v| v.as_str()).unwrap_or(""),
         );
         let bk = (
-            b.get("source_id").and_then(|v| v.as_str()).unwrap_or(""),
-            b.get("target_id").and_then(|v| v.as_str()).unwrap_or(""),
+            edge_source_id(b).unwrap_or(""),
+            edge_target_id(b).unwrap_or(""),
             b.get("relation").and_then(|v| v.as_str()).unwrap_or(""),
         );
         ak.cmp(&bk)
@@ -2010,6 +2027,23 @@ mod tests {
             .iter()
             .map(|(src, tgt, rel)| {
                 format!(r#"{{"source_id":"{src}","target_id":"{tgt}","relation":"{rel}"}}"#)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(kg_dir.join("edges.ndjson"), content + "\n").unwrap();
+    }
+
+    /// #1225: the canonical wire spelling every real NDJSON writer emits
+    /// (`khive-vcs::sync::NdjsonEdge`, `kkernel::kg::archive::NdjsonEdge`, and
+    /// the runtime portability `ExportedEdge`) is `source`/`target`, not the
+    /// `source_id`/`target_id` [`write_edges`] uses. This helper writes the
+    /// spelling real producers actually emit, so round-trip tests exercise
+    /// what `kg validate` is actually validating in production.
+    fn write_edges_canonical(kg_dir: &std::path::Path, edges: &[(&str, &str, &str)]) {
+        let content: String = edges
+            .iter()
+            .map(|(src, tgt, rel)| {
+                format!(r#"{{"source":"{src}","target":"{tgt}","relation":"{rel}"}}"#)
             })
             .collect::<Vec<_>>()
             .join("\n");
@@ -2153,6 +2187,87 @@ mod tests {
         );
         assert!(!result.passed);
         assert_eq!(result.violations.len(), 1);
+    }
+
+    /// #1225: edges.ndjson written in the CANONICAL `source`/`target` spelling
+    /// (what `khive-vcs::sync`, `kkernel::kg::archive`, and the runtime
+    /// portability exporter all actually emit) must be evaluated by
+    /// referential-integrity, not silently skipped. Same fixture as
+    /// `referential_integrity_catches_missing_target` above, just in the
+    /// spelling real writers use.
+    #[test]
+    fn referential_integrity_catches_missing_target_in_canonical_spelling() {
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        write_entities(
+            &kg_dir,
+            &[("aaaaaaaa-0000-0000-0000-000000000001", "concept", "A")],
+        );
+        write_edges_canonical(
+            &kg_dir,
+            &[(
+                "aaaaaaaa-0000-0000-0000-000000000001",
+                "bbbbbbbb-0000-0000-0000-000000000002",
+                "extends",
+            )],
+        );
+        let result = check_referential_integrity(
+            &kg_dir.join("entities.ndjson"),
+            &kg_dir.join("notes.ndjson"),
+            &kg_dir.join("edges.ndjson"),
+        );
+        assert!(
+            !result.passed,
+            "a dangling target in canonical source/target spelling must not be silently skipped"
+        );
+        assert_eq!(result.violations.len(), 1);
+    }
+
+    /// #1225: a well-formed edge in canonical `source`/`target` spelling must
+    /// round-trip cleanly through referential-integrity AND schema-compliance
+    /// — the two checks that previously either flagged it as missing required
+    /// fields or silently excluded it from endpoint evaluation.
+    #[test]
+    fn canonical_spelling_edge_round_trips_clean() {
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        write_entities(
+            &kg_dir,
+            &[
+                ("aaaaaaaa-0000-0000-0000-000000000001", "concept", "A"),
+                ("bbbbbbbb-0000-0000-0000-000000000002", "concept", "B"),
+            ],
+        );
+        write_edges_canonical(
+            &kg_dir,
+            &[(
+                "aaaaaaaa-0000-0000-0000-000000000001",
+                "bbbbbbbb-0000-0000-0000-000000000002",
+                "extends",
+            )],
+        );
+        let ref_result = check_referential_integrity(
+            &kg_dir.join("entities.ndjson"),
+            &kg_dir.join("notes.ndjson"),
+            &kg_dir.join("edges.ndjson"),
+        );
+        assert!(
+            ref_result.passed,
+            "canonical-spelling edge with valid endpoints must pass; violations: {:?}",
+            ref_result.violations
+        );
+
+        let schema_result = check_schema_compliance(
+            &kg_dir.join("entities.ndjson"),
+            &kg_dir.join("edges.ndjson"),
+            &kg_dir.join("notes.ndjson"),
+        );
+        assert!(
+            schema_result.passed,
+            "canonical-spelling edge must not be reported as missing source_id/target_id; \
+             violations: {:?}",
+            schema_result.violations
+        );
     }
 
     #[test]
@@ -2586,39 +2701,22 @@ message = "bad"
     }
 
     #[test]
-    fn note_kind_task_is_accepted_as_pack_registered() {
-        // `task` is registered by the GTD pack — must be accepted by the registry check.
+    fn note_kind_template_note_is_accepted_as_pack_registered() {
+        // `template_note` is registered by khive-pack-template (a dev-only
+        // pack here, used to prove taxonomy building isn't hardcoded to the
+        // kg pack's own note kinds) — must be accepted by the registry check.
         let tmp = TempDir::new().unwrap();
         let kg_dir = make_kg_dir(&tmp);
-        write_notes(&kg_dir, &[("note-0001", "task")]);
+        write_notes(&kg_dir, &[("note-0001", "template_note")]);
         let taxonomy = real_taxonomy();
         assert!(
-            taxonomy.note_kinds.contains("task"),
-            "VerbRegistry must include 'task' from GTD pack"
+            taxonomy.note_kinds.contains("template_note"),
+            "VerbRegistry must include 'template_note' from khive-pack-template"
         );
         let result = check_valid_note_kinds(&kg_dir.join("notes.ndjson"), &taxonomy.note_kinds);
         assert!(
             result.passed,
-            "pack-registered note kind 'task' must pass; violations: {:?}",
-            result.violations
-        );
-    }
-
-    #[test]
-    fn note_kind_memory_is_accepted_as_pack_registered() {
-        // `memory` is registered by the memory pack — must be accepted by the registry check.
-        let tmp = TempDir::new().unwrap();
-        let kg_dir = make_kg_dir(&tmp);
-        write_notes(&kg_dir, &[("note-0001", "memory")]);
-        let taxonomy = real_taxonomy();
-        assert!(
-            taxonomy.note_kinds.contains("memory"),
-            "VerbRegistry must include 'memory' from memory pack"
-        );
-        let result = check_valid_note_kinds(&kg_dir.join("notes.ndjson"), &taxonomy.note_kinds);
-        assert!(
-            result.passed,
-            "pack-registered note kind 'memory' must pass; violations: {:?}",
+            "pack-registered note kind 'template_note' must pass; violations: {:?}",
             result.violations
         );
     }

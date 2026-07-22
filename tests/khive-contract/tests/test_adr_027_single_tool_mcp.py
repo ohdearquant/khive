@@ -13,10 +13,11 @@ from khive_contract.fixtures import KG_VERBS as _KG_VERBS
 
 VERBS_UNDER_TEST = {"create"}
 
-# KG verbs imported from fixtures.py — single source of truth (18 verbs).
+# KG verbs imported from fixtures.py — single source of truth (19 verbs).
 KG_VERBS = tuple(sorted(_KG_VERBS))
+# gtd/memory are commercially licensed extensions, not part of this OSS
+# distribution — their absence from the kg-only surface is asserted below.
 GTD_VERBS = ("gtd.assign", "gtd.next", "gtd.complete", "gtd.tasks", "gtd.transition")
-MEMORY_VERBS = ("memory.remember", "memory.recall")
 
 
 @pytest.mark.adr_027
@@ -78,47 +79,6 @@ def test_gtd_verbs_absent_from_kg_only_description(
     for verb in GTD_VERBS:
         assert verb not in description, (
             f"GTD verb '{verb}' should not appear in KG-only description; "
-            f"got:\n{description!r}"
-        )
-
-
-@pytest.mark.adr_027
-@pytest.mark.slow
-def test_gtd_session_description_includes_gtd_verbs(
-    khive_gtd_session: KhiveMcpSession,
-) -> None:
-    """KG+GTD session description includes GTD verb names.
-
-    ADR: ADR-027
-    section: Pack selection; Dynamic verb catalog
-
-    Ports pack smoke startup.
-    """
-    tools = khive_gtd_session.tools_list()
-    assert tools, "tools/list returned empty for GTD session"
-    description = tools[0].get("description") or ""
-    for verb in GTD_VERBS:
-        assert verb in description, (
-            f"GTD verb '{verb}' missing from GTD session description; got:\n{description!r}"
-        )
-
-
-@pytest.mark.adr_027
-@pytest.mark.slow
-def test_memory_session_description_includes_memory_verbs(
-    khive_memory_session: KhiveMcpSession,
-) -> None:
-    """KG+memory session description includes remember and recall.
-
-    ADR: ADR-027
-    section: Pack selection; Dynamic verb catalog
-    """
-    tools = khive_memory_session.tools_list()
-    assert tools, "tools/list returned empty for memory session"
-    description = tools[0].get("description") or ""
-    for verb in MEMORY_VERBS:
-        assert verb in description, (
-            f"Memory verb '{verb}' missing from memory session description; "
             f"got:\n{description!r}"
         )
 

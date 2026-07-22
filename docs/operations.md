@@ -35,7 +35,7 @@ explicitly and describes what the code does.
 | `engine migrate` / `drift-check`     | n/a                                    | **Not implemented**, always return an error (see §3)                                    |
 | `vector capabilities`                | no                                     | Print the sqlite-vec backend's static capability set                                    |
 | `vector sweep`                       | n/a                                    | **Not implemented**, always returns an error (see §3)                                   |
-| `reindex`                            | yes (vectors + FTS)                    | Re-embed entities/notes/knowledge, fanning out across configured engines                |
+| `reindex`                            | yes (vectors + FTS)                    | Re-embed entities/notes, fanning out across configured engines                          |
 | `exec`                               | depends on the ops given               | Run a verb DSL expression, or drain due `scheduled_event` notes with `--pending-events` |
 | `mcp`                                | yes (serves writes)                    | Serve the MCP `request` surface (stdio/daemon/transport)                                |
 | `backend list` / `info`              | yes (see caveat below)                 | Enumerate configured backends                                                           |
@@ -311,9 +311,9 @@ kkernel kg commit <changeset.ndjson> --rules <rules.toml> --repo <path> -m "<mes
 ```
 
 Restores the `kg commit` verb ADR-020 §5 specified (`export + validate + git add + git commit`)
-but never shipped, scoped per [ADR-102](adr/ADR-102-tiered-validate-and-merge.md)'s "Amendment to
+but never shipped, scoped per ADR-102's "Amendment to
 ADR-020" to the tier-2 flow that ADR defines: landing an already-staged, already-reviewed
-[ADR-101](adr/ADR-101-kg-changeset-model.md) NDJSON-delta change-set into ADR-102's own
+ADR-101 NDJSON-delta change-set into ADR-102's own
 **local-only** staged-change-set/snapshot repository (D6) — this is a _different_ repository from
 the project-repository-embedded `.khive/kg/` layout every other `kg` verb above operates on.
 `--repo` here is that separate repository's root, not a project checkout.
@@ -409,60 +409,24 @@ removes any existing hook file/symlink, then on Unix **symlinks**
 instead; there is no symlink fallback there). `status` reports `{symlink_exists,
 symlink_target, target_valid}` as JSON.
 
-### `knowledge.import(...)` for corpus ingest
-
-For ingesting a knowledge corpus (atoms/sections), use `kkernel exec` with the `knowledge.import`
-verb; `exec` has no special-casing for any verb name; it forwards the DSL string to whichever
-pack owns it, exactly like the MCP `request` tool:
-
-```bash
-kkernel exec 'knowledge.import(path="/path/to/corpus.jsonl", format="ndjson")' --db ~/.khive/khive.db
-```
-
-See §3 below for `exec`'s general resolution rules, and the `knowledge` pack's own docs for
-`import`'s argument shape; that handler lives outside `kkernel` (in the pack crate), not in this
-binary.
-
 ---
 
 ## 3. Reindex
 
-`kkernel reindex` rebuilds embedding vectors and FTS documents for entities, notes, and (unless
-excluded) the knowledge corpus, fanning out across every embedding engine registered in the
-resolved config, the same resolution `kkernel mcp` uses (§1). Full flag reference
-(`reindex.rs:134-194`):
+`kkernel reindex` rebuilds embedding vectors and FTS documents for entities and notes, fanning
+out across every embedding engine registered in the resolved config, the same resolution
+`kkernel mcp` uses (§1). Full flag reference (`reindex.rs:133-177`):
 
-| Flag                              | Default                                     | Effect                                                                                  |
-| --------------------------------- | ------------------------------------------- | --------------------------------------------------------------------------------------- |
-| `--db` / `KHIVE_DB`               | `~/.khive/khive.db`                         | Target database (`:memory:` sentinel supported)                                         |
-| `--config` / `KHIVE_CONFIG`       | home-fallback search                        | TOML config path                                                                        |
-| `--namespace` / `KHIVE_NAMESPACE` | `"local"` (or `[actor] id` if not explicit) | Namespace to reindex                                                                    |
-| `--model <name>`                  | unset → every registered model              | Restrict the graph (entity/note) pass to one embedding model                            |
-| `--batch-size <n>`                | `128`                                       | Clamped at runtime to `[1, 500]`, **silently**, no warning printed on clamp             |
-| `--keep-existing`                 | off                                         | See below                                                                               |
-| `--knowledge-only`                | off                                         | Skip the entity/note graph pass entirely; run only the knowledge corpus pass            |
-| `--no-knowledge`                  | off                                         | Skip the knowledge corpus pass (atoms + sections) entirely                              |
-| `--sections-only`                 | off                                         | Narrowest scope: skip the graph pass AND atom re-embedding, only knowledge sections run |
-| `--no-sections`                   | off                                         | Skip knowledge sections, still re-embed atoms                                           |
-| `--best-effort`                   | off                                         | See below                                                                               |
-| `--human`                         | off                                         | Human-readable summary instead of JSON                                                  |
-
-`--knowledge-only`/`--no-knowledge`, `--sections-only`/`--no-knowledge`, and
-`--no-sections`/`--sections-only` are declared as clap `conflicts_with` pairs, so invalid
-combinations are rejected at parse time, before any of the scope logic below runs
-(`reindex.rs:169-188`).
-
-**Actual scope derivation** (`reindex.rs:478-481`):
-
-```rust
-let do_graph     = !args.knowledge_only && !args.sections_only;
-let do_knowledge = !args.no_knowledge;
-let do_atoms     = do_knowledge && !args.sections_only;
-let do_sections  = do_knowledge && !args.no_sections;
-```
-
-So `--sections-only` forces `do_atoms = false` regardless of `--no-sections`'s state; it is the
-narrowest possible scope, not just "skip the graph pass."
+| Flag                              | Default                                     | Effect                                                                      |
+| --------------------------------- | ------------------------------------------- | --------------------------------------------------------------------------- |
+| `--db` / `KHIVE_DB`               | `~/.khive/khive.db`                         | Target database (`:memory:` sentinel supported)                             |
+| `--config` / `KHIVE_CONFIG`       | home-fallback search                        | TOML config path                                                            |
+| `--namespace` / `KHIVE_NAMESPACE` | `"local"` (or `[actor] id` if not explicit) | Namespace to reindex                                                        |
+| `--model <name>`                  | unset → every registered model              | Restrict the graph (entity/note) pass to one embedding model                |
+| `--batch-size <n>`                | `128`                                       | Clamped at runtime to `[1, 500]`, **silently**, no warning printed on clamp |
+| `--keep-existing`                 | off                                         | See below                                                                   |
+| `--best-effort`                   | off                                         | See below                                                                   |
+| `--human`                         | off                                         | Human-readable summary instead of JSON                                      |
 
 **`--keep-existing`**: without it (default), every existing vector row for the staged
 `subject_id`s in a model's table is deleted up front (`drop_vectors_for_subjects`,
@@ -477,23 +441,22 @@ falls back to the conservative "assume nothing is embedded, re-embed everything"
 and counts it as a failure (`reindex.rs:327-340`); it does not silently re-embed.
 
 **`--best-effort` vs. the fail-closed default**: `ReindexReport::has_failures()`
-(`reindex.rs:228-236`) is a single predicate covering seven categories: vector embed/insert
-errors, entity FTS failures, note FTS failures, knowledge atom failures, a knowledge pass that
-didn't complete, Vamana ANN build/persist failure, and knowledge section failures. Without
-`--best-effort`, any of these causes `run_reindex` to `bail!`: "reindex completed with failures;
-recall/search state may be stale. Re-run, or pass `--best-effort` to accept a partial rebuild."
-With `--best-effort`, the same conditions only print a stderr warning and the process still exits
-0 (`reindex.rs:741-758`). **All seven categories are treated uniformly**; there is no failure
-class that's exempt from `--best-effort` on one side or immune to it on the other. What
-`--best-effort` cannot paper over are structural/setup failures that occur _before_ a report even
-exists: a bad `--namespace` value, a config resolution failure, a failed runtime open, a failed
-`authorize`, or a failed page-list call abort the whole run via `?` regardless of the flag.
+(`reindex.rs:203-208`) is a single predicate covering four categories: vector embed/insert
+errors, entity FTS failures, note FTS failures, and a memory-ANN epoch bump that failed after
+entity/note mutations were already committed (#812). Without `--best-effort`, any of these
+causes `run_reindex` to `bail!`: "reindex completed with failures; recall/search state may be
+stale. Re-run, or pass `--best-effort` to accept a partial rebuild." With `--best-effort`, the
+same conditions only print a stderr warning and the process still exits 0. **All four
+categories are treated uniformly**; there is no failure class that's exempt from
+`--best-effort` on one side or immune to it on the other. What `--best-effort` cannot paper
+over are structural/setup failures that occur _before_ a report even exists: a bad
+`--namespace` value, a config resolution failure, a failed runtime open, a failed `authorize`,
+or a failed page-list call abort the whole run via `?` regardless of the flag.
 
 **Engine fan-out**: omitting `--model` reindexes against `rt.registered_embedding_model_names()`,
 whatever engines the resolved runtime config actually registers, not a hardcoded list. If that
 list is empty (no embedder configured at all), a warning prints but FTS backfill for entities and
-notes still runs. The knowledge-corpus pass is **not** fanned out across this model list at all:
-it always uses the config's default embedder, independent of `--model`.
+notes still runs.
 
 **When to reindex** (genuine in-code rationale, not doc-comment fluff): after relabeling a
 namespace (vector rows would otherwise be stranded under the wrong namespace on next write,

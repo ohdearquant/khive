@@ -364,10 +364,13 @@ impl SqliteSparseStore {
 
         // Flag-off (default) path: byte-for-byte unchanged from pre-ADR-067
         // behavior — the closure owns its own BEGIN IMMEDIATE/COMMIT.
+        let origin = self.pool.origin();
         self.with_writer("sparse_insert_batch", move |conn| {
             conn.execute_batch("BEGIN IMMEDIATE")?;
-            let _tx_handle =
-                khive_storage::tx_registry::register(Some("sparse_insert_batch".to_string()));
+            let _tx_handle = khive_storage::tx_registry::register_scoped(
+                Some("sparse_insert_batch".to_string()),
+                origin,
+            );
 
             let summary = batch_insert_sparse_dml(conn, &table, &records, attempted)?;
 

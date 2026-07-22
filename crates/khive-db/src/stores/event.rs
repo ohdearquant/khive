@@ -418,11 +418,10 @@ pub fn event_insert_statements(event: &Event) -> Result<Vec<SqlStatement>, rusql
 /// vs. a `Box<dyn SqlWriter>` — so they cannot share one function body. Both
 /// build on [`event_insert_statements`] for the actual insert shape.
 /// Callers that need the event append to be part of a larger atomic unit —
-/// e.g. ADR-081's brain fold gate (`khive-pack-brain/src/fold_gate.rs`),
-/// which holds its own `BEGIN IMMEDIATE` transaction on a `SqlWriter` for
-/// the dedup claim + mass fold and needs the feedback event to land in that
-/// same transaction — call this instead of duplicating the insert shape
-/// into their own crate.
+/// e.g. a fold gate that holds its own `BEGIN IMMEDIATE` transaction on a
+/// `SqlWriter` for a dedup claim + mass fold and needs the feedback event to
+/// land in that same transaction — call this instead of duplicating the
+/// insert shape into their own crate.
 pub async fn append_event_on_writer(
     writer: &mut dyn SqlWriter,
     event: &Event,
@@ -914,20 +913,33 @@ impl EventStore for SqlEventStore {
         // through the pool-wide WriterTask. DML-only closure — no BEGIN
         // IMMEDIATE/COMMIT/ROLLBACK here, since the WriterTask's run loop
         // owns the transaction.
+        //
+        // `event_rows` is counted here at the store seam (on success, both
+        // paths) so every request-owned append — proposal lifecycle,
+        // curation, mutation events — is covered without per-call-site
+        // instrumentation. The enclosing per-dispatch audit row is appended
+        // only after the usage snapshot is frozen, so it never counts itself.
         if let Some(writer_task) = &self.writer_task {
             return writer_task
                 .send(move |conn| {
                     insert_event_with_observations(conn, &event)
                         .map_err(|e| map_err(e, "append_event"))
                 })
-                .await;
+                .await
+                .inspect(|()| {
+                    khive_storage::usage::count(khive_storage::usage::UsageUnit::EventRows, 1);
+                });
         }
 
         // Flag-off (default) path: byte-for-byte unchanged from pre-ADR-067
         // behavior — the closure owns its own BEGIN IMMEDIATE/COMMIT/ROLLBACK.
+        let origin = self.pool.origin();
         self.with_writer("append_event", move |conn| {
             conn.execute_batch("BEGIN IMMEDIATE")?;
-            let _tx_handle = khive_storage::tx_registry::register(Some("event_append".to_string()));
+            let _tx_handle = khive_storage::tx_registry::register_scoped(
+                Some("event_append".to_string()),
+                origin,
+            );
             if let Err(e) = insert_event_with_observations(conn, &event) {
                 let _ = conn.execute_batch("ROLLBACK");
                 return Err(e);
@@ -936,6 +948,9 @@ impl EventStore for SqlEventStore {
             Ok(())
         })
         .await
+        .inspect(|()| {
+            khive_storage::usage::count(khive_storage::usage::UsageUnit::EventRows, 1);
+        })
     }
 
     async fn append_events(&self, events: Vec<Event>) -> Result<BatchWriteSummary, StorageError> {
@@ -952,15 +967,24 @@ impl EventStore for SqlEventStore {
                     batch_append_events_dml(conn, &events, attempted)
                         .map_err(|e| map_err(e, "append_events"))
                 })
-                .await;
+                .await
+                .inspect(|summary| {
+                    khive_storage::usage::count(
+                        khive_storage::usage::UsageUnit::EventRows,
+                        summary.affected,
+                    );
+                });
         }
 
         // Flag-off (default) path: byte-for-byte unchanged from pre-ADR-067
         // behavior — the closure owns its own BEGIN IMMEDIATE/COMMIT/ROLLBACK.
+        let origin = self.pool.origin();
         self.with_writer("append_events", move |conn| {
             conn.execute_batch("BEGIN IMMEDIATE")?;
-            let _tx_handle =
-                khive_storage::tx_registry::register(Some("event_append_batch".to_string()));
+            let _tx_handle = khive_storage::tx_registry::register_scoped(
+                Some("event_append_batch".to_string()),
+                origin,
+            );
 
             let summary = match batch_append_events_dml(conn, &events, attempted) {
                 Ok(summary) => summary,
@@ -974,6 +998,12 @@ impl EventStore for SqlEventStore {
             Ok(summary)
         })
         .await
+        .inspect(|summary| {
+            khive_storage::usage::count(
+                khive_storage::usage::UsageUnit::EventRows,
+                summary.affected,
+            );
+        })
     }
 
     async fn get_event(&self, id: Uuid) -> Result<Option<Event>, StorageError> {

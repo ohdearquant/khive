@@ -12,25 +12,25 @@ defines the contracts that backends must satisfy.
 
 ## ADR Compliance
 
-### [ADR-004: Substrate Observables](../../../docs/adr/ADR-004-substrate-observables.md)
+### ADR-004: Substrate Observables
 
 `EventStore` is an append-only operation log. Every verb execution produces one
 `Event` record. Events are immutable once appended; projection rows are written
 beside the event at append time. The `EventFilter` struct supports querying by
 verb, substrate, actor, session, aggregate, and observed/selected referents.
 
-### [ADR-005: Storage Capability Traits](../../../docs/adr/ADR-005-storage-capability-traits.md)
+### ADR-005: Storage Capability Traits
 
 The `StorageCapability` enum in `capability.rs` identifies which surface produced
 an error (`Sql`, `Notes`, `Entities`, `Graph`, `Events`, `Vectors`, `Sparse`,
 `Text`). Each trait file defines one capability surface as a separate module.
 
-### [ADR-009: Backend Architecture](../../../docs/adr/ADR-009-backend-architecture.md)
+### ADR-009: Backend Architecture
 
 `khive-storage` depends on neither `rusqlite` nor `khive-db`, preserving the
 trait-only boundary. Backends implement these traits in their own crates.
 
-### [ADR-031: Multi-Engine Retrieval — Embedder Trait, Registry, Configuration, and Pack Orchestration](../../../docs/adr/ADR-031-multi-engine-retrieval.md)
+### ADR-031: Multi-Engine Retrieval — Embedder Trait, Registry, Configuration, and Pack Orchestration
 
 `SparseStore` defines the sparse vector capability surface over the
 `SparseVector` type (parallel `indices`/`values` arrays). `TextSearch` defines
@@ -40,7 +40,7 @@ Non-default gather options return `StorageError::Unsupported` on backends that d
 not override the method. Term-level document-frequency statistics are exposed via
 `term_stats`, also optional (`Unsupported` by default).
 
-### [ADR-041: Event Provenance Projection — Hybrid Log + Graph Edges](../../../docs/adr/ADR-041-event-provenance-projection.md) / [ADR-044: Vector Store Extensions — Capabilities, Metadata Filter, Batched Search, Update, Orphan Sweep](../../../docs/adr/ADR-044-vector-store-extensions.md)
+### ADR-041: Event Provenance Projection — Hybrid Log + Graph Edges / ADR-044: Vector Store Extensions — Capabilities, Metadata Filter, Batched Search, Update, Orphan Sweep
 
 `VectorStoreCapabilities` is returned by `VectorStore::capabilities()` and
 introspected by the retrieval layer at construction time to select code paths
