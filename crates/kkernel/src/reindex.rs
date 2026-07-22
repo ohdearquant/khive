@@ -5,9 +5,10 @@
 //! FTS index. It is NOT a pack verb — it operates on the raw runtime stores
 //! regardless of which packs are loaded.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -16,11 +17,15 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use khive_mcp::serve::{resolve_runtime_config, RuntimeConfigInputs};
-use khive_runtime::{entity_fts_document, note_fts_document, KhiveRuntime, Namespace};
+use khive_runtime::{
+    entity_embedding_text, entity_fts_document, note_embedding_text, note_fts_document,
+    KhiveRuntime, Namespace,
+};
 use khive_storage::entity::Entity;
 use khive_storage::error::StorageError;
 use khive_storage::note::Note;
-use khive_storage::VectorStore;
+use khive_storage::types::{TextDocument, VectorRecord};
+use khive_storage::{TextSearch, VectorStore};
 use khive_types::SubstrateKind;
 
 const MAX_EMBED_BYTES: usize = 32_768;
@@ -313,17 +318,50 @@ async fn embed_and_store_batch(
             .collect();
         match rt.embed_document_batch_with_model(model_name, &texts).await {
             Ok(embeddings) if embeddings.len() == subset.len() => {
-                // No pre-delete: SqliteVecStore::insert wraps DELETE+INSERT in
-                // a single transaction so a failed INSERT rolls back the DELETE
-                // and the prior vector survives (no-worse-than-stale). A separate
-                // committed delete before insert re-introduces the stranding window.
-                for ((id, _), emb) in subset.iter().zip(embeddings.iter()) {
-                    if let Err(e) = vectors
-                        .insert(*id, kind, namespace, field, vec![emb.clone()])
-                        .await
+                let expected = subset.len() as u64;
+                let now = chrono::Utc::now();
+                let records = subset
+                    .iter()
+                    .zip(embeddings)
+                    .map(|((id, _), embedding)| VectorRecord {
+                        subject_id: *id,
+                        kind,
+                        namespace: namespace.to_string(),
+                        field: field.to_string(),
+                        embedding_model: Some(model_name.clone()),
+                        vectors: vec![embedding],
+                        updated_at: now,
+                    })
+                    .collect();
+                match vectors.insert_batch(records).await {
+                    Ok(summary)
+                        if summary.attempted == expected
+                            && summary.affected.saturating_add(summary.failed) == expected =>
                     {
-                        tracing::warn!(id = %id, model = %model_name, error = %e, "vector insert failed");
-                        errors += 1;
+                        if summary.failed > 0 {
+                            tracing::warn!(
+                                model = %model_name,
+                                failed = summary.failed,
+                                first_error = %summary.first_error,
+                                "vector batch insert partially failed"
+                            );
+                            errors += summary.failed;
+                        }
+                    }
+                    Ok(summary) => {
+                        tracing::warn!(
+                            model = %model_name,
+                            expected,
+                            attempted = summary.attempted,
+                            affected = summary.affected,
+                            failed = summary.failed,
+                            "vector batch insert returned inconsistent accounting"
+                        );
+                        errors += expected;
+                    }
+                    Err(e) => {
+                        tracing::warn!(model = %model_name, error = %e, "vector batch insert failed");
+                        errors += expected;
                     }
                 }
             }
@@ -340,6 +378,86 @@ async fn embed_and_store_batch(
     errors
 }
 
+trait FtsBackfillRecord {
+    const SUBSTRATE: &'static str;
+
+    fn subject_id(&self) -> Uuid;
+    fn document(&self) -> TextDocument;
+    fn text_search(
+        rt: &KhiveRuntime,
+        token: &khive_runtime::NamespaceToken,
+    ) -> khive_runtime::RuntimeResult<Arc<dyn TextSearch>>;
+}
+
+impl FtsBackfillRecord for Note {
+    const SUBSTRATE: &'static str = "note";
+
+    fn subject_id(&self) -> Uuid {
+        self.id
+    }
+
+    fn document(&self) -> TextDocument {
+        note_fts_document(self)
+    }
+
+    fn text_search(
+        rt: &KhiveRuntime,
+        token: &khive_runtime::NamespaceToken,
+    ) -> khive_runtime::RuntimeResult<Arc<dyn TextSearch>> {
+        rt.text_for_notes(token)
+    }
+}
+
+impl FtsBackfillRecord for Entity {
+    const SUBSTRATE: &'static str = "entity";
+
+    fn subject_id(&self) -> Uuid {
+        self.id
+    }
+
+    fn document(&self) -> TextDocument {
+        entity_fts_document(self)
+    }
+
+    fn text_search(
+        rt: &KhiveRuntime,
+        token: &khive_runtime::NamespaceToken,
+    ) -> khive_runtime::RuntimeResult<Arc<dyn TextSearch>> {
+        rt.text(token)
+    }
+}
+
+async fn fts_backfill_batch<T: FtsBackfillRecord>(
+    rt: &KhiveRuntime,
+    token: &khive_runtime::NamespaceToken,
+    batch: &[T],
+) -> u64 {
+    let fts = match T::text_search(rt, token) {
+        Ok(fts) => fts,
+        Err(e) => {
+            tracing::error!(
+                substrate = T::SUBSTRATE,
+                error = %e,
+                "FTS store unavailable; counting whole batch as failed"
+            );
+            return batch.len() as u64;
+        }
+    };
+    let mut errors = 0;
+    for record in batch {
+        if let Err(e) = fts.upsert_document(record.document()).await {
+            tracing::warn!(
+                substrate = T::SUBSTRATE,
+                id = %record.subject_id(),
+                error = %e,
+                "FTS upsert failed"
+            );
+            errors += 1;
+        }
+    }
+    errors
+}
+
 /// Upsert FTS documents for a batch of notes into the namespace text index. Returns the
 /// number of per-note upsert failures. Idempotent: calling again for an already-indexed
 /// note replaces the existing row (FTS upsert semantics). Fails per-note, never panics.
@@ -348,22 +466,7 @@ async fn fts_backfill_notes_batch(
     token: &khive_runtime::NamespaceToken,
     batch: &[Note],
 ) -> u64 {
-    let fts = match rt.text_for_notes(token) {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::error!(error = %e, "FTS store unavailable; counting whole batch as failed");
-            return batch.len() as u64;
-        }
-    };
-    let mut errors: u64 = 0;
-    for note in batch {
-        let doc = note_fts_document(note);
-        if let Err(e) = fts.upsert_document(doc).await {
-            tracing::warn!(id = %note.id, error = %e, "FTS upsert failed for note");
-            errors += 1;
-        }
-    }
-    errors
+    fts_backfill_batch(rt, token, batch).await
 }
 
 /// Upsert FTS documents for a batch of entities into the namespace text index. Returns the
@@ -374,22 +477,7 @@ async fn fts_backfill_entities_batch(
     token: &khive_runtime::NamespaceToken,
     batch: &[Entity],
 ) -> u64 {
-    let fts = match rt.text(token) {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::error!(error = %e, "FTS store unavailable; counting whole batch as failed");
-            return batch.len() as u64;
-        }
-    };
-    let mut errors: u64 = 0;
-    for entity in batch {
-        let doc = entity_fts_document(entity);
-        if let Err(e) = fts.upsert_document(doc).await {
-            tracing::warn!(id = %entity.id, error = %e, "FTS upsert failed for entity");
-            errors += 1;
-        }
-    }
-    errors
+    fts_backfill_batch(rt, token, batch).await
 }
 
 /// Return the subset of `ids` that do NOT already have an embedding in `vectors`
@@ -422,28 +510,31 @@ fn vector_table_name(model_key: &str) -> Result<String> {
     Ok(format!("vec_{model_key}"))
 }
 
+struct RepairModelTarget {
+    model_name: String,
+    embedding_model: String,
+    vector_table: String,
+}
+
 async fn missing_embedding_batch(
     rt: &KhiveRuntime,
+    token: &khive_runtime::NamespaceToken,
     namespace: &str,
-    vector_table: &str,
-    embedding_model: &str,
+    target: &RepairModelTarget,
     kind: SubstrateKind,
     after: &str,
     limit: u32,
 ) -> Result<Vec<(Uuid, String)>> {
     use khive_storage::types::{SqlStatement, SqlValue};
 
-    let (select, table, text_predicate) = match kind {
-        SubstrateKind::Entity => (
-            "base.id, base.name, base.description",
-            "entities",
-            "TRIM(base.name) <> ''",
-        ),
-        SubstrateKind::Note => ("base.id, base.content", "notes", "TRIM(base.content) <> ''"),
+    let (table, text_predicate) = match kind {
+        SubstrateKind::Entity => ("entities", "TRIM(base.name) <> ''"),
+        SubstrateKind::Note => ("notes", "TRIM(base.content) <> ''"),
         _ => anyhow::bail!("embeds-only reindex does not support {kind}"),
     };
+    let vector_table = &target.vector_table;
     let sql = format!(
-        "SELECT {select} FROM {table} AS base \
+        "SELECT base.id FROM {table} AS base \
          WHERE base.namespace = ?1 AND base.deleted_at IS NULL AND base.id > ?2 \
          AND {text_predicate} \
          AND NOT EXISTS (SELECT 1 FROM {vector_table} AS vectors \
@@ -463,7 +554,7 @@ async fn missing_embedding_batch(
                 params: vec![
                     SqlValue::Text(namespace.to_string()),
                     SqlValue::Text(after.to_string()),
-                    SqlValue::Text(embedding_model.to_string()),
+                    SqlValue::Text(target.embedding_model.clone()),
                     SqlValue::Integer(i64::from(limit)),
                 ],
                 label: Some("reindex_missing_embeddings".into()),
@@ -472,38 +563,43 @@ async fn missing_embedding_batch(
             .context("select rows missing embeddings")?
     };
 
-    rows.into_iter()
-        .map(|row| {
-            let text = |name: &str| match row.get(name) {
-                Some(SqlValue::Text(value)) => Ok(value.clone()),
-                Some(SqlValue::Null) => Ok(String::new()),
-                _ => anyhow::bail!("missing or invalid {name} in embeds-only row"),
-            };
-            let id = text("id")?
+    let ids: Vec<Uuid> = rows
+        .into_iter()
+        .map(|row| match row.get("id") {
+            Some(SqlValue::Text(value)) => value
                 .parse::<Uuid>()
-                .context("invalid subject id in embeds-only row")?;
-            let content = match kind {
-                SubstrateKind::Entity => {
-                    let name = text("name")?;
-                    let description = text("description")?;
-                    if description.is_empty() {
-                        name
-                    } else {
-                        format!("{name} {description}")
-                    }
-                }
-                SubstrateKind::Note => text("content")?,
-                _ => unreachable!("kind checked above"),
-            };
-            Ok((id, content))
+                .context("invalid subject id in embeds-only row"),
+            _ => anyhow::bail!("missing or invalid id in embeds-only row"),
+        })
+        .collect::<Result<_>>()?;
+
+    let mut texts = match kind {
+        SubstrateKind::Entity => rt
+            .get_entities_by_ids(token, &ids)
+            .await
+            .context("hydrate entities missing embeddings")?
+            .into_iter()
+            .map(|entity| (entity.id, entity_embedding_text(&entity)))
+            .collect::<HashMap<_, _>>(),
+        SubstrateKind::Note => rt
+            .notes(token)
+            .context("open note store for embeds-only reindex")?
+            .get_notes_batch(&ids)
+            .await
+            .context("hydrate notes missing embeddings")?
+            .into_iter()
+            .map(|note| (note.id, note_embedding_text(&note)))
+            .collect::<HashMap<_, _>>(),
+        _ => unreachable!("kind checked above"),
+    };
+    ids.into_iter()
+        .map(|id| {
+            texts
+                .remove(&id)
+                .map(|text| (id, text))
+                .with_context(|| format!("selected {kind} {id} disappeared before hydration"))
         })
         .collect()
-}
-
-struct RepairModelTarget {
-    model_name: String,
-    embedding_model: String,
-    vector_table: String,
 }
 
 async fn prepare_repair_models(
@@ -572,13 +668,7 @@ async fn repair_missing_embeddings(
             let mut after = String::new();
             loop {
                 let batch = missing_embedding_batch(
-                    rt,
-                    namespace,
-                    &target.vector_table,
-                    &target.embedding_model,
-                    kind,
-                    &after,
-                    batch_size,
+                    rt, token, namespace, &target, kind, &after, batch_size,
                 )
                 .await?;
                 let Some((last_id, _)) = batch.last() else {
@@ -716,10 +806,7 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
 
             let mut staged: Vec<(Uuid, String)> = Vec::with_capacity(n);
             for entity in &batch {
-                let text = match &entity.description {
-                    Some(d) if !d.is_empty() => format!("{} {}", entity.name, d),
-                    _ => entity.name.clone(),
-                };
+                let text = entity_embedding_text(entity);
                 if !text.trim().is_empty() {
                     staged.push((entity.id, text));
                 }
@@ -772,7 +859,7 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
 
             let mut staged: Vec<(Uuid, String)> = Vec::with_capacity(n);
             for note in &batch {
-                let text = note.content.clone();
+                let text = note_embedding_text(note);
                 if !text.trim().is_empty() {
                     staged.push((note.id, text));
                 }
@@ -1192,6 +1279,14 @@ mod tests {
     const REPAIR_TABLE: &str = "vec_repair_test_model";
     const REPAIR_DIMS: usize = 4;
 
+    fn repair_target(model_name: &str, vector_table: &str) -> RepairModelTarget {
+        RepairModelTarget {
+            model_name: model_name.to_string(),
+            embedding_model: model_name.to_string(),
+            vector_table: vector_table.to_string(),
+        }
+    }
+
     struct RepairEmbeddingService;
 
     #[async_trait::async_trait]
@@ -1543,12 +1638,70 @@ mod tests {
             .await
             .expect("seed vector");
 
+        let target = repair_target(MODEL, TABLE);
         let selected =
-            missing_embedding_batch(&rt, "local", TABLE, MODEL, SubstrateKind::Note, "", 100)
+            missing_embedding_batch(&rt, &token, "local", &target, SubstrateKind::Note, "", 100)
                 .await
                 .expect("select missing notes");
 
         assert_eq!(selected, vec![(missing.id, missing.content)]);
+    }
+
+    #[tokio::test]
+    async fn embeds_only_selection_uses_canonical_entity_and_note_embedding_text() {
+        use khive_runtime::RuntimeConfig;
+        use lattice_embed::EmbeddingModel;
+
+        const MODEL: &str = "paraphrase-multilingual-minilm-l12-v2";
+        const TABLE: &str = "vec_paraphrase_multilingual_minilm_l12_v2";
+
+        let rt = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            embedding_model: None,
+            additional_embedding_models: vec![EmbeddingModel::ParaphraseMultilingualMiniLmL12V2],
+            ..RuntimeConfig::default()
+        })
+        .expect("runtime");
+        let token = rt
+            .authorize(Namespace::parse("local").expect("namespace"))
+            .expect("authorize");
+
+        let entity = Entity::new("local", "concept", "repair entity")
+            .with_description("canonical description");
+        let mut note = Note::new("local", "observation", "canonical note content");
+        note.name = Some("FTS-only title".to_string());
+        rt.entities(&token)
+            .expect("entities")
+            .upsert_entity(entity.clone())
+            .await
+            .expect("seed entity");
+        rt.notes(&token)
+            .expect("notes")
+            .upsert_note(note.clone())
+            .await
+            .expect("seed note");
+        rt.vectors_for_model(&token, MODEL)
+            .expect("initialize vector table");
+
+        let target = repair_target(MODEL, TABLE);
+        let entities = missing_embedding_batch(
+            &rt,
+            &token,
+            "local",
+            &target,
+            SubstrateKind::Entity,
+            "",
+            100,
+        )
+        .await
+        .expect("select missing entity");
+        let notes =
+            missing_embedding_batch(&rt, &token, "local", &target, SubstrateKind::Note, "", 100)
+                .await
+                .expect("select missing note");
+
+        assert_eq!(entities, vec![(entity.id, entity_embedding_text(&entity))]);
+        assert_eq!(notes, vec![(note.id, note_embedding_text(&note))]);
     }
 
     #[tokio::test]
@@ -1612,6 +1765,82 @@ mod tests {
             matches!(rows[0].get("namespace"), Some(SqlValue::Text(value)) if value == "local"),
             "repair must replace the stale row with the base row namespace"
         );
+    }
+
+    #[tokio::test]
+    async fn embeds_only_repair_writes_multiple_vectors_in_one_batch() {
+        use khive_runtime::RuntimeConfig;
+
+        let rt = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            ..RuntimeConfig::default()
+        })
+        .expect("runtime");
+        rt.register_embedder(RepairEmbedderProvider {
+            model_name: REPAIR_MODEL,
+        });
+        let token = rt
+            .authorize(Namespace::parse("local").expect("namespace"))
+            .expect("authorize");
+        let notes: Vec<_> = (0..3)
+            .map(|index| {
+                Note::new(
+                    "local",
+                    "observation",
+                    format!("batched repair content {index}"),
+                )
+            })
+            .collect();
+        for note in &notes {
+            rt.notes(&token)
+                .expect("notes")
+                .upsert_note(note.clone())
+                .await
+                .expect("seed note");
+        }
+
+        let result =
+            repair_missing_embeddings(&rt, &token, &[REPAIR_MODEL.to_string()], "local", 100)
+                .await
+                .expect("repair embeddings");
+        assert_eq!(result, (0, notes.len() as u64, 0));
+
+        let mut reader = rt.sql().reader().await.expect("reader");
+        let rows = reader
+            .query_all(SqlStatement {
+                sql: format!(
+                    "SELECT subject_id, namespace, kind, field, embedding_model \
+                     FROM {REPAIR_TABLE} ORDER BY subject_id"
+                ),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("read repaired vectors");
+        assert_eq!(rows.len(), notes.len());
+        let actual_ids: HashSet<_> = rows
+            .iter()
+            .map(|row| match row.get("subject_id") {
+                Some(SqlValue::Text(id)) => id.clone(),
+                other => panic!("invalid subject_id: {other:?}"),
+            })
+            .collect();
+        let expected_ids: HashSet<_> = notes.iter().map(|note| note.id.to_string()).collect();
+        assert_eq!(actual_ids, expected_ids);
+        for row in rows {
+            assert!(
+                matches!(row.get("namespace"), Some(SqlValue::Text(value)) if value == "local")
+            );
+            assert!(matches!(row.get("kind"), Some(SqlValue::Text(value)) if value == "note"));
+            assert!(
+                matches!(row.get("field"), Some(SqlValue::Text(value)) if value == "note.content")
+            );
+            assert!(
+                matches!(row.get("embedding_model"), Some(SqlValue::Text(value)) if value == REPAIR_MODEL)
+            );
+        }
     }
 
     #[tokio::test]

@@ -679,7 +679,7 @@ impl KhiveRuntime {
         let embed_model_names = self.registered_embedding_model_names();
         for model_name in &embed_model_names {
             match self
-                .embed_document_with_model(model_name, &note.content)
+                .embed_document_with_model(model_name, &note_embedding_text(note))
                 .await
             {
                 Ok(vector) => match self.vectors_for_model(token, model_name) {
@@ -997,6 +997,23 @@ impl KhiveRuntime {
 // FTS document construction
 // ---------------------------------------------------------------------------
 
+/// Build the canonical text embedded for an entity on create, update, merge,
+/// and repair paths.
+pub fn entity_embedding_text(entity: &Entity) -> String {
+    match &entity.description {
+        Some(description) if !description.is_empty() => {
+            format!("{} {description}", entity.name)
+        }
+        _ => entity.name.clone(),
+    }
+}
+
+/// Build the canonical text embedded for a note when no explicit bounded
+/// embedding prefix was supplied at creation time.
+pub fn note_embedding_text(note: &Note) -> String {
+    note.content.clone()
+}
+
 /// Build the `TextDocument` for an entity. This is the single source of truth for
 /// entity FTS document shape; all write paths (create, update, merge, reindex, backfill)
 /// must go through this function so search parity is guaranteed.
@@ -1010,17 +1027,13 @@ impl KhiveRuntime {
 /// reindex runs record the entity's actual mutation time rather than the
 /// reindex execution time.
 pub fn entity_fts_document(entity: &Entity) -> TextDocument {
-    let body = match &entity.description {
-        Some(d) if !d.is_empty() => format!("{} {}", entity.name, d),
-        _ => entity.name.clone(),
-    };
     let updated_at =
         chrono::DateTime::from_timestamp_micros(entity.updated_at).unwrap_or_else(chrono::Utc::now);
     TextDocument {
         subject_id: entity.id,
         kind: SubstrateKind::Entity,
         title: Some(entity.name.clone()),
-        body,
+        body: entity_embedding_text(entity),
         tags: entity.tags.clone(),
         namespace: entity.namespace.clone(),
         metadata: entity.properties.clone(),
