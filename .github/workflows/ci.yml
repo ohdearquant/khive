@@ -567,7 +567,10 @@ jobs:
           # in field 4 and Lines% in field 10, so the prior `awk '{print $4}'`
           # silently gated on REGION coverage while logs claimed line coverage.
           # `.data[0].totals.lines.percent` is unambiguous and format-stable.
-          cargo llvm-cov --workspace --summary-only --json > /tmp/cov.json
+          # `serial_test` only coordinates tests inside one executable. Keep
+          # instrumented workspace test executables from reopening the shared
+          # checkout-contention window by running them one at a time.
+          cargo llvm-cov --workspace --jobs 1 --summary-only --json > /tmp/cov.json
           CURRENT=$(jq -r '.data[0].totals.lines.percent' /tmp/cov.json)
           echo "Current line coverage: ${CURRENT}%"
           echo "CURRENT_COVERAGE=${CURRENT}" >> "$GITHUB_ENV"
