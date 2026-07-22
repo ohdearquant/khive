@@ -1125,6 +1125,9 @@ pub async fn run_daemon<D: DaemonDispatch>(dispatcher: D) -> anyhow::Result<()> 
 /// `/tmp` do not.
 #[cfg(unix)]
 fn ensure_socket_dir_is_trusted(parent: &std::path::Path) -> anyhow::Result<()> {
+    // SAFETY: `geteuid` is always successful and takes no arguments.
+    let daemon_euid = unsafe { libc::geteuid() } as u32;
+
     if parent == khive_dir() {
         std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
             anyhow::anyhow!(
@@ -1133,7 +1136,7 @@ fn ensure_socket_dir_is_trusted(parent: &std::path::Path) -> anyhow::Result<()> 
                 parent.display()
             )
         })?;
-        return Ok(());
+        return ensure_socket_dir_ancestors_are_swap_resistant(parent, daemon_euid);
     }
 
     // Fail closed on the stat itself: not being able to read the metadata is
@@ -1148,8 +1151,6 @@ fn ensure_socket_dir_is_trusted(parent: &std::path::Path) -> anyhow::Result<()> 
 
     use std::os::unix::fs::MetadataExt;
     let owner = meta.uid();
-    // SAFETY: `geteuid` is always successful and takes no arguments.
-    let daemon_euid = unsafe { libc::geteuid() } as u32;
     if owner != daemon_euid && owner != 0 {
         anyhow::bail!(
             "refusing to start: socket directory {} is owned by uid {owner}, not this \
@@ -1172,6 +1173,78 @@ fn ensure_socket_dir_is_trusted(parent: &std::path::Path) -> anyhow::Result<()> 
             parent.display(),
             mode & 0o7777
         );
+    }
+
+    ensure_socket_dir_ancestors_are_swap_resistant(parent, daemon_euid)
+}
+
+/// Walk every ancestor of the (already-vetted) socket directory and refuse
+/// any that would let another local user *replace a path component*: rename
+/// the trusted final directory away and recreate it, re-rooting the socket
+/// path under attacker control without ever touching the vetted directory
+/// itself.
+///
+/// The ancestor rule is deliberately weaker than the immediate parent's.
+/// The parent hosts the socket file, where the threat is *creation* of the
+/// predictable path — the sticky bit does not restrict creating, so no
+/// sticky exception is sound there. An ancestor only threatens via
+/// *rename/unlink of an existing entry we own*, which the sticky bit does
+/// restrict: in a sticky directory, only the entry's owner, the directory's
+/// owner, or root may rename it. So a root-owned `/tmp` (1777) is an
+/// acceptable ancestor of a user-owned 0700 socket directory, while a
+/// non-sticky group/other-writable ancestor, or one owned by a third uid
+/// (who could rename the entry, or chmod the directory first), is refused.
+///
+/// The path is canonicalized first so a symlink component cannot smuggle in
+/// an unvetted real location; canonicalization failure fails closed.
+#[cfg(unix)]
+fn ensure_socket_dir_ancestors_are_swap_resistant(
+    parent: &std::path::Path,
+    daemon_euid: u32,
+) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let canonical = std::fs::canonicalize(parent).map_err(|e| {
+        anyhow::anyhow!(
+            "refusing to start: cannot canonicalize socket directory {}: {e}. Ancestor \
+             trust cannot be checked through an unresolvable path.",
+            parent.display()
+        )
+    })?;
+
+    for ancestor in canonical.ancestors().skip(1) {
+        if ancestor.as_os_str().is_empty() {
+            break;
+        }
+        let meta = std::fs::metadata(ancestor).map_err(|e| {
+            anyhow::anyhow!(
+                "refusing to start: cannot stat socket-path ancestor {}: {e}. An \
+                 unreadable ancestor is not a passing one.",
+                ancestor.display()
+            )
+        })?;
+        let owner = meta.uid();
+        let mode = meta.permissions().mode();
+        let sticky = mode & 0o1000 != 0;
+        if owner != daemon_euid && owner != 0 {
+            anyhow::bail!(
+                "refusing to start: socket-path ancestor {} is owned by uid {owner}, not \
+                 this daemon's uid ({daemon_euid}) or root — its owner could rename the \
+                 next path component and re-root the socket path. Point KHIVE_SOCKET \
+                 somewhere trusted end to end, or unset it for the default.",
+                ancestor.display()
+            );
+        }
+        if mode & 0o022 != 0 && !sticky {
+            anyhow::bail!(
+                "refusing to start: socket-path ancestor {} is mode {:04o} — writable by \
+                 group or other without the sticky bit, so another local user could rename \
+                 the next path component and re-root the socket path. Point KHIVE_SOCKET \
+                 somewhere trusted end to end, or unset it for the default.",
+                ancestor.display(),
+                mode & 0o7777
+            );
+        }
     }
 
     Ok(())
@@ -2095,6 +2168,36 @@ mod tests {
                 "refusing must not re-permission a directory khive does not own"
             );
         }
+    }
+
+    /// A vetted final directory is still refused when an ANCESTOR would let
+    /// another local user rename it away and recreate it: a non-sticky
+    /// group/other-writable ancestor re-roots the whole socket path without
+    /// the final directory's own metadata ever changing. The sticky-ancestor
+    /// arm (a root-owned 1777 `/tmp` above a user-owned 0700 directory is
+    /// acceptable) is exercised implicitly by every accepting test below,
+    /// whose tempdirs live under the platform temp root.
+    #[test]
+    fn writable_non_sticky_ancestor_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let open_mid = dir.path().join("open-mid");
+        std::fs::create_dir(&open_mid).expect("create mid");
+        let inner = open_mid.join("private");
+        std::fs::create_dir(&inner).expect("create inner");
+        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        std::fs::set_permissions(&open_mid, std::fs::Permissions::from_mode(0o777))
+            .expect("chmod mid");
+
+        let err = ensure_socket_dir_is_trusted(&inner)
+            .expect_err("a 0777 non-sticky ancestor must be refused");
+        assert!(
+            err.to_string().contains("ancestor"),
+            "the refusal should say it was an ancestor that failed, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("open-mid"),
+            "the refusal should name the failing ancestor, got: {err}"
+        );
     }
 
     /// Directories this daemon can trust end to end are served as found:
