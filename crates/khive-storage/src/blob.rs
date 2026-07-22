@@ -223,6 +223,8 @@ pub trait BlobStore: Send + Sync + std::fmt::Debug + 'static {
     /// the sweep's candidate set is captured cannot be mistaken for an orphan,
     /// including when it is published between selecting live references and
     /// physical deletion.
+    /// Coordination may be advisory, so callers must publish through the
+    /// backend rather than mutate its physical storage directly.
     /// Backends that cannot provide both guarantees return
     /// `StorageError::Unsupported`.
     async fn transactional_orphan_sweep(

@@ -64,14 +64,16 @@ invocation with no live traffic, or equivalent.
 
 A DB-coordinated sweep is available separately as
 `BlobStore::transactional_orphan_sweep`. The filesystem implementation acquires
-the same canonical-root lock as `put`, captures a bounded candidate set, then
-selects every non-deleted entity's `content_ref` and deletes only those
-candidates inside one `SqlAccess::atomic_unit` writer transaction. Entity
-writes therefore cannot change liveness during the anti-join. A blob published
-after candidate capture, including between the liveness mark and physical
-deletion, is outside that sweep and survives even when the publisher is in
-another process. Backends that cannot provide both coordination boundaries
-return `Unsupported`.
+the same process-local mutex and root-local advisory file lock as `put`, captures
+a bounded candidate set, then selects every non-deleted entity's `content_ref`
+and deletes only those candidates inside one `SqlAccess::atomic_unit` writer
+transaction. Entity writes therefore cannot change liveness during the
+anti-join. A filesystem publisher in another process that begins while the
+sweep holds the advisory lock waits; after the sweep releases the lock, `put`
+rechecks the target and republishes bytes removed as an orphan before returning
+the `ContentRef`. This coordination applies to publishers using `FsBlobStore`;
+direct filesystem mutation does not participate in the advisory-lock protocol.
+Backends that cannot provide both coordination boundaries return `Unsupported`.
 
 The original `orphan_sweep` remains an offline-maintenance API for callers that
 already have a trusted `live_refs` snapshot. It intentionally retains its

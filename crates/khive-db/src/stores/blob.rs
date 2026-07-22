@@ -1,13 +1,14 @@
 //! Filesystem-backed `BlobStore` — content-addressed, BLAKE3-sharded on disk.
 //!
-//! Layout: `<root>/<hex[0..2]>/<hex[2..4]>/<hex>`, a two-level shard identical
-//! in shape to git's loose-object store, so a root holding millions of blobs
-//! never puts more than a few thousand entries in one directory. Writes are
-//! atomic-publish (khive#292): bytes land in a `tempfile` in the SAME shard
-//! directory as the final path (guaranteeing same-filesystem rename), the
-//! written length is checked against the input length, then
-//! `NamedTempFile::persist` performs the rename — crash-safe (a crash mid-write
-//! leaves an orphaned temp file, never a partially-committed blob).
+//! Layout: `<root>/<hex[0..2]>/<hex[2..4]>/<hex>`, plus a root-local advisory
+//! lock file. The two-level shard is identical in shape to git's loose-object
+//! store, so a root holding millions of blobs never puts more than a few
+//! thousand entries in one directory. Writes are atomic-publish (khive#292):
+//! bytes land in a `tempfile` in the SAME shard directory as the final path
+//! (guaranteeing same-filesystem rename), the written length is checked against
+//! the input length, then `NamedTempFile::persist` performs the rename —
+//! crash-safe (a crash mid-write leaves an orphaned temp file, never a
+//! partially-committed blob).
 
 use std::collections::HashMap;
 use std::fs;
@@ -23,6 +24,8 @@ use khive_storage::types::{SqlStatement, SqlValue, StorageResult};
 use khive_storage::{AtomicUnitOp, SqlAccess, StorageCapability};
 
 use crate::error::SqliteError;
+
+const ROOT_WRITE_LOCK_FILE: &str = ".khive-blob-write.lock";
 
 fn map_io_err(e: std::io::Error, op: &'static str) -> StorageError {
     StorageError::driver(StorageCapability::Blob, op, e)
@@ -150,7 +153,20 @@ where
 }
 
 fn put_blocking(root: &Path, floor_bytes: u64, bytes: Vec<u8>) -> StorageResult<ContentRef> {
+    let _root_write_guard = acquire_root_write_lock(root)?;
     put_blocking_with_space_probe(root, floor_bytes, bytes, |path| fs4::available_space(path))
+}
+
+fn acquire_root_write_lock(root: &Path) -> StorageResult<fs::File> {
+    let lock_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(root.join(ROOT_WRITE_LOCK_FILE))
+        .map_err(|e| map_io_err(e, "root_write_lock_open"))?;
+    fs4::FileExt::lock(&lock_file).map_err(|e| map_io_err(e, "root_write_lock_acquire"))?;
+    Ok(lock_file)
 }
 
 fn walk_blob_files(root: &Path) -> std::io::Result<Vec<(ContentRef, PathBuf)>> {
@@ -271,8 +287,9 @@ pub struct FsBlobStore {
     /// cannot release the guard before the underlying blocking write (which
     /// keeps running on its own thread regardless of the outer future's
     /// fate) actually finishes. A per-root async mutex is adequate at this
-    /// write rate; it is not meant to defend against another OS process
-    /// writing the same volume.
+    /// write rate. The blocking write also takes a root-local advisory file
+    /// lock to coordinate with publishers and transactional sweeps in other
+    /// processes.
     write_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -420,10 +437,11 @@ impl BlobStore for FsBlobStore {
         let owned_guard = self.write_lock.clone().lock_owned().await;
         let root = self.root.clone();
         let scan_root = root.clone();
-        let (owned_guard, candidates) = tokio::task::spawn_blocking(move || {
+        let (write_guards, candidates) = tokio::task::spawn_blocking(move || {
+            let root_write_guard = acquire_root_write_lock(&scan_root)?;
             let candidates = walk_blob_files(&scan_root)
                 .map_err(|e| map_io_err(e, "transactional_orphan_sweep_walk"))?;
-            Ok::<_, StorageError>((owned_guard, candidates))
+            Ok::<_, StorageError>(((owned_guard, root_write_guard), candidates))
         })
         .await
         .map_err(|e| {
@@ -437,7 +455,7 @@ impl BlobStore for FsBlobStore {
         let hook = sync_hook::take(&root);
         let op: AtomicUnitOp = Box::new(move |writer| {
             Box::pin(async move {
-                let _owned_guard = owned_guard;
+                let _write_guards = write_guards;
                 let rows = writer
                     .query_all(SqlStatement {
                         sql: "SELECT DISTINCT content_ref FROM entities \
@@ -1004,26 +1022,86 @@ mod tests {
             store.write_lock.try_lock().is_err(),
             "the sweep must hold the same root lock used by blob writers"
         );
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
         let new_ref = {
             let root = root.clone();
             tokio::task::spawn_blocking(move || {
-                // Model a writer in another process, outside this process's
-                // root-lock registry, publishing after the DB liveness mark.
+                let _ = started_tx.send(());
                 put_blocking(&root, 0, b"new concurrent blob".to_vec())
             })
-            .await
-            .unwrap()
-            .unwrap()
         };
+        assert!(recv_blocking(started_rx).await, "blob put must start");
 
         release.send(()).unwrap();
         let sweep_result = sweep.await.unwrap().unwrap();
+        let new_ref = new_ref.await.unwrap().unwrap();
 
         assert_eq!(sweep_result.deleted, 1);
         assert!(!store.exists(&orphan).await.unwrap());
         assert!(
             store.exists(&new_ref).await.unwrap(),
             "a blob put started between the liveness mark and physical sweep must survive"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn transactional_orphan_sweep_republishes_deduplicated_external_put() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("khive.db");
+        let backend = std::sync::Arc::new(crate::StorageBackend::sqlite(&db_path).unwrap());
+        {
+            let mut writer = backend.pool().writer().unwrap();
+            crate::run_migrations(writer.conn_mut()).unwrap();
+        }
+        let root = dir.path().join("blobs");
+        let store = std::sync::Arc::new(FsBlobStore::new(root.clone(), 0).unwrap());
+        let payload = b"existing orphan republished during sweep".to_vec();
+        let orphan = store.put(payload.clone()).await.unwrap();
+        let canonical_root = root.canonicalize().unwrap();
+        let (marked, release, _done) = sync_hook::install(&canonical_root);
+
+        let sweep = {
+            let store = store.clone();
+            let sql = backend.sql();
+            tokio::spawn(async move { store.transactional_orphan_sweep(sql.as_ref(), false).await })
+        };
+        assert!(
+            recv_blocking(marked).await,
+            "sweep must finish its liveness mark"
+        );
+
+        let external_lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(root.join(ROOT_WRITE_LOCK_FILE))
+            .unwrap();
+        assert!(
+            matches!(
+                fs4::FileExt::try_lock(&external_lock),
+                Err(fs4::TryLockError::WouldBlock)
+            ),
+            "the sweep must exclude a publisher using an independently opened root lock"
+        );
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let republished = {
+            let root = root.clone();
+            tokio::task::spawn_blocking(move || {
+                let _ = started_tx.send(());
+                put_blocking(&root, 0, payload)
+            })
+        };
+        assert!(recv_blocking(started_rx).await, "blob put must start");
+
+        release.send(()).unwrap();
+        let sweep_result = sweep.await.unwrap().unwrap();
+        let republished = republished.await.unwrap().unwrap();
+
+        assert_eq!(sweep_result.deleted, 1);
+        assert_eq!(republished, orphan);
+        assert!(
+            store.exists(&republished).await.unwrap(),
+            "a deduplicated put concurrent with the sweep must not return a deleted reference"
         );
     }
 
