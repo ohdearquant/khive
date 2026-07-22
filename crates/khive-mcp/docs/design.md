@@ -17,7 +17,9 @@ decisions and rationale.
   over the three execution modes. Splitting the branches would scatter the
   contract invariants (summary shape, aborted semantics, `$prev` substitution
   ordering) across files, making them harder to review as a unit.
-- Response envelope shape: `{"results": [...], "summary": {"total": N, "succeeded": K, "failed": M, "aborted": A}}`.
+- Response envelope shape: `{"results": [...], "summary": {"total": N, "succeeded": K, "failed": M, "aborted": A}, "status": "success" | "partial"}`.
+- `status` is `"partial"` when `summary.failed` or `summary.aborted` is non-zero;
+  callers must not infer full success solely from the absence of an RPC-level error.
 - Per-op failures do not abort siblings in Parallel mode; they do abort remaining
   ops in Chain mode (reported as `{"ok": false, "aborted": true}`).
 - Invalid DSL (parse/lex failure) returns an RPC-level `invalid_params` error.
