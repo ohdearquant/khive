@@ -7,7 +7,7 @@ workspace declares it as a dependency.
 
 ## Verbs
 
-17 handlers, registered under ADR-017:
+19 handlers, registered under ADR-017:
 
 | Verb        | What it does                                                                    |
 | ----------- | ------------------------------------------------------------------------------- |
@@ -28,6 +28,8 @@ workspace declares it as a dependency.
 | `verbs`     | List all MCP-callable verbs registered on the server                            |
 | `stats`     | Aggregate KG substrate counts (entities, edges, notes)                          |
 | `context`   | Entity-anchored graph context in one call (ADR-089)                             |
+| `resolve`   | Resolve natural-language references to record ids                               |
+| `whoami`    | Report the caller identity this request resolved to                             |
 
 `propose`/`review`/`withdraw` implement the event-sourced proposal lifecycle from
 ADR-046.

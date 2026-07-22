@@ -1,13 +1,13 @@
 # API Reference
 
-khive exposes exactly one MCP tool, `request`. Everything else, 18 verbs in the `kg`
+khive exposes exactly one MCP tool, `request`. Everything else, 19 verbs in the `kg`
 pack, is dispatched through that single tool via a small request DSL. This page
 documents the DSL grammar, the response envelope, and every verb's full parameter
 contract, so an agent can call khive correctly without reading Rust source.
 
 This page is verified against the live registry (`request(ops="verbs()")`) and the pack
 source (`crates/khive-pack-kg/src/*.rs` `HandlerDef`/`ParamDef` struct literals). Verb
-count: **18**, matching the live registry `total` field for the default `kg`-only pack
+count: **19**, matching the live registry `total` field for the default `kg`-only pack
 set. If your server reports a different total, your `KHIVE_PACKS` configuration loads
 additional (commercially licensed) packs beyond the open-source default — run
 `request(ops="verbs()")` against your own server to get the authoritative list.
@@ -21,7 +21,7 @@ An always-machine-readable copy of this page is at
 
 | Pack | Verbs | Load with                  | Optional?           |
 | ---- | ----- | -------------------------- | ------------------- |
-| `kg` | 18    | `KHIVE_PACKS=kg` (default) | No — base substrate |
+| `kg` | 19    | `KHIVE_PACKS=kg` (default) | No — base substrate |
 
 This distribution ships one production pack, `kg`, loaded by default. Task management,
 memory, inter-agent communication, scheduling, session continuity, workspace linking,
@@ -32,7 +32,7 @@ installed, they load the same way, via `KHIVE_PACKS`/`--pack`. Git provenance in
 `git.branch` / `git.push` write verbs (ADR-108) are likewise a commercially licensed
 extension.
 
-The default binary (no `KHIVE_PACKS`/`--pack` override) loads the `kg` pack: **18 verbs**.
+The default binary (no `KHIVE_PACKS`/`--pack` override) loads the `kg` pack: **19 verbs**.
 
 Verb names in the `kg` pack are bare (`create`, `search`, `link`, …). Extension packs
 namespace their verbs with a `pack.` prefix (`gtd.assign`, `memory.recall`,
@@ -130,7 +130,7 @@ parallel batches, since parallel failures do not cascade.
 
 ---
 
-## `kg` pack — 18 verbs
+## `kg` pack — 19 verbs
 
 Base substrate verbs, bare names (no `kg.` prefix). Category is the illocutionary act
 (Searle 1976): Assertive = retrieves state, Commissive = commits a persistent change,
@@ -605,6 +605,28 @@ silent pick among close candidates. Read-only: performs no mutation.
 
 ```
 request(ops="resolve(refs=[\"the old record\", \"<uuid>\"])")
+```
+
+### `whoami` — Assertive
+
+Report the caller's identity as the runtime already resolved it for this request:
+`actor_id`, `actor_kind`, whether the actor is the unattributed/anonymous fallback,
+the write namespace, and the read-visible namespace set. A projection of existing
+per-request state, not new state; never returns tokens or credentials. Takes no
+parameters.
+
+```
+request(ops="whoami()")
+```
+
+```json
+{
+  "actor_id": "local",
+  "actor_kind": "anonymous",
+  "unattributed": true,
+  "namespace": "local",
+  "visible_namespaces": ["local"]
+}
 ```
 
 ### `verbs` — Assertive

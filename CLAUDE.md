@@ -56,7 +56,7 @@ behavior isn't written there, it is an unspecified design decision → escalate,
 └──────────────────────────────────────────────────────────────┘
                             ↕ VerbRegistry dispatch
 ┌──────────────────────────────────────────────────────────────┐
-│  khive-pack-kg     — KG vocabulary + 18 verb handlers (ADR-017)     │
+│  khive-pack-kg     — KG vocabulary + 19 verb handlers (ADR-017)     │
 │  khive-vcs         — KG versioning: snapshots/branches (ADR-010)    │
 │  khive-merge       — KG merge algorithm (ADR-039)                   │
 └──────────────────────────────────────────────────────────────┘
@@ -98,7 +98,7 @@ not shipped.
 | `crates/khive-query`     | GQL + SPARQL parsers, AST validation, SQL compiler                                                       |
 | `crates/khive-runtime`   | Service API + VerbRegistry + PackRuntime trait                                                           |
 | `crates/khive-request`   | Request DSL parser (function-call + JSON; pipe/LNDL planned)                                             |
-| `crates/khive-pack-kg`   | KG pack: vocabulary, 18 verb handlers, kind validation                                                   |
+| `crates/khive-pack-kg`   | KG pack: vocabulary, 19 verb handlers, kind validation                                                   |
 | `crates/khive-vcs`       | KG versioning: content-addressed snapshots, branch pointers, push/pull (ADR-010)                         |
 | `crates/khive-merge`     | KG merge: three-way merge with LCA walk, conflict enum, strategy shortcuts (ADR-039)                     |
 | `crates/khive-mcp`       | Stdio MCP binary — single `request` tool over VerbRegistry; auto-spawns daemon                           |
@@ -169,7 +169,7 @@ linking, blob storage, and the profile-oriented feedback/learning-loop pack (`br
 provided by commercially licensed extensions and are not part of this distribution; when
 installed, they load the same way, via `KHIVE_PACKS`/`--pack`.
 
-### KG pack verbs (18 — ADR-017, ADR-046, ADR-089)
+### KG pack verbs (19 — ADR-017, ADR-046, ADR-089)
 
 `create`, `list`, and `search` take a `kind` discriminant. It accepts either the substrate-level
 name (`entity`, `note`, `edge`) **or** a pack-registered granular kind (`concept`, `document`,
@@ -196,6 +196,7 @@ Mixing a granular `kind` with a contradicting `entity_kind`/`note_kind` sub-filt
 | `resolve`   | `refs`, `kind?`, `limit?`                                                                    | Resolve natural-language references to ids (id passthrough, recent-ring, hybrid-search fallback) |
 | `verbs`     | `category?`, `pack?`                                                                         | List all MCP-callable verbs registered on this server                                            |
 | `context`   | `query?`, `entity_ids?`, `hops?`, `budget?`, `relations?`, `direction?`, `limit?`, `fanout?` | Entity-anchored graph context in one call (ADR-089)                                              |
+| `whoami`    | —                                                                                            | Report the caller's actor reference, write namespace, and read-visible namespace set             |
 
 Task-management (`gtd.*`) and memory-recall (`memory.*`) verbs are provided by commercially
 licensed extensions and are not part of the open-source distribution.

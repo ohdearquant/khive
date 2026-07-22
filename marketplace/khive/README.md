@@ -1,7 +1,7 @@
 # khive — Claude Code plugin
 
 One plugin for the khive knowledge graph surface, served by a single MCP server
-(`kkernel mcp`) exposing one tool — `request` — that dispatches the 18 verbs of the
+(`kkernel mcp`) exposing one tool — `request` — that dispatches the 19 verbs of the
 `kg` pack.
 
 This plugin is **guidance, not a second runtime**. It ships the pattern skill that teaches an
@@ -21,9 +21,9 @@ The skill teaches the _reusable pattern_ for the `kg` pack, not a how-to for eve
 Per-verb parameter detail is always one call away at runtime:
 `request(ops="<verb>(help=true)")`.
 
-| Skill | Pack | The pattern it teaches                                                       |
-| ----- | ---- | ------------------------------------------------------------------------------ |
-| `kg`  | kg   | Search before you create; model as typed entities + edges; explore; propose  |
+| Skill | Pack | The pattern it teaches                                                      |
+| ----- | ---- | --------------------------------------------------------------------------- |
+| `kg`  | kg   | Search before you create; model as typed entities + edges; explore; propose |
 
 ## kg stewardship agents
 

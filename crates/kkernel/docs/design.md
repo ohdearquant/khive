@@ -43,10 +43,10 @@
 
 ### Verb namespace contract (ADR-023)
 
-- The kg substrate pack owns 18 bare verb names (no dot prefix): `create`, `get`,
+- The kg substrate pack owns 19 bare verb names (no dot prefix): `create`, `get`,
   `list`, `stats`, `update`, `delete`, `search`, `link`, `neighbors`, `traverse`,
   `query`, `merge`, `propose`, `review`, `withdraw`, `resolve`, `verbs`, `context`
-  (ADR-089).
+  (ADR-089), `whoami`.
 - A commercially licensed extension pack, when installed, must prefix its verbs with
   `<pack>.` (e.g. `<pack>.verb`); sub-variants use underscore, not nested dots
   (`<pack>.verb_variant`, not `<pack>.verb.variant`).
@@ -98,7 +98,7 @@
 ### Proposal lifecycle (ADR-046)
 
 - The kg pack exposes `propose`, `review`, and `withdraw` verbs as part of the
-  18 kg-substrate bare verbs. These are validated by the contract test.
+  19 kg-substrate bare verbs. These are validated by the contract test.
 
 ### Atomic `exec --ops-file --atomic` execution path (ADR-099 Slice B3)
 

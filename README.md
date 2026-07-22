@@ -25,7 +25,7 @@ stdio, and `cargo test` finishes in 4 seconds.
 
 | Capability                  | How                                                                                                                                                      |
 | --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **18 verbs, 1 pack**        | KG: entities, edges, notes, graph queries, reference resolution — loads by default                                                                       |
+| **19 verbs, 1 pack**        | KG: entities, edges, notes, graph queries, reference resolution, caller identity — loads by default                                                      |
 | **Typed entities**          | 9 closed kinds: concept, document, dataset, project, person, org, artifact, service, resource                                                            |
 | **Typed edges**             | 17 closed relations in 9 categories (structure, derivation, provenance, temporal, dependency, impl, lateral, annotation, epistemic)                      |
 | **Typed notes**             | 5 closed kinds: observation, insight, question, decision, reference                                                                                      |
@@ -63,12 +63,12 @@ request(ops="[v1(...), v2(...), v3(...)]")             # parallel batch (max 100
 request(ops="[{\"tool\":\"v1\",\"args\":{...}}, ...]") # equivalent JSON form
 ```
 
-The `kg` pack loads by default, giving **18 verbs** out of the box (regenerate with
+The `kg` pack loads by default, giving **19 verbs** out of the box (regenerate with
 `request(ops="verbs()")` before editing this table):
 
-| Pack   | Prefix   | Verbs | What it does                                                |
-| ------ | -------- | ----- | ----------------------------------------------------------- |
-| **kg** | _(bare)_ | 18    | Entities, edges, notes, graph queries, reference resolution |
+| Pack   | Prefix   | Verbs | What it does                                                                 |
+| ------ | -------- | ----- | ---------------------------------------------------------------------------- |
+| **kg** | _(bare)_ | 19    | Entities, edges, notes, graph queries, reference resolution, caller identity |
 
 Task management, memory recall, inter-agent messaging, scheduling, session continuity,
 workspace linking, and blob storage are provided by commercially licensed extensions and
@@ -129,7 +129,7 @@ records what's connected, in which direction, and why.
 └──────────────────────────────────────────────────────────────┘
                             ↕ VerbRegistry dispatch
 ┌──────────────────────────────────────────────────────────────┐
-│  khive-pack-kg:        KG vocabulary + 18 verb handlers       │
+│  khive-pack-kg:        KG vocabulary + 19 verb handlers       │
 └──────────────────────────────────────────────────────────────┘
                             ↕ in-process
 ┌──────────────────────────────────────────────────────────────┐
@@ -230,7 +230,7 @@ kkernel --version   # confirms the binary and version you just installed
 ```
 
 The `kg` pack loads by default, a background daemon auto-spawns to keep the runtime warm, and any
-MCP client discovers the `request` tool with the full 18-verb catalog.
+MCP client discovers the `request` tool with the full 19-verb catalog.
 
 ### Alternative: npm
 
@@ -359,7 +359,7 @@ transparency and for building on top of khive under its license terms.
 
 ## Status
 
-**v0.5.0 (publication pending; crates.io currently serves 0.4.0).** 18 verbs in the
+**v0.5.0 (publication pending; crates.io currently serves 0.4.0).** 19 verbs in the
 `kg` pack, 9 entity kinds, 17 edge relations, daemon warm startup (ADR-049).
 Ready for use with Claude Code and any MCP-compatible agent.
 

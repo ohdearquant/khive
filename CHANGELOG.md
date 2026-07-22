@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `whoami` verb (kg pack, bare name): reports the caller's actor reference,
+  write namespace, and read-visible namespace set already resolved by the
+  runtime for the current request. The default pack set now exposes 19 verbs.
+
 ### Changed
 
 - Reduced the open-source distribution to a single production pack: `kg`. The

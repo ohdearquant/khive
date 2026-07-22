@@ -8,7 +8,7 @@ khive gives your agent:
 2. **Notes** — observations, insights, questions, decisions, references that persist across sessions
 3. **Pattern matching queries** — GQL/SPARQL traverse over the graph
 
-The `kg` pack loads by default, giving the `request` tool an 18-verb catalog. Task
+The `kg` pack loads by default, giving the `request` tool a 19-verb catalog. Task
 management (GTD lifecycle), memory (salience- and decay-weighted recall), communication
 (namespaced message passing between agents), scheduling (time-triggered reminders and
 future verb dispatch), session continuity (persist and resume agent-session records),
@@ -29,7 +29,7 @@ or JSON form (ADR-016,
 ADR-027). Verb semantics and namespace contract are
 defined in ADR-023.
 
-### KG pack — 18 verbs (bare names, no prefix)
+### KG pack — 19 verbs (bare names, no prefix)
 
 | Verb        | What it does                                                                                     | When to use                                                             |
 | ----------- | ------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------- |
@@ -51,6 +51,7 @@ defined in ADR-023.
 | `resolve`   | Resolve natural-language references to ids (id passthrough, recent-ring, hybrid search fallback) | Turning a fuzzy reference ("the old record") into an id before acting   |
 | `verbs`     | List all registered verbs on this server                                                         | Discovery — see what's available                                        |
 | `context`   | Entity-anchored graph context in one call (anchors + 1-2 hop expansion, budget-packed)           | Feeding an agent "everything relevant near X" in one call — see ADR-089 |
+| `whoami`    | Report the caller's actor reference, write namespace, and read-visible namespace set             | Checking whether writes are attributed before relying on it             |
 
 `get`, `update`, `delete` are by-ID — they auto-detect whether the record is an entity, note, or
 edge. The `id` parameter is resolved in three steps: (1) a full UUID (36-char dashed or 32-char
