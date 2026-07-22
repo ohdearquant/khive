@@ -2857,6 +2857,7 @@ backend = "sessions"
                 raw: Some(conflicting_override.display().to_string()),
                 anchor: None,
             },
+            false,
             spy_capture_config_id,
         )
         .await;
