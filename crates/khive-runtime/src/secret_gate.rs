@@ -831,7 +831,13 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
             // gate is accidental-persistence hygiene on a single-principal
             // same-uid host, not defense against a same-uid adversary
             // hand-splitting a credential to evade it — that adversary can
-            // write the DB directly. See
+            // write the DB directly. This module does not itself establish
+            // that the host is same-uid; it inherits that from the daemon's
+            // accept-site refusal of any peer uid other than its own
+            // (`khive-runtime/src/daemon.rs`, peer-credential check before the
+            // first frame is read). If that refusal is ever removed or
+            // weakened, the residual limitation documented here stops being
+            // residual. See
             // `allows_seven_way_hex_split_beyond_fragment_cap_documented_limitation`
             // and `allows_six_way_sub_floor_hex_split_documented_limitation`.
             //
