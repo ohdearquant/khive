@@ -43,8 +43,9 @@ See `crates/khive-db/src/stores/vectors.rs` — private fn `replace_vector_row_d
 
 `vec0` virtual tables do not support `INSERT OR REPLACE`, so every
 replacement path (single-record insert/update, batch insert, and the
-WriterTask-routed atomic upsert) deletes the prior row for `(subject_id,
-namespace)` then inserts the new one. This function issues no
+WriterTask-routed atomic upsert) deletes the prior row for `subject_id` then
+inserts the new one. `subject_id` is the vec0 table's primary key, so this also
+repairs stale namespace metadata. This function issues no
 `BEGIN`/`COMMIT`/`SAVEPOINT` itself — the caller owns the enclosing
 transaction or savepoint and its rollback semantics, so this can run equally
 inside a plain `Connection`, an `unchecked_transaction()`, or a named
@@ -55,81 +56,19 @@ DELETE and the INSERT so tests can force an error at that exact point and
 assert the caller's rollback restores the prior row (no-worse-than-stale
 guarantee). It is inert in release builds.
 
-## `insert_batch` / `update` savepoint-rollback tests
+## `insert_batch` / `update` replacement tests
 
-### `insert_batch_savepoint_rollback_on_pk_conflict_preserves_stale`
+`insert_batch_replaces_cross_namespace_row` and
+`update_replaces_cross_namespace_row` seed a subject under one namespace and
+replace it under another. Both assert that the old namespace row disappears,
+the replacement is readable under the new namespace, and the replacement
+embedding remains searchable.
 
-Tests the SAVEPOINT/ROLLBACK path — INSERT failure inside the savepoint. The
-existing wrong-dimension tests
-(`insert_batch_failed_record_preserves_prior_vector`) hit the pre-savepoint
-`continue` guard and never reach the SAVEPOINT/ROLLBACK sequence. This test
-forces a genuine INSERT failure inside the savepoint by exploiting vec0's
-single-column PRIMARY KEY (`subject_id TEXT PRIMARY KEY`, NOT scoped to
-namespace).
-
-Mechanism: store a stale row for `(id_X, ns:a)`. Submit a batch with one
-record for `(id_X, ns:b)`. The DELETE step targets `WHERE namespace = 'ns:b'`
-and finds nothing (stale is in ns:a), so nothing is removed. The INSERT then
-tries to write `id_X` into vec0's `_rowids` shadow table, but `id_X` already
-occupies it (from the ns:a stale row). The UNIQUE constraint fires — INSERT
-fails — ROLLBACK TO SAVEPOINT executes — stale row in ns:a survives intact.
-
-NOTE: removing `ROLLBACK TO SAVEPOINT` would NOT change the outcome for this
-specific test, because the DELETE was a no-op (different namespace). This
-test is NOT the rollback sentinel — it covers the PK-conflict path and
-verifies that the outer COMMIT succeeds. For the true sentinel (DELETE
-succeeds then INSERT is injected to fail), see
-`insert_batch_rollback_restores_deleted_stale_after_post_delete_insert_failure`.
-
-Additionally: insert_batch must count the record as `failed` and must not
-abort the outer `BEGIN IMMEDIATE` transaction (the COMMIT must succeed).
-
-### `insert_batch_rollback_does_not_corrupt_subsequent_record`
-
-Two-record batch where the first record's SAVEPOINT rolls back (PK
-conflict) and the second record succeeds, proving the rollback on record 1
-does not corrupt the state seen by record 2.
-
-Scenario: stale = `(id_X, ns:a, stale_vec)` in DB.
-- Record A — `(id_X, ns:b)`: SAVEPOINT; DELETE WHERE ns=ns:b (nothing);
-  INSERT id_X → PK conflict (stale holds it) → ROLLBACK TO SAVEPOINT.
-  failed=1. Stale untouched.
-- Record B — `(id_X, ns:a, new_vec)`: SAVEPOINT; DELETE WHERE ns=ns:a
-  removes stale (PK freed); INSERT id_X succeeds. RELEASE. affected=1.
-
-Final state: `(id_X, ns:a, new_vec)`. The search with new_vec yields ~1.0,
-confirming Record A's rolled-back SAVEPOINT did not corrupt what Record B
-wrote.
-
-NOTE: Record A's DELETE is a no-op (different namespace), so removing
-`ROLLBACK TO SAVEPOINT` would NOT change this test's outcome. The true
-sentinel is `insert_batch_rollback_restores_deleted_stale_after_post_delete_insert_failure`.
-
-### `update_pk_conflict_rolls_back_transaction_preserves_stale`
-
-`update`'s single-record path wraps DELETE+INSERT in `unchecked_transaction`.
-Wrong-dim tests fail in the outer Rust guard, before the transaction opens.
-This test forces an INSERT failure inside the transaction on a
-correctly-dimensioned finite vector by calling `update` with a namespace
-that does NOT match the stored row.
-
-Mechanism: stale row is `(id_X, ns:a)`. Call `update(id_X, ns:b, ...)`.
-- DELETE WHERE ns=ns:b finds nothing.
-- INSERT (id_X, ns:b) hits vec0 PK constraint (id_X in `_rowids` held by
-  ns:a).
-- `unchecked_transaction()` rolls back.
-- Stale row in ns:a survives intact.
-
-NOTE: the DELETE is a no-op (different namespace), so removing the
-transaction rollback would NOT change this test's outcome. The true
-sentinel is `update_rollback_restores_deleted_stale_after_post_delete_insert_failure`.
+`insert_batch_cross_namespace_replacements_are_ordered` writes the same subject
+twice in one batch under different namespaces. Both records succeed, and the
+second record is the final readable value.
 
 ### True ROLLBACK TO SAVEPOINT sentinels (failpoint-driven)
-
-The PK-conflict tests above exercise the SAVEPOINT path, but the DELETE is a
-no-op in those tests (different namespace). Removing the `ROLLBACK TO
-SAVEPOINT vec_batch_record` line from `insert_batch`, or the transaction
-rollback from `update`, would NOT make those tests fail.
 
 The sentinel tests (`insert_batch_rollback_restores_deleted_stale_after_post_delete_insert_failure`
 and its `update` counterpart) use a `cfg(test)` failpoint that fires AFTER a

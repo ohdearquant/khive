@@ -339,11 +339,11 @@ fn replace_vector_row_dml(
         ));
     }
 
-    let del_sql = format!("DELETE FROM {table} WHERE subject_id = ?1 AND namespace = ?2");
-    conn.execute(
-        &del_sql,
-        rusqlite::params![row.subject_id.to_string(), row.namespace],
-    )?;
+    // Vector tables use subject_id as their primary key. Replace by that same
+    // identity so a successful write also repairs stale namespace metadata.
+    // The caller's transaction/savepoint restores the prior row on failure.
+    let del_sql = format!("DELETE FROM {table} WHERE subject_id = ?1");
+    conn.execute(&del_sql, rusqlite::params![row.subject_id.to_string()])?;
 
     // Failpoint: fires only in cfg(test) when the guard is active. DELETE has
     // already run; if the caller's rollback (transaction or SAVEPOINT) is
@@ -2122,11 +2122,10 @@ mod atomic_replace_tests {
         );
     }
 
-    /// insert_batch: SAVEPOINT/ROLLBACK path — INSERT failure inside the
-    /// savepoint via a PK conflict. See
-    /// crates/khive-db/docs/api/vectors.md#insert_batch_savepoint_rollback_on_pk_conflict_preserves_stale
+    /// insert_batch atomically replaces stale namespace metadata because the
+    /// vec0 primary key is the globally unique subject ID.
     #[tokio::test]
-    async fn insert_batch_savepoint_rollback_on_pk_conflict_preserves_stale() {
+    async fn insert_batch_replaces_cross_namespace_row() {
         let pool = make_vec_pool();
         let model_key = "atomic_pk_batch";
         let dims = 4;
@@ -2160,10 +2159,7 @@ mod atomic_replace_tests {
             .await
             .expect("stale insert");
 
-        // Batch: one record for (id_X, ns:b) — correct dims, all finite.
-        // DELETE WHERE ns=ns:b finds nothing.  INSERT hits PK constraint.
-        // Code path: SAVEPOINT → DELETE(noop) → INSERT(PK fail) →
-        //            ROLLBACK TO SAVEPOINT → RELEASE → outer COMMIT.
+        let replacement_vec = vec![0.5f32, 0.6, 0.7, 0.8];
         let summary = store
             .insert_batch(vec![VectorRecord {
                 subject_id: id_x,
@@ -2171,59 +2167,55 @@ mod atomic_replace_tests {
                 namespace: ns_b.to_string(),
                 field: "body".to_string(),
                 embedding_model: None,
-                vectors: vec![vec![0.5f32, 0.6, 0.7, 0.8]],
+                vectors: vec![replacement_vec.clone()],
                 updated_at: chrono::Utc::now(),
             }])
             .await
             .expect("insert_batch must complete (outer tx must commit)");
 
         assert_eq!(summary.attempted, 1);
-        assert_eq!(summary.affected, 0, "PK conflict must count as failed");
-        assert_eq!(
-            summary.failed, 1,
-            "failed counter must increment after ROLLBACK TO SAVEPOINT"
-        );
+        assert_eq!(summary.affected, 1);
+        assert_eq!(summary.failed, 0);
 
-        // Stale row must survive — no partial state must have leaked.
-        let post = store
+        let stale = store
             .batch_exists(&[id_x], ns_a)
             .await
             .expect("batch_exists ns:a");
         assert!(
-            post.contains(&id_x),
-            "stale row in ns:a must survive after SAVEPOINT + INSERT failure"
+            !stale.contains(&id_x),
+            "the stale namespace row must be replaced"
         );
+        let replacement = store
+            .batch_exists(&[id_x], ns_b)
+            .await
+            .expect("batch_exists ns:b");
+        assert!(replacement.contains(&id_x));
 
-        // Verify embedding bytes via self-similarity — any shadow-table corruption
-        // would produce a score below 1.0.
         let hits = store
             .search(VectorSearchRequest {
-                query_vectors: vec![stale_vec.clone()],
+                query_vectors: vec![replacement_vec],
                 top_k: 1,
-                namespace: Some(ns_a.to_string()),
+                namespace: Some(ns_b.to_string()),
                 kind: Some(SubstrateKind::Entity),
                 embedding_model: None,
                 filter: None,
                 backend_hints: None,
             })
             .await
-            .expect("search ns:a after batch");
+            .expect("search ns:b after batch");
 
-        assert_eq!(hits.len(), 1, "stale vector must be searchable");
+        assert_eq!(hits.len(), 1, "replacement vector must be searchable");
         assert_eq!(hits[0].subject_id, id_x);
         let sim = hits[0].score.to_f64();
         assert!(
             sim > 0.999,
-            "cosine similarity of stale_vec to itself must be ~1.0 (got {sim:.6}); \
-             a lower value means the SAVEPOINT/ROLLBACK left partial writes visible"
+            "cosine similarity of the replacement to itself must be ~1.0 (got {sim:.6})"
         );
     }
 
-    /// insert_batch: a rolled-back first record must not corrupt a
-    /// successful second record. See
-    /// crates/khive-db/docs/api/vectors.md#insert_batch_rollback_does_not_corrupt_subsequent_record
+    /// Sequential replacements of one subject keep the final record coherent.
     #[tokio::test]
-    async fn insert_batch_rollback_does_not_corrupt_subsequent_record() {
+    async fn insert_batch_cross_namespace_replacements_are_ordered() {
         let pool = make_vec_pool();
         let model_key = "atomic_sib_batch";
         let dims = 4;
@@ -2258,7 +2250,6 @@ mod atomic_replace_tests {
             .await
             .expect("stale insert");
 
-        // Record A (ns:b) fails — PK conflict; Record B (ns:a) succeeds — replaces stale.
         let summary = store
             .insert_batch(vec![
                 VectorRecord {
@@ -2284,10 +2275,8 @@ mod atomic_replace_tests {
             .expect("insert_batch");
 
         assert_eq!(summary.attempted, 2);
-        // Record A (ns:b) hits the PK constraint → failed.
-        // Record B (ns:a) DELETEs the stale (freeing PK) then INSERTs → affected.
-        assert_eq!(summary.affected, 1, "Record B must succeed");
-        assert_eq!(summary.failed, 1, "Record A must fail (PK conflict)");
+        assert_eq!(summary.affected, 2);
+        assert_eq!(summary.failed, 0);
 
         // Record B's new_vec must be in the DB with correct embedding bytes.
         let hits = store
@@ -2308,16 +2297,13 @@ mod atomic_replace_tests {
         let sim = hits[0].score.to_f64();
         assert!(
             sim > 0.999,
-            "new_vec similarity to itself must be ~1.0 (got {sim:.6}); \
-             Record A's ROLLBACK must not corrupt Record B's write"
+            "new_vec similarity to itself must be ~1.0 (got {sim:.6})"
         );
     }
 
-    /// update: PK-conflict INSERT inside `unchecked_transaction` rolls back
-    /// and preserves the stale row. See
-    /// crates/khive-db/docs/api/vectors.md#update_pk_conflict_rolls_back_transaction_preserves_stale
+    /// update atomically replaces stale namespace metadata for a subject.
     #[tokio::test]
-    async fn update_pk_conflict_rolls_back_transaction_preserves_stale() {
+    async fn update_replaces_cross_namespace_row() {
         let pool = make_vec_pool();
         let model_key = "atomic_upd_pk";
         let dims = 4;
@@ -2351,54 +2337,51 @@ mod atomic_replace_tests {
             .await
             .expect("stale insert");
 
-        // update() with ns:b — correct dims, finite values, but different namespace.
-        // DELETE WHERE ns=ns:b finds nothing; INSERT id_X hits PK → transaction rolls back.
-        let result = store
+        let replacement_vec = vec![0.5f32, 0.6, 0.7, 0.8];
+        store
             .update(
                 id_x,
                 SubstrateKind::Entity,
                 ns_b,
                 "body",
-                vec![vec![0.5f32, 0.6, 0.7, 0.8]],
+                vec![replacement_vec.clone()],
             )
-            .await;
+            .await
+            .expect("replace stale namespace row");
 
-        assert!(
-            result.is_err(),
-            "update must fail when INSERT hits the vec0 PK constraint"
-        );
-
-        // Stale row in ns:a must be intact.
-        let post = store
+        let stale = store
             .batch_exists(&[id_x], ns_a)
             .await
-            .expect("batch_exists after failed update");
+            .expect("batch_exists old namespace");
         assert!(
-            post.contains(&id_x),
-            "stale row in ns:a must survive after update transaction rollback"
+            !stale.contains(&id_x),
+            "stale namespace metadata must be removed"
         );
+        let replacement = store
+            .batch_exists(&[id_x], ns_b)
+            .await
+            .expect("batch_exists replacement namespace");
+        assert!(replacement.contains(&id_x));
 
-        // Self-similarity check proves the embedding bytes are unchanged.
         let hits = store
             .search(VectorSearchRequest {
-                query_vectors: vec![stale_vec.clone()],
+                query_vectors: vec![replacement_vec],
                 top_k: 1,
-                namespace: Some(ns_a.to_string()),
+                namespace: Some(ns_b.to_string()),
                 kind: Some(SubstrateKind::Entity),
                 embedding_model: None,
                 filter: None,
                 backend_hints: None,
             })
             .await
-            .expect("search after failed update");
+            .expect("search after update");
 
-        assert_eq!(hits.len(), 1, "stale vector must be searchable");
+        assert_eq!(hits.len(), 1, "replacement vector must be searchable");
         assert_eq!(hits[0].subject_id, id_x);
         let sim = hits[0].score.to_f64();
         assert!(
             sim > 0.999,
-            "cosine similarity of stale_vec to itself must be ~1.0 (got {sim:.6}); \
-             transaction rollback must leave embedding bytes unchanged"
+            "cosine similarity of the replacement to itself must be ~1.0 (got {sim:.6})"
         );
     }
 

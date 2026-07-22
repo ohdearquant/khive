@@ -207,50 +207,13 @@ impl ReindexReport {
     }
 }
 
-/// Drop ALL existing vector rows for `subject_ids` in the model's canonical table,
-/// regardless of their stored namespace. This is required before re-embedding
-/// because the vec table's PRIMARY KEY is `(subject_id)` — not `(subject_id,
-/// namespace)` — so a row written by a different namespace would collide on
-/// re-insert. By deleting on subject_id alone we ensure the subsequent INSERT
-/// lands cleanly with the base row's current namespace.
-///
-/// Resolves the store via `rt.vectors_for_model(token, model_name)` — the SAME
-/// call the insert path uses — so alias resolution (`paraphrase` → canonical table
-/// name) is handled identically in both directions. Best-effort: a failure to
-/// resolve the store or delete is logged but does not abort; the subsequent INSERT
-/// will either collide (counted as an error) or succeed.
-async fn drop_vectors_for_subjects(
-    rt: &KhiveRuntime,
-    token: &khive_runtime::NamespaceToken,
-    model_name: &str,
-    ids: &[Uuid],
-) {
-    if ids.is_empty() {
-        return;
-    }
-    let store = match rt.vectors_for_model(token, model_name) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(model = %model_name, error = %e, "drop_vectors_for_subjects: could not resolve store; skipping delete");
-            return;
-        }
-    };
-    if let Err(e) = store.delete_subjects(ids).await {
-        tracing::warn!(model = %model_name, error = %e, "subject-scoped vector drop failed (continuing)");
-    }
-}
-
 /// Embed `staged` with every model in `model_names` and store one vector record
 /// per model — mirroring the multi-model write path in the runtime. Returns the
 /// number of vector inserts that failed.
 ///
-/// With `drop_existing`, all staged ids are (re)embedded. Before inserting, a
-/// subject-scoped delete removes ANY existing row for each `subject_id` in the
-/// model table, regardless of its stored namespace. This prevents UNIQUE
-/// constraint violations when the database was relabeled and vec rows from a
-/// prior namespace survive. The subsequent INSERT writes the current base-row
-/// namespace. With `--keep-existing`, existing vectors are preserved and ids
-/// already embedded are skipped.
+/// With `drop_existing`, all staged ids are (re)embedded and atomically replaced
+/// by `VectorStore::insert_batch`. With `--keep-existing`, existing vectors are
+/// preserved and ids already embedded are skipped.
 // REASON: each argument is a distinct embed dimension (runtime, token, models,
 // namespace, batch, substrate kind, field, drop flag); a struct would add
 // indirection without grouping anything cohesive.
@@ -266,19 +229,6 @@ async fn embed_and_store_batch(
     drop_existing: bool,
 ) -> u64 {
     let mut errors: u64 = 0;
-
-    // Subject-scoped drop: remove ANY existing vec rows for these subject_ids
-    // in each model table, regardless of stored namespace. This ensures the
-    // re-insert never hits a UNIQUE collision when vec rows from a prior
-    // namespace survive a relabel operation. Done once per model here; the
-    // SqliteVecStore::insert DELETE is namespace-scoped and would miss rows
-    // stored under a different namespace.
-    if drop_existing && !staged.is_empty() {
-        let subject_ids: Vec<Uuid> = staged.iter().map(|(id, _)| *id).collect();
-        for model_name in model_names {
-            drop_vectors_for_subjects(rt, token, model_name, &subject_ids).await;
-        }
-    }
 
     for model_name in model_names {
         let vectors = match rt.vectors_for_model(token, model_name) {
@@ -1330,6 +1280,49 @@ mod tests {
         }
     }
 
+    struct NonFiniteRepairEmbeddingService;
+
+    #[async_trait::async_trait]
+    impl lattice_embed::EmbeddingService for NonFiniteRepairEmbeddingService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: lattice_embed::EmbeddingModel,
+        ) -> Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+            Ok(vec![vec![f32::NAN; REPAIR_DIMS]; texts.len()])
+        }
+
+        fn supports_model(&self, _model: lattice_embed::EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "non-finite-repair-test"
+        }
+    }
+
+    struct NonFiniteRepairEmbedderProvider {
+        model_name: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl khive_runtime::EmbedderProvider for NonFiniteRepairEmbedderProvider {
+        fn name(&self) -> &str {
+            self.model_name
+        }
+
+        fn dimensions(&self) -> usize {
+            REPAIR_DIMS
+        }
+
+        async fn build(
+            &self,
+        ) -> Result<std::sync::Arc<dyn lattice_embed::EmbeddingService>, khive_runtime::RuntimeError>
+        {
+            Ok(std::sync::Arc::new(NonFiniteRepairEmbeddingService))
+        }
+    }
+
     #[tokio::test]
     async fn test_reindex_invalidates_vamana_snapshots() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
@@ -1768,6 +1761,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn embeds_only_repair_insert_failure_preserves_prior_vector() {
+        use khive_runtime::RuntimeConfig;
+        use khive_storage::types::VectorRecord;
+
+        let rt = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            ..RuntimeConfig::default()
+        })
+        .expect("runtime");
+        rt.register_embedder(RepairEmbedderProvider {
+            model_name: REPAIR_MODEL,
+        });
+        let token = rt
+            .authorize(Namespace::parse("local").expect("namespace"))
+            .expect("authorize");
+        let note = Note::new("local", "observation", "preserve prior embedding");
+        rt.notes(&token)
+            .expect("notes")
+            .upsert_note(note.clone())
+            .await
+            .expect("seed note");
+
+        let vectors = rt.vectors_for_model(&token, REPAIR_MODEL).expect("vectors");
+        vectors
+            .insert_batch(vec![VectorRecord {
+                subject_id: note.id,
+                kind: SubstrateKind::Note,
+                namespace: "stale-namespace".to_string(),
+                field: "note.content".to_string(),
+                embedding_model: Some(REPAIR_MODEL.to_string()),
+                vectors: vec![vec![0.1; REPAIR_DIMS]],
+                updated_at: chrono::Utc::now(),
+            }])
+            .await
+            .expect("seed prior vector");
+
+        rt.register_embedder(NonFiniteRepairEmbedderProvider {
+            model_name: REPAIR_MODEL,
+        });
+        let result =
+            repair_missing_embeddings(&rt, &token, &[REPAIR_MODEL.to_string()], "local", 100)
+                .await
+                .expect("repair embeddings");
+        assert_eq!(result, (0, 1, 1));
+
+        let present = vectors
+            .batch_exists(&[note.id], "stale-namespace")
+            .await
+            .expect("read prior vector after failed repair");
+        assert!(
+            present.contains(&note.id),
+            "a failed repair insert must leave the prior vector readable"
+        );
+    }
+
+    #[tokio::test]
     async fn embeds_only_repair_writes_multiple_vectors_in_one_batch() {
         use khive_runtime::RuntimeConfig;
 
@@ -2164,19 +2215,10 @@ mod tests {
         );
     }
 
-    // C3 regression: drop_vectors_for_subjects must target the SAME table as the insert path.
-    //
-    // The old code hand-sanitized model_name to derive the table name, which diverged from
-    // the insert path when the model is registered under a canonical name (e.g.
-    // "all-minilm-l6-v2" → table "vec_all_minilm_l6_v2" but a different sanitization of the
-    // raw env-var alias would yield a different key). The fix routes both drop and insert
-    // through rt.vectors_for_model() — the same Arc<dyn VectorStore> — so the table is
-    // always consistent.
-    //
-    // This test inserts a vector via vectors_for_model, calls drop_vectors_for_subjects with
-    // the same model name, and asserts the row is gone.
+    // Namespace-agnostic deletion must operate on the same model-resolved store
+    // used by vector insertion.
     #[tokio::test]
-    async fn drop_vectors_for_subjects_targets_same_table_as_insert() {
+    async fn vector_store_delete_subjects_targets_same_table_as_insert() {
         use async_trait::async_trait;
         use khive_runtime::{EmbedderProvider, RuntimeConfig, RuntimeError};
         use khive_storage::types::VectorRecord;
@@ -2265,29 +2307,19 @@ mod tests {
         let before = store.count().await.expect("count before");
         assert_eq!(before, 1, "row must exist before drop");
 
-        // Drop via drop_vectors_for_subjects — uses the same vectors_for_model path.
-        drop_vectors_for_subjects(&rt, &token, MODEL, &[subject_id]).await;
+        store
+            .delete_subjects(&[subject_id])
+            .await
+            .expect("delete subject vectors");
 
         // Row must be gone.
         let after = store.count().await.expect("count after");
-        assert_eq!(after, 0, "row must be deleted by drop_vectors_for_subjects");
+        assert_eq!(after, 0, "row must be deleted by delete_subjects");
     }
 
-    // C3 alias regression: drop_vectors_for_subjects via a lattice ALIAS must target
-    // the SAME canonical table as the insert path that used the full canonical name.
-    //
-    // Previously the old hand-sanitized path would diverge on aliases like "paraphrase"
-    // (→ "paraphrase-multilingual-minilm-l12-v2" canonical, table
-    // "vec_paraphrase_multilingual_minilm_l12_v2"). Both the insert path and the drop
-    // path go through rt.vectors_for_model() which resolves the alias to the same
-    // canonical VectorStore — the bug cannot happen with the current implementation.
-    //
-    // This test registers a stub under the canonical name, inserts via the canonical
-    // name, drops via the short alias "paraphrase", and asserts the row is gone.
-    // It FAILS if either path hand-derives the table name from the raw string instead
-    // of routing through vectors_for_model().
+    // A lattice alias and its canonical name must resolve to the same vector table.
     #[tokio::test]
-    async fn drop_vectors_for_subjects_paraphrase_alias_targets_same_table_as_insert() {
+    async fn vector_store_alias_targets_same_table_as_canonical_name() {
         use khive_runtime::RuntimeConfig;
         use khive_storage::types::VectorRecord;
         use khive_types::SubstrateKind;
@@ -2341,11 +2373,11 @@ mod tests {
         let before = store_canonical.count().await.expect("count before");
         assert_eq!(before, 1, "row must exist before alias-drop");
 
-        // Drop via the ALIAS "paraphrase".  vectors_for_model resolves alias →
-        // EmbeddingModel::ParaphraseMultilingualMiniLmL12V2 → same canonical table.
-        // If the implementation ever diverges (hand-sanitizes the raw alias string),
-        // the delete targets a different table and `after` stays 1 → test fails.
-        drop_vectors_for_subjects(&rt, &token, ALIAS, &[subject_id]).await;
+        rt.vectors_for_model(&token, ALIAS)
+            .expect("alias store")
+            .delete_subjects(&[subject_id])
+            .await
+            .expect("delete through alias store");
 
         let after = store_canonical.count().await.expect("count after");
         assert_eq!(
