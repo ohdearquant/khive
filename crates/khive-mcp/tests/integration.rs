@@ -1248,6 +1248,7 @@ model = "bge-small-en-v1.5"
         db_path: None,
         embedding_model: None,
         additional_embedding_models: vec![],
+        packs: vec!["kg".to_string()],
         ..RuntimeConfig::default()
     };
     let config = runtime_config_from_khive_config(&khive_cfg, base);
