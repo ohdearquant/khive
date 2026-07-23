@@ -1261,14 +1261,6 @@ impl VamanaIndex {
         let max_degree = config.max_degree;
         let mut graph = read_graph(&path.join("graph.bin"), max_degree, num_vectors)?;
 
-        if graph.node_count() != num_vectors {
-            return Err(VamanaError::invalid_format(format!(
-                "graph node count {} != commit num_vectors {}",
-                graph.node_count(),
-                num_vectors
-            )));
-        }
-
         let expected_len_f32 = num_vectors
             .checked_mul(dimensions)
             .ok_or_else(|| VamanaError::invalid_format("v2 metadata overflow".into()))?;
@@ -1277,51 +1269,11 @@ impl VamanaIndex {
         // Parse lifecycle.bin and restore state directly (no O(N*R) rebuild).
         let lifecycle = parse_lifecycle(lifecycle_data, num_vectors, max_degree)?;
 
-        // Validate bidirectional consistency: the persisted reverse_adj must be the exact
-        // inverse of the loaded forward graph. A checksum-valid but writer-bugged lifecycle
-        // segment can pass parse_lifecycle's per-list shape checks (in-range, no dup, no
-        // self-ref) while still being semantically wrong (phantom sources, missing entries).
-        // Wolverine delete-repair relies on the invariant at graph.rs:96-98 that
-        // reverse_adj[v] == { u | v ∈ adjacency[u] }; a false in-neighbor corrupts repair.
-        {
-            let adjacency = graph.adjacency();
-            let rev = &lifecycle.reverse_adj;
-            // Rebuild expected reverse_adj from the forward graph in O(N*R).
-            let mut expected: Vec<Vec<u32>> = vec![Vec::new(); num_vectors];
-            for (u, neighbors) in adjacency.iter().enumerate() {
-                for &v in neighbors {
-                    expected[v as usize].push(u as u32);
-                }
-            }
-            // Sort both sides before comparing (persisted lists may not be sorted).
-            for e in expected.iter_mut() {
-                e.sort_unstable();
-            }
-            for (v, (exp, got)) in expected.iter().zip(rev.iter()).enumerate() {
-                let mut got_sorted = got.clone();
-                got_sorted.sort_unstable();
-                if *exp != got_sorted {
-                    return Err(VamanaError::invalid_format(format!(
-                        "lifecycle.bin reverse_adj[{v}] is not the inverse of graph.bin \
-                         forward adjacency: expected {exp:?}, got {got_sorted:?}"
-                    )));
-                }
-            }
-        }
+        // Structural validity (node count, bidirectional reverse_adj, tombstone count) —
+        // see `validate_v2_structural` for why a checksum match alone isn't enough.
+        let tombstone_count = validate_v2_structural(&graph, &lifecycle, num_vectors)?;
 
         graph.restore_reverse_adj(lifecycle.reverse_adj);
-
-        let tombstone_count = lifecycle
-            .tombstones
-            .iter()
-            .map(|w| w.count_ones() as usize)
-            .sum();
-
-        if tombstone_count > num_vectors {
-            return Err(VamanaError::invalid_format(format!(
-                "lifecycle.bin tombstone_count {tombstone_count} exceeds num_vectors {num_vectors}"
-            )));
-        }
 
         // Codes segment: mmap `codes.bin` when the commit record carries its
         // checksum (extended format); otherwise retrain from the corpus — the
@@ -2772,6 +2724,13 @@ struct ParsedLifecycle {
     ops_since_consolidation: usize,
 }
 
+/// A checksum-valid incumbent can still be structurally corrupt (see
+/// [`validate_v2_structural`]) — one `load_or_build` would discard and rebuild on its own
+/// next load. The sequence guard must reach the same verdict, or it permanently blocks the
+/// one write (a repair checkpoint from a sequenced rebuild) that would fix the corruption:
+/// a corrupt incumbent at sequence N would reject every candidate below N forever, even
+/// though nothing before N is actually recoverable data. Only a structurally valid incumbent
+/// gets the regression guard; a structurally invalid one is treated as no incumbent at all.
 #[cfg(feature = "mmap")]
 fn reject_checkpoint_sequence_regression(path: &Path, candidate: Option<u64>) -> Result<()> {
     let metadata = match fs::read(path.join("metadata.bin")) {
@@ -2792,6 +2751,7 @@ fn reject_checkpoint_sequence_regression(path: &Path, candidate: Option<u64>) ->
         ("graph.bin", commit.graph_hash),
         ("lifecycle.bin", commit.lifecycle_hash),
     ];
+    let mut lifecycle_data: Option<Vec<u8>> = None;
     for (name, expected) in segments {
         let data = match fs::read(path.join(name)) {
             Ok(data) => data,
@@ -2800,6 +2760,9 @@ fn reject_checkpoint_sequence_regression(path: &Path, candidate: Option<u64>) ->
         };
         if blake3::hash(&data).as_bytes() != &expected {
             return Ok(());
+        }
+        if name == "lifecycle.bin" {
+            lifecycle_data = Some(data);
         }
     }
     if let Some(expected) = commit.codes_hash {
@@ -2815,6 +2778,22 @@ fn reject_checkpoint_sequence_regression(path: &Path, candidate: Option<u64>) ->
     let Some(incumbent) = commit.last_applied_seq else {
         return Ok(());
     };
+
+    let lifecycle_data = lifecycle_data.expect("lifecycle.bin hashed above");
+    let max_degree = commit.index_meta.max_degree;
+    let num_vectors = commit.index_meta.num_vectors;
+    let structurally_valid = (|| -> Result<()> {
+        let graph = read_graph(&path.join("graph.bin"), max_degree, num_vectors)?;
+        let lifecycle = parse_lifecycle(&lifecycle_data, num_vectors, max_degree)?;
+        validate_v2_structural(&graph, &lifecycle, num_vectors)?;
+        Ok(())
+    })();
+    match structurally_valid {
+        Ok(()) => {}
+        Err(VamanaError::InvalidFormat { .. }) => return Ok(()),
+        Err(error) => return Err(error),
+    }
+
     if candidate.is_none_or(|sequence| sequence < incumbent) {
         return Err(VamanaError::CheckpointSequenceRegression {
             candidate,
@@ -2822,6 +2801,73 @@ fn reject_checkpoint_sequence_regression(path: &Path, candidate: Option<u64>) ->
         });
     }
     Ok(())
+}
+
+/// Structural validity of a v2 commit's graph + lifecycle state, on top of the blake3
+/// checksum match the caller already verified. A checksum only proves the bytes on disk
+/// match what `save_atomic` last wrote — it says nothing about whether a writer bug left
+/// `reverse_adj` out of sync with the forward graph, or the node/tombstone counts
+/// inconsistent with the commit record. Shared by `load_v2_fast` (which restores lifecycle
+/// state from a checksum-valid segment) and `reject_checkpoint_sequence_regression` (which
+/// must not let a checksum-valid-but-structurally-corrupt incumbent block a repair
+/// checkpoint at a lower sequence) so the two agree on what counts as a valid incumbent.
+#[cfg(feature = "mmap")]
+fn validate_v2_structural(
+    graph: &VamanaGraph,
+    lifecycle: &ParsedLifecycle,
+    num_vectors: usize,
+) -> Result<usize> {
+    if graph.node_count() != num_vectors {
+        return Err(VamanaError::invalid_format(format!(
+            "graph node count {} != commit num_vectors {}",
+            graph.node_count(),
+            num_vectors
+        )));
+    }
+
+    // The persisted reverse_adj must be the exact inverse of the loaded forward graph. A
+    // checksum-valid but writer-bugged lifecycle segment can pass parse_lifecycle's
+    // per-list shape checks (in-range, no dup, no self-ref) while still being semantically
+    // wrong (phantom sources, missing entries). Wolverine delete-repair relies on the
+    // invariant at graph.rs:96-98 that reverse_adj[v] == { u | v ∈ adjacency[u] }; a false
+    // in-neighbor corrupts repair.
+    let adjacency = graph.adjacency();
+    let mut expected: Vec<Vec<u32>> = vec![Vec::new(); num_vectors];
+    for (u, neighbors) in adjacency.iter().enumerate() {
+        for &v in neighbors {
+            expected[v as usize].push(u as u32);
+        }
+    }
+    for e in expected.iter_mut() {
+        e.sort_unstable();
+    }
+    for (v, (exp, got)) in expected
+        .iter()
+        .zip(lifecycle.reverse_adj.iter())
+        .enumerate()
+    {
+        let mut got_sorted = got.clone();
+        got_sorted.sort_unstable();
+        if *exp != got_sorted {
+            return Err(VamanaError::invalid_format(format!(
+                "lifecycle.bin reverse_adj[{v}] is not the inverse of graph.bin \
+                 forward adjacency: expected {exp:?}, got {got_sorted:?}"
+            )));
+        }
+    }
+
+    let tombstone_count: usize = lifecycle
+        .tombstones
+        .iter()
+        .map(|w| w.count_ones() as usize)
+        .sum();
+    if tombstone_count > num_vectors {
+        return Err(VamanaError::invalid_format(format!(
+            "lifecycle.bin tombstone_count {tombstone_count} exceeds num_vectors {num_vectors}"
+        )));
+    }
+
+    Ok(tombstone_count)
 }
 
 /// Write the KHVVAMG2 commit record including embedded v1 metadata fields.
@@ -5383,6 +5429,95 @@ mod tests {
         let persisted = VamanaIndex::load(dir.path()).unwrap();
         assert_eq!(persisted.last_applied_seq(), Some(200));
         assert_eq!(persisted.vectors().unwrap(), vectors);
+    }
+
+    #[cfg(feature = "mmap")]
+    #[test]
+    fn checkpoint_publication_repairs_structurally_corrupt_incumbent() {
+        // A checksum-valid incumbent can still be structurally corrupt: a writer bug can
+        // leave lifecycle.bin's reverse_adj out of sync with graph.bin's forward adjacency
+        // while every per-segment blake3 checksum still matches what save_atomic wrote. The
+        // sequence guard must not treat such an incumbent as a legitimate barrier — doing so
+        // would reject every future repair checkpoint below its sequence forever, leaving the
+        // corruption permanent.
+        let vectors = rand_unit_vectors(20, 4, 0x2200_0100);
+        let cfg = VamanaConfig::with_dimensions(4)
+            .with_max_degree(4)
+            .with_search_list_size(8);
+        let mut incumbent = VamanaIndex::build(&vectors, cfg.clone()).unwrap();
+        incumbent.set_last_applied_seq(Some(500));
+
+        let dir = tempfile::tempdir().unwrap();
+        incumbent.save_atomic(dir.path()).unwrap();
+
+        // Corrupt the on-disk incumbent: give node 0 a phantom in-neighbor that
+        // parse_lifecycle's per-list shape checks (in-range, no dup, no self-ref) accept,
+        // but that is not actually a predecessor in graph.bin's forward adjacency. Then
+        // re-sign metadata.bin so the checksum still matches the corrupted bytes.
+        let metadata_bytes = fs::read(dir.path().join("metadata.bin")).unwrap();
+        let commit = parse_v2_commit(&metadata_bytes).unwrap();
+        let lifecycle_bytes = fs::read(dir.path().join("lifecycle.bin")).unwrap();
+        let mut lifecycle = parse_lifecycle(
+            &lifecycle_bytes,
+            commit.index_meta.num_vectors,
+            commit.index_meta.max_degree,
+        )
+        .unwrap();
+        let phantom: u32 = if lifecycle.reverse_adj[0].contains(&1) {
+            2
+        } else {
+            1
+        };
+        lifecycle.reverse_adj[0].push(phantom);
+
+        let corrupt_lifecycle_bytes = encode_lifecycle(
+            &lifecycle.tombstones,
+            &lifecycle.free_slots,
+            &lifecycle.reverse_adj,
+            lifecycle.ops_since_consolidation,
+        );
+        fs::write(dir.path().join("lifecycle.bin"), &corrupt_lifecycle_bytes).unwrap();
+        let corrupt_lifecycle_hash = *blake3::hash(&corrupt_lifecycle_bytes).as_bytes();
+
+        write_v2_commit_full(
+            &dir.path().join("metadata.bin"),
+            &commit.vectors_hash,
+            &commit.graph_hash,
+            &corrupt_lifecycle_hash,
+            &V2CorpusFingerprint {
+                vector_count: commit.fingerprint.vector_count,
+                dimensions: commit.fingerprint.dimensions,
+                content_hash: commit.fingerprint.content_hash,
+            },
+            commit.index_meta.num_vectors,
+            commit.index_meta.dimensions,
+            commit.index_meta.max_degree,
+            commit.index_meta.search_list_size,
+            commit.index_meta.alpha,
+            commit.last_applied_seq,
+            commit.codes_hash.as_ref(),
+        )
+        .unwrap();
+
+        // The on-disk incumbent now passes every checksum, but load_v2_fast's bidirectional
+        // reverse_adj check must still reject it as structurally invalid.
+        assert!(matches!(
+            VamanaIndex::load(dir.path()),
+            Err(VamanaError::InvalidFormat { .. })
+        ));
+
+        // A repair checkpoint at a lower sequence than the corrupt incumbent (500) must
+        // still be allowed to publish — the corrupt incumbent is not a legitimate barrier.
+        let repair_vectors = rand_unit_vectors(15, 4, 0x2200_0200);
+        let mut repair = VamanaIndex::build(&repair_vectors, cfg).unwrap();
+        repair.set_last_applied_seq(Some(100));
+        repair
+            .save_atomic(dir.path())
+            .expect("repair checkpoint below a structurally corrupt incumbent must publish");
+
+        let persisted = VamanaIndex::load(dir.path()).unwrap();
+        assert_eq!(persisted.last_applied_seq(), Some(100));
+        assert_eq!(persisted.vectors().unwrap(), repair_vectors);
     }
 
     #[cfg(feature = "mmap")]
