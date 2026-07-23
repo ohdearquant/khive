@@ -3840,3 +3840,43 @@ async fn stats_totals_match_list_walk_across_visible_namespaces() {
     );
     assert_eq!(stats_notes, 2);
 }
+
+#[test]
+#[serial_test::serial]
+fn test_harness_refuses_runtime_default_store() {
+    struct HomeGuard(Option<std::ffi::OsString>);
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(home) => std::env::set_var("HOME", home),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    assert_eq!(
+        std::env::var("KHIVE_TEST_HARNESS").as_deref(),
+        Ok("1"),
+        "the workspace Cargo harness must mark integration-test processes"
+    );
+    let fake_home = tempfile::tempdir().expect("temporary HOME");
+    let _home_guard = HomeGuard(std::env::var_os("HOME"));
+    std::env::set_var("HOME", fake_home.path());
+    let expected_path = fake_home.path().join(".khive/khive.db");
+    let config = RuntimeConfig::no_embeddings();
+    assert_eq!(config.db_path.as_deref(), Some(expected_path.as_path()));
+
+    let error = match KhiveRuntime::new(config) {
+        Ok(_) => panic!("test harness opened the default home-directory store"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("test harness refused"),
+        "unexpected guard error: {error}"
+    );
+    assert!(
+        !expected_path.exists(),
+        "the guarded runtime must refuse the path before SQLite creates it"
+    );
+}
