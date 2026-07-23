@@ -29,12 +29,16 @@ pub mod walpin;
 pub mod writer_task;
 
 pub use backend::StorageBackend;
-pub use checkpoint::{checkpoint_once, run_checkpoint_task, CheckpointConfig, CheckpointTick};
+pub use checkpoint::{
+    checkpoint_once, run_checkpoint_task, CheckpointConfig, CheckpointLifecycleOwner,
+    CheckpointTick,
+};
 pub use checkpoint::{run_session_sweep_task, SessionSweepConfig, SweepBackend};
 pub use error::SqliteError;
 pub use migrations::{
-    inspect_schema_version, query_embedding_models, read_schema_version, run_migrations,
-    EmbeddingModelRegistryRecord, Migration, ServiceSchemaPlan, VersionedMigration, MIGRATIONS,
+    inspect_schema, inspect_schema_version, query_embedding_models, read_schema_version,
+    run_migrations, EmbeddingModelRegistryRecord, Migration, SchemaInspection, ServiceSchemaPlan,
+    VersionedMigration, MIGRATIONS,
 };
 pub use pool::{ConnectionPool, PoolConfig, ReaderGuard, WriterGuard};
 pub use sql_bridge::SqlBridge;

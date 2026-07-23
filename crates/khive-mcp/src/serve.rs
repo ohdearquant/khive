@@ -63,6 +63,7 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
     let (server, schedule_rt) = build_server(&args)?;
 
     spawn_schedule_tick_loop_if_daemon(&args, &server, schedule_rt);
+    start_daemon_components_if_daemon(&args, &server);
 
     #[cfg(unix)]
     if args.daemon {
@@ -214,6 +215,18 @@ async fn serve_holding_sweep(
     result
 }
 
+/// Start ADR-119 daemon components in daemon role only. Non-daemon roles
+/// must not start components and stay byte-identical in behavior and output
+/// — the silent return keeps client runs unchanged. In daemon role the
+/// registry itself always logs the enumerated roster (names + count),
+/// including an empty one.
+fn start_daemon_components_if_daemon(args: &Args, server: &KhiveMcpServer) {
+    if !args.daemon {
+        return;
+    }
+    crate::components::start_daemon_components(server);
+}
+
 /// Spawn the daemon-resident schedule-event tick loop (ADR-106) iff `args`
 /// indicates this process is the daemon (mirrors the daemon-role gate
 /// pattern used by the (now-extracted) channel loops, #602). `schedule_rt`
@@ -286,6 +299,7 @@ pub async fn serve_server(
         );
     }
     spawn_schedule_tick_loop_if_daemon(args, &server, schedule_rt);
+    start_daemon_components_if_daemon(args, &server);
 
     #[cfg(unix)]
     if args.daemon {

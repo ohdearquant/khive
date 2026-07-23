@@ -1,0 +1,7 @@
+[env]
+# Cargo propagates this marker to unit tests, integration tests, and test-spawned
+# binaries. The store-open guard checks it at runtime in every build profile.
+# There is no environment override: deliberate sessions against a real store
+# run the built binary directly (outside the Cargo environment), which never
+# receives this marker.
+KHIVE_TEST_HARNESS = { value = "1", force = true }

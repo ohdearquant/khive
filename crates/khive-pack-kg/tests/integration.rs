@@ -3307,6 +3307,10 @@ async fn curation_merge_entity_event_payload_has_adr014_fields() {
         payload.get("content_strategy").is_some(),
         "entity_merged payload must contain 'content_strategy' (PR #814); got {payload}"
     );
+    assert!(
+        payload.get("force").is_none(),
+        "ordinary entity merges must not carry a force marker; got {payload}"
+    );
 }
 
 /// Handler-wiring test for PR #814: `content_strategy`
@@ -3348,7 +3352,12 @@ async fn merge_handler_wires_explicit_prefer_from_content_strategy() {
     // onto the entity policy, the into-description ("desc A") survives instead.
     p.dispatch(
         "merge",
-        json!({"into_id": &into_id, "from_id": &from_id, "content_strategy": "prefer_from"}),
+        json!({
+            "into_id": &into_id,
+            "from_id": &from_id,
+            "content_strategy": "prefer_from",
+            "force": true,
+        }),
     )
     .await
     .expect("merge must succeed");
@@ -5232,6 +5241,270 @@ async fn singleton_link_updates_weight_and_metadata_on_existing_triple() {
 }
 
 // ---- Merge symmetric-relation canonicalization regression (ADR-002 §134) ----
+
+#[tokio::test]
+async fn merge_dissimilar_cross_kind_is_refused_by_entity_kind_guard() {
+    let pack = pack();
+    let into_id = pack
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "Quantum Annealing"}),
+        )
+        .await
+        .expect("create into entity")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let from_id = pack
+        .dispatch(
+            "create",
+            json!({"kind": "project", "name": "Renaissance Painting"}),
+        )
+        .await
+        .expect("create from entity")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let err = pack
+        .dispatch("merge", json!({"into_id": into_id, "from_id": from_id}))
+        .await
+        .expect_err("cross-kind merge must be refused");
+    let RuntimeError::Khive(err) = err else {
+        panic!("expected structured merge-guard error, got {err:?}");
+    };
+    assert_eq!(err.kind(), khive_types::ErrorKind::Conflict);
+    assert_eq!(
+        err.details().and_then(|details| details.get("guard")),
+        Some("entity_kind")
+    );
+}
+
+#[tokio::test]
+async fn merge_dissimilar_cross_kind_force_overrides_guards() {
+    let pack = pack();
+    let into_id = pack
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "Quantum Annealing"}),
+        )
+        .await
+        .expect("create into entity")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let from_id = pack
+        .dispatch(
+            "create",
+            json!({"kind": "project", "name": "Renaissance Painting"}),
+        )
+        .await
+        .expect("create from entity")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let result = pack
+        .dispatch(
+            "merge",
+            json!({"into_id": into_id, "from_id": from_id, "force": true}),
+        )
+        .await
+        .expect("force=true must override all entity merge guards");
+    assert_eq!(result["removed_id"], from_id);
+}
+
+#[tokio::test]
+async fn merge_legitimate_near_duplicate_passes_safety_floor() {
+    let pack = pack();
+    let into_id = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "concept",
+                "name": "Attention Flash",
+                "properties": {"projects": ["transformers", "inference"]},
+            }),
+        )
+        .await
+        .expect("create into entity")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let from_id = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "concept",
+                "name": "Flash Attention",
+                "properties": {"projects": ["inference", "kernels"]},
+            }),
+        )
+        .await
+        .expect("create from entity")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let result = pack
+        .dispatch("merge", json!({"into_id": into_id, "from_id": from_id}))
+        .await
+        .expect("near-duplicate names with compatible projects must merge");
+    assert_eq!(result["removed_id"], from_id);
+}
+
+#[tokio::test]
+async fn merge_same_kind_dissimilar_names_is_refused_by_name_guard() {
+    let pack = pack();
+    let into_id = pack
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "Quantum Annealing"}),
+        )
+        .await
+        .expect("create into entity")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let from_id = pack
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "Renaissance Painting"}),
+        )
+        .await
+        .expect("create from entity")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let err = pack
+        .dispatch("merge", json!({"into_id": into_id, "from_id": from_id}))
+        .await
+        .expect_err("dissimilar entity names must be refused");
+    let RuntimeError::Khive(err) = err else {
+        panic!("expected structured merge-guard error, got {err:?}");
+    };
+    assert_eq!(
+        err.details().and_then(|details| details.get("guard")),
+        Some("name_similarity")
+    );
+}
+
+#[tokio::test]
+async fn merge_punctuation_collision_is_refused_unless_forced() {
+    let pack = pack();
+    let into_id = pack
+        .dispatch("create", json!({"kind": "concept", "name": "C++"}))
+        .await
+        .expect("create C++ entity")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let from_id = pack
+        .dispatch("create", json!({"kind": "concept", "name": "C#"}))
+        .await
+        .expect("create C# entity")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let err = pack
+        .dispatch("merge", json!({"into_id": &into_id, "from_id": &from_id}))
+        .await
+        .expect_err("punctuation-distinct entity names must be refused");
+    let RuntimeError::Khive(err) = err else {
+        panic!("expected structured merge-guard error, got {err:?}");
+    };
+    assert_eq!(err.kind(), khive_types::ErrorKind::Conflict);
+    assert_eq!(
+        err.details().and_then(|details| details.get("guard")),
+        Some("name_similarity")
+    );
+
+    let result = pack
+        .dispatch(
+            "merge",
+            json!({"into_id": &into_id, "from_id": &from_id, "force": true}),
+        )
+        .await
+        .expect("force=true must override the name-similarity guard");
+    assert_eq!(result["removed_id"], from_id);
+}
+
+#[tokio::test]
+async fn merge_name_equality_ignores_case_and_collapsed_whitespace() {
+    for (into_name, from_name) in [
+        ("Case Fold", "cASE fOLD"),
+        ("Graph Neural Network", "  graph  neural\t network  "),
+    ] {
+        let pack = pack();
+        let into_id = pack
+            .dispatch("create", json!({"kind": "concept", "name": into_name}))
+            .await
+            .expect("create into entity")["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let from_id = pack
+            .dispatch("create", json!({"kind": "concept", "name": from_name}))
+            .await
+            .expect("create from entity")["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let result = pack
+            .dispatch("merge", json!({"into_id": into_id, "from_id": from_id}))
+            .await
+            .expect("case and whitespace differences must remain merge-compatible");
+        assert_eq!(result["removed_id"], from_id);
+    }
+}
+
+#[tokio::test]
+async fn merge_disjoint_projects_is_refused_by_properties_guard() {
+    let pack = pack();
+    let into_id = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "concept",
+                "name": "Vector Search",
+                "properties": {"projects": ["search-service"]},
+            }),
+        )
+        .await
+        .expect("create into entity")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let from_id = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "concept",
+                "name": "vector-search",
+                "properties": {"projects": ["recommendation-service"]},
+            }),
+        )
+        .await
+        .expect("create from entity")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let err = pack
+        .dispatch("merge", json!({"into_id": into_id, "from_id": from_id}))
+        .await
+        .expect_err("disjoint project ownership must be refused");
+    let RuntimeError::Khive(err) = err else {
+        panic!("expected structured merge-guard error, got {err:?}");
+    };
+    assert_eq!(
+        err.details().and_then(|details| details.get("guard")),
+        Some("project_compatibility")
+    );
+}
 
 /// After merging B into A, B's `competes_with` edge to C is rewired to A→C.
 /// If A already has a `competes_with` edge to C, the rewire is a conflict:
@@ -10447,6 +10720,102 @@ async fn context_budget_truncation_sets_flag_and_dropped_counts() {
         dropped_neighbors > 0,
         "expected at least one dropped neighbor; got dropped={:?}",
         resp["dropped"]
+    );
+}
+
+#[tokio::test]
+async fn context_bloated_anchor_neighbors_do_not_starve_a_later_relevant_anchor() {
+    // Regression test: a higher-ranked anchor with a large neighbor fan-out must
+    // not consume the entire budget and push a lower-ranked (but still
+    // query-relevant) anchor's own entity record out of the response. Before the
+    // fix, `assemble_within_budget` walked each anchor's entity *and* neighbors
+    // before moving to the next anchor, so one anchor's neighbor sprawl could
+    // exhaust the budget and drop every anchor ranked after it — including
+    // anchors a plain entity search on the same query would have surfaced.
+    let pack = pack();
+
+    let bloat = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "CtxStarveBloatAnchor", "entity_kind": "concept", "description": "ctxstarve shared regression phrase alpha"}),
+        )
+        .await
+        .expect("create bloat anchor");
+    let bloat_id = bloat["id"].as_str().unwrap().to_string();
+
+    for i in 0..15 {
+        let n = pack
+            .dispatch(
+                "create",
+                json!({"kind": "entity", "name": format!("CtxStarveBloatNeighbor{i}"), "entity_kind": "concept", "description": "a verbose neighbor description with enough text to consume budget quickly"}),
+            )
+            .await
+            .expect("create bloat neighbor");
+        let n_id = n["id"].as_str().unwrap().to_string();
+        pack.dispatch(
+            "link",
+            json!({"source_id": bloat_id, "target_id": n_id, "relation": "extends"}),
+        )
+        .await
+        .expect("link bloat anchor -> neighbor");
+    }
+
+    let on_topic = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "CtxStarveOnTopicAnchor", "entity_kind": "concept", "description": "ctxstarve shared regression phrase beta"}),
+        )
+        .await
+        .expect("create on-topic anchor");
+    let on_topic_id = on_topic["id"].as_str().unwrap().to_string();
+
+    let query = "ctxstarve shared regression phrase";
+
+    // A plain entity search on the same query surfaces the on-topic anchor.
+    let search_resp = pack
+        .dispatch(
+            "search",
+            json!({"kind": "entity", "query": query, "limit": 5}),
+        )
+        .await
+        .expect("search must succeed");
+    let search_hits = search_resp.as_array().unwrap();
+    assert!(
+        search_hits.iter().any(|h| h["id"] == on_topic_id),
+        "plain entity search must surface the on-topic anchor; got: {search_hits:?}"
+    );
+
+    // A budget that comfortably fits both anchor entity records, but not the
+    // bloated anchor's 15 verbose neighbors.
+    let resp = pack
+        .dispatch(
+            "context",
+            json!({"query": query, "hops": 1, "fanout": 20, "limit": 5, "budget": 900}),
+        )
+        .await
+        .expect("context must succeed");
+
+    let anchors = resp["anchors"].as_array().unwrap();
+    assert!(
+        anchors.iter().any(|a| a["entity"]["id"] == on_topic_id),
+        "the on-topic anchor's entity record must survive a sibling's bloated \
+         neighbor list; got anchors: {anchors:?}"
+    );
+    assert_eq!(
+        resp["dropped"]["anchors"], 0,
+        "no anchor entity should be dropped"
+    );
+    assert!(
+        resp["truncated"] == true,
+        "the bloated neighbor list must still trigger truncation"
+    );
+    assert!(
+        resp["dropped"]["neighbors"].as_i64().unwrap() > 0,
+        "the bloated anchor's neighbors must be the thing that gets dropped"
+    );
+    assert_eq!(
+        resp["dropped"]["stage"], "budget",
+        "drop accounting must name the stage responsible for the drop"
     );
 }
 
