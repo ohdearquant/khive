@@ -7,6 +7,15 @@
 // surface stabilises post-retrieval-refactor, group by substrate (entity,
 // note, edge, search) into submodules under an `operations/` directory.
 //! High-level operations composing storage capabilities into user-facing verbs.
+//!
+//! # Fault-injection arm migration
+//!
+//! Namespace-targeted fault injection uses scoped guards. The former
+//! `arm_fts_fail`, `arm_fts_fail_many`, `arm_fts_fail_many_partial`, and
+//! `arm_vector_fail` names were removed in favor of their `_scoped` variants so
+//! stale statement-form calls fail to compile. Statement-form arming cannot be
+//! preserved because dropping the returned guard at the semicolon disarms an
+//! unconsumed injection.
 
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -96,7 +105,7 @@ std::thread_local! {
 
 /// Arm the count-targetable vector-INSERT fault: let `n` inserts succeed, then fail
 /// the next one (entity or note, single- or multi-model). Set `n = 0` to fail
-/// immediately on the first insert. Thread-local, so unlike `arm_vector_fail`
+/// immediately on the first insert. Thread-local, so unlike `arm_vector_fail_scoped`
 /// it cannot be won or disarmed by a concurrently-running test on another
 /// thread — prefer this one whenever the caller cannot guarantee it is the
 /// only test writing into the namespace it cares about.
@@ -106,9 +115,9 @@ pub fn arm_vector_fail_after(n: usize) {
     VECTOR_FAIL_AFTER.with(|cell| cell.set(Some(n)));
 }
 
-// Namespace-keyed one-shot set, not a single `Option<String>` slot:
+// Namespace-keyed one-shot arms, not a single `Option<String>` slot:
 // `create_note_inner` and `create_entity_inner` share this flag, and a
-// single-slot design let a concurrently running test's `arm_fts_fail(other_ns)`
+// single-slot design let a concurrently running test's `arm_fts_fail_scoped(other_ns)`
 // overwrite this test's armed namespace before its own create call consumed
 // it, so the intended injection silently never fired (#1095). Keying by
 // namespace fixes that at the root — arming `ns_B` inserts `ns_B` without
@@ -118,26 +127,80 @@ pub fn arm_vector_fail_after(n: usize) {
 // check-and-remove under the mutex lock keeps exactly-once semantics even
 // under concurrent same-namespace creates.
 #[cfg(any(test, feature = "fault-injection"))]
-static FTS_FAIL_NS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+type FaultArmSet = std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<()>>>;
+#[cfg(any(test, feature = "fault-injection"))]
+const MAX_FAULT_ARMS: usize = 64;
+#[cfg(any(test, feature = "fault-injection"))]
+static FTS_FAIL_NS: std::sync::LazyLock<FaultArmSet> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 // Vector insertion failures use the same namespace-keyed one-shot semantics.
 #[cfg(any(test, feature = "fault-injection"))]
-static VECTOR_FAIL_NS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+static VECTOR_FAIL_NS: std::sync::LazyLock<FaultArmSet> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 /// FTS failure injection for `create_many` — separate from `FTS_FAIL_NS` so that
 /// create_note_inner and create_many tests cannot disarm each other. Namespace-keyed
 /// set (not a single `Option<String>` slot) for the same reason as `VECTOR_FAIL_NS` (#1263).
 #[cfg(any(test, feature = "fault-injection"))]
-static FTS_FAIL_MANY_NS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+static FTS_FAIL_MANY_NS: std::sync::LazyLock<FaultArmSet> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 /// FTS partial-failure injection for `create_many` — returns `Ok(BatchWriteSummary)`
 /// with `failed > 0` so that the `summary.failed > 0` rollback branch is exercised.
 /// Distinct from `FTS_FAIL_MANY_NS` which injects a hard `Err`. Namespace-keyed set
 /// for the same reason as `VECTOR_FAIL_NS` (#1263).
 #[cfg(any(test, feature = "fault-injection"))]
-static FTS_FAIL_MANY_PARTIAL_NS: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashSet<String>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+static FTS_FAIL_MANY_PARTIAL_NS: std::sync::LazyLock<FaultArmSet> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Scoped ownership of a process-wide fault-injection arm.
+#[cfg(any(test, feature = "fault-injection"))]
+#[must_use = "the fault injection is disarmed when this guard is dropped"]
+pub struct FaultInjectionArm {
+    namespace: String,
+    token: std::sync::Arc<()>,
+    arms: &'static FaultArmSet,
+}
+
+#[cfg(any(test, feature = "fault-injection"))]
+impl Drop for FaultInjectionArm {
+    fn drop(&mut self) {
+        let mut arms = self.arms.lock().unwrap();
+        if arms
+            .get(&self.namespace)
+            .is_some_and(|token| std::sync::Arc::ptr_eq(token, &self.token))
+        {
+            arms.remove(&self.namespace);
+        }
+    }
+}
+
+#[cfg(any(test, feature = "fault-injection"))]
+fn arm_fault(arms: &'static FaultArmSet, namespace: &str, max_arms: usize) -> FaultInjectionArm {
+    let token = std::sync::Arc::new(());
+    let refusal = {
+        let mut active = arms.lock().unwrap();
+        if active.contains_key(namespace) {
+            Some("the namespace is already armed")
+        } else if active.len() >= max_arms {
+            Some("the arm set is at capacity")
+        } else {
+            active.insert(namespace.to_string(), std::sync::Arc::clone(&token));
+            None
+        }
+    };
+    if let Some(reason) = refusal {
+        panic!("cannot arm fault injection for namespace `{namespace}`: {reason}");
+    }
+    FaultInjectionArm {
+        namespace: namespace.to_string(),
+        token,
+        arms,
+    }
+}
+
+#[cfg(any(test, feature = "fault-injection"))]
+fn consume_fault(arms: &FaultArmSet, namespace: &str) -> bool {
+    arms.lock().unwrap().remove(namespace).is_some()
+}
 /// Non-parser FTS *search*-leg failure injection for `search_notes`: distinct
 /// from `FTS_FAIL_NS` (which injects at the FTS *upsert*/write step of
 /// `create_note_inner`). Injects a `StorageError::Timeout` at the `search()`
@@ -156,10 +219,12 @@ static FTS_SEARCH_FAIL_NS: std::sync::Mutex<Option<String>> = std::sync::Mutex::
 /// independent: it may be set from one OS thread and consumed by a `create_note`/
 /// `create_entity` call running on another (e.g. inside `tokio::spawn`). Concurrent
 /// arms of distinct namespaces do not interfere with each other.
+/// Keep the returned guard alive until the triggering call completes; dropping it
+/// disarms an unconsumed injection.
 /// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
 #[cfg(any(test, feature = "fault-injection"))]
-pub fn arm_fts_fail(ns: &str) {
-    FTS_FAIL_NS.lock().unwrap().insert(ns.to_string());
+pub fn arm_fts_fail_scoped(ns: &str) -> FaultInjectionArm {
+    arm_fault(&FTS_FAIL_NS, ns, MAX_FAULT_ARMS)
 }
 
 /// Arm the FTS failure injection for `create_many` targeting namespace `ns`.
@@ -168,10 +233,12 @@ pub fn arm_fts_fail(ns: &str) {
 /// error at the first FTS statement inside the atomic batch, then disarms.
 /// Calls on other namespaces are unaffected, and concurrent arms of distinct
 /// namespaces do not overwrite each other.
+/// Keep the returned guard alive until the triggering call completes; dropping it
+/// disarms an unconsumed injection.
 /// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
 #[cfg(any(test, feature = "fault-injection"))]
-pub fn arm_fts_fail_many(ns: &str) {
-    FTS_FAIL_MANY_NS.lock().unwrap().insert(ns.to_string());
+pub fn arm_fts_fail_many_scoped(ns: &str) -> FaultInjectionArm {
+    arm_fault(&FTS_FAIL_MANY_NS, ns, MAX_FAULT_ARMS)
 }
 
 /// Arm a mid-batch FTS failure for `create_many` targeting namespace `ns`.
@@ -179,13 +246,12 @@ pub fn arm_fts_fail_many(ns: &str) {
 /// The next matching call fails the second FTS statement when the batch contains at
 /// least two entities, after one entity/FTS pair has executed in the transaction.
 /// A one-entity batch fails its first FTS statement. Then disarms only that namespace.
+/// Keep the returned guard alive until the triggering call completes; dropping it
+/// disarms an unconsumed injection.
 /// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
 #[cfg(any(test, feature = "fault-injection"))]
-pub fn arm_fts_fail_many_partial(ns: &str) {
-    FTS_FAIL_MANY_PARTIAL_NS
-        .lock()
-        .unwrap()
-        .insert(ns.to_string());
+pub fn arm_fts_fail_many_partial_scoped(ns: &str) -> FaultInjectionArm {
+    arm_fault(&FTS_FAIL_MANY_PARTIAL_NS, ns, MAX_FAULT_ARMS)
 }
 
 /// Arm a non-parser FTS *search*-leg failure injection for `search_notes` targeting
@@ -208,10 +274,12 @@ pub fn arm_fts_search_fail(ns: &str) {
 /// error at the first vector insert step, then disarms.  Calls on other namespaces
 /// are unaffected, and concurrent arms of distinct namespaces do not overwrite
 /// each other.
+/// Keep the returned guard alive until the triggering call completes; dropping it
+/// disarms an unconsumed injection.
 /// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
 #[cfg(any(test, feature = "fault-injection"))]
-pub fn arm_vector_fail(ns: &str) {
-    VECTOR_FAIL_NS.lock().unwrap().insert(ns.to_string());
+pub fn arm_vector_fail_scoped(ns: &str) -> FaultInjectionArm {
+    arm_fault(&VECTOR_FAIL_NS, ns, MAX_FAULT_ARMS)
 }
 
 /// Failure injection for `delete_note_row_first_for_compensation`'s post-row-removal
@@ -1082,7 +1150,7 @@ impl KhiveRuntime {
         // FTS step — compensate entity row on failure (mirrors create_note_inner).
         {
             #[cfg(any(test, feature = "fault-injection"))]
-            let fts_inject = FTS_FAIL_NS.lock().unwrap().remove(ns);
+            let fts_inject = consume_fault(&FTS_FAIL_NS, ns);
             #[cfg(not(any(test, feature = "fault-injection")))]
             let fts_inject = false;
             let fts_result: RuntimeResult<()> = if fts_inject {
@@ -1125,7 +1193,7 @@ impl KhiveRuntime {
                 .await;
 
             #[cfg(any(test, feature = "fault-injection"))]
-            let vec_inject = VECTOR_FAIL_NS.lock().unwrap().remove(ns);
+            let vec_inject = consume_fault(&VECTOR_FAIL_NS, ns);
             #[cfg(not(any(test, feature = "fault-injection")))]
             let vec_inject = false;
             let vec_result: RuntimeResult<Vec<f32>> = if vec_inject {
@@ -3191,13 +3259,13 @@ impl KhiveRuntime {
 
         // FTS step — compensate note row on failure.
         {
-            // Injection: check FTS_FAIL_NS (armed by `arm_fts_fail(ns)`).
+            // Injection: check FTS_FAIL_NS (armed by `arm_fts_fail_scoped(ns)`).
             // Fires only when `ns` is in the armed set, removing it on the way
             // out (one-shot, atomic check-and-remove under the mutex). No lock
             // acquisition in release builds — the cfg(not) branch is a const
             // false so the compiler eliminates the if-branch entirely.
             #[cfg(any(test, feature = "fault-injection"))]
-            let fts_inject = FTS_FAIL_NS.lock().unwrap().remove(ns);
+            let fts_inject = consume_fault(&FTS_FAIL_NS, ns);
             #[cfg(not(any(test, feature = "fault-injection")))]
             let fts_inject = false;
             let fts_result: RuntimeResult<()> = if fts_inject {
@@ -3238,7 +3306,7 @@ impl KhiveRuntime {
             let model_name = &embed_model_names[0];
             let vec_result = self.embed_document_with_model(model_name, embed_text).await;
 
-            // Injection: check VECTOR_FAIL_NS (armed by `arm_vector_fail(ns)`) or
+            // Injection: check VECTOR_FAIL_NS (armed by `arm_vector_fail_scoped(ns)`) or
             // VECTOR_FAIL_AFTER (armed by `arm_vector_fail_after(n)`). The former
             // fires only when the armed namespace matches this note's namespace;
             // callers that cannot guarantee no concurrently-running test also
@@ -3249,7 +3317,7 @@ impl KhiveRuntime {
             // the cfg(not) branch is a const false eliminating the if-branch.
             #[cfg(any(test, feature = "fault-injection"))]
             let vec_inject = {
-                let ns_inject = VECTOR_FAIL_NS.lock().unwrap().remove(ns);
+                let ns_inject = consume_fault(&VECTOR_FAIL_NS, ns);
                 let count_inject = VECTOR_FAIL_AFTER.with(|cell| match cell.get() {
                     Some(0) => {
                         cell.set(None);
@@ -3511,23 +3579,21 @@ impl KhiveRuntime {
         Ok(page.items)
     }
 
-    /// Count notes matching `kind`, summed across the caller's visible
-    /// namespaces. The store-layer `count_notes` is namespace-pinned by
-    /// design (no `NamespaceFilter`-style `IN (...)` support); this sums the
-    /// per-namespace store calls, mirroring [`Self::count_edges_by_relation`]
-    /// and the multi-namespace path in [`Self::list_notes`] so `stats().notes`
-    /// reconciles with a full `list` keyset walk under the same token.
+    /// Count notes matching `kind` across the caller's visible namespaces.
     pub async fn count_notes(
         &self,
         token: &NamespaceToken,
         kind: Option<&str>,
     ) -> RuntimeResult<u64> {
-        let mut total = 0u64;
-        for ns in token.visible_namespaces() {
-            let temp = NamespaceToken::for_namespace(ns.clone());
-            total += self.notes(&temp)?.count_notes(ns.as_str(), kind).await?;
-        }
-        Ok(total)
+        let namespaces: Vec<String> = token
+            .visible_namespaces()
+            .iter()
+            .map(|namespace| namespace.as_str().to_owned())
+            .collect();
+        Ok(self
+            .notes(token)?
+            .count_notes_in_namespaces(&namespaces, kind)
+            .await?)
     }
 
     /// Search notes using a hybrid FTS5 + vector pipeline with salience weighting.
@@ -4802,14 +4868,38 @@ impl KhiveRuntime {
         &self,
         token: &NamespaceToken,
     ) -> RuntimeResult<std::collections::HashMap<String, u64>> {
-        let mut totals: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
-        for ns in token.visible_namespaces() {
-            let temp = NamespaceToken::for_namespace(ns.clone());
-            for (relation, count) in self.graph(&temp)?.count_edges_by_relation().await? {
-                *totals.entry(relation.to_string()).or_insert(0) += count;
+        let namespaces: Vec<String> = token
+            .visible_namespaces()
+            .iter()
+            .map(|namespace| namespace.as_str().to_owned())
+            .collect();
+        let graph = self.graph(token)?;
+        let counts = match graph
+            .count_edges_by_relation_in_namespaces(&namespaces)
+            .await
+        {
+            Ok(counts) => counts,
+            Err(khive_storage::StorageError::Unsupported { operation, .. })
+                if operation == "count_edges_by_relation_in_namespaces" =>
+            {
+                let mut totals = HashMap::new();
+                for namespace in token.visible_namespaces() {
+                    let scoped = NamespaceToken::for_namespace(namespace.clone());
+                    for (relation, count) in self.graph(&scoped)?.count_edges_by_relation().await? {
+                        *totals.entry(relation).or_insert(0) += count;
+                    }
+                }
+                return Ok(totals
+                    .into_iter()
+                    .map(|(relation, count)| (relation.to_string(), count))
+                    .collect());
             }
-        }
-        Ok(totals)
+            Err(error) => return Err(error.into()),
+        };
+        Ok(counts
+            .into_iter()
+            .map(|(relation, count)| (relation.to_string(), count))
+            .collect())
     }
 
     /// DML-only body of the symmetric-relation conflict-resolution path in
@@ -5186,24 +5276,38 @@ impl KhiveRuntime {
         Ok(deleted)
     }
 
-    /// Count edges matching `filter`, summed across the caller's visible
-    /// namespaces (mirrors [`Self::count_edges_by_relation`] and
-    /// [`Self::list_edges`] so `stats().edges` reconciles with a full `list`
-    /// keyset walk under the same token).
+    /// Count edges matching `filter` across the caller's visible namespaces.
     pub async fn count_edges(
         &self,
         token: &NamespaceToken,
         filter: crate::curation::EdgeListFilter,
     ) -> RuntimeResult<u64> {
-        let mut total = 0u64;
-        for ns in token.visible_namespaces() {
-            let temp = NamespaceToken::for_namespace(ns.clone());
-            total += self
-                .graph(&temp)?
-                .count_edges(filter.clone().into())
-                .await?;
+        let namespaces: Vec<String> = token
+            .visible_namespaces()
+            .iter()
+            .map(|namespace| namespace.as_str().to_owned())
+            .collect();
+        let graph = self.graph(token)?;
+        match graph
+            .count_edges_in_namespaces(&namespaces, filter.clone().into())
+            .await
+        {
+            Ok(count) => Ok(count),
+            Err(khive_storage::StorageError::Unsupported { operation, .. })
+                if operation == "count_edges_in_namespaces" =>
+            {
+                let mut total = 0;
+                for namespace in token.visible_namespaces() {
+                    let scoped = NamespaceToken::for_namespace(namespace.clone());
+                    total += self
+                        .graph(&scoped)?
+                        .count_edges(filter.clone().into())
+                        .await?;
+                }
+                Ok(total)
+            }
+            Err(error) => Err(error.into()),
         }
-        Ok(total)
     }
 
     /// Validate and construct an edge from a [`LinkSpec`] without writing to storage.
@@ -5469,12 +5573,12 @@ impl KhiveRuntime {
         }
 
         #[cfg(any(test, feature = "fault-injection"))]
-        let fts_many_inject = FTS_FAIL_MANY_NS.lock().unwrap().remove(ns);
+        let fts_many_inject = consume_fault(&FTS_FAIL_MANY_NS, ns);
         #[cfg(not(any(test, feature = "fault-injection")))]
         let fts_many_inject = false;
 
         #[cfg(any(test, feature = "fault-injection"))]
-        let fts_many_inject_partial = FTS_FAIL_MANY_PARTIAL_NS.lock().unwrap().remove(ns);
+        let fts_many_inject_partial = consume_fault(&FTS_FAIL_MANY_PARTIAL_NS, ns);
         #[cfg(not(any(test, feature = "fault-injection")))]
         let fts_many_inject_partial = false;
 
@@ -5605,6 +5709,40 @@ mod tests {
 
     fn rt() -> KhiveRuntime {
         KhiveRuntime::memory().unwrap()
+    }
+
+    #[test]
+    fn fts_fault_arm_disarms_namespace_when_scope_panics() {
+        let ns = format!("fault-arm-drop-{}", uuid::Uuid::new_v4().as_simple());
+
+        let panic_result = std::panic::catch_unwind(|| {
+            let _arm = arm_fts_fail_scoped(&ns);
+            panic!("leave the armed scope before consumption");
+        });
+
+        assert!(panic_result.is_err());
+        assert!(
+            !consume_fault(&FTS_FAIL_NS, &ns),
+            "unwinding an armed scope must remove its namespace"
+        );
+    }
+
+    #[test]
+    fn fault_arm_set_rejects_entries_over_capacity() {
+        static BOUNDED_ARMS: std::sync::LazyLock<FaultArmSet> =
+            std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+        let first_ns = format!("fault-arm-bound-a-{}", uuid::Uuid::new_v4().as_simple());
+        let overflow_ns = format!("fault-arm-bound-b-{}", uuid::Uuid::new_v4().as_simple());
+        let arm = arm_fault(&BOUNDED_ARMS, &first_ns, 1);
+
+        let overflow = std::panic::catch_unwind(|| arm_fault(&BOUNDED_ARMS, &overflow_ns, 1));
+
+        assert!(
+            overflow.is_err(),
+            "an arm set must reject entries over its bound"
+        );
+        drop(arm);
+        assert!(BOUNDED_ARMS.lock().unwrap().is_empty());
     }
 
     // ── Custom embedder fan-out regression ──────────────────────────────────
@@ -10404,7 +10542,7 @@ mod tests {
     }
 
     // Inject an FTS failure after the note row is committed and assert the note
-    // row is removed (no stranded row).  arm_fts_fail() arms the flag before
+    // row is removed (no stranded row). arm_fts_fail_scoped() arms the flag before
     // the call and it resets automatically after one trigger.
     #[tokio::test]
     async fn create_note_fts_failure_rolls_back_note_row() {
@@ -10416,7 +10554,7 @@ mod tests {
         let ns = Namespace::parse("fault-fts-rollback").unwrap();
         let tok = NamespaceToken::for_namespace(ns.clone());
 
-        arm_fts_fail(ns.as_str());
+        let _arm = arm_fts_fail_scoped(ns.as_str());
 
         let result = rt
             .create_note(
@@ -10462,7 +10600,7 @@ mod tests {
         let ns = Namespace::parse("fault-fts-rollback-cross-thread").unwrap();
         let tok = NamespaceToken::for_namespace(ns.clone());
 
-        arm_fts_fail(ns.as_str());
+        let _arm = arm_fts_fail_scoped(ns.as_str());
 
         let thread_rt = std::sync::Arc::clone(&rt);
         let thread_tok = tok.clone();
@@ -10521,7 +10659,7 @@ mod tests {
         let ns = Namespace::parse("fault-vec-rollback").unwrap();
         let tok = NamespaceToken::for_namespace(ns.clone());
 
-        arm_vector_fail(ns.as_str());
+        let _arm = arm_vector_fail_scoped(ns.as_str());
 
         let result = rt
             .create_note(
@@ -10570,8 +10708,8 @@ mod tests {
         let ns_b = Namespace::parse("fault-vec-distinct-b").unwrap();
         let tok_b = NamespaceToken::for_namespace(ns_b.clone());
 
-        arm_vector_fail(ns_a.as_str());
-        arm_vector_fail(ns_b.as_str());
+        let _arm_a = arm_vector_fail_scoped(ns_a.as_str());
+        let _arm_b = arm_vector_fail_scoped(ns_b.as_str());
 
         let (result_a, result_b) = tokio::join!(
             rt_a.create_note(
@@ -10615,7 +10753,7 @@ mod tests {
         let ns = Namespace::parse("fault-fts-rollback-embedding-content").unwrap();
         let tok = NamespaceToken::for_namespace(ns.clone());
 
-        arm_fts_fail(ns.as_str());
+        let _arm = arm_fts_fail_scoped(ns.as_str());
 
         let full = "fts-fail rollback target with an embedding-content override";
         let head = &full[.."fts-fail rollback target".len()];
@@ -10664,7 +10802,7 @@ mod tests {
         let ns = Namespace::parse("fault-vec-rollback-embedding-content").unwrap();
         let tok = NamespaceToken::for_namespace(ns.clone());
 
-        arm_vector_fail(ns.as_str());
+        let _arm = arm_vector_fail_scoped(ns.as_str());
 
         let full = "vec-fail rollback target with an embedding-content override";
         let head = &full[.."vec-fail rollback target".len()];
@@ -11474,7 +11612,7 @@ mod tests {
 
     // FTS failure in create_many rolls back both substrates.
     //
-    // Arm `arm_fts_fail_many` before the call; the FTS phase returns an injected
+    // Arm `arm_fts_fail_many_scoped` before the call; the FTS phase returns an injected
     // error; the test asserts zero rows in both `entities` and `fts_entities`.
     #[tokio::test]
     async fn create_many_fts_failure_rolls_back_both_substrates() {
@@ -11502,7 +11640,7 @@ mod tests {
             },
         ];
 
-        arm_fts_fail_many(&ns);
+        let _arm = arm_fts_fail_many_scoped(&ns);
         let result = rt.create_many(&tok, specs).await;
 
         assert!(
@@ -11544,8 +11682,8 @@ mod tests {
         let ns_b = Namespace::parse("fts-fail-many-distinct-b").unwrap();
         let tok_b = NamespaceToken::for_namespace(ns_b.clone());
 
-        arm_fts_fail_many(ns_a.as_str());
-        arm_fts_fail_many(ns_b.as_str());
+        let _arm_a = arm_fts_fail_many_scoped(ns_a.as_str());
+        let _arm_b = arm_fts_fail_many_scoped(ns_b.as_str());
 
         let (result_a, result_b) = tokio::join!(
             rt_a.create_many(
@@ -11583,7 +11721,8 @@ mod tests {
     }
 
     // A failure after the first entity and FTS document have been written rolls
-    // back both substrates for the entire batch.
+    // back both substrates for the entire batch. Injected via
+    // `arm_fts_fail_many_partial_scoped`.
     #[tokio::test]
     async fn create_many_mid_batch_storage_failure_rolls_back_both_substrates() {
         let ns = format!("fts-fail-partial-{}", uuid::Uuid::new_v4().as_simple());
@@ -11609,7 +11748,7 @@ mod tests {
             },
         ];
 
-        arm_fts_fail_many_partial(&ns);
+        let _arm = arm_fts_fail_many_partial_scoped(&ns);
         let result = rt.create_many(&tok, specs).await;
 
         assert!(
@@ -11656,8 +11795,8 @@ mod tests {
         let ns_b = Namespace::parse("fts-fail-many-partial-distinct-b").unwrap();
         let tok_b = NamespaceToken::for_namespace(ns_b.clone());
 
-        arm_fts_fail_many_partial(ns_a.as_str());
-        arm_fts_fail_many_partial(ns_b.as_str());
+        let _arm_a = arm_fts_fail_many_partial_scoped(ns_a.as_str());
+        let _arm_b = arm_fts_fail_many_partial_scoped(ns_b.as_str());
 
         let (result_a, result_b) = tokio::join!(
             rt_a.create_many(
@@ -12353,7 +12492,7 @@ mod tests {
         let ns = Namespace::parse("fault-entity-fts").unwrap();
         let tok = NamespaceToken::for_namespace(ns.clone());
 
-        arm_fts_fail(ns.as_str());
+        let _arm = arm_fts_fail_scoped(ns.as_str());
 
         let result = rt
             .create_entity(
@@ -12398,7 +12537,7 @@ mod tests {
         let ns = Namespace::parse("fault-entity-vec").unwrap();
         let tok = NamespaceToken::for_namespace(ns.clone());
 
-        arm_vector_fail(ns.as_str());
+        let _arm = arm_vector_fail_scoped(ns.as_str());
 
         let result = rt
             .create_entity(

@@ -25,9 +25,9 @@ use sha2::{Digest, Sha256};
 use khive_db::ConnectionPool;
 use khive_request::{parse_request, ArgValue, DslError, ExecutionMode, ParsedOp, PrevFailure};
 use khive_runtime::{
-    present, render_format, resolve_explicit_namespace, KhiveRuntime, OutputFormat, PackLoadError,
-    PackRegistry, PresentationMode, RuntimeConfig, RuntimeError, VerbPresentationPolicy,
-    VerbRegistry, VerbRegistryBuilder,
+    present, render_format, KhiveRuntime, OutputFormat, PackLoadError, PackRegistry,
+    PresentationMode, RuntimeConfig, RuntimeError, VerbPresentationPolicy, VerbRegistry,
+    VerbRegistryBuilder,
 };
 
 use khive_storage::EdgeRelation;
@@ -525,10 +525,8 @@ impl KhiveMcpServer {
         if coord.is_single_backend() {
             return None;
         }
-        let default_namespace = identity
-            .map(|id| id.namespace.as_str())
-            .unwrap_or(self.default_namespace.as_str());
-        dispatch_via_coordinator_inner(coord.as_ref(), tool, args_value, default_namespace).await
+        dispatch_via_coordinator_inner(coord.as_ref(), &self.registry, tool, args_value, identity)
+            .await
     }
 
     /// Namespace this server's registry was built for.
@@ -889,7 +887,6 @@ impl KhiveMcpServer {
 
                 // Clone coordinator and namespace for use in the per-op closures (ADR-029 D3/D4).
                 let coordinator: Option<Arc<dyn CoordinatorService>> = self.coordinator.clone();
-                let default_namespace = self.default_namespace.clone();
                 // ADR-096 Fork 1: a per-request identity overrides the default
                 // namespace for both the coordinator intercept and the registry
                 // dispatch below, so the two can't drift out of sync per op.
@@ -908,10 +905,6 @@ impl KhiveMcpServer {
 
                     let registry = self.registry.clone();
                     let coord = coordinator.clone();
-                    let ns_str = identity_owned
-                        .as_ref()
-                        .map(|id| id.namespace.clone())
-                        .unwrap_or_else(|| default_namespace.clone());
                     let op_identity = identity_owned.clone();
                     let op_mode = mode_for_op(i);
                     let task_tool = op.tool.clone();
@@ -992,9 +985,10 @@ impl KhiveMcpServer {
                             if !active_coord.is_single_backend() {
                                 if let Some(coord_result) = dispatch_via_coordinator_inner(
                                     active_coord.as_ref(),
+                                    &registry,
                                     &tool,
                                     &args_value,
-                                    &ns_str,
+                                    op_identity.as_ref(),
                                 )
                                 .await
                                 {
@@ -1161,30 +1155,15 @@ impl KhiveMcpServer {
 /// `crates/khive-mcp/docs/api/coordinator.md`.
 async fn dispatch_via_coordinator_inner(
     coord: &dyn CoordinatorService,
+    registry: &VerbRegistry,
     tool: &str,
     args_value: &Value,
-    default_namespace_str: &str,
+    identity: Option<&khive_runtime::RequestIdentity>,
 ) -> Option<Result<Value, (String, Value)>> {
-    // Only link/search are ever intercepted here — resolve/validate the
-    // namespace only for those verbs so unrelated verbs (which always
-    // fall through to `None` below) don't pay for a parse they don't need.
+    // Only link/search are ever intercepted here.
     if !matches!(tool, "link" | "search") {
         return None;
     }
-
-    let namespace = match resolve_explicit_namespace(args_value, default_namespace_str) {
-        Ok(ns) => ns,
-        Err(e) => {
-            return Some(Err(match e {
-                RuntimeError::Khive(k) => {
-                    let error_payload = serde_json::to_value(&k)
-                        .unwrap_or_else(|_| json!({"kind": "internal", "message": k.to_string()}));
-                    (tool.to_string(), error_payload)
-                }
-                other => (tool.to_string(), json!(other.to_string())),
-            }));
-        }
-    };
 
     match tool {
         "link" => {
@@ -1202,181 +1181,187 @@ async fn dispatch_via_coordinator_inner(
             let source_id: uuid::Uuid = source_str.parse().ok()?;
             let target_id: uuid::Uuid = target_str.parse().ok()?;
             let relation: EdgeRelation = relation_str.parse().ok()?;
-
             let weight = args_value
                 .get("weight")
                 .and_then(Value::as_f64)
                 .unwrap_or(1.0);
             let metadata = args_value.get("metadata").cloned();
 
-            let result = coord
-                .link(&namespace, source_id, target_id, relation, weight, metadata)
+            let result = registry
+                .dispatch_intercepted_with_identity(
+                    tool,
+                    args_value,
+                    identity,
+                    |namespace| async move {
+                        let coord_result = coord
+                            .link(&namespace, source_id, target_id, relation, weight, metadata)
+                            .await
+                            .map_err(RuntimeError::from)?;
+                        let mut raw = serde_json::to_value(&coord_result.edge)
+                            .unwrap_or_else(|e| json!({"error": format!("serialize edge: {e}")}));
+                        if relation.is_symmetric() {
+                            if let Some(obj) = raw.as_object_mut() {
+                                obj.insert("source_id".to_string(), json!(source_id.to_string()));
+                                obj.insert("target_id".to_string(), json!(target_id.to_string()));
+                            }
+                        }
+                        Ok(raw)
+                    },
+                )
                 .await;
-
-            let tool_name = tool.to_string();
-            Some(match result {
-                Ok(coord_result) => {
-                    // Serialize the edge using serde_json — matches `to_json(&edge)` in the kg
-                    // handler, which is what `format_edge_output` receives (identity fn).
-                    let edge_val = serde_json::to_value(&coord_result.edge)
-                        .unwrap_or_else(|e| json!({"error": format!("serialize edge: {e}")}));
-                    // Preserve symmetric-relation source/target override that the kg handler
-                    // applies: if the edge was written with swapped endpoints, inject the
-                    // canonical source/target so callers get what they requested.
-                    let mut raw = edge_val;
-                    if relation.is_symmetric() {
-                        if let Some(obj) = raw.as_object_mut() {
-                            obj.insert("source_id".to_string(), json!(source_id.to_string()));
-                            obj.insert("target_id".to_string(), json!(target_id.to_string()));
-                        }
-                    }
-                    Ok(raw)
-                }
-                Err(e) => {
-                    let re: RuntimeError = e.into();
-                    match re {
-                        RuntimeError::Khive(k) => {
-                            let error_payload = serde_json::to_value(&k).unwrap_or_else(
-                                |_| json!({"kind": "internal", "message": k.to_string()}),
-                            );
-                            Err((tool_name, error_payload))
-                        }
-                        other => Err((tool_name, json!(other.to_string()))),
-                    }
-                }
-            })
+            Some(result.map_err(|error| runtime_error_payload(tool, error)))
         }
         "search" => {
             let kind = args_value.get("kind")?.as_str()?;
             let query = args_value.get("query")?.as_str()?;
-            // Parse strictly as u32 (matching the single-backend `SearchParams { limit:
-            // Option<u32> }` contract) instead of parsing as u64 and casting — `as u32`
-            // wraps values above `u32::MAX` (e.g. 4294967297 as u32 == 1) before the
-            // `.min(100)` cap ever runs, silently truncating a huge limit to a near-empty
-            // result set rather than rejecting it (MCP-AUD-003).
-            let limit = match args_value.get("limit") {
-                None | Some(Value::Null) => 10,
-                Some(v) => match serde_json::from_value::<u32>(v.clone()) {
-                    Ok(limit) => limit.min(100),
-                    Err(_) => {
-                        return Some(Err((
-                            "search".to_string(),
-                            json!("limit must be an unsigned 32-bit integer"),
-                        )));
-                    }
-                },
-            };
-            let score_floor = args_value
-                .get("min_score")
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0)
-                .max(0.0);
+            let result = registry
+                .dispatch_intercepted_with_identity(
+                    tool,
+                    args_value,
+                    identity,
+                    |namespace| async move {
+                        // Parse strictly as u32 (matching the single-backend `SearchParams { limit:
+                        // Option<u32> }` contract) instead of parsing as u64 and casting — `as u32`
+                        // wraps values above `u32::MAX` (e.g. 4294967297 as u32 == 1) before the
+                        // `.min(100)` cap ever runs, silently truncating a huge limit to a near-empty
+                        // result set rather than rejecting it (MCP-AUD-003).
+                        let limit = match args_value.get("limit") {
+                            None | Some(Value::Null) => 10,
+                            Some(v) => match serde_json::from_value::<u32>(v.clone()) {
+                                Ok(limit) => limit.min(100),
+                                Err(_) => {
+                                    return Err(RuntimeError::InvalidInput(
+                                        "limit must be an unsigned 32-bit integer".to_string(),
+                                    ));
+                                }
+                            },
+                        };
+                        let score_floor = args_value
+                            .get("min_score")
+                            .and_then(Value::as_f64)
+                            .unwrap_or(0.0)
+                            .max(0.0);
 
-            // For substrate-level kinds ("entity" / "note"), pass None so the search
-            // is unrestricted. For granular kinds ("concept", "observation", etc.) pass
-            // the kind string so each backend filters at the storage layer — matching
-            // the behaviour of the single-backend handler (search.rs).
-            let kind_filter: Option<&str> = match kind {
-                "entity" | "note" => None,
-                other => Some(other),
-            };
+                        // For substrate-level kinds ("entity" / "note"), pass None so the search
+                        // is unrestricted. For granular kinds ("concept", "observation", etc.) pass
+                        // the kind string so each backend filters at the storage layer — matching
+                        // the behaviour of the single-backend handler (search.rs).
+                        let kind_filter: Option<&str> = match kind {
+                            "entity" | "note" => None,
+                            other => Some(other),
+                        };
 
-            // Extract entity-substrate filters and forward them to each backend.
-            // When either is active the coordinator widens the per-backend candidate
-            // window so that sparse matches ranked below the bare limit are not cut
-            // off before filtering (before-truncation parity with the single-backend
-            // handler in search.rs).
-            let props_filter: Option<&serde_json::Value> =
-                args_value.get("properties").and_then(|v| {
-                    if v.as_object().is_some_and(|m| !m.is_empty()) {
-                        Some(v)
-                    } else {
-                        None
-                    }
-                });
-            // Parse tags strictly: absent/null → no filter (empty Vec); present and
-            // valid Vec<String> → use as-is (including empty array → no filter);
-            // present but not a Vec<String> → reject with a per-op error so the
-            // multi-backend path matches single-backend behaviour, which rejects
-            // malformed tags via SearchParams deserialisation (RuntimeError::InvalidInput).
-            // filter_map(as_str) would silently drop non-string entries and produce
-            // an empty Vec, bypassing the filter and returning unfiltered results.
-            let tags_owned: Vec<String> = match args_value.get("tags") {
-                None | Some(Value::Null) => vec![],
-                Some(v) => match serde_json::from_value::<Vec<String>>(v.clone()) {
-                    Ok(t) => t,
-                    Err(_) => {
-                        return Some(Err((
-                            "search".to_string(),
-                            json!("tags must be an array of strings"),
-                        )));
-                    }
-                },
-            };
+                        // Extract entity-substrate filters and forward them to each backend.
+                        // When either is active the coordinator widens the per-backend candidate
+                        // window so that sparse matches ranked below the bare limit are not cut
+                        // off before filtering (before-truncation parity with the single-backend
+                        // handler in search.rs).
+                        let props_filter: Option<&serde_json::Value> =
+                            args_value.get("properties").and_then(|v| {
+                                if v.as_object().is_some_and(|m| !m.is_empty()) {
+                                    Some(v)
+                                } else {
+                                    None
+                                }
+                            });
+                        // Parse tags strictly: absent/null → no filter (empty Vec); present and
+                        // valid Vec<String> → use as-is (including empty array → no filter);
+                        // present but not a Vec<String> → reject with a per-op error so the
+                        // multi-backend path matches single-backend behaviour, which rejects
+                        // malformed tags via SearchParams deserialisation (RuntimeError::InvalidInput).
+                        // filter_map(as_str) would silently drop non-string entries and produce
+                        // an empty Vec, bypassing the filter and returning unfiltered results.
+                        let tags_owned: Vec<String> = match args_value.get("tags") {
+                            None | Some(Value::Null) => vec![],
+                            Some(v) => match serde_json::from_value::<Vec<String>>(v.clone()) {
+                                Ok(t) => t,
+                                Err(_) => {
+                                    return Err(RuntimeError::InvalidInput(
+                                        "tags must be an array of strings".to_string(),
+                                    ));
+                                }
+                            },
+                        };
 
-            let coord_result = coord
-                .fan_out_search(
-                    kind,
-                    query,
-                    &namespace,
-                    limit,
-                    kind_filter,
-                    props_filter,
-                    &tags_owned,
+                        let coord_result = coord
+                            .fan_out_search(
+                                kind,
+                                query,
+                                &namespace,
+                                limit,
+                                kind_filter,
+                                props_filter,
+                                &tags_owned,
+                            )
+                            .await;
+
+                        // Shape result to match the kg search handler's output fields exactly.
+                        // Entity hits: [{id, entity_kind, score, title, snippet}]
+                        //   - entity_kind: real kind string fetched from the owning backend
+                        //   - score: RRF-merged, subject to min_score floor
+                        // Note hits:   [{id, note_kind, score, title, snippet}]
+                        //   - note_kind: real kind string fetched from the owning backend
+                        let result_val = if !coord_result.note_hits.is_empty()
+                            || (coord_result.entity_hits.is_empty()
+                                && coord_result.note_hits.is_empty())
+                        {
+                            // Note substrate or empty — return note-shaped result.
+                            let items: Vec<Value> = coord_result
+                                .note_hits
+                                .iter()
+                                .filter(|h| h.score.to_f64() >= score_floor)
+                                .map(|h| {
+                                    let note_kind = coord_result.note_kinds.get(&h.note_id);
+                                    json!({
+                                        "id": h.note_id.to_string(),
+                                        "note_kind": note_kind,
+                                        "score": h.score.to_f64(),
+                                        "source": h.source.as_str(),
+                                        "title": h.title,
+                                        "snippet": h.snippet,
+                                    })
+                                })
+                                .collect();
+                            serde_json::to_value(items).unwrap_or_else(|_| json!([]))
+                        } else {
+                            // Entity substrate — return entity-shaped result.
+                            let items: Vec<Value> = coord_result
+                                .entity_hits
+                                .iter()
+                                .filter(|h| h.score.to_f64() >= score_floor)
+                                .map(|h| {
+                                    let entity_kind = coord_result.entity_kinds.get(&h.entity_id);
+                                    json!({
+                                        "id": h.entity_id.to_string(),
+                                        "entity_kind": entity_kind,
+                                        "score": h.score.to_f64(),
+                                        "source": h.source.as_str(),
+                                        "title": h.title,
+                                        "snippet": h.snippet,
+                                    })
+                                })
+                                .collect();
+                            serde_json::to_value(items).unwrap_or_else(|_| json!([]))
+                        };
+
+                        Ok(result_val)
+                    },
                 )
                 .await;
-
-            // Shape result to match the kg search handler's output fields exactly.
-            // Entity hits: [{id, entity_kind, score, title, snippet}]
-            //   - entity_kind: real kind string fetched from the owning backend
-            //   - score: RRF-merged, subject to min_score floor
-            // Note hits:   [{id, note_kind, score, title, snippet}]
-            //   - note_kind: real kind string fetched from the owning backend
-            let result_val = if !coord_result.note_hits.is_empty()
-                || (coord_result.entity_hits.is_empty() && coord_result.note_hits.is_empty())
-            {
-                // Note substrate or empty — return note-shaped result.
-                let items: Vec<Value> = coord_result
-                    .note_hits
-                    .iter()
-                    .filter(|h| h.score.to_f64() >= score_floor)
-                    .map(|h| {
-                        let note_kind = coord_result.note_kinds.get(&h.note_id);
-                        json!({
-                            "id": h.note_id.to_string(),
-                            "note_kind": note_kind,
-                            "score": h.score.to_f64(),
-                            "source": h.source.as_str(),
-                            "title": h.title,
-                            "snippet": h.snippet,
-                        })
-                    })
-                    .collect();
-                serde_json::to_value(items).unwrap_or_else(|_| json!([]))
-            } else {
-                // Entity substrate — return entity-shaped result.
-                let items: Vec<Value> = coord_result
-                    .entity_hits
-                    .iter()
-                    .filter(|h| h.score.to_f64() >= score_floor)
-                    .map(|h| {
-                        let entity_kind = coord_result.entity_kinds.get(&h.entity_id);
-                        json!({
-                            "id": h.entity_id.to_string(),
-                            "entity_kind": entity_kind,
-                            "score": h.score.to_f64(),
-                            "source": h.source.as_str(),
-                            "title": h.title,
-                            "snippet": h.snippet,
-                        })
-                    })
-                    .collect();
-                serde_json::to_value(items).unwrap_or_else(|_| json!([]))
-            };
-
-            Some(Ok(result_val))
+            Some(result.map_err(|error| runtime_error_payload(tool, error)))
         }
         _ => None,
+    }
+}
+
+fn runtime_error_payload(tool: &str, error: RuntimeError) -> (String, Value) {
+    match error {
+        RuntimeError::Khive(k) => {
+            let error_payload = serde_json::to_value(&k)
+                .unwrap_or_else(|_| json!({"kind": "internal", "message": k.to_string()}));
+            (tool.to_string(), error_payload)
+        }
+        other => (tool.to_string(), json!(other.to_string())),
     }
 }
 

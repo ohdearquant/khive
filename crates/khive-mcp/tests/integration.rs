@@ -1885,6 +1885,11 @@ async fn help_propose_params_non_empty_with_title_description_changeset() -> any
 /// the migration ran at construction time.
 #[tokio::test]
 async fn startup_migrations_applied_to_fresh_file_backed_db() -> anyhow::Result<()> {
+    // Required for correctness under process-per-test runners: without it this
+    // test only passed when a sibling test in the same process had already set
+    // KHIVE_NO_DAEMON, and a failed daemon spawn surfaces as `respawn_failed`
+    // with no local-dispatch fallback (ADR-049 Amendment 2).
+    disable_daemon();
     let db_file = tempfile::NamedTempFile::new()?;
     let config = RuntimeConfig {
         db_path: Some(db_file.path().to_path_buf()),
