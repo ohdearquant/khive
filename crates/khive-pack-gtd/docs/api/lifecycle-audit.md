@@ -32,6 +32,17 @@ Audit writes are best-effort: a failure to write the audit row is logged and
 does not fail the transition/complete call itself, since the state change
 already committed successfully.
 
+## Same-status rows: note-bearing no-ops are audited
+
+A `gtd.transition` call where `current == target` normally writes no audit
+row — an idempotent no-op is not a lifecycle event. The one exception is a
+no-op that carries a caller-supplied `note`: the note is persisted to
+`properties.transition_note` (last-write-wins), and a same-status audit row
+(`from_state == to_state`) is written so each overwritten note keeps a
+durable trail. Consumers counting or replaying *real* transitions must
+therefore filter `from_state != to_state`; same-status rows are note events,
+not lifecycle changes.
+
 ## `CompleteParams` / `TransitionParams` — `pub` structs, private fields
 
 ADR-099 B3: these two structs are `pub` (not module-private) specifically so

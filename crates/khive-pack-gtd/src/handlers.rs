@@ -1263,15 +1263,57 @@ impl GtdPack {
                 current,
                 target,
             } => {
-                // Idempotent — no write, no transition.
-                return Ok(json!({
+                // Idempotent by status (current == target) — but a caller-supplied
+                // `note` was being silently discarded here (issue #15). `transitioned`
+                // stays an accurate statement about status; persisting the note is a
+                // separate effect (reporter's preferred fix: khive-dist #15).
+                let mut note_recorded = None;
+                if let Some(n) = p.note.as_deref() {
+                    let mut props = note.properties.clone().unwrap_or_else(|| json!({}));
+                    if let Some(obj) = props.as_object_mut() {
+                        obj.insert("transition_note".into(), json!(n));
+                    }
+                    let updated_at = Utc::now().timestamp_micros();
+                    // Same conditional UPDATE `atomic_gtd_transition` uses elsewhere —
+                    // here expected == target, so it only wins if the status is still
+                    // what `prepare_transition` just observed (loses the race to a
+                    // concurrent real transition without clobbering it).
+                    let rows_affected = atomic_gtd_transition(
+                        self.runtime(),
+                        note.id,
+                        &current,
+                        &target,
+                        &props,
+                        updated_at,
+                    )
+                    .await?;
+                    if rows_affected > 0 {
+                        ensure_audit_schema(self.runtime()).await;
+                        write_audit_record(
+                            self.runtime(),
+                            note.id,
+                            &current,
+                            &target,
+                            Some(n),
+                            token.namespace().as_str(),
+                        )
+                        .await;
+                    }
+                    note_recorded = Some(rows_affected > 0);
+                }
+
+                let mut response = json!({
                     "transitioned": false,
                     "id": short_id(note.id),
                     "full_id": note.id.as_hyphenated().to_string(),
                     "from": current,
                     "to": target,
                     "note": "already in target status",
-                }));
+                });
+                if let Some(recorded) = note_recorded {
+                    response["note_recorded"] = json!(recorded);
+                }
+                return Ok(response);
             }
             TransitionDecision::Write {
                 mut note,

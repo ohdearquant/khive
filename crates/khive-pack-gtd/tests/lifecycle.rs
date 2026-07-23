@@ -471,3 +471,175 @@ async fn dsl_parallel_c2_double_complete_second_must_fail() {
         "dsl-parallel C2: second complete must fail with terminal-state error; got: {err}"
     );
 }
+
+#[tokio::test]
+async fn noop_transition_without_note_omits_note_recorded_field() {
+    let pack = pack(rt());
+    let resp = assign(
+        &pack,
+        json!({"title": "noop no-note field test", "status": "next"}),
+    )
+    .await;
+    let id = resp["full_id"].as_str().unwrap().to_string();
+
+    let r = pack
+        .dispatch("gtd.transition", json!({"id": id, "status": "next"}))
+        .await
+        .unwrap();
+    assert_eq!(r["transitioned"], false);
+    assert_eq!(r["note"], "already in target status");
+    assert!(
+        r.get("note_recorded").is_none(),
+        "note_recorded must be absent (not just false) when no note was supplied — issue #15"
+    );
+}
+
+#[tokio::test]
+async fn noop_transition_with_note_persists_transition_note_in_properties() {
+    use khive_storage::{SqlStatement, SqlValue};
+
+    let rt = rt();
+    let pack = pack(rt.clone());
+    let resp = assign(
+        &pack,
+        json!({"title": "noop note persistence test", "status": "next"}),
+    )
+    .await;
+    let id = resp["full_id"].as_str().unwrap().to_string();
+
+    // issue #15: current == target, but the note must still land in the
+    // task's stored properties, not be silently dropped.
+    let r = pack
+        .dispatch(
+            "gtd.transition",
+            json!({"id": id, "status": "next", "note": "blocked on review"}),
+        )
+        .await
+        .expect("noop transition with note should succeed");
+    assert_eq!(r["transitioned"], false);
+    assert_eq!(r["note_recorded"], true);
+
+    let sql = rt.sql();
+    let mut reader = sql.reader().await.expect("sql reader");
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: "SELECT json_extract(properties, '$.transition_note') as tn \
+                  FROM notes WHERE id = ?1"
+                .into(),
+            params: vec![SqlValue::Text(id.clone())],
+            label: None,
+        })
+        .await
+        .expect("properties query");
+
+    assert_eq!(rows.len(), 1, "task row must exist");
+    assert_eq!(
+        rows[0].get("tn").and_then(|v| {
+            if let SqlValue::Text(s) = v {
+                Some(s.as_str())
+            } else {
+                None
+            }
+        }),
+        Some("blocked on review"),
+        "properties.transition_note must be persisted on a noop transition (issue #15)"
+    );
+}
+
+#[tokio::test]
+async fn repeated_noop_notes_are_last_write_wins() {
+    use khive_storage::{SqlStatement, SqlValue};
+
+    let rt = rt();
+    let pack = pack(rt.clone());
+    let resp = assign(
+        &pack,
+        json!({"title": "noop note overwrite test", "status": "next"}),
+    )
+    .await;
+    let id = resp["full_id"].as_str().unwrap().to_string();
+
+    for note in ["first update", "second update"] {
+        let r = pack
+            .dispatch(
+                "gtd.transition",
+                json!({"id": id, "status": "next", "note": note}),
+            )
+            .await
+            .expect("noop transition with note should succeed");
+        assert_eq!(r["transitioned"], false);
+        assert_eq!(r["note_recorded"], true);
+    }
+
+    let sql = rt.sql();
+    let mut reader = sql.reader().await.expect("sql reader");
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: "SELECT json_extract(properties, '$.transition_note') as tn \
+                  FROM notes WHERE id = ?1"
+                .into(),
+            params: vec![SqlValue::Text(id.clone())],
+            label: None,
+        })
+        .await
+        .expect("properties query");
+    assert_eq!(
+        rows[0].get("tn").and_then(|v| {
+            if let SqlValue::Text(s) = v {
+                Some(s.as_str())
+            } else {
+                None
+            }
+        }),
+        Some("second update"),
+        "a later noop note must overwrite the stored transition_note (last write wins)"
+    );
+}
+
+#[tokio::test]
+async fn empty_string_noop_note_is_persisted() {
+    use khive_storage::{SqlStatement, SqlValue};
+
+    let rt = rt();
+    let pack = pack(rt.clone());
+    let resp = assign(
+        &pack,
+        json!({"title": "noop empty note test", "status": "next"}),
+    )
+    .await;
+    let id = resp["full_id"].as_str().unwrap().to_string();
+
+    let r = pack
+        .dispatch(
+            "gtd.transition",
+            json!({"id": id, "status": "next", "note": ""}),
+        )
+        .await
+        .expect("noop transition with empty note should succeed");
+    assert_eq!(r["transitioned"], false);
+    assert_eq!(r["note_recorded"], true);
+
+    let sql = rt.sql();
+    let mut reader = sql.reader().await.expect("sql reader");
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: "SELECT json_extract(properties, '$.transition_note') as tn \
+                  FROM notes WHERE id = ?1"
+                .into(),
+            params: vec![SqlValue::Text(id.clone())],
+            label: None,
+        })
+        .await
+        .expect("properties query");
+    assert_eq!(
+        rows[0].get("tn").and_then(|v| {
+            if let SqlValue::Text(s) = v {
+                Some(s.as_str())
+            } else {
+                None
+            }
+        }),
+        Some(""),
+        "an explicitly supplied empty note is stored as the empty string, not dropped"
+    );
+}

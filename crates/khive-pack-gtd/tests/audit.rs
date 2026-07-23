@@ -397,3 +397,71 @@ async fn cc1_complete_cancelled_writes_audit_record() {
         "complete(status=cancelled) must write audit row with to_state='cancelled'"
     );
 }
+
+#[tokio::test]
+async fn noop_transition_with_note_writes_audit_record_and_persists_note() {
+    let rt = rt();
+    let fixture = pack(rt.clone());
+
+    let resp = assign(
+        &fixture,
+        json!({"title": "noop with note test", "status": "inbox"}),
+    )
+    .await;
+    let task_id = resp["full_id"].as_str().unwrap().to_string();
+
+    fixture
+        .dispatch("gtd.transition", json!({"id": task_id, "status": "next"}))
+        .await
+        .expect("real transition should succeed");
+
+    // issue #15: a noop transition (current == target) with a caller-supplied
+    // `note` must persist the note instead of silently discarding it.
+    let r = fixture
+        .dispatch(
+            "gtd.transition",
+            json!({"id": task_id, "status": "next", "note": "still working on it"}),
+        )
+        .await
+        .expect("noop transition with note should succeed");
+    assert_eq!(
+        r["transitioned"], false,
+        "noop must still report transitioned=false"
+    );
+    assert_eq!(r["note"], "already in target status");
+    assert_eq!(
+        r["note_recorded"], true,
+        "note_recorded must be true when a note is persisted"
+    );
+
+    let sql = rt.sql();
+    let mut reader = sql.reader().await.expect("sql reader");
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: "SELECT from_state, to_state, note FROM gtd_lifecycle_audit \
+                  WHERE note_id = ?1 AND from_state = 'next' AND to_state = 'next'"
+                .into(),
+            params: vec![SqlValue::Text(task_id.clone())],
+            label: None,
+        })
+        .await
+        .expect("audit query");
+
+    assert_eq!(
+        rows.len(),
+        1,
+        "issue #15: a same-status transition carrying a note must write one \
+         same-status audit row; got {rows:?}"
+    );
+    assert_eq!(
+        rows[0].get("note").and_then(|v| {
+            if let SqlValue::Text(s) = v {
+                Some(s.as_str())
+            } else {
+                None
+            }
+        }),
+        Some("still working on it"),
+        "audit note text must match the caller-supplied note"
+    );
+}
