@@ -127,7 +127,13 @@ label. Known residuals, accepted under the threat model: a non-connector qualifi
 delimiter (`api key pour commit <hex>`) and a participle in verb position directly after the
 trigger (`api key updated: commit <hex>` reads as changelog prose; without the VCS marker the
 raw hex still blocks under the near-trigger rule — note the ordering: `updated api
-key: <hex>` blocks, since the walk meets the trigger first). Accepted false positives,
+key: <hex>` blocks, since the walk meets the trigger first). The no-delimiter residual is not
+limited to the VCS family: without a `:`/`=`, the walk ends open at the first content word, so
+a slash-bearing or path-dressed high-entropy value also reaches the file-path exemption behind
+an intervening verb or noun (`api key found <slash-base64>`, `auth scanner found
+<slash-base64>`, `secret note <high-entropy path>` all pass; adding a delimiter to any of them
+blocks). This is the widest documented residual of the no-delimiter tier and the first
+candidate for a future tightening of that tier. Accepted false positives,
 conservative direction: the walk has no grammar — ANY trigger word reachable inside the
 pre-delimiter clause (absent a sentence boundary or verb-position participle) is treated as a
 credential label, whether it is attributive (`see the docs for auth setup: <path>`, `secret
