@@ -100,8 +100,21 @@ where
 
     // Content-addressed: identical bytes already on disk means this put is a
     // no-op (BlobStore::put's documented dedup contract) — skip the floor
-    // check and the write entirely.
+    // check and the write entirely. The existing file's mtime is still
+    // refreshed to now: a prior orphan re-published through this path
+    // restarts its publish-grace clock exactly as a fresh write would,
+    // rather than keeping a stale mtime that lets the orphan sweep delete it
+    // out from under the caller's follow-up entity write (khive#1313). The
+    // caller already holds both the async and file-based publish advisory
+    // locks for the duration of this call, so the refresh is serialized
+    // against a concurrent sweep the same way an ordinary write is.
     if target.exists() {
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(&target)
+            .map_err(|e| map_io_err(e, "put_touch_open"))?;
+        file.set_modified(SystemTime::now())
+            .map_err(|e| map_io_err(e, "put_touch_mtime"))?;
         return Ok(content_ref);
     }
 
@@ -1313,6 +1326,117 @@ mod tests {
             .unwrap();
         assert_eq!(result.deleted, 0);
         assert!(store.exists(&blob).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn put_republishing_an_aged_orphan_restarts_its_grace_clock_before_the_reference_commits()
+    {
+        // The dedup fast path (`target.exists()`) used to return without
+        // touching the file at all -- so a stale, already-orphaned blob
+        // re-published by an identical `put` kept its OLD mtime, bypassed
+        // the publish-grace check, and a transactional sweep landing in the
+        // gap before the caller's follow-up entity write could delete it
+        // out from under that write (khive#1313). This reproduces the
+        // race end to end and proves the mtime refresh closes it.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("khive.db");
+        let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+        {
+            let mut writer = backend.pool().writer().unwrap();
+            crate::run_migrations(writer.conn_mut()).unwrap();
+        }
+        let store = FsBlobStore::new(dir.path().join("blobs"), 0)
+            .unwrap()
+            .with_orphan_sweep_grace(Duration::from_secs(60));
+
+        let bytes = b"old orphan re-published".to_vec();
+        let first = store.put(bytes.clone()).await.unwrap();
+
+        // Age the blob well past the 60s grace floor -- no sleeps, same
+        // backdating pattern as the existing older-than-grace test.
+        let path = shard_path(store.root(), &first);
+        let old_mtime = SystemTime::now() - Duration::from_secs(3600);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old_mtime)
+            .unwrap();
+
+        // A deduplicating put republishes the identical bytes. No entity
+        // anywhere references this blob yet.
+        let second = store.put(bytes).await.unwrap();
+        assert_eq!(first, second);
+
+        // The sweep lands in the gap before the follow-up entity write --
+        // the refreshed mtime must keep it inside the grace window.
+        let result = store
+            .transactional_orphan_sweep(backend.sql().as_ref(), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            result.deleted, 0,
+            "a dedup-republished blob must survive a sweep landing before its reference \
+             commits: {result:?}"
+        );
+        assert_eq!(
+            result.grace_period_skipped, 1,
+            "must be reported as grace-protected, not silently ignored: {result:?}"
+        );
+        assert!(store.exists(&first).await.unwrap());
+
+        // The caller's follow-up entity write now lands.
+        {
+            let writer = backend.pool().writer().unwrap();
+            writer
+                .conn()
+                .execute(
+                    "INSERT INTO entities \
+                     (id, namespace, kind, name, tags, created_at, updated_at, deleted_at, content_ref) \
+                     VALUES ('e1', 'local', 'document', 'e1', '[]', 1, 1, NULL, ?1)",
+                    rusqlite::params![first.as_str()],
+                )
+                .unwrap();
+        }
+
+        let result = store
+            .transactional_orphan_sweep(backend.sql().as_ref(), false)
+            .await
+            .unwrap();
+        assert_eq!(result.deleted, 0);
+        assert!(
+            store.exists(&first).await.unwrap(),
+            "the blob must stay live once its reference has committed"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_dedup_mtime_refresh_has_no_observable_effect_under_zero_grace_period() {
+        // The assumption the fix relies on for every `store(0)`-flavored
+        // test in this file: `within_publish_grace` with `Duration::ZERO`
+        // never protects a candidate regardless of its mtime (`age <
+        // Duration::ZERO` is always false), so refreshing the mtime on a
+        // deduplicated republish must not change zero-grace sweep behavior.
+        // Verified directly rather than assumed.
+        let (_dir, store) = store(0);
+        let bytes = b"zero grace dedup refresh".to_vec();
+        let first = store.put(bytes.clone()).await.unwrap();
+        let second = store.put(bytes.clone()).await.unwrap();
+        assert_eq!(first, second);
+
+        let result = store
+            .orphan_sweep(&BlobOrphanSweepConfig {
+                live_refs: std::collections::HashSet::new(),
+                dry_run: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            result.deleted, 1,
+            "a zero grace period must still delete an unreferenced blob even after a dedup \
+             put refreshed its mtime: {result:?}"
+        );
+        assert!(!store.exists(&first).await.unwrap());
     }
 
     #[tokio::test]
