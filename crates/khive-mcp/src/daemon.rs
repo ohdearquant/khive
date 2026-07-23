@@ -781,8 +781,34 @@ enum RecoveryError {
     IncumbentStillAlive { pid: u32 },
 }
 
-fn process_is_alive(pid: u32) -> bool {
+/// Reap `pid` via a non-blocking `waitpid` if it is this process's child and
+/// has already exited. Returns `true` only on a positive reap. `forward_or_spawn`
+/// drops the `Child` handle for a killed incumbent without ever calling
+/// `wait()` on it, so without this the kernel keeps its exit status pending
+/// (a zombie table entry) for the life of this process; polling it here turns
+/// that into an immediate, correct reap instead of a leak. Returns `false`
+/// both when `pid` is still running and when it is not this process's child
+/// (`ECHILD`) — callers fall back to the `ps`-based check below to tell those
+/// two cases apart.
+fn reap_exited_child(pid: u32) -> bool {
     let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    let mut status = 0;
+    // SAFETY: WNOHANG makes this a non-blocking probe that only reaps the
+    // exact PID passed in; a non-child PID fails with ECHILD and is left
+    // untouched.
+    (unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) }) == pid
+}
+
+fn process_is_alive(pid_u32: u32) -> bool {
+    if reap_exited_child(pid_u32) {
+        return false;
+    }
+    let Ok(pid) = i32::try_from(pid_u32) else {
         return false;
     };
     if pid <= 0 {
@@ -1157,9 +1183,13 @@ const RECOVERER_LOCK_TIMEOUT_MS: u64 = 16_000;
 /// (NEVER-KILL-SLOW). `LockContended` (confirm rounds inconclusive, or the
 /// recoverer lock itself timed out) → `Uncertain`, no kill — same safe
 /// behavior as `Skipped` but reported distinctly. `Dead` (confirmed,
-/// recoverer lock held) → signal + bounded exit confirmation + spawn →
+/// recoverer lock held) → signal + bounded exit confirmation → spawn →
 /// `Spawned`; a PID still alive at the deadline returns
-/// [`RecoveryError::IncumbentStillAlive`] without spawning. See
+/// [`RecoveryError::IncumbentStillAlive`] without spawning. Immediately
+/// before that spawn, identity is re-probed once more: if a concurrent peer
+/// already replaced the daemon while this call was waiting on the
+/// incumbent's exit, this returns `Skipped` (or `Uncertain` on an
+/// inconclusive re-probe) instead of double-spawning. See
 /// `crates/khive-mcp/docs/api/daemon-lifecycle.md` for why a second lock
 /// file is required and how this avoids deadlocking a booting daemon.
 async fn kill_and_respawn<F>(
@@ -1280,9 +1310,27 @@ where
             // and dropped entirely within this arm.
             let _boot_lock = acquire_recovery_lock();
             kill_stale_daemon_inner(exit_timeout).await?;
-            spawn()
-                .map(RecoveryOutcome::Spawned)
-                .map_err(RecoveryError::Spawn)
+
+            // #1271 follow-up: `kill_stale_daemon_inner` can block for up to
+            // `exit_timeout` waiting on the incumbent's exit, which is long
+            // enough for a concurrent peer recoverer — one that started its
+            // own kill+spawn before this one committed — to have already
+            // spawned and bound a healthy replacement. Re-probe identity
+            // before committing to a second spawn instead of assuming the
+            // rendezvous is still ours; `Alive` means a peer's replacement
+            // beat us to it, so skip. `Timeout`/`LockContended` are as
+            // ambiguous here as they are on the initial probe
+            // (NEVER-KILL-SLOW) — do not spawn on top of an unconfirmed
+            // state either.
+            match probe_daemon_identity(config_id, namespace, 500).await {
+                ProbeOutcome::Alive => Ok(RecoveryOutcome::Skipped),
+                ProbeOutcome::Timeout | ProbeOutcome::LockContended => {
+                    Ok(RecoveryOutcome::Uncertain)
+                }
+                ProbeOutcome::Dead => spawn()
+                    .map(RecoveryOutcome::Spawned)
+                    .map_err(RecoveryError::Spawn),
+            }
         }
     };
     drop(recoverer_guard);
@@ -3918,6 +3966,158 @@ mod tests {
             !pid_file.exists(),
             "the confirmed-dead incumbent PID file must be removed before spawning"
         );
+    }
+
+    #[tokio::test]
+    async fn wait_for_process_exit_reaps_child_dropped_without_wait() {
+        // Mirrors `forward_or_spawn` dropping its `Child` handle for a killed
+        // incumbent without ever calling `wait()` on it.
+        let child = std::process::Command::new("/bin/sh")
+            .args(["-c", "trap 'exit 0' TERM; while :; do sleep 1; done"])
+            .spawn()
+            .expect("spawn cooperative child");
+        let child_pid = child.id();
+        let child_pid_i32 = i32::try_from(child_pid).expect("child pid fits i32");
+        drop(child);
+
+        // SAFETY: this process is the direct parent of the child spawned above.
+        assert_eq!(unsafe { libc::kill(child_pid_i32, libc::SIGTERM) }, 0);
+
+        let exited = wait_for_process_exit(child_pid, std::time::Duration::from_secs(2)).await;
+        assert!(exited, "an exited child must not remain live as a zombie");
+
+        let mut status = 0;
+        // SAFETY: WNOHANG is non-blocking; this only touches the exact PID above.
+        let second_reap = unsafe { libc::waitpid(child_pid_i32, &mut status, libc::WNOHANG) };
+        let reap_errno = std::io::Error::last_os_error().raw_os_error();
+        if second_reap == 0 {
+            // Still running somehow (e.g. under load): clean it up so the
+            // suite does not leak a process, then fail with a clear reason.
+            // SAFETY: this only touches the exact PID spawned above.
+            unsafe {
+                libc::kill(child_pid_i32, libc::SIGKILL);
+                libc::waitpid(child_pid_i32, &mut status, 0);
+            }
+            panic!("child was still alive after wait_for_process_exit reported exit");
+        }
+        assert_eq!(
+            (second_reap, reap_errno),
+            (-1, Some(libc::ECHILD)),
+            "wait_for_process_exit must have already reaped the child via \
+             waitpid(WNOHANG) — a second reap attempt finding anything other \
+             than ECHILD means its exit status was left pending instead"
+        );
+    }
+
+    // ── pre-spawn re-probe skips a second spawn when a peer wins the race ──────
+    //
+    // `kill_stale_daemon_inner`'s wait for the incumbent's exit can run for its
+    // full `exit_timeout`. This drives a cooperative incumbent that marks
+    // SIGTERM receipt and then blocks on an explicit exit gate, giving the
+    // test a deterministic window — bounded by polling, never a fixed sleep —
+    // in which to stand up a REAL replacement daemon before letting the
+    // incumbent actually exit. If the pre-spawn re-probe is reverted, this
+    // call spawns a second replacement on top of the live one instead of
+    // returning `Skipped`, and `spawn_calls` observes 1 instead of 0.
+    #[tokio::test]
+    #[serial]
+    async fn kill_and_respawn_skips_spawn_when_peer_replaces_daemon_during_incumbent_wait() {
+        let mut cleanup = RecoveryTestGuard::new();
+        clear_daemon_env();
+        reset_counters();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("khived.sock");
+        let pid_file = dir.path().join("khived.pid");
+        let term_marker = dir.path().join("incumbent.term-received");
+        let exit_gate = dir.path().join("incumbent.exit-gate");
+
+        std::env::set_var("KHIVE_SOCKET", &sock);
+        std::env::set_var("KHIVE_PID", &pid_file);
+        std::env::set_var("KHIVE_LOCK", dir.path().join("khived.recovery.lock"));
+        std::env::set_var(
+            "KHIVE_RECOVERER_LOCK",
+            dir.path().join("khived.recoverer.lock"),
+        );
+        std::env::remove_var("KHIVE_NO_DAEMON");
+
+        let incumbent = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(r#"trap 'touch "$1"' TERM; while [ ! -f "$2" ]; do sleep 0.01; done; exit 0"#)
+            .arg("incumbent")
+            .arg(&term_marker)
+            .arg(&exit_gate)
+            .spawn()
+            .expect("spawn cooperative incumbent");
+        let incumbent_pid = cleanup.track_child(incumbent);
+        std::fs::write(&pid_file, incumbent_pid.to_string()).expect("write incumbent pid file");
+        FORCE_PID_IS_DAEMON.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let server = make_test_server();
+        let config_id = server.config_id().to_string();
+
+        let spawn_calls = std::sync::atomic::AtomicUsize::new(0);
+        let spawn = || {
+            spawn_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::process::Command::new("/bin/sh")
+                .args(["-c", "exit 0"])
+                .spawn()
+        };
+
+        let outcome_fut = kill_and_respawn_with_exit_timeout(
+            &config_id,
+            NS,
+            &spawn,
+            std::time::Duration::from_secs(5),
+        );
+
+        // Yields the replacement's JoinHandle so cleanup can run after the
+        // outcome assertions; it must not be awaited inside the block.
+        #[allow(clippy::async_yields_async)]
+        let orchestrate_fut = async {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+            while !term_marker.exists() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "incumbent never observed SIGTERM"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+
+            // The incumbent is now blocked on the exit gate, deep inside
+            // kill_stale_daemon_inner's exit-wait loop. Stand up the real
+            // replacement daemon a concurrent peer would have spawned.
+            let daemon_handle = tokio::spawn(async move {
+                let _ = run_daemon(server).await;
+            });
+            let _ready = connect_when_ready(&sock).await;
+            drop(_ready);
+
+            // Only now let the incumbent actually exit.
+            std::fs::write(&exit_gate, b"go").expect("open exit gate");
+            daemon_handle
+        };
+
+        let (outcome, daemon_handle) = tokio::join!(outcome_fut, orchestrate_fut);
+
+        assert!(
+            matches!(outcome, Ok(RecoveryOutcome::Skipped)),
+            "kill_and_respawn_with_exit_timeout must return Ok(RecoveryOutcome::Skipped) \
+             when the pre-spawn re-probe finds a peer's replacement already alive, got \
+             {outcome:?}"
+        );
+        assert_eq!(
+            spawn_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "must not spawn a second replacement once a peer's daemon is confirmed alive"
+        );
+        assert!(
+            sock.exists(),
+            "the peer's replacement daemon socket must survive untouched"
+        );
+
+        daemon_handle.abort();
+        let _ = daemon_handle.await;
+        cleanup.kill_and_reap_child();
     }
 
     #[tokio::test]

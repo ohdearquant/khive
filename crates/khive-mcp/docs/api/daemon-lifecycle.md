@@ -45,6 +45,27 @@ behavior as `Skipped` but reported distinctly so it is never conflated with a
 positive "confirmed alive" result. `Dead` (confirmed, recoverer lock held) →
 kill + spawn → `Spawned`.
 
+`kill_stale_daemon_inner`'s wait for the incumbent's exit can run for its
+full `exit_timeout`, which is long enough for a second recoverer — one that
+started its own kill+spawn before this one committed to the recoverer lock —
+to have already bound a replacement. Rather than spawn on top of that, the
+kill is followed by one more `probe_daemon_identity` call before `spawn()`
+runs: `Alive` there means a peer's replacement already answered, so this
+recoverer returns `Skipped` instead of double-spawning; `Timeout`/
+`LockContended` fall back to `Uncertain` for the same NEVER-KILL-SLOW reason
+as the initial probe.
+
+The exit wait itself (`wait_for_process_exit`/`process_is_alive`) first
+attempts a non-blocking `waitpid(pid, WNOHANG)` on every poll
+(`reap_exited_child`): if this process is the incumbent's parent and it has
+already exited, that positively reaps it and confirms the exit immediately.
+This matters because `forward_or_spawn` drops the `Child` handle for a killed
+incumbent without calling `wait()` on it — without the reap, the kernel keeps
+its exit status pending as a zombie table entry for the life of this process.
+A PID this process does not own fails that probe with `ECHILD` and falls
+through unchanged to the existing `kill(pid, 0)` + `ps -o stat=` liveness
+check.
+
 Two test-only barriers (`RECOVERY_RACE_BARRIER`, `SPAWN_COMMIT_BARRIER`)
 force concurrent recoverers under test to reach, respectively, the
 classification-complete point and the commit-to-spawn point at the same
