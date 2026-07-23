@@ -43,8 +43,8 @@ use khive_db::stores::entity::{
 use khive_db::stores::event::event_insert_statements;
 use khive_db::stores::graph::{
     edge_hard_delete_statement, edge_insert_guarded_by_endpoints_statement,
-    edge_soft_delete_statement, edge_symmetric_delete_if_conflict_statement,
-    edge_symmetric_refresh_or_update_inplace_statement, edge_upsert_statement,
+    edge_soft_delete_statement, edge_symmetric_absorb_or_update_inplace_statement,
+    edge_symmetric_delete_if_conflict_statement, edge_upsert_statement,
     purge_incident_edges_statement,
 };
 use khive_db::stores::note::{
@@ -842,7 +842,7 @@ pub async fn prepare_update_entity_plan(
 /// op in the same atomic unit could change the conflict landscape between
 /// probe and commit, making any such branch stale by construction. It always
 /// emits BOTH statements from [`edge_symmetric_delete_if_conflict_statement`]
-/// and [`edge_symmetric_refresh_or_update_inplace_statement`], each carrying
+/// and [`edge_symmetric_absorb_or_update_inplace_statement`], each carrying
 /// its own commit-time `WHERE`/`CASE WHEN` predicate that re-evaluates the
 /// conflict condition fresh inside the transaction. This function reads no
 /// state to guess a surviving id; the plan instead carries `edge_natural_key`
@@ -930,7 +930,7 @@ async fn prepare_update_edge(
             }),
         });
         statements.push(PlanStatement {
-            statement: edge_symmetric_refresh_or_update_inplace_statement(
+            statement: edge_symmetric_absorb_or_update_inplace_statement(
                 &namespace,
                 id,
                 canon_src,

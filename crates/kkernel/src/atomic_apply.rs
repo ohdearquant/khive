@@ -484,6 +484,7 @@ async fn build_op_result(
             let edge = runtime
                 .get_edge_by_natural_key_including_deleted(
                     token,
+                    key.namespace(),
                     key.canon_source_id(),
                     key.canon_target_id(),
                     key.relation(),

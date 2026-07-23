@@ -70,8 +70,17 @@ pub trait GraphStore: Send + Sync + 'static {
     /// update whose surviving canonical row may be tombstoned (ADR-039 DO NOTHING) — the
     /// normal `query_edges`/`list_edges` path filters `deleted_at IS NULL` and would report
     /// "not found" for exactly that row.
+    ///
+    /// `namespace` is the natural key's own `namespace` column value (part of the
+    /// `UNIQUE(namespace, source_id, target_id, relation)` constraint this method queries by)
+    /// — it is passed explicitly rather than implied by whichever store instance `self` is,
+    /// so a caller who resolved the record's namespace independently of its own ambient token
+    /// (the atomic-apply renderer, which knows the committed edge's namespace from its prepare-
+    /// time `EdgeNaturalKey`, not from the caller's token) cannot accidentally query the wrong
+    /// namespace by relying on implicit store scoping (khive#1213/#1214 fix round).
     async fn get_edge_by_natural_key_including_deleted(
         &self,
+        namespace: &str,
         source_id: Uuid,
         target_id: Uuid,
         relation: EdgeRelation,

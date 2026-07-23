@@ -340,7 +340,7 @@ pub fn edge_symmetric_update_inplace_statement(
 // 1. [`edge_symmetric_delete_if_conflict_statement`]: deletes the requested
 //    (non-canonical) row IF AND ONLY IF a differently-id'd canonical row
 //    exists at the target natural key at THIS moment (guard: 0 or 1 rows).
-// 2. [`edge_symmetric_refresh_or_update_inplace_statement`]: a single
+// 2. [`edge_symmetric_absorb_or_update_inplace_statement`]: a single
 //    `UPDATE` that no longer trusts an `id = ?2 OR natural-key` predicate
 //    (ADR-099 §B3 — that predicate could
 //    match the WRONG row: if a different op earlier in the SAME atomic unit
@@ -356,7 +356,8 @@ pub fn edge_symmetric_update_inplace_statement(
 //      requested row is still live under its own id — update it in place.
 //    - `source_id = ?3 AND target_id = ?4 AND relation = ?5 AND id != ?2
 //      AND changes() = 1`: statement 1 just deleted the requested row
-//      BECAUSE a conflict existed — refresh that surviving canonical row.
+//      BECAUSE a conflict existed — match the surviving canonical row and
+//      leave its attributes unchanged (ADR-039 DO NOTHING; see below).
 //    These two arms are mutually exclusive and, together with statement 1's
 //    own guard, jointly exhaustive: if the requested row no longer existed
 //    when statement 1 ran (the same-unit race above), statement 1 affects 0
@@ -384,9 +385,10 @@ pub fn edge_symmetric_update_inplace_statement(
 //
 // No probe, no branch, no read at all is needed to APPLY this pair. Which
 // row this plan actually touched is derived post-commit by the caller via a
-// fresh natural-key lookup (`khive-runtime::KhiveRuntime::list_edges`,
-// filtered on the canonicalized endpoints/relation — the same mechanism the
-// atomic `link` op's own result rendering already uses) — ADR-099 §B3
+// fresh natural-key lookup (`khive-runtime::KhiveRuntime::get_edge_by_natural_key_including_deleted`,
+// filtered on the canonicalized endpoints/relation and including soft-deleted rows — unlike
+// `list_edges`, which unconditionally filters `deleted_at IS NULL` and would report "not
+// found" for a surviving row this absorption arm left tombstoned) — ADR-099 §B3
 // removed the prior prepare-time advisory `target_id` probe entirely:
 // a value computed before the
 // SAME atomic unit's other ops have run is not a fact this plan can stand
@@ -419,7 +421,7 @@ pub fn edge_symmetric_delete_if_conflict_statement(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn edge_symmetric_refresh_or_update_inplace_statement(
+pub fn edge_symmetric_absorb_or_update_inplace_statement(
     namespace: &str,
     id: Uuid,
     canon_src: Uuid,
@@ -464,7 +466,7 @@ pub fn edge_symmetric_refresh_or_update_inplace_statement(
                 None => SqlValue::Null,
             },
         ],
-        label: Some("edge-symmetric-refresh-or-update-inplace".to_string()),
+        label: Some("edge-symmetric-absorb-or-update-inplace".to_string()),
     }
 }
 
@@ -1277,11 +1279,12 @@ impl GraphStore for SqlGraphStore {
 
     async fn get_edge_by_natural_key_including_deleted(
         &self,
+        namespace: &str,
         source_id: Uuid,
         target_id: Uuid,
         relation: EdgeRelation,
     ) -> Result<Option<Edge>, StorageError> {
-        let namespace = self.namespace.clone();
+        let namespace = namespace.to_string();
         let source_str = source_id.to_string();
         let target_str = target_id.to_string();
         let relation_str = relation.to_string();

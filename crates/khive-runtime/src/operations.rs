@@ -4452,16 +4452,24 @@ impl KhiveRuntime {
     /// survivor (ADR-039 DO NOTHING conflict absorption) — used by the atomic-apply
     /// post-commit result renderer, which otherwise reports "not found" for a committed
     /// update whose surviving row happens to be soft-deleted.
+    ///
+    /// `token` selects the store instance; `namespace` is the natural key's own
+    /// namespace and is bound into the query explicitly. These can legitimately differ:
+    /// the record namespace is fixed at prepare time (`EdgeNaturalKey::namespace`) and by-ID
+    /// edge updates are namespace-agnostic (ADR-007 Rev 6), so the caller's ambient `token`
+    /// namespace is never a safe substitute for the record's own — the prior implicit
+    /// `self.namespace` scoping is exactly the bug this parameter closes (khive#1213/#1214).
     pub async fn get_edge_by_natural_key_including_deleted(
         &self,
         token: &NamespaceToken,
+        namespace: &str,
         source_id: Uuid,
         target_id: Uuid,
         relation: EdgeRelation,
     ) -> RuntimeResult<Option<Edge>> {
         Ok(self
             .graph(token)?
-            .get_edge_by_natural_key_including_deleted(source_id, target_id, relation)
+            .get_edge_by_natural_key_including_deleted(namespace, source_id, target_id, relation)
             .await?)
     }
 
@@ -8536,6 +8544,74 @@ mod tests {
         let target_ids: Vec<Uuid> = neighbors.iter().map(|n| n.node_id).collect();
         assert!(target_ids.contains(&t1.id));
         assert!(target_ids.contains(&t2.id));
+    }
+
+    /// khive#1213/#1214 fix round: the atomic-apply post-commit renderer for a
+    /// symmetric-edge update resolves the surviving row's store by the CALLER's
+    /// token but must filter by the record's OWN namespace, passed explicitly —
+    /// never by re-deriving it from whichever token happened to select the store
+    /// (`self.graph(token)` scopes by `token.namespace()`, and by-ID edge updates
+    /// are namespace-agnostic, so a caller in one namespace can legitimately
+    /// commit an update against an edge recorded in another). This proves the
+    /// `namespace` parameter — not the `token` argument — decides which row the
+    /// natural-key lookup finds, at the level the review flagged as an
+    /// acceptable substitute for a full cross-namespace atomic-apply test.
+    #[tokio::test]
+    async fn get_edge_by_natural_key_including_deleted_honors_explicit_namespace_not_token() {
+        let rt = rt();
+        let ns_a = NamespaceToken::for_namespace(Namespace::parse("ns-a").unwrap());
+        let ns_b = NamespaceToken::for_namespace(Namespace::parse("ns-b").unwrap());
+
+        let a = rt
+            .create_entity(&ns_b, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(&ns_b, "concept", None, "B", None, None, vec![])
+            .await
+            .unwrap();
+        let edge = rt
+            .link(&ns_b, a.id, b.id, EdgeRelation::CompetesWith, 1.0, None)
+            .await
+            .unwrap();
+        let (canon_src, canon_tgt) =
+            canonical_edge_endpoints(EdgeRelation::CompetesWith, a.id, b.id);
+
+        // Caller token is ns-a (an unrelated namespace); passing "ns-b" explicitly
+        // must still find the edge recorded there.
+        let found = rt
+            .get_edge_by_natural_key_including_deleted(
+                &ns_a,
+                "ns-b",
+                canon_src,
+                canon_tgt,
+                EdgeRelation::CompetesWith,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            found.map(|e| Uuid::from(e.id)),
+            Some(Uuid::from(edge.id)),
+            "must find the edge by its own namespace regardless of the caller's token"
+        );
+
+        // Passing the caller token's OWN namespace ("ns-a") as the explicit filter
+        // must NOT find it — proves the lookup is keyed on the `namespace` argument,
+        // not silently re-scoped to whatever namespace the token carries.
+        let not_found = rt
+            .get_edge_by_natural_key_including_deleted(
+                &ns_a,
+                "ns-a",
+                canon_src,
+                canon_tgt,
+                EdgeRelation::CompetesWith,
+            )
+            .await
+            .unwrap();
+        assert!(
+            not_found.is_none(),
+            "must not find an edge recorded in a different namespace than the one queried"
+        );
     }
 
     /// `link` endpoint existence is a by-ID check and therefore namespace-agnostic:
