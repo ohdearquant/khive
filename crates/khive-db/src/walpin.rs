@@ -39,23 +39,19 @@
 //! file name) is converted to its `openat` argument byte-exact, never via a
 //! lossy UTF-8 conversion, since this project supports non-UTF-8 database
 //! paths and a lossy conversion could collide two distinct database names
-//! onto one sidecar directory. Windows has no `openat`/`fstat`-bound
-//! ownership-validation equivalent in `std`, so this module talks to the
-//! Win32 API directly: every write/rename/delete opens its target with
-//! `FILE_FLAG_OPEN_REPARSE_POINT` (never following a symlink/junction at
-//! the target), validates on the resulting handle via
-//! `GetFileInformationByHandle`, confirms the handle's OS-resolved path
-//! (`GetFinalPathNameByHandle`) sits inside the validated directory
-//! handle's own resolved path, and performs the rename/delete itself
-//! through `SetFileInformationByHandle` on that same handle — never a
-//! re-resolved path in between. There is no uid/mode-equivalent narrowing
-//! on Windows (documented residual gap: a Windows sidecar directory is
-//! only as protected as its inherited ACL, not actively narrowed by this
-//! code — ADR-091 specifies handle-bound validation, not ACL hardening).
+//! onto one sidecar directory. Windows uses a backup-semantics, no-follow
+//! directory handle whose `FileAttributeTagInfo` and final resolved path are
+//! verified before use. Every child open/create is then rooted at that handle
+//! through `NtCreateFile`; rename and deletion remain handle-relative. New
+//! directories receive a protected DACL containing one inheritable full-
+//! control ACE for their owner, and existing directories with broader ACLs
+//! are refused rather than repaired.
 
+#[cfg(unix)]
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -65,6 +61,7 @@ use serde::{Deserialize, Serialize};
 /// whole-second values sourced from different clocks (the writer's own
 /// `SystemTime::now()` vs. `proc_pidinfo`/`/proc/<pid>/stat`), so this is
 /// rounding slack, not a real identity ambiguity window.
+#[cfg(unix)]
 const START_TIME_EPSILON_SECS: u64 = 2;
 
 /// One process's walpin heartbeat record (ADR-091 Amendment 2 Plank B).
@@ -255,6 +252,53 @@ pub fn sidecar_enabled(is_file_backed: bool) -> bool {
         },
         Err(_) => is_file_backed,
     }
+}
+
+#[cfg(any(windows, test))]
+fn windows_attribute_tag_is_acceptable(
+    file_attributes: u32,
+    reparse_tag: u32,
+    require_directory: bool,
+) -> bool {
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+
+    let is_directory = file_attributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+    let is_reparse = file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    is_directory == require_directory && !is_reparse && reparse_tag == 0
+}
+
+#[cfg(any(windows, test))]
+fn windows_final_path_matches(expected: &[u16], opened: &[u16]) -> bool {
+    expected == opened
+}
+
+#[cfg(any(windows, test))]
+fn windows_relative_child_name_is_safe(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\', '\0'])
+}
+
+#[cfg(any(windows, test))]
+fn windows_owner_dacl_is_restricted(
+    ace_count: u32,
+    ace_type: u8,
+    ace_flags: u8,
+    access_mask: u32,
+    owner_matches: bool,
+    owner_is_token_user: bool,
+    dacl_protected: bool,
+) -> bool {
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+    const OBJECT_AND_CONTAINER_INHERIT: u8 = 0x03;
+    const FILE_ALL_ACCESS: u32 = 0x001f_01ff;
+
+    ace_count == 1
+        && ace_type == ACCESS_ALLOWED_ACE_TYPE
+        && ace_flags == OBJECT_AND_CONTAINER_INHERIT
+        && access_mask == FILE_ALL_ACCESS
+        && owner_matches
+        && owner_is_token_user
+        && dacl_protected
 }
 
 /// Unix sidecar internals (ADR-091 Amendment 2: handle-bound
@@ -970,31 +1014,60 @@ mod unix_impl {
     }
 }
 
-/// Windows sidecar internals (ADR-091 Amendment 2: "Windows
-/// is a supported target"). Uses plain `std::fs` path-based primitives —
-/// `std` has no `openat`/`fstat`-bound-validation equivalent on Windows, so
-/// the handle-bound contract ([`unix_impl`]) is Unix-normative only. Refuses
-/// symlinks via `symlink_metadata` before any read/write, exclusive
-/// `create_new(true)` for temp files, atomic `fs::rename`, plain
-/// `fs::create_dir` (no uid/mode-equivalent narrowing — see the module doc's
-/// platform-split note: a Windows sidecar directory is only as protected as
-/// its inherited ACL).
+/// Windows sidecar internals. The directory is opened without following its
+/// final component, checked through handle metadata and final-path identity,
+/// and retained as the root for all child operations. New directories receive
+/// a protected owner-only DACL before they become visible.
 #[cfg(windows)]
 mod windows_impl {
-    use super::io_other;
+    use super::{
+        io_other, windows_attribute_tag_is_acceptable, windows_final_path_matches,
+        windows_owner_dacl_is_restricted, windows_relative_child_name_is_safe,
+    };
     use std::ffi::OsStr;
     use std::fs;
     use std::io::{self, Write};
     use std::os::raw::c_void;
-    use std::os::windows::ffi::{OsStrExt, OsStringExt};
-    use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
-    use std::path::{Path, PathBuf};
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::MetadataExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
+    use std::path::Path;
     use std::time::SystemTime;
+    use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+    use windows_sys::Wdk::Storage::FileSystem::{
+        NtCreateFile, FILE_CREATE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT,
+        FILE_SYNCHRONOUS_IO_NONALERT,
+    };
+    use windows_sys::Win32::Foundation::{
+        LocalFree, RtlNtStatusToDosError, ERROR_ALREADY_EXISTS, HANDLE, UNICODE_STRING,
+    };
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        AclSizeInformation, AddAccessAllowedAceEx, EqualSid, GetAce, GetAclInformation,
+        GetLengthSid, GetSecurityDescriptorControl, GetTokenInformation, InitializeAcl,
+        InitializeSecurityDescriptor, SetSecurityDescriptorControl, SetSecurityDescriptorDacl,
+        SetSecurityDescriptorOwner, TokenUser, ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_REVISION,
+        ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, OBJECT_INHERIT_ACE,
+        OWNER_SECURITY_INFORMATION, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
+        TOKEN_QUERY, TOKEN_USER,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateDirectoryW, FileAttributeTagInfo, GetFileInformationByHandleEx, FILE_ALL_ACCESS,
+        FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, OPEN_EXISTING,
+        READ_CONTROL, SYNCHRONIZE, VOLUME_NAME_DOS,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
-    fn to_wide_nul(path: &Path) -> Vec<u16> {
+    fn to_wide_nul(path: &Path) -> io::Result<Vec<u16>> {
         let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        if wide.contains(&0) {
+            return Err(io::Error::from(io::ErrorKind::InvalidFilename));
+        }
         wide.push(0);
-        wide
+        Ok(wide)
     }
 
     /// Open `path` with `FILE_FLAG_OPEN_REPARSE_POINT`, so a symlink or
@@ -1007,7 +1080,7 @@ mod windows_impl {
         disposition: u32,
         extra_flags: u32,
     ) -> io::Result<fs::File> {
-        let wide = to_wide_nul(path);
+        let wide = to_wide_nul(path)?;
         // SAFETY: `wide` is a valid, NUL-terminated UTF-16 string for the
         // call's duration; the returned handle, on success, is uniquely
         // owned by this call and wrapped immediately below.
@@ -1015,7 +1088,7 @@ mod windows_impl {
             CreateFileW(
                 wide.as_ptr(),
                 access,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 std::ptr::null_mut(),
                 disposition,
                 FILE_FLAG_OPEN_REPARSE_POINT | extra_flags,
@@ -1031,139 +1104,449 @@ mod windows_impl {
         Ok(unsafe { fs::File::from_raw_handle(handle as RawHandle) })
     }
 
-    fn file_info(file: &fs::File) -> io::Result<ByHandleFileInformation> {
-        let mut info: ByHandleFileInformation = unsafe { std::mem::zeroed() };
-        // SAFETY: `file`'s handle is live; `info` is a valid,
-        // appropriately-sized output buffer for the call.
-        if unsafe { GetFileInformationByHandle(file.as_raw_handle() as Handle, &mut info) } == 0 {
+    fn verify_handle_kind(file: &fs::File, require_directory: bool) -> io::Result<()> {
+        let mut info = FILE_ATTRIBUTE_TAG_INFO::default();
+        // SAFETY: the handle is live and `info` is the correctly sized output
+        // buffer for `FileAttributeTagInfo`.
+        let ok = unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                FileAttributeTagInfo,
+                (&raw mut info).cast(),
+                std::mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+            )
+        };
+        if ok == 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(info)
+        if !windows_attribute_tag_is_acceptable(
+            info.FileAttributes,
+            info.ReparseTag,
+            require_directory,
+        ) {
+            return Err(io_other(
+                "opened walpin sidecar handle has the wrong kind or is a reparse point",
+            ));
+        }
+        Ok(())
     }
 
-    /// The handle's own OS-resolved canonical path, queried from the live
-    /// object rather than re-derived from a path string — the binding half
-    /// of the handle-bound contract: a path can be swapped by a concurrent
-    /// rename/symlink between a path-based validation and a path-based
-    /// use, but a resolved handle always names the exact object it was
-    /// opened against.
-    fn resolved_path(file: &fs::File) -> io::Result<PathBuf> {
-        let mut buf: Vec<u16> = vec![0u16; 260];
+    fn final_path(file: &fs::File) -> io::Result<Vec<u16>> {
+        let mut path = vec![0u16; 260];
         loop {
-            // SAFETY: `file`'s handle is live; `buf` is a valid output
-            // buffer of its declared capacity.
-            let len = unsafe {
+            // SAFETY: the handle is live and `path` exposes the supplied
+            // writable buffer for the call.
+            let length = unsafe {
                 GetFinalPathNameByHandleW(
                     file.as_raw_handle() as Handle,
-                    buf.as_mut_ptr(),
-                    buf.len() as u32,
-                    0,
+                    path.as_mut_ptr(),
+                    path.len() as u32,
+                    FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
                 )
             };
-            if len == 0 {
+            if length == 0 {
                 return Err(io::Error::last_os_error());
             }
-            if (len as usize) < buf.len() {
-                buf.truncate(len as usize);
-                return Ok(PathBuf::from(std::ffi::OsString::from_wide(&buf)));
+            let length = length as usize;
+            if length < path.len() {
+                path.truncate(length);
+                return Ok(path);
             }
-            buf.resize(len as usize + 1, 0);
+            path.resize(length.saturating_add(1), 0);
         }
     }
 
-    /// `resolved` must sit directly inside `dir_resolved` — the binding
-    /// check that catches `dir` (or an ancestor of it) having been swapped
-    /// for a symlink between the directory handle's own validation and
-    /// this entry's open.
-    fn verify_under(resolved: &Path, dir_resolved: &Path, target: &Path) -> io::Result<()> {
-        if resolved.parent() != Some(dir_resolved) {
+    fn metadata_is_reparse(metadata: &fs::Metadata) -> bool {
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+
+    fn ensure_ancestors_not_reparse(dir: &Path) -> io::Result<()> {
+        const MAX_ANCESTORS: usize = 40;
+
+        let parent = dir
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let ancestors: Vec<_> = parent
+            .ancestors()
+            .filter(|path| !path.as_os_str().is_empty())
+            .take(MAX_ANCESTORS + 1)
+            .collect();
+        if ancestors.len() > MAX_ANCESTORS {
             return Err(io_other(format!(
-                "walpin sidecar path {target:?} resolved outside its validated directory"
+                "walpin sidecar path has more than {MAX_ANCESTORS} ancestor components"
+            )));
+        }
+        for ancestor in ancestors.into_iter().rev() {
+            let metadata = fs::symlink_metadata(ancestor)?;
+            if metadata.file_type().is_symlink() || metadata_is_reparse(&metadata) {
+                return Err(io_other(format!(
+                    "walpin sidecar ancestor {ancestor:?} is a reparse point; refusing"
+                )));
+            }
+            if !metadata.is_dir() {
+                return Err(io_other(format!(
+                    "walpin sidecar ancestor {ancestor:?} is not a directory"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn lexical_prefilter(dir: &Path) -> io::Result<()> {
+        ensure_ancestors_not_reparse(dir)?;
+        let metadata = fs::symlink_metadata(dir)?;
+        if metadata.file_type().is_symlink() || metadata_is_reparse(&metadata) {
+            return Err(io_other(format!(
+                "walpin sidecar path {dir:?} is a reparse point; refusing"
+            )));
+        }
+        if !metadata.is_dir() {
+            return Err(io_other(format!(
+                "walpin sidecar path {dir:?} exists and is not a directory"
             )));
         }
         Ok(())
     }
 
-    /// Case-insensitive comparison of two `GetFinalPathNameByHandleW`-
-    /// resolved paths (NTFS default collation). Both sides of every call
-    /// site here are handle-resolved paths from the same API, so a lossy
-    /// `to_string_lossy` is a conservative (fail-closed, never
-    /// fail-open) simplification: at worst a non-ASCII-identical byte
-    /// sequence that is genuinely equal reads as a mismatch and the open
-    /// is refused, never the reverse.
-    fn resolved_paths_match(a: &Path, b: &Path) -> bool {
-        a.as_os_str().to_string_lossy().to_ascii_lowercase()
-            == b.as_os_str().to_string_lossy().to_ascii_lowercase()
+    struct LocalSecurityDescriptor(*mut c_void);
+
+    impl Drop for LocalSecurityDescriptor {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: `GetSecurityInfo` allocated this descriptor with
+                // `LocalAlloc`; this guard releases it exactly once.
+                unsafe { LocalFree(self.0) };
+            }
+        }
     }
 
-    /// Open the sidecar directory as a validated handle, bound to the
-    /// database directory that is its one legitimate anchor (the threat
-    /// model: the sidecar is always a sibling of the live database file,
-    /// so binding to the parent directory's own resolved identity is the
-    /// strongest anchor available — anything above that the OS itself
-    /// owns is trusted platform layout). `dir`'s parent is opened first
-    /// and its `GetFinalPathNameByHandleW`-resolved path establishes the
-    /// EXPECTED final path (`<parent's resolved path>\<dir's own file
-    /// name>`); `dir` is then opened the same reparse-aware way as
-    /// before — a real directory, never a reparse point, checked on the
-    /// OPENED handle via `GetFileInformationByHandle` — and its OWN
-    /// resolved path must equal that expectation. A pre-existing ancestor
-    /// junction, or a create-then-swap race between the two opens, moves
-    /// `dir`'s resolved path away from `<parent>\<name>` and is refused
-    /// here as a mismatch — the racy window collapses to detect-and-
-    /// refuse (fail closed), which is what the contract asks for; nothing
-    /// upstream of the parent open pins that race away.
+    fn validate_owner_only_dacl(file: &fs::File, dir: &Path) -> io::Result<()> {
+        let mut owner = std::ptr::null_mut();
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut descriptor = std::ptr::null_mut();
+        // SAFETY: the directory handle is live and all requested output
+        // pointers remain valid for the call.
+        let status = unsafe {
+            GetSecurityInfo(
+                file.as_raw_handle(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &raw mut owner,
+                std::ptr::null_mut(),
+                &raw mut dacl,
+                std::ptr::null_mut(),
+                &raw mut descriptor,
+            )
+        };
+        if status != 0 {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+        let _descriptor = LocalSecurityDescriptor(descriptor);
+        if owner.is_null() || dacl.is_null() || descriptor.is_null() {
+            return Err(io_other(format!(
+                "walpin sidecar dir {dir:?} has no owner-only DACL; refusing"
+            )));
+        }
+
+        let mut acl_info = ACL_SIZE_INFORMATION::default();
+        // SAFETY: `dacl` belongs to the live descriptor guard and `acl_info`
+        // is the correctly sized output buffer.
+        if unsafe {
+            GetAclInformation(
+                dacl,
+                (&raw mut acl_info).cast(),
+                std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+
+        let mut ace_ptr = std::ptr::null_mut();
+        if acl_info.AceCount != 1
+            || unsafe { GetAce(dacl, 0, &raw mut ace_ptr) } == 0
+            || ace_ptr.is_null()
+        {
+            return Err(io_other(format!(
+                "walpin sidecar dir {dir:?} grants access beyond its owner; refusing"
+            )));
+        }
+        // SAFETY: `GetAce` returned the sole ACE in the live DACL, so its
+        // common header is present. Reject every other shape before reading
+        // the allowed-ACE fields.
+        let header = unsafe { &*ace_ptr.cast::<ACE_HEADER>() };
+        if header.AceType != 0
+            || usize::from(header.AceSize) < std::mem::size_of::<ACCESS_ALLOWED_ACE>()
+        {
+            return Err(io_other(format!(
+                "walpin sidecar dir {dir:?} grants access beyond its owner; refusing"
+            )));
+        }
+        // SAFETY: the header above establishes the allowed-ACE type and the
+        // complete fixed prefix containing `Mask` and `SidStart`.
+        let ace = unsafe { &*ace_ptr.cast::<ACCESS_ALLOWED_ACE>() };
+        let ace_sid = (&raw const ace.SidStart).cast_mut().cast();
+        let owner_matches = unsafe { EqualSid(owner, ace_sid) } != 0;
+        let token_storage = current_token_user()?;
+        // SAFETY: successful `GetTokenInformation(TokenUser)` initialized a
+        // `TOKEN_USER` at the start of the aligned output buffer.
+        let token_user_sid = unsafe { (*token_storage.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+        let owner_is_token_user = unsafe { EqualSid(owner, token_user_sid) } != 0;
+        let mut control = 0;
+        let mut revision = 0;
+        // SAFETY: `descriptor` remains live under `_descriptor`; both scalar
+        // output buffers are valid for the call.
+        if unsafe { GetSecurityDescriptorControl(descriptor, &raw mut control, &raw mut revision) }
+            == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let restricted = windows_owner_dacl_is_restricted(
+            acl_info.AceCount,
+            ace.Header.AceType,
+            ace.Header.AceFlags,
+            ace.Mask,
+            owner_matches,
+            owner_is_token_user,
+            control & SE_DACL_PROTECTED != 0,
+        );
+        if !restricted {
+            return Err(io_other(format!(
+                "walpin sidecar dir {dir:?} grants access beyond its owner; refusing"
+            )));
+        }
+        Ok(())
+    }
+
     fn open_dir_handle(dir: &Path) -> io::Result<fs::File> {
-        let parent = dir.parent().unwrap_or_else(|| Path::new("."));
-        let name = dir.file_name().ok_or_else(|| {
-            io_other(format!(
-                "walpin sidecar path {dir:?} has no final path component"
-            ))
-        })?;
+        lexical_prefilter(dir)?;
+        let expected = fs::canonicalize(dir)?;
+        let expected_wide: Vec<u16> = expected.as_os_str().encode_wide().collect();
+        lexical_prefilter(dir)?;
 
-        let parent_handle =
-            open_reparse_aware(parent, 0, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS)?;
-        let parent_info = file_info(&parent_handle)?;
-        if parent_info.dw_file_attributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+        let file = open_reparse_aware(
+            dir,
+            FILE_READ_ATTRIBUTES | READ_CONTROL,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+        )?;
+        verify_handle_kind(&file, true)?;
+        let opened = final_path(&file)?;
+        if !windows_final_path_matches(&expected_wide, &opened) {
             return Err(io_other(format!(
-                "walpin sidecar parent {parent:?} is not a directory"
+                "walpin sidecar path {dir:?} changed identity while it was opened; refusing"
             )));
         }
-        let expected = resolved_path(&parent_handle)?.join(name);
-
-        let file = open_reparse_aware(dir, 0, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS)?;
-        let info = file_info(&file)?;
-        if info.dw_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Err(io_other(format!(
-                "walpin sidecar path {dir:?} is a symlink; refusing"
-            )));
-        }
-        if info.dw_file_attributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
-            return Err(io_other(format!(
-                "walpin sidecar path {dir:?} exists and is not a directory"
-            )));
-        }
-        let resolved = resolved_path(&file)?;
-        if !resolved_paths_match(&resolved, &expected) {
-            return Err(io_other(format!(
-                "walpin sidecar path {dir:?} resolved to {resolved:?}, outside its \
-                 validated database-directory anchor {expected:?}; refusing"
-            )));
-        }
+        validate_owner_only_dacl(&file, dir)?;
         Ok(file)
+    }
+
+    fn current_token_user() -> io::Result<Vec<usize>> {
+        let mut token_handle: HANDLE = std::ptr::null_mut();
+        // SAFETY: the pseudo-process handle is always valid and the output
+        // handle is transferred to `OwnedHandle` immediately on success.
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token_handle) } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `token_handle` is newly returned and transferred once.
+        let token = unsafe { OwnedHandle::from_raw_handle(token_handle as RawHandle) };
+
+        let mut token_bytes = 0;
+        // SAFETY: the first call intentionally supplies no output buffer and
+        // asks Windows for its required size.
+        unsafe {
+            GetTokenInformation(
+                token.as_raw_handle(),
+                TokenUser,
+                std::ptr::null_mut(),
+                0,
+                &raw mut token_bytes,
+            )
+        };
+        if token_bytes == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let token_words = (token_bytes as usize)
+            .div_ceil(std::mem::size_of::<usize>())
+            .max(1);
+        let mut token_storage = vec![0usize; token_words];
+        // SAFETY: the aligned storage has at least `token_bytes` writable
+        // bytes and remains live while its SID is consumed below.
+        if unsafe {
+            GetTokenInformation(
+                token.as_raw_handle(),
+                TokenUser,
+                token_storage.as_mut_ptr().cast(),
+                token_bytes,
+                &raw mut token_bytes,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(token_storage)
+    }
+
+    fn create_owner_only_dir(dir: &Path) -> io::Result<()> {
+        let token_storage = current_token_user()?;
+        // SAFETY: successful `GetTokenInformation(TokenUser)` initialized a
+        // `TOKEN_USER` at the start of the aligned output buffer.
+        let owner_sid = unsafe { (*token_storage.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+        let sid_bytes = unsafe { GetLengthSid(owner_sid) } as usize;
+        if sid_bytes == 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let acl_bytes = std::mem::size_of::<ACL>()
+            .checked_add(std::mem::size_of::<ACCESS_ALLOWED_ACE>() - std::mem::size_of::<u32>())
+            .and_then(|size| size.checked_add(sid_bytes))
+            .and_then(|size| u32::try_from(size).ok())
+            .ok_or_else(|| io_other("owner-only walpin DACL size overflow"))?;
+        let acl_words = (acl_bytes as usize)
+            .div_ceil(std::mem::size_of::<usize>())
+            .max(1);
+        let mut acl_storage = vec![0usize; acl_words];
+        let acl = acl_storage.as_mut_ptr().cast::<ACL>();
+        // SAFETY: `acl` points to aligned writable storage of `acl_bytes`.
+        if unsafe { InitializeAcl(acl, acl_bytes, ACL_REVISION) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the ACL is initialized and large enough for one full-control
+        // ACE carrying the live token-user SID.
+        if unsafe {
+            AddAccessAllowedAceEx(
+                acl,
+                ACL_REVISION,
+                OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
+                FILE_ALL_ACCESS,
+                owner_sid,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+
+        let mut descriptor = SECURITY_DESCRIPTOR::default();
+        // SAFETY: `descriptor` is writable and all referenced SID/ACL storage
+        // remains live through `CreateDirectoryW` below.
+        if unsafe { InitializeSecurityDescriptor((&raw mut descriptor).cast(), 1) } == 0
+            || unsafe { SetSecurityDescriptorOwner((&raw mut descriptor).cast(), owner_sid, 0) }
+                == 0
+            || unsafe { SetSecurityDescriptorDacl((&raw mut descriptor).cast(), 1, acl, 0) } == 0
+            || unsafe {
+                SetSecurityDescriptorControl(
+                    (&raw mut descriptor).cast(),
+                    SE_DACL_PROTECTED,
+                    SE_DACL_PROTECTED,
+                )
+            } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: (&raw mut descriptor).cast(),
+            bInheritHandle: 0,
+        };
+        let wide = to_wide_nul(dir)?;
+        // SAFETY: `wide` is NUL-terminated and the security descriptor, ACL,
+        // and owner SID remain live for the call.
+        if unsafe { CreateDirectoryW(wide.as_ptr(), &raw const attributes) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
 
     pub(super) fn ensure_sidecar_dir(dir: &Path) -> io::Result<()> {
         match open_dir_handle(dir) {
             Ok(_) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                fs::create_dir(dir)?;
-                // Re-validate post-creation the same way the Unix path
-                // does: a concurrent process could have raced this create.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                ensure_ancestors_not_reparse(dir)?;
+                if let Err(create_error) = create_owner_only_dir(dir) {
+                    if create_error.raw_os_error() != Some(ERROR_ALREADY_EXISTS as i32) {
+                        return Err(create_error);
+                    }
+                }
                 open_dir_handle(dir).map(|_| ())
             }
-            Err(e) => Err(e),
+            Err(error) => Err(error),
         }
+    }
+
+    fn open_relative(
+        dir: &fs::File,
+        name: &str,
+        desired_access: u32,
+        create_disposition: u32,
+    ) -> io::Result<fs::File> {
+        if !windows_relative_child_name_is_safe(name) {
+            return Err(io::Error::from(io::ErrorKind::InvalidFilename));
+        }
+        let mut wide: Vec<u16> = OsStr::new(name).encode_wide().collect();
+        let byte_len = wide
+            .len()
+            .checked_mul(std::mem::size_of::<u16>())
+            .and_then(|length| u16::try_from(length).ok())
+            .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidFilename))?;
+        let unicode_name = UNICODE_STRING {
+            Length: byte_len,
+            MaximumLength: byte_len,
+            Buffer: wide.as_mut_ptr(),
+        };
+        let attributes = OBJECT_ATTRIBUTES {
+            Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: dir.as_raw_handle(),
+            ObjectName: &raw const unicode_name,
+            Attributes: windows_sys::Win32::Foundation::OBJ_CASE_INSENSITIVE,
+            SecurityDescriptor: std::ptr::null(),
+            SecurityQualityOfService: std::ptr::null(),
+        };
+        let mut io_status = IO_STATUS_BLOCK::default();
+        let mut handle: HANDLE = std::ptr::null_mut();
+        // SAFETY: every input structure and the name buffer are live; the
+        // root directory handle is pinned, and a successful child handle is
+        // transferred immediately below.
+        let status = unsafe {
+            NtCreateFile(
+                &raw mut handle,
+                desired_access,
+                &raw const attributes,
+                &raw mut io_status,
+                std::ptr::null(),
+                FILE_ATTRIBUTE_NORMAL,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                create_disposition,
+                FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+                std::ptr::null(),
+                0,
+            )
+        };
+        if status < 0 {
+            // SAFETY: converting a returned failure status has no preconditions.
+            let error = unsafe { RtlNtStatusToDosError(status) };
+            return Err(io::Error::from_raw_os_error(error as i32));
+        }
+        // SAFETY: `handle` is newly returned and transferred exactly once.
+        Ok(unsafe { fs::File::from_raw_handle(handle as RawHandle) })
+    }
+
+    fn remove_relative_if_exists(dir: &fs::File, name: &str) -> io::Result<()> {
+        let file = match open_relative(
+            dir,
+            name,
+            DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            FILE_OPEN,
+        ) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        verify_handle_kind(&file, false)?;
+        delete_via_handle(&file)
     }
 
     fn delete_via_handle(file: &fs::File) -> io::Result<()> {
@@ -1211,7 +1594,7 @@ mod windows_impl {
         // pointer arithmetic below stays within that allocation.
         unsafe {
             let header = buf.as_mut_ptr() as *mut FileRenameInfo;
-            (*header).replace_if_exists = 1;
+            (*header).replace_if_exists = 0;
             (*header).root_directory = dir_handle.as_raw_handle() as Handle;
             (*header).file_name_length = name_bytes as u32;
             let name_ptr = (*header).file_name.as_mut_ptr();
@@ -1243,94 +1626,43 @@ mod windows_impl {
         body: &[u8],
     ) -> io::Result<()> {
         let dir_handle = open_dir_handle(dir)?;
-        let dir_resolved = resolved_path(&dir_handle)?;
-
-        // Refuse a pre-existing symlink at the target — checked on an
-        // opened handle (never followed, via `FILE_FLAG_OPEN_REPARSE_POINT`)
-        // rather than a path query a later step could re-resolve
-        // differently.
-        let target = dir.join(target_name);
-        match open_reparse_aware(&target, 0, OPEN_EXISTING, 0) {
-            Ok(existing) => {
-                let info = file_info(&existing)?;
-                if info.dw_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-                    return Err(io_other(format!(
-                        "walpin sidecar path {target:?} is a symlink; refusing to write through it"
-                    )));
-                }
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
-        }
-
-        // Best-effort stale-tmp cleanup: delete-on-close via a
-        // reparse-aware handle removes whatever object sits at `tmp_name`
-        // (including a symlink itself, never its target) without a
-        // separate path-based `remove_file` re-resolving it.
-        let tmp = dir.join(tmp_name);
-        if let Ok(stale) = open_reparse_aware(&tmp, DELETE, OPEN_EXISTING, 0) {
-            let _ = delete_via_handle(&stale);
-        }
-
-        let mut tmp_file = open_reparse_aware(&tmp, GENERIC_WRITE | DELETE, CREATE_NEW, 0)?;
-        verify_under(&resolved_path(&tmp_file)?, &dir_resolved, &tmp)?;
+        remove_relative_if_exists(&dir_handle, tmp_name)?;
+        let mut tmp_file = open_relative(
+            &dir_handle,
+            tmp_name,
+            GENERIC_WRITE | DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            FILE_CREATE,
+        )?;
+        verify_handle_kind(&tmp_file, false)?;
         tmp_file.write_all(body)?;
         tmp_file.sync_all()?;
+        remove_relative_if_exists(&dir_handle, target_name)?;
         rename_via_handle(&tmp_file, &dir_handle, target_name)
     }
 
     pub(super) fn remove_checked(dir: &Path, name: &str) -> io::Result<()> {
-        let dir_handle = open_dir_handle(dir)?;
-        let dir_resolved = resolved_path(&dir_handle)?;
-        let target = dir.join(name);
-        let file = match open_reparse_aware(&target, DELETE, OPEN_EXISTING, 0) {
-            Ok(f) => f,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(e),
+        let dir_handle = match open_dir_handle(dir) {
+            Ok(handle) => handle,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
         };
-        let info = file_info(&file)?;
-        if info.dw_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Err(io_other(format!(
-                "refusing to remove symlinked walpin sidecar entry {target:?}"
-            )));
-        }
-        verify_under(&resolved_path(&file)?, &dir_resolved, &target)?;
-        delete_via_handle(&file)
+        remove_relative_if_exists(&dir_handle, name)
     }
 
-    /// Validation-then-operation on a plain path (the historical
-    /// `write_atomic`/`remove_checked` pattern) is a TOCTOU race: nothing
-    /// pins the object between a path-based validation and a follow-up
-    /// path-based open. Every write/rename/delete path above, and the
-    /// touch path below, are hardened against it the same way:
-    /// `CreateFileW` with `FILE_FLAG_OPEN_REPARSE_POINT` opens the target
-    /// AS a reparse point rather than following it, the reparse-point
-    /// check runs against the SAME opened handle via
-    /// `GetFileInformationByHandle`, the created/opened object's identity
-    /// is confirmed via `GetFinalPathNameByHandle` against the validated
-    /// directory handle's own resolved path, and the rename/delete
-    /// themselves run through `SetFileInformationByHandle` on that same
-    /// handle — never a re-resolved path. ACL hardening is explicitly NOT
-    /// part of this: ADR-091 specifies handle-bound validation, not ACL
-    /// narrowing, so a Windows sidecar directory remains only as protected
-    /// as its inherited ACL — a residual, documented gap, not an
-    /// oversight.
     pub(super) fn touch_mtime(dir: &Path, name: &str) -> io::Result<()> {
         let dir_handle = open_dir_handle(dir)?;
-        let dir_resolved = resolved_path(&dir_handle)?;
-        let target = dir.join(name);
-        let file = open_reparse_aware(&target, GENERIC_WRITE, OPEN_EXISTING, 0).map_err(|_| {
+        let file = open_relative(
+            &dir_handle,
+            name,
+            FILE_WRITE_ATTRIBUTES | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            FILE_OPEN,
+        )
+        .map_err(|error| {
             io_other(format!(
-                "walpin sidecar entry {target:?} does not exist or could not be opened"
+                "walpin sidecar entry {name:?} does not exist or could not be opened: {error}"
             ))
         })?;
-        let info = file_info(&file)?;
-        if info.dw_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Err(io_other(format!(
-                "walpin sidecar entry {target:?} is a reparse point; refusing to touch it"
-            )));
-        }
-        verify_under(&resolved_path(&file)?, &dir_resolved, &target)?;
+        verify_handle_kind(&file, false)?;
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map_err(|e| io_other(e.to_string()))?;
@@ -1367,24 +1699,6 @@ mod windows_impl {
         dw_high_date_time: u32,
     }
 
-    /// Mirrors Win32's `BY_HANDLE_FILE_INFORMATION` layout exactly — every
-    /// field must stay present and in order even though callers here only
-    /// read `dw_file_attributes`, since `GetFileInformationByHandle` writes
-    /// the full struct.
-    #[repr(C)]
-    struct ByHandleFileInformation {
-        dw_file_attributes: u32,
-        ft_creation_time: FileTime,
-        ft_last_access_time: FileTime,
-        ft_last_write_time: FileTime,
-        dw_volume_serial_number: u32,
-        n_file_size_high: u32,
-        n_file_size_low: u32,
-        n_number_of_links: u32,
-        n_file_index_high: u32,
-        n_file_index_low: u32,
-    }
-
     /// Mirrors Win32's `FILE_RENAME_INFO` (the pre-Windows-10-1607 layout,
     /// the one `SetFileInformationByHandle`'s `FileRenameInfo` class
     /// expects): a `BOOLEAN`, then a `HANDLE` (natural alignment inserts
@@ -1411,14 +1725,6 @@ mod windows_impl {
     const STILL_ACTIVE: u32 = 259;
     const GENERIC_WRITE: u32 = 0x4000_0000;
     const DELETE: u32 = 0x0001_0000;
-    const FILE_SHARE_READ: u32 = 0x0000_0001;
-    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
-    const OPEN_EXISTING: u32 = 3;
-    const CREATE_NEW: u32 = 1;
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
     const FILE_RENAME_INFO_CLASS: i32 = 3;
     const FILE_DISPOSITION_INFO_CLASS: i32 = 4;
 
@@ -1450,10 +1756,6 @@ mod windows_impl {
             dw_flags_and_attributes: u32,
             h_template_file: Handle,
         ) -> Handle;
-        fn GetFileInformationByHandle(
-            h_file: Handle,
-            lp_file_information: *mut ByHandleFileInformation,
-        ) -> i32;
         fn SetFileTime(
             h_file: Handle,
             lp_creation_time: *const FileTime,
@@ -1587,6 +1889,7 @@ impl CensusResult {
     /// is positive proof the walk missed at least one live holder. This is
     /// necessary but not sufficient, so every platform applies this on top
     /// of its own per-step incompleteness markers.
+    #[cfg(unix)]
     fn apply_self_canary(&mut self) {
         self.apply_self_canary_for(census_visible_self_pid());
     }
@@ -2127,10 +2430,9 @@ pub fn census_holders(_db_path: &Path) -> io::Result<CensusResult> {
 }
 
 /// Ensure `dir` exists and is trustworthy: a real directory (never a
-/// symlink), and on Unix mode `0700` owned by the current user (Windows has
-/// no uid/mode-equivalent narrowing — see the module doc's platform-split
-/// note). Refuses — never chmod/chown/otherwise repair — a non-compliant
-/// existing directory.
+/// symlink or reparse-point component), and accessible only to its owner:
+/// Unix mode `0700`, or a protected owner-only DACL on Windows. Refuses —
+/// never chmod/chown/re-ACLs — a non-compliant existing directory.
 pub fn ensure_sidecar_dir(dir: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -2397,6 +2699,7 @@ pub fn process_start_time_secs(_pid: u32) -> Option<i64> {
     None
 }
 
+#[cfg(any(unix, test))]
 fn now_epoch_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2778,6 +3081,105 @@ mod tests {
             sidecar_enabled(false),
             "explicit on must override in-memory default"
         );
+    }
+
+    #[test]
+    fn windows_handle_kind_requires_expected_type_without_reparse_data() {
+        const DIRECTORY: u32 = 0x10;
+        const REPARSE_POINT: u32 = 0x400;
+
+        assert!(windows_attribute_tag_is_acceptable(DIRECTORY, 0, true));
+        assert!(windows_attribute_tag_is_acceptable(0, 0, false));
+        assert!(!windows_attribute_tag_is_acceptable(0, 0, true));
+        assert!(!windows_attribute_tag_is_acceptable(DIRECTORY, 0, false));
+        assert!(!windows_attribute_tag_is_acceptable(
+            DIRECTORY | REPARSE_POINT,
+            0,
+            true
+        ));
+        assert!(!windows_attribute_tag_is_acceptable(DIRECTORY, 1, true));
+    }
+
+    #[test]
+    fn windows_final_path_comparison_requires_exact_handle_resolution() {
+        let expected: Vec<u16> = r"\\?\C:\data\khive.db.walpin".encode_utf16().collect();
+        let same = expected.clone();
+        let redirected: Vec<u16> = r"\\?\C:\other\khive.db.walpin".encode_utf16().collect();
+
+        assert!(windows_final_path_matches(&expected, &same));
+        assert!(!windows_final_path_matches(&expected, &redirected));
+    }
+
+    #[test]
+    fn windows_relative_child_names_are_single_components() {
+        assert!(windows_relative_child_name_is_safe("42.json"));
+        assert!(!windows_relative_child_name_is_safe(""));
+        assert!(!windows_relative_child_name_is_safe("."));
+        assert!(!windows_relative_child_name_is_safe(".."));
+        assert!(!windows_relative_child_name_is_safe("..\\42.json"));
+        assert!(!windows_relative_child_name_is_safe("nested/42.json"));
+        assert!(!windows_relative_child_name_is_safe("42\0.json"));
+    }
+
+    #[test]
+    fn windows_owner_dacl_accepts_token_user_owner_and_rejects_broader_shapes() {
+        const ACCESS_ALLOWED: u8 = 0;
+        const OBJECT_AND_CONTAINER_INHERIT: u8 = 0x03;
+        const FILE_ALL_ACCESS: u32 = 0x001f_01ff;
+
+        assert!(windows_owner_dacl_is_restricted(
+            1,
+            ACCESS_ALLOWED,
+            OBJECT_AND_CONTAINER_INHERIT,
+            FILE_ALL_ACCESS,
+            true,
+            true,
+            true,
+        ));
+        assert!(!windows_owner_dacl_is_restricted(
+            2,
+            ACCESS_ALLOWED,
+            OBJECT_AND_CONTAINER_INHERIT,
+            FILE_ALL_ACCESS,
+            true,
+            true,
+            true,
+        ));
+        assert!(!windows_owner_dacl_is_restricted(
+            1,
+            ACCESS_ALLOWED,
+            OBJECT_AND_CONTAINER_INHERIT,
+            FILE_ALL_ACCESS,
+            false,
+            true,
+            true,
+        ));
+        assert!(!windows_owner_dacl_is_restricted(
+            1,
+            ACCESS_ALLOWED,
+            OBJECT_AND_CONTAINER_INHERIT,
+            FILE_ALL_ACCESS,
+            true,
+            true,
+            false,
+        ));
+    }
+
+    #[test]
+    fn windows_owner_dacl_rejects_group_owner() {
+        const ACCESS_ALLOWED: u8 = 0;
+        const OBJECT_AND_CONTAINER_INHERIT: u8 = 0x03;
+        const FILE_ALL_ACCESS: u32 = 0x001f_01ff;
+
+        assert!(!windows_owner_dacl_is_restricted(
+            1,
+            ACCESS_ALLOWED,
+            OBJECT_AND_CONTAINER_INHERIT,
+            FILE_ALL_ACCESS,
+            true,
+            false,
+            true,
+        ));
     }
 
     #[test]
