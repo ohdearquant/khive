@@ -66,7 +66,7 @@ jobs:
           set -euo pipefail
           pkg_args=()
           for crate in $COMPONENT_CRATES; do pkg_args+=(-p "$crate"); done
-          timeout 600 cargo bench "${pkg_args[@]}" -- --quick || true
+          timeout 600 cargo bench "${pkg_args[@]}" --benches -- --quick || true
 
       - name: Record component trend ledger entry
         id: record

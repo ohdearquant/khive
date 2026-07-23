@@ -1577,6 +1577,7 @@ version = "0.6.0"
 dependencies = [
  "criterion",
  "khive-score",
+ "khive-text",
  "parking_lot",
  "rand 0.8.7",
  "serde",
@@ -1625,6 +1626,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1738,6 +1740,7 @@ dependencies = [
  "khive-runtime",
  "khive-storage",
  "khive-types",
+ "lattice-embed",
  "serde",
  "serde_json",
  "tokio",
@@ -1880,7 +1883,6 @@ name = "khive-text"
 version = "0.6.0"
 dependencies = [
  "criterion",
- "khive-bm25",
  "rust-stemmers",
  "unicode-segmentation",
 ]
@@ -1902,6 +1904,7 @@ dependencies = [
  "bytemuck",
  "criterion",
  "khive-quant",
+ "libc",
  "memmap2",
  "rand 0.8.7",
  "rayon",
@@ -1911,6 +1914,7 @@ dependencies = [
  "thiserror",
  "toml",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1968,6 +1972,7 @@ dependencies = [
  "khive-vcs-adapters",
  "lattice-embed",
  "rmcp",
+ "rusqlite",
  "serde",
  "serde_json",
  "serial_test",

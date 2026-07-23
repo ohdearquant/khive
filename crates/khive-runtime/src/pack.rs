@@ -926,6 +926,10 @@ pub(crate) const SPECIAL_RELATIONS: &[khive_types::EdgeRelation] = &[
     khive_types::EdgeRelation::Refutes,
 ];
 
+pub(crate) fn is_special_relation(relation: khive_types::EdgeRelation) -> bool {
+    SPECIAL_RELATIONS.contains(&relation)
+}
+
 /// Compose the full per-relation endpoint allowlist surfaced by
 /// `link(help=true)` (issue #964).
 ///
@@ -965,7 +969,7 @@ fn edge_endpoint_table(packs: &[Box<dyn PackRuntime>]) -> Vec<Value> {
 
     for pack in packs.iter() {
         for rule in pack.edge_rules().iter() {
-            if SPECIAL_RELATIONS.contains(&rule.relation) {
+            if is_special_relation(rule.relation) {
                 continue;
             }
             rows.push(serde_json::json!({
@@ -6522,6 +6526,22 @@ mod help_tests {
                     && r["target"] == "entity:concept"),
                 "endpoint_rules must include the base entity:{kind}->entity:concept row \
                  for '{relation}'; got {rules:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn special_relation_predicate_matches_the_dedicated_validator_set() {
+        for relation in khive_types::EdgeRelation::ALL {
+            assert_eq!(
+                is_special_relation(relation),
+                matches!(
+                    relation,
+                    khive_types::EdgeRelation::Supersedes
+                        | khive_types::EdgeRelation::Supports
+                        | khive_types::EdgeRelation::Refutes
+                ),
+                "unexpected special-relation classification for {relation}"
             );
         }
     }

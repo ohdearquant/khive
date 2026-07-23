@@ -1170,6 +1170,91 @@ async fn update_entity_with_note_field_salience_returns_error() {
 
 // ── #764: create's embedding_content wiring ─────────────────────────────────
 
+struct WarningEmbeddingService;
+
+#[async_trait::async_trait]
+impl lattice_embed::EmbeddingService for WarningEmbeddingService {
+    async fn embed(
+        &self,
+        texts: &[String],
+        _model: lattice_embed::EmbeddingModel,
+    ) -> Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+        Ok(vec![vec![1.0]; texts.len()])
+    }
+
+    fn supports_model(&self, _model: lattice_embed::EmbeddingModel) -> bool {
+        true
+    }
+
+    fn name(&self) -> &'static str {
+        "warning-test"
+    }
+}
+
+struct WarningEmbedderProvider;
+
+#[async_trait::async_trait]
+impl khive_runtime::EmbedderProvider for WarningEmbedderProvider {
+    fn name(&self) -> &str {
+        "warning-test"
+    }
+
+    fn dimensions(&self) -> usize {
+        1
+    }
+
+    async fn build(
+        &self,
+    ) -> Result<std::sync::Arc<dyn lattice_embed::EmbeddingService>, khive_runtime::RuntimeError>
+    {
+        Ok(std::sync::Arc::new(WarningEmbeddingService))
+    }
+}
+
+#[tokio::test]
+async fn create_dispatch_emits_embedding_truncation_advisory() {
+    use crate::KgPack;
+    use khive_runtime::{KhiveRuntime, VerbRegistryBuilder};
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    rt.register_embedder(WarningEmbedderProvider);
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt));
+    let registry = builder.build().expect("registry build");
+
+    let truncated = registry
+        .dispatch(
+            "create",
+            json!({
+                "kind": "concept",
+                "name": "warning target",
+                "description": "x".repeat(lattice_embed::MAX_TEXT_CHARS),
+                "skip_dedup_check": true,
+            }),
+        )
+        .await
+        .expect("over-limit create");
+    let warnings = truncated["warnings"].as_array().expect("warnings array");
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].as_str().unwrap().contains("truncated"));
+
+    let normal = registry
+        .dispatch(
+            "create",
+            json!({
+                "kind": "concept",
+                "name": "normal target",
+                "skip_dedup_check": true,
+            }),
+        )
+        .await
+        .expect("normal create");
+    assert!(
+        normal.get("warnings").is_none(),
+        "normal input must not emit an advisory"
+    );
+}
+
 /// A note create with a proper-prefix `embedding_content` must succeed and
 /// store the full `content`; the override is a runtime-layer concern
 /// (covered by `khive-runtime`'s own unit tests) — this proves the handler
@@ -1468,6 +1553,7 @@ async fn merge_entity_reason_forwarded_through_registry_dispatch() {
                 "into_id": into.id.to_string(),
                 "from_id": from.id.to_string(),
                 "reason": "duplicate via dispatch",
+                "force": true,
             }),
         )
         .await
@@ -1497,6 +1583,15 @@ async fn merge_entity_reason_forwarded_through_registry_dispatch() {
         events.items[0].payload.get("reason").and_then(|v| v.as_str()),
         Some("duplicate via dispatch"),
         "reason supplied through the registry dispatch route must land in the EntityMerged payload; got: {:?}",
+        events.items[0].payload
+    );
+    assert_eq!(
+        events.items[0]
+            .payload
+            .get("force")
+            .and_then(|v| v.as_bool()),
+        Some(true),
+        "force=true must be durable in the EntityMerged payload; got: {:?}",
         events.items[0].payload
     );
 }
@@ -1595,6 +1690,7 @@ async fn get_dispatch_after_merge_discloses_kept_id() {
                 "kind": "entity",
                 "into_id": into.id.to_string(),
                 "from_id": from.id.to_string(),
+                "force": true,
             }),
         )
         .await
@@ -1728,6 +1824,7 @@ async fn resolve_dispatch_on_merged_uuid_stays_bare_not_found() {
                 "kind": "entity",
                 "into_id": into.id.to_string(),
                 "from_id": from.id.to_string(),
+                "force": true,
             }),
         )
         .await

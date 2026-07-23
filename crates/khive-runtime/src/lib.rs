@@ -41,12 +41,14 @@ pub use atomic_plan::{
 };
 pub use atomic_runner::{
     run_atomic_unit, AtomicOpFailure, AtomicOpPlan, AtomicRunOutcome, AtomicRunnerError,
+    CommittedPostCommitEffects,
 };
 pub use blob::resolve_blob_store;
 pub use cost_unit::{base_resource_payload, cost_unit_for_dispatch, resource_payload};
 pub use curation::{
-    entity_fts_document, note_fts_document, ContentMergeStrategy, EdgeListFilter, EdgePatch,
-    EntityDedupMergePolicy, EntityPatch, MergeSummary, NotePatch,
+    entity_embedding_text, entity_fts_document, entity_merge_guard_error, note_embedding_text,
+    note_fts_document, validate_entity_merge_floor, ContentMergeStrategy, EdgeListFilter,
+    EdgePatch, EntityDedupMergePolicy, EntityMergeGuard, EntityPatch, MergeSummary, NotePatch,
 };
 #[cfg(unix)]
 pub use daemon::{acquire_recovery_lock, pid_path, run_daemon, socket_path, DaemonDispatch};
@@ -63,8 +65,8 @@ pub use error::{fts_text_leg_or_err, GuardedWriteFailure, RuntimeError, RuntimeR
 pub use fusion::FusionStrategy;
 pub use graph_traversal::PathNode;
 pub use khive_db::{
-    checkpoint_once, run_checkpoint_task, run_migrations, CheckpointConfig, CheckpointTick,
-    ConnectionPool, StorageBackend,
+    checkpoint_once, run_checkpoint_task, run_migrations, CheckpointConfig,
+    CheckpointLifecycleOwner, CheckpointTick, ConnectionPool, StorageBackend,
 };
 pub use khive_gate::{
     ActorRef, AllowAllGate, AuditDecision, AuditEvent, Gate, GateContext, GateDecision, GateError,

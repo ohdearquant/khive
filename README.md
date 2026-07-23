@@ -72,7 +72,9 @@ The `kg` pack loads by default, giving **19 verbs** out of the box (regenerate w
 
 Task management, memory recall, inter-agent messaging, scheduling, session continuity,
 workspace linking, and blob storage are provided by commercially licensed extensions and
-are not part of the open-source distribution.
+are not part of the open-source distribution. Git provenance ingestion and write verbs,
+along with the code-quality and formal-methods ontology packs, are likewise distributed as
+commercially licensed extensions.
 
 `create`, `list`, `search` take `kind=entity|note` (or `kind=edge` for `list`).
 `get`, `update`, `delete`, `merge` are UUID-only: they auto-detect the record type.
@@ -173,7 +175,8 @@ The speedups over exhaustive search implied by these latencies (89x at 100K, 153
 at 1M) are computed against a back-derived brute-force baseline rather than a directly measured
 one (see [#167](https://github.com/ohdearquant/khive/issues/167)); treat them as indicative, not
 as a measured headline figure. The benchmark harness lives in `perf/`; raw data is in
-[`perf/ledger.csv`](perf/ledger.csv).
+[`perf/ledger.csv`](perf/ledger.csv). New latency and throughput claims used as decision evidence
+must follow the [cache-state and warm-up protocol](scripts/perf/README.md#benchmark-evidence-protocol).
 
 ---
 

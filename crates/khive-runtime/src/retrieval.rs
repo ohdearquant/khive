@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use lattice_embed::EmbeddingModel;
+use lattice_embed::{EmbeddingModel, MAX_TEXT_CHARS};
 use uuid::Uuid;
 
 use crate::config::{parse_embedding_model_alias, sanitize_key};
@@ -51,6 +51,28 @@ pub enum SearchSource {
     Both,
 }
 
+impl SearchSource {
+    /// Combine retrieval-leg membership from two appearances of the same hit.
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Text, Self::Text) => Self::Text,
+            (Self::Vector, Self::Vector) => Self::Vector,
+            _ => Self::Both,
+        }
+    }
+
+    /// Lowercase wire representation used by search serializers.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Vector => "vector",
+            Self::Text => "text",
+            Self::Both => "both",
+        }
+    }
+}
+
 /// RRF constant. Controls how strongly top ranks dominate.
 ///
 /// The paper's k=60 over-compresses scores at KG scale (tens–thousands of
@@ -61,6 +83,34 @@ const RRF_K: usize = 10;
 
 /// Candidates pulled per path before fusion. Higher = better recall, more work.
 const CANDIDATE_MULTIPLIER: u32 = 4;
+
+/// Advisory emitted by write verbs when only the embedding input was bounded.
+pub const EMBEDDING_INPUT_TRUNCATED_WARNING: &str =
+    "embedding input was truncated to the embedder maximum; full content was stored unchanged";
+
+/// Maximum document bytes accepted before the embedding service adds its model prefix.
+pub fn document_embedding_budget(model_name: &str) -> usize {
+    parse_embedding_model_alias(model_name)
+        .and_then(|model| model.document_instruction())
+        .map_or(MAX_TEXT_CHARS, |prefix| {
+            MAX_TEXT_CHARS.saturating_sub(prefix.len())
+        })
+}
+
+/// Return the longest UTF-8-safe prefix of `text` within `max_bytes` and whether it was shortened.
+pub fn bounded_embedding_input(text: &str, max_bytes: usize) -> (&str, bool) {
+    if text.len() <= max_bytes {
+        return (text, false);
+    }
+
+    let end = text
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= max_bytes)
+        .last()
+        .unwrap_or(0);
+    (&text[..end], true)
+}
 
 impl KhiveRuntime {
     /// Generate an embedding vector for `text` using the configured default model.
@@ -94,8 +144,11 @@ impl KhiveRuntime {
         let model = parse_embedding_model_alias(model_name);
         let service = self.embedder(model_name).await?;
         let emb_model = model.unwrap_or_default();
-        let out = service.embed_one(text, emb_model).await;
+        // Issued-at-dispatch: count before the provider await so a call that
+        // was handed to the provider is counted even if this task is aborted
+        // while parked on the await (drain_embed_join_set cancellation path).
         crate::usage::count(crate::usage::UsageUnit::EmbedCalls, 1);
+        let out = service.embed_one(text, emb_model).await;
         Ok(out?)
     }
 
@@ -125,8 +178,10 @@ impl KhiveRuntime {
         let model = parse_embedding_model_alias(model_name);
         let service = self.embedder(model_name).await?;
         let emb_model = model.unwrap_or_default();
-        let embeddings = service.embed_passage(&[text.to_string()], emb_model).await;
+        let (text, _) = bounded_embedding_input(text, document_embedding_budget(model_name));
+        // Issued-at-dispatch: counted before the await — see embed_with_model.
         crate::usage::count(crate::usage::UsageUnit::EmbedCalls, 1);
+        let embeddings = service.embed_passage(&[text.to_string()], emb_model).await;
         let out = embeddings?
             .into_iter()
             .next()
@@ -154,13 +209,14 @@ impl KhiveRuntime {
         let service = self.embedder(model_name).await?;
         let texts = [text.to_string()];
         let emb_model = model.unwrap_or_default();
+        // Issued-at-dispatch: counted before the await — see embed_with_model.
+        crate::usage::count(crate::usage::UsageUnit::EmbedCalls, 1);
         let embeddings = match emb_model {
             EmbeddingModel::BgeSmallEnV15
             | EmbeddingModel::BgeBaseEnV15
             | EmbeddingModel::BgeLargeEnV15 => service.embed(&texts, emb_model).await,
             _ => service.embed_query(&texts, emb_model).await,
         };
-        crate::usage::count(crate::usage::UsageUnit::EmbedCalls, 1);
         let out = embeddings?
             .into_iter()
             .next()
@@ -238,6 +294,7 @@ impl KhiveRuntime {
     ///
     /// Applies `EmbeddingService::embed_passage`. Use for all bulk
     /// index/backfill/reindex operations to apply the passage-side prefix.
+    /// Normal spans remain borrowed when a mixed batch also contains bounded items.
     ///
     /// **Reindex caveat**: see [`Self::embed_document_with_model`] — the same
     /// incomparability applies to batch-indexed vectors when switching models.
@@ -254,9 +311,47 @@ impl KhiveRuntime {
         let model = parse_embedding_model_alias(model_name);
         let service = self.embedder(model_name).await?;
         let emb_model = model.unwrap_or_default();
-        let out = service.embed_passage(texts, emb_model).await;
+        let budget = document_embedding_budget(model_name);
+        let out = if texts.iter().all(|text| text.len() <= budget) {
+            service.embed_passage(texts, emb_model).await
+        } else {
+            async {
+                let mut embeddings = Vec::with_capacity(texts.len());
+                let mut start = 0;
+                while start < texts.len() {
+                    if texts[start].len() > budget {
+                        let bounded =
+                            vec![bounded_embedding_input(&texts[start], budget).0.to_owned()];
+                        embeddings.extend(service.embed_passage(&bounded, emb_model).await?);
+                        start += 1;
+                        continue;
+                    }
+
+                    let end = texts[start..]
+                        .iter()
+                        .position(|text| text.len() > budget)
+                        .map_or(texts.len(), |offset| start + offset);
+                    embeddings.extend(service.embed_passage(&texts[start..end], emb_model).await?);
+                    start = end;
+                }
+                Ok(embeddings)
+            }
+            .await
+        };
         crate::usage::count(crate::usage::UsageUnit::EmbedCalls, texts.len() as u64);
         Ok(out?)
+    }
+
+    /// Whether any registered write embedder would receive a bounded form of `text`.
+    pub fn document_embedding_input_will_be_truncated(&self, text: &str) -> bool {
+        self.document_embedding_input_len_will_be_truncated(text.len())
+    }
+
+    /// Whether any registered write embedder would truncate a document of `input_len` bytes.
+    pub fn document_embedding_input_len_will_be_truncated(&self, input_len: usize) -> bool {
+        self.registered_embedding_model_names()
+            .iter()
+            .any(|model_name| input_len > document_embedding_budget(model_name))
     }
 
     /// Embed a batch of documents for indexing using the configured default model.
@@ -426,7 +521,10 @@ impl KhiveRuntime {
                 snippet_chars: 200,
             })
             .await;
-        crate::usage::count(crate::usage::UsageUnit::FtsPasses, 1);
+        // FtsPasses is counted inside the store's `search()` (khive-db
+        // stores/text.rs), only once a real FTS5 statement is prepared —
+        // an empty/fully-sanitized query short-circuits there before any
+        // statement exists and must not count.
         let text_hits = crate::error::fts_text_leg_or_err(
             text_search_result.map_err(RuntimeError::from),
             "hybrid_search",
@@ -1008,7 +1106,11 @@ fn rrf_fuse(
     let mut buckets: HashMap<Uuid, Bucket> = HashMap::new();
 
     let query_lower = query_text.to_lowercase();
+    let mut text_seen = HashSet::with_capacity(text_hits.len());
     for (i, hit) in text_hits.into_iter().enumerate() {
+        if !text_seen.insert(hit.subject_id) {
+            continue;
+        }
         let rank = i + 1; // RRF is 1-indexed
         let entry = buckets.entry(hit.subject_id).or_default();
         entry.score = entry.score + rrf_score(rank, RRF_K);
@@ -1030,7 +1132,11 @@ fn rrf_fuse(
         }
     }
 
+    let mut vector_seen = HashSet::with_capacity(vector_hits.len());
     for (i, hit) in vector_hits.into_iter().enumerate() {
+        if !vector_seen.insert(hit.subject_id) {
+            continue;
+        }
         let rank = i + 1;
         let entry = buckets.entry(hit.subject_id).or_default();
         entry.score = entry.score + rrf_score(rank, RRF_K);
@@ -1063,6 +1169,30 @@ mod tests {
     use khive_storage::types::{TextSearchHit, VectorSearchHit};
     use khive_types::namespace::Namespace;
     use lattice_embed::EmbeddingModel;
+
+    #[test]
+    fn bounded_embedding_input_reserves_prefix_and_preserves_utf8() {
+        assert_eq!(
+            document_embedding_budget("multilingual-e5-base"),
+            MAX_TEXT_CHARS - "passage: ".len()
+        );
+
+        let input = format!("{}\u{1f980}tail", "a".repeat(MAX_TEXT_CHARS - 1));
+        let (bounded, truncated) = bounded_embedding_input(&input, MAX_TEXT_CHARS);
+        assert!(truncated);
+        assert_eq!(bounded.len(), MAX_TEXT_CHARS - 1);
+        assert!(bounded.is_char_boundary(bounded.len()));
+        assert!(!bounded.contains('\u{1f980}'));
+    }
+
+    #[test]
+    fn bounded_embedding_input_leaves_normal_text_unchanged() {
+        let input = "normal byte-identical embedding input";
+        let (bounded, truncated) = bounded_embedding_input(input, MAX_TEXT_CHARS);
+        assert!(!truncated);
+        assert_eq!(bounded, input);
+        assert_eq!(bounded.as_ptr(), input.as_ptr());
+    }
 
     fn text_hit(id: Uuid, rank: u32, title: &str) -> TextSearchHit {
         TextSearchHit {
@@ -1111,6 +1241,40 @@ mod tests {
         let hits = rrf_fuse(text, vec, 10, "query");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].source, SearchSource::Both);
+    }
+
+    #[test]
+    fn rrf_fuse_preserves_unique_leg_scores_exactly() {
+        let text_only = Uuid::new_v4();
+        let both = Uuid::new_v4();
+        let vector_only = Uuid::new_v4();
+        let text = vec![text_hit(text_only, 1, "A"), text_hit(both, 2, "B")];
+        let vector = vec![vector_hit(both, 1), vector_hit(vector_only, 2)];
+
+        let hits = rrf_fuse(text, vector, 10, "query");
+        let score_for = |id| {
+            hits.iter()
+                .find(|hit| hit.entity_id == id)
+                .expect("expected fused hit")
+                .score
+        };
+
+        assert_eq!(score_for(text_only), rrf_score(1, RRF_K));
+        assert_eq!(score_for(both), rrf_score(2, RRF_K) + rrf_score(1, RRF_K));
+        assert_eq!(score_for(vector_only), rrf_score(2, RRF_K));
+    }
+
+    #[test]
+    fn rrf_fuse_counts_duplicate_once_per_leg() {
+        let id = Uuid::new_v4();
+        let text = vec![text_hit(id, 1, "A"), text_hit(id, 2, "A duplicate")];
+        let vector = vec![vector_hit(id, 1), vector_hit(id, 2)];
+
+        let hits = rrf_fuse(text, vector, 10, "query");
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].source, SearchSource::Both);
+        assert_eq!(hits[0].score, rrf_score(1, RRF_K) + rrf_score(1, RRF_K));
     }
 
     #[test]
@@ -1716,6 +1880,31 @@ mod tests {
                 ],
             ],
             "E5 must receive its query prefix through single and batch paths"
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_document_batch_only_rebuilds_over_limit_items() {
+        let model = EmbeddingModel::AllMiniLmL6V2;
+        let (runtime, captured) = runtime_with_capturing_embedder(model);
+        let texts = vec![
+            "first normal document".to_string(),
+            "x".repeat(MAX_TEXT_CHARS + 1),
+            "second normal document".to_string(),
+        ];
+
+        let embeddings = runtime
+            .embed_document_batch_with_model(&model.to_string(), &texts)
+            .await
+            .expect("mixed batch must embed");
+        assert_eq!(embeddings.len(), texts.len());
+        assert_eq!(
+            captured.lock().unwrap().as_slice(),
+            [
+                vec![texts[0].clone()],
+                vec!["x".repeat(MAX_TEXT_CHARS)],
+                vec![texts[2].clone()],
+            ]
         );
     }
 

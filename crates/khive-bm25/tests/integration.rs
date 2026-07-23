@@ -285,6 +285,21 @@ fn custom_tokenizer_min_length_filters_short_tokens() {
     assert_eq!(index.search("quick", 10).len(), 1);
 }
 
+#[test]
+fn unicode_min_length_changes_length_normalized_ranking() {
+    let tokenizer: BoxedTokenizer = Arc::new(SimpleTokenizer::new(true, 2));
+    let mut index =
+        Bm25Index::try_with_tokenizer(Bm25Config::default(), tokenizer).expect("valid config");
+
+    index.index_document("short", "target 你").unwrap();
+    index.index_document("long", "target extra").unwrap();
+
+    let results = index.search("target", 10);
+    assert_eq!(results.len(), 2);
+    assert_eq!(&*results[0].0, "short");
+    assert!(results[0].1 > results[1].1);
+}
+
 // ---------------------------------------------------------------------------
 // Tokenizer Tokenizer trait: verify tokenize() contract via SimpleTokenizer
 // ---------------------------------------------------------------------------
