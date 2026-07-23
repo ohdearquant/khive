@@ -417,13 +417,26 @@ pub(crate) async fn resolve_annotates_targets(
 /// `annotates` target count (summed per-item, each item deduped the same way
 /// [`resolve_annotates_targets`] would) exceeds [`ANNOTATES_BULK_BUDGET`].
 /// Runs before any per-item spec building or target resolution — a request
-/// that would blow the budget must not cost a single lookup.
+/// that would blow the budget must not cost a single lookup. Items whose raw
+/// array exceeds [`ANNOTATES_CAP`] are skipped without dedup work: they are
+/// rejected per-item downstream before any resolution, so they contribute
+/// nothing to the budget.
 pub(crate) fn check_bulk_annotates_budget(entries: &[Value]) -> Result<(), RuntimeError> {
     let mut total = 0usize;
     for entry in entries {
         let Some(raw) = entry.get("annotates") else {
             continue;
         };
+        // Length gate BEFORE any clone, deserialization, or hashing: an
+        // over-cap array is rejected per-item downstream before any
+        // resolution, so it contributes no budgeted work — and an oversized
+        // untrusted array must not buy unbounded pre-scan work either.
+        let Some(arr) = raw.as_array() else {
+            continue;
+        };
+        if arr.len() > ANNOTATES_CAP {
+            continue;
+        }
         let Ok(targets) = serde_json::from_value::<Vec<String>>(raw.clone()) else {
             continue;
         };

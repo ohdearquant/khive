@@ -408,6 +408,63 @@ async fn create_bulk_note_annotates_aggregate_budget_at_exact_limit_succeeds() {
     assert_eq!(result["failed"], 0);
 }
 
+// Regression: an item whose raw `annotates` array exceeds the per-item cap
+// is rejected per-item before any resolution, so it must contribute NOTHING
+// to the aggregate budget — and the budget pre-scan must not spend dedup
+// work on it either. Counting the over-cap item's 150 targets would push
+// this request to 1150 and reject it at request level, wrongly failing the
+// ten legal items alongside the one illegal one.
+#[tokio::test]
+async fn create_bulk_note_annotates_over_cap_item_does_not_consume_budget() {
+    let pack = pack();
+    let mut target_ids = Vec::with_capacity(100);
+    for i in 0..100 {
+        let target = pack
+            .dispatch(
+                "create",
+                json!({"kind": "concept", "name": format!("OverCapBudgetTarget{i}")}),
+            )
+            .await
+            .expect("target entity must be created");
+        target_ids.push(target["id"].as_str().expect("target id").to_string());
+    }
+
+    // 10 legal items x 100 real targets = 1000, exactly at budget; plus one
+    // over-cap item whose 150 distinct names must not be counted or deduped.
+    let mut items: Vec<Value> = (0..10)
+        .map(|i| {
+            json!({
+                "kind": "observation",
+                "content": format!("over-cap budget note {i}"),
+                "annotates": target_ids.clone(),
+            })
+        })
+        .collect();
+    let over_cap: Vec<String> = (0..150).map(|j| format!("over-cap-target-{j}")).collect();
+    items.push(json!({
+        "kind": "observation",
+        "content": "over-cap item",
+        "annotates": over_cap,
+    }));
+
+    let result = pack
+        .dispatch(
+            "create",
+            json!({"items": items, "atomic": false, "verbose": true}),
+        )
+        .await
+        .expect("over-cap item must fail per-item, not blow the request-level budget");
+    assert_eq!(result["attempted"], 11);
+    assert_eq!(result["created"], 10);
+    assert_eq!(result["failed"], 1);
+    assert_eq!(result["errors"][0]["index"], 10);
+    let err_msg = result["errors"][0]["error"].as_str().expect("error string");
+    assert!(
+        err_msg.contains("100") && err_msg.contains("150"),
+        "the over-cap item's error must be the per-item cap error; got {err_msg}"
+    );
+}
+
 // Regression: two encodings of the same UUID (e.g. differing letter case) in
 // one item's `annotates` must dedup to a single resolution and a single edge
 // — raw-string dedup alone lets equivalent UUID encodings slip through.
