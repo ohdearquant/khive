@@ -821,6 +821,24 @@ pub fn background_task_count() -> usize {
     background_tasks().load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Process-wide daemon shutdown signal (ADR-119).
+///
+/// Cancelled exactly once, when the daemon's unified shutdown future resolves
+/// — before `drain()` begins waiting on tracked tasks — so long-running
+/// daemon components supervised outside this module observe shutdown through
+/// the same path the daemon itself does, rather than inventing their own.
+/// Clones share the underlying token; child tokens derived from it are
+/// cancelled transitively.
+///
+/// In non-daemon processes the token simply never fires.
+pub fn daemon_shutdown_token() -> tokio_util::sync::CancellationToken {
+    static TOKEN: std::sync::OnceLock<tokio_util::sync::CancellationToken> =
+        std::sync::OnceLock::new();
+    TOKEN
+        .get_or_init(tokio_util::sync::CancellationToken::new)
+        .clone()
+}
+
 // ── active background phase names (ADR-103) ──────────────────────────────────
 //
 // A lightweight, best-effort process-wide gauge of which named background
@@ -1577,6 +1595,11 @@ pub async fn run_daemon_with_boot_guard<D: DaemonDispatch>(
     // actually waits on it via `track_background_task` rather than the
     // task outliving the drain window (or the process) unsignalled.
     let _ = checkpoint_shutdown_tx.send(());
+
+    // Same ordering contract for ADR-119 daemon components: cancel before
+    // drain, so each component's supervisor (itself a tracked task) can run
+    // its bounded shutdown inside the drain wait.
+    daemon_shutdown_token().cancel();
 
     drain(&active).await;
 
