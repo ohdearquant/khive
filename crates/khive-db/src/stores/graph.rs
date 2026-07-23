@@ -238,11 +238,6 @@ pub const EDGE_SYMMETRIC_CONFLICT_PROBE_SQL: &str = "SELECT id FROM graph_edges 
 pub const EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL: &str =
     "DELETE FROM graph_edges WHERE namespace = ?1 AND id = ?2";
 
-pub const EDGE_SYMMETRIC_REFRESH_CANONICAL_SQL: &str = "UPDATE graph_edges SET \
-     weight = ?1, updated_at = ?2, deleted_at = NULL, \
-     target_backend = ?3, metadata = ?4 \
-     WHERE namespace = ?5 AND id = ?6";
-
 pub const EDGE_SYMMETRIC_UPDATE_INPLACE_SQL: &str = "UPDATE graph_edges SET \
      source_id = ?1, target_id = ?2, relation = ?3, \
      weight = ?4, updated_at = ?5, metadata = ?6 \
@@ -280,37 +275,6 @@ pub fn edge_symmetric_delete_noncanonical_statement(namespace: &str, id: Uuid) -
             SqlValue::Text(id.to_string()),
         ],
         label: Some("edge-symmetric-delete-noncanonical".to_string()),
-    }
-}
-
-/// Plan-shape builder for [`EDGE_SYMMETRIC_REFRESH_CANONICAL_SQL`] —
-/// case (b) continued: refresh the surviving canonical row.
-#[allow(clippy::too_many_arguments)]
-pub fn edge_symmetric_refresh_canonical_statement(
-    namespace: &str,
-    existing_id: Uuid,
-    weight: f64,
-    updated_at_micros: i64,
-    target_backend: Option<&str>,
-    metadata: Option<&str>,
-) -> SqlStatement {
-    SqlStatement {
-        sql: EDGE_SYMMETRIC_REFRESH_CANONICAL_SQL.to_string(),
-        params: vec![
-            SqlValue::Float(weight),
-            SqlValue::Integer(updated_at_micros),
-            match target_backend {
-                Some(b) => SqlValue::Text(b.to_string()),
-                None => SqlValue::Null,
-            },
-            match metadata {
-                Some(m) => SqlValue::Text(m.to_string()),
-                None => SqlValue::Null,
-            },
-            SqlValue::Text(namespace.to_string()),
-            SqlValue::Text(existing_id.to_string()),
-        ],
-        label: Some("edge-symmetric-refresh-canonical".to_string()),
     }
 }
 
@@ -401,13 +365,22 @@ pub fn edge_symmetric_update_inplace_statement(
 //    `changes() = 1` guard is false — so this statement affects ZERO rows
 //    and the plan's `AffectedRowGuard::exactly(1)` on it fails the op,
 //    aborting the whole atomic unit rather than silently mutating an
-//    unrelated row. `target_backend` is updated only in the natural-key
-//    (absorbed-conflict) arm — the same `changes() = 1` condition, via a
-//    `CASE`, replicating [`EDGE_SYMMETRIC_UPDATE_INPLACE_SQL`]'s "leave
-//    `target_backend` untouched" behavior for the in-place case with the
-//    SAME statement that also replicates
-//    [`EDGE_SYMMETRIC_REFRESH_CANONICAL_SQL`]'s explicit `target_backend`
-//    set for the absorbed case.
+//    unrelated row.
+//
+//    ADR-039's edge-conflict contract is ON CONFLICT DO NOTHING: the
+//    natural-key (absorbed-conflict) arm must leave the surviving canonical
+//    row's attributes exactly as they were — refreshing them from the
+//    discarded edge (and forcing `deleted_at = NULL`, resurrecting a
+//    tombstone) is the same defect already fixed on the merge-rewire path
+//    (khive#1213). Every SET expression is therefore keyed on `id = ?2`:
+//    that condition is true only for the WHERE clause's first (in-place)
+//    arm — the second (absorbed) arm only ever matches a row whose id is
+//    NOT ?2 — so each column either takes its new value (in-place arm) or
+//    self-assigns its current value (absorbed arm, a true no-op). This
+//    still affects exactly one row either way (SQLite's `changes()` counts
+//    matched rows, not changed bytes), so `AffectedRowGuard::exactly(1)`
+//    and the race-abort behavior above are unaffected by this being a
+//    no-op write in the absorbed case.
 //
 // No probe, no branch, no read at all is needed to APPLY this pair. Which
 // row this plan actually touched is derived post-commit by the caller via a
@@ -459,9 +432,14 @@ pub fn edge_symmetric_refresh_or_update_inplace_statement(
 ) -> SqlStatement {
     SqlStatement {
         sql: "UPDATE graph_edges SET \
-              source_id = ?3, target_id = ?4, relation = ?5, \
-              weight = ?6, updated_at = ?7, deleted_at = NULL, metadata = ?8, \
-              target_backend = CASE WHEN changes() = 1 THEN ?9 ELSE target_backend END \
+              source_id = CASE WHEN id = ?2 THEN ?3 ELSE source_id END, \
+              target_id = CASE WHEN id = ?2 THEN ?4 ELSE target_id END, \
+              relation = CASE WHEN id = ?2 THEN ?5 ELSE relation END, \
+              weight = CASE WHEN id = ?2 THEN ?6 ELSE weight END, \
+              updated_at = CASE WHEN id = ?2 THEN ?7 ELSE updated_at END, \
+              deleted_at = CASE WHEN id = ?2 THEN NULL ELSE deleted_at END, \
+              metadata = CASE WHEN id = ?2 THEN ?8 ELSE metadata END, \
+              target_backend = CASE WHEN id = ?2 THEN ?9 ELSE target_backend END \
               WHERE namespace = ?1 \
                 AND ( \
                   (id = ?2 AND changes() = 0) \
