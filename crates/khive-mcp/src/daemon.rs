@@ -40,13 +40,17 @@ pub(crate) static KILL_COUNT: std::sync::atomic::AtomicUsize =
 pub(crate) static SPAWN_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-/// When set to `true` in tests, `pid_is_khive_daemon` returns `true` for any
-/// positive PID.  This makes every PID file entry SIGTERM-eligible so that a
-/// reverted recheck-under-lock would cause `kill_stale_daemon_inner` to attempt
-/// SIGTERM against the real daemon PID — the `KILL_COUNT` assertion catches
-/// both the SIGTERM-eligible and the skip-SIGTERM paths.
+/// When set to `true` in tests, `classify_pid_identity` identifies any positive
+/// live PID as a daemon. This makes every PID file entry SIGTERM-eligible so
+/// that a reverted recheck-under-lock would cause `kill_stale_daemon_inner` to
+/// attempt SIGTERM against the real daemon PID — the `KILL_COUNT` assertion
+/// catches both the SIGTERM-eligible and the skip-SIGTERM paths.
 #[cfg(test)]
 pub(crate) static FORCE_PID_IS_DAEMON: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+static FORCE_PID_IS_FOREIGN: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Counts how many times the daemon's dispatcher has been invoked for a
@@ -84,6 +88,7 @@ pub(crate) fn reset_counters() {
     KILL_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
     SPAWN_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
     FORCE_PID_IS_DAEMON.store(false, std::sync::atomic::Ordering::SeqCst);
+    FORCE_PID_IS_FOREIGN.store(false, std::sync::atomic::Ordering::SeqCst);
     DAEMON_DISPATCH.store(0, std::sync::atomic::Ordering::SeqCst);
     *RECOVERY_RACE_BARRIER
         .lock()
@@ -376,9 +381,14 @@ impl daemon::DaemonDispatch for crate::server::KhiveMcpServer {
         // context, built by `handle_conn` from the frame — threaded straight
         // through so this call serves under the CALLER's namespace/actor
         // rather than this server's own construction-baked identity.
-        self.dispatch_request_inner(params, from_wire, identity)
-            .await
-            .map_err(|e| e.message.to_string())
+        self.dispatch_request_inner(
+            params,
+            from_wire,
+            identity,
+            crate::server::DispatchOrigin::Daemon,
+        )
+        .await
+        .map_err(|e| e.message.to_string())
     }
 
     async fn warm_all(&self) {
@@ -701,33 +711,47 @@ fn argv_is_khive_daemon(args: &str) -> bool {
     rest.contains(&"mcp") && rest.contains(&"--daemon")
 }
 
-/// Return `true` if the process with the given PID is identifiable as a khive
-/// daemon. Uses `ps -p <pid> -o args=` (portable across macOS and Linux) and
-/// verifies that (a) the executable basename is exactly `kkernel`, AND (b) the
-/// remaining argv tokens include both `mcp` and `--daemon` (the daemon spawn
-/// shape). A process that merely mentions "kkernel" in some other argument
-/// position is rejected.
-///
-/// If the process is gone or is a foreign process, returns `false` — the caller
-/// must then clean up the stale PID file without sending SIGTERM.
-fn pid_is_khive_daemon(pid: u32) -> bool {
+enum PidIdentity {
+    KhiveDaemon,
+    Foreign,
+    Indeterminate,
+}
+
+/// Classify the process named by the daemon PID file from its command line.
+/// A live process whose identity cannot be read remains indeterminate so the
+/// caller conservatively waits for its exit instead of treating it as stale.
+fn classify_pid_identity(pid: u32) -> PidIdentity {
     let Ok(pid_i32) = i32::try_from(pid) else {
-        return false;
+        return PidIdentity::Foreign;
     };
     if pid_i32 <= 0 {
-        return false;
+        return PidIdentity::Foreign;
+    }
+    #[cfg(test)]
+    if FORCE_PID_IS_FOREIGN.load(std::sync::atomic::Ordering::SeqCst) {
+        return PidIdentity::Foreign;
     }
     // Test seam: when FORCE_PID_IS_DAEMON is set, treat any positive live PID
     // as a daemon so the SIGTERM branch is reachable in tests.
     #[cfg(test)]
     if FORCE_PID_IS_DAEMON.load(std::sync::atomic::Ordering::SeqCst) {
         // SAFETY: signal 0 is an existence/permission probe with no side effects.
-        return unsafe { libc::kill(pid_i32, 0) } == 0;
+        return if unsafe { libc::kill(pid_i32, 0) } == 0 {
+            PidIdentity::KhiveDaemon
+        } else if std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) {
+            PidIdentity::Indeterminate
+        } else {
+            PidIdentity::Foreign
+        };
     }
     // Quick liveness check before shelling out.
     // SAFETY: signal 0 is an existence/permission probe with no side effects.
     if unsafe { libc::kill(pid_i32, 0) } != 0 {
-        return false;
+        return match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::EPERM) => PidIdentity::Indeterminate,
+            Some(libc::ESRCH) => PidIdentity::Foreign,
+            _ => PidIdentity::Indeterminate,
+        };
     }
     match std::process::Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "args="])
@@ -735,25 +759,74 @@ fn pid_is_khive_daemon(pid: u32) -> bool {
     {
         Ok(out) if out.status.success() => {
             let args = String::from_utf8_lossy(&out.stdout);
-            argv_is_khive_daemon(args.trim())
+            let args = args.trim();
+            if args.is_empty() {
+                PidIdentity::Indeterminate
+            } else if argv_is_khive_daemon(args) {
+                PidIdentity::KhiveDaemon
+            } else {
+                PidIdentity::Foreign
+            }
         }
-        _ => false,
+        _ => PidIdentity::Indeterminate,
     }
 }
 
-/// Kill the daemon named by the PID file and remove its PID + socket files
-/// (caller holds the recovery lock).
-///
-/// #645: the PID observed here (`expected_pid`) is captured once, before
-/// SIGTERM, and re-checked immediately before unlinking in
-/// [`remove_daemon_paths_if_still_stale`]. The recovery lock normally
-/// serializes this whole function against a concurrent daemon boot (which
-/// holds the same lock across its own cleanup → bind → pid-write), but that
-/// guarantee depends on the daemon side successfully acquiring the lock too.
-/// Re-checking ownership right before deleting is the defense that still
-/// holds if a booting daemon ever proceeds without the lock: this call must
-/// not delete a replacement daemon's live socket/PID out from under it.
-fn kill_stale_daemon_inner() {
+const INCUMBENT_EXIT_TIMEOUT_SECS: u64 = 12;
+const INCUMBENT_EXIT_POLL_MS: u64 = 25;
+
+#[derive(Debug)]
+enum RecoveryError {
+    Spawn(std::io::Error),
+    IncumbentStillAlive { pid: u32 },
+}
+
+fn process_is_alive(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: signal 0 is an existence/permission probe with no side effects.
+    let result = unsafe { libc::kill(pid, 0) };
+    let exists = result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+    if !exists {
+        return false;
+    }
+    match std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "stat="])
+        .output()
+    {
+        Ok(output) if output.status.success() => !String::from_utf8_lossy(&output.stdout)
+            .trim_start()
+            .starts_with('Z'),
+        _ => true,
+    }
+}
+
+async fn wait_for_process_exit(pid: u32, timeout: std::time::Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if !process_is_alive(pid) {
+            return true;
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        tokio::time::sleep(
+            std::time::Duration::from_millis(INCUMBENT_EXIT_POLL_MS).min(deadline - now),
+        )
+        .await;
+    }
+}
+
+/// Signal the daemon named by the PID file and remove its rendezvous files
+/// only after its PID is positively confirmed dead (caller holds the recovery
+/// lock). The PID is captured before SIGTERM and ownership is re-checked by
+/// [`remove_daemon_paths_if_still_stale`] immediately before unlinking.
+async fn kill_stale_daemon_inner(exit_timeout: std::time::Duration) -> Result<(), RecoveryError> {
     #[cfg(test)]
     KILL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
@@ -763,25 +836,41 @@ fn kill_stale_daemon_inner() {
         .and_then(|s| s.trim().parse::<u32>().ok());
 
     if let Some(pid) = expected_pid {
-        if pid_is_khive_daemon(pid) {
-            if let Ok(signed) = i32::try_from(pid) {
-                if signed > 0 {
-                    // SAFETY: SIGTERM is a standard termination signal with no
-                    // side effects beyond asking the process to exit.
-                    unsafe {
-                        libc::kill(signed, libc::SIGTERM);
+        let wait_for_exit = match classify_pid_identity(pid) {
+            PidIdentity::KhiveDaemon => {
+                if let Ok(signed) = i32::try_from(pid) {
+                    if signed > 0 {
+                        // SAFETY: SIGTERM is a standard termination signal with no
+                        // side effects beyond asking the process to exit.
+                        unsafe {
+                            libc::kill(signed, libc::SIGTERM);
+                        }
                     }
                 }
+                true
             }
-        } else {
-            tracing::warn!(
-                pid,
-                "PID in daemon file does not belong to a khive daemon — skipping SIGTERM"
-            );
+            PidIdentity::Foreign => {
+                tracing::warn!(
+                    pid,
+                    "PID in daemon file belongs to a foreign process — treating it as stale"
+                );
+                false
+            }
+            PidIdentity::Indeterminate => {
+                tracing::warn!(
+                    pid,
+                    "could not read PID identity — skipping SIGTERM and waiting conservatively"
+                );
+                true
+            }
+        };
+        if wait_for_exit && !wait_for_process_exit(pid, exit_timeout).await {
+            return Err(RecoveryError::IncumbentStillAlive { pid });
         }
     }
 
     remove_daemon_paths_if_still_stale(&pid_file, expected_pid);
+    Ok(())
 }
 
 /// Remove `pid_file`/the daemon socket only if ownership has not changed since
@@ -1056,11 +1145,11 @@ async fn confirm_genuinely_dead(config_id: &str, namespace: &str) -> ProbeOutcom
 }
 
 /// Deadline for acquiring the recoverer-only lock before starting the
-/// dead-confirmation → kill → spawn critical section — generous enough to
-/// cover a peer's full worst-case critical section so a healthy peer's turn
-/// is never mistaken for a wedge. See
+/// dead-confirmation → kill → confirmed-exit → spawn critical section.
+/// This exceeds the incumbent-exit deadline so a peer can finish a full
+/// recovery turn before another recoverer treats the lock as wedged. See
 /// `crates/khive-mcp/docs/api/daemon-lifecycle.md`.
-const RECOVERER_LOCK_TIMEOUT_MS: u64 = 8_000;
+const RECOVERER_LOCK_TIMEOUT_MS: u64 = 16_000;
 
 /// Kill the stale daemon and spawn a fresh one, serialized against concurrent
 /// recoverers by a dedicated recoverer-only lock (#838 double-checked
@@ -1068,14 +1157,34 @@ const RECOVERER_LOCK_TIMEOUT_MS: u64 = 8_000;
 /// (NEVER-KILL-SLOW). `LockContended` (confirm rounds inconclusive, or the
 /// recoverer lock itself timed out) → `Uncertain`, no kill — same safe
 /// behavior as `Skipped` but reported distinctly. `Dead` (confirmed,
-/// recoverer lock held) → kill+spawn → `Spawned`. See
+/// recoverer lock held) → signal + bounded exit confirmation + spawn →
+/// `Spawned`; a PID still alive at the deadline returns
+/// [`RecoveryError::IncumbentStillAlive`] without spawning. See
 /// `crates/khive-mcp/docs/api/daemon-lifecycle.md` for why a second lock
 /// file is required and how this avoids deadlocking a booting daemon.
 async fn kill_and_respawn<F>(
     config_id: &str,
     namespace: &str,
     spawn: &F,
-) -> std::io::Result<RecoveryOutcome>
+) -> Result<RecoveryOutcome, RecoveryError>
+where
+    F: Fn() -> std::io::Result<std::process::Child> + Sync,
+{
+    kill_and_respawn_with_exit_timeout(
+        config_id,
+        namespace,
+        spawn,
+        std::time::Duration::from_secs(INCUMBENT_EXIT_TIMEOUT_SECS),
+    )
+    .await
+}
+
+async fn kill_and_respawn_with_exit_timeout<F>(
+    config_id: &str,
+    namespace: &str,
+    spawn: &F,
+    exit_timeout: std::time::Duration,
+) -> Result<RecoveryOutcome, RecoveryError>
 where
     F: Fn() -> std::io::Result<std::process::Child> + Sync,
 {
@@ -1170,8 +1279,10 @@ where
             // is a distinct lock file from `recoverer_guard` above, acquired
             // and dropped entirely within this arm.
             let _boot_lock = acquire_recovery_lock();
-            kill_stale_daemon_inner();
-            spawn().map(RecoveryOutcome::Spawned)
+            kill_stale_daemon_inner(exit_timeout).await?;
+            spawn()
+                .map(RecoveryOutcome::Spawned)
+                .map_err(RecoveryError::Spawn)
         }
     };
     drop(recoverer_guard);
@@ -1265,6 +1376,25 @@ fn respawn_failed_error(failure: RespawnFailure) -> McpError {
     };
     McpError::internal_error(
         "daemon respawn failed (respawn_failed); rebuild with `make local` and retry",
+        Some(data),
+    )
+}
+
+fn incumbent_still_alive_error(pid: u32) -> McpError {
+    tracing::error!(
+        reason = "incumbent_still_alive",
+        pid,
+        "daemon recovery refused because the incumbent did not exit before the deadline"
+    );
+    let mut data = serde_json::json!({
+        "reason": "incumbent_still_alive",
+        "pid": pid,
+    });
+    if is_daemon_strict_mode() {
+        data[STRICT_FALLBACK_MARKER] = serde_json::Value::Bool(true);
+    }
+    McpError::internal_error(
+        format!("daemon recovery refused: incumbent PID {pid} is still alive after the deadline"),
         Some(data),
     )
 }
@@ -1783,13 +1913,16 @@ where
     // connect-retry window or the #667 boot-quiescence wait short.
     let mut spawned_child: Option<std::process::Child> = None;
     match kill_and_respawn(&frame.config_id, &frame.namespace, spawn).await {
-        Err(e) => {
+        Err(RecoveryError::Spawn(e)) => {
             // #898: `Command::spawn` itself failed to start the child at all —
             // an unambiguous, already-fully-diagnosed respawn failure. Loud in
             // both strict and non-strict mode; never a silent local fallback.
             return Some(Err(respawn_failed_error(RespawnFailure::SpawnError {
                 os_error_code: e.raw_os_error(),
             })));
+        }
+        Err(RecoveryError::IncumbentStillAlive { pid }) => {
+            return Some(Err(incumbent_still_alive_error(pid)));
         }
         Ok(RecoveryOutcome::Skipped) => {
             // A concurrent client already has a live matching daemon ready.
@@ -1943,6 +2076,41 @@ mod tests {
         std::env::remove_var("KHIVE_NO_DAEMON");
         std::env::remove_var("KHIVE_LOCK");
         std::env::remove_var("KHIVE_RECOVERER_LOCK");
+    }
+
+    struct RecoveryTestGuard {
+        child: Option<std::process::Child>,
+    }
+
+    impl RecoveryTestGuard {
+        fn new() -> Self {
+            Self { child: None }
+        }
+
+        fn track_child(&mut self, child: std::process::Child) -> u32 {
+            let pid = child.id();
+            self.child = Some(child);
+            pid
+        }
+
+        fn child_mut(&mut self) -> &mut std::process::Child {
+            self.child.as_mut().expect("test child must be tracked")
+        }
+
+        fn kill_and_reap_child(&mut self) {
+            if let Some(mut child) = self.child.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    impl Drop for RecoveryTestGuard {
+        fn drop(&mut self) {
+            self.kill_and_reap_child();
+            reset_counters();
+            clear_daemon_env();
+        }
     }
 
     async fn connect_when_ready(sock: &std::path::Path) -> UnixStream {
@@ -3428,7 +3596,7 @@ mod tests {
         // Bind the fake old-daemon socket BEFORE starting the client.
         let listener = tokio::net::UnixListener::bind(&sock).expect("bind fake old-daemon socket");
         // Write a placeholder PID file so kill_stale_daemon finds a PID to look at.
-        // We use the current process's PID, which pid_is_khive_daemon() will reject
+        // We use the current process's PID, which classify_pid_identity() will reject
         // because the current exe is the test binary (not "kkernel"), so no SIGTERM
         // will be sent — this is the safe path we want to exercise.
         std::fs::write(&pid_file, std::process::id().to_string()).expect("write pid file");
@@ -3643,6 +3811,186 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    #[serial]
+    async fn recovery_requires_incumbent_exit_before_spawning() {
+        let mut cleanup = RecoveryTestGuard::new();
+        clear_daemon_env();
+        reset_counters();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("khived.pid");
+        let ready_file = dir.path().join("incumbent.ready");
+
+        std::env::set_var("KHIVE_SOCKET", dir.path().join("khived.sock"));
+        std::env::set_var("KHIVE_PID", &pid_file);
+        std::env::set_var("KHIVE_LOCK", dir.path().join("khived.recovery.lock"));
+        std::env::set_var(
+            "KHIVE_RECOVERER_LOCK",
+            dir.path().join("khived.recoverer.lock"),
+        );
+        std::env::remove_var("KHIVE_NO_DAEMON");
+
+        let incumbent = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("trap '' TERM; : > \"$1\"; while :; do sleep 1; done")
+            .arg("stubborn-incumbent")
+            .arg(&ready_file)
+            .spawn()
+            .expect("spawn signal-resistant incumbent");
+        let incumbent_pid = cleanup.track_child(incumbent);
+        let ready_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !ready_file.exists() {
+            assert!(
+                tokio::time::Instant::now() < ready_deadline,
+                "incumbent did not install its signal handler"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        std::fs::write(&pid_file, incumbent_pid.to_string()).expect("write incumbent pid file");
+        FORCE_PID_IS_DAEMON.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let spawn_calls = std::sync::atomic::AtomicUsize::new(0);
+        let spawn = || {
+            spawn_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::process::Command::new("/bin/sh")
+                .args(["-c", "exit 0"])
+                .spawn()
+        };
+        let outcome = kill_and_respawn_with_exit_timeout(
+            CFG,
+            NS,
+            &spawn,
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+        let refused_pid = match outcome {
+            Err(RecoveryError::IncumbentStillAlive { pid }) => Some(pid),
+            Ok(RecoveryOutcome::Spawned(mut child)) => {
+                let _ = child.wait();
+                None
+            }
+            Ok(RecoveryOutcome::Skipped | RecoveryOutcome::Uncertain)
+            | Err(RecoveryError::Spawn(_)) => None,
+        };
+        let live_pid_file_preserved = pid_file.exists();
+        cleanup.kill_and_reap_child();
+
+        assert_eq!(refused_pid, Some(incumbent_pid));
+        assert_eq!(
+            spawn_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a replacement must not spawn while the signalled incumbent PID is still alive"
+        );
+        assert!(
+            live_pid_file_preserved,
+            "the live incumbent's PID file must remain in place after refusal"
+        );
+        let refusal = incumbent_still_alive_error(incumbent_pid);
+        assert!(refusal.message.contains(&format!("PID {incumbent_pid}")));
+        let data = refusal.data.expect("live-incumbent refusal data");
+        assert_eq!(data["reason"], "incumbent_still_alive");
+        assert_eq!(data["pid"], incumbent_pid);
+
+        let recovered = kill_and_respawn_with_exit_timeout(
+            CFG,
+            NS,
+            &spawn,
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+        let spawned = match recovered {
+            Ok(RecoveryOutcome::Spawned(mut child)) => {
+                let _ = child.wait();
+                true
+            }
+            _ => false,
+        };
+
+        FORCE_PID_IS_DAEMON.store(false, std::sync::atomic::Ordering::SeqCst);
+        clear_daemon_env();
+        assert!(spawned, "a confirmed-dead incumbent must still be replaced");
+        assert_eq!(
+            spawn_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "confirmed-dead recovery must spawn exactly one replacement"
+        );
+        assert!(
+            !pid_file.exists(),
+            "the confirmed-dead incumbent PID file must be removed before spawning"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn recovery_replaces_stale_pid_without_waiting_on_live_foreign_process() {
+        let mut cleanup = RecoveryTestGuard::new();
+        clear_daemon_env();
+        reset_counters();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("khived.pid");
+
+        std::env::set_var("KHIVE_SOCKET", dir.path().join("khived.sock"));
+        std::env::set_var("KHIVE_PID", &pid_file);
+        std::env::set_var("KHIVE_LOCK", dir.path().join("khived.recovery.lock"));
+        std::env::set_var(
+            "KHIVE_RECOVERER_LOCK",
+            dir.path().join("khived.recoverer.lock"),
+        );
+        std::env::remove_var("KHIVE_NO_DAEMON");
+
+        let foreign = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn live foreign process");
+        let foreign_pid = cleanup.track_child(foreign);
+        std::fs::write(&pid_file, foreign_pid.to_string()).expect("write foreign pid file");
+        // Process inspection may be restricted in test environments, so force
+        // the classification while retaining a live child to prove it is not killed.
+        FORCE_PID_IS_FOREIGN.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let spawn_calls = std::sync::atomic::AtomicUsize::new(0);
+        let spawn = || {
+            spawn_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::process::Command::new("/bin/sh")
+                .args(["-c", "exit 0"])
+                .spawn()
+        };
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            kill_and_respawn(CFG, NS, &spawn),
+        )
+        .await
+        .expect("recovery stalled on a PID positively identified as foreign")
+        .expect("foreign-PID recovery failed");
+        match outcome {
+            RecoveryOutcome::Spawned(mut child) => {
+                child.wait().expect("reap replacement fixture");
+            }
+            RecoveryOutcome::Skipped | RecoveryOutcome::Uncertain => {
+                panic!("foreign-PID recovery did not spawn a replacement")
+            }
+        }
+
+        assert_eq!(
+            spawn_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "foreign-PID recovery must spawn exactly one replacement"
+        );
+        assert!(
+            !pid_file.exists(),
+            "the stale foreign PID file must be removed before spawning"
+        );
+        assert!(
+            cleanup
+                .child_mut()
+                .try_wait()
+                .expect("query foreign child state")
+                .is_none(),
+            "recovery must not signal the live foreign process"
+        );
+    }
+
     // ── concurrent recovery — second client skips kill+spawn when daemon alive ──
     //
     // Exercises the recheck-under-lock (double-checked locking) in
@@ -3703,8 +4051,8 @@ mod tests {
             .parse()
             .expect("daemon pid file must contain a u32");
 
-        // Arm the SIGTERM-eligible hook: pid_is_khive_daemon() will now return
-        // true for the live daemon PID.  Without the bounded-probe, a reverted
+        // Arm the SIGTERM-eligible hook: classify_pid_identity() will now identify
+        // the live daemon PID as khive. Without the bounded-probe, a reverted
         // kill_and_respawn would send SIGTERM to that PID and unlink the socket —
         // KILL_COUNT catches both paths.
         FORCE_PID_IS_DAEMON.store(true, std::sync::atomic::Ordering::SeqCst);

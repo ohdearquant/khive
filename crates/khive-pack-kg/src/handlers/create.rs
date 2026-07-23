@@ -28,6 +28,18 @@ struct BulkNoteCreateSpec {
     annotates: Vec<Uuid>,
 }
 
+pub(super) fn add_embedding_truncation_warning(response: &mut Value, truncated: bool) {
+    if !truncated {
+        return;
+    }
+    if let Some(obj) = response.as_object_mut() {
+        obj.insert(
+            "warnings".to_string(),
+            json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]),
+        );
+    }
+}
+
 impl KgPack {
     async fn prepare_bulk_create_spec(
         &self,
@@ -465,7 +477,7 @@ impl KgPack {
             None
         };
 
-        let (mut response, new_id) = match p.kind.as_str() {
+        let (mut response, new_id, embedding_input_truncated) = match p.kind.as_str() {
             "entity" => {
                 if p.embedding_content.is_some() {
                     return Err(RuntimeError::InvalidInput(
@@ -482,6 +494,18 @@ impl KgPack {
                 let tags = p.tags.unwrap_or_default();
                 let validated_type =
                     validate_entity_type(&canonical, p.entity_type.as_deref(), registry)?;
+                let embed_body_len = p
+                    .description
+                    .as_deref()
+                    .filter(|description| !description.is_empty())
+                    .map_or(name.len(), |description| {
+                        name.len()
+                            .saturating_add(1)
+                            .saturating_add(description.len())
+                    });
+                let truncated = self
+                    .runtime
+                    .document_embedding_input_len_will_be_truncated(embed_body_len);
                 let entity = self
                     .runtime
                     .create_entity(
@@ -495,7 +519,11 @@ impl KgPack {
                     )
                     .await?;
                 let id = entity.id;
-                (normalize_entity_timestamps(to_json(&entity)?), id)
+                (
+                    normalize_entity_timestamps(to_json(&entity)?),
+                    id,
+                    truncated,
+                )
             }
             "note" => {
                 let canonical = sub_kind
@@ -509,6 +537,10 @@ impl KgPack {
                     annotates.push(resolve_uuid_unfiltered(&s, &self.runtime, token).await?);
                 }
                 let properties = super::common::merge_note_tags(p.properties, p.tags)?;
+                let embed_text = p.embedding_content.as_deref().unwrap_or(&content);
+                let truncated = self
+                    .runtime
+                    .document_embedding_input_will_be_truncated(embed_text);
                 let note = self
                     .runtime
                     .create_note_with_embedding_content(
@@ -526,6 +558,7 @@ impl KgPack {
                 (
                     remap_note_status(normalize_entity_timestamps(to_json(&note)?)),
                     id,
+                    truncated,
                 )
             }
             other => {
@@ -534,6 +567,8 @@ impl KgPack {
                 )))
             }
         };
+
+        add_embedding_truncation_warning(&mut response, embedding_input_truncated);
 
         if let Some(ref h) = hook {
             if let Err(e) = h.after_create(&self.runtime, new_id, &params).await {

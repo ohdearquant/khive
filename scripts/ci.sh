@@ -92,9 +92,91 @@ phase_docs() {
     RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 }
 
+# #1204 tripwire (shared by phase_tests and phase_tests_doc):
+# RuntimeConfig::default() resolves db_path to $HOME/.khive/khive.db, and
+# migrations apply on open (forward-only, ADR-015). A test that boots a
+# runtime through a config path inheriting that default reaches the
+# operator's/runner's real store instead of an isolated one. Fingerprint the
+# sentinel file set before the suite and compare after; any change fails the
+# gate loudly instead of leaving the drift for a later direct-open to
+# discover. Covered paths are khive.db, khive.db-wal, khive.db-shm,
+# khive.db.walpin/**, and khive.db.ann/**.
+# A WAL-mode open can leave the main file unchanged until checkpoint, while
+# WAL-pin attribution and ANN persistence write the adjacent directories.
+# Size and mtime catch common changes cheaply; the content hash also catches
+# same-size writes within the filesystem's timestamp granularity.
+sentinel_file_fingerprint() {
+    f=$1
+    if [ -f "$f" ]; then
+        m=$(stat -f%m "$f" 2>/dev/null || stat -c%Y "$f")
+        s=$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f")
+        h=$({ shasum -a 256 "$f" 2>/dev/null || sha256sum "$f"; } | awk '{print $1}')
+        printf '%s mtime=%s size=%s sha256=%s\n' "$f" "$m" "$s" "$h"
+    else
+        printf '%s absent\n' "$f"
+    fi
+}
+
+sentinel_fingerprint() {
+    for f in "$HOME/.khive/khive.db" "$HOME/.khive/khive.db-wal" "$HOME/.khive/khive.db-shm"; do
+        sentinel_file_fingerprint "$f"
+    done
+
+    for d in "$HOME/.khive/khive.db.walpin" "$HOME/.khive/khive.db.ann"; do
+        if [ -d "$d" ]; then
+            printf '%s directory\n' "$d"
+            find "$d" -type f -print | LC_ALL=C sort | while IFS= read -r f; do
+                sentinel_file_fingerprint "$f"
+            done
+        else
+            printf '%s absent\n' "$d"
+        fi
+    done
+}
+
+# Run the given test command inside the #1204 sentinel guard. Every phase that
+# executes workspace tests of any kind (unit/integration or doctests) must go
+# through this wrapper so no test-execution path escapes the default-store
+# isolation invariant.
+run_with_store_sentinel() {
+    sentinel_before=$(sentinel_fingerprint)
+
+    "$@"
+
+    sentinel_after=$(sentinel_fingerprint)
+    if [ "$sentinel_after" != "$sentinel_before" ]; then
+        echo "FAIL: test suite touched the real default store under \$HOME/.khive — a test opened/migrated it instead of an isolated db_path/HOME (#1204)" >&2
+        echo "before:" >&2
+        printf '%s\n' "$sentinel_before" >&2
+        echo "after:" >&2
+        printf '%s\n' "$sentinel_after" >&2
+        exit 1
+    fi
+}
+
 phase_tests() {
     echo "=== Tests ==="
-    cargo test --workspace
+    # NEXTEST_PARTITION (e.g. "1/2") routes this phase through cargo-nextest's
+    # count-based partitioning instead of a full `cargo test --workspace` run,
+    # so CI can shard the workspace test suite across parallel jobs. Unset
+    # (the default, including every local/non-sharded invocation) keeps the
+    # plain `cargo test --workspace` path unchanged.
+    if [ -n "${NEXTEST_PARTITION:-}" ]; then
+        run_with_store_sentinel cargo nextest run --workspace --partition "count:${NEXTEST_PARTITION}"
+    else
+        run_with_store_sentinel cargo test --workspace
+    fi
+}
+
+phase_tests_doc() {
+    echo "=== Doctests ==="
+    # cargo-nextest does not execute doctests (upstream limitation); this phase
+    # covers the doctest slice that phase_tests's nextest path skips. The plain
+    # `cargo test --workspace` path in phase_tests already runs doctests itself,
+    # so this phase only needs to run alongside the sharded nextest path.
+    # Doctests execute arbitrary workspace code, so they carry the same #1204
+    # sentinel guard as every other test-execution path.
+    run_with_store_sentinel cargo test --doc --workspace
 }
 
 phase_no_default_features() {
@@ -162,6 +244,7 @@ run_phase() {
         clippy) phase_clippy ;;
         docs) phase_docs ;;
         tests) phase_tests ;;
+        tests-doc) phase_tests_doc ;;
         no-default-features) phase_no_default_features ;;
         release) phase_release ;;
         contract-tests) phase_contract_tests ;;
@@ -173,7 +256,7 @@ run_phase() {
         macos-pr-tests) phase_macos_pr_tests ;;
         *)
             echo "Unknown CI phase: $1" >&2
-            echo "Valid phases: no-stubs-scan lockfile forward-deployed lint no-stubs clippy docs tests no-default-features release contract-tests deno-tests smoke-tests vector-smoke contract-suite macos-pr-check macos-pr-tests" >&2
+            echo "Valid phases: no-stubs-scan lockfile forward-deployed lint no-stubs clippy docs tests tests-doc no-default-features release contract-tests deno-tests smoke-tests vector-smoke contract-suite macos-pr-check macos-pr-tests" >&2
             exit 2
             ;;
     esac

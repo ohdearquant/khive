@@ -95,7 +95,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   ci:
-    name: CI
+    name: CI (${{ matrix.os }}, shard ${{ matrix.shard }}/2)
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
@@ -104,6 +104,12 @@ jobs:
       fail-fast: true
       matrix:
         os: [ubuntu-latest, macos-latest]
+        # The workspace test suite is nextest-partitioned 2-way per OS (see the
+        # "Workspace tests" step below). Every other phase in this job is gated
+        # to shard 1 so it still runs exactly once per OS — shard 2 exists only
+        # to carry the second test partition, not a second copy of lint/clippy/
+        # release/etc.
+        shard: [1, 2]
     defaults:
       run:
         working-directory: crates
@@ -141,66 +147,89 @@ jobs:
           cache-on-failure: true
           # Cache key bump: artifacts built with full debuginfo predate the
           # line-tables-only profile; restoring them would defeat the disk cap.
+          # Deliberately NOT sharded into the key: both shards of the same OS
+          # build the same workspace, so sharing one key avoids doubling the
+          # cache footprint. The two shards' save-cache calls race at the end
+          # of the job; the first to finish wins and the second is a no-op
+          # (actions/cache skips saving over an existing key), which is fine.
           key: line-tables
       - uses: denoland/setup-deno@v2
-        if: env.CI_SUITE == 'full'
+        if: env.CI_SUITE == 'full' && matrix.shard == 1
         with:
           deno-version: v2.x
       - uses: astral-sh/setup-uv@v5
-        if: env.CI_SUITE == 'full'
+        if: env.CI_SUITE == 'full' && matrix.shard == 1
       # SECURITY ORDERING (#560): the placeholder-stub scan runs before any cargo
       # phase so no PR-controlled build script or proc-macro executes before the
       # guard; it reads the pristine checkout. Keep this step ahead of every cargo
       # step below, and ungated: both suites compile PR-controlled code, so gating
-      # the scan to one suite leaves the other lane unguarded.
+      # the scan to one suite (or one shard) leaves a lane unguarded.
       - name: No-stub placeholder scan (before any cargo)
         run: ../scripts/ci.sh no-stubs-scan
       - name: macOS PR compile check
-        if: env.CI_SUITE == 'macos-pr'
+        if: env.CI_SUITE == 'macos-pr' && matrix.shard == 1
         run: ../scripts/ci.sh macos-pr-check
       - name: macOS PR platform tests
-        if: env.CI_SUITE == 'macos-pr'
+        if: env.CI_SUITE == 'macos-pr' && matrix.shard == 1
         run: ../scripts/ci.sh macos-pr-tests
       - name: Lockfile freshness
-        if: env.CI_SUITE == 'full'
+        if: env.CI_SUITE == 'full' && matrix.shard == 1
         run: ../scripts/ci.sh lockfile
       - name: Forward-deployed crate checks
-        if: env.CI_SUITE == 'full'
+        if: env.CI_SUITE == 'full' && matrix.shard == 1
         run: ../scripts/ci.sh forward-deployed
       - name: Format, SQL, and ADR lints
-        if: env.CI_SUITE == 'full'
+        if: env.CI_SUITE == 'full' && matrix.shard == 1
         run: ../scripts/ci.sh lint
       - name: No-stub guard
-        if: env.CI_SUITE == 'full'
+        if: env.CI_SUITE == 'full' && matrix.shard == 1
         run: ../scripts/ci.sh no-stubs
       - name: Clippy
-        if: env.CI_SUITE == 'full'
+        if: env.CI_SUITE == 'full' && matrix.shard == 1
         run: ../scripts/ci.sh clippy
       # Rustdoc is already the separately gated doc-build job below; keep it in
       # ci.sh's local all-mode without paying for duplicate per-OS CI builds.
-      - name: Workspace tests
+      - name: Install cargo-nextest
         if: env.CI_SUITE == 'full'
+        uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2.82.2
+        with:
+          tool: cargo-nextest
+      # Sharded across both matrix.shard values via nextest's count-based
+      # partitioning (cargo-nextest's default and simplest partition scheme;
+      # hash-based partitioning was considered but count is deterministic
+      # across reruns without needing a stored test-name manifest, which is
+      # what this job cares about). nextest does not execute doctests, so the
+      # dedicated "Workspace doctests" step below covers that slice once per
+      # OS (shard 1 only) to keep coverage equivalent to the prior unsharded
+      # `cargo test --workspace`.
+      - name: Workspace tests (nextest shard ${{ matrix.shard }}/2)
+        if: env.CI_SUITE == 'full'
+        env:
+          NEXTEST_PARTITION: ${{ matrix.shard }}/2
         run: ../scripts/ci.sh tests
+      - name: Workspace doctests
+        if: env.CI_SUITE == 'full' && matrix.shard == 1
+        run: ../scripts/ci.sh tests-doc
       - name: No-default-features check
-        if: env.CI_SUITE == 'full'
+        if: env.CI_SUITE == 'full' && matrix.shard == 1
         run: ../scripts/ci.sh no-default-features
       - name: Release build
-        if: env.CI_SUITE == 'full'
+        if: env.CI_SUITE == 'full' && matrix.shard == 1
         run: ../scripts/ci.sh release
       - name: Contract tests
-        if: env.CI_SUITE == 'full'
+        if: env.CI_SUITE == 'full' && matrix.shard == 1
         run: ../scripts/ci.sh contract-tests
       - name: Deno tests
-        if: env.CI_SUITE == 'full'
+        if: env.CI_SUITE == 'full' && matrix.shard == 1
         run: ../scripts/ci.sh deno-tests
       - name: Smoke tests
-        if: env.CI_SUITE == 'full'
+        if: env.CI_SUITE == 'full' && matrix.shard == 1
         run: ../scripts/ci.sh smoke-tests
       - name: Vector smoke test
-        if: env.CI_SUITE == 'full'
+        if: env.CI_SUITE == 'full' && matrix.shard == 1
         run: ../scripts/ci.sh vector-smoke
       - name: khive-contract suite
-        if: env.CI_SUITE == 'full'
+        if: env.CI_SUITE == 'full' && matrix.shard == 1
         run: ../scripts/ci.sh contract-suite
 
   supply-chain:
@@ -561,6 +590,14 @@ jobs:
           tool: cargo-llvm-cov
       - name: Compute coverage
         working-directory: crates
+        # #705: this job runs every workspace test binary alongside instrumented
+        # (and therefore slower) execution, which widens the writer-checkout
+        # contention window some tests are hardened against at a plain-run
+        # timeout. Raise the floor for this job specifically instead of paying
+        # the cost on every CI run — the contention-sensitive test takes the
+        # max of this and its own floor, so this only ever widens the margin.
+        env:
+          KHIVE_CHECKOUT_TIMEOUT_SECS: "300"
         run: |
           # Extract TOTAL *line* coverage from the structured JSON export, not by
           # column position. In `--summary-only` text the TOTAL row has Regions%

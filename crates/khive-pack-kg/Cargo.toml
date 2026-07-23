@@ -31,6 +31,7 @@ tracing = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 criterion = { workspace = true }
 serde_json = { workspace = true }
+lattice-embed = { workspace = true }
 
 
 [[test]]

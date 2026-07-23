@@ -146,6 +146,7 @@ pub(crate) struct MergeParams {
     pub(crate) strategy: Option<String>,
     pub(crate) content_strategy: Option<String>,
     pub(crate) dry_run: Option<bool>,
+    pub(crate) force: Option<bool>,
     #[allow(dead_code)]
     pub(crate) verbose: Option<bool>,
     pub(crate) reason: Option<String>,

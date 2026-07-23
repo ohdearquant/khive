@@ -2,7 +2,10 @@
 
 use serde_json::Value;
 
-use khive_runtime::{NamespaceToken, RuntimeError, VerbRegistry};
+use khive_runtime::{
+    entity_merge_guard_error, validate_entity_merge_floor, NamespaceToken, RuntimeError,
+    VerbRegistry,
+};
 
 use super::common::{
     deser, ensure_entity_kind, ensure_note_kind, immutable_event_error, parse_content_strategy,
@@ -29,6 +32,7 @@ impl KgPack {
         let content_strategy =
             parse_content_strategy(p.content_strategy.as_deref().unwrap_or("append"))?;
         let dry_run = p.dry_run.unwrap_or(false);
+        let force = p.force.unwrap_or(false);
         let reason = p.reason.clone();
 
         let summary = match spec {
@@ -37,14 +41,12 @@ impl KgPack {
                 ensure_entity_kind(&self.runtime, token, from_id, specific.as_deref()).await?;
                 let into_entity = self.runtime.get_entity(token, into_id).await?;
                 let from_entity = self.runtime.get_entity(token, from_id).await?;
-                if into_entity.kind != from_entity.kind {
-                    return Err(RuntimeError::InvalidInput(format!(
-                        "cannot merge entities of different kinds: into={} ({}), from={} ({})",
-                        into_id, into_entity.kind, from_id, from_entity.kind
-                    )));
+                if !force {
+                    validate_entity_merge_floor(&into_entity, &from_entity)
+                        .map_err(entity_merge_guard_error)?;
                 }
                 self.runtime
-                    .merge_entity_with_reason(
+                    .merge_entity_with_reason_and_force(
                         token,
                         into_id,
                         from_id,
@@ -52,6 +54,7 @@ impl KgPack {
                         content_strategy,
                         dry_run,
                         reason,
+                        force,
                     )
                     .await?
             }

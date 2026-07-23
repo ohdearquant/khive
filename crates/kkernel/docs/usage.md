@@ -76,12 +76,17 @@ ideal for admin verb calls without standing up an MCP client. Defaults to namesp
 kkernel exec 'stats()'
 kkernel exec 'stats()' --db ~/.khive/khive.db
 kkernel exec '[list(kind="entity", limit=5), stats()]'            # parallel batch
+kkernel exec '[create(kind="concept", name="X"), stats()]' --strict  # nonzero exit if any op fails
 kkernel exec 'create(kind="entity", entity_kind="concept", name="X") | link(source_id=$prev.id, target_id="<id>", relation="extends")'   # chain ($prev)
 kkernel exec 'memory.recall(help=true)'                           # param schema for any verb
 kkernel exec 'memory.recall(query="...")' --presentation verbose
 ```
 
-Flags: `--db`, `--namespace`, `--presentation <agent|verbose|human>`.
+Flags: `--db`, `--namespace`, `--presentation <agent|verbose|human>`, `--strict`.
+A request in which every op failed or aborted always exits nonzero after printing the full
+response. Without `--strict`, a *partially* failed request (`status: "partial"` with at least
+one success) retains its compatibility behavior and exits zero; `--strict` converts any failed
+or aborted op into a nonzero process exit.
 
 ---
 

@@ -316,7 +316,7 @@ impl khive_storage::SqlWriter for SqliteWriter {
             return writer_task
                 .send(move |conn| {
                     let mut stmt = conn
-                        .prepare(&statement.sql)
+                        .prepare_cached(&statement.sql)
                         .map_err(|e| map_rusqlite_err(e, "execute"))?;
                     bind_params(&mut stmt, &statement.params)
                         .map_err(|e| map_rusqlite_err(e, "execute"))?;
@@ -334,7 +334,7 @@ impl khive_storage::SqlWriter for SqliteWriter {
         })?;
         let (conn, result) = tokio::task::spawn_blocking(move || {
             let res = (|| -> Result<usize, rusqlite::Error> {
-                let mut stmt = conn.prepare(&statement.sql)?;
+                let mut stmt = conn.prepare_cached(&statement.sql)?;
                 bind_params(&mut stmt, &statement.params)?;
                 stmt.raw_execute()
             })();
@@ -626,7 +626,7 @@ impl khive_storage::SqlWriter for PoolBackedWriter {
                 StorageError::driver(StorageCapability::Sql, "pool_writer.execute", e)
             })?;
             let mut stmt = guard
-                .prepare(&statement.sql)
+                .prepare_cached(&statement.sql)
                 .map_err(|e| map_rusqlite_err(e, "pool_writer.execute"))?;
             bind_params(&mut stmt, &statement.params)
                 .map_err(|e| map_rusqlite_err(e, "pool_writer.execute"))?;
@@ -799,7 +799,7 @@ impl khive_storage::SqlWriter for InlineWriter {
     ) -> khive_storage::types::StorageResult<u64> {
         let mut stmt = self
             .conn()
-            .prepare(&statement.sql)
+            .prepare_cached(&statement.sql)
             .map_err(|e| map_rusqlite_err(e, "inline.execute"))?;
         bind_params(&mut stmt, &statement.params)
             .map_err(|e| map_rusqlite_err(e, "inline.execute"))?;

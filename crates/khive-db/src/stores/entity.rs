@@ -547,6 +547,18 @@ fn build_candidate_entity_query(
     )
 }
 
+fn is_complete_id_lookup(filter: &EntityFilter, page: &PageRequest) -> bool {
+    !filter.ids.is_empty()
+        && filter.kinds.is_empty()
+        && filter.entity_types.is_empty()
+        && filter.name_prefix.is_none()
+        && filter.name_exact.is_none()
+        && filter.tags_any.is_empty()
+        && filter.names_ci.is_empty()
+        && page.offset == 0
+        && usize::try_from(page.limit).ok() == Some(filter.ids.len())
+}
+
 // =============================================================================
 // EntityStore implementation
 // =============================================================================
@@ -656,6 +668,7 @@ impl EntityStore for SqlEntityStore {
         page: PageRequest,
     ) -> Result<Page<Entity>, StorageError> {
         let namespace = namespace.to_string();
+        let skip_total = is_complete_id_lookup(&filter, &page);
         let limit_i64 = i64::from(page.limit);
         let offset_i64 = i64::try_from(page.offset).map_err(|_| StorageError::InvalidInput {
             capability: StorageCapability::Entities,
@@ -667,7 +680,7 @@ impl EntityStore for SqlEntityStore {
         })?;
 
         self.with_reader("query_entities", move |conn| {
-            let total = if filter.names_ci.is_empty() {
+            let total = if filter.names_ci.is_empty() && !skip_total {
                 let (count_sql, count_params) = build_entity_where(&namespace, &filter);
                 let sql = format!("SELECT COUNT(*) FROM entities{count_sql}");
                 let mut stmt = conn.prepare(&sql)?;

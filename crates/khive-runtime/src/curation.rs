@@ -16,7 +16,7 @@ use khive_db::SqliteError;
 use khive_storage::note::Note;
 use khive_storage::types::{EdgeFilter, TextDocument};
 use khive_storage::{EdgeRelation, Entity, SubstrateKind};
-use khive_types::{EdgeEndpointRule, EventKind};
+use khive_types::{Details, EdgeEndpointRule, EventKind, KhiveError};
 use rusqlite::OptionalExtension;
 
 use crate::error::{RuntimeError, RuntimeResult};
@@ -64,6 +64,149 @@ pub enum EntityDedupMergePolicy {
     PreferFrom,
     /// Deep-merge: object properties merge recursively. Scalar conflicts go to `into`.
     Union,
+}
+
+/// Safety-floor guard that refused an explicit entity merge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EntityMergeGuard {
+    EntityKind,
+    NameSimilarity,
+    ProjectCompatibility,
+}
+
+impl EntityMergeGuard {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::EntityKind => "entity_kind",
+            Self::NameSimilarity => "name_similarity",
+            Self::ProjectCompatibility => "project_compatibility",
+        }
+    }
+}
+
+/// Validate the non-forced entity-merge safety floor.
+pub fn validate_entity_merge_floor(into: &Entity, from: &Entity) -> Result<(), EntityMergeGuard> {
+    if into.kind != from.kind {
+        return Err(EntityMergeGuard::EntityKind);
+    }
+    if !names_are_similar(&into.name, &from.name) {
+        return Err(EntityMergeGuard::NameSimilarity);
+    }
+    if projects_are_disjoint(into, from) {
+        return Err(EntityMergeGuard::ProjectCompatibility);
+    }
+    Ok(())
+}
+
+/// Convert a safety-floor refusal into the merge verb's structured conflict contract.
+pub fn entity_merge_guard_error(guard: EntityMergeGuard) -> RuntimeError {
+    RuntimeError::Khive(
+        KhiveError::conflict(format!(
+            "entity merge refused by {} guard; use force=true only when the caller accepts responsibility",
+            guard.as_str()
+        ))
+        .with_details(Details::new([
+            ("guard", guard.as_str()),
+            ("override", "force=true"),
+        ])),
+    )
+}
+
+fn names_are_similar(left: &str, right: &str) -> bool {
+    let left = normalize_name(left);
+    let right = normalize_name(right);
+    if left.is_empty() || right.is_empty() {
+        return false;
+    }
+    if left == right {
+        return true;
+    }
+
+    let shorter_len = left.chars().count().min(right.chars().count());
+    if shorter_len >= 3 && (left.starts_with(&right) || right.starts_with(&left)) {
+        return true;
+    }
+
+    let left_trigrams = trigrams(&left);
+    let right_trigrams = trigrams(&right);
+    if left_trigrams.is_empty() || right_trigrams.is_empty() {
+        return false;
+    }
+    let overlap = left_trigrams.intersection(&right_trigrams).count();
+    overlap.saturating_mul(4) >= left_trigrams.len().saturating_add(right_trigrams.len())
+}
+
+fn normalize_name(name: &str) -> String {
+    let mut normalized = String::with_capacity(name.len());
+    let mut pending_space = false;
+    for ch in name.chars().flat_map(char::to_lowercase) {
+        if ch.is_whitespace() {
+            pending_space = !normalized.is_empty();
+        } else {
+            if pending_space {
+                normalized.push(' ');
+                pending_space = false;
+            }
+            normalized.push(ch);
+        }
+    }
+    normalized
+}
+
+fn trigrams(value: &str) -> HashSet<[char; 3]> {
+    let chars: Vec<char> = value.chars().collect();
+    chars
+        .windows(3)
+        .map(|window| [window[0], window[1], window[2]])
+        .collect()
+}
+
+fn projects_are_disjoint(into: &Entity, from: &Entity) -> bool {
+    let Some(into_projects) = into
+        .properties
+        .as_ref()
+        .and_then(|properties| properties.get("projects"))
+        .and_then(Value::as_array)
+    else {
+        return false;
+    };
+    let Some(from_projects) = from
+        .properties
+        .as_ref()
+        .and_then(|properties| properties.get("projects"))
+        .and_then(Value::as_array)
+    else {
+        return false;
+    };
+    if into_projects.is_empty() || from_projects.is_empty() {
+        return false;
+    }
+
+    let (indexed, candidates) = if into_projects.len() <= from_projects.len() {
+        (into_projects, from_projects)
+    } else {
+        (from_projects, into_projects)
+    };
+    let mut indexed_strings = HashSet::new();
+    let mut indexed_values = HashSet::new();
+    for value in indexed {
+        if let Some(value) = value.as_str() {
+            indexed_strings.insert(normalize_project_string(value));
+        } else {
+            indexed_values.insert(value.clone());
+        }
+    }
+    !candidates.iter().any(|candidate| {
+        if let Some(candidate) = candidate.as_str() {
+            indexed_strings.contains(&normalize_project_string(candidate))
+        } else {
+            indexed_values.contains(candidate)
+        }
+    })
+}
+
+fn normalize_project_string(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
 }
 
 /// Strategy for merging note content when two notes are combined.
@@ -170,6 +313,91 @@ impl From<EdgeListFilter> for EdgeFilter {
 // ---------------------------------------------------------------------------
 // Private types
 // ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EntityMergeValidation {
+    LegacyKind,
+    SafetyFloor,
+    Forced,
+}
+
+#[derive(Debug)]
+enum EntityMergeRefusal {
+    LegacyKind {
+        into_id: Uuid,
+        into_kind: String,
+        from_id: Uuid,
+        from_kind: String,
+    },
+    SafetyFloor(EntityMergeGuard),
+}
+
+impl EntityMergeRefusal {
+    fn into_runtime_error(self) -> RuntimeError {
+        match self {
+            Self::LegacyKind {
+                into_id,
+                into_kind,
+                from_id,
+                from_kind,
+            } => RuntimeError::InvalidInput(format!(
+                "cannot merge entities of different kinds: into={into_id} ({into_kind}), \
+                 from={from_id} ({from_kind}); merge requires both entities to share the same kind"
+            )),
+            Self::SafetyFloor(guard) => entity_merge_guard_error(guard),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum MergeEntitySqlError {
+    Sqlite(SqliteError),
+    Refusal(EntityMergeRefusal),
+}
+
+impl std::fmt::Display for MergeEntitySqlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Sqlite(error) => std::fmt::Display::fmt(error, f),
+            Self::Refusal(_) => f.write_str("entity merge refused by transactional policy"),
+        }
+    }
+}
+
+impl std::error::Error for MergeEntitySqlError {}
+
+impl From<SqliteError> for MergeEntitySqlError {
+    fn from(error: SqliteError) -> Self {
+        Self::Sqlite(error)
+    }
+}
+
+impl From<rusqlite::Error> for MergeEntitySqlError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Sqlite(SqliteError::Rusqlite(error))
+    }
+}
+
+fn map_merge_entity_storage_error(error: khive_storage::StorageError) -> RuntimeError {
+    match error {
+        khive_storage::StorageError::Driver {
+            capability,
+            operation,
+            source,
+        } => match source.downcast::<MergeEntitySqlError>() {
+            Ok(error) => match *error {
+                MergeEntitySqlError::Sqlite(error) => RuntimeError::Sqlite(error),
+                MergeEntitySqlError::Refusal(error) => error.into_runtime_error(),
+            },
+            Err(source) => RuntimeError::Storage(khive_storage::StorageError::Driver {
+                capability,
+                operation,
+                source,
+            }),
+        },
+        error => RuntimeError::Storage(error),
+    }
+}
 
 // REASON: EdgeRow fields are populated via rusqlite row mapping. The struct is fully
 // constructed even when not all fields are read back after construction. The complete
@@ -437,6 +665,69 @@ impl KhiveRuntime {
         dry_run: bool,
         reason: Option<String>,
     ) -> RuntimeResult<MergeSummary> {
+        self.merge_entity_with_validation(
+            token,
+            into_id,
+            from_id,
+            strategy,
+            content_strategy,
+            dry_run,
+            reason,
+            EntityMergeValidation::LegacyKind,
+        )
+        .await
+    }
+
+    /// Merge two entities with an explicit override for the entity safety floor.
+    ///
+    /// Non-forced calls enforce entity kind, name similarity, and project compatibility
+    /// against the rows reread inside the merge transaction. Legacy merge methods retain
+    /// their historical same-kind-only policy.
+    /// A non-dry-run override is recorded as `force: true` in the merge event.
+    // REASON: these arguments mirror the merge verb's policy, content strategy,
+    // dry-run, audit-reason, and force fields; a builder would only move that surface.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn merge_entity_with_reason_and_force(
+        &self,
+        token: &NamespaceToken,
+        into_id: Uuid,
+        from_id: Uuid,
+        strategy: EntityDedupMergePolicy,
+        content_strategy: ContentMergeStrategy,
+        dry_run: bool,
+        reason: Option<String>,
+        force: bool,
+    ) -> RuntimeResult<MergeSummary> {
+        let validation = if force {
+            EntityMergeValidation::Forced
+        } else {
+            EntityMergeValidation::SafetyFloor
+        };
+        self.merge_entity_with_validation(
+            token,
+            into_id,
+            from_id,
+            strategy,
+            content_strategy,
+            dry_run,
+            reason,
+            validation,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn merge_entity_with_validation(
+        &self,
+        token: &NamespaceToken,
+        into_id: Uuid,
+        from_id: Uuid,
+        strategy: EntityDedupMergePolicy,
+        content_strategy: ContentMergeStrategy,
+        dry_run: bool,
+        reason: Option<String>,
+        validation: EntityMergeValidation,
+    ) -> RuntimeResult<MergeSummary> {
         if let Some(reason) = reason.as_deref() {
             crate::secret_gate::check(reason)?;
         }
@@ -444,19 +735,6 @@ impl KhiveRuntime {
             return Err(RuntimeError::InvalidInput(
                 "cannot merge an entity into itself".into(),
             ));
-        }
-        // Enforce the same-kind constraint here too: any direct runtime caller
-        // (CLI, tests, future SDK) would bypass the handler-level guard otherwise.
-        {
-            let into_entity = self.get_entity(token, into_id).await?;
-            let from_entity = self.get_entity(token, from_id).await?;
-            if into_entity.kind != from_entity.kind {
-                return Err(RuntimeError::InvalidInput(format!(
-                    "cannot merge entities of different kinds: into={} ({}), from={} ({}); \
-                     merge requires both entities to share the same kind",
-                    into_id, into_entity.kind, from_id, from_entity.kind
-                )));
-            }
         }
         let ns = token.namespace().as_str().to_owned();
         let fts_table = "fts_entities".to_string();
@@ -499,6 +777,7 @@ impl KhiveRuntime {
                         content_strategy,
                         dry_run,
                         pack_rules,
+                        validation,
                     )
                     .map_err(|e| {
                         khive_storage::StorageError::driver(
@@ -509,11 +788,12 @@ impl KhiveRuntime {
                     })
                 })
                 .await
-                .map_err(RuntimeError::Storage)?
+                .map_err(map_merge_entity_storage_error)?
         } else {
             tokio::task::spawn_blocking(move || {
                 let guard = pool.writer()?;
-                guard.transaction(|conn| {
+                let mut refusal = None;
+                let result = guard.transaction(|conn| {
                     merge_entity_sql(
                         conn,
                         ns,
@@ -525,8 +805,22 @@ impl KhiveRuntime {
                         content_strategy,
                         dry_run,
                         pack_rules,
+                        validation,
                     )
-                })
+                    .map_err(|error| match error {
+                        MergeEntitySqlError::Sqlite(error) => error,
+                        MergeEntitySqlError::Refusal(error) => {
+                            refusal = Some(error);
+                            SqliteError::InvalidData(
+                                "entity merge refused by transactional policy".to_string(),
+                            )
+                        }
+                    })
+                });
+                match refusal {
+                    Some(error) => Err(error.into_runtime_error()),
+                    None => result.map_err(RuntimeError::from),
+                }
             })
             .await
             .map_err(|e| RuntimeError::Internal(e.to_string()))??
@@ -558,6 +852,9 @@ impl KhiveRuntime {
             });
             if let Some(reason) = reason {
                 payload["reason"] = serde_json::Value::String(reason);
+            }
+            if validation == EntityMergeValidation::Forced {
+                payload["force"] = serde_json::Value::Bool(true);
             }
             let event = khive_storage::event::Event::new(
                 updated_entity.namespace.clone(),
@@ -679,7 +976,7 @@ impl KhiveRuntime {
         let embed_model_names = self.registered_embedding_model_names();
         for model_name in &embed_model_names {
             match self
-                .embed_document_with_model(model_name, &note.content)
+                .embed_document_with_model(model_name, &note_embedding_text(note))
                 .await
             {
                 Ok(vector) => match self.vectors_for_model(token, model_name) {
@@ -997,6 +1294,23 @@ impl KhiveRuntime {
 // FTS document construction
 // ---------------------------------------------------------------------------
 
+/// Build the canonical text embedded for an entity on create, update, merge,
+/// and repair paths.
+pub fn entity_embedding_text(entity: &Entity) -> String {
+    match &entity.description {
+        Some(description) if !description.is_empty() => {
+            format!("{} {description}", entity.name)
+        }
+        _ => entity.name.clone(),
+    }
+}
+
+/// Build the canonical text embedded for a note when no explicit bounded
+/// embedding prefix was supplied at creation time.
+pub fn note_embedding_text(note: &Note) -> String {
+    note.content.clone()
+}
+
 /// Build the `TextDocument` for an entity. This is the single source of truth for
 /// entity FTS document shape; all write paths (create, update, merge, reindex, backfill)
 /// must go through this function so search parity is guaranteed.
@@ -1010,17 +1324,13 @@ impl KhiveRuntime {
 /// reindex runs record the entity's actual mutation time rather than the
 /// reindex execution time.
 pub fn entity_fts_document(entity: &Entity) -> TextDocument {
-    let body = match &entity.description {
-        Some(d) if !d.is_empty() => format!("{} {}", entity.name, d),
-        _ => entity.name.clone(),
-    };
     let updated_at =
         chrono::DateTime::from_timestamp_micros(entity.updated_at).unwrap_or_else(chrono::Utc::now);
     TextDocument {
         subject_id: entity.id,
         kind: SubstrateKind::Entity,
         title: Some(entity.name.clone()),
-        body,
+        body: entity_embedding_text(entity),
         tags: entity.tags.clone(),
         namespace: entity.namespace.clone(),
         metadata: entity.properties.clone(),
@@ -1196,9 +1506,29 @@ fn merge_entity_sql(
     content_strategy: ContentMergeStrategy,
     dry_run: bool,
     pack_rules: Vec<EdgeEndpointRule>,
-) -> Result<(MergeSummary, Entity), SqliteError> {
+    validation: EntityMergeValidation,
+) -> Result<(MergeSummary, Entity), MergeEntitySqlError> {
     let into_entity = read_merge_entity(conn, into_id, &namespace)?;
     let from_entity = read_merge_entity(conn, from_id, &namespace)?;
+
+    match validation {
+        EntityMergeValidation::LegacyKind if into_entity.kind != from_entity.kind => {
+            return Err(MergeEntitySqlError::Refusal(
+                EntityMergeRefusal::LegacyKind {
+                    into_id,
+                    into_kind: into_entity.kind,
+                    from_id,
+                    from_kind: from_entity.kind,
+                },
+            ));
+        }
+        EntityMergeValidation::SafetyFloor => {
+            validate_entity_merge_floor(&into_entity, &from_entity).map_err(|guard| {
+                MergeEntitySqlError::Refusal(EntityMergeRefusal::SafetyFloor(guard))
+            })?;
+        }
+        EntityMergeValidation::LegacyKind | EntityMergeValidation::Forced => {}
+    }
 
     // --- Collect edges incident to from_id ---
     let parse_id =
@@ -4971,6 +5301,81 @@ mod tests {
 
         let c2_after = rt.entities(&tok).unwrap().get_entity(c2.id).await.unwrap();
         assert!(c2_after.is_none(), "from_entity must be tombstoned");
+    }
+
+    #[tokio::test]
+    async fn merge_entity_explicit_policy_rereads_names_before_commit() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        let into = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "Transactional Guard",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let from = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "Transactional Guard",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        validate_entity_merge_floor(&into, &from)
+            .expect("the handler's fast-path validation would initially pass");
+        let renamed_into = rt
+            .update_entity(
+                &tok,
+                into.id,
+                EntityPatch {
+                    name: Some("Unrelated Renamed Target".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let expected = validate_entity_merge_floor(&renamed_into, &from)
+            .expect_err("the renamed transactional state must violate the name guard");
+        let RuntimeError::Khive(expected) = entity_merge_guard_error(expected) else {
+            unreachable!("merge guard errors are structured Khive errors")
+        };
+
+        let err = rt
+            .merge_entity_with_reason_and_force(
+                &tok,
+                into.id,
+                from.id,
+                EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
+                false,
+                None,
+                false,
+            )
+            .await
+            .expect_err("the explicit non-forced path must validate its transactional reread");
+        let RuntimeError::Khive(err) = err else {
+            panic!("expected a structured merge-guard conflict, got {err:?}");
+        };
+        assert_eq!(err.kind(), expected.kind());
+        assert_eq!(err.message(), expected.message());
+        assert_eq!(err.code(), expected.code());
+        assert_eq!(err.details(), expected.details());
+        assert!(
+            rt.get_entity(&tok, from.id).await.is_ok(),
+            "a refused merge must leave the source entity live"
+        );
     }
 
     // Cross-namespace merge_note must be denied on either ID.
