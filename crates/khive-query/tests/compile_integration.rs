@@ -264,6 +264,93 @@ fn variable_length_where_property_named_depth_uses_json_properties() {
 }
 
 #[test]
+fn variable_length_where_id_resolves_to_direct_column() {
+    let q = parse(
+        QueryLanguage::Gql,
+        r#"MATCH (a)-[:precedes*1..3]->(b) WHERE a.id = "concept-1" RETURN b.name"#,
+    )
+    .unwrap();
+    let compiled = compile(&q, &opts()).unwrap();
+    assert!(
+        compiled.sql.contains("s.id = ?"),
+        "start-node id must compile to a direct column comparison; sql: {}",
+        compiled.sql
+    );
+    assert!(
+        !compiled.sql.contains("'$.id'"),
+        "id must NOT be resolved through json_extract; sql: {}",
+        compiled.sql
+    );
+}
+
+#[test]
+fn variable_length_where_description_resolves_to_direct_column() {
+    let q = parse(
+        QueryLanguage::Gql,
+        r#"MATCH (a)-[:precedes*1..3]->(b) WHERE b.description = "abstract" RETURN b.name"#,
+    )
+    .unwrap();
+    let compiled = compile(&q, &opts()).unwrap();
+    assert!(
+        compiled.sql.contains("r.description = ?"),
+        "end-node description must compile to a direct column comparison; sql: {}",
+        compiled.sql
+    );
+    assert!(
+        !compiled.sql.contains("'$.description'"),
+        "description must NOT be resolved through json_extract; sql: {}",
+        compiled.sql
+    );
+}
+
+#[test]
+fn variable_length_where_created_at_resolves_to_direct_column() {
+    let q = parse(
+        QueryLanguage::Gql,
+        r#"MATCH (a)-[:precedes*1..3]->(b) WHERE a.created_at > "2026-01-01" RETURN b.name"#,
+    )
+    .unwrap();
+    let compiled = compile(&q, &opts()).unwrap();
+    assert!(
+        compiled.sql.contains("s.created_at > ?"),
+        "start-node created_at must compile to a direct column comparison; sql: {}",
+        compiled.sql
+    );
+    assert!(
+        !compiled.sql.contains("'$.created_at'"),
+        "created_at must NOT be resolved through json_extract; sql: {}",
+        compiled.sql
+    );
+}
+
+#[test]
+fn variable_length_where_dedicated_field_and_arbitrary_property_together() {
+    let q = parse(
+        QueryLanguage::Gql,
+        r#"MATCH (a)-[:precedes*1..3]->(b) WHERE a.id = "concept-1" AND b.custom_tag = "urgent" RETURN b.name"#,
+    )
+    .unwrap();
+    let compiled = compile(&q, &opts()).unwrap();
+    assert!(
+        compiled.sql.contains("s.id = ?"),
+        "dedicated field id must compile to a direct column comparison; sql: {}",
+        compiled.sql
+    );
+    assert!(
+        !compiled.sql.contains("'$.id'"),
+        "id must NOT be resolved through json_extract; sql: {}",
+        compiled.sql
+    );
+    assert!(
+        compiled
+            .sql
+            .contains("json_extract(r.properties, '$.custom_tag')"),
+        "arbitrary property custom_tag must still fall through to json_extract; sql: {}",
+        compiled.sql
+    );
+}
+
+#[test]
 fn entity_type_compiles_as_direct_column_not_json_extract() {
     let q = parse(
         QueryLanguage::Gql,
@@ -288,6 +375,91 @@ fn entity_type_compiles_as_direct_column_not_json_extract() {
     assert!(
         has_paper_param,
         "entity_type value 'paper' must appear as a bound parameter"
+    );
+}
+
+#[test]
+fn fixed_length_where_id_resolves_to_direct_column() {
+    let q = parse(
+        QueryLanguage::Gql,
+        "MATCH (a:concept)-[:extends]->(b) WHERE a.id = 'concept-1' RETURN a",
+    )
+    .unwrap();
+    let compiled = compile(&q, &opts()).unwrap();
+    assert!(
+        compiled.sql.contains(".id = ?"),
+        "id must compile to a direct column comparison; sql: {}",
+        compiled.sql
+    );
+    assert!(
+        !compiled.sql.contains("'$.id'"),
+        "id must NOT be resolved through json_extract; sql: {}",
+        compiled.sql
+    );
+}
+
+#[test]
+fn fixed_length_where_description_resolves_to_direct_column() {
+    let q = parse(
+        QueryLanguage::Gql,
+        "MATCH (a:concept)-[:extends]->(b) WHERE a.description = 'abstract' RETURN a",
+    )
+    .unwrap();
+    let compiled = compile(&q, &opts()).unwrap();
+    assert!(
+        compiled.sql.contains(".description = ?"),
+        "description must compile to a direct column comparison; sql: {}",
+        compiled.sql
+    );
+    assert!(
+        !compiled.sql.contains("'$.description'"),
+        "description must NOT be resolved through json_extract; sql: {}",
+        compiled.sql
+    );
+}
+
+#[test]
+fn fixed_length_where_created_at_resolves_to_direct_column() {
+    let q = parse(
+        QueryLanguage::Gql,
+        "MATCH (a:concept)-[:extends]->(b) WHERE a.created_at > '2026-01-01' RETURN a",
+    )
+    .unwrap();
+    let compiled = compile(&q, &opts()).unwrap();
+    assert!(
+        compiled.sql.contains(".created_at > ?"),
+        "created_at must compile to a direct column comparison; sql: {}",
+        compiled.sql
+    );
+    assert!(
+        !compiled.sql.contains("'$.created_at'"),
+        "created_at must NOT be resolved through json_extract; sql: {}",
+        compiled.sql
+    );
+}
+
+#[test]
+fn fixed_length_where_dedicated_field_and_arbitrary_property_together() {
+    let q = parse(
+        QueryLanguage::Gql,
+        "MATCH (a:concept)-[:extends]->(b) WHERE a.id = 'concept-1' AND a.custom_tag = 'urgent' RETURN a",
+    )
+    .unwrap();
+    let compiled = compile(&q, &opts()).unwrap();
+    assert!(
+        compiled.sql.contains(".id = ?"),
+        "dedicated field id must compile to a direct column comparison; sql: {}",
+        compiled.sql
+    );
+    assert!(
+        !compiled.sql.contains("'$.id'"),
+        "id must NOT be resolved through json_extract; sql: {}",
+        compiled.sql
+    );
+    assert!(
+        compiled.sql.contains("json_extract(") && compiled.sql.contains("'$.custom_tag'"),
+        "arbitrary property custom_tag must still fall through to json_extract; sql: {}",
+        compiled.sql
     );
 }
 
