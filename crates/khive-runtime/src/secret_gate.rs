@@ -1077,15 +1077,6 @@ const LABEL_CLAUSE_SKIP_WORDS: &[&str] = &[
 /// identifier steps) stays in range.
 const LABEL_CLAUSE_WALK_LIMIT: usize = 8;
 
-/// Maximum CONTENT words (identifiers outside the connector/glue/version/
-/// hex-fragment sets, and not past-participle shaped) the clause walk steps
-/// over after crossing a value delimiter. Natural label qualifiers are short
-/// noun compounds ("production deploy") once glue words are excluded; at
-/// three or more content nouns the trigger is treated as prose context.
-/// Verb-phrase prose ("the auth scanner flagged this file: <path>") is
-/// additionally cut by the past-participle stop before this bound matters.
-const LABEL_CLAUSE_DELIMITER_UNKNOWN_LIMIT: usize = 2;
-
 /// Sentence/paragraph boundary inside a clause-walk gap. `;`, `!`, `?`, and
 /// blank lines always end the clause. `.` ends it only when it is not
 /// immediately followed by an alphanumeric character: a dot tight between
@@ -1131,10 +1122,14 @@ fn is_hex_fragment_word(word: &str) -> bool {
 /// [`gap_has_sentence_boundary`]) — a label on the far side of a boundary is
 /// prose context, not this value's label. Crossing a value delimiter (`:` or
 /// `=`, including one attached to a VCS marker: "deploy sha: <hex>" is still
-/// assignment syntax) additionally lets the walk step over up to
-/// [`LABEL_CLAUSE_DELIMITER_UNKNOWN_LIMIT`] content words outside those
-/// sets: "label with qualifiers: value" names the value regardless of which
-/// qualifier nouns the label carries ("api key for production deploy: X").
+/// assignment syntax) additionally lets the walk step over content words
+/// outside those sets, bounded only by [`LABEL_CLAUSE_WALK_LIMIT`], the
+/// sentence boundary, and the past-participle stop: "label with qualifiers:
+/// value" names the value regardless of how many qualifier nouns the label
+/// carries ("api key for production deploy: X", "api key for shared
+/// encrypted deploy: X"). A per-clause content-word cap was tried here and
+/// removed — any cap re-admits the labeled-value bypass one natural
+/// qualifier past the cap.
 /// A past-participle content word ("flagged", "introduced") ends the walk —
 /// verb-phrase prose narrates an action on the value rather than labeling it
 /// ("the auth scanner flagged this file: <path>", "one extra token was
@@ -1149,7 +1144,6 @@ fn has_clause_credential_label(text: &str, token_offset: usize, raw_token: &str)
 
     let mut rest = &text[..token_offset];
     let mut crossed_value_delimiter = false;
-    let mut post_delimiter_unknowns = 0usize;
     // Whether the previously processed identifier (the one nearer the value)
     // was connector material. Starts true: step 0 is adjacent to the value or
     // its delimiter.
@@ -1193,10 +1187,6 @@ fn has_clause_credential_label(text: &str, token_offset: usize, raw_token: &str)
             // The walk runs backwards, so "followed by" is the identifier
             // processed on the previous iteration.
             if arrived_through_connector && lower.len() >= 5 && lower.ends_with("ed") {
-                return false;
-            }
-            post_delimiter_unknowns += 1;
-            if post_delimiter_unknowns > LABEL_CLAUSE_DELIMITER_UNKNOWN_LIMIT {
                 return false;
             }
         }
@@ -2998,6 +2988,34 @@ mod tests {
     }
 
     #[test]
+    fn blocks_forty_hex_behind_chained_qualifier_label() {
+        // Round-5 review probe: a chain of qualifiers between the value and
+        // the trigger ("shared encrypted deploy") must not exhaust the walk
+        // before the label head is reached. Any per-clause content-word cap
+        // re-admits this bypass one qualifier past the cap.
+        let revision = "d362950a3c9b1a4cb47d97f1623e38f1a1e6bcdf";
+        let content = format!("api key for shared encrypted deploy: commit {revision}");
+        assert_eq!(
+            scan(&content).map(|matched| matched.detector),
+            Some("hex-credential-token"),
+            "a chained-qualifier credential label must stay walkable: \
+             {content:?}"
+        );
+    }
+
+    #[test]
+    fn blocks_slash_base64_behind_chained_qualifier_label() {
+        let content =
+            "api key for shared encrypted deploy: Xk9mZ2vQpLrT8nJwYuA/HfBsDcGiONvMabcdefgh";
+        assert_eq!(
+            scan(content).map(|matched| matched.detector),
+            Some("high-entropy-token"),
+            "a chained-qualifier credential label must refuse the path \
+             exemption"
+        );
+    }
+
+    #[test]
     fn blocks_participle_before_trigger_word() {
         // Ordering contract: a past-participle word BEFORE the trigger never
         // matters — the walk reaches the trigger first. Pinned so the
@@ -4618,24 +4636,34 @@ mod tests {
     }
 
     #[test]
-    fn allows_workspace_artifact_path_near_standalone_secret() {
+    fn accepted_false_positive_workspace_artifact_path_behind_attributive_trigger() {
+        // "secret gate false positive repro: <path>" carries a trigger word
+        // in clause range ahead of a value delimiter. The clause walk no
+        // longer caps content words after a delimiter (any cap re-admits the
+        // chained-qualifier labeled-value bypass), so this meta-prose shape
+        // blocks. Accepted false positive — same attributive-trigger class
+        // as the auth-setup docs path; documented in docs/api/secret_gate.md.
         let content = "writing up the secret gate false positive repro: \
              .workspace/20260101/fix-secret-gate-trigger-false-positive/MEASUREMENT_REPORT.md";
         assert!(
-            check(content).is_ok(),
-            "workspace artifact path in technical prose must pass; got {:?}",
-            scan(content)
+            check(content).is_err(),
+            "accepted-FP contract changed: attributive trigger before a \
+             delimited path no longer blocks — update the docs if deliberate"
         );
     }
 
     #[test]
-    fn allows_archive_doc_path_near_standalone_secret() {
+    fn accepted_false_positive_archive_doc_path_behind_attributive_trigger() {
+        // "secret scanner archive notes: <path>" — attributive trigger two
+        // qualifiers ahead of the delimiter. Same accepted-FP class as
+        // above; the walk cannot tell an attributive trigger from a label
+        // head without reopening the chained-qualifier bypass.
         let content =
             "secret scanner archive notes: docs/_archive/ADR051-TenantEncryption-v2Notes.md";
         assert!(
-            check(content).is_ok(),
-            "archive document path in technical prose must pass; got {:?}",
-            scan(content)
+            check(content).is_err(),
+            "accepted-FP contract changed: attributive trigger before a \
+             delimited path no longer blocks — update the docs if deliberate"
         );
     }
 

@@ -97,9 +97,12 @@ qualifiers), version fragments (`v1.2` splits into version-shaped identifiers), 
 fragments (a separator-split payload piece is value material, not a label word), up to a
 bounded number of identifiers. Crossing a value delimiter (`:` or `=`, including one attached
 to a VCS marker: `deploy sha: <hex>` is assignment syntax like any other) additionally lets the
-walk step over a small bounded number of CONTENT words outside those sets — "label with
-qualifiers: value" (`api key for production deploy: <value>`) names the value regardless of
-which qualifier nouns the label carries. A past-participle content word ends the walk:
+walk step over CONTENT words outside those sets — "label with qualifiers: value" (`api key for
+production deploy: <value>`, `api key for shared encrypted deploy: <value>`) names the value
+regardless of how many qualifier nouns the label carries. Content words after a delimiter are
+bounded only by the overall walk limit, the sentence boundary, and the past-participle stop; a
+per-clause content-word cap was tried and removed, since any cap re-admits the labeled-value
+bypass one natural qualifier past the cap. A past-participle content word ends the walk:
 verb-phrase prose narrates an action on the value rather than labeling it (`the auth scanner
 flagged this file: <path>`, `one extra token was introduced by sha: <hex>` stay exempt). The
 walk stops at a sentence/paragraph boundary (`;`, `!`, `?`, blank line; `.` only when not
@@ -117,7 +120,11 @@ label. Known residuals, accepted under the threat model: a non-connector qualifi
 delimiter (`api key pour commit <hex>`), a participle in verb position directly after the
 trigger (`api key updated: <hex>` reads as changelog prose — note the ordering: `updated api
 key: <hex>` blocks, since the walk meets the trigger first), and label clauses exceeding the
-walk or content-word bounds.
+walk limit. Accepted false positives, conservative direction: the walk cannot distinguish an
+ATTRIBUTIVE trigger from a label head without reopening the labeled-value bypasses, so prose
+where a trigger word sits attributively inside the pre-delimiter clause blocks even when the
+value is an ordinary path (`see the docs for auth setup: <path>`, `secret scanner archive
+notes: <path>`, `writing up the secret gate false positive repro: <path>`).
 
 Trigger-word matching only fires on genuine mentions, not substring collisions: trigger words
 (`key`, `secret`, `password`, `passwd`, `credential`, `bearer`, `auth`, `apikey`) are matched at a
