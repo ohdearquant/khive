@@ -108,9 +108,10 @@ pub use registry::{ObjectiveRegistry, RegisteredObjective};
 pub use resource::{cpu_delta_us, process_resource_usage, ProcessResourceUsage};
 pub use retrieval::{SearchHit, SearchSource};
 pub use runtime::{
-    assert_captured_db_anchor_consistent, assert_db_anchor_consistent, parse_pack_list,
-    resolve_db_anchor, resolve_project_actor_id, runtime_config_from_khive_config, BackendId,
-    EntityTypeValidatorFn, KhiveRuntime, NamespaceToken, NoteMutationHookFn, RuntimeConfig,
+    assert_captured_db_anchor_consistent, assert_db_anchor_consistent, expand_tilde,
+    parse_pack_list, resolve_db_anchor, resolve_project_actor_id, runtime_config_from_khive_config,
+    BackendId, EntityTypeValidatorFn, KhiveRuntime, NamespaceToken, NoteMutationHookFn,
+    RuntimeConfig,
 };
 pub use secret_gate::SecretMatch;
 pub use validation::{

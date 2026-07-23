@@ -135,7 +135,7 @@ kkernel mcp --db :memory:                  # ephemeral, in-process only
 
 Once one or more `[[backends]]` entries exist in the resolved config, the
 backend topology and every backend's file path are considered authoritative.
-Two cases:
+Three cases:
 
 - **`--db :memory:` / `KHIVE_DB=:memory:`**: accepted as a deliberate,
   documented escape hatch. It forces _every_ declared backend to an in-memory
@@ -143,7 +143,14 @@ Two cases:
   ephemeral test runs where you want the declared pack-to-backend topology
   exercised without touching any real file on disk.
 
-- **Any other concrete `--db` path**: rejected at startup, fail-loud, with:
+- **A concrete `--db` / `KHIVE_DB` path resolving to the declared `main`
+  backend path**: accepted as a redundant no-op. The remaining declared
+  backends and all pack assignments are unchanged. This preserves existing
+  one-shot commands that repeat `main`'s configured path without weakening
+  the multi-backend topology.
+
+- **Any genuinely different concrete `--db` path**: rejected at startup,
+  fail-loud, with:
 
   ```
   --db "<path>" (or KHIVE_DB) cannot be combined with [[backends]]: N
@@ -157,24 +164,27 @@ Two cases:
   `{other:?}` and `{backend_count}` placeholders, and line breaks are rewrapped
   here. Source: `build_registry_for_multi_backend`,
   `crates/khive-mcp/src/serve.rs`. Verified live against the 0.3.0 binary: a
-  config declaring two `[[backends]]` entries plus a concrete `--db`/`KHIVE_DB`
-  override exits with this message and process exit code 1.)
+  config declaring two `[[backends]]` entries plus a genuinely different
+  concrete `--db`/`KHIVE_DB` override exits with this message and process exit
+  code 1.)
 
-**Why this fails loud instead of silently applying `--db` to `main` only, or
-to every backend:** with two or more distinct declared backend files, a
-concrete `--db` override is inherently ambiguous. It could mean "route
-everything to this one file instead" (silently collapsing physically
-separated substrates back together, defeating the entire point of declaring
-them) or "just override `main`, leave the others alone" (a different,
+**Why a different path fails loud instead of silently applying `--db` to
+`main` only, or to every backend:** with two or more distinct declared backend
+files, a divergent concrete `--db` override is inherently ambiguous. It could
+mean "route everything to this one file instead" (silently collapsing
+physically separated substrates back together, defeating the entire point of
+declaring them) or "just override `main`, leave the others alone" (a different,
 unstated, and equally plausible interpretation). Rather than guess and risk
 silent data mis-routing, khive refuses to start and tells you to either edit
-`khive.toml` directly or use the explicit `:memory:` escape hatch.
+`khive.toml` directly or use the explicit `:memory:` escape hatch. Repeating
+the canonical `main` path is unambiguous because it changes no routing.
 
 **If your config previously had no `[[backends]]` and you now add some:** the
 first thing to check for any client config that still passes a concrete
-`--db`/`KHIVE_DB` value is whether that value needs to be removed. Once
-backends are declared, the file paths live in the config, not on the command
-line.
+`--db`/`KHIVE_DB` value is whether it resolves to the declared `main` path.
+That identical value remains valid but redundant; remove it when convenient.
+A different value is rejected and must be removed or moved into the relevant
+`[[backends]].path` declaration.
 
 ---
 
@@ -182,8 +192,9 @@ line.
 
 `kkernel mcp` (or, in multi-backend mode, the same command backed by a config
 file) is the entry point for every MCP client. When your config declares
-`[[backends]]`, do not pass `--db`/`KHIVE_DB` at all. The config file is
-authoritative for backend paths.
+`[[backends]]`, omitting `--db`/`KHIVE_DB` is the clearest form because the
+config file is authoritative for backend paths. An identical `main` path is
+tolerated as a no-op; a different path is rejected.
 
 ### Claude Code (`.mcp.json` or `.claude/settings.json`)
 
@@ -236,12 +247,13 @@ args = ["mcp"]
 
 ### Migration note
 
-If you passed `--db` in any of the above configs before upgrading to 0.3.0
-and your config file now declares `[[backends]]`, remove the `--db` argument
-(and unset `KHIVE_DB` if it is set in the client's environment). Leaving it in
-place is what produces the connect failure in
-[Troubleshooting](#troubleshooting-a-connect-failure) below. The config
-file's `[[backends]]` paths are authoritative once declared; there is no
+If you passed `--db` in any of the above configs and your config file now
+declares `[[backends]]`, compare it with the declared `main` backend. An
+identical path is accepted but redundant. Remove a different `--db` argument
+(and unset a different `KHIVE_DB` value) or update `[[backends]].path`; a
+different path produces the connect failure in
+[Troubleshooting](#troubleshooting-a-connect-failure) below. The config file's
+`[[backends]]` paths are authoritative once declared; there is no
 partial-override mode.
 
 ---
