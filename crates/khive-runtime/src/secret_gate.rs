@@ -729,11 +729,32 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
             continue;
         }
 
-        if is_git_revision_reference(text, token_offset, raw_token)
-            && !has_immediate_credential_label(text, token_offset, raw_token)
+        // A 40-hex value attached to a VCS coordinate marker (`commit`,
+        // `revision`, `rev`, `sha`) is a public VCS coordinate, not a
+        // credential — but ONLY when the surrounding clause carries no
+        // credential label ("api key value is commit <hex>" is a labeled
+        // credential wearing a marker). The exemption is a flag, not an early
+        // `continue`: it must skip ONLY the hex-credential-shape checks
+        // below, never fragment reconstruction — an exempted anchor that
+        // skipped reconstruction would let a marker-adjacent fragment hide a
+        // split credential (the same anchor-ordering rule the file-path
+        // exemption pins via
+        // `blocks_unicode_split_hex_credential_with_path_shaped_anchor`).
+        // Marker-word form: the token IS a bare `commit`/`revision`/`rev`/
+        // `sha` whose next token is the 40-hex value. A fixed marker word is
+        // not attacker-controlled credential material, so a full `continue`
+        // is safe here — without it the marker would anchor fragment
+        // reconstruction and re-accumulate its own legitimate neighboring
+        // revision. The hex value itself is a separate token and receives
+        // the full check sequence on its own iteration.
+        if is_vcs_marker_before_hex(text, raw_token)
+            && !has_clause_credential_label(text, token_offset, raw_token)
         {
             continue;
         }
+
+        let vcs_reference_exempt = is_git_revision_reference(text, token_offset, raw_token)
+            && !has_clause_credential_label(text, token_offset, raw_token);
 
         // Hex API keys (AWS secret access key, Stripe test keys, random hex
         // tokens) are pure hex yet are real credentials.  The entropy heuristic
@@ -743,7 +764,11 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
         // flagged. Generic "sha" or "hash" prose does not rescue a token;
         // `is_git_revision_reference` requires a 40-hex value attached to a
         // VCS coordinate marker.
-        if near_trigger && is_pure_hex(token) && HEX_CREDENTIAL_LENGTHS.contains(&token.len()) {
+        if !vcs_reference_exempt
+            && near_trigger
+            && is_pure_hex(token)
+            && HEX_CREDENTIAL_LENGTHS.contains(&token.len())
+        {
             return Some((token, "hex-credential-token"));
         }
 
@@ -765,11 +790,18 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
         // this long clearing its own entropy/hex check is evidence independent
         // of that exemption's word-shape rule.
         if near_trigger {
+            // `vcs_reference_exempt` also covers the single-token forms these
+            // per-token shape checks would re-flag (`rev:<hex>` is one token
+            // whose 40-hex run and normalized-hex accumulation both match);
+            // it does NOT cover fragment reconstruction below.
             for run in token.split(|c: char| !c.is_ascii_alphanumeric()) {
                 if run.len() < MIN_ENTROPY_LEN {
                     continue;
                 }
-                if is_pure_hex(run) && HEX_CREDENTIAL_LENGTHS.contains(&run.len()) {
+                if !vcs_reference_exempt
+                    && is_pure_hex(run)
+                    && HEX_CREDENTIAL_LENGTHS.contains(&run.len())
+                {
                     return Some((token, "hex-credential-token"));
                 }
                 if shannon_entropy(run.as_bytes()) >= ENTROPY_THRESHOLD {
@@ -789,7 +821,7 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
             // length against the same HEX_CREDENTIAL_LENGTHS allowlist closes
             // this gap without widening the allowlist itself. Bounded to the
             // runs inside this one token, not a document-wide scan.
-            if contains_normalized_hex_credential(token) {
+            if !vcs_reference_exempt && contains_normalized_hex_credential(token) {
                 return Some((token, "hex-credential-token"));
             }
 
@@ -863,7 +895,16 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
             // MIN_ENTROPY_LEN, so they stay allowed; see
             // `blocks_separator_split_three_way_hex_credential_mixed_case`
             // and `allows_unrelated_short_fragments_cited_near_a_trigger_word`.
-            if tokens.len() > 1 {
+            // A vcs-exempt anchor skips reconstruction FROM ITSELF: the chain
+            // would re-accumulate the anchor's own legitimate 40-hex (any
+            // adjacent prose word is fragment-shaped enough to open a chain)
+            // and re-flag every benign marker-adjacent revision. A genuinely
+            // split credential hiding one fragment behind a marker is still
+            // caught: every OTHER fragment anchors its own chain, walks both
+            // directions, and accumulates the exempted fragment's hex into
+            // the total (see
+            // `blocks_split_hex_credential_with_marker_adjacent_fragment`).
+            if !vcs_reference_exempt && tokens.len() > 1 {
                 let fragments = bridge_fragment_chain(&tokens, text, idx);
                 if fragments.len() > 1 {
                     let hex_probe = fragments.join(" ");
@@ -881,7 +922,7 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
             }
 
             if is_plausible_file_path(token)
-                && !has_immediate_credential_label(text, token_offset, raw_token)
+                && !has_clause_credential_label(text, token_offset, raw_token)
             {
                 continue;
             }
@@ -923,21 +964,31 @@ fn is_hex_run(run: &str) -> bool {
     !run.is_empty() && run.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-fn is_git_revision_reference(text: &str, token_offset: usize, raw_token: &str) -> bool {
-    const MARKERS: &[&str] = &["commit", "revision", "rev", "sha"];
+const VCS_MARKERS: &[&str] = &["commit", "revision", "rev", "sha"];
 
+/// Marker-word form of a VCS reference: `raw_token` is itself a bare marker
+/// and the next token in `text` is a 40-hex value.
+fn is_vcs_marker_before_hex(text: &str, raw_token: &str) -> bool {
     let token = wrapper_strip_repeated(raw_token);
     let marker = strip_delimiters(token);
-    if MARKERS
+    if !VCS_MARKERS
         .iter()
         .any(|candidate| marker.eq_ignore_ascii_case(candidate))
     {
-        let raw_offset = raw_token.as_ptr() as usize - text.as_ptr() as usize;
-        let next = text[raw_offset + raw_token.len()..].trim_start();
-        let next = wrapper_strip_repeated(extract_token(next));
-        if next.len() == 40 && next.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return true;
-        }
+        return false;
+    }
+    let raw_offset = raw_token.as_ptr() as usize - text.as_ptr() as usize;
+    let next = text[raw_offset + raw_token.len()..].trim_start();
+    let next = wrapper_strip_repeated(extract_token(next));
+    next.len() == 40 && next.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn is_git_revision_reference(text: &str, token_offset: usize, raw_token: &str) -> bool {
+    const MARKERS: &[&str] = VCS_MARKERS;
+
+    let token = wrapper_strip_repeated(raw_token);
+    if is_vcs_marker_before_hex(text, raw_token) {
+        return true;
     }
 
     if token.len() == 40 && token.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -967,19 +1018,92 @@ fn trailing_identifier(text: &str) -> &str {
         .unwrap_or_default()
 }
 
-fn has_immediate_credential_label(text: &str, token_offset: usize, raw_token: &str) -> bool {
+/// Words the clause walk in [`has_clause_credential_label`] steps over when
+/// searching backwards for a credential label. Connectors are the words that
+/// commonly sit between a label and its value in natural assignment prose
+/// ("api key value is X", "the token was X"); the VCS coordinate markers are
+/// included so the marker itself cannot shield an earlier label from the
+/// walk ("api key value is commit <hex>").
+const LABEL_CLAUSE_SKIP_WORDS: &[&str] = &[
+    "commit",
+    "revision",
+    "rev",
+    "sha",
+    "is",
+    "was",
+    "are",
+    "were",
+    "be",
+    "been",
+    "being",
+    "value",
+    "values",
+    "the",
+    "a",
+    "an",
+    "this",
+    "that",
+    "it",
+    "its",
+    "as",
+    "here",
+    "now",
+    "currently",
+    "equals",
+];
+
+/// Maximum identifiers the clause walk examines before giving up. Bounds the
+/// scan to one short assignment clause; a label further away than this is
+/// window-level prose context, which `near_trigger` already models.
+const LABEL_CLAUSE_WALK_LIMIT: usize = 5;
+
+/// `true` when the candidate token sits in credential-value syntax: an inline
+/// credential shape on the token itself, or a credential label reachable by
+/// walking backwards through the current clause. The walk steps over
+/// [`LABEL_CLAUSE_SKIP_WORDS`] and stops at the first other word or at a
+/// sentence/paragraph boundary (`.`, `;`, `!`, `?`, blank line) — a label on
+/// the far side of a boundary is prose context, not this value's label. A
+/// single-identifier lookback is insufficient here: one connector word
+/// ("api key value is X") would otherwise hide the label from the exemption
+/// guards.
+fn has_clause_credential_label(text: &str, token_offset: usize, raw_token: &str) -> bool {
     if has_inline_credential_trigger(raw_token) {
         return true;
     }
 
-    let label = trailing_identifier(&text[..token_offset]).to_ascii_lowercase();
-    label == "token"
-        || COMPOUND_TRIGGER_WORDS
-            .iter()
-            .any(|trigger| label.contains(trigger))
-        || TRIGGER_WORDS
-            .iter()
-            .any(|trigger| contains_bounded_word(&label, trigger))
+    let mut rest = &text[..token_offset];
+    for step in 0..LABEL_CLAUSE_WALK_LIMIT {
+        let label = trailing_identifier(rest);
+        if label.is_empty() {
+            return false;
+        }
+        if step > 0 {
+            let gap = &rest[label.as_ptr() as usize - rest.as_ptr() as usize + label.len()..];
+            if gap.contains("\n\n")
+                || gap.contains(['.', ';', '!', '?'])
+                || gap.contains("\r\n\r\n")
+            {
+                return false;
+            }
+        }
+        let lower = label.to_ascii_lowercase();
+        if lower == "token"
+            || COMPOUND_TRIGGER_WORDS
+                .iter()
+                .any(|trigger| lower.contains(trigger))
+            || TRIGGER_WORDS
+                .iter()
+                .any(|trigger| contains_bounded_word(&lower, trigger))
+        {
+            return true;
+        }
+        if !LABEL_CLAUSE_SKIP_WORDS.contains(&lower.as_str()) {
+            return false;
+        }
+        let start = label.as_ptr() as usize - rest.as_ptr() as usize;
+        rest = &rest[..start];
+    }
+    false
 }
 
 fn is_plausible_file_path(token: &str) -> bool {
@@ -2555,6 +2679,102 @@ mod tests {
             assert!(
                 check(&content).is_err(),
                 "credential assignment must remain blocked: {content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn blocks_forty_hex_after_credential_phrase_with_vcs_marker() {
+        let revision = "d362950a3c9b1a4cb47d97f1623e38f1a1e6bcdf";
+        for content in [
+            format!("api key value is commit {revision}"),
+            format!("api key value is revision {revision}"),
+            format!("the secret is rev {revision}"),
+            format!("token value sha {revision}"),
+        ] {
+            assert_eq!(
+                scan(&content).map(|matched| matched.detector),
+                Some("hex-credential-token"),
+                "a credential phrase must not be hidden by connector words before \
+                 a VCS marker: {content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn blocks_unicode_punctuation_between_vcs_marker_and_forty_hex() {
+        let revision = "d362950a3c9b1a4cb47d97f1623e38f1a1e6bcdf";
+        let content = format!("api_key value commit\u{200B}{revision}");
+        assert!(
+            check(&content).is_err(),
+            "a zero-width space between marker and value must not rescue a \
+             labeled credential: {content:?}, got {:?}",
+            scan(&content)
+        );
+    }
+
+    #[test]
+    fn blocks_slash_bearing_base64_credential_in_value_syntax() {
+        // 40-char standard-base64-alphabet value whose `/` splits it into two
+        // runs (19 and 20 bytes) each below MIN_ENTROPY_LEN — per-run checks
+        // never see it, so the block must come from refusing the path
+        // exemption for a credential-value clause and applying whole-token
+        // entropy.
+        let content = "api key value is Xk9mZ2vQpLrT8nJwYuA/HfBsDcGiONvMabcdefgh";
+        assert_eq!(
+            scan(content).map(|matched| matched.detector),
+            Some("high-entropy-token"),
+            "slash-bearing base64 credential in value syntax must be blocked"
+        );
+    }
+
+    #[test]
+    fn blocks_angle_bracket_line_range_base64_credential_in_value_syntax() {
+        let content = "api key value is <Xk9mZ2vQpLrT8nJwYuA/HfBsDcGiONvMabcdefgh>:~97-103";
+        assert_eq!(
+            scan(content).map(|matched| matched.detector),
+            Some("high-entropy-token"),
+            "angle-bracket/line-range dressing must not exempt a credential in \
+             value syntax"
+        );
+    }
+
+    #[test]
+    fn blocks_split_hex_credential_with_marker_adjacent_fragment() {
+        // A 64-hex credential split 40+24 by a zero-width space, with the
+        // first fragment hiding behind a VCS marker. The marker-adjacent
+        // fragment is exempt as its own anchor, but the second fragment
+        // anchors its own reconstruction chain, walks back across the gap,
+        // and accumulates 40+24=64 — the symmetric-anchor property the
+        // vcs-exempt bridge skip relies on.
+        let content = concat!(
+            "api token context: commit ",
+            "d362950a3c9b1a4cb47d97f1623e38f1a1e6bcdf",
+            "\u{200B}",
+            "0123456789abcdef01234567"
+        );
+        assert_eq!(
+            scan(content).map(|matched| matched.detector),
+            Some("hex-credential-token"),
+            "split credential with a marker-adjacent fragment must be blocked"
+        );
+    }
+
+    #[test]
+    fn allows_vcs_reference_with_prose_boundary_before_trigger_word() {
+        // A sentence or paragraph boundary between a trigger word and the
+        // marker/value clause means the trigger is prose context, not this
+        // value's label — the clause walk must stop at the boundary.
+        let revision = "d362950a3c9b1a4cb47d97f1623e38f1a1e6bcdf";
+        for content in [
+            format!("configuration key\n\nrev {revision}."),
+            format!("rotate the api key. the fix is commit {revision}"),
+        ] {
+            assert!(
+                check(&content).is_ok(),
+                "boundary-separated trigger prose must not block a VCS \
+                 reference: {content:?}, got {:?}",
+                scan(&content)
             );
         }
     }
