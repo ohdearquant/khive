@@ -89,14 +89,16 @@ fn setup_memory_store() -> SqlGraphStore {
 
     {
         let writer = pool.writer().unwrap();
-        writer.conn().execute_batch(GRAPH_DDL).unwrap();
+        ensure_graph_schema(writer.conn()).unwrap();
     }
 
     SqlGraphStore::new_scoped(pool, false, "default")
 }
 
 /// Like [`setup_memory_store`] but also seeds minimal `entities`/`notes`
-/// tables (id + deleted_at only) so the `#769` guarded-write tests can
+/// tables (id + deleted_at, plus a non-`concept` `kind` default so the
+/// single-origin trigger's `entities.kind` read resolves without pulling in
+/// the full entities schema) so the `#769` guarded-write tests can
 /// exercise the real `WHERE EXISTS(entities...) OR EXISTS(notes...)` probes
 /// `edge_insert_guarded_by_endpoints_statement` and `edge_endpoints_exist`
 /// issue against those tables.
@@ -113,7 +115,7 @@ fn setup_memory_store_with_substrates() -> (Arc<ConnectionPool>, SqlGraphStore) 
         writer
             .conn()
             .execute_batch(
-                "CREATE TABLE entities (id TEXT PRIMARY KEY, deleted_at INTEGER);
+                "CREATE TABLE entities (id TEXT PRIMARY KEY, kind TEXT NOT NULL DEFAULT 'document', deleted_at INTEGER);
                  CREATE TABLE notes (id TEXT PRIMARY KEY, deleted_at INTEGER);
                  CREATE TABLE events (id TEXT PRIMARY KEY);",
             )
@@ -245,11 +247,7 @@ async fn batched_namespace_edge_counts_exceed_sqlite_variable_limit() {
         ..PoolConfig::default()
     };
     let pool = Arc::new(ConnectionPool::new(config).unwrap());
-    pool.writer()
-        .unwrap()
-        .conn()
-        .execute_batch(GRAPH_DDL)
-        .unwrap();
+    ensure_graph_schema(pool.writer().unwrap().conn()).unwrap();
     let store_a = SqlGraphStore::new_scoped(Arc::clone(&pool), false, "stats-a");
     let store_b = SqlGraphStore::new_scoped(Arc::clone(&pool), false, "stats-b");
 
@@ -315,11 +313,7 @@ async fn duplicate_namespace_across_chunk_boundary_is_not_double_counted() {
         ..PoolConfig::default()
     };
     let pool = Arc::new(ConnectionPool::new(config).unwrap());
-    pool.writer()
-        .unwrap()
-        .conn()
-        .execute_batch(GRAPH_DDL)
-        .unwrap();
+    ensure_graph_schema(pool.writer().unwrap().conn()).unwrap();
     let store_a = SqlGraphStore::new_scoped(Arc::clone(&pool), false, "stats-a");
 
     let mut edge_a1 = make_edge(Uuid::new_v4(), Uuid::new_v4(), EdgeRelation::Extends, 1.0);
@@ -1198,7 +1192,7 @@ async fn graph_traverse_read_span_scoped_to_secondary_backend_visible_only_in_it
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
     {
         let writer = pool.writer().unwrap();
-        writer.conn().execute_batch(GRAPH_DDL).unwrap();
+        ensure_graph_schema(writer.conn()).unwrap();
     }
     let secondary_identity = match pool.origin() {
         khive_storage::tx_registry::TxOrigin::Database(id) => id,
@@ -2944,7 +2938,7 @@ async fn upsert_edges_routes_through_writer_task_when_flag_enabled() {
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
     {
         let writer = pool.writer().unwrap();
-        writer.conn().execute_batch(GRAPH_DDL).unwrap();
+        ensure_graph_schema(writer.conn()).unwrap();
     }
 
     let store = SqlGraphStore::new_scoped(Arc::clone(&pool), true, "default");
@@ -3002,7 +2996,7 @@ async fn upsert_edge_routes_through_writer_task_when_flag_enabled() {
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
     {
         let writer = pool.writer().unwrap();
-        writer.conn().execute_batch(GRAPH_DDL).unwrap();
+        ensure_graph_schema(writer.conn()).unwrap();
     }
 
     let store = Arc::new(SqlGraphStore::new_scoped(
@@ -3300,7 +3294,7 @@ async fn upsert_edge_guarded_probe_is_atomic_with_insert_on_file_backed_singleto
         writer
             .conn()
             .execute_batch(
-                "CREATE TABLE entities (id TEXT PRIMARY KEY, deleted_at INTEGER);
+                "CREATE TABLE entities (id TEXT PRIMARY KEY, kind TEXT NOT NULL DEFAULT 'document', deleted_at INTEGER);
                  CREATE TABLE notes (id TEXT PRIMARY KEY, deleted_at INTEGER);
                  CREATE TABLE events (id TEXT PRIMARY KEY);",
             )
@@ -3444,7 +3438,7 @@ fn setup_store_with_a_corrupt_relation_row(node: Uuid, good: usize) -> SqlGraphS
     let pool = Arc::new(ConnectionPool::new(config).unwrap());
     {
         let writer = pool.writer().unwrap();
-        writer.conn().execute_batch(GRAPH_DDL).unwrap();
+        ensure_graph_schema(writer.conn()).unwrap();
         let now = Utc::now().timestamp_micros();
         for i in 0..good {
             writer
@@ -3771,4 +3765,169 @@ async fn traverse_both_direction_hub_depth_two_returns_full_node_set() {
         expected_depth1.len() + expected_depth2.len(),
         "no duplicate or spurious nodes"
     );
+}
+
+// =============================================================================
+// `ensure_graph_schema` legacy-upgrade preflight (lazy-DDL single-origin gap)
+// =============================================================================
+
+/// Table + index DDL only — the shape `graph_edges` had before the
+/// single-origin triggers (mirrored from migration 013 into `GRAPH_DDL`)
+/// existed. Used to simulate a database created by a pre-trigger binary via
+/// the lazy `ensure_graph_schema` path, then reopened by a binary that ships
+/// the triggers.
+const LEGACY_GRAPH_EDGES_TABLE_DDL: &str = "
+CREATE TABLE IF NOT EXISTS graph_edges (
+    namespace      TEXT NOT NULL,
+    id             TEXT NOT NULL,
+    source_id      TEXT NOT NULL,
+    target_id      TEXT NOT NULL,
+    relation       TEXT NOT NULL,
+    weight         REAL NOT NULL DEFAULT 1.0,
+    created_at     INTEGER NOT NULL,
+    updated_at     INTEGER NOT NULL,
+    deleted_at     INTEGER,
+    metadata       TEXT,
+    target_backend TEXT,
+    PRIMARY KEY (namespace, id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_graph_edges_unique_triple ON graph_edges(namespace, source_id, target_id, relation);
+";
+
+fn seed_legacy_pre_trigger_schema(conn: &rusqlite::Connection) {
+    crate::stores::entity::ensure_entities_schema(conn).unwrap();
+    conn.execute_batch(LEGACY_GRAPH_EDGES_TABLE_DDL).unwrap();
+}
+
+fn insert_concept_entity(conn: &rusqlite::Connection, id: Uuid, name: &str) {
+    let now = Utc::now().timestamp_micros();
+    conn.execute(
+        "INSERT INTO entities (id, namespace, kind, name, created_at, updated_at) \
+         VALUES (?1, 'default', 'concept', ?2, ?3, ?3)",
+        rusqlite::params![id.to_string(), name, now],
+    )
+    .unwrap();
+}
+
+fn insert_legacy_introduced_by_edge(conn: &rusqlite::Connection, concept: Uuid, origin: Uuid) {
+    let now = Utc::now().timestamp_micros();
+    conn.execute(
+        "INSERT INTO graph_edges \
+         (namespace, id, source_id, target_id, relation, weight, created_at, updated_at) \
+         VALUES ('default', ?1, ?2, ?3, 'introduced_by', 1.0, ?4, ?4)",
+        rusqlite::params![
+            Uuid::new_v4().to_string(),
+            concept.to_string(),
+            origin.to_string(),
+            now,
+        ],
+    )
+    .unwrap();
+}
+
+/// (a) A database built with the pre-trigger lazy schema, seeded with two
+/// live distinct `introduced_by` origins for one concept, must fail loudly
+/// on the next `ensure_graph_schema` call — the moment enforcement would
+/// otherwise be installed silently over a pre-existing violation.
+#[test]
+fn ensure_graph_schema_rejects_legacy_database_with_preexisting_duplicate_origins() {
+    let config = PoolConfig {
+        path: None,
+        ..PoolConfig::default()
+    };
+    let pool = ConnectionPool::new(config).unwrap();
+    let writer = pool.writer().unwrap();
+    seed_legacy_pre_trigger_schema(writer.conn());
+
+    let concept = Uuid::new_v4();
+    insert_concept_entity(writer.conn(), concept, "Duplicated Concept");
+    insert_legacy_introduced_by_edge(writer.conn(), concept, Uuid::new_v4());
+    insert_legacy_introduced_by_edge(writer.conn(), concept, Uuid::new_v4());
+
+    let err = ensure_graph_schema(writer.conn())
+        .expect_err("a legacy database with pre-existing duplicate origins must fail loudly");
+    let message = err.to_string();
+    assert!(
+        message.contains(&concept.to_string()),
+        "error must name the offending concept, got: {message}"
+    );
+    assert!(
+        message.contains("single-origin invariant"),
+        "error must explain the invariant being enforced, got: {message}"
+    );
+}
+
+/// (b) The same legacy schema with no duplicates upgrades cleanly, and the
+/// trigger installed by that upgrade then enforces the invariant going
+/// forward.
+#[test]
+fn ensure_graph_schema_upgrades_clean_legacy_database_and_trigger_then_enforces() {
+    let config = PoolConfig {
+        path: None,
+        ..PoolConfig::default()
+    };
+    let pool = ConnectionPool::new(config).unwrap();
+    let writer = pool.writer().unwrap();
+    seed_legacy_pre_trigger_schema(writer.conn());
+
+    let concept = Uuid::new_v4();
+    insert_concept_entity(writer.conn(), concept, "Single Origin Concept");
+    insert_legacy_introduced_by_edge(writer.conn(), concept, Uuid::new_v4());
+
+    ensure_graph_schema(writer.conn())
+        .expect("a legacy database without duplicates must upgrade cleanly");
+
+    let now = Utc::now().timestamp_micros();
+    let err = writer
+        .conn()
+        .execute(
+            "INSERT INTO graph_edges \
+             (namespace, id, source_id, target_id, relation, weight, created_at, updated_at) \
+             VALUES ('default', ?1, ?2, ?3, 'introduced_by', 1.0, ?4, ?4)",
+            rusqlite::params![
+                Uuid::new_v4().to_string(),
+                concept.to_string(),
+                Uuid::new_v4().to_string(),
+                now,
+            ],
+        )
+        .expect_err("the newly installed trigger must reject a second distinct origin");
+    assert!(
+        matches!(err, rusqlite::Error::SqliteFailure(_, _)),
+        "expected the trigger's RAISE(ABORT) to surface as a SqliteFailure, got: {err:?}"
+    );
+}
+
+/// (c) A fresh create (no pre-existing `graph_edges` table) is unaffected —
+/// the legacy-upgrade probe must not run, let alone reject, a brand-new
+/// database.
+#[test]
+fn ensure_graph_schema_is_unaffected_on_fresh_create() {
+    let config = PoolConfig {
+        path: None,
+        ..PoolConfig::default()
+    };
+    let pool = ConnectionPool::new(config).unwrap();
+    let writer = pool.writer().unwrap();
+    ensure_graph_schema(writer.conn()).expect("a fresh create must not be rejected");
+}
+
+/// (d) Reopening an already-triggered database (the common case — every
+/// call after the first on a given file) reopens cleanly. Once the trigger
+/// exists it also prevents a fresh duplicate from ever being written, so
+/// the negative case in (a) cannot be reconstructed against a triggered
+/// database without disabling the trigger; this asserts the steady-state
+/// behavior the probe must preserve instead.
+#[test]
+fn ensure_graph_schema_reopening_an_already_triggered_database_is_clean() {
+    let config = PoolConfig {
+        path: None,
+        ..PoolConfig::default()
+    };
+    let pool = ConnectionPool::new(config).unwrap();
+    let writer = pool.writer().unwrap();
+    ensure_graph_schema(writer.conn()).expect("first open installs the trigger");
+
+    ensure_graph_schema(writer.conn())
+        .expect("reopening an already-triggered database must reopen cleanly");
 }

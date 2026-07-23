@@ -26,6 +26,17 @@ use crate::writer_task::WriterTaskHandle;
 
 /// Map a rusqlite error to `StorageError` with `Graph` capability.
 fn map_err(e: rusqlite::Error, op: &'static str) -> StorageError {
+    if matches!(
+        &e,
+        rusqlite::Error::SqliteFailure(_, Some(message))
+            if message == "concept already has a different introduced_by origin"
+    ) {
+        return StorageError::Conflict {
+            capability: StorageCapability::Graph,
+            operation: op.into(),
+            message: "concept already has a different introduced_by origin".to_string(),
+        };
+    }
     StorageError::driver(StorageCapability::Graph, op, e)
 }
 
@@ -2355,8 +2366,59 @@ impl GraphStore for SqlGraphStore {
 
 const GRAPH_DDL: &str = include_str!("../../sql/graph-ddl.sql");
 
+/// The single-origin triggers in `GRAPH_DDL` read `entities.kind`, so the
+/// `entities` table must exist with its full column set before this DDL
+/// runs — not just whenever a caller happens to have also called
+/// `entities()`/`entities_for_namespace()` on the same backend.
+///
+/// A database that already has `graph_edges` but not yet the single-origin
+/// insert trigger is a legacy database reaching enforcement for the first
+/// time here rather than through migration 013 — the same moment the
+/// versioned migration preflights pre-existing duplicates, so this path
+/// must run the identical check before the trigger DDL below installs
+/// enforcement it cannot retroactively reconcile.
 pub(crate) fn ensure_graph_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
-    conn.execute_batch(GRAPH_DDL)
+    super::entity::ensure_entities_schema(conn)?;
+    // One IMMEDIATE transaction couples the legacy probe, the duplicate
+    // preflight, and the trigger DDL. Holding the write lock across all
+    // three closes the window where a concurrent pre-trigger writer could
+    // insert duplicate origins after the check passes but before the
+    // triggers start enforcing — enforcement must never install over state
+    // the preflight did not see.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    if is_legacy_graph_edges_upgrade(&tx)? {
+        reject_legacy_duplicate_concept_origins(&tx)?;
+    }
+    tx.execute_batch(GRAPH_DDL)?;
+    tx.commit()
+}
+
+fn is_legacy_graph_edges_upgrade(conn: &rusqlite::Connection) -> Result<bool, rusqlite::Error> {
+    conn.query_row(
+        "SELECT
+            EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'graph_edges'),
+            EXISTS (SELECT 1 FROM sqlite_master
+                    WHERE type = 'trigger'
+                      AND name = 'trg_graph_edges_concept_single_origin_insert')",
+        [],
+        |row| {
+            let has_table: bool = row.get(0)?;
+            let has_trigger: bool = row.get(1)?;
+            Ok(has_table && !has_trigger)
+        },
+    )
+}
+
+fn reject_legacy_duplicate_concept_origins(
+    conn: &rusqlite::Connection,
+) -> Result<(), rusqlite::Error> {
+    let violations = crate::migrations::find_duplicate_concept_origins(conn)?;
+    if violations.is_empty() {
+        return Ok(());
+    }
+    Err(rusqlite::Error::ToSqlConversionFailure(
+        crate::migrations::duplicate_concept_origins_message(&violations).into(),
+    ))
 }
 
 #[cfg(test)]

@@ -26,9 +26,9 @@ use uuid::Uuid;
 use khive_score::DeterministicScore;
 use khive_storage::note::Note;
 use khive_storage::types::{
-    DeleteMode, DirectedNeighborHit, Direction, EdgeSortField, GraphPath, LinkId, NeighborHit,
-    NeighborQuery, Page, PageRequest, SortOrder, SqlRow, SqlStatement, SqlValue, TextFilter,
-    TextQueryMode, TextSearchRequest, TraversalRequest,
+    DeleteMode, DirectedNeighborHit, Direction, EdgeFilter, EdgeSortField, GraphPath, LinkId,
+    NeighborHit, NeighborQuery, Page, PageRequest, SortDirection, SortOrder, SqlRow, SqlStatement,
+    SqlValue, TextFilter, TextQueryMode, TextSearchRequest, TraversalRequest,
 };
 use khive_storage::{Edge, EdgeRelation, Entity, EntityFilter, Event, EventFilter};
 use khive_types::{EdgeEndpointRule, EndpointKind, EventKind, SubstrateKind};
@@ -47,6 +47,37 @@ use crate::atomic_runner::{run_atomic_unit, AtomicOpFailure, AtomicOpPlan, Atomi
 use crate::curation::{entity_fts_document, note_embedding_text, note_fts_document};
 use crate::error::{GuardedWriteFailure, RuntimeError, RuntimeResult};
 use crate::runtime::{KhiveRuntime, NamespaceToken};
+
+#[cfg(test)]
+static INTRODUCED_BY_WRITE_BARRIERS: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<Uuid, std::sync::Arc<tokio::sync::Barrier>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+async fn wait_at_introduced_by_write_barrier(source_id: Uuid) {
+    let barrier = INTRODUCED_BY_WRITE_BARRIERS
+        .lock()
+        .expect("introduced_by barrier lock")
+        .get(&source_id)
+        .cloned();
+    if let Some(barrier) = barrier {
+        if barrier.wait().await.is_leader() {
+            INTRODUCED_BY_WRITE_BARRIERS
+                .lock()
+                .expect("introduced_by barrier lock")
+                .remove(&source_id);
+        }
+    }
+}
+
+fn map_edge_write_error(error: khive_storage::StorageError) -> RuntimeError {
+    match error {
+        khive_storage::StorageError::Conflict { message, .. } => {
+            RuntimeError::InvalidInput(message)
+        }
+        other => RuntimeError::Storage(other),
+    }
+}
 
 // Test-only failure injection for `create_note_inner`. Namespace-targeted so only
 // calls for the armed namespace fire, avoiding cross-test races without `#[serial]`.
@@ -1640,19 +1671,15 @@ impl KhiveRuntime {
     /// - `supersedes` / `supports` / `refutes`: same-substrate only (note→note or entity→entity).
     /// - All other 13 relations: both endpoints MUST be entities.
     ///
-    /// Returns `Ok(())` when valid; otherwise `InvalidInput` or `NotFound` with
-    /// the same messages as the previous inline block (byte-identical behaviour).
-    ///
-    /// `pub(crate)`: the atomic prepare pass (`crate::atomic_prepare`) reuses
-    /// this exact endpoint-type validation during its async prepare step,
-    /// before building a `LinkPlan`, rather than re-deriving the checks.
-    pub(crate) async fn validate_edge_relation_endpoints(
+    /// Returns any non-blocking direction warnings when valid; otherwise returns
+    /// `InvalidInput` or `NotFound`.
+    async fn validate_edge_relation_endpoints_with_warnings(
         &self,
         token: &NamespaceToken,
         source_id: Uuid,
         target_id: Uuid,
         relation: EdgeRelation,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeResult<Vec<String>> {
         if source_id == target_id {
             return Err(RuntimeError::InvalidInput(
                 "self-loop edges are not allowed: source_id and target_id must be different".into(),
@@ -1780,7 +1807,9 @@ impl KhiveRuntime {
                 src_res.as_ref(),
                 tgt_res.as_ref(),
             ) {
-                return Ok(());
+                return self
+                    .validate_introduced_by_direction(token, source_id, target_id, relation)
+                    .await;
             }
 
             // Substrate check: both endpoints must be entities.
@@ -1832,7 +1861,137 @@ impl KhiveRuntime {
                 )));
             }
         }
-        Ok(())
+        self.validate_introduced_by_direction(token, source_id, target_id, relation)
+            .await
+    }
+
+    async fn validate_introduced_by_direction(
+        &self,
+        token: &NamespaceToken,
+        source_id: Uuid,
+        target_id: Uuid,
+        relation: EdgeRelation,
+    ) -> RuntimeResult<Vec<String>> {
+        if relation != EdgeRelation::IntroducedBy {
+            return Ok(Vec::new());
+        }
+        let source = match self.resolve_edge_endpoint(token, source_id).await? {
+            Some(Resolved::Entity(entity)) if entity.kind == "concept" => entity,
+            _ => return Ok(Vec::new()),
+        };
+        let graph = self.graph(token)?;
+        // The single-origin invariant (ADR-039 trigger set) guarantees at most one
+        // distinct target across a concept's introduced_by edges, so a single
+        // existing edge is enough to detect a conflicting origin.
+        let origins = graph
+            .query_edges(
+                EdgeFilter {
+                    source_ids: vec![source_id],
+                    relations: vec![EdgeRelation::IntroducedBy],
+                    ..Default::default()
+                },
+                vec![SortOrder {
+                    field: EdgeSortField::CreatedAt,
+                    direction: SortDirection::Asc,
+                }],
+                PageRequest {
+                    offset: 0,
+                    limit: 1,
+                },
+            )
+            .await?;
+        if let Some(existing) = origins
+            .items
+            .iter()
+            .find(|edge| edge.target_id != target_id)
+        {
+            tracing::warn!(
+                source_id = %source_id,
+                existing_target_id = %existing.target_id,
+                existing_edge_id = %existing.id,
+                requested_target_id = %target_id,
+                "rejected introduced_by link: concept already has a conflicting origin"
+            );
+            return Err(RuntimeError::InvalidInput(format!(
+                "concept {source_id} already has a conflicting introduced_by origin; cannot add a different origin"
+            )));
+        }
+
+        let target = match self.resolve_edge_endpoint(token, target_id).await? {
+            Some(Resolved::Entity(entity)) if entity.kind == "document" => entity,
+            _ => return Ok(Vec::new()),
+        };
+        let earliest_outgoing = self
+            .earliest_edge(
+                token,
+                EdgeFilter {
+                    source_ids: vec![source_id],
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let earliest_incoming = self
+            .earliest_edge(
+                token,
+                EdgeFilter {
+                    target_ids: vec![source_id],
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let earliest_evidence = earliest_outgoing
+            .into_iter()
+            .chain(earliest_incoming)
+            .min_by(|a, b| a.created_at.cmp(&b.created_at));
+        let warnings = earliest_evidence
+            .filter(|edge| target.created_at > edge.created_at.timestamp_micros())
+            .map(|edge| {
+                vec![format!(
+                    "ingestion-order advice: introduced_by target document {target_id} was ingested after existing evidence edge {} attached to source concept {}",
+                    edge.id, source.id
+                )]
+            })
+            .unwrap_or_default();
+        for warning in &warnings {
+            tracing::warn!(source = %source_id, target = %target_id, "{warning}");
+        }
+        Ok(warnings)
+    }
+
+    async fn earliest_edge(
+        &self,
+        token: &NamespaceToken,
+        filter: EdgeFilter,
+    ) -> RuntimeResult<Option<Edge>> {
+        Ok(self
+            .graph(token)?
+            .query_edges(
+                filter,
+                vec![SortOrder {
+                    field: EdgeSortField::CreatedAt,
+                    direction: SortDirection::Asc,
+                }],
+                PageRequest {
+                    offset: 0,
+                    limit: 1,
+                },
+            )
+            .await?
+            .items
+            .into_iter()
+            .next())
+    }
+
+    pub(crate) async fn validate_edge_relation_endpoints(
+        &self,
+        token: &NamespaceToken,
+        source_id: Uuid,
+        target_id: Uuid,
+        relation: EdgeRelation,
+    ) -> RuntimeResult<()> {
+        self.validate_edge_relation_endpoints_with_warnings(token, source_id, target_id, relation)
+            .await
+            .map(|_| ())
     }
 
     /// Public delegator for cross-backend link validation.
@@ -2068,9 +2227,30 @@ impl KhiveRuntime {
         weight: f64,
         metadata: Option<serde_json::Value>,
     ) -> RuntimeResult<Edge> {
+        Ok(self
+            .link_with_warnings(token, source_id, target_id, relation, weight, metadata)
+            .await?
+            .edge)
+    }
+
+    /// Create an edge and return any non-blocking direction warnings.
+    pub async fn link_with_warnings(
+        &self,
+        token: &NamespaceToken,
+        source_id: Uuid,
+        target_id: Uuid,
+        relation: EdgeRelation,
+        weight: f64,
+        metadata: Option<serde_json::Value>,
+    ) -> RuntimeResult<LinkOutcome> {
         validate_edge_weight(weight)?;
-        self.validate_edge_relation_endpoints(token, source_id, target_id, relation)
+        let warnings = self
+            .validate_edge_relation_endpoints_with_warnings(token, source_id, target_id, relation)
             .await?;
+        #[cfg(test)]
+        if relation == EdgeRelation::IntroducedBy {
+            wait_at_introduced_by_write_barrier(source_id).await;
+        }
         let (source_id, target_id) = canonical_edge_endpoints(relation, source_id, target_id);
         let metadata = if relation == EdgeRelation::DependsOn {
             // By-ID, unfiltered — matches the namespace-agnostic endpoint validation
@@ -2114,7 +2294,12 @@ impl KhiveRuntime {
         // fact: a second concurrent write landing between the refusal and a
         // post-hoc read could otherwise misreport which endpoint was actually
         // missing at write time.
-        match self.graph(token)?.upsert_edge_guarded(edge).await? {
+        match self
+            .graph(token)?
+            .upsert_edge_guarded(edge)
+            .await
+            .map_err(map_edge_write_error)?
+        {
             khive_storage::GuardedWriteOutcome::Written => {}
             khive_storage::GuardedWriteOutcome::Refused(missing) => {
                 return Err(RuntimeError::GuardedWriteFailed(GuardedWriteFailure {
@@ -2150,7 +2335,10 @@ impl KhiveRuntime {
                     "upsert_edge succeeded but natural-key lookup for ({source_id}, {target_id}, {relation}) returned nothing"
                 ))
             })?;
-        Ok(persisted)
+        Ok(LinkOutcome {
+            edge: persisted,
+            warnings,
+        })
     }
 
     /// Write an edge with an explicit `target_backend` stamp (ADR-029 D3).
@@ -2188,7 +2376,10 @@ impl KhiveRuntime {
             metadata,
             target_backend,
         };
-        self.graph(token)?.upsert_edge(edge).await?;
+        self.graph(token)?
+            .upsert_edge(edge)
+            .await
+            .map_err(map_edge_write_error)?;
         let persisted = self
             .list_edges(
                 token,
@@ -5134,6 +5325,14 @@ impl KhiveRuntime {
     /// layer. If `spec.namespace` is set it must match `token.namespace()`;
     /// a mismatch returns `RuntimeError::InvalidInput`.
     pub async fn build_edge(&self, token: &NamespaceToken, spec: &LinkSpec) -> RuntimeResult<Edge> {
+        Ok(self.build_edge_with_warnings(token, spec).await?.edge)
+    }
+
+    async fn build_edge_with_warnings(
+        &self,
+        token: &NamespaceToken,
+        spec: &LinkSpec,
+    ) -> RuntimeResult<LinkOutcome> {
         let ns_str = match &spec.namespace {
             Some(s) => {
                 let spec_ns = crate::Namespace::parse(s)
@@ -5147,7 +5346,13 @@ impl KhiveRuntime {
             }
             None => token.namespace().as_str(),
         };
-        self.validate_edge_relation_endpoints(token, spec.source_id, spec.target_id, spec.relation)
+        let warnings = self
+            .validate_edge_relation_endpoints_with_warnings(
+                token,
+                spec.source_id,
+                spec.target_id,
+                spec.relation,
+            )
             .await?;
         let (source_id, target_id) =
             canonical_edge_endpoints(spec.relation, spec.source_id, spec.target_id);
@@ -5170,18 +5375,21 @@ impl KhiveRuntime {
         };
         validate_edge_metadata(spec.relation, metadata.as_ref())?;
         let now = chrono::Utc::now();
-        Ok(Edge {
-            id: LinkId::from(Uuid::new_v4()),
-            namespace: ns_str.to_string(),
-            source_id,
-            target_id,
-            relation: spec.relation,
-            weight: spec.weight,
-            created_at: now,
-            updated_at: now,
-            deleted_at: None,
-            metadata,
-            target_backend: None,
+        Ok(LinkOutcome {
+            edge: Edge {
+                id: LinkId::from(Uuid::new_v4()),
+                namespace: ns_str.to_string(),
+                source_id,
+                target_id,
+                relation: spec.relation,
+                weight: spec.weight,
+                created_at: now,
+                updated_at: now,
+                deleted_at: None,
+                metadata,
+                target_backend: None,
+            },
+            warnings,
         })
     }
 
@@ -5206,12 +5414,43 @@ impl KhiveRuntime {
         token: &NamespaceToken,
         specs: Vec<LinkSpec>,
     ) -> RuntimeResult<Vec<Edge>> {
+        Ok(self.link_many_with_warnings(token, specs).await?.edges)
+    }
+
+    /// Atomically create edges and return non-blocking direction warnings.
+    pub async fn link_many_with_warnings(
+        &self,
+        token: &NamespaceToken,
+        specs: Vec<LinkSpec>,
+    ) -> RuntimeResult<LinkManyOutcome> {
         if specs.is_empty() {
-            return Ok(vec![]);
+            return Ok(LinkManyOutcome {
+                edges: Vec::new(),
+                warnings: Vec::new(),
+            });
         }
         let mut edges = Vec::with_capacity(specs.len());
+        let mut warnings = Vec::new();
+        let mut batch_origins = HashMap::new();
         for spec in &specs {
-            edges.push(self.build_edge(token, spec).await?);
+            let outcome = self.build_edge_with_warnings(token, spec).await?;
+            if outcome.edge.relation == EdgeRelation::IntroducedBy {
+                let source = self.get_entity(token, outcome.edge.source_id).await?;
+                if source.kind == "concept" {
+                    if let Some(existing_target) =
+                        batch_origins.insert(outcome.edge.source_id, outcome.edge.target_id)
+                    {
+                        if existing_target != outcome.edge.target_id {
+                            return Err(RuntimeError::InvalidInput(format!(
+                                "concept {} has conflicting introduced_by origins {existing_target} and {} in the same atomic batch",
+                                outcome.edge.source_id, outcome.edge.target_id
+                            )));
+                        }
+                    }
+                }
+            }
+            warnings.extend(outcome.warnings);
+            edges.push(outcome.edge);
         }
         // `upsert_edges_guarded` re-checks every edge's endpoints as part of the
         // same write, not the separate per-spec `build_edge` validation reads
@@ -5224,7 +5463,8 @@ impl KhiveRuntime {
         let outcome = self
             .graph(token)?
             .upsert_edges_guarded(edges.clone())
-            .await?;
+            .await
+            .map_err(map_edge_write_error)?;
         if let Some(refusal) = outcome.refused {
             return Err(RuntimeError::GuardedWriteFailed(GuardedWriteFailure {
                 entry_index: Some(refusal.entry_index),
@@ -5272,7 +5512,10 @@ impl KhiveRuntime {
                 })?;
             persisted.push(row);
         }
-        Ok(persisted)
+        Ok(LinkManyOutcome {
+            edges: persisted,
+            warnings,
+        })
     }
 
     /// Create a batch of entities atomically.
@@ -5400,6 +5643,24 @@ impl KhiveRuntime {
             ))),
         }
     }
+}
+
+/// A created edge plus non-blocking direction warnings.
+#[derive(Clone, Debug)]
+pub struct LinkOutcome {
+    /// Persisted edge.
+    pub edge: Edge,
+    /// Warnings discovered before the write.
+    pub warnings: Vec<String>,
+}
+
+/// Persisted atomic edge batch plus non-blocking direction warnings.
+#[derive(Clone, Debug)]
+pub struct LinkManyOutcome {
+    /// Persisted edges in request order.
+    pub edges: Vec<Edge>,
+    /// Warnings discovered before the atomic write.
+    pub warnings: Vec<String>,
 }
 
 /// Fully specified edge creation request — input to [`KhiveRuntime::build_edge`]
@@ -14190,6 +14451,216 @@ mod tests {
             "concept->org introduced_by must be allowed by the ADR-002 \
              endpoint amendment; got {result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn link_rejects_second_distinct_origin_for_concept() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let concept = rt
+            .create_entity(&tok, "concept", None, "Method", None, None, vec![])
+            .await
+            .unwrap();
+        let first_origin = rt
+            .create_entity(&tok, "document", None, "Original paper", None, None, vec![])
+            .await
+            .unwrap();
+        let conflicting_origin = rt
+            .create_entity(&tok, "document", None, "Later survey", None, None, vec![])
+            .await
+            .unwrap();
+
+        let first_edge = rt
+            .link(
+                &tok,
+                concept.id,
+                first_origin.id,
+                EdgeRelation::IntroducedBy,
+                1.0,
+                None,
+            )
+            .await
+            .unwrap();
+        let err = rt
+            .link(
+                &tok,
+                concept.id,
+                conflicting_origin.id,
+                EdgeRelation::IntroducedBy,
+                1.0,
+                None,
+            )
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains(&concept.id.to_string()), "{msg}");
+        assert!(
+            !msg.contains(&first_origin.id.to_string()),
+            "error must not disclose the existing origin's identifier to the caller: {msg}"
+        );
+        assert!(
+            !msg.contains(&first_edge.id.to_string()),
+            "error must not disclose the existing edge's own identifier to the caller: {msg}"
+        );
+        assert!(
+            !msg.contains(&conflicting_origin.id.to_string()),
+            "error must not disclose the requested target's identifier to the caller: {msg}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_links_allow_exactly_one_distinct_origin_for_concept() {
+        let rt = Arc::new(rt());
+        let tok = NamespaceToken::local();
+        let concept = rt
+            .create_entity(&tok, "concept", None, "Method", None, None, vec![])
+            .await
+            .unwrap();
+        let origin_a = rt
+            .create_entity(&tok, "document", None, "Paper A", None, None, vec![])
+            .await
+            .unwrap();
+        let origin_b = rt
+            .create_entity(&tok, "document", None, "Paper B", None, None, vec![])
+            .await
+            .unwrap();
+
+        INTRODUCED_BY_WRITE_BARRIERS
+            .lock()
+            .unwrap()
+            .insert(concept.id, Arc::new(tokio::sync::Barrier::new(2)));
+
+        let link = |target_id| {
+            let rt = Arc::clone(&rt);
+            let tok = tok.clone();
+            tokio::spawn(async move {
+                rt.link(
+                    &tok,
+                    concept.id,
+                    target_id,
+                    EdgeRelation::IntroducedBy,
+                    1.0,
+                    None,
+                )
+                .await
+            })
+        };
+        let (result_a, result_b) = tokio::join!(link(origin_a.id), link(origin_b.id));
+        let results = [result_a.unwrap(), result_b.unwrap()];
+
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        let loser = results
+            .into_iter()
+            .find_map(Result::err)
+            .expect("one concurrent link must lose");
+        assert!(
+            matches!(loser, RuntimeError::InvalidInput(_)),
+            "loser must receive a typed invalid-input error, got {loser:?}"
+        );
+
+        let stored = rt
+            .list_edges(
+                &tok,
+                EdgeListFilter {
+                    source_id: Some(concept.id),
+                    relations: vec![EdgeRelation::IntroducedBy],
+                    ..Default::default()
+                },
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 1, "exactly one origin may persist");
+    }
+
+    #[tokio::test]
+    async fn link_many_rejects_two_distinct_origins_for_concept_atomically() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let concept = rt
+            .create_entity(&tok, "concept", None, "Method", None, None, vec![])
+            .await
+            .unwrap();
+        let origin_a = rt
+            .create_entity(&tok, "document", None, "Paper A", None, None, vec![])
+            .await
+            .unwrap();
+        let origin_b = rt
+            .create_entity(&tok, "document", None, "Paper B", None, None, vec![])
+            .await
+            .unwrap();
+        let specs = [origin_a.id, origin_b.id]
+            .into_iter()
+            .map(|target_id| LinkSpec {
+                namespace: None,
+                source_id: concept.id,
+                target_id,
+                relation: EdgeRelation::IntroducedBy,
+                weight: 1.0,
+                metadata: None,
+            })
+            .collect();
+
+        let err = rt.link_many(&tok, specs).await.unwrap_err();
+        assert!(err.to_string().contains(&origin_a.id.to_string()));
+        assert!(err.to_string().contains(&origin_b.id.to_string()));
+        let stored = rt
+            .list_edges(
+                &tok,
+                EdgeListFilter {
+                    source_id: Some(concept.id),
+                    relations: vec![EdgeRelation::IntroducedBy],
+                    ..Default::default()
+                },
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+        assert!(
+            stored.is_empty(),
+            "a rejected atomic batch must write no origins"
+        );
+    }
+
+    #[tokio::test]
+    async fn link_allows_multiple_introduced_by_targets_for_document_authorship() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let document = rt
+            .create_entity(&tok, "document", None, "Paper", None, None, vec![])
+            .await
+            .unwrap();
+        let person = rt
+            .create_entity(&tok, "person", None, "Author", None, None, vec![])
+            .await
+            .unwrap();
+        let org = rt
+            .create_entity(&tok, "org", None, "Publisher", None, None, vec![])
+            .await
+            .unwrap();
+
+        rt.link(
+            &tok,
+            document.id,
+            person.id,
+            EdgeRelation::IntroducedBy,
+            1.0,
+            None,
+        )
+        .await
+        .unwrap();
+        rt.link(
+            &tok,
+            document.id,
+            org.id,
+            EdgeRelation::IntroducedBy,
+            1.0,
+            None,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
