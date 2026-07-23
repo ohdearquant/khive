@@ -9,10 +9,12 @@ module doc-comment carries only a concise summary and points here.
 ## Module-level detection algorithm
 
 Allowlist (false-positive suppression) — **all of the following are prose-context exemptions,
-not unconditional passes: a credential trigger word in the surrounding window always dominates.**
-A UUID or a sha-prefixed content hash sitting directly beside "api_key"/"secret"/"auth" is exactly
-as ambiguous as any other high-entropy candidate and falls through to explicit detection instead
-of being silently allowed.
+not unconditional passes: a credential trigger word in the surrounding window dominates, with
+exactly two narrow trigger-context exceptions (file paths and VCS revisions, defined below),
+both of which run only after the reconstruction checks and only outside credential-value syntax
+per the clause-label guard.** A UUID or a sha-prefixed content hash sitting directly beside
+"api_key"/"secret"/"auth" is exactly as ambiguous as any other high-entropy candidate and falls
+through to explicit detection instead of being silently allowed.
 
 - Pure hex strings (sha256, git SHA) — passed when not near a trigger.
 - UUID canonical form (`xxxxxxxx-xxxx-…`) — passed when not near a trigger.
@@ -48,12 +50,92 @@ of being silently allowed.
   word: an attacker who controls where a credential's separators fall can always choose run
   lengths whose entropy reads no higher than an ordinary short English path segment, since the
   measure only sees a character-frequency histogram, never word semantics. So near a trigger word,
-  a structured-identifier-shaped token gets no exemption at all and falls through to the entropy
-  heuristic like any other token. This is an accepted false-positive tradeoff on a small number of
+  THIS exemption does not apply: a structured-identifier-shaped token falls through to the entropy
+  heuristic like any other token, and only the separate, narrower file-path exemption below (which
+  requires path shape, runs after every reconstruction check, and is refused in credential-value
+  syntax) can still admit it. This is an accepted false-positive tradeoff on a small number of
   genuine paths/doc-slugs that happen to sit near a trigger word AND read above the entropy
-  threshold on their own — see `accepted_false_positive_adr_draft_path_near_trigger` and its
-  siblings for the specific repro cases this blocks, and the call site in
-  `check_entropy_heuristic`.
+  threshold on their own without qualifying for the narrow path exemption — see
+  `accepted_false_positive_adr_draft_path_near_trigger` and its siblings for the specific repro
+  cases this blocks, and the call site in `check_entropy_heuristic`. A path that qualifies for the
+  narrow exemption can still block when a trigger word sits attributively ahead of a value
+  delimiter ("see the docs for auth setup: <path>") — the clause walk cannot distinguish an
+  attributive trigger from a label head without reopening labeled-value bypasses; pinned as
+  `accepted_false_positive_docs_path_behind_attributive_trigger_and_delimiter`.
+
+- File paths (trigger-context, narrow): a path-shaped token (two or more `/` segments; optional
+  angle-bracket wrapping; optional `:line`/`:line-range` suffix) is exempted near a trigger word
+  ONLY after the per-run entropy/hex-length checks, normalized-hex reconstruction, and
+  multi-fragment bridge reconstruction have all run against it — a path-shaped anchor must not be
+  able to skip a chain that reconstructs a blocked credential — AND only when the token is not in
+  credential-value syntax (see the clause-label guard below).
+- VCS revisions (trigger-context, narrow): a 40-hex value attached to an explicit VCS coordinate
+  marker (`commit`, `revision`, `rev`, `sha` — immediately preceding word, or `marker:value` in
+  one token) is treated as a public VCS coordinate near a trigger word, again only outside
+  credential-value syntax. The exemption is a *flag over the hex-credential-shape checks only*,
+  never an early skip of the whole check sequence. For the bare-marker form (`commit <hex>`) the
+  exempt hex value is a plain alphanumeric token, so it still participates in fragment
+  reconstruction anchored at neighboring tokens: a split credential hiding one fragment behind
+  the marker is accumulated and blocked from the other fragments' anchors. That symmetric-anchor
+  compensation is **guaranteed only for that topology**: the inline `marker:value` form is a
+  colon-bearing token that neighboring bridge anchors reject (fragments must be
+  alphanumeric-only), and a chain probing across a bare marker word terminates at the marker. A
+  split credential whose fragments are reachable only through an inline-marker token or across a
+  marker word is therefore a bounded-fragment residual (see the reconstruction bounds above), not
+  a covered topology — unless a credential label is in clause range, in which case the clause
+  guard below disables the exemption and the shape checks fire directly. The bare marker word
+  itself (form `commit <hex>`) is skipped entirely — a fixed English marker word is not
+  attacker-controlled credential material. Generic `hash`/`sha256` prose does not rescue a token.
+
+Both narrow exemptions above are gated by a **clause-label guard** (`has_clause_credential_label`):
+the exemption is refused when the candidate carries an inline credential shape
+(`api_key=<value>`) or when a credential label is reachable by walking backwards through the
+current clause. The walk steps over connector words that commonly sit between a label and its
+value (`is`, `was`, `value`, articles, the VCS marker words themselves so a marker cannot
+shield an earlier label, and prepositions/determiners/possessives — the glue of noun-compound
+qualifiers), version fragments (`v1.2` splits into version-shaped identifiers), and long hex
+fragments (a separator-split payload piece is value material, not a label word), up to a
+bounded number of identifiers. Crossing a value delimiter (`:` or `=`, including one attached
+to a VCS marker: `deploy sha: <hex>` is assignment syntax like any other) additionally lets the
+walk step over CONTENT words outside those sets — "label with qualifiers: value" (`api key for
+production deploy: <value>`, `api key for shared encrypted deploy: <value>`) names the value
+regardless of how many qualifier nouns the label carries. Content words after a delimiter are
+bounded only by the overall walk limit, the sentence boundary, and the past-participle stop; a
+per-clause content-word cap was tried and removed, since any cap re-admits the labeled-value
+bypass one natural qualifier past the cap. For the same reason, EXHAUSTING the walk limit after
+crossing a delimiter fails CLOSED: the clause is assignment-shaped and its head was never
+scanned, so it is treated as credential-labeled — clause length cannot launder a labeled value
+into the exemptions (`api key for the new shared encrypted regional staging deploy: <value>`
+blocks even though the trigger sits past the walk budget). A past-participle content word ends
+the walk:
+verb-phrase prose narrates an action on the value rather than labeling it (`the auth scanner
+flagged this file: <path>`, `one extra token was introduced by sha: <hex>` stay exempt). The
+walk stops at a sentence/paragraph boundary (`;`, `!`, `?`, blank line; `.` only when not
+immediately followed by an alphanumeric character, so a dotted version qualifier does not read
+as a sentence end). The past-participle stop is position-sensitive: it applies only in verb
+position — the participle followed (in reading order) by a glue word or the value itself
+("flagged this file:", "introduced by sha:", "key updated: <v>"). Followed by a content noun it
+is a participial ADJECTIVE inside a label qualifier ("shared deploy:", "encrypted backup:") and
+walks like any other qualifier noun. Coordinating conjunctions (`and`, `or`) are transparent to
+this classification: in "shared and encrypted staging deploy: <value>" the coordination as a
+whole is followed by a content noun, so both participles read as adjectives and walk. A participle BEFORE the trigger word never matters — the
+walk reaches the trigger first ("generated api key: <v>" blocks). A single-identifier lookback
+is deliberately NOT the contract: `api key value is commit <hex>` is a labeled credential
+wearing a marker, and one connector word must not hide the label. A label on the far side of a
+sentence boundary is prose context (the `near_trigger` window models that), not this value's
+label. Known residuals, accepted under the threat model: a non-connector qualifier without any
+delimiter (`api key pour commit <hex>`) and a participle in verb position directly after the
+trigger (`api key updated: commit <hex>` reads as changelog prose; without the VCS marker the
+raw hex still blocks under the near-trigger rule — note the ordering: `updated api
+key: <hex>` blocks, since the walk meets the trigger first). Accepted false positives,
+conservative direction: the walk has no grammar — ANY trigger word reachable inside the
+pre-delimiter clause (absent a sentence boundary or verb-position participle) is treated as a
+credential label, whether it is attributive (`see the docs for auth setup: <path>`, `secret
+scanner archive notes: <path>`, `writing up the secret gate false positive repro: <path>`) or
+a topical object (`results from testing auth against parser: <path>`); distinguishing these
+from a label head would reopen the labeled-value bypasses. Likewise a delimiter-bearing clause
+that exhausts the walk limit blocks regardless of whether a trigger was reached (exhaustion
+fails closed).
 
 Trigger-word matching only fires on genuine mentions, not substring collisions: trigger words
 (`key`, `secret`, `password`, `passwd`, `credential`, `bearer`, `auth`, `apikey`) are matched at a
