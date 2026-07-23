@@ -67,6 +67,7 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
     #[cfg(feature = "channel-telegram")]
     spawn_telegram_channel_loops_if_daemon(&server, &args);
     spawn_schedule_tick_loop_if_daemon(&args, &server, schedule_rt);
+    start_daemon_components_if_daemon(&args, &server);
 
     #[cfg(unix)]
     if args.daemon {
@@ -265,6 +266,18 @@ fn spawn_email_channel_loops_if_daemon(server: &KhiveMcpServer, args: &Args) {
 /// throwaway server built from `schedule_rt` alone would misroute replayed
 /// actions in a multi-backend deployment. See
 /// `crates/khive-mcp/docs/api/pending-events.md`.
+/// Start ADR-119 daemon components in daemon role only. Non-daemon roles
+/// must not start components and stay byte-identical in behavior and output
+/// — the silent return keeps client runs unchanged. In daemon role the
+/// registry itself always logs the enumerated roster (names + count),
+/// including an empty one.
+fn start_daemon_components_if_daemon(args: &Args, server: &KhiveMcpServer) {
+    if !args.daemon {
+        return;
+    }
+    crate::components::start_daemon_components(server);
+}
+
 fn spawn_schedule_tick_loop_if_daemon(
     args: &Args,
     server: &KhiveMcpServer,
@@ -1506,6 +1519,7 @@ pub async fn serve_server(
     #[cfg(feature = "channel-telegram")]
     spawn_telegram_channel_loops_if_daemon(&server, args);
     spawn_schedule_tick_loop_if_daemon(args, &server, schedule_rt);
+    start_daemon_components_if_daemon(args, &server);
 
     #[cfg(unix)]
     if args.daemon {
