@@ -868,7 +868,7 @@ impl VamanaIndex {
     /// staging/fsync sequence.
     #[cfg(feature = "mmap")]
     pub fn save_atomic(&self, path: &Path) -> Result<()> {
-        self.save_atomic_with_lock_hooks(path, || {}, || {})
+        self.save_atomic_with_lock_hooks(path, || {}, || {}, || {})
     }
 
     #[cfg(feature = "mmap")]
@@ -876,6 +876,7 @@ impl VamanaIndex {
         &self,
         path: &Path,
         before_lock: impl FnOnce(),
+        on_contended: impl FnOnce(),
         after_lock: impl FnOnce(),
     ) -> Result<()> {
         fs::create_dir_all(path)?;
@@ -886,7 +887,18 @@ impl VamanaIndex {
             .write(true)
             .open(path.join(".checkpoint.lock"))?;
         before_lock();
-        publication_lock.lock()?;
+        // A non-blocking probe first: `try_lock` reports `WouldBlock` only when the OS
+        // observes an incompatible lock held on this file at the instant of the call, so
+        // firing `on_contended` here is proof of genuine contention, never a guess based
+        // on elapsed time. The fallback `lock()` call blocks exactly as it always did.
+        match publication_lock.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                on_contended();
+                publication_lock.lock()?;
+            }
+            Err(std::fs::TryLockError::Error(err)) => return Err(err.into()),
+        }
         after_lock();
         reject_checkpoint_sequence_regression(path, self.last_applied_seq)?;
 
@@ -5301,6 +5313,7 @@ mod tests {
             newer.save_atomic_with_lock_hooks(
                 &newer_path,
                 || {},
+                || {},
                 || {
                     locked_tx.send(()).unwrap();
                     release_rx.recv().unwrap();
@@ -5309,29 +5322,29 @@ mod tests {
         });
         locked_rx.recv().unwrap();
 
-        // `about_to_lock` fires from `before_lock`, the seam immediately preceding the
-        // blocking `publication_lock.lock()` call — not merely "the thread started" (which
-        // would leave open the possibility that the stale writer was simply descheduled
-        // until after `newer` had already released the lock and completed, making the
-        // timeout assert below pass vacuously). Rendezvousing here proves the stale writer
-        // has reached the lock attempt itself while `newer` still holds it, so the 100ms
-        // timeout genuinely observes the stale writer blocked on contention.
+        // `newer` now holds the OS-level lock on `.checkpoint.lock` and cannot release it
+        // until `release_tx.send(())` below unblocks its `after_lock` hook. `stale`'s
+        // `on_contended` hook fires only when its own `try_lock()` call observes
+        // `TryLockError::WouldBlock` on that same file — an outcome the OS reports if and
+        // only if an incompatible lock is held at that exact instant. So `contended_rx.recv()`
+        // returning is proof by construction that the stale writer's lock attempt overlapped
+        // the newer writer's lock hold: there is no interleaving in which this channel fires
+        // without genuine contention having occurred, and no interleaving in which `newer`
+        // can race ahead and release the lock first, since it is parked on `release_rx`
+        // until this thread proceeds.
         let stale_path = dir.path().to_path_buf();
-        let (about_to_lock_tx, about_to_lock_rx) = std::sync::mpsc::sync_channel(0);
+        let (contended_tx, contended_rx) = std::sync::mpsc::sync_channel(0);
         let (result_tx, result_rx) = std::sync::mpsc::sync_channel(0);
         let stale_handle = std::thread::spawn(move || {
             let result = stale.save_atomic_with_lock_hooks(
                 &stale_path,
-                || about_to_lock_tx.send(()).unwrap(),
+                || {},
+                || contended_tx.send(()).unwrap(),
                 || {},
             );
             result_tx.send(result).unwrap();
         });
-        about_to_lock_rx.recv().unwrap();
-        assert!(matches!(
-            result_rx.recv_timeout(std::time::Duration::from_millis(100)),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-        ));
+        contended_rx.recv().unwrap();
 
         release_tx.send(()).unwrap();
         newer_handle.join().unwrap().unwrap();
