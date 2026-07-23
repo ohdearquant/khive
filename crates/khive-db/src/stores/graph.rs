@@ -2278,7 +2278,12 @@ impl GraphStore for SqlGraphStore {
 
 const GRAPH_DDL: &str = include_str!("../../sql/graph-ddl.sql");
 
+/// The single-origin triggers in `GRAPH_DDL` read `entities.kind`, so the
+/// `entities` table must exist with its full column set before this DDL
+/// runs — not just whenever a caller happens to have also called
+/// `entities()`/`entities_for_namespace()` on the same backend.
 pub(crate) fn ensure_graph_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
+    super::entity::ensure_entities_schema(conn)?;
     conn.execute_batch(GRAPH_DDL)
 }
 

@@ -1811,6 +1811,9 @@ impl KhiveRuntime {
             _ => return Ok(Vec::new()),
         };
         let graph = self.graph(token)?;
+        // The single-origin invariant (ADR-039 trigger set) guarantees at most one
+        // distinct target across a concept's introduced_by edges, so a single
+        // existing edge is enough to detect a conflicting origin.
         let origins = graph
             .query_edges(
                 EdgeFilter {
@@ -1824,7 +1827,7 @@ impl KhiveRuntime {
                 }],
                 PageRequest {
                     offset: 0,
-                    limit: u32::MAX,
+                    limit: 1,
                 },
             )
             .await?;
@@ -1833,9 +1836,15 @@ impl KhiveRuntime {
             .iter()
             .find(|edge| edge.target_id != target_id)
         {
+            tracing::warn!(
+                source_id = %source_id,
+                existing_target_id = %existing.target_id,
+                existing_edge_id = %existing.id,
+                requested_target_id = %target_id,
+                "rejected introduced_by link: concept already has a conflicting origin"
+            );
             return Err(RuntimeError::InvalidInput(format!(
-                "concept {source_id} already has introduced_by origin {} via edge {}; cannot add different origin {target_id}",
-                existing.target_id, existing.id
+                "concept {source_id} already has a conflicting introduced_by origin; cannot add a different origin"
             )));
         }
 
@@ -14341,8 +14350,14 @@ mod tests {
             .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains(&concept.id.to_string()), "{msg}");
-        assert!(msg.contains(&first_origin.id.to_string()), "{msg}");
-        assert!(msg.contains(&conflicting_origin.id.to_string()), "{msg}");
+        assert!(
+            !msg.contains(&first_origin.id.to_string()),
+            "error must not disclose the existing origin's identifier to the caller: {msg}"
+        );
+        assert!(
+            !msg.contains(&conflicting_origin.id.to_string()),
+            "error must not disclose edge identifiers to the caller: {msg}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
