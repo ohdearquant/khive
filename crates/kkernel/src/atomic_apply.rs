@@ -473,15 +473,15 @@ async fn build_op_result(
         // unsafe to branch on at prepare time makes it unsafe to render
         // from too. This mirrors the `link` arm below exactly (same
         // reasoning, same `list_edges` mechanism).
-        ("update", AtomicOpPlan::Update(p)) if p.edge_natural_key.is_some() => {
-            let key = p.edge_natural_key.as_ref().expect("checked by guard above");
+        ("update", AtomicOpPlan::Update(p)) if p.edge_natural_key().is_some() => {
+            let key = p.edge_natural_key().expect("checked by guard above");
             let edges = runtime
                 .list_edges(
                     token,
                     EdgeListFilter {
-                        source_id: Some(key.canon_source_id),
-                        target_id: Some(key.canon_target_id),
-                        relations: vec![key.relation],
+                        source_id: Some(key.canon_source_id()),
+                        target_id: Some(key.canon_target_id()),
+                        relations: vec![key.relation()],
                         ..Default::default()
                     },
                     1,
@@ -492,15 +492,15 @@ async fn build_op_result(
                 anyhow::anyhow!(
                     "atomic update result: committed symmetric edge not found by natural key \
                      ({}, {}, {})",
-                    key.canon_source_id,
-                    key.canon_target_id,
-                    key.relation
+                    key.canon_source_id(),
+                    key.canon_target_id(),
+                    key.relation()
                 )
             })?;
             Ok(serde_json::to_value(&edge)?)
         }
         ("update", AtomicOpPlan::Update(p)) => match runtime
-            .resolve_by_id(token, p.target_id)
+            .resolve_by_id(token, p.target_id())
             .await?
         {
             Some(Resolved::Entity(entity)) => {
@@ -521,17 +521,20 @@ async fn build_op_result(
             // `updated_at` already serialize as RFC3339 via its own
             // `Serialize` impl).
             None => {
-                let edge = runtime.get_edge(token, p.target_id).await?.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "atomic update result: target {} not found post-commit",
-                        p.target_id
-                    )
-                })?;
+                let edge = runtime
+                    .get_edge(token, p.target_id())
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "atomic update result: target {} not found post-commit",
+                            p.target_id()
+                        )
+                    })?;
                 Ok(serde_json::to_value(&edge)?)
             }
             _ => anyhow::bail!(
                 "atomic update result: target {} not found post-commit",
-                p.target_id
+                p.target_id()
             ),
         },
         // Canonical shape: `{"deleted": deleted, "id": p.id, "kind": p.kind}`
@@ -570,8 +573,8 @@ async fn build_op_result(
                 .list_edges(
                     token,
                     EdgeListFilter {
-                        source_id: Some(p.source_id),
-                        target_id: Some(p.target_id),
+                        source_id: Some(p.source_id()),
+                        target_id: Some(p.target_id()),
                         relations: vec![relation],
                         ..Default::default()
                     },

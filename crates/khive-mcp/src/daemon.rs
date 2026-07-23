@@ -381,9 +381,14 @@ impl daemon::DaemonDispatch for crate::server::KhiveMcpServer {
         // context, built by `handle_conn` from the frame — threaded straight
         // through so this call serves under the CALLER's namespace/actor
         // rather than this server's own construction-baked identity.
-        self.dispatch_request_inner(params, from_wire, identity)
-            .await
-            .map_err(|e| e.message.to_string())
+        self.dispatch_request_inner(
+            params,
+            from_wire,
+            identity,
+            crate::server::DispatchOrigin::Daemon,
+        )
+        .await
+        .map_err(|e| e.message.to_string())
     }
 
     async fn warm_all(&self) {
