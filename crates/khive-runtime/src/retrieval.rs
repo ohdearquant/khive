@@ -498,6 +498,60 @@ impl KhiveRuntime {
         tags_any: &[String],
         properties_filter: Option<&serde_json::Value>,
     ) -> RuntimeResult<Vec<SearchHit>> {
+        self.hybrid_search_inner(
+            token,
+            query_text,
+            query_vector,
+            limit,
+            entity_kind,
+            entity_type,
+            tags_any,
+            properties_filter,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn hybrid_search_with_vector_similarity_floor(
+        &self,
+        token: &NamespaceToken,
+        query_text: &str,
+        query_vector: Option<Vec<f32>>,
+        limit: u32,
+        entity_kind: Option<&str>,
+        entity_type: Option<&str>,
+        tags_any: &[String],
+        properties_filter: Option<&serde_json::Value>,
+        vector_similarity_floor: f64,
+    ) -> RuntimeResult<Vec<SearchHit>> {
+        self.hybrid_search_inner(
+            token,
+            query_text,
+            query_vector,
+            limit,
+            entity_kind,
+            entity_type,
+            tags_any,
+            properties_filter,
+            Some(DeterministicScore::from_f64(vector_similarity_floor)),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn hybrid_search_inner(
+        &self,
+        token: &NamespaceToken,
+        query_text: &str,
+        query_vector: Option<Vec<f32>>,
+        limit: u32,
+        entity_kind: Option<&str>,
+        entity_type: Option<&str>,
+        tags_any: &[String],
+        properties_filter: Option<&serde_json::Value>,
+        vector_similarity_floor: Option<DeterministicScore>,
+    ) -> RuntimeResult<Vec<SearchHit>> {
         let candidates = limit.saturating_mul(CANDIDATE_MULTIPLIER).max(limit);
 
         let visible_ns: Vec<String> = token
@@ -531,7 +585,7 @@ impl KhiveRuntime {
             query_text,
         )?;
 
-        let vector_hits = if query_vector.is_some() || self.config().embedding_model.is_some() {
+        let mut vector_hits = if query_vector.is_some() || self.config().embedding_model.is_some() {
             self.vector_search(
                 token,
                 query_vector,
@@ -543,6 +597,9 @@ impl KhiveRuntime {
         } else {
             Vec::new()
         };
+        if let Some(floor) = vector_similarity_floor {
+            vector_hits.retain(|hit| hit.score >= floor);
+        }
 
         // Keep the full candidate pool (untruncated) through the alive/kind/tag/property
         // filter below, so matching hits ranked below `limit` in the raw fusion aren't
