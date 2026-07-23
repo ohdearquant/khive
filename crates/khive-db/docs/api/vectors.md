@@ -51,6 +51,14 @@ transaction or savepoint and its rollback semantics, so this can run equally
 inside a plain `Connection`, an `unchecked_transaction()`, or a named
 `SAVEPOINT`.
 
+Before deleting, the helper compares the stored row's complete ANN log
+identity (`namespace`, `embedding_model`, `kind`, and `field`) with the
+incoming identity. When they differ, it copies the stored row's identity into
+`ann_write_log` as a `delete`, then deletes the vector and records the incoming
+row as an `upsert`. All three writes share the caller's transaction/savepoint,
+so they commit or roll back together. A same-identity replacement emits only
+the incoming `upsert`; it does not create redundant delete/upsert churn.
+
 `failpoint_flag`, when `Some` in a `cfg(test)` build, is checked between the
 DELETE and the INSERT so tests can force an error at that exact point and
 assert the caller's rollback restores the prior row (no-worse-than-stale
