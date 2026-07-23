@@ -952,7 +952,12 @@ pub(crate) fn canonical_path_no_side_effects(path: &std::path::Path) -> anyhow::
     // install with several undeclared directory levels). Walk up to the
     // deepest ancestor that does exist, canonicalize only that (resolving any
     // symlinked directory component along the way), then rejoin the missing
-    // tail lexically — never creating anything on disk.
+    // tail lexically — never creating anything on disk. `Path::file_name`
+    // returns `None` for a `..` component, so the walk records the real last
+    // component instead; `.`/`..` in the missing tail are collapsed lexically
+    // below, which is sound only because a nonexistent component cannot be a
+    // symlink (`missing/../x` and `x` name the same file once `missing` is
+    // created as a real directory).
     let mut tail: Vec<std::ffi::OsString> = Vec::new();
     let mut probe = absolute.as_path();
     let existing_ancestor = loop {
@@ -961,8 +966,9 @@ pub(crate) fn canonical_path_no_side_effects(path: &std::path::Path) -> anyhow::
         };
         tail.push(
             probe
-                .file_name()
-                .map(|n| n.to_os_string())
+                .components()
+                .next_back()
+                .map(|c| c.as_os_str().to_os_string())
                 .unwrap_or_default(),
         );
         if parent.exists() {
@@ -982,7 +988,16 @@ pub(crate) fn canonical_path_no_side_effects(path: &std::path::Path) -> anyhow::
     Ok(tail
         .into_iter()
         .rev()
-        .fold(canonical_ancestor, |acc, component| acc.join(component)))
+        .fold(canonical_ancestor, |mut acc, component| {
+            if component == *".." {
+                acc.pop();
+                acc
+            } else if component.is_empty() || component == *"." {
+                acc
+            } else {
+                acc.join(component)
+            }
+        }))
 }
 
 /// Build a fully-wired multi-backend `KhiveMcpServer` (ADR-028).
@@ -3355,6 +3370,36 @@ region = "us-east-1"
             "a symlinked ancestor directory two levels above a not-yet-created file \
              must canonicalize to the same target as the real directory: {resolved_via_symlink:?} \
              vs {resolved_via_real:?}"
+        );
+    }
+
+    /// A `..` inside the not-yet-created tail used to be dropped (recorded as
+    /// an empty component), so `missing/../main.db` resolved under `missing/`
+    /// instead of collapsing back to the base directory — falsely conflicting
+    /// with a plain `main.db` override naming the same file. The missing tail
+    /// must collapse `.`/`..` lexically, which is safe precisely because a
+    /// nonexistent component cannot be a symlink.
+    #[test]
+    #[serial]
+    fn canonical_path_no_side_effects_collapses_parent_refs_in_missing_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let via_parent_ref = dir.path().join("missing").join("..").join("main.db");
+        let direct = dir.path().join("main.db");
+        assert!(!dir.path().join("missing").exists());
+
+        let resolved_via_parent_ref = canonical_path_no_side_effects(&via_parent_ref).unwrap();
+        let resolved_direct = canonical_path_no_side_effects(&direct).unwrap();
+
+        assert_eq!(
+            resolved_via_parent_ref, resolved_direct,
+            "a parent-directory reference through a not-yet-created directory must \
+             collapse to the same canonical path as the direct spelling"
+        );
+        assert!(
+            !resolved_via_parent_ref
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir)),
+            "the canonical form must not retain `..` components: {resolved_via_parent_ref:?}"
         );
     }
 

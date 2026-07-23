@@ -2742,7 +2742,11 @@ backend = "sessions"
             namespace_explicit: true,
             actor_explicit: false,
             no_embed: true,
-            packs: None,
+            // Pin the pack list rather than inheriting `KHIVE_PACKS` from the
+            // ambient environment (#1276) — an ambient list naming packs not
+            // compiled into this build would fail resolution before the
+            // behavior under test.
+            packs: Some(vec!["kg".to_string()]),
             brain_profile: None,
         })
         .expect("resolve exec-shaped config without override");
@@ -2773,7 +2777,11 @@ backend = "sessions"
             namespace_explicit: true,
             actor_explicit: false,
             no_embed: true,
-            packs: None,
+            // Pin the pack list rather than inheriting `KHIVE_PACKS` from the
+            // ambient environment (#1276) — an ambient list naming packs not
+            // compiled into this build would fail resolution before the
+            // behavior under test.
+            packs: Some(vec!["kg".to_string()]),
             brain_profile: None,
         })
         .expect("resolve exec-shaped config");
