@@ -3980,7 +3980,12 @@ mod tests {
             true,
         ));
 
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        // Poll for the first emitted event instead of a fixed sleep (same
+        // slowdown-flake class as the stale-sweep test above).
+        let emitted = wait_for(Duration::from_secs(10), || {
+            !store.events.lock().unwrap().is_empty()
+        })
+        .await;
         shutdown_tx.send(()).expect("send shutdown signal");
         tokio::time::timeout(Duration::from_secs(1), handle)
             .await
@@ -3989,8 +3994,9 @@ mod tests {
 
         let events = store.events.lock().unwrap();
         assert!(
-            !events.is_empty(),
-            "an always-elevated config must append at least one CheckpointOutcomeRecorded event"
+            emitted,
+            "an always-elevated config must append at least one CheckpointOutcomeRecorded event \
+             within the poll deadline"
         );
         assert!(
             events
@@ -4027,7 +4033,12 @@ mod tests {
             false,
         ));
 
-        tokio::time::sleep(Duration::from_millis(40)).await;
+        // Poll for the first emitted event instead of a fixed sleep (same
+        // slowdown-flake class as the stale-sweep test above).
+        let emitted = wait_for(Duration::from_secs(10), || {
+            !store.events.lock().unwrap().is_empty()
+        })
+        .await;
         shutdown_tx.send(()).expect("send shutdown signal");
         tokio::time::timeout(Duration::from_secs(1), handle)
             .await
@@ -4035,8 +4046,9 @@ mod tests {
             .expect("checkpoint task panicked");
 
         assert!(
-            !store.events.lock().unwrap().is_empty(),
-            "a designated secondary lifecycle owner must append outcome events"
+            emitted,
+            "a designated secondary lifecycle owner must append outcome events within the poll \
+             deadline"
         );
     }
 
@@ -4149,7 +4161,22 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
         let handle = tokio::spawn(run_checkpoint_task(pool, cfg, None, shutdown_rx, true));
 
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        // Poll for the sweep instead of a fixed sleep: a fixed wall-clock
+        // budget assumes the spawned task completes its tick (registry scan
+        // + walpin sidecar heartbeat) within that window, which widens and
+        // flakes under slowdown (coverage instrumentation, contended CI
+        // runners) — see `wait_for`'s doc comment for the same reasoning
+        // applied to the sibling walpin tests.
+        let swept = wait_for(Duration::from_secs(10), || {
+            buffer.lock().unwrap().iter().any(|e| {
+                e.tx_label.as_deref() == Some("checkpoint_task_healthy_wal_sweep_test")
+                    && e.message
+                        .as_deref()
+                        .is_some_and(|m| m.contains("stale-op cap"))
+            })
+        })
+        .await;
+
         shutdown_tx.send(()).expect("send shutdown signal");
         tokio::time::timeout(Duration::from_secs(1), handle)
             .await
@@ -4160,14 +4187,9 @@ mod tests {
 
         let events = buffer.lock().unwrap();
         assert!(
-            events.iter().any(|e| {
-                e.tx_label.as_deref() == Some("checkpoint_task_healthy_wal_sweep_test")
-                    && e.message
-                        .as_deref()
-                        .is_some_and(|m| m.contains("stale-op cap"))
-            }),
+            swept,
             "expected the spawned task to sweep and escalate the stale registry entry \
-             to Stale on its own, got: {events:?}"
+             to Stale on its own within the poll deadline, got: {events:?}"
         );
     }
 

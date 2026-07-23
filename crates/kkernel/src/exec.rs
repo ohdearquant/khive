@@ -1308,6 +1308,15 @@ default = true
         // exec-shaped inputs: `config: None` (kkernel exec has no `--config`
         // flag today), `namespace_explicit: true` (the choice made in `run_exec`
         // above).
+        // Pin the pack list explicitly rather than inheriting `KHIVE_PACKS`
+        // from the ambient environment (same rationale as `isolated_server`
+        // above, #1276): `RuntimeConfig::default()` reads `KHIVE_PACKS` fresh
+        // on every call, so leaving this `None` makes the assertion below
+        // depend on two independent env reads observing the same ambient
+        // value — a real flake source when a concurrently-running test
+        // mutates process env between them (#1356).
+        let pinned_packs = Some(vec!["kg".to_string()]);
+
         let exec_cfg = resolve_runtime_config(RuntimeConfigInputs {
             db: Some(&db_str),
             config: None,
@@ -1315,7 +1324,7 @@ default = true
             namespace_explicit: true,
             actor_explicit: false,
             no_embed: false,
-            packs: None,
+            packs: pinned_packs.clone(),
             brain_profile: None,
         })
         .expect("resolve exec-shaped config");
@@ -1331,7 +1340,7 @@ default = true
             namespace_explicit: false,
             actor_explicit: false,
             no_embed: false,
-            packs: None,
+            packs: pinned_packs,
             brain_profile: None,
         })
         .expect("resolve serve-shaped config");
@@ -1384,6 +1393,9 @@ default = true
         let missing_config =
             std::path::PathBuf::from("/nonexistent/khive-exec-parity-test/config.toml");
         let ns = Namespace::parse("lambda:custom-ns").expect("ns");
+        // Pin packs so the `compute_config_id` comparison below never depends
+        // on two independent `KHIVE_PACKS` env reads agreeing (#1356).
+        let pinned_packs = Some(vec!["kg".to_string()]);
 
         let with_explicit_true = resolve_runtime_config(RuntimeConfigInputs {
             db: Some(":memory:"),
@@ -1392,7 +1404,7 @@ default = true
             namespace_explicit: true,
             actor_explicit: false,
             no_embed: false,
-            packs: None,
+            packs: pinned_packs.clone(),
             brain_profile: None,
         })
         .expect("resolve with namespace_explicit=true");
@@ -1404,7 +1416,7 @@ default = true
             namespace_explicit: false,
             actor_explicit: false,
             no_embed: false,
-            packs: None,
+            packs: pinned_packs,
             brain_profile: None,
         })
         .expect("resolve with namespace_explicit=false");
@@ -1491,6 +1503,10 @@ default = true
             ..KhiveConfig::default()
         };
 
+        // Pin packs so the config_id comparisons below never depend on two
+        // independent `KHIVE_PACKS` env reads agreeing (#1356).
+        let pinned_packs = Some(vec!["kg".to_string()]);
+
         // exec-shaped inputs (namespace_explicit: true — the choice `run_exec` makes).
         let exec_cfg = resolve_runtime_config(RuntimeConfigInputs {
             db: Some(":memory:"),
@@ -1499,7 +1515,7 @@ default = true
             namespace_explicit: true,
             actor_explicit: false,
             no_embed: false,
-            packs: None,
+            packs: pinned_packs.clone(),
             brain_profile: None,
         })
         .expect("resolve exec-shaped config");
@@ -1512,7 +1528,7 @@ default = true
             namespace_explicit: false,
             actor_explicit: false,
             no_embed: false,
-            packs: None,
+            packs: pinned_packs,
             brain_profile: None,
         })
         .expect("resolve serve-shaped config");
