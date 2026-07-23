@@ -41,18 +41,20 @@ pub use atomic_plan::{
 };
 pub use atomic_runner::{
     run_atomic_unit, AtomicOpFailure, AtomicOpPlan, AtomicRunOutcome, AtomicRunnerError,
+    CommittedPostCommitEffects,
 };
 pub use blob::resolve_blob_store;
 pub use cost_unit::{base_resource_payload, cost_unit_for_dispatch, resource_payload};
 pub use curation::{
-    entity_fts_document, note_fts_document, ContentMergeStrategy, EdgeListFilter, EdgePatch,
-    EntityDedupMergePolicy, EntityPatch, MergeSummary, NotePatch,
+    entity_embedding_text, entity_fts_document, entity_merge_guard_error, note_embedding_text,
+    note_fts_document, validate_entity_merge_floor, ContentMergeStrategy, EdgeListFilter,
+    EdgePatch, EntityDedupMergePolicy, EntityMergeGuard, EntityPatch, MergeSummary, NotePatch,
 };
 #[cfg(unix)]
 pub use daemon::{acquire_recovery_lock, pid_path, run_daemon, socket_path, DaemonDispatch};
 pub use daemon::{
-    active_phase_names, background_task_count, register_active_phase, track_background_task,
-    DaemonRequestFrame, DaemonResponseFrame, PhaseGuard, PROTOCOL_VERSION,
+    active_phase_names, background_task_count, daemon_shutdown_token, register_active_phase,
+    track_background_task, DaemonRequestFrame, DaemonResponseFrame, PhaseGuard, PROTOCOL_VERSION,
 };
 pub use embedder_registry::{EmbedderProvider, EmbedderRegistry, LatticeEmbedderProvider};
 pub use engine_config::{
@@ -63,8 +65,8 @@ pub use error::{fts_text_leg_or_err, GuardedWriteFailure, RuntimeError, RuntimeR
 pub use fusion::FusionStrategy;
 pub use graph_traversal::PathNode;
 pub use khive_db::{
-    checkpoint_once, run_checkpoint_task, run_migrations, CheckpointConfig, CheckpointTick,
-    ConnectionPool, StorageBackend,
+    checkpoint_once, run_checkpoint_task, run_migrations, CheckpointConfig,
+    CheckpointLifecycleOwner, CheckpointTick, ConnectionPool, StorageBackend,
 };
 pub use khive_gate::{
     ActorRef, AllowAllGate, AuditDecision, AuditEvent, Gate, GateContext, GateDecision, GateError,
@@ -80,8 +82,8 @@ pub use objectives::{
 };
 #[cfg(any(test, feature = "fault-injection"))]
 pub use operations::{
-    arm_fts_fail, arm_fts_fail_many, arm_fts_fail_many_partial, arm_rollback_cleanup_fail,
-    arm_vector_fail, arm_vector_fail_after,
+    arm_fts_fail_many_partial_scoped, arm_fts_fail_many_scoped, arm_fts_fail_scoped,
+    arm_rollback_cleanup_fail, arm_vector_fail_after, arm_vector_fail_scoped, FaultInjectionArm,
 };
 pub use operations::{
     base_entity_endpoint_rules, base_entity_rule_allows, endpoint_matches,

@@ -7,6 +7,15 @@
 // surface stabilises post-retrieval-refactor, group by substrate (entity,
 // note, edge, search) into submodules under an `operations/` directory.
 //! High-level operations composing storage capabilities into user-facing verbs.
+//!
+//! # Fault-injection arm migration
+//!
+//! Namespace-targeted fault injection uses scoped guards. The former
+//! `arm_fts_fail`, `arm_fts_fail_many`, `arm_fts_fail_many_partial`, and
+//! `arm_vector_fail` names were removed in favor of their `_scoped` variants so
+//! stale statement-form calls fail to compile. Statement-form arming cannot be
+//! preserved because dropping the returned guard at the semicolon disarms an
+//! unconsumed injection.
 
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -17,22 +26,25 @@ use uuid::Uuid;
 use khive_score::DeterministicScore;
 use khive_storage::note::Note;
 use khive_storage::types::{
-    BatchWriteSummary, DeleteMode, DirectedNeighborHit, Direction, EdgeSortField, GraphPath,
-    LinkId, NeighborHit, NeighborQuery, Page, PageRequest, SortOrder, SqlRow, SqlStatement,
-    SqlValue, TextFilter, TextQueryMode, TextSearchRequest, TraversalRequest,
+    DeleteMode, DirectedNeighborHit, Direction, EdgeSortField, GraphPath, LinkId, NeighborHit,
+    NeighborQuery, Page, PageRequest, SortOrder, SqlRow, SqlStatement, SqlValue, TextFilter,
+    TextQueryMode, TextSearchRequest, TraversalRequest,
 };
 use khive_storage::{Edge, EdgeRelation, Entity, EntityFilter, Event, EventFilter};
 use khive_types::{EdgeEndpointRule, EndpointKind, EventKind, SubstrateKind};
 
-use khive_db::stores::entity::entity_hard_delete_statement;
+use khive_db::stores::entity::{entity_hard_delete_statement, entity_upsert_statement};
 use khive_db::stores::graph::{edge_hard_delete_statement, purge_incident_edges_statement};
 use khive_db::stores::note::note_hard_delete_statement;
+use khive_db::stores::text::insert_document_statement;
 use khive_db::SqliteError;
 use rusqlite::OptionalExtension;
 
-use crate::atomic_plan::{AffectedRowGuard, DeletePlan, PlanStatement, PostCommitEffect};
+use crate::atomic_plan::{
+    AddEntityPlan, AffectedRowGuard, DeletePlan, PlanStatement, PostCommitEffect,
+};
 use crate::atomic_runner::{run_atomic_unit, AtomicOpFailure, AtomicOpPlan, AtomicRunOutcome};
-use crate::curation::{entity_fts_document, note_fts_document};
+use crate::curation::{entity_fts_document, note_embedding_text, note_fts_document};
 use crate::error::{GuardedWriteFailure, RuntimeError, RuntimeResult};
 use crate::runtime::{KhiveRuntime, NamespaceToken};
 
@@ -62,7 +74,7 @@ std::thread_local! {
 
 /// Arm the count-targetable vector-INSERT fault: let `n` inserts succeed, then fail
 /// the next one (entity or note, single- or multi-model). Set `n = 0` to fail
-/// immediately on the first insert. Thread-local, so unlike `arm_vector_fail`
+/// immediately on the first insert. Thread-local, so unlike `arm_vector_fail_scoped`
 /// it cannot be won or disarmed by a concurrently-running test on another
 /// thread — prefer this one whenever the caller cannot guarantee it is the
 /// only test writing into the namespace it cares about.
@@ -72,9 +84,9 @@ pub fn arm_vector_fail_after(n: usize) {
     VECTOR_FAIL_AFTER.with(|cell| cell.set(Some(n)));
 }
 
-// Namespace-keyed one-shot set, not a single `Option<String>` slot:
+// Namespace-keyed one-shot arms, not a single `Option<String>` slot:
 // `create_note_inner` and `create_entity_inner` share this flag, and a
-// single-slot design let a concurrently running test's `arm_fts_fail(other_ns)`
+// single-slot design let a concurrently running test's `arm_fts_fail_scoped(other_ns)`
 // overwrite this test's armed namespace before its own create call consumed
 // it, so the intended injection silently never fired (#1095). Keying by
 // namespace fixes that at the root — arming `ns_B` inserts `ns_B` without
@@ -84,24 +96,80 @@ pub fn arm_vector_fail_after(n: usize) {
 // check-and-remove under the mutex lock keeps exactly-once semantics even
 // under concurrent same-namespace creates.
 #[cfg(any(test, feature = "fault-injection"))]
-static FTS_FAIL_NS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+type FaultArmSet = std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<()>>>;
+#[cfg(any(test, feature = "fault-injection"))]
+const MAX_FAULT_ARMS: usize = 64;
+#[cfg(any(test, feature = "fault-injection"))]
+static FTS_FAIL_NS: std::sync::LazyLock<FaultArmSet> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 // Vector insertion failures use the same namespace-keyed one-shot semantics.
 #[cfg(any(test, feature = "fault-injection"))]
-static VECTOR_FAIL_NS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+static VECTOR_FAIL_NS: std::sync::LazyLock<FaultArmSet> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 /// FTS failure injection for `create_many` — separate from `FTS_FAIL_NS` so that
-/// create_note_inner and create_many tests cannot disarm each other.
+/// create_note_inner and create_many tests cannot disarm each other. Namespace-keyed
+/// set (not a single `Option<String>` slot) for the same reason as `VECTOR_FAIL_NS` (#1263).
 #[cfg(any(test, feature = "fault-injection"))]
-static FTS_FAIL_MANY_NS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+static FTS_FAIL_MANY_NS: std::sync::LazyLock<FaultArmSet> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 /// FTS partial-failure injection for `create_many` — returns `Ok(BatchWriteSummary)`
 /// with `failed > 0` so that the `summary.failed > 0` rollback branch is exercised.
-/// Distinct from `FTS_FAIL_MANY_NS` which injects a hard `Err`.
+/// Distinct from `FTS_FAIL_MANY_NS` which injects a hard `Err`. Namespace-keyed set
+/// for the same reason as `VECTOR_FAIL_NS` (#1263).
 #[cfg(any(test, feature = "fault-injection"))]
-static FTS_FAIL_MANY_PARTIAL_NS: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashSet<String>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+static FTS_FAIL_MANY_PARTIAL_NS: std::sync::LazyLock<FaultArmSet> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Scoped ownership of a process-wide fault-injection arm.
+#[cfg(any(test, feature = "fault-injection"))]
+#[must_use = "the fault injection is disarmed when this guard is dropped"]
+pub struct FaultInjectionArm {
+    namespace: String,
+    token: std::sync::Arc<()>,
+    arms: &'static FaultArmSet,
+}
+
+#[cfg(any(test, feature = "fault-injection"))]
+impl Drop for FaultInjectionArm {
+    fn drop(&mut self) {
+        let mut arms = self.arms.lock().unwrap();
+        if arms
+            .get(&self.namespace)
+            .is_some_and(|token| std::sync::Arc::ptr_eq(token, &self.token))
+        {
+            arms.remove(&self.namespace);
+        }
+    }
+}
+
+#[cfg(any(test, feature = "fault-injection"))]
+fn arm_fault(arms: &'static FaultArmSet, namespace: &str, max_arms: usize) -> FaultInjectionArm {
+    let token = std::sync::Arc::new(());
+    let refusal = {
+        let mut active = arms.lock().unwrap();
+        if active.contains_key(namespace) {
+            Some("the namespace is already armed")
+        } else if active.len() >= max_arms {
+            Some("the arm set is at capacity")
+        } else {
+            active.insert(namespace.to_string(), std::sync::Arc::clone(&token));
+            None
+        }
+    };
+    if let Some(reason) = refusal {
+        panic!("cannot arm fault injection for namespace `{namespace}`: {reason}");
+    }
+    FaultInjectionArm {
+        namespace: namespace.to_string(),
+        token,
+        arms,
+    }
+}
+
+#[cfg(any(test, feature = "fault-injection"))]
+fn consume_fault(arms: &FaultArmSet, namespace: &str) -> bool {
+    arms.lock().unwrap().remove(namespace).is_some()
+}
 /// Non-parser FTS *search*-leg failure injection for `search_notes`: distinct
 /// from `FTS_FAIL_NS` (which injects at the FTS *upsert*/write step of
 /// `create_note_inner`). Injects a `StorageError::Timeout` at the `search()`
@@ -120,38 +188,39 @@ static FTS_SEARCH_FAIL_NS: std::sync::Mutex<Option<String>> = std::sync::Mutex::
 /// independent: it may be set from one OS thread and consumed by a `create_note`/
 /// `create_entity` call running on another (e.g. inside `tokio::spawn`). Concurrent
 /// arms of distinct namespaces do not interfere with each other.
+/// Keep the returned guard alive until the triggering call completes; dropping it
+/// disarms an unconsumed injection.
 /// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
 #[cfg(any(test, feature = "fault-injection"))]
-pub fn arm_fts_fail(ns: &str) {
-    FTS_FAIL_NS.lock().unwrap().insert(ns.to_string());
+pub fn arm_fts_fail_scoped(ns: &str) -> FaultInjectionArm {
+    arm_fault(&FTS_FAIL_NS, ns, MAX_FAULT_ARMS)
 }
 
 /// Arm the FTS failure injection for `create_many` targeting namespace `ns`.
 ///
 /// The next `create_many` call whose namespace equals `ns` returns an injected
-/// error at the FTS upsert step (after entity rows are committed), then disarms.
+/// error at the first FTS statement inside the atomic batch, then disarms.
 /// Calls on other namespaces are unaffected, and concurrent arms of distinct
 /// namespaces do not overwrite each other.
+/// Keep the returned guard alive until the triggering call completes; dropping it
+/// disarms an unconsumed injection.
 /// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
 #[cfg(any(test, feature = "fault-injection"))]
-pub fn arm_fts_fail_many(ns: &str) {
-    FTS_FAIL_MANY_NS.lock().unwrap().insert(ns.to_string());
+pub fn arm_fts_fail_many_scoped(ns: &str) -> FaultInjectionArm {
+    arm_fault(&FTS_FAIL_MANY_NS, ns, MAX_FAULT_ARMS)
 }
 
-/// Arm the FTS *partial*-failure injection for `create_many` targeting namespace `ns`.
+/// Arm a mid-batch FTS failure for `create_many` targeting namespace `ns`.
 ///
-/// The next `create_many` call whose namespace equals `ns` returns
-/// `Ok(BatchWriteSummary { attempted: 2, affected: 1, failed: 1, ... })` from the
-/// FTS upsert step, exercising the `summary.failed > 0` rollback branch (as opposed
-/// to the hard-`Err` branch exercised by `arm_fts_fail_many`). Then disarms only
-/// that namespace's entry.
+/// The next matching call fails the second FTS statement when the batch contains at
+/// least two entities, after one entity/FTS pair has executed in the transaction.
+/// A one-entity batch fails its first FTS statement. Then disarms only that namespace.
+/// Keep the returned guard alive until the triggering call completes; dropping it
+/// disarms an unconsumed injection.
 /// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
 #[cfg(any(test, feature = "fault-injection"))]
-pub fn arm_fts_fail_many_partial(ns: &str) {
-    FTS_FAIL_MANY_PARTIAL_NS
-        .lock()
-        .unwrap()
-        .insert(ns.to_string());
+pub fn arm_fts_fail_many_partial_scoped(ns: &str) -> FaultInjectionArm {
+    arm_fault(&FTS_FAIL_MANY_PARTIAL_NS, ns, MAX_FAULT_ARMS)
 }
 
 /// Arm a non-parser FTS *search*-leg failure injection for `search_notes` targeting
@@ -174,10 +243,12 @@ pub fn arm_fts_search_fail(ns: &str) {
 /// error at the first vector insert step, then disarms.  Calls on other namespaces
 /// are unaffected, and concurrent arms of distinct namespaces do not overwrite
 /// each other.
+/// Keep the returned guard alive until the triggering call completes; dropping it
+/// disarms an unconsumed injection.
 /// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
 #[cfg(any(test, feature = "fault-injection"))]
-pub fn arm_vector_fail(ns: &str) {
-    VECTOR_FAIL_NS.lock().unwrap().insert(ns.to_string());
+pub fn arm_vector_fail_scoped(ns: &str) -> FaultInjectionArm {
+    arm_fault(&VECTOR_FAIL_NS, ns, MAX_FAULT_ARMS)
 }
 
 /// Failure injection for `delete_note_row_first_for_compensation`'s post-row-removal
@@ -960,6 +1031,47 @@ fn recompute_total_weight(path: &mut GraphPath) {
     path.total_weight = path.nodes.iter().map(|n| n.weight).fold(0.0_f64, f64::max);
 }
 
+/// Await every spawned multi-model embed task in `join_set`, returning one
+/// vector per model (in model order) on full success.
+///
+/// `join_set` entries are `(model_index, embed_result)` — the index lets
+/// completion order (which is arrival order, not spawn order) be reassembled
+/// into the caller's model order. On the first failure (an embed error or a
+/// task panic), every remaining handle is aborted and detached so the error
+/// return is not gated on a sibling reaching a cancellation point. A sibling
+/// already inside synchronous native inference may finish that call in the
+/// background. Embed calls are counted when issued, before the provider
+/// await, so detached completion cannot change the operation's usage count.
+/// Each task owns cloned runtime/provider state and only computes an embedding;
+/// storage writes remain in the parent after this drain succeeds.
+async fn drain_embed_join_set(
+    mut join_set: tokio::task::JoinSet<(usize, RuntimeResult<Vec<f32>>)>,
+    model_count: usize,
+) -> RuntimeResult<Vec<Vec<f32>>> {
+    let mut vectors: Vec<Option<Vec<f32>>> = (0..model_count).map(|_| None).collect();
+
+    while let Some(joined) = join_set.join_next().await {
+        match joined {
+            Ok((idx, Ok(vector))) => vectors[idx] = Some(vector),
+            Ok((_idx, Err(e))) => {
+                join_set.abort_all();
+                return Err(e);
+            }
+            Err(join_err) => {
+                join_set.abort_all();
+                return Err(RuntimeError::Internal(format!(
+                    "embed task panicked: {join_err}"
+                )));
+            }
+        }
+    }
+
+    Ok(vectors
+        .into_iter()
+        .map(|v| v.expect("every model index observed exactly once by join_set drain"))
+        .collect())
+}
+
 impl KhiveRuntime {
     // ---- Entity operations ----
 
@@ -1007,7 +1119,7 @@ impl KhiveRuntime {
         // FTS step — compensate entity row on failure (mirrors create_note_inner).
         {
             #[cfg(any(test, feature = "fault-injection"))]
-            let fts_inject = FTS_FAIL_NS.lock().unwrap().remove(ns);
+            let fts_inject = consume_fault(&FTS_FAIL_NS, ns);
             #[cfg(not(any(test, feature = "fault-injection")))]
             let fts_inject = false;
             let fts_result: RuntimeResult<()> = if fts_inject {
@@ -1050,7 +1162,7 @@ impl KhiveRuntime {
                 .await;
 
             #[cfg(any(test, feature = "fault-injection"))]
-            let vec_inject = VECTOR_FAIL_NS.lock().unwrap().remove(ns);
+            let vec_inject = consume_fault(&VECTOR_FAIL_NS, ns);
             #[cfg(not(any(test, feature = "fault-injection")))]
             let vec_inject = false;
             let vec_result: RuntimeResult<Vec<f32>> = if vec_inject {
@@ -1104,84 +1216,48 @@ impl KhiveRuntime {
             let rt_clone = self.clone();
             let body_owned = embed_body.clone();
             let usage_ctx = crate::usage::current();
-            let mut handles = Vec::with_capacity(embed_model_names.len());
-            for model_name in &embed_model_names {
+            let mut join_set = tokio::task::JoinSet::new();
+            for (idx, model_name) in embed_model_names.iter().enumerate() {
                 let rt = rt_clone.clone();
                 let text = body_owned.clone();
                 let name = model_name.clone();
                 let ctx = usage_ctx.clone();
-                handles.push(tokio::spawn(async move {
+                join_set.spawn(async move {
                     let fut = rt.embed_document_with_model(&name, &text);
-                    match ctx {
+                    let result = match ctx {
                         Some(ctx) => crate::usage::scope(ctx, fut).await,
                         None => fut.await,
-                    }
-                }));
+                    };
+                    (idx, result)
+                });
             }
-            // Await every handle before inspecting any result. Each handle holds a
-            // clone of the dispatch's UsageContext (ADR-103 Amendment 2); returning
-            // early on the first error would leave later handles un-awaited, so
-            // their embed tasks keep running (and incrementing embed_calls) after
-            // this function has already returned — the usage snapshot must never
-            // observe a task the dispatch didn't wait for.
-            let mut join_results = Vec::with_capacity(handles.len());
-            for handle in handles {
-                join_results.push(
-                    handle
-                        .await
-                        .map_err(|e| RuntimeError::Internal(format!("embed task panicked: {e}"))),
-                );
-            }
-            let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(embed_model_names.len());
-            for join_result in join_results {
-                match join_result {
-                    Err(e) => {
-                        if let Ok(store) = self.entities(token) {
-                            if let Err(ce) = store.delete_entity(entity.id, DeleteMode::Hard).await
-                            {
-                                tracing::error!(
-                                    error = %ce,
-                                    id = %entity.id,
-                                    "create_entity: failed to roll back entity row after embed task panic"
-                                );
-                            }
+            // The first failed or panicked handle aborts and detaches its
+            // siblings. Embed usage is counted at dispatch, so a synchronous
+            // provider winding down in the background cannot change it.
+            let vectors = match drain_embed_join_set(join_set, embed_model_names.len()).await {
+                Ok(vectors) => vectors,
+                Err(e) => {
+                    if let Ok(store) = self.entities(token) {
+                        if let Err(ce) = store.delete_entity(entity.id, DeleteMode::Hard).await {
+                            tracing::error!(
+                                error = %ce,
+                                id = %entity.id,
+                                "create_entity: failed to roll back entity row after embed failure"
+                            );
                         }
-                        if let Ok(fts) = self.text(token) {
-                            if let Err(ce) = fts.delete_document(ns, entity.id).await {
-                                tracing::error!(
-                                    error = %ce,
-                                    id = %entity.id,
-                                    "create_entity: failed to roll back FTS document after embed task panic"
-                                );
-                            }
-                        }
-                        return Err(e);
                     }
-                    Ok(Err(e)) => {
-                        if let Ok(store) = self.entities(token) {
-                            if let Err(ce) = store.delete_entity(entity.id, DeleteMode::Hard).await
-                            {
-                                tracing::error!(
-                                    error = %ce,
-                                    id = %entity.id,
-                                    "create_entity: failed to roll back entity row after embed failure"
-                                );
-                            }
+                    if let Ok(fts) = self.text(token) {
+                        if let Err(ce) = fts.delete_document(ns, entity.id).await {
+                            tracing::error!(
+                                error = %ce,
+                                id = %entity.id,
+                                "create_entity: failed to roll back FTS document after embed failure"
+                            );
                         }
-                        if let Ok(fts) = self.text(token) {
-                            if let Err(ce) = fts.delete_document(ns, entity.id).await {
-                                tracing::error!(
-                                    error = %ce,
-                                    id = %entity.id,
-                                    "create_entity: failed to roll back FTS document after embed failure"
-                                );
-                            }
-                        }
-                        return Err(e);
                     }
-                    Ok(Ok(vec)) => vectors.push(vec),
+                    return Err(e);
                 }
-            }
+            };
             // TODO(P2): parallelize vector inserts
             let mut inserted_models: Vec<String> = Vec::with_capacity(embed_model_names.len());
             for (model_name, vector) in embed_model_names.iter().zip(vectors) {
@@ -2835,7 +2911,7 @@ impl KhiveRuntime {
         let embed_model_names = self.registered_embedding_model_names();
         for model_name in &embed_model_names {
             match self
-                .embed_document_with_model(model_name, &note.content)
+                .embed_document_with_model(model_name, &note_embedding_text(&note))
                 .await
             {
                 Ok(vector) => {
@@ -2992,13 +3068,13 @@ impl KhiveRuntime {
 
         // FTS step — compensate note row on failure.
         {
-            // Injection: check FTS_FAIL_NS (armed by `arm_fts_fail(ns)`).
+            // Injection: check FTS_FAIL_NS (armed by `arm_fts_fail_scoped(ns)`).
             // Fires only when `ns` is in the armed set, removing it on the way
             // out (one-shot, atomic check-and-remove under the mutex). No lock
             // acquisition in release builds — the cfg(not) branch is a const
             // false so the compiler eliminates the if-branch entirely.
             #[cfg(any(test, feature = "fault-injection"))]
-            let fts_inject = FTS_FAIL_NS.lock().unwrap().remove(ns);
+            let fts_inject = consume_fault(&FTS_FAIL_NS, ns);
             #[cfg(not(any(test, feature = "fault-injection")))]
             let fts_inject = false;
             let fts_result: RuntimeResult<()> = if fts_inject {
@@ -3031,14 +3107,15 @@ impl KhiveRuntime {
         // capped override when present, otherwise the full stored content.
         // FTS indexing above always used the full `note.content` — this cap
         // affects only the vector-embedding input.
-        let embed_text: &str = embedding_content.unwrap_or(content);
+        let canonical_embed_text = note_embedding_text(&note);
+        let embed_text: &str = embedding_content.unwrap_or(&canonical_embed_text);
 
         if embed_model_names.len() == 1 {
             // Single-model path: preserves original sequential behaviour.
             let model_name = &embed_model_names[0];
             let vec_result = self.embed_document_with_model(model_name, embed_text).await;
 
-            // Injection: check VECTOR_FAIL_NS (armed by `arm_vector_fail(ns)`) or
+            // Injection: check VECTOR_FAIL_NS (armed by `arm_vector_fail_scoped(ns)`) or
             // VECTOR_FAIL_AFTER (armed by `arm_vector_fail_after(n)`). The former
             // fires only when the armed namespace matches this note's namespace;
             // callers that cannot guarantee no concurrently-running test also
@@ -3049,7 +3126,7 @@ impl KhiveRuntime {
             // the cfg(not) branch is a const false eliminating the if-branch.
             #[cfg(any(test, feature = "fault-injection"))]
             let vec_inject = {
-                let ns_inject = VECTOR_FAIL_NS.lock().unwrap().remove(ns);
+                let ns_inject = consume_fault(&VECTOR_FAIL_NS, ns);
                 let count_inject = VECTOR_FAIL_AFTER.with(|cell| match cell.get() {
                     Some(0) => {
                         cell.set(None);
@@ -3105,60 +3182,37 @@ impl KhiveRuntime {
             let rt_clone = self.clone();
             let content_owned = embed_text.to_string();
             let usage_ctx = crate::usage::current();
-            let mut handles = Vec::with_capacity(embed_model_names.len());
-            for model_name in &embed_model_names {
+            let mut join_set = tokio::task::JoinSet::new();
+            for (idx, model_name) in embed_model_names.iter().enumerate() {
                 let rt = rt_clone.clone();
                 let text = content_owned.clone();
                 let name = model_name.clone();
                 let ctx = usage_ctx.clone();
-                handles.push(tokio::spawn(async move {
+                join_set.spawn(async move {
                     let fut = rt.embed_document_with_model(&name, &text);
-                    match ctx {
+                    let result = match ctx {
                         Some(ctx) => crate::usage::scope(ctx, fut).await,
                         None => fut.await,
-                    }
-                }));
+                    };
+                    (idx, result)
+                });
             }
-            // Await every handle before inspecting any result. Each handle holds a
-            // clone of the dispatch's UsageContext (ADR-103 Amendment 2); returning
-            // early on the first error would leave later handles un-awaited, so
-            // their embed tasks keep running (and incrementing embed_calls) after
-            // this function has already returned — the usage snapshot must never
-            // observe a task the dispatch didn't wait for.
-            let mut join_results = Vec::with_capacity(handles.len());
-            for handle in handles {
-                join_results.push(
-                    handle
-                        .await
-                        .map_err(|e| RuntimeError::Internal(format!("embed task panicked: {e}"))),
-                );
-            }
-            let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(embed_model_names.len());
-            for join_result in join_results {
-                match join_result {
-                    Err(e) => {
-                        // Compensate note row + FTS (no vectors inserted yet).
-                        if let Ok(store) = self.notes(token) {
-                            let _ = store.delete_note(note.id, DeleteMode::Hard).await;
-                        }
-                        if let Ok(fts) = self.text_for_notes(token) {
-                            let _ = fts.delete_document(ns, note.id).await;
-                        }
-                        return Err(e);
+            // The first failed or panicked handle aborts and detaches its
+            // siblings. Embed usage is counted at dispatch, so a synchronous
+            // provider winding down in the background cannot change it.
+            let vectors = match drain_embed_join_set(join_set, embed_model_names.len()).await {
+                Ok(vectors) => vectors,
+                Err(e) => {
+                    // Compensate note row + FTS (no vectors inserted yet).
+                    if let Ok(store) = self.notes(token) {
+                        let _ = store.delete_note(note.id, DeleteMode::Hard).await;
                     }
-                    Ok(Err(e)) => {
-                        // Embed call failed — compensate note row + FTS.
-                        if let Ok(store) = self.notes(token) {
-                            let _ = store.delete_note(note.id, DeleteMode::Hard).await;
-                        }
-                        if let Ok(fts) = self.text_for_notes(token) {
-                            let _ = fts.delete_document(ns, note.id).await;
-                        }
-                        return Err(e);
+                    if let Ok(fts) = self.text_for_notes(token) {
+                        let _ = fts.delete_document(ns, note.id).await;
                     }
-                    Ok(Ok(vec)) => vectors.push(vec),
+                    return Err(e);
                 }
-            }
+            };
             // TODO(P2): parallelize vector inserts
             let mut inserted_models: Vec<String> = Vec::with_capacity(embed_model_names.len());
             for (model_name, vector) in embed_model_names.iter().zip(vectors) {
@@ -3334,23 +3388,21 @@ impl KhiveRuntime {
         Ok(page.items)
     }
 
-    /// Count notes matching `kind`, summed across the caller's visible
-    /// namespaces. The store-layer `count_notes` is namespace-pinned by
-    /// design (no `NamespaceFilter`-style `IN (...)` support); this sums the
-    /// per-namespace store calls, mirroring [`Self::count_edges_by_relation`]
-    /// and the multi-namespace path in [`Self::list_notes`] so `stats().notes`
-    /// reconciles with a full `list` keyset walk under the same token.
+    /// Count notes matching `kind` across the caller's visible namespaces.
     pub async fn count_notes(
         &self,
         token: &NamespaceToken,
         kind: Option<&str>,
     ) -> RuntimeResult<u64> {
-        let mut total = 0u64;
-        for ns in token.visible_namespaces() {
-            let temp = NamespaceToken::for_namespace(ns.clone());
-            total += self.notes(&temp)?.count_notes(ns.as_str(), kind).await?;
-        }
-        Ok(total)
+        let namespaces: Vec<String> = token
+            .visible_namespaces()
+            .iter()
+            .map(|namespace| namespace.as_str().to_owned())
+            .collect();
+        Ok(self
+            .notes(token)?
+            .count_notes_in_namespaces(&namespaces, kind)
+            .await?)
     }
 
     /// Search notes using a hybrid FTS5 + vector pipeline with salience weighting.
@@ -3437,7 +3489,11 @@ impl KhiveRuntime {
                 .await
         };
 
-        crate::usage::count(crate::usage::UsageUnit::FtsPasses, 1);
+        // FtsPasses is counted inside the store's `search()` (khive-db
+        // stores/text.rs), only once a real FTS5 statement is prepared —
+        // an empty/fully-sanitized query short-circuits there before any
+        // statement exists and must not count (nor does the injected-failure
+        // branch above, which never reaches the store at all).
         let text_hits = crate::error::fts_text_leg_or_err(
             text_search_result.map_err(RuntimeError::from),
             "search_notes",
@@ -4456,6 +4512,33 @@ impl KhiveRuntime {
             .await?)
     }
 
+    /// Fetch an edge by natural key (namespace, canonical source/target, relation)
+    /// including soft-deleted rows. Unlike [`Self::list_edges`]/[`Self::list_edges_after`],
+    /// which always filter `deleted_at IS NULL`, this can render a tombstoned symmetric-edge
+    /// survivor (ADR-039 DO NOTHING conflict absorption) — used by the atomic-apply
+    /// post-commit result renderer, which otherwise reports "not found" for a committed
+    /// update whose surviving row happens to be soft-deleted.
+    ///
+    /// `token` selects the store instance; `namespace` is the natural key's own
+    /// namespace and is bound into the query explicitly. These can legitimately differ:
+    /// the record namespace is fixed at prepare time (`EdgeNaturalKey::namespace`) and by-ID
+    /// edge updates are namespace-agnostic (ADR-007 Rev 6), so the caller's ambient `token`
+    /// namespace is never a safe substitute for the record's own — the prior implicit
+    /// `self.namespace` scoping is exactly the bug this parameter closes (khive#1213/#1214).
+    pub async fn get_edge_by_natural_key_including_deleted(
+        &self,
+        token: &NamespaceToken,
+        namespace: &str,
+        source_id: Uuid,
+        target_id: Uuid,
+        relation: EdgeRelation,
+    ) -> RuntimeResult<Option<Edge>> {
+        Ok(self
+            .graph(token)?
+            .get_edge_by_natural_key_including_deleted(namespace, source_id, target_id, relation)
+            .await?)
+    }
+
     /// Maximum rows returned by a single [`Self::list_edges`] /
     /// [`Self::list_edges_after`] page. A lower bound the docs promise callers
     /// can rely on; kept as a named constant so tests can exercise pagination
@@ -4594,14 +4677,38 @@ impl KhiveRuntime {
         &self,
         token: &NamespaceToken,
     ) -> RuntimeResult<std::collections::HashMap<String, u64>> {
-        let mut totals: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
-        for ns in token.visible_namespaces() {
-            let temp = NamespaceToken::for_namespace(ns.clone());
-            for (relation, count) in self.graph(&temp)?.count_edges_by_relation().await? {
-                *totals.entry(relation.to_string()).or_insert(0) += count;
+        let namespaces: Vec<String> = token
+            .visible_namespaces()
+            .iter()
+            .map(|namespace| namespace.as_str().to_owned())
+            .collect();
+        let graph = self.graph(token)?;
+        let counts = match graph
+            .count_edges_by_relation_in_namespaces(&namespaces)
+            .await
+        {
+            Ok(counts) => counts,
+            Err(khive_storage::StorageError::Unsupported { operation, .. })
+                if operation == "count_edges_by_relation_in_namespaces" =>
+            {
+                let mut totals = HashMap::new();
+                for namespace in token.visible_namespaces() {
+                    let scoped = NamespaceToken::for_namespace(namespace.clone());
+                    for (relation, count) in self.graph(&scoped)?.count_edges_by_relation().await? {
+                        *totals.entry(relation).or_insert(0) += count;
+                    }
+                }
+                return Ok(totals
+                    .into_iter()
+                    .map(|(relation, count)| (relation.to_string(), count))
+                    .collect());
             }
-        }
-        Ok(totals)
+            Err(error) => return Err(error.into()),
+        };
+        Ok(counts
+            .into_iter()
+            .map(|(relation, count)| (relation.to_string(), count))
+            .collect())
     }
 
     /// DML-only body of the symmetric-relation conflict-resolution path in
@@ -4611,14 +4718,14 @@ impl KhiveRuntime {
     /// boundary — this function issues DML only, no `BEGIN`/`COMMIT`/`ROLLBACK`.
     ///
     /// Returns `Ok(Some(existing_id))` when a canonical conflict was absorbed (the
-    /// requested edge was deleted, the existing canonical row refreshed), or
-    /// `Ok(None)` when the requested edge was updated in place.
+    /// requested edge was deleted, the existing canonical row left untouched per
+    /// ADR-039 DO NOTHING), or `Ok(None)` when the requested edge was updated in
+    /// place.
     ///
     /// DML text is the single source of truth shared with the atomic
     /// `prepare_update_edge` symmetric branch:
     /// [`khive_db::stores::graph::EDGE_SYMMETRIC_CONFLICT_PROBE_SQL`] /
     /// `EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL` /
-    /// `EDGE_SYMMETRIC_REFRESH_CANONICAL_SQL` /
     /// `EDGE_SYMMETRIC_UPDATE_INPLACE_SQL` — this function binds them against
     /// `rusqlite::params!` (it runs inside an existing transaction on a
     /// borrowed `&rusqlite::Connection`), the atomic path binds the same text
@@ -4634,7 +4741,6 @@ impl KhiveRuntime {
         relation_str: &str,
         weight: f64,
         metadata: Option<String>,
-        target_backend: Option<String>,
     ) -> Result<Option<String>, SqliteError> {
         // `updated_at` is stored in MICROSECONDS on `graph_edges` (every other
         // write path — `edge_upsert_statement`, `edge_soft_delete_statement` —
@@ -4663,25 +4769,22 @@ impl KhiveRuntime {
             .map_err(SqliteError::Rusqlite)?;
 
         if let Some(existing_id) = conflict_id {
-            // Case (b): canonical row already exists — delete the non-canonical
-            // edge and refresh the existing canonical row. Return the surviving
-            // id so the caller can re-fetch it (never the deleted edge's id).
+            // Case (b): canonical row already exists — ADR-039's edge-conflict
+            // contract is ON CONFLICT DO NOTHING: drop the non-canonical edge
+            // and leave the existing canonical row untouched (live or
+            // tombstoned). Refreshing it from the discarded edge's
+            // weight/target_backend/metadata and forcing deleted_at = NULL
+            // would silently overwrite the survivor and resurrect a
+            // tombstone — the same defect already fixed on the merge-rewire
+            // path (`merge_entity_sql`/`merge_note_sql`); this path binds the
+            // same shared `EDGE_SYMMETRIC_*_SQL` text and must honor the same
+            // contract. Return the surviving id unchanged so the caller
+            // re-fetches its real (unmodified) attributes.
             conn.execute(
                 khive_db::stores::graph::EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL,
                 rusqlite::params![&ns, &edge_id_str],
             )
             .map_err(SqliteError::Rusqlite)?;
-            let affected = conn
-                .execute(
-                    khive_db::stores::graph::EDGE_SYMMETRIC_REFRESH_CANONICAL_SQL,
-                    rusqlite::params![weight, now_ts, target_backend, metadata, &ns, &existing_id],
-                )
-                .map_err(SqliteError::Rusqlite)?;
-            if affected == 0 {
-                return Err(SqliteError::InvalidData(format!(
-                    "update_edge: surviving canonical row {existing_id} vanished during update"
-                )));
-            }
             Ok(Some(existing_id))
         } else {
             // Case (a): no conflict — update source_id/target_id in-place,
@@ -4723,8 +4826,9 @@ impl KhiveRuntime {
     /// For symmetric relations (`competes_with`, `composed_with`), endpoint order is
     /// canonicalised to `source_uuid < target_uuid` after validation. If a canonical
     /// row already exists at the target triple, the non-canonical edge is deleted and
-    /// the existing canonical row is refreshed (DELETE + UPDATE pattern, mirroring
-    /// `merge_entity_sql`).
+    /// the existing canonical row is preserved unchanged (ADR-039 ON CONFLICT DO
+    /// NOTHING, mirroring `merge_entity_sql`) — its attributes, including a soft-deleted
+    /// `deleted_at`, are never overwritten by the discarded edge's patch.
     pub async fn update_edge(
         &self,
         token: &NamespaceToken,
@@ -4800,7 +4904,6 @@ impl KhiveRuntime {
                 .metadata
                 .as_ref()
                 .map(|v| serde_json::to_string(v).unwrap_or_default());
-            let target_backend = edge.target_backend.clone();
 
             let pool = self.backend().pool_arc();
             // Route through the single-writer task when the write queue is
@@ -4809,8 +4912,8 @@ impl KhiveRuntime {
             let writer_task = pool.writer_task_handle().ok().flatten();
 
             // Some(surviving_id) when a canonical conflict was absorbed (the requested
-            // edge was deleted, existing canonical row refreshed), or None when the
-            // requested edge was updated in-place.
+            // edge was deleted, existing canonical row left untouched per ADR-039 DO
+            // NOTHING), or None when the requested edge was updated in-place.
             let surviving_id: Option<String> = if let Some(writer_task) = writer_task {
                 writer_task
                     .send(move |conn| {
@@ -4823,7 +4926,6 @@ impl KhiveRuntime {
                             &relation_str,
                             weight,
                             metadata,
-                            target_backend,
                         )
                         .map_err(|e| {
                             khive_storage::StorageError::driver(
@@ -4848,7 +4950,6 @@ impl KhiveRuntime {
                             &relation_str,
                             weight,
                             metadata,
-                            target_backend,
                         )
                     })
                 })
@@ -4860,14 +4961,17 @@ impl KhiveRuntime {
             };
 
             if let Some(sid) = surviving_id {
-                // A conflict was absorbed: re-fetch the surviving canonical row so the
-                // caller receives its real id.
-                // Use record_tok — the surviving row lives in the same namespace as the original.
+                // A conflict was absorbed (ADR-039 DO NOTHING): re-fetch the surviving
+                // canonical row so the caller receives its real, UNMODIFIED attributes —
+                // including soft-deleted rows, since the survivor's tombstone state (if
+                // any) must not be resurrected by the absorbed update either. Use
+                // record_tok — the surviving row lives in the same namespace as the
+                // original.
                 let surviving_uuid = Uuid::parse_str(&sid).map_err(|e| {
                     RuntimeError::Internal(format!("update_edge: surviving id parse failed: {e}"))
                 })?;
                 edge = self
-                    .get_edge(&record_tok, surviving_uuid)
+                    .get_edge_including_deleted(&record_tok, surviving_uuid)
                     .await?
                     .ok_or_else(|| {
                         RuntimeError::Internal(format!(
@@ -4981,24 +5085,38 @@ impl KhiveRuntime {
         Ok(deleted)
     }
 
-    /// Count edges matching `filter`, summed across the caller's visible
-    /// namespaces (mirrors [`Self::count_edges_by_relation`] and
-    /// [`Self::list_edges`] so `stats().edges` reconciles with a full `list`
-    /// keyset walk under the same token).
+    /// Count edges matching `filter` across the caller's visible namespaces.
     pub async fn count_edges(
         &self,
         token: &NamespaceToken,
         filter: crate::curation::EdgeListFilter,
     ) -> RuntimeResult<u64> {
-        let mut total = 0u64;
-        for ns in token.visible_namespaces() {
-            let temp = NamespaceToken::for_namespace(ns.clone());
-            total += self
-                .graph(&temp)?
-                .count_edges(filter.clone().into())
-                .await?;
+        let namespaces: Vec<String> = token
+            .visible_namespaces()
+            .iter()
+            .map(|namespace| namespace.as_str().to_owned())
+            .collect();
+        let graph = self.graph(token)?;
+        match graph
+            .count_edges_in_namespaces(&namespaces, filter.clone().into())
+            .await
+        {
+            Ok(count) => Ok(count),
+            Err(khive_storage::StorageError::Unsupported { operation, .. })
+                if operation == "count_edges_in_namespaces" =>
+            {
+                let mut total = 0;
+                for namespace in token.visible_namespaces() {
+                    let scoped = NamespaceToken::for_namespace(namespace.clone());
+                    total += self
+                        .graph(&scoped)?
+                        .count_edges(filter.clone().into())
+                        .await?;
+                }
+                Ok(total)
+            }
+            Err(error) => Err(error.into()),
         }
-        Ok(total)
     }
 
     /// Validate and construct an edge from a [`LinkSpec`] without writing to storage.
@@ -5159,15 +5277,10 @@ impl KhiveRuntime {
     /// (unknown kind, empty name, secret-gate violation), the method returns
     /// that error and no entities are written.
     ///
-    /// Storage writes are issued as ONE `upsert_entities` call followed by ONE
-    /// `upsert_documents` call — the same primitives that the single-entity path
-    /// uses, but batched. Embedding is intentionally skipped: bulk structural
-    /// ingest is the expected use-case, and dense vectors are backfilled later
-    /// via a `reindex` call. Callers that need immediate vector search
-    /// immediately after creation should use per-entity `create_entity` instead.
-    ///
-    /// On FTS failure, every newly written entity row is hard-deleted to maintain
-    /// consistency (mirrors the single-entity rollback in `create_entity`).
+    /// Entity rows and their FTS documents are written in one SQLite transaction.
+    /// Any statement failure rolls back the entire batch across both surfaces.
+    /// Embedding is intentionally skipped: bulk structural ingest is the expected
+    /// use-case, and dense vectors are backfilled later via a `reindex` call.
     pub async fn create_many(
         &self,
         token: &NamespaceToken,
@@ -5216,124 +5329,72 @@ impl KhiveRuntime {
             entities.push(entity);
         }
 
-        // Phase 2: single bulk entity write.
-        // Capture the BatchWriteSummary to detect partial failures.
-        // The store commits the transaction even when some rows fail (per-row error
-        // isolation). If any row failed, compensate by hard-deleting the rows that DID
-        // land, then return Err so the caller sees zero net writes.
-        //
-        // NOTE: this compensation path (delete-on-partial-failure) is a stopgap until
-        // a true single-transaction bulk primitive is available in the entity store.
-        // That primitive (writing entity rows and FTS rows in one SQL transaction) is
-        // tracked as a follow-up issue.
-        let entity_summary = self
-            .entities(token)?
-            .upsert_entities(entities.clone())
-            .await?;
-
-        if entity_summary.failed > 0 {
-            // Compensate: hard-delete any entity rows that did land.
-            if let Ok(store) = self.entities(token) {
-                for entity in &entities {
-                    if let Err(ce) = store.delete_entity(entity.id, DeleteMode::Hard).await {
-                        tracing::error!(
-                            error = %ce,
-                            id = %entity.id,
-                            "create_many: failed to roll back entity row after partial entity write"
-                        );
-                    }
-                }
-            }
-            return Err(RuntimeError::Internal(format!(
-                "create_many: {}/{} entity rows failed to write (first error: {}); \
-                 all rows rolled back",
-                entity_summary.failed, entity_summary.attempted, entity_summary.first_error
-            )));
-        }
-
-        // Phase 3: single bulk FTS write.
-        //
-        // The FTS store commits partial batches and signals per-document failures
-        // via BatchWriteSummary.failed (same as the entity store in Phase 2).
-        // We must capture the summary and treat failed > 0 as an error.
-        //
-        // Compensation is symmetric: on any FTS failure (Err or failed > 0),
-        // we first delete any FTS documents that may have landed, then
-        // hard-delete the entity rows.  This order matters: the entity delete
-        // is the authoritative write; FTS is a derived index.  Cleaning FTS
-        // first avoids a window where entity rows are gone but stale FTS rows
-        // survive.
-        let docs: Vec<_> = entities.iter().map(entity_fts_document).collect();
-
         #[cfg(any(test, feature = "fault-injection"))]
-        let fts_many_inject = FTS_FAIL_MANY_NS.lock().unwrap().remove(ns);
+        let fts_many_inject = consume_fault(&FTS_FAIL_MANY_NS, ns);
         #[cfg(not(any(test, feature = "fault-injection")))]
         let fts_many_inject = false;
 
-        // Partial-failure seam: returns Ok(summary) with failed > 0 so the
-        // `summary.failed > 0` rollback branch is exercised in tests.
         #[cfg(any(test, feature = "fault-injection"))]
-        let fts_many_inject_partial = FTS_FAIL_MANY_PARTIAL_NS.lock().unwrap().remove(ns);
+        let fts_many_inject_partial = consume_fault(&FTS_FAIL_MANY_PARTIAL_NS, ns);
         #[cfg(not(any(test, feature = "fault-injection")))]
         let fts_many_inject_partial = false;
 
-        let fts_summary_result: RuntimeResult<BatchWriteSummary> = if fts_many_inject {
-            Err(RuntimeError::Internal(
-                "injected FTS failure for create_many".to_string(),
-            ))
+        let injected_failure_index = if fts_many_inject {
+            Some(0)
         } else if fts_many_inject_partial {
-            Ok(BatchWriteSummary {
-                attempted: docs.len() as u64,
-                affected: docs.len().saturating_sub(1) as u64,
-                failed: 1,
-                first_error: "injected partial FTS failure for create_many".to_string(),
-            })
+            Some(usize::from(entities.len() > 1))
         } else {
-            match self.text(token) {
-                Ok(fts) => fts.upsert_documents(docs).await.map_err(RuntimeError::from),
-                Err(e) => Err(e),
-            }
+            None
         };
 
-        let fts_err: Option<RuntimeError> = match fts_summary_result {
-            Err(e) => Some(e),
-            Ok(summary) if summary.failed > 0 => Some(RuntimeError::Internal(format!(
-                "create_many: {}/{} FTS rows failed to index (first error: {}); \
-                 all rows rolled back",
-                summary.failed, summary.attempted, summary.first_error
+        let _ = self.entities(token)?;
+        let _ = self.text(token)?;
+
+        let plans = entities
+            .iter()
+            .enumerate()
+            .map(|(index, entity)| {
+                let mut fts_statement =
+                    insert_document_statement("fts_entities", &entity_fts_document(entity));
+                if injected_failure_index == Some(index) {
+                    fts_statement = SqlStatement {
+                        sql: "INSERT INTO __khive_create_many_injected_failure__ DEFAULT VALUES"
+                            .to_string(),
+                        params: vec![],
+                        label: Some("fts-insert-injected-failure".to_string()),
+                    };
+                }
+                AtomicOpPlan::AddEntity(AddEntityPlan {
+                    entity_id: entity.id,
+                    statements: vec![
+                        PlanStatement {
+                            statement: entity_upsert_statement(entity),
+                            guard: Some(AffectedRowGuard::exactly(1)),
+                        },
+                        PlanStatement {
+                            statement: fts_statement,
+                            guard: None,
+                        },
+                    ],
+                    post_commit: PostCommitEffect::None,
+                })
+            })
+            .collect();
+
+        match run_atomic_unit(self.sql().as_ref(), plans).await {
+            Ok(AtomicRunOutcome::Committed { .. }) => Ok(entities),
+            Ok(AtomicRunOutcome::RolledBack {
+                failed_op_index,
+                failure,
+            }) => Err(RuntimeError::Internal(format!(
+                "create_many: atomic batch rolled back at entity index {failed_op_index}: \
+                 {failure:?}"
             ))),
-            Ok(_) => None,
-        };
-
-        if let Some(e) = fts_err {
-            // Clean up any FTS docs that landed before deleting entity rows.
-            if let Ok(fts) = self.text(token) {
-                for entity in &entities {
-                    if let Err(ce) = fts.delete_document(ns, entity.id).await {
-                        tracing::error!(
-                            error = %ce,
-                            id = %entity.id,
-                            "create_many: failed to remove FTS doc during rollback"
-                        );
-                    }
-                }
-            }
-            if let Ok(store) = self.entities(token) {
-                for entity in &entities {
-                    if let Err(ce) = store.delete_entity(entity.id, DeleteMode::Hard).await {
-                        tracing::error!(
-                            error = %ce,
-                            id = %entity.id,
-                            "create_many: failed to roll back entity row after FTS failure"
-                        );
-                    }
-                }
-            }
-            return Err(e);
+            Err(e) => Err(RuntimeError::Internal(format!(
+                "create_many: atomic batch failed: {}",
+                e.0
+            ))),
         }
-
-        // Embedding is skipped intentionally — see doc comment above.
-        Ok(entities)
     }
 }
 
@@ -5375,18 +5436,52 @@ pub struct EntityCreateSpec {
 mod tests {
     use super::*;
     use crate::curation::EdgeListFilter;
-    use crate::embedder_registry::EmbedderProvider;
+    use crate::embedder_registry::{BlockingEmbeddingService, EmbedderProvider};
     use crate::error::RuntimeError;
     use crate::runtime::{KhiveRuntime, NamespaceToken};
     use crate::{ActorRef, Namespace};
     use async_trait::async_trait;
     use khive_storage::types::PathNode;
-    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService, MAX_TEXT_CHARS};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
     fn rt() -> KhiveRuntime {
         KhiveRuntime::memory().unwrap()
+    }
+
+    #[test]
+    fn fts_fault_arm_disarms_namespace_when_scope_panics() {
+        let ns = format!("fault-arm-drop-{}", uuid::Uuid::new_v4().as_simple());
+
+        let panic_result = std::panic::catch_unwind(|| {
+            let _arm = arm_fts_fail_scoped(&ns);
+            panic!("leave the armed scope before consumption");
+        });
+
+        assert!(panic_result.is_err());
+        assert!(
+            !consume_fault(&FTS_FAIL_NS, &ns),
+            "unwinding an armed scope must remove its namespace"
+        );
+    }
+
+    #[test]
+    fn fault_arm_set_rejects_entries_over_capacity() {
+        static BOUNDED_ARMS: std::sync::LazyLock<FaultArmSet> =
+            std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+        let first_ns = format!("fault-arm-bound-a-{}", uuid::Uuid::new_v4().as_simple());
+        let overflow_ns = format!("fault-arm-bound-b-{}", uuid::Uuid::new_v4().as_simple());
+        let arm = arm_fault(&BOUNDED_ARMS, &first_ns, 1);
+
+        let overflow = std::panic::catch_unwind(|| arm_fault(&BOUNDED_ARMS, &overflow_ns, 1));
+
+        assert!(
+            overflow.is_err(),
+            "an arm set must reject entries over its bound"
+        );
+        drop(arm);
+        assert!(BOUNDED_ARMS.lock().unwrap().is_empty());
     }
 
     // ── Custom embedder fan-out regression ──────────────────────────────────
@@ -5510,17 +5605,25 @@ mod tests {
         }
     }
 
-    /// Embedder provider whose `build()` always fails immediately — models
-    /// this provider's embed task resolving (with an error) well before a
-    /// slower sibling model's task completes.
+    /// Embedder that fails inference immediately unless configured to wait for
+    /// a sibling's entry signal first.
     struct FailFastProvider {
         provider_name: String,
+        wait_for: Option<Arc<AtomicBool>>,
     }
 
     impl FailFastProvider {
         fn new(name: &str) -> Self {
             Self {
                 provider_name: name.to_owned(),
+                wait_for: None,
+            }
+        }
+
+        fn after_signal(name: &str, wait_for: Arc<AtomicBool>) -> Self {
+            Self {
+                provider_name: name.to_owned(),
+                wait_for: Some(wait_for),
             }
         }
     }
@@ -5536,9 +5639,200 @@ mod tests {
         }
 
         async fn build(&self) -> crate::error::RuntimeResult<Arc<dyn EmbeddingService>> {
-            Err(RuntimeError::Internal(
-                "injected embed build failure".to_string(),
+            Ok(Arc::new(FailFastService {
+                wait_for: self.wait_for.clone(),
+            }))
+        }
+    }
+
+    struct FailFastService {
+        wait_for: Option<Arc<AtomicBool>>,
+    }
+
+    #[async_trait]
+    impl EmbeddingService for FailFastService {
+        async fn embed(
+            &self,
+            _texts: &[String],
+            _model: EmbeddingModel,
+        ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+            if let Some(wait_for) = &self.wait_for {
+                while !wait_for.load(Ordering::Acquire) {
+                    tokio::task::yield_now().await;
+                }
+            }
+            Err(EmbedError::InferenceFailed(
+                "injected embed failure".to_string(),
             ))
+        }
+
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "fail-fast"
+        }
+    }
+
+    /// Embedder whose synchronous inference section is controlled by a
+    /// condition variable, matching native inference that cannot observe task
+    /// cancellation until the encode call returns.
+    struct BlockingVecProvider {
+        provider_name: String,
+        dims: usize,
+        release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        entered: Arc<AtomicBool>,
+    }
+
+    struct BlockingVecControls {
+        release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        entered: Arc<AtomicBool>,
+    }
+
+    impl BlockingVecProvider {
+        fn new(name: &str, dims: usize) -> (Self, BlockingVecControls) {
+            let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+            let entered = Arc::new(AtomicBool::new(false));
+            (
+                Self {
+                    provider_name: name.to_owned(),
+                    dims,
+                    release: Arc::clone(&release),
+                    entered: Arc::clone(&entered),
+                },
+                BlockingVecControls { release, entered },
+            )
+        }
+    }
+
+    #[async_trait]
+    impl EmbedderProvider for BlockingVecProvider {
+        fn name(&self) -> &str {
+            &self.provider_name
+        }
+
+        fn dimensions(&self) -> usize {
+            self.dims
+        }
+
+        async fn build(&self) -> crate::error::RuntimeResult<Arc<dyn EmbeddingService>> {
+            let service = Arc::new(BlockingVecService {
+                dims: self.dims,
+                release: Arc::clone(&self.release),
+                entered: Arc::clone(&self.entered),
+            });
+            Ok(Arc::new(BlockingEmbeddingService::new(service)))
+        }
+    }
+
+    struct BlockingVecService {
+        dims: usize,
+        release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        entered: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl EmbeddingService for BlockingVecService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+            self.entered.store(true, Ordering::Release);
+            let (released, wake) = &*self.release;
+            let guard = released.lock().expect("release lock must not be poisoned");
+            let _guard = wake
+                .wait_while(guard, |released| !*released)
+                .expect("release lock must not be poisoned");
+            Ok(texts.iter().map(|_| vec![1.0_f32; self.dims]).collect())
+        }
+
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "blocking-vec"
+        }
+    }
+
+    /// Embedder whose `embed` parks until a release that never comes — models
+    /// a hung provider. Only task abort can end its embed future. `entered`
+    /// receives a permit when `embed` is reached, so a test can wait until the
+    /// parked task is provably past the dispatch point before acting on it.
+    struct ParkedVecProvider {
+        provider_name: String,
+        dims: usize,
+        release: Arc<tokio::sync::Notify>,
+        entered: Arc<tokio::sync::Notify>,
+    }
+
+    impl ParkedVecProvider {
+        fn new(
+            name: &str,
+            dims: usize,
+        ) -> (Self, Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+            let release = Arc::new(tokio::sync::Notify::new());
+            let entered = Arc::new(tokio::sync::Notify::new());
+            (
+                Self {
+                    provider_name: name.to_owned(),
+                    dims,
+                    release: Arc::clone(&release),
+                    entered: Arc::clone(&entered),
+                },
+                release,
+                entered,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl EmbedderProvider for ParkedVecProvider {
+        fn name(&self) -> &str {
+            &self.provider_name
+        }
+
+        fn dimensions(&self) -> usize {
+            self.dims
+        }
+
+        async fn build(&self) -> crate::error::RuntimeResult<Arc<dyn EmbeddingService>> {
+            Ok(Arc::new(ParkedVecService {
+                dims: self.dims,
+                release: Arc::clone(&self.release),
+                entered: Arc::clone(&self.entered),
+            }))
+        }
+    }
+
+    struct ParkedVecService {
+        dims: usize,
+        release: Arc<tokio::sync::Notify>,
+        entered: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl EmbeddingService for ParkedVecService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+            // notify_one stores a permit when no waiter is registered yet, so
+            // the entered signal cannot be lost to a start-order race.
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(texts.iter().map(|_| vec![1.0_f32; self.dims]).collect())
+        }
+
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "parked-vec"
         }
     }
 
@@ -5810,6 +6104,122 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(updated.relation, EdgeRelation::VariantOf);
+    }
+
+    /// A symmetric-relation update whose canonical natural key collides
+    /// with an existing edge must delete the requested (non-canonical)
+    /// row and leave the surviving canonical row's attributes untouched
+    /// (ADR-039 ON CONFLICT DO NOTHING) — the discarded edge's patched
+    /// weight must never overwrite the survivor (khive#1213).
+    #[tokio::test]
+    async fn update_edge_symmetric_conflict_keeps_survivor_attributes() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let a = rt
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(&tok, "concept", None, "B", None, None, vec![])
+            .await
+            .unwrap();
+
+        let requested = rt
+            .link(&tok, a.id, b.id, EdgeRelation::Extends, 0.2, None)
+            .await
+            .unwrap();
+        let requested_id: Uuid = requested.id.into();
+
+        let canonical = rt
+            .link(&tok, a.id, b.id, EdgeRelation::CompetesWith, 0.6, None)
+            .await
+            .unwrap();
+        let canonical_id: Uuid = canonical.id.into();
+
+        let updated = rt
+            .update_edge(
+                &tok,
+                requested_id,
+                crate::curation::EdgePatch {
+                    relation: Some(EdgeRelation::CompetesWith),
+                    weight: Some(0.9),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // The requested (non-canonical) row was absorbed into the survivor.
+        assert_eq!(Uuid::from(updated.id), canonical_id);
+        assert_eq!(
+            updated.weight, 0.6,
+            "survivor weight must not be overwritten by the discarded edge's patch"
+        );
+
+        let requested_after = rt
+            .get_edge_including_deleted(&tok, requested_id)
+            .await
+            .unwrap();
+        assert!(
+            requested_after.is_none(),
+            "the non-canonical requested row must be deleted, not just tombstoned"
+        );
+    }
+
+    /// A soft-deleted surviving canonical row must not be resurrected by a
+    /// conflicting symmetric-relation update (khive#1213).
+    #[tokio::test]
+    async fn update_edge_symmetric_conflict_does_not_resurrect_tombstoned_survivor() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let a = rt
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(&tok, "concept", None, "B", None, None, vec![])
+            .await
+            .unwrap();
+
+        let requested = rt
+            .link(&tok, a.id, b.id, EdgeRelation::Extends, 0.2, None)
+            .await
+            .unwrap();
+        let requested_id: Uuid = requested.id.into();
+
+        let canonical = rt
+            .link(&tok, a.id, b.id, EdgeRelation::CompetesWith, 0.6, None)
+            .await
+            .unwrap();
+        let canonical_id: Uuid = canonical.id.into();
+        rt.delete_edge(&tok, canonical_id, false).await.unwrap();
+
+        rt.update_edge(
+            &tok,
+            requested_id,
+            crate::curation::EdgePatch {
+                relation: Some(EdgeRelation::CompetesWith),
+                weight: Some(0.9),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let requested_after = rt
+            .get_edge_including_deleted(&tok, requested_id)
+            .await
+            .unwrap();
+        assert!(
+            requested_after.is_none(),
+            "the non-canonical requested row must be deleted, not just tombstoned"
+        );
+
+        let canonical_after = rt.get_edge(&tok, canonical_id).await.unwrap();
+        assert!(
+            canonical_after.is_none(),
+            "a tombstoned survivor must not be resurrected by a conflicting update"
+        );
     }
 
     // ---- update_edge endpoint validation ----
@@ -8274,6 +8684,74 @@ mod tests {
         assert!(target_ids.contains(&t2.id));
     }
 
+    /// khive#1213/#1214 fix round: the atomic-apply post-commit renderer for a
+    /// symmetric-edge update resolves the surviving row's store by the CALLER's
+    /// token but must filter by the record's OWN namespace, passed explicitly —
+    /// never by re-deriving it from whichever token happened to select the store
+    /// (`self.graph(token)` scopes by `token.namespace()`, and by-ID edge updates
+    /// are namespace-agnostic, so a caller in one namespace can legitimately
+    /// commit an update against an edge recorded in another). This proves the
+    /// `namespace` parameter — not the `token` argument — decides which row the
+    /// natural-key lookup finds, at the level the review flagged as an
+    /// acceptable substitute for a full cross-namespace atomic-apply test.
+    #[tokio::test]
+    async fn get_edge_by_natural_key_including_deleted_honors_explicit_namespace_not_token() {
+        let rt = rt();
+        let ns_a = NamespaceToken::for_namespace(Namespace::parse("ns-a").unwrap());
+        let ns_b = NamespaceToken::for_namespace(Namespace::parse("ns-b").unwrap());
+
+        let a = rt
+            .create_entity(&ns_b, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(&ns_b, "concept", None, "B", None, None, vec![])
+            .await
+            .unwrap();
+        let edge = rt
+            .link(&ns_b, a.id, b.id, EdgeRelation::CompetesWith, 1.0, None)
+            .await
+            .unwrap();
+        let (canon_src, canon_tgt) =
+            canonical_edge_endpoints(EdgeRelation::CompetesWith, a.id, b.id);
+
+        // Caller token is ns-a (an unrelated namespace); passing "ns-b" explicitly
+        // must still find the edge recorded there.
+        let found = rt
+            .get_edge_by_natural_key_including_deleted(
+                &ns_a,
+                "ns-b",
+                canon_src,
+                canon_tgt,
+                EdgeRelation::CompetesWith,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            found.map(|e| Uuid::from(e.id)),
+            Some(Uuid::from(edge.id)),
+            "must find the edge by its own namespace regardless of the caller's token"
+        );
+
+        // Passing the caller token's OWN namespace ("ns-a") as the explicit filter
+        // must NOT find it — proves the lookup is keyed on the `namespace` argument,
+        // not silently re-scoped to whatever namespace the token carries.
+        let not_found = rt
+            .get_edge_by_natural_key_including_deleted(
+                &ns_a,
+                "ns-a",
+                canon_src,
+                canon_tgt,
+                EdgeRelation::CompetesWith,
+            )
+            .await
+            .unwrap();
+        assert!(
+            not_found.is_none(),
+            "must not find an edge recorded in a different namespace than the one queried"
+        );
+    }
+
     /// `link` endpoint existence is a by-ID check and therefore namespace-agnostic:
     /// a target living in a different namespace than the caller must still
     /// resolve, exactly as `get()` would.
@@ -9803,7 +10281,7 @@ mod tests {
     }
 
     // Inject an FTS failure after the note row is committed and assert the note
-    // row is removed (no stranded row).  arm_fts_fail() arms the flag before
+    // row is removed (no stranded row). arm_fts_fail_scoped() arms the flag before
     // the call and it resets automatically after one trigger.
     #[tokio::test]
     async fn create_note_fts_failure_rolls_back_note_row() {
@@ -9815,7 +10293,7 @@ mod tests {
         let ns = Namespace::parse("fault-fts-rollback").unwrap();
         let tok = NamespaceToken::for_namespace(ns.clone());
 
-        arm_fts_fail(ns.as_str());
+        let _arm = arm_fts_fail_scoped(ns.as_str());
 
         let result = rt
             .create_note(
@@ -9861,7 +10339,7 @@ mod tests {
         let ns = Namespace::parse("fault-fts-rollback-cross-thread").unwrap();
         let tok = NamespaceToken::for_namespace(ns.clone());
 
-        arm_fts_fail(ns.as_str());
+        let _arm = arm_fts_fail_scoped(ns.as_str());
 
         let thread_rt = std::sync::Arc::clone(&rt);
         let thread_tok = tok.clone();
@@ -9920,7 +10398,7 @@ mod tests {
         let ns = Namespace::parse("fault-vec-rollback").unwrap();
         let tok = NamespaceToken::for_namespace(ns.clone());
 
-        arm_vector_fail(ns.as_str());
+        let _arm = arm_vector_fail_scoped(ns.as_str());
 
         let result = rt
             .create_note(
@@ -9969,8 +10447,8 @@ mod tests {
         let ns_b = Namespace::parse("fault-vec-distinct-b").unwrap();
         let tok_b = NamespaceToken::for_namespace(ns_b.clone());
 
-        arm_vector_fail(ns_a.as_str());
-        arm_vector_fail(ns_b.as_str());
+        let _arm_a = arm_vector_fail_scoped(ns_a.as_str());
+        let _arm_b = arm_vector_fail_scoped(ns_b.as_str());
 
         let (result_a, result_b) = tokio::join!(
             rt_a.create_note(
@@ -10014,7 +10492,7 @@ mod tests {
         let ns = Namespace::parse("fault-fts-rollback-embedding-content").unwrap();
         let tok = NamespaceToken::for_namespace(ns.clone());
 
-        arm_fts_fail(ns.as_str());
+        let _arm = arm_fts_fail_scoped(ns.as_str());
 
         let full = "fts-fail rollback target with an embedding-content override";
         let head = &full[.."fts-fail rollback target".len()];
@@ -10063,7 +10541,7 @@ mod tests {
         let ns = Namespace::parse("fault-vec-rollback-embedding-content").unwrap();
         let tok = NamespaceToken::for_namespace(ns.clone());
 
-        arm_vector_fail(ns.as_str());
+        let _arm = arm_vector_fail_scoped(ns.as_str());
 
         let full = "vec-fail rollback target with an embedding-content override";
         let head = &full[.."vec-fail rollback target".len()];
@@ -10873,7 +11351,7 @@ mod tests {
 
     // FTS failure in create_many rolls back both substrates.
     //
-    // Arm `arm_fts_fail_many` before the call; the FTS phase returns an injected
+    // Arm `arm_fts_fail_many_scoped` before the call; the FTS phase returns an injected
     // error; the test asserts zero rows in both `entities` and `fts_entities`.
     #[tokio::test]
     async fn create_many_fts_failure_rolls_back_both_substrates() {
@@ -10901,7 +11379,7 @@ mod tests {
             },
         ];
 
-        arm_fts_fail_many(&ns);
+        let _arm = arm_fts_fail_many_scoped(&ns);
         let result = rt.create_many(&tok, specs).await;
 
         assert!(
@@ -10943,8 +11421,8 @@ mod tests {
         let ns_b = Namespace::parse("fts-fail-many-distinct-b").unwrap();
         let tok_b = NamespaceToken::for_namespace(ns_b.clone());
 
-        arm_fts_fail_many(ns_a.as_str());
-        arm_fts_fail_many(ns_b.as_str());
+        let _arm_a = arm_fts_fail_many_scoped(ns_a.as_str());
+        let _arm_b = arm_fts_fail_many_scoped(ns_b.as_str());
 
         let (result_a, result_b) = tokio::join!(
             rt_a.create_many(
@@ -10981,16 +11459,11 @@ mod tests {
         );
     }
 
-    // FTS partial-failure (Ok(summary) with summary.failed > 0) rolls back
-    // both substrates.
-    //
-    // The production code has a distinct arm:
-    //   Ok(summary) if summary.failed > 0 => return Err(...)
-    // This test exercises that arm by arming `arm_fts_fail_many_partial`, which
-    // returns Ok(BatchWriteSummary { failed: 1, ... }) instead of a hard Err.
-    // Both entity rows and FTS rows must be empty after rollback.
+    // A failure after the first entity and FTS document have been written rolls
+    // back both substrates for the entire batch. Injected via
+    // `arm_fts_fail_many_partial_scoped`.
     #[tokio::test]
-    async fn create_many_fts_partial_failure_rolls_back_both_substrates() {
+    async fn create_many_mid_batch_storage_failure_rolls_back_both_substrates() {
         let ns = format!("fts-fail-partial-{}", uuid::Uuid::new_v4().as_simple());
         let rt = rt();
         let tok = NamespaceToken::for_namespace(Namespace::parse(&ns).unwrap());
@@ -11014,12 +11487,17 @@ mod tests {
             },
         ];
 
-        arm_fts_fail_many_partial(&ns);
+        let _arm = arm_fts_fail_many_partial_scoped(&ns);
         let result = rt.create_many(&tok, specs).await;
 
         assert!(
             result.is_err(),
-            "create_many must return Err when FTS summary.failed > 0"
+            "create_many must return Err when an FTS write fails mid-batch"
+        );
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains("atomic batch rolled back at entity index 1"),
+            "the failure must occur inside the atomic batch after one complete row; got: {error}"
         );
 
         // Entity substrate must be empty — entity rows must have been rolled back.
@@ -11027,7 +11505,7 @@ mod tests {
         assert_eq!(
             entity_rows.len(),
             0,
-            "entity rows must be rolled back when FTS summary.failed > 0; found {entity_rows:?}"
+            "entity rows must be empty after a mid-batch FTS failure; found {entity_rows:?}"
         );
 
         // FTS substrate must be empty — no stale fts_entities rows.
@@ -11042,7 +11520,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             fts_count, 0,
-            "fts_entities must be empty after partial-FTS-failure rollback; found {fts_count}"
+            "fts_entities must be empty after a mid-batch FTS failure; found {fts_count}"
         );
     }
 
@@ -11056,8 +11534,8 @@ mod tests {
         let ns_b = Namespace::parse("fts-fail-many-partial-distinct-b").unwrap();
         let tok_b = NamespaceToken::for_namespace(ns_b.clone());
 
-        arm_fts_fail_many_partial(ns_a.as_str());
-        arm_fts_fail_many_partial(ns_b.as_str());
+        let _arm_a = arm_fts_fail_many_partial_scoped(ns_a.as_str());
+        let _arm_b = arm_fts_fail_many_partial_scoped(ns_b.as_str());
 
         let (result_a, result_b) = tokio::join!(
             rt_a.create_many(
@@ -11753,7 +12231,7 @@ mod tests {
         let ns = Namespace::parse("fault-entity-fts").unwrap();
         let tok = NamespaceToken::for_namespace(ns.clone());
 
-        arm_fts_fail(ns.as_str());
+        let _arm = arm_fts_fail_scoped(ns.as_str());
 
         let result = rt
             .create_entity(
@@ -11798,7 +12276,7 @@ mod tests {
         let ns = Namespace::parse("fault-entity-vec").unwrap();
         let tok = NamespaceToken::for_namespace(ns.clone());
 
-        arm_vector_fail(ns.as_str());
+        let _arm = arm_vector_fail_scoped(ns.as_str());
 
         let result = rt
             .create_entity(
@@ -12017,15 +12495,10 @@ mod tests {
         );
     }
 
-    // ADR-103 Amendment 2 regression: when one of several spawned embed tasks
-    // errors, create_entity must drain (await) every remaining handle before
-    // returning — each handle holds a clone of the dispatch's UsageContext, so
-    // an un-awaited handle keeps running and can increment embed_calls after
-    // the response has already gone out, making the counter nondeterministic.
-    // The fail-fast model resolves (with an error) first; the slow model's
-    // task is still in flight at that point — the drain must wait for it too.
+    // Embed calls are counted when issued, so detached completion after a
+    // sibling failure cannot change the response's usage snapshot.
     #[tokio::test]
-    async fn create_entity_multi_model_error_drains_all_spawned_embeds_before_returning() {
+    async fn create_entity_multi_model_error_keeps_issued_usage_stable() {
         const DIMS: usize = 4;
 
         let rt = KhiveRuntime::memory().unwrap();
@@ -12061,16 +12534,15 @@ mod tests {
 
         assert_eq!(
             snap_immediately_after, snap_after_delay,
-            "no spawned embed task may still be running after create_entity returns \
-             its error — a late increment means a context-holding handle was left \
-             un-awaited; got immediately_after={snap_immediately_after:?} \
+            "embed completion after create_entity returns must not change issued \
+             usage; got immediately_after={snap_immediately_after:?} \
              after_delay={snap_after_delay:?}"
         );
     }
 
     // Same regression for the note create path's multi-model embed fan-out.
     #[tokio::test]
-    async fn create_note_multi_model_error_drains_all_spawned_embeds_before_returning() {
+    async fn create_note_multi_model_error_keeps_issued_usage_stable() {
         const DIMS: usize = 4;
 
         let rt = KhiveRuntime::memory().unwrap();
@@ -12106,10 +12578,145 @@ mod tests {
 
         assert_eq!(
             snap_immediately_after, snap_after_delay,
-            "no spawned embed task may still be running after create_note returns \
-             its error — a late increment means a context-holding handle was left \
-             un-awaited; got immediately_after={snap_immediately_after:?} \
+            "embed completion after create_note returns must not change issued \
+             usage; got immediately_after={snap_immediately_after:?} \
              after_delay={snap_after_delay:?}"
+        );
+    }
+
+    // A fast provider failure must not wait on a slow sibling: the drain
+    // aborts remaining embed tasks on the first error instead of awaiting
+    // them to completion. The sibling here parks until a release that never
+    // fires, so under await-to-completion this call would never return —
+    // a bounded prompt error return is only reachable through the abort path.
+    #[tokio::test]
+    async fn create_entity_fast_embed_failure_does_not_wait_for_hung_sibling() {
+        const DIMS: usize = 4;
+
+        let rt = KhiveRuntime::memory().unwrap();
+        rt.register_embedder(FailFastProvider::new("latency-fail-fast"));
+        let (parked, _release, _entered) = ParkedVecProvider::new("latency-parked", DIMS);
+        rt.register_embedder(parked);
+
+        let ns = Namespace::parse("usage-entity-latency").unwrap();
+        let tok = NamespaceToken::for_namespace(ns.clone());
+
+        let started = std::time::Instant::now();
+        // Outer timeout so a regression to await-to-completion FAILS this test
+        // within the bound instead of hanging the suite on the parked sibling.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            rt.create_entity(
+                &tok,
+                "concept",
+                None,
+                "latency entity",
+                Some("description so embed body is non-empty"),
+                None,
+                vec![],
+            ),
+        )
+        .await
+        .expect("create_entity must return within the timeout — a hang means the abort path regressed to await-to-completion");
+        let elapsed = started.elapsed();
+
+        assert!(
+            result.is_err(),
+            "one model failing must fail the whole create_entity call"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "a fast embed failure must return without waiting on the hung \
+             sibling (which parks forever); took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn create_entity_embed_failure_returns_under_single_worker_saturation() {
+        let (blocking, controls) = BlockingVecProvider::new("latency-blocking", 4);
+        let fail_after_entry = FailFastProvider::after_signal(
+            "latency-fail-after-entry",
+            Arc::clone(&controls.entered),
+        );
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+
+        let runtime_thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .expect("single-worker runtime must build");
+            let rt = KhiveRuntime::memory().unwrap();
+            rt.register_embedder(blocking);
+            rt.register_embedder(fail_after_entry);
+            let tok =
+                NamespaceToken::for_namespace(Namespace::parse("embed-failure-latency").unwrap());
+            let result = runtime.block_on(rt.create_entity(
+                &tok,
+                "concept",
+                None,
+                "blocked sibling entity",
+                None,
+                None,
+                vec![],
+            ));
+            result_tx
+                .send(result.map_err(|error| error.to_string()))
+                .expect("test receiver must remain connected");
+        });
+
+        let result = result_rx.recv_timeout(std::time::Duration::from_secs(3));
+
+        let (released, wake) = &*controls.release;
+        *released.lock().expect("release lock must not be poisoned") = true;
+        wake.notify_all();
+        runtime_thread
+            .join()
+            .expect("single-worker runtime thread must join after release");
+
+        let error = result
+            .expect("embed failure must return while synchronous inference remains blocked")
+            .expect_err("one failed model must fail entity creation");
+        assert!(error.contains("injected embed failure"));
+    }
+
+    // Issued-at-dispatch accounting: an embed call that was handed to the
+    // provider must count toward embed_calls even if the task is aborted
+    // while parked on the provider await — the increment sits before the
+    // await, so cancellation cannot undercount issued work.
+    #[tokio::test]
+    async fn aborted_embed_task_still_counts_issued_embed_call() {
+        const DIMS: usize = 4;
+
+        let rt = std::sync::Arc::new(KhiveRuntime::memory().unwrap());
+        let (parked, _release, entered) = ParkedVecProvider::new("abort-count-parked", DIMS);
+        rt.register_embedder(parked);
+
+        let ctx = crate::usage::UsageContext::new();
+        let task = {
+            let rt = std::sync::Arc::clone(&rt);
+            let ctx = ctx.clone();
+            tokio::spawn(crate::usage::scope(ctx, async move {
+                rt.embed_document_with_model("abort-count-parked", "abort count body")
+                    .await
+            }))
+        };
+
+        // Wait until the parked service's embed was entered — the dispatch
+        // point (and its count) is strictly before that entry.
+        entered.notified().await;
+        task.abort();
+        let joined = task.await;
+        assert!(
+            joined.is_err() && joined.unwrap_err().is_cancelled(),
+            "task must end as cancelled by the abort"
+        );
+
+        assert_eq!(
+            ctx.snapshot()["embed_calls"],
+            1,
+            "an issued embed call must be counted even when the task is \
+             aborted while parked on the provider await"
         );
     }
 
@@ -13660,6 +14267,14 @@ mod tests {
             texts: &[String],
             _model: EmbeddingModel,
         ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+            for text in texts {
+                if text.len() > MAX_TEXT_CHARS {
+                    return Err(EmbedError::TextTooLong {
+                        length: text.len(),
+                        max: MAX_TEXT_CHARS,
+                    });
+                }
+            }
             self.captured.lock().unwrap().extend(texts.iter().cloned());
             Ok(texts.iter().map(|_| vec![1.0_f32; self.dims]).collect())
         }
@@ -13695,6 +14310,80 @@ mod tests {
                 captured: Arc::clone(&self.captured),
             }))
         }
+    }
+
+    #[tokio::test]
+    async fn create_bounds_embedding_input_without_truncating_stored_content() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        rt.register_embedder(CapturingVecProvider {
+            provider_name: "strict-length-test".into(),
+            dims: 4,
+            captured: Arc::clone(&captured),
+        });
+
+        let content = format!("{}\u{1f980}tail", "a".repeat(MAX_TEXT_CHARS - 1));
+        let note = rt
+            .create_note(&tok, "observation", None, &content, None, None, vec![])
+            .await
+            .expect("over-length note create must succeed");
+        let fetched = rt
+            .notes(&tok)
+            .unwrap()
+            .get_note(note.id)
+            .await
+            .unwrap()
+            .expect("created note must be retrievable");
+        assert_eq!(fetched.content, content, "stored content must remain full");
+
+        let embedded = captured.lock().unwrap().clone();
+        assert_eq!(embedded.len(), 1);
+        assert_eq!(embedded[0].len(), MAX_TEXT_CHARS - 1);
+        assert!(embedded[0].is_char_boundary(embedded[0].len()));
+        assert!(!embedded[0].contains('\u{1f980}'));
+        assert!(rt.document_embedding_input_will_be_truncated(&content));
+
+        let vector_info = rt
+            .vectors_for_model(&tok, "strict-length-test")
+            .expect("vector store")
+            .info()
+            .await
+            .expect("vector info");
+        assert_eq!(vector_info.dimensions, 4);
+        assert_eq!(vector_info.entry_count, 1);
+
+        captured.lock().unwrap().clear();
+        rt.reindex_note(&tok, &fetched)
+            .await
+            .expect("reindex must bound the same stored content");
+        assert_eq!(captured.lock().unwrap()[0].len(), MAX_TEXT_CHARS - 1);
+
+        captured.lock().unwrap().clear();
+        rt.embed_document_batch_with_model("strict-length-test", std::slice::from_ref(&content))
+            .await
+            .expect("batch reindex seam must bound stored content");
+        assert_eq!(captured.lock().unwrap()[0].len(), MAX_TEXT_CHARS - 1);
+
+        let normal = "normal byte-identical embedding input";
+        rt.create_note(&tok, "observation", None, normal, None, None, vec![])
+            .await
+            .expect("normal note create must succeed");
+        assert_eq!(captured.lock().unwrap().last().unwrap(), normal);
+        assert!(!rt.document_embedding_input_will_be_truncated(normal));
+
+        let long_description = format!("{}\u{1f980}tail", "b".repeat(MAX_TEXT_CHARS));
+        rt.create_entity(
+            &tok,
+            "concept",
+            None,
+            "entity",
+            Some(&long_description),
+            None,
+            vec![],
+        )
+        .await
+        .expect("over-length entity create must succeed");
     }
 
     #[tokio::test]

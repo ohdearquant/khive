@@ -65,6 +65,26 @@ pub trait GraphStore: Send + Sync + 'static {
     /// Fetch an edge by link ID including soft-deleted rows. Used by the runtime hard-delete path
     /// to locate and namespace-check an already-soft-deleted edge before purging it.
     async fn get_edge_including_deleted(&self, id: LinkId) -> StorageResult<Option<Edge>>;
+    /// Fetch an edge by natural key (namespace, source, target, relation) including
+    /// soft-deleted rows. Used by the atomic-apply result renderer for a symmetric-relation
+    /// update whose surviving canonical row may be tombstoned (ADR-039 DO NOTHING) — the
+    /// normal `query_edges`/`list_edges` path filters `deleted_at IS NULL` and would report
+    /// "not found" for exactly that row.
+    ///
+    /// `namespace` is the natural key's own `namespace` column value (part of the
+    /// `UNIQUE(namespace, source_id, target_id, relation)` constraint this method queries by)
+    /// — it is passed explicitly rather than implied by whichever store instance `self` is,
+    /// so a caller who resolved the record's namespace independently of its own ambient token
+    /// (the atomic-apply renderer, which knows the committed edge's namespace from its prepare-
+    /// time `EdgeNaturalKey`, not from the caller's token) cannot accidentally query the wrong
+    /// namespace by relying on implicit store scoping (khive#1213/#1214 fix round).
+    async fn get_edge_by_natural_key_including_deleted(
+        &self,
+        namespace: &str,
+        source_id: Uuid,
+        target_id: Uuid,
+        relation: EdgeRelation,
+    ) -> StorageResult<Option<Edge>>;
     /// Delete an edge by link ID using the specified delete mode.
     async fn delete_edge(&self, id: LinkId, mode: DeleteMode) -> StorageResult<bool>;
     /// Query edges with filter, sort, and pagination.
@@ -76,10 +96,44 @@ pub trait GraphStore: Send + Sync + 'static {
     ) -> StorageResult<Page<Edge>>;
     /// Count edges matching the given filter.
     async fn count_edges(&self, filter: EdgeFilter) -> StorageResult<u64>;
+    /// Count edges across the given namespaces in one aggregate query.
+    /// Backends without batched namespace support retain the single-namespace
+    /// path and reject multi-namespace requests explicitly.
+    async fn count_edges_in_namespaces(
+        &self,
+        namespaces: &[String],
+        filter: EdgeFilter,
+    ) -> StorageResult<u64> {
+        match namespaces.len() {
+            0 => Ok(0),
+            1 => self.count_edges(filter).await,
+            _ => Err(StorageError::Unsupported {
+                capability: StorageCapability::Graph,
+                operation: "count_edges_in_namespaces".into(),
+                message: "this backend does not implement batched namespace edge counts".into(),
+            }),
+        }
+    }
     /// Count edges grouped by relation, ignoring soft-deleted rows. Cheap
     /// aggregate (`GROUP BY relation`) used to report the true per-relation
     /// population for full-graph audits (#702.3).
     async fn count_edges_by_relation(&self) -> StorageResult<Vec<(EdgeRelation, u64)>>;
+    /// Count edges grouped by relation across the given namespaces in one
+    /// aggregate query.
+    async fn count_edges_by_relation_in_namespaces(
+        &self,
+        namespaces: &[String],
+    ) -> StorageResult<Vec<(EdgeRelation, u64)>> {
+        match namespaces.len() {
+            0 => Ok(Vec::new()),
+            1 => self.count_edges_by_relation().await,
+            _ => Err(StorageError::Unsupported {
+                capability: StorageCapability::Graph,
+                operation: "count_edges_by_relation_in_namespaces".into(),
+                message: "this backend does not implement batched namespace relation counts".into(),
+            }),
+        }
+    }
     /// Seek-pagination page of edges ordered by `id` ascending, using an
     /// indexed range scan (`id > after`) against the `(namespace, id)`
     /// primary key instead of `OFFSET`. `after` is exclusive; `None` starts

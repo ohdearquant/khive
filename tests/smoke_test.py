@@ -143,6 +143,9 @@ def main():
             assert verb in request_desc, (
                 f"request description missing verb {verb!r}; got:\n{request_desc}"
             )
+        assert '"status": "success" | "partial"' in request_desc, (
+            f"request description missing batch status contract; got:\n{request_desc}"
+        )
         print(f"  [ok] tools/list — single `request` tool; description lists 11 verbs")
 
         # 3. Create entities
@@ -426,6 +429,7 @@ def main():
         assert summary.get("total") == 3 and summary.get("failed") == 0, (
             f"expected 3/0 summary, got {summary}"
         )
+        assert bulk.get("status") == "success", f"expected success status, got {bulk}"
         print(f"  [ok] parallel batch — 3 independent creates in one request call")
 
         # 24. Malformed DSL must surface as RPC-level invalid_params, not silent success.

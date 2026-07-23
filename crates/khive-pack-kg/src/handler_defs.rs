@@ -417,7 +417,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 19] = [
     // Declaration: declares two records identical
     HandlerDef {
         name: "merge",
-        description: "Deduplicate two entities or notes. Successful non-dry-run merges emit an entity_merged or note_merged audit event. Returns {kept_id, removed_id, edges_rewired, properties_merged, tags_unioned, content_appended, dry_run}; \
+        description: "Deduplicate two entities or notes. Entity merges that fail the cheap entity_kind, name_similarity, or project_compatibility guard return a structured conflict error naming the guard in details.guard. force=true bypasses those guards and means the caller accepts responsibility. Successful non-dry-run merges emit an entity_merged or note_merged audit event. Returns {kept_id, removed_id, edges_rewired, properties_merged, tags_unioned, content_appended, dry_run}; \
                        chain with $prev.kept_id (not $prev.id — merge does not return a top-level id field).",
         visibility: Visibility::Verb,
         category: VerbCategory::Declaration,
@@ -457,6 +457,12 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 19] = [
                 param_type: "bool",
                 required: false,
                 description: "If true, return the planned summary without mutating records or emitting an event.",
+            },
+            ParamDef {
+                name: "force",
+                param_type: "bool",
+                required: false,
+                description: "If true, bypass entity merge safety guards; the caller accepts responsibility for the merge.",
             },
             ParamDef {
                 name: "reason",
@@ -856,12 +862,15 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 19] = [
         description: "Resolve natural-language references to ids. Each ref in \
                        `refs` is resolved through, in order: (1) id-string \
                        passthrough (UUID / 8+ hex prefix) via the by-ID path; \
-                       (2) this actor's recently-referenced ring; (3) an exact, \
+                       Entity ids only: note, edge, and event ids return \
+                       NotFound here; use `get` for auto-detection. (2) this \
+                       actor's recently-referenced ring; (3) an exact, \
                        case-sensitive entity-name match, which resolves \
                        deterministically regardless of search rank (one match \
                        -> Resolved; several identically-named entities -> \
                        Ambiguous over exactly that set); (4) hybrid search over \
-                       the namespace. Returns one of Resolved{id,confidence} | \
+                       the namespace, discarding vector hits with raw cosine similarity \
+                       below 0.3 before RRF fusion. Returns one of Resolved{id,confidence} | \
                        Ambiguous{candidates} | NotFound per ref — never a silent \
                        pick among close candidates. For a non-exact ref that \
                        stays ambiguous, `candidates` is a bounded sample capped \
@@ -1412,11 +1421,22 @@ mod tests {
                 "merge must document required {required}"
             );
         }
-        for optional in ["kind", "strategy", "content_strategy", "dry_run", "reason"] {
+        for optional in [
+            "kind",
+            "strategy",
+            "content_strategy",
+            "dry_run",
+            "force",
+            "reason",
+        ] {
             assert!(
                 h.params.iter().any(|p| p.name == optional && !p.required),
                 "merge must document optional {optional}"
             );
         }
+        assert!(
+            h.description.contains("details.guard") && h.description.contains("force=true"),
+            "merge must document structured guard refusal and the responsibility override"
+        );
     }
 }

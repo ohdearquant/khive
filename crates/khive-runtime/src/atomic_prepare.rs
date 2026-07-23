@@ -28,6 +28,7 @@ use crate::atomic_plan::{
     PlanStatement, PostCommitEffect, UpdatePlan,
 };
 use crate::atomic_runner::AtomicOpPlan;
+use crate::atomic_runner::CommittedPostCommitEffects;
 use crate::curation::{entity_fts_document, note_fts_document};
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::operations::{
@@ -42,8 +43,8 @@ use khive_db::stores::entity::{
 use khive_db::stores::event::event_insert_statements;
 use khive_db::stores::graph::{
     edge_hard_delete_statement, edge_insert_guarded_by_endpoints_statement,
-    edge_soft_delete_statement, edge_symmetric_delete_if_conflict_statement,
-    edge_symmetric_refresh_or_update_inplace_statement, edge_upsert_statement,
+    edge_soft_delete_statement, edge_symmetric_absorb_or_update_inplace_statement,
+    edge_symmetric_delete_if_conflict_statement, edge_upsert_statement,
     purge_incident_edges_statement,
 };
 use khive_db::stores::note::{
@@ -231,6 +232,30 @@ fn purge_index_row_statement(
     }
 }
 
+fn log_vector_row_delete_statement(
+    table: &str,
+    namespace: &str,
+    subject_id: Uuid,
+    label: &str,
+) -> PlanStatement {
+    PlanStatement {
+        statement: SqlStatement {
+            sql: format!(
+                "INSERT INTO ann_write_log \
+                 (namespace, embedding_model, kind, field, subject_id, op) \
+                 SELECT namespace, embedding_model, kind, field, subject_id, 'delete' \
+                 FROM {table} WHERE namespace = ?1 AND subject_id = ?2"
+            ),
+            params: vec![
+                SqlValue::Text(namespace.to_string()),
+                SqlValue::Text(subject_id.to_string()),
+            ],
+            label: Some(label.to_string()),
+        },
+        guard: None,
+    }
+}
+
 /// `true` iff a table named `table` currently exists in the backing SQLite
 /// database (`sqlite_master` probe, read-only — safe in async prepare, does
 /// NOT open/create the vector store, so it cannot lazily create the table
@@ -283,6 +308,12 @@ async fn push_index_purge_statements(
     ));
     for vec_table in vector_table_names(runtime) {
         if vector_table_exists(runtime, &vec_table).await? {
+            statements.push(log_vector_row_delete_statement(
+                &vec_table,
+                namespace,
+                subject_id,
+                &format!("{label_prefix}-log-delete-vec-{vec_table}"),
+            ));
             statements.push(purge_index_row_statement(
                 &vec_table,
                 namespace,
@@ -811,7 +842,7 @@ pub async fn prepare_update_entity_plan(
 /// op in the same atomic unit could change the conflict landscape between
 /// probe and commit, making any such branch stale by construction. It always
 /// emits BOTH statements from [`edge_symmetric_delete_if_conflict_statement`]
-/// and [`edge_symmetric_refresh_or_update_inplace_statement`], each carrying
+/// and [`edge_symmetric_absorb_or_update_inplace_statement`], each carrying
 /// its own commit-time `WHERE`/`CASE WHEN` predicate that re-evaluates the
 /// conflict condition fresh inside the transaction. This function reads no
 /// state to guess a surviving id; the plan instead carries `edge_natural_key`
@@ -899,7 +930,7 @@ async fn prepare_update_edge(
             }),
         });
         statements.push(PlanStatement {
-            statement: edge_symmetric_refresh_or_update_inplace_statement(
+            statement: edge_symmetric_absorb_or_update_inplace_statement(
                 &namespace,
                 id,
                 canon_src,
@@ -1431,9 +1462,9 @@ async fn prepare_merge(
 pub async fn apply_post_commit_effects(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
-    effects: Vec<PostCommitEffect>,
+    effects: CommittedPostCommitEffects,
 ) -> RuntimeResult<()> {
-    for effect in effects {
+    for effect in effects.into_effects() {
         match effect {
             PostCommitEffect::None => {}
             PostCommitEffect::ReindexEntity { entity_id } => {
@@ -1704,8 +1735,8 @@ mod tests {
             other => panic!("expected Committed, got {other:?}"),
         };
         assert_eq!(
-            post_commit,
-            vec![PostCommitEffect::ReindexNote { note_id }],
+            post_commit.as_slice(),
+            &[PostCommitEffect::ReindexNote { note_id }],
             "content change must schedule exactly one ReindexNote post-commit effect"
         );
 
@@ -1747,7 +1778,7 @@ mod tests {
     /// dependency is needed at this layer, since the hook itself is
     /// generic.
     #[tokio::test]
-    async fn atomic_note_update_and_delete_post_commit_fire_the_note_mutation_hook() {
+    async fn atomic_note_update_and_delete_post_commit_effects_execute_exactly_once() {
         let runtime = scratch_runtime();
         let token = runtime
             .authorize(Namespace::parse("local").expect("ns"))
@@ -1824,8 +1855,8 @@ mod tests {
             other => panic!("expected Committed, got {other:?}"),
         };
         assert_eq!(
-            post_commit,
-            vec![PostCommitEffect::NoteDeleted {
+            post_commit.as_slice(),
+            &[PostCommitEffect::NoteDeleted {
                 note_id: delete_note_id,
                 kind: "observation".to_string(),
             }],
@@ -1835,14 +1866,13 @@ mod tests {
             .await
             .expect("apply post-commit effects (delete)");
 
-        let seen = fired.lock().expect("lock").clone();
-        assert!(
-            seen.contains(&("observation".to_string(), update_note_id)),
-            "the note-mutation hook must fire for the atomic UPDATE path: {seen:?}"
-        );
-        assert!(
-            seen.contains(&("observation".to_string(), delete_note_id)),
-            "the note-mutation hook must fire for the atomic DELETE path: {seen:?}"
+        assert_eq!(
+            *fired.lock().expect("lock"),
+            vec![
+                ("observation".to_string(), update_note_id),
+                ("observation".to_string(), delete_note_id),
+            ],
+            "each committed token must execute its note-mutation effect exactly once"
         );
     }
 
@@ -2009,6 +2039,72 @@ mod tests {
                 "vector row must be purged after atomic delete (hard={hard})"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn atomic_delete_entity_and_note_logs_vector_delete_rows() {
+        let runtime = scratch_runtime();
+        runtime.register_embedder(StubProvider);
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+
+        let entity = khive_storage::Entity::new("local", "concept", "ann-delete-entity");
+        let entity_id = entity.id;
+        runtime
+            .entities(&token)
+            .expect("entities store")
+            .upsert_entity(entity.clone())
+            .await
+            .expect("seed entity");
+        runtime
+            .reindex_entity(&token, &entity)
+            .await
+            .expect("seed entity vector row");
+        let note = khive_storage::note::Note::new("local", "observation", "ann-delete-note");
+        let note_id = note.id;
+        runtime
+            .notes(&token)
+            .expect("notes store")
+            .upsert_note(note.clone())
+            .await
+            .expect("seed note");
+        runtime
+            .reindex_note(&token, &note)
+            .await
+            .expect("seed note vector row");
+
+        for id in [entity_id, note_id] {
+            let plan = prepare_delete(&runtime, &token, &json!({"id": id.to_string()}), None)
+                .await
+                .expect("prepare delete");
+            let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+                .await
+                .expect("seam call ok");
+            assert!(matches!(
+                outcome,
+                crate::atomic_runner::AtomicRunOutcome::Committed { .. }
+            ));
+        }
+
+        let mut reader = runtime.sql().reader().await.expect("sql reader");
+        let count = reader
+            .query_scalar(SqlStatement {
+                sql: "SELECT COUNT(*) FROM ann_write_log \
+                      WHERE namespace = 'local' AND embedding_model = ?1 AND op = 'delete' \
+                      AND ((kind = 'entity' AND field = 'entity.body' AND subject_id = ?2) \
+                        OR (kind = 'note' AND field = 'note.content' AND subject_id = ?3))"
+                    .to_string(),
+                params: vec![
+                    SqlValue::Text(STUB_MODEL.to_string()),
+                    SqlValue::Text(entity_id.to_string()),
+                    SqlValue::Text(note_id.to_string()),
+                ],
+                label: Some("test-atomic-delete-ann-write-log".to_string()),
+            })
+            .await
+            .expect("query ANN write log");
+        assert!(matches!(count, Some(SqlValue::Integer(2))));
     }
 
     /// Atomic link must persist an explicit top-level `dependency_kind`
@@ -2807,8 +2903,10 @@ mod tests {
     /// (b): changing a non-symmetric edge's `relation` to a symmetric one
     /// whose canonical natural key collides with an ALREADY-EXISTING
     /// symmetric edge between the same two entities must delete the
-    /// requested (non-canonical) row and refresh the surviving canonical
-    /// row in place, rather than raising a uniqueness error.
+    /// requested (non-canonical) row and leave the surviving canonical row
+    /// untouched (ADR-039 ON CONFLICT DO NOTHING), rather than raising a
+    /// uniqueness error OR overwriting the survivor with the discarded
+    /// edge's attributes (khive#1213).
     #[tokio::test]
     async fn atomic_update_edge_symmetric_conflict_absorbs_into_surviving_row() {
         let runtime = scratch_runtime();
@@ -2889,13 +2987,18 @@ mod tests {
             "the non-canonical requested row must be deleted, not just tombstoned"
         );
 
-        // The surviving canonical row must carry the patch.
+        // ADR-039 DO NOTHING: the surviving canonical row keeps its OWN
+        // pre-existing attributes — the discarded edge's patched weight
+        // (0.9) must never overwrite it.
         let surviving = runtime
             .get_edge(&token, canonical_id)
             .await
             .expect("get_edge")
             .expect("surviving canonical row must remain");
-        assert_eq!(surviving.weight, 0.9);
+        assert_eq!(
+            surviving.weight, 0.6,
+            "survivor weight must not be overwritten by the discarded edge's patch"
+        );
         assert_eq!(surviving.relation, EdgeRelation::CompetesWith);
 
         // Event target is the CALLER-supplied id, not the surviving id —
@@ -2904,6 +3007,78 @@ mod tests {
         let events =
             events_for_target(&runtime, &token, requested_id, EventKind::EdgeUpdated).await;
         assert_eq!(events.len(), 1);
+    }
+
+    /// A soft-deleted surviving canonical row must not be resurrected by a
+    /// conflicting symmetric-relation update (ADR-039 DO NOTHING; khive#1213):
+    /// the requested edge is still deleted (conflict absorbed), but the
+    /// tombstoned survivor must stay tombstoned.
+    #[tokio::test]
+    async fn atomic_update_edge_symmetric_conflict_does_not_resurrect_tombstoned_survivor() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let entities = runtime.entities(&token).expect("entities store");
+        let a = khive_storage::Entity::new("local", "concept", "GapEdgeSymTombA");
+        let b = khive_storage::Entity::new("local", "concept", "GapEdgeSymTombB");
+        let (a_id, b_id) = (a.id, b.id);
+        entities.upsert_entity(a).await.expect("seed a");
+        entities.upsert_entity(b).await.expect("seed b");
+
+        let requested_edge = runtime
+            .link(&token, a_id, b_id, EdgeRelation::Extends, 0.2, None)
+            .await
+            .expect("seed requested edge");
+        let requested_id = Uuid::from(requested_edge.id);
+
+        let canonical_edge = runtime
+            .link(&token, a_id, b_id, EdgeRelation::CompetesWith, 0.6, None)
+            .await
+            .expect("seed canonical edge");
+        let canonical_id = Uuid::from(canonical_edge.id);
+        runtime
+            .delete_edge(&token, canonical_id, false)
+            .await
+            .expect("soft-delete canonical edge");
+
+        let plan = prepare_update(
+            &runtime,
+            &token,
+            &json!({"id": requested_id.to_string(), "relation": "competes_with", "weight": 0.9}),
+            None,
+        )
+        .await
+        .expect("prepare update edge (symmetric conflict over tombstone)");
+
+        let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+            .await
+            .expect("seam call ok");
+        assert!(
+            matches!(
+                outcome,
+                crate::atomic_runner::AtomicRunOutcome::Committed { .. }
+            ),
+            "expected a clean symmetric-conflict-absorption commit: {outcome:?}"
+        );
+
+        let requested_after = runtime
+            .get_edge_including_deleted(&token, requested_id)
+            .await
+            .expect("get_edge_including_deleted");
+        assert!(
+            requested_after.is_none(),
+            "the non-canonical requested row must be deleted, not just tombstoned"
+        );
+
+        let canonical_after = runtime
+            .get_edge(&token, canonical_id)
+            .await
+            .expect("get_edge");
+        assert!(
+            canonical_after.is_none(),
+            "a tombstoned survivor must not be resurrected by a conflicting update"
+        );
     }
 
     /// The same-unit race: `[delete(X), update(X -> competes_with)]` where
@@ -3280,12 +3455,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn atomic_add_entity_link_add_note_plan_commits_entity_edge_note_and_fts_together() {
+    async fn atomic_proposal_vectors_materialize_only_after_successful_commit() {
         let runtime = scratch_runtime();
         runtime.register_embedder(StubProvider);
         let token = runtime
             .authorize(Namespace::parse("local").expect("ns"))
             .expect("authorize");
+        let vec_store = runtime
+            .vectors_for_model(&token, STUB_MODEL)
+            .expect("vec store");
         let entities = runtime.entities(&token).expect("entities store");
         let a = khive_storage::Entity::new("local", "concept", "ProposalPlanLinkA");
         let b = khive_storage::Entity::new("local", "concept", "ProposalPlanLinkB");
@@ -3334,6 +3512,19 @@ mod tests {
             crate::atomic_runner::AtomicRunOutcome::Committed { post_commit } => post_commit,
             other => panic!("expected the whole unit to commit: {other:?}"),
         };
+        assert_eq!(
+            post_commit.as_slice(),
+            &[
+                PostCommitEffect::ReindexEntity { entity_id },
+                PostCommitEffect::ReindexNote { note_id },
+            ],
+            "prepare-derived effects must reach the committed token unchanged"
+        );
+        assert_eq!(
+            vec_store.count().await.expect("count before effects"),
+            0,
+            "commit returns deferred effects without materializing vectors"
+        );
         let entity = runtime
             .entities(&token)
             .expect("entities store")
@@ -3384,9 +3575,6 @@ mod tests {
             .await
             .expect("apply post-commit effects");
 
-        let vec_store = runtime
-            .vectors_for_model(&token, STUB_MODEL)
-            .expect("vec store");
         assert_eq!(
             vec_store.count().await.expect("count after"),
             2,
@@ -3395,11 +3583,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn atomic_add_entity_and_add_note_roll_back_on_later_link_failure_leaving_zero_trace() {
+    async fn atomic_proposal_abort_leaves_zero_vector_rows() {
         let runtime = scratch_runtime();
+        runtime.register_embedder(StubProvider);
         let token = runtime
             .authorize(Namespace::parse("local").expect("ns"))
             .expect("authorize");
+        let vec_store = runtime
+            .vectors_for_model(&token, STUB_MODEL)
+            .expect("vec store");
         let entities = runtime.entities(&token).expect("entities store");
         let a = khive_storage::Entity::new("local", "concept", "ProposalPlanRollbackA");
         let x = khive_storage::Entity::new("local", "concept", "ProposalPlanRollbackX");
@@ -3465,6 +3657,15 @@ mod tests {
             }
             other => panic!("expected the whole unit to roll back, got {other:?}"),
         }
+
+        assert_eq!(
+            vec_store
+                .count()
+                .await
+                .expect("vector count after rollback"),
+            0,
+            "a rolled-back atomic apply must not materialize vectors"
+        );
 
         assert!(
             runtime

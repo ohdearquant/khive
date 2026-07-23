@@ -49,7 +49,8 @@ workspace linking, blob storage, and brain profiles (`brain.*` verbs — Bayesia
 recall-tuning) are provided by commercially licensed extensions and are not part of this
 distribution; this plugin ships a pattern skill only for `kg`. Git provenance ingestion and
 write verbs (`git.digest`, `git.commit`, `git.branch`, `git.push`) are likewise a
-commercially licensed extension.
+commercially licensed extension. Code-quality and formal-methods ontology packs are also
+commercially licensed extensions and are not included in this plugin.
 See [INSTALL.md](../INSTALL.md) for setup, the actor config, and the smoke test.
 
 ## Links

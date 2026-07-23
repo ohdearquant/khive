@@ -30,7 +30,8 @@ provided by commercially licensed extensions and are not part of this distributi
 installed, they load the same way, via `KHIVE_PACKS`/`--pack`. Git provenance ingestion
 (`git.digest`, the `commit`/`issue`/`pull_request` note kinds) and the `git.commit` /
 `git.branch` / `git.push` write verbs (ADR-108) are likewise a commercially licensed
-extension.
+extension. The code-quality and formal-methods ontology packs are also distributed as
+commercially licensed extensions rather than as part of this repository.
 
 The default binary (no `KHIVE_PACKS`/`--pack` override) loads the `kg` pack: **19 verbs**.
 
@@ -294,6 +295,14 @@ Patch entity, note, or edge fields. Field set depends on substrate: entities acc
 ```
 request(ops="update(id=\"<uuid>\", salience=0.7)")
 ```
+
+For a symmetric-relation edge (`competes_with`, `composed_with`), setting `relation` or
+`weight` can collide with an already-existing edge at the same canonical `(source, target,
+relation)` triple. When that happens, the requested edge is dropped and the returned record
+is the pre-existing survivor, left exactly as it was (ADR-039's edge-conflict contract is
+`ON CONFLICT DO NOTHING` — the survivor's own attributes are never overwritten by the
+discarded edge's patch). If that survivor was previously soft-deleted, the returned edge may
+carry a non-null `deleted_at`: absorbing a conflicting update never resurrects a tombstone.
 
 ### `delete` — Declaration
 
@@ -593,9 +602,15 @@ request(ops="withdraw(id=\"<proposal-id>\")")
 Resolve natural-language references to ids. Each ref in `refs` is resolved through:
 (1) id-string passthrough (UUID or 8+ hex prefix) via the existing by-ID path; (2) this
 actor's recently-referenced ring; (3) a case-sensitive exact match on `entities.name`;
-(4) hybrid search over the namespace. Returns one of
+(4) hybrid search over the namespace, with vector hits below the server-side `0.3` raw
+cosine-similarity floor discarded before RRF fusion. Returns one of
 `Resolved{id,confidence}` | `Ambiguous{candidates}` | `NotFound` per ref — never a
 silent pick among close candidates. Read-only: performs no mutation.
+
+The id-string stage resolves entities only. Note, edge, and event UUIDs or hex prefixes
+return `NotFound` through `resolve` under every `kind`; use `get` when the substrate should
+be auto-detected. The similarity floor removes low-confidence ANN neighbors while preserving
+lexical partial-name matches, whose RRF score encodes rank rather than textual relevance.
 
 | Param   | Type            | Required | Notes                                                                                                           |
 | ------- | --------------- | -------- | --------------------------------------------------------------------------------------------------------------- |

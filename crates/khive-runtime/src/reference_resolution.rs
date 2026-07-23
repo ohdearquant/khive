@@ -79,8 +79,15 @@ const EXACT_NAME_CONFIDENCE: f64 = 0.98;
 /// best" the way it can for the ring. Below the margin, every hit above the
 /// score floor is surfaced as a candidate instead.
 const SEARCH_MARGIN_RATIO: f64 = 2.0;
-/// Hybrid-search hits below this score never enter the candidate set at all.
-const SEARCH_SCORE_FLOOR: f64 = 0.0;
+/// Vector hits below this raw cosine-similarity score are removed before RRF
+/// fusion. Lexical hits remain admissible because RRF magnitude encodes rank,
+/// not textual relevance, and genuine partial-name matches score below this floor.
+///
+/// This is a raw cosine value in `[-1.0, 1.0]`, not the `(1 + cos) / 2`
+/// storage scale vector hits are scored on
+/// (`khive-db` `stores/vectors.rs`) — `hybrid_search_with_vector_similarity_floor`
+/// converts between the two scales at the comparison site.
+const SEARCH_VECTOR_SIMILARITY_FLOOR: f64 = 0.3;
 /// Confidence reported on a search-stage `Resolved` outcome: not the raw
 /// RRF score, which lives on a much smaller scale (`sum 1/(k + rank)`, e.g.
 /// ~0.016-0.033) and would never clear a 0..1 confidence bar. Fixed below
@@ -249,7 +256,7 @@ pub async fn resolve_reference(
     let candidate_limit = limit.max(1);
     let search_limit = candidate_limit.max(STAGE4_MIN_SEARCH_LIMIT);
     let hits = runtime
-        .hybrid_search(
+        .hybrid_search_with_vector_similarity_floor(
             token,
             trimmed,
             None,
@@ -258,11 +265,11 @@ pub async fn resolve_reference(
             None,
             &[],
             None,
+            SEARCH_VECTOR_SIMILARITY_FLOOR,
         )
         .await?;
     let candidates: Vec<ReferenceCandidate> = hits
         .into_iter()
-        .filter(|h| h.score.to_f64() > SEARCH_SCORE_FLOOR)
         .map(|h| ReferenceCandidate {
             id: h.entity_id,
             name: h.title,
@@ -405,9 +412,74 @@ fn is_hex_prefix(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::NamespaceToken as TokenCtor;
+    use crate::config::{NamespaceToken as TokenCtor, RuntimeConfig};
+    use crate::embedder_registry::EmbedderProvider;
+    use crate::retrieval::SearchSource;
     use khive_gate::ActorRef;
-    use khive_types::namespace::Namespace;
+    use khive_types::{namespace::Namespace, SubstrateKind};
+    use lattice_embed::{EmbeddingModel, EmbeddingService};
+    use std::sync::Arc;
+
+    struct ConstantEmbeddingService {
+        dimensions: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl EmbeddingService for ConstantEmbeddingService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+            Ok(texts.iter().map(|_| vec![1.0; self.dimensions]).collect())
+        }
+
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "resolve-test-constant-embedding"
+        }
+    }
+
+    struct ConstantEmbedderProvider {
+        name: String,
+        dimensions: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl EmbedderProvider for ConstantEmbedderProvider {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn dimensions(&self) -> usize {
+            self.dimensions
+        }
+
+        async fn build(&self) -> RuntimeResult<Arc<dyn EmbeddingService>> {
+            Ok(Arc::new(ConstantEmbeddingService {
+                dimensions: self.dimensions,
+            }))
+        }
+    }
+
+    fn runtime_with_constant_embeddings() -> KhiveRuntime {
+        let model = EmbeddingModel::AllMiniLmL6V2;
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            embedding_model: Some(model),
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::no_embeddings()
+        })
+        .expect("in-memory runtime");
+        runtime.register_embedder(ConstantEmbedderProvider {
+            name: model.to_string(),
+            dimensions: model.dimensions(),
+        });
+        runtime
+    }
 
     fn actor_token(actor_id: &str) -> NamespaceToken {
         TokenCtor::mint_authorized(Namespace::local(), ActorRef::new("agent", actor_id))
@@ -811,6 +883,187 @@ mod tests {
             }
             other => panic!("expected Ambiguous on a genuine name tie, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn fallback_stage_resolves_high_similarity_semantic_only_candidate() {
+        let rt = runtime_with_constant_embeddings();
+        let token = actor_token("resolver-test");
+        let ring = ReferenceRing::new();
+
+        let entity = rt
+            .create_entity(&token, "concept", None, "Canine", None, None, vec![])
+            .await
+            .expect("create semantic match");
+
+        let raw_hits = rt
+            .vector_search(
+                &token,
+                None,
+                Some("domestic dog"),
+                5,
+                Some(SubstrateKind::Entity),
+            )
+            .await
+            .expect("vector search");
+        assert_eq!(raw_hits.len(), 1);
+        assert_eq!(raw_hits[0].subject_id, entity.id);
+        // Identical constant embeddings: raw cosine 1.0, storage score
+        // (1 + 1.0) / 2 == 1.0 — well above 0.65, the storage-scale floor a
+        // raw-cosine bar of 0.3 converts to.
+        assert!((raw_hits[0].score.to_f64() - 1.0).abs() < 1e-6);
+
+        let hits = rt
+            .hybrid_search(&token, "domestic dog", None, 5, None, None, &[], None)
+            .await
+            .expect("hybrid search");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].source, SearchSource::Vector);
+
+        let resolution = resolve_reference(&rt, &ring, &token, "domestic dog", 5, None)
+            .await
+            .expect("resolve_reference");
+
+        assert_eq!(
+            resolution,
+            ReferenceResolution::Resolved {
+                id: entity.id,
+                confidence: SEARCH_RESOLVED_CONFIDENCE,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_stage_drops_orthogonal_semantic_only_candidate() {
+        // Regression for #1366: an orthogonal vector (raw cosine 0.0) scores
+        // 0.5 on the `(1 + cos) / 2` storage scale, which clears a floor
+        // compared directly against the raw-cosine constant (0.3) even
+        // though the documented contract says it should not. A sole
+        // semantic candidate at this similarity must be dropped, not
+        // resolved.
+        let rt = runtime_with_constant_embeddings();
+        let token = actor_token("resolver-test");
+        let ring = ReferenceRing::new();
+        let dimensions = EmbeddingModel::AllMiniLmL6V2.dimensions();
+
+        let entity = rt
+            .create_entity(
+                &token,
+                "concept",
+                None,
+                "Unrelated Orthogonal",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect("create unrelated entity");
+        let vectors = rt.vectors(&token).expect("vector store");
+        vectors
+            .delete(entity.id)
+            .await
+            .expect("delete generated vector");
+        let mut orthogonal_vector = vec![1.0f32; dimensions / 2];
+        orthogonal_vector.extend(vec![-1.0f32; dimensions - dimensions / 2]);
+        vectors
+            .insert(
+                entity.id,
+                SubstrateKind::Entity,
+                token.namespace().as_str(),
+                "entity.body",
+                vec![orthogonal_vector],
+            )
+            .await
+            .expect("insert orthogonal vector");
+
+        let raw_hits = rt
+            .vector_search(
+                &token,
+                None,
+                Some("totally-nonexistent-orthogonal-zzz"),
+                5,
+                Some(SubstrateKind::Entity),
+            )
+            .await
+            .expect("vector search");
+        assert_eq!(raw_hits.len(), 1);
+        assert!((raw_hits[0].score.to_f64() - 0.5).abs() < 1e-6);
+
+        let resolution = resolve_reference(
+            &rt,
+            &ring,
+            &token,
+            "totally-nonexistent-orthogonal-zzz",
+            5,
+            None,
+        )
+        .await
+        .expect("resolve_reference");
+
+        assert_eq!(resolution, ReferenceResolution::NotFound);
+    }
+
+    #[tokio::test]
+    async fn fallback_stage_drops_low_similarity_semantic_only_candidates() {
+        let rt = runtime_with_constant_embeddings();
+        let token = actor_token("resolver-test");
+        let ring = ReferenceRing::new();
+        let dimensions = EmbeddingModel::AllMiniLmL6V2.dimensions();
+
+        let entity = rt
+            .create_entity(
+                &token,
+                "concept",
+                None,
+                "Unrelated Alpha",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect("create unrelated entity");
+        let vectors = rt.vectors(&token).expect("vector store");
+        vectors
+            .delete(entity.id)
+            .await
+            .expect("delete generated vector");
+        // A quarter of dimensions aligned, three-quarters opposed against the
+        // constant all-ones query embedding: raw cosine 2*0.25 - 1 == -0.5,
+        // storage score (1 + -0.5) / 2 == 0.25 — below floor without being
+        // the maximally-opposite case, so this exercises a genuine
+        // below-floor mismatch rather than the degenerate cosine -1 extreme.
+        let quarter = dimensions / 4;
+        let mut mismatched_vector = vec![1.0f32; quarter];
+        mismatched_vector.extend(vec![-1.0f32; dimensions - quarter]);
+        vectors
+            .insert(
+                entity.id,
+                SubstrateKind::Entity,
+                token.namespace().as_str(),
+                "entity.body",
+                vec![mismatched_vector],
+            )
+            .await
+            .expect("insert mismatched vector");
+
+        let raw_hits = rt
+            .vector_search(
+                &token,
+                None,
+                Some("totally-nonexistent-zzz"),
+                5,
+                Some(SubstrateKind::Entity),
+            )
+            .await
+            .expect("vector search");
+        assert_eq!(raw_hits.len(), 1);
+        assert!((raw_hits[0].score.to_f64() - 0.25).abs() < 1e-6);
+
+        let resolution = resolve_reference(&rt, &ring, &token, "totally-nonexistent-zzz", 5, None)
+            .await
+            .expect("resolve_reference");
+
+        assert_eq!(resolution, ReferenceResolution::NotFound);
     }
 
     // Regression for #908: garbage input that matches nothing must still be
