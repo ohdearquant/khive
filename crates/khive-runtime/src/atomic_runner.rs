@@ -149,19 +149,62 @@ pub enum AtomicOpFailure {
     },
 }
 
+/// Deferred effects whose owning atomic unit has committed successfully.
+///
+/// Only [`run_atomic_unit`] can construct this token. Consumers may inspect
+/// its effects through [`CommittedPostCommitEffects::as_slice`], while the
+/// phase-3 executor takes the token by value; no public API exposes the owned
+/// effect collection or accepts a prepare-time [`PostCommitEffect`] in its
+/// place.
+///
+/// A committed token is a one-shot capability and cannot be cloned for
+/// replay:
+///
+/// ```compile_fail
+/// use khive_runtime::CommittedPostCommitEffects;
+///
+/// fn duplicate(
+///     committed: &CommittedPostCommitEffects,
+/// ) -> CommittedPostCommitEffects {
+///     committed.clone()
+/// }
+/// ```
+#[derive(Debug, PartialEq, Eq)]
+pub struct CommittedPostCommitEffects {
+    effects: Vec<PostCommitEffect>,
+}
+
+impl CommittedPostCommitEffects {
+    fn new(effects: Vec<PostCommitEffect>) -> Self {
+        Self { effects }
+    }
+
+    /// Inspect the committed effects without discarding their commit
+    /// provenance.
+    pub fn as_slice(&self) -> &[PostCommitEffect] {
+        &self.effects
+    }
+
+    pub(crate) fn into_effects(self) -> Vec<PostCommitEffect> {
+        self.effects
+    }
+}
+
 /// The whole-unit outcome of a completed [`run_atomic_unit`] call — the
 /// commit pass ran to a clean, distinguishable verdict (never returned for
 /// a seam-level failure; see [`AtomicRunnerError`] for that case).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum AtomicRunOutcome {
-    /// Every op's plan applied and the unit committed. Carries every op's
-    /// deferred post-commit effect, in op order. Draining this list
-    /// (running the actual reindex/embedding side effects) is phase 3 of
-    /// ADR-099 D1 and is out of scope for B2 — **the B3 wiring point**: a
-    /// production caller runs these after `run_atomic_unit` returns, outside
-    /// any transaction; a test caller in this file only asserts on the
-    /// list's contents.
-    Committed { post_commit: Vec<PostCommitEffect> },
+    /// Every op's plan applied and the unit committed. Carries an opaque
+    /// [`CommittedPostCommitEffects`] token containing the deferred effects
+    /// in op order. Phase 3 consumes that token through
+    /// [`crate::atomic_prepare::apply_post_commit_effects`] after
+    /// `run_atomic_unit` returns and outside any transaction; callers can
+    /// inspect the effects without converting them back into an executable
+    /// raw collection.
+    Committed {
+        post_commit: CommittedPostCommitEffects,
+    },
     /// The op at `failed_op_index` failed; the whole unit rolled back
     /// (ADR-099 D1: "the whole unit rolls back and the failing op index is
     /// recorded"). No op's writes are present in the database after this
@@ -328,7 +371,9 @@ pub async fn run_atomic_unit(
             let post_commit = *boxed.downcast::<Vec<PostCommitEffect>>().expect(
                 "run_atomic_unit's own closure always returns Box<Vec<PostCommitEffect>> on Ok",
             );
-            Ok(AtomicRunOutcome::Committed { post_commit })
+            Ok(AtomicRunOutcome::Committed {
+                post_commit: CommittedPostCommitEffects::new(post_commit),
+            })
         }
         Err(storage_err) => {
             let recorded = failure_slot
@@ -1068,9 +1113,11 @@ mod tests {
         let outcome = run_atomic_unit(&bridge, plans).await.expect("seam call ok");
         match outcome {
             AtomicRunOutcome::Committed { post_commit } => {
+                fn require_commit_provenance(_: &CommittedPostCommitEffects) {}
+                require_commit_provenance(&post_commit);
                 assert_eq!(
-                    post_commit,
-                    vec![PostCommitEffect::ReindexEntity { entity_id: a }]
+                    post_commit.as_slice(),
+                    &[PostCommitEffect::ReindexEntity { entity_id: a }]
                 );
             }
             other => panic!("expected Committed, got {other:?}"),

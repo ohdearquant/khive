@@ -1789,8 +1789,9 @@ async fn synthetic_edge_observed_as_selected_returns_memory_note() {
 // =============================================================================
 
 /// Regression for Bug 1: when update_edge absorbs a conflict (the requested edge
-/// is deleted and the existing canonical row is refreshed), the returned edge must
-/// carry the SURVIVING canonical row's id — not the id of the deleted edge.
+/// is deleted and the existing canonical row is preserved unchanged, ADR-039 DO
+/// NOTHING), the returned edge must carry the SURVIVING canonical row's id — not
+/// the id of the deleted edge.
 ///
 /// Setup: pre-create canonical A→B competes_with (E1), create A→B extends (E2).
 /// Update E2's relation to competes_with. The returned id must be E1, not E2.
@@ -2086,6 +2087,64 @@ async fn note_create_blocks_hex_credential_in_content() {
             khive_runtime::RuntimeError::SecretDetected(_)
         ),
         "error must be SecretDetected"
+    );
+}
+
+#[tokio::test]
+async fn note_create_allows_source_path_near_ordinary_key_prose() {
+    let rt = rt();
+    let tok = rt.authorize(Namespace::local()).unwrap();
+    let content = "see <a/path/to/file.py>:~97-103 lists it as a real checkpoint-supplied key";
+
+    rt.create_note(&tok, "question", None, content, None, None, vec![])
+        .await
+        .expect("source path in technical prose must be stored");
+}
+
+#[tokio::test]
+async fn note_create_allows_git_revision_near_ordinary_token_prose() {
+    let rt = rt();
+    let tok = rt.authorize(Namespace::local()).unwrap();
+    let content = "revision d362950a3c9b1a4cb47d97f1623e38f1a1e6bcdf emits one extra token";
+
+    rt.create_note(&tok, "question", None, content, None, None, vec![])
+        .await
+        .expect("git revision in technical prose must be stored");
+}
+
+#[tokio::test]
+async fn note_create_blocks_forty_hex_in_value_syntax_behind_vcs_marker() {
+    let rt = rt();
+    let tok = rt.authorize(Namespace::local()).unwrap();
+    let content = "api key value is commit d362950a3c9b1a4cb47d97f1623e38f1a1e6bcdf";
+
+    let result = rt
+        .create_note(&tok, "question", None, content, None, None, vec![])
+        .await;
+    assert!(
+        matches!(
+            result.unwrap_err(),
+            khive_runtime::RuntimeError::SecretDetected(_)
+        ),
+        "a credential phrase must not be rescued by a VCS marker at the write path"
+    );
+}
+
+#[tokio::test]
+async fn note_create_blocks_path_dressed_base64_credential_in_value_syntax() {
+    let rt = rt();
+    let tok = rt.authorize(Namespace::local()).unwrap();
+    let content = "api key value is <Xk9mZ2vQpLrT8nJwYuA/HfBsDcGiONvMabcdefgh>:~97-103";
+
+    let result = rt
+        .create_note(&tok, "question", None, content, None, None, vec![])
+        .await;
+    assert!(
+        matches!(
+            result.unwrap_err(),
+            khive_runtime::RuntimeError::SecretDetected(_)
+        ),
+        "path dressing must not rescue a credential in value syntax at the write path"
     );
 }
 
@@ -3839,4 +3898,44 @@ async fn stats_totals_match_list_walk_across_visible_namespaces() {
         "stats() note total must equal a full list keyset walk under the same identity"
     );
     assert_eq!(stats_notes, 2);
+}
+
+#[test]
+#[serial_test::serial]
+fn test_harness_refuses_runtime_default_store() {
+    struct HomeGuard(Option<std::ffi::OsString>);
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(home) => std::env::set_var("HOME", home),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    assert_eq!(
+        std::env::var("KHIVE_TEST_HARNESS").as_deref(),
+        Ok("1"),
+        "the workspace Cargo harness must mark integration-test processes"
+    );
+    let fake_home = tempfile::tempdir().expect("temporary HOME");
+    let _home_guard = HomeGuard(std::env::var_os("HOME"));
+    std::env::set_var("HOME", fake_home.path());
+    let expected_path = fake_home.path().join(".khive/khive.db");
+    let config = RuntimeConfig::no_embeddings();
+    assert_eq!(config.db_path.as_deref(), Some(expected_path.as_path()));
+
+    let error = match KhiveRuntime::new(config) {
+        Ok(_) => panic!("test harness opened the default home-directory store"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("test harness refused"),
+        "unexpected guard error: {error}"
+    );
+    assert!(
+        !expected_path.exists(),
+        "the guarded runtime must refuse the path before SQLite creates it"
+    );
 }

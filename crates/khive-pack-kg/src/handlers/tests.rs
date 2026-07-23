@@ -1126,6 +1126,76 @@ async fn update_edge_with_non_edge_field_returns_error() {
     );
 }
 
+// khive#1213: `update(id=<edge>, relation="competes_with", ...)` that collides with an
+// already soft-deleted canonical survivor must return that survivor as-is — including its
+// non-null `deleted_at` — rather than resurrecting the tombstone (ADR-039 DO NOTHING).
+#[tokio::test]
+async fn update_edge_symmetric_conflict_returns_tombstoned_survivor_with_deleted_at() {
+    use crate::KgPack;
+    use khive_runtime::{KhiveRuntime, VerbRegistryBuilder};
+    use khive_types::EdgeRelation;
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let token = rt.authorize(khive_runtime::Namespace::local()).unwrap();
+
+    let a = rt
+        .create_entity(&token, "concept", None, "A", None, None, vec![])
+        .await
+        .expect("create a");
+    let b = rt
+        .create_entity(&token, "concept", None, "B", None, None, vec![])
+        .await
+        .expect("create b");
+
+    let requested = rt
+        .link(&token, a.id, b.id, EdgeRelation::Extends, 0.2, None)
+        .await
+        .expect("create requested edge");
+
+    let canonical = rt
+        .link(&token, a.id, b.id, EdgeRelation::CompetesWith, 0.6, None)
+        .await
+        .expect("create canonical edge");
+    rt.delete_edge(&token, canonical.id.into(), false)
+        .await
+        .expect("soft-delete canonical edge");
+
+    let pack = KgPack::new(rt.clone());
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry build");
+
+    let result = pack
+        .handle_update(
+            &token,
+            json!({
+                "id": requested.id.to_string(),
+                "relation": "competes_with",
+                "weight": 0.9,
+            }),
+            &registry,
+        )
+        .await
+        .expect("update must succeed by absorbing into the tombstoned survivor");
+
+    let returned_id = result["id"].as_str().expect("returned id");
+    assert_eq!(
+        returned_id,
+        canonical.id.to_string(),
+        "the returned edge must be the surviving canonical row, not the discarded request: {result}"
+    );
+    assert!(
+        !result["deleted_at"].is_null(),
+        "the returned edge must retain the survivor's non-null deleted_at — absorbing a \
+         conflicting update must not resurrect a tombstone: {result}"
+    );
+    assert_eq!(
+        result["weight"], 0.6,
+        "the survivor's own weight must be preserved, not overwritten by the discarded \
+         request's patch: {result}"
+    );
+}
+
 // HIGH regression: update(note_id, tags=[...]) must return an explicit error.
 // Notes have no top-level tags column; tags live in properties["tags"].
 // Before the fix, tags was silently dropped on the note path (the error string
@@ -1254,6 +1324,91 @@ async fn update_entity_with_note_field_salience_returns_error() {
 }
 
 // ── #764: create's embedding_content wiring ─────────────────────────────────
+
+struct WarningEmbeddingService;
+
+#[async_trait::async_trait]
+impl lattice_embed::EmbeddingService for WarningEmbeddingService {
+    async fn embed(
+        &self,
+        texts: &[String],
+        _model: lattice_embed::EmbeddingModel,
+    ) -> Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+        Ok(vec![vec![1.0]; texts.len()])
+    }
+
+    fn supports_model(&self, _model: lattice_embed::EmbeddingModel) -> bool {
+        true
+    }
+
+    fn name(&self) -> &'static str {
+        "warning-test"
+    }
+}
+
+struct WarningEmbedderProvider;
+
+#[async_trait::async_trait]
+impl khive_runtime::EmbedderProvider for WarningEmbedderProvider {
+    fn name(&self) -> &str {
+        "warning-test"
+    }
+
+    fn dimensions(&self) -> usize {
+        1
+    }
+
+    async fn build(
+        &self,
+    ) -> Result<std::sync::Arc<dyn lattice_embed::EmbeddingService>, khive_runtime::RuntimeError>
+    {
+        Ok(std::sync::Arc::new(WarningEmbeddingService))
+    }
+}
+
+#[tokio::test]
+async fn create_dispatch_emits_embedding_truncation_advisory() {
+    use crate::KgPack;
+    use khive_runtime::{KhiveRuntime, VerbRegistryBuilder};
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    rt.register_embedder(WarningEmbedderProvider);
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt));
+    let registry = builder.build().expect("registry build");
+
+    let truncated = registry
+        .dispatch(
+            "create",
+            json!({
+                "kind": "concept",
+                "name": "warning target",
+                "description": "x".repeat(lattice_embed::MAX_TEXT_CHARS),
+                "skip_dedup_check": true,
+            }),
+        )
+        .await
+        .expect("over-limit create");
+    let warnings = truncated["warnings"].as_array().expect("warnings array");
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].as_str().unwrap().contains("truncated"));
+
+    let normal = registry
+        .dispatch(
+            "create",
+            json!({
+                "kind": "concept",
+                "name": "normal target",
+                "skip_dedup_check": true,
+            }),
+        )
+        .await
+        .expect("normal create");
+    assert!(
+        normal.get("warnings").is_none(),
+        "normal input must not emit an advisory"
+    );
+}
 
 /// A note create with a proper-prefix `embedding_content` must succeed and
 /// store the full `content`; the override is a runtime-layer concern
@@ -1553,6 +1708,7 @@ async fn merge_entity_reason_forwarded_through_registry_dispatch() {
                 "into_id": into.id.to_string(),
                 "from_id": from.id.to_string(),
                 "reason": "duplicate via dispatch",
+                "force": true,
             }),
         )
         .await
@@ -1582,6 +1738,15 @@ async fn merge_entity_reason_forwarded_through_registry_dispatch() {
         events.items[0].payload.get("reason").and_then(|v| v.as_str()),
         Some("duplicate via dispatch"),
         "reason supplied through the registry dispatch route must land in the EntityMerged payload; got: {:?}",
+        events.items[0].payload
+    );
+    assert_eq!(
+        events.items[0]
+            .payload
+            .get("force")
+            .and_then(|v| v.as_bool()),
+        Some(true),
+        "force=true must be durable in the EntityMerged payload; got: {:?}",
         events.items[0].payload
     );
 }
@@ -1680,6 +1845,7 @@ async fn get_dispatch_after_merge_discloses_kept_id() {
                 "kind": "entity",
                 "into_id": into.id.to_string(),
                 "from_id": from.id.to_string(),
+                "force": true,
             }),
         )
         .await
@@ -1813,6 +1979,7 @@ async fn resolve_dispatch_on_merged_uuid_stays_bare_not_found() {
                 "kind": "entity",
                 "into_id": into.id.to_string(),
                 "from_id": from.id.to_string(),
+                "force": true,
             }),
         )
         .await

@@ -10,5 +10,5 @@ pub use conflict::write_keys_for_op_pub;
 pub use parser::parse_request;
 pub use types::{
     value_nesting_within_limit, ArgValue, DslError, ExecutionMode, ParsedOp, ParsedRequest,
-    MAX_OPS, MAX_OPS_INPUT_LEN, NESTING_DEPTH_LIMIT, RESERVED_ENVELOPE_ARGS,
+    PrevFailure, MAX_OPS, MAX_OPS_INPUT_LEN, NESTING_DEPTH_LIMIT, RESERVED_ENVELOPE_ARGS,
 };

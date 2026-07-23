@@ -206,7 +206,9 @@ the substrate from the UUID. `create`/`list`/`search` require `kind`.
 
 Each op returns `{ok: true, tool, result}` or `{ok: false, tool, error}`. A failed op does
 NOT abort the batch — each entry has its own ok/error. The aggregate response also carries
-`summary: {total, succeeded, failed}`.
+`summary: {total, succeeded, failed, aborted}` and a top-level `status`: `"success"` when
+every op succeeded, or `"partial"` when any op failed or was aborted. Callers should inspect
+`status` or `summary` instead of treating the absence of an RPC-level error as full success.
 
 ---
 
