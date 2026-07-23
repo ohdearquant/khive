@@ -3980,7 +3980,12 @@ mod tests {
             true,
         ));
 
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        // Poll for the first emitted event instead of a fixed sleep (same
+        // slowdown-flake class as the stale-sweep test above).
+        let emitted = wait_for(Duration::from_secs(10), || {
+            !store.events.lock().unwrap().is_empty()
+        })
+        .await;
         shutdown_tx.send(()).expect("send shutdown signal");
         tokio::time::timeout(Duration::from_secs(1), handle)
             .await
@@ -3989,8 +3994,9 @@ mod tests {
 
         let events = store.events.lock().unwrap();
         assert!(
-            !events.is_empty(),
-            "an always-elevated config must append at least one CheckpointOutcomeRecorded event"
+            emitted,
+            "an always-elevated config must append at least one CheckpointOutcomeRecorded event \
+             within the poll deadline"
         );
         assert!(
             events
@@ -4027,7 +4033,12 @@ mod tests {
             false,
         ));
 
-        tokio::time::sleep(Duration::from_millis(40)).await;
+        // Poll for the first emitted event instead of a fixed sleep (same
+        // slowdown-flake class as the stale-sweep test above).
+        let emitted = wait_for(Duration::from_secs(10), || {
+            !store.events.lock().unwrap().is_empty()
+        })
+        .await;
         shutdown_tx.send(()).expect("send shutdown signal");
         tokio::time::timeout(Duration::from_secs(1), handle)
             .await
@@ -4035,8 +4046,9 @@ mod tests {
             .expect("checkpoint task panicked");
 
         assert!(
-            !store.events.lock().unwrap().is_empty(),
-            "a designated secondary lifecycle owner must append outcome events"
+            emitted,
+            "a designated secondary lifecycle owner must append outcome events within the poll \
+             deadline"
         );
     }
 
