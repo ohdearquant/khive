@@ -54,13 +54,13 @@ use crate::tools::request::RequestParams;
 /// When `khive_cfg` is `None` or its `backends` list is empty, the fingerprint
 /// is byte-identical to what it would have been before this parameter was added.
 ///
-/// Each declared backend path is canonicalized against the process's current
-/// working directory before it enters the fingerprint. A raw relative string
-/// (e.g. `./data/main.db`)
-/// would otherwise fingerprint identically for two different projects that
-/// happen to declare the same relative path, even though they resolve to two
-/// different files — letting a warm daemon started for one project accept
-/// requests meant for the other's database.
+/// `config.db_path` and each declared backend path are canonicalized against
+/// the process's current working directory before entering the fingerprint. A
+/// raw relative string (e.g. `./data/main.db`) would otherwise fingerprint
+/// identically for two different projects that happen to declare or override
+/// the same relative path, even though they resolve to two different files —
+/// letting a warm daemon started for one project accept requests meant for
+/// the other's database.
 pub fn compute_config_id(
     config: &RuntimeConfig,
     khive_cfg: Option<&khive_runtime::KhiveConfig>,
@@ -69,8 +69,8 @@ pub fn compute_config_id(
     packs.sort();
     let db = config
         .db_path
-        .as_ref()
-        .map(|p| p.display().to_string())
+        .as_deref()
+        .map(canonical_fingerprint_path)
         .unwrap_or_else(|| ":memory:".to_string());
     let primary = config
         .embedding_model
@@ -128,8 +128,8 @@ pub fn compute_config_id(
                 .map(|b| {
                     let path = b
                         .path
-                        .as_ref()
-                        .map(|p| canonical_backend_fingerprint_path(p))
+                        .as_deref()
+                        .map(canonical_fingerprint_path)
                         .unwrap_or_else(|| ":memory:".to_string());
                     format!("{}:{:?}:{}", b.name, b.kind, path)
                 })
@@ -154,8 +154,10 @@ pub fn compute_config_id(
     format!("{base}{topology}")
 }
 
-/// Resolve a declared `[[backends]].path` to a stable, cwd-independent string
-/// for `config_id` fingerprinting, without creating anything on disk.
+/// Resolve any path headed into `config_id` fingerprinting — a declared
+/// `[[backends]].path` or the resolved `RuntimeConfig.db_path` (itself
+/// derived from `--db`/`KHIVE_DB`) — to a stable, cwd-independent string
+/// without creating anything on disk.
 ///
 /// Delegates to [`crate::serve::canonical_path_no_side_effects`] — the same
 /// no-side-effects canonicalization the `--db` override equivalence check
@@ -164,7 +166,7 @@ pub fn compute_config_id(
 /// display string only on a canonicalization error (e.g. an unreadable
 /// ancestor directory); this is strictly no worse than the pre-fix behavior,
 /// which always used the raw string.
-fn canonical_backend_fingerprint_path(path: &std::path::Path) -> String {
+fn canonical_fingerprint_path(path: &std::path::Path) -> String {
     crate::serve::canonical_path_no_side_effects(path)
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| path.display().to_string())
@@ -2224,6 +2226,59 @@ mod tests {
             "two projects declaring the same relative backend path string from \
              different working directories must not share a config_id; both \
              produced: {id_a}"
+        );
+    }
+
+    /// The same collision, one layer up the resolution chain: `--db`/`KHIVE_DB`
+    /// resolves to a raw relative `PathBuf` (`resolve_db_anchor`) that lands in
+    /// `RuntimeConfig.db_path` unchanged. Before this fix, `compute_config_id`
+    /// fingerprinted that raw string directly, so two different projects both
+    /// running `KHIVE_DB=./data/main.db` produced the SAME `config_id` while
+    /// opening two different SQLite files — the single-backend route
+    /// (`KhiveMcpServer::with_packs`) would let a warm daemon started for one
+    /// project serve requests meant for the other's database.
+    #[test]
+    #[serial]
+    fn config_id_does_not_collide_across_projects_with_same_relative_db_override() {
+        use khive_runtime::Namespace;
+
+        let project_a = tempfile::tempdir().expect("project a tempdir");
+        let project_b = tempfile::tempdir().expect("project b tempdir");
+
+        let rt_with_db = |db_path: Option<std::path::PathBuf>| RuntimeConfig {
+            db_path,
+            default_namespace: Namespace::parse("local").unwrap(),
+            embedding_model: None,
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        };
+
+        let relative_db = std::path::PathBuf::from("./data/main.db");
+
+        let id_a = {
+            let _cwd = CwdGuard::enter(project_a.path());
+            compute_config_id(&rt_with_db(Some(relative_db.clone())), None)
+        };
+        let id_b = {
+            let _cwd = CwdGuard::enter(project_b.path());
+            compute_config_id(&rt_with_db(Some(relative_db.clone())), None)
+        };
+
+        assert_ne!(
+            id_a, id_b,
+            "two projects overriding KHIVE_DB with the same relative path from \
+             different working directories must not share a config_id; both \
+             produced: {id_a}"
+        );
+
+        let id_a_again = {
+            let _cwd = CwdGuard::enter(project_a.path());
+            compute_config_id(&rt_with_db(Some(relative_db.clone())), None)
+        };
+        assert_eq!(
+            id_a, id_a_again,
+            "resolving the same project's KHIVE_DB override twice must produce \
+             the same config_id"
         );
     }
 

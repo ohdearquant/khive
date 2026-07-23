@@ -883,6 +883,11 @@ fn canonical_backend_path(cfg: &BackendConfig) -> anyhow::Result<Option<PathBuf>
     Ok(Some(canon_parent.join(file_name)))
 }
 
+/// Bound on final-component symlink hops [`canonical_path_no_side_effects`]
+/// will follow before giving up, mirroring the kernel's `ELOOP` limit — high
+/// enough for any real alias chain, low enough to fail fast on a cycle.
+const MAX_SYMLINK_HOPS: u32 = 40;
+
 pub(crate) fn canonical_path_no_side_effects(path: &std::path::Path) -> anyhow::Result<PathBuf> {
     let expanded = expand_tilde(path);
     let absolute = if expanded.is_absolute() {
@@ -898,18 +903,30 @@ pub(crate) fn canonical_path_no_side_effects(path: &std::path::Path) -> anyhow::
     // symlinks, so a missing target reads as "nothing here". Read the link
     // manually first and resolve through it, so a declared alias like
     // `link.db -> target.db` compares equal to `target.db` even before either
-    // file has been created.
-    if let Ok(link_target) = std::fs::read_link(&absolute) {
-        let resolved = if link_target.is_absolute() {
+    // file has been created. Iterate rather than recurse, and cap the hop
+    // count, so a symlink cycle (a self-link or a mutual a<->b pair) fails
+    // loud instead of recursing until the stack overflows.
+    let mut current = absolute;
+    for _ in 0..MAX_SYMLINK_HOPS {
+        let Ok(link_target) = std::fs::read_link(&current) else {
+            break;
+        };
+        current = if link_target.is_absolute() {
             link_target
         } else {
-            match absolute.parent() {
+            match current.parent() {
                 Some(parent) => parent.join(&link_target),
                 None => link_target,
             }
         };
-        return canonical_path_no_side_effects(&resolved);
     }
+    if std::fs::read_link(&current).is_ok() {
+        anyhow::bail!(
+            "too many levels of symbolic links resolving {}",
+            path.display()
+        );
+    }
+    let absolute = current;
 
     if absolute.exists() {
         return absolute
@@ -3324,6 +3341,45 @@ region = "us-east-1"
             "a symlinked ancestor directory two levels above a not-yet-created file \
              must canonicalize to the same target as the real directory: {resolved_via_symlink:?} \
              vs {resolved_via_real:?}"
+        );
+    }
+
+    /// A symlink pointing at itself used to recurse in
+    /// `canonical_path_no_side_effects` until the stack overflowed. The
+    /// bounded hop count must instead return an error naming the path.
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn canonical_path_no_side_effects_rejects_self_referential_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let link_path = dir.path().join("link.db");
+        std::os::unix::fs::symlink("link.db", &link_path).unwrap();
+
+        let result = canonical_path_no_side_effects(&link_path);
+
+        assert!(
+            result.is_err(),
+            "a self-referential symlink must fail loud, not hang or crash"
+        );
+    }
+
+    /// The two-hop variant of the self-loop above: `a -> b -> a`. Must also
+    /// fail loud rather than recursing indefinitely.
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn canonical_path_no_side_effects_rejects_two_link_symlink_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let link_a = dir.path().join("a.db");
+        let link_b = dir.path().join("b.db");
+        std::os::unix::fs::symlink("b.db", &link_a).unwrap();
+        std::os::unix::fs::symlink("a.db", &link_b).unwrap();
+
+        let result = canonical_path_no_side_effects(&link_a);
+
+        assert!(
+            result.is_err(),
+            "a two-link symlink cycle must fail loud, not hang or crash"
         );
     }
 
