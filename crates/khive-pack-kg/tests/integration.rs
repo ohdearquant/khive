@@ -332,13 +332,19 @@ async fn create_bulk_note_annotates_duplicate_targets_dedup_to_one_edge() {
 // Regression: a bulk request whose per-item `annotates` arrays are each
 // within the per-item cap, but whose total (after per-item dedup) exceeds
 // the aggregate per-request budget, must be rejected before any target
-// resolution — not accepted as N separate legal items.
+// resolution — not accepted as N separate legal items. Targets are
+// deliberately non-UUID names: a UUID target short-circuits resolution at
+// the parse step, so only a name target forces a real lookup — if the
+// budget check ran after resolution, the first nonexistent name would
+// surface a resolution error instead of the budget error asserted below.
 #[tokio::test]
 async fn create_bulk_note_annotates_aggregate_budget_over_rejected_before_resolution() {
     let pack = pack();
     let items: Vec<Value> = (0..11)
         .map(|i| {
-            let targets: Vec<String> = (0..100).map(|_| uuid::Uuid::new_v4().to_string()).collect();
+            let targets: Vec<String> = (0..100)
+                .map(|j| format!("aggregate-budget-target-{i}-{j}"))
+                .collect();
             json!({
                 "kind": "observation",
                 "content": format!("aggregate budget note {i}"),

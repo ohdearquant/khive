@@ -515,11 +515,15 @@ def test_create_many_annotates_aggregate_budget_over_rejected_before_resolution(
     surfaced as a per-item error.
     """
     ns = temp_namespace
+    # Non-UUID names on purpose: UUID targets short-circuit resolution at the
+    # parse step, so only name targets force a real lookup — a budget check
+    # ordered after resolution would surface a resolution error for the first
+    # nonexistent name instead of the budget error asserted below.
     items = [
         {
             "kind": "observation",
             "content": f"cm_aggcap_note_{ns[-6:]}_{i}",
-            "annotates": [str(uuid.uuid4()) for _ in range(100)],
+            "annotates": [f"cm_aggcap_target_{ns[-6:]}_{i}_{j}" for j in range(100)],
         }
         for i in range(11)
     ]
