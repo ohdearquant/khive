@@ -2379,10 +2379,18 @@ const GRAPH_DDL: &str = include_str!("../../sql/graph-ddl.sql");
 /// enforcement it cannot retroactively reconcile.
 pub(crate) fn ensure_graph_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
     super::entity::ensure_entities_schema(conn)?;
-    if is_legacy_graph_edges_upgrade(conn)? {
-        reject_legacy_duplicate_concept_origins(conn)?;
+    // One IMMEDIATE transaction couples the legacy probe, the duplicate
+    // preflight, and the trigger DDL. Holding the write lock across all
+    // three closes the window where a concurrent pre-trigger writer could
+    // insert duplicate origins after the check passes but before the
+    // triggers start enforcing — enforcement must never install over state
+    // the preflight did not see.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    if is_legacy_graph_edges_upgrade(&tx)? {
+        reject_legacy_duplicate_concept_origins(&tx)?;
     }
-    conn.execute_batch(GRAPH_DDL)
+    tx.execute_batch(GRAPH_DDL)?;
+    tx.commit()
 }
 
 fn is_legacy_graph_edges_upgrade(conn: &rusqlite::Connection) -> Result<bool, rusqlite::Error> {
