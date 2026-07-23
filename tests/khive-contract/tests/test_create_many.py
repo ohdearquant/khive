@@ -64,6 +64,8 @@ default `note_kind` to "observation". Both substrates may appear in the same
 
 from __future__ import annotations
 
+import uuid
+
 import pytest
 
 from khive_contract.client import KhiveOperationError, KhiveMcpSession
@@ -397,6 +399,150 @@ def test_create_many_unsupported_kind_rejected_with_atomic_false(
     assert fetched.get("name") == sibling_name, (
         f"get({sibling_id}) name mismatch for persisted sibling; got {fetched}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Per-item `annotates` cap and dedup — note items only
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.create_many
+@pytest.mark.slow
+def test_create_many_note_annotates_over_cap_rejected_per_item(
+    khive_session: KhiveMcpSession,
+    temp_namespace: str,
+) -> None:
+    """A note item's `annotates` array over the per-item cap is rejected, not resolved.
+
+    Source: crates/khive-pack-kg/src/handlers/common.rs resolve_annotates_targets,
+    ANNOTATES_CAP. The oversized array is rejected before any target lookup —
+    under atomic=false this surfaces as a per-item {index, error} entry naming
+    the cap; the valid sibling item still succeeds.
+    """
+    ns = temp_namespace
+    over_cap_targets = [str(uuid.uuid4()) for _ in range(101)]
+    items = [
+        _item(f"cm_annocap_sibling_{ns[-6:]}"),
+        {
+            "kind": "observation",
+            "content": f"cm_annocap_note_{ns[-6:]}",
+            "annotates": over_cap_targets,
+        },
+    ]
+
+    result = khive_session.verb("create", {
+        "items": items,
+        "atomic": False,
+        "namespace": ns,
+    })
+
+    assert result.get("attempted") == 2, f"attempted must be 2; got {result}"
+    assert result.get("created") == 1, (
+        f"the valid sibling entity must still be created; got {result}"
+    )
+    assert result.get("failed") == 1, f"the over-cap note item must fail; got {result}"
+    errors = result.get("errors")
+    assert errors is not None and len(errors) == 1, (
+        f"errors must contain exactly one entry for index 1; got {result}"
+    )
+    error_entry = errors[0]
+    assert error_entry.get("index") == 1, f"error entry must name index 1; got {error_entry}"
+    error_msg = str(error_entry.get("error", "")).lower()
+    assert "annotates" in error_msg and "100" in error_msg, (
+        f"cap-exceeded error must name the field and the cap; got: {error_entry!r}"
+    )
+
+
+@pytest.mark.create_many
+@pytest.mark.slow
+def test_create_many_note_annotates_duplicate_targets_produce_one_edge(
+    khive_session: KhiveMcpSession,
+    temp_namespace: str,
+) -> None:
+    """Duplicated targets in a legal-sized `annotates` array collapse to one edge.
+
+    Source: resolve_annotates_targets deduplicates raw targets before resolving
+    each to a UUID and linking — a repeated target must not produce repeated
+    `annotates` edges.
+    """
+    ns = temp_namespace
+    target = khive_session.verb("create", {
+        "kind": "concept",
+        "name": f"cm_annodedup_target_{ns[-6:]}",
+        "namespace": ns,
+    })
+    target_id = target["id"]
+
+    result = khive_session.verb("create", {
+        "items": [{
+            "kind": "observation",
+            "content": f"cm_annodedup_note_{ns[-6:]}",
+            "annotates": [target_id, target_id, target_id],
+        }],
+        "namespace": ns,
+    })
+    assert result.get("created") == 1, f"note create must succeed; got {result}"
+
+    neighbors = khive_session.verb("neighbors", {
+        "id": target_id,
+        "direction": "incoming",
+        "relations": ["annotates"],
+        "namespace": ns,
+    })
+    assert len(neighbors) == 1, (
+        f"duplicated annotates targets must produce exactly one edge; got {neighbors}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Verbose bulk-note responses project lifecycle status
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.create_many
+@pytest.mark.slow
+def test_create_many_verbose_note_projects_lifecycle_status(
+    khive_session: KhiveMcpSession,
+    temp_namespace: str,
+) -> None:
+    """A bulk-created note with properties.status returns the projected status,
+    same as singleton create — for both atomic=true and atomic=false.
+
+    Source: crates/khive-pack-kg/src/handlers/create.rs handle_bulk_create;
+    common.rs remap_note_status_array applies the same projection used by
+    singleton create/get/list to the bulk verbose "notes" array.
+    """
+    ns = temp_namespace
+
+    singleton = khive_session.verb("create", {
+        "kind": "observation",
+        "content": f"cm_lifecycle_singleton_{ns[-6:]}",
+        "properties": {"status": "blocked"},
+        "namespace": ns,
+    })
+    assert singleton.get("status") == "blocked", f"singleton create must project status; got {singleton}"
+    assert singleton.get("lifecycle") == "active", f"singleton create must preserve row-visibility as lifecycle; got {singleton}"
+
+    for atomic in (True, False):
+        result = khive_session.verb("create", {
+            "items": [{
+                "kind": "observation",
+                "content": f"cm_lifecycle_bulk_{atomic}_{ns[-6:]}",
+                "properties": {"status": "blocked"},
+            }],
+            "atomic": atomic,
+            "verbose": True,
+            "namespace": ns,
+        })
+        notes = result.get("notes", [])
+        assert len(notes) == 1, f"expected exactly 1 created note (atomic={atomic}); got {result}"
+        note = notes[0]
+        assert note.get("status") == "blocked", (
+            f"bulk verbose note (atomic={atomic}) must project lifecycle status like singleton create; got {note}"
+        )
+        assert note.get("lifecycle") == "active", (
+            f"bulk verbose note (atomic={atomic}) must preserve row-visibility as lifecycle; got {note}"
+        )
 
 
 # ---------------------------------------------------------------------------

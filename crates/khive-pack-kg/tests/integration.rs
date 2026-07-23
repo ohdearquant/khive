@@ -245,6 +245,162 @@ async fn create_bulk_items_supports_note_and_entity_shapes() {
     assert_eq!(incoming.as_array().expect("neighbors array").len(), 1);
 }
 
+// Regression: a bulk note item's `annotates` array must be capped the same
+// way as the singleton note-create path — an oversized array is rejected
+// per-item (non-atomic mode) with the cap named in the error, not resolved
+// against storage.
+#[tokio::test]
+async fn create_bulk_note_annotates_over_cap_rejected_per_item() {
+    let pack = pack();
+    let targets: Vec<String> = (0..101).map(|_| uuid::Uuid::new_v4().to_string()).collect();
+
+    let result = pack
+        .dispatch(
+            "create",
+            json!({
+                "items": [
+                    {"kind": "concept", "name": "CapSiblingEntity"},
+                    {"kind": "observation", "content": "too many annotates", "annotates": targets}
+                ],
+                "atomic": false,
+                "verbose": true
+            }),
+        )
+        .await
+        .expect(
+            "non-atomic bulk create must return per-item results even when one item is rejected",
+        );
+
+    assert_eq!(result["attempted"], 2);
+    assert_eq!(result["created"], 1);
+    assert_eq!(result["failed"], 1);
+    assert_eq!(result["errors"][0]["index"], 1);
+    let err_msg = result["errors"][0]["error"].as_str().expect("error string");
+    assert!(
+        err_msg.contains("100"),
+        "cap-exceeded error must name the cap; got {err_msg}"
+    );
+    assert!(
+        err_msg.contains("annotates"),
+        "cap-exceeded error must mention annotates; got {err_msg}"
+    );
+}
+
+// Regression: duplicated targets in a legal-sized `annotates` array must
+// collapse to exactly one edge per distinct target — no redundant lookups
+// or edge writes for repeated entries.
+#[tokio::test]
+async fn create_bulk_note_annotates_duplicate_targets_dedup_to_one_edge() {
+    let pack = pack();
+    let target = pack
+        .dispatch("create", json!({"kind": "concept", "name": "DedupTarget"}))
+        .await
+        .expect("target entity must be created");
+    let target_id = target["id"].as_str().expect("target id").to_string();
+
+    let result = pack
+        .dispatch(
+            "create",
+            json!({
+                "items": [
+                    {
+                        "kind": "observation",
+                        "content": "duplicate annotates targets",
+                        "annotates": [target_id.clone(), target_id.clone(), target_id.clone()]
+                    }
+                ]
+            }),
+        )
+        .await
+        .expect("bulk create with duplicated annotates targets must succeed");
+    assert_eq!(result["created"], 1);
+
+    let incoming = pack
+        .dispatch(
+            "neighbors",
+            json!({"id": target_id, "direction": "incoming", "relations": ["annotates"]}),
+        )
+        .await
+        .expect("annotation edges must be queryable");
+    assert_eq!(
+        incoming.as_array().expect("neighbors array").len(),
+        1,
+        "duplicated annotates targets must produce exactly one edge"
+    );
+}
+
+// Regression: bulk-created notes in verbose responses must run through the
+// same status/lifecycle projection as singleton `create`/`get`/`list` — not
+// serialize the note's row-visibility status directly.
+#[tokio::test]
+async fn create_bulk_note_verbose_response_projects_lifecycle_status_atomic() {
+    let pack = pack();
+    let singleton = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "observation",
+                "content": "lifecycle projection reference",
+                "properties": {"status": "blocked"}
+            }),
+        )
+        .await
+        .expect("singleton create must succeed");
+    assert_eq!(singleton["status"], "blocked");
+    assert_eq!(singleton["lifecycle"], "active");
+
+    let bulk = pack
+        .dispatch(
+            "create",
+            json!({
+                "items": [
+                    {
+                        "kind": "observation",
+                        "content": "lifecycle projection reference",
+                        "properties": {"status": "blocked"}
+                    }
+                ],
+                "verbose": true
+            }),
+        )
+        .await
+        .expect("atomic bulk create must succeed");
+    let note = &bulk["notes"][0];
+    assert_eq!(
+        note["status"], "blocked",
+        "atomic bulk verbose note must project lifecycle status like singleton create; got {note}"
+    );
+    assert_eq!(note["lifecycle"], "active");
+}
+
+#[tokio::test]
+async fn create_bulk_note_verbose_response_projects_lifecycle_status_non_atomic() {
+    let pack = pack();
+    let bulk = pack
+        .dispatch(
+            "create",
+            json!({
+                "items": [
+                    {
+                        "kind": "observation",
+                        "content": "lifecycle projection reference",
+                        "properties": {"status": "blocked"}
+                    }
+                ],
+                "atomic": false,
+                "verbose": true
+            }),
+        )
+        .await
+        .expect("non-atomic bulk create must succeed");
+    let note = &bulk["notes"][0];
+    assert_eq!(
+        note["status"], "blocked",
+        "non-atomic bulk verbose note must project lifecycle status like singleton create; got {note}"
+    );
+    assert_eq!(note["lifecycle"], "active");
+}
+
 #[tokio::test]
 async fn create_bulk_items_atomic_failure_rolls_back_notes() {
     let pack = pack();

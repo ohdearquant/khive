@@ -350,6 +350,36 @@ pub async fn resolve_uuid_unfiltered_including_deleted(
     resolve_name_async(s, runtime, token).await
 }
 
+/// Max `annotates` targets accepted per note create (singleton or bulk item).
+/// Shared between the singleton and bulk note-create paths so the contract
+/// stays uniform: neither path may be looser than the other.
+pub(crate) const ANNOTATES_CAP: usize = 100;
+
+/// Reject an oversized `annotates` list, then deduplicate targets before
+/// resolving each to a UUID — a duplicated target must not cost an extra
+/// lookup or produce an extra edge.
+pub(crate) async fn resolve_annotates_targets(
+    raw: Vec<String>,
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+) -> Result<Vec<Uuid>, RuntimeError> {
+    if raw.len() > ANNOTATES_CAP {
+        return Err(RuntimeError::InvalidInput(format!(
+            "annotates accepts at most {ANNOTATES_CAP} targets per note; got {}",
+            raw.len()
+        )));
+    }
+    let mut seen = std::collections::HashSet::with_capacity(raw.len());
+    let mut resolved = Vec::with_capacity(raw.len());
+    for target in raw {
+        if !seen.insert(target.clone()) {
+            continue;
+        }
+        resolved.push(resolve_uuid_unfiltered(&target, runtime, token).await?);
+    }
+    Ok(resolved)
+}
+
 // ---- Output formatting helpers ----
 
 pub(crate) fn format_edge_output(v: Value, _verbose: bool) -> Value {
@@ -398,6 +428,13 @@ pub(crate) fn remap_note_status(mut note_value: Value) -> Value {
         obj.insert("status".to_string(), Value::String(gtd_status));
     }
     note_value
+}
+
+pub(crate) fn remap_note_status_array(v: Value) -> Value {
+    match v {
+        Value::Array(arr) => Value::Array(arr.into_iter().map(remap_note_status).collect()),
+        other => remap_note_status(other),
+    }
 }
 
 pub(crate) fn parse_direction(s: Option<&str>) -> Result<Direction, RuntimeError> {

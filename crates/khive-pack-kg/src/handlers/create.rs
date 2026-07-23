@@ -9,8 +9,8 @@ use khive_storage::Note;
 use super::common::{
     canonical_entity_kind, canonical_note_kind, deser, immutable_event_error,
     normalize_entity_timestamps, parse_relation, reconcile_specific, remap_note_status,
-    resolve_kind_spec, resolve_uuid_unfiltered, to_json, validate_entity_type, validate_weight,
-    CreateParams, KindSpec,
+    remap_note_status_array, resolve_annotates_targets, resolve_kind_spec, resolve_uuid_unfiltered,
+    to_json, validate_entity_type, validate_weight, CreateParams, KindSpec,
 };
 use crate::KgPack;
 
@@ -106,16 +106,13 @@ impl KgPack {
                         "items[{idx}]: note item requires 'content'"
                     ))
                 })?;
-                let mut annotates = Vec::new();
-                for target in entry.annotates.unwrap_or_default() {
-                    annotates.push(
-                        resolve_uuid_unfiltered(&target, &self.runtime, token)
-                            .await
-                            .map_err(|e| {
-                                RuntimeError::InvalidInput(format!("items[{idx}].annotates: {e}"))
-                            })?,
-                    );
-                }
+                let annotates = resolve_annotates_targets(
+                    entry.annotates.unwrap_or_default(),
+                    &self.runtime,
+                    token,
+                )
+                .await
+                .map_err(|e| RuntimeError::InvalidInput(format!("items[{idx}].annotates: {e}")))?;
                 Ok(BulkCreateSpec::Note(BulkNoteCreateSpec {
                     kind: canonical,
                     name: entry.name,
@@ -228,7 +225,7 @@ impl KgPack {
             });
             if verbose {
                 response["entities"] = to_json(&entities)?;
-                response["notes"] = to_json(&notes)?;
+                response["notes"] = remap_note_status_array(to_json(&notes)?);
             }
             return Ok(response);
         }
@@ -287,7 +284,7 @@ impl KgPack {
         });
         if verbose {
             response["entities"] = to_json(&entities)?;
-            response["notes"] = to_json(&notes)?;
+            response["notes"] = remap_note_status_array(to_json(&notes)?);
         }
         Ok(response)
     }
@@ -543,10 +540,12 @@ impl KgPack {
                 let content = p.content.ok_or_else(|| {
                     RuntimeError::InvalidInput("kind=note requires 'content'".into())
                 })?;
-                let mut annotates = Vec::new();
-                for s in p.annotates.unwrap_or_default() {
-                    annotates.push(resolve_uuid_unfiltered(&s, &self.runtime, token).await?);
-                }
+                let annotates = resolve_annotates_targets(
+                    p.annotates.unwrap_or_default(),
+                    &self.runtime,
+                    token,
+                )
+                .await?;
                 let properties = super::common::merge_note_tags(p.properties, p.tags)?;
                 let embed_text = p.embedding_content.as_deref().unwrap_or(&content);
                 let truncated = self
