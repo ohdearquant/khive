@@ -2706,8 +2706,12 @@ backend = "sessions"
 
         let khive_dir = home_dir.path().join(".khive");
         std::fs::create_dir_all(&khive_dir).expect("mkdir .khive");
-        let main_backend_path = khive_dir.join("main-backend.db");
-        let sessions_backend_path = khive_dir.join("sessions-backend.db");
+        // Keep the configuration home-shaped while placing the stores in a
+        // separate tempdir. Test-harness builds reject every store under
+        // `$HOME/.khive`, including isolated fixtures, at the open boundary.
+        let backend_dir = tempfile::tempdir().expect("backend tempdir");
+        let main_backend_path = backend_dir.path().join("main-backend.db");
+        let sessions_backend_path = backend_dir.path().join("sessions-backend.db");
         std::fs::write(
             khive_dir.join("config.toml"),
             format!(
@@ -2796,7 +2800,7 @@ backend = "sessions"
             .with(|captured| captured.borrow_mut().take())
             .expect("matching-override frame must be captured");
 
-        let conflicting_override = khive_dir.join("override.db");
+        let conflicting_override = backend_dir.path().join("override.db");
         let result = run_exec_inline_with_forward(
             "stats()".to_string(),
             cfg,
