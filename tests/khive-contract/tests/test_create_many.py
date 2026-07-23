@@ -1,59 +1,63 @@
-"""Contract tests: create(items=[...]) bulk entity creation semantics.
+"""Contract tests: create(items=[...]) kind-aware bulk creation semantics.
 
 ADR: ADR-017 (pack standard)
-section: bulk entity creation; atomic vs non-atomic path; spec-building failure semantics
+section: bulk entity/note creation; atomic vs non-atomic path; spec-building failure semantics
 Issue: #260 (formal-pack + create_many coverage), surface: PR #232
 
 Source of truth for all asserted semantics:
-  crates/khive-pack-kg/src/handlers/create.rs — handle_create, bulk path lines 68-203
+  crates/khive-pack-kg/src/handlers/create.rs — handle_bulk_create,
+  prepare_bulk_create_spec.
 
 The create verb's bulk path activates when the top-level `items` key is present.
+Each item's `kind` resolves independently to either an entity kind (e.g.
+"concept") or a note kind (e.g. "observation") — bulk create is NOT
+entity-only. Entity items require `name`; note items require `content` and
+default `note_kind` to "observation". Both substrates may appear in the same
+`items` batch.
 
---- atomic=true (default, create.rs lines 97-164) ---
+--- atomic=true (default) ---
 
-  specs built for all items (one-shot), then self.runtime.create_many(token, specs)
-  called once.  Any runtime failure propagates via `?`, failing the whole batch.
+  Specs are built for every item first (each resolved independently), then
+  notes are created one at a time and entities are created in a single
+  self.runtime.create_many(token, entity_specs) call. Any failure — spec
+  building or the runtime write — aborts the whole batch before returning;
+  any notes already written are rolled back.
   Response shape: { attempted, created, skipped: 0, failed: 0 }
-  When verbose=true: adds "entities" array of created entity objects.
-  "entities" key is ABSENT when verbose=false (the default).
+  When verbose=true: adds "entities" and "notes" arrays of the created
+  objects. Both keys are ABSENT when verbose=false (the default).
 
---- atomic=false (create.rs lines 165-201) ---
+--- atomic=false ---
 
-  Each spec calls self.runtime.create_many(token, vec![spec]) individually.
-  Per-item errors are collected; successful items are counted in "created".
+  Each item's spec is built and (if valid) written individually; a failure
+  at either step is collected as a per-item {index, error} entry and does
+  not stop the remaining items from being attempted.
   Response always includes "errors" key (even if the list is empty).
   Response shape: { attempted, created, skipped: 0, failed, errors: [...] }
-  When verbose=true: adds "entities" array of the successful entity objects.
+  When verbose=true: adds "entities" and "notes" arrays of the successful
+  objects for each substrate.
 
---- Kind-aware bulk creation (create.rs prepare_bulk_create_spec) ---
-
-  Each item's `kind` resolves independently. Entity-kind items (e.g. "concept")
-  require `name`; note-kind items (e.g. "observation") require `content` and
-  default `note_kind` to "observation". Both substrates are valid inside the
-  same `items` batch — bulk create is NOT entity-only. See
-  docs/guide/api-reference.md ("Create") for the field-level contract.
+--- Substrate-domain rejection ---
 
   Items whose `kind` resolves to neither an entity nor a note kind (edge,
   event, proposal) hit the substrate-rejection branch:
-    return Err(RuntimeError::InvalidInput(format!(
-        "items[{idx}]: bulk create supports only entity and note kinds; got {:?}",
-        entry.kind
-    )))
+    "items[{idx}]: bulk create supports only entity and note kinds; got {:?}"
   This is spec-building, evaluated per item before any runtime write:
-  - atomic=true: the whole-batch loop uses `?`, so this aborts the entire
-    request before anything is created (nothing partially written).
+  - atomic=true: this aborts the entire request before anything is created
+    (nothing partially written, including valid siblings elsewhere in the
+    batch).
   - atomic=false: the best-effort loop catches this per item and appends
-    an {index, error} entry to "errors"; valid siblings still succeed.
+    an {index, error} entry to "errors"; valid siblings still succeed and
+    persist.
 
---- Limit guard (create.rs lines 92-95) ---
+--- Limit guard ---
 
   More than 1000 items returns Err("bulk create limited to 1000 entries per request").
 
 --- BulkCreateEntry schema (create.rs/params.rs) ---
 
   #[serde(deny_unknown_fields)]
-  Fields: kind (String), name?, entity_kind?, entity_type?, description?,
-          content?, salience?, annotates?, properties?, tags?.
+  Fields: kind (String), name?, entity_kind?, note_kind?, entity_type?,
+          description?, content?, salience?, annotates?, properties?, tags?.
   Entity items use name/entity_kind/entity_type/description; note items use
   content/note_kind/salience/annotates. Both accept properties/tags.
 """
@@ -317,6 +321,19 @@ def test_create_many_unsupported_kind_in_items_rejected(
         f"got: {exc_info.value.message!r}"
     )
 
+    # Whole-batch abort must mean nothing was written — the valid first item
+    # (index 0) must NOT have been persisted alongside the rejected one.
+    listed = khive_session.verb("list", {
+        "kind": "entity",
+        "entity_kind": "concept",
+        "namespace": ns,
+    })
+    names = [e.get("name") for e in listed]
+    assert f"cm_kindrej_concept_{ns[-6:]}" not in names, (
+        "atomic=true must not persist the valid first item when a later item "
+        f"in the same batch is rejected; found it in namespace listing: {names}"
+    )
+
 
 @pytest.mark.create_many
 @pytest.mark.slow
@@ -359,6 +376,26 @@ def test_create_many_unsupported_kind_rejected_with_atomic_false(
     assert "entity" in error_msg and "note" in error_msg, (
         "per-item error must carry the same kind-domain message as the atomic=true case; "
         f"got: {error_entry!r}"
+    )
+
+    # The valid sibling (index 0) must have actually persisted, not just been
+    # counted — look it up by namespace-scoped list and confirm it is retrievable.
+    listed = khive_session.verb("list", {
+        "kind": "entity",
+        "entity_kind": "concept",
+        "namespace": ns,
+    })
+    sibling_name = f"cm_kindrej2_concept_{ns[-6:]}"
+    matches = [e for e in listed if e.get("name") == sibling_name]
+    assert len(matches) == 1, (
+        f"the valid sibling {sibling_name!r} must be persisted exactly once; "
+        f"got matches: {matches}"
+    )
+    sibling_id = matches[0].get("id")
+    fetched = khive_session.verb("get", {"id": sibling_id, "namespace": ns})
+    assert fetched is not None, f"get({sibling_id}) returned None for persisted sibling"
+    assert fetched.get("name") == sibling_name, (
+        f"get({sibling_id}) name mismatch for persisted sibling; got {fetched}"
     )
 
 
