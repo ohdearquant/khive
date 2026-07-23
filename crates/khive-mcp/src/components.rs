@@ -292,7 +292,22 @@ async fn supervise(
     health: HealthReporter,
 ) {
     let mut restarts: u32 = 0;
-    let mut backoff_ms = reg.backoff_initial_ms.max(1);
+    let mut backoff_ms = reg.backoff_initial_ms.clamp(1, reg.backoff_max_ms.max(1));
+    // A shutdown wait longer than the daemon's drain bound could never
+    // complete its abort/state transition before the daemon returns; clamp
+    // and say so once.
+    let drain_ms = khive_runtime::daemon::drain_timeout().as_millis() as u64;
+    let shutdown_wait_ms = if reg.shutdown_timeout_ms > drain_ms {
+        tracing::warn!(
+            component = reg.name,
+            requested_ms = reg.shutdown_timeout_ms,
+            drain_bound_ms = drain_ms,
+            "daemon component: shutdown timeout exceeds the drain bound; clamped"
+        );
+        drain_ms
+    } else {
+        reg.shutdown_timeout_ms
+    };
     loop {
         health.record_start(reg.name, restarts);
         tracing::info!(
@@ -317,19 +332,13 @@ async fn supervise(
             r = &mut handle => Some(r),
             _ = token.cancelled() => {
                 match tokio::time::timeout(
-                    Duration::from_millis(reg.shutdown_timeout_ms),
+                    Duration::from_millis(shutdown_wait_ms),
                     &mut handle,
                 )
                 .await
                 {
                     Ok(r) => Some(r),
                     Err(_) => {
-                        tracing::warn!(
-                            component = reg.name,
-                            timeout_ms = reg.shutdown_timeout_ms,
-                            "daemon component: ignored cancellation past its shutdown \
-                             timeout; aborting task"
-                        );
                         handle.abort();
                         let _ = (&mut handle).await;
                         None
@@ -339,13 +348,31 @@ async fn supervise(
         };
 
         if token.is_cancelled() {
-            // Shutdown path: whatever the component returned while stopping,
-            // this is a cooperative stop, not a failure — no budget consumed.
-            if let Some(Ok(Err(e))) = &joined {
-                tracing::info!(component = reg.name, error = %e, "daemon component: error during shutdown (ignored)");
+            match &joined {
+                // Ignored cancellation until the host aborted it: the wedge
+                // was real, not cooperative — terminally unhealthy so a
+                // frozen loop is visible post-mortem, never a clean stop.
+                None => {
+                    let msg = format!("aborted: ignored cancellation for {shutdown_wait_ms}ms");
+                    tracing::error!(
+                        component = reg.name,
+                        timeout_ms = shutdown_wait_ms,
+                        "daemon component: ignored cancellation past its shutdown \
+                         timeout; aborted (terminally unhealthy)"
+                    );
+                    health.record_state(reg.name, ComponentState::Unhealthy, Some(msg));
+                }
+                // Cooperative stop: whatever the component returned while
+                // stopping, this is a shutdown, not a failure — no budget
+                // consumed.
+                Some(joined) => {
+                    if let Ok(Err(e)) = joined {
+                        tracing::info!(component = reg.name, error = %e, "daemon component: error during shutdown (ignored)");
+                    }
+                    health.record_state(reg.name, ComponentState::Stopped, None);
+                    tracing::info!(component = reg.name, "daemon component: stopped (shutdown)");
+                }
             }
-            health.record_state(reg.name, ComponentState::Stopped, None);
-            tracing::info!(component = reg.name, "daemon component: stopped (shutdown)");
             return;
         }
 
@@ -386,7 +413,7 @@ async fn supervise(
         }
 
         restarts += 1;
-        let delay = Duration::from_millis(backoff_ms + jitter_ms(backoff_ms));
+        let delay = Duration::from_millis(backoff_ms.saturating_add(jitter_ms(backoff_ms)));
         tracing::warn!(
             component = reg.name,
             error = %error,
@@ -643,11 +670,50 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
         let before = std::time::Instant::now();
         parent.cancel();
-        let status = wait_for_state(&health, "test-hung", ComponentState::Stopped).await;
-        assert_eq!(status.state, ComponentState::Stopped);
-        // Bounded: well under the hour the component wanted, and at least the
-        // shutdown timeout was honored before the abort.
+        // An abort after ignoring cancellation is a real wedge — terminally
+        // unhealthy with the abort recorded, never a clean stop.
+        let status = wait_for_state(&health, "test-hung", ComponentState::Unhealthy).await;
+        assert!(status.last_error.as_deref().unwrap().contains("aborted"));
+        // Bounded: well under the hour the component wanted.
         assert!(before.elapsed() < Duration::from_secs(5));
+    }
+
+    static OVERFLOW_RUNS: AtomicU32 = AtomicU32::new(0);
+    fn overflow_component(_ctx: HostContext) -> ComponentFuture {
+        Box::pin(async {
+            OVERFLOW_RUNS.fetch_add(1, Ordering::SeqCst);
+            Err(ComponentError::Retryable(
+                "push the backoff arithmetic".into(),
+            ))
+        })
+    }
+
+    #[tokio::test]
+    async fn extreme_backoff_values_never_panic_the_supervisor() {
+        static REG: DaemonComponentRegistration = DaemonComponentRegistration {
+            name: "test-overflow",
+            restart: RestartClass::OnFailure,
+            max_restarts: 3,
+            backoff_initial_ms: u64::MAX,
+            backoff_max_ms: u64::MAX,
+            shutdown_timeout_ms: u64::MAX,
+            start: overflow_component,
+        };
+        let (_f, db) = tmp_db();
+        let server = make_server(&db).await;
+        let health = HealthReporter::default();
+        let parent = CancellationToken::new();
+        start_components(&[&REG], &server, parent.clone(), health.clone());
+        // First failure lands Degraded, then the supervisor sits in a
+        // (saturating, non-panicking) enormous backoff sleep.
+        let status = wait_for_state(&health, "test-overflow", ComponentState::Degraded).await;
+        assert_eq!(status.restart_count, 0);
+        assert_eq!(OVERFLOW_RUNS.load(Ordering::SeqCst), 1);
+        // Cancellation during backoff still stops cleanly — proving the
+        // supervisor survived the arithmetic instead of panicking past
+        // Degraded.
+        parent.cancel();
+        wait_for_state(&health, "test-overflow", ComponentState::Stopped).await;
     }
 
     static PANIC_RUNS: AtomicU32 = AtomicU32::new(0);

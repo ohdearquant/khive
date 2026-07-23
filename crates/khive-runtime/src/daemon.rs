@@ -47,7 +47,6 @@ pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// See `docs/api/daemon.md#protocol_version` for the version-by-version history.
 pub const PROTOCOL_VERSION: u32 = 3;
 
-#[cfg(unix)]
 const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 10;
 
 // ── paths ─────────────────────────────────────────────────────────────────────
@@ -1421,6 +1420,21 @@ pub async fn run_daemon_with_boot_guard<D: DaemonDispatch>(
     // same process, which would self-deadlock on `flock`.
     let _startup_lock = boot_guard;
 
+    // ADR-119: components may have been started by the serve path before this
+    // function established (or failed to establish) daemon ownership. Cancel
+    // the process-wide shutdown token on EVERY exit — early return when
+    // another daemon owns the socket, bind errors, and normal shutdown alike
+    // — so supervisors never outlive this process's claim to daemon role.
+    // The token is process-lifetime single-shot; a process that stops being
+    // (or never becomes) the daemon has no path back except exec.
+    struct ComponentTeardown;
+    impl Drop for ComponentTeardown {
+        fn drop(&mut self) {
+            daemon_shutdown_token().cancel();
+        }
+    }
+    let _component_teardown = ComponentTeardown;
+
     if !cleanup_stale_daemon(&sock, &pid_file).await {
         tracing::info!("a responsive khived is already running; exiting");
         return Ok(());
@@ -1802,8 +1816,12 @@ async fn drain(active: &std::sync::atomic::AtomicUsize) {
     }
 }
 
-#[cfg(unix)]
-fn drain_timeout() -> std::time::Duration {
+/// The bound `drain()` waits for tracked background tasks at daemon shutdown
+/// (`KHIVE_DRAIN_TIMEOUT_SECS`, default 10s). Public so component supervision
+/// can clamp per-component shutdown timeouts against it — a component timeout
+/// longer than the drain bound could never complete its abort/state
+/// transition before the daemon returns.
+pub fn drain_timeout() -> std::time::Duration {
     let secs = std::env::var("KHIVE_DRAIN_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
