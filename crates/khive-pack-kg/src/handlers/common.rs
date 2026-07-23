@@ -355,6 +355,42 @@ pub async fn resolve_uuid_unfiltered_including_deleted(
 /// stays uniform: neither path may be looser than the other.
 pub(crate) const ANNOTATES_CAP: usize = 100;
 
+/// Max total `annotates` targets (after per-item dedup) accepted across an
+/// entire bulk create request. The per-item cap alone still lets a 1000-item
+/// batch drive up to 100,000 target resolutions and edge writes; this budget
+/// keeps a request's total annotates work in the same order as the items cap
+/// itself (1000 items, ~1 annotation each) rather than 100x it.
+pub(crate) const ANNOTATES_BULK_BUDGET: usize = 1000;
+
+/// Dedup key for an `annotates` target: targets that parse as a UUID dedup on
+/// the parsed value (so case variants and other equivalent encodings of the
+/// same UUID collapse), matching the equivalence `resolve_uuid_unfiltered`
+/// itself applies via `Uuid::from_str` before falling back to prefix/name
+/// resolution. Non-UUID references (hex prefixes, names) dedup on the raw
+/// string only — the resolver does not treat two different prefixes/names as
+/// equivalent ahead of a storage lookup, so dedup must not invent that either.
+#[derive(PartialEq, Eq, Hash)]
+enum AnnotateKey {
+    Uuid(Uuid),
+    Raw(String),
+}
+
+fn annotate_dedup_key(target: &str) -> AnnotateKey {
+    match Uuid::from_str(target) {
+        Ok(uuid) => AnnotateKey::Uuid(uuid),
+        Err(_) => AnnotateKey::Raw(target.to_string()),
+    }
+}
+
+/// Deduplicate a raw `annotates` list using [`annotate_dedup_key`], preserving
+/// first-occurrence order.
+fn dedup_annotates_raw(raw: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::with_capacity(raw.len());
+    raw.into_iter()
+        .filter(|target| seen.insert(annotate_dedup_key(target)))
+        .collect()
+}
+
 /// Reject an oversized `annotates` list, then deduplicate targets before
 /// resolving each to a UUID — a duplicated target must not cost an extra
 /// lookup or produce an extra edge.
@@ -369,15 +405,36 @@ pub(crate) async fn resolve_annotates_targets(
             raw.len()
         )));
     }
-    let mut seen = std::collections::HashSet::with_capacity(raw.len());
-    let mut resolved = Vec::with_capacity(raw.len());
-    for target in raw {
-        if !seen.insert(target.clone()) {
-            continue;
-        }
+    let deduped = dedup_annotates_raw(raw);
+    let mut resolved = Vec::with_capacity(deduped.len());
+    for target in deduped {
         resolved.push(resolve_uuid_unfiltered(&target, runtime, token).await?);
     }
     Ok(resolved)
+}
+
+/// Pre-scan a bulk create request's raw items and reject it if the total
+/// `annotates` target count (summed per-item, each item deduped the same way
+/// [`resolve_annotates_targets`] would) exceeds [`ANNOTATES_BULK_BUDGET`].
+/// Runs before any per-item spec building or target resolution — a request
+/// that would blow the budget must not cost a single lookup.
+pub(crate) fn check_bulk_annotates_budget(entries: &[Value]) -> Result<(), RuntimeError> {
+    let mut total = 0usize;
+    for entry in entries {
+        let Some(raw) = entry.get("annotates") else {
+            continue;
+        };
+        let Ok(targets) = serde_json::from_value::<Vec<String>>(raw.clone()) else {
+            continue;
+        };
+        total += dedup_annotates_raw(targets).len();
+    }
+    if total > ANNOTATES_BULK_BUDGET {
+        return Err(RuntimeError::InvalidInput(format!(
+            "bulk create annotates budget exceeded: at most {ANNOTATES_BULK_BUDGET} total annotates targets per request (after per-item dedup); got {total}"
+        )));
+    }
+    Ok(())
 }
 
 // ---- Output formatting helpers ----

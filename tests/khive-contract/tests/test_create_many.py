@@ -495,6 +495,138 @@ def test_create_many_note_annotates_duplicate_targets_produce_one_edge(
 
 
 # ---------------------------------------------------------------------------
+# Aggregate `annotates` budget across a bulk request
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.create_many
+@pytest.mark.slow
+def test_create_many_annotates_aggregate_budget_over_rejected_before_resolution(
+    khive_session: KhiveMcpSession,
+    temp_namespace: str,
+) -> None:
+    """Per-item arrays each under the per-item cap, but summing over the
+    aggregate budget, are rejected before any target resolution.
+
+    Source: crates/khive-pack-kg/src/handlers/common.rs
+    check_bulk_annotates_budget, ANNOTATES_BULK_BUDGET (1000). 11 note items
+    with 100 targets each (under the per-item cap of 100) sum to 1100, over
+    the 1000 aggregate budget — the whole request is rejected up front, not
+    surfaced as a per-item error.
+    """
+    ns = temp_namespace
+    items = [
+        {
+            "kind": "observation",
+            "content": f"cm_aggcap_note_{ns[-6:]}_{i}",
+            "annotates": [str(uuid.uuid4()) for _ in range(100)],
+        }
+        for i in range(11)
+    ]
+
+    with pytest.raises(KhiveOperationError) as exc_info:
+        khive_session.verb("create", {
+            "items": items,
+            "atomic": False,
+            "namespace": ns,
+        })
+
+    error_msg = exc_info.value.message.lower()
+    assert "1000" in error_msg, (
+        f"aggregate-budget error must name the budget (1000); got: {exc_info.value.message!r}"
+    )
+    assert "1100" in error_msg, (
+        f"aggregate-budget error must name the offending total (1100); got: {exc_info.value.message!r}"
+    )
+
+
+@pytest.mark.create_many
+@pytest.mark.slow
+def test_create_many_annotates_aggregate_budget_at_exact_limit_succeeds(
+    khive_session: KhiveMcpSession,
+    temp_namespace: str,
+) -> None:
+    """A bulk request whose total annotates (after per-item dedup) lands
+    exactly on the aggregate budget still succeeds.
+
+    10 note items x 100 distinct, real targets each = 1000 total, exactly at
+    ANNOTATES_BULK_BUDGET.
+    """
+    ns = temp_namespace
+    target_ids = [
+        khive_session.verb("create", {
+            "kind": "concept",
+            "name": f"cm_aggexact_target_{ns[-6:]}_{i}",
+            "namespace": ns,
+        })["id"]
+        for i in range(100)
+    ]
+
+    items = [
+        {
+            "kind": "observation",
+            "content": f"cm_aggexact_note_{ns[-6:]}_{i}",
+            "annotates": target_ids,
+        }
+        for i in range(10)
+    ]
+
+    result = khive_session.verb("create", {
+        "items": items,
+        "atomic": False,
+        "namespace": ns,
+        "verbose": True,
+    })
+    assert result.get("attempted") == 10, f"attempted must be 10; got {result}"
+    assert result.get("created") == 10, f"all 10 note items must succeed; got {result}"
+    assert result.get("failed") == 0, f"no item should fail; got {result}"
+
+
+@pytest.mark.create_many
+@pytest.mark.slow
+def test_create_many_annotates_uuid_case_variants_dedup_to_one_edge(
+    khive_session: KhiveMcpSession,
+    temp_namespace: str,
+) -> None:
+    """Two encodings of the same UUID (differing letter case) in one item's
+    `annotates` dedup to a single resolution and a single edge.
+
+    Source: resolve_annotates_targets now dedups on the parsed UUID (not the
+    raw string) when a target parses as a UUID — case variants of the same
+    UUID collapse instead of producing duplicate edges.
+    """
+    ns = temp_namespace
+    target = khive_session.verb("create", {
+        "kind": "concept",
+        "name": f"cm_annocase_target_{ns[-6:]}",
+        "namespace": ns,
+    })
+    target_id = target["id"]
+    upper = target_id.upper()
+    assert target_id != upper, "fixture UUID must contain letters for a meaningful case test"
+
+    result = khive_session.verb("create", {
+        "items": [{
+            "kind": "observation",
+            "content": f"cm_annocase_note_{ns[-6:]}",
+            "annotates": [target_id, upper],
+        }],
+        "namespace": ns,
+    })
+    assert result.get("created") == 1, f"note create must succeed; got {result}"
+
+    neighbors = khive_session.verb("neighbors", {
+        "id": target_id,
+        "direction": "incoming",
+        "relations": ["annotates"],
+        "namespace": ns,
+    })
+    assert len(neighbors) == 1, (
+        f"case-variant encodings of the same UUID must produce exactly one edge; got {neighbors}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Verbose bulk-note responses project lifecycle status
 # ---------------------------------------------------------------------------
 

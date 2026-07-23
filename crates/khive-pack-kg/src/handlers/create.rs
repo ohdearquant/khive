@@ -7,10 +7,11 @@ use khive_runtime::{EntityCreateSpec, NamespaceToken, RuntimeError, VerbRegistry
 use khive_storage::Note;
 
 use super::common::{
-    canonical_entity_kind, canonical_note_kind, deser, immutable_event_error,
-    normalize_entity_timestamps, parse_relation, reconcile_specific, remap_note_status,
-    remap_note_status_array, resolve_annotates_targets, resolve_kind_spec, resolve_uuid_unfiltered,
-    to_json, validate_entity_type, validate_weight, CreateParams, KindSpec,
+    canonical_entity_kind, canonical_note_kind, check_bulk_annotates_budget, deser,
+    immutable_event_error, normalize_entity_timestamps, parse_relation, reconcile_specific,
+    remap_note_status, remap_note_status_array, resolve_annotates_targets, resolve_kind_spec,
+    resolve_uuid_unfiltered, to_json, validate_entity_type, validate_weight, CreateParams,
+    KindSpec,
 };
 use crate::KgPack;
 
@@ -185,6 +186,7 @@ impl KgPack {
         registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
         let attempted = entries.len();
+        check_bulk_annotates_budget(&entries)?;
 
         if atomic {
             let mut specs = Vec::with_capacity(attempted);

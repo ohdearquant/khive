@@ -329,6 +329,130 @@ async fn create_bulk_note_annotates_duplicate_targets_dedup_to_one_edge() {
     );
 }
 
+// Regression: a bulk request whose per-item `annotates` arrays are each
+// within the per-item cap, but whose total (after per-item dedup) exceeds
+// the aggregate per-request budget, must be rejected before any target
+// resolution — not accepted as N separate legal items.
+#[tokio::test]
+async fn create_bulk_note_annotates_aggregate_budget_over_rejected_before_resolution() {
+    let pack = pack();
+    let items: Vec<Value> = (0..11)
+        .map(|i| {
+            let targets: Vec<String> = (0..100).map(|_| uuid::Uuid::new_v4().to_string()).collect();
+            json!({
+                "kind": "observation",
+                "content": format!("aggregate budget note {i}"),
+                "annotates": targets,
+            })
+        })
+        .collect();
+
+    let err = pack
+        .dispatch("create", json!({"items": items, "atomic": false}))
+        .await
+        .expect_err("total annotates over the aggregate budget must be rejected");
+    assert!(
+        matches!(err, khive_runtime::RuntimeError::InvalidInput(_)),
+        "expected InvalidInput for over-budget aggregate annotates, got {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("1000") && msg.contains("1100"),
+        "error must name both the budget and the offending total; got {msg}"
+    );
+}
+
+// Regression: a bulk request whose total `annotates` targets (after per-item
+// dedup) lands exactly on the aggregate budget must still succeed.
+#[tokio::test]
+async fn create_bulk_note_annotates_aggregate_budget_at_exact_limit_succeeds() {
+    let pack = pack();
+    let mut target_ids = Vec::with_capacity(100);
+    for i in 0..100 {
+        let target = pack
+            .dispatch(
+                "create",
+                json!({"kind": "concept", "name": format!("ExactBudgetTarget{i}")}),
+            )
+            .await
+            .expect("target entity must be created");
+        target_ids.push(target["id"].as_str().expect("target id").to_string());
+    }
+
+    // 10 items x 100 distinct-per-item targets = 1000 total, exactly at budget.
+    let items: Vec<Value> = (0..10)
+        .map(|i| {
+            json!({
+                "kind": "observation",
+                "content": format!("exact budget note {i}"),
+                "annotates": target_ids.clone(),
+            })
+        })
+        .collect();
+
+    let result = pack
+        .dispatch(
+            "create",
+            json!({"items": items, "atomic": false, "verbose": true}),
+        )
+        .await
+        .expect("total annotates exactly at the aggregate budget must succeed");
+    assert_eq!(result["attempted"], 10);
+    assert_eq!(result["created"], 10);
+    assert_eq!(result["failed"], 0);
+}
+
+// Regression: two encodings of the same UUID (e.g. differing letter case) in
+// one item's `annotates` must dedup to a single resolution and a single edge
+// — raw-string dedup alone lets equivalent UUID encodings slip through.
+#[tokio::test]
+async fn create_bulk_note_annotates_uuid_case_variants_dedup_to_one_edge() {
+    let pack = pack();
+    let target = pack
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "CaseDedupTarget"}),
+        )
+        .await
+        .expect("target entity must be created");
+    let target_id = target["id"].as_str().expect("target id").to_string();
+    let upper = target_id.to_uppercase();
+    assert_ne!(
+        target_id, upper,
+        "fixture UUID must contain letters for a meaningful case-variant test"
+    );
+
+    let result = pack
+        .dispatch(
+            "create",
+            json!({
+                "items": [
+                    {
+                        "kind": "observation",
+                        "content": "case-variant annotates targets",
+                        "annotates": [target_id.clone(), upper]
+                    }
+                ]
+            }),
+        )
+        .await
+        .expect("bulk create with case-variant annotates targets must succeed");
+    assert_eq!(result["created"], 1);
+
+    let incoming = pack
+        .dispatch(
+            "neighbors",
+            json!({"id": target_id, "direction": "incoming", "relations": ["annotates"]}),
+        )
+        .await
+        .expect("annotation edges must be queryable");
+    assert_eq!(
+        incoming.as_array().expect("neighbors array").len(),
+        1,
+        "case-variant encodings of the same UUID must produce exactly one edge"
+    );
+}
+
 // Regression: bulk-created notes in verbose responses must run through the
 // same status/lifecycle projection as singleton `create`/`get`/`list` — not
 // serialize the note's row-visibility status directly.
