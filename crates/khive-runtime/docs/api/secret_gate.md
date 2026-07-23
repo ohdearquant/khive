@@ -65,10 +65,18 @@ of being silently allowed.
   marker (`commit`, `revision`, `rev`, `sha` — immediately preceding word, or `marker:value` in
   one token) is treated as a public VCS coordinate near a trigger word, again only outside
   credential-value syntax. The exemption is a *flag over the hex-credential-shape checks only*,
-  never an early skip of the whole check sequence: the value still participates in fragment
-  reconstruction anchored at neighboring tokens, so a split credential hiding one fragment behind
-  a marker is still accumulated and blocked from the other fragments' anchors. The bare marker
-  word itself (form `commit <hex>`) is skipped entirely — a fixed English marker word is not
+  never an early skip of the whole check sequence. For the bare-marker form (`commit <hex>`) the
+  exempt hex value is a plain alphanumeric token, so it still participates in fragment
+  reconstruction anchored at neighboring tokens: a split credential hiding one fragment behind
+  the marker is accumulated and blocked from the other fragments' anchors. That symmetric-anchor
+  compensation is **guaranteed only for that topology**: the inline `marker:value` form is a
+  colon-bearing token that neighboring bridge anchors reject (fragments must be
+  alphanumeric-only), and a chain probing across a bare marker word terminates at the marker. A
+  split credential whose fragments are reachable only through an inline-marker token or across a
+  marker word is therefore a bounded-fragment residual (see the reconstruction bounds above), not
+  a covered topology — unless a credential label is in clause range, in which case the clause
+  guard below disables the exemption and the shape checks fire directly. The bare marker word
+  itself (form `commit <hex>`) is skipped entirely — a fixed English marker word is not
   attacker-controlled credential material. Generic `hash`/`sha256` prose does not rescue a token.
 
 Both narrow exemptions above are gated by a **clause-label guard** (`has_clause_credential_label`):
@@ -76,12 +84,22 @@ the exemption is refused when the candidate carries an inline credential shape
 (`api_key=<value>`) or when a credential label is reachable by walking backwards through the
 current clause. The walk steps over connector words that commonly sit between a label and its
 value (`is`, `was`, `value`, articles, and the VCS marker words themselves, so a marker cannot
-shield an earlier label) up to a bounded number of identifiers, and stops at the first other word
-or at a sentence/paragraph boundary (`.`, `;`, `!`, `?`, blank line). A single-identifier
-lookback is deliberately NOT the contract: `api key value is commit <hex>` is a labeled
-credential wearing a marker, and one connector word must not hide the label. A label on the far
-side of a sentence boundary is prose context (the `near_trigger` window models that), not this
-value's label.
+shield an earlier label), version fragments (`v1.2` splits into version-shaped identifiers), and
+long hex fragments (a separator-split payload piece is value material, not a label word), up to a
+bounded number of identifiers. Crossing a value delimiter (`:` or `=`) additionally lets the walk
+step over a small bounded number of identifiers outside those sets — "label with qualifiers:
+value" (`api key for deploy: <value>`) is assignment syntax regardless of which qualifier words
+the label carries. A delimiter attached to a VCS marker word does not count (`introduced by
+sha: <hex>` is coordinate syntax, not assignment), and at three or more interceding content
+words (`the auth scanner flagged this file: <path>`) the trigger is treated as prose context.
+The walk stops at a sentence/paragraph boundary (`;`, `!`, `?`, blank line; `.` only when not
+immediately followed by an alphanumeric character, so a dotted version qualifier does not read
+as a sentence end). A single-identifier lookback is deliberately NOT the contract: `api key
+value is commit <hex>` is a labeled credential wearing a marker, and one connector word must not
+hide the label. A label on the far side of a sentence boundary is prose context (the
+`near_trigger` window models that), not this value's label. Known residuals, accepted under the
+threat model: a non-connector qualifier without any delimiter (`api key pour commit <hex>`),
+and label clauses exceeding the walk or qualifier bounds.
 
 Trigger-word matching only fires on genuine mentions, not substring collisions: trigger words
 (`key`, `secret`, `password`, `passwd`, `credential`, `bearer`, `auth`, `apikey`) are matched at a

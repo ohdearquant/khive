@@ -1054,39 +1054,94 @@ const LABEL_CLAUSE_SKIP_WORDS: &[&str] = &[
 
 /// Maximum identifiers the clause walk examines before giving up. Bounds the
 /// scan to one short assignment clause; a label further away than this is
-/// window-level prose context, which `near_trigger` already models.
-const LABEL_CLAUSE_WALK_LIMIT: usize = 5;
+/// window-level prose context, which `near_trigger` already models. Sized so
+/// a label separated from its value by connectors plus a dotted version
+/// qualifier ("api key v1.2 value is commit <hex>" — the version costs two
+/// identifier steps) stays in range.
+const LABEL_CLAUSE_WALK_LIMIT: usize = 8;
+
+/// Maximum identifiers outside the connector/version/hex-fragment sets the
+/// clause walk steps over after crossing a value delimiter. Covers natural
+/// label qualifiers ("api key for deploy: X") without dragging whole verb
+/// phrases into label position — at three or more interceding content words
+/// ("the auth scanner flagged this file: <path>") the trigger is prose
+/// context, not this value's label.
+const LABEL_CLAUSE_DELIMITER_UNKNOWN_LIMIT: usize = 2;
+
+/// Sentence/paragraph boundary inside a clause-walk gap. `;`, `!`, `?`, and
+/// blank lines always end the clause. `.` ends it only when it is not
+/// immediately followed by an alphanumeric character: a dot tight between
+/// identifier fragments ("v1.2") is intra-token punctuation, while a dot at
+/// the end of the gap abuts the next identifier (gaps end where the adjacent
+/// identifier begins) and is likewise intra-token.
+fn gap_has_sentence_boundary(gap: &str) -> bool {
+    if gap.contains("\n\n") || gap.contains("\r\n\r\n") || gap.contains([';', '!', '?']) {
+        return true;
+    }
+    let bytes = gap.as_bytes();
+    bytes.iter().enumerate().any(|(i, b)| {
+        *b == b'.'
+            && bytes
+                .get(i + 1)
+                .is_some_and(|next| !next.is_ascii_alphanumeric())
+    })
+}
+
+/// Version-shaped identifier fragment ("2", "v1", "12") — the pieces a dotted
+/// version qualifier like `v1.2` splits into under identifier extraction.
+/// Treated as connector material so a versioned label ("api key v1.2 value
+/// is …") stays reachable.
+fn is_version_fragment(word: &str) -> bool {
+    let digits = word.strip_prefix('v').unwrap_or(word);
+    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Hex-run identifier long enough to be credential material rather than a
+/// word ("0123456789abcdef01234567"). Treated as connector material by the
+/// clause walk: a separator-split payload fragment sitting between the
+/// candidate value and its label is value material, not a label word that
+/// ends the clause.
+fn is_hex_fragment_word(word: &str) -> bool {
+    word.len() >= 12 && word.bytes().all(|b| b.is_ascii_hexdigit())
+}
 
 /// `true` when the candidate token sits in credential-value syntax: an inline
 /// credential shape on the token itself, or a credential label reachable by
 /// walking backwards through the current clause. The walk steps over
-/// [`LABEL_CLAUSE_SKIP_WORDS`] and stops at the first other word or at a
-/// sentence/paragraph boundary (`.`, `;`, `!`, `?`, blank line) — a label on
-/// the far side of a boundary is prose context, not this value's label. A
-/// single-identifier lookback is insufficient here: one connector word
-/// ("api key value is X") would otherwise hide the label from the exemption
-/// guards.
+/// [`LABEL_CLAUSE_SKIP_WORDS`], version fragments, and long hex fragments,
+/// and stops at a sentence/paragraph boundary (see
+/// [`gap_has_sentence_boundary`]) — a label on the far side of a boundary is
+/// prose context, not this value's label. Crossing a value delimiter (`:` or
+/// `=`) additionally lets the walk step over up to
+/// [`LABEL_CLAUSE_DELIMITER_UNKNOWN_LIMIT`] identifiers outside those sets:
+/// "label with qualifiers: value" is assignment syntax regardless of which
+/// qualifier words the label carries ("api key for deploy: X"). A delimiter
+/// attached to a VCS marker word does not count — "introduced by sha: <hex>"
+/// is coordinate syntax, not assignment. Without a delimiter, only the
+/// closed sets are stepped over — skipping arbitrary words there would
+/// re-block ordinary prose like "the key changes are in commit <hex>", the
+/// false-positive class these exemptions exist to fix.
 fn has_clause_credential_label(text: &str, token_offset: usize, raw_token: &str) -> bool {
     if has_inline_credential_trigger(raw_token) {
         return true;
     }
 
     let mut rest = &text[..token_offset];
+    let mut crossed_value_delimiter = false;
+    let mut post_delimiter_unknowns = 0usize;
     for step in 0..LABEL_CLAUSE_WALK_LIMIT {
         let label = trailing_identifier(rest);
         if label.is_empty() {
             return false;
         }
-        if step > 0 {
-            let gap = &rest[label.as_ptr() as usize - rest.as_ptr() as usize + label.len()..];
-            if gap.contains("\n\n")
-                || gap.contains(['.', ';', '!', '?'])
-                || gap.contains("\r\n\r\n")
-            {
-                return false;
-            }
+        let gap = &rest[label.as_ptr() as usize - rest.as_ptr() as usize + label.len()..];
+        if step > 0 && gap_has_sentence_boundary(gap) {
+            return false;
         }
         let lower = label.to_ascii_lowercase();
+        if gap.contains([':', '=']) && !VCS_MARKERS.contains(&lower.as_str()) {
+            crossed_value_delimiter = true;
+        }
         if lower == "token"
             || COMPOUND_TRIGGER_WORDS
                 .iter()
@@ -1097,8 +1152,17 @@ fn has_clause_credential_label(text: &str, token_offset: usize, raw_token: &str)
         {
             return true;
         }
-        if !LABEL_CLAUSE_SKIP_WORDS.contains(&lower.as_str()) {
-            return false;
+        let skippable = LABEL_CLAUSE_SKIP_WORDS.contains(&lower.as_str())
+            || is_version_fragment(&lower)
+            || is_hex_fragment_word(&lower);
+        if !skippable {
+            if !crossed_value_delimiter {
+                return false;
+            }
+            post_delimiter_unknowns += 1;
+            if post_delimiter_unknowns > LABEL_CLAUSE_DELIMITER_UNKNOWN_LIMIT {
+                return false;
+            }
         }
         let start = label.as_ptr() as usize - rest.as_ptr() as usize;
         rest = &rest[..start];
@@ -2758,6 +2822,103 @@ mod tests {
             Some("hex-credential-token"),
             "split credential with a marker-adjacent fragment must be blocked"
         );
+    }
+
+    #[test]
+    fn blocks_forty_hex_behind_qualified_label_with_delimiter() {
+        // A label with qualifier words the connector set cannot enumerate
+        // ("for deploy") followed by a value delimiter is assignment syntax:
+        // once the walk crosses the `:`/`=`, every label-side identifier is
+        // stepped over until the trigger word.
+        let revision = "d362950a3c9b1a4cb47d97f1623e38f1a1e6bcdf";
+        for content in [
+            format!("api key for deploy: commit {revision}"),
+            format!("prod api key for deploy = commit {revision}"),
+        ] {
+            assert_eq!(
+                scan(&content).map(|matched| matched.detector),
+                Some("hex-credential-token"),
+                "a qualified label before a value delimiter must not be \
+                 hidden from the exemption guard: {content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn blocks_slash_base64_behind_qualified_label_with_delimiter() {
+        let content = "api key for deploy: Xk9mZ2vQpLrT8nJwYuA/HfBsDcGiONvMabcdefgh";
+        assert_eq!(
+            scan(content).map(|matched| matched.detector),
+            Some("high-entropy-token"),
+            "a qualified label before a value delimiter must refuse the path \
+             exemption for a slash-bearing base64 credential"
+        );
+    }
+
+    #[test]
+    fn blocks_forty_hex_behind_versioned_label() {
+        // `v1.2` splits into version fragments under identifier extraction;
+        // the intra-token dot must not read as a sentence boundary and the
+        // fragments must be stepped over like connector words.
+        let revision = "d362950a3c9b1a4cb47d97f1623e38f1a1e6bcdf";
+        let content = format!("api key v1.2 value is commit {revision}");
+        assert_eq!(
+            scan(&content).map(|matched| matched.detector),
+            Some("hex-credential-token"),
+            "a versioned credential label must stay reachable through its \
+             version fragments: {content:?}"
+        );
+    }
+
+    #[test]
+    fn blocks_labeled_inline_marker_split_credential() {
+        // The r2 medium probes: `marker:value` inline forms carrying a split
+        // credential, with a credential label ahead of a value delimiter.
+        // The clause guard disables the VCS exemption, and whole-token
+        // normalized-hex accumulation fires on the fused token.
+        for content in [
+            concat!(
+                "api token context: rev:",
+                "d362950a3c9b1a4cb47d97f1623e38f1a1e6bcdf",
+                "\u{200B}",
+                "0123456789abcdef01234567"
+            )
+            .to_string(),
+            concat!(
+                "api token context: ",
+                "0123456789abcdef01234567",
+                "\u{200B}",
+                "rev:d362950a3c9b1a4cb47d97f1623e38f1a1e6bcdf"
+            )
+            .to_string(),
+        ] {
+            assert!(
+                check(&content).is_err(),
+                "a labeled inline-marker split credential must be blocked: \
+                 {content:?}, got {:?}",
+                scan(&content)
+            );
+        }
+    }
+
+    #[test]
+    fn allows_unlabeled_unknown_connector_without_delimiter() {
+        // Documented residuals: without a value delimiter, an identifier
+        // outside the connector set still ends the walk. Skipping arbitrary
+        // words there would re-block ordinary prose — the false-positive
+        // class the exemptions exist to fix.
+        let revision = "d362950a3c9b1a4cb47d97f1623e38f1a1e6bcdf";
+        for content in [
+            format!("the key changes are in commit {revision}"),
+            format!("deployed at commit {revision}"),
+        ] {
+            assert!(
+                check(&content).is_ok(),
+                "prose without a value delimiter must keep the VCS exemption: \
+                 {content:?}, got {:?}",
+                scan(&content)
+            );
+        }
     }
 
     #[test]
