@@ -1136,6 +1136,20 @@ fn mixed_separators_in_fn_batch_rejected() {
 }
 
 #[test]
+fn parallel_batch_of_chains_has_precise_mixed_separator_diagnostic() {
+    let err = parse_request(
+        r#"[create(kind="observation", content="one") | link(source_id=$prev.id, target_id="00000000-0000-0000-0000-000000000001", relation="annotates"), create(kind="insight", content="two") | link(source_id=$prev.id, target_id="00000000-0000-0000-0000-000000000002", relation="annotates")]"#,
+    )
+    .unwrap_err();
+
+    assert_eq!(err, DslError::MixedSeparators);
+    assert_eq!(
+        err.to_string(),
+        "cannot mix ',' (parallel) and '|' (chain) separators at the top level"
+    );
+}
+
+#[test]
 fn mixed_separator_after_chain_rejected() {
     // `a() | b(), c()` mixes `|` chain with trailing `,`.
     let err = parse_request("a() | b(), c()").unwrap_err();

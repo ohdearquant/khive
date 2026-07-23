@@ -1,16 +1,33 @@
 //! `create` verb handler.
 
 use serde_json::{json, Value};
+use uuid::Uuid;
 
 use khive_runtime::{EntityCreateSpec, NamespaceToken, RuntimeError, VerbRegistry};
+use khive_storage::Note;
 
 use super::common::{
-    canonical_entity_kind, canonical_note_kind, deser, immutable_event_error,
-    normalize_entity_timestamps, parse_relation, reconcile_specific, remap_note_status,
-    resolve_kind_spec, resolve_uuid_unfiltered, to_json, validate_entity_type, validate_weight,
-    CreateParams, KindSpec,
+    canonical_entity_kind, canonical_note_kind, check_bulk_annotates_budget, deser,
+    immutable_event_error, normalize_entity_timestamps, parse_relation, reconcile_specific,
+    remap_note_status, remap_note_status_array, resolve_annotates_targets, resolve_kind_spec,
+    resolve_uuid_unfiltered, to_json, validate_entity_type, validate_weight, CreateParams,
+    KindSpec,
 };
 use crate::KgPack;
+
+enum BulkCreateSpec {
+    Entity(EntityCreateSpec),
+    Note(BulkNoteCreateSpec),
+}
+
+struct BulkNoteCreateSpec {
+    kind: String,
+    name: Option<String>,
+    content: String,
+    salience: Option<f64>,
+    properties: Option<Value>,
+    annotates: Vec<Uuid>,
+}
 
 pub(super) fn add_embedding_truncation_warning(response: &mut Value, truncated: bool) {
     if !truncated {
@@ -25,6 +42,255 @@ pub(super) fn add_embedding_truncation_warning(response: &mut Value, truncated: 
 }
 
 impl KgPack {
+    async fn prepare_bulk_create_spec(
+        &self,
+        token: &NamespaceToken,
+        idx: usize,
+        entry: super::params::BulkCreateEntry,
+        registry: &VerbRegistry,
+    ) -> Result<BulkCreateSpec, RuntimeError> {
+        let kind = resolve_kind_spec(&entry.kind, registry)
+            .map_err(|e| RuntimeError::InvalidInput(format!("items[{idx}].kind: {e}")))?;
+        match kind {
+            KindSpec::Entity { specific } => {
+                if entry.note_kind.is_some()
+                    || entry.content.is_some()
+                    || entry.salience.is_some()
+                    || entry.annotates.is_some()
+                {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "items[{idx}]: note fields are not valid for an entity item"
+                    )));
+                }
+                let canonical = reconcile_specific(
+                    specific,
+                    entry.entity_kind.as_deref(),
+                    |s| canonical_entity_kind(s, registry),
+                    "entity_kind",
+                )?
+                .ok_or_else(|| RuntimeError::InvalidInput(format!(
+                    "items[{idx}]: kind=entity requires a specific kind — use kind=<concept|…> or kind=entity + entity_kind=<…>"
+                )))?;
+                let entity_type =
+                    validate_entity_type(&canonical, entry.entity_type.as_deref(), registry)
+                        .map_err(|e| RuntimeError::InvalidInput(format!("items[{idx}]: {e}")))?;
+                let name = entry.name.ok_or_else(|| {
+                    RuntimeError::InvalidInput(format!("items[{idx}]: entity item requires 'name'"))
+                })?;
+                Ok(BulkCreateSpec::Entity(EntityCreateSpec {
+                    kind: canonical,
+                    entity_type,
+                    name,
+                    description: entry.description,
+                    properties: entry.properties,
+                    tags: entry.tags.unwrap_or_default(),
+                }))
+            }
+            KindSpec::Note { specific } => {
+                if entry.entity_kind.is_some()
+                    || entry.entity_type.is_some()
+                    || entry.description.is_some()
+                {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "items[{idx}]: entity fields are not valid for a note item"
+                    )));
+                }
+                let canonical = reconcile_specific(
+                    specific,
+                    entry.note_kind.as_deref(),
+                    |s| canonical_note_kind(s, registry),
+                    "note_kind",
+                )?
+                .unwrap_or_else(|| "observation".to_string());
+                let content = entry.content.ok_or_else(|| {
+                    RuntimeError::InvalidInput(format!(
+                        "items[{idx}]: note item requires 'content'"
+                    ))
+                })?;
+                let annotates = resolve_annotates_targets(
+                    entry.annotates.unwrap_or_default(),
+                    &self.runtime,
+                    token,
+                )
+                .await
+                .map_err(|e| RuntimeError::InvalidInput(format!("items[{idx}].annotates: {e}")))?;
+                Ok(BulkCreateSpec::Note(BulkNoteCreateSpec {
+                    kind: canonical,
+                    name: entry.name,
+                    content,
+                    salience: entry.salience,
+                    properties: super::common::merge_note_tags(entry.properties, entry.tags)
+                        .map_err(|e| RuntimeError::InvalidInput(format!("items[{idx}]: {e}")))?,
+                    annotates,
+                }))
+            }
+            KindSpec::Edge | KindSpec::Event | KindSpec::Proposal => {
+                Err(RuntimeError::InvalidInput(format!(
+                    "items[{idx}]: bulk create supports only entity and note kinds; got {:?}",
+                    entry.kind
+                )))
+            }
+        }
+    }
+
+    async fn create_bulk_note(
+        &self,
+        token: &NamespaceToken,
+        spec: BulkNoteCreateSpec,
+    ) -> Result<Note, RuntimeError> {
+        self.runtime
+            .create_note(
+                token,
+                &spec.kind,
+                spec.name.as_deref(),
+                &spec.content,
+                spec.salience,
+                spec.properties,
+                spec.annotates,
+            )
+            .await
+    }
+
+    async fn rollback_bulk_notes(
+        &self,
+        token: &NamespaceToken,
+        notes: &[Note],
+        cause: RuntimeError,
+    ) -> RuntimeError {
+        let mut failures = Vec::new();
+        for note in notes.iter().rev() {
+            if let Err(e) = self
+                .runtime
+                .delete_note_row_first_for_compensation(token, note.id)
+                .await
+            {
+                failures.push(format!("{}: {e}", note.id));
+            }
+        }
+        if failures.is_empty() {
+            cause
+        } else {
+            RuntimeError::Internal(format!(
+                "bulk create failed: {cause}; note rollback failed: {}",
+                failures.join("; ")
+            ))
+        }
+    }
+
+    async fn handle_bulk_create(
+        &self,
+        token: &NamespaceToken,
+        entries: Vec<Value>,
+        atomic: bool,
+        verbose: bool,
+        registry: &VerbRegistry,
+    ) -> Result<Value, RuntimeError> {
+        let attempted = entries.len();
+        check_bulk_annotates_budget(&entries)?;
+
+        if atomic {
+            let mut specs = Vec::with_capacity(attempted);
+            for (idx, raw) in entries.into_iter().enumerate() {
+                let entry: super::params::BulkCreateEntry =
+                    serde_json::from_value(raw).map_err(|e| {
+                        RuntimeError::InvalidInput(format!("items[{idx}]: malformed item — {e}"))
+                    })?;
+                specs.push(
+                    self.prepare_bulk_create_spec(token, idx, entry, registry)
+                        .await?,
+                );
+            }
+            let mut entity_specs = Vec::new();
+            let mut note_specs = Vec::new();
+            for spec in specs {
+                match spec {
+                    BulkCreateSpec::Entity(spec) => entity_specs.push(spec),
+                    BulkCreateSpec::Note(spec) => note_specs.push(spec),
+                }
+            }
+            let mut notes = Vec::with_capacity(note_specs.len());
+            for spec in note_specs {
+                match self.create_bulk_note(token, spec).await {
+                    Ok(note) => notes.push(note),
+                    Err(e) => return Err(self.rollback_bulk_notes(token, &notes, e).await),
+                }
+            }
+            let entities = match self.runtime.create_many(token, entity_specs).await {
+                Ok(entities) => entities,
+                Err(e) => return Err(self.rollback_bulk_notes(token, &notes, e).await),
+            };
+            let mut response = json!({
+                "attempted": attempted,
+                "created": entities.len() + notes.len(),
+                "skipped": 0,
+                "failed": 0,
+            });
+            if verbose {
+                response["entities"] = to_json(&entities)?;
+                response["notes"] = remap_note_status_array(to_json(&notes)?);
+            }
+            return Ok(response);
+        }
+
+        let mut created = 0;
+        let mut errors = Vec::new();
+        let mut entities = Vec::new();
+        let mut notes = Vec::new();
+        for (idx, raw) in entries.into_iter().enumerate() {
+            let entry: super::params::BulkCreateEntry = match serde_json::from_value(raw) {
+                Ok(entry) => entry,
+                Err(e) => {
+                    errors.push(json!({"index": idx, "error": format!("malformed item — {e}")}));
+                    continue;
+                }
+            };
+            let spec = match self
+                .prepare_bulk_create_spec(token, idx, entry, registry)
+                .await
+            {
+                Ok(spec) => spec,
+                Err(e) => {
+                    errors.push(json!({"index": idx, "error": e.to_string()}));
+                    continue;
+                }
+            };
+            match spec {
+                BulkCreateSpec::Entity(spec) => {
+                    match self.runtime.create_many(token, vec![spec]).await {
+                        Ok(mut value) => {
+                            created += 1;
+                            if verbose {
+                                entities.append(&mut value);
+                            }
+                        }
+                        Err(e) => errors.push(json!({"index": idx, "error": e.to_string()})),
+                    }
+                }
+                BulkCreateSpec::Note(spec) => match self.create_bulk_note(token, spec).await {
+                    Ok(note) => {
+                        created += 1;
+                        if verbose {
+                            notes.push(note);
+                        }
+                    }
+                    Err(e) => errors.push(json!({"index": idx, "error": e.to_string()})),
+                },
+            }
+        }
+        let mut response = json!({
+            "attempted": attempted,
+            "created": created,
+            "skipped": 0,
+            "failed": errors.len(),
+            "errors": errors,
+        });
+        if verbose {
+            response["entities"] = to_json(&entities)?;
+            response["notes"] = remap_note_status_array(to_json(&notes)?);
+        }
+        Ok(response)
+    }
+
     pub(crate) async fn handle_create(
         &self,
         token: &NamespaceToken,
@@ -90,7 +356,7 @@ impl KgPack {
         {
             let maybe_items = if params.get("items").is_some() {
                 let raw = params["items"].clone();
-                match serde_json::from_value::<Vec<super::params::BulkCreateEntry>>(raw) {
+                match serde_json::from_value::<Vec<Value>>(raw) {
                     Ok(entries) => Some(entries),
                     Err(e) => {
                         return Err(RuntimeError::InvalidInput(format!(
@@ -107,8 +373,7 @@ impl KgPack {
                         "embedding_content is only valid for a singleton kind=note create, not bulk `items`".into(),
                     ));
                 }
-                let attempted = entries.len();
-                if attempted > 1000 {
+                if entries.len() > 1000 {
                     return Err(RuntimeError::InvalidInput(
                         "bulk create limited to 1000 entries per request".into(),
                     ));
@@ -122,104 +387,9 @@ impl KgPack {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
 
-                // Build EntityCreateSpec for every entry, resolving kind/entity_type at
-                // the handler layer (same helpers used by the single-entity path).
-                let mut specs: Vec<EntityCreateSpec> = Vec::with_capacity(attempted);
-                for (idx, entry) in entries.into_iter().enumerate() {
-                    // Resolve the item's own kind.
-                    let item_kind_spec = resolve_kind_spec(&entry.kind, registry).map_err(|e| {
-                        RuntimeError::InvalidInput(format!("items[{idx}].kind: {e}"))
-                    })?;
-                    let canonical = match &item_kind_spec {
-                        KindSpec::Entity { specific } => {
-                            let legacy = entry.entity_kind.as_deref();
-                            super::common::reconcile_specific(
-                                specific.clone(),
-                                legacy,
-                                |s| super::common::canonical_entity_kind(s, registry),
-                                "entity_kind",
-                            )
-                            .map_err(|e| {
-                                RuntimeError::InvalidInput(format!("items[{idx}]: {e}"))
-                            })?
-                            .ok_or_else(|| RuntimeError::InvalidInput(format!(
-                                "items[{idx}]: kind=entity requires a specific kind — use kind=<concept|…> or kind=entity + entity_kind=<…>"
-                            )))?
-                        }
-                        _ => {
-                            return Err(RuntimeError::InvalidInput(format!(
-                                "items[{idx}]: bulk create only supports entity kinds; got {:?}",
-                                entry.kind
-                            )));
-                        }
-                    };
-                    let validated_type =
-                        validate_entity_type(&canonical, entry.entity_type.as_deref(), registry)
-                            .map_err(|e| {
-                                RuntimeError::InvalidInput(format!("items[{idx}]: {e}"))
-                            })?;
-                    specs.push(EntityCreateSpec {
-                        kind: canonical,
-                        entity_type: validated_type,
-                        name: entry.name,
-                        description: entry.description,
-                        properties: entry.properties,
-                        tags: entry.tags.unwrap_or_default(),
-                    });
-                }
-
-                if atomic {
-                    let entities = self.runtime.create_many(token, specs).await?;
-                    let created = entities.len();
-                    let mut resp = serde_json::json!({
-                        "attempted": attempted,
-                        "created": created,
-                        "skipped": 0,
-                        "failed": 0,
-                    });
-                    if verbose {
-                        resp["entities"] = serde_json::to_value(&entities)
-                            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
-                    }
-                    return super::common::to_json(&resp);
-                } else {
-                    // Non-atomic: best-effort, per-item errors collected.
-                    let mut results: Vec<serde_json::Value> = Vec::new();
-                    let mut error_list: Vec<serde_json::Value> = Vec::new();
-                    for (idx, spec) in specs.into_iter().enumerate() {
-                        match self.runtime.create_many(token, vec![spec]).await {
-                            Ok(mut v) => {
-                                if verbose {
-                                    if let Some(e) = v.pop() {
-                                        if let Ok(jv) = serde_json::to_value(&e) {
-                                            results.push(jv);
-                                        }
-                                    }
-                                } else {
-                                    results.push(serde_json::Value::Null);
-                                }
-                            }
-                            Err(e) => {
-                                error_list.push(
-                                    serde_json::json!({"index": idx, "error": format!("{e}")}),
-                                );
-                            }
-                        }
-                    }
-                    let mut resp = serde_json::json!({
-                        "attempted": attempted,
-                        "created": results.len(),
-                        "skipped": 0,
-                        "failed": error_list.len(),
-                        "errors": error_list,
-                    });
-                    if verbose {
-                        resp["entities"] = serde_json::Value::Array(
-                            results.into_iter().filter(|v| !v.is_null()).collect(),
-                        );
-                    }
-                    return super::common::to_json(&resp);
-                }
+                return self
+                    .handle_bulk_create(token, entries, atomic, verbose, registry)
+                    .await;
             }
         }
         // ── End bulk path ──────────────────────────────────────────────────────
@@ -372,10 +542,12 @@ impl KgPack {
                 let content = p.content.ok_or_else(|| {
                     RuntimeError::InvalidInput("kind=note requires 'content'".into())
                 })?;
-                let mut annotates = Vec::new();
-                for s in p.annotates.unwrap_or_default() {
-                    annotates.push(resolve_uuid_unfiltered(&s, &self.runtime, token).await?);
-                }
+                let annotates = resolve_annotates_targets(
+                    p.annotates.unwrap_or_default(),
+                    &self.runtime,
+                    token,
+                )
+                .await?;
                 let properties = super::common::merge_note_tags(p.properties, p.tags)?;
                 let embed_text = p.embedding_content.as_deref().unwrap_or(&content);
                 let truncated = self

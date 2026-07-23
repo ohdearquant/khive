@@ -20,15 +20,18 @@ use serde_json::Value;
 /// embedding-bearing verb families, given the request's own top-level
 /// params.
 ///
-/// `params` is needed only to tell a singleton `create` from a bulk
-/// `create(items=[...])`: the amendment explicitly carves bulk create out as
-/// non-embedding-bearing (`create_many` intentionally skips embedding and
-/// backfills vectors later via a separate `reindex` call,
-/// `crates/khive-runtime/src/operations.rs:4698-4709`), regardless of its
-/// own `created`/`attempted` summary counts.
+/// `params` distinguishes singleton `create` from bulk `create(items=[...])`.
+/// Bulk entity items skip embedding and backfill vectors via `reindex`, while
+/// bulk note items use the singleton note path and embed immediately.
 fn is_embedding_bearing(verb: &str, params: &Value) -> bool {
     match verb {
-        "create" => params.get("items").is_none(),
+        "create" => params.get("items").is_none_or(|items| {
+            items.as_array().is_some_and(|items| {
+                items
+                    .iter()
+                    .any(|item| item.get("content").and_then(Value::as_str).is_some())
+            })
+        }),
         "update" | "memory.remember" | "memory.recall" | "knowledge.search"
         | "knowledge.compose" | "knowledge.index" => true,
         _ => false,
@@ -59,17 +62,38 @@ fn per_item_weight(verb: &str, params: &Value) -> i64 {
 /// when `per_item_weight` is nonzero for this verb.
 ///
 /// - `create` singleton, `memory.remember`, `update`, `memory.recall`,
-///   `knowledge.search`, `knowledge.compose`: always `1`, each is a single
-///   entity/note write or a single query embedding, never a batch.
+///   `knowledge.search`, `knowledge.compose`: `1`, except bulk `create`, which
+///   counts successfully created note items because entity items skip embedding.
 /// - `knowledge.index`: `result["total"]`, the full paged corpus count
 ///   computed across all internally paged reads, never the internal
 ///   `batch_size` chunk ceiling (`clamp(1, 1000)` on the embed-grouping
 ///   page size only, not the dispatch's total work).
-fn item_count(verb: &str, result: &Value) -> i64 {
-    if verb == "knowledge.index" {
-        result.get("total").and_then(Value::as_i64).unwrap_or(0)
-    } else {
-        1
+fn item_count(verb: &str, params: &Value, result: &Value) -> i64 {
+    match verb {
+        "knowledge.index" => result.get("total").and_then(Value::as_i64).unwrap_or(0),
+        "create" => match params.get("items").and_then(Value::as_array) {
+            Some(items) => {
+                let errors = result
+                    .get("errors")
+                    .and_then(Value::as_array)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                let count = items
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, item)| {
+                        let is_note = item.get("content").and_then(Value::as_str).is_some();
+                        let failed = errors.iter().any(|error| {
+                            error.get("index").and_then(Value::as_u64) == Some(*index as u64)
+                        });
+                        is_note && !failed
+                    })
+                    .count();
+                i64::try_from(count).unwrap_or(i64::MAX)
+            }
+            None => 1,
+        },
+        _ => 1,
     }
 }
 
@@ -79,8 +103,8 @@ fn item_count(verb: &str, result: &Value) -> i64 {
 ///
 /// `registered_model_count` is evaluated lazily via `FnOnce`, called only
 /// for the two verb families whose `model_count` is not a per-dispatch
-/// constant (`memory.remember`'s implicit-model case, and singleton
-/// `create`), so every other dispatch never touches the runtime's embedder
+/// constant (`memory.remember`'s implicit-model case, and embedding-bearing
+/// `create` paths), so every other dispatch never touches the runtime's embedder
 /// registry.
 ///
 /// `0` is a valid, deliberate result when no embedding model is registered
@@ -150,7 +174,7 @@ pub fn cost_unit_for_dispatch(
     if weight == 0 {
         return compute(base_weight(verb), 0, 0, 0);
     }
-    let items = item_count(verb, result);
+    let items = item_count(verb, params, result);
     let models = model_count(verb, params, registered_model_count);
     compute(base_weight(verb), weight, items, models)
 }
@@ -294,10 +318,10 @@ mod tests {
         assert_eq!(cost, 1);
     }
 
-    // ---- Bulk create is base-only ----
+    // ---- Bulk entity create is base-only ----
 
     #[test]
-    fn bulk_create_is_base_weight_only_never_touches_model_count() {
+    fn bulk_entity_create_is_base_weight_only_never_touches_model_count() {
         let cost = cost_unit_for_dispatch(
             "create",
             &json!({"items": [{"kind": "concept", "name": "a"}, {"kind": "concept", "name": "b"}]}),
@@ -306,15 +330,12 @@ mod tests {
         );
         assert_eq!(
             cost, 1,
-            "bulk create(items=[...]) skips embedding entirely -> base_weight(verb) alone"
+            "bulk entity create skips embedding -> base_weight(verb) alone"
         );
     }
 
     #[test]
-    fn bulk_create_is_base_only_regardless_of_created_count() {
-        // The amendment is explicit: this holds "regardless of its
-        // created/attempted summary counts" -- a large batch must not
-        // change the result.
+    fn bulk_entity_create_is_base_only_regardless_of_created_count() {
         let items: Vec<Value> = (0..250)
             .map(|i| json!({"kind": "concept", "name": format!("item-{i}")}))
             .collect();
@@ -325,6 +346,46 @@ mod tests {
             unreachable_model_count,
         );
         assert_eq!(cost, 1);
+    }
+
+    #[test]
+    fn bulk_create_counts_successful_note_embeddings_per_registered_model() {
+        let cost = cost_unit_for_dispatch(
+            "create",
+            &json!({
+                "items": [
+                    {"kind": "concept", "name": "entity"},
+                    {"kind": "observation", "content": "first note"},
+                    {"kind": "note", "note_kind": "insight", "content": "second note"}
+                ]
+            }),
+            &json!({"attempted": 3, "created": 3, "failed": 0}),
+            || 3,
+        );
+        assert_eq!(cost, 7);
+    }
+
+    #[test]
+    fn bulk_create_excludes_failed_note_items_from_embedding_cost() {
+        let cost = cost_unit_for_dispatch(
+            "create",
+            &json!({
+                "items": [
+                    {"kind": "observation", "content": "created note"},
+                    {"kind": "insight", "content": "failed note", "salience": 2.0},
+                    {"kind": "concept", "name": "entity"}
+                ],
+                "atomic": false
+            }),
+            &json!({
+                "attempted": 3,
+                "created": 2,
+                "failed": 1,
+                "errors": [{"index": 1, "error": "salience must be between 0.0 and 1.0"}]
+            }),
+            || 2,
+        );
+        assert_eq!(cost, 3);
     }
 
     // ---- knowledge.index full total, not batch_size ceiling ----

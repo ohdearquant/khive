@@ -177,6 +177,527 @@ async fn create_bulk_items_without_top_level_kind_succeeds() {
     assert_eq!(result.get("failed").and_then(Value::as_u64), Some(0));
 }
 
+#[tokio::test]
+async fn create_bulk_items_supports_note_and_entity_shapes() {
+    let pack = pack();
+    let target = pack
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "BulkNoteTarget"}),
+        )
+        .await
+        .expect("annotation target must be created");
+    let target_id = target["id"].as_str().expect("target id");
+
+    let result = pack
+        .dispatch(
+            "create",
+            json!({
+                "items": [
+                    {
+                        "kind": "observation",
+                        "name": "Bulk observation",
+                        "content": "first bulk note",
+                        "salience": 0.8,
+                        "tags": ["bulk"],
+                        "annotates": [target_id]
+                    },
+                    {
+                        "kind": "note",
+                        "note_kind": "insight",
+                        "content": "second bulk note",
+                        "properties": {"source": "issue-890"}
+                    },
+                    {"kind": "concept", "name": "BulkMixedEntity"}
+                ],
+                "verbose": true
+            }),
+        )
+        .await
+        .expect("kind-aware bulk create must accept notes and entities");
+
+    assert_eq!(result["attempted"], 3);
+    assert_eq!(result["created"], 3);
+    assert_eq!(result["failed"], 0);
+    let notes = result["notes"].as_array().expect("verbose notes array");
+    assert_eq!(notes.len(), 2);
+    assert_eq!(notes[0]["kind"], "observation");
+    assert_eq!(notes[0]["properties"]["tags"], json!(["bulk"]));
+    assert_eq!(notes[1]["kind"], "insight");
+    assert_eq!(notes[1]["properties"]["source"], "issue-890");
+    let entities = result["entities"]
+        .as_array()
+        .expect("verbose entities array");
+    assert_eq!(entities.len(), 1);
+    assert_eq!(entities[0]["name"], "BulkMixedEntity");
+
+    let incoming = pack
+        .dispatch(
+            "neighbors",
+            json!({
+                "id": target_id,
+                "direction": "incoming",
+                "relations": ["annotates"]
+            }),
+        )
+        .await
+        .expect("annotation edge must be queryable");
+    assert_eq!(incoming.as_array().expect("neighbors array").len(), 1);
+}
+
+// Regression: a bulk note item's `annotates` array must be capped the same
+// way as the singleton note-create path — an oversized array is rejected
+// per-item (non-atomic mode) with the cap named in the error, not resolved
+// against storage.
+#[tokio::test]
+async fn create_bulk_note_annotates_over_cap_rejected_per_item() {
+    let pack = pack();
+    let targets: Vec<String> = (0..101).map(|_| uuid::Uuid::new_v4().to_string()).collect();
+
+    let result = pack
+        .dispatch(
+            "create",
+            json!({
+                "items": [
+                    {"kind": "concept", "name": "CapSiblingEntity"},
+                    {"kind": "observation", "content": "too many annotates", "annotates": targets}
+                ],
+                "atomic": false,
+                "verbose": true
+            }),
+        )
+        .await
+        .expect(
+            "non-atomic bulk create must return per-item results even when one item is rejected",
+        );
+
+    assert_eq!(result["attempted"], 2);
+    assert_eq!(result["created"], 1);
+    assert_eq!(result["failed"], 1);
+    assert_eq!(result["errors"][0]["index"], 1);
+    let err_msg = result["errors"][0]["error"].as_str().expect("error string");
+    assert!(
+        err_msg.contains("100"),
+        "cap-exceeded error must name the cap; got {err_msg}"
+    );
+    assert!(
+        err_msg.contains("annotates"),
+        "cap-exceeded error must mention annotates; got {err_msg}"
+    );
+}
+
+// Regression: duplicated targets in a legal-sized `annotates` array must
+// collapse to exactly one edge per distinct target — no redundant lookups
+// or edge writes for repeated entries.
+#[tokio::test]
+async fn create_bulk_note_annotates_duplicate_targets_dedup_to_one_edge() {
+    let pack = pack();
+    let target = pack
+        .dispatch("create", json!({"kind": "concept", "name": "DedupTarget"}))
+        .await
+        .expect("target entity must be created");
+    let target_id = target["id"].as_str().expect("target id").to_string();
+
+    let result = pack
+        .dispatch(
+            "create",
+            json!({
+                "items": [
+                    {
+                        "kind": "observation",
+                        "content": "duplicate annotates targets",
+                        "annotates": [target_id.clone(), target_id.clone(), target_id.clone()]
+                    }
+                ]
+            }),
+        )
+        .await
+        .expect("bulk create with duplicated annotates targets must succeed");
+    assert_eq!(result["created"], 1);
+
+    let incoming = pack
+        .dispatch(
+            "neighbors",
+            json!({"id": target_id, "direction": "incoming", "relations": ["annotates"]}),
+        )
+        .await
+        .expect("annotation edges must be queryable");
+    assert_eq!(
+        incoming.as_array().expect("neighbors array").len(),
+        1,
+        "duplicated annotates targets must produce exactly one edge"
+    );
+}
+
+// Regression: a bulk request whose per-item `annotates` arrays are each
+// within the per-item cap, but whose total (after per-item dedup) exceeds
+// the aggregate per-request budget, must be rejected before any target
+// resolution — not accepted as N separate legal items. Targets are
+// deliberately non-UUID names: a UUID target short-circuits resolution at
+// the parse step, so only a name target forces a real lookup — if the
+// budget check ran after resolution, the first nonexistent name would
+// surface a resolution error instead of the budget error asserted below.
+#[tokio::test]
+async fn create_bulk_note_annotates_aggregate_budget_over_rejected_before_resolution() {
+    let pack = pack();
+    let items: Vec<Value> = (0..11)
+        .map(|i| {
+            let targets: Vec<String> = (0..100)
+                .map(|j| format!("aggregate-budget-target-{i}-{j}"))
+                .collect();
+            json!({
+                "kind": "observation",
+                "content": format!("aggregate budget note {i}"),
+                "annotates": targets,
+            })
+        })
+        .collect();
+
+    let err = pack
+        .dispatch("create", json!({"items": items, "atomic": false}))
+        .await
+        .expect_err("total annotates over the aggregate budget must be rejected");
+    assert!(
+        matches!(err, khive_runtime::RuntimeError::InvalidInput(_)),
+        "expected InvalidInput for over-budget aggregate annotates, got {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("1000") && msg.contains("1100"),
+        "error must name both the budget and the offending total; got {msg}"
+    );
+}
+
+// Regression: a bulk request whose total `annotates` targets (after per-item
+// dedup) lands exactly on the aggregate budget must still succeed.
+#[tokio::test]
+async fn create_bulk_note_annotates_aggregate_budget_at_exact_limit_succeeds() {
+    let pack = pack();
+    let mut target_ids = Vec::with_capacity(100);
+    for i in 0..100 {
+        let target = pack
+            .dispatch(
+                "create",
+                json!({"kind": "concept", "name": format!("ExactBudgetTarget{i}")}),
+            )
+            .await
+            .expect("target entity must be created");
+        target_ids.push(target["id"].as_str().expect("target id").to_string());
+    }
+
+    // 10 items x 100 distinct-per-item targets = 1000 total, exactly at budget.
+    let items: Vec<Value> = (0..10)
+        .map(|i| {
+            json!({
+                "kind": "observation",
+                "content": format!("exact budget note {i}"),
+                "annotates": target_ids.clone(),
+            })
+        })
+        .collect();
+
+    let result = pack
+        .dispatch(
+            "create",
+            json!({"items": items, "atomic": false, "verbose": true}),
+        )
+        .await
+        .expect("total annotates exactly at the aggregate budget must succeed");
+    assert_eq!(result["attempted"], 10);
+    assert_eq!(result["created"], 10);
+    assert_eq!(result["failed"], 0);
+}
+
+// Regression: an item whose raw `annotates` array exceeds the per-item cap
+// is rejected per-item before any resolution, so it must contribute NOTHING
+// to the aggregate budget — and the budget pre-scan must not spend dedup
+// work on it either. Counting the over-cap item's 150 targets would push
+// this request to 1150 and reject it at request level, wrongly failing the
+// ten legal items alongside the one illegal one.
+#[tokio::test]
+async fn create_bulk_note_annotates_over_cap_item_does_not_consume_budget() {
+    let pack = pack();
+    let mut target_ids = Vec::with_capacity(100);
+    for i in 0..100 {
+        let target = pack
+            .dispatch(
+                "create",
+                json!({"kind": "concept", "name": format!("OverCapBudgetTarget{i}")}),
+            )
+            .await
+            .expect("target entity must be created");
+        target_ids.push(target["id"].as_str().expect("target id").to_string());
+    }
+
+    // 10 legal items x 100 real targets = 1000, exactly at budget; plus one
+    // over-cap item whose 150 distinct names must not be counted or deduped.
+    let mut items: Vec<Value> = (0..10)
+        .map(|i| {
+            json!({
+                "kind": "observation",
+                "content": format!("over-cap budget note {i}"),
+                "annotates": target_ids.clone(),
+            })
+        })
+        .collect();
+    let over_cap: Vec<String> = (0..150).map(|j| format!("over-cap-target-{j}")).collect();
+    items.push(json!({
+        "kind": "observation",
+        "content": "over-cap item",
+        "annotates": over_cap,
+    }));
+
+    let result = pack
+        .dispatch(
+            "create",
+            json!({"items": items, "atomic": false, "verbose": true}),
+        )
+        .await
+        .expect("over-cap item must fail per-item, not blow the request-level budget");
+    assert_eq!(result["attempted"], 11);
+    assert_eq!(result["created"], 10);
+    assert_eq!(result["failed"], 1);
+    assert_eq!(result["errors"][0]["index"], 10);
+    let err_msg = result["errors"][0]["error"].as_str().expect("error string");
+    assert!(
+        err_msg.contains("100") && err_msg.contains("150"),
+        "the over-cap item's error must be the per-item cap error; got {err_msg}"
+    );
+}
+
+// Regression: two encodings of the same UUID (e.g. differing letter case) in
+// one item's `annotates` must dedup to a single resolution and a single edge
+// — raw-string dedup alone lets equivalent UUID encodings slip through.
+#[tokio::test]
+async fn create_bulk_note_annotates_uuid_case_variants_dedup_to_one_edge() {
+    let pack = pack();
+    let target = pack
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "CaseDedupTarget"}),
+        )
+        .await
+        .expect("target entity must be created");
+    let target_id = target["id"].as_str().expect("target id").to_string();
+    let upper = target_id.to_uppercase();
+    assert_ne!(
+        target_id, upper,
+        "fixture UUID must contain letters for a meaningful case-variant test"
+    );
+
+    let result = pack
+        .dispatch(
+            "create",
+            json!({
+                "items": [
+                    {
+                        "kind": "observation",
+                        "content": "case-variant annotates targets",
+                        "annotates": [target_id.clone(), upper]
+                    }
+                ]
+            }),
+        )
+        .await
+        .expect("bulk create with case-variant annotates targets must succeed");
+    assert_eq!(result["created"], 1);
+
+    let incoming = pack
+        .dispatch(
+            "neighbors",
+            json!({"id": target_id, "direction": "incoming", "relations": ["annotates"]}),
+        )
+        .await
+        .expect("annotation edges must be queryable");
+    assert_eq!(
+        incoming.as_array().expect("neighbors array").len(),
+        1,
+        "case-variant encodings of the same UUID must produce exactly one edge"
+    );
+}
+
+// Regression: bulk-created notes in verbose responses must run through the
+// same status/lifecycle projection as singleton `create`/`get`/`list` — not
+// serialize the note's row-visibility status directly.
+#[tokio::test]
+async fn create_bulk_note_verbose_response_projects_lifecycle_status_atomic() {
+    let pack = pack();
+    let singleton = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "observation",
+                "content": "lifecycle projection reference",
+                "properties": {"status": "blocked"}
+            }),
+        )
+        .await
+        .expect("singleton create must succeed");
+    assert_eq!(singleton["status"], "blocked");
+    assert_eq!(singleton["lifecycle"], "active");
+
+    let bulk = pack
+        .dispatch(
+            "create",
+            json!({
+                "items": [
+                    {
+                        "kind": "observation",
+                        "content": "lifecycle projection reference",
+                        "properties": {"status": "blocked"}
+                    }
+                ],
+                "verbose": true
+            }),
+        )
+        .await
+        .expect("atomic bulk create must succeed");
+    let note = &bulk["notes"][0];
+    assert_eq!(
+        note["status"], "blocked",
+        "atomic bulk verbose note must project lifecycle status like singleton create; got {note}"
+    );
+    assert_eq!(note["lifecycle"], "active");
+}
+
+#[tokio::test]
+async fn create_bulk_note_verbose_response_projects_lifecycle_status_non_atomic() {
+    let pack = pack();
+    let bulk = pack
+        .dispatch(
+            "create",
+            json!({
+                "items": [
+                    {
+                        "kind": "observation",
+                        "content": "lifecycle projection reference",
+                        "properties": {"status": "blocked"}
+                    }
+                ],
+                "atomic": false,
+                "verbose": true
+            }),
+        )
+        .await
+        .expect("non-atomic bulk create must succeed");
+    let note = &bulk["notes"][0];
+    assert_eq!(
+        note["status"], "blocked",
+        "non-atomic bulk verbose note must project lifecycle status like singleton create; got {note}"
+    );
+    assert_eq!(note["lifecycle"], "active");
+}
+
+#[tokio::test]
+async fn create_bulk_items_atomic_failure_rolls_back_notes() {
+    let pack = pack();
+    let err = pack
+        .dispatch(
+            "create",
+            json!({
+                "items": [
+                    {"kind": "observation", "content": "must be rolled back"},
+                    {"kind": "concept", "name": ""}
+                ]
+            }),
+        )
+        .await
+        .expect_err("an invalid entity must reject the mixed atomic batch");
+    assert!(is_invalid_input(&err), "expected InvalidInput, got {err:?}");
+
+    let notes = pack
+        .dispatch("list", json!({"kind": "note"}))
+        .await
+        .expect("note list must succeed");
+    assert!(
+        notes.as_array().expect("note list array").is_empty(),
+        "atomic rejection must roll back notes; got {notes}"
+    );
+}
+
+#[tokio::test]
+async fn create_bulk_items_non_atomic_reports_per_item_results() {
+    let pack = pack();
+    let result = pack
+        .dispatch(
+            "create",
+            json!({
+                "items": [
+                    {"kind": "concept", "name": ""},
+                    {"kind": "observation", "content": "created note"},
+                    {"kind": "insight", "content": "invalid note", "salience": 2.0},
+                    {"kind": "concept", "name": "CreatedEntity"}
+                ],
+                "atomic": false,
+                "verbose": true
+            }),
+        )
+        .await
+        .expect("non-atomic bulk create must return per-item results");
+
+    assert_eq!(result["attempted"], 4);
+    assert_eq!(result["created"], 2);
+    assert_eq!(result["failed"], 2);
+    assert_eq!(result["errors"][0]["index"], 0);
+    assert_eq!(result["errors"][1]["index"], 2);
+    assert_eq!(result["notes"].as_array().expect("notes array").len(), 1);
+    assert_eq!(
+        result["entities"].as_array().expect("entities array").len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn create_bulk_items_non_atomic_collects_preparation_errors() {
+    let pack = pack();
+    let result = pack
+        .dispatch(
+            "create",
+            json!({
+                "items": [
+                    {"kind": "concept", "name": "CreatedDespiteInvalidSibling"},
+                    {"kind": "observation"}
+                ],
+                "atomic": false,
+                "verbose": true
+            }),
+        )
+        .await
+        .expect("non-atomic bulk create must collect preparation errors");
+
+    assert_eq!(result["attempted"], 2);
+    assert_eq!(result["created"], 1);
+    assert_eq!(result["failed"], 1);
+    assert_eq!(result["errors"][0]["index"], 1);
+    assert!(result["errors"][0]["error"]
+        .as_str()
+        .expect("error string")
+        .contains("note item requires 'content'"));
+    let entities = result["entities"].as_array().expect("entities array");
+    assert_eq!(entities.len(), 1);
+    assert_eq!(entities[0]["name"], "CreatedDespiteInvalidSibling");
+}
+
+#[tokio::test]
+async fn create_bulk_items_rejects_fields_for_the_wrong_substrate() {
+    let pack = pack();
+    let invalid_items = [
+        json!({"kind": "concept", "name": "Entity", "content": "note field"}),
+        json!({"kind": "observation", "content": "Note", "description": "entity field"}),
+        json!({"kind": "concept"}),
+        json!({"kind": "observation"}),
+        json!({"kind": "edge", "name": "NotCreatable"}),
+    ];
+
+    for item in invalid_items {
+        let err = pack
+            .dispatch("create", json!({"items": [item]}))
+            .await
+            .expect_err("invalid kind-aware item shape must be rejected");
+        assert!(is_invalid_input(&err), "expected InvalidInput, got {err:?}");
+    }
+}
+
 // Regression: bulk create is atomic — one invalid item (empty name) rejects the
 // whole batch and writes nothing.
 #[tokio::test]
@@ -9159,6 +9680,71 @@ async fn create_bulk_items_malformed_unknown_field_returns_error_creates_nothing
     assert_eq!(
         count, 0,
         "malformed items rejection must create nothing; got {listed}"
+    );
+}
+
+/// `atomic: false` must attempt each item independently even when an item fails
+/// to deserialize (unknown field under `#[serde(deny_unknown_fields)]`) — a
+/// sibling's deserialization failure must not abort the whole batch.
+#[tokio::test]
+async fn create_bulk_items_non_atomic_collects_deserialization_errors() {
+    let pack = pack();
+    let result = pack
+        .dispatch(
+            "create",
+            json!({
+                "items": [
+                    {"kind": "concept", "name": "ValidSibling"},
+                    {"kind": "observation", "content": "x", "unexpected": true}
+                ],
+                "atomic": false,
+                "verbose": true
+            }),
+        )
+        .await
+        .expect("non-atomic bulk create must survive a sibling deserialization failure");
+
+    assert_eq!(result["attempted"], 2);
+    assert_eq!(result["created"], 1);
+    assert_eq!(result["failed"], 1);
+    assert_eq!(result["errors"][0]["index"], 1);
+    let entities = result["entities"].as_array().expect("entities array");
+    assert_eq!(entities.len(), 1);
+    assert_eq!(entities[0]["name"], "ValidSibling");
+}
+
+/// The same payload under `atomic: true` (the default) must remain all-or-nothing:
+/// the deserialization failure aborts the batch and writes nothing, including the
+/// otherwise-valid sibling item.
+#[tokio::test]
+async fn create_bulk_items_atomic_rejects_on_deserialization_error() {
+    let pack = pack();
+    let err = pack
+        .dispatch(
+            "create",
+            json!({
+                "items": [
+                    {"kind": "concept", "name": "ShouldNotLand"},
+                    {"kind": "observation", "content": "x", "unexpected": true}
+                ]
+            }),
+        )
+        .await
+        .expect_err("malformed item must reject the whole atomic batch");
+    assert!(is_invalid_input(&err), "expected InvalidInput, got {err:?}");
+
+    let listed = pack
+        .dispatch("list", json!({"kind": "concept"}))
+        .await
+        .expect("list must succeed");
+    let count = listed
+        .get("items")
+        .and_then(Value::as_array)
+        .map(|a| a.len())
+        .unwrap_or(0);
+    assert_eq!(
+        count, 0,
+        "atomic bulk create rejection must create nothing; got {listed}"
     );
 }
 
