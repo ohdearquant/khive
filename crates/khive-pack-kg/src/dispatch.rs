@@ -1324,6 +1324,36 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn resolve_short_case_variant_survives_relevance_floor() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let direct_tok = rt.authorize(Namespace::local()).unwrap();
+        let entity = rt
+            .create_entity(&direct_tok, "concept", None, "RoPE", None, None, vec![])
+            .await
+            .expect("direct entity create must succeed");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.with_default_namespace("local");
+        builder.register(KgPack::new(rt));
+        let registry = builder.build().expect("registry build");
+
+        let result = registry
+            .dispatch("resolve", json!({"refs": ["rope"]}))
+            .await
+            .expect("resolve must succeed");
+        let results = result.get("results").and_then(Value::as_array).unwrap();
+        assert_eq!(
+            results[0].get("status").and_then(Value::as_str),
+            Some("resolved"),
+            "a short case-only name variant must remain resolvable: {results:?}"
+        );
+        assert_eq!(
+            results[0].get("id").and_then(Value::as_str),
+            Some(entity.id.to_string().as_str())
+        );
+    }
+
     /// `search` result-sets never admit to the ring (gate condition, 2026-07-09). See `docs/api/resolve-verb.md`.
     #[tokio::test]
     async fn resolve_search_result_sets_never_populate_the_ring() {
