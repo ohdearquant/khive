@@ -153,6 +153,34 @@ async fn case_insensitive_candidate_lookup_skips_unbounded_total_count() {
 }
 
 #[tokio::test]
+async fn complete_id_lookup_skips_redundant_total_count() {
+    let store = setup_memory_store();
+    let first = make_entity("local", "concept", "first");
+    let second = make_entity("local", "concept", "second");
+    let ids = vec![first.id, second.id, Uuid::new_v4()];
+    store.upsert_entity(first).await.unwrap();
+    store.upsert_entity(second).await.unwrap();
+
+    let page = store
+        .query_entities(
+            "local",
+            EntityFilter {
+                ids: ids.clone(),
+                ..EntityFilter::default()
+            },
+            PageRequest {
+                limit: ids.len() as u32,
+                offset: 0,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(page.items.len(), 2);
+    assert_eq!(page.total, None);
+}
+
+#[tokio::test]
 async fn case_insensitive_candidate_lookup_caps_folded_names_not_duplicate_rows() {
     let store = setup_memory_store();
     let mut older_b = make_entity("local", "concept", "crowdbeta");
