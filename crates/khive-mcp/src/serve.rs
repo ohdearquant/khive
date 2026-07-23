@@ -955,9 +955,13 @@ pub(crate) fn canonical_path_no_side_effects(path: &std::path::Path) -> anyhow::
     // tail lexically — never creating anything on disk. `Path::file_name`
     // returns `None` for a `..` component, so the walk records the real last
     // component instead; `.`/`..` in the missing tail are collapsed lexically
-    // below, which is sound only because a nonexistent component cannot be a
-    // symlink (`missing/../x` and `x` name the same file once `missing` is
-    // created as a real directory).
+    // below, which is sound only for components with no filesystem identity
+    // at all. `Path::exists` follows symlinks, so a DANGLING ancestor symlink
+    // also reads as nonexistent there — but `missing/..` through a symlink
+    // resolves relative to the link's target, not its location, so lexical
+    // collapse would be wrong. Probe `symlink_metadata` (which succeeds on a
+    // dangling link) and fail loud instead: such a path cannot be opened or
+    // created through until the link target exists.
     let mut tail: Vec<std::ffi::OsString> = Vec::new();
     let mut probe = absolute.as_path();
     let existing_ancestor = loop {
@@ -973,6 +977,13 @@ pub(crate) fn canonical_path_no_side_effects(path: &std::path::Path) -> anyhow::
         );
         if parent.exists() {
             break Some(parent.to_path_buf());
+        }
+        if std::fs::symlink_metadata(parent).is_ok() {
+            anyhow::bail!(
+                "dangling symbolic link {} while resolving {}",
+                parent.display(),
+                path.display()
+            );
         }
         probe = parent;
     };
@@ -3400,6 +3411,33 @@ region = "us-east-1"
                 .components()
                 .any(|c| matches!(c, std::path::Component::ParentDir)),
             "the canonical form must not retain `..` components: {resolved_via_parent_ref:?}"
+        );
+    }
+
+    /// A DANGLING symlink in the middle of the path must fail loud rather
+    /// than participate in the lexical `..` collapse: `missing/..` through a
+    /// symlink resolves relative to the link's TARGET, so treating it as a
+    /// plain nonexistent directory would silently equate two different files.
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn canonical_path_no_side_effects_rejects_dangling_ancestor_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let dangling = dir.path().join("missing");
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), &dangling).unwrap();
+
+        let via_dangling = dangling.join("..").join("main.db");
+        let result = canonical_path_no_side_effects(&via_dangling);
+
+        assert!(
+            result.is_err(),
+            "a dangling ancestor symlink must fail loud, not collapse lexically: \
+             {result:?}"
+        );
+        let message = format!("{:#}", result.unwrap_err());
+        assert!(
+            message.contains("dangling symbolic link"),
+            "the error must name the dangling link: {message}"
         );
     }
 
