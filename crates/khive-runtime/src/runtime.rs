@@ -749,6 +749,14 @@ impl KhiveRuntime {
             .unwrap_or_default()
     }
 
+    /// Borrow the installed pack edge rules for a synchronous calculation.
+    pub(crate) fn with_pack_edge_rules<T>(&self, f: impl FnOnce(&[EdgeEndpointRule]) -> T) -> T {
+        match self.edge_rules.read() {
+            Ok(rules) => f(&rules),
+            Err(_) => f(&[]),
+        }
+    }
+
     /// Return the name of the default embedding model (empty string if none configured).
     pub fn default_embedder_name(&self) -> &str {
         self.default_embedder_name.as_ref()

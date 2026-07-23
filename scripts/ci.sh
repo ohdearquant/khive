@@ -94,7 +94,59 @@ phase_docs() {
 
 phase_tests() {
     echo "=== Tests ==="
+    # #1204 tripwire: RuntimeConfig::default() resolves db_path to
+    # $HOME/.khive/khive.db, and migrations apply on open (forward-only,
+    # ADR-015). A test that boots a runtime through a config path inheriting
+    # that default reaches the operator's/runner's real store instead of an
+    # isolated one. Fingerprint the sentinel file set before the suite and
+    # compare after; any change fails the gate loudly instead of leaving the
+    # drift for a later direct-open to discover. Covered paths are khive.db,
+    # khive.db-wal, khive.db-shm, khive.db.walpin/**, and khive.db.ann/**.
+    # A WAL-mode open can leave the main file unchanged until checkpoint, while
+    # WAL-pin attribution and ANN persistence write the adjacent directories.
+    # Size and mtime catch common changes cheaply; the content hash also catches
+    # same-size writes within the filesystem's timestamp granularity.
+    sentinel_file_fingerprint() {
+        f=$1
+        if [ -f "$f" ]; then
+            m=$(stat -f%m "$f" 2>/dev/null || stat -c%Y "$f")
+            s=$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f")
+            h=$({ shasum -a 256 "$f" 2>/dev/null || sha256sum "$f"; } | awk '{print $1}')
+            printf '%s mtime=%s size=%s sha256=%s\n' "$f" "$m" "$s" "$h"
+        else
+            printf '%s absent\n' "$f"
+        fi
+    }
+
+    sentinel_fingerprint() {
+        for f in "$HOME/.khive/khive.db" "$HOME/.khive/khive.db-wal" "$HOME/.khive/khive.db-shm"; do
+            sentinel_file_fingerprint "$f"
+        done
+
+        for d in "$HOME/.khive/khive.db.walpin" "$HOME/.khive/khive.db.ann"; do
+            if [ -d "$d" ]; then
+                printf '%s directory\n' "$d"
+                find "$d" -type f -print | LC_ALL=C sort | while IFS= read -r f; do
+                    sentinel_file_fingerprint "$f"
+                done
+            else
+                printf '%s absent\n' "$d"
+            fi
+        done
+    }
+    sentinel_before=$(sentinel_fingerprint)
+
     cargo test --workspace
+
+    sentinel_after=$(sentinel_fingerprint)
+    if [ "$sentinel_after" != "$sentinel_before" ]; then
+        echo "FAIL: workspace test suite touched the real default store under \$HOME/.khive — a test opened/migrated it instead of an isolated db_path/HOME (#1204)" >&2
+        echo "before:" >&2
+        printf '%s\n' "$sentinel_before" >&2
+        echo "after:" >&2
+        printf '%s\n' "$sentinel_after" >&2
+        exit 1
+    fi
 }
 
 phase_no_default_features() {

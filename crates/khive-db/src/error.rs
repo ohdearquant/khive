@@ -25,4 +25,17 @@ pub enum SqliteError {
         /// Human-readable description of the failure.
         error: String,
     },
+
+    /// The store was migrated by a newer binary and cannot be downgraded in place.
+    #[error(
+        "this binary knows migrations up to {max_known_migration} but the store is at version \
+         {store_version} — the binary is older than the store; upgrade the binary (in-place \
+         downgrade is not supported)"
+    )]
+    SchemaTooNew {
+        /// Highest migration version this binary can apply.
+        max_known_migration: u32,
+        /// Migration version recorded by the store.
+        store_version: u32,
+    },
 }
