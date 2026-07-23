@@ -3791,10 +3791,9 @@ async fn delete_edge_cross_namespace_audit_uses_record_namespace_hard() {
 // the scope a full `list` keyset walk computes over — not just token.namespace().
 // =============================================================================
 
-/// `count_entities` / `count_edges` / `count_edges_by_relation` / `count_notes`
-/// must all sum across an identity-bearing caller's visible-namespace set, so
-/// `stats()` totals reconcile with a full multi-namespace `list` walk, for
-/// entities, edges, and notes alike.
+/// Batched stats counts must match both a full multi-namespace `list` walk and
+/// the sum of the corresponding per-namespace counts, excluding soft-deleted
+/// rows from every path.
 #[tokio::test]
 async fn stats_totals_match_list_walk_across_visible_namespaces() {
     use khive_runtime::EdgeListFilter;
@@ -3842,6 +3841,14 @@ async fn stats_totals_match_list_walk_across_visible_namespaces() {
     rt.link(&tok_b, b1.id, b2.id, EdgeRelation::Enables, 1.0, None)
         .await
         .unwrap();
+    let deleted_edge = rt
+        .link(&tok_b, b2.id, b1.id, EdgeRelation::Extends, 1.0, None)
+        .await
+        .unwrap();
+    assert!(rt
+        .delete_edge(&tok_b, deleted_edge.id.into(), false)
+        .await
+        .unwrap());
 
     // Notes: one in each namespace.
     rt.create_note(&tok_a, "observation", None, "NoteInA", None, None, vec![])
@@ -3850,6 +3857,36 @@ async fn stats_totals_match_list_walk_across_visible_namespaces() {
     rt.create_note(&tok_b, "observation", None, "NoteInB", None, None, vec![])
         .await
         .unwrap();
+    let deleted_note = rt
+        .create_note(
+            &tok_a,
+            "observation",
+            None,
+            "DeletedNoteInA",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+    assert!(rt
+        .delete_note(&tok_a, deleted_note.id, false)
+        .await
+        .unwrap());
+
+    let per_namespace_edges = rt
+        .count_edges(&tok_a, EdgeListFilter::default())
+        .await
+        .unwrap()
+        + rt.count_edges(&tok_b, EdgeListFilter::default())
+            .await
+            .unwrap();
+    let mut per_namespace_relations = rt.count_edges_by_relation(&tok_a).await.unwrap();
+    for (relation, count) in rt.count_edges_by_relation(&tok_b).await.unwrap() {
+        *per_namespace_relations.entry(relation).or_insert(0) += count;
+    }
+    let per_namespace_notes =
+        rt.count_notes(&tok_a, None).await.unwrap() + rt.count_notes(&tok_b, None).await.unwrap();
 
     // Identity-bearing frame whose visible set spans both namespaces.
     let vis_tok = rt
@@ -3881,9 +3918,11 @@ async fn stats_totals_match_list_walk_across_visible_namespaces() {
         full_edges.len() as u64,
         "stats() edge total must equal a full list keyset walk under the same identity"
     );
+    assert_eq!(stats_edges, per_namespace_edges);
     assert_eq!(stats_edges, 3);
 
     let edges_by_relation = rt.count_edges_by_relation(&vis_tok).await.unwrap();
+    assert_eq!(edges_by_relation, per_namespace_relations);
     let relation_sum: u64 = edges_by_relation.values().sum();
     assert_eq!(
         relation_sum, stats_edges,
@@ -3897,6 +3936,7 @@ async fn stats_totals_match_list_walk_across_visible_namespaces() {
         full_notes.len() as u64,
         "stats() note total must equal a full list keyset walk under the same identity"
     );
+    assert_eq!(stats_notes, per_namespace_notes);
     assert_eq!(stats_notes, 2);
 }
 

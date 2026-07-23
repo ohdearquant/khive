@@ -3388,23 +3388,21 @@ impl KhiveRuntime {
         Ok(page.items)
     }
 
-    /// Count notes matching `kind`, summed across the caller's visible
-    /// namespaces. The store-layer `count_notes` is namespace-pinned by
-    /// design (no `NamespaceFilter`-style `IN (...)` support); this sums the
-    /// per-namespace store calls, mirroring [`Self::count_edges_by_relation`]
-    /// and the multi-namespace path in [`Self::list_notes`] so `stats().notes`
-    /// reconciles with a full `list` keyset walk under the same token.
+    /// Count notes matching `kind` across the caller's visible namespaces.
     pub async fn count_notes(
         &self,
         token: &NamespaceToken,
         kind: Option<&str>,
     ) -> RuntimeResult<u64> {
-        let mut total = 0u64;
-        for ns in token.visible_namespaces() {
-            let temp = NamespaceToken::for_namespace(ns.clone());
-            total += self.notes(&temp)?.count_notes(ns.as_str(), kind).await?;
-        }
-        Ok(total)
+        let namespaces: Vec<String> = token
+            .visible_namespaces()
+            .iter()
+            .map(|namespace| namespace.as_str().to_owned())
+            .collect();
+        Ok(self
+            .notes(token)?
+            .count_notes_in_namespaces(&namespaces, kind)
+            .await?)
     }
 
     /// Search notes using a hybrid FTS5 + vector pipeline with salience weighting.
@@ -4679,14 +4677,38 @@ impl KhiveRuntime {
         &self,
         token: &NamespaceToken,
     ) -> RuntimeResult<std::collections::HashMap<String, u64>> {
-        let mut totals: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
-        for ns in token.visible_namespaces() {
-            let temp = NamespaceToken::for_namespace(ns.clone());
-            for (relation, count) in self.graph(&temp)?.count_edges_by_relation().await? {
-                *totals.entry(relation.to_string()).or_insert(0) += count;
+        let namespaces: Vec<String> = token
+            .visible_namespaces()
+            .iter()
+            .map(|namespace| namespace.as_str().to_owned())
+            .collect();
+        let graph = self.graph(token)?;
+        let counts = match graph
+            .count_edges_by_relation_in_namespaces(&namespaces)
+            .await
+        {
+            Ok(counts) => counts,
+            Err(khive_storage::StorageError::Unsupported { operation, .. })
+                if operation == "count_edges_by_relation_in_namespaces" =>
+            {
+                let mut totals = HashMap::new();
+                for namespace in token.visible_namespaces() {
+                    let scoped = NamespaceToken::for_namespace(namespace.clone());
+                    for (relation, count) in self.graph(&scoped)?.count_edges_by_relation().await? {
+                        *totals.entry(relation).or_insert(0) += count;
+                    }
+                }
+                return Ok(totals
+                    .into_iter()
+                    .map(|(relation, count)| (relation.to_string(), count))
+                    .collect());
             }
-        }
-        Ok(totals)
+            Err(error) => return Err(error.into()),
+        };
+        Ok(counts
+            .into_iter()
+            .map(|(relation, count)| (relation.to_string(), count))
+            .collect())
     }
 
     /// DML-only body of the symmetric-relation conflict-resolution path in
@@ -5063,24 +5085,38 @@ impl KhiveRuntime {
         Ok(deleted)
     }
 
-    /// Count edges matching `filter`, summed across the caller's visible
-    /// namespaces (mirrors [`Self::count_edges_by_relation`] and
-    /// [`Self::list_edges`] so `stats().edges` reconciles with a full `list`
-    /// keyset walk under the same token).
+    /// Count edges matching `filter` across the caller's visible namespaces.
     pub async fn count_edges(
         &self,
         token: &NamespaceToken,
         filter: crate::curation::EdgeListFilter,
     ) -> RuntimeResult<u64> {
-        let mut total = 0u64;
-        for ns in token.visible_namespaces() {
-            let temp = NamespaceToken::for_namespace(ns.clone());
-            total += self
-                .graph(&temp)?
-                .count_edges(filter.clone().into())
-                .await?;
+        let namespaces: Vec<String> = token
+            .visible_namespaces()
+            .iter()
+            .map(|namespace| namespace.as_str().to_owned())
+            .collect();
+        let graph = self.graph(token)?;
+        match graph
+            .count_edges_in_namespaces(&namespaces, filter.clone().into())
+            .await
+        {
+            Ok(count) => Ok(count),
+            Err(khive_storage::StorageError::Unsupported { operation, .. })
+                if operation == "count_edges_in_namespaces" =>
+            {
+                let mut total = 0;
+                for namespace in token.visible_namespaces() {
+                    let scoped = NamespaceToken::for_namespace(namespace.clone());
+                    total += self
+                        .graph(&scoped)?
+                        .count_edges(filter.clone().into())
+                        .await?;
+                }
+                Ok(total)
+            }
+            Err(error) => Err(error.into()),
         }
-        Ok(total)
     }
 
     /// Validate and construct an edge from a [`LinkSpec`] without writing to storage.

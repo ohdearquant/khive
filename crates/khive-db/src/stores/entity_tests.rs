@@ -554,6 +554,100 @@ async fn count_entities_normalizes_case_insensitive_names() {
 }
 
 #[tokio::test]
+async fn batched_namespace_entity_count_exceeds_sqlite_variable_limit() {
+    let pool = setup_pool();
+    let store = SqlEntityStore::new(Arc::clone(&pool), false);
+    let live_a = make_entity("stats-a", "concept", "live-a");
+    let deleted_a = make_entity("stats-a", "concept", "deleted-a");
+    let deleted_a_id = deleted_a.id;
+    let live_b = make_entity("stats-b", "document", "live-b");
+
+    store.upsert_entity(live_a).await.unwrap();
+    store.upsert_entity(deleted_a).await.unwrap();
+    store.upsert_entity(live_b).await.unwrap();
+    assert!(store
+        .delete_entity(deleted_a_id, DeleteMode::Soft)
+        .await
+        .unwrap());
+
+    let per_namespace_total = store
+        .count_entities("stats-a", EntityFilter::default())
+        .await
+        .unwrap()
+        + store
+            .count_entities("stats-b", EntityFilter::default())
+            .await
+            .unwrap();
+    pool.writer()
+        .unwrap()
+        .conn()
+        .set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_VARIABLE_NUMBER, 999)
+        .unwrap();
+    let mut namespaces = vec!["stats-a".to_string(), "stats-b".to_string()];
+    namespaces.extend((0..999).map(|i| format!("empty-{i}")));
+    assert_eq!(namespaces.len(), 1_001);
+
+    let filter = EntityFilter {
+        namespaces: namespaces.clone(),
+        ..EntityFilter::default()
+    };
+    assert_eq!(
+        store.count_entities("stats-a", filter).await.unwrap(),
+        per_namespace_total
+    );
+
+    let kind_filter = EntityFilter {
+        namespaces,
+        kinds: vec!["document".to_string()],
+        ..EntityFilter::default()
+    };
+    assert_eq!(
+        store.count_entities("stats-a", kind_filter).await.unwrap(),
+        1
+    );
+    assert_eq!(per_namespace_total, 2);
+}
+
+#[tokio::test]
+async fn duplicate_namespace_across_chunk_boundary_is_not_double_counted() {
+    let pool = setup_pool();
+    let store = SqlEntityStore::new(Arc::clone(&pool), false);
+
+    store
+        .upsert_entity(make_entity("stats-a", "concept", "live-a-1"))
+        .await
+        .unwrap();
+    store
+        .upsert_entity(make_entity("stats-a", "concept", "live-a-2"))
+        .await
+        .unwrap();
+
+    let per_namespace_total = store
+        .count_entities("stats-a", EntityFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(per_namespace_total, 2);
+
+    // 501 unique namespaces ("stats-a" + 500 empties), then "stats-a" repeats
+    // once more past index 500 — the repeat lands in the second 500-entry
+    // chunk, so a dedup bug double-counts "stats-a"'s rows.
+    let mut namespaces = vec!["stats-a".to_string()];
+    namespaces.extend((0..500).map(|i| format!("empty-{i}")));
+    assert_eq!(namespaces.len(), 501);
+    namespaces.push("stats-a".to_string());
+    assert_eq!(namespaces.len(), 502);
+
+    let filter = EntityFilter {
+        namespaces,
+        ..EntityFilter::default()
+    };
+    assert_eq!(
+        store.count_entities("stats-a", filter).await.unwrap(),
+        per_namespace_total
+    );
+}
+
+#[tokio::test]
 async fn test_batch_upsert() {
     let store = setup_memory_store_ns("batch_ns");
 
