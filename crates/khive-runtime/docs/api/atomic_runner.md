@@ -51,5 +51,7 @@ Only the **commit pass** (phase 2) lives here: given an already-prepared `Vec<At
 (phase 1, the async prepare pass, is out of scope for B2), `run_atomic_unit` opens one
 `atomic_unit`, applies each plan's statements under a
 named `SAVEPOINT`, and returns either every op's collected `PostCommitEffect`s (phase 3, the
-async post-commit pass — the B3 wiring point: nothing in B2 executes these effects, a test
-consumer only drains the returned list) or the first op's failure and its index.
+async post-commit pass) inside an opaque `CommittedPostCommitEffects` token or the first op's
+failure and its index. Nothing in phase 2 executes deferred effects. After a successful commit,
+the caller passes the token by value to `apply_post_commit_effects`; callers may inspect its
+contents but cannot turn prepare-time effects into an executable token.

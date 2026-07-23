@@ -28,6 +28,7 @@ use crate::atomic_plan::{
     PlanStatement, PostCommitEffect, UpdatePlan,
 };
 use crate::atomic_runner::AtomicOpPlan;
+use crate::atomic_runner::CommittedPostCommitEffects;
 use crate::curation::{entity_fts_document, note_fts_document};
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::operations::{
@@ -1453,9 +1454,9 @@ async fn prepare_merge(
 pub async fn apply_post_commit_effects(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
-    effects: Vec<PostCommitEffect>,
+    effects: CommittedPostCommitEffects,
 ) -> RuntimeResult<()> {
-    for effect in effects {
+    for effect in effects.into_effects() {
         match effect {
             PostCommitEffect::None => {}
             PostCommitEffect::ReindexEntity { entity_id } => {
@@ -1726,8 +1727,8 @@ mod tests {
             other => panic!("expected Committed, got {other:?}"),
         };
         assert_eq!(
-            post_commit,
-            vec![PostCommitEffect::ReindexNote { note_id }],
+            post_commit.as_slice(),
+            &[PostCommitEffect::ReindexNote { note_id }],
             "content change must schedule exactly one ReindexNote post-commit effect"
         );
 
@@ -1769,7 +1770,7 @@ mod tests {
     /// dependency is needed at this layer, since the hook itself is
     /// generic.
     #[tokio::test]
-    async fn atomic_note_update_and_delete_post_commit_fire_the_note_mutation_hook() {
+    async fn atomic_note_update_and_delete_post_commit_effects_execute_exactly_once() {
         let runtime = scratch_runtime();
         let token = runtime
             .authorize(Namespace::parse("local").expect("ns"))
@@ -1846,8 +1847,8 @@ mod tests {
             other => panic!("expected Committed, got {other:?}"),
         };
         assert_eq!(
-            post_commit,
-            vec![PostCommitEffect::NoteDeleted {
+            post_commit.as_slice(),
+            &[PostCommitEffect::NoteDeleted {
                 note_id: delete_note_id,
                 kind: "observation".to_string(),
             }],
@@ -1857,14 +1858,13 @@ mod tests {
             .await
             .expect("apply post-commit effects (delete)");
 
-        let seen = fired.lock().expect("lock").clone();
-        assert!(
-            seen.contains(&("observation".to_string(), update_note_id)),
-            "the note-mutation hook must fire for the atomic UPDATE path: {seen:?}"
-        );
-        assert!(
-            seen.contains(&("observation".to_string(), delete_note_id)),
-            "the note-mutation hook must fire for the atomic DELETE path: {seen:?}"
+        assert_eq!(
+            *fired.lock().expect("lock"),
+            vec![
+                ("observation".to_string(), update_note_id),
+                ("observation".to_string(), delete_note_id),
+            ],
+            "each committed token must execute its note-mutation effect exactly once"
         );
     }
 
@@ -3368,12 +3368,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn atomic_add_entity_link_add_note_plan_commits_entity_edge_note_and_fts_together() {
+    async fn atomic_proposal_vectors_materialize_only_after_successful_commit() {
         let runtime = scratch_runtime();
         runtime.register_embedder(StubProvider);
         let token = runtime
             .authorize(Namespace::parse("local").expect("ns"))
             .expect("authorize");
+        let vec_store = runtime
+            .vectors_for_model(&token, STUB_MODEL)
+            .expect("vec store");
         let entities = runtime.entities(&token).expect("entities store");
         let a = khive_storage::Entity::new("local", "concept", "ProposalPlanLinkA");
         let b = khive_storage::Entity::new("local", "concept", "ProposalPlanLinkB");
@@ -3422,6 +3425,19 @@ mod tests {
             crate::atomic_runner::AtomicRunOutcome::Committed { post_commit } => post_commit,
             other => panic!("expected the whole unit to commit: {other:?}"),
         };
+        assert_eq!(
+            post_commit.as_slice(),
+            &[
+                PostCommitEffect::ReindexEntity { entity_id },
+                PostCommitEffect::ReindexNote { note_id },
+            ],
+            "prepare-derived effects must reach the committed token unchanged"
+        );
+        assert_eq!(
+            vec_store.count().await.expect("count before effects"),
+            0,
+            "commit returns deferred effects without materializing vectors"
+        );
         let entity = runtime
             .entities(&token)
             .expect("entities store")
@@ -3472,9 +3488,6 @@ mod tests {
             .await
             .expect("apply post-commit effects");
 
-        let vec_store = runtime
-            .vectors_for_model(&token, STUB_MODEL)
-            .expect("vec store");
         assert_eq!(
             vec_store.count().await.expect("count after"),
             2,
@@ -3483,11 +3496,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn atomic_add_entity_and_add_note_roll_back_on_later_link_failure_leaving_zero_trace() {
+    async fn atomic_proposal_abort_leaves_zero_vector_rows() {
         let runtime = scratch_runtime();
+        runtime.register_embedder(StubProvider);
         let token = runtime
             .authorize(Namespace::parse("local").expect("ns"))
             .expect("authorize");
+        let vec_store = runtime
+            .vectors_for_model(&token, STUB_MODEL)
+            .expect("vec store");
         let entities = runtime.entities(&token).expect("entities store");
         let a = khive_storage::Entity::new("local", "concept", "ProposalPlanRollbackA");
         let x = khive_storage::Entity::new("local", "concept", "ProposalPlanRollbackX");
@@ -3553,6 +3570,15 @@ mod tests {
             }
             other => panic!("expected the whole unit to roll back, got {other:?}"),
         }
+
+        assert_eq!(
+            vec_store
+                .count()
+                .await
+                .expect("vector count after rollback"),
+            0,
+            "a rolled-back atomic apply must not materialize vectors"
+        );
 
         assert!(
             runtime

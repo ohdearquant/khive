@@ -293,7 +293,7 @@ impl ProposalApplyWorker {
                     });
                     let plan = prepare_add_entity(&self.runtime, token, &args).await?;
                     let entity_id = match &plan {
-                        AtomicOpPlan::AddEntity(plan) => plan.entity_id,
+                        AtomicOpPlan::AddEntity(plan) => plan.entity_id(),
                         _ => unreachable!("prepare_add_entity returned a different plan variant"),
                     };
                     Ok(PreparedApply::Atomic {
@@ -337,7 +337,7 @@ impl ProposalApplyWorker {
                     });
                     let plan = prepare_op(&self.runtime, token, "link", &args).await?;
                     let (source_id, target_id) = match &plan {
-                        AtomicOpPlan::Link(plan) => (plan.source_id, plan.target_id),
+                        AtomicOpPlan::Link(plan) => (plan.source_id(), plan.target_id()),
                         _ => unreachable!("link prepare returned a different plan variant"),
                     };
                     Ok(PreparedApply::Atomic {
@@ -361,7 +361,7 @@ impl ProposalApplyWorker {
                     });
                     let plan = prepare_add_note(&self.runtime, token, &args).await?;
                     let note_id = match &plan {
-                        AtomicOpPlan::AddNote(plan) => plan.note_id,
+                        AtomicOpPlan::AddNote(plan) => plan.note_id(),
                         _ => unreachable!("prepare_add_note returned a different plan variant"),
                     };
                     Ok(PreparedApply::Atomic {

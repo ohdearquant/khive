@@ -157,34 +157,96 @@ pub enum PostCommitEffect {
 /// after commit.
 #[derive(Debug, Clone)]
 pub struct EdgeNaturalKey {
-    pub namespace: String,
-    pub canon_source_id: Uuid,
-    pub canon_target_id: Uuid,
-    pub relation: khive_storage::EdgeRelation,
+    pub(crate) namespace: String,
+    pub(crate) canon_source_id: Uuid,
+    pub(crate) canon_target_id: Uuid,
+    pub(crate) relation: khive_storage::EdgeRelation,
+}
+
+impl EdgeNaturalKey {
+    /// The namespace containing the surviving edge.
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    /// The canonical source endpoint of the surviving edge.
+    pub fn canon_source_id(&self) -> Uuid {
+        self.canon_source_id
+    }
+
+    /// The canonical target endpoint of the surviving edge.
+    pub fn canon_target_id(&self) -> Uuid {
+        self.canon_target_id
+    }
+
+    /// The surviving edge's relation.
+    pub fn relation(&self) -> khive_storage::EdgeRelation {
+        self.relation
+    }
 }
 
 /// Write plan for an `update` op (entity or note shape — ADR-099 D3's
 /// `update` caveat covers both substrates the same way: row/FTS DML in the
 /// plan, any reindex deferred to `post_commit`).
+///
+/// Deferred effects are assigned by this crate's prepare pass and cannot be
+/// supplied by callers constructing a plan directly:
+///
+/// ```compile_fail
+/// use khive_runtime::{PostCommitEffect, UpdatePlan};
+/// use uuid::Uuid;
+///
+/// let id = Uuid::nil();
+/// let plan = UpdatePlan {
+///     target_id: id,
+///     statements: Vec::new(),
+///     post_commit: PostCommitEffect::ReindexEntity { entity_id: id },
+///     edge_natural_key: None,
+/// };
+/// ```
+///
+/// A plan returned by a prepare function cannot have its validated
+/// statements cleared or replaced before it reaches the runner:
+///
+/// ```compile_fail
+/// use khive_runtime::UpdatePlan;
+///
+/// fn clear_prepared_statements(mut prepared: UpdatePlan) {
+///     prepared.statements.clear();
+/// }
+/// ```
 #[derive(Debug, Clone)]
 pub struct UpdatePlan {
     /// The id of the entity or note being updated. For a symmetric edge
     /// update this is the CALLER's requested id — advisory only, never the
     /// basis for post-commit result rendering (see [`EdgeNaturalKey`]).
-    pub target_id: Uuid,
+    pub(crate) target_id: Uuid,
     /// Row + FTS DML statements to apply inside the atomic unit, in order.
     /// The row-update statement carries the existence guard; any FTS-mirror
     /// statement that follows it is unguarded (its target row's existence
     /// was already asserted by the row-update statement's own guard).
-    pub statements: Vec<PlanStatement>,
-    /// Deferred reindex, if the update changed name/description/content.
-    pub post_commit: PostCommitEffect,
+    pub(crate) statements: Vec<PlanStatement>,
+    /// Deferred reindex assigned by the prepare pass when the update changed
+    /// name, description, or content.
+    pub(crate) post_commit: PostCommitEffect,
     /// `Some` only for a symmetric edge update — the natural key a caller
     /// must use to derive the committed surviving row post-commit, rather
     /// than trusting `target_id`. `None` for every other update shape
     /// (entity, note, non-symmetric edge), where `target_id` alone is
     /// already an exact, non-advisory identifier.
-    pub edge_natural_key: Option<EdgeNaturalKey>,
+    pub(crate) edge_natural_key: Option<EdgeNaturalKey>,
+}
+
+impl UpdatePlan {
+    /// The record id supplied to the prepare pass.
+    pub fn target_id(&self) -> Uuid {
+        self.target_id
+    }
+
+    /// The committed lookup key required for a symmetric edge update.
+    pub fn edge_natural_key(&self) -> Option<&EdgeNaturalKey> {
+        self.edge_natural_key.as_ref()
+    }
 }
 
 /// Write plan for an `AddEntity` proposal change: a fresh entity row plus its
@@ -193,14 +255,22 @@ pub struct UpdatePlan {
 #[derive(Debug, Clone)]
 pub struct AddEntityPlan {
     /// The freshly generated id of the entity being created.
-    pub entity_id: Uuid,
+    pub(crate) entity_id: Uuid,
     /// Row + FTS insert statements to apply inside the atomic unit, in
     /// order. The row-insert statement carries the existence guard; the
     /// FTS-insert statement that follows it is unguarded (an ordinary
     /// `INSERT` into a virtual table with no conflicting row).
-    pub statements: Vec<PlanStatement>,
-    /// Reindex the committed entity after the transaction closes.
-    pub post_commit: PostCommitEffect,
+    pub(crate) statements: Vec<PlanStatement>,
+    /// Reindex the committed entity after the transaction closes, as
+    /// assigned by the prepare pass.
+    pub(crate) post_commit: PostCommitEffect,
+}
+
+impl AddEntityPlan {
+    /// The id generated for the prepared entity.
+    pub fn entity_id(&self) -> Uuid {
+        self.entity_id
+    }
 }
 
 /// Write plan for an `AddNote` proposal change: a fresh note row plus its FTS
@@ -208,29 +278,62 @@ pub struct AddEntityPlan {
 #[derive(Debug, Clone)]
 pub struct AddNotePlan {
     /// The freshly generated id of the note being created.
-    pub note_id: Uuid,
+    pub(crate) note_id: Uuid,
     /// Row + FTS insert statements to apply inside the atomic unit, in
     /// order, mirroring [`AddEntityPlan::statements`].
-    pub statements: Vec<PlanStatement>,
-    /// Reindex the committed note after the transaction closes.
-    pub post_commit: PostCommitEffect,
+    pub(crate) statements: Vec<PlanStatement>,
+    /// Reindex the committed note after the transaction closes, as assigned
+    /// by the prepare pass.
+    pub(crate) post_commit: PostCommitEffect,
+}
+
+impl AddNotePlan {
+    /// The id generated for the prepared note.
+    pub fn note_id(&self) -> Uuid {
+        self.note_id
+    }
 }
 
 /// Write plan for a `delete` op (soft or hard).
+///
+/// Deferred effects are assigned by this crate's prepare pass and cannot be
+/// attached to a statement-free plan by external callers:
+///
+/// ```compile_fail
+/// use khive_runtime::{DeletePlan, PostCommitEffect};
+/// use uuid::Uuid;
+///
+/// let id = Uuid::nil();
+/// let plan = DeletePlan {
+///     target_id: id,
+///     statements: Vec::new(),
+///     post_commit: PostCommitEffect::NoteDeleted {
+///         note_id: id,
+///         kind: "observation".to_owned(),
+///     },
+/// };
+/// ```
 #[derive(Debug, Clone)]
 pub struct DeletePlan {
     /// The id of the entity or note being deleted.
-    pub target_id: Uuid,
+    pub(crate) target_id: Uuid,
     /// Row DML (and, for a hard delete, incident-edge cascade DML) to apply
     /// inside the atomic unit, in order. The target-row delete statement
     /// carries the existence guard; a cascade edge-delete statement (hard
     /// delete only) is unguarded — it may legitimately affect zero rows if
     /// the target had no incident edges.
-    pub statements: Vec<PlanStatement>,
-    /// Deferred note-mutation-hook fire, for a note delete (#750
-    /// 2). `PostCommitEffect::None` for entity and edge deletes — the hook
-    /// system is note-only.
-    pub post_commit: PostCommitEffect,
+    pub(crate) statements: Vec<PlanStatement>,
+    /// Deferred note-mutation-hook fire assigned by the prepare pass for a
+    /// note delete (#750 2). `PostCommitEffect::None` for entity and edge
+    /// deletes — the hook system is note-only.
+    pub(crate) post_commit: PostCommitEffect,
+}
+
+impl DeletePlan {
+    /// The record id supplied to the prepare pass.
+    pub fn target_id(&self) -> Uuid {
+        self.target_id
+    }
 }
 
 /// Write plan for a `link` op (create a typed directed edge). Endpoint
@@ -244,11 +347,23 @@ pub struct DeletePlan {
 /// convention).
 #[derive(Debug, Clone)]
 pub struct LinkPlan {
-    pub source_id: Uuid,
-    pub target_id: Uuid,
+    pub(crate) source_id: Uuid,
+    pub(crate) target_id: Uuid,
     /// The guarded `INSERT ... SELECT ... WHERE EXISTS(...)` statement:
     /// its affected-row count is the endpoint-existence probe.
-    pub statement: PlanStatement,
+    pub(crate) statement: PlanStatement,
+}
+
+impl LinkPlan {
+    /// The canonical source endpoint used by the prepared statement.
+    pub fn source_id(&self) -> Uuid {
+        self.source_id
+    }
+
+    /// The canonical target endpoint used by the prepared statement.
+    pub fn target_id(&self) -> Uuid {
+        self.target_id
+    }
 }
 
 /// Write plan for a `merge` op (deduplicate two entities). Rewires and
@@ -259,25 +374,37 @@ pub struct LinkPlan {
 /// lifecycle write assumes both rows exist, so it always is.
 #[derive(Debug, Clone)]
 pub struct MergePlan {
-    pub into_id: Uuid,
-    pub from_id: Uuid,
+    pub(crate) into_id: Uuid,
+    pub(crate) from_id: Uuid,
     /// Predicate-based edge-rewire statement(s)
     /// (`UPDATE graph_edges SET source_id = :into WHERE source_id = :from`-
     /// shaped), evaluated inside the transaction so they structurally see
     /// any earlier op's edge writes in the same file (ADR-099 acceptance
     /// criteria: "merge rewires see earlier in-file writes"). Never
     /// guarded — a rewire touching zero rows is a legitimate outcome.
-    pub rewires: Vec<PlanPredicate>,
+    pub(crate) rewires: Vec<PlanPredicate>,
     /// The `from` entity's soft-delete/tombstone DML (and any other
     /// lifecycle write prepare assumed a target row exists for). Always
     /// guarded — prepare validated `into`/`from` both exist.
-    pub lifecycle: Vec<PlanStatement>,
+    pub(crate) lifecycle: Vec<PlanStatement>,
+}
+
+impl MergePlan {
+    /// The entity retained by the prepared merge.
+    pub fn into_id(&self) -> Uuid {
+        self.into_id
+    }
+
+    /// The entity retired by the prepared merge.
+    pub fn from_id(&self) -> Uuid {
+        self.from_id
+    }
 }
 
 /// Write plan for a `gtd.transition` op (explicit task lifecycle change).
 #[derive(Debug, Clone)]
 pub struct GtdTransitionPlan {
-    pub task_id: Uuid,
+    pub(crate) task_id: Uuid,
     /// Status-column DML to apply inside the atomic unit. Property-only
     /// status mutation — triggers no reindex (ADR-099 D3). The transition
     /// statement carries the guard (prepare validated the current status
@@ -285,26 +412,40 @@ pub struct GtdTransitionPlan {
     /// no-op (`current == target` after `normalize_status`, GAP-5/GAP-6 fix
     /// round) — canonical performs no write in that case either
     /// (`handlers.rs:995-1005`).
-    pub statements: Vec<PlanStatement>,
-    /// Deferred lifecycle audit row (GAP-5): `PostCommitEffect::
-    /// None` for the idempotent no-op case, matching canonical's early
-    /// return before its own `ensure_audit_schema`/`write_audit_record`
-    /// call.
-    pub post_commit: PostCommitEffect,
+    pub(crate) statements: Vec<PlanStatement>,
+    /// Deferred lifecycle audit row assigned by the prepare pass (GAP-5):
+    /// `PostCommitEffect::None` for the idempotent no-op case, matching
+    /// canonical's early return before its own
+    /// `ensure_audit_schema`/`write_audit_record` call.
+    pub(crate) post_commit: PostCommitEffect,
+}
+
+impl GtdTransitionPlan {
+    /// The task targeted by the prepared transition.
+    pub fn task_id(&self) -> Uuid {
+        self.task_id
+    }
 }
 
 /// Write plan for a `gtd.complete` op (task lifecycle terminal transition).
 #[derive(Debug, Clone)]
 pub struct GtdCompletePlan {
-    pub task_id: Uuid,
+    pub(crate) task_id: Uuid,
     /// Status + `completed_at` DML to apply inside the atomic unit, in
     /// order. The status-update statement carries the guard (prepare
     /// validated the task was in a completable state); the `completed_at`
     /// write targets the same already-guarded row and is unguarded.
-    pub statements: Vec<PlanStatement>,
-    /// Deferred lifecycle audit row (GAP-5): mirrors
-    /// `handle_complete`'s best-effort `write_audit_record` call.
-    pub post_commit: PostCommitEffect,
+    pub(crate) statements: Vec<PlanStatement>,
+    /// Deferred lifecycle audit row assigned by the prepare pass (GAP-5):
+    /// mirrors `handle_complete`'s best-effort `write_audit_record` call.
+    pub(crate) post_commit: PostCommitEffect,
+}
+
+impl GtdCompletePlan {
+    /// The task targeted by the prepared completion.
+    pub fn task_id(&self) -> Uuid {
+        self.task_id
+    }
 }
 
 /// Which governance verb (`propose` / `review` / `withdraw`) a
@@ -320,12 +461,24 @@ pub enum GovernanceOp {
 /// event-sourced change-proposal lifecycle, ADR-046).
 #[derive(Debug, Clone)]
 pub struct GovernancePlan {
-    pub op: GovernanceOp,
-    pub proposal_id: Uuid,
+    pub(crate) op: GovernanceOp,
+    pub(crate) proposal_id: Uuid,
     /// Event-log + status DML to apply inside the atomic unit. The
     /// lifecycle-state-check statement carries the guard (prepare validated
     /// the proposal was in a state admitting this transition).
-    pub statements: Vec<PlanStatement>,
+    pub(crate) statements: Vec<PlanStatement>,
+}
+
+impl GovernancePlan {
+    /// The governance operation represented by this plan.
+    pub fn op(&self) -> GovernanceOp {
+        self.op
+    }
+
+    /// The proposal targeted by this plan.
+    pub fn proposal_id(&self) -> Uuid {
+        self.proposal_id
+    }
 }
 
 #[cfg(test)]
