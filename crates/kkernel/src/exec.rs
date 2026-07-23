@@ -2978,7 +2978,8 @@ backend = "sessions"
     /// conflict-absorbs into is created by an EARLIER op in the SAME
     /// atomic unit (so it does not exist at either op's prepare time). The
     /// commit must both write correctly (X deleted, the just-linked row
-    /// carries X's patch) and RENDER the correct surviving id — not X's
+    /// preserved unchanged per ADR-039 DO NOTHING — X's patch is discarded,
+    /// not applied) and RENDER the correct surviving id — not X's
     /// prepare-time-advisory id, which this fix removed reliance on
     /// entirely (`build_op_result` now derives it from a post-commit
     /// natural-key lookup).
@@ -3065,15 +3066,17 @@ backend = "sessions"
             "the update's rendered result must be the surviving (just-linked) row: {envelope}"
         );
         assert_eq!(
-            envelope["results"][1]["result"]["weight"], 0.9,
-            "the surviving row must carry the update's patch: {envelope}"
+            envelope["results"][1]["result"]["weight"], 0.6,
+            "ADR-039 DO NOTHING: the surviving row keeps its OWN pre-existing weight (0.6, \
+             set by the link above), not the discarded update's patched weight (0.9): {envelope}"
         );
 
         let server = isolated_server(&db_path);
         let surviving_resp = dispatch_json(&server, &format!(r#"get(id="{linked_id}")"#)).await;
         assert_eq!(
-            surviving_resp["results"][0]["result"]["weight"], 0.9,
-            "the committed row itself must carry the patch: {surviving_resp}"
+            surviving_resp["results"][0]["result"]["weight"], 0.6,
+            "the committed row itself must keep its pre-existing weight, not the discarded \
+             update's patch: {surviving_resp}"
         );
     }
 

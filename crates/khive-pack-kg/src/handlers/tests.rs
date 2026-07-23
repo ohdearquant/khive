@@ -1041,6 +1041,76 @@ async fn update_edge_with_non_edge_field_returns_error() {
     );
 }
 
+// khive#1213: `update(id=<edge>, relation="competes_with", ...)` that collides with an
+// already soft-deleted canonical survivor must return that survivor as-is — including its
+// non-null `deleted_at` — rather than resurrecting the tombstone (ADR-039 DO NOTHING).
+#[tokio::test]
+async fn update_edge_symmetric_conflict_returns_tombstoned_survivor_with_deleted_at() {
+    use crate::KgPack;
+    use khive_runtime::{KhiveRuntime, VerbRegistryBuilder};
+    use khive_types::EdgeRelation;
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let token = rt.authorize(khive_runtime::Namespace::local()).unwrap();
+
+    let a = rt
+        .create_entity(&token, "concept", None, "A", None, None, vec![])
+        .await
+        .expect("create a");
+    let b = rt
+        .create_entity(&token, "concept", None, "B", None, None, vec![])
+        .await
+        .expect("create b");
+
+    let requested = rt
+        .link(&token, a.id, b.id, EdgeRelation::Extends, 0.2, None)
+        .await
+        .expect("create requested edge");
+
+    let canonical = rt
+        .link(&token, a.id, b.id, EdgeRelation::CompetesWith, 0.6, None)
+        .await
+        .expect("create canonical edge");
+    rt.delete_edge(&token, canonical.id.into(), false)
+        .await
+        .expect("soft-delete canonical edge");
+
+    let pack = KgPack::new(rt.clone());
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry build");
+
+    let result = pack
+        .handle_update(
+            &token,
+            json!({
+                "id": requested.id.to_string(),
+                "relation": "competes_with",
+                "weight": 0.9,
+            }),
+            &registry,
+        )
+        .await
+        .expect("update must succeed by absorbing into the tombstoned survivor");
+
+    let returned_id = result["id"].as_str().expect("returned id");
+    assert_eq!(
+        returned_id,
+        canonical.id.to_string(),
+        "the returned edge must be the surviving canonical row, not the discarded request: {result}"
+    );
+    assert!(
+        !result["deleted_at"].is_null(),
+        "the returned edge must retain the survivor's non-null deleted_at — absorbing a \
+         conflicting update must not resurrect a tombstone: {result}"
+    );
+    assert_eq!(
+        result["weight"], 0.6,
+        "the survivor's own weight must be preserved, not overwritten by the discarded \
+         request's patch: {result}"
+    );
+}
+
 // HIGH regression: update(note_id, tags=[...]) must return an explicit error.
 // Notes have no top-level tags column; tags live in properties["tags"].
 // Before the fix, tags was silently dropped on the note path (the error string

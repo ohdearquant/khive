@@ -1789,8 +1789,9 @@ async fn synthetic_edge_observed_as_selected_returns_memory_note() {
 // =============================================================================
 
 /// Regression for Bug 1: when update_edge absorbs a conflict (the requested edge
-/// is deleted and the existing canonical row is refreshed), the returned edge must
-/// carry the SURVIVING canonical row's id — not the id of the deleted edge.
+/// is deleted and the existing canonical row is preserved unchanged, ADR-039 DO
+/// NOTHING), the returned edge must carry the SURVIVING canonical row's id — not
+/// the id of the deleted edge.
 ///
 /// Setup: pre-create canonical A→B competes_with (E1), create A→B extends (E2).
 /// Update E2's relation to competes_with. The returned id must be E1, not E2.

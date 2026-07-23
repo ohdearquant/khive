@@ -1275,6 +1275,38 @@ impl GraphStore for SqlGraphStore {
         .await
     }
 
+    async fn get_edge_by_natural_key_including_deleted(
+        &self,
+        source_id: Uuid,
+        target_id: Uuid,
+        relation: EdgeRelation,
+    ) -> Result<Option<Edge>, StorageError> {
+        let namespace = self.namespace.clone();
+        let source_str = source_id.to_string();
+        let target_str = target_id.to_string();
+        let relation_str = relation.to_string();
+
+        self.with_reader("get_edge_by_natural_key_including_deleted", move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT namespace, id, source_id, target_id, relation, weight, \
+                        created_at, updated_at, deleted_at, metadata, target_backend \
+                 FROM graph_edges \
+                 WHERE namespace = ?1 AND source_id = ?2 AND target_id = ?3 AND relation = ?4",
+            )?;
+            let mut rows = stmt.query(rusqlite::params![
+                namespace,
+                source_str,
+                target_str,
+                relation_str
+            ])?;
+            match rows.next()? {
+                Some(row) => Ok(Some(read_edge(row)?)),
+                None => Ok(None),
+            }
+        })
+        .await
+    }
+
     async fn get_edges(&self, ids: &[LinkId]) -> Result<Vec<Edge>, StorageError> {
         if ids.is_empty() {
             return Ok(Vec::new());

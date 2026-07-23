@@ -4446,6 +4446,25 @@ impl KhiveRuntime {
             .await?)
     }
 
+    /// Fetch an edge by natural key (namespace, canonical source/target, relation)
+    /// including soft-deleted rows. Unlike [`Self::list_edges`]/[`Self::list_edges_after`],
+    /// which always filter `deleted_at IS NULL`, this can render a tombstoned symmetric-edge
+    /// survivor (ADR-039 DO NOTHING conflict absorption) — used by the atomic-apply
+    /// post-commit result renderer, which otherwise reports "not found" for a committed
+    /// update whose surviving row happens to be soft-deleted.
+    pub async fn get_edge_by_natural_key_including_deleted(
+        &self,
+        token: &NamespaceToken,
+        source_id: Uuid,
+        target_id: Uuid,
+        relation: EdgeRelation,
+    ) -> RuntimeResult<Option<Edge>> {
+        Ok(self
+            .graph(token)?
+            .get_edge_by_natural_key_including_deleted(source_id, target_id, relation)
+            .await?)
+    }
+
     /// Maximum rows returned by a single [`Self::list_edges`] /
     /// [`Self::list_edges_after`] page. A lower bound the docs promise callers
     /// can rely on; kept as a named constant so tests can exercise pagination
@@ -4709,8 +4728,9 @@ impl KhiveRuntime {
     /// For symmetric relations (`competes_with`, `composed_with`), endpoint order is
     /// canonicalised to `source_uuid < target_uuid` after validation. If a canonical
     /// row already exists at the target triple, the non-canonical edge is deleted and
-    /// the existing canonical row is refreshed (DELETE + UPDATE pattern, mirroring
-    /// `merge_entity_sql`).
+    /// the existing canonical row is preserved unchanged (ADR-039 ON CONFLICT DO
+    /// NOTHING, mirroring `merge_entity_sql`) — its attributes, including a soft-deleted
+    /// `deleted_at`, are never overwritten by the discarded edge's patch.
     pub async fn update_edge(
         &self,
         token: &NamespaceToken,
