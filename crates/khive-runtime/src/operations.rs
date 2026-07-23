@@ -35,7 +35,7 @@ use crate::atomic_plan::{
     AddEntityPlan, AffectedRowGuard, DeletePlan, PlanStatement, PostCommitEffect,
 };
 use crate::atomic_runner::{run_atomic_unit, AtomicOpFailure, AtomicOpPlan, AtomicRunOutcome};
-use crate::curation::{entity_fts_document, note_fts_document};
+use crate::curation::{entity_fts_document, note_embedding_text, note_fts_document};
 use crate::error::{GuardedWriteFailure, RuntimeError, RuntimeResult};
 use crate::runtime::{KhiveRuntime, NamespaceToken};
 
@@ -2843,7 +2843,7 @@ impl KhiveRuntime {
         let embed_model_names = self.registered_embedding_model_names();
         for model_name in &embed_model_names {
             match self
-                .embed_document_with_model(model_name, &note.content)
+                .embed_document_with_model(model_name, &note_embedding_text(&note))
                 .await
             {
                 Ok(vector) => {
@@ -3039,7 +3039,8 @@ impl KhiveRuntime {
         // capped override when present, otherwise the full stored content.
         // FTS indexing above always used the full `note.content` — this cap
         // affects only the vector-embedding input.
-        let embed_text: &str = embedding_content.unwrap_or(content);
+        let canonical_embed_text = note_embedding_text(&note);
+        let embed_text: &str = embedding_content.unwrap_or(&canonical_embed_text);
 
         if embed_model_names.len() == 1 {
             // Single-model path: preserves original sequential behaviour.
