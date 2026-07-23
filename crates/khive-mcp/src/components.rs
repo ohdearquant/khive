@@ -18,6 +18,15 @@
 //! Blocking work inside a component must use a bounded blocking pool
 //! (`spawn_blocking`) or a subprocess boundary; a component future must not
 //! occupy an async runtime worker with synchronous work.
+//!
+//! Startup ordering caveat: components start on the serve path after the
+//! boot guard is acquired but before the daemon finishes establishing
+//! ownership (socket bind, pid write). A process that fails establishment
+//! exits through `ComponentTeardown` — components are cancelled, but may
+//! have run briefly first. Side-effecting components (the ingest class)
+//! must therefore be idempotent under that window: work emitted by a
+//! process that never became the daemon may be performed again by the one
+//! that does.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -264,6 +273,20 @@ fn start_components(
         roster = ?roster,
         "daemon components: roster"
     );
+    // Health rows are keyed by name, so two registrations sharing one name
+    // write indistinguishable, interleaved state. Both still start — refusing
+    // one would silently drop a real component — but the collision is a
+    // linked-crate defect and gets an error-level line naming it.
+    let mut seen: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
+    for name in &roster {
+        if !seen.insert(name) {
+            tracing::error!(
+                component = name,
+                "daemon components: duplicate registration name; health rows \
+                 for these components will overwrite each other"
+            );
+        }
+    }
     for reg in regs {
         khive_runtime::track_background_task(supervise(
             reg,
@@ -273,6 +296,21 @@ fn start_components(
         ));
     }
     regs.len()
+}
+
+/// Reserved slice of the drain window for post-grace supervisor work: the
+/// task abort, the terminal health record, and drain()'s 100ms poll cadence
+/// observing the exit. Per-component shutdown waits are clamped to
+/// `drain_timeout() - this`, so a supervisor always finishes inside drain.
+const SHUTDOWN_DRAIN_MARGIN_MS: u64 = 500;
+
+/// Clamp a component's requested shutdown wait strictly inside the drain
+/// window. A wait equal to the drain bound spends the whole window on the
+/// grace wait, leaving no time for the abort, the terminal state record,
+/// and drain()'s poll to observe the supervisor's exit — drain() would give
+/// up with the supervisor still tracked.
+fn clamped_shutdown_wait_ms(requested_ms: u64, drain_ms: u64) -> u64 {
+    requested_ms.min(drain_ms.saturating_sub(SHUTDOWN_DRAIN_MARGIN_MS))
 }
 
 /// Deterministic-enough restart jitter without a rand dependency: up to a
@@ -293,21 +331,17 @@ async fn supervise(
 ) {
     let mut restarts: u32 = 0;
     let mut backoff_ms = reg.backoff_initial_ms.clamp(1, reg.backoff_max_ms.max(1));
-    // A shutdown wait longer than the daemon's drain bound could never
-    // complete its abort/state transition before the daemon returns; clamp
-    // and say so once.
     let drain_ms = khive_runtime::daemon::drain_timeout().as_millis() as u64;
-    let shutdown_wait_ms = if reg.shutdown_timeout_ms > drain_ms {
+    let shutdown_wait_ms = clamped_shutdown_wait_ms(reg.shutdown_timeout_ms, drain_ms);
+    if shutdown_wait_ms < reg.shutdown_timeout_ms {
         tracing::warn!(
             component = reg.name,
             requested_ms = reg.shutdown_timeout_ms,
+            clamped_ms = shutdown_wait_ms,
             drain_bound_ms = drain_ms,
             "daemon component: shutdown timeout exceeds the drain bound; clamped"
         );
-        drain_ms
-    } else {
-        reg.shutdown_timeout_ms
-    };
+    }
     loop {
         health.record_start(reg.name, restarts);
         tracing::info!(
@@ -479,6 +513,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn shutdown_wait_is_clamped_strictly_inside_the_drain_window() {
+        let drain_ms = 10_000;
+        // A request equal to the drain bound is the failure case: the grace
+        // wait would consume the whole window with no time left for the
+        // abort and terminal state record.
+        assert_eq!(
+            clamped_shutdown_wait_ms(drain_ms, drain_ms),
+            drain_ms - SHUTDOWN_DRAIN_MARGIN_MS
+        );
+        assert_eq!(
+            clamped_shutdown_wait_ms(u64::MAX, drain_ms),
+            drain_ms - SHUTDOWN_DRAIN_MARGIN_MS
+        );
+        // Requests already inside the bound pass through unchanged.
+        assert_eq!(clamped_shutdown_wait_ms(100, drain_ms), 100);
+        assert_eq!(
+            clamped_shutdown_wait_ms(drain_ms - SHUTDOWN_DRAIN_MARGIN_MS, drain_ms),
+            drain_ms - SHUTDOWN_DRAIN_MARGIN_MS
+        );
+        // A drain window smaller than the margin degrades to an immediate
+        // abort rather than underflowing.
+        assert_eq!(
+            clamped_shutdown_wait_ms(100, SHUTDOWN_DRAIN_MARGIN_MS / 2),
+            0
+        );
+    }
+
     #[tokio::test]
     async fn empty_registration_set_is_a_no_op() {
         let (_f, db) = tmp_db();
@@ -487,6 +549,67 @@ mod tests {
         let started = start_components(&[], &server, CancellationToken::new(), health.clone());
         assert_eq!(started, 0);
         assert!(health.snapshot().is_empty());
+    }
+
+    static DUP_A_RUNS: AtomicU32 = AtomicU32::new(0);
+    static DUP_B_RUNS: AtomicU32 = AtomicU32::new(0);
+    fn dup_a(_ctx: HostContext) -> ComponentFuture {
+        Box::pin(async {
+            DUP_A_RUNS.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+    }
+    fn dup_b(_ctx: HostContext) -> ComponentFuture {
+        Box::pin(async {
+            DUP_B_RUNS.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+    }
+
+    #[tokio::test]
+    async fn duplicate_names_are_flagged_but_both_components_still_start() {
+        static REG_A: DaemonComponentRegistration = DaemonComponentRegistration {
+            name: "test-dup",
+            restart: RestartClass::Never,
+            max_restarts: 0,
+            backoff_initial_ms: 1,
+            backoff_max_ms: 2,
+            shutdown_timeout_ms: 100,
+            start: dup_a,
+        };
+        static REG_B: DaemonComponentRegistration = DaemonComponentRegistration {
+            name: "test-dup",
+            restart: RestartClass::Never,
+            max_restarts: 0,
+            backoff_initial_ms: 1,
+            backoff_max_ms: 2,
+            shutdown_timeout_ms: 100,
+            start: dup_b,
+        };
+        let (_f, db) = tmp_db();
+        let server = make_server(&db).await;
+        let health = HealthReporter::default();
+        let started = start_components(
+            &[&REG_A, &REG_B],
+            &server,
+            CancellationToken::new(),
+            health.clone(),
+        );
+        assert_eq!(started, 2);
+        // The collision is reported (error log), never resolved by dropping a
+        // registration: both components must run.
+        wait_for_state(&health, "test-dup", ComponentState::Stopped).await;
+        for _ in 0..400 {
+            if DUP_A_RUNS.load(Ordering::SeqCst) == 1 && DUP_B_RUNS.load(Ordering::SeqCst) == 1 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!(
+            "both duplicate-named components should have started; a={} b={}",
+            DUP_A_RUNS.load(Ordering::SeqCst),
+            DUP_B_RUNS.load(Ordering::SeqCst)
+        );
     }
 
     static CLEAN_RUNS: AtomicU32 = AtomicU32::new(0);
