@@ -9,8 +9,8 @@ use khive_db::StorageBackend;
 #[cfg(test)]
 use khive_gate::AllowAllGate;
 use khive_gate::GateRequest;
-use khive_storage::{EntityStore, EventStore, GraphStore, NoteStore, SqlAccess};
-use khive_types::{EdgeEndpointRule, Namespace};
+use khive_storage::{EntityStore, Event, EventStore, GraphStore, NoteStore, SqlAccess};
+use khive_types::{EdgeEndpointRule, EventKind, Namespace, SubstrateKind};
 use lattice_embed::{EmbeddingModel, EmbeddingService};
 
 use crate::config::{
@@ -817,6 +817,22 @@ impl KhiveRuntime {
     /// First call for any name loads the underlying service (cold start cost);
     /// subsequent calls are cheap (registry caches the `Arc`).
     pub async fn embedder(&self, name: &str) -> RuntimeResult<Arc<dyn EmbeddingService>> {
+        self.embedder_inner(name, None).await
+    }
+
+    pub(crate) async fn embedder_with_token(
+        &self,
+        token: &NamespaceToken,
+        name: &str,
+    ) -> RuntimeResult<Arc<dyn EmbeddingService>> {
+        self.embedder_inner(name, Some(token)).await
+    }
+
+    async fn embedder_inner(
+        &self,
+        name: &str,
+        token: Option<&NamespaceToken>,
+    ) -> RuntimeResult<Arc<dyn EmbeddingService>> {
         // Fall back to the literal name (not the alias table) so custom
         // providers registered with non-lattice names stay reachable.
         let canonical_key = match parse_embedding_model_alias(name) {
@@ -833,7 +849,43 @@ impl KhiveRuntime {
                 .get_entry(&canonical_key)
                 .ok_or_else(|| crate::RuntimeError::UnknownModel(name.to_string()))?
         };
-        entry.resolve().await
+        let (service, init_duration_us) = entry.resolve().await?;
+        if let Some(duration_us) = init_duration_us {
+            if let Some(token) = token {
+                self.emit_embedder_initialized(token, &canonical_key, duration_us)
+                    .await;
+            } else if let Ok(token) = self.authorize(self.config.default_namespace.clone()) {
+                self.emit_embedder_initialized(&token, &canonical_key, duration_us)
+                    .await;
+            }
+        }
+        Ok(service)
+    }
+
+    async fn emit_embedder_initialized(
+        &self,
+        token: &NamespaceToken,
+        model_name: &str,
+        duration_us: i64,
+    ) {
+        let Ok(store) = self.events(token) else {
+            return;
+        };
+        let event = Event::new(
+            token.namespace().as_str(),
+            "embedder.init",
+            EventKind::EmbedderInitialized,
+            SubstrateKind::Event,
+            format!("{}:{}", token.actor().kind, token.actor().id),
+        )
+        .with_payload(serde_json::json!({
+            "model_name": model_name,
+            "duration_us": duration_us,
+        }))
+        .with_duration_us(duration_us);
+        if let Err(err) = store.append_event(event).await {
+            tracing::warn!(error = %err, model_name, "embedder initialization event append failed");
+        }
     }
 
     /// Register a custom embedding provider with this runtime.

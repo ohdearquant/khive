@@ -2155,9 +2155,13 @@ async fn note_create_blocks_path_dressed_base64_credential_in_value_syntax() {
 mod embedder_registry_tests {
     use async_trait::async_trait;
     use khive_gate::AllowAllGate;
-    use khive_runtime::{EmbedderProvider, KhiveRuntime, RuntimeConfig, RuntimeError};
-    use khive_types::Namespace;
+    use khive_runtime::{
+        EmbedderProvider, KhiveRuntime, NamespaceToken, PackRuntime, RequestIdentity,
+        RuntimeConfig, RuntimeError, VerbRegistry, VerbRegistryBuilder,
+    };
+    use khive_types::{HandlerDef, Namespace, Pack, VerbCategory, Visibility};
     use lattice_embed::{EmbeddingModel, EmbeddingService};
+    use serde_json::Value;
     use std::sync::Arc;
 
     // ── MockEmbedderProvider ─────────────────────────────────────────────────
@@ -2214,7 +2218,65 @@ mod embedder_registry_tests {
         }
 
         async fn build(&self) -> Result<Arc<dyn EmbeddingService>, RuntimeError> {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             Ok(Arc::new(MockEmbeddingService { dims: self.dims }))
+        }
+    }
+
+    struct EmbedderInitPack {
+        runtime: KhiveRuntime,
+    }
+
+    impl Pack for EmbedderInitPack {
+        const NAME: &'static str = "embedder-init-test";
+        const NOTE_KINDS: &'static [&'static str] = &[];
+        const ENTITY_KINDS: &'static [&'static str] = &["concept"];
+        const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
+            name: "initialize_embedder",
+            description: "initialize the test embedder",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Commissive,
+            params: &[],
+        }];
+    }
+
+    #[async_trait]
+    impl PackRuntime for EmbedderInitPack {
+        fn name(&self) -> &str {
+            Self::NAME
+        }
+
+        fn note_kinds(&self) -> &'static [&'static str] {
+            Self::NOTE_KINDS
+        }
+
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            Self::ENTITY_KINDS
+        }
+
+        fn handlers(&self) -> &'static [HandlerDef] {
+            Self::HANDLERS
+        }
+
+        async fn dispatch(
+            &self,
+            _verb: &str,
+            _params: Value,
+            _registry: &VerbRegistry,
+            token: &NamespaceToken,
+        ) -> Result<Value, RuntimeError> {
+            self.runtime
+                .create_entity(
+                    token,
+                    "concept",
+                    None,
+                    "embedder initialization trigger",
+                    None,
+                    None,
+                    vec![],
+                )
+                .await?;
+            Ok(Value::Null)
         }
     }
 
@@ -2263,6 +2325,95 @@ mod embedder_registry_tests {
     }
 
     // ── Test: registered names include custom provider ────────────────────────
+
+    #[tokio::test]
+    async fn embedder_initialization_writes_event() {
+        let rt = memory_rt_no_model();
+        let token = rt
+            .authorize(Namespace::local())
+            .expect("authorize local namespace");
+        let event_store = rt.events(&token).expect("event store must be available");
+        rt.register_embedder(MockEmbedderProvider::new("event-test-encoder", 64));
+
+        rt.embedder("event-test-encoder")
+            .await
+            .expect("embedder initialization must succeed");
+
+        let page = event_store
+            .query_events(
+                khive_storage::EventFilter::default(),
+                khive_storage::PageRequest {
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .await
+            .expect("query embedder initialization event");
+        let event = page
+            .items
+            .iter()
+            .find(|event| event.verb == "embedder.init")
+            .expect("embedder initialization event must be written");
+
+        assert_eq!(event.kind, khive_types::EventKind::EmbedderInitialized);
+        assert_eq!(event.payload["model_name"], "event-test-encoder");
+        let duration_us = event.payload["duration_us"]
+            .as_i64()
+            .expect("duration_us must be an integer");
+        assert!(duration_us > 0);
+        assert_eq!(event.duration_us, duration_us);
+    }
+
+    #[tokio::test]
+    async fn embedder_initialization_uses_triggering_request_identity() {
+        let rt = memory_rt_no_model();
+        rt.register_embedder(MockEmbedderProvider::new("request-identity-encoder", 64));
+        let tenant = Namespace::parse("tenant-request").expect("valid tenant namespace");
+        let event_store = rt
+            .events(&rt.authorize(tenant.clone()).expect("authorize tenant"))
+            .expect("event store must be available");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(EmbedderInitPack {
+            runtime: rt.clone(),
+        });
+        builder.with_default_namespace("baked-namespace");
+        builder.with_actor_id(Some("baked-actor".to_string()));
+        let registry = builder.build().expect("registry builds");
+
+        registry
+            .dispatch_with_identity(
+                "initialize_embedder",
+                serde_json::json!({"namespace": tenant.as_str()}),
+                Some(RequestIdentity {
+                    namespace: tenant.as_str().to_string(),
+                    actor_id: Some("request-actor".to_string()),
+                    visible_namespaces: vec![],
+                    request_id: None,
+                }),
+            )
+            .await
+            .expect("request-triggered embedder initialization must succeed");
+
+        let page = event_store
+            .query_events(
+                khive_storage::EventFilter::default(),
+                khive_storage::PageRequest {
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .await
+            .expect("query embedder initialization event");
+        let event = page
+            .items
+            .iter()
+            .find(|event| event.verb == "embedder.init")
+            .expect("embedder initialization event must be written");
+
+        assert_eq!(event.namespace, tenant.as_str());
+        assert_eq!(event.actor, "actor:request-actor");
+    }
 
     #[tokio::test]
     async fn registered_names_includes_custom_provider() {

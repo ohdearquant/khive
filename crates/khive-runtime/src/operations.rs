@@ -1158,7 +1158,7 @@ impl KhiveRuntime {
         if embed_model_names.len() == 1 {
             let model_name = &embed_model_names[0];
             let vec_result = self
-                .embed_document_with_model(model_name, &embed_body)
+                .embed_document_with_model_for_token(token, model_name, &embed_body)
                 .await;
 
             #[cfg(any(test, feature = "fault-injection"))]
@@ -1222,8 +1222,9 @@ impl KhiveRuntime {
                 let text = body_owned.clone();
                 let name = model_name.clone();
                 let ctx = usage_ctx.clone();
+                let token = (*token).clone();
                 join_set.spawn(async move {
-                    let fut = rt.embed_document_with_model(&name, &text);
+                    let fut = rt.embed_document_with_model_for_token(&token, &name, &text);
                     let result = match ctx {
                         Some(ctx) => crate::usage::scope(ctx, fut).await,
                         None => fut.await,
@@ -2911,7 +2912,7 @@ impl KhiveRuntime {
         let embed_model_names = self.registered_embedding_model_names();
         for model_name in &embed_model_names {
             match self
-                .embed_document_with_model(model_name, &note_embedding_text(&note))
+                .embed_document_with_model_for_token(token, model_name, &note_embedding_text(&note))
                 .await
             {
                 Ok(vector) => {
@@ -3113,7 +3114,9 @@ impl KhiveRuntime {
         if embed_model_names.len() == 1 {
             // Single-model path: preserves original sequential behaviour.
             let model_name = &embed_model_names[0];
-            let vec_result = self.embed_document_with_model(model_name, embed_text).await;
+            let vec_result = self
+                .embed_document_with_model_for_token(token, model_name, embed_text)
+                .await;
 
             // Injection: check VECTOR_FAIL_NS (armed by `arm_vector_fail_scoped(ns)`) or
             // VECTOR_FAIL_AFTER (armed by `arm_vector_fail_after(n)`). The former
@@ -3188,8 +3191,9 @@ impl KhiveRuntime {
                 let text = content_owned.clone();
                 let name = model_name.clone();
                 let ctx = usage_ctx.clone();
+                let token = (*token).clone();
                 join_set.spawn(async move {
-                    let fut = rt.embed_document_with_model(&name, &text);
+                    let fut = rt.embed_document_with_model_for_token(&token, &name, &text);
                     let result = match ctx {
                         Some(ctx) => crate::usage::scope(ctx, fut).await,
                         None => fut.await,

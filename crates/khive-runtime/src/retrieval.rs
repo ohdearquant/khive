@@ -175,8 +175,31 @@ impl KhiveRuntime {
         model_name: &str,
         text: &str,
     ) -> RuntimeResult<Vec<f32>> {
+        self.embed_document_with_model_inner(None, model_name, text)
+            .await
+    }
+
+    pub(crate) async fn embed_document_with_model_for_token(
+        &self,
+        token: &NamespaceToken,
+        model_name: &str,
+        text: &str,
+    ) -> RuntimeResult<Vec<f32>> {
+        self.embed_document_with_model_inner(Some(token), model_name, text)
+            .await
+    }
+
+    async fn embed_document_with_model_inner(
+        &self,
+        token: Option<&NamespaceToken>,
+        model_name: &str,
+        text: &str,
+    ) -> RuntimeResult<Vec<f32>> {
         let model = parse_embedding_model_alias(model_name);
-        let service = self.embedder(model_name).await?;
+        let service = match token {
+            Some(token) => self.embedder_with_token(token, model_name).await?,
+            None => self.embedder(model_name).await?,
+        };
         let emb_model = model.unwrap_or_default();
         let (text, _) = bounded_embedding_input(text, document_embedding_budget(model_name));
         // Issued-at-dispatch: counted before the await — see embed_with_model.
@@ -205,8 +228,31 @@ impl KhiveRuntime {
         model_name: &str,
         text: &str,
     ) -> RuntimeResult<Vec<f32>> {
+        self.embed_query_with_model_inner(None, model_name, text)
+            .await
+    }
+
+    pub(crate) async fn embed_query_with_model_for_token(
+        &self,
+        token: &NamespaceToken,
+        model_name: &str,
+        text: &str,
+    ) -> RuntimeResult<Vec<f32>> {
+        self.embed_query_with_model_inner(Some(token), model_name, text)
+            .await
+    }
+
+    async fn embed_query_with_model_inner(
+        &self,
+        token: Option<&NamespaceToken>,
+        model_name: &str,
+        text: &str,
+    ) -> RuntimeResult<Vec<f32>> {
         let model = parse_embedding_model_alias(model_name);
-        let service = self.embedder(model_name).await?;
+        let service = match token {
+            Some(token) => self.embedder_with_token(token, model_name).await?,
+            None => self.embedder(model_name).await?,
+        };
         let texts = [text.to_string()];
         let emb_model = model.unwrap_or_default();
         // Issued-at-dispatch: counted before the await — see embed_with_model.
@@ -250,6 +296,19 @@ impl KhiveRuntime {
             return Err(RuntimeError::Unconfigured("embedding_model".into()));
         }
         self.embed_query_with_model(model_name, text).await
+    }
+
+    async fn embed_query_for_token(
+        &self,
+        token: &NamespaceToken,
+        text: &str,
+    ) -> RuntimeResult<Vec<f32>> {
+        let model_name = self.default_embedder_name();
+        if model_name.is_empty() {
+            return Err(RuntimeError::Unconfigured("embedding_model".into()));
+        }
+        self.embed_query_with_model_for_token(token, model_name, text)
+            .await
     }
 
     /// Generate embeddings for multiple texts in one call using the configured default model.
@@ -425,7 +484,7 @@ impl KhiveRuntime {
                         "query_text must not be empty".into(),
                     ));
                 }
-                self.embed_query(text).await?
+                self.embed_query_for_token(token, text).await?
             }
         };
 
@@ -838,7 +897,10 @@ impl KhiveRuntime {
                         continue;
                     }
 
-                    match self.embed_document_with_model(model_name, &desc).await {
+                    match self
+                        .embed_document_with_model_for_token(token, model_name, &desc)
+                        .await
+                    {
                         Ok(vector) => {
                             if let Ok(vs) = self.vectors_for_model(token, model_name) {
                                 match vs
@@ -965,7 +1027,10 @@ impl KhiveRuntime {
                     }
 
                     let content = note.content.clone();
-                    match self.embed_document_with_model(model_name, &content).await {
+                    match self
+                        .embed_document_with_model_for_token(token, model_name, &content)
+                        .await
+                    {
                         Ok(vector) => {
                             if let Ok(vs) = self.vectors_for_model(token, model_name) {
                                 match vs
