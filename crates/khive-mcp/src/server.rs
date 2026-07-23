@@ -2360,7 +2360,17 @@ fn fit_rendered_batch_envelope(
 fn frame_budget_omission(entry: &Value) -> Value {
     let ok = entry.get("ok").and_then(Value::as_bool).unwrap_or(false);
     let mut omitted = serde_json::Map::new();
-    for key in ["ok", "tool", "usage", "aborted"] {
+    // partial / missing_backends stay: a degraded search whose result is
+    // omitted is exactly the entry whose degradation advisory the client
+    // still needs, and both fields are far smaller than the omission notice.
+    for key in [
+        "ok",
+        "tool",
+        "usage",
+        "aborted",
+        "partial",
+        "missing_backends",
+    ] {
         if let Some(value) = entry.get(key) {
             omitted.insert(key.to_string(), value.clone());
         }
@@ -2816,6 +2826,35 @@ mod tests {
             &response,
             &server.config_id
         ));
+    }
+
+    #[test]
+    fn frame_budget_omission_preserves_degradation_advisory() {
+        let entry = json!({
+            "ok": true,
+            "tool": "search",
+            "result": {"hits": []},
+            "partial": true,
+            "missing_backends": ["sessions"],
+            "usage": {"embed_calls": 1},
+        });
+        let omitted = frame_budget_omission(&entry);
+        assert!(omitted.get("result").is_none());
+        assert!(omitted.get("result_omitted").is_some());
+        assert_eq!(omitted["partial"], true);
+        assert_eq!(omitted["missing_backends"], json!(["sessions"]));
+    }
+
+    #[test]
+    fn frame_budget_omission_adds_no_advisory_to_complete_entries() {
+        let entry = json!({
+            "ok": true,
+            "tool": "search",
+            "result": {"hits": []},
+        });
+        let omitted = frame_budget_omission(&entry);
+        assert!(omitted.get("partial").is_none());
+        assert!(omitted.get("missing_backends").is_none());
     }
 
     #[test]
