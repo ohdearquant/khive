@@ -215,16 +215,6 @@ async fn serve_holding_sweep(
     result
 }
 
-/// Spawn the daemon-resident schedule-event tick loop (ADR-106) iff `args`
-/// indicates this process is the daemon (mirrors the daemon-role gate
-/// pattern used by the (now-extracted) channel loops, #602). `schedule_rt`
-/// MUST be the daemon's own already-resolved `"schedule"`-pack runtime
-/// (never a fresh `RuntimeConfig`, PR #782); `None` means either this isn't
-/// the daemon role or the pack set has no `"schedule"`. `server` MUST be the
-/// daemon's own live `KhiveMcpServer`, cloned for action-dispatch only — a
-/// throwaway server built from `schedule_rt` alone would misroute replayed
-/// actions in a multi-backend deployment. See
-/// `crates/khive-mcp/docs/api/pending-events.md`.
 /// Start ADR-119 daemon components in daemon role only. Non-daemon roles
 /// must not start components and stay byte-identical in behavior and output
 /// — the silent return keeps client runs unchanged. In daemon role the
@@ -237,6 +227,16 @@ fn start_daemon_components_if_daemon(args: &Args, server: &KhiveMcpServer) {
     crate::components::start_daemon_components(server);
 }
 
+/// Spawn the daemon-resident schedule-event tick loop (ADR-106) iff `args`
+/// indicates this process is the daemon (mirrors the daemon-role gate
+/// pattern used by the (now-extracted) channel loops, #602). `schedule_rt`
+/// MUST be the daemon's own already-resolved `"schedule"`-pack runtime
+/// (never a fresh `RuntimeConfig`, PR #782); `None` means either this isn't
+/// the daemon role or the pack set has no `"schedule"`. `server` MUST be the
+/// daemon's own live `KhiveMcpServer`, cloned for action-dispatch only — a
+/// throwaway server built from `schedule_rt` alone would misroute replayed
+/// actions in a multi-backend deployment. See
+/// `crates/khive-mcp/docs/api/pending-events.md`.
 fn spawn_schedule_tick_loop_if_daemon(
     args: &Args,
     server: &KhiveMcpServer,
