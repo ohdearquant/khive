@@ -390,6 +390,65 @@ async fn fan_out_partial_failure_preserves_working_backend_hits() {
     );
 }
 
+#[tokio::test]
+async fn panicked_backend_leg_surfaces_degradation_advisory() {
+    let rt_alpha = memory_runtime();
+    let rt_beta = memory_runtime();
+    let ns = RuntimeNamespace::local();
+
+    let beta_token = rt_beta.authorize(ns.clone()).unwrap();
+    rt_beta
+        .create_entity(
+            &beta_token,
+            "concept",
+            None,
+            "JoinedFailureProbe",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create entity on working backend");
+
+    let registry = packs_registry(Arc::clone(&rt_alpha), &["kg"]);
+    let note_kinds = registry
+        .all_note_kinds()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let mut backend_registry = BackendRegistry::new();
+    backend_registry.register(BackendId::new("alpha"), rt_alpha);
+    backend_registry.register(BackendId::new("beta"), rt_beta);
+    let coordinator = SubstrateCoordinator::new(backend_registry).with_panicking_backend("alpha");
+    let service = SubstrateCoordinatorService::new(coordinator, note_kinds);
+    let server = khive_mcp::server::KhiveMcpServer::from_registry_with_meta(
+        registry,
+        "local",
+        "test-panicked-backend",
+    )
+    .with_coordinator(Arc::new(service) as Arc<dyn khive_mcp::coordinator::CoordinatorService>);
+
+    let response = server
+        .dispatch_request_local(khive_mcp::tools::request::RequestParams {
+            ops: r#"search(kind="concept", query="JoinedFailureProbe")"#.to_string(),
+            presentation: None,
+            presentation_per_op: None,
+            save_to: None,
+            format: None,
+            format_per_op: None,
+            request_id: None,
+        })
+        .await
+        .expect("search dispatch succeeds with degraded results");
+    let envelope: serde_json::Value = serde_json::from_str(&response).expect("response is JSON");
+    let operation = &envelope["results"][0];
+
+    assert_eq!(operation["ok"], true);
+    assert_eq!(operation["partial"], true);
+    assert_eq!(operation["missing_backends"], serde_json::json!(["alpha"]));
+    assert_eq!(operation["result"].as_array().map(Vec::len), Some(1));
+}
+
 // ---- D2: note-locate regression test ----
 
 /// `locate` must resolve note UUIDs in addition to entity UUIDs.

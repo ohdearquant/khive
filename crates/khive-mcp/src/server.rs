@@ -35,6 +35,27 @@ use khive_storage::EdgeRelation;
 use crate::coordinator::CoordinatorService;
 use crate::tools::request::RequestParams;
 
+struct OpSuccess {
+    result: Value,
+    partial: bool,
+    missing_backends: Vec<String>,
+}
+
+/// Side-channel slot for the coordinator degradation advisory
+/// `(partial, missing_backends)`, written inside a registry dispatch
+/// closure and read after it returns.
+type DegradationSlot = std::sync::Arc<std::sync::Mutex<Option<(bool, Vec<String>)>>>;
+
+impl OpSuccess {
+    fn complete(result: Value) -> Self {
+        Self {
+            result,
+            partial: false,
+            missing_backends: Vec::new(),
+        }
+    }
+}
+
 /// Per-request parallelism stays bounded even when the parser accepts 100 ops; must be nonzero.
 const MAX_BATCH_CONCURRENCY: usize = 8;
 
@@ -533,7 +554,7 @@ impl KhiveMcpServer {
     /// - args cannot be extracted for coordinator dispatch (e.g. non-UUID source/target)
     ///
     /// Result semantics mirror the per-op envelope from the registry:
-    /// `Ok(Value)` → success payload (caller wraps in `{ok:true, tool, result}`).
+    /// `Ok(OpSuccess)` → success payload and any coordinator advisory fields.
     /// `Err((tool, error_value))` → error payload (caller wraps in `{ok:false, tool, error}`).
     ///
     /// `identity` mirrors the override [`Self::dispatch_op`] applies to the
@@ -546,7 +567,7 @@ impl KhiveMcpServer {
         tool: &str,
         args_value: &Value,
         identity: Option<&khive_runtime::RequestIdentity>,
-    ) -> Option<Result<Value, (String, Value)>> {
+    ) -> Option<Result<OpSuccess, (String, Value)>> {
         let coord = self.coordinator.as_ref()?;
         if coord.is_single_backend() {
             return None;
@@ -815,7 +836,7 @@ impl KhiveMcpServer {
             .dispatch_with_identity(&tool, args_value, identity.cloned())
             .await
         {
-            Ok(result) => chain_ok_envelope_or_depth_error(tool, result),
+            Ok(result) => chain_ok_envelope_or_depth_error(tool, OpSuccess::complete(result)),
             Err(RuntimeError::Khive(k)) => {
                 let error_payload = serde_json::to_value(&k)
                     .unwrap_or_else(|_| json!({ "kind": "internal", "message": k.to_string() }));
@@ -852,7 +873,10 @@ impl KhiveMcpServer {
     /// already carry this information, but a caller that checks only for the
     /// absence of a top-level RPC error has nothing to branch on. `"partial"`
     /// means at least one op in this response failed or was aborted;
-    /// `"success"` means every op in `results` reports `ok: true`.
+    /// `"success"` means every op in `results` reports `ok: true`. A successful
+    /// but incomplete backend fan-out instead carries `partial: true` and
+    /// `missing_backends` on that operation's entry without changing its
+    /// canonical `result` shape.
     async fn run_parsed(
         &self,
         ops: Vec<ParsedOp>,
@@ -1039,7 +1063,7 @@ impl KhiveMcpServer {
                         {
                             Ok(result) => present_ok_envelope_or_depth_error(
                                 tool,
-                                result,
+                                OpSuccess::complete(result),
                                 effective_mode,
                                 now_unix,
                             ),
@@ -1173,7 +1197,7 @@ impl KhiveMcpServer {
 
 /// Route a `link` or `search` verb through `coord` when in multi-backend mode.
 /// Shared logic behind both dispatch sites (`dispatch_op` chain mode and the
-/// parallel/single closure in `run_parsed`). Returns `Some(Ok(Value))` when
+/// parallel/single closure in `run_parsed`). Returns `Some(Ok(OpSuccess))` when
 /// the coordinator handled the op, `Some(Err((tool, error_value)))` on a
 /// coordinator error (including fail-closed namespace rejection), `None` to
 /// fall through to the registry. Must apply the exact same fail-closed
@@ -1185,7 +1209,7 @@ async fn dispatch_via_coordinator_inner(
     tool: &str,
     args_value: &Value,
     identity: Option<&khive_runtime::RequestIdentity>,
-) -> Option<Result<Value, (String, Value)>> {
+) -> Option<Result<OpSuccess, (String, Value)>> {
     // Only link/search are ever intercepted here.
     if !matches!(tool, "link" | "search") {
         return None;
@@ -1235,11 +1259,24 @@ async fn dispatch_via_coordinator_inner(
                     },
                 )
                 .await;
-            Some(result.map_err(|error| runtime_error_payload(tool, error)))
+            // Link is written to exactly one backend — no fan-out, so no
+            // degradation advisory to carry; the envelope is always complete.
+            Some(
+                result
+                    .map(OpSuccess::complete)
+                    .map_err(|error| runtime_error_payload(tool, error)),
+            )
         }
         "search" => {
             let kind = args_value.get("kind")?.as_str()?;
             let query = args_value.get("query")?.as_str()?;
+            // The degradation advisory (partial / missing_backends) is computed
+            // from the coordinator result INSIDE the dispatch closure, but the
+            // OpSuccess envelope is assembled outside it — the registry closure
+            // contract returns a bare result Value. Side-channel the advisory
+            // through a captured slot; the closure runs at most once per call.
+            let degradation = DegradationSlot::default();
+            let degradation_w = std::sync::Arc::clone(&degradation);
             let result = registry
                 .dispatch_intercepted_with_identity(
                     tool,
@@ -1321,6 +1358,21 @@ async fn dispatch_via_coordinator_inner(
                             )
                             .await;
 
+                        // Record the degradation advisory (#1233): failed
+                        // backend legs are surfaced beside the merged result,
+                        // never silently dropped from a successful op.
+                        let mut missing_backends: Vec<String> = coord_result
+                            .per_backend
+                            .iter()
+                            .filter(|backend| backend.error.is_some())
+                            .map(|backend| backend.backend_id.as_str().to_string())
+                            .collect();
+                        missing_backends.sort();
+                        missing_backends.dedup();
+                        let partial = coord_result.partial || !missing_backends.is_empty();
+                        *degradation_w.lock().expect("degradation slot poisoned") =
+                            Some((partial, missing_backends));
+
                         // Shape result to match the kg search handler's output fields exactly.
                         // Entity hits: [{id, entity_kind, score, title, snippet}]
                         //   - entity_kind: real kind string fetched from the owning backend
@@ -1374,7 +1426,25 @@ async fn dispatch_via_coordinator_inner(
                     },
                 )
                 .await;
-            Some(result.map_err(|error| runtime_error_payload(tool, error)))
+            Some(match result {
+                Ok(result_val) => {
+                    // The slot is written on every path that produced a result
+                    // Value; a registry-level rejection (namespace, identity)
+                    // errors before the closure runs, in which case there is
+                    // no advisory to read.
+                    let (partial, missing_backends) = degradation
+                        .lock()
+                        .expect("degradation slot poisoned")
+                        .take()
+                        .unwrap_or((false, Vec::new()));
+                    Ok(OpSuccess {
+                        result: result_val,
+                        partial,
+                        missing_backends,
+                    })
+                }
+                Err(error) => Err(runtime_error_payload(tool, error)),
+            })
         }
         _ => None,
     }
@@ -1417,11 +1487,24 @@ fn depth_error_payload(context: &str) -> Value {
 /// without re-serializing an already-owned `Value` through `json!` (which
 /// would call `serde_json::to_value` and recurse over the whole tree
 /// again). The depth check must already have passed before this is called.
-fn ok_envelope(tool: String, result: Value) -> Value {
-    let mut map = serde_json::Map::with_capacity(3);
+fn ok_envelope(tool: String, success: OpSuccess) -> Value {
+    let mut map = serde_json::Map::with_capacity(if success.partial { 5 } else { 3 });
     map.insert("ok".to_string(), Value::Bool(true));
     map.insert("tool".to_string(), Value::String(tool));
-    map.insert("result".to_string(), result);
+    map.insert("result".to_string(), success.result);
+    if success.partial {
+        map.insert("partial".to_string(), Value::Bool(true));
+        map.insert(
+            "missing_backends".to_string(),
+            Value::Array(
+                success
+                    .missing_backends
+                    .into_iter()
+                    .map(Value::String)
+                    .collect(),
+            ),
+        );
+    }
     Value::Object(map)
 }
 
@@ -1500,15 +1583,18 @@ fn stamp_usage(entry: &mut Value, ctx: &khive_runtime::usage::UsageContext) {
 /// wrapped in the response envelope. On violation returns a `result_too_deep`
 /// error that does not embed the oversized value, and discards the rejected
 /// value iteratively so its own drop can't overflow the stack either.
-fn chain_ok_envelope_or_depth_error(tool: String, result: Value) -> Result<Value, (String, Value)> {
-    if !result_within_depth_limit(&result) {
-        drop_value_iteratively(result);
+fn chain_ok_envelope_or_depth_error(
+    tool: String,
+    success: OpSuccess,
+) -> Result<Value, (String, Value)> {
+    if !result_within_depth_limit(&success.result) {
+        drop_value_iteratively(success.result);
         return Err((
             tool,
             depth_error_payload("; cannot be used as $prev chain context"),
         ));
     }
-    Ok(ok_envelope(tool, result))
+    Ok(ok_envelope(tool, success))
 }
 
 /// Parallel/single-mode success path: check the raw handler `result` against
@@ -1519,16 +1605,16 @@ fn chain_ok_envelope_or_depth_error(tool: String, result: Value) -> Result<Value
 /// (see [`drop_value_iteratively`]).
 fn present_ok_envelope_or_depth_error(
     tool: String,
-    result: Value,
+    mut success: OpSuccess,
     mode: PresentationMode,
     now_unix: i64,
 ) -> Value {
-    if !result_within_depth_limit(&result) {
-        drop_value_iteratively(result);
+    if !result_within_depth_limit(&success.result) {
+        drop_value_iteratively(success.result);
         return json!({ "ok": false, "tool": tool, "error": depth_error_payload("") });
     }
-    let presented = present(result, mode, now_unix);
-    ok_envelope(tool, presented)
+    success.result = present(success.result, mode, now_unix);
+    ok_envelope(tool, success)
 }
 
 /// Returns `true` if a dispatched op's canonical `result` field nests
@@ -1635,6 +1721,8 @@ Parallel: a failed op does NOT abort siblings. Chain: failure aborts remaining
 ops (reported as {"ok": false, "aborted": true}). Committed ops are not rolled back.
 `status` is "partial" whenever summary.failed or summary.aborted is non-zero — check
 it (or summary) rather than relying on the absence of a top-level error.
+Successful backend fan-out degradation is reported separately on the affected op as
+`"partial": true, "missing_backends": [...]`; its `result` keeps the verb's normal shape.
 
 Verb discovery: install the `kg` / `gtd` plugins for usage skills. The verbs
 currently registered on this server (pack-derived) are listed below. Argument
@@ -2272,7 +2360,17 @@ fn fit_rendered_batch_envelope(
 fn frame_budget_omission(entry: &Value) -> Value {
     let ok = entry.get("ok").and_then(Value::as_bool).unwrap_or(false);
     let mut omitted = serde_json::Map::new();
-    for key in ["ok", "tool", "usage", "aborted"] {
+    // partial / missing_backends stay: a degraded search whose result is
+    // omitted is exactly the entry whose degradation advisory the client
+    // still needs, and both fields are far smaller than the omission notice.
+    for key in [
+        "ok",
+        "tool",
+        "usage",
+        "aborted",
+        "partial",
+        "missing_backends",
+    ] {
         if let Some(value) = entry.get(key) {
             omitted.insert(key.to_string(), value.clone());
         }
@@ -2731,6 +2829,35 @@ mod tests {
     }
 
     #[test]
+    fn frame_budget_omission_preserves_degradation_advisory() {
+        let entry = json!({
+            "ok": true,
+            "tool": "search",
+            "result": {"hits": []},
+            "partial": true,
+            "missing_backends": ["sessions"],
+            "usage": {"embed_calls": 1},
+        });
+        let omitted = frame_budget_omission(&entry);
+        assert!(omitted.get("result").is_none());
+        assert!(omitted.get("result_omitted").is_some());
+        assert_eq!(omitted["partial"], true);
+        assert_eq!(omitted["missing_backends"], json!(["sessions"]));
+    }
+
+    #[test]
+    fn frame_budget_omission_adds_no_advisory_to_complete_entries() {
+        let entry = json!({
+            "ok": true,
+            "tool": "search",
+            "result": {"hits": []},
+        });
+        let omitted = frame_budget_omission(&entry);
+        assert!(omitted.get("partial").is_none());
+        assert!(omitted.get("missing_backends").is_none());
+    }
+
+    #[test]
     fn auto_rendered_batch_stays_within_daemon_frame_cap() {
         let mut leaves = serde_json::Map::new();
         for index in 0..80_000 {
@@ -3158,8 +3285,11 @@ mod tests {
         // this value would be a real stack risk; the guard must reject it
         // via the iterative checker without ever attempting that recursion.
         let pathological = nest_object(khive_request::NESTING_DEPTH_LIMIT + 50_000, json!(true));
-        let err = chain_ok_envelope_or_depth_error("traverse".to_string(), pathological)
-            .expect_err("over-limit result must be rejected, not enveloped");
+        let err = chain_ok_envelope_or_depth_error(
+            "traverse".to_string(),
+            OpSuccess::complete(pathological),
+        )
+        .expect_err("over-limit result must be rejected, not enveloped");
         assert_eq!(err.0, "traverse");
         assert_eq!(err.1["kind"], json!("result_too_deep"));
         // The error payload must never embed the oversized value itself.
@@ -3170,8 +3300,11 @@ mod tests {
     #[test]
     fn chain_seam_accepts_at_limit_result_and_moves_value_without_reserializing() {
         let at_limit = nest_object(khive_request::NESTING_DEPTH_LIMIT, json!("leaf"));
-        let envelope = chain_ok_envelope_or_depth_error("get".to_string(), at_limit.clone())
-            .expect("result at exactly the limit must be accepted");
+        let envelope = chain_ok_envelope_or_depth_error(
+            "get".to_string(),
+            OpSuccess::complete(at_limit.clone()),
+        )
+        .expect("result at exactly the limit must be accepted");
         assert_eq!(envelope["ok"], json!(true));
         assert_eq!(envelope["tool"], json!("get"));
         assert_eq!(envelope["result"], at_limit);
@@ -3182,7 +3315,7 @@ mod tests {
         let pathological = nest_object(khive_request::NESTING_DEPTH_LIMIT + 50_000, json!(true));
         let envelope = present_ok_envelope_or_depth_error(
             "context".to_string(),
-            pathological,
+            OpSuccess::complete(pathological),
             PresentationMode::Agent,
             0,
         );
@@ -3197,7 +3330,7 @@ mod tests {
         let shallow = json!({"id": "11111111-1111-1111-1111-111111111111"});
         let envelope = present_ok_envelope_or_depth_error(
             "get".to_string(),
-            shallow,
+            OpSuccess::complete(shallow),
             PresentationMode::Verbose,
             0,
         );
