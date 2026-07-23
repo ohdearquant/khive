@@ -16,14 +16,13 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use khive_mcp::serve::{resolve_runtime_config, RuntimeConfigInputs};
+use khive_runtime::retrieval::{bounded_embedding_input, document_embedding_budget};
 use khive_runtime::{entity_fts_document, note_fts_document, KhiveRuntime, Namespace};
 use khive_storage::entity::Entity;
 use khive_storage::error::StorageError;
 use khive_storage::note::Note;
 use khive_storage::VectorStore;
 use khive_types::SubstrateKind;
-
-const MAX_EMBED_BYTES: usize = 32_768;
 
 // ─── progress bar ─────────────────────────────────────────────────────────────
 
@@ -235,9 +234,8 @@ async fn drop_vectors_for_subjects(
     }
 }
 
-/// Embed `staged` with every model in `model_names` and store one vector record
-/// per model — mirroring the multi-model write path in the runtime. Returns the
-/// number of vector inserts that failed.
+/// Embed one model's bounded `staged` inputs and store its vector records.
+/// Returns the number of vector inserts that failed.
 ///
 /// With `drop_existing`, all staged ids are (re)embedded. Before inserting, a
 /// subject-scoped delete removes ANY existing row for each `subject_id` in the
@@ -246,21 +244,22 @@ async fn drop_vectors_for_subjects(
 /// prior namespace survive. The subsequent INSERT writes the current base-row
 /// namespace. With `--keep-existing`, existing vectors are preserved and ids
 /// already embedded are skipped.
-// REASON: each argument is a distinct embed dimension (runtime, token, models,
+// REASON: each argument is a distinct embed dimension (runtime, token, model,
 // namespace, batch, substrate kind, field, drop flag); a struct would add
 // indirection without grouping anything cohesive.
 #[allow(clippy::too_many_arguments)]
 async fn embed_and_store_batch(
     rt: &KhiveRuntime,
     token: &khive_runtime::NamespaceToken,
-    model_names: &[String],
+    model_name: &str,
     namespace: &str,
-    staged: &[(Uuid, String)],
+    staged: Vec<(Uuid, String)>,
     kind: SubstrateKind,
     field: &str,
     drop_existing: bool,
 ) -> u64 {
     let mut errors: u64 = 0;
+    let staged_len = staged.len();
 
     // Subject-scoped drop: remove ANY existing vec rows for these subject_ids
     // in each model table, regardless of stored namespace. This ensures the
@@ -270,74 +269,115 @@ async fn embed_and_store_batch(
     // stored under a different namespace.
     if drop_existing && !staged.is_empty() {
         let subject_ids: Vec<Uuid> = staged.iter().map(|(id, _)| *id).collect();
-        for model_name in model_names {
-            drop_vectors_for_subjects(rt, token, model_name, &subject_ids).await;
-        }
+        drop_vectors_for_subjects(rt, token, model_name, &subject_ids).await;
     }
 
-    for model_name in model_names {
-        let vectors = match rt.vectors_for_model(token, model_name) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(model = %model_name, error = %e, "vector store unavailable");
-                errors += staged.len() as u64;
-                continue;
-            }
-        };
-
-        // Narrow to the records this model still needs when keeping existing vectors.
-        let subset: Vec<&(Uuid, String)> = if drop_existing {
-            staged.iter().collect()
-        } else {
-            let ids: Vec<Uuid> = staged.iter().map(|(id, _)| *id).collect();
-            match filter_unembedded(vectors.as_ref(), &ids, namespace).await {
-                Ok(unembedded) => {
-                    let keep: HashSet<Uuid> = unembedded.into_iter().collect();
-                    staged.iter().filter(|(id, _)| keep.contains(id)).collect()
-                }
-                Err(e) => {
-                    tracing::error!(model = %model_name, error = %e, "filter_unembedded failed; skipping batch for this model");
-                    errors += staged.len() as u64;
-                    continue;
-                }
-            }
-        };
-        if subset.is_empty() {
-            continue;
+    let vectors = match rt.vectors_for_model(token, model_name) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(model = %model_name, error = %e, "vector store unavailable");
+            return staged_len as u64;
         }
+    };
 
-        let budget = embed_budget(model_name);
-        let texts: Vec<String> = subset
-            .iter()
-            .map(|(_, t)| truncate_text(t, budget))
-            .collect();
-        match rt.embed_document_batch_with_model(model_name, &texts).await {
-            Ok(embeddings) if embeddings.len() == subset.len() => {
-                // No pre-delete: SqliteVecStore::insert wraps DELETE+INSERT in
-                // a single transaction so a failed INSERT rolls back the DELETE
-                // and the prior vector survives (no-worse-than-stale). A separate
-                // committed delete before insert re-introduces the stranding window.
-                for ((id, _), emb) in subset.iter().zip(embeddings.iter()) {
-                    if let Err(e) = vectors
-                        .insert(*id, kind, namespace, field, vec![emb.clone()])
-                        .await
-                    {
-                        tracing::warn!(id = %id, model = %model_name, error = %e, "vector insert failed");
-                        errors += 1;
-                    }
-                }
-            }
-            Ok(_) => {
-                tracing::warn!(model = %model_name, "embedding count mismatch for batch");
-                errors += subset.len() as u64;
+    // Narrow to the records this model still needs when keeping existing vectors.
+    let subset = if drop_existing {
+        staged
+    } else {
+        let ids: Vec<Uuid> = staged.iter().map(|(id, _)| *id).collect();
+        match filter_unembedded(vectors.as_ref(), &ids, namespace).await {
+            Ok(unembedded) => {
+                let keep: HashSet<Uuid> = unembedded.into_iter().collect();
+                staged
+                    .into_iter()
+                    .filter(|(id, _)| keep.contains(id))
+                    .collect()
             }
             Err(e) => {
-                tracing::warn!(model = %model_name, error = %e, "embed_batch failed");
-                errors += subset.len() as u64;
+                tracing::error!(model = %model_name, error = %e, "filter_unembedded failed; skipping batch for this model");
+                return staged_len as u64;
             }
+        }
+    };
+    if subset.is_empty() {
+        return errors;
+    }
+
+    let (ids, texts): (Vec<Uuid>, Vec<String>) = subset.into_iter().unzip();
+    let expected = ids.len();
+    match rt.embed_document_batch_with_model(model_name, &texts).await {
+        Ok(embeddings) if embeddings.len() == expected => {
+            // No pre-delete: SqliteVecStore::insert wraps DELETE+INSERT in
+            // a single transaction so a failed INSERT rolls back the DELETE
+            // and the prior vector survives (no-worse-than-stale). A separate
+            // committed delete before insert re-introduces the stranding window.
+            for (id, emb) in ids.into_iter().zip(embeddings.iter()) {
+                if let Err(e) = vectors
+                    .insert(id, kind, namespace, field, vec![emb.clone()])
+                    .await
+                {
+                    tracing::warn!(id = %id, model = %model_name, error = %e, "vector insert failed");
+                    errors += 1;
+                }
+            }
+        }
+        Ok(_) => {
+            tracing::warn!(model = %model_name, "embedding count mismatch for batch");
+            errors += expected as u64;
+        }
+        Err(e) => {
+            tracing::warn!(model = %model_name, error = %e, "embed_batch failed");
+            errors += expected as u64;
         }
     }
     errors
+}
+
+fn bounded_joined_embedding_input(first: &str, second: Option<&str>, budget: usize) -> String {
+    let (first, first_truncated) = bounded_embedding_input(first, budget);
+    let mut staged = String::with_capacity(budget.min(first.len().saturating_add(1)));
+    staged.push_str(first);
+    if first_truncated || staged.len() >= budget {
+        return staged;
+    }
+    if let Some(second) = second.filter(|value| !value.is_empty()) {
+        staged.push(' ');
+        let (second, _) = bounded_embedding_input(second, budget.saturating_sub(staged.len()));
+        staged.push_str(second);
+    }
+    staged
+}
+
+fn stage_entity_embedding_batch(batch: &[Entity], model_name: &str) -> Vec<(Uuid, String)> {
+    let budget = document_embedding_budget(model_name);
+    batch
+        .iter()
+        .filter(|entity| {
+            !entity.name.trim().is_empty()
+                || entity
+                    .description
+                    .as_deref()
+                    .is_some_and(|description| !description.trim().is_empty())
+        })
+        .map(|entity| {
+            (
+                entity.id,
+                bounded_joined_embedding_input(&entity.name, entity.description.as_deref(), budget),
+            )
+        })
+        .collect()
+}
+
+fn stage_note_embedding_batch(batch: &[Note], model_name: &str) -> Vec<(Uuid, String)> {
+    let budget = document_embedding_budget(model_name);
+    batch
+        .iter()
+        .filter(|note| !note.content.trim().is_empty())
+        .map(|note| {
+            let (text, _) = bounded_embedding_input(&note.content, budget);
+            (note.id, text.to_owned())
+        })
+        .collect()
 }
 
 /// Upsert FTS documents for a batch of notes into the namespace text index. Returns the
@@ -425,8 +465,7 @@ fn vector_table_name(model_key: &str) -> Result<String> {
 async fn missing_embedding_batch(
     rt: &KhiveRuntime,
     namespace: &str,
-    vector_table: &str,
-    embedding_model: &str,
+    target: &RepairModelTarget,
     kind: SubstrateKind,
     after: &str,
     limit: u32,
@@ -446,10 +485,11 @@ async fn missing_embedding_batch(
         "SELECT {select} FROM {table} AS base \
          WHERE base.namespace = ?1 AND base.deleted_at IS NULL AND base.id > ?2 \
          AND {text_predicate} \
-         AND NOT EXISTS (SELECT 1 FROM {vector_table} AS vectors \
+         AND NOT EXISTS (SELECT 1 FROM {} AS vectors \
              WHERE vectors.subject_id = base.id AND vectors.namespace = ?1 \
              AND vectors.embedding_model = ?3) \
-         ORDER BY base.id LIMIT ?4"
+         ORDER BY base.id LIMIT ?4",
+        target.vector_table
     );
     let rows = {
         let mut reader = rt
@@ -463,7 +503,7 @@ async fn missing_embedding_batch(
                 params: vec![
                     SqlValue::Text(namespace.to_string()),
                     SqlValue::Text(after.to_string()),
-                    SqlValue::Text(embedding_model.to_string()),
+                    SqlValue::Text(target.embedding_model.clone()),
                     SqlValue::Integer(i64::from(limit)),
                 ],
                 label: Some("reindex_missing_embeddings".into()),
@@ -472,11 +512,12 @@ async fn missing_embedding_batch(
             .context("select rows missing embeddings")?
     };
 
+    let budget = document_embedding_budget(&target.model_name);
     rows.into_iter()
         .map(|row| {
             let text = |name: &str| match row.get(name) {
-                Some(SqlValue::Text(value)) => Ok(value.clone()),
-                Some(SqlValue::Null) => Ok(String::new()),
+                Some(SqlValue::Text(value)) => Ok(value.as_str()),
+                Some(SqlValue::Null) => Ok(""),
                 _ => anyhow::bail!("missing or invalid {name} in embeds-only row"),
             };
             let id = text("id")?
@@ -486,13 +527,11 @@ async fn missing_embedding_batch(
                 SubstrateKind::Entity => {
                     let name = text("name")?;
                     let description = text("description")?;
-                    if description.is_empty() {
-                        name
-                    } else {
-                        format!("{name} {description}")
-                    }
+                    bounded_joined_embedding_input(name, Some(description), budget)
                 }
-                SubstrateKind::Note => text("content")?,
+                SubstrateKind::Note => bounded_embedding_input(text("content")?, budget)
+                    .0
+                    .to_owned(),
                 _ => unreachable!("kind checked above"),
             };
             Ok((id, content))
@@ -571,35 +610,29 @@ async fn repair_missing_embeddings(
         ] {
             let mut after = String::new();
             loop {
-                let batch = missing_embedding_batch(
-                    rt,
-                    namespace,
-                    &target.vector_table,
-                    &target.embedding_model,
-                    kind,
-                    &after,
-                    batch_size,
-                )
-                .await?;
+                let batch =
+                    missing_embedding_batch(rt, namespace, &target, kind, &after, batch_size)
+                        .await?;
                 let Some((last_id, _)) = batch.last() else {
                     break;
                 };
                 after = last_id.to_string();
+                let batch_len = batch.len() as u64;
                 // A selected subject may still have a stale row in another namespace.
                 errors += embed_and_store_batch(
                     rt,
                     token,
-                    std::slice::from_ref(&target.model_name),
+                    &target.model_name,
                     namespace,
-                    &batch,
+                    batch,
                     kind,
                     field,
                     true,
                 )
                 .await;
                 match kind {
-                    SubstrateKind::Entity => entities_processed += batch.len() as u64,
-                    SubstrateKind::Note => notes_processed += batch.len() as u64,
+                    SubstrateKind::Entity => entities_processed += batch_len,
+                    SubstrateKind::Note => notes_processed += batch_len,
                     _ => unreachable!("repair kinds are fixed above"),
                 }
             }
@@ -714,31 +747,31 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
                 break;
             }
 
-            let mut staged: Vec<(Uuid, String)> = Vec::with_capacity(n);
-            for entity in &batch {
-                let text = match &entity.description {
-                    Some(d) if !d.is_empty() => format!("{} {}", entity.name, d),
-                    _ => entity.name.clone(),
-                };
-                if !text.trim().is_empty() {
-                    staged.push((entity.id, text));
-                }
-            }
-
-            if !staged.is_empty() {
+            let staged_count = batch
+                .iter()
+                .filter(|entity| {
+                    !entity.name.trim().is_empty()
+                        || entity
+                            .description
+                            .as_deref()
+                            .is_some_and(|description| !description.trim().is_empty())
+                })
+                .count();
+            for model_name in &model_names {
+                let staged = stage_entity_embedding_batch(&batch, model_name);
                 errors_skipped += embed_and_store_batch(
                     &rt,
                     &token,
-                    &model_names,
+                    model_name,
                     &ns_str,
-                    &staged,
+                    staged,
                     SubstrateKind::Entity,
                     "entity.body",
                     drop_existing,
                 )
                 .await;
-                entities_processed += staged.len() as u64;
             }
+            entities_processed += staged_count as u64;
 
             // FTS backfill: index every entity in this batch regardless of whether
             // it had content to embed. Mirrors the upsert_document call in
@@ -770,28 +803,25 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
                 break;
             }
 
-            let mut staged: Vec<(Uuid, String)> = Vec::with_capacity(n);
-            for note in &batch {
-                let text = note.content.clone();
-                if !text.trim().is_empty() {
-                    staged.push((note.id, text));
-                }
-            }
-
-            if !staged.is_empty() {
+            let staged_count = batch
+                .iter()
+                .filter(|note| !note.content.trim().is_empty())
+                .count();
+            for model_name in &model_names {
+                let staged = stage_note_embedding_batch(&batch, model_name);
                 errors_skipped += embed_and_store_batch(
                     &rt,
                     &token,
-                    &model_names,
+                    model_name,
                     &ns_str,
-                    &staged,
+                    staged,
                     SubstrateKind::Note,
                     "note.content",
                     drop_existing,
                 )
                 .await;
-                notes_processed += staged.len() as u64;
             }
+            notes_processed += staged_count as u64;
 
             // FTS backfill: index every note in this batch regardless of whether
             // it had content to embed. Mirrors the upsert_document call in
@@ -1094,32 +1124,6 @@ async fn count_notes(rt: &KhiveRuntime, ns: &str) -> u64 {
     }
 }
 
-// The embed service prepends the model's document instruction (e.g. "passage: "
-// for multilingual-e5) AFTER this truncation, and its input guard rejects the
-// combined length. Reserve the prefix bytes here or a text truncated exactly to
-// the cap fails the whole batch post-prefix.
-fn embed_budget(model_name: &str) -> usize {
-    let normalized = model_name.trim().to_ascii_lowercase().replace('_', "-");
-    let prefix_len = normalized
-        .parse::<lattice_embed::EmbeddingModel>()
-        .ok()
-        .and_then(|m| m.document_instruction())
-        .map_or(0, str::len);
-    MAX_EMBED_BYTES - prefix_len
-}
-
-fn truncate_text(t: &str, max_bytes: usize) -> String {
-    if t.len() <= max_bytes {
-        t.to_string()
-    } else {
-        let mut end = max_bytes;
-        while !t.is_char_boundary(end) {
-            end -= 1;
-        }
-        t[..end].to_string()
-    }
-}
-
 fn print_report(report: &ReindexReport, human: bool) {
     if human {
         let status = if report.has_failures() {
@@ -1160,29 +1164,6 @@ fn print_report(report: &ReindexReport, human: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn embed_budget_reserves_document_prefix_bytes() {
-        // multilingual-e5 prepends "passage: " (9 bytes) after truncation; the
-        // budget must reserve it or exactly-at-cap texts fail the whole batch.
-        assert_eq!(embed_budget("multilingual-e5-base"), MAX_EMBED_BYTES - 9);
-        assert_eq!(embed_budget("multilingual_e5_small"), MAX_EMBED_BYTES - 9);
-        assert_eq!(embed_budget("all-minilm-l6-v2"), MAX_EMBED_BYTES);
-        assert_eq!(embed_budget("unknown-model"), MAX_EMBED_BYTES);
-    }
-
-    #[test]
-    fn truncate_text_respects_budget_and_char_boundaries() {
-        let long = "a".repeat(MAX_EMBED_BYTES + 100);
-        assert_eq!(
-            truncate_text(&long, MAX_EMBED_BYTES - 9).len(),
-            MAX_EMBED_BYTES - 9
-        );
-        let cjk = "\u{4e2d}".repeat(20_000); // 3 bytes each
-        let out = truncate_text(&cjk, 32_759);
-        assert!(out.len() <= 32_759);
-        assert!(out.chars().all(|c| c == '\u{4e2d}'));
-    }
-
     use crate::dbpath::resolve_db_override;
     use clap::Parser;
     use khive_storage::types::{SqlStatement, SqlValue};
@@ -1543,10 +1524,14 @@ mod tests {
             .await
             .expect("seed vector");
 
-        let selected =
-            missing_embedding_batch(&rt, "local", TABLE, MODEL, SubstrateKind::Note, "", 100)
-                .await
-                .expect("select missing notes");
+        let target = RepairModelTarget {
+            model_name: MODEL.to_string(),
+            embedding_model: MODEL.to_string(),
+            vector_table: TABLE.to_string(),
+        };
+        let selected = missing_embedding_batch(&rt, "local", &target, SubstrateKind::Note, "", 100)
+            .await
+            .expect("select missing notes");
 
         assert_eq!(selected, vec![(missing.id, missing.content)]);
     }
@@ -2171,6 +2156,48 @@ mod tests {
         let doc = note_fts_document(&note);
         assert!(doc.title.is_none());
         assert_eq!(doc.body, "body only content");
+    }
+
+    #[tokio::test]
+    async fn note_embedding_staging_is_bounded_while_fts_receives_full_content() {
+        const TAIL_SENTINEL: &str = "full-content-tail-sentinel";
+
+        // The same full record page feeds both bounded embedding staging and FTS.
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let token = rt
+            .authorize(Namespace::parse("local").expect("namespace"))
+            .expect("authorize");
+        let content = format!(
+            "{}{TAIL_SENTINEL}",
+            "a".repeat(lattice_embed::MAX_TEXT_CHARS)
+        );
+        let notes = vec![Note::new("local", "observation", content.clone())];
+
+        let staged = stage_note_embedding_batch(&notes, REPAIR_MODEL);
+        assert_eq!(staged.len(), 1);
+        assert_eq!(
+            staged[0].1.len(),
+            khive_runtime::retrieval::document_embedding_budget(REPAIR_MODEL)
+        );
+        assert!(!staged[0].1.contains(TAIL_SENTINEL));
+        assert_eq!(notes[0].content, content, "source batch must remain full");
+
+        let errors = fts_backfill_notes_batch(&rt, &token, &notes).await;
+        assert_eq!(errors, 0);
+        let hits = rt
+            .text_for_notes(&token)
+            .expect("note FTS")
+            .search(khive_storage::types::TextSearchRequest {
+                query: TAIL_SENTINEL.to_string(),
+                mode: khive_storage::types::TextQueryMode::Plain,
+                filter: None,
+                top_k: 10,
+                snippet_chars: 0,
+            })
+            .await
+            .expect("search full FTS content");
+        assert_eq!(hits.len(), 1, "FTS must receive the unbounded note body");
+        assert_eq!(hits[0].subject_id, notes[0].id);
     }
 
     // Regression: insert N notes via NoteStore (bypassing FTS), run
