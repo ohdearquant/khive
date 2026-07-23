@@ -5314,7 +5314,7 @@ mod tests {
     use crate::{ActorRef, Namespace};
     use async_trait::async_trait;
     use khive_storage::types::PathNode;
-    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
+    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService, MAX_TEXT_CHARS};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -13920,6 +13920,14 @@ mod tests {
             texts: &[String],
             _model: EmbeddingModel,
         ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+            for text in texts {
+                if text.len() > MAX_TEXT_CHARS {
+                    return Err(EmbedError::TextTooLong {
+                        length: text.len(),
+                        max: MAX_TEXT_CHARS,
+                    });
+                }
+            }
             self.captured.lock().unwrap().extend(texts.iter().cloned());
             Ok(texts.iter().map(|_| vec![1.0_f32; self.dims]).collect())
         }
@@ -13955,6 +13963,80 @@ mod tests {
                 captured: Arc::clone(&self.captured),
             }))
         }
+    }
+
+    #[tokio::test]
+    async fn create_bounds_embedding_input_without_truncating_stored_content() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        rt.register_embedder(CapturingVecProvider {
+            provider_name: "strict-length-test".into(),
+            dims: 4,
+            captured: Arc::clone(&captured),
+        });
+
+        let content = format!("{}\u{1f980}tail", "a".repeat(MAX_TEXT_CHARS - 1));
+        let note = rt
+            .create_note(&tok, "observation", None, &content, None, None, vec![])
+            .await
+            .expect("over-length note create must succeed");
+        let fetched = rt
+            .notes(&tok)
+            .unwrap()
+            .get_note(note.id)
+            .await
+            .unwrap()
+            .expect("created note must be retrievable");
+        assert_eq!(fetched.content, content, "stored content must remain full");
+
+        let embedded = captured.lock().unwrap().clone();
+        assert_eq!(embedded.len(), 1);
+        assert_eq!(embedded[0].len(), MAX_TEXT_CHARS - 1);
+        assert!(embedded[0].is_char_boundary(embedded[0].len()));
+        assert!(!embedded[0].contains('\u{1f980}'));
+        assert!(rt.document_embedding_input_will_be_truncated(&content));
+
+        let vector_info = rt
+            .vectors_for_model(&tok, "strict-length-test")
+            .expect("vector store")
+            .info()
+            .await
+            .expect("vector info");
+        assert_eq!(vector_info.dimensions, 4);
+        assert_eq!(vector_info.entry_count, 1);
+
+        captured.lock().unwrap().clear();
+        rt.reindex_note(&tok, &fetched)
+            .await
+            .expect("reindex must bound the same stored content");
+        assert_eq!(captured.lock().unwrap()[0].len(), MAX_TEXT_CHARS - 1);
+
+        captured.lock().unwrap().clear();
+        rt.embed_document_batch_with_model("strict-length-test", std::slice::from_ref(&content))
+            .await
+            .expect("batch reindex seam must bound stored content");
+        assert_eq!(captured.lock().unwrap()[0].len(), MAX_TEXT_CHARS - 1);
+
+        let normal = "normal byte-identical embedding input";
+        rt.create_note(&tok, "observation", None, normal, None, None, vec![])
+            .await
+            .expect("normal note create must succeed");
+        assert_eq!(captured.lock().unwrap().last().unwrap(), normal);
+        assert!(!rt.document_embedding_input_will_be_truncated(normal));
+
+        let long_description = format!("{}\u{1f980}tail", "b".repeat(MAX_TEXT_CHARS));
+        rt.create_entity(
+            &tok,
+            "concept",
+            None,
+            "entity",
+            Some(&long_description),
+            None,
+            vec![],
+        )
+        .await
+        .expect("over-length entity create must succeed");
     }
 
     #[tokio::test]

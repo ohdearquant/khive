@@ -17,6 +17,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use khive_mcp::serve::{resolve_runtime_config, RuntimeConfigInputs};
+use khive_runtime::retrieval::{bounded_embedding_input, document_embedding_budget};
 use khive_runtime::{
     entity_embedding_text, entity_fts_document, note_embedding_text, note_fts_document,
     KhiveRuntime, Namespace,
@@ -27,8 +28,6 @@ use khive_storage::note::Note;
 use khive_storage::types::{TextDocument, VectorRecord};
 use khive_storage::{TextSearch, VectorStore};
 use khive_types::SubstrateKind;
-
-const MAX_EMBED_BYTES: usize = 32_768;
 
 // ─── progress bar ─────────────────────────────────────────────────────────────
 
@@ -261,10 +260,10 @@ async fn embed_and_store_batch(
             continue;
         }
 
-        let budget = embed_budget(model_name);
+        let budget = document_embedding_budget(model_name);
         let texts: Vec<String> = subset
             .iter()
-            .map(|(_, t)| truncate_text(t, budget))
+            .map(|(_, t)| bounded_embedding_input(t, budget).0.to_owned())
             .collect();
         match rt.embed_document_batch_with_model(model_name, &texts).await {
             Ok(embeddings) if embeddings.len() == subset.len() => {
@@ -1131,32 +1130,6 @@ async fn count_notes(rt: &KhiveRuntime, ns: &str) -> u64 {
     }
 }
 
-// The embed service prepends the model's document instruction (e.g. "passage: "
-// for multilingual-e5) AFTER this truncation, and its input guard rejects the
-// combined length. Reserve the prefix bytes here or a text truncated exactly to
-// the cap fails the whole batch post-prefix.
-fn embed_budget(model_name: &str) -> usize {
-    let normalized = model_name.trim().to_ascii_lowercase().replace('_', "-");
-    let prefix_len = normalized
-        .parse::<lattice_embed::EmbeddingModel>()
-        .ok()
-        .and_then(|m| m.document_instruction())
-        .map_or(0, str::len);
-    MAX_EMBED_BYTES - prefix_len
-}
-
-fn truncate_text(t: &str, max_bytes: usize) -> String {
-    if t.len() <= max_bytes {
-        t.to_string()
-    } else {
-        let mut end = max_bytes;
-        while !t.is_char_boundary(end) {
-            end -= 1;
-        }
-        t[..end].to_string()
-    }
-}
-
 fn print_report(report: &ReindexReport, human: bool) {
     if human {
         let status = if report.has_failures() {
@@ -1197,29 +1170,6 @@ fn print_report(report: &ReindexReport, human: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn embed_budget_reserves_document_prefix_bytes() {
-        // multilingual-e5 prepends "passage: " (9 bytes) after truncation; the
-        // budget must reserve it or exactly-at-cap texts fail the whole batch.
-        assert_eq!(embed_budget("multilingual-e5-base"), MAX_EMBED_BYTES - 9);
-        assert_eq!(embed_budget("multilingual_e5_small"), MAX_EMBED_BYTES - 9);
-        assert_eq!(embed_budget("all-minilm-l6-v2"), MAX_EMBED_BYTES);
-        assert_eq!(embed_budget("unknown-model"), MAX_EMBED_BYTES);
-    }
-
-    #[test]
-    fn truncate_text_respects_budget_and_char_boundaries() {
-        let long = "a".repeat(MAX_EMBED_BYTES + 100);
-        assert_eq!(
-            truncate_text(&long, MAX_EMBED_BYTES - 9).len(),
-            MAX_EMBED_BYTES - 9
-        );
-        let cjk = "\u{4e2d}".repeat(20_000); // 3 bytes each
-        let out = truncate_text(&cjk, 32_759);
-        assert!(out.len() <= 32_759);
-        assert!(out.chars().all(|c| c == '\u{4e2d}'));
-    }
-
     use crate::dbpath::resolve_db_override;
     use clap::Parser;
     use khive_storage::types::{SqlStatement, SqlValue};
@@ -2432,6 +2382,49 @@ mod tests {
         let doc = note_fts_document(&note);
         assert!(doc.title.is_none());
         assert_eq!(doc.body, "body only content");
+    }
+
+    // Regression: the per-model text handed to the embedder is bounded by the
+    // shared document budget (the same expression embed_and_store_batch applies),
+    // while FTS receives the full unbounded note body.
+    #[tokio::test]
+    async fn note_embedding_input_is_bounded_while_fts_receives_full_content() {
+        const TAIL_SENTINEL: &str = "full-content-tail-sentinel";
+
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let token = rt
+            .authorize(Namespace::parse("local").expect("namespace"))
+            .expect("authorize");
+        let content = format!(
+            "{}{TAIL_SENTINEL}",
+            "a".repeat(lattice_embed::MAX_TEXT_CHARS)
+        );
+        let notes = vec![Note::new("local", "observation", content.clone())];
+
+        let budget = document_embedding_budget(REPAIR_MODEL);
+        let canonical = note_embedding_text(&notes[0]);
+        let (bounded, truncated) = bounded_embedding_input(&canonical, budget);
+        assert!(truncated, "over-length input must report truncation");
+        assert!(bounded.len() <= budget);
+        assert!(!bounded.contains(TAIL_SENTINEL));
+        assert_eq!(notes[0].content, content, "source note must remain full");
+
+        let errors = fts_backfill_notes_batch(&rt, &token, &notes).await;
+        assert_eq!(errors, 0);
+        let hits = rt
+            .text_for_notes(&token)
+            .expect("note FTS")
+            .search(khive_storage::types::TextSearchRequest {
+                query: TAIL_SENTINEL.to_string(),
+                mode: khive_storage::types::TextQueryMode::Plain,
+                filter: None,
+                top_k: 10,
+                snippet_chars: 0,
+            })
+            .await
+            .expect("search full FTS content");
+        assert_eq!(hits.len(), 1, "FTS must receive the unbounded note body");
+        assert_eq!(hits[0].subject_id, notes[0].id);
     }
 
     // Regression: insert N notes via NoteStore (bypassing FTS), run

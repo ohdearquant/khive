@@ -1170,6 +1170,91 @@ async fn update_entity_with_note_field_salience_returns_error() {
 
 // ── #764: create's embedding_content wiring ─────────────────────────────────
 
+struct WarningEmbeddingService;
+
+#[async_trait::async_trait]
+impl lattice_embed::EmbeddingService for WarningEmbeddingService {
+    async fn embed(
+        &self,
+        texts: &[String],
+        _model: lattice_embed::EmbeddingModel,
+    ) -> Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+        Ok(vec![vec![1.0]; texts.len()])
+    }
+
+    fn supports_model(&self, _model: lattice_embed::EmbeddingModel) -> bool {
+        true
+    }
+
+    fn name(&self) -> &'static str {
+        "warning-test"
+    }
+}
+
+struct WarningEmbedderProvider;
+
+#[async_trait::async_trait]
+impl khive_runtime::EmbedderProvider for WarningEmbedderProvider {
+    fn name(&self) -> &str {
+        "warning-test"
+    }
+
+    fn dimensions(&self) -> usize {
+        1
+    }
+
+    async fn build(
+        &self,
+    ) -> Result<std::sync::Arc<dyn lattice_embed::EmbeddingService>, khive_runtime::RuntimeError>
+    {
+        Ok(std::sync::Arc::new(WarningEmbeddingService))
+    }
+}
+
+#[tokio::test]
+async fn create_dispatch_emits_embedding_truncation_advisory() {
+    use crate::KgPack;
+    use khive_runtime::{KhiveRuntime, VerbRegistryBuilder};
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    rt.register_embedder(WarningEmbedderProvider);
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt));
+    let registry = builder.build().expect("registry build");
+
+    let truncated = registry
+        .dispatch(
+            "create",
+            json!({
+                "kind": "concept",
+                "name": "warning target",
+                "description": "x".repeat(lattice_embed::MAX_TEXT_CHARS),
+                "skip_dedup_check": true,
+            }),
+        )
+        .await
+        .expect("over-limit create");
+    let warnings = truncated["warnings"].as_array().expect("warnings array");
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].as_str().unwrap().contains("truncated"));
+
+    let normal = registry
+        .dispatch(
+            "create",
+            json!({
+                "kind": "concept",
+                "name": "normal target",
+                "skip_dedup_check": true,
+            }),
+        )
+        .await
+        .expect("normal create");
+    assert!(
+        normal.get("warnings").is_none(),
+        "normal input must not emit an advisory"
+    );
+}
+
 /// A note create with a proper-prefix `embedding_content` must succeed and
 /// store the full `content`; the override is a runtime-layer concern
 /// (covered by `khive-runtime`'s own unit tests) — this proves the handler

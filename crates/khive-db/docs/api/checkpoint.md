@@ -123,11 +123,17 @@ See `crates/khive-db/src/checkpoint.rs` — `run_checkpoint_task`.
 An earlier version of this task used `Arc::strong_count(&pool) <= 1` as its
 exit condition instead of an explicit signal. That check is unreachable
 whenever a sibling owner holds its own clone of `pool` for the task's
-lifetime — which the production boot path does: `event_store`
-(`Option<Arc<dyn EventStore>>`), when `Some`, is a `SqlEventStore` that
-retains its own `Arc::clone` of the same pool, so the task always observed
-`strong_count == 2` and never exited via that mechanism (issue #774). The
-explicit `watch` channel does not depend on how many other owners exist.
+lifetime — which the production boot path does: `CheckpointLifecycleOwner`
+contains a `SqlEventStore` that retains its own `Arc::clone` of the same pool,
+so the task always observed `strong_count == 2` and never exited via that
+mechanism (issue #774). The explicit `watch` channel does not depend on how
+many other owners exist.
+
+Lifecycle ownership is independent of backend role. Spawn-time fan-out gives
+the lifecycle owner to the main checkpoint task when one exists; if the main
+backend is in-memory and only secondary file-backed tasks are spawned, the
+first secondary task owns emission. Other tasks receive no owner, so the API
+cannot silently discard a caller-supplied event store based on `is_main`.
 
 ## Private tx-registry logging helpers (Plank 0)
 
@@ -160,7 +166,11 @@ snapshot is logged (reusing Plank 0's `tx_registry`) before the attempt.
 `busy_timeout` is temporarily lowered to `truncate_busy_timeout` for the
 PRAGMA call and restored immediately after, regardless of outcome. No
 transaction is ever killed here — enforcement is Plank 1's job, not this
-one's.
+one's. The OS holder census is captured immediately before the TRUNCATE
+attempt, then consumed only if that attempt makes no progress. The reported
+identities therefore include a transient holder that releases during the
+bounded TRUNCATE wait, before the no-progress diagnostic is emitted. Sidecar
+enumeration remains deferred to the no-progress path.
 
 ## `TxAgeSweepState` — identity tracking rationale
 
