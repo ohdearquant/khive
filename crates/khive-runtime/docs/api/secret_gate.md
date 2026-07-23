@@ -102,7 +102,12 @@ production deploy: <value>`, `api key for shared encrypted deploy: <value>`) nam
 regardless of how many qualifier nouns the label carries. Content words after a delimiter are
 bounded only by the overall walk limit, the sentence boundary, and the past-participle stop; a
 per-clause content-word cap was tried and removed, since any cap re-admits the labeled-value
-bypass one natural qualifier past the cap. A past-participle content word ends the walk:
+bypass one natural qualifier past the cap. For the same reason, EXHAUSTING the walk limit after
+crossing a delimiter fails CLOSED: the clause is assignment-shaped and its head was never
+scanned, so it is treated as credential-labeled — clause length cannot launder a labeled value
+into the exemptions (`api key for the new shared encrypted regional staging deploy: <value>`
+blocks even though the trigger sits past the walk budget). A past-participle content word ends
+the walk:
 verb-phrase prose narrates an action on the value rather than labeling it (`the auth scanner
 flagged this file: <path>`, `one extra token was introduced by sha: <hex>` stay exempt). The
 walk stops at a sentence/paragraph boundary (`;`, `!`, `?`, blank line; `.` only when not
@@ -111,20 +116,25 @@ as a sentence end). The past-participle stop is position-sensitive: it applies o
 position — the participle followed (in reading order) by a glue word or the value itself
 ("flagged this file:", "introduced by sha:", "key updated: <v>"). Followed by a content noun it
 is a participial ADJECTIVE inside a label qualifier ("shared deploy:", "encrypted backup:") and
-walks like any other qualifier noun. A participle BEFORE the trigger word never matters — the
+walks like any other qualifier noun. Coordinating conjunctions (`and`, `or`) are transparent to
+this classification: in "shared and encrypted staging deploy: <value>" the coordination as a
+whole is followed by a content noun, so both participles read as adjectives and walk. A participle BEFORE the trigger word never matters — the
 walk reaches the trigger first ("generated api key: <v>" blocks). A single-identifier lookback
 is deliberately NOT the contract: `api key value is commit <hex>` is a labeled credential
 wearing a marker, and one connector word must not hide the label. A label on the far side of a
 sentence boundary is prose context (the `near_trigger` window models that), not this value's
 label. Known residuals, accepted under the threat model: a non-connector qualifier without any
-delimiter (`api key pour commit <hex>`), a participle in verb position directly after the
+delimiter (`api key pour commit <hex>`) and a participle in verb position directly after the
 trigger (`api key updated: <hex>` reads as changelog prose — note the ordering: `updated api
-key: <hex>` blocks, since the walk meets the trigger first), and label clauses exceeding the
-walk limit. Accepted false positives, conservative direction: the walk cannot distinguish an
-ATTRIBUTIVE trigger from a label head without reopening the labeled-value bypasses, so prose
-where a trigger word sits attributively inside the pre-delimiter clause blocks even when the
-value is an ordinary path (`see the docs for auth setup: <path>`, `secret scanner archive
-notes: <path>`, `writing up the secret gate false positive repro: <path>`).
+key: <hex>` blocks, since the walk meets the trigger first). Accepted false positives,
+conservative direction: the walk has no grammar — ANY trigger word reachable inside the
+pre-delimiter clause (absent a sentence boundary or verb-position participle) is treated as a
+credential label, whether it is attributive (`see the docs for auth setup: <path>`, `secret
+scanner archive notes: <path>`, `writing up the secret gate false positive repro: <path>`) or
+a topical object (`results from testing auth against parser: <path>`); distinguishing these
+from a label head would reopen the labeled-value bypasses. Likewise a delimiter-bearing clause
+that exhausts the walk limit blocks regardless of whether a trigger was reached (exhaustion
+fails closed).
 
 Trigger-word matching only fires on genuine mentions, not substring collisions: trigger words
 (`key`, `secret`, `password`, `passwd`, `credential`, `bearer`, `auth`, `apikey`) are matched at a

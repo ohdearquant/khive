@@ -1063,18 +1063,22 @@ const LABEL_CLAUSE_SKIP_WORDS: &[&str] = &[
     "from",
     "per",
     "and",
+    "or",
     "our",
     "my",
     "your",
     "their",
 ];
 
-/// Maximum identifiers the clause walk examines before giving up. Bounds the
-/// scan to one short assignment clause; a label further away than this is
-/// window-level prose context, which `near_trigger` already models. Sized so
-/// a label separated from its value by connectors plus a dotted version
-/// qualifier ("api key v1.2 value is commit <hex>" — the version costs two
-/// identifier steps) stays in range.
+/// Maximum identifiers the clause walk examines. Bounds the scan cost to one
+/// short assignment clause. Exhausting the budget is NOT evidence of absence:
+/// when a value delimiter was crossed, running out of steps fails CLOSED
+/// (treated as credential-labeled) — a truncated scan cannot prove the clause
+/// is unlabeled, and any exhaustion-fails-open rule re-admits the labeled
+/// value bypass one natural word past the budget. Sized so a label separated
+/// from its value by connectors plus a dotted version qualifier ("api key
+/// v1.2 value is commit <hex>" — the version costs two identifier steps)
+/// stays in range without exhaustion.
 const LABEL_CLAUSE_WALK_LIMIT: usize = 8;
 
 /// Sentence/paragraph boundary inside a clause-walk gap. `;`, `!`, `?`, and
@@ -1129,11 +1133,15 @@ fn is_hex_fragment_word(word: &str) -> bool {
 /// carries ("api key for production deploy: X", "api key for shared
 /// encrypted deploy: X"). A per-clause content-word cap was tried here and
 /// removed — any cap re-admits the labeled-value bypass one natural
-/// qualifier past the cap.
+/// qualifier past the cap. For the same reason, exhausting the walk budget
+/// after crossing a delimiter fails CLOSED: the clause is assignment-shaped
+/// and its head was never scanned, so it is treated as credential-labeled.
 /// A past-participle content word ("flagged", "introduced") ends the walk —
 /// verb-phrase prose narrates an action on the value rather than labeling it
 /// ("the auth scanner flagged this file: <path>", "one extra token was
-/// introduced by sha: <hex>"). Without a delimiter, only the closed sets are
+/// introduced by sha: <hex>"). Coordinating conjunctions are transparent to
+/// that position test — "shared and encrypted deploy" keeps both participles
+/// in adjective position. Without a delimiter, only the closed sets are
 /// stepped over — skipping arbitrary words there would re-block ordinary
 /// prose like "the key changes are in commit <hex>", the false-positive
 /// class these exemptions exist to fix.
@@ -1190,11 +1198,22 @@ fn has_clause_credential_label(text: &str, token_offset: usize, raw_token: &str)
                 return false;
             }
         }
-        arrived_through_connector = skippable;
+        // Coordinating conjunctions are transparent to participle-position
+        // classification: in "shared and encrypted deploy" the coordination
+        // as a whole is followed by a content noun, so "shared" is still an
+        // adjective — the conjunction preserves the arrived state instead of
+        // marking connector position.
+        if !matches!(lower.as_str(), "and" | "or") {
+            arrived_through_connector = skippable;
+        }
         let start = label.as_ptr() as usize - rest.as_ptr() as usize;
         rest = &rest[..start];
     }
-    false
+    // Budget exhausted. A clause that crossed a value delimiter and ran out
+    // of steps without a sentence boundary or verb-position participle is
+    // assignment-shaped with an unscanned head — fail closed rather than let
+    // clause length launder a labeled credential into the exemptions.
+    crossed_value_delimiter
 }
 
 fn is_plausible_file_path(token: &str) -> bool {
@@ -3012,6 +3031,51 @@ mod tests {
             Some("high-entropy-token"),
             "a chained-qualifier credential label must refuse the path \
              exemption"
+        );
+    }
+
+    #[test]
+    fn blocks_over_limit_qualified_label_fails_closed() {
+        // Round-6 review probes: labels whose clause exhausts the walk budget
+        // (a marker, an extra qualifier, or an interleaved glue word pushes
+        // the trigger past the limit). Exhaustion after a value delimiter
+        // fails closed — clause length must not launder a labeled credential
+        // into the exemptions.
+        let revision = "d362950a3c9b1a4cb47d97f1623e38f1a1e6bcdf";
+        let opaque = "Xk9mZ2vQpLrT8nJwYuA/HfBsDcGiONvMabcdefgh";
+        for content in [
+            format!("api key for the new shared encrypted staging deploy: commit {revision}"),
+            format!("api key for the new shared encrypted regional staging deploy: {opaque}"),
+            format!("api key for the new shared and encrypted staging deploy: {opaque}"),
+            format!(
+                "api key for the new shared encrypted regional staging deploy: commit {revision}"
+            ),
+            format!("api key for the new shared and encrypted staging deploy: commit {revision}"),
+            format!("api key for the new shared encrypted staging deploy: {opaque}"),
+        ] {
+            assert!(
+                check(&content).is_err(),
+                "an over-limit qualified credential label must fail closed: \
+                 {content:?}, got {:?}",
+                scan(&content)
+            );
+        }
+    }
+
+    #[test]
+    fn accepted_false_positive_topical_trigger_before_delimited_path() {
+        // The clause walk treats ANY reachable pre-delimiter trigger as a
+        // credential label — it has no grammar to tell a label head ("api
+        // key ...") from a topical object ("testing auth against parser").
+        // Distinguishing them would reopen the labeled-value bypasses, so
+        // this ordinary prose shape blocks. Accepted false positive,
+        // conservative direction; documented in docs/api/secret_gate.md.
+        let content = "results from testing auth against parser: \
+             internal/workspaces/20260701/cloud-rebuild/R1-repo-audit.md";
+        assert!(
+            check(content).is_err(),
+            "accepted-FP contract changed: topical trigger before a \
+             delimited path no longer blocks — update the docs if deliberate"
         );
     }
 
