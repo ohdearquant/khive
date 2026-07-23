@@ -69,8 +69,14 @@ async fn fs_blob_store_conforms() {
     // whatever volume runs this test is not this test's concern (and a
     // dev machine or CI runner legitimately may not clear 100GB free).
     // The floor guard itself is covered by unit tests in stores/blob.rs.
-    let store: Arc<dyn BlobStore> =
-        Arc::new(FsBlobStore::new(dir.path().to_path_buf(), 0).expect("FsBlobStore::new"));
+    // Zero orphan-sweep grace period — this suite's orphan_sweep assertions
+    // exercise immediate-deletion behavior, not the publish-grace window
+    // (covered separately in stores/blob.rs).
+    let store: Arc<dyn BlobStore> = Arc::new(
+        FsBlobStore::new(dir.path().to_path_buf(), 0)
+            .expect("FsBlobStore::new")
+            .with_orphan_sweep_grace(std::time::Duration::ZERO),
+    );
     assert_conforms(store).await;
 }
 

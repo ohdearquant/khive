@@ -679,6 +679,7 @@ impl BlobStore for S3BlobStore {
             scanned,
             deleted,
             would_delete,
+            grace_period_skipped: 0,
         })
     }
 }
