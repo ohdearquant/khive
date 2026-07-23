@@ -569,7 +569,8 @@ fn reject_preexisting_duplicate_concept_origins(conn: &Connection) -> Result<(),
         error: format!(
             "cannot enforce the single-origin invariant: {} already have more than one live \
              introduced_by origin. Curate each listed concept down to a single live origin \
-             (delete or supersede the extra introduced_by edges), then re-run migrations.",
+             (soft-delete every extra introduced_by edge, keeping only the intended origin), \
+             then re-run migrations.",
             violations.join(", ")
         ),
     })
