@@ -2089,6 +2089,64 @@ async fn note_create_blocks_hex_credential_in_content() {
     );
 }
 
+#[tokio::test]
+async fn note_create_allows_source_path_near_ordinary_key_prose() {
+    let rt = rt();
+    let tok = rt.authorize(Namespace::local()).unwrap();
+    let content = "see <a/path/to/file.py>:~97-103 lists it as a real checkpoint-supplied key";
+
+    rt.create_note(&tok, "question", None, content, None, None, vec![])
+        .await
+        .expect("source path in technical prose must be stored");
+}
+
+#[tokio::test]
+async fn note_create_allows_git_revision_near_ordinary_token_prose() {
+    let rt = rt();
+    let tok = rt.authorize(Namespace::local()).unwrap();
+    let content = "revision d362950a3c9b1a4cb47d97f1623e38f1a1e6bcdf emits one extra token";
+
+    rt.create_note(&tok, "question", None, content, None, None, vec![])
+        .await
+        .expect("git revision in technical prose must be stored");
+}
+
+#[tokio::test]
+async fn note_create_blocks_forty_hex_in_value_syntax_behind_vcs_marker() {
+    let rt = rt();
+    let tok = rt.authorize(Namespace::local()).unwrap();
+    let content = "api key value is commit d362950a3c9b1a4cb47d97f1623e38f1a1e6bcdf";
+
+    let result = rt
+        .create_note(&tok, "question", None, content, None, None, vec![])
+        .await;
+    assert!(
+        matches!(
+            result.unwrap_err(),
+            khive_runtime::RuntimeError::SecretDetected(_)
+        ),
+        "a credential phrase must not be rescued by a VCS marker at the write path"
+    );
+}
+
+#[tokio::test]
+async fn note_create_blocks_path_dressed_base64_credential_in_value_syntax() {
+    let rt = rt();
+    let tok = rt.authorize(Namespace::local()).unwrap();
+    let content = "api key value is <Xk9mZ2vQpLrT8nJwYuA/HfBsDcGiONvMabcdefgh>:~97-103";
+
+    let result = rt
+        .create_note(&tok, "question", None, content, None, None, vec![])
+        .await;
+    assert!(
+        matches!(
+            result.unwrap_err(),
+            khive_runtime::RuntimeError::SecretDetected(_)
+        ),
+        "path dressing must not rescue a credential in value syntax at the write path"
+    );
+}
+
 // =============================================================================
 // EmbedderRegistry integration tests (#397)
 // =============================================================================
