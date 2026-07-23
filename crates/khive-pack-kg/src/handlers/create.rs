@@ -182,7 +182,7 @@ impl KgPack {
     async fn handle_bulk_create(
         &self,
         token: &NamespaceToken,
-        entries: Vec<super::params::BulkCreateEntry>,
+        entries: Vec<Value>,
         atomic: bool,
         verbose: bool,
         registry: &VerbRegistry,
@@ -191,7 +191,11 @@ impl KgPack {
 
         if atomic {
             let mut specs = Vec::with_capacity(attempted);
-            for (idx, entry) in entries.into_iter().enumerate() {
+            for (idx, raw) in entries.into_iter().enumerate() {
+                let entry: super::params::BulkCreateEntry =
+                    serde_json::from_value(raw).map_err(|e| {
+                        RuntimeError::InvalidInput(format!("items[{idx}]: malformed item — {e}"))
+                    })?;
                 specs.push(
                     self.prepare_bulk_create_spec(token, idx, entry, registry)
                         .await?,
@@ -233,7 +237,14 @@ impl KgPack {
         let mut errors = Vec::new();
         let mut entities = Vec::new();
         let mut notes = Vec::new();
-        for (idx, entry) in entries.into_iter().enumerate() {
+        for (idx, raw) in entries.into_iter().enumerate() {
+            let entry: super::params::BulkCreateEntry = match serde_json::from_value(raw) {
+                Ok(entry) => entry,
+                Err(e) => {
+                    errors.push(json!({"index": idx, "error": format!("malformed item — {e}")}));
+                    continue;
+                }
+            };
             let spec = match self
                 .prepare_bulk_create_spec(token, idx, entry, registry)
                 .await
@@ -346,7 +357,7 @@ impl KgPack {
         {
             let maybe_items = if params.get("items").is_some() {
                 let raw = params["items"].clone();
-                match serde_json::from_value::<Vec<super::params::BulkCreateEntry>>(raw) {
+                match serde_json::from_value::<Vec<Value>>(raw) {
                     Ok(entries) => Some(entries),
                     Err(e) => {
                         return Err(RuntimeError::InvalidInput(format!(

@@ -9340,6 +9340,71 @@ async fn create_bulk_items_malformed_unknown_field_returns_error_creates_nothing
     );
 }
 
+/// `atomic: false` must attempt each item independently even when an item fails
+/// to deserialize (unknown field under `#[serde(deny_unknown_fields)]`) — a
+/// sibling's deserialization failure must not abort the whole batch.
+#[tokio::test]
+async fn create_bulk_items_non_atomic_collects_deserialization_errors() {
+    let pack = pack();
+    let result = pack
+        .dispatch(
+            "create",
+            json!({
+                "items": [
+                    {"kind": "concept", "name": "ValidSibling"},
+                    {"kind": "observation", "content": "x", "unexpected": true}
+                ],
+                "atomic": false,
+                "verbose": true
+            }),
+        )
+        .await
+        .expect("non-atomic bulk create must survive a sibling deserialization failure");
+
+    assert_eq!(result["attempted"], 2);
+    assert_eq!(result["created"], 1);
+    assert_eq!(result["failed"], 1);
+    assert_eq!(result["errors"][0]["index"], 1);
+    let entities = result["entities"].as_array().expect("entities array");
+    assert_eq!(entities.len(), 1);
+    assert_eq!(entities[0]["name"], "ValidSibling");
+}
+
+/// The same payload under `atomic: true` (the default) must remain all-or-nothing:
+/// the deserialization failure aborts the batch and writes nothing, including the
+/// otherwise-valid sibling item.
+#[tokio::test]
+async fn create_bulk_items_atomic_rejects_on_deserialization_error() {
+    let pack = pack();
+    let err = pack
+        .dispatch(
+            "create",
+            json!({
+                "items": [
+                    {"kind": "concept", "name": "ShouldNotLand"},
+                    {"kind": "observation", "content": "x", "unexpected": true}
+                ]
+            }),
+        )
+        .await
+        .expect_err("malformed item must reject the whole atomic batch");
+    assert!(is_invalid_input(&err), "expected InvalidInput, got {err:?}");
+
+    let listed = pack
+        .dispatch("list", json!({"kind": "concept"}))
+        .await
+        .expect("list must succeed");
+    let count = listed
+        .get("items")
+        .and_then(Value::as_array)
+        .map(|a| a.len())
+        .unwrap_or(0);
+    assert_eq!(
+        count, 0,
+        "atomic bulk create rejection must create nothing; got {listed}"
+    );
+}
+
 // ── entity-type validator is installed by normal pack registration ─────────
 
 /// Build a `(KhiveRuntime, VerbRegistry)` pair using the same boot sequence as
