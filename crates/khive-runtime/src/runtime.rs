@@ -44,9 +44,9 @@ pub type NoteMutationHookFn = Arc<
 >;
 
 pub use crate::config::{
-    assert_captured_db_anchor_consistent, assert_db_anchor_consistent, parse_pack_list,
-    resolve_db_anchor, resolve_project_actor_id, runtime_config_from_khive_config, BackendId,
-    NamespaceToken, RuntimeConfig,
+    assert_captured_db_anchor_consistent, assert_db_anchor_consistent, expand_tilde,
+    parse_pack_list, resolve_db_anchor, resolve_project_actor_id, runtime_config_from_khive_config,
+    BackendId, NamespaceToken, RuntimeConfig,
 };
 
 // ---- KhiveRuntime ----
@@ -1055,6 +1055,87 @@ mod tests {
         let rt = KhiveRuntime::new(config).expect("file runtime should create");
         assert!(path.exists());
         assert_eq!(rt.config().default_namespace.as_str(), "test");
+    }
+
+    /// A `~/`-prefixed `--db`/`KHIVE_DB` override must resolve, boot, and
+    /// fingerprint identically to the equivalent absolute path. Before this
+    /// fix, `resolve_db_anchor` left a leading `~` unexpanded in
+    /// `RuntimeConfig.db_path`, so single-backend boot (`KhiveRuntime::new`)
+    /// opened a literal `./~/...` file under the process cwd while
+    /// `compute_config_id` (which canonicalizes/expands separately) still
+    /// fingerprinted the real `$HOME` path — two processes pointed at the
+    /// same logical database could open different files yet share a
+    /// `config_id`, letting daemon dispatch route requests to the wrong one.
+    #[test]
+    #[serial]
+    fn tilde_prefixed_db_override_resolves_and_boots_like_the_absolute_equivalent() {
+        let original_home = std::env::var_os("HOME");
+        let original_cwd = std::env::current_dir().expect("read cwd");
+        let home_dir = tempfile::tempdir().expect("home tempdir");
+        let work_dir = tempfile::tempdir().expect("work tempdir");
+        std::env::set_var("HOME", home_dir.path());
+        std::env::set_current_dir(work_dir.path()).expect("chdir into isolated work dir");
+
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let tilde_anchor = crate::config::resolve_db_anchor(Some("~/data.db"))
+                .expect("an explicit path always anchors");
+            let expected = home_dir.path().join("data.db");
+            assert_eq!(
+                tilde_anchor, expected,
+                "resolve_db_anchor must expand a leading ~ to $HOME before it ever \
+                 reaches RuntimeConfig.db_path"
+            );
+
+            let absolute_anchor = crate::config::resolve_db_anchor(Some(
+                expected.to_str().expect("utf8 tempdir path"),
+            ))
+            .expect("an explicit path always anchors");
+            assert_eq!(
+                tilde_anchor, absolute_anchor,
+                "a ~-prefixed override and its equivalent absolute path must resolve to \
+                 the identical anchor"
+            );
+
+            let make_config = |db_path: std::path::PathBuf| RuntimeConfig {
+                git_write: Default::default(),
+                db_path: Some(db_path),
+                default_namespace: Namespace::local(),
+                embedding_model: None,
+                additional_embedding_models: vec![],
+                gate: Arc::new(AllowAllGate),
+                packs: vec!["kg".to_string()],
+                backend_id: BackendId::main(),
+                brain_profile: None,
+                visible_namespaces: vec![],
+                allowed_outbound_namespaces: vec![],
+                actor_id: None,
+            };
+
+            let tilde_cfg = make_config(tilde_anchor.clone());
+
+            let rt = KhiveRuntime::new(tilde_cfg).expect("boot must open the expanded path");
+            assert_eq!(
+                rt.backend_data_dir().expect("file backend"),
+                home_dir.path(),
+                "single-backend boot must open the file under the expanded $HOME \
+                 directory, not a literal ~ path relative to cwd"
+            );
+            assert!(
+                expected.exists(),
+                "the database file must be created at the expanded $HOME path"
+            );
+            assert!(
+                !work_dir.path().join("~").exists(),
+                "boot must never create a literal '~' directory under the process cwd"
+            );
+        }));
+
+        match &original_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        let _ = std::env::set_current_dir(&original_cwd);
+        outcome.expect("test body panicked");
     }
 
     #[test]

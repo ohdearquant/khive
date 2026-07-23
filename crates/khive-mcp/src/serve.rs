@@ -870,7 +870,7 @@ fn canonical_backend_path(cfg: &BackendConfig) -> anyhow::Result<Option<PathBuf>
         return Ok(None);
     }
     let path = match cfg.path.as_ref() {
-        Some(p) => expand_tilde(p),
+        Some(p) => khive_runtime::expand_tilde(p),
         None => return Ok(None),
     };
     let parent = path
@@ -903,7 +903,7 @@ fn canonical_backend_path(cfg: &BackendConfig) -> anyhow::Result<Option<PathBuf>
 const MAX_SYMLINK_HOPS: u32 = 40;
 
 pub(crate) fn canonical_path_no_side_effects(path: &std::path::Path) -> anyhow::Result<PathBuf> {
-    let expanded = expand_tilde(path);
+    let expanded = khive_runtime::expand_tilde(path);
     let absolute = if expanded.is_absolute() {
         expanded
     } else {
@@ -1258,7 +1258,7 @@ fn open_backend(cfg: &BackendConfig) -> anyhow::Result<StorageBackend> {
                     cfg.name
                 )
             })?;
-            let expanded = expand_tilde(path);
+            let expanded = khive_runtime::expand_tilde(path);
             if let Some(parent) = expanded.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| {
                     anyhow::anyhow!(
@@ -1277,20 +1277,6 @@ fn open_backend(cfg: &BackendConfig) -> anyhow::Result<StorageBackend> {
                     .map_err(|e| anyhow::anyhow!("backend {}: sqlite open: {e}", cfg.name))
             }
         }
-    }
-}
-
-/// Expand a leading `~` to `$HOME` in a path.
-fn expand_tilde(path: &std::path::Path) -> PathBuf {
-    let s = path.to_string_lossy();
-    if let Some(rest) = s.strip_prefix("~/") {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        PathBuf::from(format!("{home}/{rest}"))
-    } else if s == "~" {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        PathBuf::from(home)
-    } else {
-        path.to_path_buf()
     }
 }
 
@@ -4155,6 +4141,65 @@ region = "us-east-1"
             "configs differing only in pack→backend routing must produce different config_ids; \
              both produced: {id_a}"
         );
+    }
+
+    /// Tilde divergence regression (blocking security defect): a `~/`-prefixed
+    /// `--db`/`KHIVE_DB` override must fingerprint identically to the
+    /// equivalent absolute path. Before the fix, `resolve_db_anchor` left a
+    /// leading `~` unexpanded in `RuntimeConfig.db_path`, so single-backend
+    /// boot opened a literal `./~/...` file while `compute_config_id`
+    /// canonicalized (and so expanded) the same raw string separately —
+    /// letting two processes that open different files still collide on one
+    /// `config_id` and get dispatched to each other's database by the daemon.
+    #[test]
+    #[serial]
+    fn config_id_matches_for_tilde_and_equivalent_absolute_db_override() {
+        let original_home = std::env::var_os("HOME");
+        let home_dir = tempfile::tempdir().expect("home tempdir");
+        std::env::set_var("HOME", home_dir.path());
+
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let tilde_anchor = khive_runtime::resolve_db_anchor(Some("~/data.db"))
+                .expect("an explicit path always anchors");
+            let expected = home_dir.path().join("data.db");
+            assert_eq!(
+                tilde_anchor, expected,
+                "resolve_db_anchor must expand a leading ~ before compute_config_id ever \
+                 sees it"
+            );
+
+            let absolute_anchor = khive_runtime::resolve_db_anchor(Some(
+                expected.to_str().expect("utf8 tempdir path"),
+            ))
+            .expect("an explicit path always anchors");
+            assert_eq!(tilde_anchor, absolute_anchor);
+
+            let make_config = |db_path: std::path::PathBuf| RuntimeConfig {
+                db_path: Some(db_path),
+                default_namespace: khive_runtime::Namespace::local(),
+                embedding_model: None,
+                additional_embedding_models: vec![],
+                packs: vec!["kg".to_string()],
+                ..RuntimeConfig::no_embeddings()
+            };
+
+            let tilde_cfg = make_config(tilde_anchor);
+            let abs_cfg = make_config(absolute_anchor);
+
+            let id_tilde = crate::server::compute_config_id(&tilde_cfg, None);
+            let id_abs = crate::server::compute_config_id(&abs_cfg, None);
+            assert_eq!(
+                id_tilde, id_abs,
+                "a config resolved from a ~-prefixed override must fingerprint identically \
+                 to one resolved from the equivalent absolute path"
+            );
+        }));
+
+        match original_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        outcome.expect("test body panicked");
     }
 
     // --- should_warn_unattributed predicate ---
