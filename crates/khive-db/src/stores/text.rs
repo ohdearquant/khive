@@ -13,6 +13,7 @@ use khive_storage::types::{
     TextGatherMode, TextIndexStats, TextQueryMode, TextSearchHit, TextSearchOptions,
     TextSearchRequest, TextTermStats, TextTermStatsRequest,
 };
+use khive_storage::usage::{UsageContext, UsageUnit};
 use khive_storage::StorageCapability;
 use khive_storage::TextSearch;
 use khive_types::SubstrateKind;
@@ -100,6 +101,12 @@ fn map_err(e: rusqlite::Error, op: &'static str) -> StorageError {
 
 fn map_sqlite_err(e: SqliteError, op: &'static str) -> StorageError {
     StorageError::driver(StorageCapability::Text, op, e)
+}
+
+fn count_fts_pass(context: Option<&UsageContext>) {
+    if let Some(context) = context {
+        context.add(UsageUnit::FtsPasses, 1);
+    }
 }
 
 /// A TextSearch backed by SQLite FTS5 virtual tables.
@@ -879,99 +886,104 @@ impl TextSearch for Fts5TextSearch {
 
     async fn search(&self, request: TextSearchRequest) -> Result<Vec<TextSearchHit>, StorageError> {
         let table = self.table_name.clone();
+        let usage = khive_storage::usage::current();
 
-        self.with_reader("fts_search", move |conn| {
-            let match_expr = match build_match_expr(&request.query, request.mode) {
-                Some(expr) => expr,
-                None => return Ok(Vec::new()),
-            };
+        let result = self
+            .with_reader("fts_search", move |conn| {
+                let match_expr = match build_match_expr(&request.query, request.mode) {
+                    Some(expr) => expr,
+                    None => return Ok(Vec::new()),
+                };
 
-            // Snippet column index 3 = body in the FTS5 schema.
-            // snippet_chars == 0 is the sentinel for "no snippet" — skip the
-            // snippet(...) call entirely and return NULL instead.  This avoids
-            // the ~12ms BM25 snippet computation on the hot recall path where
-            // snippets are unused.  Callers that need snippets (diagnostics) pass
-            // snippet_chars > 0 and get the same behaviour as before.
-            let snippet_expr = if request.snippet_chars == 0 {
-                "NULL AS snippet".to_string()
-            } else {
-                let chars = i32::try_from(request.snippet_chars).unwrap_or(i32::MAX);
-                format!("snippet({table}, 3, '', '', '...', {chars})")
-            };
+                // Snippet column index 3 = body in the FTS5 schema.
+                // snippet_chars == 0 is the sentinel for "no snippet" — skip the
+                // snippet(...) call entirely and return NULL instead.  This avoids
+                // the ~12ms BM25 snippet computation on the hot recall path where
+                // snippets are unused.  Callers that need snippets (diagnostics) pass
+                // snippet_chars > 0 and get the same behaviour as before.
+                let snippet_expr = if request.snippet_chars == 0 {
+                    "NULL AS snippet".to_string()
+                } else {
+                    let chars = i32::try_from(request.snippet_chars).unwrap_or(i32::MAX);
+                    format!("snippet({table}, 3, '', '', '...', {chars})")
+                };
 
-            let (filter_clause, filter_params) = if let Some(ref filter) = request.filter {
-                build_filter_clause(filter, &table, 3)
-            } else {
-                (String::new(), Vec::new())
-            };
+                let (filter_clause, filter_params) = if let Some(ref filter) = request.filter {
+                    build_filter_clause(filter, &table, 3)
+                } else {
+                    (String::new(), Vec::new())
+                };
 
-            let sql = format!(
-                "SELECT subject_id, rank, title, {snippet_expr} \
-                 FROM {table} WHERE {table} MATCH ?1{filter_clause} \
-                 ORDER BY rank LIMIT ?2",
-            );
+                let sql = format!(
+                    "SELECT subject_id, rank, title, {snippet_expr} \
+                     FROM {table} WHERE {table} MATCH ?1{filter_clause} \
+                     ORDER BY rank LIMIT ?2",
+                );
 
-            let mut stmt = conn.prepare(&sql)?;
-            stmt.raw_bind_parameter(1, &match_expr)?;
-            stmt.raw_bind_parameter(2, request.top_k as i64)?;
+                let mut stmt = conn.prepare(&sql)?;
+                count_fts_pass(usage.as_ref());
+                stmt.raw_bind_parameter(1, &match_expr)?;
+                stmt.raw_bind_parameter(2, request.top_k as i64)?;
 
-            for (i, param) in filter_params.iter().enumerate() {
-                param
-                    .to_sql()
-                    .map(|val| stmt.raw_bind_parameter(3 + i, val))
-                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))??;
-            }
+                for (i, param) in filter_params.iter().enumerate() {
+                    param
+                        .to_sql()
+                        .map(|val| stmt.raw_bind_parameter(3 + i, val))
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))??;
+                }
 
-            let mut hits = Vec::new();
-            let mut rows = stmt.raw_query();
-            let mut rank_idx = 0u32;
+                let mut hits = Vec::new();
+                let mut rows = stmt.raw_query();
+                let mut rank_idx = 0u32;
 
-            while let Some(row) = rows.next()? {
-                let id_str: String = row.get(0)?;
-                let fts_rank: f64 = row.get(1)?;
-                let title: String = row.get(2)?;
-                let snippet: Option<String> = row.get(3)?;
+                while let Some(row) = rows.next()? {
+                    let id_str: String = row.get(0)?;
+                    let fts_rank: f64 = row.get(1)?;
+                    let title: String = row.get(2)?;
+                    let snippet: Option<String> = row.get(3)?;
 
-                let subject_id = Uuid::parse_str(&id_str).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
-                })?;
+                    let subject_id = Uuid::parse_str(&id_str).map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?;
 
-                rank_idx += 1;
-                hits.push((subject_id, fts_rank, rank_idx, title, snippet));
-            }
+                    rank_idx += 1;
+                    hits.push((subject_id, fts_rank, rank_idx, title, snippet));
+                }
 
-            // Normalize scores within the result set to (0.05, 1.0].
-            // Best rank (most negative) maps to 1.0, worst to 0.05.
-            let min_rank = hits.iter().map(|h| h.1).fold(f64::INFINITY, f64::min);
-            let max_rank = hits.iter().map(|h| h.1).fold(f64::NEG_INFINITY, f64::max);
-            let range = max_rank - min_rank;
+                // Normalize scores within the result set to (0.05, 1.0].
+                // Best rank (most negative) maps to 1.0, worst to 0.05.
+                let min_rank = hits.iter().map(|h| h.1).fold(f64::INFINITY, f64::min);
+                let max_rank = hits.iter().map(|h| h.1).fold(f64::NEG_INFINITY, f64::max);
+                let range = max_rank - min_rank;
 
-            let results = hits
-                .into_iter()
-                .map(|(subject_id, raw_rank, rank, title, snippet)| {
-                    let score = if range.abs() < 1e-12 {
-                        1.0
-                    } else {
-                        let t = (max_rank - raw_rank) / range;
-                        0.05 + 0.95 * t
-                    };
-                    TextSearchHit {
-                        subject_id,
-                        score: DeterministicScore::from_f64(score),
-                        rank,
-                        title: if title.is_empty() { None } else { Some(title) },
-                        snippet: snippet.filter(|s| !s.is_empty()),
-                    }
-                })
-                .collect();
+                let results = hits
+                    .into_iter()
+                    .map(|(subject_id, raw_rank, rank, title, snippet)| {
+                        let score = if range.abs() < 1e-12 {
+                            1.0
+                        } else {
+                            let t = (max_rank - raw_rank) / range;
+                            0.05 + 0.95 * t
+                        };
+                        TextSearchHit {
+                            subject_id,
+                            score: DeterministicScore::from_f64(score),
+                            rank,
+                            title: if title.is_empty() { None } else { Some(title) },
+                            snippet: snippet.filter(|s| !s.is_empty()),
+                        }
+                    })
+                    .collect();
 
-            Ok(results)
-        })
-        .await
+                Ok(results)
+            })
+            .await;
+
+        result
     }
 
     async fn count(&self, filter: TextFilter) -> Result<u64, StorageError> {
@@ -1177,6 +1189,7 @@ impl Fts5TextSearch {
         request: TextSearchRequest,
     ) -> Result<Vec<TextSearchHit>, StorageError> {
         let table = self.table_name.clone();
+        let usage = khive_storage::usage::current();
 
         self.with_reader("fts_search_unranked", move |conn| {
             let match_expr = match build_match_expr(&request.query, request.mode) {
@@ -1198,6 +1211,7 @@ impl Fts5TextSearch {
             );
 
             let mut stmt = conn.prepare(&sql)?;
+            count_fts_pass(usage.as_ref());
             stmt.raw_bind_parameter(1, &match_expr)?;
             stmt.raw_bind_parameter(2, request.top_k as i64)?;
 
@@ -1246,6 +1260,7 @@ impl Fts5TextSearch {
         gather_limit: u32,
     ) -> Result<Vec<TextSearchHit>, StorageError> {
         let table = self.table_name.clone();
+        let usage = khive_storage::usage::current();
 
         self.with_reader("fts_search_rank_within_cap", move |conn| {
             let match_expr = match build_match_expr(&request.query, request.mode) {
@@ -1265,6 +1280,7 @@ impl Fts5TextSearch {
             );
 
             let mut stmt = conn.prepare(&gather_sql)?;
+            count_fts_pass(usage.as_ref());
             stmt.raw_bind_parameter(1, &match_expr)?;
             stmt.raw_bind_parameter(2, gather_limit as i64)?;
             for (i, param) in filter_params.iter().enumerate() {
@@ -1307,6 +1323,7 @@ impl Fts5TextSearch {
             );
 
             let mut stmt2 = conn.prepare(&rank_sql)?;
+            count_fts_pass(usage.as_ref());
             stmt2.raw_bind_parameter(1, &match_expr)?;
             stmt2.raw_bind_parameter(2, request.top_k as i64)?;
             for (i, id_str) in gathered_ids.iter().enumerate() {
