@@ -82,6 +82,11 @@ const SEARCH_MARGIN_RATIO: f64 = 2.0;
 /// Vector hits below this raw cosine-similarity score are removed before RRF
 /// fusion. Lexical hits remain admissible because RRF magnitude encodes rank,
 /// not textual relevance, and genuine partial-name matches score below this floor.
+///
+/// This is a raw cosine value in `[-1.0, 1.0]`, not the `(1 + cos) / 2`
+/// storage scale vector hits are scored on
+/// (`khive-db` `stores/vectors.rs`) — `hybrid_search_with_vector_similarity_floor`
+/// converts between the two scales at the comparison site.
 const SEARCH_VECTOR_SIMILARITY_FLOOR: f64 = 0.3;
 /// Confidence reported on a search-stage `Resolved` outcome: not the raw
 /// RRF score, which lives on a much smaller scale (`sum 1/(k + rank)`, e.g.
@@ -903,7 +908,10 @@ mod tests {
             .expect("vector search");
         assert_eq!(raw_hits.len(), 1);
         assert_eq!(raw_hits[0].subject_id, entity.id);
-        assert!(raw_hits[0].score.to_f64() >= SEARCH_VECTOR_SIMILARITY_FLOOR);
+        // Identical constant embeddings: raw cosine 1.0, storage score
+        // (1 + 1.0) / 2 == 1.0 — well above 0.65, the storage-scale floor a
+        // raw-cosine bar of 0.3 converts to.
+        assert!((raw_hits[0].score.to_f64() - 1.0).abs() < 1e-6);
 
         let hits = rt
             .hybrid_search(&token, "domestic dog", None, 5, None, None, &[], None)
@@ -923,6 +931,76 @@ mod tests {
                 confidence: SEARCH_RESOLVED_CONFIDENCE,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn fallback_stage_drops_orthogonal_semantic_only_candidate() {
+        // Regression for #1366: an orthogonal vector (raw cosine 0.0) scores
+        // 0.5 on the `(1 + cos) / 2` storage scale, which clears a floor
+        // compared directly against the raw-cosine constant (0.3) even
+        // though the documented contract says it should not. A sole
+        // semantic candidate at this similarity must be dropped, not
+        // resolved.
+        let rt = runtime_with_constant_embeddings();
+        let token = actor_token("resolver-test");
+        let ring = ReferenceRing::new();
+        let dimensions = EmbeddingModel::AllMiniLmL6V2.dimensions();
+
+        let entity = rt
+            .create_entity(
+                &token,
+                "concept",
+                None,
+                "Unrelated Orthogonal",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect("create unrelated entity");
+        let vectors = rt.vectors(&token).expect("vector store");
+        vectors
+            .delete(entity.id)
+            .await
+            .expect("delete generated vector");
+        let mut orthogonal_vector = vec![1.0f32; dimensions / 2];
+        orthogonal_vector.extend(vec![-1.0f32; dimensions - dimensions / 2]);
+        vectors
+            .insert(
+                entity.id,
+                SubstrateKind::Entity,
+                token.namespace().as_str(),
+                "entity.body",
+                vec![orthogonal_vector],
+            )
+            .await
+            .expect("insert orthogonal vector");
+
+        let raw_hits = rt
+            .vector_search(
+                &token,
+                None,
+                Some("totally-nonexistent-orthogonal-zzz"),
+                5,
+                Some(SubstrateKind::Entity),
+            )
+            .await
+            .expect("vector search");
+        assert_eq!(raw_hits.len(), 1);
+        assert!((raw_hits[0].score.to_f64() - 0.5).abs() < 1e-6);
+
+        let resolution = resolve_reference(
+            &rt,
+            &ring,
+            &token,
+            "totally-nonexistent-orthogonal-zzz",
+            5,
+            None,
+        )
+        .await
+        .expect("resolve_reference");
+
+        assert_eq!(resolution, ReferenceResolution::NotFound);
     }
 
     #[tokio::test]
@@ -949,16 +1027,24 @@ mod tests {
             .delete(entity.id)
             .await
             .expect("delete generated vector");
+        // A quarter of dimensions aligned, three-quarters opposed against the
+        // constant all-ones query embedding: raw cosine 2*0.25 - 1 == -0.5,
+        // storage score (1 + -0.5) / 2 == 0.25 — below floor without being
+        // the maximally-opposite case, so this exercises a genuine
+        // below-floor mismatch rather than the degenerate cosine -1 extreme.
+        let quarter = dimensions / 4;
+        let mut mismatched_vector = vec![1.0f32; quarter];
+        mismatched_vector.extend(vec![-1.0f32; dimensions - quarter]);
         vectors
             .insert(
                 entity.id,
                 SubstrateKind::Entity,
                 token.namespace().as_str(),
                 "entity.body",
-                vec![vec![-1.0; dimensions]],
+                vec![mismatched_vector],
             )
             .await
-            .expect("insert opposite vector");
+            .expect("insert mismatched vector");
 
         let raw_hits = rt
             .vector_search(
@@ -971,7 +1057,7 @@ mod tests {
             .await
             .expect("vector search");
         assert_eq!(raw_hits.len(), 1);
-        assert!(raw_hits[0].score.to_f64() < SEARCH_VECTOR_SIMILARITY_FLOOR);
+        assert!((raw_hits[0].score.to_f64() - 0.25).abs() < 1e-6);
 
         let resolution = resolve_reference(&rt, &ring, &token, "totally-nonexistent-zzz", 5, None)
             .await
