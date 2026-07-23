@@ -868,16 +868,20 @@ impl VamanaIndex {
     /// staging/fsync sequence.
     #[cfg(feature = "mmap")]
     pub fn save_atomic(&self, path: &Path) -> Result<()> {
-        self.save_atomic_with_lock_hooks(path, || {}, || {}, || {})
+        self.save_atomic_with_lock_hook(path, |lock| lock.lock().map_err(Into::into))
     }
 
+    /// `acquire_lock` owns the entire publication-lock handshake: it receives the open
+    /// (but unlocked) `.checkpoint.lock` file and must return only once this writer holds
+    /// an exclusive lock on it. Production goes straight to the blocking `lock()` call with
+    /// no probing — the same single syscall this always made. Tests substitute a hook that
+    /// probes with `try_lock()` first to observe contention deterministically; that probing
+    /// code never runs outside test builds.
     #[cfg(feature = "mmap")]
-    fn save_atomic_with_lock_hooks(
+    fn save_atomic_with_lock_hook(
         &self,
         path: &Path,
-        before_lock: impl FnOnce(),
-        on_contended: impl FnOnce(),
-        after_lock: impl FnOnce(),
+        acquire_lock: impl FnOnce(&File) -> Result<()>,
     ) -> Result<()> {
         fs::create_dir_all(path)?;
         let publication_lock = OpenOptions::new()
@@ -886,20 +890,7 @@ impl VamanaIndex {
             .read(true)
             .write(true)
             .open(path.join(".checkpoint.lock"))?;
-        before_lock();
-        // A non-blocking probe first: `try_lock` reports `WouldBlock` only when the OS
-        // observes an incompatible lock held on this file at the instant of the call, so
-        // firing `on_contended` here is proof of genuine contention, never a guess based
-        // on elapsed time. The fallback `lock()` call blocks exactly as it always did.
-        match publication_lock.try_lock() {
-            Ok(()) => {}
-            Err(std::fs::TryLockError::WouldBlock) => {
-                on_contended();
-                publication_lock.lock()?;
-            }
-            Err(std::fs::TryLockError::Error(err)) => return Err(err.into()),
-        }
-        after_lock();
+        acquire_lock(&publication_lock)?;
         reject_checkpoint_sequence_regression(path, self.last_applied_seq)?;
 
         // Stage under .v2new so a crash before the metadata rename leaves the previous
@@ -5310,41 +5301,70 @@ mod tests {
         let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel(0);
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
         let newer_handle = std::thread::spawn(move || {
-            newer.save_atomic_with_lock_hooks(
-                &newer_path,
-                || {},
-                || {},
-                || {
-                    locked_tx.send(()).unwrap();
-                    release_rx.recv().unwrap();
-                },
-            )
+            newer.save_atomic_with_lock_hook(&newer_path, |lock| {
+                lock.lock()?;
+                locked_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
         });
         locked_rx.recv().unwrap();
 
         // `newer` now holds the OS-level lock on `.checkpoint.lock` and cannot release it
-        // until `release_tx.send(())` below unblocks its `after_lock` hook. `stale`'s
-        // `on_contended` hook fires only when its own `try_lock()` call observes
-        // `TryLockError::WouldBlock` on that same file — an outcome the OS reports if and
-        // only if an incompatible lock is held at that exact instant. So `contended_rx.recv()`
-        // returning is proof by construction that the stale writer's lock attempt overlapped
-        // the newer writer's lock hold: there is no interleaving in which this channel fires
-        // without genuine contention having occurred, and no interleaving in which `newer`
-        // can race ahead and release the lock first, since it is parked on `release_rx`
-        // until this thread proceeds.
+        // until `release_tx.send(())` below unblocks its hook. `stale`'s hook probes with its
+        // own `try_lock()` call on that same file first: `WouldBlock` is an outcome the OS
+        // reports if and only if an incompatible lock is held at that exact instant, so
+        // observing it here is proof of genuine contention, never a guess based on elapsed
+        // time. The probe result is sent over `contended_rx` before the hook falls back to a
+        // blocking `lock()`, so the channel resolves on every probe outcome — contention,
+        // probe failure, or (unreachable in this scenario) an uncontended immediate lock —
+        // and the receiver never hangs waiting on a signal that a failed probe would
+        // otherwise never send. There is no interleaving in which `contended_rx` reports
+        // contention without genuine overlap having occurred, and no interleaving in which
+        // `newer` can race ahead and release the lock first, since it is parked on
+        // `release_rx` until this thread proceeds.
+        enum ProbeOutcome {
+            Contended,
+            Uncontended,
+            ProbeFailed(String),
+        }
         let stale_path = dir.path().to_path_buf();
         let (contended_tx, contended_rx) = std::sync::mpsc::sync_channel(0);
         let (result_tx, result_rx) = std::sync::mpsc::sync_channel(0);
         let stale_handle = std::thread::spawn(move || {
-            let result = stale.save_atomic_with_lock_hooks(
-                &stale_path,
-                || {},
-                || contended_tx.send(()).unwrap(),
-                || {},
-            );
+            let result =
+                stale.save_atomic_with_lock_hook(&stale_path, |lock| match lock.try_lock() {
+                    Ok(()) => {
+                        contended_tx.send(ProbeOutcome::Uncontended).unwrap();
+                        Ok(())
+                    }
+                    Err(std::fs::TryLockError::WouldBlock) => {
+                        contended_tx.send(ProbeOutcome::Contended).unwrap();
+                        lock.lock()?;
+                        Ok(())
+                    }
+                    Err(std::fs::TryLockError::Error(err)) => {
+                        contended_tx
+                            .send(ProbeOutcome::ProbeFailed(err.to_string()))
+                            .unwrap();
+                        Err(err.into())
+                    }
+                });
             result_tx.send(result).unwrap();
         });
-        contended_rx.recv().unwrap();
+        // The probe hook always signals before it can block, so this rendezvous cannot
+        // hang on a live probe outcome; the timeout only guards against the hook never
+        // running at all (e.g. a panic before the `try_lock` call).
+        match contended_rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("contention probe never signaled within 60s")
+        {
+            ProbeOutcome::Contended => {}
+            ProbeOutcome::Uncontended => {
+                panic!("lock probe observed no contention; newer writer should have held the lock")
+            }
+            ProbeOutcome::ProbeFailed(err) => panic!("lock probe failed: {err}"),
+        }
 
         release_tx.send(()).unwrap();
         newer_handle.join().unwrap().unwrap();
