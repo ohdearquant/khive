@@ -83,9 +83,10 @@ kkernel exec 'memory.recall(query="...")' --presentation verbose
 ```
 
 Flags: `--db`, `--namespace`, `--presentation <agent|verbose|human>`, `--strict`.
-Without `--strict`, a dispatched request retains its compatibility behavior and exits zero even
-when its response has `status: "partial"`; `--strict` converts failed or aborted ops into a
-nonzero process exit after printing the full response.
+A request in which every op failed or aborted always exits nonzero after printing the full
+response. Without `--strict`, a *partially* failed request (`status: "partial"` with at least
+one success) retains its compatibility behavior and exits zero; `--strict` converts any failed
+or aborted op into a nonzero process exit.
 
 ---
 
