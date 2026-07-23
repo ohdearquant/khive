@@ -868,11 +868,16 @@ impl VamanaIndex {
     /// staging/fsync sequence.
     #[cfg(feature = "mmap")]
     pub fn save_atomic(&self, path: &Path) -> Result<()> {
-        self.save_atomic_with_lock_hook(path, || {})
+        self.save_atomic_with_lock_hooks(path, || {}, || {})
     }
 
     #[cfg(feature = "mmap")]
-    fn save_atomic_with_lock_hook(&self, path: &Path, after_lock: impl FnOnce()) -> Result<()> {
+    fn save_atomic_with_lock_hooks(
+        &self,
+        path: &Path,
+        before_lock: impl FnOnce(),
+        after_lock: impl FnOnce(),
+    ) -> Result<()> {
         fs::create_dir_all(path)?;
         let publication_lock = OpenOptions::new()
             .create(true)
@@ -880,6 +885,7 @@ impl VamanaIndex {
             .read(true)
             .write(true)
             .open(path.join(".checkpoint.lock"))?;
+        before_lock();
         publication_lock.lock()?;
         after_lock();
         reject_checkpoint_sequence_regression(path, self.last_applied_seq)?;
@@ -5292,22 +5298,36 @@ mod tests {
         let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel(0);
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
         let newer_handle = std::thread::spawn(move || {
-            newer.save_atomic_with_lock_hook(&newer_path, || {
-                locked_tx.send(()).unwrap();
-                release_rx.recv().unwrap();
-            })
+            newer.save_atomic_with_lock_hooks(
+                &newer_path,
+                || {},
+                || {
+                    locked_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                },
+            )
         });
         locked_rx.recv().unwrap();
 
+        // `about_to_lock` fires from `before_lock`, the seam immediately preceding the
+        // blocking `publication_lock.lock()` call — not merely "the thread started" (which
+        // would leave open the possibility that the stale writer was simply descheduled
+        // until after `newer` had already released the lock and completed, making the
+        // timeout assert below pass vacuously). Rendezvousing here proves the stale writer
+        // has reached the lock attempt itself while `newer` still holds it, so the 100ms
+        // timeout genuinely observes the stale writer blocked on contention.
         let stale_path = dir.path().to_path_buf();
-        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
+        let (about_to_lock_tx, about_to_lock_rx) = std::sync::mpsc::sync_channel(0);
         let (result_tx, result_rx) = std::sync::mpsc::sync_channel(0);
         let stale_handle = std::thread::spawn(move || {
-            started_tx.send(()).unwrap();
-            let result = stale.save_atomic(&stale_path);
+            let result = stale.save_atomic_with_lock_hooks(
+                &stale_path,
+                || about_to_lock_tx.send(()).unwrap(),
+                || {},
+            );
             result_tx.send(result).unwrap();
         });
-        started_rx.recv().unwrap();
+        about_to_lock_rx.recv().unwrap();
         assert!(matches!(
             result_rx.recv_timeout(std::time::Duration::from_millis(100)),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout)
