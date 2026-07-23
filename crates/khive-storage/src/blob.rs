@@ -134,6 +134,11 @@ pub struct BlobOrphanSweepResult {
     /// is set — populated in both modes so a dry run reports the same count
     /// a real run would delete).
     pub would_delete: u64,
+    /// Objects with zero live references that were left alone because they
+    /// are still inside their publish grace period — recently written and
+    /// not yet orphaned, just not yet referenced by an entity. Reported in
+    /// both modes; never counted in `would_delete` or `deleted`.
+    pub grace_period_skipped: u64,
 }
 
 /// Content-addressed binary object CRUD.
@@ -227,6 +232,14 @@ pub trait BlobStore: Send + Sync + std::fmt::Debug + 'static {
     /// backend rather than mutate its physical storage directly.
     /// Backends that cannot provide both guarantees return
     /// `StorageError::Unsupported`.
+    ///
+    /// Publishing a blob and committing the entity write that references it
+    /// are two separate client steps; nothing serializes them against this
+    /// sweep. Implementations must therefore also give a just-published,
+    /// not-yet-referenced object a bounded grace period before treating it as
+    /// an orphan (the filesystem backend does this via file age). A client
+    /// whose own gap between the two steps exceeds that grace period is not
+    /// protected — this narrows, but does not eliminate, the hazard.
     async fn transactional_orphan_sweep(
         &self,
         sql: &dyn SqlAccess,

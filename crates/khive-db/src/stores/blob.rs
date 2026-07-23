@@ -15,6 +15,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 
@@ -205,15 +206,43 @@ fn walk_blob_files(root: &Path) -> std::io::Result<Vec<(ContentRef, PathBuf)>> {
     Ok(out)
 }
 
+/// Whether a candidate file is still inside its publish grace period and must
+/// be left alone regardless of liveness.
+///
+/// `put`'s two-step client protocol (bytes land first, a *later* entity write
+/// commits the `content_ref`) means a blob can be physically on disk with
+/// zero live references for a window entirely outside this store's control —
+/// the referencing write simply hasn't happened yet. A file whose mtime is
+/// younger than `grace_period` is therefore treated as not-yet-orphaned:
+/// `fs::metadata` failing to report an age (removed mid-scan, clock
+/// weirdness) is treated the same way (age unknown -> protect it), the safe
+/// direction for a sweep that only ever destroys data.
+fn within_publish_grace(path: &Path, now: SystemTime, grace_period: Duration) -> bool {
+    let age = fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|mtime| now.duration_since(mtime).ok());
+    match age {
+        Some(age) => age < grace_period,
+        None => true,
+    }
+}
+
 fn sweep_blob_candidates(
     files: Vec<(ContentRef, PathBuf)>,
     live_refs: &std::collections::HashSet<ContentRef>,
     dry_run: bool,
+    grace_period: Duration,
 ) -> StorageResult<BlobOrphanSweepResult> {
     let mut result = BlobOrphanSweepResult::default();
+    let now = SystemTime::now();
     for (content_ref, path) in files {
         result.scanned += 1;
         if live_refs.contains(&content_ref) {
+            continue;
+        }
+        if within_publish_grace(&path, now, grace_period) {
+            result.grace_period_skipped += 1;
             continue;
         }
         result.would_delete += 1;
@@ -229,9 +258,10 @@ fn sweep_blob_files(
     root: &Path,
     live_refs: &std::collections::HashSet<ContentRef>,
     dry_run: bool,
+    grace_period: Duration,
 ) -> StorageResult<BlobOrphanSweepResult> {
     let files = walk_blob_files(root).map_err(|e| map_io_err(e, "orphan_sweep_walk"))?;
-    sweep_blob_candidates(files, live_refs, dry_run)
+    sweep_blob_candidates(files, live_refs, dry_run, grace_period)
 }
 
 /// Process-wide registry of per-canonical-root write locks.
@@ -291,12 +321,25 @@ pub struct FsBlobStore {
     /// lock to coordinate with publishers and transactional sweeps in other
     /// processes.
     write_lock: Arc<tokio::sync::Mutex<()>>,
+    /// How long a blob with zero live references is left alone before an
+    /// orphan sweep will delete it — see `within_publish_grace`. Bounds the
+    /// window between `put` (bytes land, lock released) and the later,
+    /// separate entity write that commits a `content_ref` to it; it does not
+    /// close that window entirely; see `within_publish_grace` and
+    /// `transactional_orphan_sweep`'s doc comment for the residual exposure.
+    orphan_sweep_grace: Duration,
 }
 
 impl FsBlobStore {
     /// Default fail-closed free-space floor (khive#292 SPEC-gate ruling):
     /// 100 GB. Config-overridable via the `floor_bytes` constructor argument.
     pub const DEFAULT_FLOOR_BYTES: u64 = 100_000_000_000;
+
+    /// Default orphan-sweep publish grace period: 1 hour. Generous on
+    /// purpose — it only needs to outlast the gap between a client's `put`
+    /// call returning and its follow-up entity write landing, not any
+    /// steady-state condition.
+    pub const DEFAULT_ORPHAN_SWEEP_GRACE: Duration = Duration::from_secs(3600);
 
     /// Create a store rooted at `root`, creating the directory if absent.
     pub fn new(root: PathBuf, floor_bytes: u64) -> Result<Self, SqliteError> {
@@ -306,7 +349,15 @@ impl FsBlobStore {
             root,
             floor_bytes,
             write_lock,
+            orphan_sweep_grace: Self::DEFAULT_ORPHAN_SWEEP_GRACE,
         })
+    }
+
+    /// Override the orphan-sweep publish grace period (default: one hour —
+    /// see `DEFAULT_ORPHAN_SWEEP_GRACE`).
+    pub fn with_orphan_sweep_grace(mut self, grace_period: Duration) -> Self {
+        self.orphan_sweep_grace = grace_period;
+        self
     }
 
     /// The resolved root directory this store writes under.
@@ -424,11 +475,28 @@ impl BlobStore for FsBlobStore {
         let root = self.root.clone();
         let live_refs = config.live_refs.clone();
         let dry_run = config.dry_run;
-        tokio::task::spawn_blocking(move || sweep_blob_files(&root, &live_refs, dry_run))
-            .await
-            .map_err(|e| StorageError::driver(StorageCapability::Blob, "orphan_sweep", e))?
+        let grace_period = self.orphan_sweep_grace;
+        tokio::task::spawn_blocking(move || {
+            sweep_blob_files(&root, &live_refs, dry_run, grace_period)
+        })
+        .await
+        .map_err(|e| StorageError::driver(StorageCapability::Blob, "orphan_sweep", e))?
     }
 
+    // `put` and the entity write that later commits a `content_ref` to its
+    // result are two separate steps of the client protocol -- the write
+    // lock this method takes only serializes it against a concurrent `put`,
+    // it is not held across the caller's own gap between finishing `put` and
+    // issuing that follow-up entity write. A blob can therefore be fully on
+    // disk with zero live references purely because its referencing write
+    // hasn't landed yet, not because it is actually orphaned.
+    // `within_publish_grace` (via `orphan_sweep_grace`) is what protects that
+    // window: a file younger than the grace period is left alone regardless
+    // of liveness. Residual assumption: a client that waits longer than the
+    // grace period between `put` returning and its entity write committing
+    // is still exposed to this method deleting the blob out from under it --
+    // callers with an unusually slow publish path should widen the grace
+    // period (`FsBlobStore::with_orphan_sweep_grace`) accordingly.
     async fn transactional_orphan_sweep(
         &self,
         sql: &dyn SqlAccess,
@@ -437,6 +505,7 @@ impl BlobStore for FsBlobStore {
         let owned_guard = self.write_lock.clone().lock_owned().await;
         let root = self.root.clone();
         let scan_root = root.clone();
+        let grace_period = self.orphan_sweep_grace;
         let (write_guards, candidates) = tokio::task::spawn_blocking(move || {
             let root_write_guard = acquire_root_write_lock(&scan_root)?;
             let candidates = walk_blob_files(&scan_root)
@@ -491,7 +560,7 @@ impl BlobStore for FsBlobStore {
                     let _ = hook.reached.send(());
                     let _ = hook.release.recv();
                 }
-                let result = sweep_blob_candidates(candidates, &live_refs, dry_run)?;
+                let result = sweep_blob_candidates(candidates, &live_refs, dry_run, grace_period)?;
                 Ok(Box::new(result) as Box<dyn std::any::Any + Send>)
             })
         });
@@ -583,7 +652,12 @@ mod tests {
     fn store(floor_bytes: u64) -> (tempfile::TempDir, FsBlobStore) {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("blobs");
-        let store = FsBlobStore::new(root, floor_bytes).unwrap();
+        // Zero orphan-sweep grace period: these tests exercise immediate
+        // orphan deletion, not the publish-grace window (covered by the
+        // `orphan_sweep_grace` tests below).
+        let store = FsBlobStore::new(root, floor_bytes)
+            .unwrap()
+            .with_orphan_sweep_grace(Duration::ZERO);
         (dir, store)
     }
 
@@ -1003,7 +1077,11 @@ mod tests {
             crate::run_migrations(writer.conn_mut()).unwrap();
         }
         let root = dir.path().join("blobs");
-        let store = std::sync::Arc::new(FsBlobStore::new(root.clone(), 0).unwrap());
+        let store = std::sync::Arc::new(
+            FsBlobStore::new(root.clone(), 0)
+                .unwrap()
+                .with_orphan_sweep_grace(Duration::ZERO),
+        );
         let orphan = store.put(b"old orphan".to_vec()).await.unwrap();
         let canonical_root = root.canonicalize().unwrap();
         let (marked, release, _done) = sync_hook::install(&canonical_root);
@@ -1054,7 +1132,11 @@ mod tests {
             crate::run_migrations(writer.conn_mut()).unwrap();
         }
         let root = dir.path().join("blobs");
-        let store = std::sync::Arc::new(FsBlobStore::new(root.clone(), 0).unwrap());
+        let store = std::sync::Arc::new(
+            FsBlobStore::new(root.clone(), 0)
+                .unwrap()
+                .with_orphan_sweep_grace(Duration::ZERO),
+        );
         let payload = b"existing orphan republished during sweep".to_vec();
         let orphan = store.put(payload.clone()).await.unwrap();
         let canonical_root = root.canonicalize().unwrap();
@@ -1114,7 +1196,9 @@ mod tests {
             let mut writer = backend.pool().writer().unwrap();
             crate::run_migrations(writer.conn_mut()).unwrap();
         }
-        let store = FsBlobStore::new(dir.path().join("blobs"), 0).unwrap();
+        let store = FsBlobStore::new(dir.path().join("blobs"), 0)
+            .unwrap()
+            .with_orphan_sweep_grace(Duration::ZERO);
         let live = store.put(b"live".to_vec()).await.unwrap();
         let soft_deleted = store.put(b"soft deleted".to_vec()).await.unwrap();
         let orphan = store.put(b"orphan".to_vec()).await.unwrap();
@@ -1150,6 +1234,129 @@ mod tests {
         assert_eq!(result.deleted, 2);
         assert!(store.exists(&live).await.unwrap());
         assert!(!store.exists(&soft_deleted).await.unwrap());
+        assert!(!store.exists(&orphan).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn transactional_orphan_sweep_protects_a_freshly_published_blob_before_its_reference_commits(
+    ) {
+        // The exact two-step client protocol hazard: `put` completes and
+        // releases its write lock (step 1) while the entity write that will
+        // *later* commit a `content_ref` to this blob (step 2) has not
+        // happened yet -- nothing in this store's locking serializes the
+        // two, because they are separate calls the client makes with an
+        // arbitrary gap in between. A sweep that lands in that gap must not
+        // delete the blob: `entities.content_ref` has no row for it yet
+        // purely because the referencing write hasn't landed, not because
+        // it is actually orphaned. Without the publish-grace window this
+        // reproduces khive#1313's dangling-reference defect: the blob file
+        // is deleted here, and the still-pending entity write below would
+        // commit a `content_ref` to nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("khive.db");
+        let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+        {
+            let mut writer = backend.pool().writer().unwrap();
+            crate::run_migrations(writer.conn_mut()).unwrap();
+        }
+        // Default (non-zero) grace period -- this test exercises exactly
+        // what it exists to protect.
+        let store = FsBlobStore::new(dir.path().join("blobs"), 0).unwrap();
+
+        // Step 1: put completes, lock released. No entity anywhere
+        // references this blob yet.
+        let blob = store
+            .put(b"published, reference not yet committed".to_vec())
+            .await
+            .unwrap();
+
+        // A sweep runs in the gap before step 2 (the entity write) happens.
+        let result = store
+            .transactional_orphan_sweep(backend.sql().as_ref(), false)
+            .await
+            .unwrap();
+
+        assert_eq!(result.deleted, 0, "the blob must survive: {result:?}");
+        assert_eq!(
+            result.would_delete, 0,
+            "not treated as a deletable orphan: {result:?}"
+        );
+        assert_eq!(
+            result.grace_period_skipped, 1,
+            "must be reported as grace-protected rather than silently ignored: {result:?}"
+        );
+        assert!(
+            store.exists(&blob).await.unwrap(),
+            "a blob still inside its publish grace period must survive the sweep"
+        );
+
+        // Step 2 now lands: the entity write commits content_ref to the
+        // still-present blob.
+        {
+            let writer = backend.pool().writer().unwrap();
+            writer
+                .conn()
+                .execute(
+                    "INSERT INTO entities \
+                     (id, namespace, kind, name, tags, created_at, updated_at, deleted_at, content_ref) \
+                     VALUES ('e1', 'local', 'document', 'e1', '[]', 1, 1, NULL, ?1)",
+                    rusqlite::params![blob.as_str()],
+                )
+                .unwrap();
+        }
+
+        // A later sweep now finds it live and keeps it for the ordinary
+        // reason, independent of the grace window.
+        let result = store
+            .transactional_orphan_sweep(backend.sql().as_ref(), false)
+            .await
+            .unwrap();
+        assert_eq!(result.deleted, 0);
+        assert!(store.exists(&blob).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn transactional_orphan_sweep_still_removes_orphans_older_than_the_grace_period() {
+        // The grace window narrows the publish-vs-sweep race, it does not
+        // disable sweeping outright: an object whose age already exceeds a
+        // (short, for this test) grace period is removed exactly as before,
+        // proving the fix bounds the exposure rather than papering over it.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("khive.db");
+        let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+        {
+            let mut writer = backend.pool().writer().unwrap();
+            crate::run_migrations(writer.conn_mut()).unwrap();
+        }
+        let store = FsBlobStore::new(dir.path().join("blobs"), 0)
+            .unwrap()
+            .with_orphan_sweep_grace(Duration::from_secs(60));
+
+        let orphan = store
+            .put(b"actually orphaned, published long ago".to_vec())
+            .await
+            .unwrap();
+        // Back-date the file's mtime well past the 60s grace period instead
+        // of sleeping in the test.
+        let path = shard_path(store.root(), &orphan);
+        let old_mtime = SystemTime::now() - Duration::from_secs(3600);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old_mtime)
+            .unwrap();
+
+        let result = store
+            .transactional_orphan_sweep(backend.sql().as_ref(), false)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.deleted, 1,
+            "an orphan older than the grace period must still be swept: {result:?}"
+        );
+        assert_eq!(result.grace_period_skipped, 0);
         assert!(!store.exists(&orphan).await.unwrap());
     }
 
