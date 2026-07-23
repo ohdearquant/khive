@@ -33,6 +33,13 @@ pub enum VamanaError {
         source: std::io::Error,
     },
 
+    /// A checkpoint attempted to replace a commit with a higher applied sequence.
+    #[error("checkpoint sequence regression: candidate {candidate:?}, incumbent {incumbent}")]
+    CheckpointSequenceRegression {
+        candidate: Option<u64>,
+        incumbent: u64,
+    },
+
     /// A supplied vector slice contains non-finite values (`NaN` or `Infinity`).
     #[error("non-finite float in {location}: {detail}")]
     NonFiniteFloat { location: String, detail: String },

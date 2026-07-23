@@ -26,12 +26,25 @@ use crate::writer_task::WriterTaskHandle;
 
 /// Map a rusqlite error to `StorageError` with `Graph` capability.
 fn map_err(e: rusqlite::Error, op: &'static str) -> StorageError {
+    if matches!(
+        &e,
+        rusqlite::Error::SqliteFailure(_, Some(message))
+            if message == "concept already has a different introduced_by origin"
+    ) {
+        return StorageError::Conflict {
+            capability: StorageCapability::Graph,
+            operation: op.into(),
+            message: "concept already has a different introduced_by origin".to_string(),
+        };
+    }
     StorageError::driver(StorageCapability::Graph, op, e)
 }
 
 fn map_sqlite_err(e: SqliteError, op: &'static str) -> StorageError {
     StorageError::driver(StorageCapability::Graph, op, e)
 }
+
+const NAMESPACE_COUNT_CHUNK_SIZE: usize = 500;
 
 // ---------------------------------------------------------------------------
 // Pure statement builders (ADR-099 B3 r6 structural cut) — see entity.rs's
@@ -743,11 +756,27 @@ fn build_edge_filter_sql(
     namespace: &str,
     filter: &EdgeFilter,
 ) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
-    let mut conditions: Vec<String> = vec![
-        "namespace = ?1".to_string(),
-        "deleted_at IS NULL".to_string(),
-    ];
-    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(namespace.to_string())];
+    build_edge_filter_sql_for_namespaces(&[namespace.to_string()], filter)
+}
+
+fn build_edge_filter_sql_for_namespaces(
+    namespaces: &[String],
+    filter: &EdgeFilter,
+) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = namespaces
+        .iter()
+        .map(|namespace| -> Box<dyn rusqlite::types::ToSql> { Box::new(namespace.clone()) })
+        .collect();
+    let namespace_condition = match namespaces.len() {
+        0 => "0".to_string(),
+        1 => "namespace = ?1".to_string(),
+        _ => {
+            let placeholders: Vec<String> =
+                (1..=namespaces.len()).map(|i| format!("?{i}")).collect();
+            format!("namespace IN ({})", placeholders.join(", "))
+        }
+    };
+    let mut conditions = vec![namespace_condition, "deleted_at IS NULL".to_string()];
 
     if !filter.ids.is_empty() {
         let placeholders: Vec<String> = filter
@@ -1690,6 +1719,33 @@ impl GraphStore for SqlGraphStore {
         .await
     }
 
+    async fn count_edges_in_namespaces(
+        &self,
+        namespaces: &[String],
+        filter: EdgeFilter,
+    ) -> Result<u64, StorageError> {
+        let namespaces: Vec<String> = namespaces
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        self.with_reader("count_edges_in_namespaces", move |conn| {
+            let mut total = 0;
+            for chunk in namespaces.chunks(NAMESPACE_COUNT_CHUNK_SIZE) {
+                let (where_clause, params) = build_edge_filter_sql_for_namespaces(chunk, &filter);
+                let sql = format!("SELECT COUNT(*) FROM graph_edges{where_clause}");
+                let mut stmt = conn.prepare(&sql)?;
+                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    params.iter().map(|p| p.as_ref()).collect();
+                let count: i64 = stmt.query_row(param_refs.as_slice(), |row| row.get(0))?;
+                total += count as u64;
+            }
+            Ok(total)
+        })
+        .await
+    }
+
     async fn count_edges_by_relation(&self) -> Result<Vec<(EdgeRelation, u64)>, StorageError> {
         let namespace = self.namespace.clone();
         self.with_reader("count_edges_by_relation", move |conn| {
@@ -1715,6 +1771,49 @@ impl GraphStore for SqlGraphStore {
                 out.push((relation, count as u64));
             }
             Ok(out)
+        })
+        .await
+    }
+
+    async fn count_edges_by_relation_in_namespaces(
+        &self,
+        namespaces: &[String],
+    ) -> Result<Vec<(EdgeRelation, u64)>, StorageError> {
+        let namespaces: Vec<String> = namespaces
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        self.with_reader("count_edges_by_relation_in_namespaces", move |conn| {
+            let mut totals = HashMap::new();
+            for chunk in namespaces.chunks(NAMESPACE_COUNT_CHUNK_SIZE) {
+                let (where_clause, params) =
+                    build_edge_filter_sql_for_namespaces(chunk, &EdgeFilter::default());
+                let sql = format!(
+                    "SELECT relation, COUNT(*) FROM graph_edges{where_clause} GROUP BY relation"
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    params.iter().map(|p| p.as_ref()).collect();
+                let rows = stmt.query_map(param_refs.as_slice(), |row| {
+                    let relation_str: String = row.get(0)?;
+                    let count: i64 = row.get(1)?;
+                    Ok((relation_str, count))
+                })?;
+                for row in rows {
+                    let (relation_str, count) = row?;
+                    let relation = relation_str.parse::<EdgeRelation>().map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?;
+                    *totals.entry(relation).or_insert(0) += count as u64;
+                }
+            }
+            Ok(totals.into_iter().collect())
         })
         .await
     }
@@ -2267,8 +2366,59 @@ impl GraphStore for SqlGraphStore {
 
 const GRAPH_DDL: &str = include_str!("../../sql/graph-ddl.sql");
 
+/// The single-origin triggers in `GRAPH_DDL` read `entities.kind`, so the
+/// `entities` table must exist with its full column set before this DDL
+/// runs — not just whenever a caller happens to have also called
+/// `entities()`/`entities_for_namespace()` on the same backend.
+///
+/// A database that already has `graph_edges` but not yet the single-origin
+/// insert trigger is a legacy database reaching enforcement for the first
+/// time here rather than through migration 013 — the same moment the
+/// versioned migration preflights pre-existing duplicates, so this path
+/// must run the identical check before the trigger DDL below installs
+/// enforcement it cannot retroactively reconcile.
 pub(crate) fn ensure_graph_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
-    conn.execute_batch(GRAPH_DDL)
+    super::entity::ensure_entities_schema(conn)?;
+    // One IMMEDIATE transaction couples the legacy probe, the duplicate
+    // preflight, and the trigger DDL. Holding the write lock across all
+    // three closes the window where a concurrent pre-trigger writer could
+    // insert duplicate origins after the check passes but before the
+    // triggers start enforcing — enforcement must never install over state
+    // the preflight did not see.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    if is_legacy_graph_edges_upgrade(&tx)? {
+        reject_legacy_duplicate_concept_origins(&tx)?;
+    }
+    tx.execute_batch(GRAPH_DDL)?;
+    tx.commit()
+}
+
+fn is_legacy_graph_edges_upgrade(conn: &rusqlite::Connection) -> Result<bool, rusqlite::Error> {
+    conn.query_row(
+        "SELECT
+            EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'graph_edges'),
+            EXISTS (SELECT 1 FROM sqlite_master
+                    WHERE type = 'trigger'
+                      AND name = 'trg_graph_edges_concept_single_origin_insert')",
+        [],
+        |row| {
+            let has_table: bool = row.get(0)?;
+            let has_trigger: bool = row.get(1)?;
+            Ok(has_table && !has_trigger)
+        },
+    )
+}
+
+fn reject_legacy_duplicate_concept_origins(
+    conn: &rusqlite::Connection,
+) -> Result<(), rusqlite::Error> {
+    let violations = crate::migrations::find_duplicate_concept_origins(conn)?;
+    if violations.is_empty() {
+        return Ok(());
+    }
+    Err(rusqlite::Error::ToSqlConversionFailure(
+        crate::migrations::duplicate_concept_origins_message(&violations).into(),
+    ))
 }
 
 #[cfg(test)]

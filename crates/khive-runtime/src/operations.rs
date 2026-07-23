@@ -7,6 +7,15 @@
 // surface stabilises post-retrieval-refactor, group by substrate (entity,
 // note, edge, search) into submodules under an `operations/` directory.
 //! High-level operations composing storage capabilities into user-facing verbs.
+//!
+//! # Fault-injection arm migration
+//!
+//! Namespace-targeted fault injection uses scoped guards. The former
+//! `arm_fts_fail`, `arm_fts_fail_many`, `arm_fts_fail_many_partial`, and
+//! `arm_vector_fail` names were removed in favor of their `_scoped` variants so
+//! stale statement-form calls fail to compile. Statement-form arming cannot be
+//! preserved because dropping the returned guard at the semicolon disarms an
+//! unconsumed injection.
 
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -17,9 +26,9 @@ use uuid::Uuid;
 use khive_score::DeterministicScore;
 use khive_storage::note::Note;
 use khive_storage::types::{
-    DeleteMode, DirectedNeighborHit, Direction, EdgeSortField, GraphPath, LinkId, NeighborHit,
-    NeighborQuery, Page, PageRequest, SortOrder, SqlRow, SqlStatement, SqlValue, TextFilter,
-    TextQueryMode, TextSearchRequest, TraversalRequest,
+    DeleteMode, DirectedNeighborHit, Direction, EdgeFilter, EdgeSortField, GraphPath, LinkId,
+    NeighborHit, NeighborQuery, Page, PageRequest, SortDirection, SortOrder, SqlRow, SqlStatement,
+    SqlValue, TextFilter, TextQueryMode, TextSearchRequest, TraversalRequest,
 };
 use khive_storage::{Edge, EdgeRelation, Entity, EntityFilter, Event, EventFilter};
 use khive_types::{EdgeEndpointRule, EndpointKind, EventKind, SubstrateKind};
@@ -38,6 +47,37 @@ use crate::atomic_runner::{run_atomic_unit, AtomicOpFailure, AtomicOpPlan, Atomi
 use crate::curation::{entity_fts_document, note_embedding_text, note_fts_document};
 use crate::error::{GuardedWriteFailure, RuntimeError, RuntimeResult};
 use crate::runtime::{KhiveRuntime, NamespaceToken};
+
+#[cfg(test)]
+static INTRODUCED_BY_WRITE_BARRIERS: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<Uuid, std::sync::Arc<tokio::sync::Barrier>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+async fn wait_at_introduced_by_write_barrier(source_id: Uuid) {
+    let barrier = INTRODUCED_BY_WRITE_BARRIERS
+        .lock()
+        .expect("introduced_by barrier lock")
+        .get(&source_id)
+        .cloned();
+    if let Some(barrier) = barrier {
+        if barrier.wait().await.is_leader() {
+            INTRODUCED_BY_WRITE_BARRIERS
+                .lock()
+                .expect("introduced_by barrier lock")
+                .remove(&source_id);
+        }
+    }
+}
+
+fn map_edge_write_error(error: khive_storage::StorageError) -> RuntimeError {
+    match error {
+        khive_storage::StorageError::Conflict { message, .. } => {
+            RuntimeError::InvalidInput(message)
+        }
+        other => RuntimeError::Storage(other),
+    }
+}
 
 // Test-only failure injection for `create_note_inner`. Namespace-targeted so only
 // calls for the armed namespace fire, avoiding cross-test races without `#[serial]`.
@@ -65,7 +105,7 @@ std::thread_local! {
 
 /// Arm the count-targetable vector-INSERT fault: let `n` inserts succeed, then fail
 /// the next one (entity or note, single- or multi-model). Set `n = 0` to fail
-/// immediately on the first insert. Thread-local, so unlike `arm_vector_fail`
+/// immediately on the first insert. Thread-local, so unlike `arm_vector_fail_scoped`
 /// it cannot be won or disarmed by a concurrently-running test on another
 /// thread — prefer this one whenever the caller cannot guarantee it is the
 /// only test writing into the namespace it cares about.
@@ -75,9 +115,9 @@ pub fn arm_vector_fail_after(n: usize) {
     VECTOR_FAIL_AFTER.with(|cell| cell.set(Some(n)));
 }
 
-// Namespace-keyed one-shot set, not a single `Option<String>` slot:
+// Namespace-keyed one-shot arms, not a single `Option<String>` slot:
 // `create_note_inner` and `create_entity_inner` share this flag, and a
-// single-slot design let a concurrently running test's `arm_fts_fail(other_ns)`
+// single-slot design let a concurrently running test's `arm_fts_fail_scoped(other_ns)`
 // overwrite this test's armed namespace before its own create call consumed
 // it, so the intended injection silently never fired (#1095). Keying by
 // namespace fixes that at the root — arming `ns_B` inserts `ns_B` without
@@ -87,26 +127,80 @@ pub fn arm_vector_fail_after(n: usize) {
 // check-and-remove under the mutex lock keeps exactly-once semantics even
 // under concurrent same-namespace creates.
 #[cfg(any(test, feature = "fault-injection"))]
-static FTS_FAIL_NS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+type FaultArmSet = std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<()>>>;
+#[cfg(any(test, feature = "fault-injection"))]
+const MAX_FAULT_ARMS: usize = 64;
+#[cfg(any(test, feature = "fault-injection"))]
+static FTS_FAIL_NS: std::sync::LazyLock<FaultArmSet> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 // Vector insertion failures use the same namespace-keyed one-shot semantics.
 #[cfg(any(test, feature = "fault-injection"))]
-static VECTOR_FAIL_NS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+static VECTOR_FAIL_NS: std::sync::LazyLock<FaultArmSet> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 /// FTS failure injection for `create_many` — separate from `FTS_FAIL_NS` so that
 /// create_note_inner and create_many tests cannot disarm each other. Namespace-keyed
 /// set (not a single `Option<String>` slot) for the same reason as `VECTOR_FAIL_NS` (#1263).
 #[cfg(any(test, feature = "fault-injection"))]
-static FTS_FAIL_MANY_NS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+static FTS_FAIL_MANY_NS: std::sync::LazyLock<FaultArmSet> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 /// FTS partial-failure injection for `create_many` — returns `Ok(BatchWriteSummary)`
 /// with `failed > 0` so that the `summary.failed > 0` rollback branch is exercised.
 /// Distinct from `FTS_FAIL_MANY_NS` which injects a hard `Err`. Namespace-keyed set
 /// for the same reason as `VECTOR_FAIL_NS` (#1263).
 #[cfg(any(test, feature = "fault-injection"))]
-static FTS_FAIL_MANY_PARTIAL_NS: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashSet<String>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+static FTS_FAIL_MANY_PARTIAL_NS: std::sync::LazyLock<FaultArmSet> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Scoped ownership of a process-wide fault-injection arm.
+#[cfg(any(test, feature = "fault-injection"))]
+#[must_use = "the fault injection is disarmed when this guard is dropped"]
+pub struct FaultInjectionArm {
+    namespace: String,
+    token: std::sync::Arc<()>,
+    arms: &'static FaultArmSet,
+}
+
+#[cfg(any(test, feature = "fault-injection"))]
+impl Drop for FaultInjectionArm {
+    fn drop(&mut self) {
+        let mut arms = self.arms.lock().unwrap();
+        if arms
+            .get(&self.namespace)
+            .is_some_and(|token| std::sync::Arc::ptr_eq(token, &self.token))
+        {
+            arms.remove(&self.namespace);
+        }
+    }
+}
+
+#[cfg(any(test, feature = "fault-injection"))]
+fn arm_fault(arms: &'static FaultArmSet, namespace: &str, max_arms: usize) -> FaultInjectionArm {
+    let token = std::sync::Arc::new(());
+    let refusal = {
+        let mut active = arms.lock().unwrap();
+        if active.contains_key(namespace) {
+            Some("the namespace is already armed")
+        } else if active.len() >= max_arms {
+            Some("the arm set is at capacity")
+        } else {
+            active.insert(namespace.to_string(), std::sync::Arc::clone(&token));
+            None
+        }
+    };
+    if let Some(reason) = refusal {
+        panic!("cannot arm fault injection for namespace `{namespace}`: {reason}");
+    }
+    FaultInjectionArm {
+        namespace: namespace.to_string(),
+        token,
+        arms,
+    }
+}
+
+#[cfg(any(test, feature = "fault-injection"))]
+fn consume_fault(arms: &FaultArmSet, namespace: &str) -> bool {
+    arms.lock().unwrap().remove(namespace).is_some()
+}
 /// Non-parser FTS *search*-leg failure injection for `search_notes`: distinct
 /// from `FTS_FAIL_NS` (which injects at the FTS *upsert*/write step of
 /// `create_note_inner`). Injects a `StorageError::Timeout` at the `search()`
@@ -125,10 +219,12 @@ static FTS_SEARCH_FAIL_NS: std::sync::Mutex<Option<String>> = std::sync::Mutex::
 /// independent: it may be set from one OS thread and consumed by a `create_note`/
 /// `create_entity` call running on another (e.g. inside `tokio::spawn`). Concurrent
 /// arms of distinct namespaces do not interfere with each other.
+/// Keep the returned guard alive until the triggering call completes; dropping it
+/// disarms an unconsumed injection.
 /// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
 #[cfg(any(test, feature = "fault-injection"))]
-pub fn arm_fts_fail(ns: &str) {
-    FTS_FAIL_NS.lock().unwrap().insert(ns.to_string());
+pub fn arm_fts_fail_scoped(ns: &str) -> FaultInjectionArm {
+    arm_fault(&FTS_FAIL_NS, ns, MAX_FAULT_ARMS)
 }
 
 /// Arm the FTS failure injection for `create_many` targeting namespace `ns`.
@@ -137,10 +233,12 @@ pub fn arm_fts_fail(ns: &str) {
 /// error at the first FTS statement inside the atomic batch, then disarms.
 /// Calls on other namespaces are unaffected, and concurrent arms of distinct
 /// namespaces do not overwrite each other.
+/// Keep the returned guard alive until the triggering call completes; dropping it
+/// disarms an unconsumed injection.
 /// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
 #[cfg(any(test, feature = "fault-injection"))]
-pub fn arm_fts_fail_many(ns: &str) {
-    FTS_FAIL_MANY_NS.lock().unwrap().insert(ns.to_string());
+pub fn arm_fts_fail_many_scoped(ns: &str) -> FaultInjectionArm {
+    arm_fault(&FTS_FAIL_MANY_NS, ns, MAX_FAULT_ARMS)
 }
 
 /// Arm a mid-batch FTS failure for `create_many` targeting namespace `ns`.
@@ -148,13 +246,12 @@ pub fn arm_fts_fail_many(ns: &str) {
 /// The next matching call fails the second FTS statement when the batch contains at
 /// least two entities, after one entity/FTS pair has executed in the transaction.
 /// A one-entity batch fails its first FTS statement. Then disarms only that namespace.
+/// Keep the returned guard alive until the triggering call completes; dropping it
+/// disarms an unconsumed injection.
 /// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
 #[cfg(any(test, feature = "fault-injection"))]
-pub fn arm_fts_fail_many_partial(ns: &str) {
-    FTS_FAIL_MANY_PARTIAL_NS
-        .lock()
-        .unwrap()
-        .insert(ns.to_string());
+pub fn arm_fts_fail_many_partial_scoped(ns: &str) -> FaultInjectionArm {
+    arm_fault(&FTS_FAIL_MANY_PARTIAL_NS, ns, MAX_FAULT_ARMS)
 }
 
 /// Arm a non-parser FTS *search*-leg failure injection for `search_notes` targeting
@@ -177,10 +274,12 @@ pub fn arm_fts_search_fail(ns: &str) {
 /// error at the first vector insert step, then disarms.  Calls on other namespaces
 /// are unaffected, and concurrent arms of distinct namespaces do not overwrite
 /// each other.
+/// Keep the returned guard alive until the triggering call completes; dropping it
+/// disarms an unconsumed injection.
 /// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
 #[cfg(any(test, feature = "fault-injection"))]
-pub fn arm_vector_fail(ns: &str) {
-    VECTOR_FAIL_NS.lock().unwrap().insert(ns.to_string());
+pub fn arm_vector_fail_scoped(ns: &str) -> FaultInjectionArm {
+    arm_fault(&VECTOR_FAIL_NS, ns, MAX_FAULT_ARMS)
 }
 
 /// Failure injection for `delete_note_row_first_for_compensation`'s post-row-removal
@@ -1051,7 +1150,7 @@ impl KhiveRuntime {
         // FTS step — compensate entity row on failure (mirrors create_note_inner).
         {
             #[cfg(any(test, feature = "fault-injection"))]
-            let fts_inject = FTS_FAIL_NS.lock().unwrap().remove(ns);
+            let fts_inject = consume_fault(&FTS_FAIL_NS, ns);
             #[cfg(not(any(test, feature = "fault-injection")))]
             let fts_inject = false;
             let fts_result: RuntimeResult<()> = if fts_inject {
@@ -1090,11 +1189,11 @@ impl KhiveRuntime {
         if embed_model_names.len() == 1 {
             let model_name = &embed_model_names[0];
             let vec_result = self
-                .embed_document_with_model(model_name, &embed_body)
+                .embed_document_with_model_for_token(token, model_name, &embed_body)
                 .await;
 
             #[cfg(any(test, feature = "fault-injection"))]
-            let vec_inject = VECTOR_FAIL_NS.lock().unwrap().remove(ns);
+            let vec_inject = consume_fault(&VECTOR_FAIL_NS, ns);
             #[cfg(not(any(test, feature = "fault-injection")))]
             let vec_inject = false;
             let vec_result: RuntimeResult<Vec<f32>> = if vec_inject {
@@ -1154,8 +1253,9 @@ impl KhiveRuntime {
                 let text = body_owned.clone();
                 let name = model_name.clone();
                 let ctx = usage_ctx.clone();
+                let token = (*token).clone();
                 join_set.spawn(async move {
-                    let fut = rt.embed_document_with_model(&name, &text);
+                    let fut = rt.embed_document_with_model_for_token(&token, &name, &text);
                     let result = match ctx {
                         Some(ctx) => crate::usage::scope(ctx, fut).await,
                         None => fut.await,
@@ -1571,19 +1671,15 @@ impl KhiveRuntime {
     /// - `supersedes` / `supports` / `refutes`: same-substrate only (note→note or entity→entity).
     /// - All other 13 relations: both endpoints MUST be entities.
     ///
-    /// Returns `Ok(())` when valid; otherwise `InvalidInput` or `NotFound` with
-    /// the same messages as the previous inline block (byte-identical behaviour).
-    ///
-    /// `pub(crate)`: the atomic prepare pass (`crate::atomic_prepare`) reuses
-    /// this exact endpoint-type validation during its async prepare step,
-    /// before building a `LinkPlan`, rather than re-deriving the checks.
-    pub(crate) async fn validate_edge_relation_endpoints(
+    /// Returns any non-blocking direction warnings when valid; otherwise returns
+    /// `InvalidInput` or `NotFound`.
+    async fn validate_edge_relation_endpoints_with_warnings(
         &self,
         token: &NamespaceToken,
         source_id: Uuid,
         target_id: Uuid,
         relation: EdgeRelation,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeResult<Vec<String>> {
         if source_id == target_id {
             return Err(RuntimeError::InvalidInput(
                 "self-loop edges are not allowed: source_id and target_id must be different".into(),
@@ -1711,7 +1807,9 @@ impl KhiveRuntime {
                 src_res.as_ref(),
                 tgt_res.as_ref(),
             ) {
-                return Ok(());
+                return self
+                    .validate_introduced_by_direction(token, source_id, target_id, relation)
+                    .await;
             }
 
             // Substrate check: both endpoints must be entities.
@@ -1763,7 +1861,137 @@ impl KhiveRuntime {
                 )));
             }
         }
-        Ok(())
+        self.validate_introduced_by_direction(token, source_id, target_id, relation)
+            .await
+    }
+
+    async fn validate_introduced_by_direction(
+        &self,
+        token: &NamespaceToken,
+        source_id: Uuid,
+        target_id: Uuid,
+        relation: EdgeRelation,
+    ) -> RuntimeResult<Vec<String>> {
+        if relation != EdgeRelation::IntroducedBy {
+            return Ok(Vec::new());
+        }
+        let source = match self.resolve_edge_endpoint(token, source_id).await? {
+            Some(Resolved::Entity(entity)) if entity.kind == "concept" => entity,
+            _ => return Ok(Vec::new()),
+        };
+        let graph = self.graph(token)?;
+        // The single-origin invariant (ADR-039 trigger set) guarantees at most one
+        // distinct target across a concept's introduced_by edges, so a single
+        // existing edge is enough to detect a conflicting origin.
+        let origins = graph
+            .query_edges(
+                EdgeFilter {
+                    source_ids: vec![source_id],
+                    relations: vec![EdgeRelation::IntroducedBy],
+                    ..Default::default()
+                },
+                vec![SortOrder {
+                    field: EdgeSortField::CreatedAt,
+                    direction: SortDirection::Asc,
+                }],
+                PageRequest {
+                    offset: 0,
+                    limit: 1,
+                },
+            )
+            .await?;
+        if let Some(existing) = origins
+            .items
+            .iter()
+            .find(|edge| edge.target_id != target_id)
+        {
+            tracing::warn!(
+                source_id = %source_id,
+                existing_target_id = %existing.target_id,
+                existing_edge_id = %existing.id,
+                requested_target_id = %target_id,
+                "rejected introduced_by link: concept already has a conflicting origin"
+            );
+            return Err(RuntimeError::InvalidInput(format!(
+                "concept {source_id} already has a conflicting introduced_by origin; cannot add a different origin"
+            )));
+        }
+
+        let target = match self.resolve_edge_endpoint(token, target_id).await? {
+            Some(Resolved::Entity(entity)) if entity.kind == "document" => entity,
+            _ => return Ok(Vec::new()),
+        };
+        let earliest_outgoing = self
+            .earliest_edge(
+                token,
+                EdgeFilter {
+                    source_ids: vec![source_id],
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let earliest_incoming = self
+            .earliest_edge(
+                token,
+                EdgeFilter {
+                    target_ids: vec![source_id],
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let earliest_evidence = earliest_outgoing
+            .into_iter()
+            .chain(earliest_incoming)
+            .min_by(|a, b| a.created_at.cmp(&b.created_at));
+        let warnings = earliest_evidence
+            .filter(|edge| target.created_at > edge.created_at.timestamp_micros())
+            .map(|edge| {
+                vec![format!(
+                    "ingestion-order advice: introduced_by target document {target_id} was ingested after existing evidence edge {} attached to source concept {}",
+                    edge.id, source.id
+                )]
+            })
+            .unwrap_or_default();
+        for warning in &warnings {
+            tracing::warn!(source = %source_id, target = %target_id, "{warning}");
+        }
+        Ok(warnings)
+    }
+
+    async fn earliest_edge(
+        &self,
+        token: &NamespaceToken,
+        filter: EdgeFilter,
+    ) -> RuntimeResult<Option<Edge>> {
+        Ok(self
+            .graph(token)?
+            .query_edges(
+                filter,
+                vec![SortOrder {
+                    field: EdgeSortField::CreatedAt,
+                    direction: SortDirection::Asc,
+                }],
+                PageRequest {
+                    offset: 0,
+                    limit: 1,
+                },
+            )
+            .await?
+            .items
+            .into_iter()
+            .next())
+    }
+
+    pub(crate) async fn validate_edge_relation_endpoints(
+        &self,
+        token: &NamespaceToken,
+        source_id: Uuid,
+        target_id: Uuid,
+        relation: EdgeRelation,
+    ) -> RuntimeResult<()> {
+        self.validate_edge_relation_endpoints_with_warnings(token, source_id, target_id, relation)
+            .await
+            .map(|_| ())
     }
 
     /// Public delegator for cross-backend link validation.
@@ -1999,9 +2227,30 @@ impl KhiveRuntime {
         weight: f64,
         metadata: Option<serde_json::Value>,
     ) -> RuntimeResult<Edge> {
+        Ok(self
+            .link_with_warnings(token, source_id, target_id, relation, weight, metadata)
+            .await?
+            .edge)
+    }
+
+    /// Create an edge and return any non-blocking direction warnings.
+    pub async fn link_with_warnings(
+        &self,
+        token: &NamespaceToken,
+        source_id: Uuid,
+        target_id: Uuid,
+        relation: EdgeRelation,
+        weight: f64,
+        metadata: Option<serde_json::Value>,
+    ) -> RuntimeResult<LinkOutcome> {
         validate_edge_weight(weight)?;
-        self.validate_edge_relation_endpoints(token, source_id, target_id, relation)
+        let warnings = self
+            .validate_edge_relation_endpoints_with_warnings(token, source_id, target_id, relation)
             .await?;
+        #[cfg(test)]
+        if relation == EdgeRelation::IntroducedBy {
+            wait_at_introduced_by_write_barrier(source_id).await;
+        }
         let (source_id, target_id) = canonical_edge_endpoints(relation, source_id, target_id);
         let metadata = if relation == EdgeRelation::DependsOn {
             // By-ID, unfiltered — matches the namespace-agnostic endpoint validation
@@ -2045,7 +2294,12 @@ impl KhiveRuntime {
         // fact: a second concurrent write landing between the refusal and a
         // post-hoc read could otherwise misreport which endpoint was actually
         // missing at write time.
-        match self.graph(token)?.upsert_edge_guarded(edge).await? {
+        match self
+            .graph(token)?
+            .upsert_edge_guarded(edge)
+            .await
+            .map_err(map_edge_write_error)?
+        {
             khive_storage::GuardedWriteOutcome::Written => {}
             khive_storage::GuardedWriteOutcome::Refused(missing) => {
                 return Err(RuntimeError::GuardedWriteFailed(GuardedWriteFailure {
@@ -2081,7 +2335,10 @@ impl KhiveRuntime {
                     "upsert_edge succeeded but natural-key lookup for ({source_id}, {target_id}, {relation}) returned nothing"
                 ))
             })?;
-        Ok(persisted)
+        Ok(LinkOutcome {
+            edge: persisted,
+            warnings,
+        })
     }
 
     /// Write an edge with an explicit `target_backend` stamp (ADR-029 D3).
@@ -2119,7 +2376,10 @@ impl KhiveRuntime {
             metadata,
             target_backend,
         };
-        self.graph(token)?.upsert_edge(edge).await?;
+        self.graph(token)?
+            .upsert_edge(edge)
+            .await
+            .map_err(map_edge_write_error)?;
         let persisted = self
             .list_edges(
                 token,
@@ -2843,7 +3103,7 @@ impl KhiveRuntime {
         let embed_model_names = self.registered_embedding_model_names();
         for model_name in &embed_model_names {
             match self
-                .embed_document_with_model(model_name, &note_embedding_text(&note))
+                .embed_document_with_model_for_token(token, model_name, &note_embedding_text(&note))
                 .await
             {
                 Ok(vector) => {
@@ -3000,13 +3260,13 @@ impl KhiveRuntime {
 
         // FTS step — compensate note row on failure.
         {
-            // Injection: check FTS_FAIL_NS (armed by `arm_fts_fail(ns)`).
+            // Injection: check FTS_FAIL_NS (armed by `arm_fts_fail_scoped(ns)`).
             // Fires only when `ns` is in the armed set, removing it on the way
             // out (one-shot, atomic check-and-remove under the mutex). No lock
             // acquisition in release builds — the cfg(not) branch is a const
             // false so the compiler eliminates the if-branch entirely.
             #[cfg(any(test, feature = "fault-injection"))]
-            let fts_inject = FTS_FAIL_NS.lock().unwrap().remove(ns);
+            let fts_inject = consume_fault(&FTS_FAIL_NS, ns);
             #[cfg(not(any(test, feature = "fault-injection")))]
             let fts_inject = false;
             let fts_result: RuntimeResult<()> = if fts_inject {
@@ -3045,9 +3305,11 @@ impl KhiveRuntime {
         if embed_model_names.len() == 1 {
             // Single-model path: preserves original sequential behaviour.
             let model_name = &embed_model_names[0];
-            let vec_result = self.embed_document_with_model(model_name, embed_text).await;
+            let vec_result = self
+                .embed_document_with_model_for_token(token, model_name, embed_text)
+                .await;
 
-            // Injection: check VECTOR_FAIL_NS (armed by `arm_vector_fail(ns)`) or
+            // Injection: check VECTOR_FAIL_NS (armed by `arm_vector_fail_scoped(ns)`) or
             // VECTOR_FAIL_AFTER (armed by `arm_vector_fail_after(n)`). The former
             // fires only when the armed namespace matches this note's namespace;
             // callers that cannot guarantee no concurrently-running test also
@@ -3058,7 +3320,7 @@ impl KhiveRuntime {
             // the cfg(not) branch is a const false eliminating the if-branch.
             #[cfg(any(test, feature = "fault-injection"))]
             let vec_inject = {
-                let ns_inject = VECTOR_FAIL_NS.lock().unwrap().remove(ns);
+                let ns_inject = consume_fault(&VECTOR_FAIL_NS, ns);
                 let count_inject = VECTOR_FAIL_AFTER.with(|cell| match cell.get() {
                     Some(0) => {
                         cell.set(None);
@@ -3120,8 +3382,9 @@ impl KhiveRuntime {
                 let text = content_owned.clone();
                 let name = model_name.clone();
                 let ctx = usage_ctx.clone();
+                let token = (*token).clone();
                 join_set.spawn(async move {
-                    let fut = rt.embed_document_with_model(&name, &text);
+                    let fut = rt.embed_document_with_model_for_token(&token, &name, &text);
                     let result = match ctx {
                         Some(ctx) => crate::usage::scope(ctx, fut).await,
                         None => fut.await,
@@ -3320,23 +3583,21 @@ impl KhiveRuntime {
         Ok(page.items)
     }
 
-    /// Count notes matching `kind`, summed across the caller's visible
-    /// namespaces. The store-layer `count_notes` is namespace-pinned by
-    /// design (no `NamespaceFilter`-style `IN (...)` support); this sums the
-    /// per-namespace store calls, mirroring [`Self::count_edges_by_relation`]
-    /// and the multi-namespace path in [`Self::list_notes`] so `stats().notes`
-    /// reconciles with a full `list` keyset walk under the same token.
+    /// Count notes matching `kind` across the caller's visible namespaces.
     pub async fn count_notes(
         &self,
         token: &NamespaceToken,
         kind: Option<&str>,
     ) -> RuntimeResult<u64> {
-        let mut total = 0u64;
-        for ns in token.visible_namespaces() {
-            let temp = NamespaceToken::for_namespace(ns.clone());
-            total += self.notes(&temp)?.count_notes(ns.as_str(), kind).await?;
-        }
-        Ok(total)
+        let namespaces: Vec<String> = token
+            .visible_namespaces()
+            .iter()
+            .map(|namespace| namespace.as_str().to_owned())
+            .collect();
+        Ok(self
+            .notes(token)?
+            .count_notes_in_namespaces(&namespaces, kind)
+            .await?)
     }
 
     /// Search notes using a hybrid FTS5 + vector pipeline with salience weighting.
@@ -4611,14 +4872,38 @@ impl KhiveRuntime {
         &self,
         token: &NamespaceToken,
     ) -> RuntimeResult<std::collections::HashMap<String, u64>> {
-        let mut totals: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
-        for ns in token.visible_namespaces() {
-            let temp = NamespaceToken::for_namespace(ns.clone());
-            for (relation, count) in self.graph(&temp)?.count_edges_by_relation().await? {
-                *totals.entry(relation.to_string()).or_insert(0) += count;
+        let namespaces: Vec<String> = token
+            .visible_namespaces()
+            .iter()
+            .map(|namespace| namespace.as_str().to_owned())
+            .collect();
+        let graph = self.graph(token)?;
+        let counts = match graph
+            .count_edges_by_relation_in_namespaces(&namespaces)
+            .await
+        {
+            Ok(counts) => counts,
+            Err(khive_storage::StorageError::Unsupported { operation, .. })
+                if operation == "count_edges_by_relation_in_namespaces" =>
+            {
+                let mut totals = HashMap::new();
+                for namespace in token.visible_namespaces() {
+                    let scoped = NamespaceToken::for_namespace(namespace.clone());
+                    for (relation, count) in self.graph(&scoped)?.count_edges_by_relation().await? {
+                        *totals.entry(relation).or_insert(0) += count;
+                    }
+                }
+                return Ok(totals
+                    .into_iter()
+                    .map(|(relation, count)| (relation.to_string(), count))
+                    .collect());
             }
-        }
-        Ok(totals)
+            Err(error) => return Err(error.into()),
+        };
+        Ok(counts
+            .into_iter()
+            .map(|(relation, count)| (relation.to_string(), count))
+            .collect())
     }
 
     /// DML-only body of the symmetric-relation conflict-resolution path in
@@ -4995,24 +5280,38 @@ impl KhiveRuntime {
         Ok(deleted)
     }
 
-    /// Count edges matching `filter`, summed across the caller's visible
-    /// namespaces (mirrors [`Self::count_edges_by_relation`] and
-    /// [`Self::list_edges`] so `stats().edges` reconciles with a full `list`
-    /// keyset walk under the same token).
+    /// Count edges matching `filter` across the caller's visible namespaces.
     pub async fn count_edges(
         &self,
         token: &NamespaceToken,
         filter: crate::curation::EdgeListFilter,
     ) -> RuntimeResult<u64> {
-        let mut total = 0u64;
-        for ns in token.visible_namespaces() {
-            let temp = NamespaceToken::for_namespace(ns.clone());
-            total += self
-                .graph(&temp)?
-                .count_edges(filter.clone().into())
-                .await?;
+        let namespaces: Vec<String> = token
+            .visible_namespaces()
+            .iter()
+            .map(|namespace| namespace.as_str().to_owned())
+            .collect();
+        let graph = self.graph(token)?;
+        match graph
+            .count_edges_in_namespaces(&namespaces, filter.clone().into())
+            .await
+        {
+            Ok(count) => Ok(count),
+            Err(khive_storage::StorageError::Unsupported { operation, .. })
+                if operation == "count_edges_in_namespaces" =>
+            {
+                let mut total = 0;
+                for namespace in token.visible_namespaces() {
+                    let scoped = NamespaceToken::for_namespace(namespace.clone());
+                    total += self
+                        .graph(&scoped)?
+                        .count_edges(filter.clone().into())
+                        .await?;
+                }
+                Ok(total)
+            }
+            Err(error) => Err(error.into()),
         }
-        Ok(total)
     }
 
     /// Validate and construct an edge from a [`LinkSpec`] without writing to storage.
@@ -5026,6 +5325,14 @@ impl KhiveRuntime {
     /// layer. If `spec.namespace` is set it must match `token.namespace()`;
     /// a mismatch returns `RuntimeError::InvalidInput`.
     pub async fn build_edge(&self, token: &NamespaceToken, spec: &LinkSpec) -> RuntimeResult<Edge> {
+        Ok(self.build_edge_with_warnings(token, spec).await?.edge)
+    }
+
+    async fn build_edge_with_warnings(
+        &self,
+        token: &NamespaceToken,
+        spec: &LinkSpec,
+    ) -> RuntimeResult<LinkOutcome> {
         let ns_str = match &spec.namespace {
             Some(s) => {
                 let spec_ns = crate::Namespace::parse(s)
@@ -5039,7 +5346,13 @@ impl KhiveRuntime {
             }
             None => token.namespace().as_str(),
         };
-        self.validate_edge_relation_endpoints(token, spec.source_id, spec.target_id, spec.relation)
+        let warnings = self
+            .validate_edge_relation_endpoints_with_warnings(
+                token,
+                spec.source_id,
+                spec.target_id,
+                spec.relation,
+            )
             .await?;
         let (source_id, target_id) =
             canonical_edge_endpoints(spec.relation, spec.source_id, spec.target_id);
@@ -5062,18 +5375,21 @@ impl KhiveRuntime {
         };
         validate_edge_metadata(spec.relation, metadata.as_ref())?;
         let now = chrono::Utc::now();
-        Ok(Edge {
-            id: LinkId::from(Uuid::new_v4()),
-            namespace: ns_str.to_string(),
-            source_id,
-            target_id,
-            relation: spec.relation,
-            weight: spec.weight,
-            created_at: now,
-            updated_at: now,
-            deleted_at: None,
-            metadata,
-            target_backend: None,
+        Ok(LinkOutcome {
+            edge: Edge {
+                id: LinkId::from(Uuid::new_v4()),
+                namespace: ns_str.to_string(),
+                source_id,
+                target_id,
+                relation: spec.relation,
+                weight: spec.weight,
+                created_at: now,
+                updated_at: now,
+                deleted_at: None,
+                metadata,
+                target_backend: None,
+            },
+            warnings,
         })
     }
 
@@ -5098,12 +5414,43 @@ impl KhiveRuntime {
         token: &NamespaceToken,
         specs: Vec<LinkSpec>,
     ) -> RuntimeResult<Vec<Edge>> {
+        Ok(self.link_many_with_warnings(token, specs).await?.edges)
+    }
+
+    /// Atomically create edges and return non-blocking direction warnings.
+    pub async fn link_many_with_warnings(
+        &self,
+        token: &NamespaceToken,
+        specs: Vec<LinkSpec>,
+    ) -> RuntimeResult<LinkManyOutcome> {
         if specs.is_empty() {
-            return Ok(vec![]);
+            return Ok(LinkManyOutcome {
+                edges: Vec::new(),
+                warnings: Vec::new(),
+            });
         }
         let mut edges = Vec::with_capacity(specs.len());
+        let mut warnings = Vec::new();
+        let mut batch_origins = HashMap::new();
         for spec in &specs {
-            edges.push(self.build_edge(token, spec).await?);
+            let outcome = self.build_edge_with_warnings(token, spec).await?;
+            if outcome.edge.relation == EdgeRelation::IntroducedBy {
+                let source = self.get_entity(token, outcome.edge.source_id).await?;
+                if source.kind == "concept" {
+                    if let Some(existing_target) =
+                        batch_origins.insert(outcome.edge.source_id, outcome.edge.target_id)
+                    {
+                        if existing_target != outcome.edge.target_id {
+                            return Err(RuntimeError::InvalidInput(format!(
+                                "concept {} has conflicting introduced_by origins {existing_target} and {} in the same atomic batch",
+                                outcome.edge.source_id, outcome.edge.target_id
+                            )));
+                        }
+                    }
+                }
+            }
+            warnings.extend(outcome.warnings);
+            edges.push(outcome.edge);
         }
         // `upsert_edges_guarded` re-checks every edge's endpoints as part of the
         // same write, not the separate per-spec `build_edge` validation reads
@@ -5116,7 +5463,8 @@ impl KhiveRuntime {
         let outcome = self
             .graph(token)?
             .upsert_edges_guarded(edges.clone())
-            .await?;
+            .await
+            .map_err(map_edge_write_error)?;
         if let Some(refusal) = outcome.refused {
             return Err(RuntimeError::GuardedWriteFailed(GuardedWriteFailure {
                 entry_index: Some(refusal.entry_index),
@@ -5164,7 +5512,10 @@ impl KhiveRuntime {
                 })?;
             persisted.push(row);
         }
-        Ok(persisted)
+        Ok(LinkManyOutcome {
+            edges: persisted,
+            warnings,
+        })
     }
 
     /// Create a batch of entities atomically.
@@ -5226,12 +5577,12 @@ impl KhiveRuntime {
         }
 
         #[cfg(any(test, feature = "fault-injection"))]
-        let fts_many_inject = FTS_FAIL_MANY_NS.lock().unwrap().remove(ns);
+        let fts_many_inject = consume_fault(&FTS_FAIL_MANY_NS, ns);
         #[cfg(not(any(test, feature = "fault-injection")))]
         let fts_many_inject = false;
 
         #[cfg(any(test, feature = "fault-injection"))]
-        let fts_many_inject_partial = FTS_FAIL_MANY_PARTIAL_NS.lock().unwrap().remove(ns);
+        let fts_many_inject_partial = consume_fault(&FTS_FAIL_MANY_PARTIAL_NS, ns);
         #[cfg(not(any(test, feature = "fault-injection")))]
         let fts_many_inject_partial = false;
 
@@ -5294,6 +5645,24 @@ impl KhiveRuntime {
     }
 }
 
+/// A created edge plus non-blocking direction warnings.
+#[derive(Clone, Debug)]
+pub struct LinkOutcome {
+    /// Persisted edge.
+    pub edge: Edge,
+    /// Warnings discovered before the write.
+    pub warnings: Vec<String>,
+}
+
+/// Persisted atomic edge batch plus non-blocking direction warnings.
+#[derive(Clone, Debug)]
+pub struct LinkManyOutcome {
+    /// Persisted edges in request order.
+    pub edges: Vec<Edge>,
+    /// Warnings discovered before the atomic write.
+    pub warnings: Vec<String>,
+}
+
 /// Fully specified edge creation request — input to [`KhiveRuntime::build_edge`]
 /// and [`KhiveRuntime::link_many`].
 #[derive(Clone, Debug)]
@@ -5344,6 +5713,40 @@ mod tests {
 
     fn rt() -> KhiveRuntime {
         KhiveRuntime::memory().unwrap()
+    }
+
+    #[test]
+    fn fts_fault_arm_disarms_namespace_when_scope_panics() {
+        let ns = format!("fault-arm-drop-{}", uuid::Uuid::new_v4().as_simple());
+
+        let panic_result = std::panic::catch_unwind(|| {
+            let _arm = arm_fts_fail_scoped(&ns);
+            panic!("leave the armed scope before consumption");
+        });
+
+        assert!(panic_result.is_err());
+        assert!(
+            !consume_fault(&FTS_FAIL_NS, &ns),
+            "unwinding an armed scope must remove its namespace"
+        );
+    }
+
+    #[test]
+    fn fault_arm_set_rejects_entries_over_capacity() {
+        static BOUNDED_ARMS: std::sync::LazyLock<FaultArmSet> =
+            std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+        let first_ns = format!("fault-arm-bound-a-{}", uuid::Uuid::new_v4().as_simple());
+        let overflow_ns = format!("fault-arm-bound-b-{}", uuid::Uuid::new_v4().as_simple());
+        let arm = arm_fault(&BOUNDED_ARMS, &first_ns, 1);
+
+        let overflow = std::panic::catch_unwind(|| arm_fault(&BOUNDED_ARMS, &overflow_ns, 1));
+
+        assert!(
+            overflow.is_err(),
+            "an arm set must reject entries over its bound"
+        );
+        drop(arm);
+        assert!(BOUNDED_ARMS.lock().unwrap().is_empty());
     }
 
     // ── Custom embedder fan-out regression ──────────────────────────────────
@@ -10143,7 +10546,7 @@ mod tests {
     }
 
     // Inject an FTS failure after the note row is committed and assert the note
-    // row is removed (no stranded row).  arm_fts_fail() arms the flag before
+    // row is removed (no stranded row). arm_fts_fail_scoped() arms the flag before
     // the call and it resets automatically after one trigger.
     #[tokio::test]
     async fn create_note_fts_failure_rolls_back_note_row() {
@@ -10155,7 +10558,7 @@ mod tests {
         let ns = Namespace::parse("fault-fts-rollback").unwrap();
         let tok = NamespaceToken::for_namespace(ns.clone());
 
-        arm_fts_fail(ns.as_str());
+        let _arm = arm_fts_fail_scoped(ns.as_str());
 
         let result = rt
             .create_note(
@@ -10201,7 +10604,7 @@ mod tests {
         let ns = Namespace::parse("fault-fts-rollback-cross-thread").unwrap();
         let tok = NamespaceToken::for_namespace(ns.clone());
 
-        arm_fts_fail(ns.as_str());
+        let _arm = arm_fts_fail_scoped(ns.as_str());
 
         let thread_rt = std::sync::Arc::clone(&rt);
         let thread_tok = tok.clone();
@@ -10260,7 +10663,7 @@ mod tests {
         let ns = Namespace::parse("fault-vec-rollback").unwrap();
         let tok = NamespaceToken::for_namespace(ns.clone());
 
-        arm_vector_fail(ns.as_str());
+        let _arm = arm_vector_fail_scoped(ns.as_str());
 
         let result = rt
             .create_note(
@@ -10309,8 +10712,8 @@ mod tests {
         let ns_b = Namespace::parse("fault-vec-distinct-b").unwrap();
         let tok_b = NamespaceToken::for_namespace(ns_b.clone());
 
-        arm_vector_fail(ns_a.as_str());
-        arm_vector_fail(ns_b.as_str());
+        let _arm_a = arm_vector_fail_scoped(ns_a.as_str());
+        let _arm_b = arm_vector_fail_scoped(ns_b.as_str());
 
         let (result_a, result_b) = tokio::join!(
             rt_a.create_note(
@@ -10354,7 +10757,7 @@ mod tests {
         let ns = Namespace::parse("fault-fts-rollback-embedding-content").unwrap();
         let tok = NamespaceToken::for_namespace(ns.clone());
 
-        arm_fts_fail(ns.as_str());
+        let _arm = arm_fts_fail_scoped(ns.as_str());
 
         let full = "fts-fail rollback target with an embedding-content override";
         let head = &full[.."fts-fail rollback target".len()];
@@ -10403,7 +10806,7 @@ mod tests {
         let ns = Namespace::parse("fault-vec-rollback-embedding-content").unwrap();
         let tok = NamespaceToken::for_namespace(ns.clone());
 
-        arm_vector_fail(ns.as_str());
+        let _arm = arm_vector_fail_scoped(ns.as_str());
 
         let full = "vec-fail rollback target with an embedding-content override";
         let head = &full[.."vec-fail rollback target".len()];
@@ -11213,7 +11616,7 @@ mod tests {
 
     // FTS failure in create_many rolls back both substrates.
     //
-    // Arm `arm_fts_fail_many` before the call; the FTS phase returns an injected
+    // Arm `arm_fts_fail_many_scoped` before the call; the FTS phase returns an injected
     // error; the test asserts zero rows in both `entities` and `fts_entities`.
     #[tokio::test]
     async fn create_many_fts_failure_rolls_back_both_substrates() {
@@ -11241,7 +11644,7 @@ mod tests {
             },
         ];
 
-        arm_fts_fail_many(&ns);
+        let _arm = arm_fts_fail_many_scoped(&ns);
         let result = rt.create_many(&tok, specs).await;
 
         assert!(
@@ -11283,8 +11686,8 @@ mod tests {
         let ns_b = Namespace::parse("fts-fail-many-distinct-b").unwrap();
         let tok_b = NamespaceToken::for_namespace(ns_b.clone());
 
-        arm_fts_fail_many(ns_a.as_str());
-        arm_fts_fail_many(ns_b.as_str());
+        let _arm_a = arm_fts_fail_many_scoped(ns_a.as_str());
+        let _arm_b = arm_fts_fail_many_scoped(ns_b.as_str());
 
         let (result_a, result_b) = tokio::join!(
             rt_a.create_many(
@@ -11322,7 +11725,8 @@ mod tests {
     }
 
     // A failure after the first entity and FTS document have been written rolls
-    // back both substrates for the entire batch.
+    // back both substrates for the entire batch. Injected via
+    // `arm_fts_fail_many_partial_scoped`.
     #[tokio::test]
     async fn create_many_mid_batch_storage_failure_rolls_back_both_substrates() {
         let ns = format!("fts-fail-partial-{}", uuid::Uuid::new_v4().as_simple());
@@ -11348,7 +11752,7 @@ mod tests {
             },
         ];
 
-        arm_fts_fail_many_partial(&ns);
+        let _arm = arm_fts_fail_many_partial_scoped(&ns);
         let result = rt.create_many(&tok, specs).await;
 
         assert!(
@@ -11395,8 +11799,8 @@ mod tests {
         let ns_b = Namespace::parse("fts-fail-many-partial-distinct-b").unwrap();
         let tok_b = NamespaceToken::for_namespace(ns_b.clone());
 
-        arm_fts_fail_many_partial(ns_a.as_str());
-        arm_fts_fail_many_partial(ns_b.as_str());
+        let _arm_a = arm_fts_fail_many_partial_scoped(ns_a.as_str());
+        let _arm_b = arm_fts_fail_many_partial_scoped(ns_b.as_str());
 
         let (result_a, result_b) = tokio::join!(
             rt_a.create_many(
@@ -12092,7 +12496,7 @@ mod tests {
         let ns = Namespace::parse("fault-entity-fts").unwrap();
         let tok = NamespaceToken::for_namespace(ns.clone());
 
-        arm_fts_fail(ns.as_str());
+        let _arm = arm_fts_fail_scoped(ns.as_str());
 
         let result = rt
             .create_entity(
@@ -12137,7 +12541,7 @@ mod tests {
         let ns = Namespace::parse("fault-entity-vec").unwrap();
         let tok = NamespaceToken::for_namespace(ns.clone());
 
-        arm_vector_fail(ns.as_str());
+        let _arm = arm_vector_fail_scoped(ns.as_str());
 
         let result = rt
             .create_entity(
@@ -14047,6 +14451,216 @@ mod tests {
             "concept->org introduced_by must be allowed by the ADR-002 \
              endpoint amendment; got {result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn link_rejects_second_distinct_origin_for_concept() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let concept = rt
+            .create_entity(&tok, "concept", None, "Method", None, None, vec![])
+            .await
+            .unwrap();
+        let first_origin = rt
+            .create_entity(&tok, "document", None, "Original paper", None, None, vec![])
+            .await
+            .unwrap();
+        let conflicting_origin = rt
+            .create_entity(&tok, "document", None, "Later survey", None, None, vec![])
+            .await
+            .unwrap();
+
+        let first_edge = rt
+            .link(
+                &tok,
+                concept.id,
+                first_origin.id,
+                EdgeRelation::IntroducedBy,
+                1.0,
+                None,
+            )
+            .await
+            .unwrap();
+        let err = rt
+            .link(
+                &tok,
+                concept.id,
+                conflicting_origin.id,
+                EdgeRelation::IntroducedBy,
+                1.0,
+                None,
+            )
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains(&concept.id.to_string()), "{msg}");
+        assert!(
+            !msg.contains(&first_origin.id.to_string()),
+            "error must not disclose the existing origin's identifier to the caller: {msg}"
+        );
+        assert!(
+            !msg.contains(&first_edge.id.to_string()),
+            "error must not disclose the existing edge's own identifier to the caller: {msg}"
+        );
+        assert!(
+            !msg.contains(&conflicting_origin.id.to_string()),
+            "error must not disclose the requested target's identifier to the caller: {msg}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_links_allow_exactly_one_distinct_origin_for_concept() {
+        let rt = Arc::new(rt());
+        let tok = NamespaceToken::local();
+        let concept = rt
+            .create_entity(&tok, "concept", None, "Method", None, None, vec![])
+            .await
+            .unwrap();
+        let origin_a = rt
+            .create_entity(&tok, "document", None, "Paper A", None, None, vec![])
+            .await
+            .unwrap();
+        let origin_b = rt
+            .create_entity(&tok, "document", None, "Paper B", None, None, vec![])
+            .await
+            .unwrap();
+
+        INTRODUCED_BY_WRITE_BARRIERS
+            .lock()
+            .unwrap()
+            .insert(concept.id, Arc::new(tokio::sync::Barrier::new(2)));
+
+        let link = |target_id| {
+            let rt = Arc::clone(&rt);
+            let tok = tok.clone();
+            tokio::spawn(async move {
+                rt.link(
+                    &tok,
+                    concept.id,
+                    target_id,
+                    EdgeRelation::IntroducedBy,
+                    1.0,
+                    None,
+                )
+                .await
+            })
+        };
+        let (result_a, result_b) = tokio::join!(link(origin_a.id), link(origin_b.id));
+        let results = [result_a.unwrap(), result_b.unwrap()];
+
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        let loser = results
+            .into_iter()
+            .find_map(Result::err)
+            .expect("one concurrent link must lose");
+        assert!(
+            matches!(loser, RuntimeError::InvalidInput(_)),
+            "loser must receive a typed invalid-input error, got {loser:?}"
+        );
+
+        let stored = rt
+            .list_edges(
+                &tok,
+                EdgeListFilter {
+                    source_id: Some(concept.id),
+                    relations: vec![EdgeRelation::IntroducedBy],
+                    ..Default::default()
+                },
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 1, "exactly one origin may persist");
+    }
+
+    #[tokio::test]
+    async fn link_many_rejects_two_distinct_origins_for_concept_atomically() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let concept = rt
+            .create_entity(&tok, "concept", None, "Method", None, None, vec![])
+            .await
+            .unwrap();
+        let origin_a = rt
+            .create_entity(&tok, "document", None, "Paper A", None, None, vec![])
+            .await
+            .unwrap();
+        let origin_b = rt
+            .create_entity(&tok, "document", None, "Paper B", None, None, vec![])
+            .await
+            .unwrap();
+        let specs = [origin_a.id, origin_b.id]
+            .into_iter()
+            .map(|target_id| LinkSpec {
+                namespace: None,
+                source_id: concept.id,
+                target_id,
+                relation: EdgeRelation::IntroducedBy,
+                weight: 1.0,
+                metadata: None,
+            })
+            .collect();
+
+        let err = rt.link_many(&tok, specs).await.unwrap_err();
+        assert!(err.to_string().contains(&origin_a.id.to_string()));
+        assert!(err.to_string().contains(&origin_b.id.to_string()));
+        let stored = rt
+            .list_edges(
+                &tok,
+                EdgeListFilter {
+                    source_id: Some(concept.id),
+                    relations: vec![EdgeRelation::IntroducedBy],
+                    ..Default::default()
+                },
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+        assert!(
+            stored.is_empty(),
+            "a rejected atomic batch must write no origins"
+        );
+    }
+
+    #[tokio::test]
+    async fn link_allows_multiple_introduced_by_targets_for_document_authorship() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let document = rt
+            .create_entity(&tok, "document", None, "Paper", None, None, vec![])
+            .await
+            .unwrap();
+        let person = rt
+            .create_entity(&tok, "person", None, "Author", None, None, vec![])
+            .await
+            .unwrap();
+        let org = rt
+            .create_entity(&tok, "org", None, "Publisher", None, None, vec![])
+            .await
+            .unwrap();
+
+        rt.link(
+            &tok,
+            document.id,
+            person.id,
+            EdgeRelation::IntroducedBy,
+            1.0,
+            None,
+        )
+        .await
+        .unwrap();
+        rt.link(
+            &tok,
+            document.id,
+            org.id,
+            EdgeRelation::IntroducedBy,
+            1.0,
+            None,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

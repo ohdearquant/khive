@@ -125,6 +125,8 @@ const V11_UP: &str = include_str!("../sql/011-ann-write-log.sql");
 
 const V12_UP: &str = include_str!("../sql/012-ann-write-log-model-seq-index.sql");
 
+const V13_UP: &str = include_str!("../sql/013-concept-single-origin.sql");
+
 /// DDL for the `ann_write_log` delta table.
 ///
 /// Shared between migration V11 and the belt-and-suspenders creation in
@@ -208,6 +210,11 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         version: 12,
         name: "ann_write_log_model_seq_index",
         up: V12_UP,
+    },
+    VersionedMigration {
+        version: 13,
+        name: "concept_single_origin",
+        up: V13_UP,
     },
 ];
 
@@ -487,6 +494,10 @@ fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
             continue;
         }
 
+        if migration.version == 13 {
+            reject_preexisting_duplicate_concept_origins(&tx)?;
+        }
+
         tx.execute_batch(migration.up)
             .map_err(|e| SqliteError::Migration {
                 version: migration.version,
@@ -518,6 +529,60 @@ fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
     }
 
     Ok(applied_version)
+}
+
+/// Shared by the versioned migration preflight and the legacy lazy-DDL
+/// upgrade probe (`stores::graph::ensure_graph_schema`): both install the
+/// single-origin triggers going forward only, so both must independently
+/// refuse to enforce over a database that already violates the invariant
+/// rather than migrate into a state the new triggers cannot express.
+pub(crate) fn find_duplicate_concept_origins(
+    conn: &Connection,
+) -> Result<Vec<String>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT namespace, source_id, GROUP_CONCAT(DISTINCT target_id) AS origins \
+         FROM graph_edges \
+         WHERE relation = 'introduced_by' \
+           AND deleted_at IS NULL \
+           AND source_id IN (SELECT id FROM entities WHERE kind = 'concept' AND deleted_at IS NULL) \
+         GROUP BY namespace, source_id \
+         HAVING COUNT(DISTINCT target_id) > 1 \
+         ORDER BY namespace, source_id",
+    )?;
+    let violations = stmt
+        .query_map([], |row| {
+            let namespace: String = row.get(0)?;
+            let source_id: String = row.get(1)?;
+            let origins: String = row.get(2)?;
+            Ok(format!(
+                "concept {source_id} in namespace {namespace} (origins: {origins})"
+            ))
+        })?
+        .collect();
+    violations
+}
+
+/// Error text shared by both preflight call sites so operators see identical
+/// remediation guidance regardless of which path installed enforcement.
+pub(crate) fn duplicate_concept_origins_message(violations: &[String]) -> String {
+    format!(
+        "cannot enforce the single-origin invariant: {} already have more than one live \
+         introduced_by origin. Curate each listed concept down to a single live origin \
+         (soft-delete every extra introduced_by edge, keeping only the intended origin), \
+         then re-run migrations.",
+        violations.join(", ")
+    )
+}
+
+fn reject_preexisting_duplicate_concept_origins(conn: &Connection) -> Result<(), SqliteError> {
+    let violations = find_duplicate_concept_origins(conn)?;
+    if violations.is_empty() {
+        return Ok(());
+    }
+    Err(SqliteError::Migration {
+        version: 13,
+        error: duplicate_concept_origins_message(&violations),
+    })
 }
 
 #[derive(Debug)]

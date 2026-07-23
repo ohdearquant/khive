@@ -2155,9 +2155,13 @@ async fn note_create_blocks_path_dressed_base64_credential_in_value_syntax() {
 mod embedder_registry_tests {
     use async_trait::async_trait;
     use khive_gate::AllowAllGate;
-    use khive_runtime::{EmbedderProvider, KhiveRuntime, RuntimeConfig, RuntimeError};
-    use khive_types::Namespace;
+    use khive_runtime::{
+        EmbedderProvider, KhiveRuntime, NamespaceToken, PackRuntime, RequestIdentity,
+        RuntimeConfig, RuntimeError, VerbRegistry, VerbRegistryBuilder,
+    };
+    use khive_types::{HandlerDef, Namespace, Pack, VerbCategory, Visibility};
     use lattice_embed::{EmbeddingModel, EmbeddingService};
+    use serde_json::Value;
     use std::sync::Arc;
 
     // ── MockEmbedderProvider ─────────────────────────────────────────────────
@@ -2214,7 +2218,65 @@ mod embedder_registry_tests {
         }
 
         async fn build(&self) -> Result<Arc<dyn EmbeddingService>, RuntimeError> {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             Ok(Arc::new(MockEmbeddingService { dims: self.dims }))
+        }
+    }
+
+    struct EmbedderInitPack {
+        runtime: KhiveRuntime,
+    }
+
+    impl Pack for EmbedderInitPack {
+        const NAME: &'static str = "embedder-init-test";
+        const NOTE_KINDS: &'static [&'static str] = &[];
+        const ENTITY_KINDS: &'static [&'static str] = &["concept"];
+        const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
+            name: "initialize_embedder",
+            description: "initialize the test embedder",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Commissive,
+            params: &[],
+        }];
+    }
+
+    #[async_trait]
+    impl PackRuntime for EmbedderInitPack {
+        fn name(&self) -> &str {
+            Self::NAME
+        }
+
+        fn note_kinds(&self) -> &'static [&'static str] {
+            Self::NOTE_KINDS
+        }
+
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            Self::ENTITY_KINDS
+        }
+
+        fn handlers(&self) -> &'static [HandlerDef] {
+            Self::HANDLERS
+        }
+
+        async fn dispatch(
+            &self,
+            _verb: &str,
+            _params: Value,
+            _registry: &VerbRegistry,
+            token: &NamespaceToken,
+        ) -> Result<Value, RuntimeError> {
+            self.runtime
+                .create_entity(
+                    token,
+                    "concept",
+                    None,
+                    "embedder initialization trigger",
+                    None,
+                    None,
+                    vec![],
+                )
+                .await?;
+            Ok(Value::Null)
         }
     }
 
@@ -2263,6 +2325,95 @@ mod embedder_registry_tests {
     }
 
     // ── Test: registered names include custom provider ────────────────────────
+
+    #[tokio::test]
+    async fn embedder_initialization_writes_event() {
+        let rt = memory_rt_no_model();
+        let token = rt
+            .authorize(Namespace::local())
+            .expect("authorize local namespace");
+        let event_store = rt.events(&token).expect("event store must be available");
+        rt.register_embedder(MockEmbedderProvider::new("event-test-encoder", 64));
+
+        rt.embedder("event-test-encoder")
+            .await
+            .expect("embedder initialization must succeed");
+
+        let page = event_store
+            .query_events(
+                khive_storage::EventFilter::default(),
+                khive_storage::PageRequest {
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .await
+            .expect("query embedder initialization event");
+        let event = page
+            .items
+            .iter()
+            .find(|event| event.verb == "embedder.init")
+            .expect("embedder initialization event must be written");
+
+        assert_eq!(event.kind, khive_types::EventKind::EmbedderInitialized);
+        assert_eq!(event.payload["model_name"], "event-test-encoder");
+        let duration_us = event.payload["duration_us"]
+            .as_i64()
+            .expect("duration_us must be an integer");
+        assert!(duration_us > 0);
+        assert_eq!(event.duration_us, duration_us);
+    }
+
+    #[tokio::test]
+    async fn embedder_initialization_uses_triggering_request_identity() {
+        let rt = memory_rt_no_model();
+        rt.register_embedder(MockEmbedderProvider::new("request-identity-encoder", 64));
+        let tenant = Namespace::parse("tenant-request").expect("valid tenant namespace");
+        let event_store = rt
+            .events(&rt.authorize(tenant.clone()).expect("authorize tenant"))
+            .expect("event store must be available");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(EmbedderInitPack {
+            runtime: rt.clone(),
+        });
+        builder.with_default_namespace("baked-namespace");
+        builder.with_actor_id(Some("baked-actor".to_string()));
+        let registry = builder.build().expect("registry builds");
+
+        registry
+            .dispatch_with_identity(
+                "initialize_embedder",
+                serde_json::json!({"namespace": tenant.as_str()}),
+                Some(RequestIdentity {
+                    namespace: tenant.as_str().to_string(),
+                    actor_id: Some("request-actor".to_string()),
+                    visible_namespaces: vec![],
+                    request_id: None,
+                }),
+            )
+            .await
+            .expect("request-triggered embedder initialization must succeed");
+
+        let page = event_store
+            .query_events(
+                khive_storage::EventFilter::default(),
+                khive_storage::PageRequest {
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .await
+            .expect("query embedder initialization event");
+        let event = page
+            .items
+            .iter()
+            .find(|event| event.verb == "embedder.init")
+            .expect("embedder initialization event must be written");
+
+        assert_eq!(event.namespace, tenant.as_str());
+        assert_eq!(event.actor, "actor:request-actor");
+    }
 
     #[tokio::test]
     async fn registered_names_includes_custom_provider() {
@@ -3791,10 +3942,9 @@ async fn delete_edge_cross_namespace_audit_uses_record_namespace_hard() {
 // the scope a full `list` keyset walk computes over — not just token.namespace().
 // =============================================================================
 
-/// `count_entities` / `count_edges` / `count_edges_by_relation` / `count_notes`
-/// must all sum across an identity-bearing caller's visible-namespace set, so
-/// `stats()` totals reconcile with a full multi-namespace `list` walk, for
-/// entities, edges, and notes alike.
+/// Batched stats counts must match both a full multi-namespace `list` walk and
+/// the sum of the corresponding per-namespace counts, excluding soft-deleted
+/// rows from every path.
 #[tokio::test]
 async fn stats_totals_match_list_walk_across_visible_namespaces() {
     use khive_runtime::EdgeListFilter;
@@ -3842,6 +3992,14 @@ async fn stats_totals_match_list_walk_across_visible_namespaces() {
     rt.link(&tok_b, b1.id, b2.id, EdgeRelation::Enables, 1.0, None)
         .await
         .unwrap();
+    let deleted_edge = rt
+        .link(&tok_b, b2.id, b1.id, EdgeRelation::Extends, 1.0, None)
+        .await
+        .unwrap();
+    assert!(rt
+        .delete_edge(&tok_b, deleted_edge.id.into(), false)
+        .await
+        .unwrap());
 
     // Notes: one in each namespace.
     rt.create_note(&tok_a, "observation", None, "NoteInA", None, None, vec![])
@@ -3850,6 +4008,36 @@ async fn stats_totals_match_list_walk_across_visible_namespaces() {
     rt.create_note(&tok_b, "observation", None, "NoteInB", None, None, vec![])
         .await
         .unwrap();
+    let deleted_note = rt
+        .create_note(
+            &tok_a,
+            "observation",
+            None,
+            "DeletedNoteInA",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+    assert!(rt
+        .delete_note(&tok_a, deleted_note.id, false)
+        .await
+        .unwrap());
+
+    let per_namespace_edges = rt
+        .count_edges(&tok_a, EdgeListFilter::default())
+        .await
+        .unwrap()
+        + rt.count_edges(&tok_b, EdgeListFilter::default())
+            .await
+            .unwrap();
+    let mut per_namespace_relations = rt.count_edges_by_relation(&tok_a).await.unwrap();
+    for (relation, count) in rt.count_edges_by_relation(&tok_b).await.unwrap() {
+        *per_namespace_relations.entry(relation).or_insert(0) += count;
+    }
+    let per_namespace_notes =
+        rt.count_notes(&tok_a, None).await.unwrap() + rt.count_notes(&tok_b, None).await.unwrap();
 
     // Identity-bearing frame whose visible set spans both namespaces.
     let vis_tok = rt
@@ -3881,9 +4069,11 @@ async fn stats_totals_match_list_walk_across_visible_namespaces() {
         full_edges.len() as u64,
         "stats() edge total must equal a full list keyset walk under the same identity"
     );
+    assert_eq!(stats_edges, per_namespace_edges);
     assert_eq!(stats_edges, 3);
 
     let edges_by_relation = rt.count_edges_by_relation(&vis_tok).await.unwrap();
+    assert_eq!(edges_by_relation, per_namespace_relations);
     let relation_sum: u64 = edges_by_relation.values().sum();
     assert_eq!(
         relation_sum, stats_edges,
@@ -3897,6 +4087,7 @@ async fn stats_totals_match_list_walk_across_visible_namespaces() {
         full_notes.len() as u64,
         "stats() note total must equal a full list keyset walk under the same identity"
     );
+    assert_eq!(stats_notes, per_namespace_notes);
     assert_eq!(stats_notes, 2);
 }
 

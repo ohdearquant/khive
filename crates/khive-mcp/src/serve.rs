@@ -336,7 +336,8 @@ pub async fn serve_server(
 /// #553). `[[backends]]` in `khive.toml` otherwise wins unconditionally, so an
 /// operator's `--db :memory:` isolation request was silently discarded whenever
 /// any backend was declared. `Some(":memory:")` forces every declared backend to
-/// in-memory for this invocation (loudly logged); any other concrete path is
+/// in-memory for this invocation (loudly logged). A concrete path matching the
+/// declared `main` backend is accepted as a no-op; any other concrete path is
 /// rejected rather than silently collapsing distinct declared backends onto one
 /// caller-supplied file.
 pub fn build_registry_for_multi_backend(
@@ -380,11 +381,13 @@ pub fn build_registry_for_multi_backend_with_db_anchor(
 /// forms disagreed about whether the override was legal because only one of
 /// them ever ran this check. Returns `Ok(true)` when the override forces
 /// every backend to in-memory (`:memory:`), `Ok(false)` when there is no
-/// override to apply.
+/// override to apply or the concrete override already names the declared
+/// `main` backend.
 pub fn validate_db_override_against_backends(
     cli_db_override: Option<&str>,
-    backend_count: usize,
+    backends: &[BackendConfig],
 ) -> anyhow::Result<bool> {
+    let backend_count = backends.len();
     match cli_db_override {
         Some(":memory:") => {
             tracing::warn!(
@@ -395,26 +398,74 @@ pub fn validate_db_override_against_backends(
             Ok(true)
         }
         Some(other) => {
-            anyhow::bail!(
-                "--db {other:?} (or KHIVE_DB) cannot be combined with [[backends]]: \
+            if override_matches_declared_main_backend(other, backends)? {
+                tracing::info!(
+                    "--db {other:?} (or KHIVE_DB) matches the path declared for the \
+                     \"main\" backend in khive.toml; proceeding because the override is a no-op"
+                );
+                Ok(false)
+            } else {
+                anyhow::bail!(
+                    "--db {other:?} (or KHIVE_DB) cannot be combined with [[backends]]: \
                  {backend_count} backend(s) are already declared in khive.toml, so applying \
                  this override here is ambiguous (it could silently collapse distinct \
                  declared backends onto a single file). Edit khive.toml directly to change \
                  backend paths, or pass --db :memory: to force all backends in-memory for \
                  this invocation."
-            );
+                );
+            }
         }
         None => Ok(false),
     }
 }
 
+/// Validate a database override and normalize a redundant concrete override
+/// to the same fingerprint anchor used when no override is supplied.
+///
+/// Once a concrete path is proven to name the declared `main` backend, the
+/// backend topology fully identifies storage and the override has no remaining
+/// semantic effect. Retaining it in `RuntimeConfig.db_path` would nevertheless
+/// change `compute_config_id` and prevent sharing the default warm daemon.
+pub fn normalize_redundant_db_override(
+    config: &mut RuntimeConfig,
+    cli_db_override: Option<&str>,
+    backends: &[BackendConfig],
+) -> anyhow::Result<bool> {
+    let force_memory = validate_db_override_against_backends(cli_db_override, backends)?;
+    if matches!(cli_db_override, Some(path) if path != ":memory:") {
+        config.db_path = khive_runtime::resolve_db_anchor(None);
+    }
+    Ok(force_memory)
+}
+
+fn override_matches_declared_main_backend(
+    override_path: &str,
+    backends: &[BackendConfig],
+) -> anyhow::Result<bool> {
+    let Some(main) = backends
+        .iter()
+        .find(|backend| backend.name == BackendId::MAIN)
+    else {
+        return Ok(false);
+    };
+    if main.kind != BackendKind::Sqlite {
+        return Ok(false);
+    }
+    let Some(main_path) = main.path.as_ref() else {
+        return Ok(false);
+    };
+
+    Ok(canonical_path_no_side_effects(main_path)?
+        == canonical_path_no_side_effects(std::path::Path::new(override_path))?)
+}
+
 fn build_registry_for_multi_backend_inner(
-    base_config: RuntimeConfig,
+    mut base_config: RuntimeConfig,
     khive_cfg: &KhiveConfig,
     cli_db_override: Option<&str>,
 ) -> anyhow::Result<MultiBackendRegistry> {
-    let backend_count = khive_cfg.backends.len();
-    let force_memory = validate_db_override_against_backends(cli_db_override, backend_count)?;
+    let force_memory =
+        normalize_redundant_db_override(&mut base_config, cli_db_override, &khive_cfg.backends)?;
 
     // Open and migrate each declared backend, deduplicating SQLite backends by
     // canonical path (ADR-028 §8).
@@ -819,7 +870,7 @@ fn canonical_backend_path(cfg: &BackendConfig) -> anyhow::Result<Option<PathBuf>
         return Ok(None);
     }
     let path = match cfg.path.as_ref() {
-        Some(p) => expand_tilde(p),
+        Some(p) => khive_runtime::expand_tilde(p),
         None => return Ok(None),
     };
     let parent = path
@@ -844,6 +895,120 @@ fn canonical_backend_path(cfg: &BackendConfig) -> anyhow::Result<Option<PathBuf>
         )
     })?;
     Ok(Some(canon_parent.join(file_name)))
+}
+
+/// Bound on final-component symlink hops [`canonical_path_no_side_effects`]
+/// will follow before giving up, mirroring the kernel's `ELOOP` limit — high
+/// enough for any real alias chain, low enough to fail fast on a cycle.
+const MAX_SYMLINK_HOPS: u32 = 40;
+
+pub(crate) fn canonical_path_no_side_effects(path: &std::path::Path) -> anyhow::Result<PathBuf> {
+    let expanded = khive_runtime::expand_tilde(path);
+    let absolute = if expanded.is_absolute() {
+        expanded
+    } else {
+        std::env::current_dir()
+            .map_err(|e| anyhow::anyhow!("cannot resolve current directory: {e}"))?
+            .join(expanded)
+    };
+
+    // A dangling final-component symlink (the alias exists, its target does
+    // not yet) makes `Path::exists()` below report `false` — it follows
+    // symlinks, so a missing target reads as "nothing here". Read the link
+    // manually first and resolve through it, so a declared alias like
+    // `link.db -> target.db` compares equal to `target.db` even before either
+    // file has been created. Iterate rather than recurse, and cap the hop
+    // count, so a symlink cycle (a self-link or a mutual a<->b pair) fails
+    // loud instead of recursing until the stack overflows.
+    let mut current = absolute;
+    for _ in 0..MAX_SYMLINK_HOPS {
+        let Ok(link_target) = std::fs::read_link(&current) else {
+            break;
+        };
+        current = if link_target.is_absolute() {
+            link_target
+        } else {
+            match current.parent() {
+                Some(parent) => parent.join(&link_target),
+                None => link_target,
+            }
+        };
+    }
+    if std::fs::read_link(&current).is_ok() {
+        anyhow::bail!(
+            "too many levels of symbolic links resolving {}",
+            path.display()
+        );
+    }
+    let absolute = current;
+
+    if absolute.exists() {
+        return absolute
+            .canonicalize()
+            .map_err(|e| anyhow::anyhow!("cannot canonicalize {}: {e}", absolute.display()));
+    }
+
+    // Neither `absolute` nor its immediate parent may exist yet (a fresh
+    // install with several undeclared directory levels). Walk up to the
+    // deepest ancestor that does exist, canonicalize only that (resolving any
+    // symlinked directory component along the way), then rejoin the missing
+    // tail lexically — never creating anything on disk. `Path::file_name`
+    // returns `None` for a `..` component, so the walk records the real last
+    // component instead; `.`/`..` in the missing tail are collapsed lexically
+    // below, which is sound only for components with no filesystem identity
+    // at all. `Path::exists` follows symlinks, so a DANGLING ancestor symlink
+    // also reads as nonexistent there — but `missing/..` through a symlink
+    // resolves relative to the link's target, not its location, so lexical
+    // collapse would be wrong. Probe `symlink_metadata` (which succeeds on a
+    // dangling link) and fail loud instead: such a path cannot be opened or
+    // created through until the link target exists.
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut probe = absolute.as_path();
+    let existing_ancestor = loop {
+        let Some(parent) = probe.parent() else {
+            break None;
+        };
+        tail.push(
+            probe
+                .components()
+                .next_back()
+                .map(|c| c.as_os_str().to_os_string())
+                .unwrap_or_default(),
+        );
+        if parent.exists() {
+            break Some(parent.to_path_buf());
+        }
+        if std::fs::symlink_metadata(parent).is_ok() {
+            anyhow::bail!(
+                "dangling symbolic link {} while resolving {}",
+                parent.display(),
+                path.display()
+            );
+        }
+        probe = parent;
+    };
+
+    let Some(existing_ancestor) = existing_ancestor else {
+        return Ok(absolute);
+    };
+
+    let canonical_ancestor = existing_ancestor
+        .canonicalize()
+        .map_err(|e| anyhow::anyhow!("cannot canonicalize {}: {e}", existing_ancestor.display()))?;
+
+    Ok(tail
+        .into_iter()
+        .rev()
+        .fold(canonical_ancestor, |mut acc, component| {
+            if component == *".." {
+                acc.pop();
+                acc
+            } else if component.is_empty() || component == *"." {
+                acc
+            } else {
+                acc.join(component)
+            }
+        }))
 }
 
 /// Build a fully-wired multi-backend `KhiveMcpServer` (ADR-028).
@@ -1093,7 +1258,7 @@ fn open_backend(cfg: &BackendConfig) -> anyhow::Result<StorageBackend> {
                     cfg.name
                 )
             })?;
-            let expanded = expand_tilde(path);
+            let expanded = khive_runtime::expand_tilde(path);
             if let Some(parent) = expanded.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| {
                     anyhow::anyhow!(
@@ -1112,20 +1277,6 @@ fn open_backend(cfg: &BackendConfig) -> anyhow::Result<StorageBackend> {
                     .map_err(|e| anyhow::anyhow!("backend {}: sqlite open: {e}", cfg.name))
             }
         }
-    }
-}
-
-/// Expand a leading `~` to `$HOME` in a path.
-fn expand_tilde(path: &std::path::Path) -> PathBuf {
-    let s = path.to_string_lossy();
-    if let Some(rest) = s.strip_prefix("~/") {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        PathBuf::from(format!("{home}/{rest}"))
-    } else if s == "~" {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        PathBuf::from(home)
-    } else {
-        path.to_path_buf()
     }
 }
 
@@ -3058,6 +3209,263 @@ region = "us-east-1"
         );
     }
 
+    fn sqlite_multi_backend_config(main_path: PathBuf, secondary_path: PathBuf) -> KhiveConfig {
+        use khive_runtime::PackConfig;
+
+        KhiveConfig {
+            backends: vec![
+                BackendConfig {
+                    name: "main".to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(main_path),
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: false,
+                },
+                BackendConfig {
+                    name: "secondary".to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(secondary_path),
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: false,
+                },
+            ],
+            packs: {
+                let mut packs = std::collections::HashMap::new();
+                packs.insert(
+                    "comm".to_string(),
+                    PackConfig {
+                        backend: "secondary".to_string(),
+                    },
+                );
+                packs
+            },
+            ..KhiveConfig::default()
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn concrete_db_override_matching_declared_main_backend_path_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("main.db");
+        let nested = dir.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let declared_main_path = nested.join("..").join("main.db");
+        assert_ne!(declared_main_path, main_path);
+        let secondary_path = dir.path().join("secondary.db");
+        let khive_cfg = sqlite_multi_backend_config(declared_main_path, secondary_path);
+        let override_value = main_path.to_str().unwrap();
+        let base_cfg = RuntimeConfig {
+            db_path: khive_runtime::resolve_db_anchor(Some(override_value)),
+            ..base_runtime_config_for_multi_backend()
+        };
+
+        let result = build_registry_for_multi_backend(base_cfg, &khive_cfg, Some(override_value));
+
+        if let Err(error) = result {
+            panic!(
+                "a concrete database override resolving to the declared main backend must be accepted: {error}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn concrete_db_override_diverging_from_declared_main_backend_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("main.db");
+        let secondary_path = dir.path().join("secondary.db");
+        let override_path = dir.path().join("override.db");
+        let khive_cfg = sqlite_multi_backend_config(main_path, secondary_path);
+        let override_value = override_path.to_str().unwrap();
+        let base_cfg = RuntimeConfig {
+            db_path: khive_runtime::resolve_db_anchor(Some(override_value)),
+            ..base_runtime_config_for_multi_backend()
+        };
+
+        let error =
+            match build_registry_for_multi_backend(base_cfg, &khive_cfg, Some(override_value)) {
+                Ok(_) => panic!("a divergent concrete database override must remain ambiguous"),
+                Err(error) => error,
+            };
+
+        assert!(error.to_string().contains("khive.toml"));
+        assert!(
+            !override_path.exists(),
+            "rejecting an override must not create its database path"
+        );
+    }
+
+    /// A declared `main` backend that is a symlink whose target does not
+    /// exist yet (first-open alias, e.g. `link.db -> target.db` written by a
+    /// provisioning step before khive has ever opened the database) must
+    /// still accept a `--db` override naming the symlink's target directly —
+    /// SQLite opens both spellings as the same file. The equivalence check
+    /// used to call `Path::exists()` first, which follows symlinks and
+    /// reports `false` for a dangling one, so it never resolved the link and
+    /// compared the literal alias path against the literal target path
+    /// instead, rejecting a legitimate no-op override as ambiguous.
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn concrete_db_override_matching_declared_main_backend_via_dangling_symlink_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let target_path = dir.path().join("target.db");
+        let link_path = dir.path().join("link.db");
+        std::os::unix::fs::symlink("target.db", &link_path).unwrap();
+        assert!(
+            !target_path.exists(),
+            "target.db must not exist yet — this is the first-open case"
+        );
+        let secondary_path = dir.path().join("secondary.db");
+        let khive_cfg = sqlite_multi_backend_config(link_path, secondary_path);
+        let override_value = target_path.to_str().unwrap();
+        let base_cfg = RuntimeConfig {
+            db_path: khive_runtime::resolve_db_anchor(Some(override_value)),
+            ..base_runtime_config_for_multi_backend()
+        };
+
+        let result = build_registry_for_multi_backend(base_cfg, &khive_cfg, Some(override_value));
+
+        if let Err(error) = result {
+            panic!(
+                "a --db override naming the file a dangling symlink's declared main \
+                 backend points at must be accepted as the same database: {error}"
+            );
+        }
+    }
+
+    /// The no-side-effects equivalence check used to give up after checking
+    /// only the immediate parent directory: if that parent did not exist yet,
+    /// it returned the literal (non-canonicalized) absolute path instead of
+    /// continuing up to find and resolve a symlinked ancestor further up.
+    /// Reaching the same not-yet-created file through a symlinked directory
+    /// two levels up and through the real directory must canonicalize to the
+    /// identical path.
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn canonical_path_no_side_effects_resolves_symlinked_ancestor_before_missing_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_dir = dir.path().join("real");
+        std::fs::create_dir(&real_dir).unwrap();
+        let linked_dir = dir.path().join("linked");
+        std::os::unix::fs::symlink(&real_dir, &linked_dir).unwrap();
+
+        let via_symlink = linked_dir.join("sub").join("main.db");
+        let via_real = real_dir.join("sub").join("main.db");
+        assert!(!via_symlink.parent().unwrap().exists());
+        assert!(!via_real.parent().unwrap().exists());
+
+        let resolved_via_symlink = canonical_path_no_side_effects(&via_symlink).unwrap();
+        let resolved_via_real = canonical_path_no_side_effects(&via_real).unwrap();
+
+        assert_eq!(
+            resolved_via_symlink, resolved_via_real,
+            "a symlinked ancestor directory two levels above a not-yet-created file \
+             must canonicalize to the same target as the real directory: {resolved_via_symlink:?} \
+             vs {resolved_via_real:?}"
+        );
+    }
+
+    /// A `..` inside the not-yet-created tail used to be dropped (recorded as
+    /// an empty component), so `missing/../main.db` resolved under `missing/`
+    /// instead of collapsing back to the base directory — falsely conflicting
+    /// with a plain `main.db` override naming the same file. The missing tail
+    /// must collapse `.`/`..` lexically, which is safe precisely because a
+    /// nonexistent component cannot be a symlink.
+    #[test]
+    #[serial]
+    fn canonical_path_no_side_effects_collapses_parent_refs_in_missing_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let via_parent_ref = dir.path().join("missing").join("..").join("main.db");
+        let direct = dir.path().join("main.db");
+        assert!(!dir.path().join("missing").exists());
+
+        let resolved_via_parent_ref = canonical_path_no_side_effects(&via_parent_ref).unwrap();
+        let resolved_direct = canonical_path_no_side_effects(&direct).unwrap();
+
+        assert_eq!(
+            resolved_via_parent_ref, resolved_direct,
+            "a parent-directory reference through a not-yet-created directory must \
+             collapse to the same canonical path as the direct spelling"
+        );
+        assert!(
+            !resolved_via_parent_ref
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir)),
+            "the canonical form must not retain `..` components: {resolved_via_parent_ref:?}"
+        );
+    }
+
+    /// A DANGLING symlink in the middle of the path must fail loud rather
+    /// than participate in the lexical `..` collapse: `missing/..` through a
+    /// symlink resolves relative to the link's TARGET, so treating it as a
+    /// plain nonexistent directory would silently equate two different files.
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn canonical_path_no_side_effects_rejects_dangling_ancestor_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let dangling = dir.path().join("missing");
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), &dangling).unwrap();
+
+        let via_dangling = dangling.join("..").join("main.db");
+        let result = canonical_path_no_side_effects(&via_dangling);
+
+        assert!(
+            result.is_err(),
+            "a dangling ancestor symlink must fail loud, not collapse lexically: \
+             {result:?}"
+        );
+        let message = format!("{:#}", result.unwrap_err());
+        assert!(
+            message.contains("dangling symbolic link"),
+            "the error must name the dangling link: {message}"
+        );
+    }
+
+    /// A symlink pointing at itself used to recurse in
+    /// `canonical_path_no_side_effects` until the stack overflowed. The
+    /// bounded hop count must instead return an error naming the path.
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn canonical_path_no_side_effects_rejects_self_referential_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let link_path = dir.path().join("link.db");
+        std::os::unix::fs::symlink("link.db", &link_path).unwrap();
+
+        let result = canonical_path_no_side_effects(&link_path);
+
+        assert!(
+            result.is_err(),
+            "a self-referential symlink must fail loud, not hang or crash"
+        );
+    }
+
+    /// The two-hop variant of the self-loop above: `a -> b -> a`. Must also
+    /// fail loud rather than recursing indefinitely.
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn canonical_path_no_side_effects_rejects_two_link_symlink_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let link_a = dir.path().join("a.db");
+        let link_b = dir.path().join("b.db");
+        std::os::unix::fs::symlink("b.db", &link_a).unwrap();
+        std::os::unix::fs::symlink("a.db", &link_b).unwrap();
+
+        let result = canonical_path_no_side_effects(&link_a);
+
+        assert!(
+            result.is_err(),
+            "a two-link symlink cycle must fail loud, not hang or crash"
+        );
+    }
+
     /// Issue #553: a concrete `--db` path override combined with declared
     /// `[[backends]]` is ambiguous (which of N declared backends should it apply
     /// to?) and must fail loud, pointing at khive.toml as the place to make the
@@ -3733,6 +4141,65 @@ region = "us-east-1"
             "configs differing only in pack→backend routing must produce different config_ids; \
              both produced: {id_a}"
         );
+    }
+
+    /// Tilde divergence regression (blocking security defect): a `~/`-prefixed
+    /// `--db`/`KHIVE_DB` override must fingerprint identically to the
+    /// equivalent absolute path. Before the fix, `resolve_db_anchor` left a
+    /// leading `~` unexpanded in `RuntimeConfig.db_path`, so single-backend
+    /// boot opened a literal `./~/...` file while `compute_config_id`
+    /// canonicalized (and so expanded) the same raw string separately —
+    /// letting two processes that open different files still collide on one
+    /// `config_id` and get dispatched to each other's database by the daemon.
+    #[test]
+    #[serial]
+    fn config_id_matches_for_tilde_and_equivalent_absolute_db_override() {
+        let original_home = std::env::var_os("HOME");
+        let home_dir = tempfile::tempdir().expect("home tempdir");
+        std::env::set_var("HOME", home_dir.path());
+
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let tilde_anchor = khive_runtime::resolve_db_anchor(Some("~/data.db"))
+                .expect("an explicit path always anchors");
+            let expected = home_dir.path().join("data.db");
+            assert_eq!(
+                tilde_anchor, expected,
+                "resolve_db_anchor must expand a leading ~ before compute_config_id ever \
+                 sees it"
+            );
+
+            let absolute_anchor = khive_runtime::resolve_db_anchor(Some(
+                expected.to_str().expect("utf8 tempdir path"),
+            ))
+            .expect("an explicit path always anchors");
+            assert_eq!(tilde_anchor, absolute_anchor);
+
+            let make_config = |db_path: std::path::PathBuf| RuntimeConfig {
+                db_path: Some(db_path),
+                default_namespace: khive_runtime::Namespace::local(),
+                embedding_model: None,
+                additional_embedding_models: vec![],
+                packs: vec!["kg".to_string()],
+                ..RuntimeConfig::no_embeddings()
+            };
+
+            let tilde_cfg = make_config(tilde_anchor);
+            let abs_cfg = make_config(absolute_anchor);
+
+            let id_tilde = crate::server::compute_config_id(&tilde_cfg, None);
+            let id_abs = crate::server::compute_config_id(&abs_cfg, None);
+            assert_eq!(
+                id_tilde, id_abs,
+                "a config resolved from a ~-prefixed override must fingerprint identically \
+                 to one resolved from the equivalent absolute path"
+            );
+        }));
+
+        match original_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        outcome.expect("test body panicked");
     }
 
     // --- should_warn_unattributed predicate ---

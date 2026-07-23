@@ -25,9 +25,9 @@ use sha2::{Digest, Sha256};
 use khive_db::ConnectionPool;
 use khive_request::{parse_request, ArgValue, DslError, ExecutionMode, ParsedOp, PrevFailure};
 use khive_runtime::{
-    present, render_format, resolve_explicit_namespace, KhiveRuntime, OutputFormat, PackLoadError,
-    PackRegistry, PresentationMode, RuntimeConfig, RuntimeError, VerbPresentationPolicy,
-    VerbRegistry, VerbRegistryBuilder,
+    present, render_format, KhiveRuntime, OutputFormat, PackLoadError, PackRegistry,
+    PresentationMode, RuntimeConfig, RuntimeError, VerbPresentationPolicy, VerbRegistry,
+    VerbRegistryBuilder,
 };
 
 use khive_storage::EdgeRelation;
@@ -40,6 +40,11 @@ struct OpSuccess {
     partial: bool,
     missing_backends: Vec<String>,
 }
+
+/// Side-channel slot for the coordinator degradation advisory
+/// `(partial, missing_backends)`, written inside a registry dispatch
+/// closure and read after it returns.
+type DegradationSlot = std::sync::Arc<std::sync::Mutex<Option<(bool, Vec<String>)>>>;
 
 impl OpSuccess {
     fn complete(result: Value) -> Self {
@@ -95,6 +100,14 @@ struct RunParsedContext<'a> {
 ///
 /// When `khive_cfg` is `None` or its `backends` list is empty, the fingerprint
 /// is byte-identical to what it would have been before this parameter was added.
+///
+/// `config.db_path` and each declared backend path are canonicalized against
+/// the process's current working directory before entering the fingerprint. A
+/// raw relative string (e.g. `./data/main.db`) would otherwise fingerprint
+/// identically for two different projects that happen to declare or override
+/// the same relative path, even though they resolve to two different files —
+/// letting a warm daemon started for one project accept requests meant for
+/// the other's database.
 pub fn compute_config_id(
     config: &RuntimeConfig,
     khive_cfg: Option<&khive_runtime::KhiveConfig>,
@@ -103,8 +116,8 @@ pub fn compute_config_id(
     packs.sort();
     let db = config
         .db_path
-        .as_ref()
-        .map(|p| p.display().to_string())
+        .as_deref()
+        .map(canonical_fingerprint_path)
         .unwrap_or_else(|| ":memory:".to_string());
     let primary = config
         .embedding_model
@@ -162,8 +175,8 @@ pub fn compute_config_id(
                 .map(|b| {
                     let path = b
                         .path
-                        .as_ref()
-                        .map(|p| p.display().to_string())
+                        .as_deref()
+                        .map(canonical_fingerprint_path)
                         .unwrap_or_else(|| ":memory:".to_string());
                     format!("{}:{:?}:{}", b.name, b.kind, path)
                 })
@@ -186,6 +199,24 @@ pub fn compute_config_id(
         .unwrap_or_default();
 
     format!("{base}{topology}")
+}
+
+/// Resolve any path headed into `config_id` fingerprinting — a declared
+/// `[[backends]].path` or the resolved `RuntimeConfig.db_path` (itself
+/// derived from `--db`/`KHIVE_DB`) — to a stable, cwd-independent string
+/// without creating anything on disk.
+///
+/// Delegates to [`crate::serve::canonical_path_no_side_effects`] — the same
+/// no-side-effects canonicalization the `--db` override equivalence check
+/// uses — so a relative path resolves against the process's current working
+/// directory the same way a real backend open would. Falls back to the raw
+/// display string only on a canonicalization error (e.g. an unreadable
+/// ancestor directory); this is strictly no worse than the pre-fix behavior,
+/// which always used the raw string.
+fn canonical_fingerprint_path(path: &std::path::Path) -> String {
+    crate::serve::canonical_path_no_side_effects(path)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| path.display().to_string())
 }
 
 /// Build a sorted, human-readable verb catalog from `(pack_name, verb_name, description)` triples.
@@ -541,10 +572,8 @@ impl KhiveMcpServer {
         if coord.is_single_backend() {
             return None;
         }
-        let default_namespace = identity
-            .map(|id| id.namespace.as_str())
-            .unwrap_or(self.default_namespace.as_str());
-        dispatch_via_coordinator_inner(coord.as_ref(), tool, args_value, default_namespace).await
+        dispatch_via_coordinator_inner(coord.as_ref(), &self.registry, tool, args_value, identity)
+            .await
     }
 
     /// Namespace this server's registry was built for.
@@ -908,7 +937,6 @@ impl KhiveMcpServer {
 
                 // Clone coordinator and namespace for use in the per-op closures (ADR-029 D3/D4).
                 let coordinator: Option<Arc<dyn CoordinatorService>> = self.coordinator.clone();
-                let default_namespace = self.default_namespace.clone();
                 // ADR-096 Fork 1: a per-request identity overrides the default
                 // namespace for both the coordinator intercept and the registry
                 // dispatch below, so the two can't drift out of sync per op.
@@ -927,10 +955,6 @@ impl KhiveMcpServer {
 
                     let registry = self.registry.clone();
                     let coord = coordinator.clone();
-                    let ns_str = identity_owned
-                        .as_ref()
-                        .map(|id| id.namespace.clone())
-                        .unwrap_or_else(|| default_namespace.clone());
                     let op_identity = identity_owned.clone();
                     let op_mode = mode_for_op(i);
                     let task_tool = op.tool.clone();
@@ -1011,9 +1035,10 @@ impl KhiveMcpServer {
                             if !active_coord.is_single_backend() {
                                 if let Some(coord_result) = dispatch_via_coordinator_inner(
                                     active_coord.as_ref(),
+                                    &registry,
                                     &tool,
                                     &args_value,
-                                    &ns_str,
+                                    op_identity.as_ref(),
                                 )
                                 .await
                                 {
@@ -1180,30 +1205,15 @@ impl KhiveMcpServer {
 /// `crates/khive-mcp/docs/api/coordinator.md`.
 async fn dispatch_via_coordinator_inner(
     coord: &dyn CoordinatorService,
+    registry: &VerbRegistry,
     tool: &str,
     args_value: &Value,
-    default_namespace_str: &str,
+    identity: Option<&khive_runtime::RequestIdentity>,
 ) -> Option<Result<OpSuccess, (String, Value)>> {
-    // Only link/search are ever intercepted here — resolve/validate the
-    // namespace only for those verbs so unrelated verbs (which always
-    // fall through to `None` below) don't pay for a parse they don't need.
+    // Only link/search are ever intercepted here.
     if !matches!(tool, "link" | "search") {
         return None;
     }
-
-    let namespace = match resolve_explicit_namespace(args_value, default_namespace_str) {
-        Ok(ns) => ns,
-        Err(e) => {
-            return Some(Err(match e {
-                RuntimeError::Khive(k) => {
-                    let error_payload = serde_json::to_value(&k)
-                        .unwrap_or_else(|_| json!({"kind": "internal", "message": k.to_string()}));
-                    (tool.to_string(), error_payload)
-                }
-                other => (tool.to_string(), json!(other.to_string())),
-            }));
-        }
-    };
 
     match tool {
         "link" => {
@@ -1221,194 +1231,233 @@ async fn dispatch_via_coordinator_inner(
             let source_id: uuid::Uuid = source_str.parse().ok()?;
             let target_id: uuid::Uuid = target_str.parse().ok()?;
             let relation: EdgeRelation = relation_str.parse().ok()?;
-
             let weight = args_value
                 .get("weight")
                 .and_then(Value::as_f64)
                 .unwrap_or(1.0);
             let metadata = args_value.get("metadata").cloned();
 
-            let result = coord
-                .link(&namespace, source_id, target_id, relation, weight, metadata)
+            let result = registry
+                .dispatch_intercepted_with_identity(
+                    tool,
+                    args_value,
+                    identity,
+                    |namespace| async move {
+                        let coord_result = coord
+                            .link(&namespace, source_id, target_id, relation, weight, metadata)
+                            .await
+                            .map_err(RuntimeError::from)?;
+                        let mut raw = serde_json::to_value(&coord_result.edge)
+                            .unwrap_or_else(|e| json!({"error": format!("serialize edge: {e}")}));
+                        if relation.is_symmetric() {
+                            if let Some(obj) = raw.as_object_mut() {
+                                obj.insert("source_id".to_string(), json!(source_id.to_string()));
+                                obj.insert("target_id".to_string(), json!(target_id.to_string()));
+                            }
+                        }
+                        Ok(raw)
+                    },
+                )
                 .await;
-
-            let tool_name = tool.to_string();
-            Some(match result {
-                Ok(coord_result) => {
-                    // Serialize the edge using serde_json — matches `to_json(&edge)` in the kg
-                    // handler, which is what `format_edge_output` receives (identity fn).
-                    let edge_val = serde_json::to_value(&coord_result.edge)
-                        .unwrap_or_else(|e| json!({"error": format!("serialize edge: {e}")}));
-                    // Preserve symmetric-relation source/target override that the kg handler
-                    // applies: if the edge was written with swapped endpoints, inject the
-                    // canonical source/target so callers get what they requested.
-                    let mut raw = edge_val;
-                    if relation.is_symmetric() {
-                        if let Some(obj) = raw.as_object_mut() {
-                            obj.insert("source_id".to_string(), json!(source_id.to_string()));
-                            obj.insert("target_id".to_string(), json!(target_id.to_string()));
-                        }
-                    }
-                    Ok(OpSuccess::complete(raw))
-                }
-                Err(e) => {
-                    let re: RuntimeError = e.into();
-                    match re {
-                        RuntimeError::Khive(k) => {
-                            let error_payload = serde_json::to_value(&k).unwrap_or_else(
-                                |_| json!({"kind": "internal", "message": k.to_string()}),
-                            );
-                            Err((tool_name, error_payload))
-                        }
-                        other => Err((tool_name, json!(other.to_string()))),
-                    }
-                }
-            })
+            // Link is written to exactly one backend — no fan-out, so no
+            // degradation advisory to carry; the envelope is always complete.
+            Some(
+                result
+                    .map(OpSuccess::complete)
+                    .map_err(|error| runtime_error_payload(tool, error)),
+            )
         }
         "search" => {
             let kind = args_value.get("kind")?.as_str()?;
             let query = args_value.get("query")?.as_str()?;
-            // Parse strictly as u32 (matching the single-backend `SearchParams { limit:
-            // Option<u32> }` contract) instead of parsing as u64 and casting — `as u32`
-            // wraps values above `u32::MAX` (e.g. 4294967297 as u32 == 1) before the
-            // `.min(100)` cap ever runs, silently truncating a huge limit to a near-empty
-            // result set rather than rejecting it (MCP-AUD-003).
-            let limit = match args_value.get("limit") {
-                None | Some(Value::Null) => 10,
-                Some(v) => match serde_json::from_value::<u32>(v.clone()) {
-                    Ok(limit) => limit.min(100),
-                    Err(_) => {
-                        return Some(Err((
-                            "search".to_string(),
-                            json!("limit must be an unsigned 32-bit integer"),
-                        )));
-                    }
-                },
-            };
-            let score_floor = args_value
-                .get("min_score")
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0)
-                .max(0.0);
+            // The degradation advisory (partial / missing_backends) is computed
+            // from the coordinator result INSIDE the dispatch closure, but the
+            // OpSuccess envelope is assembled outside it — the registry closure
+            // contract returns a bare result Value. Side-channel the advisory
+            // through a captured slot; the closure runs at most once per call.
+            let degradation = DegradationSlot::default();
+            let degradation_w = std::sync::Arc::clone(&degradation);
+            let result = registry
+                .dispatch_intercepted_with_identity(
+                    tool,
+                    args_value,
+                    identity,
+                    |namespace| async move {
+                        // Parse strictly as u32 (matching the single-backend `SearchParams { limit:
+                        // Option<u32> }` contract) instead of parsing as u64 and casting — `as u32`
+                        // wraps values above `u32::MAX` (e.g. 4294967297 as u32 == 1) before the
+                        // `.min(100)` cap ever runs, silently truncating a huge limit to a near-empty
+                        // result set rather than rejecting it (MCP-AUD-003).
+                        let limit = match args_value.get("limit") {
+                            None | Some(Value::Null) => 10,
+                            Some(v) => match serde_json::from_value::<u32>(v.clone()) {
+                                Ok(limit) => limit.min(100),
+                                Err(_) => {
+                                    return Err(RuntimeError::InvalidInput(
+                                        "limit must be an unsigned 32-bit integer".to_string(),
+                                    ));
+                                }
+                            },
+                        };
+                        let score_floor = args_value
+                            .get("min_score")
+                            .and_then(Value::as_f64)
+                            .unwrap_or(0.0)
+                            .max(0.0);
 
-            // For substrate-level kinds ("entity" / "note"), pass None so the search
-            // is unrestricted. For granular kinds ("concept", "observation", etc.) pass
-            // the kind string so each backend filters at the storage layer — matching
-            // the behaviour of the single-backend handler (search.rs).
-            let kind_filter: Option<&str> = match kind {
-                "entity" | "note" => None,
-                other => Some(other),
-            };
+                        // For substrate-level kinds ("entity" / "note"), pass None so the search
+                        // is unrestricted. For granular kinds ("concept", "observation", etc.) pass
+                        // the kind string so each backend filters at the storage layer — matching
+                        // the behaviour of the single-backend handler (search.rs).
+                        let kind_filter: Option<&str> = match kind {
+                            "entity" | "note" => None,
+                            other => Some(other),
+                        };
 
-            // Extract entity-substrate filters and forward them to each backend.
-            // When either is active the coordinator widens the per-backend candidate
-            // window so that sparse matches ranked below the bare limit are not cut
-            // off before filtering (before-truncation parity with the single-backend
-            // handler in search.rs).
-            let props_filter: Option<&serde_json::Value> =
-                args_value.get("properties").and_then(|v| {
-                    if v.as_object().is_some_and(|m| !m.is_empty()) {
-                        Some(v)
-                    } else {
-                        None
-                    }
-                });
-            // Parse tags strictly: absent/null → no filter (empty Vec); present and
-            // valid Vec<String> → use as-is (including empty array → no filter);
-            // present but not a Vec<String> → reject with a per-op error so the
-            // multi-backend path matches single-backend behaviour, which rejects
-            // malformed tags via SearchParams deserialisation (RuntimeError::InvalidInput).
-            // filter_map(as_str) would silently drop non-string entries and produce
-            // an empty Vec, bypassing the filter and returning unfiltered results.
-            let tags_owned: Vec<String> = match args_value.get("tags") {
-                None | Some(Value::Null) => vec![],
-                Some(v) => match serde_json::from_value::<Vec<String>>(v.clone()) {
-                    Ok(t) => t,
-                    Err(_) => {
-                        return Some(Err((
-                            "search".to_string(),
-                            json!("tags must be an array of strings"),
-                        )));
-                    }
-                },
-            };
+                        // Extract entity-substrate filters and forward them to each backend.
+                        // When either is active the coordinator widens the per-backend candidate
+                        // window so that sparse matches ranked below the bare limit are not cut
+                        // off before filtering (before-truncation parity with the single-backend
+                        // handler in search.rs).
+                        let props_filter: Option<&serde_json::Value> =
+                            args_value.get("properties").and_then(|v| {
+                                if v.as_object().is_some_and(|m| !m.is_empty()) {
+                                    Some(v)
+                                } else {
+                                    None
+                                }
+                            });
+                        // Parse tags strictly: absent/null → no filter (empty Vec); present and
+                        // valid Vec<String> → use as-is (including empty array → no filter);
+                        // present but not a Vec<String> → reject with a per-op error so the
+                        // multi-backend path matches single-backend behaviour, which rejects
+                        // malformed tags via SearchParams deserialisation (RuntimeError::InvalidInput).
+                        // filter_map(as_str) would silently drop non-string entries and produce
+                        // an empty Vec, bypassing the filter and returning unfiltered results.
+                        let tags_owned: Vec<String> = match args_value.get("tags") {
+                            None | Some(Value::Null) => vec![],
+                            Some(v) => match serde_json::from_value::<Vec<String>>(v.clone()) {
+                                Ok(t) => t,
+                                Err(_) => {
+                                    return Err(RuntimeError::InvalidInput(
+                                        "tags must be an array of strings".to_string(),
+                                    ));
+                                }
+                            },
+                        };
 
-            let coord_result = coord
-                .fan_out_search(
-                    kind,
-                    query,
-                    &namespace,
-                    limit,
-                    kind_filter,
-                    props_filter,
-                    &tags_owned,
+                        let coord_result = coord
+                            .fan_out_search(
+                                kind,
+                                query,
+                                &namespace,
+                                limit,
+                                kind_filter,
+                                props_filter,
+                                &tags_owned,
+                            )
+                            .await;
+
+                        // Record the degradation advisory (#1233): failed
+                        // backend legs are surfaced beside the merged result,
+                        // never silently dropped from a successful op.
+                        let mut missing_backends: Vec<String> = coord_result
+                            .per_backend
+                            .iter()
+                            .filter(|backend| backend.error.is_some())
+                            .map(|backend| backend.backend_id.as_str().to_string())
+                            .collect();
+                        missing_backends.sort();
+                        missing_backends.dedup();
+                        let partial = coord_result.partial || !missing_backends.is_empty();
+                        *degradation_w.lock().expect("degradation slot poisoned") =
+                            Some((partial, missing_backends));
+
+                        // Shape result to match the kg search handler's output fields exactly.
+                        // Entity hits: [{id, entity_kind, score, title, snippet}]
+                        //   - entity_kind: real kind string fetched from the owning backend
+                        //   - score: RRF-merged, subject to min_score floor
+                        // Note hits:   [{id, note_kind, score, title, snippet}]
+                        //   - note_kind: real kind string fetched from the owning backend
+                        let result_val = if !coord_result.note_hits.is_empty()
+                            || (coord_result.entity_hits.is_empty()
+                                && coord_result.note_hits.is_empty())
+                        {
+                            // Note substrate or empty — return note-shaped result.
+                            let items: Vec<Value> = coord_result
+                                .note_hits
+                                .iter()
+                                .filter(|h| h.score.to_f64() >= score_floor)
+                                .map(|h| {
+                                    let note_kind = coord_result.note_kinds.get(&h.note_id);
+                                    json!({
+                                        "id": h.note_id.to_string(),
+                                        "note_kind": note_kind,
+                                        "score": h.score.to_f64(),
+                                        "source": h.source.as_str(),
+                                        "title": h.title,
+                                        "snippet": h.snippet,
+                                    })
+                                })
+                                .collect();
+                            serde_json::to_value(items).unwrap_or_else(|_| json!([]))
+                        } else {
+                            // Entity substrate — return entity-shaped result.
+                            let items: Vec<Value> = coord_result
+                                .entity_hits
+                                .iter()
+                                .filter(|h| h.score.to_f64() >= score_floor)
+                                .map(|h| {
+                                    let entity_kind = coord_result.entity_kinds.get(&h.entity_id);
+                                    json!({
+                                        "id": h.entity_id.to_string(),
+                                        "entity_kind": entity_kind,
+                                        "score": h.score.to_f64(),
+                                        "source": h.source.as_str(),
+                                        "title": h.title,
+                                        "snippet": h.snippet,
+                                    })
+                                })
+                                .collect();
+                            serde_json::to_value(items).unwrap_or_else(|_| json!([]))
+                        };
+
+                        Ok(result_val)
+                    },
                 )
                 .await;
-            let mut missing_backends: Vec<String> = coord_result
-                .per_backend
-                .iter()
-                .filter(|backend| backend.error.is_some())
-                .map(|backend| backend.backend_id.as_str().to_string())
-                .collect();
-            missing_backends.sort();
-            missing_backends.dedup();
-            let partial = coord_result.partial || !missing_backends.is_empty();
-
-            // Shape result to match the kg search handler's output fields exactly.
-            // Entity hits: [{id, entity_kind, score, title, snippet}]
-            //   - entity_kind: real kind string fetched from the owning backend
-            //   - score: RRF-merged, subject to min_score floor
-            // Note hits:   [{id, note_kind, score, title, snippet}]
-            //   - note_kind: real kind string fetched from the owning backend
-            let result_val = if !coord_result.note_hits.is_empty()
-                || (coord_result.entity_hits.is_empty() && coord_result.note_hits.is_empty())
-            {
-                // Note substrate or empty — return note-shaped result.
-                let items: Vec<Value> = coord_result
-                    .note_hits
-                    .iter()
-                    .filter(|h| h.score.to_f64() >= score_floor)
-                    .map(|h| {
-                        let note_kind = coord_result.note_kinds.get(&h.note_id);
-                        json!({
-                            "id": h.note_id.to_string(),
-                            "note_kind": note_kind,
-                            "score": h.score.to_f64(),
-                            "source": h.source.as_str(),
-                            "title": h.title,
-                            "snippet": h.snippet,
-                        })
+            Some(match result {
+                Ok(result_val) => {
+                    // The slot is written on every path that produced a result
+                    // Value; a registry-level rejection (namespace, identity)
+                    // errors before the closure runs, in which case there is
+                    // no advisory to read.
+                    let (partial, missing_backends) = degradation
+                        .lock()
+                        .expect("degradation slot poisoned")
+                        .take()
+                        .unwrap_or((false, Vec::new()));
+                    Ok(OpSuccess {
+                        result: result_val,
+                        partial,
+                        missing_backends,
                     })
-                    .collect();
-                serde_json::to_value(items).unwrap_or_else(|_| json!([]))
-            } else {
-                // Entity substrate — return entity-shaped result.
-                let items: Vec<Value> = coord_result
-                    .entity_hits
-                    .iter()
-                    .filter(|h| h.score.to_f64() >= score_floor)
-                    .map(|h| {
-                        let entity_kind = coord_result.entity_kinds.get(&h.entity_id);
-                        json!({
-                            "id": h.entity_id.to_string(),
-                            "entity_kind": entity_kind,
-                            "score": h.score.to_f64(),
-                            "source": h.source.as_str(),
-                            "title": h.title,
-                            "snippet": h.snippet,
-                        })
-                    })
-                    .collect();
-                serde_json::to_value(items).unwrap_or_else(|_| json!([]))
-            };
-
-            Some(Ok(OpSuccess {
-                result: result_val,
-                partial,
-                missing_backends,
-            }))
+                }
+                Err(error) => Err(runtime_error_payload(tool, error)),
+            })
         }
         _ => None,
+    }
+}
+
+fn runtime_error_payload(tool: &str, error: RuntimeError) -> (String, Value) {
+    match error {
+        RuntimeError::Khive(k) => {
+            let error_payload = serde_json::to_value(&k)
+                .unwrap_or_else(|_| json!({"kind": "internal", "message": k.to_string()}));
+            (tool.to_string(), error_payload)
+        }
+        other => (tool.to_string(), json!(other.to_string())),
     }
 }
 
@@ -2946,6 +2995,136 @@ mod tests {
             .map(|l| l.trim_start().split(' ').next().unwrap())
             .collect();
         assert_eq!(names, vec!["assign", "list", "search"]);
+    }
+
+    // ── relative backend paths must not collide across projects ────────────
+
+    /// RAII guard: temporarily chdirs into `dir`, restoring the original cwd
+    /// on drop (even on panic/unwind). Process cwd is global state, so every
+    /// test using this guard is `#[serial]`.
+    struct CwdGuard {
+        original: std::path::PathBuf,
+    }
+
+    impl CwdGuard {
+        fn enter(dir: &std::path::Path) -> Self {
+            let original = std::env::current_dir().expect("read cwd");
+            std::env::set_current_dir(dir).expect("chdir into test project root");
+            Self { original }
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.original);
+        }
+    }
+
+    /// The security finding this guards: `compute_config_id`'s backend
+    /// topology fold used to embed the RAW relative path string declared in
+    /// `khive.toml`. Two different projects that happen to declare the same
+    /// relative string (e.g. `./data/main.db`) but resolve it against two
+    /// different working directories produced the SAME `config_id` despite
+    /// opening two different physical databases — a warm daemon started for
+    /// one project could then accept forwarded requests meant for the other,
+    /// serving or writing the wrong project's data.
+    #[test]
+    #[serial]
+    fn config_id_does_not_collide_across_projects_with_same_relative_backend_path() {
+        use khive_runtime::{BackendId, BackendKind, KhiveConfig, Namespace};
+
+        let project_a = tempfile::tempdir().expect("project a tempdir");
+        let project_b = tempfile::tempdir().expect("project b tempdir");
+
+        let base_rt = RuntimeConfig {
+            db_path: None,
+            default_namespace: Namespace::parse("local").unwrap(),
+            embedding_model: None,
+            packs: vec!["kg".to_string()],
+            backend_id: BackendId::main(),
+            ..RuntimeConfig::default()
+        };
+
+        let relative_backend_cfg = || KhiveConfig {
+            backends: vec![khive_runtime::BackendConfig {
+                name: "main".to_string(),
+                kind: BackendKind::Sqlite,
+                path: Some(std::path::PathBuf::from("./data/main.db")),
+                cache_mb: None,
+                journal_mode: None,
+                read_only: false,
+            }],
+            ..KhiveConfig::default()
+        };
+
+        let id_a = {
+            let _cwd = CwdGuard::enter(project_a.path());
+            compute_config_id(&base_rt, Some(&relative_backend_cfg()))
+        };
+        let id_b = {
+            let _cwd = CwdGuard::enter(project_b.path());
+            compute_config_id(&base_rt, Some(&relative_backend_cfg()))
+        };
+
+        assert_ne!(
+            id_a, id_b,
+            "two projects declaring the same relative backend path string from \
+             different working directories must not share a config_id; both \
+             produced: {id_a}"
+        );
+    }
+
+    /// The same collision, one layer up the resolution chain: `--db`/`KHIVE_DB`
+    /// resolves to a raw relative `PathBuf` (`resolve_db_anchor`) that lands in
+    /// `RuntimeConfig.db_path` unchanged. Before this fix, `compute_config_id`
+    /// fingerprinted that raw string directly, so two different projects both
+    /// running `KHIVE_DB=./data/main.db` produced the SAME `config_id` while
+    /// opening two different SQLite files — the single-backend route
+    /// (`KhiveMcpServer::with_packs`) would let a warm daemon started for one
+    /// project serve requests meant for the other's database.
+    #[test]
+    #[serial]
+    fn config_id_does_not_collide_across_projects_with_same_relative_db_override() {
+        use khive_runtime::Namespace;
+
+        let project_a = tempfile::tempdir().expect("project a tempdir");
+        let project_b = tempfile::tempdir().expect("project b tempdir");
+
+        let rt_with_db = |db_path: Option<std::path::PathBuf>| RuntimeConfig {
+            db_path,
+            default_namespace: Namespace::parse("local").unwrap(),
+            embedding_model: None,
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        };
+
+        let relative_db = std::path::PathBuf::from("./data/main.db");
+
+        let id_a = {
+            let _cwd = CwdGuard::enter(project_a.path());
+            compute_config_id(&rt_with_db(Some(relative_db.clone())), None)
+        };
+        let id_b = {
+            let _cwd = CwdGuard::enter(project_b.path());
+            compute_config_id(&rt_with_db(Some(relative_db.clone())), None)
+        };
+
+        assert_ne!(
+            id_a, id_b,
+            "two projects overriding KHIVE_DB with the same relative path from \
+             different working directories must not share a config_id; both \
+             produced: {id_a}"
+        );
+
+        let id_a_again = {
+            let _cwd = CwdGuard::enter(project_a.path());
+            compute_config_id(&rt_with_db(Some(relative_db.clone())), None)
+        };
+        assert_eq!(
+            id_a, id_a_again,
+            "resolving the same project's KHIVE_DB override twice must produce \
+             the same config_id"
+        );
     }
 
     // ── #823: runtime `$prev` result depth guard ────────────────────────────

@@ -901,7 +901,7 @@ impl KhiveRuntime {
         let embed_model_names = self.registered_embedding_model_names();
         for model_name in &embed_model_names {
             match self
-                .embed_document_with_model(model_name, &embed_body)
+                .embed_document_with_model_for_token(token, model_name, &embed_body)
                 .await
             {
                 Ok(vector) => match self.vectors_for_model(token, model_name) {
@@ -976,7 +976,7 @@ impl KhiveRuntime {
         let embed_model_names = self.registered_embedding_model_names();
         for model_name in &embed_model_names {
             match self
-                .embed_document_with_model(model_name, &note_embedding_text(note))
+                .embed_document_with_model_for_token(token, model_name, &note_embedding_text(note))
                 .await
             {
                 Ok(vector) => match self.vectors_for_model(token, model_name) {
