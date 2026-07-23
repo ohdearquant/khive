@@ -2994,7 +2994,8 @@ backend = "sessions"
     /// conflict-absorbs into is created by an EARLIER op in the SAME
     /// atomic unit (so it does not exist at either op's prepare time). The
     /// commit must both write correctly (X deleted, the just-linked row
-    /// carries X's patch) and RENDER the correct surviving id — not X's
+    /// preserved unchanged per ADR-039 DO NOTHING — X's patch is discarded,
+    /// not applied) and RENDER the correct surviving id — not X's
     /// prepare-time-advisory id, which this fix removed reliance on
     /// entirely (`build_op_result` now derives it from a post-commit
     /// natural-key lookup).
@@ -3081,15 +3082,123 @@ backend = "sessions"
             "the update's rendered result must be the surviving (just-linked) row: {envelope}"
         );
         assert_eq!(
-            envelope["results"][1]["result"]["weight"], 0.9,
-            "the surviving row must carry the update's patch: {envelope}"
+            envelope["results"][1]["result"]["weight"], 0.6,
+            "ADR-039 DO NOTHING: the surviving row keeps its OWN pre-existing weight (0.6, \
+             set by the link above), not the discarded update's patched weight (0.9): {envelope}"
         );
 
         let server = isolated_server(&db_path);
         let surviving_resp = dispatch_json(&server, &format!(r#"get(id="{linked_id}")"#)).await;
         assert_eq!(
-            surviving_resp["results"][0]["result"]["weight"], 0.9,
-            "the committed row itself must carry the patch: {surviving_resp}"
+            surviving_resp["results"][0]["result"]["weight"], 0.6,
+            "the committed row itself must keep its pre-existing weight, not the discarded \
+             update's patch: {surviving_resp}"
+        );
+    }
+
+    /// khive#1213/#1214 fix round, Medium finding: the canonical survivor a
+    /// symmetric-update op absorbs into can ALREADY be soft-deleted before the
+    /// atomic unit even runs (not just tombstoned as a side effect of the same
+    /// unit's own writes, as the sibling test above covers). This exercises
+    /// `build_op_result`'s `get_edge_by_natural_key_including_deleted` call
+    /// through the real atomic path with a genuinely pre-existing tombstone: the
+    /// pre-fix renderer (`KhiveRuntime::list_edges`, which unconditionally
+    /// filters `deleted_at IS NULL`) would report the committed update as "not
+    /// found" for exactly this row, turning a successful DO NOTHING absorption
+    /// into a spurious post-commit error.
+    #[tokio::test]
+    async fn atomic_symmetric_update_absorbs_into_pre_existing_tombstoned_survivor_and_renders_it()
+    {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+
+        let (canonical_id, x_id) = {
+            let server = isolated_server(&db_path);
+            let resp = dispatch_json(
+                &server,
+                r#"[create(kind="concept", name="TombA"), create(kind="concept", name="TombB")]"#,
+            )
+            .await;
+            let a_id = resp["results"][0]["result"]["id"]
+                .as_str()
+                .expect("a id")
+                .to_string();
+            let b_id = resp["results"][1]["result"]["id"]
+                .as_str()
+                .expect("b id")
+                .to_string();
+
+            // The canonical survivor: created, then soft-deleted, BEFORE the atomic
+            // unit ever runs.
+            let link_resp = dispatch_json(
+                &server,
+                &format!(
+                    r#"link(source_id="{a_id}", target_id="{b_id}", relation="competes_with", weight=0.6)"#
+                ),
+            )
+            .await;
+            let canonical_id = link_resp["results"][0]["result"]["id"]
+                .as_str()
+                .expect("canonical id")
+                .to_string();
+            dispatch_json(&server, &format!(r#"delete(id="{canonical_id}")"#)).await;
+
+            // A distinct pre-existing edge under a different relation, later
+            // converted (by the atomic update below) into the same
+            // (a, b, competes_with) natural key — it must absorb into the
+            // already-tombstoned canonical row, not resurrect or overwrite it.
+            let x_resp = dispatch_json(
+                &server,
+                &format!(
+                    r#"link(source_id="{a_id}", target_id="{b_id}", relation="extends", weight=0.2)"#
+                ),
+            )
+            .await;
+            let x_id = x_resp["results"][0]["result"]["id"]
+                .as_str()
+                .expect("x id")
+                .to_string();
+            (canonical_id, x_id)
+        };
+
+        let ops = vec![atomic_op(
+            "update",
+            serde_json::json!({"id": x_id, "relation": "competes_with", "weight": 0.9}),
+        )];
+
+        let khive_cfg = KhiveConfig::default();
+        let envelope = crate::atomic_apply::execute_atomic_ops_file(
+            ops,
+            atomic_cfg(&db_path),
+            &khive_cfg,
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect("atomic run must succeed by absorbing into the tombstoned survivor");
+
+        assert_eq!(
+            envelope["atomic"]["committed"], true,
+            "envelope: {envelope}"
+        );
+
+        let rendered_id = envelope["results"][0]["result"]["id"]
+            .as_str()
+            .expect("update result id")
+            .to_string();
+        assert_eq!(
+            rendered_id, canonical_id,
+            "must render the pre-existing tombstoned canonical survivor, not X's stale \
+             requested id: {envelope}"
+        );
+        assert!(
+            !envelope["results"][0]["result"]["deleted_at"].is_null(),
+            "the rendered survivor must show its OWN tombstoned state (non-null deleted_at) \
+             — absorbing a conflicting update must not resurrect it: {envelope}"
+        );
+        assert_eq!(
+            envelope["results"][0]["result"]["weight"], 0.6,
+            "ADR-039 DO NOTHING: the survivor keeps its own pre-existing weight, not X's \
+             discarded patched weight (0.9): {envelope}"
         );
     }
 

@@ -296,6 +296,14 @@ Patch entity, note, or edge fields. Field set depends on substrate: entities acc
 request(ops="update(id=\"<uuid>\", salience=0.7)")
 ```
 
+For a symmetric-relation edge (`competes_with`, `composed_with`), setting `relation` or
+`weight` can collide with an already-existing edge at the same canonical `(source, target,
+relation)` triple. When that happens, the requested edge is dropped and the returned record
+is the pre-existing survivor, left exactly as it was (ADR-039's edge-conflict contract is
+`ON CONFLICT DO NOTHING` — the survivor's own attributes are never overwritten by the
+discarded edge's patch). If that survivor was previously soft-deleted, the returned edge may
+carry a non-null `deleted_at`: absorbing a conflicting update never resurrects a tombstone.
+
 ### `delete` — Declaration
 
 Soft or hard delete a record.

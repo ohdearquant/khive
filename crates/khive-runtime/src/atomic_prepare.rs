@@ -43,8 +43,8 @@ use khive_db::stores::entity::{
 use khive_db::stores::event::event_insert_statements;
 use khive_db::stores::graph::{
     edge_hard_delete_statement, edge_insert_guarded_by_endpoints_statement,
-    edge_soft_delete_statement, edge_symmetric_delete_if_conflict_statement,
-    edge_symmetric_refresh_or_update_inplace_statement, edge_upsert_statement,
+    edge_soft_delete_statement, edge_symmetric_absorb_or_update_inplace_statement,
+    edge_symmetric_delete_if_conflict_statement, edge_upsert_statement,
     purge_incident_edges_statement,
 };
 use khive_db::stores::note::{
@@ -842,7 +842,7 @@ pub async fn prepare_update_entity_plan(
 /// op in the same atomic unit could change the conflict landscape between
 /// probe and commit, making any such branch stale by construction. It always
 /// emits BOTH statements from [`edge_symmetric_delete_if_conflict_statement`]
-/// and [`edge_symmetric_refresh_or_update_inplace_statement`], each carrying
+/// and [`edge_symmetric_absorb_or_update_inplace_statement`], each carrying
 /// its own commit-time `WHERE`/`CASE WHEN` predicate that re-evaluates the
 /// conflict condition fresh inside the transaction. This function reads no
 /// state to guess a surviving id; the plan instead carries `edge_natural_key`
@@ -930,7 +930,7 @@ async fn prepare_update_edge(
             }),
         });
         statements.push(PlanStatement {
-            statement: edge_symmetric_refresh_or_update_inplace_statement(
+            statement: edge_symmetric_absorb_or_update_inplace_statement(
                 &namespace,
                 id,
                 canon_src,
@@ -2903,8 +2903,10 @@ mod tests {
     /// (b): changing a non-symmetric edge's `relation` to a symmetric one
     /// whose canonical natural key collides with an ALREADY-EXISTING
     /// symmetric edge between the same two entities must delete the
-    /// requested (non-canonical) row and refresh the surviving canonical
-    /// row in place, rather than raising a uniqueness error.
+    /// requested (non-canonical) row and leave the surviving canonical row
+    /// untouched (ADR-039 ON CONFLICT DO NOTHING), rather than raising a
+    /// uniqueness error OR overwriting the survivor with the discarded
+    /// edge's attributes (khive#1213).
     #[tokio::test]
     async fn atomic_update_edge_symmetric_conflict_absorbs_into_surviving_row() {
         let runtime = scratch_runtime();
@@ -2985,13 +2987,18 @@ mod tests {
             "the non-canonical requested row must be deleted, not just tombstoned"
         );
 
-        // The surviving canonical row must carry the patch.
+        // ADR-039 DO NOTHING: the surviving canonical row keeps its OWN
+        // pre-existing attributes — the discarded edge's patched weight
+        // (0.9) must never overwrite it.
         let surviving = runtime
             .get_edge(&token, canonical_id)
             .await
             .expect("get_edge")
             .expect("surviving canonical row must remain");
-        assert_eq!(surviving.weight, 0.9);
+        assert_eq!(
+            surviving.weight, 0.6,
+            "survivor weight must not be overwritten by the discarded edge's patch"
+        );
         assert_eq!(surviving.relation, EdgeRelation::CompetesWith);
 
         // Event target is the CALLER-supplied id, not the surviving id —
@@ -3000,6 +3007,78 @@ mod tests {
         let events =
             events_for_target(&runtime, &token, requested_id, EventKind::EdgeUpdated).await;
         assert_eq!(events.len(), 1);
+    }
+
+    /// A soft-deleted surviving canonical row must not be resurrected by a
+    /// conflicting symmetric-relation update (ADR-039 DO NOTHING; khive#1213):
+    /// the requested edge is still deleted (conflict absorbed), but the
+    /// tombstoned survivor must stay tombstoned.
+    #[tokio::test]
+    async fn atomic_update_edge_symmetric_conflict_does_not_resurrect_tombstoned_survivor() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let entities = runtime.entities(&token).expect("entities store");
+        let a = khive_storage::Entity::new("local", "concept", "GapEdgeSymTombA");
+        let b = khive_storage::Entity::new("local", "concept", "GapEdgeSymTombB");
+        let (a_id, b_id) = (a.id, b.id);
+        entities.upsert_entity(a).await.expect("seed a");
+        entities.upsert_entity(b).await.expect("seed b");
+
+        let requested_edge = runtime
+            .link(&token, a_id, b_id, EdgeRelation::Extends, 0.2, None)
+            .await
+            .expect("seed requested edge");
+        let requested_id = Uuid::from(requested_edge.id);
+
+        let canonical_edge = runtime
+            .link(&token, a_id, b_id, EdgeRelation::CompetesWith, 0.6, None)
+            .await
+            .expect("seed canonical edge");
+        let canonical_id = Uuid::from(canonical_edge.id);
+        runtime
+            .delete_edge(&token, canonical_id, false)
+            .await
+            .expect("soft-delete canonical edge");
+
+        let plan = prepare_update(
+            &runtime,
+            &token,
+            &json!({"id": requested_id.to_string(), "relation": "competes_with", "weight": 0.9}),
+            None,
+        )
+        .await
+        .expect("prepare update edge (symmetric conflict over tombstone)");
+
+        let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+            .await
+            .expect("seam call ok");
+        assert!(
+            matches!(
+                outcome,
+                crate::atomic_runner::AtomicRunOutcome::Committed { .. }
+            ),
+            "expected a clean symmetric-conflict-absorption commit: {outcome:?}"
+        );
+
+        let requested_after = runtime
+            .get_edge_including_deleted(&token, requested_id)
+            .await
+            .expect("get_edge_including_deleted");
+        assert!(
+            requested_after.is_none(),
+            "the non-canonical requested row must be deleted, not just tombstoned"
+        );
+
+        let canonical_after = runtime
+            .get_edge(&token, canonical_id)
+            .await
+            .expect("get_edge");
+        assert!(
+            canonical_after.is_none(),
+            "a tombstoned survivor must not be resurrected by a conflicting update"
+        );
     }
 
     /// The same-unit race: `[delete(X), update(X -> competes_with)]` where

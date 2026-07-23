@@ -471,32 +471,34 @@ async fn build_op_result(
         // `p.target_id` — that field is prepare-time-only (the caller's
         // requested id), and the SAME staleness that made the write path
         // unsafe to branch on at prepare time makes it unsafe to render
-        // from too. This mirrors the `link` arm below exactly (same
-        // reasoning, same `list_edges` mechanism).
+        // from too. This mirrors the `link` arm below (same reasoning), but
+        // uses the deleted-inclusive natural-key lookup, not `list_edges`:
+        // ADR-039's DO NOTHING conflict-absorption arm can commit leaving the
+        // surviving canonical row tombstoned (khive#1213/#1214 fix round),
+        // and `list_edges` unconditionally filters `deleted_at IS NULL` — it
+        // would report "not found" for exactly the row that was just
+        // committed, turning a successful, correct commit into a spurious
+        // post-commit error.
         ("update", AtomicOpPlan::Update(p)) if p.edge_natural_key().is_some() => {
             let key = p.edge_natural_key().expect("checked by guard above");
-            let edges = runtime
-                .list_edges(
+            let edge = runtime
+                .get_edge_by_natural_key_including_deleted(
                     token,
-                    EdgeListFilter {
-                        source_id: Some(key.canon_source_id()),
-                        target_id: Some(key.canon_target_id()),
-                        relations: vec![key.relation()],
-                        ..Default::default()
-                    },
-                    1,
-                    0,
-                )
-                .await?;
-            let edge = edges.into_iter().next().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "atomic update result: committed symmetric edge not found by natural key \
-                     ({}, {}, {})",
+                    key.namespace(),
                     key.canon_source_id(),
                     key.canon_target_id(),
-                    key.relation()
+                    key.relation(),
                 )
-            })?;
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "atomic update result: committed symmetric edge not found by natural key \
+                         ({}, {}, {})",
+                        key.canon_source_id(),
+                        key.canon_target_id(),
+                        key.relation()
+                    )
+                })?;
             Ok(serde_json::to_value(&edge)?)
         }
         ("update", AtomicOpPlan::Update(p)) => match runtime

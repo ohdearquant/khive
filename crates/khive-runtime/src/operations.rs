@@ -4446,6 +4446,33 @@ impl KhiveRuntime {
             .await?)
     }
 
+    /// Fetch an edge by natural key (namespace, canonical source/target, relation)
+    /// including soft-deleted rows. Unlike [`Self::list_edges`]/[`Self::list_edges_after`],
+    /// which always filter `deleted_at IS NULL`, this can render a tombstoned symmetric-edge
+    /// survivor (ADR-039 DO NOTHING conflict absorption) — used by the atomic-apply
+    /// post-commit result renderer, which otherwise reports "not found" for a committed
+    /// update whose surviving row happens to be soft-deleted.
+    ///
+    /// `token` selects the store instance; `namespace` is the natural key's own
+    /// namespace and is bound into the query explicitly. These can legitimately differ:
+    /// the record namespace is fixed at prepare time (`EdgeNaturalKey::namespace`) and by-ID
+    /// edge updates are namespace-agnostic (ADR-007 Rev 6), so the caller's ambient `token`
+    /// namespace is never a safe substitute for the record's own — the prior implicit
+    /// `self.namespace` scoping is exactly the bug this parameter closes (khive#1213/#1214).
+    pub async fn get_edge_by_natural_key_including_deleted(
+        &self,
+        token: &NamespaceToken,
+        namespace: &str,
+        source_id: Uuid,
+        target_id: Uuid,
+        relation: EdgeRelation,
+    ) -> RuntimeResult<Option<Edge>> {
+        Ok(self
+            .graph(token)?
+            .get_edge_by_natural_key_including_deleted(namespace, source_id, target_id, relation)
+            .await?)
+    }
+
     /// Maximum rows returned by a single [`Self::list_edges`] /
     /// [`Self::list_edges_after`] page. A lower bound the docs promise callers
     /// can rely on; kept as a named constant so tests can exercise pagination
@@ -4601,14 +4628,14 @@ impl KhiveRuntime {
     /// boundary — this function issues DML only, no `BEGIN`/`COMMIT`/`ROLLBACK`.
     ///
     /// Returns `Ok(Some(existing_id))` when a canonical conflict was absorbed (the
-    /// requested edge was deleted, the existing canonical row refreshed), or
-    /// `Ok(None)` when the requested edge was updated in place.
+    /// requested edge was deleted, the existing canonical row left untouched per
+    /// ADR-039 DO NOTHING), or `Ok(None)` when the requested edge was updated in
+    /// place.
     ///
     /// DML text is the single source of truth shared with the atomic
     /// `prepare_update_edge` symmetric branch:
     /// [`khive_db::stores::graph::EDGE_SYMMETRIC_CONFLICT_PROBE_SQL`] /
     /// `EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL` /
-    /// `EDGE_SYMMETRIC_REFRESH_CANONICAL_SQL` /
     /// `EDGE_SYMMETRIC_UPDATE_INPLACE_SQL` — this function binds them against
     /// `rusqlite::params!` (it runs inside an existing transaction on a
     /// borrowed `&rusqlite::Connection`), the atomic path binds the same text
@@ -4624,7 +4651,6 @@ impl KhiveRuntime {
         relation_str: &str,
         weight: f64,
         metadata: Option<String>,
-        target_backend: Option<String>,
     ) -> Result<Option<String>, SqliteError> {
         // `updated_at` is stored in MICROSECONDS on `graph_edges` (every other
         // write path — `edge_upsert_statement`, `edge_soft_delete_statement` —
@@ -4653,25 +4679,22 @@ impl KhiveRuntime {
             .map_err(SqliteError::Rusqlite)?;
 
         if let Some(existing_id) = conflict_id {
-            // Case (b): canonical row already exists — delete the non-canonical
-            // edge and refresh the existing canonical row. Return the surviving
-            // id so the caller can re-fetch it (never the deleted edge's id).
+            // Case (b): canonical row already exists — ADR-039's edge-conflict
+            // contract is ON CONFLICT DO NOTHING: drop the non-canonical edge
+            // and leave the existing canonical row untouched (live or
+            // tombstoned). Refreshing it from the discarded edge's
+            // weight/target_backend/metadata and forcing deleted_at = NULL
+            // would silently overwrite the survivor and resurrect a
+            // tombstone — the same defect already fixed on the merge-rewire
+            // path (`merge_entity_sql`/`merge_note_sql`); this path binds the
+            // same shared `EDGE_SYMMETRIC_*_SQL` text and must honor the same
+            // contract. Return the surviving id unchanged so the caller
+            // re-fetches its real (unmodified) attributes.
             conn.execute(
                 khive_db::stores::graph::EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL,
                 rusqlite::params![&ns, &edge_id_str],
             )
             .map_err(SqliteError::Rusqlite)?;
-            let affected = conn
-                .execute(
-                    khive_db::stores::graph::EDGE_SYMMETRIC_REFRESH_CANONICAL_SQL,
-                    rusqlite::params![weight, now_ts, target_backend, metadata, &ns, &existing_id],
-                )
-                .map_err(SqliteError::Rusqlite)?;
-            if affected == 0 {
-                return Err(SqliteError::InvalidData(format!(
-                    "update_edge: surviving canonical row {existing_id} vanished during update"
-                )));
-            }
             Ok(Some(existing_id))
         } else {
             // Case (a): no conflict — update source_id/target_id in-place,
@@ -4713,8 +4736,9 @@ impl KhiveRuntime {
     /// For symmetric relations (`competes_with`, `composed_with`), endpoint order is
     /// canonicalised to `source_uuid < target_uuid` after validation. If a canonical
     /// row already exists at the target triple, the non-canonical edge is deleted and
-    /// the existing canonical row is refreshed (DELETE + UPDATE pattern, mirroring
-    /// `merge_entity_sql`).
+    /// the existing canonical row is preserved unchanged (ADR-039 ON CONFLICT DO
+    /// NOTHING, mirroring `merge_entity_sql`) — its attributes, including a soft-deleted
+    /// `deleted_at`, are never overwritten by the discarded edge's patch.
     pub async fn update_edge(
         &self,
         token: &NamespaceToken,
@@ -4790,7 +4814,6 @@ impl KhiveRuntime {
                 .metadata
                 .as_ref()
                 .map(|v| serde_json::to_string(v).unwrap_or_default());
-            let target_backend = edge.target_backend.clone();
 
             let pool = self.backend().pool_arc();
             // Route through the single-writer task when the write queue is
@@ -4799,8 +4822,8 @@ impl KhiveRuntime {
             let writer_task = pool.writer_task_handle().ok().flatten();
 
             // Some(surviving_id) when a canonical conflict was absorbed (the requested
-            // edge was deleted, existing canonical row refreshed), or None when the
-            // requested edge was updated in-place.
+            // edge was deleted, existing canonical row left untouched per ADR-039 DO
+            // NOTHING), or None when the requested edge was updated in-place.
             let surviving_id: Option<String> = if let Some(writer_task) = writer_task {
                 writer_task
                     .send(move |conn| {
@@ -4813,7 +4836,6 @@ impl KhiveRuntime {
                             &relation_str,
                             weight,
                             metadata,
-                            target_backend,
                         )
                         .map_err(|e| {
                             khive_storage::StorageError::driver(
@@ -4838,7 +4860,6 @@ impl KhiveRuntime {
                             &relation_str,
                             weight,
                             metadata,
-                            target_backend,
                         )
                     })
                 })
@@ -4850,14 +4871,17 @@ impl KhiveRuntime {
             };
 
             if let Some(sid) = surviving_id {
-                // A conflict was absorbed: re-fetch the surviving canonical row so the
-                // caller receives its real id.
-                // Use record_tok — the surviving row lives in the same namespace as the original.
+                // A conflict was absorbed (ADR-039 DO NOTHING): re-fetch the surviving
+                // canonical row so the caller receives its real, UNMODIFIED attributes —
+                // including soft-deleted rows, since the survivor's tombstone state (if
+                // any) must not be resurrected by the absorbed update either. Use
+                // record_tok — the surviving row lives in the same namespace as the
+                // original.
                 let surviving_uuid = Uuid::parse_str(&sid).map_err(|e| {
                     RuntimeError::Internal(format!("update_edge: surviving id parse failed: {e}"))
                 })?;
                 edge = self
-                    .get_edge(&record_tok, surviving_uuid)
+                    .get_edge_including_deleted(&record_tok, surviving_uuid)
                     .await?
                     .ok_or_else(|| {
                         RuntimeError::Internal(format!(
@@ -5942,6 +5966,122 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(updated.relation, EdgeRelation::VariantOf);
+    }
+
+    /// A symmetric-relation update whose canonical natural key collides
+    /// with an existing edge must delete the requested (non-canonical)
+    /// row and leave the surviving canonical row's attributes untouched
+    /// (ADR-039 ON CONFLICT DO NOTHING) — the discarded edge's patched
+    /// weight must never overwrite the survivor (khive#1213).
+    #[tokio::test]
+    async fn update_edge_symmetric_conflict_keeps_survivor_attributes() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let a = rt
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(&tok, "concept", None, "B", None, None, vec![])
+            .await
+            .unwrap();
+
+        let requested = rt
+            .link(&tok, a.id, b.id, EdgeRelation::Extends, 0.2, None)
+            .await
+            .unwrap();
+        let requested_id: Uuid = requested.id.into();
+
+        let canonical = rt
+            .link(&tok, a.id, b.id, EdgeRelation::CompetesWith, 0.6, None)
+            .await
+            .unwrap();
+        let canonical_id: Uuid = canonical.id.into();
+
+        let updated = rt
+            .update_edge(
+                &tok,
+                requested_id,
+                crate::curation::EdgePatch {
+                    relation: Some(EdgeRelation::CompetesWith),
+                    weight: Some(0.9),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // The requested (non-canonical) row was absorbed into the survivor.
+        assert_eq!(Uuid::from(updated.id), canonical_id);
+        assert_eq!(
+            updated.weight, 0.6,
+            "survivor weight must not be overwritten by the discarded edge's patch"
+        );
+
+        let requested_after = rt
+            .get_edge_including_deleted(&tok, requested_id)
+            .await
+            .unwrap();
+        assert!(
+            requested_after.is_none(),
+            "the non-canonical requested row must be deleted, not just tombstoned"
+        );
+    }
+
+    /// A soft-deleted surviving canonical row must not be resurrected by a
+    /// conflicting symmetric-relation update (khive#1213).
+    #[tokio::test]
+    async fn update_edge_symmetric_conflict_does_not_resurrect_tombstoned_survivor() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let a = rt
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(&tok, "concept", None, "B", None, None, vec![])
+            .await
+            .unwrap();
+
+        let requested = rt
+            .link(&tok, a.id, b.id, EdgeRelation::Extends, 0.2, None)
+            .await
+            .unwrap();
+        let requested_id: Uuid = requested.id.into();
+
+        let canonical = rt
+            .link(&tok, a.id, b.id, EdgeRelation::CompetesWith, 0.6, None)
+            .await
+            .unwrap();
+        let canonical_id: Uuid = canonical.id.into();
+        rt.delete_edge(&tok, canonical_id, false).await.unwrap();
+
+        rt.update_edge(
+            &tok,
+            requested_id,
+            crate::curation::EdgePatch {
+                relation: Some(EdgeRelation::CompetesWith),
+                weight: Some(0.9),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let requested_after = rt
+            .get_edge_including_deleted(&tok, requested_id)
+            .await
+            .unwrap();
+        assert!(
+            requested_after.is_none(),
+            "the non-canonical requested row must be deleted, not just tombstoned"
+        );
+
+        let canonical_after = rt.get_edge(&tok, canonical_id).await.unwrap();
+        assert!(
+            canonical_after.is_none(),
+            "a tombstoned survivor must not be resurrected by a conflicting update"
+        );
     }
 
     // ---- update_edge endpoint validation ----
@@ -8404,6 +8544,74 @@ mod tests {
         let target_ids: Vec<Uuid> = neighbors.iter().map(|n| n.node_id).collect();
         assert!(target_ids.contains(&t1.id));
         assert!(target_ids.contains(&t2.id));
+    }
+
+    /// khive#1213/#1214 fix round: the atomic-apply post-commit renderer for a
+    /// symmetric-edge update resolves the surviving row's store by the CALLER's
+    /// token but must filter by the record's OWN namespace, passed explicitly —
+    /// never by re-deriving it from whichever token happened to select the store
+    /// (`self.graph(token)` scopes by `token.namespace()`, and by-ID edge updates
+    /// are namespace-agnostic, so a caller in one namespace can legitimately
+    /// commit an update against an edge recorded in another). This proves the
+    /// `namespace` parameter — not the `token` argument — decides which row the
+    /// natural-key lookup finds, at the level the review flagged as an
+    /// acceptable substitute for a full cross-namespace atomic-apply test.
+    #[tokio::test]
+    async fn get_edge_by_natural_key_including_deleted_honors_explicit_namespace_not_token() {
+        let rt = rt();
+        let ns_a = NamespaceToken::for_namespace(Namespace::parse("ns-a").unwrap());
+        let ns_b = NamespaceToken::for_namespace(Namespace::parse("ns-b").unwrap());
+
+        let a = rt
+            .create_entity(&ns_b, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(&ns_b, "concept", None, "B", None, None, vec![])
+            .await
+            .unwrap();
+        let edge = rt
+            .link(&ns_b, a.id, b.id, EdgeRelation::CompetesWith, 1.0, None)
+            .await
+            .unwrap();
+        let (canon_src, canon_tgt) =
+            canonical_edge_endpoints(EdgeRelation::CompetesWith, a.id, b.id);
+
+        // Caller token is ns-a (an unrelated namespace); passing "ns-b" explicitly
+        // must still find the edge recorded there.
+        let found = rt
+            .get_edge_by_natural_key_including_deleted(
+                &ns_a,
+                "ns-b",
+                canon_src,
+                canon_tgt,
+                EdgeRelation::CompetesWith,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            found.map(|e| Uuid::from(e.id)),
+            Some(Uuid::from(edge.id)),
+            "must find the edge by its own namespace regardless of the caller's token"
+        );
+
+        // Passing the caller token's OWN namespace ("ns-a") as the explicit filter
+        // must NOT find it — proves the lookup is keyed on the `namespace` argument,
+        // not silently re-scoped to whatever namespace the token carries.
+        let not_found = rt
+            .get_edge_by_natural_key_including_deleted(
+                &ns_a,
+                "ns-a",
+                canon_src,
+                canon_tgt,
+                EdgeRelation::CompetesWith,
+            )
+            .await
+            .unwrap();
+        assert!(
+            not_found.is_none(),
+            "must not find an edge recorded in a different namespace than the one queried"
+        );
     }
 
     /// `link` endpoint existence is a by-ID check and therefore namespace-agnostic:
