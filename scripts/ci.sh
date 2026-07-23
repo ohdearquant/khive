@@ -136,7 +136,16 @@ phase_tests() {
     }
     sentinel_before=$(sentinel_fingerprint)
 
-    cargo test --workspace
+    # NEXTEST_PARTITION (e.g. "1/2") routes this phase through cargo-nextest's
+    # count-based partitioning instead of a full `cargo test --workspace` run,
+    # so CI can shard the workspace test suite across parallel jobs. Unset
+    # (the default, including every local/non-sharded invocation) keeps the
+    # plain `cargo test --workspace` path unchanged.
+    if [ -n "${NEXTEST_PARTITION:-}" ]; then
+        cargo nextest run --workspace --partition "count:${NEXTEST_PARTITION}"
+    else
+        cargo test --workspace
+    fi
 
     sentinel_after=$(sentinel_fingerprint)
     if [ "$sentinel_after" != "$sentinel_before" ]; then
@@ -147,6 +156,15 @@ phase_tests() {
         printf '%s\n' "$sentinel_after" >&2
         exit 1
     fi
+}
+
+phase_tests_doc() {
+    echo "=== Doctests ==="
+    # cargo-nextest does not execute doctests (upstream limitation); this phase
+    # covers the doctest slice that phase_tests's nextest path skips. The plain
+    # `cargo test --workspace` path in phase_tests already runs doctests itself,
+    # so this phase only needs to run alongside the sharded nextest path.
+    cargo test --doc --workspace
 }
 
 phase_no_default_features() {
@@ -214,6 +232,7 @@ run_phase() {
         clippy) phase_clippy ;;
         docs) phase_docs ;;
         tests) phase_tests ;;
+        tests-doc) phase_tests_doc ;;
         no-default-features) phase_no_default_features ;;
         release) phase_release ;;
         contract-tests) phase_contract_tests ;;
@@ -225,7 +244,7 @@ run_phase() {
         macos-pr-tests) phase_macos_pr_tests ;;
         *)
             echo "Unknown CI phase: $1" >&2
-            echo "Valid phases: no-stubs-scan lockfile forward-deployed lint no-stubs clippy docs tests no-default-features release contract-tests deno-tests smoke-tests vector-smoke contract-suite macos-pr-check macos-pr-tests" >&2
+            echo "Valid phases: no-stubs-scan lockfile forward-deployed lint no-stubs clippy docs tests tests-doc no-default-features release contract-tests deno-tests smoke-tests vector-smoke contract-suite macos-pr-check macos-pr-tests" >&2
             exit 2
             ;;
     esac
