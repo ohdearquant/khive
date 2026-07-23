@@ -238,6 +238,133 @@ async fn test_count_edges() {
     assert_eq!(store.count_edges(EdgeFilter::default()).await.unwrap(), 5);
 }
 
+#[tokio::test]
+async fn batched_namespace_edge_counts_exceed_sqlite_variable_limit() {
+    let config = PoolConfig {
+        path: None,
+        ..PoolConfig::default()
+    };
+    let pool = Arc::new(ConnectionPool::new(config).unwrap());
+    pool.writer()
+        .unwrap()
+        .conn()
+        .execute_batch(GRAPH_DDL)
+        .unwrap();
+    let store_a = SqlGraphStore::new_scoped(Arc::clone(&pool), false, "stats-a");
+    let store_b = SqlGraphStore::new_scoped(Arc::clone(&pool), false, "stats-b");
+
+    let mut edge_a = make_edge(Uuid::new_v4(), Uuid::new_v4(), EdgeRelation::Extends, 1.0);
+    edge_a.namespace = "stats-a".to_string();
+    let mut deleted_edge = make_edge(Uuid::new_v4(), Uuid::new_v4(), EdgeRelation::Enables, 1.0);
+    deleted_edge.namespace = "stats-a".to_string();
+    let deleted_edge_id = deleted_edge.id;
+    let mut edge_b = make_edge(Uuid::new_v4(), Uuid::new_v4(), EdgeRelation::DependsOn, 1.0);
+    edge_b.namespace = "stats-b".to_string();
+
+    store_a.upsert_edge(edge_a).await.unwrap();
+    store_a.upsert_edge(deleted_edge).await.unwrap();
+    store_b.upsert_edge(edge_b).await.unwrap();
+    assert!(store_a
+        .delete_edge(deleted_edge_id, DeleteMode::Soft)
+        .await
+        .unwrap());
+
+    let per_namespace_total = store_a.count_edges(EdgeFilter::default()).await.unwrap()
+        + store_b.count_edges(EdgeFilter::default()).await.unwrap();
+    let mut per_namespace_relations: HashMap<EdgeRelation, u64> = store_a
+        .count_edges_by_relation()
+        .await
+        .unwrap()
+        .into_iter()
+        .collect();
+    for (relation, count) in store_b.count_edges_by_relation().await.unwrap() {
+        *per_namespace_relations.entry(relation).or_insert(0) += count;
+    }
+    pool.writer()
+        .unwrap()
+        .conn()
+        .set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_VARIABLE_NUMBER, 999)
+        .unwrap();
+    let mut namespaces = vec!["stats-a".to_string(), "stats-b".to_string()];
+    namespaces.extend((0..999).map(|i| format!("empty-{i}")));
+    assert_eq!(namespaces.len(), 1_001);
+
+    assert_eq!(
+        store_a
+            .count_edges_in_namespaces(&namespaces, EdgeFilter::default())
+            .await
+            .unwrap(),
+        per_namespace_total
+    );
+    assert_eq!(per_namespace_total, 2);
+    assert_eq!(
+        store_a
+            .count_edges_by_relation_in_namespaces(&namespaces)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect::<HashMap<_, _>>(),
+        per_namespace_relations
+    );
+}
+
+#[tokio::test]
+async fn duplicate_namespace_across_chunk_boundary_is_not_double_counted() {
+    let config = PoolConfig {
+        path: None,
+        ..PoolConfig::default()
+    };
+    let pool = Arc::new(ConnectionPool::new(config).unwrap());
+    pool.writer()
+        .unwrap()
+        .conn()
+        .execute_batch(GRAPH_DDL)
+        .unwrap();
+    let store_a = SqlGraphStore::new_scoped(Arc::clone(&pool), false, "stats-a");
+
+    let mut edge_a1 = make_edge(Uuid::new_v4(), Uuid::new_v4(), EdgeRelation::Extends, 1.0);
+    edge_a1.namespace = "stats-a".to_string();
+    let mut edge_a2 = make_edge(Uuid::new_v4(), Uuid::new_v4(), EdgeRelation::Enables, 1.0);
+    edge_a2.namespace = "stats-a".to_string();
+    store_a.upsert_edge(edge_a1).await.unwrap();
+    store_a.upsert_edge(edge_a2).await.unwrap();
+
+    let per_namespace_total = store_a.count_edges(EdgeFilter::default()).await.unwrap();
+    assert_eq!(per_namespace_total, 2);
+    let per_namespace_relations: HashMap<EdgeRelation, u64> = store_a
+        .count_edges_by_relation()
+        .await
+        .unwrap()
+        .into_iter()
+        .collect();
+
+    // 501 unique namespaces ("stats-a" + 500 empties), then "stats-a" repeats
+    // once more past index 500 — the repeat lands in the second 500-entry
+    // chunk, so a dedup bug double-counts "stats-a"'s rows.
+    let mut namespaces = vec!["stats-a".to_string()];
+    namespaces.extend((0..500).map(|i| format!("empty-{i}")));
+    assert_eq!(namespaces.len(), 501);
+    namespaces.push("stats-a".to_string());
+    assert_eq!(namespaces.len(), 502);
+
+    assert_eq!(
+        store_a
+            .count_edges_in_namespaces(&namespaces, EdgeFilter::default())
+            .await
+            .unwrap(),
+        per_namespace_total
+    );
+    assert_eq!(
+        store_a
+            .count_edges_by_relation_in_namespaces(&namespaces)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect::<HashMap<_, _>>(),
+        per_namespace_relations
+    );
+}
+
 // `#[serial(neighbor_select_count)]`: shares the key with the tests that
 // assert on the process-wide `NEIGHBOR_SELECT_COUNT` so a concurrent
 // `neighbors()` call from this test can't corrupt their count.
