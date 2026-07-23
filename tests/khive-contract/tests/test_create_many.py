@@ -25,31 +25,37 @@ The create verb's bulk path activates when the top-level `items` key is present.
   Response shape: { attempted, created, skipped: 0, failed, errors: [...] }
   When verbose=true: adds "entities" array of the successful entity objects.
 
---- Spec-building errors (create.rs lines 109-148) ---
+--- Kind-aware bulk creation (create.rs prepare_bulk_create_spec) ---
 
-  The for loop that builds EntityCreateSpec values uses `?` for each item.
-  If any item triggers an error during spec building, the handler returns Err
-  immediately, before reaching the atomic/non-atomic split.
-  Items carrying a note kind (e.g., "observation") hit the `_ =>` branch at
-  create.rs lines 130-136:
+  Each item's `kind` resolves independently. Entity-kind items (e.g. "concept")
+  require `name`; note-kind items (e.g. "observation") require `content` and
+  default `note_kind` to "observation". Both substrates are valid inside the
+  same `items` batch — bulk create is NOT entity-only. See
+  docs/guide/api-reference.md ("Create") for the field-level contract.
+
+  Items whose `kind` resolves to neither an entity nor a note kind (edge,
+  event, proposal) hit the substrate-rejection branch:
     return Err(RuntimeError::InvalidInput(format!(
-        "items[{idx}]: bulk create only supports entity kinds; got {:?}",
+        "items[{idx}]: bulk create supports only entity and note kinds; got {:?}",
         entry.kind
     )))
-  This failure is NOT per-item in the non-atomic sense — it aborts the batch
-  regardless of the atomic flag.
+  This is spec-building, evaluated per item before any runtime write:
+  - atomic=true: the whole-batch loop uses `?`, so this aborts the entire
+    request before anything is created (nothing partially written).
+  - atomic=false: the best-effort loop catches this per item and appends
+    an {index, error} entry to "errors"; valid siblings still succeed.
 
 --- Limit guard (create.rs lines 92-95) ---
 
   More than 1000 items returns Err("bulk create limited to 1000 entries per request").
 
---- BulkCreateEntry schema (create.rs/params.rs lines 16-26) ---
+--- BulkCreateEntry schema (create.rs/params.rs) ---
 
   #[serde(deny_unknown_fields)]
-  Fields: kind (String), name (String), entity_kind?, entity_type?,
-          description?, properties?, tags?
-  Note: "content" is not a field; passing it would fail serde deserialization.
-  Bulk create supports ENTITY kinds only (kind must resolve to KindSpec::Entity).
+  Fields: kind (String), name?, entity_kind?, entity_type?, description?,
+          content?, salience?, annotates?, properties?, tags?.
+  Entity items use name/entity_kind/entity_type/description; note items use
+  content/note_kind/salience/annotates. Both accept properties/tags.
 """
 
 from __future__ import annotations
@@ -231,37 +237,72 @@ def test_create_many_atomic_true_has_no_errors_key(
 
 
 # ---------------------------------------------------------------------------
-# Spec-building failures — affect the whole batch before atomic split
+# Mixed entity + note items — the intended kind-aware bulk contract
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.create_many
 @pytest.mark.slow
-def test_create_many_note_kind_in_items_rejected(
+def test_create_many_mixed_entity_and_note_items_succeeds(
     khive_session: KhiveMcpSession,
     temp_namespace: str,
 ) -> None:
-    """items containing a note kind triggers a whole-batch failure before atomic/non-atomic split.
+    """A note-kind item with valid `content` creates a note, not a rejection.
 
-    Source: create.rs lines 111-136 (spec-building loop, _ => branch):
-      match &item_kind_spec {
-          KindSpec::Entity { .. } => { ... }
-          _ => {
-              return Err(RuntimeError::InvalidInput(format!(
-                  "items[{idx}]: bulk create only supports entity kinds; got {:?}",
-                  entry.kind
-              )));
-          }
-      }
-    This return Err is inside the for loop before the atomic check at line 151.
-    The error propagates immediately regardless of the atomic flag.
-    Note: "content" is not a BulkCreateEntry field (deny_unknown_fields).
-          Use name= to avoid a serde deserialization error.
+    Source: create.rs prepare_bulk_create_spec — KindSpec::Entity and
+    KindSpec::Note are both accepted bulk substrates (docs/guide/api-reference.md,
+    "Create"). A note item is only rejected for missing/invalid note fields
+    (e.g. missing `content`), never for carrying a note kind.
     """
     ns = temp_namespace
     items = [
-        _item(f"cm_noterej_concept_{ns[-6:]}"),  # valid entity item
-        {"kind": "observation", "name": f"cm_noterej_note_{ns[-6:]}"},  # note kind
+        _item(f"cm_mixed_entity_{ns[-6:]}"),
+        {"kind": "observation", "content": f"cm_mixed_note_{ns[-6:]}"},
+    ]
+
+    result = khive_session.verb("create", {
+        "items": items,
+        "verbose": True,
+        "namespace": ns,
+    })
+
+    assert result.get("attempted") == 2, f"attempted must be 2; got {result}"
+    assert result.get("created") == 2, (
+        f"both the entity item and the note item must succeed; got {result}"
+    )
+    assert result.get("failed") == 0, f"failed must be 0; got {result}"
+    entities = result.get("entities", [])
+    notes = result.get("notes", [])
+    assert len(entities) == 1, f"expected exactly 1 created entity; got {result}"
+    assert len(notes) == 1, f"expected exactly 1 created note; got {result}"
+
+
+# ---------------------------------------------------------------------------
+# Substrate-domain rejection — kinds outside entity|note
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.create_many
+@pytest.mark.slow
+def test_create_many_unsupported_kind_in_items_rejected(
+    khive_session: KhiveMcpSession,
+    temp_namespace: str,
+) -> None:
+    """An item whose kind resolves outside entity|note aborts the whole batch (atomic=true).
+
+    Source: create.rs prepare_bulk_create_spec, KindSpec::Edge | Event | Proposal:
+      return Err(RuntimeError::InvalidInput(format!(
+          "items[{idx}]: bulk create supports only entity and note kinds; got {:?}",
+          entry.kind
+      )));
+    This runs inside the atomic spec-building loop, which uses `?` per item —
+    the whole request fails before anything is written, regardless of where
+    in the batch the unsupported item sits.
+    """
+    ns = temp_namespace
+    items = [
+        _item(f"cm_kindrej_concept_{ns[-6:]}"),  # valid entity item
+        {"kind": "edge", "name": f"cm_kindrej_edge_{ns[-6:]}"},  # unsupported substrate
     ]
 
     with pytest.raises(KhiveOperationError) as exc_info:
@@ -271,35 +312,54 @@ def test_create_many_note_kind_in_items_rejected(
         })
 
     error_msg = exc_info.value.message.lower()
-    # Error from create.rs line 134: "bulk create only supports entity kinds"
-    assert "entity" in error_msg or "bulk" in error_msg or "kind" in error_msg, (
-        "note-kind rejection must mention entity/bulk/kind in the error; "
+    assert "entity" in error_msg and "note" in error_msg, (
+        "unsupported-kind rejection must name the allowed substrates (entity, note); "
         f"got: {exc_info.value.message!r}"
     )
 
 
 @pytest.mark.create_many
 @pytest.mark.slow
-def test_create_many_note_kind_rejected_with_atomic_false(
+def test_create_many_unsupported_kind_rejected_with_atomic_false(
     khive_session: KhiveMcpSession,
     temp_namespace: str,
 ) -> None:
-    """Note kind in items is rejected even when atomic=false.
+    """An unsupported-kind item is a per-item error under atomic=false; siblings still succeed.
 
-    The spec-building loop failure happens before the atomic split
-    (create.rs lines 109-148 vs lines 151/165).  atomic=false does not
-    provide per-item tolerance for spec-building errors — only runtime
-    errors in the non-atomic loop at line 170 are collected per-item.
+    Source: create.rs handle_bulk_create non-atomic loop — prepare_bulk_create_spec
+    is called per item inside the best-effort loop, so its InvalidInput becomes
+    that item's {index, error} entry instead of aborting the request. This is
+    the per-item-error contract atomic=false exists to provide; it applies to
+    substrate rejection the same way it applies to any other per-item failure.
     """
     ns = temp_namespace
-    items = [{"kind": "observation", "name": f"cm_noterej2_{ns[-6:]}"}]
+    items = [
+        _item(f"cm_kindrej2_concept_{ns[-6:]}"),  # valid entity item, index 0
+        {"kind": "edge", "name": f"cm_kindrej2_edge_{ns[-6:]}"},  # rejected, index 1
+    ]
 
-    with pytest.raises(KhiveOperationError):
-        khive_session.verb("create", {
-            "items": items,
-            "atomic": False,
-            "namespace": ns,
-        })
+    result = khive_session.verb("create", {
+        "items": items,
+        "atomic": False,
+        "namespace": ns,
+    })
+
+    assert result.get("attempted") == 2, f"attempted must be 2; got {result}"
+    assert result.get("created") == 1, (
+        f"the valid entity sibling must still be created; got {result}"
+    )
+    assert result.get("failed") == 1, f"the unsupported-kind item must fail; got {result}"
+    errors = result.get("errors")
+    assert errors is not None and len(errors) == 1, (
+        f"errors must contain exactly one entry for index 1; got {result}"
+    )
+    error_entry = errors[0]
+    assert error_entry.get("index") == 1, f"error entry must name index 1; got {error_entry}"
+    error_msg = str(error_entry.get("error", "")).lower()
+    assert "entity" in error_msg and "note" in error_msg, (
+        "per-item error must carry the same kind-domain message as the atomic=true case; "
+        f"got: {error_entry!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
