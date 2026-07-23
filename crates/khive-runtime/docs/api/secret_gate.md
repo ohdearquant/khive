@@ -9,10 +9,12 @@ module doc-comment carries only a concise summary and points here.
 ## Module-level detection algorithm
 
 Allowlist (false-positive suppression) — **all of the following are prose-context exemptions,
-not unconditional passes: a credential trigger word in the surrounding window always dominates.**
-A UUID or a sha-prefixed content hash sitting directly beside "api_key"/"secret"/"auth" is exactly
-as ambiguous as any other high-entropy candidate and falls through to explicit detection instead
-of being silently allowed.
+not unconditional passes: a credential trigger word in the surrounding window dominates, with
+exactly two narrow trigger-context exceptions (file paths and VCS revisions, defined below),
+both of which run only after the reconstruction checks and only outside credential-value syntax
+per the clause-label guard.** A UUID or a sha-prefixed content hash sitting directly beside
+"api_key"/"secret"/"auth" is exactly as ambiguous as any other high-entropy candidate and falls
+through to explicit detection instead of being silently allowed.
 
 - Pure hex strings (sha256, git SHA) — passed when not near a trigger.
 - UUID canonical form (`xxxxxxxx-xxxx-…`) — passed when not near a trigger.
@@ -48,12 +50,18 @@ of being silently allowed.
   word: an attacker who controls where a credential's separators fall can always choose run
   lengths whose entropy reads no higher than an ordinary short English path segment, since the
   measure only sees a character-frequency histogram, never word semantics. So near a trigger word,
-  a structured-identifier-shaped token gets no exemption at all and falls through to the entropy
-  heuristic like any other token. This is an accepted false-positive tradeoff on a small number of
+  THIS exemption does not apply: a structured-identifier-shaped token falls through to the entropy
+  heuristic like any other token, and only the separate, narrower file-path exemption below (which
+  requires path shape, runs after every reconstruction check, and is refused in credential-value
+  syntax) can still admit it. This is an accepted false-positive tradeoff on a small number of
   genuine paths/doc-slugs that happen to sit near a trigger word AND read above the entropy
-  threshold on their own — see `accepted_false_positive_adr_draft_path_near_trigger` and its
-  siblings for the specific repro cases this blocks, and the call site in
-  `check_entropy_heuristic`.
+  threshold on their own without qualifying for the narrow path exemption — see
+  `accepted_false_positive_adr_draft_path_near_trigger` and its siblings for the specific repro
+  cases this blocks, and the call site in `check_entropy_heuristic`. A path that qualifies for the
+  narrow exemption can still block when a trigger word sits attributively ahead of a value
+  delimiter ("see the docs for auth setup: <path>") — the clause walk cannot distinguish an
+  attributive trigger from a label head without reopening labeled-value bypasses; pinned as
+  `accepted_false_positive_docs_path_behind_attributive_trigger_and_delimiter`.
 
 - File paths (trigger-context, narrow): a path-shaped token (two or more `/` segments; optional
   angle-bracket wrapping; optional `:line`/`:line-range` suffix) is exempted near a trigger word
@@ -96,13 +104,20 @@ verb-phrase prose narrates an action on the value rather than labeling it (`the 
 flagged this file: <path>`, `one extra token was introduced by sha: <hex>` stay exempt). The
 walk stops at a sentence/paragraph boundary (`;`, `!`, `?`, blank line; `.` only when not
 immediately followed by an alphanumeric character, so a dotted version qualifier does not read
-as a sentence end). A single-identifier lookback is deliberately NOT the contract: `api key
-value is commit <hex>` is a labeled credential wearing a marker, and one connector word must not
-hide the label. A label on the far side of a sentence boundary is prose context (the
-`near_trigger` window models that), not this value's label. Known residuals, accepted under the
-threat model: a non-connector qualifier without any delimiter (`api key pour commit <hex>`),
-labels whose qualifier is itself past-participle shaped (`updated api key: <hex>` reads as
-changelog prose), and label clauses exceeding the walk or content-word bounds.
+as a sentence end). The past-participle stop is position-sensitive: it applies only in verb
+position — the participle followed (in reading order) by a glue word or the value itself
+("flagged this file:", "introduced by sha:", "key updated: <v>"). Followed by a content noun it
+is a participial ADJECTIVE inside a label qualifier ("shared deploy:", "encrypted backup:") and
+walks like any other qualifier noun. A participle BEFORE the trigger word never matters — the
+walk reaches the trigger first ("generated api key: <v>" blocks). A single-identifier lookback
+is deliberately NOT the contract: `api key value is commit <hex>` is a labeled credential
+wearing a marker, and one connector word must not hide the label. A label on the far side of a
+sentence boundary is prose context (the `near_trigger` window models that), not this value's
+label. Known residuals, accepted under the threat model: a non-connector qualifier without any
+delimiter (`api key pour commit <hex>`), a participle in verb position directly after the
+trigger (`api key updated: <hex>` reads as changelog prose — note the ordering: `updated api
+key: <hex>` blocks, since the walk meets the trigger first), and label clauses exceeding the
+walk or content-word bounds.
 
 Trigger-word matching only fires on genuine mentions, not substring collisions: trigger words
 (`key`, `secret`, `password`, `passwd`, `credential`, `bearer`, `auth`, `apikey`) are matched at a

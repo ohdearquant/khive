@@ -1150,6 +1150,10 @@ fn has_clause_credential_label(text: &str, token_offset: usize, raw_token: &str)
     let mut rest = &text[..token_offset];
     let mut crossed_value_delimiter = false;
     let mut post_delimiter_unknowns = 0usize;
+    // Whether the previously processed identifier (the one nearer the value)
+    // was connector material. Starts true: step 0 is adjacent to the value or
+    // its delimiter.
+    let mut arrived_through_connector = true;
     for step in 0..LABEL_CLAUSE_WALK_LIMIT {
         let label = trailing_identifier(rest);
         if label.is_empty() {
@@ -1180,11 +1184,15 @@ fn has_clause_credential_label(text: &str, token_offset: usize, raw_token: &str)
             if !crossed_value_delimiter {
                 return false;
             }
-            // Past-participle shape ("flagged", "introduced") is verb-phrase
-            // evidence: the clause is narrating an action on the value, not
-            // naming it. Label qualifiers are noun compounds; a verb between
-            // delimiter and trigger word means the trigger is prose context.
-            if lower.len() >= 5 && lower.ends_with("ed") {
+            // A past-participle word is verb-phrase evidence ONLY in verb
+            // position — followed by a glue word or the value itself
+            // ("flagged THIS file", "introduced BY sha", "updated: <v>").
+            // Followed by a content word it is a participial adjective
+            // inside a noun-compound label qualifier ("SHARED deploy",
+            // "ENCRYPTED backup") and walks like any other qualifier noun.
+            // The walk runs backwards, so "followed by" is the identifier
+            // processed on the previous iteration.
+            if arrived_through_connector && lower.len() >= 5 && lower.ends_with("ed") {
                 return false;
             }
             post_delimiter_unknowns += 1;
@@ -1192,6 +1200,7 @@ fn has_clause_credential_label(text: &str, token_offset: usize, raw_token: &str)
                 return false;
             }
         }
+        arrived_through_connector = skippable;
         let start = label.as_ptr() as usize - rest.as_ptr() as usize;
         rest = &rest[..start];
     }
@@ -2958,6 +2967,71 @@ mod tests {
             Some("high-entropy-token"),
             "possessive-qualified credential label must refuse the path \
              exemption"
+        );
+    }
+
+    #[test]
+    fn blocks_forty_hex_behind_participial_adjective_qualifier() {
+        // Round-4 review probes: a past-participle word in ADJECTIVE position
+        // (followed by a content noun: "shared deploy", "encrypted backup")
+        // is a label qualifier, not verb-phrase prose, and must not end the
+        // walk.
+        let revision = "d362950a3c9b1a4cb47d97f1623e38f1a1e6bcdf";
+        let content = format!("api key for shared deploy: commit {revision}");
+        assert_eq!(
+            scan(&content).map(|matched| matched.detector),
+            Some("hex-credential-token"),
+            "a participial-adjective label qualifier must stay walkable: \
+             {content:?}"
+        );
+    }
+
+    #[test]
+    fn blocks_slash_base64_behind_participial_adjective_qualifier() {
+        let content = "api key for encrypted backup: Xk9mZ2vQpLrT8nJwYuA/HfBsDcGiONvMabcdefgh";
+        assert_eq!(
+            scan(content).map(|matched| matched.detector),
+            Some("high-entropy-token"),
+            "a participial-adjective label qualifier must refuse the path \
+             exemption"
+        );
+    }
+
+    #[test]
+    fn blocks_participle_before_trigger_word() {
+        // Ordering contract: a past-participle word BEFORE the trigger never
+        // matters — the walk reaches the trigger first. Pinned so the
+        // verb-position rule cannot regress into shielding these labels.
+        let revision = "d362950a3c9b1a4cb47d97f1623e38f1a1e6bcdf";
+        let opaque = "Xk9mZ2vQpLrT8nJwYuA/HfBsDcGiONvMabcdefgh";
+        for content in [
+            format!("shared key: {revision}"),
+            format!("generated api key: {revision}"),
+            format!("encrypted token = {opaque}"),
+        ] {
+            assert!(
+                check(&content).is_err(),
+                "a participle before the trigger word must not shield the \
+                 label: {content:?}, got {:?}",
+                scan(&content)
+            );
+        }
+    }
+
+    #[test]
+    fn accepted_false_positive_docs_path_behind_attributive_trigger_and_delimiter() {
+        // "auth setup: <path>" carries a trigger word in clause range ahead
+        // of a value delimiter; the walk cannot distinguish an attributive
+        // trigger ("auth setup") from a label head ("api key ...") without
+        // reopening the labeled-value bypasses, so this ordinary prose shape
+        // blocks. Accepted false positive — conservative direction under the
+        // threat model; documented in docs/api/secret_gate.md.
+        let content = "see the docs for auth setup: \
+             internal/workspaces/20260701/cloud-rebuild/R1-repo-audit.md";
+        assert!(
+            check(content).is_err(),
+            "accepted-FP contract changed: attributive trigger before a \
+             delimited path no longer blocks — update the docs if deliberate"
         );
     }
 
