@@ -512,6 +512,12 @@ impl KhiveRuntime {
         .await
     }
 
+    /// `vector_similarity_floor` is a raw cosine-similarity value in `[-1.0,
+    /// 1.0]`, matching the scale documented on the `resolve` verb and on
+    /// `SEARCH_VECTOR_SIMILARITY_FLOOR`. Vector store hits are scored on the
+    /// `(1 + cos) / 2` storage scale (`khive-db` `stores/vectors.rs`), so the
+    /// comparison converts the floor to that scale rather than comparing the
+    /// raw cosine value against a storage-scale score directly.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn hybrid_search_with_vector_similarity_floor(
         &self,
@@ -534,7 +540,7 @@ impl KhiveRuntime {
             entity_type,
             tags_any,
             properties_filter,
-            Some(DeterministicScore::from_f64(vector_similarity_floor)),
+            Some(vector_similarity_floor),
         )
         .await
     }
@@ -550,7 +556,7 @@ impl KhiveRuntime {
         entity_type: Option<&str>,
         tags_any: &[String],
         properties_filter: Option<&serde_json::Value>,
-        vector_similarity_floor: Option<DeterministicScore>,
+        vector_similarity_floor: Option<f64>,
     ) -> RuntimeResult<Vec<SearchHit>> {
         let candidates = limit.saturating_mul(CANDIDATE_MULTIPLIER).max(limit);
 
@@ -597,8 +603,15 @@ impl KhiveRuntime {
         } else {
             Vec::new()
         };
-        if let Some(floor) = vector_similarity_floor {
-            vector_hits.retain(|hit| hit.score >= floor);
+        if let Some(raw_cosine_floor) = vector_similarity_floor {
+            // Vector store scores are `(1 + cos) / 2` (khive-db stores/vectors.rs),
+            // so a raw-cosine floor must be converted to that scale before it is
+            // compared against `hit.score` — comparing the raw floor directly
+            // against a storage-scale score only rejects hits below raw cosine
+            // -0.4, letting an orthogonal (cosine 0, storage score 0.5) or
+            // opposite-direction candidate clear a floor meant to reject them.
+            let storage_floor = DeterministicScore::from_f64((1.0 + raw_cosine_floor) / 2.0);
+            vector_hits.retain(|hit| hit.score >= storage_floor);
         }
 
         // Keep the full candidate pool (untruncated) through the alive/kind/tag/property
