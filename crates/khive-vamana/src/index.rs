@@ -424,7 +424,16 @@ fn parse_codes_bin(data: &[u8], expected_dims: usize, expected_count: usize) -> 
             "codes.bin shape {count}x{dims} != expected {expected_count}x{expected_dims}"
         )));
     }
-    let expected_len = CODES_HEADER_LEN + dims * 4 + count * dims;
+    let min_header_bytes = dims.checked_mul(4).ok_or_else(|| {
+        VamanaError::invalid_format("codes.bin dims byte length overflows".into())
+    })?;
+    let codes_bytes = count
+        .checked_mul(dims)
+        .ok_or_else(|| VamanaError::invalid_format("codes.bin count * dims overflows".into()))?;
+    let expected_len = CODES_HEADER_LEN
+        .checked_add(min_header_bytes)
+        .and_then(|len| len.checked_add(codes_bytes))
+        .ok_or_else(|| VamanaError::invalid_format("codes.bin expected length overflows".into()))?;
     if data.len() != expected_len {
         return Err(VamanaError::invalid_format(format!(
             "codes.bin length {} != expected {expected_len}",
@@ -2752,6 +2761,7 @@ fn reject_checkpoint_sequence_regression(path: &Path, candidate: Option<u64>) ->
         ("lifecycle.bin", commit.lifecycle_hash),
     ];
     let mut lifecycle_data: Option<Vec<u8>> = None;
+    let mut vectors_len: Option<usize> = None;
     for (name, expected) in segments {
         let data = match fs::read(path.join(name)) {
             Ok(data) => data,
@@ -2763,6 +2773,8 @@ fn reject_checkpoint_sequence_regression(path: &Path, candidate: Option<u64>) ->
         }
         if name == "lifecycle.bin" {
             lifecycle_data = Some(data);
+        } else if name == "vectors.bin" {
+            vectors_len = Some(data.len());
         }
     }
     let mut codes_data: Option<Vec<u8>> = None;
@@ -2782,11 +2794,43 @@ fn reject_checkpoint_sequence_regression(path: &Path, candidate: Option<u64>) ->
     };
 
     let lifecycle_data = lifecycle_data.expect("lifecycle.bin hashed above");
+    let vectors_len = vectors_len.expect("vectors.bin hashed above");
     let max_degree = commit.index_meta.max_degree;
     let num_vectors = commit.index_meta.num_vectors;
     let dimensions = commit.index_meta.dimensions;
+    // Every check `load_v2_fast` applies to a v2 checkpoint, replicated here so guard-valid
+    // implies loader-loadable with no residual segment:
+    //   metadata.bin  -> parse_v2_commit (done above) + VamanaConfig::validate on index_meta
+    //   graph.bin     -> read_graph (checked degree/neighbor bounds, medoid, num_nodes)
+    //   vectors.bin   -> checked num_vectors * dimensions shape, exact byte-length match
+    //   lifecycle.bin -> parse_lifecycle (checked tombstone/free-slot/reverse-adj bounds)
+    //   cross-segment -> validate_v2_structural (bidirectional reverse_adj, tombstone count)
+    //   codes.bin     -> parse_codes_bin (magic, checked shape, non-finite codec params)
     let structurally_valid = (|| -> Result<()> {
+        let config = VamanaConfig {
+            dimensions,
+            max_degree,
+            search_list_size: commit.index_meta.search_list_size,
+            alpha: commit.index_meta.alpha,
+        };
+        config.validate()?;
+
         let graph = read_graph(&path.join("graph.bin"), max_degree, num_vectors)?;
+
+        let expected_len_f32 = num_vectors
+            .checked_mul(dimensions)
+            .ok_or_else(|| VamanaError::invalid_format("v2 metadata overflow".into()))?;
+        let expected_vectors_bytes = expected_len_f32
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| {
+                VamanaError::invalid_format("vectors.bin byte length overflow".into())
+            })?;
+        if vectors_len != expected_vectors_bytes {
+            return Err(VamanaError::invalid_format(format!(
+                "vectors.bin byte length {vectors_len} != expected {expected_vectors_bytes}"
+            )));
+        }
+
         let lifecycle = parse_lifecycle(&lifecycle_data, num_vectors, max_degree)?;
         validate_v2_structural(&graph, &lifecycle, num_vectors)?;
         // A checksum-valid codes.bin can still fail the same structural checks
@@ -3262,6 +3306,23 @@ fn parse_lifecycle(data: &[u8], num_vectors: usize, _max_degree: usize) -> Resul
     if rev_num_nodes != num_vectors {
         return Err(VamanaError::invalid_format(format!(
             "lifecycle.bin rev_num_nodes {rev_num_nodes} != num_vectors {num_vectors}"
+        )));
+    }
+
+    // Every declared node contributes at least its 4-byte degree field. Reject a
+    // rev_num_nodes that cannot possibly fit the remaining bytes before requesting an
+    // allocation sized to it — same pattern as parse_graph's num_nodes preflight, needed
+    // here because a re-signed lifecycle.bin can pass the rev_num_nodes == num_vectors
+    // check above while the file itself is truncated well short of that many nodes.
+    let min_remaining_bytes = rev_num_nodes.checked_mul(4).ok_or_else(|| {
+        VamanaError::invalid_format(
+            "lifecycle.bin rev_num_nodes overflows minimum size check".into(),
+        )
+    })?;
+    if data.len() - offset < min_remaining_bytes {
+        return Err(VamanaError::invalid_format(format!(
+            "lifecycle.bin too short for {rev_num_nodes} declared reverse-adjacency nodes: {} bytes remaining, need at least {min_remaining_bytes}",
+            data.len() - offset
         )));
     }
 
@@ -5478,7 +5539,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         incumbent.save_atomic(dir.path()).unwrap();
 
-        // Corrupt the on-disk incumbent: give node 0 a phantom in-neighbor that
+        // Corrupt the on-disk incumbent: give some node a phantom in-neighbor that
         // parse_lifecycle's per-list shape checks (in-range, no dup, no self-ref) accept,
         // but that is not actually a predecessor in graph.bin's forward adjacency. Then
         // re-sign metadata.bin so the checksum still matches the corrupted bytes.
@@ -5491,22 +5552,36 @@ mod tests {
             commit.index_meta.max_degree,
         )
         .unwrap();
-        // The chosen node must be provably absent from reverse_adj[0] — otherwise
-        // appending it creates a duplicate, which parse_lifecycle rejects on its
-        // own before validate_v2_structural ever runs, and the test would pass
-        // without exercising the shared structural validator at all.
-        let num_vectors = commit.index_meta.num_vectors as u32;
-        let phantom = (1..num_vectors)
-            .find(|candidate| !lifecycle.reverse_adj[0].contains(candidate))
-            .expect("20 nodes at max_degree 4 cannot all be predecessors of node 0");
-        // A node absent from the persisted reverse_adj[0] is only a genuine phantom
-        // if it is also not a true forward predecessor of node 0 in graph.bin —
-        // otherwise the corruption would be indistinguishable from legitimate data.
-        assert!(
-            !incumbent.graph.adjacency()[phantom as usize].contains(&0),
-            "node {phantom} must not already point at node 0 in the forward graph"
-        );
-        lifecycle.reverse_adj[0].push(phantom);
+        let num_vectors = commit.index_meta.num_vectors;
+        // Reverse in-degree is bounded by num_vectors-1, not max_degree, so a fixed
+        // destination (e.g. node 0) can in principle already list every other node as a
+        // predecessor, leaving no room for a phantom. Search all destinations for one with
+        // a free reverse-adjacency slot, and require the chosen source to be provably
+        // absent from BOTH the persisted reverse list and the true forward predecessors —
+        // otherwise the corruption would be indistinguishable from legitimate data. A
+        // future graph-shape change that breaks this precondition fails loudly here, at
+        // setup, instead of panicking deep inside the corruption path.
+        let (dest, phantom) = (0..num_vectors)
+            .find_map(|dest| {
+                let reverse = &lifecycle.reverse_adj[dest];
+                if reverse.len() >= num_vectors.saturating_sub(1) {
+                    return None;
+                }
+                (0..num_vectors)
+                    .filter(|&candidate| candidate != dest)
+                    .map(|candidate| candidate as u32)
+                    .find(|candidate| {
+                        !reverse.contains(candidate)
+                            && !incumbent.graph.adjacency()[*candidate as usize]
+                                .contains(&(dest as u32))
+                    })
+                    .map(|candidate| (dest, candidate))
+            })
+            .expect(
+                "some destination node must have both a free reverse-adjacency slot and a \
+                 source absent from its reverse list and forward predecessors",
+            );
+        lifecycle.reverse_adj[dest].push(phantom);
 
         let corrupt_lifecycle_bytes = encode_lifecycle(
             &lifecycle.tombstones,
@@ -5691,6 +5766,127 @@ mod tests {
         assert!(
             started.elapsed() < std::time::Duration::from_secs(10),
             "guard must reject the forged incumbent cheaply, not attempt a huge allocation"
+        );
+
+        let persisted = VamanaIndex::load(dir.path()).unwrap();
+        assert_eq!(persisted.last_applied_seq(), Some(100));
+        assert_eq!(persisted.vectors().unwrap(), repair_vectors);
+    }
+
+    #[test]
+    fn parse_lifecycle_rejects_short_body_for_absurd_rev_num_nodes_without_huge_allocation() {
+        // A re-signed lifecycle.bin can declare a rev_num_nodes that equals num_vectors
+        // (passing the equality check) while the segment itself carries no per-node data.
+        // Before the preflight below, `Vec::with_capacity(rev_num_nodes)` on a
+        // `Vec<Vec<u32>>` (24 bytes per element) ran immediately after the equality check,
+        // driving a multi-gigabyte allocation instead of returning InvalidFormat.
+        let absurd_num_vectors = u32::MAX as usize;
+        let mut body = b"KHVVLIF1".to_vec();
+        body.extend_from_slice(&0u64.to_le_bytes()); // ts_words
+        body.extend_from_slice(&0u64.to_le_bytes()); // fs_count
+        body.extend_from_slice(&0u64.to_le_bytes()); // ops_since_consolidation
+        body.extend_from_slice(&(absurd_num_vectors as u64).to_le_bytes()); // rev_num_nodes
+
+        let started = std::time::Instant::now();
+        let result = parse_lifecycle(&body, absurd_num_vectors, 4);
+        assert!(
+            matches!(result, Err(VamanaError::InvalidFormat { .. })),
+            "parse_lifecycle must reject a short body for an absurd rev_num_nodes"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "guard must reject cheaply, not attempt a huge allocation"
+        );
+    }
+
+    #[cfg(feature = "mmap")]
+    #[test]
+    fn parse_codes_bin_rejects_overflowing_shape_without_allocation() {
+        // A re-signed metadata.bin can pair a small, checksum-matching codes.bin with an
+        // attacker-controlled shape whose header-length arithmetic overflows usize. Before
+        // the checked arithmetic below, `dims * 4 + count * dims` could wrap past the
+        // segment's actual length and let a tiny file pass the length check, immediately
+        // followed by `Vec::with_capacity(dims)` requesting an enormous allocation.
+        let dims = 1usize << 61;
+        let count = 4usize;
+        let mut data = Vec::with_capacity(CODES_HEADER_LEN);
+        data.extend_from_slice(CODES_MAGIC);
+        data.extend_from_slice(&(dims as u64).to_le_bytes());
+        data.extend_from_slice(&(count as u64).to_le_bytes());
+        data.extend_from_slice(&1.0f32.to_le_bytes()); // gs
+        data.extend_from_slice(&0.0f32.to_le_bytes()); // anisotropy_ratio
+        assert_eq!(data.len(), CODES_HEADER_LEN);
+
+        let result = parse_codes_bin(&data, dims, count);
+        assert!(
+            matches!(result, Err(VamanaError::InvalidFormat { .. })),
+            "parse_codes_bin must reject an overflowing shape as InvalidFormat"
+        );
+    }
+
+    #[cfg(feature = "mmap")]
+    #[test]
+    fn checkpoint_publication_repairs_incumbent_with_wrong_length_vectors_segment() {
+        // A checksum-valid vectors.bin can still be the wrong length for its declared
+        // num_vectors * dimensions shape: the guard used to hash vectors.bin without
+        // validating its shape, so a checksum-valid-but-wrong-length vectors segment was
+        // treated as a legitimate incumbent and could block every repair checkpoint below
+        // its sequence forever — the same failure mode this PR closes for graph/lifecycle.
+        let vectors = rand_unit_vectors(20, 4, 0x2200_0700);
+        let cfg = VamanaConfig::with_dimensions(4)
+            .with_max_degree(4)
+            .with_search_list_size(8);
+        let mut incumbent = VamanaIndex::build(&vectors, cfg.clone()).unwrap();
+        incumbent.set_last_applied_seq(Some(500));
+
+        let dir = tempfile::tempdir().unwrap();
+        incumbent.save_atomic(dir.path()).unwrap();
+
+        let metadata_bytes = fs::read(dir.path().join("metadata.bin")).unwrap();
+        let commit = parse_v2_commit(&metadata_bytes).unwrap();
+
+        // Truncate vectors.bin by one f32 and re-sign metadata.bin so the checksum still
+        // matches the shortened bytes.
+        let mut vectors_bytes = fs::read(dir.path().join("vectors.bin")).unwrap();
+        let new_len = vectors_bytes.len() - 4;
+        vectors_bytes.truncate(new_len);
+        fs::write(dir.path().join("vectors.bin"), &vectors_bytes).unwrap();
+        let corrupt_vectors_hash = *blake3::hash(&vectors_bytes).as_bytes();
+
+        write_v2_commit_full(
+            &dir.path().join("metadata.bin"),
+            &corrupt_vectors_hash,
+            &commit.graph_hash,
+            &commit.lifecycle_hash,
+            &V2CorpusFingerprint {
+                vector_count: commit.fingerprint.vector_count,
+                dimensions: commit.fingerprint.dimensions,
+                content_hash: commit.fingerprint.content_hash,
+            },
+            commit.index_meta.num_vectors,
+            commit.index_meta.dimensions,
+            commit.index_meta.max_degree,
+            commit.index_meta.search_list_size,
+            commit.index_meta.alpha,
+            commit.last_applied_seq,
+            commit.codes_hash.as_ref(),
+        )
+        .unwrap();
+
+        // The on-disk incumbent now passes every checksum, but load_v2_fast's vectors.bin
+        // byte-length check must still reject it as structurally invalid.
+        assert!(matches!(
+            VamanaIndex::load(dir.path()),
+            Err(VamanaError::InvalidFormat { .. })
+        ));
+
+        // A repair checkpoint at a lower sequence than the corrupt incumbent (500) must
+        // still be allowed to publish — the corrupt incumbent is not a legitimate barrier.
+        let repair_vectors = rand_unit_vectors(15, 4, 0x2200_0800);
+        let mut repair = VamanaIndex::build(&repair_vectors, cfg).unwrap();
+        repair.set_last_applied_seq(Some(100));
+        repair.save_atomic(dir.path()).expect(
+            "repair checkpoint below an incumbent with a wrong-length vectors segment must publish",
         );
 
         let persisted = VamanaIndex::load(dir.path()).unwrap();
