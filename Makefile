@@ -55,8 +55,8 @@ bench-1m-ci:
 
 local:
 	@echo "==> Building kkernel (release)..."
-	@cd crates && cargo build --release -p kkernel
-	@SRC=crates/target/release/kkernel; \
+	@cargo build --release -p kkernel --manifest-path crates/Cargo.toml
+	@SRC=$${CARGO_TARGET_DIR:-crates/target}/release/kkernel; \
 	DEST=$$HOME/.cargo/bin/kkernel; \
 	if [ ! -f "$$SRC" ]; then echo "==> ERROR: build artifact $$SRC missing"; exit 1; fi; \
 	SRC_HASH=$$(md5 -q "$$SRC"); \
