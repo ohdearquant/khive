@@ -428,17 +428,20 @@ out across every embedding engine registered in the resolved config, the same re
 | `--best-effort`                   | off                                         | See below                                                                   |
 | `--human`                         | off                                         | Human-readable summary instead of JSON                                      |
 
-**`--keep-existing`**: without it (default), every existing vector row for the staged
-`subject_id`s in a model's table is deleted up front (`drop_vectors_for_subjects`,
-`reindex.rs:305-310`); necessary because the vector table's primary key is `(subject_id)` only,
-not `(subject_id, namespace)`, so a namespace relabel followed by reindex would otherwise collide.
-Every staged record is then re-embedded unconditionally. With `--keep-existing`, no delete runs at
-all, and the batch is narrowed to subjects **not already present for that specific model +
-namespace** (`filter_unembedded`, `reindex.rs:326-338`). Within that narrowing, only the specific
-case of `StorageError::Unsupported` (a backend that doesn't implement existence checks at all)
-falls back to the conservative "assume nothing is embedded, re-embed everything" path
-(`reindex.rs:425-440`); any other `batch_exists` error instead skips that model's batch entirely
-and counts it as a failure (`reindex.rs:327-340`); it does not silently re-embed.
+**`--keep-existing`**: without it (default), every staged record is re-embedded
+unconditionally; there is no upfront delete pass. Replacement happens at insert time: vector
+tables are keyed by `(subject_id)` only, so the store replaces by that same identity — any
+existing row for the subject whose stored `(namespace, embedding_model, kind, field)` identity
+differs is recorded in the vector delete log and removed as part of the same write, inside the
+caller's transaction/savepoint (a failed write restores the prior row). This is what repairs
+stale namespace metadata after a relabel (`embed_and_store_batch`, `reindex.rs:220-330`;
+replacement semantics in `khive-db/src/stores/vectors.rs`). With `--keep-existing`, the batch
+is narrowed per model to subjects **not already present for that specific model + namespace**
+(`filter_unembedded`, `reindex.rs:435-448`). Within that narrowing, only the specific case of
+`StorageError::Unsupported` (a backend that doesn't implement existence checks at all) falls
+back to the conservative "assume nothing is embedded, re-embed everything" path
+(`reindex.rs:446`); any other `batch_exists` error instead skips that model's batch entirely
+and counts it as a failure (`reindex.rs:246-256`); it does not silently re-embed.
 
 **`--best-effort` vs. the fail-closed default**: `ReindexReport::has_failures()`
 (`reindex.rs:203-208`) is a single predicate covering four categories: vector embed/insert
