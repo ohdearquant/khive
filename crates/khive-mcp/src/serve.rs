@@ -883,7 +883,7 @@ fn canonical_backend_path(cfg: &BackendConfig) -> anyhow::Result<Option<PathBuf>
     Ok(Some(canon_parent.join(file_name)))
 }
 
-fn canonical_path_no_side_effects(path: &std::path::Path) -> anyhow::Result<PathBuf> {
+pub(crate) fn canonical_path_no_side_effects(path: &std::path::Path) -> anyhow::Result<PathBuf> {
     let expanded = expand_tilde(path);
     let absolute = if expanded.is_absolute() {
         expanded
@@ -892,24 +892,66 @@ fn canonical_path_no_side_effects(path: &std::path::Path) -> anyhow::Result<Path
             .map_err(|e| anyhow::anyhow!("cannot resolve current directory: {e}"))?
             .join(expanded)
     };
+
+    // A dangling final-component symlink (the alias exists, its target does
+    // not yet) makes `Path::exists()` below report `false` — it follows
+    // symlinks, so a missing target reads as "nothing here". Read the link
+    // manually first and resolve through it, so a declared alias like
+    // `link.db -> target.db` compares equal to `target.db` even before either
+    // file has been created.
+    if let Ok(link_target) = std::fs::read_link(&absolute) {
+        let resolved = if link_target.is_absolute() {
+            link_target
+        } else {
+            match absolute.parent() {
+                Some(parent) => parent.join(&link_target),
+                None => link_target,
+            }
+        };
+        return canonical_path_no_side_effects(&resolved);
+    }
+
     if absolute.exists() {
         return absolute
             .canonicalize()
             .map_err(|e| anyhow::anyhow!("cannot canonicalize {}: {e}", absolute.display()));
     }
-    let Some(parent) = absolute.parent() else {
+
+    // Neither `absolute` nor its immediate parent may exist yet (a fresh
+    // install with several undeclared directory levels). Walk up to the
+    // deepest ancestor that does exist, canonicalize only that (resolving any
+    // symlinked directory component along the way), then rejoin the missing
+    // tail lexically — never creating anything on disk.
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut probe = absolute.as_path();
+    let existing_ancestor = loop {
+        let Some(parent) = probe.parent() else {
+            break None;
+        };
+        tail.push(
+            probe
+                .file_name()
+                .map(|n| n.to_os_string())
+                .unwrap_or_default(),
+        );
+        if parent.exists() {
+            break Some(parent.to_path_buf());
+        }
+        probe = parent;
+    };
+
+    let Some(existing_ancestor) = existing_ancestor else {
         return Ok(absolute);
     };
-    if !parent.exists() {
-        return Ok(absolute);
-    }
-    let canonical_parent = parent
+
+    let canonical_ancestor = existing_ancestor
         .canonicalize()
-        .map_err(|e| anyhow::anyhow!("cannot canonicalize {}: {e}", parent.display()))?;
-    Ok(match absolute.file_name() {
-        Some(file_name) => canonical_parent.join(file_name),
-        None => canonical_parent,
-    })
+        .map_err(|e| anyhow::anyhow!("cannot canonicalize {}: {e}", existing_ancestor.display()))?;
+
+    Ok(tail
+        .into_iter()
+        .rev()
+        .fold(canonical_ancestor, |acc, component| acc.join(component)))
 }
 
 /// Build a fully-wired multi-backend `KhiveMcpServer` (ADR-028).
@@ -3210,6 +3252,78 @@ region = "us-east-1"
         assert!(
             !override_path.exists(),
             "rejecting an override must not create its database path"
+        );
+    }
+
+    /// A declared `main` backend that is a symlink whose target does not
+    /// exist yet (first-open alias, e.g. `link.db -> target.db` written by a
+    /// provisioning step before khive has ever opened the database) must
+    /// still accept a `--db` override naming the symlink's target directly —
+    /// SQLite opens both spellings as the same file. The equivalence check
+    /// used to call `Path::exists()` first, which follows symlinks and
+    /// reports `false` for a dangling one, so it never resolved the link and
+    /// compared the literal alias path against the literal target path
+    /// instead, rejecting a legitimate no-op override as ambiguous.
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn concrete_db_override_matching_declared_main_backend_via_dangling_symlink_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let target_path = dir.path().join("target.db");
+        let link_path = dir.path().join("link.db");
+        std::os::unix::fs::symlink("target.db", &link_path).unwrap();
+        assert!(
+            !target_path.exists(),
+            "target.db must not exist yet — this is the first-open case"
+        );
+        let secondary_path = dir.path().join("secondary.db");
+        let khive_cfg = sqlite_multi_backend_config(link_path, secondary_path);
+        let override_value = target_path.to_str().unwrap();
+        let base_cfg = RuntimeConfig {
+            db_path: khive_runtime::resolve_db_anchor(Some(override_value)),
+            ..base_runtime_config_for_multi_backend()
+        };
+
+        let result = build_registry_for_multi_backend(base_cfg, &khive_cfg, Some(override_value));
+
+        if let Err(error) = result {
+            panic!(
+                "a --db override naming the file a dangling symlink's declared main \
+                 backend points at must be accepted as the same database: {error}"
+            );
+        }
+    }
+
+    /// The no-side-effects equivalence check used to give up after checking
+    /// only the immediate parent directory: if that parent did not exist yet,
+    /// it returned the literal (non-canonicalized) absolute path instead of
+    /// continuing up to find and resolve a symlinked ancestor further up.
+    /// Reaching the same not-yet-created file through a symlinked directory
+    /// two levels up and through the real directory must canonicalize to the
+    /// identical path.
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn canonical_path_no_side_effects_resolves_symlinked_ancestor_before_missing_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_dir = dir.path().join("real");
+        std::fs::create_dir(&real_dir).unwrap();
+        let linked_dir = dir.path().join("linked");
+        std::os::unix::fs::symlink(&real_dir, &linked_dir).unwrap();
+
+        let via_symlink = linked_dir.join("sub").join("main.db");
+        let via_real = real_dir.join("sub").join("main.db");
+        assert!(!via_symlink.parent().unwrap().exists());
+        assert!(!via_real.parent().unwrap().exists());
+
+        let resolved_via_symlink = canonical_path_no_side_effects(&via_symlink).unwrap();
+        let resolved_via_real = canonical_path_no_side_effects(&via_real).unwrap();
+
+        assert_eq!(
+            resolved_via_symlink, resolved_via_real,
+            "a symlinked ancestor directory two levels above a not-yet-created file \
+             must canonicalize to the same target as the real directory: {resolved_via_symlink:?} \
+             vs {resolved_via_real:?}"
         );
     }
 
