@@ -1,5 +1,6 @@
 //! SQL-backed `EntityStore` implementation.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -798,8 +799,16 @@ impl EntityStore for SqlEntityStore {
                 return Ok(count as u64);
             }
 
+            let deduped_namespaces: Vec<String> = filter
+                .namespaces
+                .iter()
+                .cloned()
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
+
             let mut total = 0;
-            for chunk in filter.namespaces.chunks(NAMESPACE_COUNT_CHUNK_SIZE) {
+            for chunk in deduped_namespaces.chunks(NAMESPACE_COUNT_CHUNK_SIZE) {
                 let chunk_filter = EntityFilter {
                     namespaces: chunk.to_vec(),
                     ..filter.clone()

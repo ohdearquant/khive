@@ -581,6 +581,45 @@ async fn batched_namespace_entity_count_exceeds_sqlite_variable_limit() {
 }
 
 #[tokio::test]
+async fn duplicate_namespace_across_chunk_boundary_is_not_double_counted() {
+    let pool = setup_pool();
+    let store = SqlEntityStore::new(Arc::clone(&pool), false);
+
+    store
+        .upsert_entity(make_entity("stats-a", "concept", "live-a-1"))
+        .await
+        .unwrap();
+    store
+        .upsert_entity(make_entity("stats-a", "concept", "live-a-2"))
+        .await
+        .unwrap();
+
+    let per_namespace_total = store
+        .count_entities("stats-a", EntityFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(per_namespace_total, 2);
+
+    // 501 unique namespaces ("stats-a" + 500 empties), then "stats-a" repeats
+    // once more past index 500 — the repeat lands in the second 500-entry
+    // chunk, so a dedup bug double-counts "stats-a"'s rows.
+    let mut namespaces = vec!["stats-a".to_string()];
+    namespaces.extend((0..500).map(|i| format!("empty-{i}")));
+    assert_eq!(namespaces.len(), 501);
+    namespaces.push("stats-a".to_string());
+    assert_eq!(namespaces.len(), 502);
+
+    let filter = EntityFilter {
+        namespaces,
+        ..EntityFilter::default()
+    };
+    assert_eq!(
+        store.count_entities("stats-a", filter).await.unwrap(),
+        per_namespace_total
+    );
+}
+
+#[tokio::test]
 async fn test_batch_upsert() {
     let store = setup_memory_store_ns("batch_ns");
 

@@ -1700,7 +1700,12 @@ impl GraphStore for SqlGraphStore {
         namespaces: &[String],
         filter: EdgeFilter,
     ) -> Result<u64, StorageError> {
-        let namespaces = namespaces.to_vec();
+        let namespaces: Vec<String> = namespaces
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
         self.with_reader("count_edges_in_namespaces", move |conn| {
             let mut total = 0;
             for chunk in namespaces.chunks(NAMESPACE_COUNT_CHUNK_SIZE) {
@@ -1750,7 +1755,12 @@ impl GraphStore for SqlGraphStore {
         &self,
         namespaces: &[String],
     ) -> Result<Vec<(EdgeRelation, u64)>, StorageError> {
-        let namespaces = namespaces.to_vec();
+        let namespaces: Vec<String> = namespaces
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
         self.with_reader("count_edges_by_relation_in_namespaces", move |conn| {
             let mut totals = HashMap::new();
             for chunk in namespaces.chunks(NAMESPACE_COUNT_CHUNK_SIZE) {

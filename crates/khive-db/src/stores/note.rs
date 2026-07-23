@@ -1,5 +1,6 @@
 //! SQL-backed `NoteStore` implementation.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -1116,7 +1117,12 @@ impl NoteStore for SqlNoteStore {
         namespaces: &[String],
         kind: Option<&str>,
     ) -> Result<u64, StorageError> {
-        let namespaces = namespaces.to_vec();
+        let namespaces: Vec<String> = namespaces
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
         let kind = kind.map(str::to_string);
 
         self.with_reader("count_notes_in_namespaces", move |conn| {
