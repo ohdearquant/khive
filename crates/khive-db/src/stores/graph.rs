@@ -2385,27 +2385,20 @@ pub(crate) fn ensure_graph_schema(conn: &rusqlite::Connection) -> Result<(), rus
     conn.execute_batch(GRAPH_DDL)
 }
 
-fn sqlite_master_has(
-    conn: &rusqlite::Connection,
-    kind: &str,
-    name: &str,
-) -> Result<bool, rusqlite::Error> {
-    conn.query_row(
-        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = ?1 AND name = ?2)",
-        rusqlite::params![kind, name],
-        |row| row.get(0),
-    )
-}
-
 fn is_legacy_graph_edges_upgrade(conn: &rusqlite::Connection) -> Result<bool, rusqlite::Error> {
-    if !sqlite_master_has(conn, "table", "graph_edges")? {
-        return Ok(false);
-    }
-    Ok(!sqlite_master_has(
-        conn,
-        "trigger",
-        "trg_graph_edges_concept_single_origin_insert",
-    )?)
+    conn.query_row(
+        "SELECT
+            EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'graph_edges'),
+            EXISTS (SELECT 1 FROM sqlite_master
+                    WHERE type = 'trigger'
+                      AND name = 'trg_graph_edges_concept_single_origin_insert')",
+        [],
+        |row| {
+            let has_table: bool = row.get(0)?;
+            let has_trigger: bool = row.get(1)?;
+            Ok(has_table && !has_trigger)
+        },
+    )
 }
 
 fn reject_legacy_duplicate_concept_origins(
