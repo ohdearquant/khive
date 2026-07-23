@@ -125,7 +125,8 @@ wearing a marker, and one connector word must not hide the label. A label on the
 sentence boundary is prose context (the `near_trigger` window models that), not this value's
 label. Known residuals, accepted under the threat model: a non-connector qualifier without any
 delimiter (`api key pour commit <hex>`) and a participle in verb position directly after the
-trigger (`api key updated: <hex>` reads as changelog prose — note the ordering: `updated api
+trigger (`api key updated: commit <hex>` reads as changelog prose; without the VCS marker the
+raw hex still blocks under the near-trigger rule — note the ordering: `updated api
 key: <hex>` blocks, since the walk meets the trigger first). Accepted false positives,
 conservative direction: the walk has no grammar — ANY trigger word reachable inside the
 pre-delimiter clause (absent a sentence boundary or verb-position participle) is treated as a

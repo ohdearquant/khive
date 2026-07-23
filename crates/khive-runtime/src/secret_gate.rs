@@ -3127,6 +3127,7 @@ mod tests {
         for content in [
             format!("one extra token was introduced by sha: {revision}"),
             format!("the api key was rotated. deploy notes reference commit {revision}"),
+            format!("api key updated: commit {revision}"),
         ] {
             assert!(
                 check(&content).is_ok(),
