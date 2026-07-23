@@ -83,23 +83,26 @@ Both narrow exemptions above are gated by a **clause-label guard** (`has_clause_
 the exemption is refused when the candidate carries an inline credential shape
 (`api_key=<value>`) or when a credential label is reachable by walking backwards through the
 current clause. The walk steps over connector words that commonly sit between a label and its
-value (`is`, `was`, `value`, articles, and the VCS marker words themselves, so a marker cannot
-shield an earlier label), version fragments (`v1.2` splits into version-shaped identifiers), and
-long hex fragments (a separator-split payload piece is value material, not a label word), up to a
-bounded number of identifiers. Crossing a value delimiter (`:` or `=`) additionally lets the walk
-step over a small bounded number of identifiers outside those sets — "label with qualifiers:
-value" (`api key for deploy: <value>`) is assignment syntax regardless of which qualifier words
-the label carries. A delimiter attached to a VCS marker word does not count (`introduced by
-sha: <hex>` is coordinate syntax, not assignment), and at three or more interceding content
-words (`the auth scanner flagged this file: <path>`) the trigger is treated as prose context.
-The walk stops at a sentence/paragraph boundary (`;`, `!`, `?`, blank line; `.` only when not
+value (`is`, `was`, `value`, articles, the VCS marker words themselves so a marker cannot
+shield an earlier label, and prepositions/determiners/possessives — the glue of noun-compound
+qualifiers), version fragments (`v1.2` splits into version-shaped identifiers), and long hex
+fragments (a separator-split payload piece is value material, not a label word), up to a
+bounded number of identifiers. Crossing a value delimiter (`:` or `=`, including one attached
+to a VCS marker: `deploy sha: <hex>` is assignment syntax like any other) additionally lets the
+walk step over a small bounded number of CONTENT words outside those sets — "label with
+qualifiers: value" (`api key for production deploy: <value>`) names the value regardless of
+which qualifier nouns the label carries. A past-participle content word ends the walk:
+verb-phrase prose narrates an action on the value rather than labeling it (`the auth scanner
+flagged this file: <path>`, `one extra token was introduced by sha: <hex>` stay exempt). The
+walk stops at a sentence/paragraph boundary (`;`, `!`, `?`, blank line; `.` only when not
 immediately followed by an alphanumeric character, so a dotted version qualifier does not read
 as a sentence end). A single-identifier lookback is deliberately NOT the contract: `api key
 value is commit <hex>` is a labeled credential wearing a marker, and one connector word must not
 hide the label. A label on the far side of a sentence boundary is prose context (the
 `near_trigger` window models that), not this value's label. Known residuals, accepted under the
 threat model: a non-connector qualifier without any delimiter (`api key pour commit <hex>`),
-and label clauses exceeding the walk or qualifier bounds.
+labels whose qualifier is itself past-participle shaped (`updated api key: <hex>` reads as
+changelog prose), and label clauses exceeding the walk or content-word bounds.
 
 Trigger-word matching only fires on genuine mentions, not substring collisions: trigger words
 (`key`, `secret`, `password`, `passwd`, `credential`, `bearer`, `auth`, `apikey`) are matched at a

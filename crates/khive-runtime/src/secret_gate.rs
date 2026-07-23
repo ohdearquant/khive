@@ -1023,7 +1023,9 @@ fn trailing_identifier(text: &str) -> &str {
 /// commonly sit between a label and its value in natural assignment prose
 /// ("api key value is X", "the token was X"); the VCS coordinate markers are
 /// included so the marker itself cannot shield an earlier label from the
-/// walk ("api key value is commit <hex>").
+/// walk ("api key value is commit <hex>"); prepositions, determiners, and
+/// possessives are the glue of noun-compound label qualifiers ("api key for
+/// our production deploy: X") and carry no content of their own.
 const LABEL_CLAUSE_SKIP_WORDS: &[&str] = &[
     "commit",
     "revision",
@@ -1050,6 +1052,21 @@ const LABEL_CLAUSE_SKIP_WORDS: &[&str] = &[
     "now",
     "currently",
     "equals",
+    "for",
+    "of",
+    "to",
+    "in",
+    "on",
+    "at",
+    "by",
+    "with",
+    "from",
+    "per",
+    "and",
+    "our",
+    "my",
+    "your",
+    "their",
 ];
 
 /// Maximum identifiers the clause walk examines before giving up. Bounds the
@@ -1060,12 +1077,13 @@ const LABEL_CLAUSE_SKIP_WORDS: &[&str] = &[
 /// identifier steps) stays in range.
 const LABEL_CLAUSE_WALK_LIMIT: usize = 8;
 
-/// Maximum identifiers outside the connector/version/hex-fragment sets the
-/// clause walk steps over after crossing a value delimiter. Covers natural
-/// label qualifiers ("api key for deploy: X") without dragging whole verb
-/// phrases into label position — at three or more interceding content words
-/// ("the auth scanner flagged this file: <path>") the trigger is prose
-/// context, not this value's label.
+/// Maximum CONTENT words (identifiers outside the connector/glue/version/
+/// hex-fragment sets, and not past-participle shaped) the clause walk steps
+/// over after crossing a value delimiter. Natural label qualifiers are short
+/// noun compounds ("production deploy") once glue words are excluded; at
+/// three or more content nouns the trigger is treated as prose context.
+/// Verb-phrase prose ("the auth scanner flagged this file: <path>") is
+/// additionally cut by the past-participle stop before this bound matters.
 const LABEL_CLAUSE_DELIMITER_UNKNOWN_LIMIT: usize = 2;
 
 /// Sentence/paragraph boundary inside a clause-walk gap. `;`, `!`, `?`, and
@@ -1112,15 +1130,18 @@ fn is_hex_fragment_word(word: &str) -> bool {
 /// and stops at a sentence/paragraph boundary (see
 /// [`gap_has_sentence_boundary`]) — a label on the far side of a boundary is
 /// prose context, not this value's label. Crossing a value delimiter (`:` or
-/// `=`) additionally lets the walk step over up to
-/// [`LABEL_CLAUSE_DELIMITER_UNKNOWN_LIMIT`] identifiers outside those sets:
-/// "label with qualifiers: value" is assignment syntax regardless of which
-/// qualifier words the label carries ("api key for deploy: X"). A delimiter
-/// attached to a VCS marker word does not count — "introduced by sha: <hex>"
-/// is coordinate syntax, not assignment. Without a delimiter, only the
-/// closed sets are stepped over — skipping arbitrary words there would
-/// re-block ordinary prose like "the key changes are in commit <hex>", the
-/// false-positive class these exemptions exist to fix.
+/// `=`, including one attached to a VCS marker: "deploy sha: <hex>" is still
+/// assignment syntax) additionally lets the walk step over up to
+/// [`LABEL_CLAUSE_DELIMITER_UNKNOWN_LIMIT`] content words outside those
+/// sets: "label with qualifiers: value" names the value regardless of which
+/// qualifier nouns the label carries ("api key for production deploy: X").
+/// A past-participle content word ("flagged", "introduced") ends the walk —
+/// verb-phrase prose narrates an action on the value rather than labeling it
+/// ("the auth scanner flagged this file: <path>", "one extra token was
+/// introduced by sha: <hex>"). Without a delimiter, only the closed sets are
+/// stepped over — skipping arbitrary words there would re-block ordinary
+/// prose like "the key changes are in commit <hex>", the false-positive
+/// class these exemptions exist to fix.
 fn has_clause_credential_label(text: &str, token_offset: usize, raw_token: &str) -> bool {
     if has_inline_credential_trigger(raw_token) {
         return true;
@@ -1139,7 +1160,7 @@ fn has_clause_credential_label(text: &str, token_offset: usize, raw_token: &str)
             return false;
         }
         let lower = label.to_ascii_lowercase();
-        if gap.contains([':', '=']) && !VCS_MARKERS.contains(&lower.as_str()) {
+        if gap.contains([':', '=']) {
             crossed_value_delimiter = true;
         }
         if lower == "token"
@@ -1157,6 +1178,13 @@ fn has_clause_credential_label(text: &str, token_offset: usize, raw_token: &str)
             || is_hex_fragment_word(&lower);
         if !skippable {
             if !crossed_value_delimiter {
+                return false;
+            }
+            // Past-participle shape ("flagged", "introduced") is verb-phrase
+            // evidence: the clause is narrating an action on the value, not
+            // naming it. Label qualifiers are noun compounds; a verb between
+            // delimiter and trigger word means the trigger is prose context.
+            if lower.len() >= 5 && lower.ends_with("ed") {
                 return false;
             }
             post_delimiter_unknowns += 1;
@@ -2896,6 +2924,58 @@ mod tests {
                 check(&content).is_err(),
                 "a labeled inline-marker split credential must be blocked: \
                  {content:?}, got {:?}",
+                scan(&content)
+            );
+        }
+    }
+
+    #[test]
+    fn blocks_forty_hex_behind_multiword_label_and_marker_delimiter() {
+        // Round-3 review probes: qualifier nouns beyond the two-word case are
+        // reachable once prepositions/possessives read as glue, and a
+        // delimiter attached to the VCS marker itself ("deploy sha: <hex>")
+        // is assignment syntax like any other delimiter.
+        let revision = "d362950a3c9b1a4cb47d97f1623e38f1a1e6bcdf";
+        for content in [
+            format!("api key for deploy sha: {revision}"),
+            format!("prod api key for deploy sha: {revision}"),
+            format!("api key for production deploy: commit {revision}"),
+        ] {
+            assert_eq!(
+                scan(&content).map(|matched| matched.detector),
+                Some("hex-credential-token"),
+                "a natural multiword credential label must not be hidden by \
+                 glue words or a marker-attached delimiter: {content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn blocks_slash_base64_behind_possessive_qualified_label() {
+        let content = "api key for our production deploy: Xk9mZ2vQpLrT8nJwYuA/HfBsDcGiONvMabcdefgh";
+        assert_eq!(
+            scan(content).map(|matched| matched.detector),
+            Some("high-entropy-token"),
+            "possessive-qualified credential label must refuse the path \
+             exemption"
+        );
+    }
+
+    #[test]
+    fn allows_verb_phrase_prose_with_delimiter_before_trigger_word() {
+        // Past-participle content words are verb-phrase evidence: the clause
+        // narrates an action on the value instead of labeling it. These are
+        // the false-positive shapes the exemptions exist for, and they must
+        // survive the marker-attached-delimiter and glue-word widenings.
+        let revision = "d362950a3c9b1a4cb47d97f1623e38f1a1e6bcdf";
+        for content in [
+            format!("one extra token was introduced by sha: {revision}"),
+            format!("the api key was rotated. deploy notes reference commit {revision}"),
+        ] {
+            assert!(
+                check(&content).is_ok(),
+                "verb-phrase prose must keep the VCS exemption: {content:?}, \
+                 got {:?}",
                 scan(&content)
             );
         }
