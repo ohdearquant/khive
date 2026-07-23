@@ -26,6 +26,8 @@ fn map_sqlite_err(e: SqliteError, op: &'static str) -> StorageError {
     StorageError::driver(StorageCapability::Entities, op, e)
 }
 
+const NAMESPACE_COUNT_CHUNK_SIZE: usize = 500;
+
 // ---------------------------------------------------------------------------
 // Pure statement builders (ADR-099 B3 r6 structural cut)
 //
@@ -786,13 +788,31 @@ impl EntityStore for SqlEntityStore {
         let namespace = namespace.to_string();
 
         self.with_reader("count_entities", move |conn| {
-            let (where_sql, params) = build_entity_where(&namespace, &filter);
-            let sql = format!("SELECT COUNT(*) FROM entities{}", where_sql);
-            let mut stmt = conn.prepare(&sql)?;
-            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                params.iter().map(|p| p.as_ref()).collect();
-            let count: i64 = stmt.query_row(param_refs.as_slice(), |row| row.get(0))?;
-            Ok(count as u64)
+            if filter.namespaces.is_empty() {
+                let (where_sql, params) = build_entity_where(&namespace, &filter);
+                let sql = format!("SELECT COUNT(*) FROM entities{}", where_sql);
+                let mut stmt = conn.prepare(&sql)?;
+                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    params.iter().map(|p| p.as_ref()).collect();
+                let count: i64 = stmt.query_row(param_refs.as_slice(), |row| row.get(0))?;
+                return Ok(count as u64);
+            }
+
+            let mut total = 0;
+            for chunk in filter.namespaces.chunks(NAMESPACE_COUNT_CHUNK_SIZE) {
+                let chunk_filter = EntityFilter {
+                    namespaces: chunk.to_vec(),
+                    ..filter.clone()
+                };
+                let (where_sql, params) = build_entity_where(&namespace, &chunk_filter);
+                let sql = format!("SELECT COUNT(*) FROM entities{}", where_sql);
+                let mut stmt = conn.prepare(&sql)?;
+                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    params.iter().map(|p| p.as_ref()).collect();
+                let count: i64 = stmt.query_row(param_refs.as_slice(), |row| row.get(0))?;
+                total += count as u64;
+            }
+            Ok(total)
         })
         .await
     }
