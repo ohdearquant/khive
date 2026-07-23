@@ -238,11 +238,6 @@ pub const EDGE_SYMMETRIC_CONFLICT_PROBE_SQL: &str = "SELECT id FROM graph_edges 
 pub const EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL: &str =
     "DELETE FROM graph_edges WHERE namespace = ?1 AND id = ?2";
 
-pub const EDGE_SYMMETRIC_REFRESH_CANONICAL_SQL: &str = "UPDATE graph_edges SET \
-     weight = ?1, updated_at = ?2, deleted_at = NULL, \
-     target_backend = ?3, metadata = ?4 \
-     WHERE namespace = ?5 AND id = ?6";
-
 pub const EDGE_SYMMETRIC_UPDATE_INPLACE_SQL: &str = "UPDATE graph_edges SET \
      source_id = ?1, target_id = ?2, relation = ?3, \
      weight = ?4, updated_at = ?5, metadata = ?6 \
@@ -280,37 +275,6 @@ pub fn edge_symmetric_delete_noncanonical_statement(namespace: &str, id: Uuid) -
             SqlValue::Text(id.to_string()),
         ],
         label: Some("edge-symmetric-delete-noncanonical".to_string()),
-    }
-}
-
-/// Plan-shape builder for [`EDGE_SYMMETRIC_REFRESH_CANONICAL_SQL`] —
-/// case (b) continued: refresh the surviving canonical row.
-#[allow(clippy::too_many_arguments)]
-pub fn edge_symmetric_refresh_canonical_statement(
-    namespace: &str,
-    existing_id: Uuid,
-    weight: f64,
-    updated_at_micros: i64,
-    target_backend: Option<&str>,
-    metadata: Option<&str>,
-) -> SqlStatement {
-    SqlStatement {
-        sql: EDGE_SYMMETRIC_REFRESH_CANONICAL_SQL.to_string(),
-        params: vec![
-            SqlValue::Float(weight),
-            SqlValue::Integer(updated_at_micros),
-            match target_backend {
-                Some(b) => SqlValue::Text(b.to_string()),
-                None => SqlValue::Null,
-            },
-            match metadata {
-                Some(m) => SqlValue::Text(m.to_string()),
-                None => SqlValue::Null,
-            },
-            SqlValue::Text(namespace.to_string()),
-            SqlValue::Text(existing_id.to_string()),
-        ],
-        label: Some("edge-symmetric-refresh-canonical".to_string()),
     }
 }
 
@@ -376,7 +340,7 @@ pub fn edge_symmetric_update_inplace_statement(
 // 1. [`edge_symmetric_delete_if_conflict_statement`]: deletes the requested
 //    (non-canonical) row IF AND ONLY IF a differently-id'd canonical row
 //    exists at the target natural key at THIS moment (guard: 0 or 1 rows).
-// 2. [`edge_symmetric_refresh_or_update_inplace_statement`]: a single
+// 2. [`edge_symmetric_absorb_or_update_inplace_statement`]: a single
 //    `UPDATE` that no longer trusts an `id = ?2 OR natural-key` predicate
 //    (ADR-099 §B3 — that predicate could
 //    match the WRONG row: if a different op earlier in the SAME atomic unit
@@ -392,7 +356,8 @@ pub fn edge_symmetric_update_inplace_statement(
 //      requested row is still live under its own id — update it in place.
 //    - `source_id = ?3 AND target_id = ?4 AND relation = ?5 AND id != ?2
 //      AND changes() = 1`: statement 1 just deleted the requested row
-//      BECAUSE a conflict existed — refresh that surviving canonical row.
+//      BECAUSE a conflict existed — match the surviving canonical row and
+//      leave its attributes unchanged (ADR-039 DO NOTHING; see below).
 //    These two arms are mutually exclusive and, together with statement 1's
 //    own guard, jointly exhaustive: if the requested row no longer existed
 //    when statement 1 ran (the same-unit race above), statement 1 affects 0
@@ -401,19 +366,29 @@ pub fn edge_symmetric_update_inplace_statement(
 //    `changes() = 1` guard is false — so this statement affects ZERO rows
 //    and the plan's `AffectedRowGuard::exactly(1)` on it fails the op,
 //    aborting the whole atomic unit rather than silently mutating an
-//    unrelated row. `target_backend` is updated only in the natural-key
-//    (absorbed-conflict) arm — the same `changes() = 1` condition, via a
-//    `CASE`, replicating [`EDGE_SYMMETRIC_UPDATE_INPLACE_SQL`]'s "leave
-//    `target_backend` untouched" behavior for the in-place case with the
-//    SAME statement that also replicates
-//    [`EDGE_SYMMETRIC_REFRESH_CANONICAL_SQL`]'s explicit `target_backend`
-//    set for the absorbed case.
+//    unrelated row.
+//
+//    ADR-039's edge-conflict contract is ON CONFLICT DO NOTHING: the
+//    natural-key (absorbed-conflict) arm must leave the surviving canonical
+//    row's attributes exactly as they were — refreshing them from the
+//    discarded edge (and forcing `deleted_at = NULL`, resurrecting a
+//    tombstone) is the same defect already fixed on the merge-rewire path
+//    (khive#1213). Every SET expression is therefore keyed on `id = ?2`:
+//    that condition is true only for the WHERE clause's first (in-place)
+//    arm — the second (absorbed) arm only ever matches a row whose id is
+//    NOT ?2 — so each column either takes its new value (in-place arm) or
+//    self-assigns its current value (absorbed arm, a true no-op). This
+//    still affects exactly one row either way (SQLite's `changes()` counts
+//    matched rows, not changed bytes), so `AffectedRowGuard::exactly(1)`
+//    and the race-abort behavior above are unaffected by this being a
+//    no-op write in the absorbed case.
 //
 // No probe, no branch, no read at all is needed to APPLY this pair. Which
 // row this plan actually touched is derived post-commit by the caller via a
-// fresh natural-key lookup (`khive-runtime::KhiveRuntime::list_edges`,
-// filtered on the canonicalized endpoints/relation — the same mechanism the
-// atomic `link` op's own result rendering already uses) — ADR-099 §B3
+// fresh natural-key lookup (`khive-runtime::KhiveRuntime::get_edge_by_natural_key_including_deleted`,
+// filtered on the canonicalized endpoints/relation and including soft-deleted rows — unlike
+// `list_edges`, which unconditionally filters `deleted_at IS NULL` and would report "not
+// found" for a surviving row this absorption arm left tombstoned) — ADR-099 §B3
 // removed the prior prepare-time advisory `target_id` probe entirely:
 // a value computed before the
 // SAME atomic unit's other ops have run is not a fact this plan can stand
@@ -446,7 +421,7 @@ pub fn edge_symmetric_delete_if_conflict_statement(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn edge_symmetric_refresh_or_update_inplace_statement(
+pub fn edge_symmetric_absorb_or_update_inplace_statement(
     namespace: &str,
     id: Uuid,
     canon_src: Uuid,
@@ -459,9 +434,14 @@ pub fn edge_symmetric_refresh_or_update_inplace_statement(
 ) -> SqlStatement {
     SqlStatement {
         sql: "UPDATE graph_edges SET \
-              source_id = ?3, target_id = ?4, relation = ?5, \
-              weight = ?6, updated_at = ?7, deleted_at = NULL, metadata = ?8, \
-              target_backend = CASE WHEN changes() = 1 THEN ?9 ELSE target_backend END \
+              source_id = CASE WHEN id = ?2 THEN ?3 ELSE source_id END, \
+              target_id = CASE WHEN id = ?2 THEN ?4 ELSE target_id END, \
+              relation = CASE WHEN id = ?2 THEN ?5 ELSE relation END, \
+              weight = CASE WHEN id = ?2 THEN ?6 ELSE weight END, \
+              updated_at = CASE WHEN id = ?2 THEN ?7 ELSE updated_at END, \
+              deleted_at = CASE WHEN id = ?2 THEN NULL ELSE deleted_at END, \
+              metadata = CASE WHEN id = ?2 THEN ?8 ELSE metadata END, \
+              target_backend = CASE WHEN id = ?2 THEN ?9 ELSE target_backend END \
               WHERE namespace = ?1 \
                 AND ( \
                   (id = ?2 AND changes() = 0) \
@@ -486,7 +466,7 @@ pub fn edge_symmetric_refresh_or_update_inplace_statement(
                 None => SqlValue::Null,
             },
         ],
-        label: Some("edge-symmetric-refresh-or-update-inplace".to_string()),
+        label: Some("edge-symmetric-absorb-or-update-inplace".to_string()),
     }
 }
 
@@ -1289,6 +1269,39 @@ impl GraphStore for SqlGraphStore {
                  FROM graph_edges WHERE id = ?1",
             )?;
             let mut rows = stmt.query(rusqlite::params![id_str])?;
+            match rows.next()? {
+                Some(row) => Ok(Some(read_edge(row)?)),
+                None => Ok(None),
+            }
+        })
+        .await
+    }
+
+    async fn get_edge_by_natural_key_including_deleted(
+        &self,
+        namespace: &str,
+        source_id: Uuid,
+        target_id: Uuid,
+        relation: EdgeRelation,
+    ) -> Result<Option<Edge>, StorageError> {
+        let namespace = namespace.to_string();
+        let source_str = source_id.to_string();
+        let target_str = target_id.to_string();
+        let relation_str = relation.to_string();
+
+        self.with_reader("get_edge_by_natural_key_including_deleted", move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT namespace, id, source_id, target_id, relation, weight, \
+                        created_at, updated_at, deleted_at, metadata, target_backend \
+                 FROM graph_edges \
+                 WHERE namespace = ?1 AND source_id = ?2 AND target_id = ?3 AND relation = ?4",
+            )?;
+            let mut rows = stmt.query(rusqlite::params![
+                namespace,
+                source_str,
+                target_str,
+                relation_str
+            ])?;
             match rows.next()? {
                 Some(row) => Ok(Some(read_edge(row)?)),
                 None => Ok(None),

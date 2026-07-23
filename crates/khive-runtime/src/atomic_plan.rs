@@ -147,14 +147,16 @@ pub enum PostCommitEffect {
 
 /// The natural key a committed symmetric edge update's surviving row must
 /// be looked up by (ADR-099 B3, second
-/// half). `khive-db`'s `edge_symmetric_refresh_or_update_inplace_statement`
+/// half). `khive-db`'s `edge_symmetric_absorb_or_update_inplace_statement`
 /// pair never trusts a prepare-time-computed target id (see that builder's
 /// doc comment); a caller rendering this op's result derives the actual
 /// surviving id by querying `graph_edges`'s own
-/// `UNIQUE(namespace, source_id, target_id, relation)` constraint (e.g. via
-/// `KhiveRuntime::list_edges` filtered on these fields — the same mechanism
-/// the atomic `link` op's own result rendering already uses), strictly
-/// after commit.
+/// `UNIQUE(namespace, source_id, target_id, relation)` constraint via
+/// `KhiveRuntime::get_edge_by_natural_key_including_deleted`, which — unlike
+/// `list_edges` — includes soft-deleted rows: the ADR-039 DO NOTHING absorption
+/// arm can commit leaving the surviving canonical row tombstoned
+/// (khive#1213/#1214), and `list_edges` would report "not found" for exactly
+/// that row. Looked up strictly after commit.
 #[derive(Debug, Clone)]
 pub struct EdgeNaturalKey {
     pub(crate) namespace: String,
