@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 #[cfg(feature = "mmap")]
 use std::{
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::Write,
     path::Path,
 };
@@ -424,7 +424,16 @@ fn parse_codes_bin(data: &[u8], expected_dims: usize, expected_count: usize) -> 
             "codes.bin shape {count}x{dims} != expected {expected_count}x{expected_dims}"
         )));
     }
-    let expected_len = CODES_HEADER_LEN + dims * 4 + count * dims;
+    let min_header_bytes = dims.checked_mul(4).ok_or_else(|| {
+        VamanaError::invalid_format("codes.bin dims byte length overflows".into())
+    })?;
+    let codes_bytes = count
+        .checked_mul(dims)
+        .ok_or_else(|| VamanaError::invalid_format("codes.bin count * dims overflows".into()))?;
+    let expected_len = CODES_HEADER_LEN
+        .checked_add(min_header_bytes)
+        .and_then(|len| len.checked_add(codes_bytes))
+        .ok_or_else(|| VamanaError::invalid_format("codes.bin expected length overflows".into()))?;
     if data.len() != expected_len {
         return Err(VamanaError::invalid_format(format!(
             "codes.bin length {} != expected {expected_len}",
@@ -861,11 +870,37 @@ impl VamanaIndex {
     /// atomically renames `metadata.bin.tmp` → `metadata.bin` as the commit record. A
     /// crash at any point before that rename leaves the previous `metadata.bin` (v1 or
     /// v2) valid and untouched — [`Self::load_or_build`] never observes a torn v2
-    /// commit. See crates/khive-vamana/docs/api/persistence.md#v2-crash-safe-save-load for
-    /// the staging/fsync sequence.
+    /// commit. Publication is serialized per directory; a candidate whose applied
+    /// sequence is lower than the incumbent returns
+    /// [`VamanaError::CheckpointSequenceRegression`] before staging any files. See
+    /// crates/khive-vamana/docs/api/persistence.md#v2-crash-safe-save-load for the
+    /// staging/fsync sequence.
     #[cfg(feature = "mmap")]
     pub fn save_atomic(&self, path: &Path) -> Result<()> {
+        self.save_atomic_with_lock_hook(path, |lock| lock.lock().map_err(Into::into))
+    }
+
+    /// `acquire_lock` owns the entire publication-lock handshake: it receives the open
+    /// (but unlocked) `.checkpoint.lock` file and must return only once this writer holds
+    /// an exclusive lock on it. Production goes straight to the blocking `lock()` call with
+    /// no probing — the same single syscall this always made. Tests substitute a hook that
+    /// probes with `try_lock()` first to observe contention deterministically; that probing
+    /// code never runs outside test builds.
+    #[cfg(feature = "mmap")]
+    fn save_atomic_with_lock_hook(
+        &self,
+        path: &Path,
+        acquire_lock: impl FnOnce(&File) -> Result<()>,
+    ) -> Result<()> {
         fs::create_dir_all(path)?;
+        let publication_lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path.join(".checkpoint.lock"))?;
+        acquire_lock(&publication_lock)?;
+        reject_checkpoint_sequence_regression(path, self.last_applied_seq)?;
 
         // Stage under .v2new so a crash before the metadata rename leaves the previous
         // segments (v1 or v2) intact and readable.
@@ -983,7 +1018,26 @@ impl VamanaIndex {
         corpus_vectors: &[f32],
         fallback_config: VamanaConfig,
     ) -> Result<Self> {
+        Self::load_or_build_with_sequence(path, corpus_vectors, fallback_config, None)
+    }
+
+    /// Fingerprint-gated restore with the write-log sequence to use if the index
+    /// must be rebuilt and persisted. The caller owns the log and must supply the
+    /// highest sequence reflected in `corpus_vectors`.
+    #[cfg(feature = "mmap")]
+    pub fn load_or_build_with_sequence(
+        path: &Path,
+        corpus_vectors: &[f32],
+        fallback_config: VamanaConfig,
+        rebuild_last_applied_seq: Option<u64>,
+    ) -> Result<Self> {
         let metadata_path = path.join("metadata.bin");
+        let rebuild_and_persist = |config| {
+            let mut index = Self::rebuild_from_corpus(corpus_vectors, config)?;
+            index.set_last_applied_seq(rebuild_last_applied_seq);
+            index.save_atomic(path)?;
+            Ok(index)
+        };
 
         let metadata_bytes = match fs::read(&metadata_path) {
             Ok(b) => b,
@@ -996,26 +1050,20 @@ impl VamanaIndex {
                 ] {
                     let _ = fs::remove_file(path.join(suffix));
                 }
-                let index = Self::rebuild_from_corpus(corpus_vectors, fallback_config)?;
-                index.save_atomic(path)?;
-                return Ok(index);
+                return rebuild_and_persist(fallback_config);
             }
             Err(e) => return Err(e.into()),
         };
 
         if metadata_bytes.len() < 8 {
-            let index = Self::rebuild_from_corpus(corpus_vectors, fallback_config)?;
-            index.save_atomic(path)?;
-            return Ok(index);
+            return rebuild_and_persist(fallback_config);
         }
 
         if &metadata_bytes[..8] == V2_COMMIT_MAGIC {
             let commit = match parse_v2_commit(&metadata_bytes) {
                 Ok(c) => c,
                 Err(_) => {
-                    let index = Self::rebuild_from_corpus(corpus_vectors, fallback_config)?;
-                    index.save_atomic(path)?;
-                    return Ok(index);
+                    return rebuild_and_persist(fallback_config);
                 }
             };
 
@@ -1029,9 +1077,7 @@ impl VamanaIndex {
                         search_list_size: commit.index_meta.search_list_size,
                         alpha: commit.index_meta.alpha,
                     };
-                    let index = Self::rebuild_from_corpus(corpus_vectors, config)?;
-                    index.save_atomic(path)?;
-                    return Ok(index);
+                    return rebuild_and_persist(config);
                 }
                 Err(e) => return Err(e.into()),
             };
@@ -1044,9 +1090,7 @@ impl VamanaIndex {
                         search_list_size: commit.index_meta.search_list_size,
                         alpha: commit.index_meta.alpha,
                     };
-                    let index = Self::rebuild_from_corpus(corpus_vectors, config)?;
-                    index.save_atomic(path)?;
-                    return Ok(index);
+                    return rebuild_and_persist(config);
                 }
                 Err(e) => return Err(e.into()),
             };
@@ -1059,9 +1103,7 @@ impl VamanaIndex {
                         search_list_size: commit.index_meta.search_list_size,
                         alpha: commit.index_meta.alpha,
                     };
-                    let index = Self::rebuild_from_corpus(corpus_vectors, config)?;
-                    index.save_atomic(path)?;
-                    return Ok(index);
+                    return rebuild_and_persist(config);
                 }
                 Err(e) => return Err(e.into()),
             };
@@ -1080,9 +1122,7 @@ impl VamanaIndex {
                     search_list_size: commit.index_meta.search_list_size,
                     alpha: commit.index_meta.alpha,
                 };
-                let index = Self::rebuild_from_corpus(corpus_vectors, config)?;
-                index.save_atomic(path)?;
-                return Ok(index);
+                return rebuild_and_persist(config);
             }
 
             // codes.bin is checksum-gated exactly like the other segments whenever the
@@ -1099,9 +1139,7 @@ impl VamanaIndex {
                         search_list_size: commit.index_meta.search_list_size,
                         alpha: commit.index_meta.alpha,
                     };
-                    let index = Self::rebuild_from_corpus(corpus_vectors, config)?;
-                    index.save_atomic(path)?;
-                    return Ok(index);
+                    return rebuild_and_persist(config);
                 }
             }
 
@@ -1114,9 +1152,7 @@ impl VamanaIndex {
                     search_list_size: commit.index_meta.search_list_size,
                     alpha: commit.index_meta.alpha,
                 };
-                let index = Self::rebuild_from_corpus(corpus_vectors, config)?;
-                index.save_atomic(path)?;
-                return Ok(index);
+                return rebuild_and_persist(config);
             }
             let live_count = corpus_vectors.len() / dim;
             let live_content_hash = *blake3::hash(cast_slice(corpus_vectors)).as_bytes();
@@ -1132,9 +1168,7 @@ impl VamanaIndex {
                     search_list_size: commit.index_meta.search_list_size,
                     alpha: commit.index_meta.alpha,
                 };
-                let index = Self::rebuild_from_corpus(corpus_vectors, config)?;
-                index.save_atomic(path)?;
-                return Ok(index);
+                return rebuild_and_persist(config);
             }
 
             // Fast path: load all segments, restore lifecycle state.
@@ -1151,9 +1185,7 @@ impl VamanaIndex {
                         search_list_size: commit.index_meta.search_list_size,
                         alpha: commit.index_meta.alpha,
                     };
-                    let index = Self::rebuild_from_corpus(corpus_vectors, config)?;
-                    index.save_atomic(path)?;
-                    Ok(index)
+                    rebuild_and_persist(config)
                 }
                 Err(e) => Err(e),
             }
@@ -1169,15 +1201,14 @@ impl VamanaIndex {
             let mut index = Self::load(path)?;
             // Release the mmap before save_atomic overwrites the same files.
             index.ensure_owned()?;
+            index.set_last_applied_seq(rebuild_last_applied_seq);
             index.save_atomic(path)?;
             Ok(index)
         } else {
             // Unknown or garbage magic: treat as corrupt snapshot and rebuild.
             // VamanaIndex::load (direct v1 callers) remains strict; load_or_build always
             // recovers because the caller supplies a corpus and fallback config.
-            let index = Self::rebuild_from_corpus(corpus_vectors, fallback_config)?;
-            index.save_atomic(path)?;
-            Ok(index)
+            rebuild_and_persist(fallback_config)
         }
     }
 
@@ -1239,14 +1270,6 @@ impl VamanaIndex {
         let max_degree = config.max_degree;
         let mut graph = read_graph(&path.join("graph.bin"), max_degree, num_vectors)?;
 
-        if graph.node_count() != num_vectors {
-            return Err(VamanaError::invalid_format(format!(
-                "graph node count {} != commit num_vectors {}",
-                graph.node_count(),
-                num_vectors
-            )));
-        }
-
         let expected_len_f32 = num_vectors
             .checked_mul(dimensions)
             .ok_or_else(|| VamanaError::invalid_format("v2 metadata overflow".into()))?;
@@ -1255,51 +1278,11 @@ impl VamanaIndex {
         // Parse lifecycle.bin and restore state directly (no O(N*R) rebuild).
         let lifecycle = parse_lifecycle(lifecycle_data, num_vectors, max_degree)?;
 
-        // Validate bidirectional consistency: the persisted reverse_adj must be the exact
-        // inverse of the loaded forward graph. A checksum-valid but writer-bugged lifecycle
-        // segment can pass parse_lifecycle's per-list shape checks (in-range, no dup, no
-        // self-ref) while still being semantically wrong (phantom sources, missing entries).
-        // Wolverine delete-repair relies on the invariant at graph.rs:96-98 that
-        // reverse_adj[v] == { u | v ∈ adjacency[u] }; a false in-neighbor corrupts repair.
-        {
-            let adjacency = graph.adjacency();
-            let rev = &lifecycle.reverse_adj;
-            // Rebuild expected reverse_adj from the forward graph in O(N*R).
-            let mut expected: Vec<Vec<u32>> = vec![Vec::new(); num_vectors];
-            for (u, neighbors) in adjacency.iter().enumerate() {
-                for &v in neighbors {
-                    expected[v as usize].push(u as u32);
-                }
-            }
-            // Sort both sides before comparing (persisted lists may not be sorted).
-            for e in expected.iter_mut() {
-                e.sort_unstable();
-            }
-            for (v, (exp, got)) in expected.iter().zip(rev.iter()).enumerate() {
-                let mut got_sorted = got.clone();
-                got_sorted.sort_unstable();
-                if *exp != got_sorted {
-                    return Err(VamanaError::invalid_format(format!(
-                        "lifecycle.bin reverse_adj[{v}] is not the inverse of graph.bin \
-                         forward adjacency: expected {exp:?}, got {got_sorted:?}"
-                    )));
-                }
-            }
-        }
+        // Structural validity (node count, bidirectional reverse_adj, tombstone count) —
+        // see `validate_v2_structural` for why a checksum match alone isn't enough.
+        let tombstone_count = validate_v2_structural(&graph, &lifecycle, num_vectors)?;
 
         graph.restore_reverse_adj(lifecycle.reverse_adj);
-
-        let tombstone_count = lifecycle
-            .tombstones
-            .iter()
-            .map(|w| w.count_ones() as usize)
-            .sum();
-
-        if tombstone_count > num_vectors {
-            return Err(VamanaError::invalid_format(format!(
-                "lifecycle.bin tombstone_count {tombstone_count} exceeds num_vectors {num_vectors}"
-            )));
-        }
 
         // Codes segment: mmap `codes.bin` when the commit record carries its
         // checksum (extended format); otherwise retrain from the corpus — the
@@ -2750,6 +2733,198 @@ struct ParsedLifecycle {
     ops_since_consolidation: usize,
 }
 
+/// A checksum-valid incumbent can still be structurally corrupt (see
+/// [`validate_v2_structural`]) — one `load_or_build` would discard and rebuild on its own
+/// next load. The sequence guard must reach the same verdict, or it permanently blocks the
+/// one write (a repair checkpoint from a sequenced rebuild) that would fix the corruption:
+/// a corrupt incumbent at sequence N would reject every candidate below N forever, even
+/// though nothing before N is actually recoverable data. Only a structurally valid incumbent
+/// gets the regression guard; a structurally invalid one is treated as no incumbent at all.
+#[cfg(feature = "mmap")]
+fn reject_checkpoint_sequence_regression(path: &Path, candidate: Option<u64>) -> Result<()> {
+    let metadata = match fs::read(path.join("metadata.bin")) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.len() < V2_COMMIT_MAGIC.len()
+        || &metadata[..V2_COMMIT_MAGIC.len()] != V2_COMMIT_MAGIC
+    {
+        return Ok(());
+    }
+    let Ok(commit) = parse_v2_commit(&metadata) else {
+        return Ok(());
+    };
+    let segments = [
+        ("vectors.bin", commit.vectors_hash),
+        ("graph.bin", commit.graph_hash),
+        ("lifecycle.bin", commit.lifecycle_hash),
+    ];
+    let mut lifecycle_data: Option<Vec<u8>> = None;
+    let mut vectors_len: Option<usize> = None;
+    for (name, expected) in segments {
+        let data = match fs::read(path.join(name)) {
+            Ok(data) => data,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        if blake3::hash(&data).as_bytes() != &expected {
+            return Ok(());
+        }
+        if name == "lifecycle.bin" {
+            lifecycle_data = Some(data);
+        } else if name == "vectors.bin" {
+            vectors_len = Some(data.len());
+        }
+    }
+    let mut codes_data: Option<Vec<u8>> = None;
+    if let Some(expected) = commit.codes_hash {
+        let data = match fs::read(path.join("codes.bin")) {
+            Ok(data) => data,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        if blake3::hash(&data).as_bytes() != &expected {
+            return Ok(());
+        }
+        codes_data = Some(data);
+    }
+    let Some(incumbent) = commit.last_applied_seq else {
+        return Ok(());
+    };
+
+    let lifecycle_data = lifecycle_data.expect("lifecycle.bin hashed above");
+    let vectors_len = vectors_len.expect("vectors.bin hashed above");
+    let max_degree = commit.index_meta.max_degree;
+    let num_vectors = commit.index_meta.num_vectors;
+    let dimensions = commit.index_meta.dimensions;
+    // Every check `load_v2_fast` applies to a v2 checkpoint, replicated here so guard-valid
+    // implies loader-loadable with no residual segment:
+    //   metadata.bin  -> parse_v2_commit (done above) + VamanaConfig::validate on index_meta
+    //   graph.bin     -> read_graph (checked degree/neighbor bounds, medoid, num_nodes)
+    //   vectors.bin   -> checked num_vectors * dimensions shape, exact byte-length match
+    //   lifecycle.bin -> parse_lifecycle (checked tombstone/free-slot/reverse-adj bounds)
+    //   cross-segment -> validate_v2_structural (bidirectional reverse_adj, tombstone count)
+    //   codes.bin     -> parse_codes_bin (magic, checked shape, non-finite codec params)
+    let structurally_valid = (|| -> Result<()> {
+        let config = VamanaConfig {
+            dimensions,
+            max_degree,
+            search_list_size: commit.index_meta.search_list_size,
+            alpha: commit.index_meta.alpha,
+        };
+        config.validate()?;
+
+        let graph = read_graph(&path.join("graph.bin"), max_degree, num_vectors)?;
+
+        let expected_len_f32 = num_vectors
+            .checked_mul(dimensions)
+            .ok_or_else(|| VamanaError::invalid_format("v2 metadata overflow".into()))?;
+        let expected_vectors_bytes = expected_len_f32
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| {
+                VamanaError::invalid_format("vectors.bin byte length overflow".into())
+            })?;
+        if vectors_len != expected_vectors_bytes {
+            return Err(VamanaError::invalid_format(format!(
+                "vectors.bin byte length {vectors_len} != expected {expected_vectors_bytes}"
+            )));
+        }
+
+        let lifecycle = parse_lifecycle(&lifecycle_data, num_vectors, max_degree)?;
+        validate_v2_structural(&graph, &lifecycle, num_vectors)?;
+        // A checksum-valid codes.bin can still fail the same structural checks
+        // `load_v2_fast` applies (bad magic, shape mismatch, non-finite codec
+        // params). The guard must agree with the loader on what counts as a
+        // usable incumbent, or a malformed codes segment blocks every future
+        // repair checkpoint below its sequence forever.
+        if let Some(codes_data) = &codes_data {
+            parse_codes_bin(codes_data, dimensions, num_vectors)?;
+        }
+        Ok(())
+    })();
+    match structurally_valid {
+        Ok(()) => {}
+        Err(VamanaError::InvalidFormat { .. }) => return Ok(()),
+        Err(error) => return Err(error),
+    }
+
+    if candidate.is_none_or(|sequence| sequence < incumbent) {
+        return Err(VamanaError::CheckpointSequenceRegression {
+            candidate,
+            incumbent,
+        });
+    }
+    Ok(())
+}
+
+/// Structural validity of a v2 commit's graph + lifecycle state, on top of the blake3
+/// checksum match the caller already verified. A checksum only proves the bytes on disk
+/// match what `save_atomic` last wrote — it says nothing about whether a writer bug left
+/// `reverse_adj` out of sync with the forward graph, or the node/tombstone counts
+/// inconsistent with the commit record. Shared by `load_v2_fast` (which restores lifecycle
+/// state from a checksum-valid segment) and `reject_checkpoint_sequence_regression` (which
+/// must not let a checksum-valid-but-structurally-corrupt incumbent block a repair
+/// checkpoint at a lower sequence) so the two agree on what counts as a valid incumbent.
+#[cfg(feature = "mmap")]
+fn validate_v2_structural(
+    graph: &VamanaGraph,
+    lifecycle: &ParsedLifecycle,
+    num_vectors: usize,
+) -> Result<usize> {
+    if graph.node_count() != num_vectors {
+        return Err(VamanaError::invalid_format(format!(
+            "graph node count {} != commit num_vectors {}",
+            graph.node_count(),
+            num_vectors
+        )));
+    }
+
+    // The persisted reverse_adj must be the exact inverse of the loaded forward graph. A
+    // checksum-valid but writer-bugged lifecycle segment can pass parse_lifecycle's
+    // per-list shape checks (in-range, no dup, no self-ref) while still being semantically
+    // wrong (phantom sources, missing entries). Wolverine delete-repair relies on the
+    // invariant at graph.rs:96-98 that reverse_adj[v] == { u | v ∈ adjacency[u] }; a false
+    // in-neighbor corrupts repair.
+    let adjacency = graph.adjacency();
+    let mut expected: Vec<Vec<u32>> = vec![Vec::new(); num_vectors];
+    for (u, neighbors) in adjacency.iter().enumerate() {
+        for &v in neighbors {
+            expected[v as usize].push(u as u32);
+        }
+    }
+    for e in expected.iter_mut() {
+        e.sort_unstable();
+    }
+    for (v, (exp, got)) in expected
+        .iter()
+        .zip(lifecycle.reverse_adj.iter())
+        .enumerate()
+    {
+        let mut got_sorted = got.clone();
+        got_sorted.sort_unstable();
+        if *exp != got_sorted {
+            return Err(VamanaError::invalid_format(format!(
+                "lifecycle.bin reverse_adj[{v}] is not the inverse of graph.bin \
+                 forward adjacency: expected {exp:?}, got {got_sorted:?}"
+            )));
+        }
+    }
+
+    let tombstone_count: usize = lifecycle
+        .tombstones
+        .iter()
+        .map(|w| w.count_ones() as usize)
+        .sum();
+    if tombstone_count > num_vectors {
+        return Err(VamanaError::invalid_format(format!(
+            "lifecycle.bin tombstone_count {tombstone_count} exceeds num_vectors {num_vectors}"
+        )));
+    }
+
+    Ok(tombstone_count)
+}
+
 /// Write the KHVVAMG2 commit record including embedded v1 metadata fields.
 #[allow(clippy::too_many_arguments)]
 #[cfg(feature = "mmap")]
@@ -3134,6 +3309,23 @@ fn parse_lifecycle(data: &[u8], num_vectors: usize, _max_degree: usize) -> Resul
         )));
     }
 
+    // Every declared node contributes at least its 4-byte degree field. Reject a
+    // rev_num_nodes that cannot possibly fit the remaining bytes before requesting an
+    // allocation sized to it — same pattern as parse_graph's num_nodes preflight, needed
+    // here because a re-signed lifecycle.bin can pass the rev_num_nodes == num_vectors
+    // check above while the file itself is truncated well short of that many nodes.
+    let min_remaining_bytes = rev_num_nodes.checked_mul(4).ok_or_else(|| {
+        VamanaError::invalid_format(
+            "lifecycle.bin rev_num_nodes overflows minimum size check".into(),
+        )
+    })?;
+    if data.len() - offset < min_remaining_bytes {
+        return Err(VamanaError::invalid_format(format!(
+            "lifecycle.bin too short for {rev_num_nodes} declared reverse-adjacency nodes: {} bytes remaining, need at least {min_remaining_bytes}",
+            data.len() - offset
+        )));
+    }
+
     let mut reverse_adj: Vec<Vec<u32>> = Vec::with_capacity(rev_num_nodes);
     for node in 0..rev_num_nodes {
         if offset + 4 > data.len() {
@@ -3366,6 +3558,23 @@ fn parse_graph(data: &[u8], max_degree: usize, num_vectors: usize) -> Result<Vam
     }
 
     let mut offset = 16usize;
+
+    // Every declared node contributes at least its 4-byte degree field. Reject a
+    // num_nodes that cannot possibly fit the remaining bytes before requesting an
+    // allocation sized to it — otherwise a corrupt or forged header (e.g. num_nodes
+    // near u32::MAX paired with a tiny segment) drives `Vec::with_capacity` to try
+    // reserving tens of gigabytes and aborts the process instead of returning
+    // `InvalidFormat`.
+    let min_remaining_bytes = num_nodes.checked_mul(4).ok_or_else(|| {
+        VamanaError::invalid_format("graph.bin num_nodes overflows minimum size check".into())
+    })?;
+    if data.len() - offset < min_remaining_bytes {
+        return Err(VamanaError::invalid_format(format!(
+            "graph.bin too short for {num_nodes} declared nodes: {} bytes remaining, need at least {min_remaining_bytes}",
+            data.len() - offset
+        )));
+    }
+
     let mut adjacency: Vec<Vec<u32>> = Vec::with_capacity(num_nodes);
 
     for _node in 0..num_nodes {
@@ -5207,6 +5416,482 @@ mod tests {
             via_lob.search(&query, 5).unwrap(),
             "raw load and load_or_build fast path must produce identical results"
         );
+    }
+
+    #[cfg(feature = "mmap")]
+    #[test]
+    fn overlapping_checkpoint_writers_linearize_sequence_validation() {
+        let vectors = rand_unit_vectors(30, 8, 0x1138_0200);
+        let stale_vectors = rand_unit_vectors(20, 8, 0x1138_0100);
+        let config = VamanaConfig::with_dimensions(8)
+            .with_max_degree(8)
+            .with_search_list_size(16);
+        let mut newer = VamanaIndex::build(&vectors, config.clone()).unwrap();
+        let mut stale = VamanaIndex::build(&stale_vectors, config).unwrap();
+        newer.set_last_applied_seq(Some(200));
+        stale.set_last_applied_seq(Some(100));
+
+        let dir = tempfile::tempdir().unwrap();
+        let newer_path = dir.path().to_path_buf();
+        let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let newer_handle = std::thread::spawn(move || {
+            newer.save_atomic_with_lock_hook(&newer_path, |lock| {
+                lock.lock()?;
+                locked_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+        });
+        locked_rx.recv().unwrap();
+
+        // `newer` now holds the OS-level lock on `.checkpoint.lock` and cannot release it
+        // until `release_tx.send(())` below unblocks its hook. `stale`'s hook probes with its
+        // own `try_lock()` call on that same file first: `WouldBlock` is an outcome the OS
+        // reports if and only if an incompatible lock is held at that exact instant, so
+        // observing it here is proof of genuine contention, never a guess based on elapsed
+        // time. The probe result is sent over `contended_rx` before the hook falls back to a
+        // blocking `lock()`, so the channel resolves on every probe outcome — contention,
+        // probe failure, or (unreachable in this scenario) an uncontended immediate lock —
+        // and the receiver never hangs waiting on a signal that a failed probe would
+        // otherwise never send. There is no interleaving in which `contended_rx` reports
+        // contention without genuine overlap having occurred, and no interleaving in which
+        // `newer` can race ahead and release the lock first, since it is parked on
+        // `release_rx` until this thread proceeds.
+        enum ProbeOutcome {
+            Contended,
+            Uncontended,
+            ProbeFailed(String),
+        }
+        let stale_path = dir.path().to_path_buf();
+        let (contended_tx, contended_rx) = std::sync::mpsc::sync_channel(0);
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(0);
+        let stale_handle = std::thread::spawn(move || {
+            let result =
+                stale.save_atomic_with_lock_hook(&stale_path, |lock| match lock.try_lock() {
+                    Ok(()) => {
+                        contended_tx.send(ProbeOutcome::Uncontended).unwrap();
+                        Ok(())
+                    }
+                    Err(std::fs::TryLockError::WouldBlock) => {
+                        contended_tx.send(ProbeOutcome::Contended).unwrap();
+                        lock.lock()?;
+                        Ok(())
+                    }
+                    Err(std::fs::TryLockError::Error(err)) => {
+                        contended_tx
+                            .send(ProbeOutcome::ProbeFailed(err.to_string()))
+                            .unwrap();
+                        Err(err.into())
+                    }
+                });
+            result_tx.send(result).unwrap();
+        });
+        // The probe hook always signals before it can block, so this rendezvous cannot
+        // hang on a live probe outcome; the timeout only guards against the hook never
+        // running at all (e.g. a panic before the `try_lock` call).
+        match contended_rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("contention probe never signaled within 60s")
+        {
+            ProbeOutcome::Contended => {}
+            ProbeOutcome::Uncontended => {
+                panic!("lock probe observed no contention; newer writer should have held the lock")
+            }
+            ProbeOutcome::ProbeFailed(err) => panic!("lock probe failed: {err}"),
+        }
+
+        release_tx.send(()).unwrap();
+        newer_handle.join().unwrap().unwrap();
+        let stale_result = result_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        assert!(matches!(
+            stale_result,
+            Err(VamanaError::CheckpointSequenceRegression {
+                candidate: Some(100),
+                incumbent: 200,
+            })
+        ));
+        stale_handle.join().unwrap();
+
+        let persisted = VamanaIndex::load(dir.path()).unwrap();
+        assert_eq!(persisted.last_applied_seq(), Some(200));
+        assert_eq!(persisted.vectors().unwrap(), vectors);
+    }
+
+    #[cfg(feature = "mmap")]
+    #[test]
+    fn checkpoint_publication_repairs_structurally_corrupt_incumbent() {
+        // A checksum-valid incumbent can still be structurally corrupt: a writer bug can
+        // leave lifecycle.bin's reverse_adj out of sync with graph.bin's forward adjacency
+        // while every per-segment blake3 checksum still matches what save_atomic wrote. The
+        // sequence guard must not treat such an incumbent as a legitimate barrier — doing so
+        // would reject every future repair checkpoint below its sequence forever, leaving the
+        // corruption permanent.
+        let vectors = rand_unit_vectors(20, 4, 0x2200_0100);
+        let cfg = VamanaConfig::with_dimensions(4)
+            .with_max_degree(4)
+            .with_search_list_size(8);
+        let mut incumbent = VamanaIndex::build(&vectors, cfg.clone()).unwrap();
+        incumbent.set_last_applied_seq(Some(500));
+
+        let dir = tempfile::tempdir().unwrap();
+        incumbent.save_atomic(dir.path()).unwrap();
+
+        // Corrupt the on-disk incumbent: give some node a phantom in-neighbor that
+        // parse_lifecycle's per-list shape checks (in-range, no dup, no self-ref) accept,
+        // but that is not actually a predecessor in graph.bin's forward adjacency. Then
+        // re-sign metadata.bin so the checksum still matches the corrupted bytes.
+        let metadata_bytes = fs::read(dir.path().join("metadata.bin")).unwrap();
+        let commit = parse_v2_commit(&metadata_bytes).unwrap();
+        let lifecycle_bytes = fs::read(dir.path().join("lifecycle.bin")).unwrap();
+        let mut lifecycle = parse_lifecycle(
+            &lifecycle_bytes,
+            commit.index_meta.num_vectors,
+            commit.index_meta.max_degree,
+        )
+        .unwrap();
+        let num_vectors = commit.index_meta.num_vectors;
+        // Reverse in-degree is bounded by num_vectors-1, not max_degree, so a fixed
+        // destination (e.g. node 0) can in principle already list every other node as a
+        // predecessor, leaving no room for a phantom. Search all destinations for one with
+        // a free reverse-adjacency slot, and require the chosen source to be provably
+        // absent from BOTH the persisted reverse list and the true forward predecessors —
+        // otherwise the corruption would be indistinguishable from legitimate data. A
+        // future graph-shape change that breaks this precondition fails loudly here, at
+        // setup, instead of panicking deep inside the corruption path.
+        let (dest, phantom) = (0..num_vectors)
+            .find_map(|dest| {
+                let reverse = &lifecycle.reverse_adj[dest];
+                if reverse.len() >= num_vectors.saturating_sub(1) {
+                    return None;
+                }
+                (0..num_vectors)
+                    .filter(|&candidate| candidate != dest)
+                    .map(|candidate| candidate as u32)
+                    .find(|candidate| {
+                        !reverse.contains(candidate)
+                            && !incumbent.graph.adjacency()[*candidate as usize]
+                                .contains(&(dest as u32))
+                    })
+                    .map(|candidate| (dest, candidate))
+            })
+            .expect(
+                "some destination node must have both a free reverse-adjacency slot and a \
+                 source absent from its reverse list and forward predecessors",
+            );
+        lifecycle.reverse_adj[dest].push(phantom);
+
+        let corrupt_lifecycle_bytes = encode_lifecycle(
+            &lifecycle.tombstones,
+            &lifecycle.free_slots,
+            &lifecycle.reverse_adj,
+            lifecycle.ops_since_consolidation,
+        );
+        fs::write(dir.path().join("lifecycle.bin"), &corrupt_lifecycle_bytes).unwrap();
+        let corrupt_lifecycle_hash = *blake3::hash(&corrupt_lifecycle_bytes).as_bytes();
+
+        write_v2_commit_full(
+            &dir.path().join("metadata.bin"),
+            &commit.vectors_hash,
+            &commit.graph_hash,
+            &corrupt_lifecycle_hash,
+            &V2CorpusFingerprint {
+                vector_count: commit.fingerprint.vector_count,
+                dimensions: commit.fingerprint.dimensions,
+                content_hash: commit.fingerprint.content_hash,
+            },
+            commit.index_meta.num_vectors,
+            commit.index_meta.dimensions,
+            commit.index_meta.max_degree,
+            commit.index_meta.search_list_size,
+            commit.index_meta.alpha,
+            commit.last_applied_seq,
+            commit.codes_hash.as_ref(),
+        )
+        .unwrap();
+
+        // The on-disk incumbent now passes every checksum, but load_v2_fast's bidirectional
+        // reverse_adj check must still reject it as structurally invalid.
+        assert!(matches!(
+            VamanaIndex::load(dir.path()),
+            Err(VamanaError::InvalidFormat { .. })
+        ));
+
+        // A repair checkpoint at a lower sequence than the corrupt incumbent (500) must
+        // still be allowed to publish — the corrupt incumbent is not a legitimate barrier.
+        let repair_vectors = rand_unit_vectors(15, 4, 0x2200_0200);
+        let mut repair = VamanaIndex::build(&repair_vectors, cfg).unwrap();
+        repair.set_last_applied_seq(Some(100));
+        repair
+            .save_atomic(dir.path())
+            .expect("repair checkpoint below a structurally corrupt incumbent must publish");
+
+        let persisted = VamanaIndex::load(dir.path()).unwrap();
+        assert_eq!(persisted.last_applied_seq(), Some(100));
+        assert_eq!(persisted.vectors().unwrap(), repair_vectors);
+    }
+
+    #[cfg(feature = "mmap")]
+    #[test]
+    fn checkpoint_publication_repairs_incumbent_with_malformed_codes_segment() {
+        // A checksum-valid but structurally malformed codes.bin (bad magic) is rejected by
+        // load_v2_fast just like a malformed graph or lifecycle segment, but the sequence
+        // guard used to check codes.bin by hash alone — so this class of corruption slipped
+        // past the guard and blocked every repair checkpoint below its sequence forever.
+        let vectors = rand_unit_vectors(20, 4, 0x2200_0300);
+        let cfg = VamanaConfig::with_dimensions(4)
+            .with_max_degree(4)
+            .with_search_list_size(8);
+        let mut incumbent = VamanaIndex::build(&vectors, cfg.clone()).unwrap();
+        incumbent.set_last_applied_seq(Some(500));
+
+        let dir = tempfile::tempdir().unwrap();
+        incumbent.save_atomic(dir.path()).unwrap();
+
+        let metadata_bytes = fs::read(dir.path().join("metadata.bin")).unwrap();
+        let commit = parse_v2_commit(&metadata_bytes).unwrap();
+
+        // Corrupt codes.bin's magic while keeping its length unchanged, then re-sign
+        // metadata.bin so the checksum still matches the corrupted bytes.
+        let mut codes_bytes = fs::read(dir.path().join("codes.bin")).unwrap();
+        codes_bytes[..8].copy_from_slice(b"CORRUPT!");
+        fs::write(dir.path().join("codes.bin"), &codes_bytes).unwrap();
+        let corrupt_codes_hash = *blake3::hash(&codes_bytes).as_bytes();
+
+        write_v2_commit_full(
+            &dir.path().join("metadata.bin"),
+            &commit.vectors_hash,
+            &commit.graph_hash,
+            &commit.lifecycle_hash,
+            &V2CorpusFingerprint {
+                vector_count: commit.fingerprint.vector_count,
+                dimensions: commit.fingerprint.dimensions,
+                content_hash: commit.fingerprint.content_hash,
+            },
+            commit.index_meta.num_vectors,
+            commit.index_meta.dimensions,
+            commit.index_meta.max_degree,
+            commit.index_meta.search_list_size,
+            commit.index_meta.alpha,
+            commit.last_applied_seq,
+            Some(&corrupt_codes_hash),
+        )
+        .unwrap();
+
+        // The on-disk incumbent now passes every checksum, but load_v2_fast's codes.bin
+        // header validation must still reject it as structurally invalid.
+        assert!(matches!(
+            VamanaIndex::load(dir.path()),
+            Err(VamanaError::InvalidFormat { .. })
+        ));
+
+        // A repair checkpoint at a lower sequence than the corrupt incumbent (500) must
+        // still be allowed to publish — the corrupt incumbent is not a legitimate barrier.
+        let repair_vectors = rand_unit_vectors(15, 4, 0x2200_0400);
+        let mut repair = VamanaIndex::build(&repair_vectors, cfg).unwrap();
+        repair.set_last_applied_seq(Some(100));
+        repair.save_atomic(dir.path()).expect(
+            "repair checkpoint below an incumbent with a malformed codes segment must publish",
+        );
+
+        let persisted = VamanaIndex::load(dir.path()).unwrap();
+        assert_eq!(persisted.last_applied_seq(), Some(100));
+        assert_eq!(persisted.vectors().unwrap(), repair_vectors);
+    }
+
+    #[cfg(feature = "mmap")]
+    #[test]
+    fn checkpoint_guard_rejects_absurd_num_vectors_without_huge_allocation() {
+        // A re-signed incumbent can declare an attacker-controlled num_vectors that
+        // doesn't match the actual size of its segments. Before parse_graph preflighted
+        // the declared node count against the segment's actual byte length, a header
+        // declaring num_nodes near u32::MAX paired with a tiny graph segment drove
+        // `Vec::with_capacity(num_nodes)` to reserve ~103GB and abort the process instead
+        // of returning InvalidFormat. The guard must reject this cheaply and quickly.
+        let vectors = rand_unit_vectors(5, 4, 0x2200_0500);
+        let cfg = VamanaConfig::with_dimensions(4)
+            .with_max_degree(4)
+            .with_search_list_size(8);
+        let mut incumbent = VamanaIndex::build(&vectors, cfg.clone()).unwrap();
+        incumbent.set_last_applied_seq(Some(500));
+
+        let dir = tempfile::tempdir().unwrap();
+        incumbent.save_atomic(dir.path()).unwrap();
+
+        let metadata_bytes = fs::read(dir.path().join("metadata.bin")).unwrap();
+        let commit = parse_v2_commit(&metadata_bytes).unwrap();
+
+        // Forge the shortest possible malformed graph.bin: a valid 16-byte header
+        // declaring an absurd node count, with no per-node data at all.
+        let absurd_num_vectors = u32::MAX as usize;
+        let mut malicious_graph = Vec::with_capacity(16);
+        malicious_graph.extend_from_slice(GRAPH_MAGIC);
+        malicious_graph.extend_from_slice(&(absurd_num_vectors as u32).to_le_bytes());
+        malicious_graph.extend_from_slice(&0u32.to_le_bytes()); // medoid
+        fs::write(dir.path().join("graph.bin"), &malicious_graph).unwrap();
+        let malicious_graph_hash = *blake3::hash(&malicious_graph).as_bytes();
+
+        write_v2_commit_full(
+            &dir.path().join("metadata.bin"),
+            &commit.vectors_hash,
+            &malicious_graph_hash,
+            &commit.lifecycle_hash,
+            &V2CorpusFingerprint {
+                vector_count: commit.fingerprint.vector_count,
+                dimensions: commit.fingerprint.dimensions,
+                content_hash: commit.fingerprint.content_hash,
+            },
+            absurd_num_vectors,
+            commit.index_meta.dimensions,
+            commit.index_meta.max_degree,
+            commit.index_meta.search_list_size,
+            commit.index_meta.alpha,
+            commit.last_applied_seq,
+            commit.codes_hash.as_ref(),
+        )
+        .unwrap();
+
+        // A repair checkpoint below the forged incumbent's sequence must publish quickly:
+        // the guard must reject the forged incumbent as structurally invalid (too short
+        // for its declared node count) rather than attempt a multi-gigabyte allocation.
+        let repair_vectors = rand_unit_vectors(3, 4, 0x2200_0600);
+        let mut repair = VamanaIndex::build(&repair_vectors, cfg).unwrap();
+        repair.set_last_applied_seq(Some(100));
+        let started = std::time::Instant::now();
+        repair
+            .save_atomic(dir.path())
+            .expect("repair checkpoint below a structurally invalid incumbent must publish");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "guard must reject the forged incumbent cheaply, not attempt a huge allocation"
+        );
+
+        let persisted = VamanaIndex::load(dir.path()).unwrap();
+        assert_eq!(persisted.last_applied_seq(), Some(100));
+        assert_eq!(persisted.vectors().unwrap(), repair_vectors);
+    }
+
+    #[test]
+    fn parse_lifecycle_rejects_short_body_for_absurd_rev_num_nodes_without_huge_allocation() {
+        // A re-signed lifecycle.bin can declare a rev_num_nodes that equals num_vectors
+        // (passing the equality check) while the segment itself carries no per-node data.
+        // Before the preflight below, `Vec::with_capacity(rev_num_nodes)` on a
+        // `Vec<Vec<u32>>` (24 bytes per element) ran immediately after the equality check,
+        // driving a multi-gigabyte allocation instead of returning InvalidFormat.
+        let absurd_num_vectors = u32::MAX as usize;
+        let mut body = b"KHVVLIF1".to_vec();
+        body.extend_from_slice(&0u64.to_le_bytes()); // ts_words
+        body.extend_from_slice(&0u64.to_le_bytes()); // fs_count
+        body.extend_from_slice(&0u64.to_le_bytes()); // ops_since_consolidation
+        body.extend_from_slice(&(absurd_num_vectors as u64).to_le_bytes()); // rev_num_nodes
+
+        let started = std::time::Instant::now();
+        let result = parse_lifecycle(&body, absurd_num_vectors, 4);
+        assert!(
+            matches!(result, Err(VamanaError::InvalidFormat { .. })),
+            "parse_lifecycle must reject a short body for an absurd rev_num_nodes"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "guard must reject cheaply, not attempt a huge allocation"
+        );
+    }
+
+    #[cfg(feature = "mmap")]
+    #[test]
+    fn parse_codes_bin_rejects_overflowing_shape_without_allocation() {
+        // A re-signed metadata.bin can pair a small, checksum-matching codes.bin with an
+        // attacker-controlled shape whose header-length arithmetic overflows usize. Before
+        // the checked arithmetic below, `dims * 4 + count * dims` could wrap past the
+        // segment's actual length and let a tiny file pass the length check, immediately
+        // followed by `Vec::with_capacity(dims)` requesting an enormous allocation.
+        let dims = 1usize << 61;
+        let count = 4usize;
+        let mut data = Vec::with_capacity(CODES_HEADER_LEN);
+        data.extend_from_slice(CODES_MAGIC);
+        data.extend_from_slice(&(dims as u64).to_le_bytes());
+        data.extend_from_slice(&(count as u64).to_le_bytes());
+        data.extend_from_slice(&1.0f32.to_le_bytes()); // gs
+        data.extend_from_slice(&0.0f32.to_le_bytes()); // anisotropy_ratio
+        assert_eq!(data.len(), CODES_HEADER_LEN);
+
+        let result = parse_codes_bin(&data, dims, count);
+        assert!(
+            matches!(result, Err(VamanaError::InvalidFormat { .. })),
+            "parse_codes_bin must reject an overflowing shape as InvalidFormat"
+        );
+    }
+
+    #[cfg(feature = "mmap")]
+    #[test]
+    fn checkpoint_publication_repairs_incumbent_with_wrong_length_vectors_segment() {
+        // A checksum-valid vectors.bin can still be the wrong length for its declared
+        // num_vectors * dimensions shape: the guard used to hash vectors.bin without
+        // validating its shape, so a checksum-valid-but-wrong-length vectors segment was
+        // treated as a legitimate incumbent and could block every repair checkpoint below
+        // its sequence forever — the same failure mode this PR closes for graph/lifecycle.
+        let vectors = rand_unit_vectors(20, 4, 0x2200_0700);
+        let cfg = VamanaConfig::with_dimensions(4)
+            .with_max_degree(4)
+            .with_search_list_size(8);
+        let mut incumbent = VamanaIndex::build(&vectors, cfg.clone()).unwrap();
+        incumbent.set_last_applied_seq(Some(500));
+
+        let dir = tempfile::tempdir().unwrap();
+        incumbent.save_atomic(dir.path()).unwrap();
+
+        let metadata_bytes = fs::read(dir.path().join("metadata.bin")).unwrap();
+        let commit = parse_v2_commit(&metadata_bytes).unwrap();
+
+        // Truncate vectors.bin by one f32 and re-sign metadata.bin so the checksum still
+        // matches the shortened bytes.
+        let mut vectors_bytes = fs::read(dir.path().join("vectors.bin")).unwrap();
+        let new_len = vectors_bytes.len() - 4;
+        vectors_bytes.truncate(new_len);
+        fs::write(dir.path().join("vectors.bin"), &vectors_bytes).unwrap();
+        let corrupt_vectors_hash = *blake3::hash(&vectors_bytes).as_bytes();
+
+        write_v2_commit_full(
+            &dir.path().join("metadata.bin"),
+            &corrupt_vectors_hash,
+            &commit.graph_hash,
+            &commit.lifecycle_hash,
+            &V2CorpusFingerprint {
+                vector_count: commit.fingerprint.vector_count,
+                dimensions: commit.fingerprint.dimensions,
+                content_hash: commit.fingerprint.content_hash,
+            },
+            commit.index_meta.num_vectors,
+            commit.index_meta.dimensions,
+            commit.index_meta.max_degree,
+            commit.index_meta.search_list_size,
+            commit.index_meta.alpha,
+            commit.last_applied_seq,
+            commit.codes_hash.as_ref(),
+        )
+        .unwrap();
+
+        // The on-disk incumbent now passes every checksum, but load_v2_fast's vectors.bin
+        // byte-length check must still reject it as structurally invalid.
+        assert!(matches!(
+            VamanaIndex::load(dir.path()),
+            Err(VamanaError::InvalidFormat { .. })
+        ));
+
+        // A repair checkpoint at a lower sequence than the corrupt incumbent (500) must
+        // still be allowed to publish — the corrupt incumbent is not a legitimate barrier.
+        let repair_vectors = rand_unit_vectors(15, 4, 0x2200_0800);
+        let mut repair = VamanaIndex::build(&repair_vectors, cfg).unwrap();
+        repair.set_last_applied_seq(Some(100));
+        repair.save_atomic(dir.path()).expect(
+            "repair checkpoint below an incumbent with a wrong-length vectors segment must publish",
+        );
+
+        let persisted = VamanaIndex::load(dir.path()).unwrap();
+        assert_eq!(persisted.last_applied_seq(), Some(100));
+        assert_eq!(persisted.vectors().unwrap(), repair_vectors);
     }
 
     #[cfg(feature = "mmap")]

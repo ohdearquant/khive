@@ -315,6 +315,38 @@ fn v2_roundtrip_preserves_lifecycle_state() {
     }
 }
 
+#[cfg(feature = "mmap")]
+#[test]
+fn v2_stale_checkpoint_cannot_replace_newer_commit() {
+    let dim = 4usize;
+    let cfg = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(4)
+        .with_search_list_size(8);
+    let newer_vectors = rand_unit_vectors(16, dim, 0x1138_0200);
+    let stale_vectors = rand_unit_vectors(8, dim, 0x1138_0100);
+    let mut newer = VamanaIndex::build(&newer_vectors, cfg.clone()).unwrap();
+    let mut stale = VamanaIndex::build(&stale_vectors, cfg).unwrap();
+    newer.set_last_applied_seq(Some(200));
+    stale.set_last_applied_seq(Some(100));
+
+    let dir = tempfile::tempdir().unwrap();
+    newer.save_atomic(dir.path()).unwrap();
+
+    let stale_result = stale.save_atomic(dir.path());
+    assert!(matches!(
+        stale_result,
+        Err(VamanaError::CheckpointSequenceRegression {
+            candidate: Some(100),
+            incumbent: 200,
+        })
+    ));
+
+    let persisted = VamanaIndex::load(dir.path()).unwrap();
+    assert_eq!(persisted.last_applied_seq(), Some(200));
+    assert_eq!(persisted.num_vectors(), newer.num_vectors());
+    assert_eq!(persisted.vectors().unwrap(), newer.vectors().unwrap());
+}
+
 /// Crash consistency: corrupt metadata.bin after writing segments → load_or_build rebuilds.
 #[cfg(feature = "mmap")]
 #[test]
@@ -350,13 +382,14 @@ fn v2_crash_corrupted_metadata_falls_back_to_rebuild() {
 /// fast mmap parse: load_or_build rebuilds and rewrites the segment.
 #[cfg(feature = "mmap")]
 #[test]
-fn v2_corrupt_codes_segment_triggers_rebuild_in_load_or_build() {
+fn v2_sequenced_recovery_after_codes_corruption_succeeds() {
     let dim = 4usize;
     let vectors = rand_unit_vectors(20, dim, 0xC0_DE);
     let cfg = VamanaConfig::with_dimensions(dim)
         .with_max_degree(4)
         .with_search_list_size(8);
-    let idx = VamanaIndex::build(&vectors, cfg).unwrap();
+    let mut idx = VamanaIndex::build(&vectors, cfg).unwrap();
+    idx.set_last_applied_seq(Some(200));
 
     let dir = tempfile::tempdir().unwrap();
     idx.save_atomic(dir.path()).unwrap();
@@ -373,8 +406,11 @@ fn v2_corrupt_codes_segment_triggers_rebuild_in_load_or_build() {
     let fallback = VamanaConfig::with_dimensions(dim)
         .with_max_degree(4)
         .with_search_list_size(8);
-    let loaded = VamanaIndex::load_or_build(dir.path(), &vectors, fallback).unwrap();
+    let loaded =
+        VamanaIndex::load_or_build_with_sequence(dir.path(), &vectors, fallback, Some(100))
+            .unwrap();
     assert_eq!(loaded.num_vectors(), idx.num_vectors());
+    assert_eq!(loaded.last_applied_seq(), Some(100));
 
     // The rebuild path re-runs save_atomic, replacing the corrupted bytes. A
     // fast-path load would have left the corrupt file in place untouched.
@@ -427,13 +463,14 @@ fn v2_truncated_extended_trailer_is_invalid() {
 /// Fingerprint mismatch: modify corpus → load_or_build triggers rebuild.
 #[cfg(feature = "mmap")]
 #[test]
-fn v2_fingerprint_mismatch_triggers_rebuild() {
+fn v2_sequenced_fingerprint_mismatch_rebuild_succeeds() {
     let dim = 4usize;
     let vectors = rand_unit_vectors(15, dim, 0xA2_03);
     let cfg = VamanaConfig::with_dimensions(dim)
         .with_max_degree(4)
         .with_search_list_size(8);
-    let idx = VamanaIndex::build(&vectors, cfg).unwrap();
+    let mut idx = VamanaIndex::build(&vectors, cfg).unwrap();
+    idx.set_last_applied_seq(Some(200));
 
     let dir = tempfile::tempdir().unwrap();
     idx.save_atomic(dir.path()).unwrap();
@@ -446,8 +483,11 @@ fn v2_fingerprint_mismatch_triggers_rebuild() {
     let fallback = VamanaConfig::with_dimensions(dim)
         .with_max_degree(4)
         .with_search_list_size(8);
-    let rebuilt = VamanaIndex::load_or_build(dir.path(), &new_corpus, fallback).unwrap();
+    let rebuilt =
+        VamanaIndex::load_or_build_with_sequence(dir.path(), &new_corpus, fallback, Some(200))
+            .unwrap();
     assert_eq!(rebuilt.num_vectors(), new_corpus.len() / dim);
+    assert_eq!(rebuilt.last_applied_seq(), Some(200));
     let query = rand_unit_vectors(1, dim, 0xbcd);
     assert!(!rebuilt.search(&query, 3).unwrap().is_empty());
 }
