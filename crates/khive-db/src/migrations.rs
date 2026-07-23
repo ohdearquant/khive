@@ -531,14 +531,14 @@ fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
     Ok(applied_version)
 }
 
-/// Migration V13 (`concept_single_origin`) only installs enforcement triggers
-/// going forward; it cannot retroactively decide which of two pre-existing
-/// live origins for the same concept is correct. Auto-picking one would
-/// silently discard a user's `introduced_by` edge, so a database that already
-/// violates the invariant must fail the migration with the offending concept
-/// ids named, rather than migrate into a state the new triggers cannot
-/// express.
-fn reject_preexisting_duplicate_concept_origins(conn: &Connection) -> Result<(), SqliteError> {
+/// Shared by the versioned migration preflight and the legacy lazy-DDL
+/// upgrade probe (`stores::graph::ensure_graph_schema`): both install the
+/// single-origin triggers going forward only, so both must independently
+/// refuse to enforce over a database that already violates the invariant
+/// rather than migrate into a state the new triggers cannot express.
+pub(crate) fn find_duplicate_concept_origins(
+    conn: &Connection,
+) -> Result<Vec<String>, rusqlite::Error> {
     let mut stmt = conn.prepare(
         "SELECT namespace, source_id, GROUP_CONCAT(DISTINCT target_id) AS origins \
          FROM graph_edges \
@@ -558,21 +558,30 @@ fn reject_preexisting_duplicate_concept_origins(conn: &Connection) -> Result<(),
                 "concept {source_id} in namespace {namespace} (origins: {origins})"
             ))
         })?
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect();
+    violations
+}
 
+/// Error text shared by both preflight call sites so operators see identical
+/// remediation guidance regardless of which path installed enforcement.
+pub(crate) fn duplicate_concept_origins_message(violations: &[String]) -> String {
+    format!(
+        "cannot enforce the single-origin invariant: {} already have more than one live \
+         introduced_by origin. Curate each listed concept down to a single live origin \
+         (soft-delete every extra introduced_by edge, keeping only the intended origin), \
+         then re-run migrations.",
+        violations.join(", ")
+    )
+}
+
+fn reject_preexisting_duplicate_concept_origins(conn: &Connection) -> Result<(), SqliteError> {
+    let violations = find_duplicate_concept_origins(conn)?;
     if violations.is_empty() {
         return Ok(());
     }
-
     Err(SqliteError::Migration {
         version: 13,
-        error: format!(
-            "cannot enforce the single-origin invariant: {} already have more than one live \
-             introduced_by origin. Curate each listed concept down to a single live origin \
-             (soft-delete every extra introduced_by edge, keeping only the intended origin), \
-             then re-run migrations.",
-            violations.join(", ")
-        ),
+        error: duplicate_concept_origins_message(&violations),
     })
 }
 

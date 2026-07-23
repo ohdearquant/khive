@@ -2370,9 +2370,54 @@ const GRAPH_DDL: &str = include_str!("../../sql/graph-ddl.sql");
 /// `entities` table must exist with its full column set before this DDL
 /// runs — not just whenever a caller happens to have also called
 /// `entities()`/`entities_for_namespace()` on the same backend.
+///
+/// A database that already has `graph_edges` but not yet the single-origin
+/// insert trigger is a legacy database reaching enforcement for the first
+/// time here rather than through migration 013 — the same moment the
+/// versioned migration preflights pre-existing duplicates, so this path
+/// must run the identical check before the trigger DDL below installs
+/// enforcement it cannot retroactively reconcile.
 pub(crate) fn ensure_graph_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
     super::entity::ensure_entities_schema(conn)?;
+    if is_legacy_graph_edges_upgrade(conn)? {
+        reject_legacy_duplicate_concept_origins(conn)?;
+    }
     conn.execute_batch(GRAPH_DDL)
+}
+
+fn sqlite_master_has(
+    conn: &rusqlite::Connection,
+    kind: &str,
+    name: &str,
+) -> Result<bool, rusqlite::Error> {
+    conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = ?1 AND name = ?2)",
+        rusqlite::params![kind, name],
+        |row| row.get(0),
+    )
+}
+
+fn is_legacy_graph_edges_upgrade(conn: &rusqlite::Connection) -> Result<bool, rusqlite::Error> {
+    if !sqlite_master_has(conn, "table", "graph_edges")? {
+        return Ok(false);
+    }
+    Ok(!sqlite_master_has(
+        conn,
+        "trigger",
+        "trg_graph_edges_concept_single_origin_insert",
+    )?)
+}
+
+fn reject_legacy_duplicate_concept_origins(
+    conn: &rusqlite::Connection,
+) -> Result<(), rusqlite::Error> {
+    let violations = crate::migrations::find_duplicate_concept_origins(conn)?;
+    if violations.is_empty() {
+        return Ok(());
+    }
+    Err(rusqlite::Error::ToSqlConversionFailure(
+        crate::migrations::duplicate_concept_origins_message(&violations).into(),
+    ))
 }
 
 #[cfg(test)]
