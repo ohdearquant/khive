@@ -280,12 +280,12 @@ pub struct ExecArgs {
     pub atomic_max_ops: Option<usize>,
 
     /// Exit non-zero when any op in the batch fails (or, for `--ops-file`,
-    /// when any applied op fails). Without this flag the process exits 0
-    /// whenever the request itself was dispatched, even if every op inside
-    /// it failed — the per-op `results` entries and the `summary`/`status`
-    /// fields in the printed output are the only signal (#1220). Not
-    /// meaningful with `--atomic`, which already fails the whole file on
-    /// any rejected op.
+    /// when any applied op fails). Without this flag a *partially* failed
+    /// batch still exits 0 — the per-op `results` entries and the
+    /// `summary`/`status` fields in the printed output are the signal
+    /// (#1220). A batch in which *every* op failed always exits non-zero,
+    /// with or without this flag (#1339). Not meaningful with `--atomic`,
+    /// which already fails the whole file on any rejected op.
     #[arg(long)]
     pub strict: bool,
 }
@@ -470,6 +470,11 @@ async fn apply_ops_file(
         "{}",
         serde_json::to_string_pretty(&summary).expect("serialize summary")
     );
+    if total > 0 && total_succeeded == 0 {
+        anyhow::bail!(
+            "every op failed: {total_failed} op(s) failed out of {total}, 0 succeeded (see printed summary above)"
+        );
+    }
     if strict && total_failed > 0 {
         anyhow::bail!(
             "--strict: {total_failed} op(s) failed out of {total} (see printed summary above)"
@@ -602,23 +607,33 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
     }
 }
 
-/// Returns `Err` describing the failed/aborted op counts when `strict` is set
-/// and the parsed response envelope's `summary` reports either as non-zero
-/// (#1220). `raw` must be the exact envelope string already printed to
-/// stdout — the caller prints first, unconditionally, then this decides the
-/// exit code; a caller piping the output still sees the full result either way.
+/// Decides the process exit code from the response envelope's `summary`.
+/// `raw` must be the exact envelope string already printed to stdout — the
+/// caller prints first, unconditionally, then this decides the exit code; a
+/// caller piping the output still sees the full result either way.
+///
+/// Two tiers (#1220, #1339):
+/// - Always: `Err` when the batch had ops and none succeeded. A fully-failed
+///   invocation has no success to report; scripted single-op callers (the
+///   dominant `exec` shape) check the process exit code, and exiting 0 there
+///   converts loud op-level rejections into silent drops.
+/// - `--strict` only: `Err` when any op failed or aborted (partial failure).
 fn enforce_strict_batch_result(raw: &str, strict: bool) -> Result<()> {
-    if !strict {
-        return Ok(());
-    }
     let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw) else {
         // Non-JSON output (e.g. --output-format table/auto): nothing to
-        // inspect here. `--strict` only applies to the default JSON shape.
+        // inspect here. Exit-code enforcement only applies to the default
+        // JSON shape.
         return Ok(());
     };
+    let succeeded = parsed["summary"]["succeeded"].as_u64().unwrap_or(0);
     let failed = parsed["summary"]["failed"].as_u64().unwrap_or(0);
     let aborted = parsed["summary"]["aborted"].as_u64().unwrap_or(0);
-    if failed > 0 || aborted > 0 {
+    if succeeded == 0 && (failed > 0 || aborted > 0) {
+        anyhow::bail!(
+            "every op failed: {failed} failed, {aborted} aborted, 0 succeeded (see printed output above)"
+        );
+    }
+    if strict && (failed > 0 || aborted > 0) {
         anyhow::bail!(
             "--strict: {failed} op(s) failed, {aborted} op(s) aborted (see printed output above)"
         );
@@ -2099,13 +2114,47 @@ default = true
     // ── #1220: --strict exit-code signal for partially-failed batches ─────────
 
     #[test]
-    fn enforce_strict_batch_result_ok_when_strict_off_regardless_of_failures() {
+    fn enforce_strict_batch_result_ok_when_strict_off_and_partially_failed() {
+        let raw = serde_json::json!({
+            "results": [],
+            "summary": {"total": 2, "succeeded": 1, "failed": 1, "aborted": 0},
+        })
+        .to_string();
+        assert!(enforce_strict_batch_result(&raw, false).is_ok());
+    }
+
+    // ── #1339: fully-failed batches exit non-zero even without --strict ──────
+
+    #[test]
+    fn enforce_strict_batch_result_errs_when_strict_off_and_every_op_failed() {
         let raw = serde_json::json!({
             "results": [],
             "summary": {"total": 1, "succeeded": 0, "failed": 1, "aborted": 0},
         })
         .to_string();
+        let err = enforce_strict_batch_result(&raw, false).unwrap_err();
+        assert!(format!("{err}").contains("every op failed"));
+    }
+
+    #[test]
+    fn enforce_strict_batch_result_errs_when_strict_off_and_chain_fully_aborted() {
+        let raw = serde_json::json!({
+            "results": [],
+            "summary": {"total": 3, "succeeded": 0, "failed": 1, "aborted": 2},
+        })
+        .to_string();
+        assert!(enforce_strict_batch_result(&raw, false).is_err());
+    }
+
+    #[test]
+    fn enforce_strict_batch_result_ok_on_empty_batch_summary() {
+        let raw = serde_json::json!({
+            "results": [],
+            "summary": {"total": 0, "succeeded": 0, "failed": 0, "aborted": 0},
+        })
+        .to_string();
         assert!(enforce_strict_batch_result(&raw, false).is_ok());
+        assert!(enforce_strict_batch_result(&raw, true).is_ok());
     }
 
     #[test]
@@ -2182,6 +2231,26 @@ default = true
             .await
             .expect_err("strict mode must surface the per-op failure as a process error");
         assert!(format!("{err}").contains("1 op(s) failed"));
+    }
+
+    #[tokio::test]
+    async fn apply_ops_file_errs_without_strict_when_every_op_fails() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        let server = isolated_server(&db_path);
+
+        let mut f = NamedTempFile::new().unwrap();
+        use std::io::Write as _;
+        f.write_all(
+            b"{\"tool\":\"search\",\"args\":{\"kind\":\"not_a_real_kind\",\"query\":\"x\"}}\n",
+        )
+        .unwrap();
+
+        let ops = parse_ops_file(&f.path().to_path_buf()).unwrap();
+        let err = apply_ops_file(&server, ops, None, false)
+            .await
+            .expect_err("a fully-failed ops-file must exit non-zero even without --strict");
+        assert!(format!("{err}").contains("every op failed"));
     }
 
     // ── ADR-099 B1 inertness (golden shape) ────────────────────────────────────
