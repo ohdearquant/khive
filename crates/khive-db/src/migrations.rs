@@ -494,6 +494,10 @@ fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
             continue;
         }
 
+        if migration.version == 13 {
+            reject_preexisting_duplicate_concept_origins(&tx)?;
+        }
+
         tx.execute_batch(migration.up)
             .map_err(|e| SqliteError::Migration {
                 version: migration.version,
@@ -525,6 +529,50 @@ fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
     }
 
     Ok(applied_version)
+}
+
+/// Migration V13 (`concept_single_origin`) only installs enforcement triggers
+/// going forward; it cannot retroactively decide which of two pre-existing
+/// live origins for the same concept is correct. Auto-picking one would
+/// silently discard a user's `introduced_by` edge, so a database that already
+/// violates the invariant must fail the migration with the offending concept
+/// ids named, rather than migrate into a state the new triggers cannot
+/// express.
+fn reject_preexisting_duplicate_concept_origins(conn: &Connection) -> Result<(), SqliteError> {
+    let mut stmt = conn.prepare(
+        "SELECT namespace, source_id, GROUP_CONCAT(DISTINCT target_id) AS origins \
+         FROM graph_edges \
+         WHERE relation = 'introduced_by' \
+           AND deleted_at IS NULL \
+           AND source_id IN (SELECT id FROM entities WHERE kind = 'concept' AND deleted_at IS NULL) \
+         GROUP BY namespace, source_id \
+         HAVING COUNT(DISTINCT target_id) > 1 \
+         ORDER BY namespace, source_id",
+    )?;
+    let violations = stmt
+        .query_map([], |row| {
+            let namespace: String = row.get(0)?;
+            let source_id: String = row.get(1)?;
+            let origins: String = row.get(2)?;
+            Ok(format!(
+                "concept {source_id} in namespace {namespace} (origins: {origins})"
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if violations.is_empty() {
+        return Ok(());
+    }
+
+    Err(SqliteError::Migration {
+        version: 13,
+        error: format!(
+            "cannot enforce the single-origin invariant: {} already have more than one live \
+             introduced_by origin. Curate each listed concept down to a single live origin \
+             (delete or supersede the extra introduced_by edges), then re-run migrations.",
+            violations.join(", ")
+        ),
+    })
 }
 
 #[derive(Debug)]

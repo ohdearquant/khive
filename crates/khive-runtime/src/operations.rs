@@ -14327,16 +14327,17 @@ mod tests {
             .await
             .unwrap();
 
-        rt.link(
-            &tok,
-            concept.id,
-            first_origin.id,
-            EdgeRelation::IntroducedBy,
-            1.0,
-            None,
-        )
-        .await
-        .unwrap();
+        let first_edge = rt
+            .link(
+                &tok,
+                concept.id,
+                first_origin.id,
+                EdgeRelation::IntroducedBy,
+                1.0,
+                None,
+            )
+            .await
+            .unwrap();
         let err = rt
             .link(
                 &tok,
@@ -14355,8 +14356,12 @@ mod tests {
             "error must not disclose the existing origin's identifier to the caller: {msg}"
         );
         assert!(
+            !msg.contains(&first_edge.id.to_string()),
+            "error must not disclose the existing edge's own identifier to the caller: {msg}"
+        );
+        assert!(
             !msg.contains(&conflicting_origin.id.to_string()),
-            "error must not disclose edge identifiers to the caller: {msg}"
+            "error must not disclose the requested target's identifier to the caller: {msg}"
         );
     }
 

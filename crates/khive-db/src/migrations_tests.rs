@@ -968,3 +968,97 @@ fn mixed_version_boot_rejects_newer_schema_under_lock() {
         } if store_version == latest + 1 && max_known_migration == latest
     ));
 }
+
+fn migrate_to_v12(conn: &Connection, now: i64) {
+    conn.execute_batch(MIGRATION_TRACKING_TABLE).unwrap();
+    for migration in MIGRATIONS.iter().filter(|m| m.version <= 12) {
+        conn.execute_batch(migration.up).unwrap();
+        conn.execute(
+            "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (?1, ?2, ?3)",
+            rusqlite::params![migration.version, migration.name, now],
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn v13_fails_loudly_on_preexisting_duplicate_concept_origins() {
+    // Simulate a V12-state database that already violates the invariant V13
+    // is about to start enforcing: one concept with two distinct live
+    // introduced_by origins, created before any trigger existed to stop it.
+    let mut conn = open_memory();
+    let now = chrono::Utc::now().timestamp_micros();
+    migrate_to_v12(&conn, now);
+
+    conn.execute(
+        "INSERT INTO entities (id, namespace, kind, name, created_at, updated_at) \
+         VALUES ('concept-dup', 'local', 'concept', 'dup concept', ?1, ?1)",
+        rusqlite::params![now],
+    )
+    .expect("concept entity");
+    conn.execute(
+        "INSERT INTO graph_edges (namespace, id, source_id, target_id, relation, created_at, updated_at) \
+         VALUES ('local', 'edge-a', 'concept-dup', 'doc-a', 'introduced_by', ?1, ?1)",
+        rusqlite::params![now],
+    )
+    .expect("first pre-existing origin");
+    conn.execute(
+        "INSERT INTO graph_edges (namespace, id, source_id, target_id, relation, created_at, updated_at) \
+         VALUES ('local', 'edge-b', 'concept-dup', 'doc-b', 'introduced_by', ?1, ?1)",
+        rusqlite::params![now],
+    )
+    .expect("second pre-existing origin — still legal pre-V13");
+
+    let err = run_migrations(&mut conn)
+        .expect_err("V13 must refuse to migrate a database with duplicate live origins");
+    let message = err.to_string();
+    assert!(
+        message.contains("concept-dup"),
+        "error must name the violating concept id, got: {message}"
+    );
+    assert!(
+        message.contains("single live origin"),
+        "error must state the remediation, got: {message}"
+    );
+
+    let version = read_schema_version(&conn).unwrap();
+    assert_eq!(
+        version, 12,
+        "a rejected V13 must leave the ledger at the last successful version"
+    );
+}
+
+#[test]
+fn v13_migrates_cleanly_when_no_duplicate_origins_exist() {
+    let mut conn = open_memory();
+    let now = chrono::Utc::now().timestamp_micros();
+    migrate_to_v12(&conn, now);
+
+    conn.execute(
+        "INSERT INTO entities (id, namespace, kind, name, created_at, updated_at) \
+         VALUES ('concept-clean', 'local', 'concept', 'clean concept', ?1, ?1)",
+        rusqlite::params![now],
+    )
+    .expect("concept entity");
+    conn.execute(
+        "INSERT INTO graph_edges (namespace, id, source_id, target_id, relation, created_at, updated_at) \
+         VALUES ('local', 'edge-clean', 'concept-clean', 'doc-clean', 'introduced_by', ?1, ?1)",
+        rusqlite::params![now],
+    )
+    .expect("single pre-existing origin");
+
+    let version =
+        run_migrations(&mut conn).expect("V13 must succeed when no duplicate origins exist");
+    let latest = MIGRATIONS.last().expect("at least one migration").version;
+    assert_eq!(version, latest, "migrations must reach the latest version");
+
+    let rejected = conn.execute(
+        "INSERT INTO graph_edges (namespace, id, source_id, target_id, relation, created_at, updated_at) \
+         VALUES ('local', 'edge-clean-2', 'concept-clean', 'doc-other', 'introduced_by', ?1, ?1)",
+        rusqlite::params![now],
+    );
+    assert!(
+        rejected.is_err(),
+        "V13 trigger must reject a second distinct origin once the migration has applied"
+    );
+}
