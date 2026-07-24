@@ -159,8 +159,10 @@ pub(crate) async fn execute_atomic_ops_file(
     // whole `--atomic` process regardless of whether a call site invoked
     // it. This closes the in-process half of the gap; the note-mutation
     // hook's effect (a bumped `AnnState` generation) is itself process-
-    // local, so it still cannot reach a separately-running daemon's warm
-    // cache — see the cross-process analysis in #750.
+    // local, so on its own it still cannot reach a separately-running
+    // daemon's warm cache — see the cross-process analysis in #750. The
+    // durable-epoch bump after commit below (#752) closes the remaining
+    // cross-process half.
     verb_registry.call_register_note_mutation_hooks(&runtime);
 
     // ── async prepare pass (reads only, no writes) ───────────────────────────
@@ -205,9 +207,29 @@ pub(crate) async fn execute_atomic_ops_file(
             // functions and never propagated — a missing audit row must
             // never fail an already-committed atomic unit.
             apply_gtd_audit_post_commit_effects(&runtime, &post_commit).await;
+            // #752: `--atomic` runs as its own short-lived process (the
+            // daemon fast-path is intentionally skipped for bulk apply —
+            // see this module's doc comment), so the in-process
+            // note-mutation hook's `AnnState` generation bump
+            // (`call_register_note_mutation_hooks` above) dies with this
+            // process and can never reach an already-warm daemon sharing
+            // the same database file. Bump the SAME durable epoch signal
+            // `kkernel reindex` uses (`khive_pack_memory::ann::
+            // maybe_check_durable_epoch`, sampled from the daemon's recall
+            // path) whenever this unit committed at least one note
+            // mutation, closing the cross-process gap for this path too.
+            let touched_notes = post_commit.iter().any(|effect| {
+                matches!(
+                    effect,
+                    PostCommitEffect::ReindexNote { .. } | PostCommitEffect::NoteDeleted { .. }
+                )
+            });
             khive_runtime::atomic_prepare::apply_post_commit_effects(&runtime, &token, post_commit)
                 .await
                 .context("post-commit reindex after atomic unit commit")?;
+            if touched_notes {
+                bump_memory_ann_epoch_after_atomic_commit(&runtime).await;
+            }
             // ADR-099 B3: render each committed op's
             // canonical-shaped `result` payload (ADR-099 D4 requires
             // `results[i].result`; the pre-fix envelope carried only
@@ -308,6 +330,26 @@ async fn apply_gtd_audit_post_commit_effects(runtime: &KhiveRuntime, effects: &[
             )
             .await;
         }
+    }
+}
+
+/// Bump the durable `memory_ann_epoch` counter after a committed atomic unit
+/// touched at least one note (#752). Mirrors `kkernel reindex`'s own
+/// completion-side bump (`invalidate_active_memory_vamana_snapshot` in
+/// `reindex.rs`): best-effort, since the atomic unit already committed by
+/// this point — a failed bump here means a live daemon might keep serving a
+/// slightly stale warm index a little longer, never that an already-applied
+/// write is lost. `ensure_ann_epoch_schema` is called first because
+/// `--atomic` builds its `KhiveRuntime` directly (like `kkernel reindex`),
+/// never booting a pack registry that would otherwise apply
+/// `MemoryPack::SCHEMA_PLAN` up front.
+async fn bump_memory_ann_epoch_after_atomic_commit(runtime: &KhiveRuntime) {
+    if let Err(e) = khive_pack_memory::ensure_ann_epoch_schema(runtime).await {
+        tracing::warn!(error = %e, "failed to ensure memory_ann_epoch schema after atomic commit");
+        return;
+    }
+    if let Err(e) = khive_pack_memory::bump_memory_ann_epoch(runtime).await {
+        tracing::warn!(error = %e, "failed to bump durable memory ANN epoch after atomic commit");
     }
 }
 

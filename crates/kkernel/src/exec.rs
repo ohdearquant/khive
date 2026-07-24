@@ -2475,6 +2475,141 @@ backend = "sessions"
         );
     }
 
+    /// Read the durable `memory_ann_epoch` row against a fresh runtime
+    /// pointed at `db_path` — mirrors how a live daemon sharing the same
+    /// database file would observe it, without depending on any
+    /// `khive-pack-memory`-internal API.
+    async fn read_memory_ann_epoch(db_path: &str) -> i64 {
+        let rt = KhiveRuntime::new(RuntimeConfig {
+            db_path: Some(PathBuf::from(db_path)),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            ..Default::default()
+        })
+        .expect("runtime for epoch read");
+        let sql = rt.sql();
+        let mut reader = sql.reader().await.expect("reader");
+        let rows = reader
+            .query_all(khive_storage::types::SqlStatement {
+                sql: "SELECT epoch FROM memory_ann_epoch WHERE id = 1".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("query memory_ann_epoch");
+        match rows.first().and_then(|r| r.get("epoch")) {
+            Some(khive_storage::types::SqlValue::Integer(n)) => *n,
+            _ => 0,
+        }
+    }
+
+    /// Regression test (#752): `kkernel exec --ops-file --atomic` runs as its
+    /// own short-lived process, separate from any already-warm `kkernel mcp
+    /// --daemon` sharing the same database file. Before this fix, an atomic
+    /// unit that mutated a `kind="memory"` note only bumped this process's
+    /// own in-memory `AnnState` generation counter (#750) — a signal that
+    /// dies with the process and can never reach that daemon's warm ANN
+    /// cache. `kkernel reindex` already closes the equivalent gap for itself
+    /// via the durable `memory_ann_epoch` counter (#812); this asserts
+    /// `--atomic` now bumps the SAME durable signal.
+    ///
+    /// Fail-on-revert: removing the `bump_memory_ann_epoch_after_atomic_commit`
+    /// call in `atomic_apply.rs` makes `epoch_after` equal `epoch_before`.
+    #[tokio::test]
+    async fn atomic_update_of_memory_note_bumps_durable_ann_epoch() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+
+        let note_id = {
+            let server = isolated_server(&db_path);
+            let resp = dispatch_json(
+                &server,
+                r#"create(kind="memory", content="atomic epoch test note")"#,
+            )
+            .await;
+            resp["results"][0]["result"]["id"]
+                .as_str()
+                .expect("note id")
+                .to_string()
+        };
+
+        let epoch_before = read_memory_ann_epoch(&db_path).await;
+
+        let ops = vec![atomic_op(
+            "update",
+            serde_json::json!({"id": note_id, "content": "atomic epoch test note, updated"}),
+        )];
+
+        let khive_cfg = KhiveConfig::default();
+        let envelope = crate::atomic_apply::execute_atomic_ops_file(
+            ops,
+            atomic_cfg(&db_path),
+            &khive_cfg,
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect("atomic run must succeed");
+        assert_eq!(
+            envelope["atomic"]["committed"], true,
+            "envelope: {envelope}"
+        );
+
+        let epoch_after = read_memory_ann_epoch(&db_path).await;
+        assert!(
+            epoch_after > epoch_before,
+            "an atomic update of a memory note must durably bump the memory \
+             ANN epoch so an already-warm daemon sharing this database file \
+             can detect the mutation; before={epoch_before}, after={epoch_after}"
+        );
+    }
+
+    /// A committed atomic unit that touches no note at all (pure entity
+    /// update here) must NOT bump the durable memory ANN epoch — the gate
+    /// is scoped to note mutations, not every atomic commit.
+    #[tokio::test]
+    async fn atomic_update_of_entity_only_does_not_bump_durable_ann_epoch() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+
+        let entity_id = {
+            let server = isolated_server(&db_path);
+            let resp =
+                dispatch_json(&server, r#"create(kind="concept", name="EpochGateX")"#).await;
+            resp["results"][0]["result"]["id"]
+                .as_str()
+                .expect("entity id")
+                .to_string()
+        };
+
+        let epoch_before = read_memory_ann_epoch(&db_path).await;
+
+        let ops = vec![atomic_op(
+            "update",
+            serde_json::json!({"id": entity_id, "name": "EpochGateX-renamed"}),
+        )];
+
+        let khive_cfg = KhiveConfig::default();
+        let envelope = crate::atomic_apply::execute_atomic_ops_file(
+            ops,
+            atomic_cfg(&db_path),
+            &khive_cfg,
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect("atomic run must succeed");
+        assert_eq!(
+            envelope["atomic"]["committed"], true,
+            "envelope: {envelope}"
+        );
+
+        let epoch_after = read_memory_ann_epoch(&db_path).await;
+        assert_eq!(
+            epoch_after, epoch_before,
+            "an entity-only atomic commit must not bump the memory ANN epoch: \
+             before={epoch_before}, after={epoch_after}"
+        );
+    }
+
     /// ADR-099 B3 (second half): the inverse
     /// same-unit race — `[link(A, B, competes_with), update(X
     /// extends A-B -> competes_with)]`, where the CANONICAL row the update
