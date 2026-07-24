@@ -3513,3 +3513,205 @@ mod corpus_replay {
         }
     }
 }
+
+// ─── Measurement harness: issue #1040 (manual, opt-in, THROWAWAY) ───────────
+//
+// Empirical measurement for whether dropping the `!near_trigger` gate on the
+// `is_structured_identifier` exemption is sound for real codex-review-verdict
+// false positives. Not part of the shipped detector; scoped to
+// `cargo test -p khive-runtime measure_1040 -- --ignored --nocapture`.
+#[cfg(test)]
+mod measure_1040 {
+    use super::*;
+    use std::fs;
+
+    const CORPUS: &[&str] = &[
+        "/Users/lion/projects/khive/khive/.khive/codex_reviews/codex_review_pr129_round1.md",
+        "/Users/lion/projects/khive/khive/.khive/codex_reviews/codex_review_pr365_round2.md",
+        "/Users/lion/projects/khive/khive/.khive/codex_reviews/codex_review_pr401_round2.md",
+        "/Users/lion/projects/khive/khive/.khive/codex_reviews/codex_review_pr835.md",
+        "/Users/lion/projects/khive/khive/.khive/codex_reviews/codex_review_pr862.md",
+    ];
+
+    fn mask(token: &str) -> String {
+        let chars: Vec<char> = token.chars().collect();
+        let preview: String = chars.iter().take(6).collect();
+        format!("{preview}...{}chars", chars.len())
+    }
+
+    /// Recompute near_trigger for an arbitrary (offset, raw_token) pair the
+    /// same way `check_entropy_heuristic` does, so Part A/B can report it for
+    /// tokens picked outside the leftmost-match path too.
+    fn recompute_trigger(text: &str, tok_offset: usize, raw_token: &str) -> (bool, &'static str) {
+        let window_start = floor_char_boundary(text, tok_offset.saturating_sub(TRIGGER_WINDOW));
+        let window_end = floor_char_boundary(text, tok_offset + raw_token.len() + TRIGGER_WINDOW);
+        let window = &text[window_start..window_end];
+        let raw_start = tok_offset - window_start;
+        let raw_end = raw_start + raw_token.len();
+        let left = contains_trigger(&window[..raw_start]);
+        let right = contains_trigger(&window[raw_end..]);
+        let inline = has_inline_credential_trigger(raw_token);
+        if inline {
+            (true, "inline")
+        } else if left {
+            (true, "left-of-token")
+        } else if right {
+            (true, "right-of-token")
+        } else {
+            (false, "none")
+        }
+    }
+
+    fn segment_report(token: &str) -> String {
+        let segments: Vec<&str> = token
+            .split(|c: char| c == '/' || c == ':')
+            .filter(|s| !s.is_empty())
+            .collect();
+        let mut out = String::new();
+        for seg in segments {
+            let e = shannon_entropy(seg.as_bytes());
+            out.push_str(&format!(
+                "\n    - seg={:?} len={} entropy={:.3} solo_flaggable(>=24len & >=4.5H)={}",
+                seg,
+                seg.len(),
+                e,
+                seg.len() >= MIN_ENTROPY_LEN && e >= ENTROPY_THRESHOLD
+            ));
+        }
+        out
+    }
+
+    fn text_tokens(text: &str) -> Vec<(usize, &str)> {
+        text.split(|c: char| c.is_ascii_whitespace() || !c.is_ascii())
+            .filter(|t| !t.is_empty())
+            .map(|t| (t.as_ptr() as usize - text.as_ptr() as usize, t))
+            .collect()
+    }
+
+    fn strip_delims(s: &str) -> &str {
+        s.trim_matches(|c| {
+            matches!(
+                c,
+                '"' | '\'' | '`' | ':' | '=' | ',' | ';' | '(' | ')' | '[' | ']'
+            )
+        })
+    }
+
+    #[test]
+    #[ignore]
+    fn part_a_reproduce_fps() {
+        for path in CORPUS {
+            let content = fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+            let overall = scan_match(&content);
+            println!("\n=== {path} ===");
+            match overall {
+                Some((tok, detector)) => {
+                    let tok_offset = tok.as_ptr() as usize - content.as_ptr() as usize;
+                    let (near, near_kind) = recompute_trigger(&content, tok_offset, tok);
+                    println!(
+                        "BLOCKED detector={detector} masked={} len={} entropy={:.3} is_structured_identifier={} near_trigger={near}({near_kind})",
+                        mask(tok),
+                        tok.len(),
+                        shannon_entropy(tok.as_bytes()),
+                        is_structured_identifier(tok)
+                    );
+                    println!("  segments:{}", segment_report(tok));
+                }
+                None => println!("NOT BLOCKED (no match) -- reproduction FAILED for this file"),
+            }
+            // Every long slash-bearing token, regardless of which one
+            // scan_match picked as leftmost, so all path-shaped candidates
+            // in the file are visible.
+            for (tok_offset, raw) in text_tokens(&content) {
+                let token = strip_delims(raw);
+                if token.len() < MIN_ENTROPY_LEN || !token.contains('/') {
+                    continue;
+                }
+                let (near, near_kind) = recompute_trigger(&content, tok_offset, raw);
+                println!(
+                    "  candidate masked={} len={} entropy={:.3} structured={} near_trigger={near}({near_kind})",
+                    mask(token),
+                    token.len(),
+                    shannon_entropy(token.as_bytes()),
+                    is_structured_identifier(token)
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn part_b_adversarial() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "aws-in-path",
+                "key: crates/config/AKIAIOSFODNN7EXAMPLE99/mod.rs",
+            ),
+            (
+                "anthropic-in-path",
+                "see docs/sk-ant-api03-AAAAAAAAAAAAAAAAAAAA/x.md secret",
+            ),
+            (
+                "base64url-in-path",
+                "auth path a/wJalrXUtnFEMI-K7MDENGbPxRfiCYEXAMPLEKEYX123/b.rs",
+            ),
+            (
+                "hex40-in-path",
+                "api key vault/9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c/rotate.md",
+            ),
+            (
+                "padded-short-runs",
+                "secret path a/b/c/d/Xk9m/ZvQp/LrT8/nJwY/uAeH/fBsD/e/f.rs",
+            ),
+            (
+                "camelcase-hex-runs",
+                "token: repo/Ab12Cd34Ef56Gh78Ij90Kl12Mn34Op56/deploy.rs",
+            ),
+            (
+                "dashed-blocks-secret",
+                "auth key at Xk9m-ZvQp-LrT8-nJwY-uAeH-fBsD/config.rs",
+            ),
+            (
+                "same-case-run-gap",
+                "secret at path/ABCDEFGHIJKLMNOPQRSTUV/config.rs",
+            ),
+            (
+                "same-case-run-gap-with-digits",
+                "auth token repo/QWERTYUIOPASDFGHJKL1234/deploy.rs",
+            ),
+            (
+                "same-case-lowercase-run-gap",
+                "api key at internal/zxcvbnmasdfghjklqwertyu/rotate.rs",
+            ),
+        ];
+        for (label, content) in cases {
+            let blocked = check(content).is_err();
+            let m = scan_match(content);
+            println!("\n=== planted: {label} ===");
+            println!("content={content:?}");
+            println!("blocked={blocked}");
+            if let Some((tok, detector)) = m {
+                println!(
+                    "leftmost_detector={detector} token={tok:?} is_structured_identifier(whole_token)={}",
+                    is_structured_identifier(tok)
+                );
+            } else {
+                println!("leftmost_detector=NONE (nothing fired at all)");
+            }
+            // Report is_structured_identifier for every '/'-bearing token in
+            // the planted content, not just the leftmost match, since the
+            // question is whether a near-trigger-exempted identifier check
+            // would ever pass a token containing the credential.
+            for (_, raw) in text_tokens(content) {
+                let token = strip_delims(raw);
+                if token.contains('/') {
+                    println!(
+                        "  path-token={token:?} is_structured_identifier={} entropy={:.3}",
+                        is_structured_identifier(token),
+                        shannon_entropy(token.as_bytes())
+                    );
+                }
+            }
+        }
+    }
+}
