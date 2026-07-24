@@ -582,6 +582,31 @@ argument, the rejected alternatives (wire-facing verb retirement, a composed
 field-validation registry analogous to `EDGE_RULES`), and the accompanying internal
 refactor that unifies `gtd.assign` onto the shared create-plus-`TaskHook` path.
 
+## Amendment: `create` on-conflict-by-name policy via `if_exists` (2026-07-14)
+
+Per #965, `create` gains an optional `if_exists` argument, valid only for
+`kind=entity` (or a granular entity kind). It resolves a conflict on an exact
+`(name, entity_kind)` match, scoped to the caller's namespace:
+
+- `if_exists="create"` (the default when omitted) — unconditional create,
+  unchanged from prior behavior.
+- `if_exists="reuse"` — on an exact match, returns the existing entity
+  (`reused: true` in the response) instead of creating a duplicate. Any
+  `edges` in the same call are still linked against the existing entity's id.
+- `if_exists="error"` — on an exact match, rejects the call with
+  `InvalidInput` instead of creating a duplicate or silently reusing.
+
+The match is deterministic and case-sensitive equality on `entities.name`
+plus the canonical entity kind — not the fuzzy `similar_existing` hybrid-search
+advisory that `create` already attaches to the response (that check remains
+unconditional, informational-only, and unaffected by `if_exists`). Supplying
+`if_exists` for `kind=note` is rejected: note identity is not name-keyed, so
+an exact-name conflict check is not meaningful there.
+
+This codifies the search-then-extend dedup pre-pass — previously left to
+each caller to hand-roll before every create — directly into the `create`
+contract.
+
 ## References
 
 - [ADR-001](ADR-001-entity-kind-taxonomy.md) — closed `EntityKind` taxonomy that packs

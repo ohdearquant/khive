@@ -3,6 +3,8 @@
 use serde_json::{json, Value};
 
 use khive_runtime::{EntityCreateSpec, NamespaceToken, RuntimeError, VerbRegistry};
+use khive_storage::types::PageRequest;
+use khive_storage::EntityFilter;
 
 use super::common::{
     canonical_entity_kind, canonical_note_kind, deser, immutable_event_error,
@@ -42,6 +44,7 @@ impl KgPack {
             "annotates",
             "embedding_content",
             "skip_dedup_check",
+            "if_exists",
             "edges",
             "title",
             "priority",
@@ -294,6 +297,19 @@ impl KgPack {
         let p: CreateParams = deser(params.clone())?;
         let skip_dedup = p.skip_dedup_check.unwrap_or(false);
 
+        if let Some(mode) = p.if_exists.as_deref() {
+            if !matches!(mode, "reuse" | "error" | "create") {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "create: invalid if_exists {mode:?}; valid: reuse | error | create"
+                )));
+            }
+            if p.kind != "entity" {
+                return Err(RuntimeError::InvalidInput(
+                    "if_exists is only valid for kind=entity (or a specific entity kind)".into(),
+                ));
+            }
+        }
+
         let dedup_name: Option<String> = if !skip_dedup && p.kind == "entity" {
             p.name.clone()
         } else {
@@ -305,6 +321,7 @@ impl KgPack {
             None
         };
 
+        let mut reused = false;
         let (mut response, new_id) = match p.kind.as_str() {
             "entity" => {
                 if p.embedding_content.is_some() {
@@ -319,23 +336,64 @@ impl KgPack {
                 if name.trim().is_empty() {
                     return Err(RuntimeError::InvalidInput("name must not be empty".into()));
                 }
-                let tags = p.tags.unwrap_or_default();
-                let validated_type =
-                    validate_entity_type(&canonical, p.entity_type.as_deref(), registry)?;
-                let entity = self
-                    .runtime
-                    .create_entity(
-                        token,
-                        &canonical,
-                        validated_type.as_deref(),
-                        &name,
-                        p.description.as_deref(),
-                        p.properties,
-                        tags,
-                    )
-                    .await?;
-                let id = entity.id;
-                (normalize_entity_timestamps(to_json(&entity)?), id)
+
+                let existing = if matches!(p.if_exists.as_deref(), Some("reuse") | Some("error")) {
+                    let filter = EntityFilter {
+                        name_exact: Some(name.clone()),
+                        kinds: vec![canonical.clone()],
+                        ..EntityFilter::default()
+                    };
+                    let page = self
+                        .runtime
+                        .entities(token)?
+                        .query_entities(
+                            token.namespace().as_str(),
+                            filter,
+                            PageRequest {
+                                offset: 0,
+                                limit: 1,
+                            },
+                        )
+                        .await
+                        .map_err(RuntimeError::Storage)?;
+                    page.items.into_iter().next()
+                } else {
+                    None
+                };
+
+                if let Some(existing) = existing {
+                    if p.if_exists.as_deref() == Some("error") {
+                        return Err(RuntimeError::InvalidInput(format!(
+                            "create: an entity named {name:?} of kind {canonical:?} already exists (id={})",
+                            existing.id
+                        )));
+                    }
+                    reused = true;
+                    let id = existing.id;
+                    let mut entity_json = normalize_entity_timestamps(to_json(&existing)?);
+                    if let Some(obj) = entity_json.as_object_mut() {
+                        obj.insert("reused".into(), json!(true));
+                    }
+                    (entity_json, id)
+                } else {
+                    let tags = p.tags.unwrap_or_default();
+                    let validated_type =
+                        validate_entity_type(&canonical, p.entity_type.as_deref(), registry)?;
+                    let entity = self
+                        .runtime
+                        .create_entity(
+                            token,
+                            &canonical,
+                            validated_type.as_deref(),
+                            &name,
+                            p.description.as_deref(),
+                            p.properties,
+                            tags,
+                        )
+                        .await?;
+                    let id = entity.id;
+                    (normalize_entity_timestamps(to_json(&entity)?), id)
+                }
             }
             "note" => {
                 let canonical = sub_kind
@@ -375,61 +433,65 @@ impl KgPack {
             }
         };
 
-        if let Some(ref h) = hook {
-            if let Err(e) = h.after_create(&self.runtime, new_id, &params).await {
-                tracing::warn!(
-                    kind = %sub_kind.as_deref().unwrap_or(""),
-                    id = %new_id,
-                    error = %e,
-                    "kind hook after_create failed (storage write already committed)"
-                );
+        if !reused {
+            if let Some(ref h) = hook {
+                if let Err(e) = h.after_create(&self.runtime, new_id, &params).await {
+                    tracing::warn!(
+                        kind = %sub_kind.as_deref().unwrap_or(""),
+                        id = %new_id,
+                        error = %e,
+                        "kind hook after_create failed (storage write already committed)"
+                    );
+                }
             }
         }
 
-        if let (Some(ref name), Some(ref kind)) = (&dedup_name, &dedup_kind) {
-            const DEDUP_LIMIT: u32 = 3;
-            const DEDUP_SCORE_THRESHOLD: f64 = 0.1;
-            match self
-                .runtime
-                .hybrid_search(
-                    token,
-                    name,
-                    None,
-                    DEDUP_LIMIT + 1,
-                    Some(kind.as_str()),
-                    None,
-                    &[],
-                    None,
-                )
-                .await
-            {
-                Ok(hits) => {
-                    let similar: Vec<Value> = hits
-                        .into_iter()
-                        .filter(|h| {
-                            h.entity_id != new_id && h.score.to_f64() >= DEDUP_SCORE_THRESHOLD
-                        })
-                        .take(DEDUP_LIMIT as usize)
-                        .map(|h| {
-                            json!({
-                                "id": h.entity_id.to_string(),
-                                "name": h.title,
-                                "score": h.score.to_f64(),
+        if !reused {
+            if let (Some(ref name), Some(ref kind)) = (&dedup_name, &dedup_kind) {
+                const DEDUP_LIMIT: u32 = 3;
+                const DEDUP_SCORE_THRESHOLD: f64 = 0.1;
+                match self
+                    .runtime
+                    .hybrid_search(
+                        token,
+                        name,
+                        None,
+                        DEDUP_LIMIT + 1,
+                        Some(kind.as_str()),
+                        None,
+                        &[],
+                        None,
+                    )
+                    .await
+                {
+                    Ok(hits) => {
+                        let similar: Vec<Value> = hits
+                            .into_iter()
+                            .filter(|h| {
+                                h.entity_id != new_id && h.score.to_f64() >= DEDUP_SCORE_THRESHOLD
                             })
-                        })
-                        .collect();
-                    if !similar.is_empty() {
-                        if let Some(obj) = response.as_object_mut() {
-                            obj.insert("similar_existing".to_string(), json!(similar));
+                            .take(DEDUP_LIMIT as usize)
+                            .map(|h| {
+                                json!({
+                                    "id": h.entity_id.to_string(),
+                                    "name": h.title,
+                                    "score": h.score.to_f64(),
+                                })
+                            })
+                            .collect();
+                        if !similar.is_empty() {
+                            if let Some(obj) = response.as_object_mut() {
+                                obj.insert("similar_existing".to_string(), json!(similar));
+                            }
                         }
                     }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        id = %new_id,
-                        error = %e,
-                        "dedup similarity search failed (entity already created)"
-                    );
+                    Err(e) => {
+                        tracing::warn!(
+                            id = %new_id,
+                            error = %e,
+                            "dedup similarity search failed (entity already created)"
+                        );
+                    }
                 }
             }
         }

@@ -153,6 +153,158 @@ async fn create_entity_valid_kind_concept_succeeds() {
     );
 }
 
+// #965: `if_exists="reuse"` on a name+kind match returns the existing
+// entity's id instead of creating a duplicate.
+#[tokio::test]
+async fn create_if_exists_reuse_returns_existing_id_on_name_kind_match() {
+    let pack = pack();
+    let first = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "Retrieval Augmented Generation", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("first create must succeed");
+    let first_id = first["id"].as_str().expect("id present").to_string();
+
+    let second = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "entity",
+                "name": "Retrieval Augmented Generation",
+                "entity_kind": "concept",
+                "if_exists": "reuse",
+            }),
+        )
+        .await
+        .expect("reuse create must succeed, not error");
+
+    assert_eq!(
+        second["id"].as_str().unwrap(),
+        first_id,
+        "if_exists=reuse must return the existing entity's id"
+    );
+    assert_eq!(second["reused"], json!(true));
+
+    let count = pack
+        .dispatch("list", json!({"kind": "concept"}))
+        .await
+        .expect("list must succeed");
+    let items = count.as_array().expect("list returns an array");
+    assert_eq!(
+        items.len(),
+        1,
+        "if_exists=reuse must not create a duplicate entity"
+    );
+}
+
+// #965: `if_exists="error"` on a name+kind match rejects the create instead
+// of silently creating a duplicate or reusing.
+#[tokio::test]
+async fn create_if_exists_error_rejects_on_name_kind_match() {
+    let pack = pack();
+    pack.dispatch(
+        "create",
+        json!({"kind": "entity", "name": "Vector Quantization", "entity_kind": "concept"}),
+    )
+    .await
+    .expect("first create must succeed");
+
+    let err = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "entity",
+                "name": "Vector Quantization",
+                "entity_kind": "concept",
+                "if_exists": "error",
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        is_invalid_input(&err),
+        "if_exists=error on conflict must be InvalidInput"
+    );
+    assert!(
+        invalid_input_message(&err).contains("already exists"),
+        "error message must explain the conflict: {}",
+        invalid_input_message(&err)
+    );
+}
+
+// #965: `if_exists="create"` (and the default, unset) must keep the
+// existing unconditional-create behavior — no reuse, no rejection.
+#[tokio::test]
+async fn create_if_exists_create_allows_duplicate_names() {
+    let pack = pack();
+    pack.dispatch(
+        "create",
+        json!({"kind": "entity", "name": "Duplicate Name", "entity_kind": "concept"}),
+    )
+    .await
+    .expect("first create must succeed");
+
+    let second = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "entity",
+                "name": "Duplicate Name",
+                "entity_kind": "concept",
+                "if_exists": "create",
+            }),
+        )
+        .await
+        .expect("if_exists=create must still allow a second entity");
+
+    let count = pack
+        .dispatch("list", json!({"kind": "concept"}))
+        .await
+        .expect("list must succeed");
+    let items = count.as_array().expect("list returns an array");
+    assert_eq!(items.len(), 2, "if_exists=create must not dedup");
+    assert!(second["reused"].is_null(), "must not be marked reused");
+}
+
+// #965: `if_exists` on `kind=note` is rejected — dedup-by-name is only
+// meaningful for entities.
+#[tokio::test]
+async fn create_if_exists_on_note_kind_returns_invalid_input() {
+    let pack = pack();
+    let err = pack
+        .dispatch(
+            "create",
+            json!({"kind": "observation", "content": "a note", "if_exists": "reuse"}),
+        )
+        .await
+        .unwrap_err();
+    assert!(is_invalid_input(&err));
+    assert!(invalid_input_message(&err).contains("kind=entity"));
+}
+
+// #965: an unrecognized `if_exists` value must be rejected, not silently
+// coerced to the default create behavior.
+#[tokio::test]
+async fn create_if_exists_invalid_value_returns_invalid_input() {
+    let pack = pack();
+    let err = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "entity",
+                "name": "Something",
+                "entity_kind": "concept",
+                "if_exists": "overwrite",
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(is_invalid_input(&err));
+    assert!(invalid_input_message(&err).contains("if_exists"));
+}
+
 // Regression: bulk `create(items=[...])` must NOT require a redundant top-level
 // `kind` — each item carries its own kind. The single-record `kind` requirement
 // runs only after the bulk early-exit. Caught when the requirement fired first.

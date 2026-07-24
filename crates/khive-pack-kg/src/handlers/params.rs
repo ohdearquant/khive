@@ -37,6 +37,10 @@ pub(crate) struct CreateParams {
     pub(crate) properties: Option<Value>,
     pub(crate) tags: Option<Vec<String>>,
     pub(crate) skip_dedup_check: Option<bool>,
+    /// Exact name+kind conflict policy for `kind=entity` creates: `reuse`
+    /// returns the existing entity instead of creating a duplicate, `error`
+    /// rejects the create, `create` (the default) creates unconditionally.
+    pub(crate) if_exists: Option<String>,
     pub(crate) edges: Option<Vec<EdgeSpec>>,
     /// Singleton-note-only vector-embedding input override (issue #764). When
     /// present, `content` is still stored/FTS-indexed in full; only the text
