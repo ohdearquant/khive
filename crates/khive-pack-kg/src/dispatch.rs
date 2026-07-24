@@ -498,6 +498,165 @@ mod tests {
         );
     }
 
+    /// Regression for #711: `stats()` and `list(kind="edge"/"entity"/"note")`
+    /// must agree on namespace scope for an identity-bearing caller whose
+    /// frame carries a visible-namespace set beyond `local`.
+    ///
+    /// Writes one entity/edge/note pair to `local` and a second pair to a
+    /// configured extra-visible namespace, then dispatches `stats()` and
+    /// `list()` through the SAME registry-default (identity-bearing) token.
+    /// Every `stats()` scalar must equal the count of a full `list` walk
+    /// under that identity, and `edges_by_relation` must sum to the `edges`
+    /// scalar.
+    #[tokio::test]
+    async fn dispatch_stats_matches_list_across_visible_namespaces_issue_711() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+
+        let extra_ns = Namespace::parse("stats-parity-extra-ns").expect("valid namespace");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.with_default_namespace("local");
+        builder.with_visible_namespaces(vec![extra_ns.clone()]);
+        builder.register(KgPack::new(rt.clone()));
+        let registry = builder.build().expect("registry builds");
+
+        let pack = KgPack::new(rt.clone());
+        let local_token = rt.authorize(Namespace::local()).expect("authorize local");
+        let extra_token = rt.authorize(extra_ns.clone()).expect("authorize extra-ns");
+
+        // One entity + one edge + one note in "local".
+        let local_a = pack
+            .dispatch(
+                "create",
+                json!({ "kind": "concept", "name": "StatsParityLocalA" }),
+                &registry,
+                &local_token,
+            )
+            .await
+            .expect("create local_a must succeed");
+        let local_b = pack
+            .dispatch(
+                "create",
+                json!({ "kind": "concept", "name": "StatsParityLocalB" }),
+                &registry,
+                &local_token,
+            )
+            .await
+            .expect("create local_b must succeed");
+        pack.dispatch(
+            "link",
+            json!({
+                "source_id": local_a.get("id").and_then(Value::as_str).unwrap(),
+                "target_id": local_b.get("id").and_then(Value::as_str).unwrap(),
+                "relation": "extends",
+            }),
+            &registry,
+            &local_token,
+        )
+        .await
+        .expect("link in local must succeed");
+        pack.dispatch(
+            "create",
+            json!({ "kind": "note", "note_kind": "observation", "content": "local note" }),
+            &registry,
+            &local_token,
+        )
+        .await
+        .expect("create local note must succeed");
+
+        // One entity + one edge + one note in the extra visible namespace.
+        let extra_a = pack
+            .dispatch(
+                "create",
+                json!({ "kind": "concept", "name": "StatsParityExtraA" }),
+                &registry,
+                &extra_token,
+            )
+            .await
+            .expect("create extra_a must succeed");
+        let extra_b = pack
+            .dispatch(
+                "create",
+                json!({ "kind": "concept", "name": "StatsParityExtraB" }),
+                &registry,
+                &extra_token,
+            )
+            .await
+            .expect("create extra_b must succeed");
+        pack.dispatch(
+            "link",
+            json!({
+                "source_id": extra_a.get("id").and_then(Value::as_str).unwrap(),
+                "target_id": extra_b.get("id").and_then(Value::as_str).unwrap(),
+                "relation": "enables",
+            }),
+            &registry,
+            &extra_token,
+        )
+        .await
+        .expect("link in extra-ns must succeed");
+        pack.dispatch(
+            "create",
+            json!({ "kind": "note", "note_kind": "observation", "content": "extra-ns note" }),
+            &registry,
+            &extra_token,
+        )
+        .await
+        .expect("create extra-ns note must succeed");
+
+        // Dispatch stats() and list() through the SAME identity-bearing,
+        // registry-default token (no explicit `namespace=` — this is the
+        // caller frame whose visible set is `['local'] ∪ visible_namespaces`).
+        let stats = registry
+            .dispatch("stats", json!({}))
+            .await
+            .expect("stats must succeed");
+
+        async fn list_count(registry: &VerbRegistry, kind: &str) -> u64 {
+            let result = registry
+                .dispatch("list", json!({ "kind": kind, "limit": 100 }))
+                .await
+                .expect("list must succeed");
+            match result {
+                serde_json::Value::Array(arr) => arr.len() as u64,
+                other => panic!("list must return a JSON array; got: {other:?}"),
+            }
+        }
+
+        let entity_list_count = list_count(&registry, "entity").await;
+        let edge_list_count = list_count(&registry, "edge").await;
+        let note_list_count = list_count(&registry, "note").await;
+
+        assert_eq!(
+            stats.get("entities").and_then(Value::as_u64),
+            Some(entity_list_count),
+            "stats().entities must equal a full list(kind=entity) walk under the same identity; got {stats:?}"
+        );
+        assert_eq!(
+            stats.get("edges").and_then(Value::as_u64),
+            Some(edge_list_count),
+            "stats().edges must equal a full list(kind=edge) walk under the same identity; got {stats:?}"
+        );
+        assert_eq!(
+            stats.get("notes").and_then(Value::as_u64),
+            Some(note_list_count),
+            "stats().notes must equal a full list(kind=note) walk under the same identity; got {stats:?}"
+        );
+
+        let edges_by_relation = stats
+            .get("edges_by_relation")
+            .and_then(Value::as_object)
+            .expect("edges_by_relation must be an object");
+        let relation_sum: u64 = edges_by_relation
+            .values()
+            .map(|v| v.as_u64().unwrap_or(0))
+            .sum();
+        assert_eq!(
+            relation_sum, edge_list_count,
+            "edges_by_relation must sum to the edges scalar under all identities; got {edges_by_relation:?}"
+        );
+    }
+
     /// ADR-007 Rev 4: backward-compat — with visible_namespaces UNSET, default read scope = ['local'] only.
     ///
     /// A registry with no `visible_namespaces` configured has the same behavior as Rev 3:

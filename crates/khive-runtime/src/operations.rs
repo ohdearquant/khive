@@ -2999,6 +2999,21 @@ impl KhiveRuntime {
         Ok(page.items)
     }
 
+    /// Count notes visible to the token, optionally filtered by kind.
+    ///
+    /// When the token carries a multi-namespace visible set, the count spans
+    /// all visible namespaces — matching `list_notes`'s scope so that
+    /// `stats()`'s `notes` scalar reconciles with a full listing walk under
+    /// the same caller identity (#711).
+    pub async fn count_notes(&self, token: &NamespaceToken, kind: Option<&str>) -> RuntimeResult<u64> {
+        let note_store = self.notes(token)?;
+        let mut total: u64 = 0;
+        for ns in token.visible_namespaces() {
+            total += note_store.count_notes(ns.as_str(), kind).await?;
+        }
+        Ok(total)
+    }
+
     /// Search notes using a hybrid FTS5 + vector pipeline with salience weighting.
     ///
     /// Pipeline:
@@ -3970,17 +3985,28 @@ impl KhiveRuntime {
         Ok(deleted)
     }
 
-    /// Count entities in a namespace, optionally filtered.
+    /// Count entities visible to the token, optionally filtered by kind.
+    ///
+    /// When the token carries a multi-namespace visible set, the count spans
+    /// all visible namespaces — matching `list_entities`'s scope so that
+    /// `stats()` totals reconcile with a full listing walk under the same
+    /// caller identity (#711).
     pub async fn count_entities(
         &self,
         token: &NamespaceToken,
         kind: Option<&str>,
     ) -> RuntimeResult<u64> {
+        let ns_strs: Vec<String> = token
+            .visible_namespaces()
+            .iter()
+            .map(|ns| ns.as_str().to_owned())
+            .collect();
         let filter = EntityFilter {
             kinds: match kind {
                 Some(k) => vec![k.to_string()],
                 None => vec![],
             },
+            namespaces: ns_strs,
             ..Default::default()
         };
         Ok(self
@@ -4596,13 +4622,26 @@ impl KhiveRuntime {
         Ok(deleted)
     }
 
-    /// Count edges matching `filter`.
+    /// Count edges matching `filter`, visible to the token.
+    ///
+    /// When the token carries a multi-namespace visible set, the count spans
+    /// all visible namespaces — matching `list_edges`/`list_edges_after`'s
+    /// scope so that `stats()`'s `edges` scalar reconciles with a full
+    /// listing walk under the same caller identity (#711).
     pub async fn count_edges(
         &self,
         token: &NamespaceToken,
         filter: crate::curation::EdgeListFilter,
     ) -> RuntimeResult<u64> {
-        Ok(self.graph(token)?.count_edges(filter.into()).await?)
+        let mut total: u64 = 0;
+        for ns in token.visible_namespaces() {
+            let temp = NamespaceToken::for_namespace(ns.clone());
+            total += self
+                .graph(&temp)?
+                .count_edges(filter.clone().into())
+                .await?;
+        }
+        Ok(total)
     }
 
     /// Validate and construct an edge from a [`LinkSpec`] without writing to storage.

@@ -22,12 +22,7 @@ impl KgPack {
             .count_edges(token, EdgeListFilter::default())
             .await?;
         let edges_by_relation = self.runtime.count_edges_by_relation(token).await?;
-        let notes = self
-            .runtime
-            .notes(token)?
-            .count_notes(token.namespace().as_str(), None)
-            .await
-            .map_err(RuntimeError::Storage)?;
+        let notes = self.runtime.count_notes(token, None).await?;
         Ok(serde_json::json!({
             "entities": entities,
             "edges": edges,
