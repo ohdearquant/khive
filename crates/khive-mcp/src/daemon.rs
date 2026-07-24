@@ -824,9 +824,20 @@ fn process_is_alive(pid_u32: u32) -> bool {
         .args(["-p", &pid.to_string(), "-o", "stat="])
         .output()
     {
-        Ok(output) if output.status.success() => !String::from_utf8_lossy(&output.stdout)
-            .trim_start()
-            .starts_with('Z'),
+        Ok(output) if output.status.success() => {
+            let zombie = String::from_utf8_lossy(&output.stdout)
+                .trim_start()
+                .starts_with('Z');
+            if zombie {
+                // The process exited between the WNOHANG probe above and this
+                // ps check; reap now so a dropped-without-wait child does not
+                // leave its exit status pending (non-children fail with ECHILD
+                // and are left for their own parent).
+                reap_exited_child(pid_u32);
+                return false;
+            }
+            true
+        }
         _ => true,
     }
 }
@@ -4015,7 +4026,7 @@ mod tests {
     // full `exit_timeout`. This drives a cooperative incumbent that marks
     // SIGTERM receipt and then blocks on an explicit exit gate, giving the
     // test a deterministic window — bounded by polling, never a fixed sleep —
-    // in which to stand up a REAL replacement daemon before letting the
+    // in which to stand up a replacement probe responder before letting the
     // incumbent actually exit. If the pre-spawn re-probe is reverted, this
     // call spawns a second replacement on top of the live one instead of
     // returning `Skipped`, and `spawn_calls` observes 1 instead of 0.
@@ -4084,13 +4095,12 @@ mod tests {
             }
 
             // The incumbent is now blocked on the exit gate, deep inside
-            // kill_stale_daemon_inner's exit-wait loop. Stand up the real
-            // replacement daemon a concurrent peer would have spawned.
-            let daemon_handle = tokio::spawn(async move {
-                let _ = run_daemon(server).await;
-            });
-            let _ready = connect_when_ready(&sock).await;
-            drop(_ready);
+            // kill_stale_daemon_inner's exit-wait loop. Stand up an
+            // already-bound replacement probe responder, as if a concurrent
+            // peer had completed its daemon boot.
+            let listener =
+                tokio::net::UnixListener::bind(&sock).expect("bind replacement probe responder");
+            let daemon_handle = tokio::spawn(serve_probe_ack_forever(listener, config_id.clone()));
 
             // Only now let the incumbent actually exit.
             std::fs::write(&exit_gate, b"go").expect("open exit gate");
