@@ -1027,12 +1027,16 @@ fn advance_repeat_past_missed(
 }
 
 fn reminder_delivery_action(actor: &str, content: &str) -> String {
+    // A reminder always delivers to its own `created_by_actor` (ADR-106 Amendment
+    // C) -- that is the intentional self-send this scheduled action represents,
+    // not a mis-resolved cross-actor address (khive #820), so it must opt in.
     let action = json!([{
         "tool": "comm.send",
         "args": {
             "to": actor,
             "subject": reminder_subject(content),
             "content": content,
+            "self_send": true,
         }
     }]);
     serde_json::to_string(&action).expect("reminder delivery action is JSON-serializable")
@@ -1580,6 +1584,63 @@ mod tests {
         assert!(subject.starts_with("[Reminder] "));
         assert!(subject.ends_with('…'));
         assert_eq!(subject.chars().count(), "[Reminder] ".chars().count() + 81);
+    }
+
+    #[tokio::test]
+    async fn fired_reminder_delivers_to_creator_when_daemon_actor_is_unchanged() {
+        let (_tmp, db_path) = tmp_db();
+        let actor = "lambda:reminder-owner";
+        let rt = make_rt_with_actor(&db_path, Some(actor)).await;
+        let server = KhiveMcpServer::new(rt.clone()).expect("server");
+        let remind_ops = serde_json::to_string(&json!([{
+            "tool": "schedule.remind",
+            "args": {
+                "content": "test reminder",
+                "at": "2099-01-01T00:00:00Z"
+            }
+        }]))
+        .expect("serialize reminder op");
+        let result = server
+            .dispatch_request_local(RequestParams {
+                ops: remind_ops,
+                ..Default::default()
+            })
+            .await
+            .expect("create reminder through schedule.remind");
+        let result: Value = serde_json::from_str(&result).expect("reminder result JSON");
+        assert_eq!(result["results"][0]["ok"], true, "{result}");
+        let id = result["results"][0]["result"]["full_id"]
+            .as_str()
+            .expect("reminder full_id")
+            .parse()
+            .expect("reminder UUID");
+        let props = get_note_props(&rt, id).await;
+        assert_eq!(props["created_by_actor"], actor, "{props}");
+        make_repeat_due_again(&rt, id).await;
+
+        // The daemon that drains the event is the SAME configured actor that
+        // created it (khive #820's `self_send` opt-in, wired through
+        // `reminder_delivery_action`) -- the ordinary case, not the
+        // changed-daemon-actor control above.
+        let summary = run_pending_events_on(&rt, &server, false)
+            .await
+            .expect("drain");
+
+        assert_eq!(summary.fired, 1);
+        assert_eq!(summary.failed, 0);
+        let messages = inbound_reminder_messages(&rt, actor).await;
+        assert_eq!(
+            messages.len(),
+            1,
+            "reminder delivers to its own creator even though from_actor == to_actor"
+        );
+        assert_eq!(messages[0].0, "test reminder");
+        assert_eq!(messages[0].1["direction"], "inbound");
+        assert_eq!(messages[0].1["to_actor"], actor);
+        assert_eq!(messages[0].1["subject"], "[Reminder] test reminder");
+        let props = get_note_props(&rt, id).await;
+        assert_eq!(props["status"], "fired");
+        assert!(props["fired_at"].as_str().is_some());
     }
 
     #[tokio::test]
