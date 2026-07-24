@@ -1212,14 +1212,22 @@ pub fn build_registry_for_multi_backend(
             true
         }
         Some(other) => {
-            anyhow::bail!(
-                "--db {other:?} (or KHIVE_DB) cannot be combined with [[backends]]: \
+            if override_matches_declared_main_backend(other, khive_cfg)? {
+                tracing::info!(
+                    "--db {other:?} (or KHIVE_DB) matches the path already declared for the \
+                     \"main\" backend in khive.toml; proceeding since the override is a no-op"
+                );
+                false
+            } else {
+                anyhow::bail!(
+                    "--db {other:?} (or KHIVE_DB) cannot be combined with [[backends]]: \
                  {backend_count} backend(s) are already declared in khive.toml, so applying \
                  this override here is ambiguous (it could silently collapse distinct \
                  declared backends onto a single file). Edit khive.toml directly to change \
                  backend paths, or pass --db :memory: to force all backends in-memory for \
                  this invocation."
-            );
+                );
+            }
         }
         None => false,
     };
@@ -1610,6 +1618,74 @@ pub fn build_server_with_explicit_namespace(
         .map(|rt| (**rt).clone());
     let server = build_server_from_multi_backend_registry(multi, &khive_cfg, None);
     Ok((server, schedule_rt))
+}
+
+/// Return whether a concrete `--db`/`KHIVE_DB` path override (issue #707)
+/// names the exact same file as the declared `main` backend in `khive.toml`.
+///
+/// The general rejection of a concrete override alongside declared
+/// `[[backends]]` (issue #553) exists because applying one caller path
+/// across multiple declared backends is ambiguous. That ambiguity does not
+/// exist when the override simply repeats the `main` backend's own path:
+/// nothing collapses, so the override is a redundant no-op rather than a
+/// silent data-loss risk. Returns `false` (not a match) whenever no `main`
+/// backend is declared, or the `main` backend is `memory`-kind, since
+/// neither case has a concrete path to compare against.
+///
+/// Deliberately uses [`canonical_path_no_side_effects`] rather than
+/// [`canonical_backend_path`]: this runs on the rejection path too, and
+/// must not create directories for a path that turns out not to match
+/// (which would otherwise happen on every rejected override).
+fn override_matches_declared_main_backend(
+    override_path: &str,
+    khive_cfg: &KhiveConfig,
+) -> anyhow::Result<bool> {
+    let Some(main_cfg) = khive_cfg
+        .backends
+        .iter()
+        .find(|b| b.name == BackendId::MAIN)
+    else {
+        return Ok(false);
+    };
+    if main_cfg.kind != BackendKind::Sqlite {
+        return Ok(false);
+    }
+    let Some(main_path) = main_cfg.path.as_ref() else {
+        return Ok(false);
+    };
+    let main_canonical = canonical_path_no_side_effects(main_path)?;
+    let override_canonical = canonical_path_no_side_effects(std::path::Path::new(override_path))?;
+    Ok(main_canonical == override_canonical)
+}
+
+/// Best-effort path canonicalization that never touches the filesystem
+/// (unlike [`canonical_backend_path`], which creates the parent directory
+/// so it can canonicalize it). Resolves symlinks when the parent directory
+/// already exists; otherwise falls back to a lexically-absolute path. A
+/// mismatch under the fallback is always safe here: callers use this only
+/// to detect a redundant no-op override, and the general ambiguity
+/// rejection remains the default outcome for anything not proven identical.
+fn canonical_path_no_side_effects(path: &std::path::Path) -> anyhow::Result<PathBuf> {
+    let expanded = expand_tilde(path);
+    let absolute = if expanded.is_absolute() {
+        expanded
+    } else {
+        std::env::current_dir()
+            .map_err(|e| anyhow::anyhow!("cannot resolve current directory: {e}"))?
+            .join(expanded)
+    };
+    match absolute.parent() {
+        Some(parent) if parent.exists() => {
+            let canon_parent = parent
+                .canonicalize()
+                .map_err(|e| anyhow::anyhow!("cannot canonicalize {}: {e}", parent.display()))?;
+            match absolute.file_name() {
+                Some(name) => Ok(canon_parent.join(name)),
+                None => Ok(canon_parent),
+            }
+        }
+        _ => Ok(absolute),
+    }
 }
 
 /// Canonicalize a SQLite backend path for deduplication (ADR-028 §8).
@@ -3509,6 +3585,140 @@ id = "lambda:project-actor"
                  instead; got: {msg}"
             );
         }
+    }
+
+    /// Issue #707: a concrete `--db`/`KHIVE_DB` override that names the exact
+    /// same file as the declared `main` backend must be accepted rather than
+    /// rejected as ambiguous. #553's rejection guards against collapsing
+    /// distinct declared backends onto one caller-supplied file; repeating
+    /// `main`'s own path collapses nothing, so it must proceed as a no-op.
+    #[test]
+    #[serial]
+    fn concrete_db_override_matching_declared_main_backend_path_is_accepted() {
+        use khive_runtime::PackConfig;
+
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("main.db");
+        let secondary_path = dir.path().join("secondary.db");
+
+        let khive_cfg = KhiveConfig {
+            backends: vec![
+                BackendConfig {
+                    name: "main".to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(main_path.clone()),
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: false,
+                },
+                BackendConfig {
+                    name: "secondary".to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(secondary_path.clone()),
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: false,
+                },
+            ],
+            packs: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(
+                    "comm".to_string(),
+                    PackConfig {
+                        backend: "secondary".to_string(),
+                    },
+                );
+                m
+            },
+            ..KhiveConfig::default()
+        };
+
+        let override_str = main_path.to_str().unwrap().to_string();
+        let base_cfg = RuntimeConfig {
+            db_path: khive_runtime::resolve_db_anchor(Some(override_str.as_str())),
+            ..base_runtime_config_for_multi_backend()
+        };
+
+        let result =
+            build_registry_for_multi_backend(base_cfg, &khive_cfg, Some(override_str.as_str()));
+        if let Err(ref e) = result {
+            panic!(
+                "--db override naming the same path as the declared \"main\" backend \
+                 must be accepted as a redundant no-op; got: {e}"
+            );
+        }
+    }
+
+    /// Issue #707: the no-op carve-out must not weaken #553's rejection for a
+    /// genuinely divergent path — only an override that resolves to the exact
+    /// same file as the declared `main` backend may proceed.
+    #[test]
+    #[serial]
+    fn concrete_db_override_diverging_from_sqlite_main_backend_is_still_rejected() {
+        use khive_runtime::PackConfig;
+
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("main.db");
+        let secondary_path = dir.path().join("secondary.db");
+        let override_path = dir.path().join("not-main.db");
+
+        let khive_cfg = KhiveConfig {
+            backends: vec![
+                BackendConfig {
+                    name: "main".to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(main_path.clone()),
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: false,
+                },
+                BackendConfig {
+                    name: "secondary".to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(secondary_path.clone()),
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: false,
+                },
+            ],
+            packs: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(
+                    "comm".to_string(),
+                    PackConfig {
+                        backend: "secondary".to_string(),
+                    },
+                );
+                m
+            },
+            ..KhiveConfig::default()
+        };
+
+        let override_str = override_path.to_str().unwrap().to_string();
+        let base_cfg = RuntimeConfig {
+            db_path: khive_runtime::resolve_db_anchor(Some(override_str.as_str())),
+            ..base_runtime_config_for_multi_backend()
+        };
+
+        let result =
+            build_registry_for_multi_backend(base_cfg, &khive_cfg, Some(override_str.as_str()));
+        assert!(
+            result.is_err(),
+            "a --db override that diverges from the declared \"main\" backend path \
+             must still be rejected as ambiguous"
+        );
+        if let Err(err) = result {
+            let msg = err.to_string();
+            assert!(
+                msg.contains("khive.toml"),
+                "error message must point at khive.toml as where to make the change \
+                 instead; got: {msg}"
+            );
+        }
+        assert!(
+            !override_path.exists(),
+            "a rejected override path must never be created on disk"
+        );
     }
 
     /// Regression: the multi-backend boot path
