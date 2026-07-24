@@ -23,7 +23,7 @@ own boot lock — before `confirm_genuinely_dead` runs, and holds it through
 kill + spawn. This makes recovery mutually exclusive across recoverers
 without risking a deadlock against a booting daemon: the daemon itself never
 acquires this lock, only `kill_and_respawn` does. A bounded, deadline-aware
-acquisition (`RECOVERER_LOCK_TIMEOUT_MS` = 8000, generous enough to cover a
+acquisition (`RECOVERER_LOCK_TIMEOUT_MS` = 16000, generous enough to cover a
 peer's full worst-case critical section) is used instead of an unbounded
 `flock` so a second recoverer never blocks forever on a wedged first one.
 
