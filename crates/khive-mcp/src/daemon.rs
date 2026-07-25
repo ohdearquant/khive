@@ -687,7 +687,7 @@ fn spawn_daemon_with_exe(exe: &std::path::Path) -> std::io::Result<std::process:
 ///
 /// Both conditions must hold:
 /// (a) the first whitespace-delimited token's file-name basename is exactly
-///     `kkernel` (an absolute path like `/Users/x/.cargo/bin/kkernel` is
+///     `kkernel` (an absolute path like `/usr/local/bin/kkernel` is
 ///     accepted; a basename of `not-kkernel` or a wrapper whose argv[0] merely
 ///     mentions kkernel elsewhere is rejected), AND
 /// (b) the remaining tokens contain both `mcp` and `--daemon` as distinct
@@ -3758,7 +3758,7 @@ mod tests {
     fn argv_daemon_true_absolute_path() {
         // Absolute path to kkernel binary — basename must match.
         assert!(argv_is_khive_daemon(
-            "/Users/x/.cargo/bin/kkernel mcp --daemon"
+            "/usr/local/bin/kkernel mcp --daemon"
         ));
     }
 
@@ -3772,7 +3772,7 @@ mod tests {
     fn argv_daemon_false_less_with_kkernel_path() {
         // less paging a kkernel source file — argv[0] is "less", not "kkernel".
         assert!(!argv_is_khive_daemon(
-            "less /Users/x/projects/kkernel/daemon.rs"
+            "less /usr/local/src/kkernel/daemon.rs"
         ));
     }
 
@@ -3797,7 +3797,7 @@ mod tests {
     #[test]
     fn argv_daemon_true_with_surrounding_and_inner_whitespace() {
         assert!(argv_is_khive_daemon(
-            "  /Users/x/.cargo/bin/kkernel   mcp    --daemon  "
+            "  /usr/local/bin/kkernel   mcp    --daemon  "
         ));
     }
 
@@ -3807,7 +3807,7 @@ mod tests {
         // as a valid daemon so stale bench daemons are SIGTERM'd on respawn.
         assert!(argv_is_khive_daemon("kkernel-bench mcp --daemon"));
         assert!(argv_is_khive_daemon(
-            "/Users/x/.cargo/bin/kkernel-bench mcp --daemon"
+            "/usr/local/bin/kkernel-bench mcp --daemon"
         ));
     }
 

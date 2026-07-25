@@ -4330,7 +4330,7 @@ mod tests {
         // `contains_bounded_word`), so `auth` does not match inside
         // `authorized`; this UUID has no trigger in its window and passes via
         // the ordinary out-of-context UUID allowlist.
-        let content = "area_id: cfcea31d-6f50-4fd1-ad6d-5f160de1694c\n\n## Problem\nReduce Lion microkernel axioms. Converted authorized_write_requires_dominance from axiom to theorem.";
+        let content = "area_id: cfcea31d-6f50-4fd1-ad6d-5f160de1694c\n\n## Problem\nReduce microkernel axioms. Converted authorized_write_requires_dominance from axiom to theorem.";
         assert!(
             check(content).is_ok(),
             "internal area_id UUID near the 'authorized' substring \
