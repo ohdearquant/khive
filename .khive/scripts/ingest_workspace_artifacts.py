@@ -44,7 +44,7 @@ Design notes:
   missing required edge (crates/khive-runtime/src/operations.rs
   create_note_inner).
 - CONCURRENCY: a machine-wide POSIX advisory lock (fcntl.flock on the fixed
-  path `/tmp/lion-khive-wsingest.lock`, independent of which checkout/
+  path `/tmp/khive-wsingest.lock`, independent of which checkout/
   worktree the script runs from) excludes concurrent --live invocations on
   this host. This is NOT a substitute for a server-side atomic natural-key
   dedup: the generic `create` verb does not expose the `external_id` /
@@ -83,7 +83,7 @@ CURSOR_PATH = SCRIPT_DIR / ".ws_ingest_cursor"
 # multiple repos, incidentally) share the same khive.db, so the exclusion
 # lock must be machine-wide, not per-checkout. /tmp, lion-prefixed, never
 # inside a cargo target tree (fleet lock-naming convention).
-LOCK_PATH = Path("/tmp/lion-khive-wsingest.lock")
+LOCK_PATH = Path("/tmp/khive-wsingest.lock")
 KKERNEL = os.path.expanduser("~/.cargo/bin/kkernel")
 
 # The daemon's embedder rejects create() content whose UTF-8 BYTE length
