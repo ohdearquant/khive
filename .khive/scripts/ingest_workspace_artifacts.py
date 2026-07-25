@@ -81,8 +81,8 @@ KHIVE_DIR = REPO_ROOT / ".khive"
 CURSOR_PATH = SCRIPT_DIR / ".ws_ingest_cursor"
 # Fixed, checkout-independent path: multiple worktrees of this repo (or
 # multiple repos, incidentally) share the same khive.db, so the exclusion
-# lock must be machine-wide, not per-checkout. /tmp, lion-prefixed, never
-# inside a cargo target tree (fleet lock-naming convention).
+# lock must be machine-wide, not per-checkout. A fixed /tmp path, never
+# inside a cargo target tree.
 LOCK_PATH = Path("/tmp/khive-wsingest.lock")
 KKERNEL = os.path.expanduser("~/.cargo/bin/kkernel")
 
