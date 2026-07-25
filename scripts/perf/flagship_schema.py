@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Flagship E2E result schema v3 (stdlib-only).
 
-Implements the Distribution contract and the Ledger record contract from
-`.khive/workspaces/20260711/bench-overhaul/DESIGN.md` ("Typed interfaces")
-as plain-dict validators, mirroring `schemas/flagship-result-v3.json` (the
+Implements the Distribution contract and the Ledger record contract as
+plain-dict validators, mirroring `schemas/flagship-result-v3.json` (the
 checked JSON Schema copy of the same contract, kept for external tooling
 and IDE validation). This module is the one `scripts/perf/coverage_validator.py`
 actually imports - no `jsonschema` dependency, matching the stdlib-only
@@ -61,7 +60,7 @@ ESTIMATOR = "nearest_rank_v1"
 DISTRIBUTION_UNIT = "us"
 # Global floor for status="ok" records: nearest-rank p99 needs n>=100 to
 # land on a real observation rather than interpolate/repeat a low-n sample
-# (khive#945 amendment, Leo signed §2.1). A scenario may declare a HIGHER
+# A scenario may declare a HIGHER
 # minimum (raise-only, enforced in coverage_validator.py against the
 # manifest); a declared minimum below this floor never lowers it.
 TIMED_MIN_SUCCESSES = 100

@@ -1290,7 +1290,7 @@ mod tests {
             khive_dir.join("config.toml"),
             r#"
 [actor]
-id = "lambda:test-actor"
+id = "agent:test-actor"
 
 [[engines]]
 name = "primary"
@@ -1350,12 +1350,12 @@ default = true
 
         // The TOML must actually have reached both constructions — the direct
         // regression proxy for #581, verified without a live daemon socket.
-        assert_eq!(exec_cfg.actor_id.as_deref(), Some("lambda:test-actor"));
-        assert_eq!(serve_cfg.actor_id.as_deref(), Some("lambda:test-actor"));
+        assert_eq!(exec_cfg.actor_id.as_deref(), Some("agent:test-actor"));
+        assert_eq!(serve_cfg.actor_id.as_deref(), Some("agent:test-actor"));
         assert!(
             exec_cfg
                 .visible_namespaces
-                .contains(&Namespace::parse("lambda:test-actor").expect("ns")),
+                .contains(&Namespace::parse("agent:test-actor").expect("ns")),
             "actor.id must fold into visible_namespaces (ADR-007 Rev 4 Rule 3b)"
         );
         assert!(
@@ -1395,7 +1395,7 @@ default = true
 
         let missing_config =
             std::path::PathBuf::from("/nonexistent/khive-exec-parity-test/config.toml");
-        let ns = Namespace::parse("lambda:custom-ns").expect("ns");
+        let ns = Namespace::parse("agent:custom-ns").expect("ns");
         // Pin packs so the `compute_config_id` comparison below never depends
         // on two independent `KHIVE_PACKS` env reads agreeing (#1356).
         let pinned_packs = Some(vec!["kg".to_string()]);
@@ -1427,7 +1427,7 @@ default = true
         // The fill-when-None guard DOES fire differently between the two arms...
         assert_eq!(
             with_explicit_true.actor_id.as_deref(),
-            Some("lambda:custom-ns"),
+            Some("agent:custom-ns"),
             "namespace_explicit=true + non-local namespace + no config actor.id \
              must fill actor_id from the namespace (ADR-057)"
         );
@@ -2465,7 +2465,7 @@ default = true
         let cfg = RuntimeConfig {
             db_path: None,
             packs: vec!["kg".to_string()],
-            actor_id: Some("lambda:tenant-x".to_string()), // actor configured → no gate
+            actor_id: Some("agent:tenant-x".to_string()), // actor configured → no gate
             ..RuntimeConfig::default()
         };
 
@@ -3639,8 +3639,7 @@ backend = "sessions"
 
     /// `link`: a typo'd key (`relatoin` for `relation`) must be rejected
     /// before any write; a well-formed link still succeeds. (Distinct from
-    /// the Leo-accepted `target_backend` conflict-arm deferral — out of
-    /// scope here.)
+    /// the `target_backend` conflict-arm deferral — out of scope here.)
     #[tokio::test]
     async fn atomic_link_unknown_field_rejected_well_formed_succeeds() {
         let db_file = NamedTempFile::new().expect("temp db");

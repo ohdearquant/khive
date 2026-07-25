@@ -94,7 +94,7 @@ pub struct RegressionReport {
 // weights_as_of
 // ---------------------------------------------------------------------------
 
-/// Reconstruct the weight state for a lambda at a given point in time.
+/// Reconstruct the weight state for a actor at a given point in time.
 ///
 /// For each (lambda_id, atom_id) pair, selects the latest `weight_events` row
 /// with `ts ≤ at_time` and returns `weight_after`.  Atoms with no history
@@ -180,7 +180,7 @@ pub async fn weights_as_of(
 /// The in-memory HNSW snapshot is global (it indexes all atoms regardless of
 /// namespace).  Without this post-filter, `replay()` would return atoms from
 /// any namespace that happen to be semantically close to the query, leaking
-/// cross-tenant atom UUIDs to the requesting lambda.
+/// cross-tenant atom UUIDs to the requesting actor.
 // REASON: called only from the `#[cfg(feature = "engine")]` replay() function; without the
 // feature gate the caller is compiled out, making this function appear dead to rustc.
 #[allow(dead_code)]
@@ -256,13 +256,13 @@ pub async fn replay(
         .await
         .map_err(|e| EngineError::Retrieval(format!("replay search: {e}")))?;
 
-    // Step 2b (B1 fix): filter to atoms owned by this lambda's namespace.
+    // Step 2b (B1 fix): filter to atoms owned by this actor's namespace.
     //
     // The HNSW snapshot is global — it contains atoms from every namespace
     // stored in this engine instance.  Without this filter, `replay()` would
     // leak cross-tenant atom UUIDs into the ranked result (they default to
     // weight 1.0 when absent from the weight map, potentially outranking the
-    // requesting lambda's own down-weighted atoms).
+    // requesting actor's own down-weighted atoms).
     //
     // A single engine instance may serve multiple lambdas whose atoms co-exist
     // in SQLite but whose HNSW vectors are interleaved.
@@ -868,21 +868,21 @@ mod tests {
     #[tokio::test]
     async fn test_weights_as_of_returns_snapshot_at_time() {
         let conn = make_conn();
-        let lambda = "lambda:test";
+        let actor = "agent:test";
         let atom = Uuid::new_v4();
         let atom_str = atom.to_string();
 
         // t0: weight 1.5
         let t0_us: i64 = 1_000_000_000;
-        insert_weight_event(&conn, lambda, &atom_str, 1.5, t0_us);
+        insert_weight_event(&conn, actor, &atom_str, 1.5, t0_us);
 
         // t1: weight 2.5 (later)
         let t1_us: i64 = 2_000_000_000;
-        insert_weight_event(&conn, lambda, &atom_str, 2.5, t1_us);
+        insert_weight_event(&conn, actor, &atom_str, 2.5, t1_us);
 
         // Query at t0 + 1: should see 1.5.
         let at_t0 = DateTime::from_timestamp_micros(t0_us + 1).unwrap();
-        let snapshot = weights_as_of(&conn, lambda, at_t0)
+        let snapshot = weights_as_of(&conn, actor, at_t0)
             .await
             .expect("weights_as_of");
         let w = *snapshot.get(&atom).expect("atom must be in snapshot");
@@ -890,7 +890,7 @@ mod tests {
 
         // Query at t1 + 1: should see 2.5.
         let at_t1 = DateTime::from_timestamp_micros(t1_us + 1).unwrap();
-        let snapshot2 = weights_as_of(&conn, lambda, at_t1)
+        let snapshot2 = weights_as_of(&conn, actor, at_t1)
             .await
             .expect("weights_as_of at t1");
         let w2 = *snapshot2
@@ -902,16 +902,16 @@ mod tests {
     #[tokio::test]
     async fn test_weights_as_of_before_any_event_is_empty() {
         let conn = make_conn();
-        let lambda = "lambda:test";
+        let actor = "agent:test";
         let atom = Uuid::new_v4();
         let atom_str = atom.to_string();
 
         let t1_us: i64 = 2_000_000_000;
-        insert_weight_event(&conn, lambda, &atom_str, 2.0, t1_us);
+        insert_weight_event(&conn, actor, &atom_str, 2.0, t1_us);
 
         // Query before t1: no rows.
         let before = DateTime::from_timestamp_micros(t1_us - 1).unwrap();
-        let snapshot = weights_as_of(&conn, lambda, before)
+        let snapshot = weights_as_of(&conn, actor, before)
             .await
             .expect("weights_as_of");
         assert!(
@@ -923,15 +923,15 @@ mod tests {
     #[tokio::test]
     async fn test_rank_history_returns_ordered_events() {
         let conn = make_conn();
-        let lambda = "lambda:rank_hist";
+        let actor = "agent:rank_hist";
         let atom = Uuid::new_v4();
         let atom_str = atom.to_string();
 
-        insert_weight_event(&conn, lambda, &atom_str, 1.2, 1_000);
-        insert_weight_event(&conn, lambda, &atom_str, 1.4, 2_000);
-        insert_weight_event(&conn, lambda, &atom_str, 1.1, 3_000);
+        insert_weight_event(&conn, actor, &atom_str, 1.2, 1_000);
+        insert_weight_event(&conn, actor, &atom_str, 1.4, 2_000);
+        insert_weight_event(&conn, actor, &atom_str, 1.1, 3_000);
 
-        let history = rank_history(&conn, lambda, atom)
+        let history = rank_history(&conn, actor, atom)
             .await
             .expect("rank_history");
 
@@ -996,7 +996,7 @@ mod tests {
     #[tokio::test]
     async fn test_adjustment_rate_per_day() {
         let conn = make_conn();
-        let lambda = "lambda:rate_test";
+        let actor = "agent:rate_test";
         let atom = Uuid::new_v4();
         let atom_str = atom.to_string();
 
@@ -1004,11 +1004,11 @@ mod tests {
         let now_us = Utc::now().timestamp_micros();
         let yesterday_us = now_us - 86_400_000_001_i64; // slightly over 24h ago
 
-        insert_weight_event(&conn, lambda, &atom_str, 1.1, now_us - 100);
-        insert_weight_event(&conn, lambda, &atom_str, 1.2, now_us - 50);
-        insert_weight_event(&conn, lambda, &atom_str, 1.3, yesterday_us);
+        insert_weight_event(&conn, actor, &atom_str, 1.1, now_us - 100);
+        insert_weight_event(&conn, actor, &atom_str, 1.2, now_us - 50);
+        insert_weight_event(&conn, actor, &atom_str, 1.3, yesterday_us);
 
-        let rates = metrics::adjustment_rate_per_day(&conn, lambda, 7)
+        let rates = metrics::adjustment_rate_per_day(&conn, actor, 7)
             .await
             .expect("adjustment_rate_per_day");
 

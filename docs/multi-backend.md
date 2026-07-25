@@ -96,7 +96,7 @@ or `~/.khive/config.toml`; see [Config resolution](#config-resolution) below).
 ```toml
 # ── Actor identity ─────────────────────────────────────────────────────────────
 [actor]
-id = "lambda:app"                   # attribution label (optional)
+id = "agent:app"                   # attribution label (optional)
 display_name = "khive app node"     # advisory; not used by the runtime
 
 # ── Embedding engines ──────────────────────────────────────────────────────────

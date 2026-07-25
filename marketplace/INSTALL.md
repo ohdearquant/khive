@@ -57,7 +57,7 @@ Create or update `.mcp.json` in your project root:
         "kg"
       ],
       "env": {
-        "KHIVE_ACTOR": "lambda:your-id"
+        "KHIVE_ACTOR": "agent:your-id"
       }
     }
   }
@@ -79,10 +79,10 @@ silently defaults to `"local"`, which leaves your messages unattributed and your
 unscoped (it returns every `"local"` message, not just yours). Set it once, per agent.
 
 The `env` block in Option A is the simplest place — set `KHIVE_ACTOR` to this agent's id (e.g.
-`lambda:khive`, `lambda:lattice`). For per-session CLI registration, pass the flag instead:
+`agent:alpha`, `agent:beta`). For per-session CLI registration, pass the flag instead:
 
 ```bash
-claude mcp add --transport stdio khive -- kkernel mcp --actor lambda:your-id --pack kg
+claude mcp add --transport stdio khive -- kkernel mcp --actor agent:your-id --pack kg
 ```
 
 Resolution order (highest to lowest):
@@ -97,7 +97,7 @@ The config-file form (searched in order `./khive.toml`, `./.khive/config.toml`,
 
 ```toml
 [actor]
-id = "lambda:your-id"
+id = "agent:your-id"
 ```
 
 When a messaging extension pack (e.g. `comm`, a commercially licensed extension not part of

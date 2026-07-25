@@ -56,17 +56,17 @@ mod tests {
 
     #[test]
     fn resolve_actor_configured_id_is_attributed() {
-        let actor = resolve_actor(Some("lambda:khive"));
+        let actor = resolve_actor(Some("agent:khive"));
         assert_eq!(actor.kind, "actor");
-        assert_eq!(actor.id, "lambda:khive");
+        assert_eq!(actor.id, "agent:khive");
         assert!(!actor_is_unattributed(&actor));
     }
 
     #[test]
     fn resolve_actor_preserves_untrimmed_id() {
         // Trim only decides emptiness; the id itself is stored verbatim.
-        let actor = resolve_actor(Some(" lambda:khive "));
-        assert_eq!(actor.id, " lambda:khive ");
+        let actor = resolve_actor(Some(" agent:khive "));
+        assert_eq!(actor.id, " agent:khive ");
     }
 
     #[test]
@@ -86,9 +86,6 @@ mod tests {
     #[test]
     fn should_warn_unattributed_actor_silent_when_attributed() {
         let packs = vec!["kg".to_string(), "comm".to_string()];
-        assert!(!should_warn_unattributed_actor(
-            Some("lambda:khive"),
-            &packs
-        ));
+        assert!(!should_warn_unattributed_actor(Some("agent:khive"), &packs));
     }
 }

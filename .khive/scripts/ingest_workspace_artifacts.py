@@ -9,8 +9,7 @@ verdicts that name a PR) an additional `annotates` edge to the matching
 git-pack `pull_request` note.
 
 No new MCP verbs are needed — this uses only the existing generic
-create/link/list/search verbs over the merged workspace-pack substrate
-(Ocean ruling 2026-07-13).
+create/link/list/search verbs over the merged workspace-pack substrate.
 
 Usage:
     uv run python .khive/scripts/ingest_workspace_artifacts.py --dry-run

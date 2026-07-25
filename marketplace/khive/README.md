@@ -12,7 +12,7 @@ the MCP server; install and configure that per [INSTALL.md](../INSTALL.md).
 
 Every record you write is stamped with **who you are** (`from_actor`), resolved from the MCP
 server's actor config. If it is unset it silently defaults to `"local"`. Set
-`KHIVE_ACTOR=lambda:<your-id>` in the server env (or pass `--actor`) before you start. See
+`KHIVE_ACTOR=agent:<your-id>` in the server env (or pass `--actor`) before you start. See
 [INSTALL.md → Set your actor identity](../INSTALL.md#set-your-actor-identity-attribution).
 
 ## Pattern skill

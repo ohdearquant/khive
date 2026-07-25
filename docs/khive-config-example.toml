@@ -37,11 +37,11 @@
 # optional — the defaults apply when the section is absent.
 
 [actor]
-# Attribution identity. Must be a valid namespace string ("local", "lambda:khive",
+# Attribution identity. Must be a valid namespace string ("local", "agent:khive",
 # …). Validated at load — an invalid value is a startup error, not a silent
 # fallback. Absent → `local`. Overridden by --actor / KHIVE_ACTOR. A non-`local` id
 # does NOT route writes; it only widens the default read scope (see below).
-# id = "lambda:khive"
+# id = "agent:khive"
 
 # Human-readable label. Surfaced in introspection and logs only; never used for
 # routing.
@@ -50,11 +50,11 @@
 # Widen the DEFAULT multi-record READ scope to {local} ∪ these namespaces
 # (ADR-007 Rev 4 Rule 3b). Writes stay pinned to `local`. An explicit `namespace=`
 # request parameter is a precise escape and is not widened by this list.
-# visible_namespaces = ["lambda:khive", "local"]
+# visible_namespaces = ["agent:khive", "local"]
 
 # Namespaces this actor's comm.send / comm.reply may deliver INTO. Empty (default)
 # denies all cross-namespace delivery. Each entry must be a valid namespace.
-# allowed_outbound_namespaces = ["lambda:leo"]
+# allowed_outbound_namespaces = ["agent:alpha"]
 
 # ── [runtime] — runtime knobs ────────────────────────────────────────────────────
 

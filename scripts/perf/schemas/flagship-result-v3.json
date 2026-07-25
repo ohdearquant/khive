@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://khive.dev/schemas/flagship-result-v3.json",
   "title": "FlagshipRecord",
-  "description": "Checked result contract for the flagship E2E benchmark manifest (bench-overhaul PR 1). Implements the Distribution contract and the Ledger record contract from .khive/workspaces/20260711/bench-overhaul/DESIGN.md ('Typed interfaces'), which fixes FlagshipRecord.schema_version at 3 - the same schema_version track scripts/perf/bench_track.py's ledger will carry for flagship-e2e records once PR 2 wires this runner's output into that ledger. bench_track.py itself remains at its own SCHEMA_VERSION = 2 for its existing (non-flagship) suites until then. No runner emits documents against this schema yet - PR 2+ implement the scenario runner.",
+  "description": "Checked result contract for the flagship E2E benchmark manifest. Implements the Distribution contract and the Ledger record contract, which fixes FlagshipRecord.schema_version at 3 - the same schema_version track scripts/perf/bench_track.py's ledger will carry for flagship-e2e records once this runner's output is wired into that ledger. bench_track.py itself remains at its own SCHEMA_VERSION = 2 for its existing (non-flagship) suites until then.",
   "type": "object",
   "required": [
     "schema_version",

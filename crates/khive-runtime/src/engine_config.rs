@@ -122,9 +122,9 @@ pub struct EngineConfig {
 ///
 /// ```toml
 /// [actor]
-/// id = "lambda:leo"                          # attribution identity (required)
+/// id = "agent:alpha"                          # attribution identity (required)
 /// display_name = "example actor"   # human label (optional)
-/// visible_namespaces = ["lambda:khive", "local"]  # widens default read scope (ADR-007 Rev 4 Rule 3b)
+/// visible_namespaces = ["agent:khive", "local"]  # widens default read scope (ADR-007 Rev 4 Rule 3b)
 /// ```
 ///
 /// `visible_namespaces` is consumed by OSS dispatch to widen the DEFAULT
@@ -136,7 +136,7 @@ pub struct EngineConfig {
 pub struct ActorConfig {
     /// Namespace identifier used as the default actor for all operations.
     ///
-    /// Must be a valid `Namespace` string (e.g. `"local"`, `"lambda:khive"`).
+    /// Must be a valid `Namespace` string (e.g. `"local"`, `"agent:khive"`).
     /// Defaults to `"local"` when absent — backward-compatible with pre-actor
     /// deployments.
     #[serde(default)]
@@ -1125,14 +1125,14 @@ fusion_weight = 0.3
             &dir,
             r#"
 [actor]
-id = "lambda:khive"
+id = "agent:khive"
 display_name = "example actor"
 "#,
         );
         let cfg = KhiveConfig::load(Some(&path))
             .expect("load should succeed")
             .expect("file should be found");
-        assert_eq!(cfg.actor.id.as_deref(), Some("lambda:khive"));
+        assert_eq!(cfg.actor.id.as_deref(), Some("agent:khive"));
         assert_eq!(cfg.actor.display_name.as_deref(), Some("example actor"));
         assert!(cfg.engines.is_empty());
     }
@@ -1144,7 +1144,7 @@ display_name = "example actor"
             &dir,
             r#"
 [actor]
-id = "lambda:test"
+id = "agent:test"
 
 [[engines]]
 name = "default"
@@ -1155,7 +1155,7 @@ default = true
         let cfg = KhiveConfig::load(Some(&path))
             .expect("load should succeed")
             .expect("file should be found");
-        assert_eq!(cfg.actor.id.as_deref(), Some("lambda:test"));
+        assert_eq!(cfg.actor.id.as_deref(), Some("agent:test"));
         assert_eq!(cfg.engines.len(), 1);
     }
 
@@ -1198,13 +1198,13 @@ default = true
             &dir,
             r#"
 [actor]
-id = "lambda:explicit"
+id = "agent:explicit"
 "#,
         );
         let cfg = KhiveConfig::load_with_home_fallback(Some(&path), None)
             .expect("no error expected")
             .expect("file found");
-        assert_eq!(cfg.actor.id.as_deref(), Some("lambda:explicit"));
+        assert_eq!(cfg.actor.id.as_deref(), Some("agent:explicit"));
     }
 
     #[test]
@@ -1248,14 +1248,14 @@ id = ""
             &dir,
             r#"
 [actor]
-id = "lambda:"
+id = "agent:"
 "#,
         );
         let err =
-            KhiveConfig::load(Some(&path)).expect_err("lambda: with no slug should be rejected");
+            KhiveConfig::load(Some(&path)).expect_err("agent: with no slug should be rejected");
         assert!(
             matches!(err, ConfigError::InvalidActorId { .. }),
-            "expected InvalidActorId for 'lambda:', got {err:?}"
+            "expected InvalidActorId for 'agent:', got {err:?}"
         );
     }
 
@@ -1270,7 +1270,7 @@ id = "lambda:"
         let cfg = KhiveConfig {
             engines: vec![],
             actor: ActorConfig {
-                id: Some("lambda:test-actor".to_string()),
+                id: Some("agent:test-actor".to_string()),
                 display_name: None,
                 ..Default::default()
             },
@@ -1291,7 +1291,7 @@ id = "lambda:"
         assert!(
             result
                 .visible_namespaces
-                .contains(&Namespace::parse("lambda:test-actor").unwrap()),
+                .contains(&Namespace::parse("agent:test-actor").unwrap()),
             "actor.id must be folded into visible_namespaces (ADR-007 Rev 4 Rule 3b fold-in); \
              got: {:?}",
             result.visible_namespaces
@@ -1315,7 +1315,7 @@ id = "lambda:"
         };
         cfg.validate().expect("valid config");
 
-        let base_ns = Namespace::parse("lambda:base").unwrap();
+        let base_ns = Namespace::parse("agent:base").unwrap();
         let base = RuntimeConfig {
             default_namespace: base_ns.clone(),
             ..RuntimeConfig::default()
@@ -1335,14 +1335,14 @@ id = "lambda:"
         std::fs::create_dir_all(dir.path().join(".khive")).unwrap();
         std::fs::write(
             dir.path().join(".khive/config.toml"),
-            "[actor]\nid = \"lambda:hidden\"\n",
+            "[actor]\nid = \"agent:hidden\"\n",
         )
         .unwrap();
 
         // Write khive.toml (tier 2) — should win.
         std::fs::write(
             dir.path().join("khive.toml"),
-            "[actor]\nid = \"lambda:project-root\"\n",
+            "[actor]\nid = \"agent:project-root\"\n",
         )
         .unwrap();
 
@@ -1351,7 +1351,7 @@ id = "lambda:"
             .expect("file should be found");
         assert_eq!(
             cfg.actor.id.as_deref(),
-            Some("lambda:project-root"),
+            Some("agent:project-root"),
             "khive.toml (tier 2) must win over .khive/config.toml (tier 3)"
         );
     }
@@ -1363,7 +1363,7 @@ id = "lambda:"
         std::fs::create_dir_all(dir.path().join(".khive")).unwrap();
         std::fs::write(
             dir.path().join(".khive/config.toml"),
-            "[actor]\nid = \"lambda:hidden-config\"\n",
+            "[actor]\nid = \"agent:hidden-config\"\n",
         )
         .unwrap();
         // No khive.toml.
@@ -1373,7 +1373,7 @@ id = "lambda:"
             .expect("file should be found");
         assert_eq!(
             cfg.actor.id.as_deref(),
-            Some("lambda:hidden-config"),
+            Some("agent:hidden-config"),
             ".khive/config.toml (tier 3) must be found when khive.toml is absent"
         );
     }
@@ -1386,7 +1386,7 @@ id = "lambda:"
         std::fs::create_dir_all(home_dir.path().join(".khive")).unwrap();
         std::fs::write(
             home_dir.path().join(".khive/config.toml"),
-            "[actor]\nid = \"lambda:user-global\"\n",
+            "[actor]\nid = \"agent:user-global\"\n",
         )
         .unwrap();
         // No project-level files.
@@ -1396,7 +1396,7 @@ id = "lambda:"
             .expect("file should be found");
         assert_eq!(
             cfg.actor.id.as_deref(),
-            Some("lambda:user-global"),
+            Some("agent:user-global"),
             "~/.khive/config.toml (tier 4) must be found when project files absent"
         );
     }
@@ -1410,7 +1410,7 @@ id = "lambda:"
         std::fs::create_dir_all(home_dir.path().join(".khive")).unwrap();
         std::fs::write(
             home_dir.path().join(".khive/config.toml"),
-            "[actor]\nid = \"lambda:user-global\"\n",
+            "[actor]\nid = \"agent:user-global\"\n",
         )
         .unwrap();
 
@@ -1418,7 +1418,7 @@ id = "lambda:"
         std::fs::create_dir_all(project_dir.path().join(".khive")).unwrap();
         std::fs::write(
             project_dir.path().join(".khive/config.toml"),
-            "[actor]\nid = \"lambda:project-wins\"\n",
+            "[actor]\nid = \"agent:project-wins\"\n",
         )
         .unwrap();
 
@@ -1427,7 +1427,7 @@ id = "lambda:"
             .expect("file should be found");
         assert_eq!(
             cfg.actor.id.as_deref(),
-            Some("lambda:project-wins"),
+            Some("agent:project-wins"),
             "project .khive/config.toml (tier 3) must win over ~/.khive/config.toml (tier 4)"
         );
     }
@@ -1449,13 +1449,13 @@ id = "lambda:"
         std::fs::create_dir_all(cwd_a.path().join(".khive")).unwrap();
         std::fs::write(
             cwd_a.path().join(".khive/config.toml"),
-            "[actor]\nid = \"lambda:wrong-cwd-a\"\n",
+            "[actor]\nid = \"agent:wrong-cwd-a\"\n",
         )
         .unwrap();
         std::fs::create_dir_all(cwd_b.path().join(".khive")).unwrap();
         std::fs::write(
             cwd_b.path().join(".khive/config.toml"),
-            "[actor]\nid = \"lambda:wrong-cwd-b\"\n",
+            "[actor]\nid = \"agent:wrong-cwd-b\"\n",
         )
         .unwrap();
 
@@ -1468,7 +1468,7 @@ id = "lambda:"
         std::fs::write(&db_path, b"").unwrap(); // must exist for canonicalize to succeed
         std::fs::write(
             khive_dir.join("config.toml"),
-            "[actor]\nid = \"lambda:db-anchored\"\n",
+            "[actor]\nid = \"agent:db-anchored\"\n",
         )
         .unwrap();
 
@@ -1481,12 +1481,12 @@ id = "lambda:"
 
         assert_eq!(
             cfg_a.actor.id.as_deref(),
-            Some("lambda:db-anchored"),
+            Some("agent:db-anchored"),
             "cwd A must resolve the db-anchored config, not its own decoy"
         );
         assert_eq!(
             cfg_b.actor.id.as_deref(),
-            Some("lambda:db-anchored"),
+            Some("agent:db-anchored"),
             "cwd B must resolve the db-anchored config, not its own decoy"
         );
         assert_eq!(
@@ -1502,7 +1502,7 @@ id = "lambda:"
     #[test]
     fn test_load_with_home_fallback_explicit_config_wins_over_db_anchor() {
         let explicit_dir = tempfile::tempdir().unwrap();
-        let explicit_path = write_toml(&explicit_dir, "[actor]\nid = \"lambda:explicit-wins\"\n");
+        let explicit_path = write_toml(&explicit_dir, "[actor]\nid = \"agent:explicit-wins\"\n");
 
         let db_root = tempfile::tempdir().unwrap();
         let khive_dir = db_root.path().join(".khive");
@@ -1511,7 +1511,7 @@ id = "lambda:"
         std::fs::write(&db_path, b"").unwrap();
         std::fs::write(
             khive_dir.join("config.toml"),
-            "[actor]\nid = \"lambda:db-anchor-loses\"\n",
+            "[actor]\nid = \"agent:db-anchor-loses\"\n",
         )
         .unwrap();
 
@@ -1520,7 +1520,7 @@ id = "lambda:"
             .expect("explicit path must be found");
         assert_eq!(
             cfg.actor.id.as_deref(),
-            Some("lambda:explicit-wins"),
+            Some("agent:explicit-wins"),
             "explicit --config/KHIVE_CONFIG must win over the db-dir anchor"
         );
     }
@@ -1534,7 +1534,7 @@ id = "lambda:"
         std::fs::create_dir_all(home_dir.path().join(".khive")).unwrap();
         std::fs::write(
             home_dir.path().join(".khive/config.toml"),
-            "[actor]\nid = \"lambda:home-fallback\"\n",
+            "[actor]\nid = \"agent:home-fallback\"\n",
         )
         .unwrap();
 
@@ -1550,7 +1550,7 @@ id = "lambda:"
             .expect("home-tier config must be found");
         assert_eq!(
             cfg.actor.id.as_deref(),
-            Some("lambda:home-fallback"),
+            Some("agent:home-fallback"),
             "tier 4 (~/.khive/config.toml) must still be reached when the db-anchored \
              tier-3 directory has no config.toml"
         );
@@ -1565,7 +1565,7 @@ id = "lambda:"
         std::fs::create_dir_all(home_dir.path().join(".khive")).unwrap();
         std::fs::write(
             home_dir.path().join(".khive/config.toml"),
-            "[actor]\nid = \"lambda:home-cold-start\"\n",
+            "[actor]\nid = \"agent:home-cold-start\"\n",
         )
         .unwrap();
 
@@ -1578,7 +1578,7 @@ id = "lambda:"
                 .expect("home-tier config must still be found");
         assert_eq!(
             cfg.actor.id.as_deref(),
-            Some("lambda:home-cold-start"),
+            Some("agent:home-cold-start"),
             "a nonexistent db path (cold start) must fall through to tier 4, not panic"
         );
     }

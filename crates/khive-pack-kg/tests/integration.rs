@@ -12415,7 +12415,7 @@ async fn envelope_usage_equals_audit_row_resource_units() {
 async fn whoami_reports_configured_actor_and_namespace() {
     let rt = KhiveRuntime::memory().expect("in-memory runtime must succeed");
     let mut builder = VerbRegistryBuilder::new();
-    builder.with_actor_id(Some("lambda:khive".to_string()));
+    builder.with_actor_id(Some("agent:khive".to_string()));
     builder.register(KgPack::new(rt));
     let registry = builder.build().expect("registry builds");
 
@@ -12426,7 +12426,7 @@ async fn whoami_reports_configured_actor_and_namespace() {
 
     assert_eq!(
         result.get("actor_id").and_then(Value::as_str),
-        Some("lambda:khive"),
+        Some("agent:khive"),
         "whoami must report the configured actor id; got: {result}"
     );
     assert_eq!(

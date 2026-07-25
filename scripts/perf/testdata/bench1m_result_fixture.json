@@ -35,7 +35,7 @@
     "exit_code": 0,
     "overall": "PASS",
     "target_key": "khive-vamana/ci-synthetic/clustered-128",
-    "targets_file": "/Users/lion/khive-work/worktrees/fix830-r2/perf/targets.toml"
+    "targets_file": "perf/targets.toml"
   },
   "caveats": [
     "2-point fit",

@@ -581,7 +581,7 @@ fn build_registry_for_multi_backend_inner(
         tracing::warn!(
             "actor identity resolved to \"local\": comm sends will be stamped from \
              \"local\" (unattributed) and comm.inbox will be unscoped (party-line). \
-             Set KHIVE_ACTOR or --actor to this lambda's id."
+             Set KHIVE_ACTOR or --actor to this agent's id."
         );
     }
 
@@ -714,7 +714,7 @@ pub fn enforce_strict_actor_mode(
     if is_strict_actor_mode() && should_warn_unattributed(actor_id, loaded_packs) {
         anyhow::bail!(
             "KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1 is set but no actor identity is \
-             configured. Set KHIVE_ACTOR or --actor to this lambda's id before \
+             configured. Set KHIVE_ACTOR or --actor to this agent's id before \
              starting in strict mode (comm pack requires an attributed actor to \
              prevent party-line inbox exposure)."
         );
@@ -827,7 +827,7 @@ pub fn build_server_with_explicit_namespace(
             tracing::warn!(
                 "actor identity resolved to \"local\": comm sends will be stamped from \
                  \"local\" (unattributed) and comm.inbox will be unscoped (party-line). \
-                 Set KHIVE_ACTOR or --actor to this lambda's id."
+                 Set KHIVE_ACTOR or --actor to this agent's id."
             );
         }
         let schedule_rt = runtime
@@ -1867,7 +1867,7 @@ brain_profile = "project-profile"
 
     /// Regression for #203: the `--actor` / `--namespace`
     /// CLI flag must set `actor_id`, not just `default_namespace`. Before the fix,
-    /// `--actor lambda:x` with no `KHIVE_ACTOR` env and no config-file `[actor] id`
+    /// `--actor agent:x` with no `KHIVE_ACTOR` env and no config-file `[actor] id`
     /// left actor_id None → anonymous token → degraded ADR-057 comm + false warning.
     #[test]
     #[serial]
@@ -1885,7 +1885,7 @@ brain_profile = "project-profile"
         let resolved = resolve_runtime_config(RuntimeConfigInputs {
             db: Some(":memory:"),
             config: Some(&missing_config),
-            namespace: Namespace::parse("lambda:agent-x").expect("ns"),
+            namespace: Namespace::parse("agent:agent-x").expect("ns"),
             namespace_explicit: true,
             actor_explicit: true,
             no_embed: true,
@@ -1896,12 +1896,12 @@ brain_profile = "project-profile"
 
         assert_eq!(
             resolved.actor_id.as_deref(),
-            Some("lambda:agent-x"),
+            Some("agent:agent-x"),
             "--actor flag must populate actor_id (flag==env parity), not just default_namespace"
         );
         assert_eq!(
             resolved.default_namespace.as_str(),
-            "lambda:agent-x",
+            "agent:agent-x",
             "the flag still sets the write namespace"
         );
     }
@@ -1924,7 +1924,7 @@ brain_profile = "project-profile"
         let resolved = resolve_runtime_config(RuntimeConfigInputs {
             db: Some(":memory:"),
             config: Some(&path),
-            namespace: Namespace::parse("lambda:cli-actor").expect("ns"),
+            namespace: Namespace::parse("agent:cli-actor").expect("ns"),
             namespace_explicit: true,
             actor_explicit: true,
             no_embed: true,
@@ -1933,8 +1933,8 @@ brain_profile = "project-profile"
         })
         .expect("resolve no-embed config");
 
-        assert_eq!(resolved.default_namespace.as_str(), "lambda:cli-actor");
-        assert_eq!(resolved.actor_id.as_deref(), Some("lambda:cli-actor"));
+        assert_eq!(resolved.default_namespace.as_str(), "agent:cli-actor");
+        assert_eq!(resolved.actor_id.as_deref(), Some("agent:cli-actor"));
         assert_eq!(resolved.git_write.allowed.len(), 1);
         assert_eq!(
             resolved.git_write.allowed[0].repo,
@@ -2031,7 +2031,7 @@ brain_profile = "project-profile"
         std::fs::create_dir_all(seat_dir.path().join(".khive")).expect("mkdir seat .khive");
         std::fs::write(
             seat_dir.path().join(".khive/config.toml"),
-            "[actor]\nid = \"lambda:seat-actor\"\n",
+            "[actor]\nid = \"agent:seat-actor\"\n",
         )
         .expect("write seat config");
 
@@ -2039,7 +2039,7 @@ brain_profile = "project-profile"
 
         assert_eq!(
             khive_runtime::resolve_project_actor_id(None).expect("no config error"),
-            Some("lambda:seat-actor".to_string()),
+            Some("agent:seat-actor".to_string()),
             "resolve_project_actor_id must read the cwd-anchored .khive/config.toml \
              regardless of any database directory"
         );
@@ -2066,7 +2066,7 @@ brain_profile = "project-profile"
         std::fs::create_dir_all(seat_dir.path().join(".khive")).expect("mkdir seat .khive");
         std::fs::write(
             seat_dir.path().join(".khive/config.toml"),
-            "[actor]\nid = \"lambda:seat-actor\"\n",
+            "[actor]\nid = \"agent:seat-actor\"\n",
         )
         .expect("write seat config");
 
@@ -2095,7 +2095,7 @@ brain_profile = "project-profile"
 
         assert_eq!(
             resolved.actor_id.as_deref(),
-            Some("lambda:seat-actor"),
+            Some("agent:seat-actor"),
             "a seat-shaped cwd with its own [actor] must resolve that actor through \
              the full discovery path even when the shared db-anchored config \
              location carries none — got {:?}",
@@ -2178,7 +2178,7 @@ brain_profile = "project-profile"
         std::fs::create_dir_all(seat_dir.path().join(".khive")).expect("mkdir seat .khive");
         std::fs::write(
             seat_dir.path().join(".khive/config.toml"),
-            "[actor]\nid = \"lambda:project-actor\"\n",
+            "[actor]\nid = \"agent:project-actor\"\n",
         )
         .expect("write seat config");
 
@@ -2187,7 +2187,7 @@ brain_profile = "project-profile"
         let resolved = resolve_runtime_config(RuntimeConfigInputs {
             db: Some(":memory:"),
             config: None,
-            namespace: Namespace::parse("lambda:cli-actor").expect("ns"),
+            namespace: Namespace::parse("agent:cli-actor").expect("ns"),
             namespace_explicit: true,
             actor_explicit: true,
             no_embed: true,
@@ -2198,7 +2198,7 @@ brain_profile = "project-profile"
 
         assert_eq!(
             resolved.actor_id.as_deref(),
-            Some("lambda:cli-actor"),
+            Some("agent:cli-actor"),
             "an explicit --actor flag must win over a discovered project-config actor"
         );
     }
@@ -2216,11 +2216,11 @@ brain_profile = "project-profile"
             dir.path(),
             r#"
 [actor]
-id = "lambda:project-actor"
+id = "agent:project-actor"
 "#,
         );
 
-        std::env::set_var("KHIVE_ACTOR", "lambda:env-actor");
+        std::env::set_var("KHIVE_ACTOR", "agent:env-actor");
 
         let with_project_config = resolve_runtime_config(RuntimeConfigInputs {
             db: Some(":memory:"),
@@ -2252,12 +2252,12 @@ id = "lambda:project-actor"
 
         assert_eq!(
             with_project_config.actor_id.as_deref(),
-            Some("lambda:project-actor"),
+            Some("agent:project-actor"),
             "a project-config [actor] id must win over KHIVE_ACTOR env"
         );
         assert_eq!(
             without_project_config.actor_id.as_deref(),
-            Some("lambda:env-actor"),
+            Some("agent:env-actor"),
             "KHIVE_ACTOR env must still be used when no project config actor exists"
         );
     }
@@ -2279,12 +2279,12 @@ id = "lambda:project-actor"
         std::fs::create_dir_all(seat_dir.path().join(".khive")).expect("mkdir seat .khive");
         std::fs::write(
             seat_dir.path().join(".khive/config.toml"),
-            "[actor]\nid = \"lambda:project-actor\"\n",
+            "[actor]\nid = \"agent:project-actor\"\n",
         )
         .expect("write seat config");
 
         let _seat_env = SeatEnv::enter(seat_dir.path());
-        std::env::set_var("KHIVE_ACTOR", "lambda:env-actor");
+        std::env::set_var("KHIVE_ACTOR", "agent:env-actor");
 
         // The real arg vector `kkernel mcp` parses — no `--actor` flag, so a
         // pre-fix `env = "KHIVE_ACTOR"` binding would populate `args.actor`.
@@ -2312,7 +2312,7 @@ id = "lambda:project-actor"
         );
         assert_eq!(
             resolved.actor_id.as_deref(),
-            Some("lambda:project-actor"),
+            Some("agent:project-actor"),
             "project-config [actor] id must win over KHIVE_ACTOR env on the real clap path"
         );
         assert_eq!(
@@ -2338,7 +2338,7 @@ id = "lambda:project-actor"
         // (~/.khive/config.toml) both come up empty.
         let seat_dir = tempfile::tempdir().expect("seat tempdir");
         let _seat_env = SeatEnv::enter(seat_dir.path());
-        std::env::set_var("KHIVE_ACTOR", "lambda:env-only-actor");
+        std::env::set_var("KHIVE_ACTOR", "agent:env-only-actor");
 
         let args = Args::try_parse_from(["mcp"]).expect("parse real mcp args");
         let (namespace_explicit, namespace) =
@@ -2364,7 +2364,7 @@ id = "lambda:project-actor"
         );
         assert_eq!(
             resolved.actor_id.as_deref(),
-            Some("lambda:env-only-actor"),
+            Some("agent:env-only-actor"),
             "KHIVE_ACTOR env must still land as the tier-3 actor_id fallback \
              when no project config exists"
         );
@@ -2392,7 +2392,7 @@ id = "lambda:project-actor"
         std::fs::create_dir_all(seat_dir.path().join(".khive")).expect("mkdir seat .khive");
         std::fs::write(
             seat_dir.path().join(".khive/config.toml"),
-            "[actor]\nid = \"lambda:seat-actor\"\n",
+            "[actor]\nid = \"agent:seat-actor\"\n",
         )
         .expect("write seat config");
 
@@ -2404,7 +2404,7 @@ id = "lambda:project-actor"
         std::fs::create_dir_all(&khive_dir).expect("mkdir db .khive");
         std::fs::write(
             khive_dir.join("config.toml"),
-            "[actor]\nid = \"lambda:db-actor\"\n",
+            "[actor]\nid = \"agent:db-actor\"\n",
         )
         .expect("write db-anchored config");
         let db_path = khive_dir.join("khive.db");
@@ -2478,7 +2478,7 @@ id = "lambda:project-actor"
         std::fs::create_dir_all(seat_a.path().join(".khive")).expect("mkdir seat a .khive");
         std::fs::write(
             seat_a.path().join(".khive/config.toml"),
-            "[actor]\nid = \"lambda:actor-a\"\n",
+            "[actor]\nid = \"agent:actor-a\"\n",
         )
         .expect("write seat a config");
 
@@ -2486,7 +2486,7 @@ id = "lambda:project-actor"
         std::fs::create_dir_all(seat_b.path().join(".khive")).expect("mkdir seat b .khive");
         std::fs::write(
             seat_b.path().join(".khive/config.toml"),
-            "[actor]\nid = \"lambda:actor-b\"\n",
+            "[actor]\nid = \"agent:actor-b\"\n",
         )
         .expect("write seat b config");
 
@@ -2520,8 +2520,8 @@ id = "lambda:project-actor"
             .expect("resolve config b")
         };
 
-        assert_eq!(cfg_a.actor_id.as_deref(), Some("lambda:actor-a"));
-        assert_eq!(cfg_b.actor_id.as_deref(), Some("lambda:actor-b"));
+        assert_eq!(cfg_a.actor_id.as_deref(), Some("agent:actor-a"));
+        assert_eq!(cfg_b.actor_id.as_deref(), Some("agent:actor-b"));
         assert_ne!(
             cfg_a.actor_id, cfg_b.actor_id,
             "precondition: the two connections must actually declare different actors"
@@ -4224,7 +4224,7 @@ region = "us-east-1"
     #[test]
     fn no_warn_when_actor_is_configured() {
         assert!(!should_warn_unattributed(
-            Some("lambda:khive"),
+            Some("agent:khive"),
             &packs(&["kg", "comm"])
         ));
     }
@@ -4323,7 +4323,7 @@ region = "us-east-1"
         // Strict mode ON + proper actor = Ok (comm pack present is irrelevant).
         let prev = std::env::var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR").ok();
         std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", "1");
-        let result = enforce_strict_actor_mode(Some("lambda:tenant-x"), &packs(&["kg", "comm"]));
+        let result = enforce_strict_actor_mode(Some("agent:tenant-x"), &packs(&["kg", "comm"]));
         match prev {
             Some(v) => std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", v),
             None => std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR"),

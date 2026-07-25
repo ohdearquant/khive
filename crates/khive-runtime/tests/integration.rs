@@ -3954,7 +3954,7 @@ async fn stats_totals_match_list_walk_across_visible_namespaces() {
         db_path: None,
         packs: vec!["kg".to_string()],
         brain_profile: None,
-        actor_id: Some("lambda:stats-711-test".to_string()),
+        actor_id: Some("agent:stats-711-test".to_string()),
         ..RuntimeConfig::no_embeddings()
     })
     .expect("in-memory runtime with actor identity");

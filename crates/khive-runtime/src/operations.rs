@@ -13191,20 +13191,28 @@ mod tests {
     #[tokio::test]
     async fn get_entity_cross_namespace_succeeds() {
         let rt = rt();
-        // Create under "lambda:leo".
-        let leo_tok = NamespaceToken::for_namespace(Namespace::parse("lambda:leo").unwrap());
+        // Create under "agent:alpha".
+        let peer_tok = NamespaceToken::for_namespace(Namespace::parse("agent:alpha").unwrap());
         let entity = rt
-            .create_entity(&leo_tok, "concept", None, "Peer-Entity", None, None, vec![])
+            .create_entity(
+                &peer_tok,
+                "concept",
+                None,
+                "Peer-Entity",
+                None,
+                None,
+                vec![],
+            )
             .await
             .unwrap();
-        assert_eq!(entity.namespace, "lambda:leo");
+        assert_eq!(entity.namespace, "agent:alpha");
 
         // Read from "local" — must succeed (no namespace gate on by-ID get).
         let local_tok = NamespaceToken::local();
         let fetched = rt.get_entity(&local_tok, entity.id).await;
         assert!(
             fetched.is_ok(),
-            "get_entity from local token must find lambda:leo entity; got {:?}",
+            "get_entity from local token must find agent:alpha entity; got {:?}",
             fetched
         );
         assert_eq!(fetched.unwrap().id, entity.id);
@@ -13213,10 +13221,10 @@ mod tests {
     #[tokio::test]
     async fn update_entity_cross_namespace_succeeds() {
         let rt = rt();
-        let leo_tok = NamespaceToken::for_namespace(Namespace::parse("lambda:leo").unwrap());
+        let peer_tok = NamespaceToken::for_namespace(Namespace::parse("agent:alpha").unwrap());
         let entity = rt
             .create_entity(
-                &leo_tok,
+                &peer_tok,
                 "concept",
                 None,
                 "Peer-Entity-Update",
@@ -13236,7 +13244,7 @@ mod tests {
         let result = rt.update_entity(&local_tok, entity.id, patch).await;
         assert!(
             result.is_ok(),
-            "update_entity from local token must succeed on lambda:leo entity; got {:?}",
+            "update_entity from local token must succeed on agent:alpha entity; got {:?}",
             result
         );
         assert_eq!(result.unwrap().name, "Peer-Entity-Updated");
@@ -13245,10 +13253,10 @@ mod tests {
     #[tokio::test]
     async fn delete_entity_cross_namespace_succeeds() {
         let rt = rt();
-        let leo_tok = NamespaceToken::for_namespace(Namespace::parse("lambda:leo").unwrap());
+        let peer_tok = NamespaceToken::for_namespace(Namespace::parse("agent:alpha").unwrap());
         let entity = rt
             .create_entity(
-                &leo_tok,
+                &peer_tok,
                 "concept",
                 None,
                 "Peer-Entity-Delete",
@@ -13264,7 +13272,7 @@ mod tests {
         let deleted = rt.delete_entity(&local_tok, entity.id, false).await;
         assert!(
             deleted.is_ok(),
-            "delete_entity from local token must succeed on lambda:leo entity; got {:?}",
+            "delete_entity from local token must succeed on agent:alpha entity; got {:?}",
             deleted
         );
         assert!(
@@ -13276,10 +13284,10 @@ mod tests {
     #[tokio::test]
     async fn namespace_preserved_on_entity_after_cross_namespace_get() {
         let rt = rt();
-        let leo_tok = NamespaceToken::for_namespace(Namespace::parse("lambda:leo").unwrap());
+        let peer_tok = NamespaceToken::for_namespace(Namespace::parse("agent:alpha").unwrap());
         let entity = rt
             .create_entity(
-                &leo_tok,
+                &peer_tok,
                 "concept",
                 None,
                 "NS-Preserved",
@@ -13290,11 +13298,11 @@ mod tests {
             .await
             .unwrap();
 
-        // The namespace column on the fetched record must still say "lambda:leo".
+        // The namespace column on the fetched record must still say "agent:alpha".
         let local_tok = NamespaceToken::local();
         let fetched = rt.get_entity(&local_tok, entity.id).await.unwrap();
         assert_eq!(
-            fetched.namespace, "lambda:leo",
+            fetched.namespace, "agent:alpha",
             "namespace column must be preserved; not overwritten with caller's namespace"
         );
     }

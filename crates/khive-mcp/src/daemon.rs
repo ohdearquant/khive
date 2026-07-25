@@ -3382,8 +3382,8 @@ mod tests {
         std::env::set_var("KHIVE_PID", &pid);
         std::env::remove_var("KHIVE_NO_DAEMON");
 
-        let actor_a = "lambda:actor-a";
-        let actor_b = "lambda:actor-b";
+        let actor_a = "agent:actor-a";
+        let actor_b = "agent:actor-b";
         let cfg_a = folded_actor_memory_config(actor_a);
         let cfg_b = folded_actor_memory_config(actor_b);
         let ns_a = Namespace::parse(actor_a).expect("actor a namespace");
@@ -3446,7 +3446,7 @@ mod tests {
         let seed_a = exchange(
             &sock,
             &frame(
-                r#"create(kind="concept", name="ActorAVisibleOnly", namespace="lambda:actor-a")"#,
+                r#"create(kind="concept", name="ActorAVisibleOnly", namespace="agent:actor-a")"#,
                 actor_a,
                 &cfg_a.visible_namespaces,
             ),
@@ -3456,7 +3456,7 @@ mod tests {
         let seed_b = exchange(
             &sock,
             &frame(
-                r#"create(kind="concept", name="ActorBVisibleOnly", namespace="lambda:actor-b")"#,
+                r#"create(kind="concept", name="ActorBVisibleOnly", namespace="agent:actor-b")"#,
                 actor_b,
                 &cfg_b.visible_namespaces,
             ),

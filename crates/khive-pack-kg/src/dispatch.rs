@@ -712,9 +712,9 @@ mod tests {
     async fn non_local_actor_config_does_not_route_storage_adr007_rule0() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
 
-        // Registry whose default namespace mirrors what `[actor] id = "lambda:leo"` sets.
+        // Registry whose default namespace mirrors what `[actor] id = "agent:alpha"` sets.
         let mut builder = VerbRegistryBuilder::new();
-        builder.with_default_namespace("lambda:leo");
+        builder.with_default_namespace("agent:alpha");
         builder.register(KgPack::new(rt.clone()));
         let registry = builder.build().expect("registry builds");
 
@@ -739,7 +739,7 @@ mod tests {
                 .and_then(|v| v.as_str())
                 .unwrap_or(""),
             "local",
-            "entity must land in 'local' even when default_namespace='lambda:leo'; \
+            "entity must land in 'local' even when default_namespace='agent:alpha'; \
              actor identity must not silently become the storage namespace (ADR-007 Rule 0)"
         );
 
@@ -765,8 +765,8 @@ mod tests {
         // written there, confirming storage was not routed through the actor namespace.
         let pack = KgPack::new(rt.clone());
         let actor_ns_token = rt
-            .authorize(Namespace::parse("lambda:leo").expect("valid namespace"))
-            .expect("authorize lambda:leo token");
+            .authorize(Namespace::parse("agent:alpha").expect("valid namespace"))
+            .expect("authorize agent:alpha token");
         let actor_list_result = pack
             .dispatch(
                 "list",
@@ -785,7 +785,7 @@ mod tests {
         };
         assert!(
             !ids_in_actor_ns.contains(&entity_id),
-            "storage must not have been routed to 'lambda:leo'; \
+            "storage must not have been routed to 'agent:alpha'; \
              entity must NOT appear when listing directly under that namespace; \
              got ids: {ids_in_actor_ns:?}"
         );
@@ -1415,7 +1415,7 @@ mod tests {
     async fn resolve_via_ring_survives_non_local_default_namespace() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let mut builder = VerbRegistryBuilder::new();
-        builder.with_default_namespace("lambda:leo");
+        builder.with_default_namespace("agent:alpha");
         builder.register(KgPack::new(rt.clone()));
         let registry = builder.build().expect("registry build");
 

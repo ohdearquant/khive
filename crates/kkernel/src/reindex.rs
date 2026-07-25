@@ -2095,11 +2095,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let config_path = dir.path().join("khive.toml");
         let mut f = std::fs::File::create(&config_path).expect("create config");
-        f.write_all(b"[actor]\nid = \"lambda:prod\"\n")
+        f.write_all(b"[actor]\nid = \"agent:prod\"\n")
             .expect("write config");
 
         // No --namespace: config [actor] id is attribution only (Rule 0), so the
-        // effective namespace stays `local` — it must NOT become lambda:prod.
+        // effective namespace stays `local` — it must NOT become agent:prod.
         let resolved = resolve_runtime_config(RuntimeConfigInputs {
             db: Some(":memory:"),
             config: Some(&config_path),

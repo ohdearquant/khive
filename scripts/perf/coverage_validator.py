@@ -55,10 +55,9 @@ never `"unverified"` - and downgrades the scenario straight to confounded
 No manifest scenario is ever reported "measured" when the records
 directory is absent or empty - the coverage percentage is 0% in that case,
 by construction (every scenario starts in the "missing" bucket and nothing
-promotes it without a matching record). This is the PR 1 gate from
-`.khive/workspaces/20260711/bench-overhaul/DESIGN.md`: "coverage validator
-reports the expected scenario set and intentionally reports 0% measured
-until records exist."
+promotes it without a matching record). The coverage validator reports the
+expected scenario set and intentionally reports 0% measured until records
+exist.
 
 This script performs no benchmark execution and adds no CI wiring - it
 only reads the manifest and an existing records directory.

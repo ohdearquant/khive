@@ -12,7 +12,7 @@ _graph discipline_, not the verb list.
 Per-verb param detail is one call away: `request(ops="create(help=true)")`.
 
 **Namespace (ADR-007).** kg ops always use the shared `local` namespace, even when the server
-runs as `--actor lambda:<you>`. Do not override the namespace for entity/edge/note ops — the
+runs as `--actor agent:<you>`. Do not override the namespace for entity/edge/note ops — the
 graph is cross-project by design.
 
 ## The pattern
@@ -99,5 +99,5 @@ reach for them instead of hand-rolling:
 - **Reversed edge direction.** `introduced_by` is concept → paper, never paper → concept. Check the table.
 - **Forcing a fact into an edge.** "published 2021", "written in Rust" are properties, not relations.
 - **`neighbors` without `direction="both"`.** It defaults to outgoing-only and you miss half the graph.
-- **Overriding the namespace with `lambda:*`.** kg is shared `local`; attribution lives elsewhere.
+- **Overriding the namespace with `agent:*`.** kg is shared `local`; attribution lives elsewhere.
 - **Hand-rolling a bulk ingest or a polish sweep.** That is what the digester / polisher agents are for.

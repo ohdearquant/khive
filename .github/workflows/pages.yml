@@ -103,7 +103,7 @@ jobs:
           EOF
 
           # basename -> "nav_order|Title|one-line description used in llms.txt"
-          # Order matches Ocean's requested sidebar: Getting Started, Knowledge
+          # Sidebar order: Getting Started, Knowledge
           # Graph Modeling, Memory, Search, Tasks, Prompt Cookbook, API Reference.
           declare -A NAV_ORDER=(
             [getting-started]="2|Getting Started|Install, connect an MCP client, and run your first khive session."

@@ -4,8 +4,8 @@
 Appends one JSONL record per (suite, commit) to bench-data/<suite>.jsonl and
 renders a compact markdown trend summary (last N runs, per-metric direction
 arrows). This is purely observational per the bench-program spec's
-blocking-promotion ladder (docs `.khive/workspaces/20260710/bench-program/
-SPEC-draft.md`) - it never asserts pass/fail and never places a threshold.
+blocking-promotion ladder - it never asserts pass/fail and never places a
+threshold.
 That is `bench_calibrate.py`'s job for calibration and, eventually, a real
 CI gate's job for enforcement.
 

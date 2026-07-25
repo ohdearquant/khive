@@ -808,11 +808,11 @@ mod resolve_project_actor_id_tests {
     #[test]
     fn extracts_non_empty_actor_id_from_explicit_path() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = write_toml(&dir, "[actor]\nid = \"lambda:explicit-actor\"\n");
+        let path = write_toml(&dir, "[actor]\nid = \"agent:explicit-actor\"\n");
 
         assert_eq!(
             resolve_project_actor_id(Some(&path)).expect("no error"),
-            Some("lambda:explicit-actor".to_string())
+            Some("agent:explicit-actor".to_string())
         );
     }
 

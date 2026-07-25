@@ -2,7 +2,7 @@
   "name": "khive",
   "description": "Knowledge graph runtime, structured memory, and agent coordination tools.",
   "owner": {
-    "name": "Ocean (HaiyangLi)",
+    "name": "HaiyangLi",
     "url": "https://github.com/ohdearquant"
   },
   "plugins": [

@@ -901,7 +901,7 @@ fn concurrent_boots_converge() {
     );
 }
 
-// khive#1217 review blocking finding: the pre-lock ahead-of-latest guard runs
+// Regression: the pre-lock ahead-of-latest guard runs
 // on a stale read. If a NEWER build commits a schema version above this
 // binary's latest while this process waits for the migration write lock, the
 // under-lock re-read must reject that version — not clamp it into a false Ok.

@@ -17,7 +17,7 @@ request(ops="[create(kind=\"entity\", entity_kind=\"concept\", name=\"LoRA\"), c
 The verb examples in this skill show the inner call. Wrap each one as `request(ops="…")`.
 
 **Namespace rule (ADR-007)**: KG operations always use the shared namespace (`local`), even when the
-MCP server runs with `--actor lambda:myproject`. Do NOT override the namespace for entity/edge/note
+MCP server runs with `--actor agent:myproject`. Do NOT override the namespace for entity/edge/note
 operations. The knowledge graph is cross-project by design.
 
 ## Workflow

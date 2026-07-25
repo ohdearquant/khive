@@ -1,5 +1,5 @@
 # perf/targets.toml — scale-proof assertion thresholds
-# Changes that loosen any threshold require a PR comment from lambda:khive citing the cause.
+# Changes that loosen any threshold require a PR comment from a maintainer citing the cause.
 #
 # Threshold format: hard limit with optional relative tolerance (fractional).
 # A tolerance of 0.10 means:

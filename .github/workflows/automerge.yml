@@ -48,7 +48,7 @@ jobs:
     timeout-minutes: 5
 
     # Guard: only bot-authored, non-draft PRs when the variable is set.
-    # Ocean flips LEO_AUTOMERGE_ENABLED to activate; flip back to deactivate.
+    # A repository admin flips LEO_AUTOMERGE_ENABLED to activate; flip back to deactivate.
     # LEO_AUTOMERGE_ENABLED is a repository variable settable only by an admin,
     # so no PR author can satisfy this guard on their own.
     if: >-

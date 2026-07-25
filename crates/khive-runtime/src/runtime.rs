@@ -527,11 +527,11 @@ impl KhiveRuntime {
     /// the token may read. The primary is always included in the visible set
     /// regardless of `extra_visible`.
     ///
-    /// Usage (lambda:leo reading both leo and khive namespaces):
+    /// Usage (an actor reading both its own and a peer namespace):
     /// ```rust,ignore
     /// let tok = rt.authorize_with_visibility(
-    ///     Namespace::parse("lambda:leo").unwrap(),
-    ///     vec![Namespace::parse("lambda:khive").unwrap()],
+    ///     Namespace::parse("agent:alpha").unwrap(),
+    ///     vec![Namespace::parse("agent:khive").unwrap()],
     /// )?;
     /// ```
     pub fn authorize_with_visibility(
@@ -1355,7 +1355,7 @@ mod tests {
             allowed_outbound_namespaces: vec![],
             actor_id: None,
         };
-        let cfg = khive_cfg_with_actor("lambda:khive");
+        let cfg = khive_cfg_with_actor("agent:khive");
         let result = runtime_config_from_khive_config(&cfg, base);
         assert_eq!(
             result.default_namespace.as_str(),
@@ -1369,7 +1369,7 @@ mod tests {
         let base = RuntimeConfig {
             git_write: Default::default(),
             db_path: None,
-            default_namespace: Namespace::parse("lambda:base").unwrap(),
+            default_namespace: Namespace::parse("agent:base").unwrap(),
             embedding_model: None,
             additional_embedding_models: vec![],
             gate: Arc::new(AllowAllGate),
@@ -1392,7 +1392,7 @@ mod tests {
         let result = runtime_config_from_khive_config(&cfg, base);
         assert_eq!(
             result.default_namespace.as_str(),
-            "lambda:base",
+            "agent:base",
             "empty actor.id must not override base namespace"
         );
     }
@@ -1402,7 +1402,7 @@ mod tests {
         let base = RuntimeConfig {
             git_write: Default::default(),
             db_path: None,
-            default_namespace: Namespace::parse("lambda:base").unwrap(),
+            default_namespace: Namespace::parse("agent:base").unwrap(),
             embedding_model: None,
             additional_embedding_models: vec![],
             gate: Arc::new(AllowAllGate),
@@ -1417,7 +1417,7 @@ mod tests {
         let result = runtime_config_from_khive_config(&cfg, base);
         assert_eq!(
             result.default_namespace.as_str(),
-            "lambda:base",
+            "agent:base",
             "absent actor.id must not override base namespace"
         );
     }
@@ -1447,7 +1447,7 @@ mod tests {
                 dims: None,
             }],
             actor: ActorConfig {
-                id: Some("lambda:test".to_string()),
+                id: Some("agent:test".to_string()),
                 display_name: None,
                 ..Default::default()
             },
@@ -1477,10 +1477,10 @@ mod tests {
         let prior = std::env::var("KHIVE_ACTOR").ok();
         // SAFETY: test is #[serial]; no other test in this crate reads/writes KHIVE_ACTOR.
         unsafe {
-            std::env::set_var("KHIVE_ACTOR", "lambda:test-env-actor");
+            std::env::set_var("KHIVE_ACTOR", "agent:test-env-actor");
         }
         let base = RuntimeConfig::default();
-        assert_eq!(base.actor_id.as_deref(), Some("lambda:test-env-actor"));
+        assert_eq!(base.actor_id.as_deref(), Some("agent:test-env-actor"));
 
         let cfg = KhiveConfig {
             engines: vec![crate::engine_config::EngineConfig {
@@ -1496,7 +1496,7 @@ mod tests {
         let result = runtime_config_from_khive_config(&cfg, base);
         assert_eq!(
             result.actor_id.as_deref(),
-            Some("lambda:test-env-actor"),
+            Some("agent:test-env-actor"),
             "engines-present arm must preserve base.actor_id (env actor) when TOML has no [actor] id"
         );
 
@@ -1515,10 +1515,10 @@ mod tests {
         let prior = std::env::var("KHIVE_ACTOR").ok();
         // SAFETY: test is #[serial]; no other test in this crate reads/writes KHIVE_ACTOR.
         unsafe {
-            std::env::set_var("KHIVE_ACTOR", "lambda:test-env-actor");
+            std::env::set_var("KHIVE_ACTOR", "agent:test-env-actor");
         }
         let base = RuntimeConfig::default();
-        assert_eq!(base.actor_id.as_deref(), Some("lambda:test-env-actor"));
+        assert_eq!(base.actor_id.as_deref(), Some("agent:test-env-actor"));
 
         let cfg = KhiveConfig {
             engines: vec![],
@@ -1528,7 +1528,7 @@ mod tests {
         let result = runtime_config_from_khive_config(&cfg, base);
         assert_eq!(
             result.actor_id.as_deref(),
-            Some("lambda:test-env-actor"),
+            Some("agent:test-env-actor"),
             "engines-empty early-return arm must preserve base.actor_id (env actor) when TOML has no [actor] id"
         );
 
@@ -1547,16 +1547,16 @@ mod tests {
         let prior = std::env::var("KHIVE_ACTOR").ok();
         // SAFETY: test is #[serial]; no other test in this crate reads/writes KHIVE_ACTOR.
         unsafe {
-            std::env::set_var("KHIVE_ACTOR", "lambda:test-env-actor");
+            std::env::set_var("KHIVE_ACTOR", "agent:test-env-actor");
         }
         let base = RuntimeConfig::default();
-        assert_eq!(base.actor_id.as_deref(), Some("lambda:test-env-actor"));
+        assert_eq!(base.actor_id.as_deref(), Some("agent:test-env-actor"));
 
-        let cfg = khive_cfg_with_actor("lambda:toml-actor");
+        let cfg = khive_cfg_with_actor("agent:toml-actor");
         let result = runtime_config_from_khive_config(&cfg, base);
         assert_eq!(
             result.actor_id.as_deref(),
-            Some("lambda:toml-actor"),
+            Some("agent:toml-actor"),
             "TOML [actor] id must win over the env-resolved base.actor_id"
         );
 

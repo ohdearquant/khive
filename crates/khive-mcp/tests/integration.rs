@@ -2521,14 +2521,14 @@ fn actor_precedence_config_actor_id_does_not_route_namespace() {
     let path = dir.path().join("config.toml");
     writeln!(
         std::fs::File::create(&path).unwrap(),
-        "[actor]\nid = \"lambda:from-config\"\n"
+        "[actor]\nid = \"agent:from-config\"\n"
     )
     .unwrap();
 
     let khive_cfg = KhiveConfig::load(Some(&path))
         .expect("load should succeed")
         .expect("file found");
-    assert_eq!(khive_cfg.actor.id.as_deref(), Some("lambda:from-config"));
+    assert_eq!(khive_cfg.actor.id.as_deref(), Some("agent:from-config"));
 
     // No CLI actor → base stays at "local" default; config actor.id must not move it.
     let base = RuntimeConfig::default();
@@ -2558,7 +2558,7 @@ fn actor_precedence_explicit_namespace_local_wins_over_config() {
     let path = dir.path().join("config.toml");
     writeln!(
         std::fs::File::create(&path).unwrap(),
-        "[actor]\nid = \"lambda:from-config\"\n"
+        "[actor]\nid = \"agent:from-config\"\n"
     )
     .unwrap();
 
@@ -2594,7 +2594,7 @@ fn actor_precedence_cli_actor_wins_over_config() {
     let path = dir.path().join("config.toml");
     writeln!(
         std::fs::File::create(&path).unwrap(),
-        "[actor]\nid = \"lambda:from-config\"\n"
+        "[actor]\nid = \"agent:from-config\"\n"
     )
     .unwrap();
 
@@ -2602,20 +2602,20 @@ fn actor_precedence_cli_actor_wins_over_config() {
         .expect("load should succeed")
         .expect("file found");
 
-    // Simulate: --actor lambda:cli-actor supplied → cli_namespace_explicit = true.
+    // Simulate: --actor agent:cli-actor supplied → cli_namespace_explicit = true.
     let mut effective_cfg = khive_cfg;
     effective_cfg.actor.id = None; // CLI wins — suppress config actor.
 
     let base = RuntimeConfig {
-        default_namespace: Namespace::parse("lambda:cli-actor").unwrap(),
+        default_namespace: Namespace::parse("agent:cli-actor").unwrap(),
         additional_embedding_models: vec![],
         ..RuntimeConfig::default()
     };
     let resolved = runtime_config_from_khive_config(&effective_cfg, base);
     assert_eq!(
         resolved.default_namespace,
-        Namespace::parse("lambda:cli-actor").unwrap(),
-        "--actor lambda:cli-actor must win over config actor.id"
+        Namespace::parse("agent:cli-actor").unwrap(),
+        "--actor agent:cli-actor must win over config actor.id"
     );
 }
 
@@ -2707,10 +2707,10 @@ fn cli_args_actor_flag_is_explicit() {
     use khive_runtime::Namespace;
 
     let _guard = ClearEnvGuard::new(&["KHIVE_ACTOR", "KHIVE_NAMESPACE"]);
-    let args = Args::try_parse_from(["khive-mcp", "--actor", "lambda:cli-actor"]).unwrap();
+    let args = Args::try_parse_from(["khive-mcp", "--actor", "agent:cli-actor"]).unwrap();
     let (explicit, ns) = resolve_cli_namespace(&args).unwrap();
     assert!(explicit, "--actor must mark namespace as explicit");
-    assert_eq!(ns, Namespace::parse("lambda:cli-actor").unwrap());
+    assert_eq!(ns, Namespace::parse("agent:cli-actor").unwrap());
 }
 
 /// Tier 1b: --actor local → explicit=true (regression guard: must NOT be treated as absent).
@@ -2740,10 +2740,10 @@ fn cli_args_namespace_flag_is_explicit() {
     use khive_runtime::Namespace;
 
     let _guard = ClearEnvGuard::new(&["KHIVE_ACTOR", "KHIVE_NAMESPACE"]);
-    let args = Args::try_parse_from(["khive-mcp", "--namespace", "lambda:ns-flag"]).unwrap();
+    let args = Args::try_parse_from(["khive-mcp", "--namespace", "agent:ns-flag"]).unwrap();
     let (explicit, ns) = resolve_cli_namespace(&args).unwrap();
     assert!(explicit, "--namespace must mark namespace as explicit");
-    assert_eq!(ns, Namespace::parse("lambda:ns-flag").unwrap());
+    assert_eq!(ns, Namespace::parse("agent:ns-flag").unwrap());
 }
 
 /// Tier 2b: --namespace local → explicit=true (the original regression case).
@@ -2776,16 +2776,16 @@ fn cli_args_actor_wins_over_namespace_when_both_supplied() {
     let args = Args::try_parse_from([
         "khive-mcp",
         "--actor",
-        "lambda:actor-wins",
+        "agent:actor-wins",
         "--namespace",
-        "lambda:ns-loses",
+        "agent:ns-loses",
     ])
     .unwrap();
     let (explicit, ns) = resolve_cli_namespace(&args).unwrap();
     assert!(explicit);
     assert_eq!(
         ns,
-        Namespace::parse("lambda:actor-wins").unwrap(),
+        Namespace::parse("agent:actor-wins").unwrap(),
         "--actor must win over --namespace when both are supplied"
     );
 }
@@ -2824,7 +2824,7 @@ fn cli_args_khive_namespace_env_is_explicit() {
 
     let _guard = ClearEnvGuard::new(&["KHIVE_NAMESPACE", "KHIVE_ACTOR"]);
 
-    std::env::set_var("KHIVE_NAMESPACE", "lambda:from-env");
+    std::env::set_var("KHIVE_NAMESPACE", "agent:from-env");
     let args = Args::try_parse_from(["khive-mcp"]).unwrap();
     std::env::remove_var("KHIVE_NAMESPACE");
 
@@ -2833,7 +2833,7 @@ fn cli_args_khive_namespace_env_is_explicit() {
         explicit,
         "KHIVE_NAMESPACE env must mark namespace as explicit"
     );
-    assert_eq!(ns, Namespace::parse("lambda:from-env").unwrap());
+    assert_eq!(ns, Namespace::parse("agent:from-env").unwrap());
 }
 
 /// ADR-096 Fork 2 (PR #657): `KHIVE_ACTOR` env var must NOT
@@ -2856,8 +2856,8 @@ fn cli_args_khive_actor_env_no_longer_occupies_cli_tier() {
 
     let _guard = ClearEnvGuard::new(&["KHIVE_NAMESPACE", "KHIVE_ACTOR"]);
 
-    std::env::set_var("KHIVE_ACTOR", "lambda:actor-env");
-    std::env::set_var("KHIVE_NAMESPACE", "lambda:ns-env");
+    std::env::set_var("KHIVE_ACTOR", "agent:actor-env");
+    std::env::set_var("KHIVE_NAMESPACE", "agent:ns-env");
     let args = Args::try_parse_from(["khive-mcp"]).unwrap();
     std::env::remove_var("KHIVE_ACTOR");
     std::env::remove_var("KHIVE_NAMESPACE");
@@ -2875,7 +2875,7 @@ fn cli_args_khive_actor_env_no_longer_occupies_cli_tier() {
     );
     assert_eq!(
         ns,
-        Namespace::parse("lambda:ns-env").unwrap(),
+        Namespace::parse("agent:ns-env").unwrap(),
         "with KHIVE_ACTOR no longer in the CLI tier, KHIVE_NAMESPACE decides \
          the resolved namespace instead of KHIVE_ACTOR"
     );
@@ -3477,7 +3477,7 @@ fn compute_config_id_is_identical_when_only_visible_namespaces_differ() {
 /// fingerprints.
 ///
 /// Without this, a daemon started with `allowed_outbound_namespaces =
-/// ["lambda:khive"]` could be reused for a client whose local config has an
+/// ["agent:khive"]` could be reused for a client whose local config has an
 /// empty allowlist — granting cross-namespace writes that the client should
 /// fail closed on.
 #[test]
@@ -3491,7 +3491,7 @@ fn compute_config_id_differs_when_allowed_outbound_namespaces_differ() {
     base.default_namespace = Namespace::parse("out-a").unwrap();
     base.allowed_outbound_namespaces = vec![];
     let with_outbound = RuntimeConfig {
-        allowed_outbound_namespaces: vec![Namespace::parse("lambda:khive").unwrap()],
+        allowed_outbound_namespaces: vec![Namespace::parse("agent:khive").unwrap()],
         ..base.clone()
     };
 
@@ -3504,8 +3504,8 @@ fn compute_config_id_differs_when_allowed_outbound_namespaces_differ() {
          same id would allow wrong-allowlist daemon reuse"
     );
     assert!(
-        id_with_outbound.contains("lambda:khive"),
-        "allowed outbound namespace 'lambda:khive' must appear in config_id string; got: {id_with_outbound}"
+        id_with_outbound.contains("agent:khive"),
+        "allowed outbound namespace 'agent:khive' must appear in config_id string; got: {id_with_outbound}"
     );
 }
 
@@ -3521,21 +3521,21 @@ fn compute_config_id_is_stable_under_allowed_outbound_namespace_reorder() {
         .clone();
     cfg_ab.default_namespace = Namespace::parse("out-a").unwrap();
     cfg_ab.allowed_outbound_namespaces = vec![
-        Namespace::parse("lambda:khive").unwrap(),
-        Namespace::parse("lambda:leo").unwrap(),
+        Namespace::parse("agent:khive").unwrap(),
+        Namespace::parse("agent:alpha").unwrap(),
     ];
     let cfg_ba = RuntimeConfig {
         allowed_outbound_namespaces: vec![
-            Namespace::parse("lambda:leo").unwrap(),
-            Namespace::parse("lambda:khive").unwrap(),
+            Namespace::parse("agent:alpha").unwrap(),
+            Namespace::parse("agent:khive").unwrap(),
         ],
         ..cfg_ab.clone()
     };
     let cfg_dup = RuntimeConfig {
         allowed_outbound_namespaces: vec![
-            Namespace::parse("lambda:khive").unwrap(),
-            Namespace::parse("lambda:leo").unwrap(),
-            Namespace::parse("lambda:khive").unwrap(), // duplicate
+            Namespace::parse("agent:khive").unwrap(),
+            Namespace::parse("agent:alpha").unwrap(),
+            Namespace::parse("agent:khive").unwrap(), // duplicate
         ],
         ..cfg_ab.clone()
     };
@@ -3663,13 +3663,13 @@ fn compute_config_id_normalizes_absent_and_present_but_empty_git_write_to_same_f
 ///
 ///   (a) with `default_namespace = local`, a plain `create` lands in `"local"`.
 ///
-///   (b) an explicit `create(namespace="lambda:leo")` lands in `"lambda:leo"` —
+///   (b) an explicit `create(namespace="agent:alpha")` lands in `"agent:alpha"` —
 ///       the caller deliberately targeting a namespace (Rule 1).  This is exactly
 ///       what #159's unconditional `Namespace::local()` hard-pin wrongly collapsed
 ///       to `"local"`.
 ///
-///   (c) a default `list` (local) sees the local entity but NOT the lambda:leo one,
-///       and `list(namespace="lambda:leo")` sees the lambda:leo entity but NOT the
+///   (c) a default `list` (local) sees the local entity but NOT the agent:alpha one,
+///       and `list(namespace="agent:alpha")` sees the agent:alpha entity but NOT the
 ///       local one — multi-record reads filter by the supplied namespace.
 ///
 /// Regression sensitivity: if dispatch reverts to pinning `Namespace::local()`,
@@ -3749,10 +3749,10 @@ async fn dispatch_honors_explicit_namespace_else_local_adr007() {
         .expect("create result must carry 'id'")
         .to_string();
 
-    // ── (b) EXPLICIT CREATE: namespace="lambda:leo" is honored ───────────────
+    // ── (b) EXPLICIT CREATE: namespace="agent:alpha" is honored ───────────────
     let named_res = dispatch_op(
         &server,
-        r#"create(kind="concept", name="NamedProbe", namespace="lambda:leo")"#,
+        r#"create(kind="concept", name="NamedProbe", namespace="agent:alpha")"#,
     )
     .await;
     assert_eq!(
@@ -3762,8 +3762,8 @@ async fn dispatch_honors_explicit_namespace_else_local_adr007() {
     );
     assert_eq!(
         named_res["result"]["namespace"].as_str().unwrap_or(""),
-        "lambda:leo",
-        "create(namespace=\"lambda:leo\") must land in 'lambda:leo', not be collapsed to \
+        "agent:alpha",
+        "create(namespace=\"agent:alpha\") must land in 'agent:alpha', not be collapsed to \
          'local' (ADR-007 Rev 2 Rule 1 — explicit namespace is honored); got: {named_res}"
     );
     let named_id = named_res["result"]["id"]
@@ -3771,7 +3771,7 @@ async fn dispatch_honors_explicit_namespace_else_local_adr007() {
         .expect("create result must carry 'id'")
         .to_string();
 
-    // ── (c) LIST scoping: default(local) vs explicit(lambda:leo) ─────────────
+    // ── (c) LIST scoping: default(local) vs explicit(agent:alpha) ─────────────
     let local_ids = list_ids(&dispatch_op(&server, r#"list(kind="entity")"#).await);
     assert!(
         local_ids.contains(&default_id),
@@ -3779,18 +3779,18 @@ async fn dispatch_honors_explicit_namespace_else_local_adr007() {
     );
     assert!(
         !local_ids.contains(&named_id),
-        "default(local) list must NOT see the lambda:leo entity; got: {local_ids:?}"
+        "default(local) list must NOT see the agent:alpha entity; got: {local_ids:?}"
     );
 
-    let leo_ids =
-        list_ids(&dispatch_op(&server, r#"list(kind="entity", namespace="lambda:leo")"#).await);
+    let peer_ids =
+        list_ids(&dispatch_op(&server, r#"list(kind="entity", namespace="agent:alpha")"#).await);
     assert!(
-        leo_ids.contains(&named_id),
-        "list(namespace=lambda:leo) must see the lambda:leo entity; got: {leo_ids:?}"
+        peer_ids.contains(&named_id),
+        "list(namespace=agent:alpha) must see the agent:alpha entity; got: {peer_ids:?}"
     );
     assert!(
-        !leo_ids.contains(&default_id),
-        "list(namespace=lambda:leo) must NOT see the local entity; got: {leo_ids:?}"
+        !peer_ids.contains(&default_id),
+        "list(namespace=agent:alpha) must NOT see the local entity; got: {peer_ids:?}"
     );
 }
 
@@ -3957,7 +3957,7 @@ async fn presentation_per_op_verbose_preserves_full_id_namespace_and_props() {
     // top-level `name`/`description` fields — the same shape the redundancy-
     // drop pre-pass targets (ADR-078 §7.2).
     let create_params = RequestParams {
-        ops: r#"create(kind="entity", entity_kind="concept", name="verbose-pin-entity", description="verbose-pin-description", properties={"name":"verbose-pin-entity","description":"verbose-pin-description","team":"lambda:test"})"#
+        ops: r#"create(kind="entity", entity_kind="concept", name="verbose-pin-entity", description="verbose-pin-description", properties={"name":"verbose-pin-entity","description":"verbose-pin-description","team":"agent:test"})"#
             .to_string(),
         presentation: Some("verbose".to_string()),
         presentation_per_op: None,
@@ -4082,7 +4082,7 @@ async fn format_auto_always_verbose_verb_skips_redundancy_drop_without_override(
     // Create a kg entity whose `properties` deliberately duplicate the
     // top-level `name`/`description` fields, and which carries namespace="local".
     let create_params = RequestParams {
-        ops: r#"create(kind="entity", entity_kind="concept", name="always-verbose-pin", description="always-verbose-pin-description", properties={"name":"always-verbose-pin","description":"always-verbose-pin-description","team":"lambda:test"})"#
+        ops: r#"create(kind="entity", entity_kind="concept", name="always-verbose-pin", description="always-verbose-pin-description", properties={"name":"always-verbose-pin","description":"always-verbose-pin-description","team":"agent:test"})"#
             .to_string(),
         presentation: Some("verbose".to_string()),
         presentation_per_op: None,

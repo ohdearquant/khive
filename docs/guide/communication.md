@@ -14,12 +14,12 @@ send always produces two notes and no cross-namespace write occurs even when
 
 ## Actor addressing
 
-Actors are labeled strings such as `lambda:leo` or `lambda:khive`. `comm.send`
+Actors are labeled strings such as `agent:alpha` or `agent:khive`. `comm.send`
 stores the caller's actor label as `from_actor` and the `to` argument as
 `to_actor` on both the outbound and inbound copies.
 
 ```
-request(ops="comm.send(to=\"lambda:leo\", content=\"PR #610 merged\")")
+request(ops="comm.send(to=\"agent:alpha\", content=\"PR #610 merged\")")
 ```
 
 `comm.inbox` filters by `to_actor` for the calling actor. Legacy messages
@@ -31,7 +31,7 @@ hidden by the newer filter.
 
 | Param       | Type   | Required | Notes                                                                                                                                                                                           |
 | ----------- | ------ | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `to`        | string | yes      | Actor label, e.g. `"lambda:leo"`.                                                                                                                                                               |
+| `to`        | string | yes      | Actor label, e.g. `"agent:alpha"`.                                                                                                                                                               |
 | `content`   | string | yes      | Message body. Must not be empty.                                                                                                                                                                |
 | `subject`   | string | no       | Optional subject line.                                                                                                                                                                          |
 | `thread_id` | uuid   | no       | Groups the message into an existing thread.                                                                                                                                                     |
@@ -232,7 +232,7 @@ Optional, with defaults:
   quarantine record instead of dropping it)
 - `KHIVE_EMAIL_INGEST_NAMESPACE` (default `local`; target namespace for
   ingested messages)
-- `KHIVE_EMAIL_DEFAULT_ACTOR` (default `lambda:leo`; inbound actor assigned to
+- `KHIVE_EMAIL_DEFAULT_ACTOR` (inbound actor assigned to
   fresh, uncorrelated email messages)
 - `KHIVE_EMAIL_SEND_ALLOWED_RECIPIENTS` (comma-separated outbound allowlist;
   falls back to the maintainer address when unset)

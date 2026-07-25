@@ -190,7 +190,7 @@ pub async fn apply_weight_delta_with_eta(
 // batch_load_weights
 // ---------------------------------------------------------------------------
 
-/// Batch-load current weights for a slice of atom IDs under one lambda.
+/// Batch-load current weights for a slice of atom IDs under one actor.
 ///
 /// Only rows that exist in `atom_weights` are returned.  Missing atoms are
 /// **not** inserted; callers should treat absent entries as implicit 1.0.
@@ -305,7 +305,7 @@ mod tests {
     #[tokio::test]
     async fn test_apply_weight_delta_ambient_channel() {
         let conn = make_conn();
-        let lambda = "lambda:test";
+        let actor = "agent:test";
         let atom = Uuid::new_v4();
         let delta = 0.01_f32; // positive ambient nudge
 
@@ -313,7 +313,7 @@ mod tests {
         for _ in 0..5 {
             let (w, _row_id) = apply_weight_delta(
                 &conn,
-                lambda,
+                actor,
                 atom,
                 delta,
                 WeightChannel::Ambient,
@@ -335,7 +335,7 @@ mod tests {
         );
 
         // Verify 5 audit rows were written.
-        let map = batch_load_weights(&conn, lambda, &[atom])
+        let map = batch_load_weights(&conn, actor, &[atom])
             .await
             .expect("batch_load_weights");
         assert!(map.contains_key(&atom), "weight row should exist");
@@ -345,7 +345,7 @@ mod tests {
             let c = conn.lock();
             c.query_row(
                 "SELECT COUNT(*) FROM weight_events WHERE namespace = ?1 AND atom_id = ?2 AND channel = 'ambient'",
-                params![lambda, atom.to_string()],
+                params![actor, atom.to_string()],
                 |r| r.get(0),
             )
             .unwrap()
@@ -359,14 +359,14 @@ mod tests {
     #[tokio::test]
     async fn test_apply_weight_delta_clamps_at_ceiling() {
         let conn = make_conn();
-        let lambda = "lambda:test";
+        let actor = "agent:test";
         let atom = Uuid::new_v4();
 
         // Repeatedly push large positive deltas.
         for _ in 0..100 {
             apply_weight_delta(
                 &conn,
-                lambda,
+                actor,
                 atom,
                 5.0, // huge delta
                 WeightChannel::GroundTruth,
@@ -377,7 +377,7 @@ mod tests {
             .expect("apply_weight_delta should succeed");
         }
 
-        let map = batch_load_weights(&conn, lambda, &[atom])
+        let map = batch_load_weights(&conn, actor, &[atom])
             .await
             .expect("batch_load_weights");
         let w = *map.get(&atom).expect("atom weight must exist");
@@ -393,13 +393,13 @@ mod tests {
     #[tokio::test]
     async fn test_apply_weight_delta_namespace_isolation() {
         let conn = make_conn();
-        let lambda_a = "lambda:a";
-        let lambda_b = "lambda:b";
+        let actor_a = "agent:a";
+        let actor_b = "agent:b";
         let atom = Uuid::new_v4();
 
         apply_weight_delta(
             &conn,
-            lambda_a,
+            actor_a,
             atom,
             0.5,
             WeightChannel::Explicit,
@@ -407,24 +407,24 @@ mod tests {
             None,
         )
         .await
-        .expect("apply for lambda:a");
+        .expect("apply for agent:a");
 
-        // lambda:b should see nothing.
-        let map_b = batch_load_weights(&conn, lambda_b, &[atom])
+        // agent:b should see nothing.
+        let map_b = batch_load_weights(&conn, actor_b, &[atom])
             .await
-            .expect("batch_load for lambda:b");
+            .expect("batch_load for agent:b");
         assert!(
             !map_b.contains_key(&atom),
-            "lambda:b should not see lambda:a's weight"
+            "agent:b should not see agent:a's weight"
         );
 
-        // lambda:a should see the written weight.
-        let map_a = batch_load_weights(&conn, lambda_a, &[atom])
+        // agent:a should see the written weight.
+        let map_a = batch_load_weights(&conn, actor_a, &[atom])
             .await
-            .expect("batch_load for lambda:a");
+            .expect("batch_load for agent:a");
         assert!(
             map_a.contains_key(&atom),
-            "lambda:a should see its own weight"
+            "agent:a should see its own weight"
         );
     }
 
@@ -434,7 +434,7 @@ mod tests {
     #[tokio::test]
     async fn test_batch_load_weights_missing_atoms_default() {
         let conn = make_conn();
-        let lambda = "lambda:test";
+        let actor = "agent:test";
         let atom_a = Uuid::new_v4();
         let atom_b = Uuid::new_v4();
         let atom_c = Uuid::new_v4();
@@ -442,7 +442,7 @@ mod tests {
         // Write only atom_a.
         apply_weight_delta(
             &conn,
-            lambda,
+            actor,
             atom_a,
             0.3,
             WeightChannel::Explicit,
@@ -452,7 +452,7 @@ mod tests {
         .await
         .expect("apply for atom_a");
 
-        let map = batch_load_weights(&conn, lambda, &[atom_a, atom_b, atom_c])
+        let map = batch_load_weights(&conn, actor, &[atom_a, atom_b, atom_c])
             .await
             .expect("batch_load");
 
@@ -479,13 +479,13 @@ mod tests {
     #[tokio::test]
     async fn test_channel_a_applies_on_negative_delta() {
         let conn = make_conn();
-        let lambda = "lambda:test";
+        let actor = "agent:test";
         let atom = Uuid::new_v4();
 
         // First boost the atom so it is above floor.
         apply_weight_delta(
             &conn,
-            lambda,
+            actor,
             atom,
             0.5,
             WeightChannel::GroundTruth,
@@ -498,7 +498,7 @@ mod tests {
         // Now apply a negative ambient delta (simulates decay).
         let (w_after, _) = apply_weight_delta(
             &conn,
-            lambda,
+            actor,
             atom,
             -0.1,
             WeightChannel::Ambient,
@@ -524,7 +524,7 @@ mod tests {
             c.query_row(
                 "SELECT COUNT(*) FROM weight_events \
                  WHERE namespace = ?1 AND atom_id = ?2 AND delta < 0",
-                params![lambda, atom.to_string()],
+                params![actor, atom.to_string()],
                 |r| r.get(0),
             )
             .unwrap()
@@ -556,12 +556,12 @@ mod tests {
     #[tokio::test]
     async fn test_apply_weight_delta_rejects_nan_delta() {
         let conn = make_conn();
-        let lambda = "lambda:test";
+        let actor = "agent:test";
         let atom = Uuid::new_v4();
 
         let result = apply_weight_delta(
             &conn,
-            lambda,
+            actor,
             atom,
             f32::NAN,
             WeightChannel::Ambient,
@@ -581,12 +581,12 @@ mod tests {
     #[tokio::test]
     async fn test_apply_weight_delta_rejects_inf_delta() {
         let conn = make_conn();
-        let lambda = "lambda:test";
+        let actor = "agent:test";
         let atom = Uuid::new_v4();
 
         let result = apply_weight_delta(
             &conn,
-            lambda,
+            actor,
             atom,
             f32::INFINITY,
             WeightChannel::Ambient,

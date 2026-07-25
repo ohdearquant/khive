@@ -52,9 +52,9 @@ fn anonymous_actor_binding_id_is_none() {
 
 #[test]
 fn configured_actor_binding_id_is_its_id() {
-    let a = ActorRef::new("lambda", "leo");
+    let a = ActorRef::new("lambda", "alpha");
     assert!(!a.is_anonymous());
-    assert_eq!(a.binding_id(), Some("leo"));
+    assert_eq!(a.binding_id(), Some("alpha"));
 }
 
 #[test]

@@ -1,9 +1,8 @@
 name: Bench Trend Tracking
 
 # Informational trend tracking for BOTH component (Criterion) and e2e
-# (bench-1m synthetic) benchmarks. Per the bench-program spec
-# (.khive/workspaces/20260710/bench-program/SPEC-draft.md, "Blocking-promotion
-# ladder"): every metric here is Advisory - measured, appended to
+# (bench-1m synthetic) benchmarks. Per the bench-program blocking-promotion
+# ladder: every metric here is Advisory - measured, appended to
 # bench-data/<suite>.jsonl on the `perf-data` branch, and rendered as a trend
 # summary. Nothing in this workflow asserts pass/fail or sets a threshold;
 # that requires K>=10 same-SHA calibration (scripts/perf/bench_calibrate.py)
