@@ -6,6 +6,11 @@ on:
   # Keep pull_request (not pull_request_target): GitHub's first-time-contributor
   # approval gate must remain in front of workflows from external forks.
   pull_request:
+    # ready_for_review is NOT in GitHub's default activity types, so without
+    # this explicit list a draft-to-ready flip with no push would produce no
+    # run; the required contexts this workflow provides must report on the
+    # ready PR without needing a push.
+    types: [opened, synchronize, reopened, ready_for_review]
     branches: [main, "integration/**"]
   workflow_dispatch:
   schedule:
