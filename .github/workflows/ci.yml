@@ -6,10 +6,28 @@ on:
   # Keep pull_request (not pull_request_target): GitHub's first-time-contributor
   # approval gate must remain in front of workflows from external forks.
   pull_request:
+    # ready_for_review is NOT in GitHub's default activity types, so without
+    # this explicit list a draft-to-ready flip with no push would produce no
+    # run; the required contexts this workflow provides must report on the
+    # ready PR without needing a push.
+    types: [opened, synchronize, reopened, ready_for_review]
     branches: [main, "integration/**"]
   workflow_dispatch:
   schedule:
     - cron: "17 6 * * *"
+
+# PR runs group by PR number so a superseded run (push then a no-push
+# ready flip, or rapid pushes) is cancelled. The group key includes the
+# event class because a queued run REPLACES a pending run in its group
+# regardless of cancel-in-progress, which only protects in-progress runs:
+# without the event class, a queued schedule run could displace a queued
+# push run on the same ref, leaving that push without its required
+# contexts. All pull_request activity for one PR still shares one group
+# (event_name is 'pull_request' for synchronize and ready_for_review
+# alike), and cancel-in-progress stays PR-only.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
