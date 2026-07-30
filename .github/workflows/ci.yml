@@ -16,6 +16,14 @@ on:
   schedule:
     - cron: "17 6 * * *"
 
+# PR runs group by PR number so a superseded run (push then a no-push
+# ready flip, or rapid pushes) is cancelled; push/schedule/dispatch runs
+# group by ref and never cancel each other (cancel-in-progress is false
+# outside pull_request), so main pushes and nightly runs still queue.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
 
