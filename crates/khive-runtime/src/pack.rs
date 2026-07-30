@@ -1129,6 +1129,163 @@ impl VerbRegistry {
         }
     }
 
+    /// Gate and execute an operation handled outside normal pack dispatch.
+    ///
+    /// Multi-backend transports use this to route an operation through a
+    /// coordinator while retaining [`Self::dispatch_with_identity`]'s gate and
+    /// audit lifecycle. Deny is authoritative, gate errors fail open, and an
+    /// allowed audit is persisted after the intercepted operation resolves so
+    /// its outcome and duration reflect the operation result.
+    pub async fn dispatch_intercepted_with_identity<F, Fut>(
+        &self,
+        verb: &str,
+        params: &Value,
+        identity: Option<&RequestIdentity>,
+        dispatch: F,
+    ) -> Result<Value, RuntimeError>
+    where
+        F: FnOnce(Namespace) -> Fut,
+        Fut: std::future::Future<Output = Result<Value, RuntimeError>>,
+    {
+        let request_id = identity.and_then(|id| id.request_id);
+        let gate_req = self.gate_request_with_identity(verb, params, identity)?;
+        let deferred_audit = match self.gate.check(&gate_req) {
+            Ok(decision) => {
+                let audit = AuditEvent::from_check(&gate_req, &decision, self.gate.impl_name());
+                tracing::info!(
+                    audit_event = %serde_json::to_string(&audit)
+                        .unwrap_or_else(|_| "{\"error\":\"serialize\"}".into()),
+                    "gate.check"
+                );
+                if let GateDecision::Deny { reason } = decision {
+                    if let Some(store) = &self.event_store {
+                        let event = build_audit_storage_event(
+                            &gate_req,
+                            &audit,
+                            EventOutcome::Denied,
+                            Some(crate::cost_unit::base_resource_payload(request_id)),
+                        );
+                        append_audit_event_best_effort(store, event, verb).await;
+                    }
+                    return Err(RuntimeError::PermissionDenied {
+                        verb: verb.to_string(),
+                        reason,
+                    });
+                }
+                Some(audit)
+            }
+            Err(err) => {
+                tracing::warn!(verb, error = %err, "gate check failed (fail-open)");
+                None
+            }
+        };
+
+        let started = Instant::now();
+        let result = dispatch(gate_req.namespace.clone()).await;
+        let duration_us = started.elapsed().as_micros() as i64;
+        if let Some(audit) = deferred_audit {
+            self.persist_intercepted_audit(
+                verb,
+                &gate_req,
+                audit,
+                &result,
+                duration_us,
+                request_id,
+            )
+            .await;
+        }
+        result
+    }
+
+    async fn persist_intercepted_audit(
+        &self,
+        verb: &str,
+        gate_req: &GateRequest,
+        audit: AuditEvent,
+        result: &Result<Value, RuntimeError>,
+        duration_us: i64,
+        request_id: Option<u64>,
+    ) {
+        let Some(store) = &self.event_store else {
+            return;
+        };
+        let event = match result {
+            Ok(value) if verb == "link" && gate_req.args.get("links").is_none() => {
+                let resource = crate::cost_unit::resource_payload(
+                    verb,
+                    &gate_req.args,
+                    value,
+                    || 0,
+                    request_id,
+                );
+                match link_audit_success_from_result(audit.clone(), value) {
+                    Some((edge_id, mut payload)) => {
+                        if let Value::Object(ref mut map) = payload {
+                            map.insert("resource".to_string(), resource);
+                        }
+                        Event::new(
+                            gate_req.namespace.as_str(),
+                            gate_req.verb.as_str(),
+                            EventKind::Audit,
+                            SubstrateKind::Event,
+                            format!("{}:{}", gate_req.actor.kind, gate_req.actor.id),
+                        )
+                        .with_outcome(EventOutcome::Success)
+                        .with_target(edge_id)
+                        .with_payload(payload)
+                        .with_payload_schema_version(2)
+                        .with_duration_us(duration_us)
+                    }
+                    None => build_audit_storage_event(
+                        gate_req,
+                        &audit,
+                        EventOutcome::Success,
+                        Some(resource),
+                    )
+                    .with_duration_us(duration_us),
+                }
+            }
+            Ok(value) => build_audit_storage_event(
+                gate_req,
+                &audit,
+                EventOutcome::Success,
+                Some(crate::cost_unit::resource_payload(
+                    verb,
+                    &gate_req.args,
+                    value,
+                    || 0,
+                    request_id,
+                )),
+            )
+            .with_duration_us(duration_us),
+            Err(_) => build_audit_storage_event(
+                gate_req,
+                &audit,
+                EventOutcome::Error,
+                Some(crate::cost_unit::base_resource_payload(request_id)),
+            )
+            .with_duration_us(duration_us),
+        };
+        append_audit_event_best_effort(store, event, verb).await;
+    }
+
+    fn gate_request_with_identity(
+        &self,
+        verb: &str,
+        params: &Value,
+        identity: Option<&RequestIdentity>,
+    ) -> Result<GateRequest, RuntimeError> {
+        let default_namespace = identity
+            .map(|id| id.namespace.as_str())
+            .unwrap_or(self.default_namespace.as_str());
+        let namespace = resolve_explicit_namespace(params, default_namespace)?;
+        let actor_id = identity
+            .map(|id| id.actor_id.as_deref())
+            .unwrap_or(self.actor_id.as_deref());
+        let actor = crate::actor_identity::resolve_actor(actor_id);
+        Ok(GateRequest::new(actor, namespace, verb, params.clone()))
+    }
+
     /// Dispatch a verb to the first pack that handles it.
     ///
     /// Routes through the gate, then invokes the matching pack handler. When
@@ -1178,24 +1335,14 @@ impl VerbRegistry {
         // here so it is in scope for every audit-append site below,
         // including the ones that run before pack dispatch is attempted.
         let request_id: Option<u64> = identity.as_ref().and_then(|id| id.request_id);
-        // A supplied per-request identity overrides the baked
-        // default_namespace/actor_id/visible_namespaces for this call only.
-        let default_namespace_str: &str = identity
-            .as_ref()
-            .map(|id| id.namespace.as_str())
-            .unwrap_or(self.default_namespace.as_str());
-        let ns = resolve_explicit_namespace(&params, default_namespace_str)?;
-        let actor_id_str: Option<&str> = match identity.as_ref() {
-            Some(id) => id.actor_id.as_deref(),
-            None => self.actor_id.as_deref(),
-        };
         // Thread the configured actor identity into the gate request so the
         // gate can distinguish human vs agent callers at the dispatch seam.
         // Resolved once via the shared actor-identity policy and reused for
         // token minting below, so the gate's notion of "who is the caller"
         // and the storage token's notion can never drift apart.
-        let resolved_actor = crate::actor_identity::resolve_actor(actor_id_str);
-        let gate_req = GateRequest::new(resolved_actor.clone(), ns.clone(), verb, params.clone());
+        let gate_req = self.gate_request_with_identity(verb, &params, identity.as_ref())?;
+        let ns = gate_req.namespace.clone();
+        let resolved_actor = gate_req.actor.clone();
 
         // Consult the gate.
         //

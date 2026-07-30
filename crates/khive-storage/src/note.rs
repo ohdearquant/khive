@@ -359,6 +359,21 @@ pub trait NoteStore: Send + Sync + 'static {
     ) -> StorageResult<Vec<Note>>;
     /// Count notes in a namespace, optionally filtered by kind.
     async fn count_notes(&self, namespace: &str, kind: Option<&str>) -> StorageResult<u64>;
+    /// Count notes across the given namespaces, optionally filtered by kind.
+    /// The default preserves compatibility by summing the existing
+    /// single-namespace operation; SQL backends should override this with one
+    /// `IN` aggregate.
+    async fn count_notes_in_namespaces(
+        &self,
+        namespaces: &[String],
+        kind: Option<&str>,
+    ) -> StorageResult<u64> {
+        let mut total = 0;
+        for namespace in namespaces {
+            total += self.count_notes(namespace, kind).await?;
+        }
+        Ok(total)
+    }
 
     /// Attempt to insert a note without overwriting an existing row.
     ///

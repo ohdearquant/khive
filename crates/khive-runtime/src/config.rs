@@ -350,12 +350,35 @@ impl RuntimeConfig {
     }
 }
 
+/// Expand a leading `~` to `$HOME` in a path.
+///
+/// This is the single shared expansion point for every `RuntimeConfig.db_path`
+/// construction site (CLI `--db`, `KHIVE_DB`, declared `[[backends]].path`).
+/// [`resolve_db_anchor`] calls it so a `~`-prefixed override is expanded once,
+/// at resolution, before the path ever reaches boot (single- or multi-backend),
+/// `compute_config_id` fingerprinting, or the `--db` override equivalence
+/// guard — those consumers then agree on one expanded path instead of a raw
+/// `~` diverging from its already-expanded equivalent.
+pub fn expand_tilde(path: &std::path::Path) -> std::path::PathBuf {
+    let s = path.to_string_lossy();
+    if let Some(rest) = s.strip_prefix("~/") {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        std::path::PathBuf::from(format!("{home}/{rest}"))
+    } else if s == "~" {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        std::path::PathBuf::from(home)
+    } else {
+        path.to_path_buf()
+    }
+}
+
 /// Resolve the `--db`/`KHIVE_DB` value into the anchor path used for tier-3
 /// project-local `.khive/config.toml` discovery, mirroring the precedence
 /// `kkernel mcp` and `kkernel exec` use to open the database itself:
 /// `:memory:` has no file to anchor on (`None`); an explicit path anchors on
-/// that path; an unset value falls back to `$HOME/.khive/khive.db`, or
-/// `./.khive/khive.db` when `HOME` is unset.
+/// that path (with a leading `~` expanded via [`expand_tilde`]); an unset
+/// value falls back to `$HOME/.khive/khive.db`, or `./.khive/khive.db` when
+/// `HOME` is unset.
 ///
 /// Always resolves to a concrete anchor (unlike a 2-arm "override the
 /// default?" resolver): when `HOME` is unset this falls back to
@@ -365,7 +388,7 @@ impl RuntimeConfig {
 pub fn resolve_db_anchor(db: Option<&str>) -> Option<std::path::PathBuf> {
     match db {
         Some(":memory:") => None,
-        Some(path) => Some(std::path::PathBuf::from(path)),
+        Some(path) => Some(expand_tilde(std::path::Path::new(path))),
         None => {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
             Some(std::path::PathBuf::from(format!("{home}/.khive/khive.db")))

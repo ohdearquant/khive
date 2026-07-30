@@ -23,7 +23,9 @@ filter every real match out (#849) — `entities.kind` only ever holds a granula
 
 1. **Id-string passthrough** — a UUID ref resolves at confidence `1.0` regardless of whether
    the entity was ever touched through this registry's ring. Entity-only: a note's id-string
-   is `NotFound` through `resolve`, even though `get` on the same id would succeed.
+   is `NotFound` through `resolve`, even though `get` on the same id would succeed. The same
+   boundary applies to edge and event UUIDs and hex prefixes under every `kind`: `resolve`
+   never resolves them, while `get` auto-detects their substrate.
 2. **Recently-referenced ring** — the dispatch boundary (`VerbRegistry::dispatch_with_identity`
    in `pack.rs`, not `KgPack::dispatch`) admits ids under their name whenever `create`/`get`/
    `update`/`delete`/`merge`/`link` runs through the registry. A later `resolve(refs=[name])`
@@ -46,11 +48,15 @@ filter every real match out (#849) — `entities.kind` only ever holds a granula
 4. **Hybrid search fallback** — a ref with no exact-name match falls through to hybrid search
    at a confidence below the exact-name stage's 0.98. The fallback searches deeper than the
    caller's `limit` so a match ranked just outside a small `limit` is still ranked against the
-   alternatives. When the result stays ambiguous, the returned `candidates` are a bounded sample
-   capped at `limit`. That bound is intentional. Outside exact matches there is no oracle for a
-   single "canonical" candidate (an exact identity would have resolved at stage 3), so `resolve`
-   returns a bounded ambiguous sample instead of silently picking one, and raising `limit`
-   surfaces deeper-ranked matches. A ref matching nothing at any stage is `NotFound`.
+   alternatives. Vector hits below the server-side `0.3` raw cosine-similarity floor are discarded
+   before RRF fusion;
+   this rejects low-confidence ANN neighbors while preserving lexical partial-name matches whose
+   RRF score encodes rank rather than textual relevance. When the result stays ambiguous, the
+   returned `candidates` are a bounded sample capped at `limit`. That bound is intentional.
+   Outside exact matches there is no oracle for a single "canonical" candidate (an exact identity
+   would have resolved at stage 3), so `resolve` returns a bounded ambiguous sample instead of
+   silently picking one, and raising `limit` surfaces deeper-ranked matches. A ref matching nothing
+   at any stage is `NotFound`.
 
 `resolve`'s `kind` param is entity-only: a note kind is rejected with a clear error rather
 than silently over-filtering to zero matches. `resolve` is registered as a public verb and

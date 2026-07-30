@@ -666,6 +666,91 @@ async fn link_invalid_relation_error_suggests_valid_relations() {
     );
 }
 
+#[tokio::test]
+async fn link_surfaces_temporal_implausibility_warning() {
+    use crate::KgPack;
+    use khive_runtime::KhiveRuntime;
+    use khive_storage::EdgeRelation;
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let token = rt.authorize(khive_runtime::Namespace::local()).unwrap();
+    let concept = rt
+        .create_entity(
+            &token,
+            "concept",
+            None,
+            "Established method",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+    let predecessor = rt
+        .create_entity(
+            &token,
+            "concept",
+            None,
+            "Earlier method",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+    let evidence = rt
+        .link(
+            &token,
+            concept.id,
+            predecessor.id,
+            EdgeRelation::Extends,
+            1.0,
+            None,
+        )
+        .await
+        .unwrap();
+    let mut recent_document = rt
+        .create_entity(
+            &token,
+            "document",
+            None,
+            "Recent survey",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+    recent_document.created_at = evidence.created_at.timestamp_micros() + 1_000_000;
+    recent_document.updated_at = recent_document.created_at;
+    rt.entities(&token)
+        .unwrap()
+        .upsert_entity(recent_document.clone())
+        .await
+        .unwrap();
+
+    let result = KgPack::new(rt)
+        .handle_link(
+            &token,
+            json!({
+                "source_id": concept.id.to_string(),
+                "target_id": recent_document.id.to_string(),
+                "relation": "introduced_by",
+            }),
+        )
+        .await
+        .unwrap();
+    let warning = result["warnings"][0]
+        .as_str()
+        .expect("temporally implausible introduced_by must return a warning");
+    assert!(warning.contains(&concept.id.to_string()), "{warning}");
+    assert!(
+        warning.contains(&recent_document.id.to_string()),
+        "{warning}"
+    );
+    assert!(warning.contains(&evidence.id.to_string()), "{warning}");
+}
+
 // ── #567 regression: ensure_note_kind must not disclose foreign note metadata ──
 
 #[tokio::test]

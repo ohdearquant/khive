@@ -58,21 +58,25 @@ impl KgPack {
                         metadata,
                     });
                 }
-                let edges = self.runtime.link_many(token, specs).await?;
+                let outcome = self.runtime.link_many_with_warnings(token, specs).await?;
                 let mut resp = serde_json::json!({
                     "attempted": attempted,
-                    "created": edges.len(),
+                    "created": outcome.edges.len(),
                     "skipped": skipped,
                     "failed": 0,
                 });
+                if !outcome.warnings.is_empty() {
+                    resp["warnings"] = json!(outcome.warnings);
+                }
                 if verbose {
-                    resp["edges"] = serde_json::to_value(&edges)
+                    resp["edges"] = serde_json::to_value(&outcome.edges)
                         .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
                 }
                 return to_json(&resp);
             } else {
                 let mut results: Vec<Value> = Vec::new();
                 let mut error_list: Vec<Value> = Vec::new();
+                let mut warning_list: Vec<String> = Vec::new();
                 let mut seen = std::collections::HashSet::new();
                 let mut skipped = 0usize;
                 for (idx, entry) in entries.into_iter().enumerate() {
@@ -128,10 +132,15 @@ impl KgPack {
                     };
                     match self
                         .runtime
-                        .link(token, source, target, relation, weight, metadata)
+                        .link_with_warnings(token, source, target, relation, weight, metadata)
                         .await
                     {
-                        Ok(edge) => results.push(to_json(&edge)?),
+                        Ok(outcome) => {
+                            for warning in outcome.warnings {
+                                warning_list.push(format!("entry {idx}: {warning}"));
+                            }
+                            results.push(to_json(&outcome.edge)?);
+                        }
                         Err(e) => error_list.push(json!({"index": idx, "error": format!("{e}")})),
                     }
                 }
@@ -142,6 +151,9 @@ impl KgPack {
                     "failed": error_list.len(),
                     "errors": error_list,
                 });
+                if !warning_list.is_empty() {
+                    resp["warnings"] = json!(warning_list);
+                }
                 if verbose {
                     resp["edges"] = serde_json::Value::Array(results);
                 }
@@ -164,12 +176,12 @@ impl KgPack {
         let relation = parse_relation(&relation_str)?;
         let metadata = merge_entry_metadata(p.metadata, p.dependency_kind)?;
 
-        let edge = match self
+        let outcome = match self
             .runtime
-            .link(token, source, target, relation, weight, metadata)
+            .link_with_warnings(token, source, target, relation, weight, metadata)
             .await
         {
-            Ok(e) => e,
+            Ok(outcome) => outcome,
             Err(RuntimeError::InvalidInput(ref msg))
                 if msg.contains("not in the base endpoint allowlist") =>
             {
@@ -180,11 +192,16 @@ impl KgPack {
             }
             Err(e) => return Err(e),
         };
-        let mut raw = to_json(&edge)?;
+        let mut raw = to_json(&outcome.edge)?;
         if relation.is_symmetric() {
             if let Some(obj) = raw.as_object_mut() {
                 obj.insert("source_id".to_string(), json!(source.to_string()));
                 obj.insert("target_id".to_string(), json!(target.to_string()));
+            }
+        }
+        if !outcome.warnings.is_empty() {
+            if let Some(obj) = raw.as_object_mut() {
+                obj.insert("warnings".to_string(), json!(outcome.warnings));
             }
         }
         Ok(format_edge_output(raw, verbose))

@@ -62,7 +62,7 @@ impl fmt::Display for EventOutcome {
     }
 }
 
-/// Discriminant for the 38 typed event variants produced by the verb dispatch path
+/// Discriminant for the 39 typed event variants produced by the verb dispatch path
 /// and by lifecycle telemetry producers (channel polling/backoff, config-lock,
 /// checkpoint outcome, background phase spans).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -115,6 +115,8 @@ pub enum EventKind {
     EmbeddingMigrationFailed,
     /// Drift was detected between stored and live embeddings.
     EmbeddingDriftDetected,
+    /// A lazily loaded embedder finished initialization.
+    EmbedderInitialized,
     /// A proposal was submitted for review.
     ProposalCreated,
     /// A reviewer accepted, rejected, or commented on a proposal.
@@ -148,8 +150,8 @@ pub enum EventKind {
 }
 
 impl EventKind {
-    /// All 38 event kind variants in declaration order.
-    pub const ALL: [Self; 38] = [
+    /// All 39 event kind variants in declaration order.
+    pub const ALL: [Self; 39] = [
         Self::Audit,
         Self::RecallExecuted,
         Self::RerankExecuted,
@@ -173,6 +175,7 @@ impl EventKind {
         Self::EmbeddingMigrationCompleted,
         Self::EmbeddingMigrationFailed,
         Self::EmbeddingDriftDetected,
+        Self::EmbedderInitialized,
         Self::ProposalCreated,
         Self::ProposalReviewed,
         Self::ProposalApplied,
@@ -216,6 +219,7 @@ impl EventKind {
             Self::EmbeddingMigrationCompleted => "embedding_migration_completed",
             Self::EmbeddingMigrationFailed => "embedding_migration_failed",
             Self::EmbeddingDriftDetected => "embedding_drift_detected",
+            Self::EmbedderInitialized => "embedder_initialized",
             Self::ProposalCreated => "proposal_created",
             Self::ProposalReviewed => "proposal_reviewed",
             Self::ProposalApplied => "proposal_applied",
@@ -265,6 +269,7 @@ const EVENT_KIND_VALID: &[&str] = &[
     "embedding_migration_completed",
     "embedding_migration_failed",
     "embedding_drift_detected",
+    "embedder_initialized",
     "proposal_created",
     "proposal_reviewed",
     "proposal_applied",
@@ -310,6 +315,7 @@ impl core::str::FromStr for EventKind {
             "embedding_migration_completed" => Ok(Self::EmbeddingMigrationCompleted),
             "embedding_migration_failed" => Ok(Self::EmbeddingMigrationFailed),
             "embedding_drift_detected" => Ok(Self::EmbeddingDriftDetected),
+            "embedder_initialized" => Ok(Self::EmbedderInitialized),
             "proposal_created" => Ok(Self::ProposalCreated),
             "proposal_reviewed" => Ok(Self::ProposalReviewed),
             "proposal_applied" => Ok(Self::ProposalApplied),

@@ -93,6 +93,25 @@ inline. Each completed operation has one of these shapes:
 { "ok": true, "tool": "search", "result": { "...": "..." } }
 ```
 
+A successful operation whose backend fan-out was incomplete keeps its normal
+`result` shape and adds structural advisory fields to the operation envelope:
+
+```json
+{
+  "ok": true,
+  "tool": "search",
+  "result": [],
+  "partial": true,
+  "missing_backends": ["archive"]
+}
+```
+
+Check `partial` before treating a successful search as complete.
+`missing_backends` identifies the failed backend legs. These fields are omitted
+for complete operations. The aggregate `status` and `summary.failed` fields
+continue to describe operation failures; a successfully degraded operation is
+still counted as succeeded.
+
 ```json
 { "ok": false, "tool": "get", "error": "not found: ..." }
 ```

@@ -168,6 +168,7 @@ pub(crate) mod tests {
         pub link_called: std::sync::atomic::AtomicBool,
         pub search_called: std::sync::atomic::AtomicBool,
         pub single_backend: bool,
+        pub failed_backend: Option<BackendId>,
         /// The `limit` value `fan_out_search` was last called with (MCP-AUD-003).
         pub last_limit: std::sync::atomic::AtomicU32,
     }
@@ -178,6 +179,17 @@ pub(crate) mod tests {
                 link_called: std::sync::atomic::AtomicBool::new(false),
                 search_called: std::sync::atomic::AtomicBool::new(false),
                 single_backend: false,
+                failed_backend: None,
+                last_limit: std::sync::atomic::AtomicU32::new(0),
+            })
+        }
+
+        pub fn degraded_multi_backend(failed_backend: &str) -> Arc<Self> {
+            Arc::new(Self {
+                link_called: std::sync::atomic::AtomicBool::new(false),
+                search_called: std::sync::atomic::AtomicBool::new(false),
+                single_backend: false,
+                failed_backend: Some(BackendId::new(failed_backend)),
                 last_limit: std::sync::atomic::AtomicU32::new(0),
             })
         }
@@ -187,6 +199,7 @@ pub(crate) mod tests {
                 link_called: std::sync::atomic::AtomicBool::new(false),
                 search_called: std::sync::atomic::AtomicBool::new(false),
                 single_backend: true,
+                failed_backend: None,
                 last_limit: std::sync::atomic::AtomicU32::new(0),
             })
         }
@@ -257,8 +270,18 @@ pub(crate) mod tests {
                 } else {
                     vec![]
                 },
-                per_backend: vec![],
-                partial: false,
+                per_backend: self
+                    .failed_backend
+                    .iter()
+                    .cloned()
+                    .map(|backend_id| BackendSearchResult {
+                        backend_id,
+                        entity_hits: vec![],
+                        note_hits: vec![],
+                        error: Some("injected search failure".to_string()),
+                    })
+                    .collect(),
+                partial: self.failed_backend.is_some(),
                 entity_kinds: std::collections::HashMap::from([(id, "concept".to_string())]),
                 note_kinds: std::collections::HashMap::from([(id, "observation".to_string())]),
             }
@@ -273,25 +296,41 @@ pub(crate) mod tests {
 
     use crate::server::KhiveMcpServer;
     use crate::tools::request::RequestParams;
-    use khive_runtime::{KhiveRuntime, Namespace as RuntimeNamespace, RuntimeConfig};
+    use khive_runtime::{
+        AllowAllGate, Gate, GateDecision, GateError, GateRef, GateRequest, KhiveRuntime,
+        Namespace as RuntimeNamespace, RuntimeConfig,
+    };
+    use khive_storage::{Event, EventFilter, PageRequest};
+    use khive_types::{EventKind, EventOutcome};
 
     fn make_registry() -> (khive_runtime::VerbRegistry, khive_runtime::KhiveRuntime) {
+        make_registry_with_gate(Arc::new(AllowAllGate))
+    }
+
+    fn make_registry_with_gate(
+        gate: GateRef,
+    ) -> (khive_runtime::VerbRegistry, khive_runtime::KhiveRuntime) {
         let config = RuntimeConfig {
             db_path: None,
             default_namespace: RuntimeNamespace::parse("local").unwrap(),
             embedding_model: None,
             additional_embedding_models: vec![],
             packs: vec!["kg".to_string()],
+            gate: Arc::clone(&gate),
             ..RuntimeConfig::default()
         };
         let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
-        let gate = runtime.config().gate.clone();
         let default_ns = runtime.config().default_namespace.clone();
         let actor_id = runtime.config().actor_id.clone();
         let mut builder = khive_runtime::VerbRegistryBuilder::new();
         builder.with_gate(gate);
         builder.with_default_namespace(default_ns.as_str());
         builder.with_actor_id(actor_id);
+        let token = runtime
+            .authorize(RuntimeNamespace::local())
+            .expect("authorize event store");
+        let event_store = runtime.events(&token).expect("in-memory event store");
+        builder.with_event_store(event_store);
         khive_runtime::PackRegistry::register_packs(
             &["kg".to_string()],
             runtime.clone(),
@@ -301,6 +340,54 @@ pub(crate) mod tests {
         let registry = builder.build().expect("build registry");
         runtime.install_edge_rules(registry.all_edge_rules());
         (registry, runtime)
+    }
+
+    #[derive(Debug, Default)]
+    struct CapturingGate {
+        requests: std::sync::Mutex<Vec<GateRequest>>,
+        deny: bool,
+    }
+
+    impl CapturingGate {
+        fn denying() -> Self {
+            Self {
+                requests: std::sync::Mutex::new(Vec::new()),
+                deny: true,
+            }
+        }
+    }
+
+    impl Gate for CapturingGate {
+        fn check(&self, req: &GateRequest) -> Result<GateDecision, GateError> {
+            self.requests.lock().unwrap().push(req.clone());
+            if self.deny && req.verb != "authorize" {
+                Ok(GateDecision::deny("denied by coordinator parity test"))
+            } else {
+                Ok(GateDecision::allow())
+            }
+        }
+    }
+
+    async fn audit_events(runtime: &KhiveRuntime, namespace: &str) -> Vec<Event> {
+        let token = runtime
+            .authorize(RuntimeNamespace::parse(namespace).expect("audit namespace"))
+            .expect("authorize audit query");
+        runtime
+            .events(&token)
+            .expect("runtime event store")
+            .query_events(
+                EventFilter {
+                    kinds: vec![EventKind::Audit],
+                    ..EventFilter::default()
+                },
+                PageRequest {
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .await
+            .expect("query audit events")
+            .items
     }
 
     /// T6a: a multi-backend server MUST route `link` through the coordinator.
@@ -366,6 +453,127 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn coordinator_and_registry_routes_submit_equivalent_link_and_search_gate_requests() {
+        let direct_gate = Arc::new(CapturingGate::default());
+        let coordinator_gate = Arc::new(CapturingGate::default());
+        let (direct_registry, _direct_runtime) =
+            make_registry_with_gate(Arc::clone(&direct_gate) as GateRef);
+        let (coordinator_registry, coordinator_runtime) =
+            make_registry_with_gate(Arc::clone(&coordinator_gate) as GateRef);
+        let direct_server =
+            KhiveMcpServer::from_registry_with_meta(direct_registry, "local", "test-cfg");
+        let coord = MockCoordinator::multi_backend();
+        let coordinator_server =
+            KhiveMcpServer::from_registry_with_meta(coordinator_registry, "local", "test-cfg")
+                .with_coordinator(Arc::clone(&coord) as Arc<dyn CoordinatorService>);
+
+        let source_id = Uuid::new_v4();
+        let target_id = Uuid::new_v4();
+        let operations = [
+            format!(
+                r#"link(source_id="{source_id}", target_id="{target_id}", relation="implements", namespace="tenant-a")"#
+            ),
+            r#"search(kind="entity", query="gate parity", limit=7, namespace="tenant-a")"#
+                .to_string(),
+        ];
+
+        for ops in operations {
+            for server in [&direct_server, &coordinator_server] {
+                server
+                    .dispatch_request_local(RequestParams {
+                        ops: ops.clone(),
+                        presentation: None,
+                        presentation_per_op: None,
+                        save_to: None,
+                        format: None,
+                        format_per_op: None,
+                        request_id: None,
+                    })
+                    .await
+                    .expect("dispatch returns a per-operation result");
+            }
+        }
+
+        let direct_requests: Vec<_> = direct_gate
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| matches!(request.verb.as_str(), "link" | "search"))
+            .cloned()
+            .collect();
+        let coordinator_requests: Vec<_> = coordinator_gate
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| matches!(request.verb.as_str(), "link" | "search"))
+            .cloned()
+            .collect();
+        assert_eq!(direct_requests.len(), 2);
+        assert_eq!(coordinator_requests.len(), 2);
+        for (direct, coordinated) in direct_requests.iter().zip(&coordinator_requests) {
+            assert_eq!(
+                serde_json::to_value(direct).unwrap(),
+                serde_json::to_value(coordinated).unwrap()
+            );
+        }
+
+        let coordinator_audits = audit_events(&coordinator_runtime, "tenant-a").await;
+        assert_eq!(coordinator_audits.len(), 2);
+        assert!(coordinator_audits
+            .iter()
+            .all(|event| event.payload["decision"] == "allow"));
+        assert!(coordinator_audits
+            .iter()
+            .any(|event| event.verb == "link" && event.outcome == EventOutcome::Error));
+        assert!(coordinator_audits
+            .iter()
+            .any(|event| event.verb == "search" && event.outcome == EventOutcome::Success));
+    }
+
+    #[tokio::test]
+    async fn coordinator_route_persists_denied_gate_audit() {
+        let gate = Arc::new(CapturingGate::denying());
+        let (registry, runtime) = make_registry_with_gate(Arc::clone(&gate) as GateRef);
+        let coord = MockCoordinator::multi_backend();
+        let server = KhiveMcpServer::from_registry_with_meta(registry, "local", "test-cfg")
+            .with_coordinator(Arc::clone(&coord) as Arc<dyn CoordinatorService>);
+
+        server
+            .dispatch_request_local(RequestParams {
+                ops: r#"search(kind="entity", query="gate parity", namespace="tenant-a")"#
+                    .to_string(),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .expect("dispatch returns a denied per-operation result");
+
+        assert_eq!(
+            gate.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request.verb == "search")
+                .count(),
+            1
+        );
+        assert!(!coord
+            .search_called
+            .load(std::sync::atomic::Ordering::SeqCst));
+        let audits = audit_events(&runtime, "tenant-a").await;
+        assert_eq!(audits.len(), 1);
+        assert_eq!(audits[0].verb, "search");
+        assert_eq!(audits[0].outcome, EventOutcome::Denied);
+        assert_eq!(audits[0].payload["decision"], "deny");
+    }
+
+    #[tokio::test]
     async fn multi_backend_search_serializes_entity_and_note_sources() {
         for (kind, expected_source) in [("entity", "both"), ("note", "vector")] {
             let (registry, _runtime) = make_registry();
@@ -387,14 +595,80 @@ pub(crate) mod tests {
                 .expect("search dispatch must succeed");
             let response: serde_json::Value =
                 serde_json::from_str(&raw).expect("response must be valid JSON");
-            let hit = &response["results"][0]["result"][0];
+            let entry = &response["results"][0];
+            let hit = &entry["result"][0];
 
             assert_eq!(
                 hit.get("source").and_then(serde_json::Value::as_str),
                 Some(expected_source),
                 "{kind} hit must expose its retrieval source; got: {hit}"
             );
+            assert!(entry.get("partial").is_none());
+            assert!(entry.get("missing_backends").is_none());
         }
+    }
+
+    async fn degraded_search_entry(kind: &str) -> serde_json::Value {
+        let (registry, _runtime) = make_registry();
+        let coord = MockCoordinator::degraded_multi_backend("archive");
+        let server = KhiveMcpServer::from_registry_with_meta(registry, "local", "test-cfg")
+            .with_coordinator(Arc::clone(&coord) as Arc<dyn CoordinatorService>);
+
+        let raw = server
+            .dispatch_request_local(RequestParams {
+                ops: format!(r#"search(kind="{kind}", query="anything")"#),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .expect("degraded search dispatch must succeed");
+        let response: serde_json::Value =
+            serde_json::from_str(&raw).expect("response must be valid JSON");
+        response["results"][0].clone()
+    }
+
+    #[tokio::test]
+    async fn degraded_entity_search_surfaces_failed_backend_in_op_envelope() {
+        let entry = degraded_search_entry("entity").await;
+
+        assert!(
+            entry["result"].is_array(),
+            "search result shape changed: {entry}"
+        );
+        assert_eq!(entry["result"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            entry["partial"], true,
+            "degradation must be structural: {entry}"
+        );
+        assert_eq!(
+            entry["missing_backends"],
+            serde_json::json!(["archive"]),
+            "the failed retrieval leg must be identified: {entry}"
+        );
+    }
+
+    #[tokio::test]
+    async fn degraded_note_search_surfaces_failed_backend_in_op_envelope() {
+        let entry = degraded_search_entry("note").await;
+
+        assert!(
+            entry["result"].is_array(),
+            "search result shape changed: {entry}"
+        );
+        assert_eq!(entry["result"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            entry["partial"], true,
+            "degradation must be structural: {entry}"
+        );
+        assert_eq!(
+            entry["missing_backends"],
+            serde_json::json!(["archive"]),
+            "the failed retrieval leg must be identified: {entry}"
+        );
     }
 
     /// T6d: a multi-backend search with a malformed `tags` value must return a

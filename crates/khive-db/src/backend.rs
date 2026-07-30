@@ -707,6 +707,68 @@ mod tests {
         );
     }
 
+    /// `entities_for_namespace`/`graph_for_namespace` apply their
+    /// DDL lazily (`ENTITIES_DDL`/`GRAPH_DDL`) without ever running the
+    /// versioned migration chain. This exercises that exact path — no
+    /// `apply_schema`/`run_migrations` call anywhere — to confirm the
+    /// single-origin trigger set mirrored into `graph-ddl.sql` is actually
+    /// installed there, not only by migration 013.
+    #[tokio::test]
+    async fn lazy_ddl_path_rejects_second_introduced_by_origin_for_concept() {
+        let backend = StorageBackend::memory().expect("memory backend");
+        let entities = backend.entities().expect("lazy entities schema");
+        let graph = backend.graph().expect("lazy graph schema");
+
+        let concept = khive_storage::Entity::new("local", "concept", "Lazy DDL Concept");
+        let concept_id = concept.id;
+        entities
+            .upsert_entity(concept)
+            .await
+            .expect("concept upsert should succeed");
+
+        let origin_a = khive_storage::Entity::new("local", "document", "Origin A");
+        let origin_a_id = origin_a.id;
+        entities
+            .upsert_entity(origin_a)
+            .await
+            .expect("origin A upsert should succeed");
+        let origin_b = khive_storage::Entity::new("local", "document", "Origin B");
+        let origin_b_id = origin_b.id;
+        entities
+            .upsert_entity(origin_b)
+            .await
+            .expect("origin B upsert should succeed");
+
+        let now = chrono::Utc::now();
+        let make_edge = |target_id: uuid::Uuid| khive_storage::Edge {
+            id: uuid::Uuid::new_v4().into(),
+            namespace: "local".to_string(),
+            source_id: concept_id,
+            target_id,
+            relation: khive_storage::EdgeRelation::IntroducedBy,
+            weight: 1.0,
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+            metadata: None,
+            target_backend: None,
+        };
+
+        graph
+            .upsert_edge(make_edge(origin_a_id))
+            .await
+            .expect("first introduced_by origin should be accepted");
+
+        let err = graph
+            .upsert_edge(make_edge(origin_b_id))
+            .await
+            .expect_err("a second, distinct introduced_by origin must be rejected");
+        assert!(
+            matches!(err, khive_storage::StorageError::Conflict { .. }),
+            "expected a Conflict error from the single-origin trigger, got: {err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn sql_access_memory_roundtrip() {
         let backend = StorageBackend::memory().unwrap();

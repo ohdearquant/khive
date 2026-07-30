@@ -1,5 +1,6 @@
 //! SQL-backed `NoteStore` implementation.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -25,6 +26,8 @@ fn map_err(e: rusqlite::Error, op: &'static str) -> StorageError {
 fn map_sqlite_err(e: SqliteError, op: &'static str) -> StorageError {
     StorageError::driver(StorageCapability::Notes, op, e)
 }
+
+const NAMESPACE_COUNT_CHUNK_SIZE: usize = 500;
 
 // ---------------------------------------------------------------------------
 // Pure statement builders (ADR-099 B3 r6 structural cut) — see entity.rs's
@@ -464,6 +467,34 @@ fn build_note_where(
 
     if let Some(k) = kind {
         params.push(Box::new(k.to_string()));
+        conditions.push(format!("kind = ?{}", params.len()));
+    }
+
+    let clause = format!(" WHERE {}", conditions.join(" AND "));
+    (clause, params)
+}
+
+fn build_note_where_for_namespaces(
+    namespaces: &[String],
+    kind: Option<&str>,
+) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = namespaces
+        .iter()
+        .map(|namespace| -> Box<dyn rusqlite::types::ToSql> { Box::new(namespace.clone()) })
+        .collect();
+    let namespace_condition = match namespaces.len() {
+        0 => "0".to_string(),
+        1 => "namespace = ?1".to_string(),
+        _ => {
+            let placeholders: Vec<String> =
+                (1..=namespaces.len()).map(|i| format!("?{i}")).collect();
+            format!("namespace IN ({})", placeholders.join(", "))
+        }
+    };
+    let mut conditions = vec![namespace_condition, "deleted_at IS NULL".to_string()];
+
+    if let Some(kind) = kind {
+        params.push(Box::new(kind.to_string()));
         conditions.push(format!("kind = ?{}", params.len()));
     }
 
@@ -1077,6 +1108,35 @@ impl NoteStore for SqlNoteStore {
                 params.iter().map(|p| p.as_ref()).collect();
             let count: i64 = stmt.query_row(param_refs.as_slice(), |row| row.get(0))?;
             Ok(count as u64)
+        })
+        .await
+    }
+
+    async fn count_notes_in_namespaces(
+        &self,
+        namespaces: &[String],
+        kind: Option<&str>,
+    ) -> Result<u64, StorageError> {
+        let namespaces: Vec<String> = namespaces
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let kind = kind.map(str::to_string);
+
+        self.with_reader("count_notes_in_namespaces", move |conn| {
+            let mut total = 0;
+            for chunk in namespaces.chunks(NAMESPACE_COUNT_CHUNK_SIZE) {
+                let (where_sql, params) = build_note_where_for_namespaces(chunk, kind.as_deref());
+                let sql = format!("SELECT COUNT(*) FROM notes{where_sql}");
+                let mut stmt = conn.prepare(&sql)?;
+                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    params.iter().map(|p| p.as_ref()).collect();
+                let count: i64 = stmt.query_row(param_refs.as_slice(), |row| row.get(0))?;
+                total += count as u64;
+            }
+            Ok(total)
         })
         .await
     }

@@ -357,10 +357,12 @@ async fn supervise(
             name: reg.name,
             health: health.clone(),
         };
-        // A separate task per run isolates panics at the task boundary: a
-        // panicking component surfaces as a JoinError here instead of
-        // unwinding through the supervisor.
-        let mut handle = tokio::spawn((reg.start)(ctx));
+        // A separate task per run isolates panics at the task boundary. The
+        // factory call runs inside the spawned task too: a synchronous panic
+        // while constructing the future surfaces as a JoinError here, exactly
+        // like a panic inside the running component, instead of unwinding
+        // through the supervisor and silently ending supervision.
+        let mut handle = tokio::spawn(async move { (reg.start)(ctx).await });
 
         let joined = tokio::select! {
             r = &mut handle => Some(r),
@@ -864,6 +866,35 @@ mod tests {
         start_components(&[&REG], &server, CancellationToken::new(), health.clone());
         let status = wait_for_state(&health, "test-panic", ComponentState::Unhealthy).await;
         assert_eq!(PANIC_RUNS.load(Ordering::SeqCst), 2);
+        assert!(status.last_error.as_deref().unwrap().contains("panic"));
+    }
+
+    static FACTORY_PANIC_RUNS: AtomicU32 = AtomicU32::new(0);
+    // Panics BEFORE constructing the future — the supervisor must treat a
+    // synchronous factory panic exactly like a panic inside the running
+    // component, not unwind its own task and end supervision at zero retries.
+    fn sync_panicking_factory(_ctx: HostContext) -> ComponentFuture {
+        FACTORY_PANIC_RUNS.fetch_add(1, Ordering::SeqCst);
+        panic!("factory panic before future construction");
+    }
+
+    #[tokio::test]
+    async fn sync_factory_panic_is_supervised_not_fatal() {
+        static REG: DaemonComponentRegistration = DaemonComponentRegistration {
+            name: "test-factory-panic",
+            restart: RestartClass::OnFailure,
+            max_restarts: 1,
+            backoff_initial_ms: 1,
+            backoff_max_ms: 2,
+            shutdown_timeout_ms: 100,
+            start: sync_panicking_factory,
+        };
+        let (_f, db) = tmp_db();
+        let server = make_server(&db).await;
+        let health = HealthReporter::default();
+        start_components(&[&REG], &server, CancellationToken::new(), health.clone());
+        let status = wait_for_state(&health, "test-factory-panic", ComponentState::Unhealthy).await;
+        assert_eq!(FACTORY_PANIC_RUNS.load(Ordering::SeqCst), 2);
         assert!(status.last_error.as_deref().unwrap().contains("panic"));
     }
 
