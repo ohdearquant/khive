@@ -130,7 +130,7 @@ jobs:
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
           sudo docker image prune --all --force || true
           df -h /
-      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: rustfmt, clippy
       - name: Pin the real toolchain bin on PATH
@@ -287,7 +287,7 @@ jobs:
         working-directory: crates
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: crates
@@ -347,7 +347,7 @@ jobs:
         working-directory: crates
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: dtolnay/rust-toolchain@1.95.0
         with:
           targets: wasm32-unknown-unknown,wasm32-wasip1
       - uses: Swatinem/rust-cache@v2
@@ -403,7 +403,7 @@ jobs:
         working-directory: crates
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: dtolnay/rust-toolchain@1.95.0
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
@@ -446,7 +446,7 @@ jobs:
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
           fi
-      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: dtolnay/rust-toolchain@1.95.0
         if: steps.changed.outputs.run == 'true'
       - uses: Swatinem/rust-cache@v2
         if: steps.changed.outputs.run == 'true'
@@ -510,7 +510,7 @@ jobs:
         working-directory: crates
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: crates
@@ -549,7 +549,7 @@ jobs:
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
           sudo docker image prune --all --force || true
           df -h /
-      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
