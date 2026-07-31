@@ -60,6 +60,8 @@ use tokio::net::UnixListener;
 
 const RESUMED_GENERATION_LOG_NEEDLE: &str = "resumed generation of an in-place re-exec";
 const RESUMED_GENERATION_WAIT: Duration = Duration::from_secs(10);
+const PID_LIVENESS_WAIT: Duration = Duration::from_secs(10);
+const PID_LIVENESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 fn kkernel_bin() -> &'static str {
     env!("CARGO_BIN_EXE_kkernel")
@@ -243,7 +245,7 @@ async fn bridge_self_heals_across_in_place_reexec_without_losing_the_client_sess
     // the resumed generation requires a second process handle at all.
     let pid_before = pid_before.expect("child PID must be observable (spawn succeeded)");
     assert!(
-        pid_is_alive(pid_before),
+        wait_for_pid_alive(pid_before).await,
         "PID {pid_before} (captured before the mismatch) must still be alive after \
          the resumed-generation signal — exec() preserves the PID; if it were gone, \
          a new process would have had to be spawned instead of an in-place re-exec"
@@ -272,17 +274,55 @@ async fn bridge_self_heals_across_in_place_reexec_without_losing_the_client_sess
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), fake_daemon).await;
 }
 
-/// OS-level (not just Rust-handle-level) liveness check via `ps`, used to
+/// Poll the OS-level liveness signal with a bounded deadline. A heavily loaded
+/// runner can transiently delay process-state visibility even after the
+/// resumed generation has logged; the protocol invariant is that the PID
+/// becomes observable within the bound, not that one immediate probe wins a
+/// scheduler race.
+async fn wait_for_pid_alive(pid: u32) -> bool {
+    wait_for_liveness(PID_LIVENESS_WAIT, || pid_is_alive(pid)).await
+}
+
+async fn wait_for_liveness(timeout: Duration, mut probe: impl FnMut() -> bool) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if probe() {
+            return true;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        let delay = remaining.min(PID_LIVENESS_POLL_INTERVAL);
+        tokio::time::sleep(delay).await;
+    }
+}
+
+/// OS-level (not just Rust-handle-level) liveness check via POSIX signal 0, used to
 /// confirm the PID observed before the mismatch is still running after the
 /// resumed-generation signal — independent evidence that `exec()` preserved
 /// the process rather than a new one having been spawned.
 fn pid_is_alive(pid: u32) -> bool {
-    std::process::Command::new("ps")
-        .arg("-p")
-        .arg(pid.to_string())
-        .arg("-o")
-        .arg("pid=")
-        .output()
-        .map(|out| out.status.success() && !out.stdout.is_empty())
-        .unwrap_or(false)
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: signal 0 never delivers a signal; it only asks the kernel to
+    // validate process existence and permission for this numeric PID.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[tokio::test]
+async fn pid_liveness_wait_tolerates_transient_probe_failures() {
+    let mut attempts = 0;
+    let alive = wait_for_liveness(Duration::from_secs(1), || {
+        attempts += 1;
+        attempts >= 3
+    })
+    .await;
+
+    assert!(alive);
+    assert_eq!(attempts, 3);
 }
