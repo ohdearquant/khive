@@ -415,6 +415,76 @@ only the pack count moves from ten to eleven. Every surface that enumerates the 
 list. The force-link discipline of Amendment 1 applies: `workspace` carries a `Cargo.toml`
 dependency and an anchor line in `crates/khive-mcp/src/pack.rs`.
 
+## Amendment 3 (2026-07-21): configuration-file pack selection
+
+**Status**: proposed
+
+### Context
+
+Pack selection is specified by this ADR as `--pack` CLI > `KHIVE_PACKS` env > built-in
+default. [ADR-035](ADR-035-cli-config-and-auto-embed.md) additionally lists a
+`runtime.packs` configuration key in its option table, but that key was never
+implemented: the configuration loader parses only `[packs.<name>]` backend assignments
+(ADR-028), and the runtime resolves the loaded set from the environment alone.
+
+Environment-only selection makes the loaded pack set a property of each spawning
+process's environment. Every spawn path — interactive shells, service managers,
+supervisor-launched helpers, a daemon auto-spawned by its first client — must
+independently carry the same variable, and a path that misses it silently boots a
+different surface: service managers do not read shell profiles, and long-lived
+processes re-spawned after a host restart inherit whatever environment their
+launcher happened to have. This per-spawn-path threading requirement is structural,
+not a matter of operator discipline, so a declaration in discovered configuration
+removes it entirely.
+
+### Decision
+
+**1. `runtime.packs` in discovered configuration.** The discovered `khive.toml` gains
+the selection key ADR-035 already lists:
+
+```toml
+[runtime]
+packs = ["kg", "gtd", "memory"]
+```
+
+This is distinct from `[packs.<name>]`, which remains backend assignment (ADR-028)
+and plays no role in selection.
+
+**2. Precedence of the requested set.**
+
+```text
+--pack (CLI) > KHIVE_PACKS (env) > runtime.packs (config) > built-in default
+```
+
+Layers override, never merge: the first present layer supplies the entire resolved
+set, and lower layers are ignored. An empty value at any layer (`--pack` with no
+names, an empty `KHIVE_PACKS`, `runtime.packs = []`) is treated as absent and falls
+through to the next layer — matching the existing environment-variable behavior.
+
+The built-in default remains Amendment 2's eleven-pack set (plus `blob`, ADR-111), matching
+the runtime's default configuration; this amendment adds a configuration layer to the existing
+precedence chain without changing what that default set is.
+
+For this option the environment outranks discovered configuration, deviating from the
+general ADR-035 rule (config over env). Pack selection is deployment topology: a
+single host legitimately runs processes with different surfaces, and a per-process
+override must not require editing a shared file. ADR-035's option table is updated by
+this amendment to reflect the deviation.
+
+### Alternatives considered
+
+- **Keep environment-only selection.** Rejected: the per-spawn-path threading failure
+  class is structural, not a matter of operator discipline.
+- **Configuration over environment (strict ADR-035 ordering).** Rejected: breaks
+  per-process override on multi-surface hosts.
+
+### Consequences
+
+- Service-manager and supervised deployments declare packs once in configuration; the
+  environment variable becomes an override, not a load-bearing requirement.
+- One more selection layer to document and test; the resolution order is centralized
+  in the runtime configuration loader and reported by introspection.
+
 ## References
 
 - [ADR-003](ADR-003-system-architecture.md) — `kkernel` binary; `pack list` introspection

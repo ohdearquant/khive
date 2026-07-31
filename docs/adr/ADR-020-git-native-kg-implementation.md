@@ -3,6 +3,8 @@
 **Status**: accepted
 **Date**: 2026-05-23
 **Authors**: khive maintainers
+**Amended by**: [ADR-102](ADR-102-tiered-validate-and-merge.md), which restores the
+`kg commit` CLI primitive.
 
 ## Context
 
@@ -80,8 +82,8 @@ It does NOT cover:
 
 ```
 .khive/
-├── .gitignore          # allowlist: only kg/ and khive.toml are tracked
-├── khive.toml         # project config — git-tracked
+├── .gitignore          # allowlist: only kg/ and config.toml are tracked
+├── config.toml         # project config — git-tracked (ADR-035/096)
 └── kg/                 # committed knowledge graph — git-tracked
     ├── schema.yaml         # ontology manifest
     ├── entities.ndjson     # sorted by UUID
@@ -100,11 +102,13 @@ introduced later is gitignored by default:
 !.gitignore
 !kg/
 !kg/**
-!khive.toml
+!config.toml
 ```
 
-`khive kg init` creates the layout. `working.db` is fully reconstructable from the
-NDJSON files via `khive kg sync` and is never committed.
+`khive kg init` creates the layout. The obsolete `.khive/khive.toml` spelling
+is not a config-loader tier; init diagnoses it explicitly rather than adding a
+silent precedence rule. `working.db` is fully reconstructable from the NDJSON
+files via `khive kg sync` and is never committed.
 
 **One KG per repository.** There is no `.khive/kg/<name>/` namespace multiplexer. Multiple
 independent KGs live in separate repositories, with cross-repo edges (§7) handling the

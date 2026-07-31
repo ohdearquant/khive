@@ -491,13 +491,13 @@ are deferred with native rerank.
 
 ## References
 
-- [ADR-008 (lattice)](../../../../lattice/docs/adr/ADR-008-lora-injection.md): `LoraHook` trait — the per-layer per-module adapter
+- [ADR-008 (lattice)](https://github.com/ohdearquant/lattice/blob/main/docs/adr/ADR-008-lora-injection.md): `LoraHook` trait — the per-layer per-module adapter
   injection point this ADR consumes.
-- [ADR-009 (lattice)](../../../../lattice/docs/adr/ADR-009-model-architectures.md): Qwen3 architecture — the v1 sentinel rerank model
+- [ADR-009 (lattice)](https://github.com/ohdearquant/lattice/blob/main/docs/adr/ADR-009-model-architectures.md): Qwen3 architecture — the v1 sentinel rerank model
   class.
-- [ADR-029 (lattice)](../../../../lattice/docs/adr/ADR-029-model-registry.md): Model Registry — the `rerank_model_id` references
+- [ADR-029 (lattice)](https://github.com/ohdearquant/lattice/blob/main/docs/adr/ADR-029-model-registry.md): Model Registry — the `rerank_model_id` references
   RegisteredModel.id.
-- [ADR-031 (lattice)](../../../../lattice/docs/adr/ADR-031-lora-adapter-management.md): LoRA Adapter Management — `LoraAdapter:
+- [ADR-031 (lattice)](https://github.com/ohdearquant/lattice/blob/main/docs/adr/ADR-031-lora-adapter-management.md): LoRA Adapter Management — `LoraAdapter:
   LoraHook` impl behind `inference-hook` feature.
 - [ADR-011](ADR-011-embedding-and-inference.md): Embedding and Inference Architecture
   — establishes the lattice-inference dependency pattern this ADR extends.

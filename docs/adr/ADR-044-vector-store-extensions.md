@@ -11,7 +11,9 @@
 - [ADR-031](ADR-031-multi-engine-retrieval.md) — Multi-Engine Retrieval (`RetrievalContext`, per-engine stores)
 - [ADR-032](ADR-032-brain-profile-orchestration.md) — Brain Profile Orchestration (§6.1 profile-scoped recall filter)
 - [ADR-033](ADR-033-recall-pipeline.md) — Recall Pipeline (`candidate_multiplier`, filter pushdown consumer)
-- [ADR-043](ADR-043-embedding-model-migration.md) — Embedding Model Migration (`orphan_sweep` consumer, `capabilities()` consumer)
+**Related**: [ADR-043](ADR-043-embedding-model-migration.md) — Embedding Model Migration
+consumes `orphan_sweep` and `capabilities()`; the extension contract does not depend on its
+consumer.
 
 ---
 

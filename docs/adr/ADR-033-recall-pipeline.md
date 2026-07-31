@@ -60,7 +60,7 @@ pub struct RecallConfig {
     // Retrieval parameters
     pub candidate_multiplier: u32,    // default 20 — candidates per path before fusion
     pub candidate_limit: Option<u32>, // explicit cap; None preserves multiplier behavior
-    pub fuse_strategy: FusionStrategy, // default Weighted { weights: [0.7, 0.3] }
+    pub fuse_strategy: FusionStrategy, // default Rrf { k: 10 } (calibrated 2026-07-21)
     pub min_score: f64,               // default 0.0
     pub min_salience: f64,            // default 0.0
     pub include_breakdown: bool,      // default false
@@ -232,14 +232,17 @@ current default behavior.
 | Parameter         | Type             | Default             | Semantics                                                                                                                                                         |
 | ----------------- | ---------------- | ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `top_k`           | `usize` \| null  | `limit` or `10`     | Maximum number of results to return. Overrides `limit` when set. Capped at `100`.                                                                                 |
-| `fusion_strategy` | `string` \| null | `"weighted"` (CC-6) | Fusion algorithm for candidate merging. Must be one of `"rrf"`, `"weighted"`, `"union"`, `"vector_only"`, `"keyword_only"`. Returns an error for any other value. |
+| `fusion_strategy` | `string` \| null | omitted = RRF `k = 10` | Fusion algorithm for candidate merging. Must be one of `"rrf"`, `"weighted"`, `"union"`, `"vector_only"`, `"keyword_only"`; any other value errors. Omitting the parameter selects the calibrated pack default, RRF `k = 10`; the explicit string `"rrf"` selects `k = 60`. |
 | `score_floor`     | `f32` \| null    | `0.0` (no floor)    | Minimum composite score threshold applied after `compute_score`. Results below this floor are excluded. `0.0` or `null` = no filtering.                           |
 
 **`fusion_strategy` details:**
 
-- `"rrf"` — Reciprocal Rank Fusion with k=60. Robust across query types.
-- `"weighted"` — Weighted linear combination (default; CC-6). Vector weight 0.7, text weight 0.3
-  from pack-level config (`RecallConfig.fuse_strategy`). The request cannot override weights.
+- `"rrf"` — Reciprocal Rank Fusion with k=60. Robust across query types. (Omitting
+  `fusion_strategy` entirely selects the calibrated pack default, RRF with k=10 — a
+  distinct configuration from the explicit `"rrf"` string.)
+- `"weighted"` — Weighted linear combination (explicit, non-default). Vector weight 0.7,
+  text weight 0.3 from pack-level config (`RecallConfig.fuse_strategy` when set to
+  Weighted). The request cannot override weights.
 - `"union"` — Max-score per candidate ID. Inclusive but may surface low-quality text-only hits.
 - `"vector_only"` — Skip text search entirely; rank by vector similarity alone. Useful when the
   query is a raw embedding or when FTS noise degrades results.

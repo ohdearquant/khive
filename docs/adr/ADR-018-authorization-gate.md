@@ -2,6 +2,12 @@
 
 **Status**: accepted\
 **Date**: 2026-05-23\
+**Amended by**: [ADR-129](ADR-129-fail-closed-gate-default.md), which supersedes
+this ADR's original permissive default-gate selection and fail-open gate-error
+behaviour; all other decisions remain in force; and proposed
+[ADR-117a](ADR-117a-session-identity-tenant-isolation.md), which would add a
+fail-closed verb class; proposed [ADR-068](ADR-068-process-isolation-topology.md)
+would replace the deployment-topology clause.\
 **Authors**: khive maintainers
 
 ## Context
@@ -22,18 +28,22 @@ The system must satisfy:
 
 1. **Pluggable policy.** No hardcoded auth logic. Each deployment plugs in its policy
    engine — Rego, capability-based, OAuth-scope-based, or custom.
-2. **Permissive defaults.** A permissive default (`AllowAllGate`) is the boot
-   default; nothing changes for personal-local users.
+2. **Fail-closed defaults** *(revised by ADR-129 Stage 2)*. `RuntimeConfig::default()`
+   carries an unprovisioned `CapabilityGate`, which denies every request until a
+   composition root provisions that same gate instance through the boot mint.
+   `AllowAllGate` remains available only as an explicit permissive opt-out.
 3. **Hard enforcement from day 1.** `Deny` decisions block dispatch — no advisory
    phase, no "log-and-allow" mode. The gate is authoritative.
 4. **Structured audit trail.** Every gate consultation produces a queryable record:
    who attempted what verb, on which namespace, with what decision, what reason. Stored
    in the substrate (`EventStore`) and emitted via structured logging.
-5. **Fail-open on infrastructure errors.** A misconfigured Rego policy must not take
-   down the whole server. Gate-infrastructure failures log a warning and proceed; only
-   explicit `Deny` decisions block.
-6. **License clean.** The default impl lives in Apache-2.0. Custom Gate backends
-   ship under their own licenses without any coupling to this crate's license.
+5. **Fail-closed on infrastructure errors** *(revised by Amendment 3; the original
+   fail-open principle is preserved there as history)*. A gate that cannot answer
+   refuses: gate-infrastructure failures are audited and dispatch returns a typed
+   gate-unavailable error.
+6. **License clean.** The gate contract and explicit `AllowAllGate` opt-out live
+   in Apache-2.0. Custom Gate backends ship under their own licenses without any
+   coupling to this crate's license.
 
 ## Decision
 
@@ -84,7 +94,7 @@ The JSON projection of `GateRequest` is the **public contract**. Field names
 (`input.actor.kind`, `input.namespace`, `input.verb`, etc.) are what policies receive
 as input. Changing a field name is a breaking change requiring an ADR amendment.
 
-### `AllowAllGate`: the default gate
+### `AllowAllGate`: explicit permissive opt-out *(default superseded by ADR-129)*
 
 ```rust
 // crates/khive-gate/src/lib.rs
@@ -98,13 +108,32 @@ impl Gate for AllowAllGate {
 }
 ```
 
-`RuntimeConfig::default()` sets `gate: Arc::new(AllowAllGate)`. Personal-local users
-who do not explicitly configure a policy backend see no change from earlier khive
-behavior — every verb is allowed.
+The original version of this ADR made `AllowAllGate` the
+`RuntimeConfig::default()` gate. [ADR-129](ADR-129-fail-closed-gate-default.md)
+Stage 2 supersedes that selection: the default is now an **unprovisioned
+`CapabilityGate`** with an empty principal registry, so it denies every request.
+Production composition roots resolve configuration, mint the normalized grant set
+into one `CapabilityGate`, install that same instance into the configuration, and
+only then construct the runtime.
 
-The documentation warns that `AllowAllGate` is a footgun in multi-user or
-networked contexts. Deployments serving multiple users should configure `RegoGate` or a custom backend before
-serving traffic.
+Personal-local boot remains usable because the composition root mints its explicit
+local grant, not because authorization is bypassed. Library callers that construct
+`RuntimeConfig::default()` or a runtime directly without that mint intentionally get
+a deny-all runtime.
+
+`AllowAllGate` remains available for tests and for embedders that deliberately opt
+out of capability enforcement. The named `RuntimeConfig::permissive()` and
+`RuntimeConfig::permissive_no_embeddings()` constructors make that choice explicit
+and searchable; production composition roots must not use them.
+
+#### Migration and library construction
+
+The ADR-129 Stage 2 flip is a runtime behaviour change, not a compile-guided
+migration. Existing `Default` construction sites continue to compile, but refuse
+dispatch until they provision the default gate through the boot-mint API. An
+embedder must choose one of two explicit paths: perform the same mint before runtime
+construction, or opt out with `RuntimeConfig::permissive()` / an explicitly installed
+`AllowAllGate`.
 
 ### `RegoGate`: canonical policy backend in `khive-gate-rego`
 
@@ -194,38 +223,47 @@ match &decision {
         });
     }
     Err(err) => {
-        // Gate infrastructure failed — log and proceed (fail-open)
-        tracing::warn!(error = ?err, "gate check failed; proceeding (fail-open)");
-        // No audit event — no decision was produced
+        // Gate infrastructure failed — audit and refuse (fail-closed;
+        // Amendment 3 / ADR-129 Stage 1a)
+        audit_gate_unavailable(&gate_req, &err);
+        return Err(RuntimeError::GateUnavailable {
+            verb: gate_req.verb.clone(),
+            reason: err.to_string(),
+        });
     }
 }
 
-// Continue to pack handler...
+// Continue to pack handler... (reached only on Allow)
 ```
 
 `RuntimeError::PermissionDenied { verb, reason }` is a first-class error variant.
 Callers can match on it to distinguish authorization failures from operational errors.
 
-### Fail-open on gate `Err`
+### Gate `Err`: fail-closed *(revised by Amendment 3 / ADR-129 Stage 1a)*
 
 A gate that errors out before it can produce a decision (e.g. request serialization
 failure, a poisoned internal lock surfaced as `GateError::Internal`) returns
-`Err(GateError)`. This is treated as **infrastructure failure**, not an authorization
-decision. The dispatch proceeds; the error is logged.
+`Err(GateError)`. This is **infrastructure failure**, not an authorization decision —
+and it refuses: the outage is audited as `gate_unavailable` and dispatch returns
+`RuntimeError::GateUnavailable` without invoking the pack handler. No decision was
+produced, so there is no permission to proceed on.
 
-Rationale: blocking dispatch on infrastructure failures means every verb depends on
-gate-infrastructure availability. A misconfigured policy in production would take down
-the entire khive surface. Fail-open at the infra layer keeps khive serving traffic;
-operators see the warning and fix the policy.
+`Deny` and `Err` remain distinct in both the error surface (`PermissionDenied` vs
+`GateUnavailable`) and the audit trail (`outcome=denied` + `deny_reason` vs
+`outcome=error` + `decision="gate_unavailable"`).
 
-This is distinct from `Deny`, which is an explicit policy decision. Deny blocks; Err
-does not. Future deployments needing strict-mode (block on gate Err) can wrap `Gate`
-in a `StrictGate { inner: Arc<dyn Gate> }` adapter — but that's not the default.
+**Historical (superseded).** This section originally specified fail-open: dispatch
+proceeded on gate `Err`, on the rationale that a misconfigured policy should not take
+down the whole surface, with a `StrictGate` wrapper suggested for deployments wanting
+strict mode. ADR-129 reversed this — an authorization layer whose outage grants access
+is a bypass, not a safeguard — and made strict the only behaviour; the `StrictGate`
+adapter is retired unbuilt. Amendment 3 records the revision.
 
 **`RegoGate` narrows this further than the base contract implies.** Policy-load
 failures (a Rego file that fails to compile, or an empty policy directory) surface as
 `Err(GateError::Policy)` at construction time, before the gate is ever installed —
-consistent with fail-open-on-infra-error above. But at _dispatch_ time, `RegoGate`
+a broken policy never reaches dispatch, the same posture as the fail-closed rule
+above. But at _dispatch_ time, `RegoGate`
 never returns `Err` for policy-evaluation uncertainty: an undefined `decision` rule, a
 `regorus` evaluation throw, a poisoned engine mutex, or a decision value that fails to
 serialize or doesn't match the `GateDecision` shape are all converted to an explicit
@@ -334,6 +372,7 @@ during pack registration:
 
 ```rust
 // In kkernel mcp startup
+khive_runtime::boot::install_boot_gate_into(&mut config)?;
 let runtime = KhiveRuntime::new(config.clone())?;
 let registry = VerbRegistry::builder()
     .with_gate(config.gate.clone())
@@ -399,19 +438,19 @@ policies but NOT enforced by the runtime in v1. They're declarative signals:
 The shape is locked now so policy authors can write `allow { ... obligations: [...]
 }` today. Enforcement subsystems land independently.
 
-### Trust boundary alignment with ADR-003
+### Trust boundary alignment with ADR-003 *(revised by ADR-129)*
 
-Per ADR-003, the gate enforcement layer exists only in the agent binary (`khive-mcp`
-or `kkernel mcp`). The operator binary (`kkernel sync`, `kkernel db migrate`, `kkernel
-pack list`) runs without the gate — `AllowAllGate` is installed by default in
-operator mode.
+ADR-129 supersedes this ADR's original interpretation that operator mode implicitly
+ran under `AllowAllGate`. Authorization is enforced at the runtime dispatch and
+token-mint seams, independent of whether the composition root is MCP serving, an
+operator command, or an embedder. Every production composition root that constructs
+a runtime and reaches those seams must provision the default `CapabilityGate` before
+runtime construction. Commands that never construct or dispatch through a runtime do
+not consult a gate; local shell access is not itself an implicit authorization bypass.
 
-This matches the trust model: operators are trusted by definition (they have local
-shell access); agents are untrusted by design (they speak through MCP from
-potentially-untrusted clients).
-
-The boundary is structural, not configurational. Operator commands cannot accidentally
-be gated; agent commands cannot accidentally bypass the gate.
+The boundary remains structural: code that reaches a gated runtime seam cannot
+silently fall back to permissive behaviour. A permissive runtime exists only where a
+caller explicitly installs `AllowAllGate`.
 
 ### `GateRequest.namespace` and runtime alignment
 
@@ -463,7 +502,8 @@ Hierarchy:
 `Allow` and the verb is owned by the registering pack. A `Deny` from a pack
 policy is treated identically to a base-gate `Deny`: dispatch aborts with
 `RuntimeError::PermissionDenied`. A pack policy error (infrastructure failure)
-follows the same fail-open rule as the base gate.
+follows the same fail-closed rule as the base gate (Amendment 3): it refuses
+dispatch as gate-unavailable.
 
 ## Rationale
 
@@ -479,22 +519,25 @@ mode would mean another phase of "we'll enforce later" — and "later" has a way
 arriving.
 
 Hard enforcement is the honest behavior: if a policy says Deny, we deny. The
-`AllowAllGate` default preserves personal-local behavior; deployments that
-configure a policy backend get the policy they configured. No magic.
+boot-minted `CapabilityGate` preserves the personal-local experience by granting the
+resolved local principal exactly its configured authority. Embedders that choose
+`AllowAllGate` do so explicitly; no permissive behaviour is inherited from
+`Default`.
 
-### Why fail-open on gate Err?
+### Why fail-open on gate Err originally — and why Amendment 3 reversed it
 
-A misconfigured Rego policy is an operations problem, not a security policy. If the
-operator's policy file has a syntax error, the gate fails to evaluate — but that's
-the operator's bug, not an authorization decision. Blocking dispatch would take down
-the entire server until the operator fixes the policy.
+The original rationale: a misconfigured Rego policy is an operations problem, not a
+security policy — blocking dispatch would take down the entire server until the
+operator fixes the policy, so fail-open kept khive serving during a misconfiguration
+while warning logs surfaced the bug.
 
-Fail-open at the infra layer keeps khive serving during a misconfiguration. The
-warning logs surface the bug; the operator fixes it; the gate goes back to evaluating
-correctly. No global outage from one bad Rego file.
-
-Deployments that prefer strict mode wrap `Gate` in a `StrictGate { inner: Arc<dyn
-Gate> }` adapter that converts `Err` to `Deny`. The choice belongs to the operator.
+ADR-129 reversed the trade. An authorization layer whose outage grants access is a
+bypass reachable by inducing an error, and the availability concern is already met
+one layer down: `RegoGate` converts policy-evaluation failures to explicit `Deny` at
+dispatch time and refuses broken policies at construction time, so a bad Rego file
+produces denials or a failed boot — not a server that silently stops authorizing.
+The remaining `Err` paths are genuine infrastructure faults, and those refuse
+(§"Gate `Err`: fail-closed").
 
 ### Why two audit sinks (tracing + EventStore)?
 
@@ -573,12 +616,16 @@ care; alert pipelines do.
 
 - Pluggable policy engine. Deployments configure Rego, capability-based, OAuth-scope,
   or custom backends without modifying khive core.
-- Default is zero-config (`AllowAllGate`). Personal-local users see no behavior
-  change.
+- Default is fail-closed (`CapabilityGate`). An unprovisioned runtime denies every
+  request; a production composition root mints configured authority before serving.
+  Personal-local boot remains usable through that explicit local grant.
 - Hard enforcement from day 1. Deny means deny; no "we'll enforce later" debt.
 - Structured audit trail. Tracing for log aggregators, EventStore for persistent
   queries. Both formats locked.
-- Fail-open on gate Err. Infra failures don't cascade into server outages.
+- Fail-closed on gate Err (Amendment 3). A gate outage refuses with a typed, audited
+  gate-unavailable error rather than serving unauthorized traffic; `RegoGate`'s
+  deny-on-evaluation-failure and refuse-at-construction keep policy misconfiguration
+  from becoming a global outage.
 - Narrow registry coupling (Option B). No transitive dependency explosion.
 - Audit shape locked before deployment scales. No retroactive schema churn.
 - Rego portability. Policies move between khive and any OPA consumer.
@@ -592,11 +639,10 @@ care; alert pipelines do.
   single-threaded eval.
   Mitigated: bench-driven; switch to compiled-policy or engine pool when contention
   becomes measurable.
-- `AllowAllGate` is a footgun in multi-user environments. The default exists for
-  personal use, but operators who forget to configure a policy in a networked deployment
-  have no protection.
-  Mitigated: documentation emphasis; future "strict mode" config flag that requires
-  an explicit non-default gate.
+- `AllowAllGate` remains a footgun wherever an embedder explicitly selects it.
+  Mitigated: it is no longer the default; permissive construction is a named,
+  searchable opt-out reserved for tests and embedders that deliberately decline
+  capability enforcement.
 - `Obligation::RateLimit` is declared but not enforced in v1. Policy authors who
   return rate-limit obligations get audit visibility but no actual rate limiting.
   Mitigated: shape is locked so future rate-limiter ADR can wire enforcement without
@@ -609,15 +655,23 @@ care; alert pipelines do.
 - `AuditEvent` adds ~80 LOC to `khive-gate` for a public-contract type. Reasonable.
 - The two-sink design means operators choose which they want. Both fire when both are
   configured.
-- Personal-local use is unchanged: `AllowAllGate` allows everything, audit fires
-  through tracing, no `EventStore` configuration needed.
+- Personal-local boot is unchanged at the user-facing level: the composition root
+  provisions the local principal before serving. Direct, unminted library
+  construction refuses by design.
 
 ## Implementation
 
 - `crates/khive-gate/src/lib.rs`:
   - `Gate` trait + `GateRequest`, `GateDecision`, `Obligation`, `GateError`.
-  - `AllowAllGate` default impl.
+  - `AllowAllGate` explicit permissive opt-out.
   - `AuditEvent`, `AuditDecision`, `AuditEvent::from_check`.
+- `crates/khive-runtime/src/config.rs`:
+  - `RuntimeConfig::default()` installs an unprovisioned `CapabilityGate`.
+  - `RuntimeConfig::permissive()` and `permissive_no_embeddings()` select
+    `AllowAllGate` explicitly.
+- `crates/khive-capability/src/boot.rs` and production composition roots:
+  - Normalize configured grants, mint them into one `CapabilityGate`, and install
+    that same instance before runtime construction.
 - `crates/khive-gate-rego/src/lib.rs`:
   - `RegoGate` (Apache-2.0, depends on `regorus`).
   - `DEFAULT_ENTRYPOINT = "data.khive.gate.decision"`.
@@ -634,8 +688,8 @@ care; alert pipelines do.
 
 ## References
 
-- ADR-003: System Architecture — gate enforcement is the agent-binary boundary;
-  operator binary (`kkernel`) runs `AllowAllGate`.
+- ADR-003: System Architecture — process and runtime trust boundaries; ADR-129
+  supersedes this ADR's former operator-mode `AllowAllGate` interpretation.
 - ADR-004: Substrate Observables — `Event` substrate stores audit records.
 - ADR-005: Storage Capability Traits — `EventStore::append_event` is the persistence
   primitive.
@@ -702,25 +756,32 @@ remains the source of truth for its own contract.
 
 ### Context
 
-The base contract fails open on gate infrastructure `Err` (§"Fail-open on gate Err"): a gate that
-errors before producing a decision proceeds, and only an explicit `Deny` blocks. Amendment 1 §4
+When this amendment was written the base contract failed open on gate infrastructure `Err`: a gate
+that errored before producing a decision proceeded, and only an explicit `Deny` blocked. (Since
+revised — Amendment 3 makes gate `Err` refuse dispatch; this amendment's requirement stands on its
+own regardless, see the note at the end of the Decision.) Amendment 1 §4
 already carved one fail-closed exception — a wire verb that resolves to no registered canonical id is
 denied before dispatch. Some verbs return rows so sensitive that their safety must not depend on the
 Gate at all — the Gate is pre-dispatch and row-blind, so it can neither see nor isolate matched rows,
-and its fail-open default must not become a data-leak path for them.
+and its then-fail-open default must not have become a data-leak path for them.
 
 ### Decision
 
 A verb may declare membership in a **fail-closed verb class**. A member carries a handler-seam
 requirement of a **positive authenticated tenant scope**: its handler must refuse to execute without
-one. For a member, the Gate's fail-open default cannot leak data, because the handler's
-construction-primary refusal stands independently of the Gate decision — a failed-open allow still
-yields no scope, and no scope yields no rows, not a widened query.
+one. For a member, no Gate behaviour can leak data, because the handler's construction-primary
+refusal stands independently of the Gate decision — any allow (correct or erroneous) still yields
+no scope, and no scope yields no rows, not a widened query.
 
 The amendment is a contract-level codification of a property the member's handler seam already
-guarantees by construction. It does **not** move enforcement into the Gate: the Gate stays pre-dispatch,
-row-blind, and fail-open on infra error. It names the class of verbs whose row-isolation is a
+guarantees by construction. It does **not** move enforcement into the Gate: the Gate stays
+pre-dispatch and row-blind. It names the class of verbs whose row-isolation is a
 construction-primary handler-seam predicate rather than a Gate decision.
+
+*Note (Amendment 3).* The base contract now refuses dispatch on gate `Err`, so the failure
+mode that motivated this amendment is no longer reachable through the Gate. The handler-seam
+positive-scope requirement is unchanged: it guards against every path to the handler, not just
+the Gate's former fail-open one, and remains the construction-primary defense for its members.
 
 `session.search` (ADR-117a) is the first member. Future verbs that return cross-tenant-sensitive rows
 join by the same handler-seam contract.
@@ -733,3 +794,40 @@ join by the same handler-seam contract.
 - Membership is a per-verb contract a pack declares; the enforcement lives in the member's handler and
   is proven by that verb's isolation and no-scope-refusal tests (ADR-117a discharges both for
   `session.search`).
+
+---
+
+## Amendment 3 (2026-07-25) — Gate `Err` fails closed
+
+Specified by [ADR-129](ADR-129-fail-closed-gate-default.md) (Stage 1a); recorded here so this
+ADR remains the source of truth for its own contract.
+
+### Context
+
+The base contract treated gate infrastructure `Err` as permission to proceed (§"Gate `Err`:
+fail-closed", originally titled "Fail-open on gate `Err`"). That was masked in practice by the
+then-default gate: `AllowAllGate::check` is infallible, so deployments using that historical
+default could not reach the fail-open arm. ADR-129 introduced fallible gates over the capability
+substrate, which turned the arm into a live authorization bypass — an attacker who can induce a
+gate error acquires the gate's absence.
+
+### Decision
+
+Every `Gate::check` call-site in `khive-runtime` treats `Err(GateError)` as a refusal:
+
+- Dispatch returns `RuntimeError::GateUnavailable { verb, reason }` without invoking the pack
+  handler or intercepted operation. The variant is distinct from `PermissionDenied`: the gate
+  could not answer, versus the gate answered "no".
+- The outage is audited: `EventKind::Audit` with `EventOutcome::Error` and payload
+  `decision = "gate_unavailable"`, distinguishable from a denial's `EventOutcome::Denied` +
+  `deny_reason`. A gate outage is as visible in the event log as a denial.
+- The `StrictGate` wrapper suggested by the original section is retired unbuilt — strict is
+  the only behaviour, not an opt-in.
+- Availability under policy misconfiguration is preserved one layer down, unchanged:
+  `RegoGate` refuses broken policies at construction and converts evaluation failures to
+  explicit `Deny` at dispatch, so a bad policy file cannot produce a gate-outage storm.
+
+The revised sections above (principle 5, the dispatch sketch, §"Gate `Err`: fail-closed",
+the pack-policy rule, the rationale, the consequences bullet, and Amendment 2's context)
+were updated in the same change that landed the behaviour, per ADR-129 Stage 1a's
+documentation requirement.

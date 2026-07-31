@@ -1357,7 +1357,7 @@ lattice-transport 0.2.5 to crates.io (currently only 0.2.1 published).
 
 ## References
 
-- [ADR-032](ADR-032-brain-pack.md): Brain pack — profiles, posteriors, feedback
+- [ADR-032](ADR-032-brain-profile-orchestration.md): Brain pack — profiles, posteriors, feedback
 - [ADR-047](ADR-047-knowledge-pack.md): Knowledge pack — corpus tier, atom schema
 - [ADR-002](ADR-002-edge-ontology.md): Edge ontology — closed relation set
 - Atlas `khive_domains/atom/types/section.py`: Canonical section type enum

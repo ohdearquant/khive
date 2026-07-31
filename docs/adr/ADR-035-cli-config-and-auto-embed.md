@@ -21,51 +21,54 @@ the git-native KG workflow:
    automatic embedding on commit and sync, vectors grow stale and search quality degrades
    silently — no error, just worse results.
 
-### One config file, not two
+### One config schema and one selected file
 
-ADR-028 introduces `khive.toml` for deployment topology: `[[backends]]`, `[[engines]]`, and
-`[packs.*]` sections. This ADR originally specified a separate `config.toml` for embed and
-schema settings. Having two configuration files in the same `.khive/` directory with
-overlapping scopes is confusing and unnecessary. The decision is to **unify both into one
-`khive.toml`** per scope, not two separate files.
+ADR-028 introduces the khive TOML schema for deployment topology:
+`[[backends]]`, `[[engines]]`, and `[packs.*]` sections. This ADR adds embed and
+schema settings to that same schema; it does not create a second sidecar file
+with an overlapping purpose.
 
-The two files that ADR-028 and this ADR together define:
+The accepted loader discovers these filenames, in precedence order:
 
-| File                  | Scope         | Committed                         |
-| --------------------- | ------------- | --------------------------------- |
-| `.khive/khive.toml`   | Project-level | Yes — shared across collaborators |
-| `~/.khive/khive.toml` | User-level    | No — machine-specific             |
+| File                      | Scope                                  | Committed                         |
+| ------------------------- | -------------------------------------- | --------------------------------- |
+| `./khive.toml`            | Project-root compatibility location    | Operator choice                   |
+| `./.khive/config.toml`    | Canonical project-local location       | Yes — shared across collaborators |
+| `~/.khive/config.toml`    | User-global fallback                   | No — machine-specific             |
 
-`khive.toml` is the single configuration file for khive at each scope level. There is no
-`config.toml`. ADR-020's `.khive/.gitignore` allowlist includes `khive.toml`.
+Only the first existing file is loaded. The files are not merged per key.
+`.khive/khive.toml` is not a discovery tier and must never be silently treated
+as one. ADR-020's `.khive/.gitignore` allowlist includes `config.toml`.
 
 ### The consistency requirement
 
 Embedding vectors are only comparable if produced by the same model. If Alice commits with
-`mE5-small` (384 dimensions) and Bob syncs with `BGE-small` (same dimension count but a
+`all-minilm-l6-v2` (384 dimensions) and Bob syncs with `BGE-small` (same dimension count but a
 different model), their vectors are numerically incompatible: cosine similarity across models
-is meaningless. The project-level `khive.toml` must specify the embedding model, and that
-file must be committed so all collaborators use the same model.
+is meaningless. The project-level `.khive/config.toml` (or accepted root
+`khive.toml` alternative) must specify the embedding model, and that file must
+be committed so all collaborators use the same model.
 
 This means:
 
 - The embedding model is a **project-level setting** — committed to git, enforced across
   the team, not overridable per-user.
-- Device preferences are **user-level settings** — machine-specific, not committed,
-  reflecting local hardware (Metal, CUDA, CPU).
+- Device preferences are **machine-local settings** — supplied through a
+  process-local override rather than a second TOML file merged behind the
+  selected project config.
 
 ## Decision
 
-### 1. Unified `khive.toml` — one file per scope
+### 1. Unified TOML schema
 
-`khive.toml` carries all configuration for khive at a given scope. ADR-028's `[[backends]]`,
-`[[engines]]`, and `[packs.*]` sections are joined by `[embed]` and `[schema]` sections from
-this ADR. There is no separate `config.toml`.
+The selected config file carries all configuration for khive. ADR-028's
+`[[backends]]`, `[[engines]]`, and `[packs.*]` sections are joined by
+`[embed]` and `[schema]` sections from this ADR.
 
-**Project-level** (`.khive/khive.toml` — committed to git):
+**Canonical project-level file** (`.khive/config.toml` — committed to git):
 
 ```toml
-# .khive/khive.toml — project configuration
+# .khive/config.toml — project configuration
 # Committed to git. All collaborators use these settings.
 # See: ADR-028 (backends/packs) and ADR-035 (embed/schema).
 
@@ -73,31 +76,28 @@ this ADR. There is no separate `config.toml`.
 
 [[backends]]
 name = "main"
+kind = "sqlite"
 path = "~/.khive/khive.db"
-cache_mb = 256
-journal_mode = "wal"
 
 [[engines]]
-name = "mE5-small"
-dim = 384
-weight = 1.0
+name = "default"
+model = "all-minilm-l6-v2"
+default = true
+dims = 384
 
 [packs.kg]
 backend = "main"
-engines = ["mE5-small"]
 
 [packs.memory]
 backend = "main"
-engines = ["mE5-small"]
 
 [packs.gtd]
 backend = "main"
-engines = []
 
 # --- Embedding configuration (ADR-035) ---
 
 [embed]
-model = "mE5-small"        # lattice-embed model name — must match [[engines]] entry
+model = "default"          # logical name — must match a [[engines]] entry
 dimensions = 384            # vector dimensions
 auto_embed = true           # embed on commit and sync (default: true)
 batch_size = 64             # entities per embed batch
@@ -111,40 +111,44 @@ include = ["name", "description"]  # entity fields concatenated for embedding
 strict = true               # reject unknown entity kinds and edge relations on import
 ```
 
-**User-level** (`~/.khive/khive.toml` — not committed):
+**User-global fallback** (`~/.khive/config.toml` — not committed):
 
 ```toml
-# ~/.khive/khive.toml — user defaults, not committed to any project
+# ~/.khive/config.toml — user defaults, not committed to any project
 
-[[backends]]
-name = "main"
-path = "~/.khive/khive.db"
-
-[embed]
-model = "mE5-small"        # default model for new projects
-device = "metal"            # inference device: metal | cuda | cpu
+[[engines]]
+name = "default"
+model = "all-minilm-l6-v2"
+default = true
 ```
 
-Only keys that diverge from built-in defaults need to appear in either file.
+Only keys that diverge from built-in defaults need to appear. The global file
+is selected only when neither project location exists; it is not merged into a
+selected project file.
 
 ### 2. Configuration resolution order
 
-For every config key: **CLI flag > project `khive.toml` > global `khive.toml` > built-in
-default**. A missing key at any level falls through to the next. When both levels specify
-the same key, the **project level wins**. This ensures project maintainers can lock the
-embedding model for consistency while users retain the ability to set their inference device
-locally without touching committed files.
+Configuration-file discovery is **explicit `--config` / `KHIVE_CONFIG` path
+> project-root `./khive.toml` > DB-anchored or cwd project
+`./.khive/config.toml` > `~/.khive/config.toml` > no file**. The first file
+that exists is parsed and validated; a malformed higher-precedence file is an
+error, not a reason to continue to a lower tier.
 
-`embed.device` is user-level only. A project-level `khive.toml` that sets `embed.device`
-is valid TOML but will be warned against at startup: device selection should not be committed.
+When an explicit database path is supplied, the hidden project tier is
+anchored beside that resolved database so a thin client and its daemon select
+the same file. With no explicit database path, it is anchored to the current
+project directory. This is the ADR-096 `config_id` coherence rule.
+
+There is no per-key merge between project and global files. A machine-local
+setting that must coexist with committed project settings uses the applicable
+CLI or environment override.
 
 ## CLI / env / config precedence
 
 For each runtime option, precedence is:
-**CLI flag > project khive.toml > global khive.toml > `KHIVE_*` env var > built-in default**.
-A `KHIVE_*` env var is only a fallback default — when a TOML key resolves at either level it
-wins over the env var. This matches the runtime config loader (`engine_config.rs`) and the
-config docs (`docs/khive-config-example.toml`).
+**CLI flag > selected config file > applicable `KHIVE_*` env var > built-in
+default**. Exact option-specific exceptions are listed in the canonical config
+reference (`docs/core/khive-config-example.toml`).
 
 | Option             | CLI flag          | Env var                  | Config key                | Default           |
 | ------------------ | ----------------- | ------------------------ | ------------------------- | ----------------- |
@@ -168,7 +172,7 @@ The `brain_profile` option designates which brain profile receives feedback from
 boosting reads. It is configured the same way namespace is — via `--brain-profile`,
 `KHIVE_BRAIN_PROFILE`, or `runtime.brain_profile` in `khive.toml`.
 
-**Configuration example** (`.khive/khive.toml`):
+**Configuration example** (`.khive/config.toml`):
 
 ```toml
 [runtime]
@@ -198,7 +202,7 @@ working as before.
 The `[embed]` section controls the automatic embedding pipeline (§5). The `[schema]`
 section controls import validation.
 
-**Built-in defaults** (when no `khive.toml` is present):
+**Built-in defaults** (when no selected config file supplies the setting):
 
 | Key                    | Default                   |
 | ---------------------- | ------------------------- |
@@ -216,62 +220,48 @@ other string is treated as a key under the entity's `properties` map. The reserv
 discriminant `kind` is explicitly forbidden — it is a closed-taxonomy tag (ADR-001), not
 an embeddable text field.
 
-### 4. `kkernel kg init` writes `.khive/khive.toml`
+### 4. `kkernel kg init` writes `.khive/config.toml`
 
-`kkernel kg init` writes `.khive/khive.toml` with the built-in defaults, making project
-settings explicit and reviewable in PRs:
+`kkernel kg init` writes a minimal, valid `.khive/config.toml` that pins the
+default embedding engine in the schema the accepted loader consumes:
 
 ```toml
-# .khive/khive.toml — project KG configuration
+# .khive/config.toml — project KG configuration
 # Committed to git. All collaborators use these settings.
 
-[[backends]]
-name = "main"
-path = "~/.khive/khive.db"
-cache_mb = 256
-journal_mode = "wal"
-
 [[engines]]
-name = "mE5-small"
-dim = 384
-weight = 1.0
-
-[packs.kg]
-backend = "main"
-engines = ["mE5-small"]
-
-[packs.memory]
-backend = "main"
-engines = ["mE5-small"]
-
-[packs.gtd]
-backend = "main"
-engines = []
-
-[embed]
-model = "mE5-small"
-dimensions = 384
-auto_embed = true
-batch_size = 64
-
-[embed.fields]
-include = ["name", "description"]
-
-[schema]
-strict = true
+name = "default"
+model = "all-minilm-l6-v2"
+default = true
+dims = 384
 ```
 
-If `.khive/khive.toml` already exists, `init` does not overwrite it.
+If `.khive/config.toml` already exists, `init` does not overwrite it. The
+non-overwrite guarantee uses an atomic create rather than an existence check
+followed by a truncating write. If root `khive.toml` already exists, init
+preserves that accepted higher-precedence config and does not create a hidden
+file that the loader would ignore.
 
-The `.khive/.gitignore` allowlist from ADR-020 adds `khive.toml` alongside `kg/`:
+`.khive/khive.toml` is the obsolete initializer spelling and is not a loader
+tier. When it exists, init fails before writing scaffolding and names both the
+legacy and canonical paths. When legacy and canonical files both exist, init
+fails without modifying either one; the operator must reconcile them
+explicitly.
+
+The `.khive/.gitignore` allowlist from ADR-020 adds `config.toml` alongside
+`kg/`:
 
 ```gitignore
 *
 !.gitignore
 !kg/
 !kg/**
-!khive.toml
+!config.toml
 ```
+
+Init automatically updates only the byte-exact `.gitignore` emitted by the
+old initializer (`!khive.toml` to `!config.toml`). It never rewrites a
+customized ignore file.
 
 ### 5. Automatic embedding pipeline
 
@@ -358,14 +348,14 @@ When the project's embedding model changes, all vectors in `working.db` are inco
 with the new model. The workflow is:
 
 ```bash
-# 1. Edit .khive/khive.toml:
+# 1. Edit .khive/config.toml:
 #    embed.model = "BGE-large"
 #    embed.dimensions = 1024
 
 # 2. Re-embed all entities with the new model
 kkernel kg embed --all
 
-# 3. Commit the config change (vectors are local-only — only khive.toml changes in git)
+# 3. Commit the config change (vectors are local-only — only config.toml changes in git)
 kkernel kg commit -m "switch embedding model to BGE-large"
 ```
 
@@ -376,12 +366,12 @@ git pull
 kkernel kg sync     # rebuilds DB from NDJSON; auto-embeds with new model
 ```
 
-`kkernel kg sync` reads the updated `.khive/khive.toml` after the DB rebuild step, so the
+`kkernel kg sync` reads the updated `.khive/config.toml` after the DB rebuild step, so the
 `embed_missing` pass uses the new model automatically.
 
 ### 8. Config validation
 
-The CLI validates both `khive.toml` files at startup. Validation checks:
+The CLI validates the one selected config file at startup. Validation checks:
 
 - `embed.model` is a non-empty string. Model availability is validated by lattice-embed
   at runtime; the config loader does not check against a list.
@@ -394,14 +384,14 @@ The CLI validates both `khive.toml` files at startup. Validation checks:
 - `embed.device` (global config only) is one of `metal`, `cuda`, `cpu`.
 - `[[backends]]` and `[[engines]]` sections are validated per ADR-028.
 
-Unknown keys produce a warning but do not abort. This allows newer `khive.toml` shapes to
+Unknown keys produce a warning but do not abort. This allows newer config shapes to
 exist without breaking older `kkernel` versions.
 
 A config parse error (malformed TOML, invalid value type) aborts with a structured message
 that names the offending file and line:
 
 ```
-ERROR: .khive/khive.toml line 5: expected integer for embed.dimensions, got "384px"
+ERROR: .khive/config.toml line 5: expected integer for embed.dimensions, got "384px"
 ```
 
 ### 9. Relationship between `[embed]` and `[[engines]]`
@@ -424,28 +414,27 @@ model for the commit/sync pipeline.
 
 ## Rationale
 
-### Why one `khive.toml`, not two files
+### Why one selected config, not a merged pair
 
-A separate `config.toml` alongside `khive.toml` in the same directory creates an
-unnecessary split. Operators editing topology (`[[backends]]`) need to be in the same
-mental context as operators editing embedding settings (`[embed]`). Merging both into
-`khive.toml` reduces cognitive overhead, reduces the number of files the user must manage,
-and produces a single committed file whose git diff shows the full project configuration
-change.
+Two simultaneously active files in the same project create an unnecessary
+split. Operators editing topology (`[[backends]]`) need to be in the same
+mental context as operators editing embedding settings (`[embed]`). One
+selected file reduces cognitive overhead and produces a single committed diff
+that shows the full project configuration change.
 
 The sections are orthogonal in structure (`[[backends]]` vs `[embed]`) and serve different
 purposes (ADR-028 topology vs this ADR's embed pipeline), so there is no entanglement —
 just cohabitation in one well-sectioned file.
 
-### Why project config wins over global config
+### Why project config wins over the global fallback
 
-The embedding model is a project invariant. If a global `~/.khive/khive.toml` could
+The embedding model is a project invariant. If a global `~/.khive/config.toml` could
 override the project's `embed.model`, a collaborator with a different default would silently
 produce incompatible vectors. The project config must win on embedding-related keys.
 
-`embed.device` is the only meaningful per-user override — it reflects local hardware. It
-lives in the global config and does not affect the model selection that determines vector
-compatibility.
+Machine-local overrides such as device choice belong in an explicit CLI or
+environment tier when a project config is selected. The global file is a
+fallback for projects without a project config, not a merge source.
 
 ### Why auto-embed defaults to true
 
@@ -480,8 +469,8 @@ as separating source files from build artifacts in a standard software project.
 
 | Alternative                                            | Pros                        | Cons                                                                  | Why rejected                                                       |
 | ------------------------------------------------------ | --------------------------- | --------------------------------------------------------------------- | ------------------------------------------------------------------ |
-| Separate `config.toml` alongside `khive.toml`          | Clear file roles            | Two files to manage; split mental context                             | One file per scope is simpler and sufficient                       |
-| Single flat config (no two-level merge)                | Simplest model              | Cannot separate device (user) from model (project)                    | Model consistency across collaborators requires project-level lock |
+| Separate active topology and embedding files in one project | Clear file roles       | Two files to manage; split mental context                             | One selected file is simpler and sufficient                        |
+| Per-key project/global TOML merge                      | Machine-local overlays      | Hidden composite config; client/daemon fingerprint drift risk         | First-file selection is deterministic and auditable                |
 | YAML config format                                     | Familiar                    | Ambiguous parsing; indentation errors in practice                     | TOML is unambiguous; already used in Cargo and this project        |
 | JSON config format                                     | Machine-writable            | No comments; annoying to hand-edit; trailing-comma errors             | TOML is better for human-edited files                              |
 | Vectors stored in NDJSON (committed)                   | Single source of truth      | 15 MB+ non-diffable content per 10K entities; breaks merge guarantees | Recomputable state should not be committed                         |
@@ -505,21 +494,21 @@ as separating source files from build artifacts in a standard software project.
 
 - Search quality is reliable: every collaborator who runs `kkernel kg sync` or `kkernel kg
   commit` has current vectors without manual intervention.
-- The embedding model is recorded in `.khive/khive.toml`, committed alongside the KG data.
+- The embedding model is recorded in `.khive/config.toml`, committed alongside the KG data.
   Changing the model produces a one-line diff in git that reviewers can see and approve.
 - Device preferences stay local: `device = "metal"` never appears in committed files.
-- `kkernel kg init` writes a well-commented `.khive/khive.toml` that makes all defaults
+- `kkernel kg init` writes a valid, well-commented `.khive/config.toml` that makes its defaults
   explicit and reviewable in the initial PR.
 - `kkernel kg embed --dry-run` gives visibility into which entities lack vectors before
   committing.
-- One config file per scope, not two, reduces operator friction.
+- One selected config file, not a hidden per-key merge, reduces operator friction.
 
 ### Negative
 
 - `kkernel kg commit` and `kkernel kg sync` have an optional embed step that adds latency.
   For large KGs on slow hardware, this may be noticeable. Mitigation: `auto_embed = false`
   moves embedding to an explicit `kkernel kg embed` call.
-- `~/.khive/khive.toml` introduces user-level config that must be documented and
+- `~/.khive/config.toml` introduces a user-global fallback that must be documented and
   supported. A misconfigured `embed.device` produces a runtime error from lattice-embed
   rather than a config validation error. Mitigation: type validation catches `device`
   value errors at startup; model availability errors from lattice-embed are propagated
@@ -534,7 +523,7 @@ as separating source files from build artifacts in a standard software project.
 ### Neutral
 
 - The NDJSON files and their git history are unchanged. This ADR adds no new committed
-  artifacts beyond the `[embed]` and `[schema]` sections in `.khive/khive.toml`.
+  artifacts beyond the selected config sections in `.khive/config.toml`.
 - `working.db` already carries a per-(model, dim) vector table layout (ADR-005, ADR-009).
   This ADR specifies when those tables are populated, not how they are structured.
 - Projects that do not use `kkernel search` can set `auto_embed = false` and ignore the
@@ -571,9 +560,9 @@ as separating source files from build artifacts in a standard software project.
   calls lattice-embed for batched inference
 - [ADR-020](ADR-020-git-native-kg-implementation.md) — git-native KG implementation;
   this ADR extends the `commit` and `sync` pipelines defined in ADR-020 §6; the
-  `.khive/.gitignore` allowlist gains `khive.toml`
+  `.khive/.gitignore` allowlist gains `config.toml`
 - [ADR-028](ADR-028-pack-scoped-backends.md) — pack-scoped backends; `[[backends]]`,
-  `[[engines]]`, and `[packs.*]` sections live in the same `khive.toml` this ADR governs
+  `[[engines]]`, and `[packs.*]` sections live in the same selected TOML file this ADR governs
 - [ADR-031](ADR-031-multi-engine-retrieval.md) — `EmbedderRegistry`; `embed_missing`
   routes inference requests through the registry; `embed.model` must reference a registered
   engine name

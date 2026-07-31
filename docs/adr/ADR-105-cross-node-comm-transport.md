@@ -179,10 +179,10 @@ three-node star, verified by the end-to-end flow above.
   regression surface and stays byte-identical.
 - MAY NOT add any inbound listener or port on a residential spoke.
 - MAY NOT place bearer tokens or mailbox credentials in any khive store.
-- MAY NOT route this traffic through the commercial cloud deployment: fleet transport
-  and product deploy stay decoupled — coupling them makes the product a hard runtime
-  dependency of the operator's own communications and entangles fleet changes with
-  product release gates.
+- MAY NOT route this traffic through any separately-hosted service deployment: node
+  transport and any hosted service stay decoupled — coupling them makes the hosted
+  service a hard runtime dependency of the operator's own communications and
+  entangles node-transport changes with an unrelated release cadence.
 - MAY NOT transport anything beyond `message` notes.
 
 ## Alternatives considered
@@ -197,10 +197,11 @@ three-node star, verified by the end-to-end flow above.
    spokes that the fixed constraints forbid. A narrow future exception is noted: if a
    hub ever needs a spoke's full daemon surface for state federation, an overlay is a
    candidate transport for that separate design.
-2. **Relay through the commercial cloud deployment.** Rejected for coupling: a product
-   outage, deploy, or launch hold would take fleet comm down with it, fleet-internal
-   traffic would live inside a multi-tenant product database, and an internal
-   infrastructure need would entangle with product release gates.
+2. **Relay through a separately-hosted service deployment.** Rejected for coupling: an
+   outage, deploy, or launch hold on that service would take node-to-node
+   communication down with it, node-internal traffic would live inside a
+   multi-tenant database it does not need, and an internal infrastructure need would
+   entangle with an unrelated release cadence.
 3. **Generic "grow a listener on the hub" without the spoke-initiated discipline.**
    Subsumed: since residential spokes must never listen, the only viable shape is the
    one specified here; this ADR is that shape written down.

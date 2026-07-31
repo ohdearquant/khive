@@ -67,8 +67,8 @@ transport, or canonical hash algorithm in detail. Those are owned by implementat
 | `schema.yaml` ontology file         | Shipped                   | ADR-020                              |
 | Git branches / commits / log / diff | Shipped (through git)     | ADR-020                              |
 | `kkernel sync` DB rebuild           | Shipped                   | ADR-020                              |
-| `KgArchive` representation          | Retained                  | ADR-042 / ADR-020                    |
-| Canonical hash algorithm            | Retained, under-specified | ADR-042; future canonicalization ADR |
+| `KgArchive` representation          | Retained                  | ADR-020                              |
+| Canonical hash algorithm            | Retained, under-specified | ADR-020; future canonicalization ADR |
 | Custom `khive-vcs` commands         | Superseded                | ADR-020                              |
 | Custom `khive-sync` HTTP server     | Superseded for v1         | ADR-020                              |
 | Custom merge engine                 | Superseded for v1         | ADR-020; conflict taxonomy retained  |
@@ -82,10 +82,6 @@ transport, or canonical hash algorithm in detail. Those are owned by implementat
 ```text
 ADR-010: strategic root (this ADR)
   └── ADR-020: current implementation contract (git-native versioning)
-        ├── ADR-042: retained for KgArchive + content-hash algorithm
-        │     (until superseded by canonicalization ADR)
-        └── ADR-043: conflict taxonomy retained for future conflict resolution ADR
-              (custom merge engine superseded for v1)
 ```
 
 ### Snapshot coverage
@@ -299,6 +295,6 @@ validation reports) adds value on top of GitHub without replacing it.
 
 ### Neutral
 
-- `KgArchive` representation unchanged from ADR-042.
+- `KgArchive` representation retained by ADR-020.
 - Git as remote protocol is already the v1 implementation.
-- Conflict taxonomy from ADR-043 retained for future `khive kg resolve`.
+- Conflict taxonomy from ADR-020 retained for future `khive kg resolve`.

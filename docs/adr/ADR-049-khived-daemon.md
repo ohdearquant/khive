@@ -3,6 +3,9 @@
 **Status**: accepted
 **Date**: 2026-05-30
 **Authors**: khive maintainers
+**Amended by**: [ADR-067](ADR-067-write-owner-daemon.md), which adds the single-writer
+queue, and [ADR-096](ADR-096-warm-daemon-per-request-identity.md), which permits
+per-request identity in one warm daemon.
 
 ## Context
 
@@ -11,7 +14,8 @@ client (`.mcp.json` → `command: khive-mcp`). Every client reconnect — every 
 in Claude Code, every new session — spawns a **fresh process** with an empty in-memory state.
 
 The knowledge pack ([ADR-047](ADR-047-knowledge-pack.md)) serves `knowledge.search` by fusing
-FTS5 candidates with a Vamana ANN signal ([ADR-033](ADR-033-vamana-ann.md) family). The ANN
+FTS5 candidates with a Vamana ANN signal ([ADR-052](ADR-052-ann-production-lifecycle.md)
+family). The ANN
 index over the ~466K-vector corpus is held in memory. On a cold process it is rebuilt by
 restoring a persisted snapshot (`retrieval_snapshots` BLOB) — today a **~350 MB JSON blob**
 that must be read from SQLite, `serde_json`-deserialized, and reconstructed into the graph.

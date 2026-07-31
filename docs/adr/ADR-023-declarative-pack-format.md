@@ -3,6 +3,8 @@
 **Status**: accepted (supersedes the original ADR-023 "Declarative Pack Format")
 **Date**: 2026-05-23
 **Authors**: khive maintainers
+**Amended by**: proposed [ADR-084](ADR-084-verb-surface-consistency.md), which records
+the live ontology-introspection contract.
 
 ## Context
 
@@ -147,7 +149,11 @@ available to operator-only introspection.
 ### 4. Verb naming — kg bare, all others pack-prefixed
 
 The native kg pack (`khive-pack-kg`) owns the **substrate verbs** and exposes them as
-bare verb names (17 verbs total):
+bare verb names. This document deliberately states no total. The authoritative set is
+`KG_SUBSTRATE_VERBS` in `crates/kkernel/tests/verb_namespace_contract.rs`, which is
+enforced against the registered handlers by the test suite; the current surface is
+readable at runtime with `request(ops="verbs(pack=\"kg\")")`. The table below classifies
+the semantic allowlist by speech act, which is this section's actual subject:
 
 | Verb        | Speech act  | Description                                                                                                                                                                                                                                                                                                                                                                                     |
 | ----------- | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -168,6 +174,9 @@ bare verb names (17 verbs total):
 | `stats`     | assertive   | Aggregate counts and health metrics for the namespace graph.                                                                                                                                                                                                                                                                                                                                    |
 | `verbs`     | assertive   | Enumerate all MCP-callable verbs; supports `category` and `pack` filters.                                                                                                                                                                                                                                                                                                                       |
 | `context`   | assertive   | Entity-anchored graph context in one call: resolves anchors (by ID or hybrid search), expands 1-2 hops with per-node fanout caps, and packs the result within a char budget (ADR-089).                                                                                                                                                                                                          |
+| `resolve`   | assertive   | Resolve natural-language references to record ids: id-string passthrough, recently-referenced ring, exact-name match, then hybrid-search fallback; returns Resolved/Ambiguous/NotFound per ref, never a silent pick.                                                                                                                                                                            |
+| `whoami`    | assertive   | Report the caller's already-resolved identity: actor id and kind, whether the actor is the unattributed fallback, the write namespace, and the read-visible namespace set. Never returns tokens or credentials.                                                                                                                                                                                 |
+| `db_diagnostics` | assertive | Report WAL/checkpoint health for the daemon's own store, including checkpoint counters and WAL-pin attribution. The live PASSIVE checkpoint probe can perform ordinary checkpoint I/O, so this is non-mutating by intent but not read-only.                                                                                                                                              |
 
 `verbs` was added in Wave 4 (ue-help-introspection H5) to provide a machine-readable discovery
 endpoint. It is a pure read operation with no side effects. It excludes internal subhandlers
@@ -202,7 +211,8 @@ The single rule: **first dot is always the pack name. There is no second dot.**
 `crates/kkernel/tests/verb_namespace_contract.rs`. The test loads every
 `inventory`-registered pack, walks all `HandlerDef` names, and asserts:
 
-- A bare name (no dot) must be in the 17-entry kg-substrate allowlist.
+- A bare name (no dot) must be owned by the kg pack and appear in the
+  kg-substrate allowlist.
 - A dotted name must carry exactly one dot whose prefix matches `Pack::NAME`.
 - Two or more dots are always a violation.
 
@@ -607,3 +617,19 @@ refactor that unifies `gtd.assign` onto the shared create-plus-`TaskHook` path.
 The v0 ADR-023 ("Declarative Pack Format") — YAML-manifest model is rescinded per
 Accepted decision (2026-05-23). Packs are Rust crates; vocabulary and verbs are declared together
 in the pack trait.
+
+## Amendment: no verb totals in normative text (2026-07-29)
+
+Editorial. This document stated the kg pack's verb total in two places, §4 and the
+open-source surface consequence. Both were stale: the pack had reached twenty verbs while
+the text still said nineteen, and it was one of many copies of that number across the
+repository that had drifted together.
+
+Both totals are removed rather than corrected. A count restated in prose records when
+someone last remembered to update it, not what the surface is, and correcting it only
+resets the clock. The authoritative set is `KG_SUBSTRATE_VERBS` in
+`crates/kkernel/tests/verb_namespace_contract.rs`, which the test suite enforces against
+the registered handlers, and the live surface is readable with
+`request(ops="verbs(pack=\"kg\")")`.
+
+The decision this ADR records is unchanged. Only the restatements of a number are removed.

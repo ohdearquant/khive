@@ -37,7 +37,7 @@ Following Searle's five categories (1976):
 
 | Category        | Illocutionary force                            | Verbs                                                                                         | What the verb DOES                              |
 | --------------- | ---------------------------------------------- | --------------------------------------------------------------------------------------------- | ----------------------------------------------- |
-| **Assertive**   | Speaker represents a state of affairs          | `get`, `list`, `search`, `recall`, `neighbors`, `traverse`, `query`, `next`, `tasks`, `inbox` | Retrieves and presents facts from the substrate |
+| **Assertive**   | Speaker represents a state of affairs          | `get`, `list`, `search`, `recall`, `neighbors`, `traverse`, `query`, `next`, `tasks`, `inbox`, `stats`, `verbs`, `context` (ADR-089), `resolve`, `whoami` | Retrieves and presents facts from the substrate |
 | **Directive**   | Speaker attempts to get hearer to do something | `assign`, `transition`                                                                        | Directs an actor or state machine to act        |
 | **Commissive**  | Speaker commits to a future course of action   | `create`, `remember`, `link`, `send`, `propose`, `withdraw` (ADR-046)                         | Commits the caller to a persistent change       |
 | **Declaration** | Speaker brings about a state of affairs        | `update`, `delete`, `merge`, `complete`, `review` (ADR-046)                                   | Changes institutional status by fiat            |
@@ -131,8 +131,14 @@ The taxonomy is **only** for the verb-addition decision and for documentation/in
 ### Why formalize at all
 
 "N verbs, closed" without an extension criterion is just "we have not needed to add one
-yet." (The product surface has grown: the kg pack now carries 15 verbs including `propose`,
-`review`, `withdraw` from ADR-046 and `verbs` discovery from Wave 4; the full classified surface is in the table above.) The first verb-addition pressure (e.g., for a future audit/compliance pack) will
+yet." (The product surface has grown: the kg pack has taken on `propose`,
+`review`, `withdraw` from ADR-046, `verbs` discovery from Wave 4, and the later assertive
+additions `stats`, `context` (ADR-089), `resolve`, `db_diagnostics` (ADR-091), and
+`whoami`; the full classified surface is in the table above, and the enforced list is
+`KG_SUBSTRATE_VERBS` in `crates/kkernel/tests/verb_namespace_contract.rs`. No total is
+given here on purpose: the growth is the point being made, and a count restated in prose
+only records when someone last remembered to update it.) The first verb-addition pressure
+(e.g., for a future audit/compliance pack) will
 re-open the debate from scratch. A principled taxonomy gives the debate a frame: "is this
 a new illocutionary force, or a synonym?" The answer is usually decisive.
 
@@ -257,3 +263,16 @@ Rejected. Documentation convention is enough.
 - Finin et al., "KQML as an Agent Communication Language" (1994)
 - FIPA, "FIPA ACL Message Structure Specification" (1997) — direct prior art for
   illocutionary-force-classified agent APIs
+
+## Amendment: no verb totals in normative text (2026-07-29)
+
+Editorial, matching the amendment of the same name on ADR-023. The "Why formalize at all"
+section stated a kg verb total that had gone stale, and the enumeration beside it omitted
+`db_diagnostics` (ADR-091).
+
+The verb is added to the enumeration and the total is removed rather than corrected. The
+argument that section makes is that the surface grows, which the list of additions carries
+on its own; the number added nothing except another thing to keep in sync. The enforced
+list is `KG_SUBSTRATE_VERBS` in `crates/kkernel/tests/verb_namespace_contract.rs`.
+
+The taxonomy and the extension criterion this ADR records are unchanged.

@@ -10,7 +10,7 @@
 - ADR-031 (Multi-Engine Retrieval — `[[engines]]` config, EngineConfig, vec table naming)
 - ADR-033 (Recall Pipeline — fallback semantics during migration)
 - ADR-044 (Vector Store Extensions — orphan sweep, batch search, Capabilities)
-- lattice ADR-029 (RegisteredModel registry)
+- external `lattice` repository decision 029 (RegisteredModel registry; not a khive ADR)
 
 ## Context
 
