@@ -61,28 +61,34 @@ transport, or canonical hash algorithm in detail. Those are owned by implementat
 
 ### Implementation status
 
-| Area                                | Status                    | Authority                            |
-| ----------------------------------- | ------------------------- | ------------------------------------ |
-| NDJSON KG export/import             | Shipped                   | ADR-020                              |
-| `schema.yaml` ontology file         | Shipped                   | ADR-020                              |
-| Git branches / commits / log / diff | Shipped (through git)     | ADR-020                              |
-| `kkernel sync` DB rebuild           | Shipped                   | ADR-020                              |
-| `KgArchive` representation          | Retained                  | ADR-020                              |
-| Canonical hash algorithm            | Retained, under-specified | ADR-020; future canonicalization ADR |
-| Custom `khive-vcs` commands         | Superseded                | ADR-020                              |
-| Custom `khive-sync` HTTP server     | Superseded for v1         | ADR-020                              |
-| Custom merge engine                 | Superseded for v1         | ADR-020; conflict taxonomy retained  |
-| Conflict resolution UX              | Future                    | Future conflict resolution ADR       |
-| Federated snapshots                 | Future                    | New federation ADR                   |
-| Notes versioning                    | Future (v2)               | New note export/versioning ADR       |
-| Semantic review / PR enrichment     | Future (v2)               | New review ADR                       |
+| Area                                | Status                    | Authority                                                                       |
+| ----------------------------------- | ------------------------- | ------------------------------------------------------------------------------- |
+| NDJSON KG export/import             | Shipped                   | [ADR-020](ADR-020-git-native-kg-implementation.md)                              |
+| `schema.yaml` ontology file         | Shipped                   | [ADR-020](ADR-020-git-native-kg-implementation.md)                              |
+| Git branches / commits / log / diff | Shipped (through git)     | [ADR-020](ADR-020-git-native-kg-implementation.md)                              |
+| `kkernel sync` DB rebuild           | Shipped                   | [ADR-020](ADR-020-git-native-kg-implementation.md)                              |
+| `KgArchive` representation          | Retained                  | [ADR-020](ADR-020-git-native-kg-implementation.md)                              |
+| Canonical hash algorithm            | Retained, under-specified | [ADR-020](ADR-020-git-native-kg-implementation.md); future canonicalization ADR |
+| Custom `khive-vcs` commands         | Superseded                | [ADR-020](ADR-020-git-native-kg-implementation.md)                              |
+| Custom `khive-sync` HTTP server     | Superseded for v1         | [ADR-020](ADR-020-git-native-kg-implementation.md)                              |
+| Custom merge engine                 | Superseded for v1         | [ADR-020](ADR-020-git-native-kg-implementation.md); conflict taxonomy retained  |
+| Conflict resolution UX              | Future                    | Future conflict resolution ADR                                                  |
+| Federated snapshots                 | Future                    | New federation ADR                                                              |
+| Notes versioning                    | Future (v2)               | New note export/versioning ADR                                                  |
+| Semantic review / PR enrichment     | Future (v2)               | New review ADR                                                                  |
 
 ### Authority chain
 
 ```text
 ADR-010: strategic root (this ADR)
   └── ADR-020: current implementation contract (git-native versioning)
+      ├── KgArchive representation + current snapshot-hash floor
+      └── git merge behavior + retained conflict taxonomy
 ```
+
+[ADR-020](ADR-020-git-native-kg-implementation.md) is the current authority for all three child
+concepts. Dedicated canonicalization and conflict-resolution records remain future work; unrelated
+numbered ADRs are not placeholders for those decisions.
 
 ### Snapshot coverage
 

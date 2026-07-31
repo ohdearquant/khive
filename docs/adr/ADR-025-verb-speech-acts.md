@@ -133,8 +133,8 @@ The taxonomy is **only** for the verb-addition decision and for documentation/in
 "N verbs, closed" without an extension criterion is just "we have not needed to add one
 yet." (The product surface has grown: the kg pack has taken on `propose`,
 `review`, `withdraw` from ADR-046, `verbs` discovery from Wave 4, and the later assertive
-additions `stats`, `context` (ADR-089), `resolve`, `db_diagnostics` (ADR-091), and
-`whoami`; the full classified surface is in the table above, and the enforced list is
+additions `stats`, `context` (ADR-089), `resolve`, and `whoami`; the full classified surface is
+in the table above, and the enforced list is
 `KG_SUBSTRATE_VERBS` in `crates/kkernel/tests/verb_namespace_contract.rs`. No total is
 given here on purpose: the growth is the point being made, and a count restated in prose
 only records when someone last remembered to update it.) The first verb-addition pressure
@@ -267,12 +267,13 @@ Rejected. Documentation convention is enough.
 ## Amendment: no verb totals in normative text (2026-07-29)
 
 Editorial, matching the amendment of the same name on ADR-023. The "Why formalize at all"
-section stated a kg verb total that had gone stale, and the enumeration beside it omitted
-`db_diagnostics` (ADR-091).
+section stated a kg verb total that had gone stale.
 
-The verb is added to the enumeration and the total is removed rather than corrected. The
-argument that section makes is that the surface grows, which the list of additions carries
-on its own; the number added nothing except another thing to keep in sync. The enforced
-list is `KG_SUBSTRATE_VERBS` in `crates/kkernel/tests/verb_namespace_contract.rs`.
+The total is removed rather than corrected. The argument that section makes is that the surface
+grows, which the list of shipped additions carries on its own; the number added nothing except
+another thing to keep in sync. `db_diagnostics` remains a future-design name and is deliberately
+excluded from the current classified surface: no such `HandlerDef` exists, and it is absent from
+the enforced `KG_SUBSTRATE_VERBS` list in
+`crates/kkernel/tests/verb_namespace_contract.rs`.
 
 The taxonomy and the extension criterion this ADR records are unchanged.

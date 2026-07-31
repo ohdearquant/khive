@@ -56,7 +56,7 @@ behavior isn't written there, it is an unspecified design decision → escalate,
 └──────────────────────────────────────────────────────────────┘
                             ↕ VerbRegistry dispatch
 ┌──────────────────────────────────────────────────────────────┐
-│  khive-pack-kg     — KG vocabulary + 18 verb handlers (ADR-017)     │
+│  khive-pack-kg     — KG vocabulary + 19 verb handlers (ADR-017)     │
 │  khive-pack-gtd    — GTD lifecycle, 5 verbs (ADR-019, optional)     │
 │  khive-pack-memory — memory/recall verbs + feedback + decay (ADR-021, optional)│
 │  khive-vcs         — KG versioning: snapshots/branches (ADR-010)    │
@@ -100,7 +100,7 @@ not shipped.
 | `crates/khive-query`       | GQL + SPARQL parsers, AST validation, SQL compiler                                                                                                                                                                                               |
 | `crates/khive-runtime`     | Service API + VerbRegistry + PackRuntime trait                                                                                                                                                                                                   |
 | `crates/khive-request`     | Request DSL parser (function-call + JSON; pipe/LNDL planned)                                                                                                                                                                                     |
-| `crates/khive-pack-kg`     | KG pack: vocabulary, 18 verb handlers, kind validation                                                                                                                                                                                           |
+| `crates/khive-pack-kg`     | KG pack: vocabulary, 19 verb handlers, kind validation                                                                                                                                                                                           |
 | `crates/khive-pack-gtd`    | GTD pack: 5 verbs over notes (assign / next / complete / tasks / transition)                                                                                                                                                                     |
 | `crates/khive-pack-memory` | Memory pack: `remember`/`recall`/`feedback` verbs, decay-weighted recall ([ADR-021](docs/adr/ADR-021-memory-pack.md))                                                                                                                            |
 | `crates/khive-pack-formal` | Formal-methods pack: typed edge endpoint rules for six formal-math concept subtypes (theorem, definition, structure, instance, axiom, goal); pure ontology, no verbs ([ADR-069](docs/adr/ADR-069-subject-model.md)); not in the default pack set |
@@ -169,7 +169,7 @@ request(ops="[{\"tool\":\"v1\",\"args\":{...}}, ...]")
 
 Verbs come from whichever packs are loaded via `KHIVE_PACKS` (env) or `--pack` (CLI). Default
 loads all 12 production packs: kg, gtd, memory, brain, comm, schedule, knowledge, session, git,
-code, workspace, blob (verbs at 85: the `code` pack contributes one verb, `code.ingest`
+code, workspace, blob (the aggregate is registry-discovered with `verbs()`; the `code` pack contributes one verb, `code.ingest`
 (ADR-085 Amendment 2, PR #1039 — L1 manifest + L1.5 import-scan source ingest into a
 dedicated map database); its `finding` note kind and `findings.json` batch ingest are
 still reached only through the `kkernel code-ingest` admin CLI path (ADR-085 Amendment
@@ -186,7 +186,7 @@ beside the database file with no config needed, and the verbs stay unconfigured 
 against an in-memory backend;
 regenerate via `request(ops="verbs()")` before editing this line).
 
-### KG pack verbs (18 — ADR-017, ADR-046, ADR-089)
+### KG pack verbs (19 — ADR-017, ADR-046, ADR-089)
 
 `create`, `list`, and `search` take a `kind` discriminant. It accepts either the substrate-level
 name (`entity`, `note`, `edge`) **or** a pack-registered granular kind (`concept`, `document`,
@@ -213,6 +213,7 @@ Mixing a granular `kind` with a contradicting `entity_kind`/`note_kind` sub-filt
 | `resolve`   | `refs`, `kind?`, `limit?`                                                                    | Resolve natural-language references to ids (id passthrough, recent-ring, hybrid-search fallback) |
 | `verbs`     | `category?`, `pack?`                                                                         | List all MCP-callable verbs registered on this server                                            |
 | `context`   | `query?`, `entity_ids?`, `hops?`, `budget?`, `relations?`, `direction?`, `limit?`, `fanout?` | Entity-anchored graph context in one call (ADR-089)                                              |
+| `whoami`    | —                                                                                            | Report the caller's already-resolved identity and namespace scope; never returns credentials     |
 
 ### GTD pack verbs (5 — ADR-019, optional)
 
