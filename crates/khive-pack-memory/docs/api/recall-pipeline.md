@@ -84,7 +84,7 @@ Recall resolves legacy missing properties at read time: memory type defaults to 
 
 Results sort deterministically by descending score with stable tie behavior. Optional score breakdowns expose component contributions and profile effects. `full_content = false` truncates returned content to 200 characters; ranking always uses full stored content.
 
-Superseded candidates are suppressed by inbound `supersedes` graph edges, with the archive-compatible property shortcut as a secondary route. MMR reduces near-duplicate prefixes, and the token budget bounds aggregate response text.
+Superseded candidates are suppressed by inbound `supersedes` graph edges, with the archive-compatible property shortcut as a secondary route. MMR reduces near-duplicate prefixes, and the token budget bounds aggregate response text. Default responses are arrays; when the budget removes candidates, surviving results carry `truncated: true`. When the budget removes every ranked candidate, the default response becomes `{ "results": [], "truncated": true }` so the cutoff stays distinguishable from a genuine no-match, which remains an unadorned empty array.
 
 ## Subhandlers
 

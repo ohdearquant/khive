@@ -57,6 +57,45 @@ fn schedule_has_required_action_and_at() {
     assert!(at.required, "schedule.at must be required");
 }
 
+/// #110: the outer `at` and a nested action's own `at` are two independent
+/// timestamps (outer = when this schedule fires and dispatches `action`;
+/// inner = whatever that nested verb's own `at` means, e.g. a reminder's own
+/// trigger time). Nothing in the surface previously said so — the handler
+/// description now carries a full worked example naming both roles
+/// explicitly, so a caller hits the explanation before hitting the error.
+#[test]
+fn schedule_description_documents_nested_action_at_example() {
+    let h = find_handler("schedule.schedule");
+    assert!(
+        h.description.contains("schedule.remind"),
+        "schedule.schedule's description must show a worked nested-action example; got: {}",
+        h.description
+    );
+    assert!(
+        h.description.matches("at=").count() >= 1
+            && h.description.contains("OUTER")
+            && h.description.contains("INNER"),
+        "schedule.schedule's description must explain the outer vs. inner `at` roles; got: {}",
+        h.description
+    );
+}
+
+#[test]
+fn schedule_action_param_description_flags_nested_required_params() {
+    let h = find_handler("schedule.schedule");
+    let action = h
+        .params
+        .iter()
+        .find(|p| p.name == "action")
+        .expect("schedule must have 'action'");
+    assert!(
+        action.description.contains("self-sufficient") || action.description.contains("OWN"),
+        "schedule.action's description must warn that the nested verb's own required \
+         params (e.g. its own `at`) must be supplied on the nested call; got: {}",
+        action.description
+    );
+}
+
 #[test]
 fn schedule_has_optional_repeat() {
     let h = find_handler("schedule.schedule");

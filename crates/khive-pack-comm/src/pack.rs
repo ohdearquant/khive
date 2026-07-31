@@ -88,6 +88,7 @@ impl PackRuntime for CommPack {
             "comm.send" => handlers::handle_send(self.runtime(), token, params).await,
             "comm.inbox" => handlers::handle_inbox(self.runtime(), token, params).await,
             "comm.read" => handlers::handle_read(self.runtime(), token, params).await,
+            "comm.unread" => handlers::handle_unread(self.runtime(), token, params).await,
             "comm.reply" => handlers::handle_reply(self.runtime(), token, params).await,
             "comm.thread" => handlers::handle_thread(self.runtime(), token, params).await,
             "comm.ingest" => handlers::handle_ingest(self.runtime(), token, params).await,
@@ -204,6 +205,27 @@ mod help_tests {
         assert!(id.required, "read.id must be required");
     }
 
+    /// #93 instance 3: the top-level description must not contradict `actor`
+    /// being a required, non-inferred param — a caller reading only the
+    /// one-line description (not the full param list) must not be misled
+    /// into calling `comm.probe()` the way it can call `comm.inbox()`.
+    #[test]
+    fn probe_description_documents_required_actor() {
+        let h = find_handler("comm.probe");
+        assert!(
+            h.description.contains("actor") && h.description.contains("required"),
+            "comm.probe's top-level description must state that `actor` is \
+             required and not inferred from the caller (issue #93); got: {:?}",
+            h.description
+        );
+        let actor = h
+            .params
+            .iter()
+            .find(|p| p.name == "actor")
+            .expect("probe must have 'actor'");
+        assert!(actor.required, "probe.actor must be required");
+    }
+
     #[test]
     fn reply_has_required_id_and_content() {
         let h = find_handler("comm.reply");
@@ -224,10 +246,8 @@ mod help_tests {
 
     #[test]
     fn all_comm_handlers_have_non_empty_params() {
-        // comm.health is a legitimate no-args verb (khive #606 design review: "read-only,
-        // NO args") -- same shape as kg's `stats()`. Every other comm verb takes at
-        // least one param, so the invariant still holds for the rest.
-        const NO_ARGS_VERBS: &[&str] = &["comm.health"];
+        // comm.health and caller-scoped comm.unread are legitimate no-args verbs.
+        const NO_ARGS_VERBS: &[&str] = &["comm.health", "comm.unread"];
         for handler in CommPack::HANDLERS {
             if NO_ARGS_VERBS.contains(&handler.name) {
                 assert!(

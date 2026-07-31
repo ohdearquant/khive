@@ -170,6 +170,65 @@ async fn s_c1_schedule_valid_rfc3339_succeeds() {
     assert_eq!(result["status"], "pending");
 }
 
+/// #110, World 2 (diagnosed, not incidental): the outer `at` and a nested
+/// action's own `at` are genuinely different timestamps that can diverge —
+/// outer = when `schedule.schedule` fires and dispatches the stored `action`;
+/// inner = whatever the nested verb's own `at` means (here, the reminder's
+/// own future trigger time). Round-trip both through `schedule.agenda` and
+/// assert they land in distinct places: the outer `at` becomes this event's
+/// own `trigger_at`, while the inner `at` survives untouched, literally,
+/// inside the stored `action` payload — nothing coerces or overwrites either
+/// with the other.
+#[tokio::test]
+async fn s_c1_schedule_outer_and_nested_at_are_independent_and_both_preserved() {
+    let (registry, _rt) = build_registry();
+
+    let outer_at = "2099-01-01T00:00:00Z";
+    let inner_at = "2099-12-31T00:00:00Z";
+    assert_ne!(outer_at, inner_at, "the two `at`s must genuinely differ");
+
+    registry
+        .dispatch(
+            "schedule.schedule",
+            serde_json::json!({
+                "action": format!("schedule.remind(content=\"renew\", at=\"{inner_at}\")"),
+                "at": outer_at,
+            }),
+        )
+        .await
+        .expect("schedule with distinct outer/inner at must succeed");
+
+    let agenda = registry
+        .dispatch("schedule.agenda", serde_json::json!({}))
+        .await
+        .expect("agenda must succeed");
+    let events = agenda["events"]
+        .as_array()
+        .expect("agenda.events is an array");
+    let event = events
+        .iter()
+        .find(|e| e["properties"]["event_type"] == "schedule")
+        .expect("the scheduled event must be on the agenda");
+
+    assert_eq!(
+        event["properties"]["trigger_at"], outer_at,
+        "the OUTER at must be this event's own trigger_at (when it fires)"
+    );
+    let payload = event["properties"]["payload"]
+        .as_str()
+        .expect("payload must be the stored action string");
+    assert!(
+        payload.contains(inner_at),
+        "the INNER at must survive verbatim inside the stored action payload, \
+         independent of the outer trigger_at; payload was: {payload}"
+    );
+    assert_ne!(
+        event["properties"]["trigger_at"].as_str().unwrap(),
+        inner_at,
+        "the outer trigger_at must NOT have been overwritten by the nested at"
+    );
+}
+
 #[tokio::test]
 async fn s_c1_schedule_invalid_at_not_a_date() {
     let (registry, _rt) = build_registry();

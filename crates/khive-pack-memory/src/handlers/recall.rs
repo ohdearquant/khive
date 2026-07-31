@@ -30,7 +30,7 @@ use super::common::{
     compute_score, deser, fuse_candidates, make_pipeline, note_matches_tags, plog, plog_n,
     recall_candidate_count, to_json, validate_memory_type, RecallCandidateParams, RecallParams,
     TextSnippetPolicy, DEFAULT_DECAY_EPISODIC, DEFAULT_DECAY_SEMANTIC, DEFAULT_SALIENCE_EPISODIC,
-    DEFAULT_SALIENCE_SEMANTIC, PROF_CID, RECALL_CALL_ID,
+    DEFAULT_SALIENCE_SEMANTIC, PROF_CID, RECALL_CALL_ID, RECALL_SLOW_THRESHOLD_MS,
 };
 
 impl MemoryPack {
@@ -705,6 +705,11 @@ impl MemoryPack {
                     // Per-result stamp keeps degradation visible without verbose output.
                     result["degraded"] = json!("ann_unavailable");
                 }
+                if budget_capped {
+                    // Surviving partial results retain the per-item signal so callers
+                    // that inspect hits individually can still detect truncation.
+                    result["truncated"] = json!(true);
+                }
                 result
             })
             .collect();
@@ -758,6 +763,27 @@ impl MemoryPack {
             }
         }
 
+        // #30/#889: unconditional slow-request observability, mirroring the
+        // knowledge.compose WARN added for #887. Fires on every completed recall
+        // whose total handler time crosses the threshold, regardless of whether
+        // KHIVE_RECALL_PROFILE is set, so a slow-but-completing recall leaves
+        // daemon-side evidence even when nobody opted into per-stage profiling.
+        {
+            let total_ms = recall_start.elapsed().as_millis() as u64;
+            if total_ms >= RECALL_SLOW_THRESHOLD_MS {
+                tracing::warn!(
+                    total_ms,
+                    threshold_ms = RECALL_SLOW_THRESHOLD_MS,
+                    result_count = results.len(),
+                    query_bytes = query_trimmed.len(),
+                    ann_degraded,
+                    budget_capped,
+                    is_verbose,
+                    "memory.recall exceeded slow-request threshold"
+                );
+            }
+        }
+
         if is_verbose && candidates.vector_hits_per_model.len() > 1 {
             // Raw global ANN diagnostics MUST use the same hydrated namespace filter as results.
             let per_model: Vec<Value> = candidates
@@ -802,6 +828,18 @@ impl MemoryPack {
             }
         }
 
+        if budget_capped && results.is_empty() {
+            // Only the ambiguous case changes shape: a budget cutoff at the first
+            // ranked candidate leaves no item to carry the per-result stamp, so a
+            // bare [] would be indistinguishable from a genuine no-match. Non-empty
+            // capped responses keep the bare-array shape (load-bearing for callers
+            // that index the top-level array) with per-item truncated stamps.
+            return to_json(&json!({
+                "results": results,
+                "truncated": true,
+            }));
+        }
+
         to_json(&results)
     }
 
@@ -814,7 +852,6 @@ impl MemoryPack {
         target_ids: Vec<String>,
         latency_us: i64,
     ) {
-        let result_count = target_ids.len();
         let registry = registry.clone();
         let namespace = token.namespace().as_str().to_string();
         let query_raw = query_raw.to_string();
@@ -833,8 +870,8 @@ impl MemoryPack {
                 let mut ledger_params = json!({
                     "namespace": namespace,
                     "consumer_kind": "recall",
-                    "target_ids": target_ids,
-                    "query_raw": query_raw,
+                    "target_ids": target_ids.clone(),
+                    "query_raw": query_raw.clone(),
                     "served_at": served_at_us,
                 });
                 if let Some(ref profile_id) = served_by_profile_id {
@@ -851,27 +888,53 @@ impl MemoryPack {
             emit_recall_executed_event(
                 &runtime,
                 &token,
-                actor,
-                served_by_profile_id,
-                query_class,
-                result_count,
-                latency_us,
+                RecallExecutedFields {
+                    actor,
+                    served_by_profile_id,
+                    query_raw,
+                    query_class,
+                    target_ids,
+                    latency_us,
+                },
             )
             .await;
         });
     }
 }
 
+/// Fields for the best-effort `RecallExecuted` telemetry event. Grouped into a
+/// struct rather than passed positionally to stay under clippy's
+/// too-many-arguments threshold.
+struct RecallExecutedFields {
+    actor: String,
+    served_by_profile_id: Option<String>,
+    query_raw: String,
+    query_class: String,
+    target_ids: Vec<String>,
+    latency_us: i64,
+}
+
 /// Append best-effort recall telemetry without affecting the recall response.
+///
+/// khive#36: carries the full returned result-ID list (both `candidates` and
+/// `selected` — the recall pipeline does not track a broader pre-selection
+/// candidate pool at this emission boundary, so every served id is reported
+/// as both), the typed result kind (`memory.recall` always serves `note`
+/// substrate records), the full query text, `served_by_profile_id`, the
+/// calling actor, and a timestamp (`Event::new` stamps `created_at`).
 async fn emit_recall_executed_event(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
-    actor: String,
-    served_by_profile_id: Option<String>,
-    query_class: String,
-    result_count: usize,
-    latency_us: i64,
+    fields: RecallExecutedFields,
 ) {
+    let RecallExecutedFields {
+        actor,
+        served_by_profile_id,
+        query_raw,
+        query_class,
+        target_ids,
+        latency_us,
+    } = fields;
     let store = match rt.events(token) {
         Ok(store) => store,
         Err(err) => {
@@ -884,11 +947,16 @@ async fn emit_recall_executed_event(
             return;
         }
     };
+    let result_count = target_ids.len();
     let payload = json!({
         "actor": actor,
         "served_by_profile_id": served_by_profile_id,
+        "query": query_raw,
         "query_class": query_class,
+        "result_kind": "note",
         "result_count": result_count,
+        "candidates": target_ids.clone(),
+        "selected": target_ids,
         "latency_us": latency_us,
     });
     let event = khive_storage::Event::new(
@@ -4890,6 +4958,177 @@ mod tests {
         }
     }
 
+    // ── #30/#889: tracing-capture harness for the deadline-exceeded WARN ──────
+    //
+    // The reported incident (`memory.recall` hit the 300s client timeout with
+    // zero daemon-side evidence) is exactly the case where `handle_recall`'s
+    // own future is dropped by `tokio::time::timeout`, never reaching
+    // `recall.rs`'s slow-request WARN. The abandoned-request WARN added to
+    // `handle_recall_with_deadline` in `pack.rs` is the one that must fire
+    // instead; a real `tracing::Subscriber` installed only as this test's
+    // thread-local default (`tracing::subscriber::with_default`) observes it
+    // without a multi-second sleep or interfering with any other test.
+
+    #[derive(Clone, Debug, Default)]
+    struct CapturedEvent {
+        message: Option<String>,
+        fields: std::collections::HashMap<String, String>,
+    }
+
+    #[derive(Default)]
+    struct CapturedEventVisitor(CapturedEvent);
+
+    impl tracing::field::Visit for CapturedEventVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            let formatted = format!("{value:?}");
+            if field.name() == "message" {
+                self.0.message = Some(
+                    formatted
+                        .trim_start_matches('"')
+                        .trim_end_matches('"')
+                        .to_string(),
+                );
+            } else {
+                self.0.fields.insert(field.name().to_string(), formatted);
+            }
+        }
+
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            self.0
+                .fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+    }
+
+    struct CaptureSubscriber {
+        events: Arc<std::sync::Mutex<Vec<CapturedEvent>>>,
+    }
+
+    impl tracing::Subscriber for CaptureSubscriber {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut visitor = CapturedEventVisitor::default();
+            event.record(&mut visitor);
+            self.events.lock().unwrap().push(visitor.0);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// A deadline-exceeded recall emits an unconditional daemon-side WARN — the
+    /// exact evidence #30/#889 reported as missing during the incident.
+    #[test]
+    fn recall_30_deadline_exceeded_emits_abandoned_slow_path_warn() {
+        let buffer = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = CaptureSubscriber {
+            events: Arc::clone(&buffer),
+        };
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+
+        tracing::subscriber::with_default(subscriber, || {
+            runtime.block_on(async {
+                const MODEL: &str = "recall-30-warn-model";
+                let hold = Arc::new(Notify::new());
+
+                let rt = KhiveRuntime::memory().expect("in-memory runtime");
+                rt.register_embedder(SlowEmbedProvider {
+                    model_name: MODEL.to_owned(),
+                    hold: hold.clone(),
+                });
+
+                let ns = Namespace::parse("local").expect("local namespace");
+                let token = rt.authorize(ns).expect("authorize local");
+
+                hold.notify_one();
+                rt.create_note(
+                    &token,
+                    "memory",
+                    None,
+                    "issue 30 abandoned slow-path warn test note",
+                    Some(0.7),
+                    None,
+                    vec![],
+                )
+                .await
+                .expect("create note");
+
+                let mut builder = VerbRegistryBuilder::new();
+                builder.register(KgPack::new(rt.clone()));
+                builder.register(MemoryPack::new(rt.clone()));
+                let registry = builder.build().expect("registry");
+
+                let result = registry
+                    .dispatch(
+                        "memory.recall",
+                        serde_json::json!({
+                            "query": "30 abandoned slow-path warn test",
+                            "limit": 10,
+                            "config": { "recall_deadline_ms": 50 }
+                        }),
+                    )
+                    .await;
+                hold.notify_one();
+                assert!(
+                    matches!(result, Err(RuntimeError::DeadlineExceeded { .. })),
+                    "expected DeadlineExceeded, got: {result:?}"
+                );
+            });
+        });
+
+        let events = buffer.lock().unwrap();
+        let warn = events
+            .iter()
+            .find(|e| {
+                e.message.as_deref()
+                    == Some("memory.recall exceeded its deadline and was abandoned")
+            })
+            .unwrap_or_else(|| panic!("expected the abandoned-deadline WARN, got: {events:?}"));
+        assert_eq!(
+            warn.fields.get("operation").map(String::as_str),
+            Some("\"memory.recall\"")
+        );
+        assert_eq!(warn.fields.get("budget_ms").map(String::as_str), Some("50"));
+        assert!(
+            warn.fields.contains_key("elapsed_ms"),
+            "abandoned WARN must carry elapsed_ms, got: {warn:?}"
+        );
+    }
+
+    /// `RECALL_SLOW_THRESHOLD_MS` stays sane: high enough that a healthy recall
+    /// never trips it, low enough it fires well before the deadline default.
+    /// Sanity-bounds the const rather than pinning it exactly, so a deliberate
+    /// future retune doesn't require touching the test — but a typo (e.g.
+    /// dropping three zeros) still fails loudly. Both sides are
+    /// compile-time-constant, so `clippy::assertions_on_constants` requires
+    /// the `const { }` wrapper (mirrors `COMPOSE_SLOW_THRESHOLD_MS`'s
+    /// `slow_threshold_is_sane` test, #887).
+    #[test]
+    fn recall_slow_threshold_is_sane() {
+        const {
+            assert!(
+                super::RECALL_SLOW_THRESHOLD_MS >= 1_000,
+                "threshold must not fire on ordinary sub-second recalls"
+            );
+        }
+        const {
+            assert!(
+                super::RECALL_SLOW_THRESHOLD_MS < 30_000,
+                "threshold must fire before the default 30s recall_deadline_ms budget expires"
+            );
+        }
+    }
+
     /// A deadline-exceeded dispatch does not affect a concurrent sibling dispatch.
     /// See `crates/khive-pack-memory/docs/recall-reliability.md`.
     #[tokio::test]
@@ -5325,6 +5564,99 @@ mod tests {
             !hits.is_empty(),
             "recall must surface the healthy engine's hits despite the other \
              engine's sqlite-vec retrieval failing; got {result:?}"
+        );
+    }
+
+    // ── RecallExecuted event plane emission ─────────────────
+
+    /// `memory.recall` must persist a `RecallExecuted` event carrying the full
+    /// served result-id list (`candidates` + `selected`), the typed result
+    /// kind, the full query text, `served_by_profile_id`, the calling actor,
+    /// and a timestamp — not just the transient in-memory brain-posterior
+    /// stamp.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn recall_persists_recall_executed_event_with_full_payload() {
+        const NOTE_TEXT: &str = "khive#36 recall executed event payload coverage note";
+
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns).expect("authorize local");
+
+        let note = rt
+            .create_note(&token, "memory", None, NOTE_TEXT, Some(0.7), None, vec![])
+            .await
+            .expect("create note");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+
+        let before = khive_runtime::background_task_count();
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "query": NOTE_TEXT,
+                    "limit": 10,
+                }),
+            )
+            .await
+            .expect("memory.recall must succeed");
+        let hits = result.as_array().expect("bare array result");
+        assert!(!hits.is_empty(), "seeded note must be recalled");
+
+        // The RecallExecuted event append happens on a tracked background
+        // task off the response path; wait for it to drain before querying.
+        for _ in 0..200 {
+            if khive_runtime::background_task_count() <= before {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let store = rt.events(&token).expect("event store");
+        let page = store
+            .query_events(
+                khive_storage::event::EventFilter {
+                    kinds: vec![khive_types::EventKind::RecallExecuted],
+                    ..Default::default()
+                },
+                khive_storage::types::PageRequest {
+                    offset: 0,
+                    limit: 10,
+                },
+            )
+            .await
+            .expect("query_events");
+
+        assert_eq!(
+            page.items.len(),
+            1,
+            "exactly one RecallExecuted event must be persisted: {page:?}"
+        );
+        let event = &page.items[0];
+        assert_eq!(event.verb, "memory.recall");
+        assert_eq!(
+            event.actor,
+            format!("{}:{}", token.actor().kind, token.actor().id)
+        );
+        assert_eq!(event.payload["query"], serde_json::json!(NOTE_TEXT));
+        assert_eq!(event.payload["result_kind"], serde_json::json!("note"));
+        assert_eq!(event.payload["result_count"], serde_json::json!(1));
+        let selected = event.payload["selected"]
+            .as_array()
+            .expect("selected must be an array")
+            .clone();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0], serde_json::json!(note.id.to_string()));
+        let candidates = event.payload["candidates"]
+            .as_array()
+            .expect("candidates must be an array");
+        assert_eq!(
+            candidates, &selected,
+            "candidates mirrors selected at this emission boundary"
         );
     }
 }

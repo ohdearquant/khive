@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use khive_runtime::{NamespaceToken, RuntimeError};
-use khive_storage::types::{DeleteMode, SqlStatement, SqlValue};
+use khive_storage::types::{SqlStatement, SqlValue};
 
 use crate::ann;
 use crate::MemoryPack;
@@ -127,17 +127,30 @@ impl MemoryPack {
             }));
         }
 
-        // Soft-delete each candidate via NoteStore.
-        let note_store = self.runtime.notes(token)?;
+        // Soft-delete each candidate through the runtime's coherent delete path
+        // (`KhiveRuntime::delete_note`, ADR-014), not the raw `NoteStore::delete_note`
+        // used before #50: `delete_note` marks the row deleted AND cleans that note's
+        // FTS5 document and every registered model's vector row within the same call,
+        // instead of leaving stale FTS/vector entries behind until a full ANN rebuild
+        // (the same coherent path `delete_entity`/`delete_note` already give every
+        // other curation verb). It also fires the note-mutation hook, so a pack that
+        // has installed one (this pack's own ANN generation bump, wired in production
+        // via `call_register_note_mutation_hooks`) observes the corpus change per note.
         let mut pruned = 0usize;
         for id in to_delete {
-            if note_store.delete_note(id, DeleteMode::Soft).await? {
+            if self.runtime.delete_note(token, id, false).await? {
                 pruned += 1;
             }
         }
 
-        // Raw NoteStore deletion bypasses runtime mutation hooks, so prune bumps directly.
-        // Keep the stale graph intact while a live-row scan builds its replacement.
+        // Belt-and-suspenders generation bump: the mutation-hook fire above is a
+        // no-op wherever no pack has installed a hook (registries built without
+        // calling `call_register_note_mutation_hooks`, e.g. some embedded/test
+        // setups), so this pack still bumps its own ANN generation directly and
+        // schedules a background rebuild here too. Redundant-but-idempotent when
+        // the hook already fired (`bump_generation`/`ensure_ann_background` are
+        // both dedup-guarded), and the only path to ANN freshness when it didn't.
+        // Keeps the stale graph intact while a live-row scan builds its replacement.
         if pruned > 0 {
             for model in self.runtime.registered_embedding_model_names() {
                 let key = ann::AnnKey::new(model.as_str());
@@ -464,6 +477,138 @@ mod prune_recall_visibility_tests {
                 "pruned note must not be returned via {label}, got: {hits:?}"
             );
         }
+    }
+}
+
+// ── #50: memory.prune must clean the FTS5 document and every registered
+// model's vector row for each pruned note, not just mark it deleted ────────
+
+#[cfg(test)]
+mod prune_index_cleanup_tests {
+    use khive_pack_kg::KgPack;
+    use khive_runtime::{KhiveRuntime, Namespace, VerbRegistryBuilder};
+    use uuid::Uuid;
+
+    use crate::test_support::HashVecProvider;
+
+    /// `memory.prune` must remove the pruned note's FTS5 document and vector row,
+    /// not merely soft-delete the notes-table row and leave the auxiliary indexes
+    /// stale. Follow-up to #429/#533 (recall-correctness, already covered by
+    /// `prune_recall_visibility_tests`): this test checks storage-level cleanup
+    /// directly against the TextSearch and VectorStore capabilities, independent
+    /// of any recall-path filtering.
+    #[tokio::test]
+    async fn prune_removes_fts_document_and_vector_row_for_pruned_note() {
+        const MODEL: &str = "prune-50-index-cleanup-model";
+        const DIMS: usize = 16;
+
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        rt.register_embedder(HashVecProvider {
+            model_name: MODEL.to_owned(),
+            dims: DIMS,
+        });
+
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns).expect("authorize local");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(crate::MemoryPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+
+        // One low-salience note to be pruned, one high-salience note that must survive.
+        let pruned = registry
+            .dispatch(
+                "memory.remember",
+                serde_json::json!({
+                    "content": "issue 50 index cleanup pruned note",
+                    "salience": 0.1,
+                    "memory_type": "semantic",
+                }),
+            )
+            .await
+            .expect("remember (to be pruned)");
+        let pruned_id: Uuid = pruned["id"]
+            .as_str()
+            .expect("id present")
+            .parse()
+            .expect("valid uuid");
+
+        let survivor = registry
+            .dispatch(
+                "memory.remember",
+                serde_json::json!({
+                    "content": "issue 50 index cleanup surviving note",
+                    "salience": 0.9,
+                    "memory_type": "semantic",
+                }),
+            )
+            .await
+            .expect("remember (survivor)");
+        let survivor_id: Uuid = survivor["id"]
+            .as_str()
+            .expect("id present")
+            .parse()
+            .expect("valid uuid");
+
+        // Sanity: both notes are indexed pre-prune -- a store that never indexed
+        // either note would satisfy the post-prune absence assertion vacuously.
+        let text = rt.text_for_notes(&token).expect("text_for_notes");
+        assert!(
+            text.get_document("local", pruned_id)
+                .await
+                .expect("get_document")
+                .is_some(),
+            "pruned note must have an FTS5 document before prune"
+        );
+        assert!(
+            text.get_document("local", survivor_id)
+                .await
+                .expect("get_document")
+                .is_some(),
+            "survivor note must have an FTS5 document before prune"
+        );
+
+        let vectors = rt
+            .vectors_for_model(&token, MODEL)
+            .expect("vectors_for_model");
+        assert_eq!(
+            vectors.count().await.expect("vector count"),
+            2,
+            "both notes must have a vector row before prune"
+        );
+
+        let prune_result = registry
+            .dispatch("memory.prune", serde_json::json!({ "min_salience": 0.5 }))
+            .await
+            .expect("memory.prune");
+        assert_eq!(
+            prune_result["pruned"], 1,
+            "only the low-salience note must be pruned: {prune_result:?}"
+        );
+
+        // The pruned note's FTS5 document and vector row must be gone.
+        assert!(
+            text.get_document("local", pruned_id)
+                .await
+                .expect("get_document")
+                .is_none(),
+            "#50: pruned note must have no FTS5 document after prune"
+        );
+        assert_eq!(
+            vectors.count().await.expect("vector count"),
+            1,
+            "#50: pruned note's vector row must be removed, leaving only the survivor's"
+        );
+
+        // The surviving note's indexes must be untouched.
+        assert!(
+            text.get_document("local", survivor_id)
+                .await
+                .expect("get_document")
+                .is_some(),
+            "survivor note's FTS5 document must remain after prune"
+        );
     }
 }
 

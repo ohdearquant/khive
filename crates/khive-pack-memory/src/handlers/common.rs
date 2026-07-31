@@ -368,6 +368,16 @@ pub(super) const DEFAULT_DECAY_EPISODIC: f64 = 0.02;
 /// Default decay_factor for semantic memories (~139-day half-life).
 pub(super) const DEFAULT_DECAY_SEMANTIC: f64 = 0.005;
 
+/// `memory.recall` requests whose total handler time reaches this are logged at WARN
+/// with a duration/result-shape breakdown, unconditionally (unlike the opt-in
+/// `KHIVE_RECALL_PROFILE` per-stage eprintln profiler). Matches the threshold and
+/// rationale established for `knowledge.compose` (#887 / PR #915): well above a
+/// healthy recall (sub-second in the common case) but comfortably inside the
+/// end-to-end `recall_deadline_ms` budget (30s default), so a slow-but-completing
+/// recall is visible in the daemon log before it ever risks tripping the deadline
+/// or a client-side timeout (#30 / originally #889).
+pub(super) const RECALL_SLOW_THRESHOLD_MS: u64 = 10_000;
+
 pub(super) fn compute_score(
     cfg: &RecallConfig,
     pipeline: &MemoryRecallPipeline,

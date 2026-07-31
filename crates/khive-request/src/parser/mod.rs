@@ -7,4 +7,4 @@ mod scan;
 
 pub use dispatch::parse_request;
 
-pub(crate) use path::{apply_path_segment, split_path};
+pub(crate) use path::{apply_path_segment, split_path, PathSegment};

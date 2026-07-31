@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use khive_pack_comm::CommPack;
 use khive_runtime::{
-    AllowAllGate, BackendId, KhiveRuntime, Namespace, RuntimeConfig, VerbRegistry,
+    AllowAllGate, BackendId, KhiveRuntime, Namespace, RequestIdentity, RuntimeConfig, VerbRegistry,
     VerbRegistryBuilder,
 };
 use khive_storage::note::Note;
@@ -652,8 +652,18 @@ async fn probe_read_does_not_resurrect_message_via_rowid_churn() {
         .expect("cursor_us is an integer");
     assert_eq!(first["new_messages"].as_array().unwrap().len(), 1);
 
+    // #87: read() is restricted to the message's addressee — dispatch as `actor`
+    // (the planted message's `to_actor`), not the registry's baked anonymous identity.
     registry
-        .dispatch("comm.read", json!({ "id": id.to_string() }))
+        .dispatch_with_identity(
+            "comm.read",
+            json!({ "id": id.to_string() }),
+            Some(RequestIdentity {
+                namespace: "local".to_string(),
+                actor_id: Some(actor.to_string()),
+                ..Default::default()
+            }),
+        )
         .await
         .expect("comm.read succeeds");
 

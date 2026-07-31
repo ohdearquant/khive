@@ -23,6 +23,7 @@ Key design decisions from ADR-040:
   - `comm.send` — Commissive (the sender commits to delivery)
   - `comm.inbox` — Assertive (queries state)
   - `comm.read` — Declaration (changes the read/unread state)
+  - `comm.unread` — Assertive (queries state; count-only, khive #66)
   - `comm.reply` — Commissive (the sender commits to a reply)
   - `comm.thread` — Assertive (queries state)
 - **Pack-auxiliary indexes**: two partial indexes on the `notes` table (`idx_comm_message_direction`

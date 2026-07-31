@@ -20,9 +20,10 @@ use super::scoring::{
     Candidate, Weights,
 };
 use super::util::{
-    atom_embed_text, atom_from_row, deser, domain_from_row, explicitly_requested_status, is_stop,
-    row_bool, row_str, sql_err, status_multiplier, status_sql_clause, status_values,
-    CANDIDATE_POOL, MIN_TERM_LEN,
+    atom_embed_text, atom_from_row, compose_item_char_cost, deser, domain_from_row,
+    estimate_compose_item_tokens, explicitly_requested_status, is_stop, row_bool, row_str, sql_err,
+    status_multiplier, status_sql_clause, status_values, CANDIDATE_POOL, CHARS_PER_TOKEN,
+    D_SUGGEST_RERANK_ALPHA, MIN_TERM_LEN,
 };
 use super::vamana;
 use super::KnowledgeHandlers;
@@ -501,9 +502,9 @@ async fn rerank_with_embeddings(
     query: &str,
     hits: &mut [ScoredHit],
     alpha: f32,
-) -> Result<(), RuntimeError> {
+) -> Result<bool, RuntimeError> {
     if hits.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     let texts: Vec<String> = hits
         .iter()
@@ -525,8 +526,9 @@ async fn rerank_with_embeddings(
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| a.slug.cmp(&b.slug))
         });
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
@@ -809,6 +811,65 @@ fn parse_domain_members(domain: &Domain) -> Result<Vec<String>, RuntimeError> {
     })
 }
 
+async fn load_domain_member_token_sizes(
+    runtime: &KhiveRuntime,
+    ns: &str,
+    domain_ids: &[String],
+) -> Result<HashMap<String, usize>, RuntimeError> {
+    let mut sizes: HashMap<String, usize> = domain_ids.iter().map(|id| (id.clone(), 0)).collect();
+    if domain_ids.is_empty() {
+        return Ok(sizes);
+    }
+
+    let placeholders = domain_ids
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("?{}", i + 2))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut params = vec![SqlValue::Text(ns.to_owned())];
+    params.extend(domain_ids.iter().cloned().map(SqlValue::Text));
+
+    let sql = runtime.sql();
+    let mut reader = sql
+        .reader()
+        .await
+        .map_err(|e| sql_err("suggest member size reader", e))?;
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: format!(
+                "SELECT d.id AS domain_id, a.name, a.content \
+                 FROM knowledge_domains AS d \
+                 JOIN json_each(d.members) AS member ON 1 = 1 \
+                 JOIN knowledge_atoms AS a \
+                   ON a.namespace = d.namespace \
+                  AND a.slug = member.value \
+                  AND a.deleted_at IS NULL \
+                 WHERE d.namespace = ?1 \
+                   AND d.id IN ({placeholders}) \
+                   AND d.deleted_at IS NULL"
+            ),
+            params,
+            label: None,
+        })
+        .await
+        .map_err(|e| sql_err("suggest member size query", e))?;
+
+    for row in rows {
+        let Some(domain_id) = row_str(&row, "domain_id") else {
+            continue;
+        };
+        let Some(content) = row_str(&row, "content") else {
+            continue;
+        };
+        let name = row_str(&row, "name").unwrap_or_default();
+        let size = sizes.entry(domain_id).or_default();
+        *size = size.saturating_add(estimate_compose_item_tokens(&name, &content));
+    }
+
+    Ok(sizes)
+}
+
 async fn rerank_text_items(
     runtime: &KhiveRuntime,
     query: &str,
@@ -974,7 +1035,7 @@ fn trim_kg_entities_to_budget(hits: Vec<KgEntityHit>, remaining_budget: usize) -
     let mut used = 0usize;
     hits.into_iter()
         .take_while(|h| {
-            let cost = h.name.len() + h.description.len() + 40;
+            let cost = compose_item_char_cost(&h.name, &h.description);
             if used + cost > remaining_budget {
                 return false;
             }
@@ -1358,20 +1419,25 @@ impl KnowledgeHandlers {
                 {
                     ann_hits_opt = vamana::search_loaded(ann, &key, &query_emb, ann_k).await;
                 } else {
-                    // Still not ready after the wait.  If FTS already collected
-                    // non-empty hits, return those partial results rather than
-                    // erroring — mirrors the same guard in `search`.  Only set
-                    // ann_unavailable when FTS is also empty and the corpus is
-                    // non-empty (a genuinely misleading silent-zero case) (issue #322).
-                    if hits.is_empty() {
-                        let model = runtime.default_embedder_name();
-                        let corpus_non_empty = vamana::compute_fingerprint(runtime, token, model)
-                            .await
-                            .map(|fp| fp.vector_count > 0)
-                            .unwrap_or(false);
-                        if corpus_non_empty {
-                            ann_unavailable = true;
-                        }
+                    // Still not ready after the wait.  FTS/full-scan lexical hits
+                    // (if any) already sit in `hits` and are returned regardless —
+                    // ANN unavailability degrades candidate recall breadth, not
+                    // necessarily final ranking: the fresh embedding rerank below
+                    // can still apply a dense score to the lexical candidates.
+                    // A caller must not read non-empty `hits` here as evidence of
+                    // healthy candidate retrieval either.
+                    // Flag degraded whenever the corpus is genuinely non-empty,
+                    // in BOTH the empty-hits case (issue #322: total:0 could
+                    // mean "nothing exists" or "couldn't check") and the
+                    // non-empty case (issue #91: partial candidate retrieval looks
+                    // identical to a healthy response unless flagged).
+                    let model = runtime.default_embedder_name();
+                    let corpus_non_empty = vamana::compute_fingerprint(runtime, token, model)
+                        .await
+                        .map(|fp| fp.vector_count > 0)
+                        .unwrap_or(false);
+                    if corpus_non_empty {
+                        ann_unavailable = true;
                     }
                 }
             }
@@ -1389,21 +1455,71 @@ impl KnowledgeHandlers {
             }
         }
 
-        rerank_with_embeddings(runtime, &raw_query, &mut hits, 0.7).await?;
+        let fresh_rerank_applied =
+            rerank_with_embeddings(runtime, &raw_query, &mut hits, D_SUGGEST_RERANK_ALPHA).await?;
 
         // Safety net: retain only domain hits in case any non-domain survived above.
         hits.retain(|h| h.is_domain);
         hits.truncate(limit);
 
+        let domain_ids: Vec<String> = hits.iter().map(|h| h.id.clone()).collect();
+        let member_token_sizes = load_domain_member_token_sizes(runtime, &ns, &domain_ids).await?;
+
+        // Price the member atom bodies that compose expands, not the much smaller
+        // domain mirror description used for retrieval. The batched join keeps the
+        // suggest -> fold budget in compose's estimated-token unit without an N+1
+        // hydration pass.
         let results: Vec<Value> = hits
             .iter()
-            .map(|h| json!({ "id": h.id, "name": h.name, "score": h.score }))
+            .map(|h| {
+                json!({
+                    "id": h.id,
+                    "name": h.name,
+                    "score": h.score,
+                    "size": member_token_sizes.get(&h.id).copied().unwrap_or_default(),
+                })
+            })
             .collect();
         let count = results.len();
 
         let mut out = json!({ "results": results, "total": count });
         if ann_unavailable {
+            // issue #91: escalate degradation to a top-level, self-explaining
+            // signal instead of a bare total:0 or an unflagged partial list.
+            // `ann_unavailable` is kept unchanged for existing callers; `degraded`
+            // states the consequence so a caller does not have to infer it.
             out["ann_unavailable"] = json!(true);
+            let (mode, note): (&str, &str) = match (count, fresh_rerank_applied) {
+                (0, _) => (
+                    "no_match",
+                    "ANN index unavailable and lexical/FTS matching also found no \
+                     domain for this query. This does NOT confirm the corpus has \
+                     nothing relevant — only that this call could not find one. \
+                     Do not cache as an absence; retry once the index is healthy.",
+                ),
+                (_, true) => (
+                    "ann_candidates_degraded",
+                    "ANN index unavailable: candidate retrieval used lexical/FTS \
+                     matching, but fresh embedding cosine reranking was applied to \
+                     those candidates. Final ranking includes a dense signal, while \
+                     topically relevant domains outside the lexical candidate set may \
+                     still be missing. Do not cache; retry once the index is healthy.",
+                ),
+                (_, false) => (
+                    "lexical_only",
+                    "ANN index unavailable and fresh embedding reranking did not run: \
+                     these results were ranked by lexical/FTS matching only. Ranking \
+                     may be less precise than a healthy call, and topically relevant \
+                     domains outside the lexical match may be missing. Do not cache; \
+                     retry once the index is healthy.",
+                ),
+            };
+            out["degraded"] = json!({
+                "reason": "ann_unavailable",
+                "mode": mode,
+                "cache_safe": false,
+                "note": note,
+            });
         }
         Ok(out)
     }
@@ -1660,7 +1776,6 @@ impl KnowledgeHandlers {
         timing.begin(Phase::Trim);
 
         let max_tokens = p.max_tokens.unwrap_or(8000).clamp(500, 100_000);
-        const CHARS_PER_TOKEN: usize = 4;
         let char_budget = max_tokens * CHARS_PER_TOKEN;
 
         // Tracks characters consumed by the atom/section body so blended KG
@@ -1670,7 +1785,7 @@ impl KnowledgeHandlers {
 
         if !section_results.is_empty() {
             section_results.retain(|s| {
-                let cost = s.heading.len() + s.content.len() + 40;
+                let cost = compose_item_char_cost(&s.heading, &s.content);
                 if body_used + cost > char_budget {
                     return false;
                 }
@@ -1723,7 +1838,7 @@ impl KnowledgeHandlers {
                         .map(|a| (a, item.score))
                 })
                 .take_while(|(a, _)| {
-                    let cost = a.name.len() + a.content.len() + 40;
+                    let cost = compose_item_char_cost(&a.name, &a.content);
                     if body_used + cost > char_budget {
                         return false;
                     }

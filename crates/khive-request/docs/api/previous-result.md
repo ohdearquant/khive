@@ -39,3 +39,13 @@ JSON decoding produces `\$prev.id`; the parser removes that one escape and store
 `resolve_all` recursively materializes an argument into owned JSON. Concrete values are cloned, references are resolved and cloned, and dynamic arrays/objects preserve order while resolving every descendant. If any reference path misses, the entire call returns `None`; partial materialization is never returned.
 
 Runtime results used as future `$prev` context should first pass `value_nesting_within_limit`. That function walks an explicit heap worklist, avoiding recursive clone/serialization of attacker-controlled deep JSON before the depth bound is checked.
+
+## `ArgValue::find_prev_failure`
+
+`resolve_all` returning `None` only says *that* a reference missed, not *why*. `find_prev_failure` walks the same argument (including nested `$prev` refs inside array/object literals) and returns a [`PrevFailure`] explaining the first miss it finds:
+
+- `NotFound` — the field or index simply isn't there; carries the sibling field names (or array length) available at that point.
+- `WrongType` — a path segment expects an object (for a field) or an array (for an index) to continue into, but the value at that point is a different JSON type.
+- `Unsupported` — the path contains bracket syntax that isn't a valid non-negative-integer index. The public DSL parser rejects this shape before it ever reaches `ArgValue::PrevRef`, so this variant only fires against an `ArgValue` built some other way.
+
+Callers building an error message for a `resolve_all` miss should call `find_prev_failure` for the specific reason, rather than emitting one generic "not found" for all three mistakes.

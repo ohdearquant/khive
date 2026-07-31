@@ -164,7 +164,7 @@ pub(crate) async fn execute_atomic_ops_file(
             // DDL/INSERT. Best-effort: errors are logged inside those
             // functions and never propagated — a missing audit row must
             // never fail an already-committed atomic unit.
-            apply_gtd_audit_post_commit_effects(&runtime, &post_commit).await;
+            apply_gtd_audit_post_commit_effects(&runtime, post_commit.as_slice()).await;
             khive_runtime::atomic_prepare::apply_post_commit_effects(&runtime, &token, post_commit)
                 .await
                 .context("post-commit reindex after atomic unit commit")?;
@@ -554,15 +554,15 @@ async fn build_op_result(
         // unsafe to branch on at prepare time makes it unsafe to render
         // from too. This mirrors the `link` arm below exactly (same
         // reasoning, same `list_edges` mechanism).
-        ("update", AtomicOpPlan::Update(p)) if p.edge_natural_key.is_some() => {
-            let key = p.edge_natural_key.as_ref().expect("checked by guard above");
+        ("update", AtomicOpPlan::Update(p)) if p.edge_natural_key().is_some() => {
+            let key = p.edge_natural_key().expect("checked by guard above");
             let edges = runtime
                 .list_edges(
                     token,
                     EdgeListFilter {
-                        source_id: Some(key.canon_source_id),
-                        target_id: Some(key.canon_target_id),
-                        relations: vec![key.relation],
+                        source_id: Some(key.canon_source_id()),
+                        target_id: Some(key.canon_target_id()),
+                        relations: vec![key.relation()],
                         ..Default::default()
                     },
                     1,
@@ -573,15 +573,15 @@ async fn build_op_result(
                 anyhow::anyhow!(
                     "atomic update result: committed symmetric edge not found by natural key \
                      ({}, {}, {})",
-                    key.canon_source_id,
-                    key.canon_target_id,
-                    key.relation
+                    key.canon_source_id(),
+                    key.canon_target_id(),
+                    key.relation()
                 )
             })?;
             Ok(serde_json::to_value(&edge)?)
         }
         ("update", AtomicOpPlan::Update(p)) => match runtime
-            .resolve_by_id(token, p.target_id)
+            .resolve_by_id(token, p.target_id())
             .await?
         {
             Some(Resolved::Entity(entity)) => {
@@ -602,17 +602,20 @@ async fn build_op_result(
             // `updated_at` already serialize as RFC3339 via its own
             // `Serialize` impl).
             None => {
-                let edge = runtime.get_edge(token, p.target_id).await?.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "atomic update result: target {} not found post-commit",
-                        p.target_id
-                    )
-                })?;
+                let edge = runtime
+                    .get_edge(token, p.target_id())
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "atomic update result: target {} not found post-commit",
+                            p.target_id()
+                        )
+                    })?;
                 Ok(serde_json::to_value(&edge)?)
             }
             _ => anyhow::bail!(
                 "atomic update result: target {} not found post-commit",
-                p.target_id
+                p.target_id()
             ),
         },
         // Canonical shape: `{"deleted": deleted, "id": p.id, "kind": p.kind}`
@@ -651,8 +654,8 @@ async fn build_op_result(
                 .list_edges(
                     token,
                     EdgeListFilter {
-                        source_id: Some(p.source_id),
-                        target_id: Some(p.target_id),
+                        source_id: Some(p.source_id()),
+                        target_id: Some(p.target_id()),
                         relations: vec![relation],
                         ..Default::default()
                     },
@@ -689,13 +692,13 @@ async fn build_op_result(
         ("gtd.transition", AtomicOpPlan::GtdTransition(p)) => {
             let note = runtime
                 .notes(token)?
-                .get_note(p.task_id)
+                .get_note(p.task_id())
                 .await?
                 .ok_or_else(|| {
                     anyhow::anyhow!("atomic gtd.transition result: task not found post-commit")
                 })?;
             let task = khive_pack_gtd::handlers::render_task(&note);
-            if p.statements.is_empty() {
+            if p.statements().is_empty() {
                 let raw_status = original_args
                     .as_object()
                     .and_then(|o| o.get("status"))
@@ -714,7 +717,7 @@ async fn build_op_result(
                 }))
             } else {
                 let (from_status, to_status) =
-                    gtd_audit_from_to(&p.post_commit).ok_or_else(|| {
+                    gtd_audit_from_to(p.post_commit()).ok_or_else(|| {
                         anyhow::anyhow!("atomic gtd.transition result: missing audit effect")
                     })?;
                 Ok(json!({
@@ -735,13 +738,13 @@ async fn build_op_result(
         ("gtd.complete", AtomicOpPlan::GtdComplete(p)) => {
             let note = runtime
                 .notes(token)?
-                .get_note(p.task_id)
+                .get_note(p.task_id())
                 .await?
                 .ok_or_else(|| {
                     anyhow::anyhow!("atomic gtd.complete result: task not found post-commit")
                 })?;
             let task = khive_pack_gtd::handlers::render_task(&note);
-            let (from_status, to_status) = gtd_audit_from_to(&p.post_commit).ok_or_else(|| {
+            let (from_status, to_status) = gtd_audit_from_to(p.post_commit()).ok_or_else(|| {
                 anyhow::anyhow!("atomic gtd.complete result: missing audit effect")
             })?;
             let completed_at = note
@@ -810,11 +813,11 @@ async fn prepare_gtd_transition(
 
     match decision {
         khive_pack_gtd::handlers::TransitionDecision::NoOp { note, .. } => {
-            Ok(AtomicOpPlan::GtdTransition(GtdTransitionPlan {
-                task_id: note.id,
-                statements: vec![],
-                post_commit: PostCommitEffect::None,
-            }))
+            Ok(AtomicOpPlan::GtdTransition(GtdTransitionPlan::new(
+                note.id,
+                vec![],
+                PostCommitEffect::None,
+            )))
         }
         khive_pack_gtd::handlers::TransitionDecision::Write {
             note,
@@ -829,20 +832,20 @@ async fn prepare_gtd_transition(
             )
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-            Ok(AtomicOpPlan::GtdTransition(GtdTransitionPlan {
-                task_id: note.id,
-                statements: vec![PlanStatement {
+            Ok(AtomicOpPlan::GtdTransition(GtdTransitionPlan::new(
+                note.id,
+                vec![PlanStatement {
                     statement,
                     guard: Some(AffectedRowGuard::exactly(1)),
                 }],
-                post_commit: PostCommitEffect::GtdAudit {
+                PostCommitEffect::GtdAudit {
                     task_id: note.id,
                     from_status: current,
                     to_status: target,
                     note: transition_note,
                     namespace: token.namespace().as_str().to_string(),
                 },
-            }))
+            )))
         }
     }
 }
@@ -880,20 +883,20 @@ async fn prepare_gtd_complete(
     )
     .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    Ok(AtomicOpPlan::GtdComplete(GtdCompletePlan {
-        task_id: decision.note.id,
-        statements: vec![PlanStatement {
+    Ok(AtomicOpPlan::GtdComplete(GtdCompletePlan::new(
+        decision.note.id,
+        vec![PlanStatement {
             statement,
             guard: Some(AffectedRowGuard::exactly(1)),
         }],
-        post_commit: PostCommitEffect::GtdAudit {
+        PostCommitEffect::GtdAudit {
             task_id: decision.note.id,
             from_status: decision.current,
             to_status: decision.target.to_string(),
             note: None,
             namespace: token.namespace().as_str().to_string(),
         },
-    }))
+    )))
 }
 
 /// ADR-099 B3 fix (deny_unknown_fields parity): `validate_atomic_args`
@@ -1277,7 +1280,7 @@ mod tests {
             other => panic!("idempotent no-op must still succeed as Committed, got {other:?}"),
         };
         assert!(
-            post_commit.is_empty(),
+            post_commit.as_slice().is_empty(),
             "an idempotent no-op transition must produce no post-commit effect (no audit row \
              either — canonical never reaches its own write_audit_record call): {post_commit:?}"
         );
@@ -1325,7 +1328,7 @@ mod tests {
             AtomicRunOutcome::Committed { post_commit } => post_commit,
             other => panic!("expected Committed, got {other:?}"),
         };
-        apply_gtd_audit_post_commit_effects(&runtime, &post_commit).await;
+        apply_gtd_audit_post_commit_effects(&runtime, post_commit.as_slice()).await;
 
         // (b) complete next -> done.
         let complete_task = seed_task(&runtime, &token, "next").await;
@@ -1344,7 +1347,7 @@ mod tests {
             AtomicRunOutcome::Committed { post_commit } => post_commit,
             other => panic!("expected Committed, got {other:?}"),
         };
-        apply_gtd_audit_post_commit_effects(&runtime, &post_commit).await;
+        apply_gtd_audit_post_commit_effects(&runtime, post_commit.as_slice()).await;
 
         let mut reader = runtime.sql().reader().await.expect("reader");
         let rows = reader

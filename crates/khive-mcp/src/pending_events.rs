@@ -1346,11 +1346,13 @@ mod tests {
             default_namespace: Namespace::parse("local").unwrap(),
             embedding_model: None,
             additional_embedding_models: vec![],
-            // kg + schedule + comm: this module's tests drive schedule.remind /
-            // schedule.cancel through the drain path and assert delivery lands in
-            // the creator's comm inbox, on top of the kg-verb fixture actions.
-            packs: vec!["kg".to_string(), "schedule".to_string(), "comm".to_string()],
             actor_id: actor_id.map(str::to_string),
+            // Pin the pack list explicitly rather than inheriting `KHIVE_PACKS`
+            // from the ambient environment (#1269). kg + schedule + comm: this
+            // module's tests drive schedule.remind / schedule.cancel through the
+            // drain path and assert delivery lands in the creator's comm inbox,
+            // on top of the kg-verb fixture actions.
+            packs: vec!["kg".to_string(), "schedule".to_string(), "comm".to_string()],
             ..Default::default()
         };
         KhiveRuntime::new(cfg).expect("runtime")
@@ -2187,8 +2189,23 @@ mod tests {
                 }
             }
         }
-        let _restore = RestoreTimeout(std::env::var("KHIVE_CHECKOUT_TIMEOUT_SECS").ok());
-        std::env::set_var("KHIVE_CHECKOUT_TIMEOUT_SECS", "120");
+        let prior_timeout = std::env::var("KHIVE_CHECKOUT_TIMEOUT_SECS").ok();
+        let _restore = RestoreTimeout(prior_timeout.clone());
+        // #705: an instrumented coverage run (cargo llvm-cov --workspace) runs
+        // this test's binary alongside every other workspace test binary, and
+        // instrumentation overhead widens the contention window this test's
+        // 120s floor was sized for on a plain (uninstrumented) run. Rather than
+        // unconditionally clobbering down to "120" — which would silently
+        // discard a larger value the coverage job set specifically for this
+        // path — take the max of the ambient value (if any) and the 120s
+        // floor, so a caller can raise it further without this test undoing
+        // that raise.
+        let effective_timeout = prior_timeout
+            .as_deref()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|ambient| ambient.max(120))
+            .unwrap_or(120);
+        std::env::set_var("KHIVE_CHECKOUT_TIMEOUT_SECS", effective_timeout.to_string());
 
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;

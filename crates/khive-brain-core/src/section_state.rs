@@ -15,6 +15,12 @@ pub const DEFAULT_EXPLORATION_EPOCH: u64 = 50;
 pub const DEFAULT_TAU_0: f64 = 1.0;
 pub const DEFAULT_TAU_EXPLOIT: f64 = 0.1;
 pub const DEFAULT_SECTION_WEIGHT_FLOOR: f64 = 0.05;
+/// Standard-deviation multiplier for `lower_confidence_bound`'s pessimistic
+/// estimate. `exploration_epoch` decays to 0 permanently (it only ever counts
+/// down), after which `deterministic_weights` is the sole scoring path
+/// forever — it must not rank a section on posterior mean alone, since mean
+/// is well-defined for a 1-observation posterior with no evidence behind it.
+pub const DEFAULT_LCB_Z: f64 = 1.0;
 
 /// Per-profile section posterior state.
 pub struct SectionPosteriorState {
@@ -125,7 +131,7 @@ impl SectionPosteriorState {
         let logits: HashMap<SectionType, f64> = self
             .posteriors
             .iter()
-            .map(|(&st, p)| (st, p.mean() / tau))
+            .map(|(&st, p)| (st, lower_confidence_bound(p) / tau))
             .collect();
         let max_val = logits.values().cloned().fold(f64::NEG_INFINITY, f64::max);
         let mut raw: HashMap<SectionType, f64> = HashMap::new();
@@ -203,6 +209,21 @@ pub struct SectionPosteriorSnapshot {
     pub priors: HashMap<SectionType, BetaPosterior>,
     pub total_events: u64,
     pub exploration_epoch: u64,
+}
+
+/// Count-aware pessimistic estimate of a section's posterior: the mean minus
+/// `DEFAULT_LCB_Z` standard deviations, floored at 0.
+///
+/// The raw posterior mean alone cannot distinguish a section with one lucky
+/// observation (small `alpha + beta`, high mean, high variance) from one with
+/// hundreds of observations at the same or lower mean (large `alpha + beta`,
+/// low variance) — `deterministic_weights` would rank the former higher on
+/// mean despite having no evidence behind it. Subtracting a variance-scaled
+/// penalty shrinks under-evidenced means toward the floor while barely
+/// touching well-evidenced ones, without discarding `BetaPosterior`'s existing
+/// deterministic `mean()`/`variance()` accessors or introducing randomness.
+fn lower_confidence_bound(p: &BetaPosterior) -> f64 {
+    (p.mean() - DEFAULT_LCB_Z * p.variance().sqrt()).max(0.0)
 }
 
 // ── Sampling helpers ────────────────────────────────────────────────────────
@@ -348,5 +369,63 @@ mod tests {
         let og = weights[&SectionType::OperationalGuidance];
         let form = weights[&SectionType::Formalism];
         assert!(og > form, "og={og:.4} form={form:.4}");
+    }
+
+    /// BRAIN-0483: hand-computed `lower_confidence_bound` values.
+    ///
+    /// alpha=11, beta=1 (10-for-10 lucky streak): mean = 11/12 = 0.916667,
+    /// variance = alpha*beta / (n^2*(n+1)) = 11 / (144*13) = 0.00587607,
+    /// sqrt(variance) = 0.0766595, lcb = 0.916667 - 0.0766595 = 0.840007.
+    ///
+    /// alpha=901, beta=101 (900-for-1000): mean = 901/1002 = 0.899202,
+    /// variance = 91001 / (1002^2*1003) = 91001 / 1007016012 = 0.0000903668,
+    /// sqrt(variance) = 0.00950614, lcb = 0.899202 - 0.00950614 = 0.889696.
+    #[test]
+    fn lower_confidence_bound_hand_computed() {
+        let lucky = BetaPosterior::new(11.0, 1.0);
+        let seasoned = BetaPosterior::new(901.0, 101.0);
+        assert!(
+            (lower_confidence_bound(&lucky) - 0.840_007).abs() < 1e-5,
+            "lucky lcb = {}",
+            lower_confidence_bound(&lucky)
+        );
+        assert!(
+            (lower_confidence_bound(&seasoned) - 0.889_696).abs() < 1e-5,
+            "seasoned lcb = {}",
+            lower_confidence_bound(&seasoned)
+        );
+    }
+
+    /// BRAIN-0483: a section with one lucky streak (high mean, tiny evidence)
+    /// must not outrank a section with hundreds of observations at a lower raw
+    /// mean once `deterministic_weights` is the permanent scoring path
+    /// (`exploration_epoch == 0`). Raw mean alone gets this backwards
+    /// (0.916667 > 0.899202); the lower-confidence-bound correction flips it
+    /// (0.840007 < 0.889696), matching the evidence.
+    #[test]
+    fn deterministic_weights_does_not_let_a_lucky_streak_beat_seasoned_evidence() {
+        let mut priors = SectionPosteriorState::default_priors();
+        priors.insert(SectionType::Examples, BetaPosterior::new(11.0, 1.0));
+        priors.insert(
+            SectionType::OperationalGuidance,
+            BetaPosterior::new(901.0, 101.0),
+        );
+        let mut state = SectionPosteriorState::from_priors(priors);
+        state.exploration_epoch = 0;
+
+        let raw_mean_examples = state.posteriors[&SectionType::Examples].mean();
+        let raw_mean_og = state.posteriors[&SectionType::OperationalGuidance].mean();
+        assert!(
+            raw_mean_examples > raw_mean_og,
+            "fixture must reproduce the raw-mean inversion: examples={raw_mean_examples:.6} og={raw_mean_og:.6}"
+        );
+
+        let weights = derive_deterministic_weights(&state);
+        let examples = weights[&SectionType::Examples];
+        let og = weights[&SectionType::OperationalGuidance];
+        assert!(
+            og > examples,
+            "seasoned evidence must outrank a lucky streak once corrected: og={og:.6} examples={examples:.6}"
+        );
     }
 }

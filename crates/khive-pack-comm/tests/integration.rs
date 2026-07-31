@@ -43,14 +43,18 @@ fn comm_pack_declares_message_note_kind() {
 fn comm_pack_declares_nine_handlers() {
     assert_eq!(
         CommPack::HANDLERS.len(),
-        11,
-        "comm pack must declare 11 handlers: send, inbox, read, reply, thread, ingest, \
-         heartbeat, health, probe, cursor_get, cursor_commit (khive #449)"
+        12,
+        "comm pack must declare 12 handlers: send, inbox, read, unread, reply, thread, \
+         ingest, heartbeat, health, probe, cursor_get, cursor_commit (khive #449, #66)"
     );
     let names: Vec<&str> = CommPack::HANDLERS.iter().map(|h| h.name).collect();
     assert!(names.contains(&"comm.send"));
     assert!(names.contains(&"comm.inbox"));
     assert!(names.contains(&"comm.read"));
+    assert!(
+        names.contains(&"comm.unread"),
+        "comm.unread verb must be registered (khive #66)"
+    );
     assert!(names.contains(&"comm.reply"));
     assert!(
         names.contains(&"comm.thread"),
@@ -759,6 +763,311 @@ async fn test_reply_from_recipient_routes_to_sender() {
     );
 }
 
+/// reply() to an inbound message marks the original read — callers previously
+/// chained `reply | read`; the read is now folded into reply itself.
+#[tokio::test]
+async fn test_reply_marks_inbound_original_read() {
+    let backend = shared_backend();
+    let (registry, _rt) = build_actor_registry(backend, "lambda:khive");
+
+    registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:khive", "content": "needs an answer", "self_send": true }),
+        )
+        .await
+        .expect("self-send succeeds");
+
+    let inbox = registry
+        .dispatch("comm.inbox", serde_json::json!({ "status": "unread" }))
+        .await
+        .expect("inbox succeeds");
+    let msgs = inbox
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .expect("messages array");
+    assert_eq!(msgs.len(), 1, "must have 1 unread inbound message");
+    let inbound_full_id = msgs[0]
+        .get("full_id")
+        .and_then(|v| v.as_str())
+        .expect("full_id on inbound message")
+        .to_string();
+
+    let reply = registry
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({ "id": inbound_full_id, "content": "answered" }),
+        )
+        .await
+        .expect("reply succeeds");
+    assert_eq!(
+        reply.get("marked_read").and_then(|v| v.as_bool()),
+        Some(true),
+        "reply to an inbound message must report marked_read=true; got {reply}"
+    );
+
+    let inbox_after = registry
+        .dispatch("comm.inbox", serde_json::json!({ "status": "unread" }))
+        .await
+        .expect("inbox succeeds after reply");
+    let unread_after = inbox_after
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .expect("messages array");
+    assert!(
+        unread_after
+            .iter()
+            .all(|m| m.get("full_id").and_then(|v| v.as_str()) != Some(inbound_full_id.as_str())),
+        "the replied-to inbound message must no longer be unread"
+    );
+}
+
+/// reply() to an outbound original performs no read-marking (read is a
+/// recipient action); `marked_read` is null.
+#[tokio::test]
+async fn test_reply_to_outbound_original_does_not_mark_read() {
+    let (registry, _rt) = build_registry();
+
+    let original = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "root message" }),
+        )
+        .await
+        .expect("send succeeds");
+    let outbound_id = original
+        .get("full_id")
+        .and_then(|v| v.as_str())
+        .expect("send returns full_id");
+
+    let reply = registry
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({ "id": outbound_id, "content": "follow-up" }),
+        )
+        .await
+        .expect("reply to own outbound succeeds");
+    assert!(
+        reply
+            .get("marked_read")
+            .map(|v| v.is_null())
+            .unwrap_or(false),
+        "reply to an outbound original must report marked_read=null; got {reply}"
+    );
+}
+
+/// A legacy message carrying no `direction` property is still markable —
+/// reply() skips only an explicitly outbound original, exactly as read() does.
+/// Before this, requiring a literal "inbound" made a directionless legacy
+/// record report `marked_read: null`, which is specified to mean "outbound".
+#[tokio::test]
+async fn test_reply_marks_directionless_legacy_original() {
+    use khive_storage::note::Note;
+    use uuid::Uuid;
+    let (registry, rt) = build_registry();
+    let token = rt.authorize(khive_runtime::Namespace::local()).unwrap();
+    let store = rt.notes(&token).expect("notes store");
+    let now = chrono::Utc::now().timestamp_micros();
+    let id = Uuid::parse_str("dd110000-3333-4000-8000-000000000003").unwrap();
+
+    store
+        .upsert_note(Note {
+            id,
+            namespace: token.namespace().as_str().to_string(),
+            kind: "message".into(),
+            status: "active".into(),
+            name: None,
+            content: "legacy message with no direction".into(),
+            salience: None,
+            decay_factor: None,
+            expires_at: None,
+            // No `direction` — the pre-ADR-057 shape.
+            properties: Some(serde_json::json!({ "from": "x", "to": "local" })),
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+        })
+        .await
+        .expect("insert legacy message");
+
+    let reply = registry
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({ "id": id.as_hyphenated().to_string(), "content": "answered" }),
+        )
+        .await
+        .expect("reply to legacy message succeeds");
+    assert_eq!(
+        reply.get("marked_read").and_then(|v| v.as_bool()),
+        Some(true),
+        "a directionless legacy original must be marked, not reported null; got {reply}"
+    );
+
+    let stored = store
+        .get_note(id)
+        .await
+        .expect("get_note")
+        .expect("legacy message still present");
+    assert_eq!(
+        stored
+            .properties
+            .as_ref()
+            .and_then(|p| p.get("read"))
+            .and_then(|v| v.as_bool()),
+        Some(true),
+        "the legacy original must actually carry read=true"
+    );
+}
+
+/// The read-patch must not clobber properties written between the original's
+/// fetch and the patch: reply re-reads current properties before setting
+/// `read`, since the store replaces the properties object wholesale.
+#[tokio::test]
+async fn test_reply_read_patch_preserves_concurrent_properties() {
+    use khive_storage::note::Note;
+    use uuid::Uuid;
+    let (registry, rt) = build_registry();
+    let token = rt.authorize(khive_runtime::Namespace::local()).unwrap();
+    let store = rt.notes(&token).expect("notes store");
+    let now = chrono::Utc::now().timestamp_micros();
+    let id = Uuid::parse_str("dd110000-4444-4000-8000-000000000004").unwrap();
+
+    store
+        .upsert_note(Note {
+            id,
+            namespace: token.namespace().as_str().to_string(),
+            kind: "message".into(),
+            status: "active".into(),
+            name: None,
+            content: "message that gains a property mid-flight".into(),
+            salience: None,
+            decay_factor: None,
+            expires_at: None,
+            properties: Some(
+                serde_json::json!({ "direction": "inbound", "from": "x", "to": "local", "read": false }),
+            ),
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+        })
+        .await
+        .expect("insert message");
+
+    // Stand in for another writer stamping metadata after the original was
+    // fetched: patch a new property directly, then reply.
+    let mut with_stamp = serde_json::json!({
+        "direction": "inbound", "from": "x", "to": "local", "read": false,
+        "delivery_stamp": "channel-email"
+    });
+    with_stamp["read"] = serde_json::json!(false);
+    store
+        .update_note_properties(id, Some(with_stamp), now + 1)
+        .await
+        .expect("stamp applied");
+
+    registry
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({ "id": id.as_hyphenated().to_string(), "content": "answered" }),
+        )
+        .await
+        .expect("reply succeeds");
+
+    let stored = store
+        .get_note(id)
+        .await
+        .expect("get_note")
+        .expect("message present");
+    let props = stored.properties.expect("properties");
+    assert_eq!(
+        props.get("read").and_then(|v| v.as_bool()),
+        Some(true),
+        "read must be set"
+    );
+    assert_eq!(
+        props.get("delivery_stamp").and_then(|v| v.as_str()),
+        Some("channel-email"),
+        "the concurrently written property must survive the read patch; got {props}"
+    );
+}
+
+/// A non-participant may reach a message id, but replying must be rejected
+/// without flipping someone else's message to read.
+#[tokio::test]
+async fn test_reply_by_non_participant_is_rejected_without_marking_read() {
+    let backend = shared_backend();
+    let (registry_a, rt_a) = build_actor_registry(backend.clone(), "lambda:a");
+    let (registry_b, _rt_b) = build_actor_registry(backend.clone(), "lambda:b");
+    let (registry_c, _rt_c) = build_actor_registry(backend.clone(), "lambda:c");
+
+    registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:b", "content": "for b only" }),
+        )
+        .await
+        .expect("send succeeds");
+
+    let token = rt_a.authorize(khive_runtime::Namespace::local()).unwrap();
+    let notes = rt_a
+        .list_notes(&token, Some("message"), 100, 0)
+        .await
+        .unwrap();
+    let inbound = notes
+        .iter()
+        .find(|n| {
+            n.properties.as_ref().is_some_and(|p| {
+                p.get("direction").and_then(|v| v.as_str()) == Some("inbound")
+                    && p.get("to_actor").and_then(|v| v.as_str()) == Some("lambda:b")
+            })
+        })
+        .expect("b's inbound copy exists");
+    let id = inbound.id.as_hyphenated().to_string();
+
+    let err = registry_c
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({ "id": id.clone(), "content": "not mine to read" }),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("not addressed to or from caller actor"),
+        "a non-participant reply must be rejected; got {err}"
+    );
+
+    let store = rt_a.notes(&token).expect("notes store");
+    let after = store
+        .get_note(inbound.id)
+        .await
+        .expect("get_note")
+        .expect("message present");
+    assert_eq!(
+        after
+            .properties
+            .as_ref()
+            .and_then(|p| p.get("read"))
+            .and_then(|v| v.as_bool()),
+        Some(false),
+        "the original must remain unread after a rejected reply"
+    );
+
+    // The real addressee replying still marks it.
+    let by_b = registry_b
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({ "id": id, "content": "mine, and read" }),
+        )
+        .await
+        .expect("addressee reply succeeds");
+    assert_eq!(
+        by_b["marked_read"].as_bool(),
+        Some(true),
+        "the addressee's reply must still mark the original read; got {by_b}"
+    );
+}
+
 // ── UE6-H2: reply thread_id must be full 36-char UUID ───────────────────────
 
 /// reply thread_id must be the full 36-char hyphenated UUID of the root message.
@@ -1128,6 +1437,184 @@ async fn test_read_rejects_outbound_message() {
     assert!(
         err_msg.contains("outbound") || err_msg.contains("direction"),
         "ue-comm-sched C2: error must mention outbound/direction; got {err_msg}"
+    );
+}
+
+// ── #87 regression: read() is restricted to the message's addressee ─────────
+
+/// A caller whose actor label does not match a message's `to_actor` must not be
+/// able to flip it to read — read-state is delivery state owned by the addressee.
+/// The message must stay unread after the rejected attempt.
+#[tokio::test]
+async fn t87_non_addressee_read_rejected_and_stays_unread() {
+    let backend = shared_backend();
+    let (registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:a");
+    let (registry_b, rt_b) = build_actor_registry(backend.clone(), "lambda:b");
+
+    registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:b", "content": "for B's eyes only" }),
+        )
+        .await
+        .expect("A sends to B");
+
+    let local_tok = rt_b.authorize(Namespace::parse("local").unwrap()).unwrap();
+    let notes = rt_b
+        .list_notes(&local_tok, Some("message"), 100, 0)
+        .await
+        .unwrap();
+    let inbound_id = notes
+        .iter()
+        .find(|n| {
+            n.deleted_at.is_none()
+                && n.properties
+                    .as_ref()
+                    .and_then(|p| p.get("direction"))
+                    .and_then(|v| v.as_str())
+                    == Some("inbound")
+        })
+        .map(|n| n.id.as_hyphenated().to_string())
+        .expect("inbound copy addressed to lambda:b must exist");
+
+    // A (not the addressee) attempts to mark B's inbound message as read.
+    let result = registry_a
+        .dispatch("comm.read", serde_json::json!({ "id": inbound_id }))
+        .await;
+    assert!(
+        result.is_err(),
+        "#87: non-addressee read must be rejected; got {result:?}"
+    );
+    let err_msg = format!("{}", result.unwrap_err());
+    assert!(
+        err_msg.contains("lambda:a") && !err_msg.contains("lambda:b"),
+        "#87: error must name only the caller's own actor, never the real \
+         addressee; got {err_msg:?}"
+    );
+
+    // The message must remain unread.
+    let refetched = rt_b
+        .list_notes(&local_tok, Some("message"), 100, 0)
+        .await
+        .unwrap();
+    let still_unread = refetched
+        .iter()
+        .find(|n| n.id.as_hyphenated().to_string() == inbound_id)
+        .and_then(|n| n.properties.as_ref())
+        .and_then(|p| p.get("read"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    assert!(
+        !still_unread,
+        "#87: message must stay unread after a rejected non-addressee read attempt"
+    );
+
+    // B (the true addressee) can still mark it read.
+    let ok = registry_b
+        .dispatch("comm.read", serde_json::json!({ "id": inbound_id }))
+        .await
+        .expect("#87: addressee read must still succeed");
+    assert_eq!(
+        ok.get("read").and_then(|v| v.as_bool()),
+        Some(true),
+        "#87: addressee read must return read:true; got {ok}"
+    );
+}
+
+/// The anonymous/"local" single-actor deployment (no actor.id configured) must keep
+/// working: caller and to_actor both resolve to "local", so the equality check passes.
+#[tokio::test]
+async fn t87_anonymous_local_single_actor_read_still_works() {
+    let (registry, rt) = build_registry_for_ns("local");
+
+    registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "single-tenant read" }),
+        )
+        .await
+        .expect("send succeeds");
+
+    let caller_token = rt
+        .authorize(khive_runtime::Namespace::parse("local").unwrap())
+        .unwrap();
+    let notes = rt
+        .list_notes(&caller_token, Some("message"), 100, 0)
+        .await
+        .unwrap();
+    let inbound_full_id = notes
+        .iter()
+        .find(|n| {
+            n.deleted_at.is_none()
+                && n.properties
+                    .as_ref()
+                    .and_then(|p| p.get("direction"))
+                    .and_then(|v| v.as_str())
+                    == Some("inbound")
+        })
+        .expect("inbound copy must exist after self-send")
+        .id
+        .to_string();
+
+    let result = registry
+        .dispatch("comm.read", serde_json::json!({ "id": inbound_full_id }))
+        .await
+        .expect("#87: anonymous single-actor 'local' read must still succeed");
+    assert_eq!(
+        result.get("read").and_then(|v| v.as_bool()),
+        Some(true),
+        "#87: read returns read:true — got {result}"
+    );
+}
+
+/// Pre-ADR-057 legacy messages may carry no `to_actor` at all. Decision: fail-open
+/// (with a tracing warning) — mirrors the inbox `EqOrMissing` filter precedent (#199),
+/// where legacy to_actor-less messages stay visible to any caller. Failing closed here
+/// would leave such messages permanently unreadable and stuck "unread", defeating the
+/// unread-based wake/sweep logic this fix protects.
+#[tokio::test]
+async fn t87_legacy_message_without_to_actor_reads_fail_open() {
+    let (_registry, rt) = build_registry_for_ns("lambda:legacy");
+    let token = rt
+        .authorize(khive_runtime::Namespace::parse("local").unwrap())
+        .unwrap();
+
+    // Simulate a pre-ADR-057 row: kind=message, direction=inbound, no `to_actor` field.
+    let legacy_note = rt
+        .create_note(
+            &token,
+            "message",
+            None,
+            "legacy inbound, no to_actor",
+            None,
+            Some(serde_json::json!({
+                "from": "someone",
+                "to": "lambda:legacy",
+                "direction": "inbound",
+            })),
+            vec![],
+        )
+        .await
+        .expect("legacy note creation succeeds");
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(khive_pack_kg::KgPack::new(rt.clone()));
+    builder.register(CommPack::new(rt.clone()));
+    builder.with_default_namespace("local");
+    builder.with_actor_id(Some("lambda:legacy".to_string()));
+    let registry = builder.build().expect("registry builds");
+
+    let result = registry
+        .dispatch(
+            "comm.read",
+            serde_json::json!({ "id": legacy_note.id.as_hyphenated().to_string() }),
+        )
+        .await
+        .expect("#87: legacy message without to_actor must fail open on read");
+    assert_eq!(
+        result.get("read").and_then(|v| v.as_bool()),
+        Some(true),
+        "#87: legacy to_actor-less read returns read:true — got {result}"
     );
 }
 
@@ -4389,7 +4876,7 @@ async fn reply_and_get_outbound_props(
 /// The reply must read `wire_message_id` and wrap it for the wire.
 #[tokio::test]
 async fn reply_sets_in_reply_to_for_inbound_originated_parent() {
-    let (registry, rt) = build_registry_for_ns("local");
+    let (registry, rt) = build_actor_registry(shared_backend(), "lambda:khive");
 
     let parent_id = plant_message_note(
         &rt,
@@ -4425,7 +4912,7 @@ async fn reply_sets_in_reply_to_for_inbound_originated_parent() {
 /// reply must reuse it verbatim.
 #[tokio::test]
 async fn reply_sets_in_reply_to_for_outbound_minted_parent() {
-    let (registry, rt) = build_registry_for_ns("local");
+    let (registry, rt) = build_actor_registry(shared_backend(), "lambda:khive");
 
     let parent_id = plant_message_note(
         &rt,
@@ -4458,7 +4945,7 @@ async fn reply_sets_in_reply_to_for_outbound_minted_parent() {
 /// fabricated, and the reply still succeeds exactly as before this feature.
 #[tokio::test]
 async fn reply_omits_in_reply_to_when_parent_has_no_wire_message_id() {
-    let (registry, rt) = build_registry_for_ns("local");
+    let (registry, rt) = build_actor_registry(shared_backend(), "lambda:khive");
 
     let parent_id = plant_message_note(
         &rt,
@@ -4611,7 +5098,7 @@ async fn ingest_omits_wire_references_when_absent() {
 /// Message-ID, and In-Reply-To must remain exactly the parent Message-ID.
 #[tokio::test]
 async fn reply_extends_existing_references_chain_of_two_or_more() {
-    let (registry, rt) = build_registry_for_ns("local");
+    let (registry, rt) = build_actor_registry(shared_backend(), "lambda:khive");
 
     let parent_id = plant_message_note(
         &rt,
@@ -4651,7 +5138,7 @@ async fn reply_extends_existing_references_chain_of_two_or_more() {
 /// alone, identical to pre-chain-preservation behavior.
 #[tokio::test]
 async fn reply_references_falls_back_to_parent_message_id_when_no_chain() {
-    let (registry, rt) = build_registry_for_ns("local");
+    let (registry, rt) = build_actor_registry(shared_backend(), "lambda:khive");
 
     let parent_id = plant_message_note(
         &rt,
@@ -4690,7 +5177,7 @@ async fn reply_references_falls_back_to_parent_message_id_when_no_chain() {
 /// `comm.reply` end-to-end, not just unit-tested on `parent_references_chain`.
 #[tokio::test]
 async fn reply_extends_references_chain_for_outbound_parent() {
-    let (registry, rt) = build_registry_for_ns("local");
+    let (registry, rt) = build_actor_registry(shared_backend(), "lambda:khive");
 
     let parent_id = plant_message_note(
         &rt,
@@ -4735,7 +5222,7 @@ async fn reply_extends_references_chain_for_outbound_parent() {
 /// rather than propagated into the reply's References header.
 #[tokio::test]
 async fn reply_skips_malformed_token_in_parent_references_chain() {
-    let (registry, rt) = build_registry_for_ns("local");
+    let (registry, rt) = build_actor_registry(shared_backend(), "lambda:khive");
 
     let parent_id = plant_message_note(
         &rt,
@@ -4774,7 +5261,7 @@ async fn reply_skips_malformed_token_in_parent_references_chain() {
 /// chain rather than being appended again at the end.
 #[tokio::test]
 async fn reply_dedups_tainted_parent_references_chain_containing_parent_id() {
-    let (registry, rt) = build_registry_for_ns("local");
+    let (registry, rt) = build_actor_registry(shared_backend(), "lambda:khive");
 
     let parent_id = plant_message_note(
         &rt,
@@ -6024,9 +6511,11 @@ async fn t494_thread_default_order_truncates_head_unchanged() {
             .unwrap_or_else(|e| panic!("reply-{i} succeeds: {e:?}"));
     }
 
-    // 5 logical messages (root + 4 replies) = 10 physical notes (outbound+inbound
-    // pairs). limit=2 with no order= must return the OLDEST 2 physical notes —
-    // both copies of "root" — matching pre-#494 truncate-from-head behavior.
+    // 5 logical messages (root + 4 replies), each an ADR-057 dual-write pair
+    // (outbound+inbound) collapsed by #94's dedup fix into ONE thread entry
+    // per logical message. limit=2 with no order= must return the OLDEST 2
+    // logical messages: root, reply-1 — no duplicate "root" entry anymore
+    // (pre-#94-fix behavior returned both physical copies of "root").
     let result = registry
         .dispatch(
             "comm.thread",
@@ -6042,8 +6531,9 @@ async fn t494_thread_default_order_truncates_head_unchanged() {
         .collect();
     assert_eq!(
         contents,
-        vec!["root", "root"],
-        "default order must truncate from the tail (keep the head), unchanged from before #494"
+        vec!["root", "reply-1"],
+        "default order must truncate from the tail (keep the head), one entry per \
+         logical message post-#94 dedup"
     );
 }
 
@@ -6087,9 +6577,10 @@ async fn t494_thread_order_desc_returns_newest_messages() {
         .collect();
     assert_eq!(
         contents,
-        vec!["reply-4", "reply-4"],
-        "order=desc + limit=2 must return the newest 2 physical notes — both copies \
-         of the last reply — not the oldest (#494 fix: the tail is now reachable)"
+        vec!["reply-4", "reply-3"],
+        "order=desc + limit=2 must return the newest 2 logical messages — not the \
+         oldest (#494 fix: the tail is now reachable), one entry per logical message \
+         post-#94 dedup (no duplicate 'reply-4' entry)"
     );
 }
 
@@ -6126,9 +6617,10 @@ async fn t494_thread_invalid_order_rejected() {
 
 /// `after` accepts a message id cursor and returns only messages strictly after it
 /// (enables incremental polling without re-fetching history). The cursor resolves
-/// to the OUTBOUND copy's `full_id` (what `comm.reply` returns); its own inbound
-/// copy — created a moment later in the same dual-write call — is strictly after
-/// it and so is included.
+/// to the OUTBOUND copy's `full_id` (what `comm.reply` returns), which post-#94 is
+/// also the canonical id of the "reply-1" logical message itself — so it is
+/// excluded by the strict `>` comparison, and there is nothing after it (reply-1
+/// was the last message sent).
 #[tokio::test]
 async fn t494_thread_after_id_cursor_returns_strictly_later_messages() {
     let (registry, _rt) = build_registry_for_ns("local");
@@ -6168,9 +6660,9 @@ async fn t494_thread_after_id_cursor_returns_strictly_later_messages() {
         .collect();
     assert_eq!(
         contents,
-        vec!["reply-1"],
-        "after=reply-1's outbound id must return only its own inbound copy \
-         (strictly later), excluding root and reply-1's own outbound copy; got {contents:?}"
+        Vec::<&str>::new(),
+        "after=reply-1's own canonical (outbound) id excludes reply-1 itself post-#94 \
+         dedup, and reply-1 was the last message sent, so nothing remains; got {contents:?}"
     );
 }
 
@@ -6396,11 +6888,11 @@ async fn t494_thread_order_desc_with_after_id_cursor_returns_strictly_older_in_d
 
     // `comm.send(to="local", ...)` is a self-send: ADR-057 dual-write stores
     // both an outbound and an inbound copy of "root", both real-clock (and so
-    // both strictly older than the synthetic 2099 timestamps). Full desc
-    // sequence is therefore [msg-c, msg-b, msg-a, root, root]. `after=msg-b`
-    // must return only what comes strictly after it in THAT sequence —
-    // msg-a and both root copies — never msg-c, even though msg-c is also
-    // `>` msg-b in wall-clock terms.
+    // both strictly older than the synthetic 2099 timestamps) — collapsed by
+    // #94's dedup fix into a single "root" thread entry. Full desc sequence
+    // is therefore [msg-c, msg-b, msg-a, root]. `after=msg-b` must return
+    // only what comes strictly after it in THAT sequence — msg-a and root —
+    // never msg-c, even though msg-c is also `>` msg-b in wall-clock terms.
     let result = registry
         .dispatch(
             "comm.thread",
@@ -6416,15 +6908,16 @@ async fn t494_thread_order_desc_with_after_id_cursor_returns_strictly_older_in_d
         .collect();
     assert_eq!(
         contents,
-        vec!["msg-a", "root", "root"],
+        vec!["msg-a", "root"],
         "order=desc + after=msg-b must return only rows strictly older than msg-b \
-         (further along the desc sequence), in desc order — both self-send root \
-         copies included, msg-c excluded; got {contents:?}"
+         (further along the desc sequence), in desc order — one 'root' entry \
+         post-#94 dedup, msg-c excluded; got {contents:?}"
     );
 }
 
-/// Absent `order`/`after` preserves today's behavior exactly: same messages, same order,
-/// same truncation as before #494 (regression guard alongside the existing #485 test).
+/// Absent `order`/`after` preserves the #494 ordering/truncation behavior; the message
+/// count itself changed under #94's dedup fix (one entry per logical message, not one
+/// per ADR-057 dual-write physical copy) — see the updated assertions below.
 #[tokio::test]
 async fn t494_thread_without_new_params_unchanged() {
     let (registry, _rt) = build_registry_for_ns("local");
@@ -6453,14 +6946,202 @@ async fn t494_thread_without_new_params_unchanged() {
     let msgs = result["messages"].as_array().expect("messages array");
     assert_eq!(
         msgs.len(),
-        4,
-        "root (outbound+inbound) + reply-1 (outbound+inbound) = 4 physical notes"
+        2,
+        "root + reply-1 = 2 logical messages post-#94 dedup (each was an ADR-057 \
+         dual-write outbound+inbound pair, now collapsed to one thread entry)"
     );
     let contents: Vec<&str> = msgs
         .iter()
         .map(|m| m["content"].as_str().unwrap_or(""))
         .collect();
-    assert_eq!(contents, vec!["root", "root", "reply-1", "reply-1"]);
+    assert_eq!(contents, vec!["root", "reply-1"]);
+}
+
+// ── #94: dual-write dedup + actor-scoped thread visibility ───────────────────
+
+/// Full round trip: A sends to B, B replies, A replies again. `comm.thread`
+/// must return exactly 3 logical messages (not 6 ADR-057 dual-write physical
+/// copies), in chronological order, each attributed to the actor that
+/// actually sent it, with no duplicate entries (issue #94 symptom 3).
+#[tokio::test]
+async fn t94_thread_round_trip_returns_deduped_logical_messages() {
+    let backend = shared_backend();
+    let (registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:a");
+    let (registry_b, _rt_b) = build_actor_registry(backend.clone(), "lambda:b");
+
+    // 1. A -> B.
+    let sent = registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:b", "content": "hello from A" }),
+        )
+        .await
+        .expect("A sends to B");
+    let root_id = sent["full_id"].as_str().expect("full_id").to_string();
+
+    // 2. B finds it in inbox and replies.
+    let b_inbox = registry_b
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "all", "limit": 10 }),
+        )
+        .await
+        .expect("B inbox");
+    let b_msgs = b_inbox["messages"].as_array().expect("messages");
+    assert_eq!(b_msgs.len(), 1, "B sees exactly 1 inbound message");
+    let b_inbound_id = b_msgs[0]["full_id"].as_str().expect("full_id").to_string();
+    registry_b
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({ "id": b_inbound_id, "content": "reply from B" }),
+        )
+        .await
+        .expect("B replies");
+
+    // 3. A finds B's reply in inbox and replies again.
+    let a_inbox = registry_a
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "all", "limit": 10 }),
+        )
+        .await
+        .expect("A inbox");
+    let a_msgs = a_inbox["messages"].as_array().expect("messages");
+    assert_eq!(a_msgs.len(), 1, "A sees exactly B's reply");
+    let a_inbound_id = a_msgs[0]["full_id"].as_str().expect("full_id").to_string();
+    registry_a
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({ "id": a_inbound_id, "content": "reply from A again" }),
+        )
+        .await
+        .expect("A replies again");
+
+    // 4. thread() must show exactly 3 logical messages, in order, correctly
+    // attributed, with no duplicates — from either party's point of view.
+    let thread = registry_a
+        .dispatch("comm.thread", serde_json::json!({ "id": root_id }))
+        .await
+        .expect("A reads the thread");
+    let count = thread["count"].as_u64().expect("count");
+    assert_eq!(
+        count, 3,
+        "3 logical messages (not 6 dual-write physical copies); got {thread}"
+    );
+    let msgs = thread["messages"].as_array().expect("messages array");
+    let contents: Vec<&str> = msgs
+        .iter()
+        .map(|m| m["content"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        contents,
+        vec!["hello from A", "reply from B", "reply from A again"],
+        "messages in chronological order with no duplicates; got {contents:?}"
+    );
+    let from_actors: Vec<&str> = msgs
+        .iter()
+        .map(|m| m["from"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        from_actors,
+        vec!["lambda:a", "lambda:b", "lambda:a"],
+        "each entry attributed to the actor that actually sent it; got {from_actors:?}"
+    );
+
+    // B's view must match exactly — the same 3 deduped, correctly attributed entries.
+    let thread_from_b = registry_b
+        .dispatch("comm.thread", serde_json::json!({ "id": root_id }))
+        .await
+        .expect("B reads the thread");
+    assert_eq!(thread_from_b["count"].as_u64().unwrap_or(0), 3);
+}
+
+/// A message addressed to one actor pair must not be visible to an unrelated
+/// third actor who merely knows (or can resolve) the thread's root id — the
+/// caller-boundary gap between `thread` (previously unfiltered by actor) and
+/// `inbox` (already actor-scoped) from issue #94 symptom 1/2.
+#[tokio::test]
+async fn t94_thread_excludes_messages_not_addressed_to_or_from_caller() {
+    let backend = shared_backend();
+    let (registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:a");
+    let (registry_c, _rt_c) = build_actor_registry(backend, "lambda:c");
+
+    let sent = registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:b", "content": "private to B" }),
+        )
+        .await
+        .expect("A sends to B");
+    let root_id = sent["full_id"].as_str().expect("full_id").to_string();
+
+    // C is neither the sender nor the addressee of any row in this thread, even
+    // though C shares the same namespace and can resolve the root id.
+    let thread_from_c = registry_c
+        .dispatch("comm.thread", serde_json::json!({ "id": root_id }))
+        .await
+        .expect("C can resolve the root id but must see zero messages");
+    assert_eq!(
+        thread_from_c["count"].as_u64().unwrap_or(99),
+        0,
+        "an actor who is neither sender nor addressee must see zero thread messages \
+         (issue #94: thread previously exposed every actor's copies unfiltered); \
+         got {thread_from_c}"
+    );
+
+    // A, the actual sender, still sees it.
+    let thread_from_a = registry_a
+        .dispatch("comm.thread", serde_json::json!({ "id": root_id }))
+        .await
+        .expect("A reads own thread");
+    assert_eq!(thread_from_a["count"].as_u64().unwrap_or(0), 1);
+}
+
+/// A legacy message note lacking `to_actor` (pre-ADR-057 data, or directly
+/// store-inserted content) must remain visible via `comm.thread`'s actor
+/// scoping — the same EqOrMissing rule `comm.inbox` already applies for
+/// exactly this shape (ADR-057 Q3).
+#[tokio::test]
+async fn t94_thread_legacy_message_without_to_actor_stays_visible() {
+    let (registry, rt) = build_registry_for_ns("local");
+
+    let root = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "root" }),
+        )
+        .await
+        .expect("root send succeeds");
+    let root_full_id = root["full_id"].as_str().expect("root full_id").to_string();
+    let root_uuid = uuid::Uuid::parse_str(&root_full_id).unwrap();
+
+    // insert_thread_message stores only `from`/`to` (no from_actor/to_actor) —
+    // exactly the legacy shape this test guards.
+    let legacy_id = uuid::Uuid::new_v4();
+    insert_thread_message(
+        &rt,
+        "local",
+        legacy_id,
+        root_uuid,
+        chrono::Utc::now().timestamp_micros(),
+        "legacy no-to_actor",
+    )
+    .await;
+
+    let thread = registry
+        .dispatch("comm.thread", serde_json::json!({ "id": root_full_id }))
+        .await
+        .expect("thread succeeds");
+    let contents: Vec<&str> = thread["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["content"].as_str().unwrap_or(""))
+        .collect();
+    assert!(
+        contents.contains(&"legacy no-to_actor"),
+        "a message without to_actor must stay visible (EqOrMissing); got {contents:?}"
+    );
 }
 
 // ── #495: comm.send / comm.reply metadata (tags) passthrough ────────────────
@@ -7068,5 +7749,313 @@ async fn i820_anonymous_local_party_line_send_still_succeeds() {
         result.is_ok(),
         "unattributed to=local send must not be rejected by the #820 self-address guard; \
          got {result:?}"
+    );
+}
+
+// ── #113: reply is restricted to a thread participant ─────────────────────────
+
+/// A third party holding a message id (neither the sender nor the addressee)
+/// must not be able to reply to it.
+#[tokio::test]
+async fn i113_non_participant_reply_rejected() {
+    let backend = shared_backend();
+    let (registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:a");
+    let (registry_c, _rt_c) = build_actor_registry(backend.clone(), "lambda:c");
+
+    let send_result = registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:b", "content": "hello B from A" }),
+        )
+        .await
+        .expect("send succeeds");
+    let msg_id = send_result["full_id"]
+        .as_str()
+        .expect("full_id")
+        .to_string();
+
+    let err = registry_c
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({ "id": msg_id, "content": "forged reply from C" }),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("not addressed to or from caller actor"),
+        "non-participant reply must be rejected; got {err}"
+    );
+}
+
+/// An unattributed caller is still a distinct `local` actor and must not bypass
+/// participant checks for messages carrying explicit actor fields.
+#[tokio::test]
+async fn i113_anonymous_non_participant_reply_rejected() {
+    let backend = shared_backend();
+    let (registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:a");
+    let (registry_local, _rt_local) = build_crossns_registry(backend, "local", vec![]);
+
+    let send_result = registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:b", "content": "hello B from A" }),
+        )
+        .await
+        .expect("send succeeds");
+    let msg_id = send_result["full_id"]
+        .as_str()
+        .expect("full_id")
+        .to_string();
+
+    let err = registry_local
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({ "id": msg_id, "content": "forged anonymous reply" }),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("not addressed to or from caller actor"),
+        "anonymous non-participant reply must be rejected; got {err}"
+    );
+}
+
+/// The addressee (recipient) may reply — this is the common case.
+#[tokio::test]
+async fn i113_addressee_reply_succeeds() {
+    let backend = shared_backend();
+    let (registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:a");
+    let (registry_b, _rt_b) = build_actor_registry(backend.clone(), "lambda:b");
+
+    let send_result = registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:b", "content": "hello B from A" }),
+        )
+        .await
+        .expect("send succeeds");
+    let msg_id = send_result["full_id"]
+        .as_str()
+        .expect("full_id")
+        .to_string();
+
+    let reply = registry_b
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({ "id": msg_id, "content": "reply from B" }),
+        )
+        .await
+        .expect("addressee reply must succeed");
+    assert_eq!(reply["from"], "lambda:b");
+}
+
+/// The original sender may also reply to their own outbound message (e.g. a
+/// follow-up before the recipient has responded) — either party is a
+/// participant, not addressee-only.
+#[tokio::test]
+async fn i113_sender_reply_to_own_message_succeeds() {
+    let backend = shared_backend();
+    let (registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:a");
+
+    let send_result = registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:b", "content": "hello B from A" }),
+        )
+        .await
+        .expect("send succeeds");
+    let msg_id = send_result["full_id"]
+        .as_str()
+        .expect("full_id")
+        .to_string();
+
+    let reply = registry_a
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({ "id": msg_id, "content": "follow-up from A" }),
+        )
+        .await
+        .expect("sender reply to own message must succeed");
+    assert_eq!(reply["from"], "lambda:a");
+}
+
+/// A legacy message with neither `to_actor` nor `from_actor` fails open
+/// (no attributed party to restrict against), matching the #87/#94 precedent.
+#[tokio::test]
+async fn i113_legacy_message_without_actors_fails_open() {
+    use khive_storage::note::Note;
+
+    let (registry, rt) = build_registry_for_ns("local");
+    let token = rt
+        .authorize(khive_runtime::Namespace::parse("local").unwrap())
+        .unwrap();
+    let store = rt.notes(&token).expect("notes store");
+
+    let legacy =
+        Note::new("local", "message", "legacy message body").with_properties(serde_json::json!({
+            "direction": "inbound",
+            "sent_at": chrono::Utc::now().to_rfc3339(),
+        }));
+    let legacy_id = legacy.id;
+    store.upsert_note(legacy).await.expect("legacy note insert");
+
+    let reply = registry
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({ "id": legacy_id.to_string(), "content": "reply to legacy" }),
+        )
+        .await;
+    assert!(
+        reply.is_ok(),
+        "reply to a legacy message with no to_actor/from_actor must fail open; got {reply:?}"
+    );
+}
+
+// ── #66: comm.unread — count-only unread view ──────────────────────────────────
+
+#[tokio::test]
+async fn i66_unread_counts_only_matching_inbound_unread() {
+    let backend = shared_backend();
+    let (registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:a");
+    let (registry_b, _rt_b) = build_actor_registry(backend.clone(), "lambda:b");
+
+    registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:b", "content": "msg 1" }),
+        )
+        .await
+        .expect("send 1");
+    registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:b", "content": "msg 2" }),
+        )
+        .await
+        .expect("send 2");
+
+    let unread_before = registry_b
+        .dispatch("comm.unread", serde_json::json!({}))
+        .await
+        .expect("unread succeeds");
+    assert_eq!(unread_before["count"], 2);
+    assert_eq!(unread_before["actor"], "lambda:b");
+
+    // Mark B's own inbound copy of msg 2 read (the id `comm.inbox` returns for
+    // B, not the outbound `send` response's id); unread count must drop to 1.
+    let inbox = registry_b
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "unread", "limit": 50 }),
+        )
+        .await
+        .expect("inbox succeeds");
+    let msg2_inbound_id = inbox["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["preview"].as_str().unwrap_or("").contains("msg 2"))
+        .map(|m| m["full_id"].as_str().unwrap().to_string())
+        .expect("find B's inbound copy of msg 2");
+    registry_b
+        .dispatch("comm.read", serde_json::json!({ "id": msg2_inbound_id }))
+        .await
+        .expect("read succeeds");
+
+    let unread_after = registry_b
+        .dispatch("comm.unread", serde_json::json!({}))
+        .await
+        .expect("unread succeeds");
+    assert_eq!(unread_after["count"], 1);
+}
+
+/// `comm.unread` is caller-scoped and rejects the removed `assignee` override.
+#[tokio::test]
+async fn i66_unread_rejects_assignee_override() {
+    let backend = shared_backend();
+    let (registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:a");
+    let (registry_orch, _rt_o) = build_actor_registry(backend.clone(), "lambda:orch");
+
+    registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:b", "content": "msg for b" }),
+        )
+        .await
+        .expect("send succeeds");
+
+    let err = registry_orch
+        .dispatch("comm.unread", serde_json::json!({ "assignee": "lambda:b" }))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("unknown field `assignee`"),
+        "removed assignee override must be rejected as an unknown param; got {err}"
+    );
+
+    // Without the override, the orchestrator's own unread count is 0.
+    let own_unread = registry_orch
+        .dispatch("comm.unread", serde_json::json!({}))
+        .await
+        .expect("unread succeeds");
+    assert_eq!(own_unread["count"], 0);
+}
+
+/// `comm.inbox`'s response carries `unread_count` alongside `messages`/`count`.
+#[tokio::test]
+async fn i66_inbox_response_carries_unread_count() {
+    let backend = shared_backend();
+    let (registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:a");
+    let (registry_b, _rt_b) = build_actor_registry(backend.clone(), "lambda:b");
+
+    registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:b", "content": "msg 1" }),
+        )
+        .await
+        .expect("send 1");
+
+    let inbox = registry_b
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "unread", "limit": 50 }),
+        )
+        .await
+        .expect("inbox succeeds");
+    assert_eq!(inbox["count"], 1);
+    assert_eq!(
+        inbox["unread_count"], 1,
+        "unread_count must be present and match count when status=unread"
+    );
+}
+
+/// `limit=0` is the count-only inbox path: it returns no message payloads but
+/// still reports the caller's real unread total.
+#[tokio::test]
+async fn i66_inbox_limit_zero_carries_real_unread_count() {
+    let backend = shared_backend();
+    let (registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:a");
+    let (registry_b, _rt_b) = build_actor_registry(backend, "lambda:b");
+
+    registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:b", "content": "count me" }),
+        )
+        .await
+        .expect("send succeeds");
+
+    let inbox = registry_b
+        .dispatch("comm.inbox", serde_json::json!({ "limit": 0 }))
+        .await
+        .expect("limit=0 inbox succeeds");
+    assert_eq!(inbox["messages"], serde_json::json!([]));
+    assert_eq!(inbox["count"], 0);
+    assert_eq!(
+        inbox["unread_count"], 1,
+        "limit=0 must return the caller's real unread count"
     );
 }

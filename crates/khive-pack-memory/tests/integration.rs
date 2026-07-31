@@ -3108,10 +3108,9 @@ async fn test_recall_legacy_note_no_memory_type_returned_as_episodic() {
 /// #94 regression (budget cap): when the token budget caps the returned count below
 /// the requested `limit`, fewer results than `limit` are returned.
 ///
-/// The non-verbose path always returns a bare array; the budget-capped status is
-/// observable as a count < limit.  Budget signal fields (`budget_capped`,
-/// `truncated_for_budget`) are available on the verbose/breakdown path when the
-/// runtime loads two or more embedding models (multi-model production setup).
+/// The default budget-capped path returns an envelope with top-level
+/// `truncated: true`; each surviving result also retains its per-item signal.
+/// Uncapped responses remain bare arrays.
 #[tokio::test]
 async fn test_recall_budget_capped_surfaces_signal() {
     let rt = make_runtime();
@@ -3152,10 +3151,9 @@ async fn test_recall_budget_capped_surfaces_signal() {
         .await
         .expect("recall with tiny budget succeeds");
 
-    // Non-verbose path always returns a bare array regardless of budget state.
     let returned = result
         .as_array()
-        .expect("#94: recall must return a bare array on the non-verbose path");
+        .expect("#94: non-empty budget-capped recall keeps the bare-array shape");
     assert!(
         !returned.is_empty(),
         "#94: at least one result must fit within the budget"
@@ -3165,6 +3163,84 @@ async fn test_recall_budget_capped_surfaces_signal() {
         "#94: returned count ({}) must be < requested limit (5) when budget is exhausted; \
          prefix-cut is not working if all 5 fit in an 80-char budget",
         returned.len()
+    );
+
+    // #49: every item in a budget-capped bare-array response must carry an
+    // explicit `truncated: true` stamp, distinguishing "capped by budget" from
+    // "only N matched" without requiring include_breakdown.
+    for item in returned {
+        assert_eq!(
+            item.get("truncated").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "#49: budget-capped default-path result must carry truncated:true, got: {item}"
+        );
+    }
+}
+
+/// A budget cutoff at the first ranked candidate must remain distinguishable
+/// from a genuine recall miss even though both contain zero returned items.
+#[tokio::test]
+async fn test_recall_oversized_single_candidate_surfaces_top_level_truncation() {
+    let rt = make_runtime();
+    let registry = make_registry(rt.clone());
+
+    let query = "oversized single candidate budget regression";
+    registry
+        .dispatch(
+            "memory.remember",
+            json!({
+                "content": format!("{query} {}", "oversized".repeat(32)),
+                "salience": 0.8
+            }),
+        )
+        .await
+        .expect("remember oversized candidate");
+
+    let truncated = registry
+        .dispatch(
+            "memory.recall",
+            json!({
+                "query": query,
+                "limit": 1,
+                "config": {
+                    "scoring": {
+                        "default_token_budget": 1,
+                        "chars_per_token": 1,
+                        "mmr_penalty": 0.0
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("recall with oversized first candidate succeeds");
+
+    assert_eq!(
+        truncated
+            .get("truncated")
+            .and_then(serde_json::Value::as_bool),
+        Some(true),
+        "a budget cutoff at the first candidate must surface top-level truncated:true: {truncated}"
+    );
+    assert!(
+        truncated
+            .get("results")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(Vec::is_empty),
+        "the oversized candidate must not be returned: {truncated}"
+    );
+
+    let no_match = registry
+        .dispatch(
+            "memory.recall",
+            json!({ "query": "genuine unmatched recall phrase", "limit": 1 }),
+        )
+        .await
+        .expect("genuine no-match recall succeeds");
+
+    assert!(no_match.as_array().is_some_and(Vec::is_empty));
+    assert!(
+        no_match.get("truncated").is_none(),
+        "a genuine no-match must not carry a truncation signal: {no_match}"
     );
 }
 
@@ -3196,6 +3272,16 @@ async fn test_recall_no_budget_cap_returns_plain_array() {
         result.is_array(),
         "#94 no-cap path: recall must return a plain array; got: {result}"
     );
+
+    // #49: an uncapped result must NOT carry the truncated stamp — the field is
+    // present only when budget_capped is true, matching the pre-existing
+    // `degraded` stamp's absent-when-false convention.
+    for item in result.as_array().expect("array") {
+        assert!(
+            item.get("truncated").is_none(),
+            "#49: uncapped default-path result must not carry a truncated field, got: {item}"
+        );
+    }
 }
 
 /// #94 regression (rank order): when the token budget forces truncation, the
@@ -3272,10 +3358,9 @@ async fn test_recall_budget_truncation_preserves_rank_order() {
         .await
         .expect("recall with rank-order budget test");
 
-    // Non-verbose path returns a bare array.
     let returned = result
         .as_array()
-        .expect("#94 rank-order: recall must return a bare array");
+        .expect("#94 rank-order: non-empty budget-capped recall keeps the bare-array shape");
 
     // Exactly 1 result (rank #1 fits, prefix cut stops at rank #2 overflow).
     // Old retain would return 2 results: [rank#1, rank#3].

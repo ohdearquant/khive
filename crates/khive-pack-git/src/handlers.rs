@@ -141,13 +141,15 @@ impl GitPack {
             DigestSource::Remote { canonical, gh_slug } => {
                 let cloned = cache::ensure_clone(canonical).map_err(|e| {
                     RuntimeError::InvalidInput(format!(
-                        "remote clone/fetch of {canonical:?} failed: {e}"
+                        "remote clone/fetch of {:?} failed: {e}",
+                        redact_repo_url(canonical)
                     ))
                 })?;
                 if gh_slug.is_none() {
                     warnings.push(format!(
-                        "host for {canonical:?} is not github.com; issue/pull_request \
-                         ingestion is skipped (commits-only degradation, ADR-088 Amendment 1)"
+                        "host for {:?} is not github.com; issue/pull_request \
+                         ingestion is skipped (commits-only degradation, ADR-088 Amendment 1)",
+                        redact_repo_url(canonical)
                     ));
                 }
                 (cloned, gh_slug.is_some())
@@ -305,11 +307,23 @@ async fn resolve_or_create_project(
         .await
         .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
     if let Some((id, duplicates)) = slug_matches.split_first() {
+        // issue #6 item 2: a step-1 slug match used to return immediately
+        // without consulting legacy pre-slug anchors, so an older
+        // alternate-spelling anchor for the same repository never
+        // surfaced in the duplicate-anchor warning. Selection is
+        // unchanged (the slug-tier match still wins); this only widens
+        // what gets reported alongside it.
+        let mut slug_duplicates = duplicates.to_vec();
+        slug_duplicates.extend(
+            find_normalized_legacy_matches(runtime, token, &identity)
+                .await
+                .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?,
+        );
         return Ok(ProjectResolution {
             id: *id,
             created: false,
             orphan: None,
-            slug_duplicates: duplicates.to_vec(),
+            slug_duplicates,
         });
     }
 
@@ -537,6 +551,74 @@ async fn find_legacy_projects_without_slug(
         .collect())
 }
 
+/// Same shape as `find_legacy_projects_without_slug`, scoped to soft-deleted
+/// rows (`deleted_at IS NOT NULL`) instead of live ones, and carrying each
+/// row's own `deleted_at` so callers can merge-sort tombstones by recency
+/// alongside an exact-match set (issue #6 item 1).
+async fn find_soft_deleted_legacy_projects_without_slug(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+) -> anyhow::Result<Vec<(Uuid, String, i64)>> {
+    let sql = runtime.sql();
+    let mut r = sql.reader().await.map_err(|e| anyhow!("{e}"))?;
+    let rows = r
+        .query_all(SqlStatement {
+            sql: "SELECT id, deleted_at, json_extract(properties,'$.repo_url') AS repo_url \
+                  FROM entities WHERE kind='project' AND namespace=?1 \
+                  AND deleted_at IS NOT NULL \
+                  AND json_extract(properties,'$.repo_slug') IS NULL \
+                  AND json_extract(properties,'$.repo_url') IS NOT NULL"
+                .into(),
+            params: vec![SqlValue::Text(token.namespace().as_str().to_string())],
+            label: Some("git_digest_find_soft_deleted_legacy_projects_without_slug".into()),
+        })
+        .await
+        .map_err(|e| anyhow!("{e}"))?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| {
+            let id = match r.get("id") {
+                Some(SqlValue::Uuid(u)) => Some(*u),
+                Some(SqlValue::Text(s)) => Uuid::parse_str(s).ok(),
+                _ => None,
+            }?;
+            let deleted_at = match r.get("deleted_at") {
+                Some(SqlValue::Integer(n)) => *n,
+                _ => 0,
+            };
+            let url = match r.get("repo_url") {
+                Some(SqlValue::Text(s)) => Some(s.clone()),
+                _ => None,
+            }?;
+            Some((id, url, deleted_at))
+        })
+        .collect())
+}
+
+/// Scan every live legacy (pre-slug) project anchor and return the ids whose
+/// stored `repo_url` normalizes to the same `identity` as the caller's
+/// resolved source -- the same normalize-and-compare step ADR-088 Amendment
+/// 2 step 2 already applies, reused here to surface a cross-tier duplicate
+/// when a *different* tier's exact match already won (issue #6 item 2).
+async fn find_normalized_legacy_matches(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    identity: &str,
+) -> anyhow::Result<Vec<Uuid>> {
+    let legacy_candidates = find_legacy_projects_without_slug(runtime, token).await?;
+    let mut matches = Vec::new();
+    for (id, candidate_repo_url) in legacy_candidates {
+        if normalize_legacy_repo_url(&candidate_repo_url)
+            .await
+            .as_deref()
+            == Some(identity)
+        {
+            matches.push(id);
+        }
+    }
+    Ok(matches)
+}
+
 /// Re-derive the repo-identity slug a legacy anchor's stored `repo_url`
 /// would resolve to today (ADR-088 Amendment 2 step 2). A URL-shaped value
 /// normalizes directly via `remote_url_to_slug`. A path-shaped value (an
@@ -589,11 +671,10 @@ async fn find_orphaned_anchor(
     let mut r = sql.reader().await.map_err(|e| anyhow!("{e}"))?;
     let rows = r
         .query_all(SqlStatement {
-            sql: "SELECT id FROM entities WHERE kind='project' AND namespace=?1 \
+            sql: "SELECT id, deleted_at FROM entities WHERE kind='project' AND namespace=?1 \
                   AND deleted_at IS NOT NULL \
                   AND (json_extract(properties,'$.repo_slug')=?2 \
-                       OR json_extract(properties,'$.repo_url')=?3) \
-                  ORDER BY deleted_at DESC"
+                       OR json_extract(properties,'$.repo_url')=?3)"
                 .into(),
             params: vec![
                 SqlValue::Text(token.namespace().as_str().to_string()),
@@ -604,11 +685,49 @@ async fn find_orphaned_anchor(
         })
         .await
         .map_err(|e| anyhow!("{e}"))?;
-    let dead_project_ids = rows.into_iter().filter_map(|r| match r.get("id") {
-        Some(SqlValue::Uuid(u)) => Some(*u),
-        Some(SqlValue::Text(s)) => Uuid::parse_str(s).ok(),
-        _ => None,
-    });
+    let mut dead_projects: Vec<(Uuid, i64)> = rows
+        .iter()
+        .filter_map(|r| {
+            let id = match r.get("id") {
+                Some(SqlValue::Uuid(u)) => Some(*u),
+                Some(SqlValue::Text(s)) => Uuid::parse_str(s).ok(),
+                _ => None,
+            }?;
+            let deleted_at = match r.get("deleted_at") {
+                Some(SqlValue::Integer(n)) => *n,
+                _ => 0,
+            };
+            Some((id, deleted_at))
+        })
+        .collect();
+
+    // issue #6 item 1: the exact-match scan above misses a soft-deleted
+    // legacy anchor whose stored repo_url is an alternate spelling of the
+    // same repository (one that would normalize to the same identity).
+    // Extend the tombstone scan with the same normalize-and-compare step
+    // the live step-2 path already uses, scoped to soft-deleted rows.
+    let legacy_tombstones = find_soft_deleted_legacy_projects_without_slug(runtime, token)
+        .await
+        .map_err(|e| anyhow!("{e}"))?;
+    let already_matched: std::collections::HashSet<Uuid> =
+        dead_projects.iter().map(|(id, _)| *id).collect();
+    for (id, candidate_repo_url, deleted_at) in legacy_tombstones {
+        if already_matched.contains(&id) {
+            continue;
+        }
+        if normalize_legacy_repo_url(&candidate_repo_url)
+            .await
+            .as_deref()
+            == Some(identity)
+        {
+            dead_projects.push((id, deleted_at));
+        }
+    }
+    // Newest-deleted-first across both sources: the signal below fires for
+    // the first matching tombstone (newest first) that still has a live
+    // annotating corpus, per the doc comment above.
+    dead_projects.sort_by_key(|(_, deleted_at)| std::cmp::Reverse(*deleted_at));
+    let dead_project_ids = dead_projects.into_iter().map(|(id, _)| id);
 
     for dead_project_id in dead_project_ids {
         let count = r
@@ -1346,6 +1465,116 @@ mod tests {
             still_legacy,
             vec![ids[1]],
             "duplicate stays pre-slug; no third anchor minted"
+        );
+    }
+
+    /// Issue #6 item 1: a soft-deleted legacy (pre-slug) anchor whose stored
+    /// `repo_url` is an alternate spelling (here, a `.git` suffix) of the
+    /// same repository must still be detected by the orphan scan -- the
+    /// exact-match tombstone query alone would miss it.
+    #[tokio::test]
+    async fn orphaned_anchor_with_alternate_spelling_repo_url_is_still_flagged() {
+        let (rt, token, registry) = fixture().await;
+
+        let source = DigestSource::Remote {
+            canonical: "https://github.com/org/normalized-orphan-repo".to_string(),
+            gh_slug: Some(("org".to_string(), "normalized-orphan-repo".to_string())),
+        };
+
+        let dead = registry
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "project",
+                    "name": "normalized-orphan-repo",
+                    "properties": {
+                        "repo_url": "https://github.com/org/normalized-orphan-repo.git",
+                    },
+                }),
+            )
+            .await
+            .expect("create dead anchor");
+        let dead_id = Uuid::parse_str(dead["id"].as_str().unwrap()).expect("uuid");
+
+        create_note_annotating(&registry, "commit", "c1", dead_id).await;
+
+        let deleted = rt
+            .delete_entity(&token, dead_id, false)
+            .await
+            .expect("soft delete");
+        assert!(deleted);
+
+        let resolution = resolve_or_create_project(&rt, &registry, &token, &source)
+            .await
+            .expect("resolve");
+        assert!(
+            resolution.created,
+            "no live anchor matches -- a fresh one is minted"
+        );
+        let orphan = resolution.orphan.expect(
+            "issue #6: an alternate-spelling soft-deleted anchor must still be flagged as orphan",
+        );
+        assert_eq!(orphan.dead_project_id, dead_id);
+        assert_eq!(orphan.annotated_note_count, 1);
+    }
+
+    /// Issue #6 item 2: when a step-1 slug match wins resolution, a live
+    /// legacy (pre-slug) anchor for an alternate spelling of the same
+    /// repository must still surface in `slug_duplicates` -- previously,
+    /// resolution returned at step 1 without ever consulting legacy anchors.
+    #[tokio::test]
+    async fn slug_tier_match_surfaces_cross_tier_legacy_duplicate() {
+        let (rt, token, registry) = fixture().await;
+
+        let source = DigestSource::Remote {
+            canonical: "https://github.com/org/cross-tier-repo".to_string(),
+            gh_slug: Some(("org".to_string(), "cross-tier-repo".to_string())),
+        };
+
+        let winner = registry
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "project",
+                    "name": "cross-tier-repo",
+                    "properties": {
+                        "repo_url": "https://github.com/org/cross-tier-repo",
+                        "repo_slug": "github.com/org/cross-tier-repo",
+                    },
+                }),
+            )
+            .await
+            .expect("create winner anchor");
+        let winner_id = Uuid::parse_str(winner["id"].as_str().unwrap()).expect("uuid");
+
+        // A LIVE legacy (pre-slug) anchor, alternate `.git`-suffixed
+        // spelling of the same repo -- a different resolution tier than
+        // the step-1 winner above.
+        let legacy = registry
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "project",
+                    "name": "cross-tier-repo-legacy",
+                    "properties": {
+                        "repo_url": "https://github.com/org/cross-tier-repo.git",
+                    },
+                }),
+            )
+            .await
+            .expect("create legacy anchor");
+        let legacy_id = Uuid::parse_str(legacy["id"].as_str().unwrap()).expect("uuid");
+
+        let resolution = resolve_or_create_project(&rt, &registry, &token, &source)
+            .await
+            .expect("resolve");
+        assert_eq!(resolution.id, winner_id, "slug tier still wins selection");
+        assert!(!resolution.created);
+        assert!(
+            resolution.slug_duplicates.contains(&legacy_id),
+            "issue #6: a live legacy-tier anchor for the same identity must surface \
+             as a cross-tier duplicate; got {:?}",
+            resolution.slug_duplicates
         );
     }
 }

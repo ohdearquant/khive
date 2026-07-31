@@ -38,7 +38,7 @@ pub(crate) const COMM_CHANNEL_CURSOR_SCHEMA_STMT: &str =
     PRIMARY KEY (channel_kind, channel_slug)\
 )";
 
-pub(crate) static COMM_HANDLERS: [HandlerDef; 11] = [
+pub(crate) static COMM_HANDLERS: [HandlerDef; 12] = [
     HandlerDef {
         name: "comm.send",
         description: "Send a message, optionally threaded.",
@@ -126,6 +126,13 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 11] = [
             required: true,
             description: "Short 8-char prefix or full UUID of the inbound message to mark read. Outbound messages cannot be marked read.",
         }],
+    },
+    HandlerDef {
+        name: "comm.unread",
+        description: "Count-only view of the caller's unread inbound messages (same filter as inbox(status=\"unread\"), no message payloads).",
+        visibility: Visibility::Verb,
+        category: khive_types::VerbCategory::Assertive,
+        params: &[],
     },
     HandlerDef {
         name: "comm.reply",
@@ -367,7 +374,9 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 11] = [
     },
     HandlerDef {
         name: "comm.probe",
-        description: "Read-only poll for new inbound message metadata and stale unread count.",
+        description: "Read-only poll for new inbound message metadata and stale unread count. \
+                      Unlike comm.inbox, the actor is not inferred from the caller — pass it \
+                      explicitly via the required `actor` param (khive #93).",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[

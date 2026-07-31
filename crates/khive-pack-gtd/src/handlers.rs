@@ -665,6 +665,7 @@ pub async fn prepare_transition(
         )));
     }
 
+    let updated_at = Utc::now().timestamp_micros();
     let mut props = note.properties.clone().unwrap_or_else(|| json!({}));
     if let Some(obj) = props.as_object_mut() {
         obj.insert("status".into(), json!(target.to_string()));
@@ -674,8 +675,32 @@ pub async fn prepare_transition(
         if target == "done" {
             obj.insert("completed_at".into(), json!(Utc::now().to_rfc3339()));
         }
+
+        // #95: `transition_note` above is last-write-wins by design (it's the
+        // "latest note" quick-read field every existing caller already
+        // depends on) — but that means every note before the last one was
+        // gone with no trace anywhere in the record. `gtd_lifecycle_audit`
+        // (see `write_audit_record` below) already persists the full
+        // from/to/note/at history in SQL, so the storage-side history this
+        // issue asks about already exists; it just isn't surfaced back to a
+        // caller reading the task. `transition_history` mirrors that same
+        // per-transition record onto the note's own `properties` blob (a
+        // free-form JSON column — no schema/storage change needed) so a
+        // plain `get`/`tasks` read of the task, not just a raw SQL query
+        // against the audit table, shows the accumulated history.
+        let entry = json!({
+            "from": current,
+            "to": target,
+            "note": note_arg,
+            "at": micros_to_iso(updated_at),
+        });
+        match obj.get_mut("transition_history") {
+            Some(Value::Array(history)) => history.push(entry),
+            _ => {
+                obj.insert("transition_history".into(), json!([entry]));
+            }
+        }
     }
-    let updated_at = Utc::now().timestamp_micros();
 
     Ok(TransitionDecision::Write {
         note,
@@ -1149,8 +1174,8 @@ impl GtdPack {
         };
         let filter = NoteFilter {
             kind: Some("task".to_string()),
-            property_filters,
-            namespaces,
+            property_filters: property_filters.clone(),
+            namespaces: namespaces.clone(),
             ..Default::default()
         };
         let page = self
@@ -1168,6 +1193,52 @@ impl GtdPack {
             .map_err(|e| RuntimeError::Internal(format!("query_notes_filtered: {e}")))?;
 
         let result: Vec<Value> = page.items.iter().map(render_task).collect();
+
+        // #96: a bare `[]` is indistinguishable from "no such task" when the
+        // *default* terminal-status exclusion is what emptied the result —
+        // the common case a caller hits right after `gtd.complete`. Probe for
+        // a terminal task with the same namespace/assignee/priority filters
+        // before changing the response shape; other empty results keep the
+        // established bare array.
+        if result.is_empty() && status_filter.is_none() {
+            property_filters[0] = PropertyFilter {
+                json_path: "$.status".to_string(),
+                op: FilterOp::In(vec![
+                    SqlValue::Text("done".to_string()),
+                    SqlValue::Text("cancelled".to_string()),
+                ]),
+                value: SqlValue::Null,
+            };
+            let terminal_filter = NoteFilter {
+                kind: Some("task".to_string()),
+                property_filters,
+                namespaces,
+                ..Default::default()
+            };
+            let terminal_page = self
+                .runtime()
+                .notes(token)?
+                .query_notes_filtered(
+                    token.namespace().as_str(),
+                    &terminal_filter,
+                    PageRequest {
+                        limit: 1,
+                        offset: 0,
+                    },
+                )
+                .await
+                .map_err(|e| RuntimeError::Internal(format!("query_notes_filtered: {e}")))?;
+
+            if !terminal_page.items.is_empty() {
+                return Ok(json!({
+                    "tasks": result,
+                    "filter_excluded": ["done", "cancelled"],
+                    "hint": "no tasks matched, but the default filter excludes done/cancelled \
+                              tasks — pass status=\"done\" or status=\"cancelled\" to check \
+                              whether a completed task exists before concluding it doesn't",
+                }));
+            }
+        }
         Ok(Value::Array(result))
     }
 

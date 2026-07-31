@@ -158,7 +158,7 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
     // Assertive: retrieves memory notes via decay-aware ranking
     HandlerDef {
         name: "memory.recall",
-        description: "Recall memory notes with decay-aware hybrid ranking. Each hit carries resolved (read-model) values: memory_type defaults to \"episodic\" when not stored, salience and decay_factor reflect the effective defaults used for ranking.",
+        description: "Recall memory notes with decay-aware hybrid ranking. Each hit carries resolved (read-model) values: memory_type defaults to \"episodic\" when not stored, salience and decay_factor reflect the effective defaults used for ranking. Default responses are arrays; budget-capped hits carry truncated: true per result. When the budget removes every ranked candidate, the response is {results: [], truncated: true} so the cutoff stays distinguishable from a genuine no-match.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -481,11 +481,25 @@ impl MemoryPack {
         .await
         {
             Ok(result) => result,
-            Err(_) => Err(RuntimeError::DeadlineExceeded {
-                operation: "memory.recall".to_string(),
-                budget_ms,
-                elapsed_ms: start.elapsed().as_millis() as u64,
-            }),
+            Err(_) => {
+                let elapsed_ms = start.elapsed().as_millis() as u64;
+                // #30/#889: the deadline-exceeded case is exactly the incident this
+                // issue reports (a recall that never returns, no daemon-side trace)
+                // -- the request never reaches recall.rs's own slow-request WARN
+                // because `handle_recall`'s future is dropped, not completed. Log
+                // it here, at the one call site every recall passes through.
+                tracing::warn!(
+                    operation = "memory.recall",
+                    budget_ms,
+                    elapsed_ms,
+                    "memory.recall exceeded its deadline and was abandoned"
+                );
+                Err(RuntimeError::DeadlineExceeded {
+                    operation: "memory.recall".to_string(),
+                    budget_ms,
+                    elapsed_ms,
+                })
+            }
         }
     }
 }

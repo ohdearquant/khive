@@ -22,6 +22,8 @@ const DEFAULT_WAL_AUTOCHECKPOINT_PAGES: u32 = 4000;
 const DEFAULT_JOURNAL_SIZE_LIMIT_BYTES: i64 = 67_108_864; // 64 MiB
 const DEFAULT_WRITE_QUEUE_CAPACITY: usize = 256;
 
+const TEST_HARNESS_ENV: &str = "KHIVE_TEST_HARNESS";
+
 /// Configuration for the connection pool.
 #[derive(Clone, Debug)]
 pub struct PoolConfig {
@@ -119,6 +121,96 @@ impl Default for PoolConfig {
                 .unwrap_or(DEFAULT_WRITE_QUEUE_CAPACITY),
         }
     }
+}
+
+/// Prevent Cargo-launched tests and test subprocesses from opening the
+/// operator's default data tree in every build profile. Activation is solely
+/// the runtime `KHIVE_TEST_HARNESS=1` marker; production/installed binaries do
+/// not receive that workspace Cargo environment.
+///
+/// There is deliberately no environment override: any inheritable escape
+/// hatch set for one Cargo invocation leaks into the next `cargo test` in the
+/// same shell and re-opens the store the guard exists to protect. A deliberate
+/// session against the real store runs the built binary directly (for example
+/// `target/release/...` or an installed binary), which never receives the
+/// workspace Cargo environment and therefore never trips this guard.
+/// Existing path ancestors are canonicalized before comparison, resolving
+/// traversal, symlinks, and filesystem-provided case (including APFS case
+/// folding). Missing trailing components remain lexical because they have no
+/// filesystem identity yet. SQLite URI paths are rejected rather than trying
+/// to reproduce SQLite's URI normalization rules.
+fn refuse_home_data_store_in_tests(config: &PoolConfig) -> Result<(), SqliteError> {
+    if std::env::var(TEST_HARNESS_ENV).as_deref() != Ok("1") {
+        return Ok(());
+    }
+
+    let Some(path) = config.path.as_deref() else {
+        return Ok(());
+    };
+    if path
+        .as_os_str()
+        .as_encoded_bytes()
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"file:"))
+    {
+        return Err(SqliteError::InvalidData(format!(
+            "test harness refused SQLite URI database path {}; use a filesystem path outside \
+             HOME/.khive (deliberate sessions against a real store run the built binary \
+             directly, outside the Cargo test environment)",
+            path.display()
+        )));
+    }
+
+    let Some(home) = std::env::var_os("HOME") else {
+        return Ok(());
+    };
+    let canonical_path = canonicalize_deepest_existing(path)?;
+    let canonical_home_data_dir =
+        canonicalize_deepest_existing(&PathBuf::from(home).join(".khive"))?;
+    if canonical_path.starts_with(&canonical_home_data_dir) {
+        return Err(SqliteError::InvalidData(format!(
+            "test harness refused to open SQLite database under HOME/.khive: {} \
+             (deliberate sessions against a real store run the built binary directly, \
+             outside the Cargo test environment)",
+            canonical_path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn canonicalize_deepest_existing(path: &Path) -> Result<PathBuf, SqliteError> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().map_err(SqliteError::Io)?.join(path)
+    };
+
+    for ancestor in absolute.ancestors() {
+        match fs::canonicalize(ancestor) {
+            Ok(mut canonical) => {
+                let missing = absolute.strip_prefix(ancestor).map_err(|error| {
+                    SqliteError::InvalidData(format!(
+                        "failed to preserve missing path components for {}: {error}",
+                        absolute.display()
+                    ))
+                })?;
+                canonical.push(missing);
+                return Ok(canonical);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(SqliteError::InvalidData(format!(
+                    "failed to canonicalize database path ancestor {}: {error}",
+                    ancestor.display()
+                )));
+            }
+        }
+    }
+
+    Err(SqliteError::InvalidData(format!(
+        "database path has no canonicalizable ancestor: {}",
+        absolute.display()
+    )))
 }
 
 /// A read-write connection pool for SQLite.
@@ -281,6 +373,8 @@ impl ConnectionPool {
     /// WAL is disabled or unavailable, the pool falls back to single-connection
     /// mode.
     pub fn new(config: PoolConfig) -> Result<Self, SqliteError> {
+        refuse_home_data_store_in_tests(&config)?;
+
         let writer = open_writer_connection(&config)?;
         let wal_enabled = configure_writer_connection(&writer, &config)?;
         let max_readers = effective_reader_count(&config, wal_enabled);
@@ -932,10 +1026,56 @@ mod tests {
         }
     }
 
+    const POOL_ENV_VARS: [&str; 6] = [
+        "KHIVE_BUSY_TIMEOUT_SECS",
+        "KHIVE_CHECKOUT_TIMEOUT_SECS",
+        "KHIVE_WAL_AUTOCHECKPOINT_PAGES",
+        "KHIVE_JOURNAL_SIZE_LIMIT_BYTES",
+        "KHIVE_WRITE_QUEUE",
+        "KHIVE_WRITE_QUEUE_CAPACITY",
+    ];
+
+    struct PoolEnvGuard {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl PoolEnvGuard {
+        fn capture() -> Self {
+            Self {
+                saved: POOL_ENV_VARS
+                    .into_iter()
+                    .map(|key| (key, std::env::var_os(key)))
+                    .collect(),
+            }
+        }
+    }
+
+    impl Drop for PoolEnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.saved {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    fn clear_pool_env() -> PoolEnvGuard {
+        let guard = PoolEnvGuard::capture();
+        for var in POOL_ENV_VARS {
+            std::env::remove_var(var);
+        }
+        guard
+    }
+
     #[test]
     #[serial]
     fn pool_config_default_values_match_constants() {
-        // Ensure defaults are not accidentally changed.
+        // Ensure defaults are not accidentally changed. The process env may
+        // legitimately carry overrides (CI jobs set KHIVE_CHECKOUT_TIMEOUT_SECS),
+        // so clear them first — this test asserts the constants, not the env.
+        let _pool_env = clear_pool_env();
         let cfg = PoolConfig::default();
         assert_eq!(
             cfg.wal_autocheckpoint_pages,
@@ -988,9 +1128,27 @@ mod tests {
     #[test]
     #[serial]
     fn pool_config_write_queue_defaults_off() {
+        let _pool_env = clear_pool_env();
         let cfg = PoolConfig::default();
         assert!(!cfg.write_queue_enabled);
         assert_eq!(cfg.write_queue_capacity, DEFAULT_WRITE_QUEUE_CAPACITY);
+    }
+
+    #[test]
+    #[serial]
+    fn clear_pool_env_restores_overrides_on_drop() {
+        let _ambient_env = PoolEnvGuard::capture();
+        std::env::set_var("KHIVE_BUSY_TIMEOUT_SECS", "73");
+
+        {
+            let _pool_env = clear_pool_env();
+            assert_eq!(std::env::var_os("KHIVE_BUSY_TIMEOUT_SECS"), None);
+        }
+
+        assert_eq!(
+            std::env::var_os("KHIVE_BUSY_TIMEOUT_SECS"),
+            Some(std::ffi::OsString::from("73"))
+        );
     }
 
     #[test]

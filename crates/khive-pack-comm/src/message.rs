@@ -117,6 +117,18 @@ fn build_preview(content: &str) -> String {
 /// namespace), rolling back the outbound note if the inbound write fails
 /// (atomicity guarantee). Returns the outbound `Note` on success.
 ///
+/// Known gap (external desk review, 2026-07-21): the two `create_note` calls
+/// below are not wrapped in one DB transaction, so a process crash between
+/// them (as opposed to an in-process error, which the rollback above already
+/// handles) can still leave a durable orphan outbound note with no inbound
+/// copy. `khive-runtime` exposes a lower-level atomic primitive
+/// (`run_atomic_unit`/`AtomicOpPlan::AddNote`) that spans one transaction, but
+/// it bypasses `create_note_inner`'s FTS/embedding/decay handling, so using it
+/// here would require re-deriving that logic at the pack layer rather than
+/// wrapping the existing calls. Blocked on `khive-runtime` exposing a
+/// transaction-scoped `create_note` equivalent; not safe to hack around from
+/// this crate.
+///
 /// Invariant: when `thread_id` is `None` (root send), both copies are patched
 /// to share the sender's outbound UUID as their canonical `thread_id`, so
 /// `comm.thread` finds replies regardless of which copy they replied to. When

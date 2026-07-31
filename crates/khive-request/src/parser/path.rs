@@ -7,6 +7,11 @@ use serde_json::Value;
 pub(crate) enum PathSegment<'a> {
     Field(&'a str),
     Index(usize),
+    /// Bracket syntax that is not a valid non-negative-integer index, e.g.
+    /// `[abc]` or `[-1]`. Always a lookup miss (see `apply_path_segment`);
+    /// kept distinct from `Field` so callers building error messages can
+    /// tell "no such field" apart from "this isn't a supported path form".
+    Malformed(&'a str),
 }
 
 /// Splits a `$prev` path into field and index segments.
@@ -25,7 +30,7 @@ pub(crate) fn split_path(path: &str) -> Vec<PathSegment<'_>> {
                 }
             }
             // Preserve malformed quoted paths as a lookup miss, never a partial match.
-            segments.push(PathSegment::Field(remaining));
+            segments.push(PathSegment::Malformed(remaining));
             break;
         }
         let end = remaining.find(['.', '[']).unwrap_or(remaining.len());
@@ -44,5 +49,6 @@ pub(crate) fn apply_path_segment<'a>(cur: &'a Value, seg: PathSegment<'_>) -> Op
     match seg {
         PathSegment::Field(key) => cur.get(key),
         PathSegment::Index(idx) => cur.as_array()?.get(idx),
+        PathSegment::Malformed(_) => None,
     }
 }

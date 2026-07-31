@@ -80,6 +80,18 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 19] = [
                 required: false,
                 description: "Pagination offset",
             },
+            ParamDef {
+                name: "status",
+                param_type: "string | array<string>",
+                required: false,
+                description: "Filter atoms to this status or set of statuses (e.g. \"draft\" or [\"draft\",\"reviewed\"]). Ignored for domains.",
+            },
+            ParamDef {
+                name: "exclude_status",
+                param_type: "string",
+                required: false,
+                description: "Exclude atoms with this exact status. Only used when status= is not set. Ignored for domains.",
+            },
         ],
     },
     HandlerDef {
@@ -87,12 +99,20 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 19] = [
         description: "Soft-delete atoms by slug or ID",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
-        params: &[ParamDef {
-            name: "ids",
-            param_type: "array<string>",
-            required: true,
-            description: "Atom slugs or UUIDs to delete",
-        }],
+        params: &[
+            ParamDef {
+                name: "ids",
+                param_type: "array<string>",
+                required: true,
+                description: "Atom slugs or UUIDs to delete",
+            },
+            ParamDef {
+                name: "cascade",
+                param_type: "boolean",
+                required: false,
+                description: "Deprecated no-op. Accepted for API compatibility but not yet implemented; sections are not cascade-deleted when atoms are soft-deleted.",
+            },
+        ],
     },
     HandlerDef {
         name: "knowledge.stats",
@@ -143,7 +163,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 19] = [
                 name: "candidates",
                 param_type: "array<object>",
                 required: true,
-                description: "Scored items: {id, score, size, content?, category?}",
+                description: "Scored items: {id, score, size, name?, content?, category?, information_gain?}. `knowledge.suggest`'s `results` feed this directly.",
             },
             ParamDef {
                 name: "budget",
@@ -162,6 +182,18 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 19] = [
                 param_type: "object",
                 required: false,
                 description: "Per-category score multipliers",
+            },
+            ParamDef {
+                name: "diversity_bias",
+                param_type: "number",
+                required: false,
+                description: "Selector diversity bias weight (default 0.0; must be finite)",
+            },
+            ParamDef {
+                name: "epistemic_weight",
+                param_type: "number",
+                required: false,
+                description: "Selector weight applied to each candidate's information_gain (default 0.0; must be finite)",
             },
         ],
     },
@@ -259,7 +291,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 19] = [
     },
     HandlerDef {
         name: "knowledge.suggest",
-        description: "Suggest relevant knowledge domains for a query. Draft and deprecated domain atoms are excluded by default (same quality default as knowledge.search).",
+        description: "Suggest relevant knowledge domains for a query. Draft and deprecated domain atoms are excluded by default (same quality default as knowledge.search). Each result carries {id, name, score, size} — `size` is the aggregate estimated-token cost of the domain's member atom bodies that compose expands, in the same unit as `knowledge.fold`'s `budget`, so results feed `knowledge.fold(candidates=...)` directly with no caller-side field construction. When ANN candidate retrieval is unavailable, the response sets `ann_unavailable: true` and reports `degraded.mode`: `no_match` when lexical/FTS retrieval found no candidates, `ann_candidates_degraded` when lexical/FTS candidates still received fresh embedding cosine reranking, or `lexical_only` when that fresh rerank did not run.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -312,6 +344,24 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 19] = [
                 param_type: "boolean",
                 required: false,
                 description: "Blend relevant KG concept/document entities into the briefing as a supplementary \"Knowledge graph\" section (default true). Has no effect on atom_ids-only calls, which never blend.",
+            },
+            ParamDef {
+                name: "auto_limit",
+                param_type: "integer",
+                required: false,
+                description: "Number of domains to auto-suggest from `query` when both domain_ids and atom_ids are empty (default 5, clamped 1-20).",
+            },
+            ParamDef {
+                name: "max_tokens",
+                param_type: "integer",
+                required: false,
+                description: "Output token budget for the composed briefing (default 8000, clamped 500-100000; ~4 chars/token). Sections are trimmed to fit after scoring/selection.",
+            },
+            ParamDef {
+                name: "explain",
+                param_type: "boolean",
+                required: false,
+                description: "Include per-section score breakdowns in the response (default false).",
             },
         ],
     },
@@ -439,14 +489,14 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 19] = [
             ParamDef {
                 name: "name",
                 param_type: "string",
-                required: true,
-                description: "Concept name",
+                required: false,
+                description: "Concept name. When omitted, auto-derived from `description`/`content` (truncated to the last word boundary <=60 chars); at least one of name or description/content must be non-empty.",
             },
             ParamDef {
                 name: "description",
                 param_type: "string",
                 required: false,
-                description: "Optional concept description",
+                description: "Optional concept description. Also accepted as `content` (alias) for UX consistency.",
             },
             ParamDef {
                 name: "domain",
@@ -484,7 +534,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 19] = [
                 name: "weight",
                 param_type: "float",
                 required: false,
-                description: "Edge weight; defaults to 1.0",
+                description: "Edge weight; defaults to 1.0, clamped 0.0-1.0",
             },
         ],
     },
@@ -577,5 +627,129 @@ mod tests {
             sections.description.contains("closed enum"),
             "knowledge.edit sections description must state that section_type is a closed enum"
         );
+    }
+
+    /// Parameter-parity guard (cross-model tooling evaluation, "compose budget
+    /// discoverability"): the top-level field names each handler's `#[derive(Deserialize)]`
+    /// params struct actually accepts, hand-kept in sync with
+    /// `src/knowledge/schema.rs` and `src/handlers.rs`. Every verb's entry here must be
+    /// exactly the set of top-level param names advertised in `KNOWLEDGE_HANDLERS` for
+    /// that verb (order-independent) -- so a field added to a params struct without a
+    /// matching `ParamDef` (or a stale `ParamDef` for a removed field) fails this test
+    /// instead of silently drifting from the actual accepted request shape.
+    ///
+    /// Nested/child structs (e.g. `AtomInput` within `upsert_atoms.atoms`,
+    /// `FoldCandidate` within `fold.candidates`) are documented in prose inside the
+    /// parent `ParamDef.description` rather than as separate top-level entries here.
+    fn expected_params() -> &'static [(&'static str, &'static [&'static str])] {
+        &[
+            ("knowledge.upsert_atoms", &["atoms", "chunk_size"]),
+            ("knowledge.upsert_domains", &["domains"]),
+            ("knowledge.get", &["id", "include_sections"]),
+            (
+                "knowledge.list",
+                &["type", "limit", "offset", "status", "exclude_status"],
+            ),
+            ("knowledge.delete_atoms", &["ids", "cascade"]),
+            ("knowledge.stats", &[]),
+            (
+                "knowledge.index",
+                &["ids", "batch_size", "insert_only", "rebuild_ann"],
+            ),
+            (
+                "knowledge.fold",
+                &[
+                    "candidates",
+                    "budget",
+                    "min_score",
+                    "category_weights",
+                    "diversity_bias",
+                    "epistemic_weight",
+                ],
+            ),
+            (
+                "knowledge.search",
+                &[
+                    "query",
+                    "type",
+                    "include_drafts",
+                    "status",
+                    "exclude_status",
+                    "role",
+                    "limit",
+                    "min_score",
+                    "weights",
+                    "decompose",
+                    "decompose_threshold",
+                    "intersection_bonus",
+                    "rerank",
+                    "rerank_alpha",
+                ],
+            ),
+            ("knowledge.suggest", &["query", "role", "limit"]),
+            (
+                "knowledge.compose",
+                &[
+                    "domain_ids",
+                    "atom_ids",
+                    "query",
+                    "blend_kg",
+                    "auto_limit",
+                    "max_tokens",
+                    "explain",
+                ],
+            ),
+            ("knowledge.edit", &["id", "sections"]),
+            ("knowledge.import", &["path", "format", "chunk_strategy"]),
+            (
+                "knowledge.challenge",
+                &["atom_id", "section_type", "content_hash", "reason"],
+            ),
+            (
+                "knowledge.adjudicate",
+                &["atom_id", "section_type", "content_hash", "resolution"],
+            ),
+            (
+                "knowledge.learn",
+                &["name", "description", "domain", "tags"],
+            ),
+            ("knowledge.cite", &["concept_id", "source_id", "weight"]),
+            ("knowledge.topic", &["domain", "query", "limit"]),
+            ("knowledge.feedback", &["section_signals", "target_id"]),
+        ]
+    }
+
+    #[test]
+    fn advertised_params_match_expected_deserialized_fields_for_every_verb() {
+        for (verb, expected) in expected_params() {
+            let h = find_handler(verb);
+            let mut advertised: Vec<&str> = h.params.iter().map(|p| p.name).collect();
+            let mut expected: Vec<&str> = expected.to_vec();
+            advertised.sort_unstable();
+            expected.sort_unstable();
+            assert_eq!(
+                advertised, expected,
+                "{verb}: advertised params {advertised:?} do not match the params \
+                 struct's deserialized fields {expected:?} -- update either the \
+                 `ParamDef`s in KNOWLEDGE_HANDLERS or the `expected_params()` table \
+                 in this test (whichever is stale)"
+            );
+        }
+    }
+
+    /// Every verb declared in `KNOWLEDGE_HANDLERS` must have a parity row above --
+    /// otherwise a newly added verb could silently escape this guard.
+    #[test]
+    fn every_handler_has_a_parity_row() {
+        let covered: std::collections::HashSet<&str> =
+            expected_params().iter().map(|(name, _)| *name).collect();
+        for h in KNOWLEDGE_HANDLERS.iter() {
+            assert!(
+                covered.contains(h.name),
+                "{}: no entry in expected_params() -- add one so parameter drift \
+                 on this verb cannot silently return",
+                h.name
+            );
+        }
     }
 }

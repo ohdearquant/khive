@@ -23,8 +23,8 @@ pub use profile::{
 pub use query_class::compute_query_class;
 pub use section_state::{
     derive_deterministic_weights, derive_weights, SectionPosteriorSnapshot, SectionPosteriorState,
-    DEFAULT_ESS_CAP, DEFAULT_EXPLORATION_EPOCH, DEFAULT_SECTION_WEIGHT_FLOOR, DEFAULT_TAU_0,
-    DEFAULT_TAU_EXPLOIT,
+    DEFAULT_ESS_CAP, DEFAULT_EXPLORATION_EPOCH, DEFAULT_LCB_Z, DEFAULT_SECTION_WEIGHT_FLOOR,
+    DEFAULT_TAU_0, DEFAULT_TAU_EXPLOIT,
 };
 pub use section_type::SectionType;
 pub use signal::{FeedbackEventKind, FeedbackSignal};

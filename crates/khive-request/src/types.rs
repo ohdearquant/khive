@@ -127,6 +127,249 @@ impl ArgValue {
             }
         }
     }
+
+    /// Finds the first `$prev` reference within this argument that fails to
+    /// resolve against `prev_result`, and explains why. `None` means every
+    /// reference resolves (consistent with `resolve_all(prev_result).is_some()`)
+    /// or this argument holds no `$prev` reference at all.
+    ///
+    /// Walks the same segments as `resolve_prev`/`resolve_all` but never
+    /// changes what resolves — it exists purely to build an actionable error
+    /// message for a `resolve_all` miss.
+    pub fn find_prev_failure(&self, prev_result: &Value) -> Option<PrevFailure> {
+        self.find_prev_failure_at("", prev_result)
+    }
+
+    fn find_prev_failure_at(&self, arg_path: &str, prev_result: &Value) -> Option<PrevFailure> {
+        match self {
+            ArgValue::Value(_) => None,
+            ArgValue::PrevRef { path } => {
+                // Empty path = whole-value reference; always resolves. Its
+                // downstream shape (bare $prev onto a map/array) is a
+                // separate, already-handled concern (UE4-H1), not a lookup miss.
+                if path.is_empty() {
+                    return None;
+                }
+                let mut cur = prev_result;
+                let mut resolved_prefix = String::new();
+                for seg in crate::parser::split_path(path) {
+                    match seg {
+                        crate::parser::PathSegment::Field(key) => match cur {
+                            Value::Object(map) => match map.get(key) {
+                                Some(v) => {
+                                    cur = v;
+                                    if !resolved_prefix.is_empty() {
+                                        resolved_prefix.push('.');
+                                    }
+                                    resolved_prefix.push_str(key);
+                                }
+                                None => {
+                                    let mut available: Vec<String> = map.keys().cloned().collect();
+                                    available.sort_unstable();
+                                    return Some(PrevFailure::NotFound {
+                                        arg_path: arg_path.to_string(),
+                                        prev_path: render_prev_path(path),
+                                        resolved_prefix: prev_path_prefix(&resolved_prefix),
+                                        missing: key.to_string(),
+                                        available,
+                                    });
+                                }
+                            },
+                            other => {
+                                return Some(PrevFailure::WrongType {
+                                    arg_path: arg_path.to_string(),
+                                    prev_path: render_prev_path(path),
+                                    resolved_prefix: prev_path_prefix(&resolved_prefix),
+                                    segment: key.to_string(),
+                                    expected: "object",
+                                    found: json_type_name(other),
+                                });
+                            }
+                        },
+                        crate::parser::PathSegment::Index(idx) => match cur {
+                            Value::Array(arr) => match arr.get(idx) {
+                                Some(v) => {
+                                    cur = v;
+                                    resolved_prefix.push_str(&format!("[{idx}]"));
+                                }
+                                None => {
+                                    return Some(PrevFailure::NotFound {
+                                        arg_path: arg_path.to_string(),
+                                        prev_path: render_prev_path(path),
+                                        resolved_prefix: prev_path_prefix(&resolved_prefix),
+                                        missing: format!("[{idx}]"),
+                                        available: vec![format!(
+                                            "array has {} element(s)",
+                                            arr.len()
+                                        )],
+                                    });
+                                }
+                            },
+                            other => {
+                                return Some(PrevFailure::WrongType {
+                                    arg_path: arg_path.to_string(),
+                                    prev_path: render_prev_path(path),
+                                    resolved_prefix: prev_path_prefix(&resolved_prefix),
+                                    segment: format!("[{idx}]"),
+                                    expected: "array",
+                                    found: json_type_name(other),
+                                });
+                            }
+                        },
+                        crate::parser::PathSegment::Malformed(raw) => {
+                            return Some(PrevFailure::Unsupported {
+                                arg_path: arg_path.to_string(),
+                                prev_path: render_prev_path(path),
+                                segment: raw.to_string(),
+                            });
+                        }
+                    }
+                }
+                None
+            }
+            ArgValue::Array(elements) => elements.iter().enumerate().find_map(|(i, el)| {
+                el.find_prev_failure_at(&format!("{arg_path}[{i}]"), prev_result)
+            }),
+            ArgValue::Object(pairs) => pairs.iter().find_map(|(k, v)| {
+                let sub = if arg_path.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{arg_path}.{k}")
+                };
+                v.find_prev_failure_at(&sub, prev_result)
+            }),
+        }
+    }
+}
+
+fn render_prev_path(path: &str) -> String {
+    format!("$prev.{path}").replace(".[", "[")
+}
+
+/// Renders the `$prev`-relative path successfully traversed before a failure,
+/// for messages like "`$prev.user` is a string, not an object".
+fn prev_path_prefix(resolved_prefix: &str) -> String {
+    if resolved_prefix.is_empty() {
+        "$prev".to_string()
+    } else {
+        format!("$prev.{resolved_prefix}")
+    }
+}
+
+fn json_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+/// Explains why a `$prev` path failed to resolve, for error-message
+/// construction. Distinguishes three mistakes that a single generic
+/// "not found" message conflates:
+///
+/// - the field/index simply isn't there (`NotFound`);
+/// - a segment expects an object or array to index into, but the prior
+///   result holds a scalar at that point (`WrongType`);
+/// - the bracket syntax itself isn't a supported index form (`Unsupported`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum PrevFailure {
+    /// A path segment names a field or index that does not exist on an
+    /// otherwise correctly-typed container.
+    NotFound {
+        /// Path to the offending `$prev` reference within the verb argument
+        /// it appears in (empty when the argument itself is the reference).
+        arg_path: String,
+        /// The full `$prev` path that was attempted, e.g. `$prev.user.id`.
+        prev_path: String,
+        /// The `$prev`-relative path successfully traversed before the miss.
+        resolved_prefix: String,
+        /// The field name or `[index]` that could not be found.
+        missing: String,
+        /// Sibling field names (object) or a length note (array) at the
+        /// point of failure.
+        available: Vec<String>,
+    },
+    /// A path segment expects an object (for a field) or an array (for an
+    /// index) to continue into, but the prior result holds a different JSON
+    /// type at that point.
+    WrongType {
+        arg_path: String,
+        prev_path: String,
+        /// The `$prev`-relative path successfully traversed before the type
+        /// mismatch — this is what actually holds `found`.
+        resolved_prefix: String,
+        /// The field name or `[index]` that could not be applied.
+        segment: String,
+        expected: &'static str,
+        found: &'static str,
+    },
+    /// Bracket syntax that is not a valid non-negative-integer index.
+    Unsupported {
+        arg_path: String,
+        prev_path: String,
+        /// The unsupported segment as written, e.g. `[bad]`.
+        segment: String,
+    },
+}
+
+impl fmt::Display for PrevFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn arg_ref(arg_path: &str) -> String {
+            if arg_path.is_empty() {
+                String::new()
+            } else {
+                format!(" (at {arg_path})")
+            }
+        }
+        match self {
+            PrevFailure::NotFound {
+                arg_path,
+                prev_path,
+                resolved_prefix,
+                missing,
+                available,
+            } => {
+                write!(
+                    f,
+                    "{prev_path}{arg}: {resolved_prefix} has no {missing:?}. \
+                     Available top-level fields: [{}]",
+                    available.join(", "),
+                    arg = arg_ref(arg_path),
+                )
+            }
+            PrevFailure::WrongType {
+                arg_path,
+                prev_path,
+                resolved_prefix,
+                segment,
+                expected,
+                found,
+            } => {
+                write!(
+                    f,
+                    "{prev_path}{arg}: {resolved_prefix} is a {found}, not an {expected}, so \
+                     {segment:?} cannot be applied to it",
+                    arg = arg_ref(arg_path),
+                )
+            }
+            PrevFailure::Unsupported {
+                arg_path,
+                prev_path,
+                segment,
+            } => {
+                write!(
+                    f,
+                    "{prev_path}{arg}: {segment:?} is not a supported $prev path segment; \
+                     array indices must be a plain non-negative integer, e.g. $prev.items[0]",
+                    arg = arg_ref(arg_path),
+                )
+            }
+        }
+    }
 }
 
 /// One parsed tool name and its deterministically ordered named arguments.
