@@ -4735,3 +4735,55 @@ async fn test_vacuum_succeeds() {
         "vacuum must return ok=true; got: {result:?}"
     );
 }
+
+/// A bound serving profile whose record cannot be read (here: no brain pack
+/// registered, so `brain.profile` dispatch fails) must NOT be stamped as
+/// `served_by_profile_id` — the recall scored with configured defaults, and
+/// stamping would credit downstream feedback to a profile that never served.
+/// A readable record with a null snapshot (new profile) still stamps; that is
+/// the posterior bootstrap path, exercised by the brain pack's own tests.
+#[tokio::test]
+async fn test_unreadable_bound_profile_is_not_stamped_as_served_by() {
+    let rt = KhiveRuntime::new(RuntimeConfig {
+        db_path: None,
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        brain_profile: Some("ghost-profile-v1".to_string()),
+        ..RuntimeConfig::default()
+    })
+    .expect("in-memory runtime");
+    let registry = make_registry(rt.clone());
+
+    registry
+        .dispatch(
+            "memory.remember",
+            json!({ "content": "served-by attribution regression fixture" }),
+        )
+        .await
+        .expect("memory.remember succeeds");
+
+    let hits = registry
+        .dispatch(
+            "memory.recall",
+            json!({ "query": "served-by attribution regression fixture" }),
+        )
+        .await
+        .expect("memory.recall succeeds with an unreadable bound profile");
+    let hits = hits.as_array().expect("array of hits");
+    assert!(!hits.is_empty(), "recall returned at least one result");
+    for hit in hits {
+        assert!(
+            hit.get("served_by_profile_id").is_none() || hit["served_by_profile_id"].is_null(),
+            "unreadable bound profile must not be stamped as served_by; got: {hit:?}"
+        );
+    }
+
+    // Explicit unknown profile_id remains a hard per-op error, unchanged.
+    let err = registry
+        .dispatch(
+            "memory.recall",
+            json!({ "query": "served-by attribution regression fixture", "profile_id": "ghost-profile-v1" }),
+        )
+        .await;
+    assert!(err.is_err(), "explicit unknown profile_id must error");
+}

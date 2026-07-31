@@ -70,6 +70,14 @@ pub fn parse_request(input: &str) -> Result<ParsedRequest, DslError> {
         return parse_chain_tail(p, first_op);
     }
 
+    // A top-level `,` here means the caller wrote `a(), b()` without the
+    // `[...]` a parallel batch requires — the same top-level-separator
+    // mistake `parse_fn_batch` and `parse_chain_tail` already name via
+    // `MixedSeparators`, just hit before either of them ran.
+    if p.peek() == Some(',') {
+        return Err(DslError::MixedSeparators);
+    }
+
     Err(DslError::UnexpectedChar {
         pos: p.pos,
         found: p.peek().unwrap(),
@@ -199,8 +207,12 @@ fn parse_fn_batch(input: &str) -> Result<ParsedRequest, DslError> {
         p.skip_ws();
         match p.peek() {
             Some(',') => {
+                let comma_pos = p.pos;
                 p.advance(1);
                 p.skip_ws();
+                if p.peek() == Some(']') {
+                    return Err(DslError::TrailingComma { pos: comma_pos });
+                }
             }
             Some(']') => {
                 p.advance(1);

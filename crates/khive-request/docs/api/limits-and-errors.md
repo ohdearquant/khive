@@ -30,7 +30,7 @@ This public helper checks a runtime `serde_json::Value`, including handler resul
 | `UnexpectedEof`          | input ends before a required token                                   |
 | `InvalidIdentifier`      | identifier violates the ASCII identifier grammar                     |
 | `DuplicateArg`           | one operation repeats an argument name                               |
-| `InvalidValue`           | function-form value cannot be decoded or reference syntax is invalid |
+| `InvalidValue`           | function-form value cannot be decoded or reference syntax is invalid; an unquoted bareword names the quoting fix (and the corrected call, when the argument or key is known) |
 | `InvalidJson`            | JSON form is malformed or has the wrong shape                        |
 | `UnclosedString`         | quoted string has no terminator                                      |
 | `UnclosedBracket`        | array, object, or parenthesis has no matching close                  |
@@ -41,5 +41,6 @@ This public helper checks a runtime `serde_json::Value`, including handler resul
 | `UnsupportedVerbNesting` | a tool name has more than one dot                                    |
 | `WriteKeyConflict`       | two parallel operations claim the same derived write key             |
 | `ReservedEnvelopeArg`    | an operation contains an envelope-only field                         |
+| `TrailingComma`          | a batch element list ends `,` immediately before its closing `]`     |
 
 Display messages are actionable and retain values such as byte position, count, duplicated argument, conflicting tools, or reserved field. The enum implements `std::error::Error` and is surfaced as invalid request parameters rather than an operation-level execution failure.

@@ -222,6 +222,12 @@ pub enum DslError {
         arg_name: String,
         verb: String,
     },
+    /// A batch element list has a `,` immediately before its closing `]`,
+    /// e.g. `[a(),]` — the slot between the comma and the bracket looks
+    /// like a missing element, not a second `,` mistake.
+    TrailingComma {
+        pos: usize,
+    },
 }
 
 impl fmt::Display for DslError {
@@ -312,6 +318,13 @@ impl fmt::Display for DslError {
                     f,
                     "argument {arg_name:?} in verb {verb:?} is reserved for the request \
                      envelope; pass it at the envelope level, not inside verb args"
+                )
+            }
+            DslError::TrailingComma { pos } => {
+                write!(
+                    f,
+                    "at position {pos}: trailing comma before ']' — a batch cannot end with \
+                     an empty element; remove the comma or add another op after it"
                 )
             }
         }

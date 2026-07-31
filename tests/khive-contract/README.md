@@ -66,12 +66,12 @@ Tests are in `tests/` and organized by ADR. The `khive_contract/` package provid
 Some test filenames use numbers from the play specification that diverged from the final ADR
 numbering in this worktree:
 
-| File | Spec filename | Actual ADR covered |
-|------|--------------|-------------------|
-| `test_adr_020_request_dsl.py` | as-requested | ADR-016 request DSL |
-| `test_adr_027_single_tool_mcp.py` | as-requested | ADR-027 dynamic pack loading |
-| `test_adr_021_recall_pipeline.py` | as-requested | ADR-021 memory pack |
-| `test_adr_033_recall_configurability.py` | as-requested | ADR-033 recall configurability |
+| File                                     | Spec filename | Actual ADR covered             |
+| ---------------------------------------- | ------------- | ------------------------------ |
+| `test_adr_020_request_dsl.py`            | as-requested  | ADR-016 request DSL            |
+| `test_adr_027_single_tool_mcp.py`        | as-requested  | ADR-027 dynamic pack loading   |
+| `test_adr_021_recall_pipeline.py`        | as-requested  | ADR-021 memory pack            |
+| `test_adr_033_recall_configurability.py` | as-requested  | ADR-033 recall configurability |
 
 Each test docstring cites the actual ADR section.
 

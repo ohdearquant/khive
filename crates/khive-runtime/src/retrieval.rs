@@ -51,6 +51,28 @@ pub enum SearchSource {
     Both,
 }
 
+impl SearchSource {
+    /// Combine retrieval-leg membership from two appearances of the same hit.
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Text, Self::Text) => Self::Text,
+            (Self::Vector, Self::Vector) => Self::Vector,
+            _ => Self::Both,
+        }
+    }
+
+    /// Lowercase wire representation used by search serializers.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Vector => "vector",
+            Self::Text => "text",
+            Self::Both => "both",
+        }
+    }
+}
+
 /// RRF constant. Controls how strongly top ranks dominate.
 ///
 /// The paper's k=60 over-compresses scores at KG scale (tens–thousands of
@@ -94,7 +116,9 @@ impl KhiveRuntime {
         let model = parse_embedding_model_alias(model_name);
         let service = self.embedder(model_name).await?;
         let emb_model = model.unwrap_or_default();
-        Ok(service.embed_one(text, emb_model).await?)
+        let out = service.embed_one(text, emb_model).await;
+        crate::usage::count(crate::usage::UsageUnit::EmbedCalls, 1);
+        Ok(out?)
     }
 
     /// Embed a document/passage for indexing using the named model.
@@ -123,12 +147,13 @@ impl KhiveRuntime {
         let model = parse_embedding_model_alias(model_name);
         let service = self.embedder(model_name).await?;
         let emb_model = model.unwrap_or_default();
-        service
-            .embed_passage(&[text.to_string()], emb_model)
-            .await?
+        let embeddings = service.embed_passage(&[text.to_string()], emb_model).await;
+        crate::usage::count(crate::usage::UsageUnit::EmbedCalls, 1);
+        let out = embeddings?
             .into_iter()
             .next()
-            .ok_or_else(|| RuntimeError::Internal("embed_passage returned empty vec".into()))
+            .ok_or_else(|| RuntimeError::Internal("embed_passage returned empty vec".into()))?;
+        Ok(out)
     }
 
     /// Embed a query string for retrieval using the named model.
@@ -154,13 +179,15 @@ impl KhiveRuntime {
         let embeddings = match emb_model {
             EmbeddingModel::BgeSmallEnV15
             | EmbeddingModel::BgeBaseEnV15
-            | EmbeddingModel::BgeLargeEnV15 => service.embed(&texts, emb_model).await?,
-            _ => service.embed_query(&texts, emb_model).await?,
+            | EmbeddingModel::BgeLargeEnV15 => service.embed(&texts, emb_model).await,
+            _ => service.embed_query(&texts, emb_model).await,
         };
-        embeddings
+        crate::usage::count(crate::usage::UsageUnit::EmbedCalls, 1);
+        let out = embeddings?
             .into_iter()
             .next()
-            .ok_or_else(|| RuntimeError::Internal("embed_query returned empty vec".into()))
+            .ok_or_else(|| RuntimeError::Internal("embed_query returned empty vec".into()))?;
+        Ok(out)
     }
 
     /// Embed a document for indexing using the configured default model.
@@ -224,7 +251,9 @@ impl KhiveRuntime {
         let model = parse_embedding_model_alias(model_name);
         let service = self.embedder(model_name).await?;
         let emb_model = model.unwrap_or_default();
-        Ok(service.embed(texts, emb_model).await?)
+        let out = service.embed(texts, emb_model).await;
+        crate::usage::count(crate::usage::UsageUnit::EmbedCalls, texts.len() as u64);
+        Ok(out?)
     }
 
     /// Embed a batch of documents for indexing using the named model.
@@ -247,7 +276,9 @@ impl KhiveRuntime {
         let model = parse_embedding_model_alias(model_name);
         let service = self.embedder(model_name).await?;
         let emb_model = model.unwrap_or_default();
-        Ok(service.embed_passage(texts, emb_model).await?)
+        let out = service.embed_passage(texts, emb_model).await;
+        crate::usage::count(crate::usage::UsageUnit::EmbedCalls, texts.len() as u64);
+        Ok(out?)
     }
 
     /// Embed a batch of documents for indexing using the configured default model.
@@ -285,12 +316,14 @@ impl KhiveRuntime {
         let model = parse_embedding_model_alias(model_name);
         let service = self.embedder(model_name).await?;
         let emb_model = model.unwrap_or_default();
-        match emb_model {
+        let out = match emb_model {
             EmbeddingModel::BgeSmallEnV15
             | EmbeddingModel::BgeBaseEnV15
-            | EmbeddingModel::BgeLargeEnV15 => Ok(service.embed(texts, emb_model).await?),
-            _ => Ok(service.embed_query(texts, emb_model).await?),
-        }
+            | EmbeddingModel::BgeLargeEnV15 => service.embed(texts, emb_model).await,
+            _ => service.embed_query(texts, emb_model).await,
+        };
+        crate::usage::count(crate::usage::UsageUnit::EmbedCalls, texts.len() as u64);
+        Ok(out?)
     }
 
     /// Search vectors using either a caller-provided embedding or query text.
@@ -324,7 +357,7 @@ impl KhiveRuntime {
         };
 
         let ns = token.namespace().as_str().to_owned();
-        Ok(self
+        let hits = self
             .vectors(token)?
             .search(VectorSearchRequest {
                 query_vectors: vec![embedding],
@@ -335,7 +368,9 @@ impl KhiveRuntime {
                 filter: None,
                 backend_hints: None,
             })
-            .await?)
+            .await;
+        crate::usage::count(crate::usage::UsageUnit::VectorPasses, 1);
+        Ok(hits?)
     }
 
     /// Hybrid search: text (FTS5) + vector retrieval fused via Reciprocal Rank Fusion.
@@ -413,6 +448,7 @@ impl KhiveRuntime {
                 snippet_chars: 200,
             })
             .await;
+        crate::usage::count(crate::usage::UsageUnit::FtsPasses, 1);
         let text_hits = crate::error::fts_text_leg_or_err(
             text_search_result.map_err(RuntimeError::from),
             "hybrid_search",
@@ -994,7 +1030,11 @@ fn rrf_fuse(
     let mut buckets: HashMap<Uuid, Bucket> = HashMap::new();
 
     let query_lower = query_text.to_lowercase();
+    let mut text_seen = HashSet::with_capacity(text_hits.len());
     for (i, hit) in text_hits.into_iter().enumerate() {
+        if !text_seen.insert(hit.subject_id) {
+            continue;
+        }
         let rank = i + 1; // RRF is 1-indexed
         let entry = buckets.entry(hit.subject_id).or_default();
         entry.score = entry.score + rrf_score(rank, RRF_K);
@@ -1016,7 +1056,11 @@ fn rrf_fuse(
         }
     }
 
+    let mut vector_seen = HashSet::with_capacity(vector_hits.len());
     for (i, hit) in vector_hits.into_iter().enumerate() {
+        if !vector_seen.insert(hit.subject_id) {
+            continue;
+        }
         let rank = i + 1;
         let entry = buckets.entry(hit.subject_id).or_default();
         entry.score = entry.score + rrf_score(rank, RRF_K);
@@ -1097,6 +1141,40 @@ mod tests {
         let hits = rrf_fuse(text, vec, 10, "query");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].source, SearchSource::Both);
+    }
+
+    #[test]
+    fn rrf_fuse_preserves_unique_leg_scores_exactly() {
+        let text_only = Uuid::new_v4();
+        let both = Uuid::new_v4();
+        let vector_only = Uuid::new_v4();
+        let text = vec![text_hit(text_only, 1, "A"), text_hit(both, 2, "B")];
+        let vector = vec![vector_hit(both, 1), vector_hit(vector_only, 2)];
+
+        let hits = rrf_fuse(text, vector, 10, "query");
+        let score_for = |id| {
+            hits.iter()
+                .find(|hit| hit.entity_id == id)
+                .expect("expected fused hit")
+                .score
+        };
+
+        assert_eq!(score_for(text_only), rrf_score(1, RRF_K));
+        assert_eq!(score_for(both), rrf_score(2, RRF_K) + rrf_score(1, RRF_K));
+        assert_eq!(score_for(vector_only), rrf_score(2, RRF_K));
+    }
+
+    #[test]
+    fn rrf_fuse_counts_duplicate_once_per_leg() {
+        let id = Uuid::new_v4();
+        let text = vec![text_hit(id, 1, "A"), text_hit(id, 2, "A duplicate")];
+        let vector = vec![vector_hit(id, 1), vector_hit(id, 2)];
+
+        let hits = rrf_fuse(text, vector, 10, "query");
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].source, SearchSource::Both);
+        assert_eq!(hits[0].score, rrf_score(1, RRF_K) + rrf_score(1, RRF_K));
     }
 
     #[test]

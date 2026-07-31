@@ -3,6 +3,12 @@
 This directory holds the machine-generated performance record for khive-vamana's
 approximate nearest-neighbour (ANN) engine.
 
+Ledger rows become decision evidence only when their run follows the
+[benchmark evidence protocol](../scripts/perf/README.md#benchmark-evidence-protocol),
+including pre-registered cache-state labels and a warm-up boundary. Older rows
+without that provenance remain historical observations and must not be pooled
+with protocol-compliant samples.
+
 ## Directory contents
 
 | File | Purpose |

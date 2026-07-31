@@ -17,7 +17,7 @@ use khive_types::EventKind;
 use super::common::{
     deser, flatten_get_result, normalize_entity_timestamps, normalize_event_timestamps,
     parse_event_kind, parse_event_outcome, parse_event_substrate, remap_note_status,
-    resolve_uuid_unfiltered, to_json, GetParams,
+    resolve_uuid_unfiltered, resolve_uuid_unfiltered_including_deleted, to_json, GetParams,
 };
 use crate::KgPack;
 
@@ -33,9 +33,18 @@ impl KgPack {
 
         // By-ID resolution (including the hex-prefix form) is namespace-agnostic
         // (ADR-007 Rev 6 / #391 §3) — the Gate is the authz seam, not this lookup.
+        // Live rows resolve first so ambiguity semantics are unchanged; the
+        // including-deleted fallback lets a short prefix reach soft-deleted
+        // rows — required both for `include_deleted=true` and for the
+        // merged_into disclosure below (absorbed entities are soft-deleted, so
+        // a live-only prefix scan would miss them before the hint could fire).
         let id = if let Ok(id) = resolve_uuid_unfiltered(&p.id, &self.runtime, graph_token).await {
             id
         } else if let Ok(id) = resolve_uuid_unfiltered(&p.id, &self.runtime, token).await {
+            id
+        } else if let Ok(id) =
+            resolve_uuid_unfiltered_including_deleted(&p.id, &self.runtime, graph_token).await
+        {
             id
         } else {
             if let Some(payload_val) = self.try_get_proposal_payload(token, &p.id).await? {
@@ -46,6 +55,14 @@ impl KgPack {
 
         let include_deleted = p.include_deleted.unwrap_or(false);
 
+        // Interim merged_into disclosure (data-integrity, precedes the full
+        // ADR-113 redirect chase): `get_entity` names the kept id in its
+        // NotFound message when `id` was consumed by `merge`. Captured here
+        // so it can stand in for the generic not-found built below once
+        // every other substrate (note/edge/event/pack-resolver) also misses
+        // — the marker string is one we control on the write side above.
+        let mut merge_redirect_hint: Option<String> = None;
+
         match self.runtime.get_entity(graph_token, id).await {
             Ok(entity) => {
                 return flatten_get_result(
@@ -53,7 +70,24 @@ impl KgPack {
                     normalize_entity_timestamps(to_json(&entity)?),
                 );
             }
-            Err(RuntimeError::NotFound(_) | RuntimeError::NamespaceMismatch { .. }) => {
+            Err(RuntimeError::NotFound(msg)) => {
+                if msg.contains("was merged into") {
+                    merge_redirect_hint = Some(msg);
+                }
+                if include_deleted {
+                    if let Some(deleted) = self
+                        .runtime
+                        .get_entity_including_deleted(graph_token, id)
+                        .await?
+                    {
+                        return flatten_get_result(
+                            "entity",
+                            normalize_entity_timestamps(to_json(&deleted)?),
+                        );
+                    }
+                }
+            }
+            Err(RuntimeError::NamespaceMismatch { .. }) => {
                 if include_deleted {
                     if let Some(deleted) = self
                         .runtime
@@ -110,6 +144,10 @@ impl KgPack {
 
         if let Some(payload_val) = self.try_get_proposal_payload(token, &p.id).await? {
             return Ok(payload_val);
+        }
+
+        if let Some(hint) = merge_redirect_hint {
+            return Err(RuntimeError::NotFound(hint));
         }
 
         Err(RuntimeError::NotFound(format!("not found: {}", p.id)))

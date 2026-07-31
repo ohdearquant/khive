@@ -4,7 +4,10 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use khive_runtime::Namespace as RuntimeNamespace;
-use khive_runtime::{BackendId, KhiveRuntime, PackRegistry, VerbRegistryBuilder};
+use khive_runtime::{
+    BackendId, KhiveRuntime, PackRegistry, SearchHit, SearchSource, VerbRegistryBuilder,
+};
+use khive_score::DeterministicScore;
 use khive_storage::EdgeRelation;
 use khive_types::namespace::Namespace;
 
@@ -12,6 +15,16 @@ use super::{BackendRegistry, LocatorCache, SubstrateCoordinator, SubstrateCoordi
 
 fn memory_runtime() -> Arc<KhiveRuntime> {
     Arc::new(KhiveRuntime::memory().expect("memory runtime"))
+}
+
+fn search_hit(entity_id: Uuid, source: SearchSource) -> SearchHit {
+    SearchHit {
+        entity_id,
+        score: DeterministicScore::from_f64(1.0),
+        source,
+        title: None,
+        snippet: None,
+    }
 }
 
 /// Build a VerbRegistry with the given packs loaded, using the given runtime.
@@ -243,6 +256,50 @@ async fn fan_out_search_two_backends_merged() {
         !merged_hits.is_empty(),
         "merged results should not be empty"
     );
+}
+
+#[test]
+fn cross_backend_entity_merge_preserves_retrieval_leg_membership() {
+    let text_only = Uuid::new_v4();
+    let vector_only = Uuid::new_v4();
+    let both_only = Uuid::new_v4();
+    let text_and_vector = Uuid::new_v4();
+    let text_on_both = Uuid::new_v4();
+    let vector_on_both = Uuid::new_v4();
+    let both_and_vector = Uuid::new_v4();
+
+    let merged = super::dispatch::rrf_merge_entity_hits(
+        vec![
+            vec![
+                search_hit(text_only, SearchSource::Text),
+                search_hit(both_only, SearchSource::Both),
+                search_hit(text_and_vector, SearchSource::Text),
+                search_hit(text_on_both, SearchSource::Text),
+                search_hit(vector_on_both, SearchSource::Vector),
+                search_hit(both_and_vector, SearchSource::Both),
+            ],
+            vec![
+                search_hit(vector_only, SearchSource::Vector),
+                search_hit(text_and_vector, SearchSource::Vector),
+                search_hit(text_on_both, SearchSource::Text),
+                search_hit(vector_on_both, SearchSource::Vector),
+                search_hit(both_and_vector, SearchSource::Vector),
+            ],
+        ],
+        10,
+    );
+    let sources: std::collections::HashMap<Uuid, SearchSource> = merged
+        .into_iter()
+        .map(|hit| (hit.entity_id, hit.source))
+        .collect();
+
+    assert_eq!(sources[&text_only], SearchSource::Text);
+    assert_eq!(sources[&vector_only], SearchSource::Vector);
+    assert_eq!(sources[&both_only], SearchSource::Both);
+    assert_eq!(sources[&text_and_vector], SearchSource::Both);
+    assert_eq!(sources[&text_on_both], SearchSource::Text);
+    assert_eq!(sources[&vector_on_both], SearchSource::Vector);
+    assert_eq!(sources[&both_and_vector], SearchSource::Both);
 }
 
 #[tokio::test]

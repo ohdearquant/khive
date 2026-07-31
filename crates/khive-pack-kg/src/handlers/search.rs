@@ -11,13 +11,14 @@ use std::time::Instant;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
+use khive_runtime::{micros_to_iso, KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
 use khive_storage::types::PageRequest;
 use khive_storage::EntityFilter;
 
 use super::common::{
-    canonical_entity_kind, canonical_note_kind, deser, props_match, reconcile_specific,
-    resolve_kind_spec, tags_match_any, to_json, validate_entity_type, KindSpec, SearchParams,
+    canonical_entity_kind, canonical_note_kind, deser, missing_kind_error, props_match,
+    reconcile_specific, resolve_kind_spec, tags_match_any, to_json, validate_entity_type, KindSpec,
+    SearchParams,
 };
 use crate::KgPack;
 
@@ -31,7 +32,11 @@ impl KgPack {
         let search_start = Instant::now();
         let p: SearchParams = deser(params)?;
         let limit = p.limit.unwrap_or(10).min(100);
-        let spec = resolve_kind_spec(&p.kind, registry)?;
+        let kind_raw = p
+            .kind
+            .as_deref()
+            .ok_or_else(|| missing_kind_error("kind", registry))?;
+        let spec = resolve_kind_spec(kind_raw, registry)?;
         match spec {
             KindSpec::Entity { specific } => {
                 let kind_filter = reconcile_specific(
@@ -79,7 +84,7 @@ impl KgPack {
                     .await?;
 
                 let candidate_ids: Vec<Uuid> = hits.iter().map(|h| h.entity_id).collect();
-                let entity_meta: HashMap<Uuid, (String, Option<Value>, Vec<String>)> =
+                let entity_meta: HashMap<Uuid, (String, Option<Value>, Vec<String>, i64)> =
                     if candidate_ids.is_empty() {
                         HashMap::new()
                     } else {
@@ -107,14 +112,14 @@ impl KgPack {
                         entities_page
                             .items
                             .into_iter()
-                            .map(|e| (e.id, (e.kind, e.properties, e.tags)))
+                            .map(|e| (e.id, (e.kind, e.properties, e.tags, e.created_at)))
                             .collect()
                     };
 
                 let filtered_hits = if props_filter.is_some() || tag_filter.is_some() {
                     hits.into_iter()
                         .filter(|h| {
-                            let Some((_, props, tags)) = entity_meta.get(&h.entity_id) else {
+                            let Some((_, props, tags, _)) = entity_meta.get(&h.entity_id) else {
                                 return false;
                             };
                             props_filter
@@ -134,13 +139,22 @@ impl KgPack {
                     .filter(|h| h.score.to_f64() >= score_floor)
                     .map(|h| {
                         let entity_kind =
-                            entity_meta.get(&h.entity_id).map(|(k, _, _)| k.as_str());
+                            entity_meta.get(&h.entity_id).map(|(k, _, _, _)| k.as_str());
+                        let created_at = entity_meta
+                            .get(&h.entity_id)
+                            .map(|(_, _, _, c)| micros_to_iso(*c));
                         serde_json::json!({
                             "id": h.entity_id.to_string(),
+                            // `kind`/`name` match the list()/get() row shape (#1174);
+                            // `entity_kind`/`title` are kept for compatibility.
+                            "kind": entity_kind,
                             "entity_kind": entity_kind,
+                            "name": h.title,
                             "score": h.score.to_f64(),
+                            "source": h.source.as_str(),
                             "title": h.title,
                             "snippet": h.snippet,
+                            "created_at": created_at,
                         })
                     })
                     .collect();
@@ -192,24 +206,25 @@ impl KgPack {
                 // N individual gets. Notes absent from the batch result (deleted
                 // between the search and the fetch) are simply absent from the map
                 // and filtered out by the `note_meta.get` guard below.
-                let note_meta: HashMap<Uuid, (String, Option<Value>)> = if hits.is_empty() {
-                    HashMap::new()
-                } else {
-                    let candidate_ids: Vec<Uuid> = hits.iter().map(|h| h.note_id).collect();
-                    let note_store = self.runtime.notes(token)?;
-                    note_store
-                        .get_notes_batch(&candidate_ids)
-                        .await
-                        .map_err(RuntimeError::Storage)?
-                        .into_iter()
-                        .map(|n| (n.id, (n.kind, n.properties)))
-                        .collect()
-                };
+                let note_meta: HashMap<Uuid, (String, Option<Value>, Option<String>, i64)> =
+                    if hits.is_empty() {
+                        HashMap::new()
+                    } else {
+                        let candidate_ids: Vec<Uuid> = hits.iter().map(|h| h.note_id).collect();
+                        let note_store = self.runtime.notes(token)?;
+                        note_store
+                            .get_notes_batch(&candidate_ids)
+                            .await
+                            .map_err(RuntimeError::Storage)?
+                            .into_iter()
+                            .map(|n| (n.id, (n.kind, n.properties, n.name, n.created_at)))
+                            .collect()
+                    };
 
                 let filtered_hits: Vec<_> = if props_filter.is_some() || tag_filter.is_some() {
                     hits.into_iter()
                         .filter(|h| {
-                            let Some((_, props)) = note_meta.get(&h.note_id) else {
+                            let Some((_, props, _, _)) = note_meta.get(&h.note_id) else {
                                 return false;
                             };
                             let props_ok = props_filter
@@ -241,14 +256,22 @@ impl KgPack {
                     .iter()
                     .filter(|h| h.score.to_f64() >= score_floor)
                     .map(|h| {
-                        let note_kind =
-                            note_meta.get(&h.note_id).map(|(k, _)| k.as_str());
+                        let meta = note_meta.get(&h.note_id);
+                        let note_kind = meta.map(|(k, _, _, _)| k.as_str());
+                        let name = meta.and_then(|(_, _, name, _)| name.clone());
+                        let created_at = meta.map(|(_, _, _, c)| micros_to_iso(*c));
                         serde_json::json!({
                             "id": h.note_id.to_string(),
+                            // `kind`/`name` match the list()/get() row shape (#1174);
+                            // `note_kind`/`title` are kept for compatibility.
+                            "kind": note_kind,
                             "note_kind": note_kind,
+                            "name": name,
                             "score": h.score.to_f64(),
+                            "source": h.source.as_str(),
                             "title": h.title,
                             "snippet": h.snippet,
+                            "created_at": created_at,
                         })
                     })
                     .collect();

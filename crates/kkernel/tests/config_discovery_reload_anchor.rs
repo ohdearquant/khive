@@ -119,6 +119,7 @@ path = "{}"
         dry_run: false,
         atomic: false,
         atomic_max_ops: None,
+        strict: false,
     };
 
     let result = run_exec(args).await;

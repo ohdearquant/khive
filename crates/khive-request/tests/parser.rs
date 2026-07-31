@@ -221,12 +221,11 @@ fn other_raw_control_chars_in_quoted_string_still_rejected() {
 }
 
 #[test]
-fn control_char_error_teaches_escape_syntax_and_mcp_double_escape() {
+fn control_char_error_teaches_escape_syntax_without_transport_guidance() {
     // #491: the bare serde message ("control character ... found while
     // parsing a string") teaches nothing. The wrapped error must name the
-    // JSON escape grammar and the MCP-transport double-escape gotcha, so a
-    // caller can actually fix the `ops` string instead of landing on the
-    // wrong "switch to JSON op form" workaround.
+    // JSON escape grammar while remaining transport-neutral; wire encoding
+    // guidance belongs to the transport boundary, not this parser.
     let src = format!("gtd.assign(title=\"a{}b\")", '\u{c}');
     let err = parse_request(&src).unwrap_err();
     let msg = err.to_string();
@@ -239,8 +238,8 @@ fn control_char_error_teaches_escape_syntax_and_mcp_double_escape() {
         "error should name the JSON escape grammar, got: {msg}"
     );
     assert!(
-        msg.to_lowercase().contains("double"),
-        "error should call out the MCP double-escape requirement, got: {msg}"
+        !msg.contains("MCP") && !msg.to_lowercase().contains("transport"),
+        "generic parser error should stay transport-neutral, got: {msg}"
     );
 }
 
@@ -275,8 +274,8 @@ fn control_char_in_object_key_rejected_with_plain_serde_message() {
         "expected InvalidValue, got {err:?}"
     );
     assert!(
-        !msg.to_lowercase().contains("double"),
-        "key-path error should not carry the value-path MCP double-escape teaching, got: {msg}"
+        !msg.contains("DSL string escapes follow JSON"),
+        "key-path error should not carry the value-path escape teaching, got: {msg}"
     );
 }
 
@@ -295,6 +294,92 @@ fn raw_control_byte_in_object_key_rejected() {
             raw as u32
         );
     }
+}
+
+#[test]
+fn bareword_value_names_the_quoting_fix() {
+    // `id=abc` is the most common invalid-value mistake: a string typed
+    // without its surrounding quotes. The message must say it is a
+    // bareword, that string values need double quotes, and — since the
+    // argument name is known here — show the exact corrected call.
+    let err = parse_request("get(id=abc)").unwrap_err();
+    assert!(matches!(err, DslError::InvalidValue { .. }));
+    let msg = err.to_string();
+    assert!(
+        msg.contains("bareword") && msg.contains("double-quoted"),
+        "must name the bareword and the quoting fix, got: {msg}"
+    );
+    assert!(
+        msg.contains(r#"id="abc""#),
+        "must show the corrected call, got: {msg}"
+    );
+}
+
+#[test]
+fn bareword_value_in_object_literal_uses_the_key_as_hint() {
+    // Same mistake, inside a JSON-object-shaped argument value: the key is
+    // known there too, so the reconstructed call still names it.
+    let err = parse_request(r#"update(patch={"name": abc})"#).unwrap_err();
+    assert!(matches!(err, DslError::InvalidValue { .. }));
+    let msg = err.to_string();
+    assert!(
+        msg.contains(r#"name="abc""#),
+        "must show the corrected key:value, got: {msg}"
+    );
+}
+
+#[test]
+fn bareword_value_in_array_element_has_no_reconstruction_to_guess() {
+    // Same mistake, as a bare array element: there is no argument name to
+    // anchor a reconstruction to, so the message must describe the fix
+    // without inventing a call it cannot verify.
+    let err = parse_request("get(id=[abc])").unwrap_err();
+    assert!(matches!(err, DslError::InvalidValue { .. }));
+    let msg = err.to_string();
+    assert!(
+        msg.contains("bareword") && msg.contains("double-quoted"),
+        "must still name the bareword mistake, got: {msg}"
+    );
+}
+
+#[test]
+fn invalid_value_position_and_message_no_longer_disagree() {
+    // Before this fix, a non-bareword invalid value (e.g. `1.2.3`) leaked
+    // serde_json's own "at line 1 column N" — always relative to that
+    // single value's isolated slice, so it disagreed with the DSL-absolute
+    // "at position N" this crate reports for the same failure. The
+    // descriptive part of the message stays; the contradicting position
+    // clause must be gone.
+    let err = parse_request("get(id=1.2.3)").unwrap_err();
+    assert!(matches!(err, DslError::InvalidValue { .. }));
+    let msg = err.to_string();
+    assert!(
+        msg.starts_with("at position 7:"),
+        "expected the DSL-absolute position, got: {msg}"
+    );
+    assert!(
+        !msg.contains("line 1 column"),
+        "must not leak serde's own, disagreeing position, got: {msg}"
+    );
+    assert!(
+        msg.contains("trailing characters"),
+        "must keep serde's descriptive text, got: {msg}"
+    );
+}
+
+#[test]
+fn json_request_form_keeps_its_own_serde_position() {
+    // The JSON request form (an object/array of objects sent as `ops`) is
+    // genuinely JSON end to end — its serde `line`/`column` IS the real
+    // location of the problem, so it must NOT be stripped the way the
+    // function-call form's per-value serde fragment is.
+    let err = parse_request(r#"{"tool": "get", "args": {"id": }}"#).unwrap_err();
+    assert!(matches!(err, DslError::InvalidJson { .. }));
+    let msg = err.to_string();
+    assert!(
+        msg.contains("line 1 column"),
+        "JSON form's own serde position is meaningful and must be kept, got: {msg}"
+    );
 }
 
 #[test]
@@ -318,7 +403,7 @@ fn invalid_escape_with_unrelated_control_byte_not_misattributed() {
     let msg = err.to_string();
     assert!(matches!(err, DslError::InvalidValue { .. }));
     assert!(
-        !msg.to_lowercase().contains("double"),
+        !msg.contains("DSL string escapes follow JSON"),
         "an invalid \\q escape must not be enriched with the control-char diagnostic, got: {msg}"
     );
 }
@@ -331,7 +416,7 @@ fn malformed_unicode_escape_adjacent_to_control_byte_not_misattributed() {
     // with the recorded control-byte hit (the 4th hex-digit slot serde reads
     // is the control byte itself). Offset alone is not enough to gate the
     // enrichment; the error's kind must also be checked, or this lands the
-    // control-char/double-escape guidance on an invalid-escape failure.
+    // control-character escape guidance on an invalid-escape failure.
     let src = format!("gtd.assign(title=\"bad \\u123{}tail\")", '\u{c}');
     let err = parse_request(&src).unwrap_err();
     let msg = err.to_string();
@@ -341,7 +426,7 @@ fn malformed_unicode_escape_adjacent_to_control_byte_not_misattributed() {
         "expected the plain serde invalid-escape message, got: {msg}"
     );
     assert!(
-        !msg.to_lowercase().contains("double"),
+        !msg.contains("DSL string escapes follow JSON"),
         "a malformed \\u escape must not be enriched with the control-char diagnostic, got: {msg}"
     );
 }
@@ -354,7 +439,7 @@ fn short_unicode_escape_backslash_adjacent_control_byte_not_misattributed() {
     // 3-hex-digit case above. That adjacency is spurious: both bytes are
     // consumed as `\u`'s own hex-digit slots, never reinterpreted as a fresh
     // `\<ctrl>` escape pair. The failure must stay the plain malformed
-    // unicode-escape message with no double-escape guidance.
+    // unicode-escape message with no control-character escape guidance.
     let src = format!("gtd.assign(title=\"bad \\u12\\{}tail\")", '\u{c}');
     let err = parse_request(&src).unwrap_err();
     let msg = err.to_string();
@@ -364,7 +449,7 @@ fn short_unicode_escape_backslash_adjacent_control_byte_not_misattributed() {
         "expected the plain serde invalid-escape message, got: {msg}"
     );
     assert!(
-        !msg.to_lowercase().contains("double"),
+        !msg.contains("DSL string escapes follow JSON"),
         "a short \\u escape landing on a backslash+control-byte pair must not be \
          enriched with the control-char diagnostic, got: {msg}"
     );
@@ -377,8 +462,8 @@ fn short_unicode_escape_backslash_adjacent_control_byte_not_misattributed() {
     let genuine_msg = genuine_err.to_string();
     assert!(matches!(genuine_err, DslError::InvalidValue { .. }));
     assert!(
-        genuine_msg.to_lowercase().contains("double"),
-        "a genuine broken \\<ctrl> pair must still get the double-escape guidance, got: {genuine_msg}"
+        genuine_msg.contains("DSL string escapes follow JSON"),
+        "a genuine broken \\<ctrl> pair must still get the escape guidance, got: {genuine_msg}"
     );
 }
 
@@ -391,7 +476,7 @@ fn leading_surrogate_escape_followed_by_control_byte_not_misattributed() {
     // escape. Scan's general backslash-pair walk resets after the high
     // surrogate's 4 hex slots, so without the surrogate-continuation guard it
     // would record that `\<ctrl>` as a genuine broken pair
-    // (`preceded_by_backslash: true`) and land the double-escape teaching on a
+    // (`preceded_by_backslash: true`) and land the escape teaching on a
     // failure it does not explain. The continuation control byte must not be
     // recorded, so the error stays serde's own surrogate message.
     let src = format!("gtd.assign(title=\"bad \\uD800\\{}tail\")", '\u{c}');
@@ -399,9 +484,9 @@ fn leading_surrogate_escape_followed_by_control_byte_not_misattributed() {
     let msg = err.to_string();
     assert!(matches!(err, DslError::InvalidValue { .. }));
     assert!(
-        !msg.to_lowercase().contains("double"),
+        !msg.contains("DSL string escapes follow JSON"),
         "a control byte on a surrogate-continuation path must not be enriched \
-         with the control-char double-escape diagnostic, got: {msg}"
+         with the control-char escape diagnostic, got: {msg}"
     );
 
     // A broken `\<ctrl>` pair AFTER a complete surrogate pair (high + low) is a
@@ -412,9 +497,9 @@ fn leading_surrogate_escape_followed_by_control_byte_not_misattributed() {
     let after_pair_msg = after_pair_err.to_string();
     assert!(matches!(after_pair_err, DslError::InvalidValue { .. }));
     assert!(
-        after_pair_msg.to_lowercase().contains("double"),
+        after_pair_msg.contains("DSL string escapes follow JSON"),
         "a broken \\<ctrl> pair after a complete surrogate pair must still get \
-         the double-escape guidance, got: {after_pair_msg}"
+         the escape guidance, got: {after_pair_msg}"
     );
 }
 
@@ -434,10 +519,7 @@ fn raw_newline_immediately_after_backslash_caught_as_control_char_cause() {
         msg.contains(r#"\n"#) && msg.contains(r#"\t"#) && msg.contains(r#"\""#),
         "error should name the JSON escape grammar, got: {msg}"
     );
-    assert!(
-        msg.to_lowercase().contains("double"),
-        "error should call out the MCP double-escape requirement, got: {msg}"
-    );
+    assert!(msg.contains("DSL string escapes follow JSON"));
 }
 
 #[test]
@@ -453,8 +535,8 @@ fn raw_carriage_return_and_tab_after_backslash_also_caught() {
         );
         let msg = err.to_string();
         assert!(
-            msg.to_lowercase().contains("double"),
-            "error should call out the MCP double-escape requirement for {:#04x}, got: {msg}",
+            msg.contains("DSL string escapes follow JSON"),
+            "error should explain DSL escape syntax for {:#04x}, got: {msg}",
             raw as u32
         );
     }
@@ -477,8 +559,8 @@ fn backslash_followed_by_other_raw_control_bytes_also_caught() {
         );
         let msg = err.to_string();
         assert!(
-            msg.to_lowercase().contains("double"),
-            "error should call out the MCP double-escape requirement for {:#04x}, got: {msg}",
+            msg.contains("DSL string escapes follow JSON"),
+            "error should explain DSL escape syntax for {:#04x}, got: {msg}",
             raw as u32
         );
     }
@@ -1069,6 +1151,41 @@ fn comma_only_parallel_accepted() {
     let r = parse_request("[a(), b(), c()]").unwrap();
     assert_eq!(r.mode, ExecutionMode::Parallel);
     assert_eq!(r.ops.len(), 3);
+}
+
+#[test]
+fn mixed_separator_before_any_chain_pipe_reaches_the_same_message() {
+    // `a(), b() | c()` hits the mixed-separator mistake on the very first
+    // op, before a chain `|` has ever been seen — a third code path from
+    // the other two `MixedSeparators` tests above (`[a() | b(), c()]` and
+    // `a() | b(), c()`). All three must reach the same actionable message,
+    // not fall through to a generic "expected '|' or end of input" report.
+    let err = parse_request("a(), b() | c()").unwrap_err();
+    assert!(
+        matches!(err, DslError::MixedSeparators),
+        "expected MixedSeparators, got {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("cannot mix ',' (parallel) and '|' (chain) separators"),
+        "message must name the mix mistake, got: {msg}"
+    );
+}
+
+#[test]
+fn trailing_comma_before_batch_close_bracket_named() {
+    // `[gtd.next(),]` used to fail with a confusing "invalid identifier"
+    // report pointing at the `]` — the real mistake is the trailing `,`.
+    let err = parse_request("[gtd.next(),]").unwrap_err();
+    assert!(
+        matches!(err, DslError::TrailingComma { .. }),
+        "expected TrailingComma, got {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("trailing comma"),
+        "message must name the trailing comma, got: {msg}"
+    );
 }
 
 #[test]

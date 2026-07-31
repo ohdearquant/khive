@@ -156,7 +156,7 @@ impl MemoryPack {
             profile_state = super::common::balanced_recall_state_from_profile_response(&resp);
             Some(pid.clone())
         } else {
-            let resolved =
+            let mut resolved =
                 super::common::resolve_serving_profile(&self.brain_profile, token, registry).await;
             if let Some(ref profile_id) = resolved {
                 match registry
@@ -171,8 +171,13 @@ impl MemoryPack {
                         tracing::warn!(
                             profile_id = %profile_id,
                             error = %e,
-                            "ADR-104 §1: profile state read failed; recall scores with configured defaults"
+                            "ADR-104 §1: profile record unreadable; recall scores with configured defaults and is not attributed to the profile"
                         );
+                        // A profile whose record cannot be read never served this recall;
+                        // stamping it would credit downstream feedback to a profile that
+                        // had no effect on ranking. A readable record with a null snapshot
+                        // (new profile) still stamps — that is the posterior bootstrap path.
+                        resolved = None;
                     }
                 }
             }

@@ -23,7 +23,8 @@ use crate::vocab::NoteKind;
 pub(crate) use super::params::{
     ContextParams, CreateParams, DeleteParams, GetParams, LinkParams, ListParams,
     ListProposalsParams, MergeParams, NeighborsParams, ProposeParams, QueryParams, ReviewParams,
-    SearchParams, StatsParams, TraverseParams, UpdateParams, WithdrawParams, HARD_CAP,
+    SearchParams, StatsParams, TraverseParams, UpdateParams, WhoamiParams, WithdrawParams,
+    HARD_CAP,
 };
 
 // ---- Kind canonicalization ----
@@ -115,6 +116,35 @@ impl KindSpec {
     }
 }
 
+/// Every wire-level `kind` value accepted anywhere in the KG pack: the five
+/// fixed substrate names plus every granular entity/note kind `registry` has
+/// merged in from the loaded pack set. Sourced entirely from the registry so
+/// a pack that registers a new kind is reflected here without a code change.
+fn all_valid_kind_names(registry: &VerbRegistry) -> Vec<String> {
+    let mut all: Vec<String> = vec![
+        "entity".into(),
+        "note".into(),
+        "edge".into(),
+        "event".into(),
+        "proposal".into(),
+    ];
+    all.extend(registry.all_entity_kinds().iter().map(|s| (*s).to_string()));
+    all.extend(registry.all_note_kinds().iter().map(|s| (*s).to_string()));
+    all.sort();
+    all.dedup();
+    all
+}
+
+/// Build the error for a required `kind`-shaped param that the caller omitted
+/// entirely, enumerating every value the registry currently accepts (same
+/// list [`resolve_kind_spec`] uses for an unrecognized value).
+pub fn missing_kind_error(param_name: &str, registry: &VerbRegistry) -> RuntimeError {
+    RuntimeError::InvalidInput(format!(
+        "missing required param {param_name:?}; valid kinds: {}",
+        all_valid_kind_names(registry).join(" | ")
+    ))
+}
+
 /// Resolve a wire-level `kind` value into a [`KindSpec`]. Accepts a bare substrate
 /// name (`entity`, `note`, `edge`, `event`, `proposal`) or a granular entity/note kind
 /// registered on `registry`.
@@ -162,20 +192,9 @@ pub fn resolve_kind_spec(raw: &str, registry: &VerbRegistry) -> Result<KindSpec,
         });
     }
 
-    let mut all: Vec<String> = vec![
-        "entity".into(),
-        "note".into(),
-        "edge".into(),
-        "event".into(),
-        "proposal".into(),
-    ];
-    all.extend(registry.all_entity_kinds().iter().map(|s| (*s).to_string()));
-    all.extend(registry.all_note_kinds().iter().map(|s| (*s).to_string()));
-    all.sort();
-    all.dedup();
     Err(RuntimeError::InvalidInput(format!(
         "unknown kind {raw:?}; valid: {}",
-        all.join(" | ")
+        all_valid_kind_names(registry).join(" | ")
     )))
 }
 
@@ -869,5 +888,9 @@ pub(crate) fn render_query_result(result: QueryResult) -> Value {
     if !result.warnings.is_empty() {
         out.insert("warnings".to_string(), json!(result.warnings));
     }
+    // Always present (not gated on the cap having fired) so a caller can
+    // check it unconditionally rather than inferring "not truncated" from
+    // the field's absence (#1168, #1247).
+    out.insert("truncated".to_string(), json!(result.truncated));
     Value::Object(out)
 }
