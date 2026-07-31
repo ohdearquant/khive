@@ -8,9 +8,12 @@
 # merge takes the per-day maximum, since a partial day's count only grows
 # toward its final value.
 #
-# Requires: gh (authenticated via GH_TOKEN), jq. The traffic API needs push
-# access, which is why this runs in-repo with GITHUB_TOKEN rather than
-# through any third-party tracker.
+# Requires: gh (authenticated via GH_TOKEN), jq. The traffic API needs
+# push-level access beyond what the workflow-scoped GITHUB_TOKEN can be
+# granted, so in CI the workflow supplies GH_TOKEN from the TRAFFIC_TOKEN
+# repository secret (fine-grained PAT, this repository only,
+# Administration: read-only). Running in-repo still avoids handing any
+# third-party tracker a token.
 set -euo pipefail
 
 REPO="${TRAFFIC_REPO:?TRAFFIC_REPO must be set, e.g. owner/name}"
