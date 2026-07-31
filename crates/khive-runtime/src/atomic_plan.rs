@@ -421,9 +421,32 @@ pub struct GtdTransitionPlan {
 }
 
 impl GtdTransitionPlan {
+    /// Build a plan from its already-decided statements and audit effect.
+    /// Callers outside this crate (e.g. the atomic-apply layer wiring
+    /// `gtd.transition` into a multi-op unit) cannot construct the struct
+    /// literal directly since its fields are crate-private.
+    pub fn new(task_id: Uuid, statements: Vec<PlanStatement>, post_commit: PostCommitEffect) -> Self {
+        Self {
+            task_id,
+            statements,
+            post_commit,
+        }
+    }
+
     /// The task targeted by the prepared transition.
     pub fn task_id(&self) -> Uuid {
         self.task_id
+    }
+
+    /// Status-column DML for this transition; empty for the idempotent
+    /// no-op case.
+    pub fn statements(&self) -> &[PlanStatement] {
+        &self.statements
+    }
+
+    /// The deferred lifecycle audit effect assigned by the prepare pass.
+    pub fn post_commit(&self) -> &PostCommitEffect {
+        &self.post_commit
     }
 }
 
@@ -442,9 +465,31 @@ pub struct GtdCompletePlan {
 }
 
 impl GtdCompletePlan {
+    /// Build a plan from its already-decided statements and audit effect.
+    /// Callers outside this crate (e.g. the atomic-apply layer wiring
+    /// `gtd.complete` into a multi-op unit) cannot construct the struct
+    /// literal directly since its fields are crate-private.
+    pub fn new(task_id: Uuid, statements: Vec<PlanStatement>, post_commit: PostCommitEffect) -> Self {
+        Self {
+            task_id,
+            statements,
+            post_commit,
+        }
+    }
+
     /// The task targeted by the prepared completion.
     pub fn task_id(&self) -> Uuid {
         self.task_id
+    }
+
+    /// Status + `completed_at` DML for this completion.
+    pub fn statements(&self) -> &[PlanStatement] {
+        &self.statements
+    }
+
+    /// The deferred lifecycle audit effect assigned by the prepare pass.
+    pub fn post_commit(&self) -> &PostCommitEffect {
+        &self.post_commit
     }
 }
 
