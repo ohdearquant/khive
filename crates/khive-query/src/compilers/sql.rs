@@ -1989,6 +1989,35 @@ mod tests {
     }
 
     #[test]
+    fn documented_single_path_parallel_edge_audit_compiles_exact_projection_aliases() {
+        const QUERY: &str = "MATCH (a)-[e]->(b) RETURN a.id, e.id, e.relation, b.id";
+
+        let query = gql::parse(QUERY).unwrap();
+        let compiled = compile(&query, &opts()).unwrap();
+        let select_list = compiled
+            .sql
+            .strip_prefix("SELECT ")
+            .and_then(|sql| sql.split_once(" FROM ").map(|(select, _)| select))
+            .unwrap_or_else(|| {
+                panic!(
+                    "compiled query must be a SELECT statement: {}",
+                    compiled.sql
+                )
+            });
+        let aliases: Vec<&str> = select_list
+            .split(", ")
+            .map(|projection| {
+                projection
+                    .rsplit_once(" AS ")
+                    .map(|(_, alias)| alias)
+                    .unwrap_or_else(|| panic!("projection must have an alias: {projection}"))
+            })
+            .collect();
+
+        assert_eq!(aliases, ["a_id", "e_id", "e_relation", "b_id"]);
+    }
+
+    #[test]
     fn entity_type_compiles_as_direct_column_not_json_extract() {
         let q = gql::parse("MATCH (n:document {entity_type: 'paper'})-[:extends]->(m) RETURN n")
             .unwrap();
