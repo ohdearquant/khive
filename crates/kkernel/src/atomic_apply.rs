@@ -1280,7 +1280,7 @@ mod tests {
             other => panic!("idempotent no-op must still succeed as Committed, got {other:?}"),
         };
         assert!(
-            post_commit.is_empty(),
+            post_commit.as_slice().is_empty(),
             "an idempotent no-op transition must produce no post-commit effect (no audit row \
              either — canonical never reaches its own write_audit_record call): {post_commit:?}"
         );
