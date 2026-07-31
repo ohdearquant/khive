@@ -17,9 +17,15 @@ access, so callers with embedding models pre-compute KL-divergence proxies befor
 
 `GreedySelector` implements priority-ordered budget packing with category-weight multipliers
 and deterministic tie-breaking (effective-score desc, size asc, id asc). The `diversity_bias`
-field controls how aggressively the selector prefers different categories at each pick step.
-At `diversity_bias = 0.0` the behavior reduces to a single-pass greedy sort
-(backward-compatible).
+field controls how aggressively the selector prefers different categories at each pick step;
+values outside the inclusive `[0.0, 1.0]` range are rejected. At `diversity_bias = 0.0` the
+behavior reduces to a single-pass greedy sort (backward-compatible).
+
+This is an ordering heuristic, not a knapsack optimizer. It provides no optimality or
+approximation-ratio guarantee against the additive-value optimum. For example, with a budget
+of 10, a size-10 candidate scoring 1.1 ranks before ten size-1 candidates scoring 1.0 each;
+the selector admits the large candidate and returns total score 1.1 even though the ten small
+candidates form a feasible selection with total score 10.0.
 
 ## Rank-score precision (PR #535)
 
