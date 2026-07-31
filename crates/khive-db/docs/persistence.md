@@ -32,6 +32,8 @@ The backend also provides:
 - `apply_pack_ddl_statements(stmts)` -- run pack-auxiliary DDL (ADR-017)
 - `sql()` -- raw `SqlAccess` bridge for the query compiler
 
+Each pack DDL plan is applied atomically in one transaction and remains idempotent on repeat application.
+
 ## Connection pooling
 
 `pool.rs` manages a writer lock (exclusive) and reader connections. All store
