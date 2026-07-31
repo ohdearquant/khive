@@ -17,8 +17,14 @@ pub(crate) async fn handle_resume(
 ) -> Result<Value, RuntimeError> {
     let p: ResumeParams = deser(params)?;
 
-    let uuid = resolve_session_uuid(runtime, token, &p.id, VERB).await?;
-    let note = fetch_session_note(runtime, token, uuid, VERB).await?;
+    // Session notes live in the main shared-graph backend (ADR-083 §4:
+    // store/list write and read through `core()`), so resolution must go
+    // through `core()` too — on a secondary-backend runtime, resolving
+    // against `runtime` itself looks in the pack backend and misses every
+    // stored session.
+    let core = runtime.core();
+    let uuid = resolve_session_uuid(&core, token, &p.id, VERB).await?;
+    let note = fetch_session_note(&core, token, uuid, VERB).await?;
 
     let result = ResumeResult {
         ok: true,
@@ -34,6 +40,60 @@ mod tests {
     use uuid::Uuid;
 
     use super::handle_resume;
+
+    /// A runtime shaped like the pack's M2 configuration: bound to a
+    /// secondary `sessions` backend with the shared-graph main backend
+    /// reachable only through `core()`. Both backends are fresh in-memory
+    /// databases with migrations applied.
+    fn secondary_backend_runtime() -> KhiveRuntime {
+        use std::sync::Arc;
+
+        let make_backend = || {
+            let backend = khive_db::StorageBackend::memory().expect("in-memory backend");
+            {
+                let mut writer = backend.pool().try_writer().expect("writer");
+                khive_db::run_migrations(writer.conn_mut()).expect("migrations");
+            }
+            Arc::new(backend)
+        };
+        let main_backend = make_backend();
+        let sessions_backend = make_backend();
+
+        let mut config = khive_runtime::RuntimeConfig::no_embeddings();
+        config.packs = vec!["kg".to_string()];
+        config.backend_id = khive_runtime::BackendId::new("sessions");
+
+        KhiveRuntime::from_backend(sessions_backend, config).with_core_backend(main_backend)
+    }
+
+    #[tokio::test]
+    async fn resume_finds_session_stored_through_core_on_secondary_backend() {
+        let rt = secondary_backend_runtime();
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+
+        let stored = crate::handlers::store::handle_store(
+            &rt,
+            &token,
+            json!({ "content": "transcript body", "title": "probe" }),
+        )
+        .await
+        .expect("store succeeds");
+        let id = stored["session"]["id"].as_str().expect("id").to_string();
+
+        let resumed = handle_resume(&rt, &token, json!({ "id": id }))
+            .await
+            .expect("resume must find the session store just wrote (ADR-083 §4 core() seam)");
+        assert_eq!(resumed["session"]["id"].as_str(), Some(id.as_str()));
+
+        let exported = crate::handlers::export::handle_export(
+            &rt,
+            &token,
+            json!({ "id": id, "format": "json" }),
+        )
+        .await
+        .expect("export shares the same core() seam and must also find it");
+        assert_eq!(exported["session"]["id"].as_str(), Some(id.as_str()));
+    }
 
     #[tokio::test]
     async fn non_uuid_non_hex_id_rejected() {

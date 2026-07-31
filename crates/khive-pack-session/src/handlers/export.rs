@@ -25,8 +25,11 @@ pub(crate) async fn handle_export(
         )));
     }
 
-    let uuid = resolve_session_uuid(runtime, token, &p.id, VERB).await?;
-    let note = fetch_session_note(runtime, token, uuid, VERB).await?;
+    // Same seam as `session.resume`: session notes are stored through
+    // `core()`, so lookup must target the main backend as well.
+    let core = runtime.core();
+    let uuid = resolve_session_uuid(&core, token, &p.id, VERB).await?;
+    let note = fetch_session_note(&core, token, uuid, VERB).await?;
     let record = to_session_record(&note);
 
     match format {
