@@ -77,7 +77,7 @@ pub trait GraphStore: Send + Sync + 'static {
     /// so a caller who resolved the record's namespace independently of its own ambient token
     /// (the atomic-apply renderer, which knows the committed edge's namespace from its prepare-
     /// time `EdgeNaturalKey`, not from the caller's token) cannot accidentally query the wrong
-    /// namespace by relying on implicit store scoping (khive#1213/#1214 fix round).
+    /// namespace by relying on implicit store scoping.
     async fn get_edge_by_natural_key_including_deleted(
         &self,
         namespace: &str,

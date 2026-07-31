@@ -555,7 +555,7 @@ async fn build_op_result(
         // from too. This mirrors the `link` arm below (same reasoning), but
         // uses the deleted-inclusive natural-key lookup, not `list_edges`:
         // ADR-039's DO NOTHING conflict-absorption arm can commit leaving the
-        // surviving canonical row tombstoned (khive#1213/#1214 fix round),
+        // surviving canonical row tombstoned,
         // and `list_edges` unconditionally filters `deleted_at IS NULL` — it
         // would report "not found" for exactly the row that was just
         // committed, turning a successful, correct commit into a spurious

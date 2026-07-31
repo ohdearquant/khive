@@ -3375,7 +3375,7 @@ backend = "sessions"
         );
     }
 
-    /// khive#1213/#1214 fix round, Medium finding: the canonical survivor a
+    /// The canonical survivor a
     /// symmetric-update op absorbs into can ALREADY be soft-deleted before the
     /// atomic unit even runs (not just tombstoned as a side effect of the same
     /// unit's own writes, as the sibling test above covers). This exercises

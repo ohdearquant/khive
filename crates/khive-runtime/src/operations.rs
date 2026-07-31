@@ -8688,7 +8688,7 @@ mod tests {
         assert!(target_ids.contains(&t2.id));
     }
 
-    /// khive#1213/#1214 fix round: the atomic-apply post-commit renderer for a
+    /// The atomic-apply post-commit renderer for a
     /// symmetric-edge update resolves the surviving row's store by the CALLER's
     /// token but must filter by the record's OWN namespace, passed explicitly —
     /// never by re-deriving it from whichever token happened to select the store
@@ -8696,7 +8696,7 @@ mod tests {
     /// are namespace-agnostic, so a caller in one namespace can legitimately
     /// commit an update against an edge recorded in another). This proves the
     /// `namespace` parameter — not the `token` argument — decides which row the
-    /// natural-key lookup finds, at the level the review flagged as an
+    /// natural-key lookup finds, at the level that is otherwise an
     /// acceptable substitute for a full cross-namespace atomic-apply test.
     #[tokio::test]
     async fn get_edge_by_natural_key_including_deleted_honors_explicit_namespace_not_token() {

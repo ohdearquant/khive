@@ -2949,7 +2949,7 @@ mod tests {
 
     #[test]
     fn blocks_forty_hex_behind_multiword_label_and_marker_delimiter() {
-        // Round-3 review probes: qualifier nouns beyond the two-word case are
+        // Coverage: qualifier nouns beyond the two-word case are
         // reachable once prepositions/possessives read as glue, and a
         // delimiter attached to the VCS marker itself ("deploy sha: <hex>")
         // is assignment syntax like any other delimiter.
@@ -2981,7 +2981,7 @@ mod tests {
 
     #[test]
     fn blocks_forty_hex_behind_participial_adjective_qualifier() {
-        // Round-4 review probes: a past-participle word in ADJECTIVE position
+        // Coverage: a past-participle word in ADJECTIVE position
         // (followed by a content noun: "shared deploy", "encrypted backup")
         // is a label qualifier, not verb-phrase prose, and must not end the
         // walk.
@@ -3008,7 +3008,7 @@ mod tests {
 
     #[test]
     fn blocks_forty_hex_behind_chained_qualifier_label() {
-        // Round-5 review probe: a chain of qualifiers between the value and
+        // Coverage: a chain of qualifiers between the value and
         // the trigger ("shared encrypted deploy") must not exhaust the walk
         // before the label head is reached. Any per-clause content-word cap
         // re-admits this bypass one qualifier past the cap.
@@ -3036,7 +3036,7 @@ mod tests {
 
     #[test]
     fn blocks_over_limit_qualified_label_fails_closed() {
-        // Round-6 review probes: labels whose clause exhausts the walk budget
+        // Coverage: labels whose clause exhausts the walk budget
         // (a marker, an extra qualifier, or an interleaved glue word pushes
         // the trigger past the limit). Exhaustion after a value delimiter
         // fails closed — clause length must not launder a labeled credential
