@@ -35,7 +35,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: dtolnay/rust-toolchain@1.95.0
 
       - name: Pin the real toolchain bin on PATH
         run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
