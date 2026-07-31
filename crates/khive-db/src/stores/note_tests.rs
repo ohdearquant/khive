@@ -377,6 +377,45 @@ async fn test_filtered_order_by_json_path_asc() {
 }
 
 #[tokio::test]
+async fn filtered_default_order_is_stable_across_equal_timestamp_pages() {
+    let store = setup_memory_store();
+    let created_at = 1_750_000_000_000_000_i64;
+    let mut expected_ids = Vec::new();
+
+    for index in 0..317 {
+        let mut note = make_note("ns1", "observation", &format!("note-{index}"));
+        note.created_at = created_at;
+        expected_ids.push(note.id);
+        store.upsert_note(note).await.unwrap();
+    }
+    expected_ids.sort_unstable();
+
+    let mut actual_ids = Vec::new();
+    let page_size = 29_u32;
+    let mut offset = 0_u64;
+    loop {
+        let page = store
+            .query_notes_filtered(
+                "ns1",
+                &NoteFilter::default(),
+                PageRequest {
+                    offset,
+                    limit: page_size,
+                },
+            )
+            .await
+            .unwrap();
+        if page.items.is_empty() {
+            break;
+        }
+        offset += page.items.len() as u64;
+        actual_ids.extend(page.items.into_iter().map(|note| note.id));
+    }
+
+    assert_eq!(actual_ids, expected_ids);
+}
+
+#[tokio::test]
 async fn test_filtered_soft_deleted_excluded() {
     let store = setup_memory_store();
     use khive_storage::note::PropertyFilter as NotePropFilter;
