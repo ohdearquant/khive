@@ -136,7 +136,7 @@ records what's connected, in which direction, and why.
 └──────────────────────────────────────────────────────────────┘
                             ↕ VerbRegistry dispatch
 ┌──────────────────────────────────────────────────────────────┐
-│  khive-pack-kg:        KG vocabulary + 18 verb handlers       │
+│  khive-pack-kg:        KG vocabulary + 19 verb handlers       │
 │  khive-pack-gtd:       task lifecycle (5 verbs)               │
 │  khive-pack-memory:    salience + decay recall (5 verbs)      │
 │  khive-pack-brain:     Bayesian profiles (15 verbs)           │
