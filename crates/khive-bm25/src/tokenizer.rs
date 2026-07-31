@@ -13,7 +13,10 @@ pub use khive_text::{BoxedTokenizer, Tokenizer};
 pub struct SimpleTokenizer {
     /// Whether to lowercase tokens.
     pub lowercase: bool,
-    /// Minimum token length (tokens shorter than this are filtered out).
+    /// Minimum Unicode-scalar token length after punctuation trimming.
+    ///
+    /// Zero disables the length threshold, but empty normalized tokens are
+    /// always discarded.
     pub min_length: usize,
     /// Whether to filter out English stop words.
     pub filter_stop_words: bool,
@@ -30,7 +33,10 @@ impl Default for SimpleTokenizer {
 }
 
 impl SimpleTokenizer {
-    /// Create a new SimpleTokenizer with specified options.
+    /// Create a new `SimpleTokenizer` with the specified options.
+    ///
+    /// `min_length = 0` is supported and retains every non-empty normalized
+    /// token; punctuation-only input still produces no terms.
     pub fn new(lowercase: bool, min_length: usize) -> Self {
         Self {
             lowercase,
@@ -136,6 +142,14 @@ mod tests {
     fn test_simple_tokenizer_min_length_counts_unicode_characters() {
         let tokenizer = SimpleTokenizer::new(true, 2);
         assert_eq!(tokenizer.tokenize("你 rust"), vec!["rust"]);
+    }
+
+    #[test]
+    fn test_simple_tokenizer_zero_min_length_never_emits_empty_terms() {
+        let tokenizer = SimpleTokenizer::new(true, 0);
+
+        assert!(tokenizer.tokenize("!!!").is_empty());
+        assert_eq!(tokenizer.tokenize("... alpha ???"), vec!["alpha"]);
     }
 
     #[test]
