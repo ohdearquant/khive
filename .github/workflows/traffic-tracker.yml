@@ -50,7 +50,7 @@ jobs:
       - name: Fetch existing ledger without checking out the data branch
         run: |
           set -euo pipefail
-          if git ls-remote --exit-code origin traffic-data >/dev/null 2>&1; then
+          if git ls-remote --exit-code origin refs/heads/traffic-data >/dev/null 2>&1; then
             git fetch --depth 1 origin '+refs/heads/traffic-data:refs/remotes/origin/traffic-data'
             if git rev-parse -q --verify origin/traffic-data:data/traffic-ledger.json >/dev/null; then
               git show origin/traffic-data:data/traffic-ledger.json > "$RUNNER_TEMP/traffic-ledger.json"
