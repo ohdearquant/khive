@@ -464,27 +464,27 @@ let do_sections  = do_knowledge && !args.no_sections;
 So `--sections-only` forces `do_atoms = false` regardless of `--no-sections`'s state; it is the
 narrowest possible scope, not just "skip the graph pass."
 
-**`--keep-existing`**: without it (default), every existing vector row for the staged
-`subject_id`s in a model's table is deleted up front (`drop_vectors_for_subjects`,
-`reindex.rs:305-310`); necessary because the vector table's primary key is `(subject_id)` only,
-not `(subject_id, namespace)`, so a namespace relabel followed by reindex would otherwise collide.
-Every staged record is then re-embedded unconditionally. With `--keep-existing`, no delete runs at
-all, and the batch is narrowed to subjects **not already present for that specific model +
-namespace** (`filter_unembedded`, `reindex.rs:326-338`). Within that narrowing, only the specific
-case of `StorageError::Unsupported` (a backend that doesn't implement existence checks at all)
-falls back to the conservative "assume nothing is embedded, re-embed everything" path
-(`reindex.rs:425-440`); any other `batch_exists` error instead skips that model's batch entirely
-and counts it as a failure (`reindex.rs:327-340`); it does not silently re-embed.
+**`--keep-existing`**: without it (default), every staged record is re-embedded and handed to
+`VectorStore::insert_batch`. Each subject's old vector is replaced with the new vector in one
+per-record savepoint; there is no committed pre-delete, so a failed embed or insert leaves the
+prior vector stale rather than absent. With `--keep-existing`, the batch is narrowed to subjects
+**not already present for that specific model + namespace** (`filter_unembedded`). Within that
+narrowing, only `StorageError::Unsupported` (a backend that does not implement existence checks)
+falls back to the conservative "assume nothing is embedded, re-embed everything" path. Any other
+`batch_exists` error skips that model's batch and counts it as a failure; it does not silently
+re-embed. In both modes the selected graph pass still backfills FTS. There is no
+`--embeds-only` mode.
 
 **`--best-effort` vs. the fail-closed default**: `ReindexReport::has_failures()`
-(`reindex.rs:228-236`) is a single predicate covering seven categories: vector embed/insert
+(`reindex.rs`) is a single predicate covering eight categories: vector embed/insert
 errors, entity FTS failures, note FTS failures, knowledge atom failures, a knowledge pass that
 didn't complete, Vamana ANN build/persist failure, and knowledge section failures. Without
 `--best-effort`, any of these causes `run_reindex` to `bail!`: "reindex completed with failures;
 recall/search state may be stale. Re-run, or pass `--best-effort` to accept a partial rebuild."
 With `--best-effort`, the same conditions only print a stderr warning and the process still exits
-0 (`reindex.rs:741-758`). **All seven categories are treated uniformly**; there is no failure
-class that's exempt from `--best-effort` on one side or immune to it on the other. What
+0 (`reindex.rs:741-758`). **All eight categories are treated uniformly**; there is no failure
+class that's exempt from `--best-effort` on one side or immune to it on the other. A failed
+completion epoch bump is the eighth category. What
 `--best-effort` cannot paper over are structural/setup failures that occur _before_ a report even
 exists: a bad `--namespace` value, a config resolution failure, a failed runtime open, a failed
 `authorize`, or a failed page-list call abort the whole run via `?` regardless of the flag.

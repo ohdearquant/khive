@@ -996,7 +996,7 @@ async fn upsert_entities(
 
         // FTS docs — one BEGIN IMMEDIATE / COMMIT per chunk.
         // Vectors are intentionally skipped: they are local-only derived state
-        // and will be computed by `kkernel kg embed` when needed.
+        // and can be repaired explicitly by `kkernel reindex` when needed.
         let summary = text
             .upsert_documents(docs_chunk)
             .await
@@ -1716,7 +1716,7 @@ mod tests {
     }
 
     /// F195: verify that FTS5 is populated during sync so text search works
-    /// after sync without a separate `kkernel kg embed` pass.
+    /// after sync without a separate `kkernel reindex` pass.
     #[tokio::test]
     async fn sync_populates_fts_for_text_search() {
         use khive_runtime::RuntimeConfig;

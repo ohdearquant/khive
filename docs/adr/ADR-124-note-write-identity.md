@@ -31,6 +31,12 @@ general-purpose column reached by several runtime write paths that are kind-agno
 3. `update`, which merges a caller `properties` patch into the stored object.
 4. `merge`, which folds two already-written notes' properties together per a strategy.
 
+There is also a specialized direct-ingest path: `KhiveRuntime::try_create_note` uses
+`INSERT OR IGNORE` for transport-level deduplication and intentionally does not route through the
+generic create validator. `comm.ingest` constructs the inbound message identity and routing
+properties before calling it. That exception matters: "direct Rust caller" below means a caller of
+the `create_note*` family, not every Rust function capable of inserting a note.
+
 Each of those paths stores what it is given. Identity that is a function of the token on one
 path and a function of caller input on another is not identity; a stored value is only evidence
 of authorship if every path that can write it derives it the same way.
@@ -48,11 +54,12 @@ exist because a rule that lives in one pack's verb handler is not a rule about t
 `KhiveRuntime` gains `note_write_validator`, sibling to `entity_type_validator` and
 `note_mutation_hook`, installed at pack registration through
 `PackRuntime::register_note_write_validator`. It receives `(note_kind, actor_id,
-caller_properties)` and returns the properties to store. It is invoked at every runtime site
-that materialises a `Note` from caller-supplied properties — `create_note_inner` (the `create`
-verb and every direct Rust caller) and `prepare_add_note` (proposal apply). Kinds the
-installing pack does not own are returned unchanged; the slot is single-occupancy, like
-`note_mutation_hook`.
+caller_properties)` and returns the properties to store. It is invoked by the generic
+caller-supplied-property sites: `create_note_inner` (the `create` verb and direct Rust callers of
+the `create_note*` family) and `prepare_add_note` (proposal apply). It is deliberately not invoked
+by `try_create_note`, whose channel-ingest caller constructs transport identity before the
+deduplicating insert. Kinds the installing pack does not own are returned unchanged; the slot is
+single-occupancy, like `note_mutation_hook`.
 
 `khive-pack-comm` installs one that derives a `message` note's `from_actor` from the
 authorization token, using the same `token.actor().id` resolution `comm.send` already performs,
@@ -277,8 +284,10 @@ carried on the changeset itself and is out of scope here.
 
 ## Consequences
 
-- Identity on a `message` row is a function of the authorization token on every runtime write
-  path, including direct Rust callers and proposal apply.
+- On the generic create family and proposal apply, a `message` row's derived identity is a
+  function of the authorization token, including direct Rust callers of `create_note*`.
+  `try_create_note` is the explicit exception: `comm.ingest` supplies transport-derived inbound
+  identity before that deduplicating insert, and the generic validator does not run there.
 - A bare runtime with no packs installs neither the validator nor the kind set, so all four
   rules are inert there and embedded/unit-test callers keep their current behaviour.
 - Packs owning other identity-bearing kinds can install their own derivation without a new
