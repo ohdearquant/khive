@@ -1,0 +1,72 @@
+name: Traffic Tracker (14-day rolling)
+
+# GitHub's traffic API retains clone/view data for only 14 days. This
+# workflow runs every 13 days (24h safety overlap), merges the current
+# window into data/traffic-ledger.json via scripts/track-traffic.sh, and
+# commits the result to the dedicated `traffic-data` branch — main is
+# protected, so the ledger lives on its own unprotected branch instead of
+# riding release history.
+#
+# The traffic API requires push access, so this runs in-repo with
+# GITHUB_TOKEN rather than granting any third-party tracker a token.
+
+on:
+  schedule:
+    # every 13 days, off the :00 mark to spread cron load
+    - cron: '23 5 */13 * *'
+  workflow_dispatch:
+    # manual runs, e.g. after a release announcement to capture the spike
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/track-traffic.sh'
+      - '.github/workflows/traffic-tracker.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: traffic-tracker
+  cancel-in-progress: false
+
+jobs:
+  track:
+    name: Snapshot repository traffic
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Check out traffic-data branch (create from main on first run)
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code origin traffic-data >/dev/null 2>&1; then
+            git fetch origin traffic-data
+            git checkout -B traffic-data origin/traffic-data
+          else
+            git checkout -B traffic-data
+          fi
+
+      - name: Merge current traffic window into the ledger
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TRAFFIC_REPO: ${{ github.repository }}
+        run: bash scripts/track-traffic.sh
+
+      - name: Commit and push snapshot
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/traffic-ledger.json
+          if git diff --cached --quiet; then
+            echo "No ledger change to commit"
+            exit 0
+          fi
+          clones=$(jq -r '.last_snapshot.clones_14d' data/traffic-ledger.json)
+          views=$(jq -r '.last_snapshot.views_14d' data/traffic-ledger.json)
+          git commit -m "chore(data): traffic snapshot — ${clones} clones / ${views} views (14d)"
+          git push origin traffic-data
