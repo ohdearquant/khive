@@ -16,8 +16,13 @@ name: Traffic Tracker (14-day rolling)
 # with git plumbing (hash-object/mktree/commit-tree), which also keeps
 # `traffic-data` an orphan branch whose tree contains only the ledger.
 #
-# The traffic API requires push access, so this runs in-repo with
-# GITHUB_TOKEN rather than granting any third-party tracker a token.
+# The traffic API requires push-level repository access that the
+# workflow-scoped GITHUB_TOKEN cannot be granted (it returns HTTP 403,
+# "Resource not accessible by integration"), so the API read uses the
+# TRAFFIC_TOKEN repository secret: a fine-grained personal access token
+# scoped to this repository only, with Administration: read-only. The
+# workflow still runs in-repo rather than granting any third-party
+# tracker a token.
 
 on:
   schedule:
@@ -57,9 +62,20 @@ jobs:
             fi
           fi
 
+      - name: Require the traffic API token
+        env:
+          TRAFFIC_TOKEN: ${{ secrets.TRAFFIC_TOKEN }}
+        run: |
+          if [ -z "$TRAFFIC_TOKEN" ]; then
+            echo "::error::TRAFFIC_TOKEN repository secret is not set." \
+              "The traffic API needs a fine-grained PAT (this repo only," \
+              "Administration: read-only); GITHUB_TOKEN cannot read it."
+            exit 1
+          fi
+
       - name: Merge current traffic window into the ledger
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.TRAFFIC_TOKEN }}
           TRAFFIC_REPO: ${{ github.repository }}
           TRAFFIC_LEDGER: ${{ runner.temp }}/traffic-ledger.json
         run: bash scripts/track-traffic.sh
