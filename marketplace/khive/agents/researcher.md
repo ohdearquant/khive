@@ -123,7 +123,7 @@ Never store findings ONLY as notes. If a concept is worth naming, it's an entity
 "What does entity X connect to?"     → neighbors(node_id=X, direction="both")
 "What builds on X? (lineage)"        → traverse(roots=[X], direction="in", relations=["extends","variant_of"])
 "What does X depend on?"             → traverse(roots=[X], direction="out", relations=["depends_on"])
-"All concepts in domain Y"           → query(query="MATCH (a:concept) WHERE a.domain='Y' RETURN a.name, a.id LIMIT 50")
+"All concepts in domain Y"           → query(query="MATCH (a:concept) WHERE a.properties.domain='Y' RETURN a.name, a.id LIMIT 50")
 "Implementations of concept X"       → query(query="MATCH (p:project)-[:implements]->(c:concept) WHERE c.name='X' RETURN p.name, c.name LIMIT 20")
 "What concepts did paper P introduce?"→ neighbors(node_id=paper_id, direction="in", relations=["introduced_by"])
 "Previously observed/decided on X"   → search(kind="note", query=X)

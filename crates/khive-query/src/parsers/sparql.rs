@@ -357,7 +357,7 @@ fn triples_to_ast(
                 Object::NumberLiteral(val) => {
                     where_cond_list.push(Condition {
                         variable: triple.subject,
-                        property: name,
+                        property: PropertyRef::JsonPath(vec![name]),
                         op: CompareOp::Eq,
                         value: ConditionValue::Number(val),
                     });
@@ -653,6 +653,13 @@ mod tests {
             nodes[0].properties.get("domain").unwrap(),
             &ConditionValue::String("attention".into())
         );
+    }
+
+    #[test]
+    fn numeric_property_filter_is_explicit_json_path_in_ast() {
+        let q = parse("SELECT ?a WHERE { ?a :score 1.5 . ?a :extends ?b . }").unwrap();
+        let cond = q.where_clause.conditions().next().unwrap();
+        assert_eq!(cond.property, PropertyRef::JsonPath(vec!["score".into()]));
     }
 
     #[test]

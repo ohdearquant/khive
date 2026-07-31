@@ -111,10 +111,10 @@ fn compile_rejects_unknown_relation_in_where() {
 }
 
 #[test]
-fn compile_resolves_node_property_name_in_where() {
+fn compile_resolves_explicit_node_property_path_in_where() {
     let q = parse(
         QueryLanguage::Gql,
-        "MATCH (a)-[:extends]->(b) WHERE a.domain = 'query' RETURN a.name",
+        "MATCH (a)-[:extends]->(b) WHERE a.properties.domain = 'query' RETURN a.name",
     )
     .unwrap();
     let compiled = compile(&q, &opts()).unwrap();
@@ -124,6 +124,22 @@ fn compile_resolves_node_property_name_in_where() {
             .contains("json_extract(n0.properties, '$.domain') = ?"),
         "sql: {}",
         compiled.sql
+    );
+}
+
+#[test]
+fn fixed_length_where_unknown_unqualified_field_rejected() {
+    let q = parse(
+        QueryLanguage::Gql,
+        "MATCH (a)-[:extends]->(b) WHERE a.domain = 'query' RETURN a.name",
+    )
+    .unwrap();
+    let err = compile(&q, &opts()).unwrap_err();
+    assert!(
+        matches!(err, QueryError::Compile(ref msg)
+            if msg.contains("unknown node field 'domain'")
+                && msg.contains("properties.<path>")),
+        "got {err:?}"
     );
 }
 
@@ -247,10 +263,26 @@ fn variable_length_where_valid_node_property_compiles() {
 }
 
 #[test]
-fn variable_length_where_property_named_depth_uses_json_properties() {
+fn variable_length_where_unknown_depth_field_rejected() {
     let q = parse(
         QueryLanguage::Gql,
         r#"MATCH (a)-[:precedes*1..3]->(b) WHERE a.name LIKE "%SpecInfer%" AND b._depth > 1 RETURN b.name"#,
+    )
+    .unwrap();
+    let err = compile(&q, &opts()).unwrap_err();
+    assert!(
+        matches!(err, QueryError::Compile(ref msg)
+            if msg.contains("unknown node field '_depth'")
+                && msg.contains("properties.<path>")),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn variable_length_where_explicit_property_named_depth_uses_json_properties() {
+    let q = parse(
+        QueryLanguage::Gql,
+        r#"MATCH (a)-[:precedes*1..3]->(b) WHERE a.name LIKE "%SpecInfer%" AND b.properties._depth > 1 RETURN b.name"#,
     )
     .unwrap();
     let compiled = compile(&q, &opts()).unwrap();
@@ -327,7 +359,7 @@ fn variable_length_where_created_at_resolves_to_direct_column() {
 fn variable_length_where_dedicated_field_and_arbitrary_property_together() {
     let q = parse(
         QueryLanguage::Gql,
-        r#"MATCH (a)-[:precedes*1..3]->(b) WHERE a.id = "concept-1" AND b.custom_tag = "urgent" RETURN b.name"#,
+        r#"MATCH (a)-[:precedes*1..3]->(b) WHERE a.id = "concept-1" AND b.properties.custom_tag = "urgent" RETURN b.name"#,
     )
     .unwrap();
     let compiled = compile(&q, &opts()).unwrap();
@@ -345,7 +377,7 @@ fn variable_length_where_dedicated_field_and_arbitrary_property_together() {
         compiled
             .sql
             .contains("json_extract(r.properties, '$.custom_tag')"),
-        "arbitrary property custom_tag must still fall through to json_extract; sql: {}",
+        "explicit property custom_tag must compile through json_extract; sql: {}",
         compiled.sql
     );
 }
@@ -442,7 +474,7 @@ fn fixed_length_where_created_at_resolves_to_direct_column() {
 fn fixed_length_where_dedicated_field_and_arbitrary_property_together() {
     let q = parse(
         QueryLanguage::Gql,
-        "MATCH (a:concept)-[:extends]->(b) WHERE a.id = 'concept-1' AND a.custom_tag = 'urgent' RETURN a",
+        "MATCH (a:concept)-[:extends]->(b) WHERE a.id = 'concept-1' AND a.properties.custom_tag = 'urgent' RETURN a",
     )
     .unwrap();
     let compiled = compile(&q, &opts()).unwrap();
@@ -458,7 +490,7 @@ fn fixed_length_where_dedicated_field_and_arbitrary_property_together() {
     );
     assert!(
         compiled.sql.contains("json_extract(") && compiled.sql.contains("'$.custom_tag'"),
-        "arbitrary property custom_tag must still fall through to json_extract; sql: {}",
+        "explicit property custom_tag must compile through json_extract; sql: {}",
         compiled.sql
     );
 }
@@ -1081,7 +1113,7 @@ fn gql_inline_property_map_i64_min_binds_exact() {
 fn gql_where_equality_large_integer_binds_exact_i64_not_lossy_float() {
     let q = parse(
         QueryLanguage::Gql,
-        "MATCH (n:artifact) WHERE n.number = 9007199254740993 RETURN n",
+        "MATCH (n:artifact) WHERE n.properties.number = 9007199254740993 RETURN n",
     )
     .unwrap();
     let compiled = compile(&q, &opts()).unwrap();
@@ -1100,7 +1132,7 @@ fn gql_where_equality_i64_bounds_bind_exact() {
     for bound in [i64::MIN, i64::MAX] {
         let q = parse(
             QueryLanguage::Gql,
-            &format!("MATCH (n:artifact) WHERE n.number = {bound} RETURN n"),
+            &format!("MATCH (n:artifact) WHERE n.properties.number = {bound} RETURN n"),
         )
         .unwrap();
         let compiled = compile(&q, &opts()).unwrap();
@@ -1122,7 +1154,10 @@ fn variable_length_where_i64_bounds_bind_exact() {
     for bound in [i64::MIN, i64::MAX] {
         let q = parse(
             QueryLanguage::Gql,
-            &format!("MATCH (a)-[:extends*1..3]->(b) WHERE b.number = {bound} RETURN b"),
+            &format!(
+                "MATCH (a)-[:extends*1..3]->(b) \
+                 WHERE b.properties.number = {bound} RETURN b"
+            ),
         )
         .unwrap();
         let compiled = compile(&q, &opts()).unwrap();
@@ -1180,7 +1215,7 @@ fn gql_where_equality_integer_overflow_rejected_at_parse_time() {
     let overflow = "9223372036854775808";
     let err = parse(
         QueryLanguage::Gql,
-        &format!("MATCH (n:artifact) WHERE n.number = {overflow} RETURN n"),
+        &format!("MATCH (n:artifact) WHERE n.properties.number = {overflow} RETURN n"),
     )
     .unwrap_err();
     assert!(matches!(err, QueryError::Parse { .. }));
@@ -1266,7 +1301,7 @@ fn gql_inline_property_map_well_formed_float_still_parses() {
 fn extended_where_operators_compile_with_bound_parameters() {
     let q = parse(
         QueryLanguage::Gql,
-        r#"MATCH (n) WHERE n.name CONTAINS "%_\' OR 1=1 --" AND n.name STARTS WITH "pre%_\" AND n.kind IN ["concept", "' OR 1=1 --"] AND n.domain IS NOT NULL RETURN n"#,
+        r#"MATCH (n) WHERE n.name CONTAINS "%_\' OR 1=1 --" AND n.name STARTS WITH "pre%_\" AND n.kind IN ["concept", "' OR 1=1 --"] AND n.properties.domain IS NOT NULL RETURN n"#,
     )
     .unwrap();
     let compiled = compile(&q, &opts()).unwrap();
@@ -1319,7 +1354,7 @@ fn extended_where_operators_compile_for_variable_length_patterns() {
         QueryLanguage::Gql,
         "MATCH (a)-[:extends*1..2]->(b) WHERE a.name CONTAINS 'Lo' \
          AND a.name STARTS WITH 'L' AND b.kind IN ['concept', 'document'] \
-         AND b.domain IS NOT NULL RETURN b",
+         AND b.properties.domain IS NOT NULL RETURN b",
     )
     .unwrap();
     let compiled = compile(&q, &opts()).unwrap();
@@ -1574,12 +1609,38 @@ mod substrate_labels {
         insert_entity(&conn, "e-without-domain", "without domain", "{}");
         let q = parse(
             QueryLanguage::Gql,
-            "MATCH (e:entity) WHERE e.domain IS NOT NULL RETURN e.id",
+            "MATCH (e:entity) WHERE e.properties.domain IS NOT NULL RETURN e.id",
         )
         .unwrap();
         let compiled = compile(&q, &opts()).unwrap();
 
         assert_eq!(run(&conn, &compiled), vec!["e-with-domain"]);
+    }
+
+    #[test]
+    fn nested_json_property_path_filters_end_to_end() {
+        let conn = fixture_db();
+        insert_entity(
+            &conn,
+            "e-high",
+            "high severity",
+            r#"{"finding":{"severity":"high"}}"#,
+        );
+        insert_entity(
+            &conn,
+            "e-low",
+            "low severity",
+            r#"{"finding":{"severity":"low"}}"#,
+        );
+        let q = parse(
+            QueryLanguage::Gql,
+            "MATCH (e:entity) \
+             WHERE e.properties.finding.severity = 'high' RETURN e.id",
+        )
+        .unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+
+        assert_eq!(run(&conn, &compiled), vec!["e-high"]);
     }
 
     /// `fixture_db()` plus a second entity and a `graph_edges` row connecting

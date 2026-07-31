@@ -448,11 +448,32 @@ impl Parser {
         }
     }
 
+    fn parse_property_ref(&mut self) -> Result<PropertyRef, QueryError> {
+        let root = self.parse_ident()?;
+        self.skip_whitespace();
+        if self.peek() != Some('.') {
+            return Ok(PropertyRef::Field(root));
+        }
+        if root != "properties" {
+            return Err(self.err(format!(
+                "invalid WHERE property path root '{root}'; nested paths must start with 'properties'"
+            )));
+        }
+
+        let mut path = Vec::new();
+        while self.peek() == Some('.') {
+            self.advance();
+            path.push(self.parse_ident()?);
+            self.skip_whitespace();
+        }
+        Ok(PropertyRef::JsonPath(path))
+    }
+
     fn parse_condition(&mut self) -> Result<Condition, QueryError> {
         self.skip_whitespace();
         let variable = self.parse_ident()?;
         self.expect_char('.')?;
-        let property = self.parse_ident()?;
+        let property = self.parse_property_ref()?;
         let op = self.parse_compare_op()?;
         let value = match op {
             CompareOp::In => ConditionValue::List(self.parse_list_literal()?),
@@ -644,7 +665,27 @@ mod tests {
         let conds: Vec<_> = q.where_clause.conditions().collect();
         assert_eq!(conds.len(), 1);
         assert_eq!(conds[0].variable, "b");
-        assert_eq!(conds[0].property, "name");
+        assert_eq!(conds[0].property, PropertyRef::Field("name".into()));
+    }
+
+    #[test]
+    fn where_json_property_path_is_explicit_in_ast() {
+        let q = parse("MATCH (n) WHERE n.properties.finding.severity = 'high' RETURN n").unwrap();
+        let cond = q.where_clause.conditions().next().unwrap();
+        assert_eq!(
+            cond.property,
+            PropertyRef::JsonPath(vec!["finding".into(), "severity".into()])
+        );
+    }
+
+    #[test]
+    fn where_nested_path_rejects_non_properties_root() {
+        let err = parse("MATCH (n) WHERE n.finding.severity = 'high' RETURN n").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("invalid WHERE property path root 'finding'"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -691,7 +732,7 @@ mod tests {
     fn where_clause_extended_operators() {
         let q = parse(
             "MATCH (n:entity) WHERE n.name CONTAINS '%_' AND n.name STARTS WITH 'pre' \
-             AND n.kind IN ['concept', 'document'] AND n.domain IS NOT NULL RETURN n",
+             AND n.kind IN ['concept', 'document'] AND n.properties.domain IS NOT NULL RETURN n",
         )
         .unwrap();
         let conds: Vec<_> = q.where_clause.conditions().collect();
@@ -713,8 +754,11 @@ mod tests {
 
     #[test]
     fn where_in_accepts_scalar_list_and_empty_list() {
-        let q = parse("MATCH (n) WHERE n.value IN ['x', 1, 2.5, true] OR n.value IN [] RETURN n")
-            .unwrap();
+        let q = parse(
+            "MATCH (n) WHERE n.properties.value IN ['x', 1, 2.5, true] \
+             OR n.properties.value IN [] RETURN n",
+        )
+        .unwrap();
         let conds: Vec<_> = q.where_clause.conditions().collect();
         assert_eq!(
             conds[0].value,

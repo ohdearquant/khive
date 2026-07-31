@@ -1397,6 +1397,41 @@ const EVENT_COLUMNS: &[&str] = &[
     "created_at",
 ];
 const EDGE_COLUMNS: &[&str] = &["id", "source_id", "target_id", "relation", "weight"];
+const NODE_WHERE_COLUMNS: &[&str] = &[
+    "id",
+    "name",
+    "kind",
+    "entity_type",
+    "description",
+    "created_at",
+    "updated_at",
+];
+const OBSERVATION_TARGET_WHERE_COLUMNS: &[&str] = &[
+    "id",
+    "kind",
+    "entity_type",
+    "status",
+    "name",
+    "content",
+    "salience",
+    "decay_factor",
+    "created_at",
+    "updated_at",
+    "referent_kind",
+];
+const EVENT_WHERE_COLUMNS: &[&str] = &[
+    "id",
+    "verb",
+    "substrate",
+    "actor",
+    "kind",
+    "outcome",
+    "payload",
+    "duration_us",
+    "target_id",
+    "session_id",
+    "created_at",
+];
 const EDGE_WHERE_COLUMNS: &[&str] = &["relation", "weight"];
 
 fn property_columns(kind: &VarKind) -> (&'static [&'static str], &'static str) {
@@ -1421,29 +1456,62 @@ fn property_to_column<'a>(prop: &'a str, kind: &VarKind) -> Result<&'a str, Quer
     }
 }
 
+fn where_property_columns(kind: &VarKind) -> (&'static [&'static str], &'static str) {
+    match kind {
+        VarKind::Node => (NODE_WHERE_COLUMNS, "node"),
+        VarKind::ObservationTargetNode => (OBSERVATION_TARGET_WHERE_COLUMNS, "observation target"),
+        VarKind::EventNode => (EVENT_WHERE_COLUMNS, "event"),
+        VarKind::Edge => (EDGE_WHERE_COLUMNS, "edge"),
+    }
+}
+
 fn where_property_expression(
-    prop: &str,
+    property: &PropertyRef,
     kind: &VarKind,
     alias: &str,
 ) -> Result<String, QueryError> {
-    let (projection_columns, kind_name) = property_columns(kind);
-    let valid = if *kind == VarKind::Edge {
-        EDGE_WHERE_COLUMNS
-    } else {
-        projection_columns
-    };
-    if valid.contains(&prop) {
-        Ok(format!("{alias}.{prop}"))
-    } else if projection_columns.contains(&"properties") {
-        Ok(format!(
-            "json_extract({alias}.properties, '$.{}')",
-            prop.replace('\'', "''")
-        ))
-    } else {
-        Err(QueryError::Compile(format!(
-            "unknown {kind_name} property '{prop}' in WHERE clause. Valid: {}",
+    let (valid, kind_name) = where_property_columns(kind);
+    match property {
+        PropertyRef::Field(field) if valid.contains(&field.as_str()) => {
+            Ok(format!("{alias}.{field}"))
+        }
+        PropertyRef::Field(field) if field == "properties" => Err(QueryError::Compile(
+            "'properties' is reserved as the JSON path root in WHERE clauses; \
+             use 'properties.<path>'"
+                .into(),
+        )),
+        PropertyRef::Field(field) => Err(QueryError::Compile(format!(
+            "unknown {kind_name} field '{field}' in WHERE clause. Valid fields: {}; \
+             JSON properties must use 'properties.<path>'",
             valid.join(", ")
-        )))
+        ))),
+        PropertyRef::JsonPath(path) => {
+            let (projection_columns, _) = property_columns(kind);
+            if !projection_columns.contains(&"properties") {
+                return Err(QueryError::Compile(format!(
+                    "{kind_name} variables do not expose JSON properties in WHERE clauses. \
+                     Valid fields: {}",
+                    valid.join(", ")
+                )));
+            }
+            if path.is_empty() {
+                return Err(QueryError::Compile(
+                    "JSON property path cannot be empty; use 'properties.<path>'".into(),
+                ));
+            }
+            if let Some(segment) = path.iter().find(|segment| {
+                segment.is_empty() || !segment.chars().all(|ch| ch.is_alphanumeric() || ch == '_')
+            }) {
+                return Err(QueryError::Compile(format!(
+                    "invalid JSON property path segment '{segment}'; \
+                     path segments must be identifiers"
+                )));
+            }
+            Ok(format!(
+                "json_extract({alias}.properties, '$.{}')",
+                path.join(".")
+            ))
+        }
     }
 }
 
@@ -1692,6 +1760,89 @@ mod tests {
                 .unwrap();
         let err = compile(&q, &opts()).unwrap_err();
         assert!(err.to_string().contains("namespace"), "msg: {err}");
+    }
+
+    #[test]
+    fn compile_explicit_nested_json_property_in_where() {
+        let q = gql::parse(
+            "MATCH (a)-[:extends]->(b) \
+             WHERE a.properties.finding.severity = 'high' RETURN a",
+        )
+        .unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert!(
+            compiled
+                .sql
+                .contains("json_extract(n0.properties, '$.finding.severity') = ?"),
+            "sql: {}",
+            compiled.sql
+        );
+    }
+
+    #[test]
+    fn compile_rejects_unknown_unqualified_where_field() {
+        let q = gql::parse("MATCH (a)-[:extends]->(b) WHERE a.severity = 'high' RETURN a").unwrap();
+        let err = compile(&q, &opts()).unwrap_err();
+        assert!(
+            matches!(err, QueryError::Compile(ref msg)
+                if msg.contains("unknown node field 'severity'")
+                    && msg.contains("properties.<path>")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn compile_rejects_bare_properties_where_field() {
+        let q = gql::parse("MATCH (a)-[:extends]->(b) WHERE a.properties = '{}' RETURN a").unwrap();
+        let err = compile(&q, &opts()).unwrap_err();
+        assert!(
+            matches!(err, QueryError::Compile(ref msg)
+                if msg.contains("reserved as the JSON path root")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn where_json_path_rejects_empty_hand_built_path() {
+        let err =
+            where_property_expression(&PropertyRef::JsonPath(Vec::new()), &VarKind::Node, "n0")
+                .unwrap_err();
+        assert!(
+            matches!(err, QueryError::Compile(ref msg) if msg.contains("cannot be empty")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn where_json_path_rejects_injection_shaped_hand_built_segment() {
+        let err = where_property_expression(
+            &PropertyRef::JsonPath(vec!["severity') OR 1=1 --".into()]),
+            &VarKind::Node,
+            "n0",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, QueryError::Compile(ref msg)
+                if msg.contains("invalid JSON property path segment")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn where_json_path_rejects_edge_and_event_bindings() {
+        for kind in [VarKind::Edge, VarKind::EventNode] {
+            let err = where_property_expression(
+                &PropertyRef::JsonPath(vec!["severity".into()]),
+                &kind,
+                "bound",
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, QueryError::Compile(ref msg)
+                    if msg.contains("do not expose JSON properties")),
+                "got {err:?}"
+            );
+        }
     }
 
     #[test]

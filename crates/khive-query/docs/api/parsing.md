@@ -21,6 +21,8 @@ and_expr   = condition ("AND" condition)*
 
 Conditions support `=`, `!=`, `>`, `<`, `>=`, `<=`, `LIKE`, `CONTAINS`, `STARTS WITH`, `IN [...]`, and `IS NOT NULL`. `CONTAINS` and `STARTS WITH` treat `%`, `_`, and `\` literally; the compiler escapes them before adding its own wildcard.
 
+A condition references either a dedicated field (`n.name`) or an explicit JSON-property path (`n.properties.finding.severity`). JSON paths require one or more identifier segments after `properties`; another dotted root such as `n.finding.severity` is a parse error. A single unknown field such as `n.severity` parses as a field reference and is rejected during substrate-aware compilation with the valid direct fields and the `properties.<path>` guidance.
+
 ### Literal grammar
 
 Inline maps and `WHERE` conditions share this scalar grammar:
@@ -37,6 +39,8 @@ Digits are required on both sides of a float's decimal point, so `.5`, `1.`, and
 ## SPARQL parser
 
 `parsers::sparql::parse` accepts the crate's SPARQL-inspired `SELECT ... WHERE { ... } LIMIT ...` subset and converts triples into the same alternating path AST. Predicate paths support one hop, `+`, and explicit inclusive ranges.
+
+A numeric predicate condition targets a JSON property explicitly, even when its predicate name matches a dedicated field. This matches string-valued predicate properties and removes the prior value-type-dependent field ambiguity.
 
 The AST currently represents one connected, non-branching path. Disconnected or branched edge triples, and kind/property constraints on variables outside that path, are rejected so no conjunct is silently discarded. Triple conditions are folded into a left-associative `AND` tree.
 
