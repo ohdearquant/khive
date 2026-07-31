@@ -15,6 +15,9 @@ pub enum AliasError {
     /// A collection with this name already exists.
     CollectionAlreadyExists(String),
 
+    /// The collection is still referenced by at least one alias.
+    CollectionInUse(String),
+
     /// An alias with this name already exists.
     AliasAlreadyExists(String),
 
@@ -49,6 +52,9 @@ impl fmt::Display for AliasError {
             Self::CollectionNotFound(name) => write!(f, "collection not found: {name}"),
             Self::CollectionAlreadyExists(name) => {
                 write!(f, "collection already exists: {name}")
+            }
+            Self::CollectionInUse(name) => {
+                write!(f, "collection is still referenced by an alias: {name}")
             }
             Self::AliasAlreadyExists(name) => write!(f, "alias already exists: {name}"),
             Self::ValidationFailed {

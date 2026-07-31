@@ -12,7 +12,7 @@ service offline.
 3. Validate the new index (recall@k benchmark)
 4. Atomic swap: `alias("active")` now points to `collection("index_v2")`
 5. In-flight queries on v1 complete on v1; new queries go to v2
-6. After drain (all v1 readers dropped), deallocate v1
+6. If no other alias references v1, retire it and deallocate after its readers drain
 
 ## Concurrency Model
 
@@ -20,7 +20,10 @@ service offline.
   short critical sections)
 - **Write path**: Brief exclusive lock for pointer swap only
 - **Background build**: `tokio::task::spawn_blocking`, no locks held during build
-- **Drain**: Async poll via `AtomicU64` reader counter
+- **Lock order**: Operations that need both registries always acquire aliases before
+  collections
+- **Drain**: Retirement is rejected while any alias references the collection; after
+  retirement, readers drain through async polling of an `AtomicU64` counter
 
 ## Module Structure
 
